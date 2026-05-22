@@ -213,12 +213,15 @@ impl<'a> BlobReader<'a> {
     ) -> Option<Vec<u8>> {
         let actual_hash = kin_blobs::digest(&content);
         if actual_hash != *expected {
-            tracing::debug!(
+            // Surface as warn (not debug) so silent-pass mode is observable:
+            // caller sees `None` either way, but logs distinguish
+            // "blob missing everywhere" from "blob retrieved but corrupted".
+            tracing::warn!(
                 file = %file_path,
                 expected = %expected,
                 actual = %actual_hash,
                 source = source,
-                "git blob hash mismatch during repair, skipping"
+                "git blob hash mismatch during repair: retrieved blob content does not match expected hash, skipping repair"
             );
             return None;
         }
@@ -2211,5 +2214,275 @@ def uri_encoder(value):\n    return value\n",
         // Hash that was never written.
         let missing = kin_blobs::Hash256::from_bytes([0xfe; 32]);
         assert!(reader.read(&missing, "any/path").is_none());
+    }
+
+    /// Gap 4 (audit follow-up): when a fallback tier returns content whose
+    /// hash does not match the expected hash, accept_repaired_blob refuses
+    /// the repair (returns None) and emits a warn-level log so the
+    /// silent-pass mode is observable to operators.
+    ///
+    /// Note: log emission itself is not asserted here — the kin-core test
+    /// suite has no log-capture helper. The log promotion to warn is
+    /// covered by inspecting the source: accept_repaired_blob uses
+    /// `tracing::warn!` on the mismatch path.
+    #[test]
+    fn blob_reader_warns_on_hash_mismatch_during_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
+        let reader = BlobReader::new(&blob_store, None, None);
+
+        // Expected hash addresses some imaginary blob; the content we hand
+        // in corresponds to a different payload and therefore hashes to a
+        // different value. accept_repaired_blob must refuse it.
+        let real_content = b"actual blob content from git fallback";
+        let actual_hash = kin_blobs::digest(real_content);
+        let expected_hash = kin_blobs::Hash256::from_bytes([0xab; 32]);
+        assert_ne!(actual_hash, expected_hash);
+
+        let result = reader.accept_repaired_blob(
+            &expected_hash,
+            "src/lib.rs",
+            real_content.to_vec(),
+            "git tree",
+        );
+        assert!(
+            result.is_none(),
+            "hash-mismatched repaired blob must be rejected"
+        );
+
+        // The blob store must NOT have been polluted by the rejected content.
+        assert!(
+            blob_store.read(&expected_hash).is_err(),
+            "rejected blob must not be back-filled under the expected hash"
+        );
+        assert!(
+            blob_store.read(&actual_hash).is_err(),
+            "rejected blob must not be back-filled under its own hash either"
+        );
+    }
+
+    /// Gap 5 (audit follow-up): rename chains spanning more than one hop
+    /// must resolve transitively. A → B → C means resolve("path-a")
+    /// returns "path-c", and resolving the intermediate "path-b" also
+    /// reaches "path-c".
+    #[test]
+    fn historical_path_resolver_follows_multi_hop_renames() {
+        let blob_ab = Hash256::from_bytes([0xf1; 32]);
+        let blob_bc = Hash256::from_bytes([0xf2; 32]);
+
+        let create_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xf3; 32]));
+        let rename1_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xf4; 32]));
+        let rename2_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xf5; 32]));
+
+        let create_change = SemanticChange {
+            id: create_id,
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "create".into(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![ArtifactDelta {
+                file_id: FilePathId::new("path-a"),
+                kind: ArtifactDeltaKind::Added,
+                old_hash: None,
+                new_hash: Some(blob_ab),
+            }],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+        // First hop: path-a -> path-b, content unchanged so blob_ab carries.
+        let rename1 = SemanticChange {
+            id: rename1_id,
+            parents: vec![create_id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "a->b".into(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![
+                ArtifactDelta {
+                    file_id: FilePathId::new("path-a"),
+                    kind: ArtifactDeltaKind::Removed,
+                    old_hash: Some(blob_ab),
+                    new_hash: None,
+                },
+                ArtifactDelta {
+                    file_id: FilePathId::new("path-b"),
+                    kind: ArtifactDeltaKind::Added,
+                    old_hash: None,
+                    new_hash: Some(blob_ab),
+                },
+            ],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+        // Second hop: path-b -> path-c with a new content hash (blob_bc).
+        // The resolver still chains b->c via the Removed/Added pair on
+        // blob_bc; collapse then promotes a -> c.
+        let rename2 = SemanticChange {
+            id: rename2_id,
+            parents: vec![rename1_id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "b->c".into(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![
+                ArtifactDelta {
+                    file_id: FilePathId::new("path-b"),
+                    kind: ArtifactDeltaKind::Removed,
+                    old_hash: Some(blob_bc),
+                    new_hash: None,
+                },
+                ArtifactDelta {
+                    file_id: FilePathId::new("path-c"),
+                    kind: ArtifactDeltaKind::Added,
+                    old_hash: None,
+                    new_hash: Some(blob_bc),
+                },
+            ],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+
+        let mut file_tree = HashMap::new();
+        file_tree.insert(FilePathId::new("path-c"), blob_bc);
+
+        let resolver =
+            HistoricalPathResolver::from_changes(&[create_change, rename1, rename2], &file_tree);
+
+        let resolved_a = resolver
+            .resolve(&FilePathId::new("path-a"), &file_tree)
+            .expect("multi-hop chain a->b->c should resolve");
+        assert_eq!(
+            resolved_a,
+            FilePathId::new("path-c"),
+            "transitive rename chain should collapse a -> c"
+        );
+
+        let resolved_b = resolver
+            .resolve(&FilePathId::new("path-b"), &file_tree)
+            .expect("mid-chain reference should still resolve to canonical");
+        assert_eq!(
+            resolved_b,
+            FilePathId::new("path-c"),
+            "intermediate path b should also resolve to canonical c"
+        );
+    }
+
+    /// Gap 2 (audit follow-up): mixed binding — when only some persisted
+    /// entities are alive at the ref, enrich_sparse_historical_source_file
+    /// MUST reparse fresh and reuse NO persisted IDs. This guards against
+    /// degrading the all-or-nothing semantic into a per-entity decision.
+    #[test]
+    fn enrich_sparse_reparses_fresh_when_any_persisted_entity_not_alive() {
+        let reachable_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xb0; 32]));
+        let unreachable_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xb1; 32]));
+
+        let mut alive_one = test_entity("alive_one", "src/lib.py");
+        alive_one.created_in = Some(reachable_id);
+        let mut alive_two = test_entity("alive_two", "src/lib.py");
+        alive_two.created_in = Some(reachable_id);
+        let mut stale = test_entity("stale_dropped", "src/lib.py");
+        stale.created_in = Some(unreachable_id);
+
+        let persisted = vec![alive_one.clone(), alive_two.clone(), stale.clone()];
+        let persisted_ids: HashSet<EntityId> = persisted.iter().map(|entity| entity.id).collect();
+
+        // Parser sees four entities — two whose (kind, name) keys overlap
+        // with persisted alive entries, plus two brand-new ones. This
+        // satisfies `should_enrich_with_parsed_semantics` (parsed.len >
+        // persisted.len, shared > 0, parsed_only >= 2).
+        let parsed_alive_one = test_entity("alive_one", "src/lib.py");
+        let parsed_alive_two = test_entity("alive_two", "src/lib.py");
+        let parsed_new_one = test_entity("brand_new_one", "src/lib.py");
+        let parsed_new_two = test_entity("brand_new_two", "src/lib.py");
+        let parsed_ids: HashSet<EntityId> = [
+            parsed_alive_one.id,
+            parsed_alive_two.id,
+            parsed_new_one.id,
+            parsed_new_two.id,
+        ]
+        .into_iter()
+        .collect();
+
+        // Sanity: parser-issued IDs are distinct from any persisted ID.
+        for parsed_id in &parsed_ids {
+            assert!(
+                !persisted_ids.contains(parsed_id),
+                "test fixture invariant: parser IDs must not collide with persisted IDs"
+            );
+        }
+
+        let indexed_file = kin_index::IndexedFile {
+            file_id: FilePathId::new("src/lib.py"),
+            language: kin_model::LanguageId::Python,
+            entities: vec![
+                parsed_alive_one,
+                parsed_alive_two,
+                parsed_new_one,
+                parsed_new_two,
+            ],
+            relations: vec![],
+            unresolved_relations: vec![],
+            file_layout: FileLayout {
+                file_id: FilePathId::new("src/lib.py"),
+                parse_completeness: ParseCompleteness::Full,
+                imports: ImportSection {
+                    byte_range: 0..0,
+                    items: vec![],
+                },
+                regions: vec![],
+            },
+            parse_state: kin_model::ParseState::Valid,
+            blob_hash: Hash256::from_bytes([0xcc; 32]),
+            extracted_relations: vec![],
+            imports: vec![],
+        };
+
+        let lifecycle = RefLifecycle {
+            reachable_changes: [reachable_id].into_iter().collect(),
+            removed_entities: HashSet::new(),
+        };
+
+        let enrichment = enrich_sparse_historical_source_file(&persisted, indexed_file, &lifecycle)
+            .expect("mixed-binding input should still enter the reparse-fresh branch");
+
+        // All-or-nothing: no persisted ID may appear in the returned
+        // enrichment. This is the load-bearing guarantee — flipping to a
+        // per-entity decision would allow alive_one/alive_two to bind
+        // while stale stays unbound, which we explicitly forbid here.
+        for entity in &enrichment.entities {
+            assert!(
+                !persisted_ids.contains(&entity.id),
+                "reparsed enrichment must not reuse persisted IDs (entity {} reused {})",
+                entity.name,
+                entity.id
+            );
+        }
+        assert_eq!(
+            enrichment.entities.len(),
+            4,
+            "reparse-fresh path returns parser entities verbatim"
+        );
+        // The file layout must reflect the partial-parse origin so callers
+        // can observe that this enrichment is not a full historical bind.
+        assert!(
+            matches!(
+                enrichment.file_layout.parse_completeness,
+                ParseCompleteness::Partial(_)
+            ),
+            "reparse-fresh path must emit a Partial layout to signal lifecycle gap"
+        );
     }
 }
