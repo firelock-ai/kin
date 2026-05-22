@@ -2545,6 +2545,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -3268,6 +3269,7 @@ dependencies = [
  "object_store",
  "parking_lot",
  "rayon",
+ "reqwest",
  "rmp-serde",
  "safetensors",
  "serde",
@@ -5010,6 +5012,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
+ "webpki-roots",
 ]
 
 [[package]]
