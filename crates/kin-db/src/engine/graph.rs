@@ -366,9 +366,18 @@ fn migrate_legacy_verification_relations(snapshot: &mut GraphSnapshot) {
 // ---------------------------------------------------------------------------
 
 /// Progress of the background embedding pipeline.
+///
+/// `pending` reports outstanding embedding work, defined as
+/// `max(queue_length, total - indexed)`. This deliberately covers both
+/// queued-but-unembedded entities and unindexed entities that have not yet
+/// been queued (the latter is the steady state after loading a graph whose
+/// embedding queue does not persist across restarts). Coverage gates that
+/// only inspect this field stay correct without also reading `indexed` and
+/// `total`. Callers that need the raw runtime queue length specifically
+/// should use [`InMemoryGraph::pending_embeddings`] instead.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EmbeddingStatus {
-    /// Entities queued but not yet embedded.
+    /// Outstanding embedding work: `max(queue_length, total - indexed)`.
     pub pending: usize,
     /// Entities currently in the HNSW vector index.
     pub indexed: usize,
@@ -2488,10 +2497,15 @@ impl InMemoryGraph {
     }
 
     /// Get the current embedding status.
+    ///
+    /// The returned `pending` field is `max(queue_length, total - indexed)` so
+    /// that coverage gates remain correct when entities exist that have not
+    /// yet been queued for embedding (the steady state after loading a graph
+    /// whose embedding queue does not persist across restarts).
     pub fn embedding_status(&self) -> EmbeddingStatus {
         #[cfg(feature = "vector")]
-        let (pending, indexed) = {
-            let pending = self.embedding_queue.lock().len();
+        let (queue_len, indexed) = {
+            let queue_len = self.embedding_queue.lock().len();
             let indexed = {
                 let ent = self.entities.read();
                 self.vector_index
@@ -2500,12 +2514,13 @@ impl InMemoryGraph {
                     .map(|vi| ent.entities.keys().filter(|id| vi.contains(id)).count())
                     .unwrap_or(0)
             };
-            (pending, indexed)
+            (queue_len, indexed)
         };
         #[cfg(not(feature = "vector"))]
-        let (pending, indexed) = (0, 0);
+        let (queue_len, indexed) = (0usize, 0usize);
 
         let total = self.entity_count();
+        let pending = queue_len.max(total.saturating_sub(indexed));
         EmbeddingStatus {
             pending,
             indexed,
@@ -7827,6 +7842,43 @@ mod tests {
         assert_eq!(status.indexed, 0);
         #[cfg(feature = "vector")]
         assert_eq!(status.pending, 2);
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn embedding_status_pending_covers_unindexed_when_queue_drained() {
+        // Reproduces the operational case where a graph is reopened with some
+        // entities already in the vector index but the embedding queue is
+        // empty because it does not persist across restarts. Before this
+        // regression test landed, `embedding_status().pending` returned the
+        // raw queue length, so a coverage gate that inspected `pending`
+        // alone saw zero outstanding work even though entities remained
+        // unindexed. See SP-17 in the methodology paper.
+        let graph = InMemoryGraph::new();
+        let e1 = test_entity("foo", "src/a.rs");
+        let e2 = test_entity("bar", "src/b.rs");
+        let e3 = test_entity("baz", "src/c.rs");
+        graph.upsert_entity(&e1).unwrap();
+        graph.upsert_entity(&e2).unwrap();
+        graph.upsert_entity(&e3).unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let index = crate::VectorIndex::new(2).unwrap();
+        index.upsert(e1.id, &[1.0, 0.0]).unwrap();
+        index.save(&path).unwrap();
+        graph.load_vector_index(&path).unwrap();
+
+        graph.embedding_queue.lock().clear();
+        assert_eq!(graph.pending_embeddings(), 0);
+
+        let status = graph.embedding_status();
+        assert_eq!(status.total, 3);
+        assert_eq!(status.indexed, 1);
+        assert_eq!(
+            status.pending, 2,
+            "pending must report outstanding work, not raw queue length"
+        );
     }
 
     #[test]
