@@ -68,6 +68,8 @@ struct VectorIndexMetadata {
     dimensions: usize,
     indexed: usize,
     #[serde(default)]
+    embedding_provider: Option<String>,
+    #[serde(default)]
     embedding_model_id: Option<String>,
     #[serde(default)]
     embedding_model_revision: Option<String>,
@@ -188,20 +190,28 @@ fn write_vector_index_metadata(
 }
 
 #[cfg(feature = "vector")]
-fn current_embedding_runtime_fields() -> (Option<String>, Option<String>, Option<String>) {
+fn current_embedding_runtime_fields() -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<usize>,
+) {
     #[cfg(feature = "embeddings")]
     {
         let runtime = crate::embed::configured_embedding_runtime();
         return (
+            Some(runtime.provider),
             Some(runtime.model_id),
             Some(runtime.revision),
             Some(runtime.pipeline_epoch),
+            runtime.dimensions,
         );
     }
 
     #[cfg(not(feature = "embeddings"))]
     {
-        (None, None, None)
+        (None, None, None, None, None)
     }
 }
 
@@ -217,6 +227,13 @@ fn vector_metadata_matches_graph(
     #[cfg(feature = "embeddings")]
     {
         let runtime = crate::embed::configured_embedding_runtime();
+        if let Some(provider) = metadata.embedding_provider.as_ref() {
+            if provider != &runtime.provider {
+                return false;
+            }
+        } else if runtime.provider != "local" {
+            return false;
+        }
         if let Some(model_id) = metadata.embedding_model_id.as_ref() {
             if model_id != &runtime.model_id {
                 return false;
@@ -229,6 +246,11 @@ fn vector_metadata_matches_graph(
         }
         if let Some(epoch) = metadata.embedding_pipeline_epoch.as_ref() {
             if epoch != &runtime.pipeline_epoch {
+                return false;
+            }
+        }
+        if let Some(dimensions) = runtime.dimensions {
+            if metadata.dimensions != dimensions {
                 return false;
             }
         }
@@ -427,12 +449,14 @@ impl SnapshotManager {
         let count = graph.load_vector_index(&vector_path)?;
         if metadata.is_none() && write_missing_metadata {
             if let Some((dimensions, indexed)) = graph.vector_index_stats() {
-                let (model_id, revision, pipeline_epoch) = current_embedding_runtime_fields();
+                let (provider, model_id, revision, pipeline_epoch, runtime_dimensions) =
+                    current_embedding_runtime_fields();
                 let metadata = VectorIndexMetadata {
                     version: VectorIndexMetadata::VERSION,
                     graph_root_hash: hex::encode(graph_root_hash),
-                    dimensions,
+                    dimensions: runtime_dimensions.unwrap_or(dimensions),
                     indexed,
+                    embedding_provider: provider,
                     embedding_model_id: model_id,
                     embedding_model_revision: revision,
                     embedding_pipeline_epoch: pipeline_epoch,
@@ -887,12 +911,14 @@ impl SnapshotManager {
             graph.save_vector_index(&vector_path)?;
             let metadata_path = vector_index_metadata_path_for(&path);
             if let Some((dimensions, indexed)) = graph.vector_index_stats() {
-                let (model_id, revision, pipeline_epoch) = current_embedding_runtime_fields();
+                let (provider, model_id, revision, pipeline_epoch, runtime_dimensions) =
+                    current_embedding_runtime_fields();
                 let metadata = VectorIndexMetadata {
                     version: VectorIndexMetadata::VERSION,
                     graph_root_hash: hex::encode(graph_root_hash),
-                    dimensions,
+                    dimensions: runtime_dimensions.unwrap_or(dimensions),
                     indexed,
+                    embedding_provider: provider,
                     embedding_model_id: model_id,
                     embedding_model_revision: revision,
                     embedding_pipeline_epoch: pipeline_epoch,
@@ -1757,6 +1783,7 @@ mod tests {
         );
         assert_eq!(metadata.dimensions, 4);
         assert_eq!(metadata.indexed, 1);
+        assert_eq!(metadata.embedding_provider.as_deref(), Some("local"));
     }
 
     #[test]
@@ -1822,6 +1849,7 @@ mod tests {
                 graph_root_hash: hex::encode([42u8; 32]),
                 dimensions: 4,
                 indexed: 1,
+                embedding_provider: None,
                 embedding_model_id: None,
                 embedding_model_revision: None,
                 embedding_pipeline_epoch: None,

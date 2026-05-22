@@ -19,6 +19,7 @@ embeddings = [
     "dep:hf-hub",
     "dep:tokenizers",
     "dep:kin-infer",
+    "dep:reqwest",
 ]
 metal = ["embeddings", "kin-infer/metal"]
 archive = ["rkyv"]
@@ -58,6 +59,7 @@ rayon = "1"
 sysinfo = "0.38"
 tempfile = "3"
 tracing = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
 
 [dev-dependencies]
 kin-vector = { version = "0.1.0", registry = "kin" }

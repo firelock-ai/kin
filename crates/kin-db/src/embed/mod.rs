@@ -11,6 +11,8 @@ use hf_hub::{api::sync::Api, Repo, RepoType};
 #[cfg(feature = "embeddings")]
 use kin_infer::gpu::GpuBackend;
 #[cfg(feature = "embeddings")]
+use reqwest::blocking::Client as BlockingHttpClient;
+#[cfg(feature = "embeddings")]
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "embeddings")]
 use sha2::{Digest, Sha256};
@@ -40,6 +42,10 @@ use kin_model::{
 /// down enough for repo-scale indexing to stay practical on developer
 /// machines.
 const DEFAULT_MODEL_ID: &str = "BAAI/bge-small-en-v1.5";
+#[cfg(feature = "embeddings")]
+const DEFAULT_LMSTUDIO_EMBED_MODEL_ID: &str = "text-embedding-nomic-embed-text-v1.5";
+#[cfg(feature = "embeddings")]
+const DEFAULT_OPENAI_EMBED_MODEL_ID: &str = "text-embedding-3-small";
 
 /// Default model revision.
 const DEFAULT_REVISION: &str = "main";
@@ -60,8 +66,10 @@ const FILE_SURFACE_CONTEXT_KEY: &str = "file_surface_context";
 #[cfg(feature = "embeddings")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbeddingRuntimeConfig {
+    pub provider: String,
     pub model_id: String,
     pub revision: String,
+    pub dimensions: Option<usize>,
     pub pipeline_epoch: String,
 }
 
@@ -72,6 +80,21 @@ pub struct EmbeddingRuntimeConfig {
 /// The model is downloaded from HuggingFace Hub on first use and cached locally.
 pub struct CodeEmbedder {
     #[cfg(feature = "embeddings")]
+    backend: CodeEmbedderBackend,
+    #[cfg(feature = "embeddings")]
+    dimensions: usize,
+    #[cfg(feature = "embeddings")]
+    cache: Option<EmbeddingCache>,
+}
+
+#[cfg(feature = "embeddings")]
+enum CodeEmbedderBackend {
+    Bert(BertEmbedder),
+    OpenAiCompat(OpenAiCompatEmbedder),
+}
+
+#[cfg(feature = "embeddings")]
+struct BertEmbedder {
     model: BertModel,
     /// CPU-only BertModel, loaded lazily the first time the dispatcher
     /// routes a batch through the CPU path. Held behind a Mutex + OnceLock
@@ -83,12 +106,26 @@ pub struct CodeEmbedder {
     /// Captured arguments needed to build `cpu_model` on demand.
     #[cfg(feature = "embeddings")]
     cpu_model_source: std::sync::Mutex<Option<CpuModelSource>>,
-    #[cfg(feature = "embeddings")]
     tokenizer: Tokenizer,
-    #[cfg(feature = "embeddings")]
+}
+
+#[cfg(feature = "embeddings")]
+struct OpenAiCompatEmbedder {
+    client: BlockingHttpClient,
+    endpoint: String,
+    model_id: String,
+    api_key: Option<String>,
     dimensions: usize,
-    #[cfg(feature = "embeddings")]
-    cache: Option<EmbeddingCache>,
+    request_overrides: serde_json::Map<String, serde_json::Value>,
+    query_prefix: String,
+    document_prefix: String,
+}
+
+#[cfg(feature = "embeddings")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EmbeddingInputRole {
+    Query,
+    Document,
 }
 
 /// Paths captured at model load time so the CPU twin can be constructed
@@ -122,15 +159,27 @@ impl CodeEmbedder {
     /// Create a new embedder with the default code model.
     pub fn new() -> Result<Self, KinDbError> {
         let _span = tracing::info_span!("kindb.embedder.new").entered();
-        let model_id = std::env::var("KIN_EMBED_MODEL_ID")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
-        let revision = std::env::var("KIN_EMBED_MODEL_REVISION")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_REVISION.to_string());
-        Self::with_model(&model_id, &revision)
+        #[cfg(feature = "embeddings")]
+        {
+            let provider = configured_embedding_provider();
+            return match provider {
+                EmbeddingProvider::Local => {
+                    let model_id = env_nonempty("KIN_EMBED_MODEL_ID")
+                        .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
+                    let revision = env_nonempty("KIN_EMBED_MODEL_REVISION")
+                        .unwrap_or_else(|| DEFAULT_REVISION.to_string());
+                    Self::with_model(&model_id, &revision)
+                }
+                EmbeddingProvider::OpenAiCompat { profile } => {
+                    Self::with_openai_compat(OpenAiCompatConfig::from_profile(profile)?)
+                }
+            };
+        }
+
+        #[cfg(not(feature = "embeddings"))]
+        {
+            Err(disabled_error())
+        }
     }
 
     /// Create with a specific HuggingFace model.
@@ -204,7 +253,7 @@ impl CodeEmbedder {
             [&config_path, &tokenizer_path, &weights_path],
         );
 
-        Ok(Self {
+        let backend = BertEmbedder {
             model,
             cpu_model: std::sync::OnceLock::new(),
             cpu_model_source: std::sync::Mutex::new(Some(CpuModelSource {
@@ -212,6 +261,10 @@ impl CodeEmbedder {
                 config_json: config_data,
             })),
             tokenizer,
+        };
+
+        Ok(Self {
+            backend: CodeEmbedderBackend::Bert(backend),
             dimensions,
             cache: EmbeddingCache::new(cache_namespace, dimensions),
         })
@@ -221,6 +274,19 @@ impl CodeEmbedder {
     #[cfg(not(feature = "embeddings"))]
     pub fn with_model(_model_id: &str, _revision: &str) -> Result<Self, KinDbError> {
         Err(disabled_error())
+    }
+
+    /// Create with an OpenAI-compatible embeddings endpoint.
+    #[cfg(feature = "embeddings")]
+    fn with_openai_compat(config: OpenAiCompatConfig) -> Result<Self, KinDbError> {
+        let embedder = OpenAiCompatEmbedder::new(config)?;
+        let dimensions = embedder.dimensions;
+        let cache_namespace = embedder.cache_namespace();
+        Ok(Self {
+            backend: CodeEmbedderBackend::OpenAiCompat(embedder),
+            dimensions,
+            cache: EmbeddingCache::new(cache_namespace, dimensions),
+        })
     }
 
     /// Generate an embedding for a single entity.
@@ -262,7 +328,7 @@ impl CodeEmbedder {
     pub fn embed_text(&self, text: &str) -> Result<Vec<f32>, KinDbError> {
         let _span =
             tracing::info_span!("kindb.embedder.embed_text", text_len = text.len()).entered();
-        let mut vecs = self.embed_batch(&[text.to_string()])?;
+        let mut vecs = self.embed_batch_for_role(&[text.to_string()], EmbeddingInputRole::Query)?;
         vecs.pop()
             .ok_or_else(|| KinDbError::IndexError("embedding returned empty result".into()))
     }
@@ -278,10 +344,20 @@ impl CodeEmbedder {
     pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, KinDbError> {
         let _span =
             tracing::info_span!("kindb.embedder.embed_batch", texts = texts.len()).entered();
+        self.embed_batch_for_role(texts, EmbeddingInputRole::Document)
+    }
+
+    #[cfg(feature = "embeddings")]
+    fn embed_batch_for_role(
+        &self,
+        texts: &[String],
+        role: EmbeddingInputRole,
+    ) -> Result<Vec<Vec<f32>>, KinDbError> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
 
+        let prepared_texts = self.prepare_inputs(texts, role);
         let mut cached_results: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
         let mut missing_texts = Vec::new();
         let mut missing_slots: Vec<Vec<usize>> = Vec::new();
@@ -289,7 +365,7 @@ impl CodeEmbedder {
 
         if let Some(cache) = self.cache.as_ref() {
             let mut missing_by_key: HashMap<String, usize> = HashMap::new();
-            for (idx, text) in texts.iter().enumerate() {
+            for (idx, text) in prepared_texts.iter().enumerate() {
                 let key = cache.key_for_text(text);
                 if let Some(vector) = cache.get_by_key(&key) {
                     cached_results[idx] = Some(vector);
@@ -307,7 +383,7 @@ impl CodeEmbedder {
                 }
             }
         } else {
-            for (idx, text) in texts.iter().enumerate() {
+            for (idx, text) in prepared_texts.iter().enumerate() {
                 missing_texts.push(text.clone());
                 missing_slots.push(vec![idx]);
             }
@@ -324,12 +400,86 @@ impl CodeEmbedder {
                 .collect();
         }
 
+        let missing_results = self.embed_uncached_batch(&missing_texts)?;
+        if missing_results.len() != missing_texts.len() {
+            return Err(KinDbError::IndexError(format!(
+                "embedding endpoint returned {} vectors for {} inputs",
+                missing_results.len(),
+                missing_texts.len()
+            )));
+        }
+
+        for (miss_idx, vector) in missing_results.into_iter().enumerate() {
+            let vector = sanitize_embedding(vector, self.dimensions, || {
+                missing_texts
+                    .get(miss_idx)
+                    .map(String::as_str)
+                    .unwrap_or("")
+            });
+            if let Some(cache) = self.cache.as_ref() {
+                if let Some(key) = missing_keys.get(miss_idx) {
+                    cache.put_by_key(key, &vector);
+                }
+            }
+
+            for original_idx in &missing_slots[miss_idx] {
+                cached_results[*original_idx] = Some(vector.clone());
+            }
+        }
+
+        cached_results
+            .into_iter()
+            .map(|vector| {
+                vector.ok_or_else(|| {
+                    KinDbError::IndexError("embedding batch result order mismatch".into())
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "embeddings")]
+    fn prepare_inputs(&self, texts: &[String], role: EmbeddingInputRole) -> Vec<String> {
+        match &self.backend {
+            CodeEmbedderBackend::Bert(_) => texts.to_vec(),
+            CodeEmbedderBackend::OpenAiCompat(embedder) => embedder.prepare_inputs(texts, role),
+        }
+    }
+
+    #[cfg(feature = "embeddings")]
+    fn embed_uncached_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, KinDbError> {
+        match &self.backend {
+            CodeEmbedderBackend::Bert(embedder) => {
+                embedder.embed_uncached_batch(texts, self.dimensions)
+            }
+            CodeEmbedderBackend::OpenAiCompat(embedder) => embedder.embed_batch(texts),
+        }
+    }
+
+    /// Batch-embed multiple pre-formatted text strings.
+    #[cfg(not(feature = "embeddings"))]
+    pub fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, KinDbError> {
+        Err(disabled_error())
+    }
+
+    /// The number of dimensions produced by this model.
+    #[cfg(feature = "embeddings")]
+    pub fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+}
+
+#[cfg(feature = "embeddings")]
+impl BertEmbedder {
+    fn embed_uncached_batch(
+        &self,
+        texts: &[String],
+        dimensions: usize,
+    ) -> Result<Vec<Vec<f32>>, KinDbError> {
         let encodings = {
             let _span =
-                tracing::info_span!("kindb.embedder.tokenize_batch", texts = missing_texts.len())
-                    .entered();
+                tracing::info_span!("kindb.embedder.tokenize_batch", texts = texts.len()).entered();
             self.tokenizer
-                .encode_batch(missing_texts.clone(), true)
+                .encode_batch(texts.to_vec(), true)
                 .map_err(|e| KinDbError::IndexError(format!("tokenization failed: {e}")))?
         };
 
@@ -352,7 +502,7 @@ impl CodeEmbedder {
             .filter(|value| *value > 0)
             .unwrap_or_else(|| default_max_batch_tokens(self.model.backend()));
 
-        let mut missing_results: Vec<Option<Vec<f32>>> = vec![None; missing_texts.len()];
+        let mut results: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
         let mut start = 0usize;
         while start < encoded.len() {
             let mut end = start;
@@ -378,19 +528,7 @@ impl CodeEmbedder {
             // kernels for the batched code path (fused_attention_batched —
             // scale_mask_alibi_grouped.metal / softmax_rows.metal — likely softmax
             // max-subtract missing). See embedder agent diagnosis 2026-04-14 and
-            // planning/metal-bert-nan-bug.md. Vue produced 2980/2980 zero-vectors
-            // against that bug before the sanitize guard landed in kin-db 0d620a7.
-            //
-            // This dispatcher routes long-sequence batches through the single-input
-            // `forward` path (different Metal kernel — fused_attention — which is
-            // known-correct on this regime). True CPU execution is not possible
-            // from here without a kin-infer constructor that accepts a GpuBackend;
-            // that is a separate follow-up. The single-input forward path is
-            // functionally "CPU-equivalent correctness" for BGE-small today.
-            //
-            // Remove this dispatcher when kin-infer's batched attention kernel is
-            // fixed and `KIN_EMBED_BACKEND=metal cargo test -p kin-db --test \
-            // metal_seq_len_regression` passes the batched sweep at seq_len>=512.
+            // planning/metal-bert-nan-bug.md.
             let backend_choice = resolve_embed_backend(longest);
             let vectors = match backend_choice {
                 EmbedBackendChoice::Metal { reason } => {
@@ -427,11 +565,6 @@ impl CodeEmbedder {
                         longest = longest
                     )
                     .entered();
-                    // Route through the CPU-only BertModel twin so we are
-                    // guaranteed a non-Metal attention kernel. Falls back to
-                    // the primary model only if the CPU twin cannot be
-                    // constructed (e.g. weight file unavailable) — better
-                    // than failing the whole index build.
                     let cpu_model = match self.cpu_model() {
                         Ok(m) => Some(m),
                         Err(e) => {
@@ -450,10 +583,9 @@ impl CodeEmbedder {
             };
 
             // Defense in depth: if the dispatched path still returned any
-            // non-finite vectors (e.g. `metal` forced via env and the kernel
-            // misbehaves), retry per-sample through the single-input `forward`
-            // path. Preserves the existing sanitize_embedding contract for
-            // downstream writers while keeping the dispatcher's explicit log.
+            // non-finite vectors, retry per-sample through the single-input
+            // forward path before the outer sanitizer handles any remaining
+            // bad vectors.
             let vectors = if vectors.iter().any(|v| !v.iter().all(|x| x.is_finite())) {
                 tracing::warn!(
                     batch = batch.len(),
@@ -476,34 +608,19 @@ impl CodeEmbedder {
             };
 
             for ((original_idx, _, _), vector) in batch.iter().zip(vectors.into_iter()) {
-                let vector = sanitize_embedding(vector, self.dimensions, || {
-                    missing_texts
-                        .get(*original_idx)
-                        .map(String::as_str)
-                        .unwrap_or("<missing>")
-                });
-                missing_results[*original_idx] = Some(vector);
+                if vector.len() != dimensions {
+                    return Err(KinDbError::IndexError(format!(
+                        "embedding returned {} dimensions, expected {}",
+                        vector.len(),
+                        dimensions
+                    )));
+                }
+                results[*original_idx] = Some(vector);
             }
             start = end;
         }
 
-        for (miss_idx, vector) in missing_results.into_iter().enumerate() {
-            let vector = vector.ok_or_else(|| {
-                KinDbError::IndexError("embedding batch result order mismatch".into())
-            })?;
-
-            if let Some(cache) = self.cache.as_ref() {
-                if let Some(key) = missing_keys.get(miss_idx) {
-                    cache.put_by_key(key, &vector);
-                }
-            }
-
-            for original_idx in &missing_slots[miss_idx] {
-                cached_results[*original_idx] = Some(vector.clone());
-            }
-        }
-
-        cached_results
+        results
             .into_iter()
             .map(|vector| {
                 vector.ok_or_else(|| {
@@ -511,18 +628,6 @@ impl CodeEmbedder {
                 })
             })
             .collect()
-    }
-
-    /// Batch-embed multiple pre-formatted text strings.
-    #[cfg(not(feature = "embeddings"))]
-    pub fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, KinDbError> {
-        Err(disabled_error())
-    }
-
-    /// The number of dimensions produced by this model.
-    #[cfg(feature = "embeddings")]
-    pub fn dimensions(&self) -> usize {
-        self.dimensions
     }
 
     /// Lazily construct (or return) the CPU-only BertModel twin.
@@ -590,19 +695,453 @@ impl CodeEmbedder {
 }
 
 #[cfg(feature = "embeddings")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EmbeddingProvider {
+    Local,
+    OpenAiCompat { profile: OpenAiCompatProfile },
+}
+
+#[cfg(feature = "embeddings")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenAiCompatProfile {
+    OpenAi,
+    LmStudio,
+    Compatible,
+}
+
+#[cfg(feature = "embeddings")]
+#[derive(Debug, Clone)]
+struct OpenAiCompatConfig {
+    provider_label: String,
+    base_url: String,
+    model_id: String,
+    api_key: Option<String>,
+    dimensions: Option<usize>,
+    send_dimensions: bool,
+    timeout_secs: u64,
+    request_overrides: serde_json::Map<String, serde_json::Value>,
+    query_prefix: String,
+    document_prefix: String,
+}
+
+#[cfg(feature = "embeddings")]
+impl OpenAiCompatConfig {
+    fn from_profile(profile: OpenAiCompatProfile) -> Result<Self, KinDbError> {
+        let provider_label = match profile {
+            OpenAiCompatProfile::OpenAi => "openai",
+            OpenAiCompatProfile::LmStudio => "lmstudio",
+            OpenAiCompatProfile::Compatible => "openai-compatible",
+        }
+        .to_string();
+
+        let default_base_url = match profile {
+            OpenAiCompatProfile::OpenAi => "https://api.openai.com/v1",
+            OpenAiCompatProfile::LmStudio | OpenAiCompatProfile::Compatible => {
+                "http://localhost:1234/v1"
+            }
+        };
+        let default_model = match profile {
+            OpenAiCompatProfile::OpenAi => DEFAULT_OPENAI_EMBED_MODEL_ID,
+            OpenAiCompatProfile::LmStudio | OpenAiCompatProfile::Compatible => {
+                DEFAULT_LMSTUDIO_EMBED_MODEL_ID
+            }
+        };
+        let base_url = env_nonempty("KIN_EMBED_OPENAI_BASE_URL")
+            .or_else(|| env_nonempty("KIN_EMBED_BASE_URL"))
+            .unwrap_or_else(|| default_base_url.to_string());
+        let model_id = env_nonempty("KIN_EMBED_OPENAI_MODEL")
+            .or_else(|| env_nonempty("KIN_EMBED_MODEL_ID"))
+            .unwrap_or_else(|| default_model.to_string());
+        let api_key = env_nonempty("KIN_EMBED_OPENAI_API_KEY").or_else(|| {
+            if matches!(profile, OpenAiCompatProfile::OpenAi) {
+                env_nonempty("OPENAI_API_KEY")
+            } else {
+                None
+            }
+        });
+        let dimensions = env_nonempty("KIN_EMBED_OPENAI_DIMENSIONS")
+            .map(|value| parse_positive_usize("KIN_EMBED_OPENAI_DIMENSIONS", &value))
+            .transpose()?;
+        let timeout_secs = env_nonempty("KIN_EMBED_OPENAI_TIMEOUT_SECS")
+            .map(|value| parse_positive_u64("KIN_EMBED_OPENAI_TIMEOUT_SECS", &value))
+            .transpose()?
+            .unwrap_or(120);
+        let send_dimensions = env_flag("KIN_EMBED_OPENAI_SEND_DIMENSIONS");
+        let request_overrides = match env_nonempty("KIN_EMBED_OPENAI_REQUEST_JSON") {
+            Some(value) => parse_json_object_env("KIN_EMBED_OPENAI_REQUEST_JSON", &value)?,
+            None => serde_json::Map::new(),
+        };
+        let (default_query_prefix, default_document_prefix) =
+            default_openai_embedding_prefixes(&model_id);
+        let query_prefix =
+            env_nonempty("KIN_EMBED_OPENAI_QUERY_PREFIX").unwrap_or(default_query_prefix);
+        let document_prefix =
+            env_nonempty("KIN_EMBED_OPENAI_DOCUMENT_PREFIX").unwrap_or(default_document_prefix);
+
+        Ok(Self {
+            provider_label,
+            base_url,
+            model_id,
+            api_key,
+            dimensions,
+            send_dimensions,
+            timeout_secs,
+            request_overrides,
+            query_prefix,
+            document_prefix,
+        })
+    }
+
+    fn endpoint(&self) -> String {
+        let trimmed = self.base_url.trim_end_matches('/');
+        if trimmed.ends_with("/embeddings") {
+            trimmed.to_string()
+        } else {
+            format!("{trimmed}/embeddings")
+        }
+    }
+
+    fn provider_identity(&self) -> String {
+        format!(
+            "{}:{}",
+            self.provider_label,
+            self.base_url.trim_end_matches('/')
+        )
+    }
+
+    fn request_overrides_fingerprint(&self) -> String {
+        let mut hasher = Sha256::new();
+        if let Ok(encoded) = serde_json::to_vec(&self.request_overrides) {
+            hasher.update(encoded);
+        }
+        let digest = hex::encode(hasher.finalize());
+        digest[..16].to_string()
+    }
+
+    fn runtime_revision(&self) -> String {
+        format!(
+            "openai-compatible;query_prefix={};document_prefix={};send_dimensions={};request={}",
+            self.query_prefix,
+            self.document_prefix,
+            self.send_dimensions,
+            self.request_overrides_fingerprint()
+        )
+    }
+}
+
+#[cfg(feature = "embeddings")]
+impl OpenAiCompatEmbedder {
+    fn new(config: OpenAiCompatConfig) -> Result<Self, KinDbError> {
+        let client = BlockingHttpClient::builder()
+            .timeout(std::time::Duration::from_secs(config.timeout_secs))
+            .build()
+            .map_err(|e| {
+                KinDbError::IndexError(format!("failed to build embeddings HTTP client: {e}"))
+            })?;
+        let mut embedder = Self {
+            client,
+            endpoint: config.endpoint(),
+            model_id: config.model_id,
+            api_key: config.api_key,
+            dimensions: config.dimensions.unwrap_or(0),
+            request_overrides: config.request_overrides,
+            query_prefix: config.query_prefix,
+            document_prefix: config.document_prefix,
+        };
+        if config.send_dimensions {
+            if let Some(dimensions) = config.dimensions {
+                embedder
+                    .request_overrides
+                    .insert("dimensions".to_string(), serde_json::json!(dimensions));
+            }
+        }
+        if embedder.dimensions == 0 {
+            let probe = embedder.embed_batch_raw(&["kin embedding dimension probe".to_string()])?;
+            embedder.dimensions = probe.first().map(Vec::len).ok_or_else(|| {
+                KinDbError::IndexError("embedding probe returned no vectors".into())
+            })?;
+        }
+        Ok(embedder)
+    }
+
+    fn prepare_inputs(&self, texts: &[String], role: EmbeddingInputRole) -> Vec<String> {
+        let prefix = match role {
+            EmbeddingInputRole::Query => &self.query_prefix,
+            EmbeddingInputRole::Document => &self.document_prefix,
+        };
+        if prefix.is_empty() {
+            return texts.to_vec();
+        }
+        texts.iter().map(|text| format!("{prefix}{text}")).collect()
+    }
+
+    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, KinDbError> {
+        let vectors = self.embed_batch_raw(texts)?;
+        for vector in &vectors {
+            if vector.len() != self.dimensions {
+                return Err(KinDbError::IndexError(format!(
+                    "embedding endpoint returned {} dimensions, expected {}",
+                    vector.len(),
+                    self.dimensions
+                )));
+            }
+        }
+        Ok(vectors)
+    }
+
+    fn embed_batch_raw(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, KinDbError> {
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "model".to_string(),
+            serde_json::Value::String(self.model_id.clone()),
+        );
+        body.insert("input".to_string(), serde_json::json!(texts));
+        for (key, value) in &self.request_overrides {
+            if matches!(key.as_str(), "model" | "input") {
+                return Err(KinDbError::IndexError(format!(
+                    "KIN_EMBED_OPENAI_REQUEST_JSON cannot override reserved embeddings field '{key}'"
+                )));
+            }
+            body.insert(key.clone(), value.clone());
+        }
+
+        let mut req = self
+            .client
+            .post(&self.endpoint)
+            .json(&serde_json::Value::Object(body));
+        if let Some(api_key) = self.api_key.as_ref() {
+            req = req.bearer_auth(api_key);
+        }
+
+        let resp = req
+            .send()
+            .map_err(|e| KinDbError::IndexError(format!("embedding request failed: {e}")))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .map_err(|e| KinDbError::IndexError(format!("embedding response read failed: {e}")))?;
+        if !status.is_success() {
+            return Err(KinDbError::IndexError(format!(
+                "embedding endpoint error (HTTP {status}): {text}"
+            )));
+        }
+        parse_openai_embedding_response(&text, texts.len())
+    }
+
+    fn cache_namespace(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(EMBEDDING_CACHE_PIPELINE_EPOCH.as_bytes());
+        hasher.update([0]);
+        hasher.update(self.endpoint.as_bytes());
+        hasher.update([0]);
+        hasher.update(self.model_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(self.dimensions.to_le_bytes());
+        hasher.update([0]);
+        hasher.update(self.query_prefix.as_bytes());
+        hasher.update([0]);
+        hasher.update(self.document_prefix.as_bytes());
+        hasher.update([0]);
+        if !self.request_overrides.is_empty() {
+            if let Ok(encoded) = serde_json::to_vec(&self.request_overrides) {
+                hasher.update(encoded);
+            }
+        }
+        let digest = hex::encode(hasher.finalize());
+        format!(
+            "{}-{}",
+            sanitize_component(&format!("{}-{}", self.endpoint, self.model_id)),
+            &digest[..16]
+        )
+    }
+}
+
+#[cfg(feature = "embeddings")]
+#[derive(Debug, Deserialize)]
+struct OpenAiEmbeddingResponse {
+    data: Vec<OpenAiEmbeddingData>,
+}
+
+#[cfg(feature = "embeddings")]
+#[derive(Debug, Deserialize)]
+struct OpenAiEmbeddingData {
+    embedding: Vec<f32>,
+    #[serde(default)]
+    index: Option<usize>,
+}
+
+#[cfg(feature = "embeddings")]
+fn parse_openai_embedding_response(
+    text: &str,
+    expected: usize,
+) -> Result<Vec<Vec<f32>>, KinDbError> {
+    let response: OpenAiEmbeddingResponse = serde_json::from_str(text)
+        .map_err(|e| KinDbError::IndexError(format!("invalid embeddings JSON: {e}")))?;
+    if response.data.len() != expected {
+        return Err(KinDbError::IndexError(format!(
+            "embedding endpoint returned {} vectors for {} inputs",
+            response.data.len(),
+            expected
+        )));
+    }
+    let mut ordered: Vec<Option<Vec<f32>>> = vec![None; expected];
+    for (fallback_idx, item) in response.data.into_iter().enumerate() {
+        let index = item.index.unwrap_or(fallback_idx);
+        if index >= expected {
+            return Err(KinDbError::IndexError(format!(
+                "embedding response index {index} out of range for {expected} inputs"
+            )));
+        }
+        if ordered[index].replace(item.embedding).is_some() {
+            return Err(KinDbError::IndexError(format!(
+                "embedding response duplicated index {index}"
+            )));
+        }
+    }
+    ordered
+        .into_iter()
+        .enumerate()
+        .map(|(index, vector)| {
+            vector.ok_or_else(|| {
+                KinDbError::IndexError(format!("embedding response missing index {index}"))
+            })
+        })
+        .collect()
+}
+
+#[cfg(feature = "embeddings")]
+fn configured_embedding_provider() -> EmbeddingProvider {
+    match env_nonempty("KIN_EMBED_PROVIDER")
+        .unwrap_or_else(|| "local".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "local" | "hf" | "huggingface" | "bge" => EmbeddingProvider::Local,
+        "openai" => EmbeddingProvider::OpenAiCompat {
+            profile: OpenAiCompatProfile::OpenAi,
+        },
+        "lmstudio" | "lm-studio" => EmbeddingProvider::OpenAiCompat {
+            profile: OpenAiCompatProfile::LmStudio,
+        },
+        "openai-compat" | "openai-compatible" | "compatible" => EmbeddingProvider::OpenAiCompat {
+            profile: OpenAiCompatProfile::Compatible,
+        },
+        other => {
+            tracing::warn!(
+                provider = %other,
+                "unknown KIN_EMBED_PROVIDER value, falling back to local embeddings"
+            );
+            EmbeddingProvider::Local
+        }
+    }
+}
+
+#[cfg(feature = "embeddings")]
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(feature = "embeddings")]
+fn env_flag(name: &str) -> bool {
+    env_nonempty(name)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "embeddings")]
+fn parse_positive_usize(name: &str, value: &str) -> Result<usize, KinDbError> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|e| KinDbError::IndexError(format!("{name} must be a positive integer: {e}")))?;
+    if parsed == 0 {
+        return Err(KinDbError::IndexError(format!(
+            "{name} must be a positive integer"
+        )));
+    }
+    Ok(parsed)
+}
+
+#[cfg(feature = "embeddings")]
+fn parse_positive_u64(name: &str, value: &str) -> Result<u64, KinDbError> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|e| KinDbError::IndexError(format!("{name} must be a positive integer: {e}")))?;
+    if parsed == 0 {
+        return Err(KinDbError::IndexError(format!(
+            "{name} must be a positive integer"
+        )));
+    }
+    Ok(parsed)
+}
+
+#[cfg(feature = "embeddings")]
+fn parse_json_object_env(
+    name: &str,
+    value: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, KinDbError> {
+    let parsed: serde_json::Value = serde_json::from_str(value)
+        .map_err(|e| KinDbError::IndexError(format!("{name} must be JSON: {e}")))?;
+    parsed
+        .as_object()
+        .cloned()
+        .ok_or_else(|| KinDbError::IndexError(format!("{name} must be a JSON object")))
+}
+
+#[cfg(feature = "embeddings")]
+fn default_openai_embedding_prefixes(model_id: &str) -> (String, String) {
+    let lower = model_id.to_ascii_lowercase();
+    if lower.contains("nomic-embed") || lower.contains("nomic_embed") {
+        (
+            "search_query: ".to_string(),
+            "search_document: ".to_string(),
+        )
+    } else {
+        (String::new(), String::new())
+    }
+}
+
+#[cfg(feature = "embeddings")]
 pub fn configured_embedding_runtime() -> EmbeddingRuntimeConfig {
-    let model_id = std::env::var("KIN_EMBED_MODEL_ID")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
-    let revision = std::env::var("KIN_EMBED_MODEL_REVISION")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_REVISION.to_string());
-    EmbeddingRuntimeConfig {
-        model_id,
-        revision,
-        pipeline_epoch: EMBEDDING_CACHE_PIPELINE_EPOCH.to_string(),
+    match configured_embedding_provider() {
+        EmbeddingProvider::Local => EmbeddingRuntimeConfig {
+            provider: "local".to_string(),
+            model_id: env_nonempty("KIN_EMBED_MODEL_ID")
+                .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string()),
+            revision: env_nonempty("KIN_EMBED_MODEL_REVISION")
+                .unwrap_or_else(|| DEFAULT_REVISION.to_string()),
+            dimensions: None,
+            pipeline_epoch: EMBEDDING_CACHE_PIPELINE_EPOCH.to_string(),
+        },
+        EmbeddingProvider::OpenAiCompat { profile } => {
+            let config =
+                OpenAiCompatConfig::from_profile(profile).unwrap_or_else(|_| OpenAiCompatConfig {
+                    provider_label: "openai-compatible".to_string(),
+                    base_url: env_nonempty("KIN_EMBED_OPENAI_BASE_URL")
+                        .unwrap_or_else(|| "http://localhost:1234/v1".to_string()),
+                    model_id: env_nonempty("KIN_EMBED_OPENAI_MODEL")
+                        .or_else(|| env_nonempty("KIN_EMBED_MODEL_ID"))
+                        .unwrap_or_else(|| DEFAULT_LMSTUDIO_EMBED_MODEL_ID.to_string()),
+                    api_key: None,
+                    dimensions: None,
+                    send_dimensions: false,
+                    timeout_secs: 120,
+                    request_overrides: serde_json::Map::new(),
+                    query_prefix: String::new(),
+                    document_prefix: String::new(),
+                });
+            let revision = config.runtime_revision();
+            EmbeddingRuntimeConfig {
+                provider: config.provider_identity(),
+                model_id: config.model_id,
+                revision,
+                dimensions: config.dimensions,
+                pipeline_epoch: EMBEDDING_CACHE_PIPELINE_EPOCH.to_string(),
+            }
+        }
     }
 }
 
@@ -1298,5 +1837,66 @@ mod tests {
 
         cache.put_by_key(&key, &[1.0, 2.0, 3.0, 4.0]);
         assert_eq!(cache.get_by_key(&key).unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn openai_embedding_response_is_ordered_by_index() {
+        let body = r#"{
+            "object": "list",
+            "data": [
+                {"object": "embedding", "index": 1, "embedding": [0.0, 1.0]},
+                {"object": "embedding", "index": 0, "embedding": [1.0, 0.0]}
+            ],
+            "model": "test"
+        }"#;
+
+        let vectors = parse_openai_embedding_response(body, 2).unwrap();
+        assert_eq!(vectors, vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn openai_embedding_response_rejects_count_mismatch() {
+        let body = r#"{"data":[{"index":0,"embedding":[1.0]}]}"#;
+        let err = parse_openai_embedding_response(body, 2).unwrap_err();
+        assert!(err.to_string().contains("returned 1 vectors for 2 inputs"));
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn nomic_defaults_use_search_prefixes() {
+        let (query, document) =
+            default_openai_embedding_prefixes("text-embedding-nomic-embed-text-v1.5");
+        assert_eq!(query, "search_query: ");
+        assert_eq!(document, "search_document: ");
+
+        let (query, document) = default_openai_embedding_prefixes("text-embedding-3-small");
+        assert_eq!(query, "");
+        assert_eq!(document, "");
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn openai_runtime_revision_includes_request_overrides() {
+        let base = OpenAiCompatConfig {
+            provider_label: "openai-compatible".into(),
+            base_url: "http://localhost:1234/v1".into(),
+            model_id: "test-embed".into(),
+            api_key: None,
+            dimensions: Some(3),
+            send_dimensions: false,
+            timeout_secs: 30,
+            request_overrides: serde_json::Map::new(),
+            query_prefix: String::new(),
+            document_prefix: String::new(),
+        };
+        let mut tuned = base.clone();
+        tuned.request_overrides.insert(
+            "encoding_format".into(),
+            serde_json::Value::String("float".into()),
+        );
+
+        assert_ne!(base.runtime_revision(), tuned.runtime_revision());
     }
 }
