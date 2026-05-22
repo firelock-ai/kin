@@ -8,6 +8,46 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Resolve session id from KIN_SESSION_ID env var.
+///
+/// Optional: returns None if unset/empty (commands behave as if no scope).
+fn resolve_session_id_opt() -> Option<String> {
+    std::env::var("KIN_SESSION_ID")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// If a session id is present, look up its active scope from the daemon and log it.
+///
+/// Returns the active scope (if any) for downstream observability. The daemon-side
+/// consumption of session scope in query handlers is being added in parallel by
+/// `daemon-scope-consumer`; until that lands, this surface only logs and does not
+/// alter query results.
+async fn announce_active_scope(
+    layout: &kin_core::KinLayout,
+    command: &str,
+) -> Result<Option<crate::daemon_client::ScopeResponse>> {
+    let Some(session_id) = resolve_session_id_opt() else {
+        return Ok(None);
+    };
+    let Some(daemon_url) = crate::daemon_client::resolve_daemon_url(layout).await? else {
+        return Ok(None);
+    };
+    let client = crate::daemon_client::DaemonClient::from_base_url(daemon_url)?;
+    let scope = client.get_scope(&session_id).await?;
+    if let Some(ref scope) = scope {
+        eprintln!(
+            "[kin {}] session={} scope={} (head={}, age={}s)",
+            command,
+            session_id,
+            scope.ref_string,
+            &scope.head[..12.min(scope.head.len())],
+            scope.created_at_secs_ago
+        );
+    }
+    Ok(scope)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefsRequest {
     pub entity: String,
@@ -23,6 +63,7 @@ pub struct RefsResponse {
 pub async fn run(entity: String, kind: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let _scope = announce_active_scope(&layout, "refs").await?;
     let response = run_daemon_refs(&layout, &RefsRequest { entity, kind }).await?;
     for line in response.lines {
         println!("{line}");
