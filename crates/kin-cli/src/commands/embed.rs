@@ -45,6 +45,10 @@ fn should_queue_full_embedding_pass(status: &kin_db::engine::EmbeddingStatus) ->
     status.pending == 0 && status.indexed < status.total
 }
 
+fn effective_batch_size(requested: usize) -> usize {
+    requested.max(1)
+}
+
 /// Ask the repo daemon to build embeddings for the current repo's graph.
 pub async fn run(batch_size: usize, json: bool, max_seconds: Option<u64>) -> Result<()> {
     let _span = tracing::info_span!(
@@ -128,12 +132,7 @@ pub fn build_embed_response(
     if graph.pending_artifact_embeddings() == 0 {
         graph.queue_missing_artifacts_for_embedding();
     }
-    let effective_batch_size = request.batch_size.max(1);
-    let effective_batch_size = if request.max_seconds.is_some() {
-        effective_batch_size.min(1)
-    } else {
-        effective_batch_size
-    };
+    let effective_batch_size = effective_batch_size(request.batch_size);
 
     // Embed entities with per-batch progress
     let embed_start = std::time::Instant::now();
@@ -225,7 +224,17 @@ pub fn build_embed_response(
 
 #[cfg(test)]
 mod tests {
-    use super::should_queue_full_embedding_pass;
+    use super::{effective_batch_size, should_queue_full_embedding_pass};
+
+    #[test]
+    fn effective_batch_size_respects_nonzero_request() {
+        assert_eq!(effective_batch_size(512), 512);
+    }
+
+    #[test]
+    fn effective_batch_size_clamps_zero_to_one() {
+        assert_eq!(effective_batch_size(0), 1);
+    }
 
     #[test]
     fn queues_full_pass_when_index_missing_and_queue_empty() {
