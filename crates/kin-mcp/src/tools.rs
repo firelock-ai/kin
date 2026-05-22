@@ -34,8 +34,30 @@ pub fn tool_definitions() -> ToolsListResult {
                 }),
             },
             ToolDefinition {
+                name: "get_entity_source".into(),
+                description: "Retrieve the exact implementation source body for a specific entity by ID.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "entity_id": { "type": "string", "description": "Entity UUID" }
+                    },
+                    "required": ["entity_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "get_entity_body".into(),
+                description: "Alias for get_entity_source: retrieve the exact implementation body for a specific entity by ID.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "entity_id": { "type": "string", "description": "Entity UUID" }
+                    },
+                    "required": ["entity_id"]
+                }),
+            },
+            ToolDefinition {
                 name: "get_context_pack".into(),
-                description: "Build a focused context pack for an entity — returns the entity's source body plus nearby dependencies within a token budget. One call replaces reading multiple files when you need implementation context. Pass an entity_id from semantic_search results.".into(),
+                description: "Build a focused context pack for an entity — returns nearby dependencies within a token budget. Prefer get_entity_source when you only need the exact implementation body. Pass an entity_id from semantic_search results.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -664,6 +686,8 @@ pub fn benchmark_tool_names() -> &'static [&'static str] {
     &[
         "semantic_search",
         "get_entity",
+        "get_entity_source",
+        "get_entity_body",
         "get_context_pack",
         "find_references",
         "dead_code",
@@ -691,6 +715,7 @@ mod tests {
         let list = tool_definitions();
         let json = serde_json::to_string(&list).unwrap();
         assert!(json.contains("semantic_search"));
+        assert!(json.contains("get_entity_source"));
         assert!(json.contains("find_references"));
         assert!(json.contains("impact_analysis"));
         assert!(json.contains("register_session"));
@@ -706,8 +731,8 @@ mod tests {
     #[test]
     fn expected_tool_count() {
         let list = tool_definitions();
-        // 12 original + 1 explore_codebase + 6 Phase 7 + 12 Phase 8 + 6 Phase 9-10 + 1 graph_status + 10 Phase 11 review = 48
-        assert_eq!(list.tools.len(), 48);
+        // 12 original + 1 explore_codebase + 2 entity source aliases + 6 Phase 7 + 12 Phase 8 + 6 Phase 9-10 + 1 graph_status + 10 Phase 11 review = 50
+        assert_eq!(list.tools.len(), 50);
     }
 
     #[test]

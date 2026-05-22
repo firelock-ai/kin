@@ -4,7 +4,9 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
-use kin_model::{EntityId, EntityKind, EntityRole, EntityStore, RelationKind};
+use kin_model::{
+    Entity, EntityId, EntityKind, EntityRole, EntityStore, FilePathId, GraphStore, RelationKind,
+};
 use serde::{Deserialize, Serialize};
 
 use super::graph_health::inspect_graph;
@@ -15,6 +17,7 @@ pub enum GraphCommandRequest {
     Status,
     Validate,
     Inspect { name: String },
+    Source { entity: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +26,23 @@ pub struct GraphCommandResponse {
     pub lines: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<GraphSourceRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphSourceRecord {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub language: String,
+    pub file_path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub signature: String,
+    pub body: String,
 }
 
 /// `kin graph status` — quick health check of the semantic graph.
@@ -44,6 +64,29 @@ pub async fn inspect(name: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     print_graph_response(run_daemon_graph(&layout, &GraphCommandRequest::Inspect { name }).await?)
+}
+
+/// `kin graph source <entity>` — print the exact implementation body.
+pub async fn source(entity: String, json: bool) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let response = run_daemon_graph(&layout, &GraphCommandRequest::Source { entity }).await?;
+    if json {
+        if let Some(error) = response.error {
+            anyhow::bail!(error);
+        }
+        let source = response
+            .source
+            .ok_or_else(|| anyhow::anyhow!("daemon source response did not include source"))?;
+        println!("{}", serde_json::to_string_pretty(&source)?);
+        return Ok(());
+    }
+    print_graph_response(response)
+}
+
+/// `kin graph body <entity>` — alias for `kin graph source <entity>`.
+pub async fn body(entity: String, json: bool) -> Result<()> {
+    source(entity, json).await
 }
 
 async fn run_daemon_graph(
@@ -86,6 +129,9 @@ pub fn execute_graph_command(
         GraphCommandRequest::Status => build_graph_status_response(layout, graph),
         GraphCommandRequest::Validate => build_graph_validate_response(layout, graph),
         GraphCommandRequest::Inspect { name } => build_graph_inspect_response(graph, name),
+        GraphCommandRequest::Source { entity } => {
+            build_graph_source_response(layout, graph, entity)
+        }
     }
 }
 
@@ -260,6 +306,7 @@ fn build_graph_status_response(
         lines,
         error: (!criticals.is_empty())
             .then(|| format!("{} critical graph health issue(s) found", criticals.len())),
+        source: None,
     })
 }
 
@@ -362,6 +409,7 @@ fn build_graph_validate_response(
     Ok(GraphCommandResponse {
         lines,
         error: (!issues.is_empty()).then(|| format!("{} issue(s) found", issues.len())),
+        source: None,
     })
 }
 
@@ -459,16 +507,152 @@ fn build_graph_inspect_response(
         lines.push(String::new());
     }
 
-    Ok(GraphCommandResponse { lines, error: None })
+    Ok(GraphCommandResponse {
+        lines,
+        error: None,
+        source: None,
+    })
+}
+
+pub fn build_graph_source_response(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    entity_query: &str,
+) -> Result<GraphCommandResponse> {
+    let entity = resolve_source_entity(graph, entity_query)?
+        .ok_or_else(|| anyhow::anyhow!("no entity found matching '{}'", entity_query))?;
+    let record = graph_source_record(layout, graph, &entity)?;
+
+    let mut lines = vec![
+        format!(
+            "Entity source for '{}' -> {} ({})",
+            entity_query, record.name, record.kind
+        ),
+        format!("ID: {}", record.id),
+        format!("File: {}", record.file_path),
+        format!("Lines: {}-{}", record.start_line, record.end_line),
+    ];
+    if !record.signature.is_empty() {
+        lines.push(format!("Signature: {}", record.signature));
+    }
+    lines.push("--- Source ---".to_string());
+    lines.push(record.body.clone());
+
+    Ok(GraphCommandResponse {
+        lines,
+        error: None,
+        source: Some(record),
+    })
+}
+
+fn resolve_source_entity(
+    graph: &kin_db::InMemoryGraph,
+    entity_query: &str,
+) -> Result<Option<Entity>> {
+    let trimmed = entity_query.trim();
+    if let Ok(uuid) = uuid::Uuid::parse_str(trimmed) {
+        return Ok(graph.get_entity(&EntityId(uuid))?);
+    }
+
+    if let Some(entity) = kin_ranking::entity_ranking::select_best_entity(graph, trimmed)? {
+        return Ok(Some(entity));
+    }
+
+    let matches = kin_core::query_trace_matches(graph, trimmed)?;
+    Ok(matches.into_iter().next())
+}
+
+fn graph_source_record(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    entity: &Entity,
+) -> Result<GraphSourceRecord> {
+    let file_origin = entity
+        .file_origin
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("entity '{}' has no file origin", entity.name))?;
+    let span = entity
+        .span
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("entity '{}' has no source span", entity.name))?;
+    let bytes = read_entity_file_bytes_from_graph(layout, graph, file_origin)?;
+    if span.start_byte >= span.end_byte {
+        anyhow::bail!(
+            "entity '{}' has an empty or invalid source span ({}..{})",
+            entity.name,
+            span.start_byte,
+            span.end_byte
+        );
+    }
+    if span.end_byte > bytes.len() {
+        anyhow::bail!(
+            "entity '{}' source span {}..{} is out of bounds for '{}' ({} bytes)",
+            entity.name,
+            span.start_byte,
+            span.end_byte,
+            file_origin.0,
+            bytes.len()
+        );
+    }
+
+    let body = std::str::from_utf8(&bytes[span.start_byte..span.end_byte])
+        .with_context(|| {
+            format!(
+                "entity '{}' source span {}..{} in '{}' is not valid UTF-8",
+                entity.name, span.start_byte, span.end_byte, file_origin.0
+            )
+        })?
+        .to_string();
+    Ok(GraphSourceRecord {
+        id: entity.id.to_string(),
+        name: entity.name.clone(),
+        kind: format!("{:?}", entity.kind),
+        language: entity.language.to_string(),
+        file_path: file_origin.0.clone(),
+        start_line: span.start_line,
+        end_line: span.end_line,
+        start_byte: span.start_byte,
+        end_byte: span.end_byte,
+        signature: entity.signature.clone(),
+        body,
+    })
+}
+
+fn read_entity_file_bytes_from_graph(
+    layout: &kin_core::KinLayout,
+    graph: &impl GraphStore,
+    file_id: &FilePathId,
+) -> Result<Vec<u8>> {
+    let branch_name = kin_core::read_current_branch(layout)?;
+    let branch = graph
+        .get_branch(&branch_name)?
+        .ok_or_else(|| anyhow::anyhow!("current branch '{}' not found in graph", branch_name))?;
+    let genesis = kin_core::build_genesis_change();
+    let tree = kin_core::build_file_tree(graph, &genesis.id, &branch.head)?;
+    let hash = tree
+        .get(file_id)
+        .ok_or_else(|| anyhow::anyhow!("file '{}' not found in graph file tree", file_id.0))?;
+    let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())?;
+    let blob_hash = kin_blobs::Hash256(*hash.as_bytes());
+    blob_store
+        .read(&blob_hash)
+        .with_context(|| {
+            format!(
+                "graph blob for file '{}' is unavailable (hash {}, branch '{}', head {}); source body cannot be read from daemon-backed graph",
+                file_id.0, blob_hash, branch_name, branch.head
+            )
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use kin_model::{
-        Entity, EntityMetadata, FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint,
-        Visibility,
+        ArtifactDelta, ArtifactDeltaKind, AuthorId, Branch, BranchName, ChangeStore, Entity,
+        EntityMetadata, FingerprintAlgorithm, Hash256, LanguageId, SemanticChange,
+        SemanticChangeId, SemanticFingerprint, SourceSpan, Timestamp, Visibility,
     };
+    use std::fs;
 
     fn test_entity(name: &str) -> Entity {
         Entity {
@@ -513,5 +697,148 @@ mod tests {
             .lines
             .iter()
             .any(|line| line == &format!("  ID: {id}")));
+    }
+
+    struct GraphSourceFixture {
+        _temp: tempfile::TempDir,
+        layout: kin_core::KinLayout,
+        graph: kin_db::InMemoryGraph,
+        file_id: FilePathId,
+    }
+
+    fn graph_source_fixture(source: Option<&[u8]>) -> GraphSourceFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let kin_root = temp.path().join(".kin");
+        fs::create_dir_all(kin_root.join("objects")).unwrap();
+        let layout = kin_core::KinLayout::new(kin_root);
+        let graph = kin_db::InMemoryGraph::new();
+
+        let branch_name = BranchName::new("main");
+        let genesis = kin_core::build_genesis_change();
+        graph.create_change(&genesis).unwrap();
+
+        let file_id = FilePathId::new("src/lib.rs");
+        let blob_hash = if let Some(source) = source {
+            let blob_store = kin_blobs::BlobStore::new(layout.objects_dir()).unwrap();
+            blob_store.write(source).unwrap()
+        } else {
+            Hash256::from_bytes([0x99; 32])
+        };
+        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x42; 32]));
+        graph
+            .create_change(&SemanticChange {
+                id: change_id,
+                parents: vec![genesis.id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "add source".to_string(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas: vec![ArtifactDelta {
+                    file_id: file_id.clone(),
+                    kind: ArtifactDeltaKind::Added,
+                    old_hash: None,
+                    new_hash: Some(blob_hash),
+                }],
+                projected_files: vec![file_id.clone()],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: Some(branch_name.clone()),
+            })
+            .unwrap();
+        graph
+            .create_branch(&Branch {
+                name: branch_name.clone(),
+                head: change_id,
+            })
+            .unwrap();
+        kin_core::write_current_branch(&layout, &branch_name).unwrap();
+
+        GraphSourceFixture {
+            _temp: temp,
+            layout,
+            graph,
+            file_id,
+        }
+    }
+
+    fn source_entity(name: &str, file_id: FilePathId, start: usize, end: usize) -> Entity {
+        let mut entity = test_entity(name);
+        entity.file_origin = Some(file_id);
+        entity.span = Some(SourceSpan {
+            file: entity.file_origin.clone().unwrap(),
+            start_byte: start,
+            end_byte: end,
+            start_line: 2,
+            start_col: 1,
+            end_line: 4,
+            end_col: 2,
+        });
+        entity.signature = format!("fn {name}()");
+        entity
+    }
+
+    #[test]
+    fn graph_source_reads_exact_body_from_graph_blob_by_uuid() {
+        let source = "fn before() {}\nfn target() {\n    2 + 2\n}\nfn after() {}\n";
+        let body = "fn target() {\n    2 + 2\n}";
+        let start = source.find(body).unwrap();
+        let end = start + body.len();
+        let fixture = graph_source_fixture(Some(source.as_bytes()));
+
+        let entity = source_entity("target", fixture.file_id.clone(), start, end);
+        let id = entity.id;
+        fixture.graph.upsert_entity(&entity).unwrap();
+
+        let response =
+            build_graph_source_response(&fixture.layout, &fixture.graph, &id.to_string()).unwrap();
+        let source = response.source.unwrap();
+
+        assert_eq!(source.body, body);
+        assert_eq!(source.file_path, "src/lib.rs");
+        assert_eq!(source.start_byte, start);
+        assert_eq!(source.end_byte, end);
+    }
+
+    #[test]
+    fn graph_source_returns_error_on_oob_span() {
+        let source = "fn target() {}\n";
+        let fixture = graph_source_fixture(Some(source.as_bytes()));
+        let end = source.len() + 10;
+        let entity = source_entity("target", fixture.file_id.clone(), 0, end);
+        let id = entity.id;
+        fixture.graph.upsert_entity(&entity).unwrap();
+
+        let err = build_graph_source_response(&fixture.layout, &fixture.graph, &id.to_string())
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains(&format!("source span 0..{end} is out of bounds")),
+            "{err}"
+        );
+        assert!(err.contains("src/lib.rs"), "{err}");
+    }
+
+    #[test]
+    fn graph_source_returns_error_on_missing_blob() {
+        let fixture = graph_source_fixture(None);
+        let entity = source_entity("target", fixture.file_id.clone(), 0, 8);
+        let id = entity.id;
+        fixture.graph.upsert_entity(&entity).unwrap();
+
+        let err = build_graph_source_response(&fixture.layout, &fixture.graph, &id.to_string())
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("graph blob for file 'src/lib.rs' is unavailable"),
+            "{err}"
+        );
+        assert!(
+            err.contains("source body cannot be read from daemon-backed graph"),
+            "{err}"
+        );
     }
 }
