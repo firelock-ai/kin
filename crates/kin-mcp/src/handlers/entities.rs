@@ -76,6 +76,40 @@ pub fn handle_get_entity<G: GraphStore>(
     }
 }
 
+pub fn handle_get_entity_source<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    let id_str = get_string_param(args, "entity_id")?;
+    let entity_id = parse_entity_id(&id_str)?;
+
+    match store.get_entity(&entity_id).map_err(McpError::graph)? {
+        Some(entity) => {
+            let body = read_entity_source_excerpt(&entity, 10_000, 1_000_000)
+                .ok_or_else(|| McpError::Context("entity source body unavailable".into()))?;
+            let span = entity.span.as_ref();
+            let value = serde_json::json!({
+                "id": entity.id,
+                "name": entity.name,
+                "kind": entity.kind,
+                "language": entity.language,
+                "file_path": entity.file_origin.as_ref().map(|p| p.to_string()),
+                "read_path": entity_read_path(&entity),
+                "start_line": span.map(|s| s.start_line),
+                "end_line": span.map(|s| s.end_line),
+                "signature": entity.signature,
+                "body": body,
+            });
+            let json = serde_json::to_string_pretty(&value).map_err(McpError::Json)?;
+            Ok(ToolCallResult::text(json))
+        }
+        None => Ok(ToolCallResult::error(format!(
+            "Entity not found: {}",
+            id_str
+        ))),
+    }
+}
+
 pub fn handle_get_context_pack<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,

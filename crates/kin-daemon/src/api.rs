@@ -3094,6 +3094,39 @@ async fn mcp_tools_call(
     } else {
         resolve_session_graph(&state, session_id.as_ref()).await
     };
+
+    if matches!(
+        request.name.as_str(),
+        "get_entity_source" | "get_entity_body"
+    ) {
+        let Some(entity_id) = request
+            .arguments
+            .get("entity_id")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Ok(Json(kin_mcp::ToolCallResult::error(
+                "missing required parameter: entity_id".to_string(),
+            )));
+        };
+        let result = match kin_cli::commands::graph::build_graph_source_response(
+            &state.layout,
+            graph.as_ref(),
+            entity_id,
+        ) {
+            Ok(response) => match response.source {
+                Some(source) => match serde_json::to_string_pretty(&source) {
+                    Ok(json) => kin_mcp::ToolCallResult::text(json),
+                    Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
+                },
+                None => kin_mcp::ToolCallResult::error(
+                    "graph source response missing source".to_string(),
+                ),
+            },
+            Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
+        };
+        return Ok(Json(result));
+    }
+
     let sessions = mcp_session_registry_snapshot(&state)?;
 
     let result = match kin_mcp::handlers::handle_tool_call(

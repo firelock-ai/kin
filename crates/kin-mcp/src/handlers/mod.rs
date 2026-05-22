@@ -32,6 +32,9 @@ pub async fn handle_tool_call<G: GraphStore>(
         // Entities
         "semantic_search" => entities::handle_semantic_search(arguments, store),
         "get_entity" => entities::handle_get_entity(arguments, store),
+        "get_entity_source" | "get_entity_body" => {
+            entities::handle_get_entity_source(arguments, store)
+        }
         "get_context_pack" => entities::handle_get_context_pack(arguments, store, sessions),
         "find_references" => entities::handle_find_references(arguments, store).await,
         "explore_codebase" => entities::handle_explore_codebase(arguments, store),

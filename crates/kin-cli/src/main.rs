@@ -824,6 +824,22 @@ enum GraphAction {
         /// Entity name to inspect
         name: String,
     },
+    /// Print the exact implementation body for an entity
+    Source {
+        /// Entity name or ID
+        entity: String,
+        /// Output machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Alias for source: print the exact implementation body for an entity
+    Body {
+        /// Entity name or ID
+        entity: String,
+        /// Output machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Serve an interactive force-directed visualization of the semantic graph
     Viz {
         /// Port to bind the local HTTP server to
@@ -2024,6 +2040,10 @@ fn main() -> Result<()> {
                     GraphAction::Status => commands::graph::status().await,
                     GraphAction::Validate => commands::graph::validate().await,
                     GraphAction::Inspect { name } => commands::graph::inspect(name).await,
+                    GraphAction::Source { entity, json } => {
+                        commands::graph::source(entity, json).await
+                    }
+                    GraphAction::Body { entity, json } => commands::graph::body(entity, json).await,
                     GraphAction::Viz { port, open } => commands::graph_viz::run(port, open).await,
                 },
                 Command::Git { action } => match action {
