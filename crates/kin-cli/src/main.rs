@@ -300,6 +300,9 @@ enum Command {
         /// Set --no-compact for verbose rows with name/kind/file_path/matched_kinds.
         #[arg(long, default_value_t = true)]
         compact: bool,
+        /// Force verbose bulk-mode rows (overrides --compact). Required for clap to accept `--no-compact`.
+        #[arg(long = "no-compact", default_value_t = false, action = clap::ArgAction::SetTrue)]
+        no_compact: bool,
     },
     /// Run semantic review on changes, or manage review state
     Review {
@@ -1799,6 +1802,7 @@ fn main() -> Result<()> {
                     bulk_json,
                     entities,
                     compact,
+                    no_compact,
                 } => {
                     if bulk_json {
                         let entities = entities.ok_or_else(|| {
@@ -1806,7 +1810,8 @@ fn main() -> Result<()> {
                                 "--bulk-json requires --entities (comma-separated entity UUIDs)"
                             )
                         })?;
-                        commands::refs::run_bulk(entities, kind, compact).await
+                        let effective_compact = compact && !no_compact;
+                        commands::refs::run_bulk(entities, kind, effective_compact).await
                     } else {
                         if entity.is_empty() {
                             anyhow::bail!(
