@@ -36,6 +36,7 @@ pub async fn handle_tool_call<G: GraphStore>(
             entities::handle_get_entity_source(arguments, store)
         }
         "get_context_pack" => entities::handle_get_context_pack(arguments, store, sessions),
+        "trace_computation" => entities::handle_trace_computation(arguments, store, sessions),
         "find_references" => entities::handle_find_references(arguments, store).await,
         "bulk_check_references" => entities::handle_bulk_check_references(arguments, store),
         "explore_codebase" => entities::handle_explore_codebase(arguments, store),
@@ -2020,5 +2021,75 @@ mod tests {
         let listed_json: serde_json::Value = serde_json::from_str(&listed_text).unwrap();
         assert_eq!(listed_json.as_array().unwrap().len(), 1);
         assert_eq!(listed_json[0]["scopes"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn handle_trace_computation_returns_focal_body_for_entity_id() {
+        use kin_model::graph::EntityStore;
+        let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  if (value < minVal) {\n    return false;\n  }\n  return value <= maxVal;\n}\n";
+        let (_dir, entity) = make_source_backed_entity(content);
+        let store = InMemoryGraph::default();
+        store.upsert_entity(&entity).unwrap();
+
+        let sessions = SessionRegistry::new();
+        let mut args = HashMap::new();
+        args.insert("entity_id".into(), serde_json::json!(entity.id.to_string()));
+
+        let result =
+            entities::handle_trace_computation(&args, &store, &sessions).unwrap();
+        let text = match &result.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let response: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        let focal = response
+            .get("focal_entity")
+            .expect("focal_entity present in trace_computation response");
+        let body = focal
+            .get("body")
+            .and_then(|v| v.as_str())
+            .expect("focal entity body");
+        assert!(
+            body.contains("return value <= maxVal;"),
+            "trace_computation focal body should include the real source excerpt; got: {body}"
+        );
+        assert!(response.get("token_budget").is_some());
+    }
+
+    #[test]
+    fn handle_trace_computation_resolves_query_to_entity() {
+        use kin_model::graph::EntityStore;
+        let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  if (value < minVal) {\n    return false;\n  }\n  return value <= maxVal;\n}\n";
+        let (_dir, entity) = make_source_backed_entity(content);
+        let store = InMemoryGraph::default();
+        store.upsert_entity(&entity).unwrap();
+
+        let sessions = SessionRegistry::new();
+        let mut args = HashMap::new();
+        args.insert("query".into(), serde_json::json!(entity.name.clone()));
+
+        let result =
+            entities::handle_trace_computation(&args, &store, &sessions).unwrap();
+        let text = match &result.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let response: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let focal_id = response
+            .get("focal_entity")
+            .and_then(|f| f.get("id"))
+            .and_then(|v| v.as_str())
+            .expect("focal_entity.id present");
+        assert_eq!(focal_id, entity.id.to_string());
+    }
+
+    #[test]
+    fn handle_trace_computation_requires_entity_id_or_query() {
+        let store = InMemoryGraph::default();
+        let sessions = SessionRegistry::new();
+        let args = HashMap::new();
+
+        let err = entities::handle_trace_computation(&args, &store, &sessions)
+            .expect_err("missing entity_id and query should error");
+        assert!(matches!(err, McpError::InvalidParams(_)));
     }
 }

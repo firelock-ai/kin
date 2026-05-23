@@ -71,6 +71,20 @@ pub fn tool_definitions() -> ToolsListResult {
                 }),
             },
             ToolDefinition {
+                name: "trace_computation".into(),
+                description: "Daemon-backed trace-computation primitive. Given a focal entity, returns the focal body PLUS its data/control-flow neighborhood (callers + callees + imports) in a single structured response within a token budget. Prefer this over looping get_entity_source over each step of a trace — that pattern exhausts context. The response contains everything needed to answer step-by-step data-flow or control-flow questions in ONE call.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "entity_id": { "type": "string", "description": "Focal entity UUID. Required if `query` is not given." },
+                        "query": { "type": "string", "description": "Exact entity name to resolve to a focal entity. Required if `entity_id` is not given." },
+                        "depth": { "type": "integer", "description": "Dependency traversal depth across the trace neighborhood", "default": 3 },
+                        "token_budget": { "type": "integer", "description": "Token budget for the assembled trace response", "default": 8000 },
+                        "compact": { "type": "boolean", "description": "If true, return signature-only entries for everyone (smaller). If false (default), focal gets FullBody, deps get SignatureOnly — better for trace-style reasoning.", "default": false }
+                    }
+                }),
+            },
+            ToolDefinition {
                 name: "find_references".into(),
                 description: "Find direct upstream callers/importers/references for an entity. Accepts either an entity_id or an exact query name, resolves the best matching canonical definition, and returns one row per upstream file with relation kinds and file paths.".into(),
                 input_schema: serde_json::json!({
@@ -717,6 +731,7 @@ pub fn benchmark_tool_names() -> &'static [&'static str] {
         "get_entity_source",
         "get_entity_body",
         "get_context_pack",
+        "trace_computation",
         "find_references",
         "dead_code",
         "graph_neighborhood",
@@ -761,8 +776,9 @@ mod tests {
     fn expected_tool_count() {
         let list = tool_definitions();
         // 12 original + 1 explore_codebase + 2 entity source aliases + 6 Phase 7 + 12 Phase 8
-        // + 6 Phase 9-10 + 1 graph_status + 10 Phase 11 review + 1 bulk_check_references = 51
-        assert_eq!(list.tools.len(), 51);
+        // + 6 Phase 9-10 + 1 graph_status + 10 Phase 11 review + 1 bulk_check_references
+        // + 1 trace_computation = 52
+        assert_eq!(list.tools.len(), 52);
     }
 
     #[test]
