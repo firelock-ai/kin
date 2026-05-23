@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_BATCH_SIZE: usize = 512;
@@ -100,7 +100,10 @@ async fn run_daemon_embed(
         anyhow::anyhow!("Kin daemon is required for embed but no daemon endpoint is available")
     })?;
     let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
-    client.embed(request).await.context("daemon embed failed")
+    client
+        .embed(request)
+        .await
+        .map_err(|e| anyhow::anyhow!("daemon embed failed: {e:#}"))
 }
 
 pub fn build_embed_response(
@@ -246,19 +249,32 @@ mod tests {
 
     #[test]
     fn queues_full_pass_when_index_missing_and_queue_empty() {
-        // queue_len=0 but 3/5 indexed → must queue the remaining 2.
         assert!(should_queue_full_embedding_pass(0, 3, 5));
     }
 
     #[test]
     fn reuses_existing_pending_queue() {
-        // queue_len=2 already covers the unindexed entities → do not requeue.
         assert!(!should_queue_full_embedding_pass(2, 3, 5));
     }
 
     #[test]
     fn skips_full_queue_when_embeddings_are_current() {
-        // queue_len=0 and 5/5 indexed → no work outstanding.
         assert!(!should_queue_full_embedding_pass(0, 5, 5));
+    }
+
+    #[test]
+    fn embed_error_wrap_preserves_underlying_chain() {
+        let inner = anyhow::anyhow!("daemon embed error (HTTP 500): Graph error: kindb foo");
+        let wrapped: anyhow::Error =
+            anyhow::anyhow!("daemon embed failed: {inner:#}", inner = inner);
+        let rendered = format!("{wrapped:#}");
+        assert!(
+            rendered.contains("daemon embed failed"),
+            "missing outer hint: {rendered}"
+        );
+        assert!(
+            rendered.contains("Graph error: kindb foo"),
+            "underlying cause was flattened away: {rendered}"
+        );
     }
 }

@@ -5,22 +5,22 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum DaemonError {
-    #[error("Graph error")]
+    #[error("Graph error: {0}")]
     Graph(#[source] kin_db::KinDbError),
 
-    #[error("Blob error")]
+    #[error("Blob error: {0}")]
     Blob(#[source] kin_blobs::BlobError),
 
-    #[error("Index error")]
+    #[error("Index error: {0}")]
     Index(#[source] kin_index::IndexError),
 
-    #[error("Reconcile error")]
+    #[error("Reconcile error: {0}")]
     Reconcile(#[source] kin_reconcile::ReconcileError),
 
-    #[error("Projection error")]
+    #[error("Projection error: {0}")]
     Projection(#[source] kin_projection::ProjectionError),
 
-    #[error("Core error")]
+    #[error("Core error: {0}")]
     Core(#[source] kin_core::KinError),
 
     #[error("Not initialized: no .kin/ directory found")]
