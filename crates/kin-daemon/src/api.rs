@@ -2772,12 +2772,12 @@ async fn embed(
             state_for_embed.graph.as_ref(),
             &req,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("embed build failed: {error:#}"))?;
         if result.result.total_entities > 0 || result.result.total_artifacts > 0 {
             state_for_embed.bump_version();
             state_for_embed
                 .save_snapshot()
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| format!("embed snapshot save failed: {error:#}"))?;
             state_for_embed.mark_clean();
         }
         Ok::<_, String>(result)
