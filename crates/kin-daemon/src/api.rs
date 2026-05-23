@@ -539,6 +539,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/overview", post(command_overview))
         .route("/commands/dead-code", post(command_dead_code))
         .route("/commands/refs", post(command_refs))
+        .route("/commands/bulk-refs", post(command_bulk_refs))
         .route("/commands/xref", post(command_xref))
         .route("/commands/diff", post(command_diff))
         .route("/commands/log", post(command_log))
@@ -1499,6 +1500,31 @@ async fn command_refs(
     let response =
         kin_cli::commands::refs::build_refs_response(&state.layout, graph.as_ref(), &request)
             .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/bulk-refs — classify reachability for many entities in a single
+/// daemon-graph traversal. Closes the find-dead-code / count-real-callers token
+/// blowup where the agent makes one find_references call per entity.
+async fn command_bulk_refs(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::refs::BulkRefsRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let response = kin_cli::commands::refs::build_bulk_refs_response(graph.as_ref(), &request)
+        .map_err(internal_error)?;
     Ok(Json(response))
 }
 
