@@ -344,6 +344,165 @@ pub async fn handle_find_references<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
+/// Batched reachability check: classify many entities in a single call.
+///
+/// Returns one row per requested entity_id with `has_references`, `reference_count`,
+/// and (in non-compact mode) the matching relation kinds and entity metadata.
+/// Designed for reachability / dead-code / count-callers workloads where calling
+/// `find_references` per entity blows up token budgets.
+pub fn handle_bulk_check_references<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    const MAX_BULK_ENTITIES: usize = 200;
+
+    let entity_ids_raw = get_optional_string_array(args, "entity_ids").ok_or_else(|| {
+        McpError::InvalidParams(
+            "missing required parameter: entity_ids (array of entity UUIDs)".into(),
+        )
+    })?;
+    if entity_ids_raw.is_empty() {
+        return Err(McpError::InvalidParams(
+            "entity_ids must contain at least one UUID".into(),
+        ));
+    }
+    if entity_ids_raw.len() > MAX_BULK_ENTITIES {
+        return Err(McpError::InvalidParams(format!(
+            "entity_ids contains {} entries; maximum is {}",
+            entity_ids_raw.len(),
+            MAX_BULK_ENTITIES
+        )));
+    }
+
+    let relation_kinds = parse_bulk_relation_kind(
+        get_optional_string_param(args, "relation_kind")
+            .as_deref()
+            .unwrap_or("Any"),
+    )?;
+    let compact = get_optional_bool(args, "compact", true);
+
+    let allowed: std::collections::HashSet<RelationKind> = relation_kinds.iter().copied().collect();
+    let mut results = Vec::with_capacity(entity_ids_raw.len());
+    let mut with_references = 0usize;
+
+    for raw_id in &entity_ids_raw {
+        let entity_id = match parse_entity_id(raw_id) {
+            Ok(id) => id,
+            Err(_) => {
+                let mut row = serde_json::json!({
+                    "entity_id": raw_id,
+                    "error": "invalid entity_id (not a UUID)",
+                });
+                if !compact {
+                    row["has_references"] = serde_json::json!(false);
+                    row["reference_count"] = serde_json::json!(0);
+                }
+                results.push(row);
+                continue;
+            }
+        };
+
+        let entity = store.get_entity(&entity_id).map_err(McpError::graph)?;
+        let Some(entity) = entity else {
+            let mut row = serde_json::json!({
+                "entity_id": raw_id,
+                "error": "entity not found",
+                "has_references": false,
+                "reference_count": 0,
+            });
+            if !compact {
+                row["name"] = serde_json::Value::Null;
+                row["kind"] = serde_json::Value::Null;
+                row["file_path"] = serde_json::Value::Null;
+                row["matched_kinds"] = serde_json::json!([]);
+            }
+            results.push(row);
+            continue;
+        };
+
+        let mut reference_count = 0usize;
+        let mut matched_kinds: Vec<RelationKind> = Vec::new();
+        for rel in store
+            .get_all_relations_for_entity(&entity_id)
+            .map_err(McpError::graph)?
+        {
+            let Some(src_entity_id) = rel.src.as_entity() else {
+                continue;
+            };
+            if rel.dst != kin_model::relation::GraphNodeId::Entity(entity_id) {
+                continue;
+            }
+            if !allowed.contains(&rel.kind) {
+                continue;
+            }
+            if src_entity_id == entity_id {
+                continue;
+            }
+            reference_count += 1;
+            if !matched_kinds.contains(&rel.kind) {
+                matched_kinds.push(rel.kind);
+            }
+        }
+
+        let has_references = reference_count > 0;
+        if has_references {
+            with_references += 1;
+        }
+
+        if compact {
+            results.push(serde_json::json!({
+                "entity_id": entity_id,
+                "has_references": has_references,
+                "reference_count": reference_count,
+            }));
+        } else {
+            matched_kinds.sort_by_key(|kind| relation_kind_rank(kind));
+            results.push(serde_json::json!({
+                "entity_id": entity_id,
+                "name": entity.name,
+                "kind": format!("{:?}", entity.kind),
+                "file_path": entity.file_origin.as_ref().map(|p| p.to_string()),
+                "has_references": has_references,
+                "reference_count": reference_count,
+                "matched_kinds": matched_kinds
+                    .into_iter()
+                    .map(relation_kind_name)
+                    .collect::<Vec<_>>(),
+            }));
+        }
+    }
+
+    let total_checked = entity_ids_raw.len();
+    let result = serde_json::json!({
+        "total_checked": total_checked,
+        "with_references": with_references,
+        "without_references": total_checked - with_references,
+        "relation_kinds": relation_kinds
+            .iter()
+            .copied()
+            .map(relation_kind_name)
+            .collect::<Vec<_>>(),
+        "compact": compact,
+        "results": results,
+    });
+
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
+fn parse_bulk_relation_kind(value: &str) -> Result<Vec<RelationKind>> {
+    match value.to_ascii_lowercase().as_str() {
+        "any" | "all" => Ok(default_reference_kinds()),
+        "calls" | "call" => Ok(vec![RelationKind::Calls]),
+        "imports" | "import" => Ok(vec![RelationKind::Imports]),
+        "references" | "reference" | "refs" => Ok(vec![RelationKind::References]),
+        other => Err(McpError::InvalidParams(format!(
+            "unsupported relation_kind '{}': use Calls, Imports, References, or Any",
+            other
+        ))),
+    }
+}
+
 pub fn handle_explore_codebase<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -936,4 +1095,192 @@ pub fn handle_graph_status<G: GraphStore>(
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kin_db::InMemoryGraph;
+    use kin_model::entity::{
+        Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint,
+        Visibility,
+    };
+    use kin_model::graph::EntityStore as _;
+    use kin_model::ids::{EntityId, FilePathId, Hash256, LanguageId, RelationId};
+    use kin_model::relation::{GraphNodeId, Relation, RelationKind, RelationOrigin};
+
+    fn make_entity(name: &str, file: &str) -> Entity {
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([0; 32]),
+                behavior_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new(file)),
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn make_relation(src: EntityId, dst: EntityId, kind: RelationKind) -> Relation {
+        Relation {
+            id: RelationId::new(),
+            kind,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+        }
+    }
+
+    fn parsed_response(result: &ToolCallResult) -> serde_json::Value {
+        let crate::types::ContentBlock::Text { text } = result
+            .content
+            .first()
+            .expect("expected at least one content block");
+        serde_json::from_str(text).expect("response must be valid JSON")
+    }
+
+    #[test]
+    fn bulk_check_references_compact_and_verbose_shapes() {
+        let store = InMemoryGraph::new();
+        let caller = make_entity("caller", "src/a.rs");
+        let live = make_entity("live", "src/b.rs");
+        let dead = make_entity("dead", "src/c.rs");
+        let caller_id = caller.id;
+        let live_id = live.id;
+        let dead_id = dead.id;
+
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&live).unwrap();
+        store.upsert_entity(&dead).unwrap();
+
+        store
+            .upsert_relation(&make_relation(caller_id, live_id, RelationKind::Calls))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation(caller_id, live_id, RelationKind::Imports))
+            .unwrap();
+
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_ids".to_string(),
+            serde_json::json!([live_id.to_string(), dead_id.to_string()]),
+        );
+        args.insert("relation_kind".to_string(), serde_json::json!("Any"));
+
+        let compact = handle_bulk_check_references(&args, &store).unwrap();
+        let body = parsed_response(&compact);
+        assert_eq!(body["total_checked"], 2);
+        assert_eq!(body["with_references"], 1);
+        assert_eq!(body["without_references"], 1);
+        assert_eq!(body["compact"], true);
+        let rows = body["results"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        let live_row = rows
+            .iter()
+            .find(|r| r["entity_id"] == serde_json::json!(live_id))
+            .unwrap();
+        assert_eq!(live_row["has_references"], true);
+        assert_eq!(live_row["reference_count"], 2);
+        assert!(live_row.get("name").is_none(), "compact mode must omit name");
+        let dead_row = rows
+            .iter()
+            .find(|r| r["entity_id"] == serde_json::json!(dead_id))
+            .unwrap();
+        assert_eq!(dead_row["has_references"], false);
+        assert_eq!(dead_row["reference_count"], 0);
+
+        args.insert("compact".to_string(), serde_json::json!(false));
+        let verbose = handle_bulk_check_references(&args, &store).unwrap();
+        let vbody = parsed_response(&verbose);
+        let vrows = vbody["results"].as_array().unwrap();
+        let live_row = vrows
+            .iter()
+            .find(|r| r["entity_id"] == serde_json::json!(live_id))
+            .unwrap();
+        assert_eq!(live_row["name"], "live");
+        assert_eq!(live_row["kind"], "Function");
+        assert_eq!(live_row["file_path"], "src/b.rs");
+        let matched = live_row["matched_kinds"].as_array().unwrap();
+        assert!(matched.iter().any(|v| v == "calls"));
+        assert!(matched.iter().any(|v| v == "imports"));
+    }
+
+    #[test]
+    fn bulk_check_references_relation_kind_filter() {
+        let store = InMemoryGraph::new();
+        let caller = make_entity("caller", "src/a.rs");
+        let target = make_entity("target", "src/b.rs");
+        let caller_id = caller.id;
+        let target_id = target.id;
+
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&target).unwrap();
+        store
+            .upsert_relation(&make_relation(
+                caller_id,
+                target_id,
+                RelationKind::Imports,
+            ))
+            .unwrap();
+
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_ids".to_string(),
+            serde_json::json!([target_id.to_string()]),
+        );
+
+        // Asking for Calls only — Imports edge must NOT count.
+        args.insert("relation_kind".to_string(), serde_json::json!("Calls"));
+        let calls_resp = parsed_response(&handle_bulk_check_references(&args, &store).unwrap());
+        assert_eq!(calls_resp["with_references"], 0);
+        assert_eq!(calls_resp["results"][0]["reference_count"], 0);
+
+        // Asking for Imports — should match.
+        args.insert("relation_kind".to_string(), serde_json::json!("Imports"));
+        let imports_resp = parsed_response(&handle_bulk_check_references(&args, &store).unwrap());
+        assert_eq!(imports_resp["with_references"], 1);
+        assert_eq!(imports_resp["results"][0]["reference_count"], 1);
+    }
+
+    #[test]
+    fn bulk_check_references_rejects_empty_and_invalid() {
+        let store = InMemoryGraph::new();
+
+        let args = HashMap::new();
+        let err = handle_bulk_check_references(&args, &store).unwrap_err();
+        assert!(matches!(err, McpError::InvalidParams(_)));
+
+        let mut empty = HashMap::new();
+        empty.insert("entity_ids".to_string(), serde_json::json!([]));
+        let err = handle_bulk_check_references(&empty, &store).unwrap_err();
+        assert!(matches!(err, McpError::InvalidParams(_)));
+
+        let mut bad = HashMap::new();
+        bad.insert(
+            "entity_ids".to_string(),
+            serde_json::json!(["not-a-uuid", EntityId::new().to_string()]),
+        );
+        let resp = parsed_response(&handle_bulk_check_references(&bad, &store).unwrap());
+        let rows = resp["results"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["error"], "invalid entity_id (not a UUID)");
+        assert_eq!(rows[1]["error"], "entity not found");
+    }
 }

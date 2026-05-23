@@ -87,6 +87,34 @@ pub fn tool_definitions() -> ToolsListResult {
                 }),
             },
             ToolDefinition {
+                name: "bulk_check_references".into(),
+                description: "Batched reachability check across many entities in a single call. Pass up to 200 entity UUIDs and receive one classification row per entity: whether incoming relations of the requested kind exist, plus a reference count. Designed for reachability / dead-code / count-callers workloads where the naive shape (`find_references` per entity) blows up token budgets — ask 'of these N entities, which have callers?' once instead of N times.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "entity_ids": {
+                            "type": "array",
+                            "description": "Entity UUIDs to classify. Minimum 1, maximum 200.",
+                            "items": { "type": "string" },
+                            "minItems": 1,
+                            "maxItems": 200
+                        },
+                        "relation_kind": {
+                            "type": "string",
+                            "description": "Relation kind to check for: 'Calls', 'Imports', 'References', or 'Any' for the union.",
+                            "enum": ["Calls", "Imports", "References", "Any"],
+                            "default": "Any"
+                        },
+                        "compact": {
+                            "type": "boolean",
+                            "description": "If true (default), return only {entity_id, has_references, reference_count} per result. If false, also include name/kind/file_path/matched_kinds.",
+                            "default": true
+                        }
+                    },
+                    "required": ["entity_ids"]
+                }),
+            },
+            ToolDefinition {
                 name: "impact_analysis".into(),
                 description: "Analyze downstream impact of changes. Accepts base/head change IDs, OR entity_ids (UUIDs), OR files (paths), OR change_ids (list of change hashes). Only one mode at a time.".into(),
                 input_schema: serde_json::json!({
@@ -717,6 +745,7 @@ mod tests {
         assert!(json.contains("semantic_search"));
         assert!(json.contains("get_entity_source"));
         assert!(json.contains("find_references"));
+        assert!(json.contains("bulk_check_references"));
         assert!(json.contains("impact_analysis"));
         assert!(json.contains("register_session"));
         // Phase 7 tools
@@ -731,8 +760,9 @@ mod tests {
     #[test]
     fn expected_tool_count() {
         let list = tool_definitions();
-        // 12 original + 1 explore_codebase + 2 entity source aliases + 6 Phase 7 + 12 Phase 8 + 6 Phase 9-10 + 1 graph_status + 10 Phase 11 review = 50
-        assert_eq!(list.tools.len(), 50);
+        // 12 original + 1 explore_codebase + 2 entity source aliases + 6 Phase 7 + 12 Phase 8
+        // + 6 Phase 9-10 + 1 graph_status + 10 Phase 11 review + 1 bulk_check_references = 51
+        assert_eq!(list.tools.len(), 51);
     }
 
     #[test]

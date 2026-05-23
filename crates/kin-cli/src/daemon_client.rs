@@ -563,6 +563,28 @@ impl DaemonClient {
         Ok(resp.json().await.context("parse daemon refs response")?)
     }
 
+    pub async fn bulk_refs(
+        &self,
+        request: &crate::commands::refs::BulkRefsRequest,
+    ) -> Result<crate::commands::refs::BulkRefsResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/commands/bulk-refs", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon bulk-refs request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon bulk-refs error (HTTP {}): {}", status, body);
+        }
+        Ok(resp
+            .json()
+            .await
+            .context("parse daemon bulk-refs response")?)
+    }
+
     pub async fn xref(
         &self,
         request: &crate::commands::xref::XrefRequest,

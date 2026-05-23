@@ -60,6 +60,35 @@ pub struct RefsResponse {
     pub lines: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkRefsRequest {
+    pub entity_ids: Vec<String>,
+    #[serde(default = "default_bulk_kind")]
+    pub kind: String,
+    #[serde(default = "default_bulk_compact")]
+    pub compact: bool,
+}
+
+fn default_bulk_kind() -> String {
+    "Any".to_string()
+}
+
+fn default_bulk_compact() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkRefsResponse {
+    pub total_checked: usize,
+    pub with_references: usize,
+    pub without_references: usize,
+    #[serde(default)]
+    pub relation_kinds: Vec<String>,
+    pub compact: bool,
+    #[serde(default)]
+    pub results: Vec<serde_json::Value>,
+}
+
 pub async fn run(entity: String, kind: String) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
@@ -68,6 +97,31 @@ pub async fn run(entity: String, kind: String) -> Result<()> {
     for line in response.lines {
         println!("{line}");
     }
+    Ok(())
+}
+
+pub async fn run_bulk(entities: String, kind: String, compact: bool) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let _scope = announce_active_scope(&layout, "refs:bulk").await?;
+    let entity_ids: Vec<String> = entities
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if entity_ids.is_empty() {
+        anyhow::bail!("--entities must be a comma-separated list of one or more entity UUIDs");
+    }
+    let response = run_daemon_bulk_refs(
+        &layout,
+        &BulkRefsRequest {
+            entity_ids,
+            kind,
+            compact,
+        },
+    )
+    .await?;
+    println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
 
@@ -85,6 +139,25 @@ async fn run_daemon_refs(
     })?;
     let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
     client.refs(request).await.context("daemon refs failed")
+}
+
+async fn run_daemon_bulk_refs(
+    layout: &kin_core::KinLayout,
+    request: &BulkRefsRequest,
+) -> Result<BulkRefsResponse> {
+    let daemon_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(Some)
+        .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
+    let base_url = daemon_url.ok_or_else(|| {
+        anyhow::anyhow!("Kin daemon is required for bulk refs but no daemon endpoint is available")
+    })?;
+    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    client
+        .bulk_refs(request)
+        .await
+        .context("daemon bulk refs failed")
 }
 
 pub fn build_refs_response(
@@ -144,6 +217,152 @@ pub fn build_refs_response(
     }
 
     Ok(RefsResponse { lines })
+}
+
+pub fn build_bulk_refs_response(
+    graph: &kin_db::InMemoryGraph,
+    request: &BulkRefsRequest,
+) -> Result<BulkRefsResponse> {
+    const MAX_BULK_ENTITIES: usize = 200;
+
+    if request.entity_ids.is_empty() {
+        anyhow::bail!("bulk_refs requires at least one entity_id");
+    }
+    if request.entity_ids.len() > MAX_BULK_ENTITIES {
+        anyhow::bail!(
+            "bulk_refs accepts at most {} entity_ids (got {})",
+            MAX_BULK_ENTITIES,
+            request.entity_ids.len()
+        );
+    }
+
+    let relation_kinds = parse_bulk_relation_kind(&request.kind)?;
+    let allowed: std::collections::HashSet<RelationKind> = relation_kinds.iter().copied().collect();
+    let mut results = Vec::with_capacity(request.entity_ids.len());
+    let mut with_references = 0usize;
+
+    for raw_id in &request.entity_ids {
+        let parsed = uuid::Uuid::parse_str(raw_id.trim());
+        let Ok(uuid) = parsed else {
+            let mut row = serde_json::json!({
+                "entity_id": raw_id,
+                "error": "invalid entity_id (not a UUID)",
+            });
+            if !request.compact {
+                row["has_references"] = serde_json::json!(false);
+                row["reference_count"] = serde_json::json!(0);
+            }
+            results.push(row);
+            continue;
+        };
+        let entity_id = EntityId(uuid);
+        let entity = graph.get_entity(&entity_id)?;
+        let Some(entity) = entity else {
+            let mut row = serde_json::json!({
+                "entity_id": raw_id,
+                "error": "entity not found",
+                "has_references": false,
+                "reference_count": 0,
+            });
+            if !request.compact {
+                row["name"] = serde_json::Value::Null;
+                row["kind"] = serde_json::Value::Null;
+                row["file_path"] = serde_json::Value::Null;
+                row["matched_kinds"] = serde_json::json!([]);
+            }
+            results.push(row);
+            continue;
+        };
+
+        let mut reference_count = 0usize;
+        let mut matched_kinds: Vec<RelationKind> = Vec::new();
+        for rel in graph.get_all_relations_for_entity(&entity_id)? {
+            let Some(src_entity_id) = rel.src.as_entity() else {
+                continue;
+            };
+            if rel.dst != GraphNodeId::Entity(entity_id) {
+                continue;
+            }
+            if !allowed.contains(&rel.kind) {
+                continue;
+            }
+            if src_entity_id == entity_id {
+                continue;
+            }
+            reference_count += 1;
+            if !matched_kinds.contains(&rel.kind) {
+                matched_kinds.push(rel.kind);
+            }
+        }
+
+        let has_references = reference_count > 0;
+        if has_references {
+            with_references += 1;
+        }
+
+        if request.compact {
+            results.push(serde_json::json!({
+                "entity_id": entity_id.to_string(),
+                "has_references": has_references,
+                "reference_count": reference_count,
+            }));
+        } else {
+            matched_kinds.sort_by_key(relation_kind_rank);
+            results.push(serde_json::json!({
+                "entity_id": entity_id.to_string(),
+                "name": entity.name,
+                "kind": format!("{:?}", entity.kind),
+                "file_path": entity.file_origin.as_ref().map(|p| p.0.clone()),
+                "has_references": has_references,
+                "reference_count": reference_count,
+                "matched_kinds": matched_kinds
+                    .into_iter()
+                    .map(relation_kind_label)
+                    .collect::<Vec<_>>(),
+            }));
+        }
+    }
+
+    let total_checked = request.entity_ids.len();
+    Ok(BulkRefsResponse {
+        total_checked,
+        with_references,
+        without_references: total_checked - with_references,
+        relation_kinds: relation_kinds
+            .iter()
+            .copied()
+            .map(relation_kind_label)
+            .collect(),
+        compact: request.compact,
+        results,
+    })
+}
+
+fn parse_bulk_relation_kind(value: &str) -> Result<Vec<RelationKind>> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "any" | "all" | "" => Ok(vec![
+            RelationKind::Calls,
+            RelationKind::Imports,
+            RelationKind::References,
+        ]),
+        "calls" | "call" => Ok(vec![RelationKind::Calls]),
+        "imports" | "import" => Ok(vec![RelationKind::Imports]),
+        "references" | "reference" | "refs" => Ok(vec![RelationKind::References]),
+        other => anyhow::bail!(
+            "invalid --kind '{}': use Calls, Imports, References, or Any",
+            other
+        ),
+    }
+}
+
+fn relation_kind_label(kind: RelationKind) -> String {
+    match kind {
+        RelationKind::Calls => "Calls",
+        RelationKind::Imports => "Imports",
+        RelationKind::References => "References",
+        _ => "Other",
+    }
+    .to_string()
 }
 
 #[derive(Debug, Clone)]

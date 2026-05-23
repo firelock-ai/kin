@@ -283,11 +283,23 @@ enum Command {
     },
     /// Show upstream callers/importers/references for an entity
     Refs {
-        /// Entity name or ID
+        /// Entity name or ID. Required unless --bulk-json + --entities is provided.
+        #[arg(default_value = "")]
         entity: String,
-        /// Filter relation kinds: all, calls, imports, or references
+        /// Filter relation kinds: all, calls, imports, or references (or Any for bulk mode)
         #[arg(long, default_value = "all")]
         kind: String,
+        /// Bulk mode: classify many entities by reachability in one daemon call.
+        /// Outputs JSON to stdout. Requires --entities.
+        #[arg(long, default_value_t = false)]
+        bulk_json: bool,
+        /// Comma-separated entity UUIDs for --bulk-json. Required when --bulk-json is set.
+        #[arg(long)]
+        entities: Option<String>,
+        /// If true (default) emit compact bulk-mode rows ({entity_id, has_references, reference_count}).
+        /// Set --no-compact for verbose rows with name/kind/file_path/matched_kinds.
+        #[arg(long, default_value_t = true)]
+        compact: bool,
     },
     /// Run semantic review on changes, or manage review state
     Review {
@@ -1781,7 +1793,29 @@ fn main() -> Result<()> {
                     column,
                     json,
                 } => commands::rename::run(symbol, new_name, file, line, column, json).await,
-                Command::Refs { entity, kind } => commands::refs::run(entity, kind).await,
+                Command::Refs {
+                    entity,
+                    kind,
+                    bulk_json,
+                    entities,
+                    compact,
+                } => {
+                    if bulk_json {
+                        let entities = entities.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "--bulk-json requires --entities (comma-separated entity UUIDs)"
+                            )
+                        })?;
+                        commands::refs::run_bulk(entities, kind, compact).await
+                    } else {
+                        if entity.is_empty() {
+                            anyhow::bail!(
+                                "missing positional entity argument (or use --bulk-json --entities)"
+                            );
+                        }
+                        commands::refs::run(entity, kind).await
+                    }
+                }
                 Command::Review {
                     change,
                     json,
