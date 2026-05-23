@@ -178,6 +178,11 @@ pub struct DaemonState {
     /// Cached SemanticChangeId → Git OID mapping for fast scope switching.
     /// Built lazily on first `set_scope` call, reused for subsequent calls.
     pub change_oid_cache: std::sync::RwLock<Option<kin_core::ChangeOidCache>>,
+    /// Repo ID resolved once at construction. Cached to avoid re-reading
+    /// `.kin/manifest.json` on every snapshot save — under high host
+    /// concurrency those reads contend and surface as opaque "Core error"
+    /// shutdown-save failures (SP-20).
+    pub cached_repo_id: String,
 }
 
 impl DaemonState {
@@ -323,6 +328,11 @@ impl DaemonState {
         // don't see a reset after daemon restart.
         let persisted_vfs_version = Self::load_persisted_vfs_version(&layout);
 
+        let explicit_repo_id = std::env::var("KIN_REPO_ID").ok();
+        let cached_repo_id =
+            kin_core::manifest::resolve_repo_id(&layout, explicit_repo_id.as_deref())
+                .map_err(DaemonError::from)?;
+
         let state = Self {
             layout,
             graph,
@@ -350,6 +360,7 @@ impl DaemonState {
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
             change_oid_cache: std::sync::RwLock::new(None),
+            cached_repo_id,
         };
         Ok(state)
     }
@@ -456,6 +467,7 @@ impl DaemonState {
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
             change_oid_cache: std::sync::RwLock::new(None),
+            cached_repo_id: repo_id.to_string(),
         };
 
         // Pre-load repos into the map BEFORE any async context.
@@ -912,10 +924,7 @@ impl DaemonState {
     /// `.kin/kindb/generation` so CLI and MCP processes can detect
     /// when their loaded snapshot is stale (P2-2.7).
     pub fn save_snapshot(&self) -> Result<()> {
-        let explicit_repo_id = std::env::var("KIN_REPO_ID").ok();
-        let repo_id =
-            kin_core::manifest::resolve_repo_id(&self.layout, explicit_repo_id.as_deref())
-                .map_err(DaemonError::from)?;
+        let repo_id = self.cached_repo_id.as_str();
 
         let new_gen = if let Some(backend) = &self.storage_backend {
             let (bytes, _) = self
@@ -925,7 +934,7 @@ impl DaemonState {
             let expected_gen = self.snapshot_generation.load(Ordering::SeqCst);
 
             backend
-                .save_snapshot(&repo_id, &bytes, expected_gen)
+                .save_snapshot(repo_id, &bytes, expected_gen)
                 .map_err(DaemonError::from)?
         } else {
             kin_db::SnapshotManager::save_graph(
@@ -1184,6 +1193,7 @@ mod tests {
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
             change_oid_cache: std::sync::RwLock::new(None),
+            cached_repo_id: "test-repo".to_string(),
         }
     }
 
