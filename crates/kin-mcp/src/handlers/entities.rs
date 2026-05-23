@@ -234,6 +234,46 @@ pub fn handle_get_context_pack<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
+/// Name-aliased wrapper over `get_context_pack` so models pick this primitive by
+/// task-family name on trace/data-flow questions instead of looping `get_entity_source`.
+pub fn handle_trace_computation<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+    sessions: &SessionRegistry,
+) -> Result<ToolCallResult> {
+    let mut merged: HashMap<String, serde_json::Value> = args.clone();
+
+    if !merged.contains_key("entity_id") {
+        if let Some(query) = get_optional_string_param(args, "query") {
+            let target = select_best_reference_target(store, &query).map_err(McpError::graph)?;
+            let Some(entity) = target else {
+                return Ok(ToolCallResult::error(format!(
+                    "trace_computation: no entity matches query '{}'",
+                    query
+                )));
+            };
+            merged.insert(
+                "entity_id".into(),
+                serde_json::Value::String(entity.id.to_string()),
+            );
+        } else {
+            return Err(McpError::InvalidParams(
+                "trace_computation requires either entity_id or query".into(),
+            ));
+        }
+    }
+
+    merged.entry("depth".into()).or_insert(serde_json::json!(3));
+    merged
+        .entry("token_budget".into())
+        .or_insert(serde_json::json!(8000));
+    merged
+        .entry("compact".into())
+        .or_insert(serde_json::json!(false));
+
+    handle_get_context_pack(&merged, store, sessions)
+}
+
 pub async fn handle_find_references<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
