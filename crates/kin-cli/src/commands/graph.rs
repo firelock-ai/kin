@@ -107,7 +107,7 @@ async fn run_daemon_graph(
     client
         .graph_command(request)
         .await
-        .context("daemon graph command failed")
+        .map_err(|e| anyhow::anyhow!("daemon graph command failed: {e:#}"))
 }
 
 fn print_graph_response(response: GraphCommandResponse) -> Result<()> {
