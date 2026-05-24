@@ -41,6 +41,7 @@ pub async fn handle_tool_call<G: GraphStore>(
         "bulk_check_references" => entities::handle_bulk_check_references(arguments, store),
         "explore_codebase" => entities::handle_explore_codebase(arguments, store),
         "dead_code" => entities::handle_dead_code(arguments, store),
+        "find_dead_code_seeded" => entities::handle_find_dead_code_seeded(arguments, store),
         "graph_neighborhood" => entities::handle_graph_neighborhood(arguments, store),
         // Review
         "semantic_diff" => review::handle_semantic_diff(arguments, store),
