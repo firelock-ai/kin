@@ -566,6 +566,28 @@ impl DaemonClient {
             .context("parse daemon seeded dead-code response")?)
     }
 
+    pub async fn trace_data_flow(
+        &self,
+        request: &crate::commands::trace_data_flow::TraceDataFlowRequest,
+    ) -> Result<crate::commands::trace_data_flow::TraceDataFlowResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/commands/trace-data-flow", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon trace-data-flow request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon trace-data-flow error (HTTP {}): {}", status, body);
+        }
+        Ok(resp
+            .json()
+            .await
+            .context("parse daemon trace-data-flow response")?)
+    }
+
     pub async fn refs(
         &self,
         request: &crate::commands::refs::RefsRequest,

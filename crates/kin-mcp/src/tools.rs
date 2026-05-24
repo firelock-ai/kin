@@ -85,6 +85,25 @@ pub fn tool_definitions() -> ToolsListResult {
                 }),
             },
             ToolDefinition {
+                name: "trace_data_flow".into(),
+                description: "Return the actual call/data-flow chain rooted at a focal entity in a single substrate call. Unlike trace_computation (which returns a flat context pack), this primitive walks Calls/Imports/References relations from the focal in the requested direction (callees, callers, or both), recurses to depth N, and inlines each step's body. Closes the trace-computation accuracy gap where the agent loops get_entity_source per step and burns the 24-round tool-call cap.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "focal": { "type": "string", "description": "Focal entity UUID or exact entity name to start tracing from" },
+                        "depth": { "type": "integer", "description": "Maximum traversal depth from the focal (default 3, capped at 8)", "default": 3, "minimum": 1, "maximum": 8 },
+                        "direction": {
+                            "type": "string",
+                            "enum": ["calls", "callers", "both"],
+                            "description": "Direction of traversal: 'calls' walks outgoing edges (focal -> callees), 'callers' walks incoming edges (callers -> focal), 'both' merges. Default 'both'.",
+                            "default": "both"
+                        },
+                        "limit_per_step": { "type": "integer", "description": "Max relations expanded per step (default 5, capped at 25)", "default": 5, "minimum": 1, "maximum": 25 }
+                    },
+                    "required": ["focal"]
+                }),
+            },
+            ToolDefinition {
                 name: "find_references".into(),
                 description: "Find direct upstream callers/importers/references for an entity. Accepts either an entity_id or an exact query name, resolves the best matching canonical definition, and returns one row per upstream file with relation kinds and file paths.".into(),
                 input_schema: serde_json::json!({
@@ -753,6 +772,7 @@ pub fn benchmark_tool_names() -> &'static [&'static str] {
         "get_entity_body",
         "get_context_pack",
         "trace_computation",
+        "trace_data_flow",
         "find_references",
         "dead_code",
         "find_dead_code_seeded",
@@ -799,8 +819,8 @@ mod tests {
         let list = tool_definitions();
         // 12 original + 1 explore_codebase + 2 entity source aliases + 6 Phase 7 + 12 Phase 8
         // + 6 Phase 9-10 + 1 graph_status + 10 Phase 11 review + 1 bulk_check_references
-        // + 1 trace_computation + 1 find_dead_code_seeded = 53
-        assert_eq!(list.tools.len(), 53);
+        // + 1 trace_computation + 1 find_dead_code_seeded + 1 trace_data_flow = 54
+        assert_eq!(list.tools.len(), 54);
     }
 
     #[test]

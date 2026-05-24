@@ -1162,6 +1162,193 @@ pub fn handle_find_dead_code_seeded<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
+/// Trace the actual call/data-flow chain rooted at a focal entity.
+///
+/// Fix #3 in the per-family accuracy plan. Walks Calls/Imports/References
+/// relations from the focal in the requested direction, recurses to depth N,
+/// and returns the chain as a structured response. Generic-`GraphStore`
+/// implementation here produces the chain without inlined source bodies; the
+/// daemon special-cases this tool against the concrete graph to also inline
+/// source records — both share this same chain-construction logic.
+pub fn handle_trace_data_flow<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    const DEFAULT_DEPTH: u64 = 3;
+    const MAX_DEPTH: u64 = 8;
+    const DEFAULT_LIMIT_PER_STEP: u64 = 5;
+    const MAX_LIMIT_PER_STEP: u64 = 25;
+    const MAX_TOTAL_STEPS: usize = 200;
+
+    let focal = get_string_param(args, "focal")?;
+    let trimmed = focal.trim();
+    if trimmed.is_empty() {
+        return Err(McpError::InvalidParams(
+            "focal must be a non-empty string".into(),
+        ));
+    }
+    let depth = get_optional_u64(args, "depth", DEFAULT_DEPTH).clamp(1, MAX_DEPTH) as usize;
+    let limit_per_step = get_optional_u64(args, "limit_per_step", DEFAULT_LIMIT_PER_STEP)
+        .clamp(1, MAX_LIMIT_PER_STEP) as usize;
+    let direction = match get_optional_string_param(args, "direction") {
+        Some(value) => match value.trim().to_lowercase().as_str() {
+            "calls" | "callee" | "callees" | "out" | "outgoing" => "calls",
+            "callers" | "caller" | "in" | "incoming" => "callers",
+            "both" | "all" | "" => "both",
+            other => {
+                return Err(McpError::InvalidParams(format!(
+                    "invalid direction '{other}': expected calls, callers, or both"
+                )));
+            }
+        },
+        None => "both",
+    };
+
+    // Resolve focal: UUID first, then exact-name lookup via the ranking path.
+    let focal_entity = if let Ok(uuid) = uuid::Uuid::parse_str(trimmed) {
+        store
+            .get_entity(&kin_model::ids::EntityId(uuid))
+            .map_err(McpError::graph)?
+    } else {
+        select_best_reference_target(store, trimmed).map_err(McpError::graph)?
+    };
+    let Some(focal_entity) = focal_entity else {
+        return Ok(ToolCallResult::error(format!(
+            "trace_data_flow: no entity matches focal '{}'",
+            trimmed
+        )));
+    };
+
+    let reference_kinds = [
+        RelationKind::Calls,
+        RelationKind::Imports,
+        RelationKind::References,
+    ];
+    let allowed: std::collections::HashSet<RelationKind> =
+        reference_kinds.iter().copied().collect();
+
+    let want_callees = matches!(direction, "calls" | "both");
+    let want_callers = matches!(direction, "callers" | "both");
+
+    let mut chain: Vec<serde_json::Value> = Vec::new();
+    let mut visited: std::collections::HashSet<kin_model::ids::EntityId> =
+        std::collections::HashSet::new();
+    visited.insert(focal_entity.id);
+    let mut truncated = false;
+
+    let mut frontier: Vec<(usize, kin_model::ids::EntityId, usize)> =
+        vec![(0, focal_entity.id, 0)];
+
+    while !frontier.is_empty() {
+        let mut next_frontier: Vec<(usize, kin_model::ids::EntityId, usize)> = Vec::new();
+        for (parent_step, parent_id, parent_depth) in frontier.drain(..) {
+            if parent_depth >= depth {
+                continue;
+            }
+            let relations = store
+                .get_all_relations_for_entity(&parent_id)
+                .map_err(McpError::graph)?;
+            // Independent per-direction budgets so `direction=both` doesn't
+            // starve one side when relations are emitted in either order.
+            let mut callee_count = 0usize;
+            let mut caller_count = 0usize;
+            for rel in &relations {
+                if !allowed.contains(&rel.kind) {
+                    continue;
+                }
+                let src_entity = rel.src.as_entity();
+                let dst_entity = match rel.dst {
+                    kin_model::relation::GraphNodeId::Entity(id) => Some(id),
+                    _ => None,
+                };
+                let (next_id, role) = if want_callees
+                    && src_entity == Some(parent_id)
+                    && dst_entity.is_some()
+                    && dst_entity != Some(parent_id)
+                {
+                    (dst_entity.unwrap(), "callee")
+                } else if want_callers
+                    && dst_entity == Some(parent_id)
+                    && src_entity.is_some()
+                    && src_entity != Some(parent_id)
+                {
+                    (src_entity.unwrap(), "caller")
+                } else {
+                    continue;
+                };
+
+                if role == "callee" && callee_count >= limit_per_step {
+                    truncated = true;
+                    continue;
+                }
+                if role == "caller" && caller_count >= limit_per_step {
+                    truncated = true;
+                    continue;
+                }
+
+                if !visited.insert(next_id) {
+                    continue;
+                }
+                if role == "callee" {
+                    callee_count += 1;
+                } else {
+                    caller_count += 1;
+                }
+                if chain.len() >= MAX_TOTAL_STEPS {
+                    truncated = true;
+                    break;
+                }
+                let next_entity = match store.get_entity(&next_id).map_err(McpError::graph)? {
+                    Some(entity) => entity,
+                    None => continue,
+                };
+                let next_depth = parent_depth + 1;
+                let step_index = chain.len() + 1;
+                chain.push(serde_json::json!({
+                    "step": step_index,
+                    "role": role,
+                    "relation_kind": format!("{:?}", rel.kind),
+                    "parent_step": parent_step,
+                    "depth": next_depth,
+                    "entity_id": next_entity.id.to_string(),
+                    "entity_name": next_entity.name,
+                    "entity_kind": format!("{:?}", next_entity.kind),
+                    "entity_file": next_entity.file_origin.as_ref().map(|p| p.to_string()),
+                    "signature": (!next_entity.signature.is_empty()).then_some(next_entity.signature),
+                }));
+                if next_depth < depth {
+                    next_frontier.push((step_index, next_id, next_depth));
+                }
+            }
+            if chain.len() >= MAX_TOTAL_STEPS {
+                truncated = true;
+                break;
+            }
+        }
+        if chain.len() >= MAX_TOTAL_STEPS {
+            truncated = true;
+            break;
+        }
+        frontier = next_frontier;
+    }
+
+    let total_steps = chain.len();
+    let result = serde_json::json!({
+        "focal_id": focal_entity.id.to_string(),
+        "focal_name": focal_entity.name,
+        "focal_kind": format!("{:?}", focal_entity.kind),
+        "focal_file": focal_entity.file_origin.as_ref().map(|p| p.to_string()),
+        "direction": direction,
+        "depth": depth,
+        "chain": chain,
+        "total_steps": total_steps,
+        "truncated": truncated,
+    });
+
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
 pub fn handle_graph_neighborhood<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,

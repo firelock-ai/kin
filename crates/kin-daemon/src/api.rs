@@ -539,6 +539,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/overview", post(command_overview))
         .route("/commands/dead-code", post(command_dead_code))
         .route("/commands/dead-code-seeded", post(command_dead_code_seeded))
+        .route("/commands/trace-data-flow", post(command_trace_data_flow))
         .route("/commands/refs", post(command_refs))
         .route("/commands/bulk-refs", post(command_bulk_refs))
         .route("/commands/xref", post(command_xref))
@@ -1506,6 +1507,38 @@ async fn command_dead_code_seeded(
     let response =
         kin_cli::commands::dead_code::build_dead_code_seeded_response(graph.as_ref(), &request)
             .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/trace-data-flow — return the actual call/data-flow chain
+/// rooted at a focal entity in a single substrate call.
+///
+/// Closes the trace-computation accuracy gap (Fix #3 in the per-family
+/// accuracy plan) where the agent loops `get_entity_source` per step and
+/// exhausts the 24-round tool-call cap on large repos.
+async fn command_trace_data_flow(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::trace_data_flow::TraceDataFlowRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let response = kin_cli::commands::trace_data_flow::build_trace_data_flow_response(
+        &state.layout,
+        graph.as_ref(),
+        &request,
+    )
+    .map_err(internal_error)?;
     Ok(Json(response))
 }
 
@@ -3177,6 +3210,66 @@ async fn mcp_tools_call(
                 None => kin_mcp::ToolCallResult::error(
                     "graph source response missing source".to_string(),
                 ),
+            },
+            Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
+        };
+        return Ok(Json(result));
+    }
+
+    // Special-case `trace_data_flow` so MCP callers get the same response
+    // shape as the CLI (`kin trace-data-flow`) — including inlined source
+    // bodies for each step. The generic GraphStore handler in kin-mcp
+    // returns the chain without bodies; the concrete InMemoryGraph here
+    // unlocks the blob-backed source records.
+    if request.name == "trace_data_flow" {
+        let focal = request
+            .arguments
+            .get("focal")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.to_string());
+        let depth = request
+            .arguments
+            .get("depth")
+            .and_then(serde_json::Value::as_u64)
+            .map(|v| v as usize);
+        let limit_per_step = request
+            .arguments
+            .get("limit_per_step")
+            .and_then(serde_json::Value::as_u64)
+            .map(|v| v as usize);
+        let direction = request
+            .arguments
+            .get("direction")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.to_string());
+        let Some(focal) = focal else {
+            return Ok(Json(kin_mcp::ToolCallResult::error(
+                "missing required parameter: focal".to_string(),
+            )));
+        };
+        let parsed_direction = match direction.as_deref() {
+            Some(value) => match kin_cli::commands::trace_data_flow::TraceDirection::parse(value) {
+                Ok(dir) => Some(dir),
+                Err(error) => {
+                    return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string())));
+                }
+            },
+            None => None,
+        };
+        let req = kin_cli::commands::trace_data_flow::TraceDataFlowRequest {
+            focal,
+            depth,
+            direction: parsed_direction,
+            limit_per_step,
+        };
+        let result = match kin_cli::commands::trace_data_flow::build_trace_data_flow_response(
+            &state.layout,
+            graph.as_ref(),
+            &req,
+        ) {
+            Ok(response) => match serde_json::to_string_pretty(&response) {
+                Ok(json) => kin_mcp::ToolCallResult::text(json),
+                Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
             },
             Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
         };
