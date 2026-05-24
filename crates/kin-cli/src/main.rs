@@ -347,6 +347,11 @@ enum Command {
         /// Ignored when --seed is not set.
         #[arg(long = "limit", value_name = "N")]
         limit: Option<usize>,
+        /// Optional case-insensitive substring filter on the candidate entity name.
+        /// Lets callers pre-narrow to a known prefix or suffix (e.g., a planted-secret
+        /// tag like "_eaca1f07") without burning extra tool-call rounds.
+        #[arg(long = "name-pattern", value_name = "SUBSTRING")]
+        name_pattern: Option<String>,
     },
     /// Show local cross-repo dependencies
     Deps,
@@ -1896,8 +1901,12 @@ fn main() -> Result<()> {
                 Command::History { entity, reference } => {
                     commands::history::run(entity, reference).await
                 }
-                Command::DeadCode { seed, limit } => match seed {
-                    Some(query) => commands::dead_code::run_seeded(query, limit).await,
+                Command::DeadCode {
+                    seed,
+                    limit,
+                    name_pattern,
+                } => match seed {
+                    Some(query) => commands::dead_code::run_seeded(query, limit, name_pattern).await,
                     None => commands::dead_code::run().await,
                 },
                 Command::Deps => commands::deps::run().await,
