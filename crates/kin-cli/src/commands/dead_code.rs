@@ -2,8 +2,15 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{Context, Result};
-use kin_model::EntityStore;
+use kin_model::{EntityId, EntityStore, GraphNodeId, GraphStore, RelationKind};
 use serde::{Deserialize, Serialize};
+
+use crate::commands::search::{
+    collect_daemon_search_response, DaemonSearchRecord, DaemonSearchRequest,
+};
+
+const DEFAULT_SEEDED_LIMIT: usize = 20;
+const MAX_SEEDED_LIMIT: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DeadCodeRequest {}
@@ -14,6 +21,36 @@ pub struct DeadCodeResponse {
     pub lines: Vec<String>,
 }
 
+/// Request shape for the seeded find-dead-code primitive.
+///
+/// Combines `semantic_search` + `bulk_check_references` + dead-filter into a
+/// single substrate call so the agent doesn't burn the 24-round tool-call cap
+/// looping `semantic_search` → `find_references` per entity on large repos.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DeadCodeSeededRequest {
+    pub query: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadCodeSeededCandidate {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub file: Option<String>,
+    pub signature: Option<String>,
+    pub reference_count: usize,
+    pub dead: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadCodeSeededResponse {
+    pub query: String,
+    pub total_searched: usize,
+    pub candidates: Vec<DeadCodeSeededCandidate>,
+}
+
 pub async fn run() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
@@ -21,6 +58,21 @@ pub async fn run() -> Result<()> {
     for line in response.lines {
         println!("{line}");
     }
+    Ok(())
+}
+
+pub async fn run_seeded(query: String, limit: Option<usize>) -> Result<()> {
+    let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
+        .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
+    let response = run_daemon_dead_code_seeded(
+        &layout,
+        &DeadCodeSeededRequest {
+            query,
+            limit,
+        },
+    )
+    .await?;
+    println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
 
@@ -40,6 +92,27 @@ async fn run_daemon_dead_code(layout: &kin_core::KinLayout) -> Result<DeadCodeRe
         .dead_code(&DeadCodeRequest::default())
         .await
         .context("daemon dead-code scan failed")
+}
+
+async fn run_daemon_dead_code_seeded(
+    layout: &kin_core::KinLayout,
+    request: &DeadCodeSeededRequest,
+) -> Result<DeadCodeSeededResponse> {
+    let daemon_url = std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(Some)
+        .unwrap_or(crate::daemon_client::resolve_daemon_url(layout).await?);
+    let base_url = daemon_url.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Kin daemon is required for seeded dead-code scan but no daemon endpoint is available"
+        )
+    })?;
+    let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    client
+        .dead_code_seeded(request)
+        .await
+        .context("daemon seeded dead-code scan failed")
 }
 
 pub fn build_dead_code_response(graph: &kin_db::InMemoryGraph) -> Result<DeadCodeResponse> {
@@ -65,4 +138,272 @@ pub fn build_dead_code_response(graph: &kin_db::InMemoryGraph) -> Result<DeadCod
     }
 
     Ok(DeadCodeResponse { lines })
+}
+
+/// Build a seeded dead-code response: semantic_search(query) → top N candidates,
+/// classify each by incoming Calls/Imports/References, sort dead-first.
+///
+/// This is the one-shot substrate primitive that closes the find-dead-code
+/// accuracy gap (Fix #2). The agent calls this instead of looping
+/// `semantic_search` then `find_references` per entity.
+pub fn build_dead_code_seeded_response(
+    graph: &kin_db::InMemoryGraph,
+    request: &DeadCodeSeededRequest,
+) -> Result<DeadCodeSeededResponse> {
+    let query = request.query.trim();
+    if query.is_empty() {
+        anyhow::bail!("seeded dead-code requires a non-empty query");
+    }
+    let limit = request
+        .limit
+        .unwrap_or(DEFAULT_SEEDED_LIMIT)
+        .clamp(1, MAX_SEEDED_LIMIT);
+
+    let search_request = DaemonSearchRequest {
+        query: query.to_string(),
+        kind: None,
+        language: None,
+        limit: Some(limit),
+        semantic: true,
+        show_body: false,
+        body_limit: None,
+    };
+    let search_response = collect_daemon_search_response(graph, &search_request)?;
+
+    let reference_kinds = [
+        RelationKind::Calls,
+        RelationKind::Imports,
+        RelationKind::References,
+    ];
+
+    let mut candidates: Vec<DeadCodeSeededCandidate> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for record in search_response.records.iter().take(limit) {
+        let entity_record = match record {
+            DaemonSearchRecord::Entity(entity) => entity,
+            DaemonSearchRecord::Artifact(_) => continue,
+        };
+        if !seen.insert(entity_record.id.clone()) {
+            continue;
+        }
+        let Ok(uuid) = uuid::Uuid::parse_str(&entity_record.id) else {
+            continue;
+        };
+        let entity_id = EntityId(uuid);
+        let entity = match graph.get_entity(&entity_id)? {
+            Some(entity) => entity,
+            None => continue,
+        };
+
+        let reference_count = count_incoming_references(graph, &entity_id, &reference_kinds)?;
+        let dead = reference_count == 0;
+
+        candidates.push(DeadCodeSeededCandidate {
+            id: entity.id.to_string(),
+            name: entity.name.clone(),
+            kind: format!("{:?}", entity.kind),
+            file: entity.file_origin.as_ref().map(|p| p.0.clone()),
+            signature: (!entity.signature.is_empty()).then(|| entity.signature.clone()),
+            reference_count,
+            dead,
+        });
+    }
+
+    candidates.sort_by(|a, b| {
+        a.reference_count
+            .cmp(&b.reference_count)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    Ok(DeadCodeSeededResponse {
+        query: query.to_string(),
+        total_searched: candidates.len(),
+        candidates,
+    })
+}
+
+/// Count incoming relations of the given kinds for an entity.
+///
+/// Mirrors the classification logic in `build_bulk_refs_response` so the
+/// "dead" flag here matches what `kin refs --bulk-json` would report
+/// (reference_count == 0 across Calls + Imports + References).
+fn count_incoming_references(
+    graph: &impl GraphStore,
+    entity_id: &EntityId,
+    kinds: &[RelationKind],
+) -> Result<usize> {
+    let allowed: std::collections::HashSet<RelationKind> = kinds.iter().copied().collect();
+    let mut count = 0usize;
+    for rel in graph.get_all_relations_for_entity(entity_id)? {
+        let Some(src_entity_id) = rel.src.as_entity() else {
+            continue;
+        };
+        if rel.dst != GraphNodeId::Entity(*entity_id) {
+            continue;
+        }
+        if !allowed.contains(&rel.kind) {
+            continue;
+        }
+        if src_entity_id == *entity_id {
+            continue;
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kin_db::InMemoryGraph;
+    use kin_model::entity::{
+        Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint,
+        Visibility,
+    };
+    use kin_model::ids::{FilePathId, Hash256, LanguageId, RelationId};
+    use kin_model::relation::{Relation, RelationOrigin};
+
+    fn make_entity(name: &str, file: &str) -> Entity {
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([0; 32]),
+                behavior_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new(file)),
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn make_relation(src: EntityId, dst: EntityId, kind: RelationKind) -> Relation {
+        Relation {
+            id: RelationId::new(),
+            kind,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+        }
+    }
+
+    #[test]
+    fn count_incoming_references_filters_relation_kind_and_self_loops() {
+        let graph = InMemoryGraph::new();
+        let caller = make_entity("caller", "src/a.rs");
+        let target = make_entity("target", "src/b.rs");
+        let caller_id = caller.id;
+        let target_id = target.id;
+
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&target).unwrap();
+        graph
+            .upsert_relation(&make_relation(caller_id, target_id, RelationKind::Calls))
+            .unwrap();
+        // Self-loop should be excluded.
+        graph
+            .upsert_relation(&make_relation(target_id, target_id, RelationKind::Calls))
+            .unwrap();
+
+        let count = count_incoming_references(
+            &graph,
+            &target_id,
+            &[
+                RelationKind::Calls,
+                RelationKind::Imports,
+                RelationKind::References,
+            ],
+        )
+        .unwrap();
+        assert_eq!(count, 1, "should count the single caller, not the self-loop");
+    }
+
+    #[test]
+    fn seeded_dead_code_marks_unreferenced_first_and_sets_dead_flag() {
+        let graph = InMemoryGraph::new();
+        let caller = make_entity("probe_caller_seed", "src/a.rs");
+        let live = make_entity("probe_alpha_seed", "src/b.rs");
+        let dead = make_entity("probe_delta_seed", "src/c.rs");
+        let caller_id = caller.id;
+        let live_id = live.id;
+        let dead_id = dead.id;
+
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&live).unwrap();
+        graph.upsert_entity(&dead).unwrap();
+        graph
+            .upsert_relation(&make_relation(caller_id, live_id, RelationKind::Calls))
+            .unwrap();
+
+        let response = build_dead_code_seeded_response(
+            &graph,
+            &DeadCodeSeededRequest {
+                query: "probe".to_string(),
+                limit: Some(10),
+            },
+        )
+        .unwrap();
+
+        // Both probe_* entities (live + dead) should be classified. The caller
+        // also matches the substring "probe" so it lands in the candidate set;
+        // accept that and validate the dead-first sort + dead flag.
+        assert!(response.candidates.len() >= 2);
+        let dead_idx = response
+            .candidates
+            .iter()
+            .position(|c| c.id == dead_id.to_string())
+            .expect("dead candidate must appear");
+        let live_idx = response
+            .candidates
+            .iter()
+            .position(|c| c.id == live_id.to_string())
+            .expect("live candidate must appear");
+        assert!(
+            dead_idx < live_idx,
+            "dead-first sort: {} (idx {}) should precede {} (idx {})",
+            dead_id,
+            dead_idx,
+            live_id,
+            live_idx
+        );
+
+        let dead_row = &response.candidates[dead_idx];
+        assert_eq!(dead_row.reference_count, 0);
+        assert!(dead_row.dead);
+
+        let live_row = &response.candidates[live_idx];
+        assert_eq!(live_row.reference_count, 1);
+        assert!(!live_row.dead);
+    }
+
+    #[test]
+    fn seeded_dead_code_rejects_empty_query() {
+        let graph = InMemoryGraph::new();
+        let err = build_dead_code_seeded_response(
+            &graph,
+            &DeadCodeSeededRequest {
+                query: "  ".to_string(),
+                limit: Some(5),
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("non-empty query"));
+    }
 }

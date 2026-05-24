@@ -544,6 +544,28 @@ impl DaemonClient {
             .context("parse daemon dead-code response")?)
     }
 
+    pub async fn dead_code_seeded(
+        &self,
+        request: &crate::commands::dead_code::DeadCodeSeededRequest,
+    ) -> Result<crate::commands::dead_code::DeadCodeSeededResponse> {
+        let resp = self
+            .client
+            .post(format!("{}/commands/dead-code-seeded", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .context("send daemon seeded dead-code request")?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon seeded dead-code error (HTTP {}): {}", status, body);
+        }
+        Ok(resp
+            .json()
+            .await
+            .context("parse daemon seeded dead-code response")?)
+    }
+
     pub async fn refs(
         &self,
         request: &crate::commands::refs::RefsRequest,

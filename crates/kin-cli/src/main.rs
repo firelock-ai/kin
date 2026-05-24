@@ -335,8 +335,19 @@ enum Command {
         #[arg(long = "ref", value_name = "REF")]
         reference: Option<String>,
     },
-    /// Find dead code
-    DeadCode,
+    /// Find dead code (whole-repo scan, or seeded by semantic query)
+    DeadCode {
+        /// Seeded mode: run semantic_search(query) → classify each top-N
+        /// candidate by incoming references → return dead-first ranked JSON.
+        /// Closes the find-dead-code accuracy gap on large repos where
+        /// the agent burns the tool-call cap looping search → find_references.
+        #[arg(long = "seed", value_name = "QUERY")]
+        seed: Option<String>,
+        /// Max candidates to classify in seeded mode (default 20, max 200).
+        /// Ignored when --seed is not set.
+        #[arg(long = "limit", value_name = "N")]
+        limit: Option<usize>,
+    },
     /// Show local cross-repo dependencies
     Deps,
     /// Show federated cross-repo references (xrefs) for an entity
@@ -1885,7 +1896,10 @@ fn main() -> Result<()> {
                 Command::History { entity, reference } => {
                     commands::history::run(entity, reference).await
                 }
-                Command::DeadCode => commands::dead_code::run().await,
+                Command::DeadCode { seed, limit } => match seed {
+                    Some(query) => commands::dead_code::run_seeded(query, limit).await,
+                    None => commands::dead_code::run().await,
+                },
                 Command::Deps => commands::deps::run().await,
                 Command::Xref { entity } => commands::xref::run(entity).await,
                 Command::Spec { action } => match action {

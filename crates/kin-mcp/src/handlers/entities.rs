@@ -1056,6 +1056,112 @@ pub fn handle_dead_code<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
+/// Seeded find-dead-code primitive: semantic_search(query) + bulk reference
+/// counting + dead-filter, returned as one structured response.
+///
+/// Closes the find-dead-code accuracy gap (Fix #2 in the per-family accuracy
+/// plan) where the agent burns the tool-call cap looping
+/// `semantic_search` → `find_references` per entity on large repos.
+///
+/// This generic-`GraphStore` implementation uses substring matching against
+/// `query_entities` (matching the MCP `semantic_search` shape). In product
+/// mode the daemon may special-case this tool to use the concrete-graph
+/// vector path for true semantic ranking — both share the same response
+/// shape and dead-classification logic.
+pub fn handle_find_dead_code_seeded<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    const DEFAULT_LIMIT: usize = 20;
+    const MAX_LIMIT: usize = 200;
+
+    let query = get_string_param(args, "query")?;
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Err(McpError::InvalidParams(
+            "query must be a non-empty string".into(),
+        ));
+    }
+    let limit = (get_optional_u64(args, "limit", DEFAULT_LIMIT as u64) as usize)
+        .clamp(1, MAX_LIMIT);
+
+    let filter = kin_model::graph::EntityFilter {
+        name_pattern: Some(trimmed.to_string()),
+        ..Default::default()
+    };
+    let entities = store.query_entities(&filter).map_err(McpError::graph)?;
+
+    let reference_kinds = [
+        RelationKind::Calls,
+        RelationKind::Imports,
+        RelationKind::References,
+    ];
+    let allowed: std::collections::HashSet<RelationKind> =
+        reference_kinds.iter().copied().collect();
+
+    let mut candidates: Vec<serde_json::Value> = Vec::new();
+    let mut seen: std::collections::HashSet<kin_model::EntityId> =
+        std::collections::HashSet::new();
+
+    for entity in entities.into_iter().take(limit) {
+        if !seen.insert(entity.id) {
+            continue;
+        }
+        let mut reference_count = 0usize;
+        for rel in store
+            .get_all_relations_for_entity(&entity.id)
+            .map_err(McpError::graph)?
+        {
+            let Some(src_entity_id) = rel.src.as_entity() else {
+                continue;
+            };
+            if rel.dst != kin_model::relation::GraphNodeId::Entity(entity.id) {
+                continue;
+            }
+            if !allowed.contains(&rel.kind) {
+                continue;
+            }
+            if src_entity_id == entity.id {
+                continue;
+            }
+            reference_count += 1;
+        }
+        let dead = reference_count == 0;
+        candidates.push(serde_json::json!({
+            "id": entity.id.to_string(),
+            "name": entity.name,
+            "kind": format!("{:?}", entity.kind),
+            "file": entity.file_origin.as_ref().map(|p| p.to_string()),
+            "signature": (!entity.signature.is_empty()).then_some(entity.signature),
+            "reference_count": reference_count,
+            "dead": dead,
+        }));
+    }
+
+    candidates.sort_by(|a, b| {
+        let a_count = a["reference_count"].as_u64().unwrap_or(0);
+        let b_count = b["reference_count"].as_u64().unwrap_or(0);
+        let a_name = a["name"].as_str().unwrap_or("");
+        let b_name = b["name"].as_str().unwrap_or("");
+        let a_id = a["id"].as_str().unwrap_or("");
+        let b_id = b["id"].as_str().unwrap_or("");
+        a_count
+            .cmp(&b_count)
+            .then_with(|| a_name.cmp(b_name))
+            .then_with(|| a_id.cmp(b_id))
+    });
+
+    let total_searched = candidates.len();
+    let result = serde_json::json!({
+        "query": trimmed,
+        "total_searched": total_searched,
+        "candidates": candidates,
+    });
+
+    let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
 pub fn handle_graph_neighborhood<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,

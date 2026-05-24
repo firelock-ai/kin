@@ -189,6 +189,27 @@ pub fn tool_definitions() -> ToolsListResult {
                 }),
             },
             ToolDefinition {
+                name: "find_dead_code_seeded".into(),
+                description: "Seeded dead-code discovery: combines `semantic_search` + bulk reference counting + dead-filter into a single call. Pass a query (e.g. a concept or partial name) and receive the top-N matching entities ranked dead-first, each annotated with `reference_count` and a boolean `dead` flag. Designed for find-dead-code workloads where the naive shape (`semantic_search` then `find_references` per entity) burns the tool-call cap on large repos.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query — concept or partial name to seed candidates"
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max candidates to classify (default 20, max 200)",
+                            "default": 20,
+                            "minimum": 1,
+                            "maximum": 200
+                        }
+                    },
+                    "required": ["query"]
+                }),
+            },
+            ToolDefinition {
                 name: "entity_history".into(),
                 description: "Get the change history of a specific entity".into(),
                 input_schema: serde_json::json!({
@@ -734,6 +755,7 @@ pub fn benchmark_tool_names() -> &'static [&'static str] {
         "trace_computation",
         "find_references",
         "dead_code",
+        "find_dead_code_seeded",
         "graph_neighborhood",
         "explore_codebase",
     ]
@@ -777,8 +799,8 @@ mod tests {
         let list = tool_definitions();
         // 12 original + 1 explore_codebase + 2 entity source aliases + 6 Phase 7 + 12 Phase 8
         // + 6 Phase 9-10 + 1 graph_status + 10 Phase 11 review + 1 bulk_check_references
-        // + 1 trace_computation = 52
-        assert_eq!(list.tools.len(), 52);
+        // + 1 trace_computation + 1 find_dead_code_seeded = 53
+        assert_eq!(list.tools.len(), 53);
     }
 
     #[test]

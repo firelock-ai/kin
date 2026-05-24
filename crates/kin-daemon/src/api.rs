@@ -538,6 +538,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/graph", post(command_graph))
         .route("/commands/overview", post(command_overview))
         .route("/commands/dead-code", post(command_dead_code))
+        .route("/commands/dead-code-seeded", post(command_dead_code_seeded))
         .route("/commands/refs", post(command_refs))
         .route("/commands/bulk-refs", post(command_bulk_refs))
         .route("/commands/xref", post(command_xref))
@@ -1476,6 +1477,35 @@ async fn command_dead_code(
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
     let response = kin_cli::commands::dead_code::build_dead_code_response(graph.as_ref())
         .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/dead-code-seeded — seeded dead-code classification.
+///
+/// Combines `semantic_search(query)` + per-candidate incoming-reference count
+/// + dead-filter into a single daemon-graph traversal. Closes the
+/// find-dead-code token blowup where the agent loops `semantic_search` →
+/// `find_references` per entity on large repos.
+async fn command_dead_code_seeded(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::dead_code::DeadCodeSeededRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let response =
+        kin_cli::commands::dead_code::build_dead_code_seeded_response(graph.as_ref(), &request)
+            .map_err(internal_error)?;
     Ok(Json(response))
 }
 
@@ -3147,6 +3177,40 @@ async fn mcp_tools_call(
                 None => kin_mcp::ToolCallResult::error(
                     "graph source response missing source".to_string(),
                 ),
+            },
+            Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
+        };
+        return Ok(Json(result));
+    }
+
+    // Special-case `find_dead_code_seeded` so MCP callers get the same
+    // vector-semantic search path as the CLI (`kin dead_code --seed ...`).
+    // The generic GraphStore handler in kin-mcp falls back to substring
+    // matching; the concrete InMemoryGraph here unlocks the HNSW vector index.
+    if request.name == "find_dead_code_seeded" {
+        let query = request
+            .arguments
+            .get("query")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.to_string());
+        let limit = request
+            .arguments
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .map(|v| v as usize);
+        let Some(query) = query else {
+            return Ok(Json(kin_mcp::ToolCallResult::error(
+                "missing required parameter: query".to_string(),
+            )));
+        };
+        let req = kin_cli::commands::dead_code::DeadCodeSeededRequest { query, limit };
+        let result = match kin_cli::commands::dead_code::build_dead_code_seeded_response(
+            graph.as_ref(),
+            &req,
+        ) {
+            Ok(response) => match serde_json::to_string_pretty(&response) {
+                Ok(json) => kin_mcp::ToolCallResult::text(json),
+                Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
             },
             Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
         };
