@@ -353,6 +353,27 @@ enum Command {
         #[arg(long = "name-pattern", value_name = "SUBSTRING")]
         name_pattern: Option<String>,
     },
+    /// Trace the call/data-flow chain rooted at a focal entity.
+    ///
+    /// Returns the focal body plus a structured chain of callees, callers, or
+    /// both (with bodies inlined) in a single substrate call. Closes the
+    /// trace-computation accuracy gap where the agent loops `get_entity_source`
+    /// per step and burns the 24-round tool-call cap.
+    TraceDataFlow {
+        /// Focal entity to start tracing from. Accepts a UUID or an exact
+        /// entity name (resolved via the same ranking path as `graph source`).
+        #[arg(long = "focal", value_name = "ENTITY")]
+        focal: String,
+        /// Maximum traversal depth from the focal (default 3, capped at 8).
+        #[arg(long = "depth", value_name = "N")]
+        depth: Option<usize>,
+        /// Traversal direction: `calls`, `callers`, or `both` (default both).
+        #[arg(long = "direction", value_name = "DIR")]
+        direction: Option<String>,
+        /// Max relations expanded per step (default 5, capped at 25).
+        #[arg(long = "limit-per-step", value_name = "M")]
+        limit_per_step: Option<usize>,
+    },
     /// Show local cross-repo dependencies
     Deps,
     /// Show federated cross-repo references (xrefs) for an entity
@@ -1909,6 +1930,15 @@ fn main() -> Result<()> {
                     Some(query) => commands::dead_code::run_seeded(query, limit, name_pattern).await,
                     None => commands::dead_code::run().await,
                 },
+                Command::TraceDataFlow {
+                    focal,
+                    depth,
+                    direction,
+                    limit_per_step,
+                } => {
+                    commands::trace_data_flow::run_seeded(focal, depth, direction, limit_per_step)
+                        .await
+                }
                 Command::Deps => commands::deps::run().await,
                 Command::Xref { entity } => commands::xref::run(entity).await,
                 Command::Spec { action } => match action {

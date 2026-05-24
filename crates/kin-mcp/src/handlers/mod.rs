@@ -37,6 +37,7 @@ pub async fn handle_tool_call<G: GraphStore>(
         }
         "get_context_pack" => entities::handle_get_context_pack(arguments, store, sessions),
         "trace_computation" => entities::handle_trace_computation(arguments, store, sessions),
+        "trace_data_flow" => entities::handle_trace_data_flow(arguments, store),
         "find_references" => entities::handle_find_references(arguments, store).await,
         "bulk_check_references" => entities::handle_bulk_check_references(arguments, store),
         "explore_codebase" => entities::handle_explore_codebase(arguments, store),
