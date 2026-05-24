@@ -59,21 +59,53 @@ pub async fn validate() -> Result<()> {
     print_graph_response(run_daemon_graph(&layout, &GraphCommandRequest::Validate).await?)
 }
 
-/// `kin graph inspect <entity_name>` — look up an entity and show its relations.
-pub async fn inspect(name: String) -> Result<()> {
+/// `kin graph inspect <entity>` — look up an entity (by name or UUID) and show its relations.
+///
+/// In `--json` mode, the full `GraphCommandResponse` ({lines, error}) is emitted
+/// as JSON. A missing-entity response (response.error set) is emitted with exit
+/// 0, matching the graceful behavior of `get_context_pack` and `graph source --json`.
+/// This lets an LLM agent recover from a hallucinated UUID instead of treating
+/// the tool call as a hard CLI failure.
+pub async fn inspect(name: String, json: bool) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    print_graph_response(run_daemon_graph(&layout, &GraphCommandRequest::Inspect { name }).await?)
+    let response = run_daemon_graph(&layout, &GraphCommandRequest::Inspect { name }).await?;
+    if json {
+        // SP-23 graceful-error: emit the full response (lines + error) as JSON
+        // with exit 0 even when entity is missing.
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "lines": response.lines,
+                "error": response.error,
+            }))?
+        );
+        return Ok(());
+    }
+    print_graph_response(response)
 }
 
 /// `kin graph source <entity>` — print the exact implementation body.
+///
+/// In `--json` mode, a missing-entity response (HTTP 200 with `error` set) is
+/// emitted as `{"error": "..."}` on stdout with exit code 0, matching the
+/// graceful behavior of `get_context_pack`. This lets an LLM agent recover from
+/// a hallucinated UUID by treating the tool call as a structured "not found"
+/// response rather than a hard CLI failure. Non-JSON mode keeps the existing
+/// exit-1-on-error behavior for shell-script compatibility.
 pub async fn source(entity: String, json: bool) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let response = run_daemon_graph(&layout, &GraphCommandRequest::Source { entity }).await?;
     if json {
         if let Some(error) = response.error {
-            anyhow::bail!(error);
+            // SP-23 graceful-error: emit structured {"error": "..."} on stdout
+            // and exit 0 so the model can recover from a fabricated UUID.
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({ "error": error }))?
+            );
+            return Ok(());
         }
         let source = response
             .source
@@ -428,7 +460,11 @@ fn build_graph_inspect_response(
     };
 
     if matches.is_empty() {
-        anyhow::bail!("no entity found matching '{}'", name);
+        return Ok(GraphCommandResponse {
+            lines: vec![format!("Entity '{}' not found", name)],
+            error: Some(format!("no entity found matching '{}'", name)),
+            source: None,
+        });
     }
 
     let mut lines = Vec::new();
@@ -519,8 +555,16 @@ pub fn build_graph_source_response(
     graph: &kin_db::InMemoryGraph,
     entity_query: &str,
 ) -> Result<GraphCommandResponse> {
-    let entity = resolve_source_entity(graph, entity_query)?
-        .ok_or_else(|| anyhow::anyhow!("no entity found matching '{}'", entity_query))?;
+    let entity = match resolve_source_entity(graph, entity_query)? {
+        Some(e) => e,
+        None => {
+            return Ok(GraphCommandResponse {
+                lines: vec![format!("Entity '{}' not found", entity_query)],
+                error: Some(format!("no entity found matching '{}'", entity_query)),
+                source: None,
+            });
+        }
+    };
     let record = graph_source_record(layout, graph, &entity)?;
 
     let mut lines = vec![
