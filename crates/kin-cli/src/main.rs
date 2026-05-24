@@ -836,8 +836,11 @@ enum GraphAction {
     Validate,
     /// Look up an entity by name and show its relations
     Inspect {
-        /// Entity name to inspect
+        /// Entity name or UUID to inspect
         name: String,
+        /// Output machine-readable JSON ({lines, error}); missing entities exit 0 with structured error.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Print the exact implementation body for an entity
     Source {
@@ -2078,7 +2081,7 @@ fn main() -> Result<()> {
                 Command::Graph { action } => match action {
                     GraphAction::Status => commands::graph::status().await,
                     GraphAction::Validate => commands::graph::validate().await,
-                    GraphAction::Inspect { name } => commands::graph::inspect(name).await,
+                    GraphAction::Inspect { name, json } => commands::graph::inspect(name, json).await,
                     GraphAction::Source { entity, json } => {
                         commands::graph::source(entity, json).await
                     }
