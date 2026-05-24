@@ -31,6 +31,12 @@ pub struct DeadCodeSeededRequest {
     pub query: String,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Optional substring filter applied to each candidate's entity name AFTER
+    /// the semantic search. Lets the caller pre-narrow to a known prefix or
+    /// suffix (e.g., a planted-secret tag) without burning extra tool rounds.
+    /// Case-insensitive; empty/missing means no filter.
+    #[serde(default)]
+    pub name_pattern: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,7 +67,11 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-pub async fn run_seeded(query: String, limit: Option<usize>) -> Result<()> {
+pub async fn run_seeded(
+    query: String,
+    limit: Option<usize>,
+    name_pattern: Option<String>,
+) -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let response = run_daemon_dead_code_seeded(
@@ -69,6 +79,7 @@ pub async fn run_seeded(query: String, limit: Option<usize>) -> Result<()> {
         &DeadCodeSeededRequest {
             query,
             limit,
+            name_pattern,
         },
     )
     .await?;
@@ -158,12 +169,26 @@ pub fn build_dead_code_seeded_response(
         .limit
         .unwrap_or(DEFAULT_SEEDED_LIMIT)
         .clamp(1, MAX_SEEDED_LIMIT);
+    let name_filter = request
+        .name_pattern
+        .as_ref()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty());
+
+    // When a name filter is supplied, widen the semantic-search pool so the
+    // post-filter still has a reasonable candidate count. Keeps the caller's
+    // `limit` as the OUTPUT cap on filtered candidates.
+    let search_limit = if name_filter.is_some() {
+        (limit * 5).min(MAX_SEEDED_LIMIT)
+    } else {
+        limit
+    };
 
     let search_request = DaemonSearchRequest {
         query: query.to_string(),
         kind: None,
         language: None,
-        limit: Some(limit),
+        limit: Some(search_limit),
         semantic: true,
         show_body: false,
         body_limit: None,
@@ -179,7 +204,10 @@ pub fn build_dead_code_seeded_response(
     let mut candidates: Vec<DeadCodeSeededCandidate> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for record in search_response.records.iter().take(limit) {
+    for record in search_response.records.iter() {
+        if candidates.len() >= limit {
+            break;
+        }
         let entity_record = match record {
             DaemonSearchRecord::Entity(entity) => entity,
             DaemonSearchRecord::Artifact(_) => continue,
@@ -195,6 +223,13 @@ pub fn build_dead_code_seeded_response(
             Some(entity) => entity,
             None => continue,
         };
+
+        // Apply name_pattern filter (case-insensitive substring) if provided.
+        if let Some(ref pat) = name_filter {
+            if !entity.name.to_lowercase().contains(pat) {
+                continue;
+            }
+        }
 
         let reference_count = count_incoming_references(graph, &entity_id, &reference_kinds)?;
         let dead = reference_count == 0;
@@ -357,6 +392,7 @@ mod tests {
             &DeadCodeSeededRequest {
                 query: "probe".to_string(),
                 limit: Some(10),
+                name_pattern: None,
             },
         )
         .unwrap();
@@ -401,6 +437,7 @@ mod tests {
             &DeadCodeSeededRequest {
                 query: "  ".to_string(),
                 limit: Some(5),
+                name_pattern: None,
             },
         )
         .unwrap_err();

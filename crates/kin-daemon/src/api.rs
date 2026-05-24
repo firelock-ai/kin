@@ -3198,12 +3198,22 @@ async fn mcp_tools_call(
             .get("limit")
             .and_then(serde_json::Value::as_u64)
             .map(|v| v as usize);
+        let name_pattern = request
+            .arguments
+            .get("name_pattern")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.to_string())
+            .filter(|s| !s.trim().is_empty());
         let Some(query) = query else {
             return Ok(Json(kin_mcp::ToolCallResult::error(
                 "missing required parameter: query".to_string(),
             )));
         };
-        let req = kin_cli::commands::dead_code::DeadCodeSeededRequest { query, limit };
+        let req = kin_cli::commands::dead_code::DeadCodeSeededRequest {
+            query,
+            limit,
+            name_pattern,
+        };
         let result = match kin_cli::commands::dead_code::build_dead_code_seeded_response(
             graph.as_ref(),
             &req,
