@@ -13,7 +13,7 @@ use kin_index::{
     FileParseData, IndexPipeline,
 };
 use kin_model::{
-    ArtifactDeltaKind, BranchName, ChangeStore, EntityId, EntityKind, FileLayout, FilePathId,
+    ArtifactDeltaKind, ChangeStore, EntityId, EntityKind, FileLayout, FilePathId,
     GraphStore, Hash256, ImportSection, OpaqueArtifact, ParseCompleteness, RelationKind,
     SemanticChange, SemanticChangeId, ShallowTrackedFile, SourceRegion, StructuredArtifact,
 };
@@ -84,7 +84,35 @@ pub fn build_graph_at_ref_with_repo(
         .iter()
         .map(|(file_id, hash)| (file_id.0.clone(), *hash.as_bytes()))
         .collect();
-    snapshot.branches = HashMap::<BranchName, kin_model::Branch>::new();
+    let mut branches = HashMap::new();
+    if let Ok(parent_branches) = graph.list_branches() {
+        let reachable_ids: HashSet<SemanticChangeId> = changes.iter().map(|c| c.id).collect();
+        for mut b in parent_branches {
+            let mut curr = b.head;
+            let mut found = false;
+            let mut visited = HashSet::new();
+            while !visited.contains(&curr) {
+                visited.insert(curr);
+                if reachable_ids.contains(&curr) {
+                    b.head = curr;
+                    found = true;
+                    break;
+                }
+                if let Ok(Some(change)) = graph.get_change(&curr) {
+                    if change.parents.is_empty() {
+                        break;
+                    }
+                    curr = change.parents[0];
+                } else {
+                    break;
+                }
+            }
+            if found {
+                branches.insert(b.name.clone(), b);
+            }
+        }
+    }
+    snapshot.branches = branches;
 
     let lifecycle = RefLifecycle::from_changes(&changes);
     let path_resolver = HistoricalPathResolver::from_changes(&changes, &resolved.file_tree);

@@ -57,6 +57,7 @@ pub const SKIP_DIRS: &[&str] = &[
 pub fn should_skip_dir(name: &str) -> bool {
     matches!(name, ".kin" | ".git" | ".git-export")
         || name.starts_with(".kin-")
+        || name.starts_with(".bench-")
         || SKIP_DIRS.contains(&name)
 }
 

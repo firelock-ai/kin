@@ -892,6 +892,24 @@ impl DaemonState {
         Arc::clone(&self.graph)
     }
 
+    /// Scoped graph for a WRITE (reconcile). Returns the session's private
+    /// scoped graph ONLY if a live (non-expired) scope exists, refreshing its
+    /// TTL so an in-use session cannot expire mid-task. Returns `None` when no
+    /// live scope exists — callers MUST treat `None` as an error and MUST NOT
+    /// fall back to the shared HEAD graph for a write. Falling back would leak
+    /// one session's workspace edits into every other session's HEAD reads and
+    /// silently diverge in-memory HEAD from the durable snapshot.
+    pub async fn scoped_graph_for_write(
+        &self,
+        session_id: &kin_model::SessionId,
+    ) -> Option<Arc<kin_db::InMemoryGraph>> {
+        let mut scopes = self.session_scopes.write().await;
+        scopes.retain(|_, scope| !scope.is_expired());
+        let scope = scopes.get_mut(session_id)?;
+        scope.created_at = Instant::now();
+        Some(Arc::clone(&scope.cached_graph))
+    }
+
     /// Resolve the graph for a request: scoped historical graph when the
     /// session has an active temporal scope, otherwise the live HEAD graph.
     /// When `session_id` is `None`, always returns HEAD.
@@ -1398,5 +1416,141 @@ mod tests {
 
         let resolved = state.graph_for_request(Some(&session_id)).await;
         assert!(Arc::ptr_eq(&resolved, &state.graph));
+    }
+
+    #[tokio::test]
+    async fn touch_activity_resets_idle_clock() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+
+        // `last_activity_ms` is seeded to 0, so before any activity the idle
+        // clock counts from `started_at`. Let real time pass, then confirm the
+        // idle duration has grown.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let before = state.idle_duration();
+        assert!(
+            before >= Duration::from_millis(20),
+            "idle clock should count from startup until first activity, got {before:?}"
+        );
+
+        // The idle monitor calls touch_activity() when it starts so the idle
+        // window begins from readiness, not process construction. Confirm the
+        // clock resets back toward zero.
+        state.touch_activity();
+        let after = state.idle_duration();
+        assert!(
+            after < before,
+            "touch_activity must reset the idle clock: before={before:?} after={after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_graph_for_write_returns_none_without_scope() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+
+        let session_id = kin_model::SessionId::new();
+        // No scope was ever opened for this session: a write must NOT silently
+        // fall back to the shared HEAD graph.
+        assert!(state.scoped_graph_for_write(&session_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn scoped_graph_for_write_returns_private_scope_not_head() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+
+        state
+            .graph
+            .upsert_entity(&test_entity("head_only_fn", "src/head.rs"))
+            .unwrap();
+        let scoped_graph = make_scoped_graph_with_entity("scoped_fn", "src/scoped.rs");
+
+        let session_id = kin_model::SessionId::new();
+        let head = kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([3; 32]));
+        state
+            .set_session_scope(
+                &session_id,
+                "git:abc123".to_string(),
+                head,
+                Arc::clone(&scoped_graph),
+            )
+            .await;
+
+        let resolved = state
+            .scoped_graph_for_write(&session_id)
+            .await
+            .expect("live scope should yield a write graph");
+        // Must be the session's private scoped graph, never the shared HEAD.
+        assert!(Arc::ptr_eq(&resolved, &scoped_graph));
+        assert!(!Arc::ptr_eq(&resolved, &state.graph));
+    }
+
+    #[tokio::test]
+    async fn scoped_graph_for_write_returns_none_when_scope_expired() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+
+        let scoped_graph = make_scoped_graph_with_entity("scoped_fn", "src/scoped.rs");
+        let session_id = kin_model::SessionId::new();
+        let head = kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([4; 32]));
+        {
+            let mut scopes = state.session_scopes.write().await;
+            scopes.insert(
+                session_id,
+                TemporalScope {
+                    ref_string: "git:abc123".to_string(),
+                    head,
+                    cached_graph: Arc::clone(&scoped_graph),
+                    // Already expired: created in the past with a zero TTL.
+                    created_at: Instant::now() - Duration::from_secs(60),
+                    ttl: Duration::from_secs(0),
+                },
+            );
+        }
+
+        // An expired scope is not a live scope; a write must not fall through
+        // to HEAD just because a stale entry lingers in the map.
+        assert!(state.scoped_graph_for_write(&session_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn scoped_graph_for_write_refreshes_ttl() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+
+        let scoped_graph = make_scoped_graph_with_entity("scoped_fn", "src/scoped.rs");
+        let session_id = kin_model::SessionId::new();
+        let head = kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([5; 32]));
+        // Plant a scope with a short TTL whose deadline is close.
+        {
+            let mut scopes = state.session_scopes.write().await;
+            scopes.insert(
+                session_id,
+                TemporalScope {
+                    ref_string: "git:abc123".to_string(),
+                    head,
+                    cached_graph: Arc::clone(&scoped_graph),
+                    created_at: Instant::now() - Duration::from_millis(80),
+                    ttl: Duration::from_millis(100),
+                },
+            );
+        }
+
+        // First write succeeds AND slides the TTL window (created_at reset).
+        assert!(state.scoped_graph_for_write(&session_id).await.is_some());
+
+        // Sleep past the ORIGINAL deadline. Without the TTL slide the scope
+        // would now be expired; with it, the scope is still live.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            state.scoped_graph_for_write(&session_id).await.is_some(),
+            "in-use scope must not expire mid-task; TTL should slide on each write"
+        );
     }
 }
