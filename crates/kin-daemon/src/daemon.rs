@@ -106,6 +106,12 @@ async fn run_idle_monitor(
         return;
     };
     let check_interval = idle_check_interval(idle_timeout);
+    // Start the idle window from when monitoring begins, not from process
+    // construction. `last_activity_ms` is seeded to 0, so without this the
+    // idle clock counts from `started_at` — which includes snapshot load and
+    // projection rebuild — and a short timeout can fire before the daemon has
+    // ever served a request, racing clients that haven't connected yet.
+    state.touch_activity();
     info!(
         idle_timeout_s = idle_timeout.as_secs_f64(),
         "daemon idle shutdown enabled"
