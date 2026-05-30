@@ -65,7 +65,11 @@ fn collect_supported_inputs(layout: &kin_core::KinLayout) -> Result<SupportedInp
     for file in all_files {
         match kin_index::FileClassifier::classify(&file) {
             kin_index::FileClassification::EntitySource => entity_source += 1,
-            kin_index::FileClassification::ShallowSyntax { .. } => shallow_source += 1,
+            kin_index::FileClassification::ShallowSyntax { language_hint } => {
+                if kin_parser::get_shallow_grammar(&language_hint).is_some() {
+                    shallow_source += 1;
+                }
+            }
             kin_index::FileClassification::StructuredArtifact(_)
             | kin_index::FileClassification::OpaqueArtifact { .. } => {}
         }
