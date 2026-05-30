@@ -165,6 +165,13 @@ pub struct DaemonState {
     /// worker so they cannot drain queues and mutate the vector index
     /// concurrently.
     pub embedding_work: Mutex<()>,
+    /// Serializes the entire snapshot/index/vector save sequence so the
+    /// persistence loop, idle-shutdown flush, and embedding worker can never
+    /// interleave saves. Holding this across the kndb + kidx writes (and the
+    /// embed worker's kvec write) keeps the on-disk trio from tearing when two
+    /// writers fire at once. Held only for the synchronous save critical
+    /// section — never across an `.await` or another lock.
+    pub persist_lock: Mutex<()>,
     /// When the last successful background save completed.
     pub last_save: std::sync::Mutex<Instant>,
     /// Last externally visible daemon activity, measured as milliseconds since
@@ -355,6 +362,7 @@ impl DaemonState {
             allowed_repo_ids: None,
             dirty: AtomicBool::new(false),
             embedding_work: Mutex::new(()),
+            persist_lock: Mutex::new(()),
             last_save: std::sync::Mutex::new(Instant::now()),
             last_activity_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
@@ -462,6 +470,7 @@ impl DaemonState {
             allowed_repo_ids,
             dirty: AtomicBool::new(false),
             embedding_work: Mutex::new(()),
+            persist_lock: Mutex::new(()),
             last_save: std::sync::Mutex::new(Instant::now()),
             last_activity_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
@@ -942,6 +951,15 @@ impl DaemonState {
     /// `.kin/kindb/generation` so CLI and MCP processes can detect
     /// when their loaded snapshot is stale (P2-2.7).
     pub fn save_snapshot(&self) -> Result<()> {
+        // Serialize the whole kndb + generation-marker + kidx write sequence
+        // against any other save (persist loop, idle flush, embed worker).
+        // Without this, two concurrent saves race on the shared tmp paths and
+        // can leave a torn kndb/kidx pair. Held only for this synchronous body
+        // (no `.await` inside), so a std Mutex is sound.
+        let _persist_guard = self.persist_lock.lock().map_err(|_| {
+            DaemonError::Io(std::io::Error::other("persist lock poisoned"))
+        })?;
+
         let repo_id = self.cached_repo_id.as_str();
 
         let new_gen = if let Some(backend) = &self.storage_backend {
@@ -1206,6 +1224,7 @@ mod tests {
             allowed_repo_ids: None,
             dirty: AtomicBool::new(false),
             embedding_work: Mutex::new(()),
+            persist_lock: Mutex::new(()),
             last_save: std::sync::Mutex::new(Instant::now()),
             last_activity_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
@@ -1551,6 +1570,76 @@ mod tests {
         assert!(
             state.scoped_graph_for_write(&session_id).await.is_some(),
             "in-use scope must not expire mid-task; TTL should slide on each write"
+        );
+    }
+
+    #[test]
+    fn persist_lock_serializes_concurrent_saves() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = Arc::new(test_state(init.layout, repo_dir.path()));
+        state
+            .graph
+            .upsert_entity(&test_entity("locked_fn", "src/lib.rs"))
+            .unwrap();
+
+        // Hold the persist lock to mimic an in-flight save, then launch a
+        // second save on another thread. It must NOT complete until we release
+        // the guard — proving the two saves can never interleave.
+        let guard = state.persist_lock.lock().unwrap();
+        let completed = Arc::new(AtomicBool::new(false));
+
+        let saver_state = Arc::clone(&state);
+        let saver_completed = Arc::clone(&completed);
+        let handle = std::thread::spawn(move || {
+            saver_state.save_snapshot().unwrap();
+            saver_completed.store(true, Ordering::SeqCst);
+        });
+
+        // Give the spawned save ample time to run if it were NOT blocked.
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !completed.load(Ordering::SeqCst),
+            "save_snapshot must block while the persist lock is held"
+        );
+
+        // Release the lock; the blocked save now proceeds to completion.
+        drop(guard);
+        handle.join().unwrap();
+        assert!(
+            completed.load(Ordering::SeqCst),
+            "save_snapshot must complete once the persist lock is released"
+        );
+    }
+
+    #[test]
+    fn sequential_saves_leave_consistent_kndb_kidx_pair() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let kndb_path = init.layout.kindb_snapshot_path();
+        let kidx_path = kndb_path.with_extension("kidx");
+        let state = test_state(init.layout, repo_dir.path());
+        state
+            .graph
+            .upsert_entity(&test_entity("paired_fn", "src/lib.rs"))
+            .unwrap();
+
+        // Two back-to-back saves (as the persist loop + flush would issue) must
+        // each leave both halves of the on-disk pair present and reloadable —
+        // no torn kndb without its kidx, and no kidx without its kndb.
+        state.save_snapshot().unwrap();
+        state.save_snapshot().unwrap();
+
+        assert!(kndb_path.exists(), "graph.kndb must exist after save");
+        assert!(kidx_path.exists(), "graph.kidx must exist after save");
+
+        // The kndb must reload as a valid snapshot exposing the saved entity.
+        let mgr = kin_db::SnapshotManager::open(&kndb_path).unwrap();
+        let reloaded = mgr.graph();
+        let entities = reloaded.list_all_entities().unwrap();
+        assert!(
+            entities.iter().any(|e| e.name == "paired_fn"),
+            "reloaded snapshot must contain the saved entity"
         );
     }
 }
