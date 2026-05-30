@@ -2972,6 +2972,7 @@ async fn command_verify(
 /// POST /reconcile — reconcile a session workspace into daemon-owned graph state.
 async fn reconcile(
     State(state): State<Arc<DaemonState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<kin_cli::commands::reconcile::ReconcileRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     if !state
@@ -2984,26 +2985,60 @@ async fn reconcile(
         ));
     }
 
+    let session_id = extract_session_id_from_headers(&headers)?;
     let state_for_reconcile = Arc::clone(&state);
-    let summary = tokio::task::spawn_blocking(move || {
-        kin_cli::commands::reconcile::execute_reconcile_session_dir_with_persist(
-            &state_for_reconcile.layout,
-            state_for_reconcile.graph.as_ref(),
-            &req.session_dir,
-            || {
-                state_for_reconcile.bump_version();
-                state_for_reconcile.save_snapshot().map_err(|error| {
-                    std::io::Error::new(std::io::ErrorKind::Other, error.to_string())
-                })?;
-                state_for_reconcile.mark_clean();
-                Ok(())
-            },
-        )
-        .map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(internal_error)?
-    .map_err(internal_error)?;
+
+    let summary = if let Some(sid) = session_id {
+        // Resolve the session's PRIVATE scoped graph for this write. A scoped
+        // reconcile mutates this graph in place without persisting (session
+        // edits are ephemeral and isolated from HEAD). It must therefore never
+        // fall back to the shared HEAD graph: doing so would leak the edits
+        // into every other session and diverge in-memory HEAD from the durable
+        // snapshot while the generation marker still reads clean.
+        let scoped_graph = match state_for_reconcile.scoped_graph_for_write(&sid).await {
+            Some(graph) => graph,
+            None => {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!(
+                        "no active temporal scope for session {sid}; \
+                         POST /session/{{id}}/scope before reconcile"
+                    ),
+                ));
+            }
+        };
+        tokio::task::spawn_blocking(move || {
+            kin_cli::commands::reconcile::execute_reconcile_session_dir_scoped(
+                &state_for_reconcile.layout,
+                scoped_graph.as_ref(),
+                &req.session_dir,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(internal_error)?
+        .map_err(internal_error)?
+    } else {
+        tokio::task::spawn_blocking(move || {
+            kin_cli::commands::reconcile::execute_reconcile_session_dir_with_persist(
+                &state_for_reconcile.layout,
+                state_for_reconcile.graph.as_ref(),
+                &req.session_dir,
+                || {
+                    state_for_reconcile.bump_version();
+                    state_for_reconcile.save_snapshot().map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::Other, error.to_string())
+                    })?;
+                    state_for_reconcile.mark_clean();
+                    Ok(())
+                },
+            )
+            .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(internal_error)?
+        .map_err(internal_error)?
+    };
     Ok(Json(summary))
 }
 

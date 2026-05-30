@@ -113,9 +113,18 @@ pub struct LocateRequest {
 impl DaemonClient {
     pub fn from_base_url(base_url: impl Into<String>) -> Result<Self> {
         let base_url = base_url.into();
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Ok(session_id) = std::env::var("KIN_SESSION_ID") {
+            if !session_id.trim().is_empty() {
+                if let Ok(header_val) = reqwest::header::HeaderValue::from_str(&session_id) {
+                    headers.insert("X-Kin-Session", header_val);
+                }
+            }
+        }
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .connect_timeout(Duration::from_secs(2))
+            .default_headers(headers)
             .build()
             .context("build daemon client")?;
         Ok(Self { base_url, client })

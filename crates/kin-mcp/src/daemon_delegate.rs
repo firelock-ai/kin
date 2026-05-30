@@ -141,6 +141,10 @@ async fn forward_mcp_tool_call(
         }));
     if let Some(session_id) = optional_string(arguments, "session_id") {
         request = request.header("X-Kin-Session", session_id);
+    } else if let Ok(session_id) = std::env::var("KIN_SESSION_ID") {
+        if !session_id.trim().is_empty() {
+            request = request.header("X-Kin-Session", session_id);
+        }
     }
     let resp = request
         .send()

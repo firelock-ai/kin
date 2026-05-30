@@ -120,6 +120,161 @@ pub fn execute_reconcile_session_dir(
     execute_reconcile_session_dir_with_persist(layout, graph, session_dir, || Ok(()))
 }
 
+pub fn execute_reconcile_session_dir_scoped(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    session_dir: &Path,
+) -> Result<ReconcileSummary> {
+    let source = kin_core::source_dir(layout);
+
+    ensure_session_dir_exists(session_dir)?;
+
+    println!("Reconciling session workspace (scoped): {}", session_dir.display());
+    println!("Against source: {}", source.display());
+
+    let changes = diff_directories(session_dir, &source)?;
+
+    if changes.is_empty() {
+        return Ok(ReconcileSummary {
+            changes: Vec::new(),
+            change_count: 0,
+            files_indexed: 0,
+            total_upserted: 0,
+            total_removed: 0,
+        });
+    }
+
+    let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
+        .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
+
+    let mut reconciler = Reconciler::new(session_dir.to_path_buf());
+    let mut overlay = GraphOverlay::default();
+    let mut total_upserted = 0usize;
+    let mut total_removed = 0usize;
+    let mut files_indexed = 0usize;
+    let change_summaries: Vec<(String, String)> = changes
+        .iter()
+        .map(|change| {
+            let label = match change.kind {
+                ChangeKind::Modified => "modified",
+                ChangeKind::Added => "added",
+                ChangeKind::Deleted => "deleted",
+            };
+            (
+                label.to_string(),
+                change.relative_path.display().to_string(),
+            )
+        })
+        .collect();
+
+    for change in &changes {
+        let session_file = session_dir.join(&change.relative_path);
+        let strict_semantic_guard = requires_strict_reconcile_guard(&change.relative_path);
+
+        match change.kind {
+            ChangeKind::Modified | ChangeKind::Added => {
+                let event = FileEvent::Changed(session_file.clone());
+                match reconciler.reconcile_file_change(&event, &blob_store, graph, &mut overlay) {
+                    Ok(ReconcileOutcome::Updated {
+                        added,
+                        modified,
+                        removed,
+                        ..
+                    }) => {
+                        total_upserted += added.len() + modified.len();
+                        total_removed += removed.len();
+                        files_indexed += 1;
+                    }
+                    Ok(ReconcileOutcome::BrokenAst { file_id, .. })
+                        if strict_semantic_guard =>
+                    {
+                        anyhow::bail!(
+                            "reconcile aborted for {}: broken AST retained LKG state for {}",
+                            change.relative_path.display(),
+                            file_id
+                        );
+                    }
+                    Ok(ReconcileOutcome::BrokenAst { file_id, .. }) => {
+                        eprintln!("  Note: {} has broken AST, retaining LKG state", file_id);
+                    }
+                    Ok(ReconcileOutcome::Conflict(conflict)) if strict_semantic_guard => {
+                        anyhow::bail!(
+                            "reconcile aborted for {}: semantic conflict ({:?})",
+                            change.relative_path.display(),
+                            conflict.kind
+                        );
+                    }
+                    Ok(ReconcileOutcome::Conflict(conflict)) => {
+                        eprintln!(
+                            "  Note: {} produced a conflict ({:?})",
+                            change.relative_path.display(),
+                            conflict.kind
+                        );
+                    }
+                    Ok(ReconcileOutcome::FileRemoved { .. }) if strict_semantic_guard => {
+                        anyhow::bail!(
+                            "reconcile aborted for {}: unexpected file removal outcome",
+                            change.relative_path.display()
+                        );
+                    }
+                    Ok(ReconcileOutcome::FileRemoved { .. }) => {
+                        // Shouldn't happen for a Changed event, but handle gracefully.
+                    }
+                    Err(e) if strict_semantic_guard => {
+                        anyhow::bail!(
+                            "reconcile aborted for {}: {}",
+                            change.relative_path.display(),
+                            e
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "  Note: {} not indexable ({})",
+                            change.relative_path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+            ChangeKind::Deleted => {
+                let event = FileEvent::Removed(session_file.clone());
+                match reconciler.reconcile_file_change(&event, &blob_store, graph, &mut overlay) {
+                    Ok(ReconcileOutcome::FileRemoved { removed, .. }) => {
+                        total_removed += removed.len();
+                    }
+                    Ok(_) if strict_semantic_guard => {
+                        anyhow::bail!(
+                            "reconcile aborted for {}: unexpected remove outcome",
+                            change.relative_path.display()
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) if strict_semantic_guard => {
+                        anyhow::bail!(
+                            "reconcile aborted for {}: {}",
+                            change.relative_path.display(),
+                            e
+                        );
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+
+    apply_overlay_to_graph(graph, &mut overlay)
+        .map_err(|e| anyhow::anyhow!("failed to apply reconciled overlay: {}", e))?;
+
+    Ok(ReconcileSummary {
+        changes: change_summaries,
+        change_count: changes.len(),
+        files_indexed,
+        total_upserted,
+        total_removed,
+    })
+}
+
+
 pub fn execute_reconcile_session_dir_with_persist<F>(
     layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,

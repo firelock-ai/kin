@@ -28,6 +28,9 @@ impl KinLayout {
     ///
     /// Returns `None` if no `.kin/` directory is found.
     pub fn discover(start: &Path) -> Option<Self> {
+        if std::env::var("KIN_DAEMON_URL").is_ok() {
+            return Some(Self::new(start.join(".kin")));
+        }
         let mut current = start.to_path_buf();
         loop {
             let candidate = current.join(".kin");
@@ -39,6 +42,7 @@ impl KinLayout {
             }
         }
     }
+
 
     /// The `.kin/` root directory.
     pub fn root(&self) -> &Path {

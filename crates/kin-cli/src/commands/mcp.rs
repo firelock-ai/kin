@@ -10,18 +10,23 @@ use std::collections::HashSet;
 /// repo daemon resolved through the supervisor route; MCP never loads or serves
 /// a local graph snapshot in product mode.
 pub async fn start() -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let layout = kin_core::KinLayout::discover(&cwd).ok_or_else(|| {
-        anyhow::anyhow!("not a Kin repository (no .kin/ found); run `kin init .` first")
-    })?;
-    let daemon_url = crate::daemon_client::resolve_daemon_url(&layout)
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Kin daemon is required for MCP startup but no daemon endpoint is available"
-            )
+    let daemon_url = if let Ok(url) = std::env::var("KIN_DAEMON_URL") {
+        url
+    } else {
+        let cwd = std::env::current_dir()?;
+        let layout = kin_core::KinLayout::discover(&cwd).ok_or_else(|| {
+            anyhow::anyhow!("not a Kin repository (no .kin/ found); run `kin init .` first")
         })?;
-    std::env::set_var("KIN_DAEMON_URL", &daemon_url);
+        let url = crate::daemon_client::resolve_daemon_url(&layout)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Kin daemon is required for MCP startup but no daemon endpoint is available"
+                )
+            })?;
+        std::env::set_var("KIN_DAEMON_URL", &url);
+        url
+    };
     eprintln!("{}", session_authority_notice());
     eprintln!("Kin MCP: forwarding graph tools to repo daemon at {daemon_url}");
 

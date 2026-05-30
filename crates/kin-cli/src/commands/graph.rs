@@ -668,14 +668,53 @@ fn read_entity_file_bytes_from_graph(
     file_id: &FilePathId,
 ) -> Result<Vec<u8>> {
     let branch_name = kin_core::read_current_branch(layout)?;
-    let branch = graph
-        .get_branch(&branch_name)?
-        .ok_or_else(|| anyhow::anyhow!("current branch '{}' not found in graph", branch_name))?;
+
+    // Try the filesystem branch first, then fall back to any branch in the
+    // graph.  Scoped/historical graphs may not carry the exact branch name
+    // that the on-disk `.kin/HEAD` advertises (e.g. when the scope points to
+    // a sibling change lineage).
+    let branch = match graph.get_branch(&branch_name)? {
+        Some(b) => b,
+        None => {
+            // Fallback: pick any branch present in the graph.
+            let all = graph.list_branches()?;
+            if let Some(b) = all.into_iter().next() {
+                tracing::debug!(
+                    fs_branch = %branch_name,
+                    graph_branch = %b.name,
+                    "filesystem branch not in graph, falling back"
+                );
+                b
+            } else {
+                // Last resort: try to read the file hash directly from the
+                // graph's file_hash store (populated by scoped snapshot).
+                if let Ok(Some(hash)) = graph.get_file_hash(file_id) {
+                    let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())?;
+                    let blob_hash = kin_blobs::Hash256(*hash.as_bytes());
+                    return blob_store.read(&blob_hash).with_context(|| {
+                        format!(
+                            "graph blob for file '{}' is unavailable (hash {}, no branch); source body cannot be read from daemon-backed graph",
+                            file_id.0, blob_hash,
+                        )
+                    });
+                }
+                anyhow::bail!("current branch '{}' not found in graph and no fallback branch available", branch_name);
+            }
+        }
+    };
+
     let genesis = kin_core::build_genesis_change();
     let tree = kin_core::build_file_tree(graph, &genesis.id, &branch.head)?;
-    let hash = tree
-        .get(file_id)
-        .ok_or_else(|| anyhow::anyhow!("file '{}' not found in graph file tree", file_id.0))?;
+    let hash = match tree.get(file_id) {
+        Some(h) => *h,
+        None => {
+            if let Ok(Some(h)) = graph.get_file_hash(file_id) {
+                h
+            } else {
+                anyhow::bail!("file '{}' not found in graph file tree", file_id.0);
+            }
+        }
+    };
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())?;
     let blob_hash = kin_blobs::Hash256(*hash.as_bytes());
     blob_store
@@ -683,7 +722,7 @@ fn read_entity_file_bytes_from_graph(
         .with_context(|| {
             format!(
                 "graph blob for file '{}' is unavailable (hash {}, branch '{}', head {}); source body cannot be read from daemon-backed graph",
-                file_id.0, blob_hash, branch_name, branch.head
+                file_id.0, blob_hash, branch.name, branch.head
             )
         })
 }
