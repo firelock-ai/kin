@@ -9,7 +9,7 @@ pub fn tool_definitions() -> ToolsListResult {
         tools: vec![
             ToolDefinition {
                 name: "semantic_search".into(),
-                description: "Search the semantic code graph for entities (functions, classes, types, traits, constants) by name, kind, or language. Returns exact file:line locations, signatures, and entity IDs. Faster and more precise than text search — matches parsed declarations, not string occurrences.".into(),
+                description: crate::handlers::entities::SEMANTIC_SEARCH_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -24,7 +24,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "get_entity".into(),
-                description: "Retrieve a specific entity by ID. Returns full entity metadata including kind, language, file path, line range, and signature.".into(),
+                description: crate::handlers::entities::GET_ENTITY_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -35,7 +35,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "get_entity_source".into(),
-                description: "Retrieve the exact implementation source body for a specific entity by ID.".into(),
+                description: crate::handlers::entities::GET_ENTITY_SOURCE_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -46,7 +46,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "get_entity_body".into(),
-                description: "Alias for get_entity_source: retrieve the exact implementation body for a specific entity by ID.".into(),
+                description: crate::handlers::entities::GET_ENTITY_BODY_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -57,7 +57,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "get_context_pack".into(),
-                description: "Build a focused context pack for an entity — returns nearby dependencies within a token budget. Prefer get_entity_source when you only need the exact implementation body. Pass an entity_id from semantic_search results.".into(),
+                description: crate::handlers::entities::GET_CONTEXT_PACK_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -72,7 +72,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "trace_computation".into(),
-                description: "Daemon-backed trace-computation primitive. Given a focal entity, returns the focal body PLUS its data/control-flow neighborhood (callers + callees + imports) in a single structured response within a token budget. Prefer this over looping get_entity_source over each step of a trace — that pattern exhausts context. The response contains everything needed to answer step-by-step data-flow or control-flow questions in ONE call.".into(),
+                description: crate::handlers::entities::TRACE_COMPUTATION_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -86,7 +86,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "trace_data_flow".into(),
-                description: "Return the actual call/data-flow chain rooted at a focal entity in a single substrate call. Unlike trace_computation (which returns a flat context pack), this primitive walks Calls/Imports/References relations from the focal in the requested direction (callees, callers, or both), recurses to depth N, and inlines each step's body. Closes the trace-computation accuracy gap where the agent loops get_entity_source per step and burns the 24-round tool-call cap.".into(),
+                description: crate::handlers::entities::TRACE_DATA_FLOW_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -105,7 +105,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "find_references".into(),
-                description: "Find direct upstream callers/importers/references for an entity. Accepts either an entity_id or an exact query name, resolves the best matching canonical definition, and returns one row per upstream file with relation kinds and file paths.".into(),
+                description: crate::handlers::entities::FIND_REFERENCES_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -121,7 +121,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "bulk_check_references".into(),
-                description: "Batched reachability check across many entities in a single call. Pass up to 200 entity UUIDs and receive one classification row per entity: whether incoming relations of the requested kind exist, plus a reference count. Designed for reachability / dead-code / count-callers workloads where the naive shape (`find_references` per entity) blows up token budgets — ask 'of these N entities, which have callers?' once instead of N times.".into(),
+                description: crate::handlers::entities::BULK_CHECK_REFERENCES_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -149,7 +149,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "impact_analysis".into(),
-                description: "Analyze downstream impact of changes. Accepts base/head change IDs, OR entity_ids (UUIDs), OR files (paths), OR change_ids (list of change hashes). Only one mode at a time.".into(),
+                description: crate::handlers::review::IMPACT_ANALYSIS_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -164,7 +164,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "semantic_diff".into(),
-                description: "Compute entity-level diff. Accepts base/head change IDs, OR entity_ids (UUIDs), OR files (paths), OR change_ids (list of change hashes to combine). Only one mode at a time.".into(),
+                description: crate::handlers::review::SEMANTIC_DIFF_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -178,7 +178,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "semantic_review".into(),
-                description: "Full semantic review: diff + impact + risk. Accepts base/head change IDs, OR entity_ids (UUIDs), OR files (paths), OR change_ids (list of change hashes). Only one mode at a time.".into(),
+                description: crate::handlers::review::SEMANTIC_REVIEW_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -194,7 +194,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "dead_code".into(),
-                description: "Find dead/unreachable code in the semantic graph. Without filters, returns entities with no incoming relations. For task-scoped checks, pass `files` to return only dead functions/classes from those files, ignoring same-file references.".into(),
+                description: crate::handlers::entities::DEAD_CODE_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -209,7 +209,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "find_dead_code_seeded".into(),
-                description: "Seeded dead-code discovery: combines `semantic_search` + bulk reference counting + dead-filter into a single call. Pass a query (e.g. a concept or partial name) and receive the top-N matching entities ranked dead-first, each annotated with `reference_count` and a boolean `dead` flag. Designed for find-dead-code workloads where the naive shape (`semantic_search` then `find_references` per entity) burns the tool-call cap on large repos.".into(),
+                description: crate::handlers::entities::FIND_DEAD_CODE_SEEDED_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -230,7 +230,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "entity_history".into(),
-                description: "Get the change history of a specific entity".into(),
+                description: crate::handlers::review::ENTITY_HISTORY_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -241,7 +241,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "graph_neighborhood".into(),
-                description: "Get the dependency neighborhood of an entity — what it depends on and what depends on it. Traverses the semantic relation graph (calls, imports, implements) to the specified depth. Returns compact summaries (name, kind, file) to stay within token budgets.".into(),
+                description: crate::handlers::entities::GRAPH_NEIGHBORHOOD_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -254,7 +254,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "benchmark".into(),
-                description: "Get benchmark results and metrics".into(),
+                description: crate::handlers::bench::BENCHMARK_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -264,7 +264,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "register_session".into(),
-                description: "Register an assistant session with Kin (legacy, prefer kin_session_start)".into(),
+                description: crate::handlers::sessions::REGISTER_SESSION_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -277,7 +277,7 @@ pub fn tool_definitions() -> ToolsListResult {
             // ── Phase 7: Session/Intent/Traffic tools ──
             ToolDefinition {
                 name: "kin_session_start".into(),
-                description: "Start a rich agent session with capabilities, transport, and vendor info".into(),
+                description: crate::handlers::sessions::SESSION_START_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -304,7 +304,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_session_heartbeat".into(),
-                description: "Send a heartbeat to keep an agent session alive".into(),
+                description: crate::handlers::sessions::SESSION_HEARTBEAT_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -315,7 +315,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_session_end".into(),
-                description: "End an agent session and release all its intents".into(),
+                description: crate::handlers::sessions::SESSION_END_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -326,7 +326,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_register_intent".into(),
-                description: "Declare what scopes the agent intends to modify, enabling collision detection".into(),
+                description: crate::handlers::sessions::REGISTER_INTENT_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -345,7 +345,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_release_intent".into(),
-                description: "Release a previously registered intent".into(),
+                description: crate::handlers::sessions::RELEASE_INTENT_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -357,7 +357,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_check_traffic".into(),
-                description: "Check what agents are actively working on or near given scopes".into(),
+                description: crate::handlers::sessions::CHECK_TRAFFIC_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -372,7 +372,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "explore_codebase".into(),
-                description: "One-shot codebase exploration — replaces multi-round-trip MCP calls with a single request. Use 'overview' for entity counts and top declarations, 'search' to find entities and their context packs, or 'trace' to follow an ordered call chain from a matched entity with real source bodies and imported constants.".into(),
+                description: crate::handlers::entities::EXPLORE_CODEBASE_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -386,7 +386,7 @@ pub fn tool_definitions() -> ToolsListResult {
             // Phase 8: Work graph tools
             ToolDefinition {
                 name: "kin_work_create".into(),
-                description: "Create a new work item (feature, task, issue, debt, todo, investigation)".into(),
+                description: crate::handlers::work::WORK_CREATE_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -401,7 +401,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_work_list".into(),
-                description: "List work items with optional status and kind filters".into(),
+                description: crate::handlers::work::WORK_LIST_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -413,7 +413,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_work_show".into(),
-                description: "Show full details of a work item including parents, children, blockers, implementors, and attached annotations".into(),
+                description: crate::handlers::work::WORK_SHOW_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -424,7 +424,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_work_link".into(),
-                description: "Link a work item to semantic scopes (entities, contracts, artifacts)".into(),
+                description: crate::handlers::work::WORK_LINK_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -436,7 +436,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_work_decompose".into(),
-                description: "Link a parent work item to a child work item".into(),
+                description: crate::handlers::work::WORK_DECOMPOSE_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -448,7 +448,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_work_block".into(),
-                description: "Mark one work item as blocked by another".into(),
+                description: crate::handlers::work::WORK_BLOCK_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -460,7 +460,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_work_implement".into(),
-                description: "Link semantic scopes that implement a work item".into(),
+                description: crate::handlers::work::WORK_IMPLEMENT_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -472,7 +472,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_work_status".into(),
-                description: "Update a work item status".into(),
+                description: crate::handlers::work::WORK_STATUS_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -485,7 +485,7 @@ pub fn tool_definitions() -> ToolsListResult {
             // Phase 8: Annotation tools
             ToolDefinition {
                 name: "kin_annotation_add".into(),
-                description: "Add a semantic annotation (comment, warning, instruction, reasoning) to scopes or work items".into(),
+                description: crate::handlers::work::ANNOTATION_ADD_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -499,7 +499,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_annotation_list".into(),
-                description: "List annotations for given scopes or work items".into(),
+                description: crate::handlers::work::ANNOTATION_LIST_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -511,7 +511,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_annotation_mark_resolved".into(),
-                description: "Mark an annotation as resolved (removes it)".into(),
+                description: crate::handlers::work::ANNOTATION_MARK_RESOLVED_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -522,7 +522,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_todo_import".into(),
-                description: "Scan source files for inline TODO/FIXME/HACK markers and import them as work items".into(),
+                description: crate::handlers::work::TODO_IMPORT_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -533,7 +533,7 @@ pub fn tool_definitions() -> ToolsListResult {
             // Phase 9-10: Verification, security, release, contract, and provenance tools
             ToolDefinition {
                 name: "kin_verify_entity".into(),
-                description: "Inspect linked tests and recorded coverage for a specific entity. Returns linked tests and coverage statistics; does not execute verification runs.".into(),
+                description: crate::handlers::verification::VERIFY_ENTITY_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -545,7 +545,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_coverage_summary".into(),
-                description: "Get repo-wide test coverage statistics. Shows total entities, covered count, coverage ratio, and entities missing proof.".into(),
+                description: crate::handlers::verification::COVERAGE_SUMMARY_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {}
@@ -553,7 +553,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_security_scan".into(),
-                description: "Run security analysis on the semantic graph. Finds dead/unreachable code and optionally propagates downstream impact for each finding.".into(),
+                description: crate::handlers::verification::SECURITY_SCAN_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -563,7 +563,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_release_check".into(),
-                description: "Pre-release gate check. Validates coverage thresholds and approval status before a release.".into(),
+                description: crate::handlers::verification::RELEASE_CHECK_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -574,7 +574,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_contract_check".into(),
-                description: "Check test coverage for a specific contract. Returns linked tests and coverage status.".into(),
+                description: crate::handlers::verification::CONTRACT_CHECK_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -585,7 +585,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_provenance_query".into(),
-                description: "Query who changed an entity and its approval status. Returns recent audit events and any approvals for the entity's latest change.".into(),
+                description: crate::handlers::provenance::PROVENANCE_QUERY_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -597,7 +597,7 @@ pub fn tool_definitions() -> ToolsListResult {
             // Phase 11: Review mutation tools
             ToolDefinition {
                 name: "kin_review_create".into(),
-                description: "Create a new review for a set of changes. Supports base/head refs or repo-local scope-driven review creation.".into(),
+                description: crate::handlers::review::REVIEW_CREATE_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -622,7 +622,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_review_decide".into(),
-                description: "Record a review decision: approve, needs-work, or block.".into(),
+                description: crate::handlers::review::REVIEW_DECIDE_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -638,7 +638,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_review_note_add".into(),
-                description: "Add a note to a review, optionally scoped to a specific entity.".into(),
+                description: crate::handlers::review::REVIEW_NOTE_ADD_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -655,7 +655,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_review_discuss".into(),
-                description: "Start a discussion thread on a review, optionally scoped to a specific entity.".into(),
+                description: crate::handlers::review::REVIEW_DISCUSS_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -672,7 +672,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_review_discuss_reply".into(),
-                description: "Reply to an existing discussion thread on a review.".into(),
+                description: crate::handlers::review::REVIEW_DISCUSS_REPLY_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -686,7 +686,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_review_discuss_resolve".into(),
-                description: "Resolve or reopen a discussion thread.".into(),
+                description: crate::handlers::review::REVIEW_DISCUSS_RESOLVE_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -701,7 +701,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_review_assign".into(),
-                description: "Assign one or more reviewers to a review.".into(),
+                description: crate::handlers::review::REVIEW_ASSIGN_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -720,7 +720,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_review_unassign".into(),
-                description: "Remove a reviewer assignment from a review.".into(),
+                description: crate::handlers::review::REVIEW_UNASSIGN_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -732,7 +732,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_review_list".into(),
-                description: "List reviews with optional state filter.".into(),
+                description: crate::handlers::review::REVIEW_LIST_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -742,7 +742,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_review_get".into(),
-                description: "Get a specific review with all details: decisions, notes, discussions, and assignments.".into(),
+                description: crate::handlers::review::REVIEW_GET_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -753,7 +753,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_graph_status".into(),
-                description: "Report the graph status visible to MCP. In product mode this is served by the repo daemon, so it reflects live daemon-owned graph state rather than an MCP-local snapshot.".into(),
+                description: crate::handlers::entities::GRAPH_STATUS_DESC.into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {},

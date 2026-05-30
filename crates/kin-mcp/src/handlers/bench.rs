@@ -8,6 +8,13 @@ use kin_model::graph::GraphStore;
 use crate::error::Result;
 use crate::types::ToolCallResult;
 
+pub const BENCHMARK_DESC: &str = "\
+Report on Kin's benchmark results and metrics. The benchmark engine now lives in the \
+standalone `kin-bench` binary, so this tool returns pointers on how to install and run \
+it (e.g. `kin bench <subcommand>`) rather than computing metrics in-process. Reach for \
+it when you want to know where Kin's velocity/reliability/economic measurements come \
+from or how to reproduce them.";
+
 pub fn handle_benchmark<G: GraphStore>(
     _args: &HashMap<String, serde_json::Value>,
     _store: &G,

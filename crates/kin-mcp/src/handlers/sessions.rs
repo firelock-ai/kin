@@ -20,6 +20,13 @@ fn daemon_required_unavailable(operation: &str) -> ToolCallResult {
     ))
 }
 
+pub const REGISTER_SESSION_DESC: &str = "\
+Register a lightweight assistant session with Kin so its activity can be tracked. This \
+is the legacy, minimal entry point — it records an assistant name and session ID and \
+nothing more. Prefer kin_session_start for new integrations, which captures \
+capabilities, transport, and working directory and unlocks intent registration and \
+collision detection. Use this only for simple or backward-compatible setups.";
+
 pub fn handle_register_session(
     args: &HashMap<String, serde_json::Value>,
     sessions: &SessionRegistry,
@@ -42,6 +49,17 @@ pub fn handle_register_session(
     let json = serde_json::to_string_pretty(&result).map_err(crate::error::McpError::Json)?;
     Ok(ToolCallResult::text(json))
 }
+
+pub const SESSION_START_DESC: &str = "\
+Start a rich agent session with Kin, declaring who you are and what you can do: vendor, \
+client name, transport, working directory, optional PID, and a capability set \
+(read/write/execute/branch/commit, max concurrent intents). Reach for it at the \
+beginning of an agent's work so Kin can attribute activity, surface your presence to \
+other agents, and gate collaboration features. It returns a session ID that the rest of \
+the session lifecycle uses — keep it alive with kin_session_heartbeat, declare what \
+you'll touch via kin_register_intent (enabling collision detection against other \
+agents), and close out with kin_session_end. Prefer this over the legacy \
+register_session, which captures none of this context.";
 
 pub async fn handle_session_start(
     args: &HashMap<String, serde_json::Value>,
@@ -105,6 +123,13 @@ pub async fn handle_session_start(
     Ok(ToolCallResult::text(json))
 }
 
+pub const SESSION_HEARTBEAT_DESC: &str = "\
+Send a heartbeat to keep an agent session marked alive. Reach for it periodically \
+during a long-running session so Kin doesn't treat it as stale and so the agent's \
+presence (and any held intents) stays visible to other agents. Pair it with \
+kin_session_start (which issues the session ID) and kin_session_end (which closes the \
+session and releases its intents).";
+
 pub async fn handle_session_heartbeat(
     args: &HashMap<String, serde_json::Value>,
     sessions: &SessionRegistry,
@@ -147,6 +172,13 @@ pub async fn handle_session_heartbeat(
         )))
     }
 }
+
+pub const SESSION_END_DESC: &str = "\
+End an agent session and release everything it held — all of its registered intents are \
+freed so other agents are no longer blocked or warned off the scopes it was working. \
+Reach for it when an agent finishes its work or shuts down, so the collaboration graph \
+reflects reality and doesn't leave stale locks behind. The complement to \
+kin_session_start.";
 
 pub async fn handle_session_end(
     args: &HashMap<String, serde_json::Value>,
@@ -192,6 +224,16 @@ pub async fn handle_session_end(
         ))),
     }
 }
+
+pub const REGISTER_INTENT_DESC: &str = "\
+Declare, ahead of acting, which scopes (entities, contracts, or artifacts) an agent \
+intends to modify and why. This is how Kin does collision detection: by publishing your \
+intent — with a soft or hard lock — other agents can see you're working a region and \
+avoid clobbering it, and you can see if someone is already there. Reach for it before \
+making changes in a multi-agent setting so concurrent work coordinates through graph \
+truth instead of racing. Optionally set an expiry; release it early with \
+kin_release_intent, and check who else is active with kin_check_traffic. Requires an \
+active session from kin_session_start.";
 
 pub async fn handle_register_intent(
     args: &HashMap<String, serde_json::Value>,
@@ -270,6 +312,13 @@ pub async fn handle_register_intent(
     }
 }
 
+pub const RELEASE_INTENT_DESC: &str = "\
+Release a single previously registered intent by ID, freeing the scopes it held so \
+other agents can proceed. Reach for it as soon as you finish the specific piece of work \
+an intent covered, rather than holding the lock until session end — it keeps the \
+collaboration graph tight and unblocks teammates promptly. Ending the whole session \
+with kin_session_end releases all remaining intents at once.";
+
 pub async fn handle_release_intent(
     args: &HashMap<String, serde_json::Value>,
     sessions: &SessionRegistry,
@@ -315,6 +364,14 @@ pub async fn handle_release_intent(
         ))),
     }
 }
+
+pub const CHECK_TRAFFIC_DESC: &str = "\
+Check whether other agents are actively working on or near a set of scopes (entities, \
+contracts, or artifacts), and what they're doing. Reach for it before you start \
+changing something in a multi-agent setting — it surfaces in-flight intents and locks \
+so you can avoid collisions, coordinate, or pick different work. It's the read-side \
+companion to kin_register_intent (the write side): one declares what you'll touch, the \
+other tells you what others are touching.";
 
 pub async fn handle_check_traffic(
     args: &HashMap<String, serde_json::Value>,

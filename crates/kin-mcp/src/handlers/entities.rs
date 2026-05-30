@@ -13,6 +13,22 @@ use crate::types::ToolCallResult;
 
 use super::common::*;
 
+pub const SEMANTIC_SEARCH_DESC: &str = "\
+Find code declarations in the semantic graph by name, kind, or language. Kin has \
+already parsed the repository into entities — functions, methods, classes, structs, \
+traits, enums, interfaces, types, and constants — so this matches real declarations, \
+not raw string occurrences the way a grep would. Reach for it as your first step \
+whenever you need to locate \"the thing called X\" or \"every Y of kind class in \
+language rust\": it answers in one call and hands back the exact file path, line \
+range, signature, and stable entity ID for each match. Those IDs are the currency for \
+every other tool here (get_entity_source, get_context_pack, find_references, \
+trace_data_flow, …), so a single search gives you everything you need to drill in \
+without re-locating the symbol. Returns a ranked list (compact by default: \
+id/name/kind/language/file_path/line range/signature; set compact=false to also get \
+the doc summary) plus the total match count so you know whether results were \
+truncated. Prefer it over text search when you care about declarations and want \
+precise, navigable anchors rather than a pile of line hits.";
+
 pub fn handle_semantic_search<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -56,6 +72,15 @@ pub fn handle_semantic_search<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
+pub const GET_ENTITY_DESC: &str = "\
+Look up one entity by its ID and return its full metadata: kind, language, file path, \
+line range, signature, visibility, role, and any doc summary — but not the source \
+body. Use it when you already hold an entity ID (typically from semantic_search or a \
+graph traversal) and want the authoritative facts about that declaration without \
+pulling in its implementation. It is the lightweight counterpart to get_entity_source: \
+reach for get_entity when you only need to confirm what/where a symbol is, and \
+get_entity_source when you actually need to read the code.";
+
 pub fn handle_get_entity<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -75,6 +100,22 @@ pub fn handle_get_entity<G: GraphStore>(
         ))),
     }
 }
+
+pub const GET_ENTITY_SOURCE_DESC: &str = "\
+Return the exact implementation body of one entity by ID, served from graph-owned \
+truth, along with its metadata (name, kind, language, file path, line range, \
+signature). This is how you read the actual code for a declaration once \
+semantic_search (or any traversal) has handed you its ID — no need to open the file \
+and hunt for line numbers yourself. It returns just the focal entity's body, so it is \
+the most economical way to inspect a single function/method/class; when you also need \
+the surrounding callers, callees, and imports, use get_context_pack or trace_data_flow \
+instead so you don't have to call this repeatedly.";
+
+pub const GET_ENTITY_BODY_DESC: &str = "\
+Alias for get_entity_source — same behavior and return shape. Provided so that whichever \
+name comes naturally (\"source\" or \"body\") resolves to the same tool. Returns the exact \
+implementation body of one entity by ID plus its metadata; prefer get_context_pack or \
+trace_data_flow when you also need the entity's neighborhood rather than just its body.";
 
 pub fn handle_get_entity_source<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -109,6 +150,20 @@ pub fn handle_get_entity_source<G: GraphStore>(
         ))),
     }
 }
+
+pub const GET_CONTEXT_PACK_DESC: &str = "\
+Assemble a focused, ready-to-read context bundle around one entity, fitted to a token \
+budget. Starting from a focal entity ID, Kin walks the relation graph to gather the \
+nearby code you'd actually need to understand or change it — the focal body plus its \
+direct dependencies (signatures), and optionally transitive deps, linked tests, \
+contracts, work items, and annotations — and returns it all in a single structured \
+response with the token accounting included. Reach for it when a question is about a \
+unit of code in context (\"what does X do and what does it touch?\") rather than a single \
+isolated body. Its value is that it replaces an open-ended chain of \
+get_entity_source / find_references calls — which burns round-trips and easily blows \
+your context window — with one budgeted call that stays within the limit you set. If \
+you only need the focal entity's raw body, get_entity_source is cheaper; if you need to \
+follow an actual call chain step by step, use trace_data_flow.";
 
 pub fn handle_get_context_pack<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -234,8 +289,25 @@ pub fn handle_get_context_pack<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
-/// Name-aliased wrapper over `get_context_pack` so models pick this primitive by
-/// task-family name on trace/data-flow questions instead of looping `get_entity_source`.
+pub const TRACE_COMPUTATION_DESC: &str = "\
+Get a focal entity together with its data- and control-flow neighborhood — its body \
+plus callers, callees, and imports — in a single structured response within a token \
+budget. You can address the focal either by entity_id or by exact name (query), so you \
+don't have to resolve the symbol first. Reach for it on \"how does this computation \
+work / where does this value come from / what does this end up calling\" questions, \
+where the answer lives across several connected entities rather than in one body. Its \
+value is consolidation: instead of looping get_entity_source over each step of a trace \
+— which exhausts your context and round-trips — one call returns everything needed to \
+reason about the flow step by step. By default the focal comes back as a full body and \
+its dependencies as signatures (the shape best suited to trace reasoning); set \
+compact=true for signature-only entries everywhere when you just need the structure. \
+When you specifically want the ordered call chain itself (not a flat neighborhood), \
+trace_data_flow walks the relations directionally and inlines each step.";
+
+/// Convenience wrapper over `get_context_pack`: resolves the focal entity from
+/// either `entity_id` or an exact-name `query`, applies trace-friendly defaults
+/// (full focal body, signature-only deps), and returns the focal neighborhood in
+/// one call so callers don't loop `get_entity_source` over each step of a trace.
 pub fn handle_trace_computation<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -273,6 +345,17 @@ pub fn handle_trace_computation<G: GraphStore>(
 
     handle_get_context_pack(&merged, store, sessions)
 }
+
+pub const FIND_REFERENCES_DESC: &str = "\
+Find who depends on an entity — its direct upstream callers, importers, and references. \
+Give it an entity_id or an exact symbol name (it resolves the best-matching canonical \
+definition) and it returns one row per upstream site with the relation kind, file path, \
+line, and signature. Use it to answer \"who calls / imports / uses this?\" before you \
+change or remove something, to gauge blast radius, or to navigate from a definition out \
+to its usages. Filter with relation_kinds (calls, imports, references) when you only \
+care about one kind of edge; it defaults to all three. When you need this answer for \
+many entities at once (e.g. classifying a whole set as used vs. unused), don't loop \
+this call per entity — bulk_check_references does the batch in one shot.";
 
 pub async fn handle_find_references<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -390,6 +473,21 @@ pub async fn handle_find_references<G: GraphStore>(
 /// and (in non-compact mode) the matching relation kinds and entity metadata.
 /// Designed for reachability / dead-code / count-callers workloads where calling
 /// `find_references` per entity blows up token budgets.
+pub const BULK_CHECK_REFERENCES_DESC: &str = "\
+Classify many entities for reachability in one call. Pass up to 200 entity IDs and get \
+back one row each: whether incoming relations of the requested kind exist \
+(has_references) and how many (reference_count); set compact=false to also include \
+name, kind, file path, and the matched relation kinds. Reach for it whenever the \
+question is \"of these N entities, which have callers / which are unused?\" — \
+reachability sweeps, dead-code candidate filtering, or counting callers across a set. \
+Its value is that it collapses what would otherwise be N separate find_references calls \
+(and N round-trips, plus the token cost of N full reference listings) into a single \
+batched classification. Choose relation_kind to scope the check to Calls, Imports, \
+References, or Any (the union, default). For a single entity where you want the actual \
+list of callers, find_references is the right tool; for finding dead code from a search \
+concept rather than a known ID set, find_dead_code_seeded combines the search and the \
+classification.";
+
 pub fn handle_bulk_check_references<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -542,6 +640,20 @@ fn parse_bulk_relation_kind(value: &str) -> Result<Vec<RelationKind>> {
         ))),
     }
 }
+
+pub const EXPLORE_CODEBASE_DESC: &str = "\
+Explore a codebase in one shot, choosing the lens that fits the question. With \
+strategy='overview' you get a map of the repository — entity counts broken down by \
+kind and language, plus the top public declarations — ideal for orienting yourself in \
+an unfamiliar repo. With strategy='search' (the default) you get the best-matching \
+entities for your query each wrapped in its own focused context pack. With \
+strategy='trace' you get a matched entity followed out along an ordered call chain, \
+with real source bodies and the constants it imports inlined. The whole point is to \
+answer broad, open-ended questions (\"how is auth structured?\", \"walk me through the \
+request path\") in a single budgeted request instead of a long back-and-forth of \
+semantic_search → get_entity_source → find_references. Use it to start exploration; \
+once you've identified a specific entity, the targeted tools (get_entity_source, \
+get_context_pack, find_references, trace_data_flow) let you go deeper precisely.";
 
 pub fn handle_explore_codebase<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -984,6 +1096,19 @@ pub fn handle_explore_codebase<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
+pub const DEAD_CODE_DESC: &str = "\
+List dead or unreachable code straight from the semantic graph. With no filters it \
+returns entities that have no incoming relations at all — nothing calls, imports, or \
+references them — across the whole repo, up to `limit`. Pass `files` to narrow the \
+scan to specific file paths and return only the dead functions, methods, and classes \
+declared there, ignoring within-file references so genuinely-unused declarations stand \
+out. Reach for it when you want to find removable code, audit a module for orphaned \
+definitions, or check whether a particular file still has live entry points. Because \
+reachability is read directly off the graph's relation edges, you get the answer in one \
+call without manually cross-referencing every symbol. When you'd rather start from a \
+search concept than scan files — \"which of the entities matching X are dead?\" — \
+find_dead_code_seeded combines the search and the dead-classification in one step.";
+
 pub fn handle_dead_code<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -1056,12 +1181,22 @@ pub fn handle_dead_code<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
-/// Seeded find-dead-code primitive: semantic_search(query) + bulk reference
-/// counting + dead-filter, returned as one structured response.
-///
-/// Closes the find-dead-code accuracy gap (Fix #2 in the per-family accuracy
-/// plan) where the agent burns the tool-call cap looping
-/// `semantic_search` → `find_references` per entity on large repos.
+pub const FIND_DEAD_CODE_SEEDED_DESC: &str = "\
+Find dead code starting from a search concept, in a single call. Give it a query (a \
+concept or partial name) and it searches the graph for the top-N matching entities, \
+counts each one's incoming references, and returns them ranked dead-first — each row \
+annotated with reference_count and a boolean `dead` flag, plus name, kind, file, and \
+signature. Reach for it when you suspect a feature/area is unused and want to confirm \
+which of its declarations are actually orphaned, without first knowing their IDs. Its \
+value is that it fuses three steps — semantic_search, then a reference count per match, \
+then the dead filter — into one response, so you don't loop find_references over every \
+candidate and exhaust your round-trips on a large repo. Use dead_code instead when you \
+want a whole-repo or file-scoped sweep rather than a concept-seeded one, and \
+bulk_check_references when you already hold the exact set of entity IDs to classify.";
+
+/// Seeded find-dead-code primitive: `semantic_search(query)` + per-candidate
+/// reference counting + dead-filter, returned as one structured response, so
+/// callers don't loop `semantic_search` → `find_references` per entity.
 ///
 /// This generic-`GraphStore` implementation uses substring matching against
 /// `query_entities` (matching the MCP `semantic_search` shape). In product
@@ -1162,14 +1297,28 @@ pub fn handle_find_dead_code_seeded<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
+pub const TRACE_DATA_FLOW_DESC: &str = "\
+Walk the actual call/data-flow chain rooted at a focal entity and return it as an \
+ordered list of steps in one call. Unlike trace_computation (which returns a flat \
+neighborhood), this follows Calls/Imports/References edges directionally from the \
+focal: direction='calls' walks outward to callees, 'callers' walks inward to callers, \
+'both' merges them — recursing to depth N with a per-step fan-out cap, and inlining \
+each step's body (in product mode, served from graph source records). Address the focal \
+by entity_id or by exact name. Reach for it when you need to follow a path \"what does \
+this call, and what do those call?\" or \"trace this value back to its source\" and want \
+the chain in traversal order, not a bag of neighbors. Its value is that the whole walk \
+happens substrate-side and comes back as one structured response, so you don't loop \
+get_entity_source per hop and exhaust your tool-call budget. Tune depth and \
+limit_per_step to control breadth; results flag when they were truncated.";
+
 /// Trace the actual call/data-flow chain rooted at a focal entity.
 ///
-/// Fix #3 in the per-family accuracy plan. Walks Calls/Imports/References
-/// relations from the focal in the requested direction, recurses to depth N,
-/// and returns the chain as a structured response. Generic-`GraphStore`
-/// implementation here produces the chain without inlined source bodies; the
-/// daemon special-cases this tool against the concrete graph to also inline
-/// source records — both share this same chain-construction logic.
+/// Walks Calls/Imports/References relations from the focal in the requested
+/// direction, recurses to depth N, and returns the chain as a structured
+/// response, so callers don't loop `get_entity_source` per step. The
+/// generic-`GraphStore` implementation here produces the chain without inlined
+/// source bodies; the daemon special-cases this tool against the concrete graph
+/// to also inline source records — both share this same chain-construction logic.
 pub fn handle_trace_data_flow<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -1349,6 +1498,19 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
+pub const GRAPH_NEIGHBORHOOD_DESC: &str = "\
+Get the dependency neighborhood of an entity — both what it depends on and what depends \
+on it — as a compact graph. Starting from an entity ID, Kin traverses the semantic \
+relations (calls, imports, implements, …) out to the depth you specify and returns the \
+reachable entities as lightweight summaries (id, name, kind, file, signature) plus the \
+edges connecting them, along with total counts and a truncation flag. Reach for it when \
+you want the structural shape around a symbol — its blast radius and its supports — \
+rather than full source bodies: impact-scoping a change, understanding coupling, or \
+mapping how a module hangs together. It returns summaries rather than code precisely so \
+the neighborhood stays within token budgets even at depth; when you then want to read a \
+specific neighbor's implementation, follow up with get_entity_source, and when you want \
+a directional ordered chain with bodies inlined, use trace_data_flow.";
+
 pub fn handle_graph_neighborhood<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -1407,6 +1569,14 @@ pub fn handle_graph_neighborhood<G: GraphStore>(
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
 }
+
+pub const GRAPH_STATUS_DESC: &str = "\
+Report the status of the semantic graph that MCP is serving from — currently the live \
+entity count and the authority backing it. In product mode this is answered by the repo \
+daemon, so it reflects the daemon-owned, live graph state rather than a stale \
+MCP-local snapshot. Reach for it as a quick health/readiness check: confirm the graph \
+is populated and that you're talking to graph-owned truth before relying on the other \
+tools, or sanity-check that the repository has been indexed at all.";
 
 /// Report the health of the graph visible to this dispatcher.
 ///
