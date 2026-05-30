@@ -539,12 +539,33 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                         remaining = pending.saturating_sub(count),
                         "embedded entities"
                     );
-                    let snapshot_path = embed_state.layout.kindb_snapshot_path();
-                    if let Err(e) = kin_db::SnapshotManager::save_vector_index_for_graph(
-                        snapshot_path,
-                        embed_state.graph.as_ref(),
-                    ) {
-                        error!(error = %e, "failed to persist vector index");
+                    // Persist the vector index under the shared persist lock so
+                    // this kvec write can never interleave with a snapshot save
+                    // running in the persistence loop or idle-shutdown flush.
+                    // Run inside spawn_blocking so the std persist Mutex is held
+                    // only across the synchronous write, never across an await.
+                    let state_for_persist = Arc::clone(&embed_state);
+                    let persist_result = tokio::task::spawn_blocking(move || {
+                        let _persist_guard =
+                            state_for_persist.persist_lock.lock().map_err(|_| {
+                                kin_db::KinDbError::ConcurrentAccessError(
+                                    "persist lock poisoned".to_string(),
+                                )
+                            })?;
+                        kin_db::SnapshotManager::save_vector_index_for_graph(
+                            state_for_persist.layout.kindb_snapshot_path(),
+                            state_for_persist.graph.as_ref(),
+                        )
+                    })
+                    .await;
+                    match persist_result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            error!(error = %e, "failed to persist vector index");
+                        }
+                        Err(e) => {
+                            error!(error = %e, "vector index persist task panicked");
+                        }
                     }
                 }
                 Ok(Ok(_)) => {
