@@ -242,7 +242,12 @@ fn extract_js_node(
                 // arrow functions — these represent real code entities.
                 if kind == EntityKind::Constant {
                     if let Some(ref value) = value_node {
-                        if is_data_only_js_value(value) {
+                        // Keep named constants with a scalar literal value
+                        // (e.g. `MAX_RETRIES = 5`) so trace tasks resolve
+                        // through them. Object/array literals stay filtered
+                        // even when named (avoids config-token bloat).
+                        let rescue = is_named_constant(&name) && is_scalar_literal(value);
+                        if is_data_only_js_value(value) && !rescue {
                             continue;
                         }
                     }
@@ -320,6 +325,43 @@ fn is_js_function_like_node(node: &tree_sitter::Node) -> bool {
         node.kind(),
         "function_expression" | "function" | "arrow_function" | "generator_function"
     )
+}
+
+/// Returns true if `name` looks like a deliberately-named constant
+/// (e.g. `MAX_RETRIES`, `API_URL`, `HTTP_TIMEOUT_ms`, `PROBE_BASE_d6177fd8`)
+/// rather than an incidental local (`x`, `count`, `tmp`). Such constants are
+/// kept even when their value is a data-only scalar so trace-computation tasks
+/// can resolve through them. Detects an internal run of two uppercase letters
+/// or an underscore immediately followed by an uppercase letter; a naive
+/// all-uppercase rule would reject lowercase-hex-tagged names.
+fn is_named_constant(name: &str) -> bool {
+    let n = name.trim();
+    if n.is_empty() {
+        return false;
+    }
+    let has_upper_run = n
+        .as_bytes()
+        .windows(2)
+        .any(|w| w[0].is_ascii_uppercase() && w[1].is_ascii_uppercase());
+    let has_underscore_upper = n
+        .as_bytes()
+        .windows(2)
+        .any(|w| w[0] == b'_' && w[1].is_ascii_uppercase());
+    has_upper_run || has_underscore_upper
+}
+
+/// Returns true if a value node is a scalar literal (number, string, boolean,
+/// null/undefined). Used to scope the named-constant rescue to scalars so that
+/// named object/array literals (theme tokens, config maps) stay filtered.
+fn is_scalar_literal(node: &tree_sitter::Node) -> bool {
+    match node.kind() {
+        "number" | "string" | "true" | "false" | "null" | "undefined" => true,
+        "parenthesized_expression" => node
+            .child(1)
+            .map(|inner| is_scalar_literal(&inner))
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 /// Returns true if a value node is a data-only constant that should be
@@ -1374,5 +1416,76 @@ mod tests {
             "index.js should create a Module entity named after its directory"
         );
         assert_eq!(modules[0].name, "LoadingButton");
+    }
+
+    #[test]
+    fn keep_named_numeric_constant() {
+        let adapter = JavaScriptAdapter;
+        // A named numeric constant must be indexed so trace-computation tasks
+        // can resolve through it — even though `13` is a data-only scalar.
+        let source = b"export const PROBE_BASE_d6177fd8 = 13;";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let constants: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Constant)
+            .collect();
+        assert_eq!(
+            constants.len(),
+            1,
+            "named numeric constant should be kept, got: {:?}",
+            constants.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        assert_eq!(constants[0].name, "PROBE_BASE_d6177fd8");
+    }
+
+    #[test]
+    fn keep_named_scalar_constants_drop_incidental_locals() {
+        let adapter = JavaScriptAdapter;
+        // Positive matrix: deliberately-named constants are kept even with
+        // data-only scalar values. Negative matrix: incidental lowercase
+        // locals with scalar values stay filtered (avoids entity-set bloat).
+        let source = br#"
+export const PROBE_BASE_d6177fd8 = 13;
+export const MAX_RETRIES = 5;
+export const API_URL = "x";
+export const HTTP_TIMEOUT_ms = 30;
+const x = 1;
+const count = 0;
+const total = 100;
+const i = 0;
+const tmp = 2;
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.js");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let names: Vec<&str> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Constant)
+            .map(|e| e.name.as_str())
+            .collect();
+
+        for kept in [
+            "PROBE_BASE_d6177fd8",
+            "MAX_RETRIES",
+            "API_URL",
+            "HTTP_TIMEOUT_ms",
+        ] {
+            assert!(
+                names.contains(&kept),
+                "named constant `{kept}` should be kept, got: {names:?}"
+            );
+        }
+        for dropped in ["x", "count", "total", "i", "tmp"] {
+            assert!(
+                !names.contains(&dropped),
+                "incidental local `{dropped}` should be dropped, got: {names:?}"
+            );
+        }
     }
 }
