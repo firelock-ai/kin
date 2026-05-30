@@ -3,13 +3,17 @@
 
 pub mod common;
 
-mod bench;
-mod entities;
-mod provenance;
-mod review;
-mod sessions;
-mod verification;
-mod work;
+// Handler submodules are public so each tool's rich `*_DESC` description const
+// can live next to the handler that implements it, and be referenced by the
+// MCP tool registry in `tools.rs`. Keeping the prose beside the code keeps the
+// two from drifting apart.
+pub mod bench;
+pub mod entities;
+pub mod provenance;
+pub mod review;
+pub mod sessions;
+pub mod verification;
+pub mod work;
 
 use std::collections::HashMap;
 

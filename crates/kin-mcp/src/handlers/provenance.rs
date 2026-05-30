@@ -10,6 +10,14 @@ use crate::types::ToolCallResult;
 
 use super::common::*;
 
+pub const PROVENANCE_QUERY_DESC: &str = "\
+Answer who-and-whether-approved for an entity: it returns the entity's change count, \
+its latest change, any approvals recorded on that change, and recent audit events. \
+Reach for it to establish accountability and trust before relying on a piece of code — \
+\"who last touched this, and has it been signed off?\" — or when assembling an audit \
+trail. It builds on entity_history (the raw change list) by adding approval status and \
+audit context in one call.";
+
 pub fn handle_provenance_query<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,

@@ -10,6 +10,15 @@ use crate::types::ToolCallResult;
 
 use super::common::*;
 
+pub const VERIFY_ENTITY_DESC: &str = "\
+Inspect the test coverage recorded for a single entity: which tests are linked to it, \
+how many, and whether it is covered at all, alongside the repo-wide coverage figures for \
+context. Filter by runner (e.g. cargo, jest, pytest) when you only care about one test \
+system. Reach for it to answer \"is this function tested, and by what?\" before changing \
+or relying on it. Note this reports linked tests and recorded coverage from the graph — \
+it does not execute tests. For the whole-repo picture use kin_coverage_summary; for \
+contracts use kin_contract_check.";
+
 pub fn handle_verify_entity<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -47,6 +56,13 @@ pub fn handle_verify_entity<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
+pub const COVERAGE_SUMMARY_DESC: &str = "\
+Get repo-wide test coverage at a glance: total entities, how many are covered, the \
+coverage ratio, and the list of entities still missing test proof. Reach for it to \
+assess overall test health, find what's untested, or feed a release/quality gate. It's \
+the whole-repo counterpart to kin_verify_entity (one entity) and underlies \
+kin_release_check's proof requirement.";
+
 pub fn handle_coverage_summary<G: GraphStore>(store: &G) -> Result<ToolCallResult> {
     let coverage = store.get_coverage_summary().map_err(McpError::graph)?;
 
@@ -61,6 +77,14 @@ pub fn handle_coverage_summary<G: GraphStore>(store: &G) -> Result<ToolCallResul
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
 }
+
+pub const SECURITY_SCAN_DESC: &str = "\
+Run a graph-based security/quality scan and return findings with severity. Today it \
+surfaces dead/unreachable code (a common source of latent risk and confusion) as \
+findings; set propagate=true to also compute, for each finding, the downstream entities \
+it would affect. Reach for it as a quick hygiene pass over the semantic graph. For \
+plain dead-code enumeration without the findings framing, dead_code is more direct; \
+this tool packages results as severity-tagged findings suitable for a security review.";
 
 pub fn handle_security_scan<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -106,6 +130,14 @@ pub fn handle_security_scan<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
+pub const RELEASE_CHECK_DESC: &str = "\
+Run a pre-release gate and get a pass/fail verdict with the specific blockers. Toggle \
+the policy you want enforced: require_proof fails when entities are missing test proof; \
+require_approval fails when the latest change has no recorded approval. Returns whether \
+the release would pass plus a list of what's blocking it and the current coverage \
+figures. Reach for it as the final go/no-go check before cutting a release, \
+consolidating coverage and approval gates into one answer.";
+
 pub fn handle_release_check<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -149,6 +181,12 @@ pub fn handle_release_check<G: GraphStore>(
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
 }
+
+pub const CONTRACT_CHECK_DESC: &str = "\
+Check the test coverage of a specific contract: which tests cover it, how many, and \
+whether it is covered at all. Reach for it to verify that a behavioral contract has \
+backing tests before relying on or releasing it. It is the contract-level analogue of \
+kin_verify_entity (which checks an entity).";
 
 pub fn handle_contract_check<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,

@@ -12,6 +12,16 @@ use crate::types::ToolCallResult;
 
 use super::common::*;
 
+pub const SEMANTIC_DIFF_DESC: &str = "\
+Compute an entity-level diff — what declarations were added, removed, or changed — \
+rather than a line-by-line text diff. You can target it four ways (pick one): base/head \
+semantic change IDs, a set of entity_ids (current state vs. their history), file paths \
+(resolved to their entities), or a list of change_ids to combine. Reach for it when you \
+want to understand a change in terms of the code's structure — \"which functions/types \
+actually changed?\" — instead of reading raw hunks, which is far more meaningful for \
+review and impact reasoning. When you also want the downstream blast radius or a risk \
+summary alongside the diff, use impact_analysis or semantic_review.";
+
 pub fn handle_semantic_diff<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -20,6 +30,16 @@ pub fn handle_semantic_diff<G: GraphStore>(
     let formatted = kin_review::format_diff(&diff);
     Ok(ToolCallResult::text(formatted))
 }
+
+pub const IMPACT_ANALYSIS_DESC: &str = "\
+Analyze the downstream impact of a change: starting from what changed, walk the \
+relation graph to find every entity that could be affected. Target it four ways (one at \
+a time): base/head change IDs, entity_ids, file paths, or a list of change_ids to \
+combine. Optionally include active agent traffic on the impacted entities so you can see \
+who else is working nearby. Reach for it before merging or refactoring to gauge blast \
+radius — \"if I change this, what else might break?\" — answered from the graph in one \
+call instead of hand-tracing callers. Pair it with semantic_diff (what changed) or use \
+semantic_review when you want diff + impact + risk together in a single report.";
 
 pub async fn handle_impact_analysis<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -78,6 +98,17 @@ pub async fn handle_impact_analysis<G: GraphStore>(
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
 }
+
+pub const SEMANTIC_REVIEW_DESC: &str = "\
+Produce a complete semantic review of a change in one call: the entity-level diff, the \
+downstream impact, and an overall risk assessment, combined into a single report. \
+Target it four ways (one at a time): base/head change IDs, entity_ids, file paths, or a \
+list of change_ids. Choose format='text' for a human-readable summary or format='json' \
+for structured output suited to editor/CI integrations, and optionally fold in active \
+agent traffic on the reviewed entities. Reach for it when you want the whole \"what \
+changed, what it touches, how risky is it\" picture at once — it saves you from running \
+semantic_diff and impact_analysis separately and stitching them together yourself. Use \
+the narrower tools when you only need one of those facets.";
 
 pub fn handle_semantic_review<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -152,6 +183,13 @@ fn collect_review_traffic_lines(
     traffic_lines
 }
 
+pub const ENTITY_HISTORY_DESC: &str = "\
+Return the change history of a single entity — the ordered list of semantic changes \
+that created, modified, or superseded it over time. Reach for it to answer \"how did \
+this declaration get to its current form?\", to find the change IDs you can feed into \
+semantic_diff/impact_analysis, or as a starting point for provenance questions. For \
+who-made-the-change and approval status, kin_provenance_query builds on this.";
+
 pub fn handle_entity_history<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -168,6 +206,15 @@ pub fn handle_entity_history<G: GraphStore>(
 }
 
 // ── Review mutation handlers (Phase 11) ──
+
+pub const REVIEW_CREATE_DESC: &str = "\
+Open a new review over a set of changes and persist it in the graph. Scope it by \
+base/head refs (branch names or change IDs), by KinLab-style scope_type + entity_ids, \
+or by raw semantic scopes — and optionally seed a title, description, creator identity, \
+and an initial reviewer list. Reach for it to start a code-review workflow that lives \
+in graph truth (so decisions, notes, and discussions attach to entities, not just \
+files), whether driven by a human, an assistant, or CI. Returns the new review's ID, \
+which the other kin_review_* tools (decide, note_add, discuss, assign, get) operate on.";
 
 pub fn handle_review_create<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -223,6 +270,13 @@ pub fn handle_review_create<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
+pub const REVIEW_DECIDE_DESC: &str = "\
+Record a reviewer's verdict on a review: approved, needs_work, or blocked, with an \
+optional explanatory comment and reviewer identity. Reach for it to land the outcome of \
+a review in graph truth so downstream gates (like kin_release_check's approval \
+requirement) and other agents can see where the review stands. The decision is appended \
+to the review's history rather than overwriting prior verdicts.";
+
 pub fn handle_review_decide<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -263,6 +317,14 @@ pub fn handle_review_decide<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
+pub const REVIEW_NOTE_ADD_DESC: &str = "\
+Attach a standalone note to a review, optionally anchored to a specific entity or file \
+(and line). Reach for it to leave a non-blocking observation or comment that doesn't \
+need a back-and-forth thread — \"FYI this also affects X\". Because notes can be scoped \
+to an entity, they travel with that declaration in graph truth rather than being pinned \
+to a line number that drifts. For a comment that expects replies, start a thread with \
+kin_review_discuss instead.";
+
 pub fn handle_review_note_add<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -297,6 +359,14 @@ pub fn handle_review_note_add<G: GraphStore>(
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
 }
+
+pub const REVIEW_DISCUSS_DESC: &str = "\
+Open a discussion thread on a review with an initial message, optionally anchored to a \
+specific entity or file/line. Reach for it when a point needs conversation — a question \
+or concern others should reply to and eventually resolve — rather than a one-off note. \
+Returns the new discussion's ID; reply with kin_review_discuss_reply and close it out \
+with kin_review_discuss_resolve. Anchoring to an entity keeps the thread attached to \
+the code in graph truth as it evolves.";
 
 pub fn handle_review_discuss<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -341,6 +411,13 @@ pub fn handle_review_discuss<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
+pub const REVIEW_DISCUSS_REPLY_DESC: &str = "\
+Append a reply to an existing review discussion thread, identified by its discussion \
+ID. Reach for it to continue a conversation started with kin_review_discuss — the reply \
+is added in order with its author recorded, so the thread reads as a coherent exchange. \
+When the conversation has reached a conclusion, resolve it with \
+kin_review_discuss_resolve.";
+
 pub fn handle_review_discuss_reply<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -370,6 +447,12 @@ pub fn handle_review_discuss_reply<G: GraphStore>(
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
 }
+
+pub const REVIEW_DISCUSS_RESOLVE_DESC: &str = "\
+Resolve a review discussion thread (or reopen one) by its discussion ID. Reach for it \
+to mark a conversation as settled once its concern is addressed, or to reopen it if the \
+issue resurfaces. Tracking resolution in graph truth lets a review report which threads \
+are still outstanding versus done.";
 
 pub fn handle_review_discuss_resolve<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -408,6 +491,12 @@ pub fn handle_review_discuss_resolve<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
+pub const REVIEW_ASSIGN_DESC: &str = "\
+Assign one or more reviewers to a review. Pass a single `reviewer` or a batch via \
+`reviewers`, and optionally who assigned them. Reach for it to route a review to the \
+people (or agents) who should weigh in, so the request shows up as their responsibility \
+in graph truth. Remove an assignment with kin_review_unassign.";
+
 pub fn handle_review_assign<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -443,6 +532,11 @@ pub fn handle_review_assign<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
+pub const REVIEW_UNASSIGN_DESC: &str = "\
+Remove a reviewer's assignment from a review. Reach for it when someone is no longer \
+expected to review — reassigned, out, or added by mistake — so the review's outstanding \
+reviewer list stays accurate in graph truth. Add assignments with kin_review_assign.";
+
 pub fn handle_review_unassign<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
@@ -462,6 +556,12 @@ pub fn handle_review_unassign<G: GraphStore>(
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
 }
+
+pub const REVIEW_LIST_DESC: &str = "\
+List reviews, optionally filtered by state (pending, approved, needs_work, blocked). \
+Each row is a compact summary — review ID, title, state, and base/head refs. Reach for \
+it to see what reviews exist and triage them: what's awaiting a decision, what's \
+blocked, what's done. Use kin_review_get to pull the full detail of any one review.";
 
 pub fn handle_review_list<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -500,6 +600,12 @@ pub fn handle_review_list<G: GraphStore>(
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
 }
+
+pub const REVIEW_GET_DESC: &str = "\
+Fetch one review in full by ID: its decisions, notes, discussion threads, and reviewer \
+assignments together in a single response. Reach for it to see the complete state of a \
+review — where it stands, what's been said, what's unresolved — in one call rather than \
+piecing it together. Use kin_review_list first when you need to find the review ID.";
 
 pub fn handle_review_get<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
