@@ -2583,9 +2583,15 @@ fn count_supported_source_inputs(indexable_files: &[IndexableFile]) -> (usize, u
     let mut shallow_source_count = 0usize;
 
     for file in indexable_files {
-        match file.classification {
+        match &file.classification {
             FileClassification::EntitySource => entity_source_count += 1,
-            FileClassification::ShallowSyntax { .. } => shallow_source_count += 1,
+            // Only count shallow inputs a grammar can actually parse; ungrammared
+            // languages fall back to opaque artifacts and must not trip the abort.
+            FileClassification::ShallowSyntax { language_hint } => {
+                if kin_parser::get_shallow_grammar(language_hint.as_str()).is_some() {
+                    shallow_source_count += 1;
+                }
+            }
             FileClassification::StructuredArtifact(_)
             | FileClassification::OpaqueArtifact { .. } => {}
         }

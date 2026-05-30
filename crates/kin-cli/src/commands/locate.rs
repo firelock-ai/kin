@@ -1560,7 +1560,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // Broad entity resolution produces resolve signal for many files, but
     // the support filter (has_entity_resolve) treats them all equally.
     // Capping to the strongest files keeps precision tight.
-    let resolve_cap = locate_env_usize("KIN_LOCATE_RESOLVE_SUPPORT_CAP", 4);
+    let resolve_cap = locate_env_usize("KIN_LOCATE_RESOLVE_SUPPORT_CAP", 8);
     let resolve_strength_floor = locate_env_f32("KIN_LOCATE_RESOLVE_STRENGTH_FLOOR", 0.25);
     let top_resolve_score = resolved_hits
         .values()
@@ -1952,7 +1952,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 fv.snippet_score = signal_score(3);
                 fv.import_score = signal_score(4);
                 fv.error_score = signal_score(5);
-                fv.embedding_score = 0.0;
+                fv.embedding_score = signal_score(9);
                 fv.cochange_score = signal_score(6);
                 fv.projection_score = signal_score(7);
 
@@ -1976,7 +1976,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 fv.snippet_present = if fv.snippet_score > 0.0 { 1.0 } else { 0.0 };
                 fv.import_present = if fv.import_score > 0.0 { 1.0 } else { 0.0 };
                 fv.error_present = if fv.error_score > 0.0 { 1.0 } else { 0.0 };
-                fv.embedding_present = 0.0;
+                fv.embedding_present = if fv.embedding_score > 0.0 { 1.0 } else { 0.0 };
                 fv.cochange_present = if fv.cochange_score > 0.0 { 1.0 } else { 0.0 };
                 fv.projection_present = if fv.projection_score > 0.0 { 1.0 } else { 0.0 };
 
@@ -7802,6 +7802,15 @@ fn adaptive_cap(
     } else {
         fused.len().min(max_cluster)
     };
+    // L1: scan beyond the cluster window so corroborated cross-file candidates past
+    // the top cluster can still be admitted (released below), fixing under-retrieval.
+    let support_scan_limit = if max_files_explicit {
+        scan_limit
+    } else {
+        fused
+            .len()
+            .min(locate_env_usize("KIN_LOCATE_SUPPORT_SCAN_WINDOW", 40).max(max_cluster))
+    };
     for i in 1..scan_limit {
         let score = fused[i].1;
         let prev_score = fused[i - 1].1;
@@ -7837,7 +7846,8 @@ fn adaptive_cap(
     let support_floor_min = min_cluster.min(support_floor_limit.max(1));
     let support_floor_max = support_floor_limit.max(support_floor_min);
     let mut supported_indices: Vec<usize> = Vec::new();
-    for (i, (path, score)) in fused.iter().take(scan_limit).enumerate() {
+    let mut corroborated_indices: Vec<usize> = Vec::new();
+    for (i, (path, score)) in fused.iter().take(support_scan_limit).enumerate() {
         let has_entity_resolve = all_hits
             .get(7)
             .is_some_and(|er| er.contains_key(path.as_str()));
@@ -7847,11 +7857,13 @@ fn adaptive_cap(
                 .enumerate()
                 .any(|(idx, signal)| idx != 6 && idx != 7 && signal.contains_key(path.as_str()));
         let is_priority_retained = priority_retention_paths.contains(path.as_str());
-        let floor_pct = if cochange_seed_paths.contains(path) {
+        let is_cochange_seed = cochange_seed_paths.contains(path.as_str());
+        let multi_signal = signal_support_count(path, all_hits) >= signal_support_threshold;
+        let floor_pct = if is_cochange_seed {
             retention_floor_pct
         } else if has_corroborated_resolve {
             corroborated_resolve_floor_pct
-        } else if priority_retention_paths.contains(path.as_str()) {
+        } else if is_priority_retained {
             priority_retention_floor_pct
         } else {
             support_floor_pct
@@ -7859,12 +7871,14 @@ fn adaptive_cap(
         if !is_priority_retained && *score < top_score * floor_pct {
             continue;
         }
-        if has_entity_resolve
-            || signal_support_count(path, all_hits) >= signal_support_threshold
-            || priority_retention_paths.contains(path.as_str())
-            || cochange_seed_paths.contains(path.as_str())
-        {
+        if has_entity_resolve || multi_signal || is_priority_retained || is_cochange_seed {
             supported_indices.push(i);
+            // L1: only STRONGLY corroborated candidates may be admitted beyond the cluster
+            // cap — require 3+ independent signals (multi_signal) or a priority/cochange
+            // seed. A lone or doubly-signalled file on a flat query must not flood results.
+            if multi_signal || is_priority_retained || is_cochange_seed {
+                corroborated_indices.push(i);
+            }
         }
     }
     let support_floor = supported_indices
@@ -7878,16 +7892,21 @@ fn adaptive_cap(
     };
     let cap = cap.min(fused.len());
     let mut result: Vec<(String, f32)> = fused.iter().take(cap).cloned().collect();
-    let result_set: HashSet<String> = result.iter().map(|(p, _)| p.clone()).collect();
-    for &i in &supported_indices {
+    let mut result_set: HashSet<String> = result.iter().map(|(p, _)| p.clone()).collect();
+    // L1: release corroborated cross-file candidates that ranked beyond the cluster cap
+    // (previously only priority paths were re-admitted), bounded to avoid flooding.
+    let support_max_total = cap.saturating_add(locate_env_usize("KIN_LOCATE_SUPPORT_EXTRA", 3));
+    for &i in &corroborated_indices {
+        if result.len() >= support_max_total {
+            break;
+        }
         if i >= cap {
             let (ref path, _) = fused[i];
             if result_set.contains(path.as_str()) {
                 continue;
             }
-            if priority_retention_paths.contains(path.as_str()) {
-                result.push(fused[i].clone());
-            }
+            result_set.insert(path.clone());
+            result.push(fused[i].clone());
         }
     }
     if max_files_explicit && result.len() > max_files {
