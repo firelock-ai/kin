@@ -411,7 +411,7 @@ impl SnapshotManager {
                 cache_path.display()
             ))
         })?;
-        mmap::atomic_write_bytes(&cache_path, &bytes)
+        mmap::atomic_write_bytes_no_magic(&cache_path, &bytes)
     }
 
     #[cfg(feature = "vector")]

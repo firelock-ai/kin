@@ -12,8 +12,8 @@
 //! |----------|------|---------|
 //! | Main snapshot | `graph.kndb` | MessagePack-serialized GraphSnapshot |
 //! | Lock file | `graph.lock` | flock sentinel for exclusive process access |
-//! | Recovery candidate | `graph.tmp` | In-flight write; promoted to graph.kndb on success |
-//! | Recovery marker | `graph.tmp.meta` | SHA-256 + byte length of graph.tmp for crash validation |
+//! | Recovery candidate | `graph.kndb.tmp` | In-flight write; promoted to graph.kndb on success |
+//! | Recovery marker | `graph.kndb.tmp.meta` | SHA-256 + byte length of graph.kndb.tmp for crash validation |
 //!
 //! ## Persisted artifacts (StorageBackend/LocalFileBackend path):
 //!
@@ -213,8 +213,15 @@ fn crash_recovery_from_valid_tmp() {
         let snapshot = graph.to_snapshot();
         let bytes = snapshot.to_bytes().unwrap();
 
-        let tmp_path = path.with_extension("tmp");
-        let marker_path = path.with_extension("tmp.meta");
+        // Append the suffix to the full path (graph.kndb.tmp /
+        // graph.kndb.tmp.meta), matching the production recovery_tmp_path
+        // derivation so reopen recovery finds these files.
+        let mut tmp_name = std::ffi::OsString::from(path.as_os_str());
+        tmp_name.push(".tmp");
+        let tmp_path = std::path::PathBuf::from(tmp_name);
+        let mut marker_name = std::ffi::OsString::from(path.as_os_str());
+        marker_name.push(".tmp.meta");
+        let marker_path = std::path::PathBuf::from(marker_name);
 
         // Write tmp file.
         std::fs::write(&tmp_path, &bytes).unwrap();
@@ -251,8 +258,10 @@ fn crash_recovery_from_valid_tmp() {
 
     // The primary should now exist (promoted from .tmp).
     assert!(path.exists(), "primary snapshot should be restored");
+    let mut consumed_tmp = std::ffi::OsString::from(path.as_os_str());
+    consumed_tmp.push(".tmp");
     assert!(
-        !path.with_extension("tmp").exists(),
+        !std::path::PathBuf::from(consumed_tmp).exists(),
         "recovery .tmp should be consumed"
     );
 }

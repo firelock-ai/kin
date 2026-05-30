@@ -4,8 +4,9 @@
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::ffi::OsString;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::KinDbError;
@@ -20,12 +21,26 @@ struct RecoveryMarker {
     sha256: [u8; 32],
 }
 
+/// Append a suffix to `path` without disturbing its existing extension.
+///
+/// `with_extension` *replaces* the extension, so `graph.kndb` and
+/// `graph.kidx` would both collapse to `graph.tmp` and cross-contaminate
+/// during concurrent saves. Appending keeps the discriminating extension,
+/// so `graph.kndb` → `graph.kndb.tmp` and `graph.kidx` → `graph.kidx.tmp`
+/// stay provably disjoint. The result is deterministic so crash recovery
+/// can reconstruct the same name on reopen.
+fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = OsString::from(path.as_os_str());
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
 pub(crate) fn recovery_tmp_path(path: &Path) -> PathBuf {
-    path.with_extension("tmp")
+    append_suffix(path, ".tmp")
 }
 
 pub(crate) fn recovery_marker_path(path: &Path) -> PathBuf {
-    path.with_extension("tmp.meta")
+    append_suffix(path, ".tmp.meta")
 }
 
 fn write_bytes_and_fsync(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
@@ -150,7 +165,51 @@ pub(crate) fn load_recovery_candidate_with_persisted_root_hash(
     GraphSnapshot::from_bytes_with_persisted_root_hash(&bytes)
 }
 
+/// Read the leading 4 bytes of `path` and confirm they equal `expected`.
+///
+/// Run immediately after promoting a recovery candidate so a tmp file that
+/// somehow carried the wrong content (e.g. cross-contamination between the
+/// snapshot and read-index tmp files) fails loudly at write time instead of
+/// surfacing as a confusing "expected KNDB magic, got KIDX" at the next reopen.
+fn verify_destination_magic(path: &Path, expected: &[u8; 4]) -> Result<(), KinDbError> {
+    let mut file = File::open(path).map_err(|e| {
+        KinDbError::StorageError(format!(
+            "failed to reopen {} to verify magic: {e}",
+            path.display()
+        ))
+    })?;
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic).map_err(|e| {
+        KinDbError::StorageError(format!(
+            "failed to read magic from {}: {e}",
+            path.display()
+        ))
+    })?;
+    if &magic != expected {
+        return Err(KinDbError::StorageError(format!(
+            "promoted {} but magic {:?} does not match expected {:?}",
+            path.display(),
+            magic,
+            expected
+        )));
+    }
+    Ok(())
+}
+
+/// Promote the recovery candidate onto the primary path.
+///
+/// `expected_magic` is the leading 4 bytes the promoted file must carry. The
+/// KNDB snapshot path passes `Some(GraphSnapshot::MAGIC)` so cross-contaminated
+/// content fails loudly here; callers writing other on-disk formats through
+/// this primitive (e.g. the msgpack locate cache) pass `None`.
 pub(crate) fn promote_recovery_candidate(path: &Path) -> Result<(), KinDbError> {
+    promote_recovery_candidate_with_magic(path, Some(&GraphSnapshot::MAGIC))
+}
+
+pub(crate) fn promote_recovery_candidate_with_magic(
+    path: &Path,
+    expected_magic: Option<&[u8; 4]>,
+) -> Result<(), KinDbError> {
     let tmp_path = recovery_tmp_path(path);
     let marker_path = recovery_marker_path(path);
 
@@ -162,6 +221,10 @@ pub(crate) fn promote_recovery_candidate(path: &Path) -> Result<(), KinDbError> 
         ))
     })?;
     sync_parent_dir(path);
+
+    if let Some(expected) = expected_magic {
+        verify_destination_magic(path, expected)?;
+    }
 
     if marker_path.exists() {
         std::fs::remove_file(&marker_path).map_err(|e| {
@@ -282,10 +345,19 @@ pub fn atomic_write(path: &Path, snapshot: &GraphSnapshot) -> Result<(), KinDbEr
 }
 
 /// Like [`atomic_write`] but accepts pre-serialized bytes (from
-/// [`BorrowedGraphSnapshot::to_bytes`]).
+/// [`BorrowedGraphSnapshot::to_bytes`]). Asserts the promoted file carries the
+/// KNDB magic.
 pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
     write_recovery_candidate_bytes(path, bytes)?;
     promote_recovery_candidate(path)
+}
+
+/// Like [`atomic_write_bytes`] but for on-disk formats that do not carry the
+/// KNDB magic (e.g. the msgpack locate cache). Skips the post-promote magic
+/// assert while keeping the same crash-safe tmp/marker/rename sequence.
+pub(crate) fn atomic_write_bytes_no_magic(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
+    write_recovery_candidate_bytes(path, bytes)?;
+    promote_recovery_candidate_with_magic(path, None)
 }
 
 #[cfg(test)]
@@ -313,7 +385,7 @@ mod tests {
 
         atomic_write(&path, &snap).unwrap();
 
-        let tmp_path = path.with_extension("tmp");
+        let tmp_path = recovery_tmp_path(&path);
         std::fs::write(&tmp_path, b"partial write").unwrap();
 
         atomic_write(&path, &snap).unwrap();
@@ -368,5 +440,59 @@ mod tests {
 
         let err = load_recovery_candidate(&path).unwrap_err();
         assert!(err.to_string().contains("does not match marker"));
+    }
+
+    #[test]
+    fn recovery_tmp_paths_preserve_extension() {
+        let snapshot = Path::new("/repo/kindb/graph.kndb");
+        assert_eq!(
+            recovery_tmp_path(snapshot),
+            PathBuf::from("/repo/kindb/graph.kndb.tmp")
+        );
+        assert_eq!(
+            recovery_marker_path(snapshot),
+            PathBuf::from("/repo/kindb/graph.kndb.tmp.meta")
+        );
+    }
+
+    #[test]
+    fn snapshot_and_index_tmp_paths_are_disjoint() {
+        // Sibling artifacts in the same dir: the snapshot (graph.kndb) and the
+        // read-index (graph.kidx). Before the fix both derived `graph.tmp` via
+        // `with_extension` and cross-contaminated. Appending the suffix keeps
+        // the discriminating extension, so the tmp paths are provably disjoint.
+        let dir = Path::new("/repo/kindb");
+        let snapshot_tmp = recovery_tmp_path(&dir.join("graph.kndb"));
+        let index_tmp = append_suffix(&dir.join("graph.kidx"), ".tmp");
+
+        assert_ne!(snapshot_tmp, index_tmp);
+        assert_eq!(snapshot_tmp, PathBuf::from("/repo/kindb/graph.kndb.tmp"));
+        assert_eq!(index_tmp, PathBuf::from("/repo/kindb/graph.kidx.tmp"));
+    }
+
+    #[test]
+    fn promote_rejects_wrong_magic() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_owned();
+
+        // Write a tmp + marker whose body has the wrong magic (KIDX, the
+        // read-index magic) so the promoted file would not be a valid KNDB
+        // snapshot. The post-rename magic check must fail loudly.
+        let bytes = b"KIDX not actually a snapshot".to_vec();
+        let tmp_path = recovery_tmp_path(&path);
+        let marker_path = recovery_marker_path(&path);
+        let marker = RecoveryMarker {
+            version: RECOVERY_MARKER_VERSION,
+            byte_len: bytes.len() as u64,
+            sha256: Sha256::digest(&bytes).into(),
+        };
+        std::fs::write(&tmp_path, &bytes).unwrap();
+        std::fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+
+        let err = promote_recovery_candidate(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("does not match expected"),
+            "expected a magic-mismatch error, got: {err}"
+        );
     }
 }

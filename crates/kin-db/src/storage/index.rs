@@ -185,7 +185,15 @@ impl ReadIndex {
         let checksum = Sha256::digest(&buf);
         buf.extend_from_slice(&checksum);
 
-        let tmp = path.with_extension("tmp");
+        // Append ".tmp" to the full path instead of replacing the extension.
+        // `with_extension("tmp")` would collapse graph.kidx to graph.tmp, which
+        // collides with the snapshot's recovery tmp and cross-contaminates the
+        // two files. Appending keeps the discriminating extension so the index
+        // tmp (graph.kidx.tmp) stays disjoint from the snapshot tmp
+        // (graph.kndb.tmp).
+        let mut tmp_name = std::ffi::OsString::from(path.as_os_str());
+        tmp_name.push(".tmp");
+        let tmp = std::path::PathBuf::from(tmp_name);
         {
             let mut file = File::create(&tmp)
                 .map_err(|e| KinDbError::StorageError(format!("write failed: {e}")))?;
@@ -197,6 +205,25 @@ impl ReadIndex {
 
         std::fs::rename(&tmp, path)
             .map_err(|e| KinDbError::StorageError(format!("rename failed: {e}")))?;
+
+        // Defense-in-depth: confirm the promoted file leads with KIDX so a bad
+        // promote fails loudly here rather than as a confusing magic error on
+        // the next load.
+        {
+            use std::io::Read;
+            let mut promoted = File::open(path)
+                .map_err(|e| KinDbError::StorageError(format!("reopen failed: {e}")))?;
+            let mut magic = [0u8; 4];
+            promoted
+                .read_exact(&mut magic)
+                .map_err(|e| KinDbError::StorageError(format!("magic read failed: {e}")))?;
+            if magic != INDEX_MAGIC {
+                return Err(KinDbError::StorageError(format!(
+                    "promoted index {} has magic {magic:?}, expected KIDX",
+                    path.display()
+                )));
+            }
+        }
 
         // fsync the parent directory so the rename is durable
         if let Some(parent) = path.parent() {
@@ -377,5 +404,32 @@ mod tests {
             Some(&1),
         );
         assert_eq!(index.language_counts.get(&(LanguageId::Go as u8)), Some(&1),);
+    }
+
+    #[test]
+    fn save_uses_append_suffix_tmp_and_round_trips() {
+        let graph = InMemoryGraph::new();
+        graph
+            .upsert_entity(&make_entity("parseRust", LanguageId::Rust, "src/lib.rs"))
+            .unwrap();
+        let index = ReadIndex::from_graph(&graph).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph.kidx");
+
+        index.save(&path).unwrap();
+
+        // The promoted index exists; the tmp is consumed and was named with the
+        // extension preserved (graph.kidx.tmp), provably disjoint from the
+        // snapshot's graph.kndb.tmp.
+        assert!(path.exists());
+        let mut tmp_name = std::ffi::OsString::from(path.as_os_str());
+        tmp_name.push(".tmp");
+        let tmp = std::path::PathBuf::from(tmp_name);
+        assert!(!tmp.exists(), "index tmp should be consumed after promote");
+        assert_eq!(tmp, dir.path().join("graph.kidx.tmp"));
+
+        let loaded = ReadIndex::load(&path).unwrap();
+        assert_eq!(loaded.entity_count, 1);
     }
 }
