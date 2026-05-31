@@ -614,16 +614,25 @@ impl<Id: DocId> TextIndex<Id> {
             }
         }
 
-        // Sort by score descending, take top `limit`
-        let mut results: Vec<(Id, f32)> = scores.into_iter().collect();
-        results.sort_by(|a, b| {
-            let a_score = if a.1.is_nan() { 0.0 } else { a.1 };
-            let b_score = if b.1.is_nan() { 0.0 } else { b.1 };
+        // Sort by score descending, then by a stable id tie-break so results are
+        // deterministic regardless of the HashMap's process-randomized iteration
+        // order (otherwise tied scores at the `truncate(limit)` cutoff vary run to
+        // run). DocId guarantees Debug but not Ord, so tie-break on the Debug repr,
+        // precomputed once to keep the comparator allocation-free.
+        let mut keyed: Vec<(String, Id, f32)> = scores
+            .into_iter()
+            .map(|(id, score)| (format!("{id:?}"), id, score))
+            .collect();
+        keyed.sort_by(|a, b| {
+            let a_score = if a.2.is_nan() { 0.0 } else { a.2 };
+            let b_score = if b.2.is_nan() { 0.0 } else { b.2 };
             b_score
                 .partial_cmp(&a_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
         });
-        results.truncate(limit);
+        keyed.truncate(limit);
+        let results: Vec<(Id, f32)> = keyed.into_iter().map(|(_, id, s)| (id, s)).collect();
 
         Ok(results)
     }
