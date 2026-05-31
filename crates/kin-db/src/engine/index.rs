@@ -132,18 +132,24 @@ impl IndexSet {
 
         if let Some(suffix) = pat.strip_prefix('*') {
             // *suffix — names ending with suffix
-            self.name
+            let mut ids: Vec<EntityId> = self
+                .name
                 .par_iter()
                 .filter(|(k, _)| k.ends_with(suffix))
                 .flat_map(|(_, ids)| ids.par_iter().copied())
-                .collect()
+                .collect();
+            ids.sort_unstable_by_key(|id| id.0);
+            ids
         } else if let Some(prefix) = pat.strip_suffix('*') {
             // prefix* — names starting with prefix
-            self.name
+            let mut ids: Vec<EntityId> = self
+                .name
                 .par_iter()
                 .filter(|(k, _)| k.starts_with(prefix))
                 .flat_map(|(_, ids)| ids.par_iter().copied())
-                .collect()
+                .collect();
+            ids.sort_unstable_by_key(|id| id.0);
+            ids
         } else {
             let mut ranked = Vec::new();
             let mut seen = HashSet::new();
@@ -163,11 +169,14 @@ impl IndexSet {
             }
 
             // Fallback: substring / contains match (matches KuzuDB CONTAINS behavior)
-            self.name
+            let mut ids: Vec<EntityId> = self
+                .name
                 .par_iter()
                 .filter(|(k, _)| k.contains(&*pat))
                 .flat_map(|(_, ids)| ids.par_iter().copied())
-                .collect()
+                .collect();
+            ids.sort_unstable_by_key(|id| id.0);
+            ids
         }
     }
 }

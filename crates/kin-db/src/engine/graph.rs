@@ -3434,7 +3434,7 @@ impl EntityStore for InMemoryGraph {
             ent.entities.keys().copied().collect()
         };
 
-        let results: Vec<Entity> = candidate_ids
+        let mut results: Vec<Entity> = candidate_ids
             .par_iter()
             .filter_map(|eid| {
                 ent.entities.get(eid).and_then(|entity| {
@@ -3447,6 +3447,7 @@ impl EntityStore for InMemoryGraph {
             })
             .collect();
 
+        results.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(results)
     }
 
