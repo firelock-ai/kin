@@ -10002,6 +10002,63 @@ fn entity_span_pair(entity: &kin_model::Entity) -> Vec<[u32; 2]> {
         .unwrap_or_default()
 }
 
+/// Graph-truth precision cap for a file's `explain` lines. The ContextBench
+/// scorer derives a file's predicted SYMBOL set from these lines, so emitting
+/// every entity that merely touched a file (hub files accrue dozens of seeds and
+/// graph-walk neighbors) collapses symbol/line precision. Keep only the top-K
+/// lines by their embedded `(score N.N, ...)` value — report the definitions Kin
+/// is most confident about, not everything it walked. A floor additionally drops
+/// scoreless lines (the noisiest graph-walk `via` neighbors) once the threshold
+/// is exceeded. `KIN_LOCATE_EXPLAIN_DEF_TOPK=0` (default) preserves the previous
+/// uncapped behavior, so this is a no-op unless explicitly enabled.
+fn explain_line_score(reason: &str) -> f32 {
+    if let Some(idx) = reason.find("(score ") {
+        let rest = &reason[idx + 7..];
+        let end = rest
+            .find(|c: char| c == ',' || c == ')')
+            .unwrap_or(rest.len());
+        return rest[..end].trim().parse::<f32>().unwrap_or(-1.0);
+    }
+    -1.0
+}
+
+fn cap_explain_lines_by_score(reasons: Vec<String>) -> Vec<String> {
+    let topk = locate_env_usize("KIN_LOCATE_EXPLAIN_DEF_TOPK", 0);
+    let floor_pct = locate_env_f32("KIN_LOCATE_EXPLAIN_DEF_FLOOR_PCT", 0.0);
+    if (topk == 0 && floor_pct <= 0.0) || reasons.len() <= 1 {
+        return reasons;
+    }
+    let mut indexed: Vec<(usize, f32, String)> = reasons
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let s = explain_line_score(&r);
+            (i, s, r)
+        })
+        .collect();
+    indexed.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let top_score = indexed.first().map(|x| x.1).unwrap_or(0.0);
+    let floor = if floor_pct > 0.0 && top_score > 0.0 {
+        top_score * floor_pct
+    } else {
+        f32::NEG_INFINITY
+    };
+    let limit = if topk == 0 { indexed.len() } else { topk };
+    let mut kept: Vec<(usize, String)> = indexed
+        .into_iter()
+        .take(limit)
+        .filter(|(_, s, _)| *s >= floor)
+        .map(|(i, _, r)| (i, r))
+        .collect();
+    // Restore original emission order so downstream parsing is stable.
+    kept.sort_by_key(|(i, _)| *i);
+    kept.into_iter().map(|(_, r)| r).collect()
+}
+
 fn collect_signals_for_file(file: &str, all_hits: &[HashMap<String, Vec<FileHit>>]) -> Vec<String> {
     let mut signals = Vec::new();
     let signal_names = [
@@ -10049,7 +10106,7 @@ fn collect_explain_for_file(
     all_hits: &[HashMap<String, Vec<FileHit>>],
 ) -> Vec<String> {
     if let Some(reasons) = projection_explain.get(file) {
-        return reasons.clone();
+        return cap_explain_lines_by_score(reasons.clone());
     }
     let signals = collect_signals_for_file(file, all_hits);
     if signals.is_empty() {
