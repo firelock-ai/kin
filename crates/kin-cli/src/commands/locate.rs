@@ -6,10 +6,17 @@ use kin_model::{
     ChangeStore, EntityFilter, EntityKind, EntityRole, EntityStore, GraphNodeId, RelationKind,
     SemanticChangeId,
 };
+use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasherDefault;
 
 use crate::capability::LocateProfile;
+
+/// Deterministic-iteration map for transient locate accumulators. Fixed-seed
+/// hashing keeps fusion/resolution iteration order stable across processes so
+/// float score accumulation and tie-breaks are bit-reproducible.
+type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 // ---------------------------------------------------------------------------
 // JSON output types
@@ -7119,12 +7126,12 @@ fn resolve_entities_to_files(
     // These are normalized independently then blended so that graph traversal
     // (which inflates hub files via many paths) cannot drown direct attribution
     // (which tells us the entity IS in this specific file).
-    let mut direct_scores: HashMap<String, f32> = HashMap::new();
-    let mut graph_scores: HashMap<String, f32> = HashMap::new();
+    let mut direct_scores: FxHashMap<String, f32> = FxHashMap::default();
+    let mut graph_scores: FxHashMap<String, f32> = FxHashMap::default();
     let mut file_explain: HashMap<String, Vec<String>> = HashMap::new();
     let mut file_signal_scores: HashMap<String, HashMap<String, f32>> = HashMap::new();
-    let mut file_entity_counts: HashMap<String, usize> = HashMap::new();
-    let mut direct_entity_counts: HashMap<String, usize> = HashMap::new();
+    let mut file_entity_counts: FxHashMap<String, usize> = FxHashMap::default();
+    let mut direct_entity_counts: FxHashMap<String, usize> = FxHashMap::default();
 
     // Sort seeds by score descending, then use greedy gap detection to find the
     // natural cluster boundary between relevant entities and noise.
@@ -7133,6 +7140,7 @@ fn resolve_entities_to_files(
         b.1.score
             .partial_cmp(&a.1.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(b.0))
     });
 
     // Hard cap to prevent runaway processing, but the gap detection will usually cut sooner.
@@ -7464,7 +7472,7 @@ fn resolve_entities_to_files(
         .chain(graph_scores.keys())
         .cloned()
         .collect();
-    let mut file_scores: HashMap<String, f32> = HashMap::new();
+    let mut file_scores: FxHashMap<String, f32> = FxHashMap::default();
     for path in all_files {
         let direct_norm = direct_scores.get(&path).copied().unwrap_or(0.0) / direct_max;
         let graph_norm = graph_scores.get(&path).copied().unwrap_or(0.0) / graph_max;
@@ -7513,14 +7521,14 @@ fn reciprocal_rank_fusion(ranked_lists: &[Vec<(String, f32)>], k: f32) -> Vec<(S
         k = k as f64
     )
     .entered();
-    let mut rrf_scores: HashMap<String, f32> = HashMap::new();
-    let mut raw_scores: HashMap<String, f32> = HashMap::new();
-    let mut signal_counts: HashMap<String, usize> = HashMap::new();
+    let mut rrf_scores: FxHashMap<String, f32> = FxHashMap::default();
+    let mut raw_scores: FxHashMap<String, f32> = FxHashMap::default();
+    let mut signal_counts: FxHashMap<String, usize> = FxHashMap::default();
 
     // Track which graph-structural signal indices each file appears in.
     // multihop=1, tests=2, imports=4, cochange=6.
     let graph_signal_indices: HashSet<usize> = [1, 2, 4, 6].iter().copied().collect();
-    let mut graph_signal_counts: HashMap<String, usize> = HashMap::new();
+    let mut graph_signal_counts: FxHashMap<String, usize> = FxHashMap::default();
 
     for (list_idx, list) in ranked_lists.iter().enumerate() {
         // Compute max score in this list for normalization
@@ -7547,7 +7555,7 @@ fn reciprocal_rank_fusion(ranked_lists: &[Vec<(String, f32)>], k: f32) -> Vec<(S
     }
 
     // Combine: RRF + normalized raw scores + cross-signal bonus + graph tiebreaker
-    let mut combined: HashMap<String, f32> = HashMap::new();
+    let mut combined: FxHashMap<String, f32> = FxHashMap::default();
     for (file, rrf) in &rrf_scores {
         let raw = raw_scores.get(file).copied().unwrap_or(0.0);
         let signals = signal_counts.get(file).copied().unwrap_or(0) as f32;
@@ -7583,8 +7591,11 @@ fn aggregate_entity_seed_file_support(
     graph: &kin_db::InMemoryGraph,
 ) -> Result<HashMap<String, f32>> {
     let mut file_scores: HashMap<String, f32> = HashMap::new();
-    for (&entity_id, discovery) in entity_seeds {
-        let Some(entity) = graph.get_entity(&entity_id)? else {
+    let mut ordered_seeds: Vec<(&kin_model::EntityId, &EntityDiscovery)> =
+        entity_seeds.iter().collect();
+    ordered_seeds.sort_by(|a, b| a.0.cmp(b.0));
+    for (entity_id, discovery) in ordered_seeds {
+        let Some(entity) = graph.get_entity(entity_id)? else {
             continue;
         };
         let Some(file_origin) = entity.file_origin.as_ref() else {
