@@ -588,27 +588,37 @@ impl<Id: DocId> TextIndex<Id> {
             }
 
             // Substring match: query token is a substring of an indexed token
-            // (or vice versa) — with minimum 3-char tokens for substring matching
+            // (or vice versa) — with minimum 3-char tokens for substring matching.
+            // Iterate matching tokens in sorted order: `index` is a HashMap with
+            // process-randomized iteration, and the per-entity score below is a
+            // float `+=` accumulation. Float addition is non-associative, so an
+            // unordered walk yields low-bit-different scores run to run, which
+            // turns genuine ties into spurious orderings and makes the downstream
+            // `truncate(limit)` keep different docs each run. Sorting the matched
+            // tokens makes the accumulation order — and the result — deterministic.
             if qt.len() >= 3 {
-                for (indexed_token, postings) in index.iter() {
-                    if indexed_token == qt {
-                        continue; // already handled above
-                    }
-                    if indexed_token.len() < 3 {
-                        continue; // skip very short tokens for substring matching
-                    }
-                    if indexed_token.contains(qt.as_str()) || qt.contains(indexed_token.as_str()) {
-                        let df = postings.len() as f32;
-                        let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln().max(0.0);
-                        let substring_penalty = 0.5;
-                        for (eid, weight) in postings {
-                            let dl = docs.get(eid).map(|d| d.doc_length as f32).unwrap_or(avgdl);
-                            let tf = *weight;
-                            let tf_saturated = (tf * (BM25_K1 + 1.0))
-                                / (tf + BM25_K1 * (1.0 - BM25_B + BM25_B * dl / avgdl));
-                            *scores.entry(*eid).or_insert(0.0) +=
-                                idf * tf_saturated * substring_penalty;
-                        }
+                let mut matched_tokens: Vec<&String> = index
+                    .keys()
+                    .filter(|indexed_token| {
+                        indexed_token.as_str() != qt.as_str()
+                            && indexed_token.len() >= 3
+                            && (indexed_token.contains(qt.as_str())
+                                || qt.contains(indexed_token.as_str()))
+                    })
+                    .collect();
+                matched_tokens.sort_unstable();
+                for indexed_token in matched_tokens {
+                    let postings = &index[indexed_token];
+                    let df = postings.len() as f32;
+                    let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln().max(0.0);
+                    let substring_penalty = 0.5;
+                    for (eid, weight) in postings {
+                        let dl = docs.get(eid).map(|d| d.doc_length as f32).unwrap_or(avgdl);
+                        let tf = *weight;
+                        let tf_saturated = (tf * (BM25_K1 + 1.0))
+                            / (tf + BM25_K1 * (1.0 - BM25_B + BM25_B * dl / avgdl));
+                        *scores.entry(*eid).or_insert(0.0) +=
+                            idf * tf_saturated * substring_penalty;
                     }
                 }
             }
