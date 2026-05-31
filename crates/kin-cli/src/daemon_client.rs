@@ -1134,11 +1134,16 @@ fn find_daemon_binary() -> Result<PathBuf> {
     bail!("kin-daemon binary is stale or incompatible; rebuild kin-daemon. Checked: {checked}")
 }
 
+/// Readiness wait for a freshly spawned per-repo daemon. Large repositories take
+/// far longer than a few seconds to load their graph into memory before `/readiness`
+/// succeeds, so this cap is generous: a *dead* daemon is detected immediately by
+/// `child.try_wait()` in `wait_for_daemon_ready`, leaving this to bound patience only
+/// for a live daemon that is still loading. Override with KIN_DAEMON_READY_TIMEOUT_SECS.
 fn daemon_ready_timeout_secs() -> u64 {
     std::env::var("KIN_DAEMON_READY_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(15)
+        .unwrap_or(300)
 }
 
 fn default_idle_timeout_secs() -> &'static str {
