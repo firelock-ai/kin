@@ -7,7 +7,7 @@
 //! ranking logic. It produces [`RetrievalCandidate`] structs with raw scores
 //! from each dimension; kin-search combines these into a final ranking.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::engine::InMemoryGraph;
 use crate::error::KinDbError;
@@ -81,7 +81,7 @@ pub fn unified_retrieve(
     #[cfg(feature = "vector")] vector_index: Option<&VectorIndex>,
     query: &RetrievalQuery,
 ) -> Result<Vec<RetrievalCandidate>, KinDbError> {
-    let mut candidates: HashMap<RetrievalKey, RetrievalCandidate> = HashMap::new();
+    let mut candidates: FxHashMap<RetrievalKey, RetrievalCandidate> = FxHashMap::default();
 
     // Dimension 1: Lexical (tantivy full-text search)
     if let (Some(text_query), Some(ti)) = (&query.text_query, text_index) {
@@ -149,16 +149,17 @@ pub fn unified_retrieve(
         }
     }
 
-    Ok(candidates.into_values().collect())
+    let mut out: Vec<RetrievalCandidate> = candidates.into_values().collect();
+    out.sort_by(|a, b| a.retrieval_key.cmp(&b.retrieval_key));
+    Ok(out)
 }
 
 /// BFS from an anchor entity over an expanded subgraph, returning
 /// `(entity_id, hop_count)` pairs.
 fn bfs_hop_distances(anchor: &EntityId, neighborhood: &SubGraph) -> Vec<(EntityId, u32)> {
-    use std::collections::{HashSet, VecDeque};
+    use std::collections::VecDeque;
 
-    let mut adjacency: std::collections::HashMap<EntityId, Vec<EntityId>> =
-        std::collections::HashMap::new();
+    let mut adjacency: FxHashMap<EntityId, Vec<EntityId>> = FxHashMap::default();
     for relation in &neighborhood.relations {
         let (Some(src), Some(dst)) = (relation.src.as_entity(), relation.dst.as_entity()) else {
             continue;
@@ -167,7 +168,7 @@ fn bfs_hop_distances(anchor: &EntityId, neighborhood: &SubGraph) -> Vec<(EntityI
         adjacency.entry(dst).or_default().push(src);
     }
 
-    let mut visited = HashSet::new();
+    let mut visited = rustc_hash::FxHashSet::default();
     let mut queue = VecDeque::new();
     let mut results = Vec::new();
 

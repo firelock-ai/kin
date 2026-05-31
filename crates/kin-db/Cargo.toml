@@ -36,6 +36,7 @@ serde_json = "1"
 thiserror = "2"
 parking_lot = "0.12"
 hashbrown = { version = "0.15", features = ["serde", "rayon"] }
+rustc-hash = "1.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
