@@ -42,8 +42,14 @@ impl ExtractedEntity {
                 serde_json::Value::String(preview),
             );
         }
+        let entity_id = EntityId::from_content(
+            &file_id.0,
+            &self.name,
+            &format!("{:?}", self.kind),
+            self.span.start_line,
+        );
         Entity {
-            id: EntityId::new(),
+            id: entity_id,
             kind: self.kind,
             name: self.name,
             language,

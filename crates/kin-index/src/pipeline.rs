@@ -771,7 +771,11 @@ fn resolve_relations(
             (Some(s), Some(d)) => {
                 // Same-file relation: fully resolved
                 resolved.push(Relation {
-                    id: RelationId::new(),
+                    id: RelationId::from_content(
+                        &s.id.0.to_string(),
+                        &d.id.0.to_string(),
+                        &format!("{:?}", rel.kind),
+                    ),
                     kind: rel.kind,
                     src: kin_model::GraphNodeId::Entity(s.id),
                     dst: kin_model::GraphNodeId::Entity(d.id),
