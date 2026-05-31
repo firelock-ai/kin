@@ -263,6 +263,26 @@ impl<Id: DocId> TextIndex<Id> {
         self.docs.read().contains_key(doc_id)
     }
 
+    /// Document frequency of a query `term`: the number of committed documents
+    /// containing the term's RAREST token. This is exactly the per-token posting
+    /// count BM25 search uses to compute IDF (see [`fuzzy_search`](Self::fuzzy_search)),
+    /// exposed so callers can derive a term-discrimination weight WITHOUT
+    /// re-implementing IDF. A multi-token identifier (e.g. `depthwise_conv` ->
+    /// `[depthwise, conv]`) is only as specific as its rarest token, so we take
+    /// the minimum across tokens. Returns 0 when no token of the term is indexed
+    /// (the caller treats 0 as "unknown" and falls back to its default weight).
+    pub fn doc_frequency(&self, term: &str) -> usize {
+        let index = self.index.read();
+        let mut min_df: Option<usize> = None;
+        for tok in tokenize(term) {
+            if let Some(postings) = index.get(&tok) {
+                let df = postings.len();
+                min_df = Some(min_df.map_or(df, |m| m.min(df)));
+            }
+        }
+        min_df.unwrap_or(0)
+    }
+
     fn with_path(path: Option<PathBuf>) -> Self {
         Self {
             index: RwLock::new(HashMap::new()),
