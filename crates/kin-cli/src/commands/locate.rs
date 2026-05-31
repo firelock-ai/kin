@@ -2912,7 +2912,25 @@ fn extract_priority_file_traces(
 
             // Only use if specific (<=3 unique files)
             if !unique_files.is_empty() && unique_files.len() <= 3 {
-                let score = if *is_title { 50.0 } else { 30.0 };
+                // Term-discrimination: a generic high-document-frequency word
+                // (e.g. "backend", present in ~8% of docs) must not get the same
+                // flat priority as a rare discriminating identifier (e.g.
+                // "depthwise_conv"). Reuse the text index's BM25 document
+                // frequency — no new IDF implementation. Terms in <= COMMON_FRAC
+                // of the corpus keep full weight; commoner terms decay inversely
+                // so hub-name words stop force-injecting their __init__/config
+                // files over the true edit sites.
+                let base = if *is_title { 50.0 } else { 30.0 };
+                let df = graph.text_doc_frequency(leaf);
+                let n = graph.text_document_count();
+                let score = if df > 0 && n > 0 {
+                    let common_frac = locate_env_f32("KIN_LOCATE_PRIORITY_COMMON_FRAC", 0.02);
+                    let common = (common_frac * n as f32).max(1.0);
+                    let weight = (common / df as f32).min(1.0);
+                    base * weight
+                } else {
+                    base
+                };
                 for path in &unique_files {
                     if !is_test_path(path) {
                         let detail = if *is_title {
@@ -6092,9 +6110,14 @@ fn extract_source_text_signals(
         for (rank, (retrieval_key, _score)) in
             graph.text_search(&term, hit_limit)?.into_iter().enumerate()
         {
-            let kin_db::RetrievalKey::Artifact(_) = retrieval_key else {
-                continue;
-            };
+            // Accept both Artifact and Entity hits. Entity-typed hits carry the
+            // BM25-IDF signal for a discriminating term that names a function/class
+            // (e.g. `depthwise_conv`): discarding them dropped the one signal that
+            // already down-weights common words and surfaces the true edit sites,
+            // leaving only the flat-scored entity_name_exact priority path (which
+            // favors generic hub files). file_path_from_retrieval_key resolves both
+            // key kinds, and the source_paths / source-contains guards below still
+            // bound which files are admitted.
             let Some(path) = file_path_from_retrieval_key(graph, &retrieval_key) else {
                 continue;
             };
