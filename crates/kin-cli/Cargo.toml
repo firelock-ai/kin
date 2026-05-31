@@ -68,6 +68,7 @@ regex = "1"
 tar = "0.4"
 zip = "2"
 rayon = { workspace = true }
+rustc-hash = "1.1"
 sysinfo = "0.38"
 kin-spine = { version = "0.1.0", path = "../kin-spine" }
 
