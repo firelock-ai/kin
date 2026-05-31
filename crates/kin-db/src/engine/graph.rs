@@ -1752,6 +1752,25 @@ impl InMemoryGraph {
         }
     }
 
+    /// Document frequency of `term` in the text index (its rarest token's
+    /// posting count), for IDF-style term-discrimination weighting by callers.
+    /// Returns 0 when there is no text index or the term is unindexed.
+    pub fn text_doc_frequency(&self, term: &str) -> usize {
+        match self.text_index {
+            Some(ref ti) => ti.doc_frequency(term),
+            None => 0,
+        }
+    }
+
+    /// Number of documents currently visible to text search (the N for IDF).
+    /// Returns 0 when there is no text index.
+    pub fn text_document_count(&self) -> usize {
+        match self.text_index {
+            Some(ref ti) => ti.live_document_count(),
+            None => 0,
+        }
+    }
+
     pub fn resolve_retrieval_key(&self, key: &RetrievalKey) -> Option<ResolvedRetrievalItem> {
         let ent = self.entities.read();
         match key {

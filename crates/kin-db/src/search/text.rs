@@ -201,6 +201,12 @@ impl TextIndex {
             .map_err(|e| KinDbError::IndexError(e.to_string()))
     }
 
+    /// Document frequency of a term (its rarest token's posting count) — the
+    /// same value BM25 uses for IDF, exposed for term-discrimination weighting.
+    pub fn doc_frequency(&self, term: &str) -> usize {
+        self.inner.doc_frequency(term)
+    }
+
     /// Search across entity names, signatures, and file paths.
     ///
     /// Returns up to `limit` matching retrieval keys with their relevance
