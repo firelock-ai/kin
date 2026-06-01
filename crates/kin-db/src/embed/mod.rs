@@ -42,6 +42,13 @@ use kin_model::{
 /// down enough for repo-scale indexing to stay practical on developer
 /// machines.
 const DEFAULT_MODEL_ID: &str = "BAAI/bge-small-en-v1.5";
+/// Asymmetric query instruction for SweRankEmbed / nomic_bert code retrievers.
+///
+/// SweRankEmbed-Small prepends this exact string (trailing space included) to
+/// queries and encodes documents raw. BGE stays symmetric, so this only fires
+/// when the loaded model reports a nomic_bert architecture.
+#[cfg(feature = "embeddings")]
+const SWERANK_QUERY_PREFIX: &str = "Represent this query for searching relevant code: ";
 #[cfg(feature = "embeddings")]
 const DEFAULT_LMSTUDIO_EMBED_MODEL_ID: &str = "text-embedding-nomic-embed-text-v1.5";
 #[cfg(feature = "embeddings")]
@@ -58,7 +65,7 @@ const METAL_MAX_BATCH_TOKENS: usize = 16_384;
 #[cfg(feature = "embeddings")]
 const EMBEDDING_CACHE_SCHEMA_VERSION: &str = "v2";
 #[cfg(feature = "embeddings")]
-const EMBEDDING_CACHE_PIPELINE_EPOCH: &str = "embed-pipeline-2026-03-28";
+const EMBEDDING_CACHE_PIPELINE_EPOCH: &str = "embed-pipeline-2026-05-31-swerank";
 pub const EMBEDDING_BODY_PREVIEW_KEY: &str = "embedding_body_preview";
 const FILE_IMPORT_CONTEXT_KEY: &str = "file_import_context";
 const FILE_SURFACE_CONTEXT_KEY: &str = "file_surface_context";
@@ -107,6 +114,9 @@ struct BertEmbedder {
     #[cfg(feature = "embeddings")]
     cpu_model_source: std::sync::Mutex<Option<CpuModelSource>>,
     tokenizer: Tokenizer,
+    /// Instruction prepended to queries for asymmetric retrievers (SweRank /
+    /// nomic_bert). Empty for symmetric models like BGE.
+    query_prefix: String,
 }
 
 #[cfg(feature = "embeddings")]
@@ -191,21 +201,31 @@ impl CodeEmbedder {
             revision = %revision
         )
         .entered();
-        let repo = Repo::with_revision(model_id.to_string(), RepoType::Model, revision.to_string());
-        let api = Api::new().map_err(|e| {
-            KinDbError::IndexError(format!("failed to initialise HuggingFace API: {e}"))
-        })?;
-        let api = api.repo(repo);
+        let (config_path, tokenizer_path, weights_path) =
+            if let Some(dir) = local_model_dir(model_id) {
+                resolve_local_model_artifacts(&dir)?
+            } else {
+                let repo = Repo::with_revision(
+                    model_id.to_string(),
+                    RepoType::Model,
+                    revision.to_string(),
+                );
+                let api = Api::new().map_err(|e| {
+                    KinDbError::IndexError(format!("failed to initialise HuggingFace API: {e}"))
+                })?;
+                let api = api.repo(repo);
 
-        let config_path = api
-            .get("config.json")
-            .map_err(|e| KinDbError::IndexError(format!("failed to download model config: {e}")))?;
-        let tokenizer_path = api
-            .get("tokenizer.json")
-            .map_err(|e| KinDbError::IndexError(format!("failed to download tokenizer: {e}")))?;
-        let weights_path = api.get("model.safetensors").map_err(|e| {
-            KinDbError::IndexError(format!("failed to download model weights: {e}"))
-        })?;
+                let config_path = api.get("config.json").map_err(|e| {
+                    KinDbError::IndexError(format!("failed to download model config: {e}"))
+                })?;
+                let tokenizer_path = api.get("tokenizer.json").map_err(|e| {
+                    KinDbError::IndexError(format!("failed to download tokenizer: {e}"))
+                })?;
+                let weights_path = api.get("model.safetensors").map_err(|e| {
+                    KinDbError::IndexError(format!("failed to download model weights: {e}"))
+                })?;
+                (config_path, tokenizer_path, weights_path)
+            };
 
         let config_data = std::fs::read_to_string(&config_path)
             .map_err(|e| KinDbError::IndexError(format!("failed to read config: {e}")))?;
@@ -213,6 +233,7 @@ impl CodeEmbedder {
             .map_err(|e| KinDbError::IndexError(format!("failed to parse model config: {e}")))?;
 
         let dimensions = config.hidden_size;
+        let query_prefix = local_query_prefix(config.model_type.as_deref());
 
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| KinDbError::IndexError(format!("failed to load tokenizer: {e}")))?;
@@ -261,6 +282,7 @@ impl CodeEmbedder {
                 config_json: config_data,
             })),
             tokenizer,
+            query_prefix,
         };
 
         Ok(Self {
@@ -440,7 +462,7 @@ impl CodeEmbedder {
     #[cfg(feature = "embeddings")]
     fn prepare_inputs(&self, texts: &[String], role: EmbeddingInputRole) -> Vec<String> {
         match &self.backend {
-            CodeEmbedderBackend::Bert(_) => texts.to_vec(),
+            CodeEmbedderBackend::Bert(embedder) => embedder.prepare_inputs(texts, role),
             CodeEmbedderBackend::OpenAiCompat(embedder) => embedder.prepare_inputs(texts, role),
         }
     }
@@ -470,6 +492,16 @@ impl CodeEmbedder {
 
 #[cfg(feature = "embeddings")]
 impl BertEmbedder {
+    fn prepare_inputs(&self, texts: &[String], role: EmbeddingInputRole) -> Vec<String> {
+        if self.query_prefix.is_empty() || role != EmbeddingInputRole::Query {
+            return texts.to_vec();
+        }
+        texts
+            .iter()
+            .map(|text| format!("{}{}", self.query_prefix, text))
+            .collect()
+    }
+
     fn embed_uncached_batch(
         &self,
         texts: &[String],
@@ -1089,6 +1121,48 @@ fn parse_json_object_env(
         .as_object()
         .cloned()
         .ok_or_else(|| KinDbError::IndexError(format!("{name} must be a JSON object")))
+}
+
+/// When `model_id` resolves to an existing local directory, return it so model
+/// artifacts load from disk instead of HuggingFace Hub. Lets the bench point at
+/// a local SweRank checkout via `KIN_EMBED_MODEL_ID=/path/to/model` while a bare
+/// repo id (e.g. `BAAI/bge-small-en-v1.5`) still downloads as before.
+#[cfg(feature = "embeddings")]
+fn local_model_dir(model_id: &str) -> Option<PathBuf> {
+    let path = Path::new(model_id);
+    if path.is_dir() {
+        Some(path.to_path_buf())
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "embeddings")]
+fn resolve_local_model_artifacts(dir: &Path) -> Result<(PathBuf, PathBuf, PathBuf), KinDbError> {
+    let require = |name: &str| -> Result<PathBuf, KinDbError> {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            Ok(candidate)
+        } else {
+            Err(KinDbError::IndexError(format!(
+                "local model directory {} is missing {name}",
+                dir.display()
+            )))
+        }
+    };
+    Ok((
+        require("config.json")?,
+        require("tokenizer.json")?,
+        require("model.safetensors")?,
+    ))
+}
+
+#[cfg(feature = "embeddings")]
+fn local_query_prefix(model_type: Option<&str>) -> String {
+    match model_type.map(str::trim) {
+        Some("nomic_bert") | Some("nomic-bert") => SWERANK_QUERY_PREFIX.to_string(),
+        _ => String::new(),
+    }
 }
 
 #[cfg(feature = "embeddings")]
