@@ -56,6 +56,7 @@ pub enum ModelArchitecture {
     Phi,
     Gemma,
     Qwen2,
+    NomicBert,
     Unknown,
 }
 
@@ -73,6 +74,7 @@ impl ModelArchitecture {
             "phi" | "phi3" => Self::Phi,
             "gemma" | "gemma2" => Self::Gemma,
             "qwen2" => Self::Qwen2,
+            "nomic_bert" | "nomic-bert" => Self::NomicBert,
             _ => Self::Unknown,
         }
     }
@@ -94,7 +96,7 @@ impl ModelArchitecture {
     fn uses_rope(self) -> bool {
         matches!(
             self,
-            Self::Llama | Self::Mistral | Self::Phi | Self::Gemma | Self::Qwen2
+            Self::Llama | Self::Mistral | Self::Phi | Self::Gemma | Self::Qwen2 | Self::NomicBert
         )
     }
 
@@ -112,20 +114,33 @@ impl ModelArchitecture {
 
 #[derive(serde::Deserialize)]
 pub struct BertConfig {
+    #[serde(alias = "n_embd")]
     pub hidden_size: usize,
+    #[serde(alias = "n_layer")]
     pub num_hidden_layers: usize,
+    #[serde(alias = "n_head")]
     pub num_attention_heads: usize,
+    #[serde(alias = "n_inner")]
     pub intermediate_size: usize,
+    #[serde(alias = "n_positions")]
     pub max_position_embeddings: usize,
     pub vocab_size: usize,
     #[serde(default)]
     pub type_vocab_size: Option<usize>,
-    #[serde(default = "default_eps")]
+    #[serde(default = "default_eps", alias = "layer_norm_epsilon")]
     pub layer_norm_eps: f64,
     #[serde(default)]
     pub position_embedding_type: Option<String>,
     #[serde(default = "default_feed_forward_type")]
     pub feed_forward_type: String,
+    /// GPT-style FFN activation key (nomic_bert: "swiglu"). Normalized into
+    /// `feed_forward_type` after load so the gated-FFN path activates.
+    #[serde(default)]
+    pub activation_function: Option<String>,
+    /// Sentence-Transformers pooling override ("cls" or "mean"). When None the
+    /// architecture default applies (mean for BERT-family, cls for nomic_bert).
+    #[serde(default)]
+    pub pooling_mode: Option<String>,
     #[serde(default)]
     pub pad_token_id: Option<u32>,
     // --- Universal extensions ---
@@ -144,7 +159,7 @@ pub struct BertConfig {
     #[serde(default)]
     pub pre_ln: Option<bool>,
     /// RoPE base frequency (default 10000.0).
-    #[serde(default = "default_rope_theta")]
+    #[serde(default = "default_rope_theta", alias = "rotary_emb_base")]
     pub rope_theta: f64,
     /// RMSNorm epsilon (used by LLaMA family, defaults to layer_norm_eps).
     #[serde(default)]
@@ -208,6 +223,16 @@ impl BertConfig {
 
     fn uses_rmsnorm(&self) -> bool {
         self.architecture().uses_rmsnorm()
+    }
+
+    /// CLS pooling (take the first-token hidden state) vs mean pooling.
+    /// Explicit `pooling_mode` wins; otherwise nomic_bert pools on CLS and the
+    /// rest of the BERT family pools on the mean.
+    fn uses_cls_pooling(&self) -> bool {
+        match self.pooling_mode.as_deref() {
+            Some(mode) => mode.eq_ignore_ascii_case("cls"),
+            None => self.architecture() == ModelArchitecture::NomicBert,
+        }
     }
 }
 
@@ -598,8 +623,17 @@ impl BertModel {
         Self::load_from_tensors(&tensors, config)
     }
 
-    fn load_from_tensors(tensors: &SafeTensors, config: BertConfig) -> Result<Self, InferError> {
+    fn load_from_tensors(tensors: &SafeTensors, mut config: BertConfig) -> Result<Self, InferError> {
         let _names: Vec<_> = tensors.names().into_iter().collect();
+
+        // GPT-style configs (nomic_bert) name the FFN activation via
+        // `activation_function`; fold it into `feed_forward_type` so the gated
+        // SwiGLU/GeGLU path engages. Only override the BERT default ("original").
+        if config.feed_forward_type == default_feed_forward_type() {
+            if let Some(act) = config.activation_function.as_deref() {
+                config.feed_forward_type = act.to_string();
+            }
+        }
         let arch = config.architecture();
 
         let h = config.hidden_size;
@@ -642,8 +676,10 @@ impl BertModel {
             embed_dim,
         )?;
 
-        let embed_ln_weight = try_load_1d_flexible(tensors, &["embeddings.LayerNorm.weight"], h)?;
-        let embed_ln_bias = try_load_1d_flexible(tensors, &["embeddings.LayerNorm.bias"], h)?;
+        let embed_ln_weight =
+            try_load_1d_flexible(tensors, &["embeddings.LayerNorm.weight", "emb_ln.weight"], h)?;
+        let embed_ln_bias =
+            try_load_1d_flexible(tensors, &["embeddings.LayerNorm.bias", "emb_ln.bias"], h)?;
 
         // ALBERT: factorized embedding projection
         let embed_projection = if embed_dim != h {
@@ -668,16 +704,32 @@ impl BertModel {
         for i in 0..unique_layers {
             let lp = format!("encoder.layer.{i}");
             let lp_dec = format!("layers.{i}");
+            let lp_nomic = format!("encoder.layers.{i}");
 
-            let q_weight = load_2d_flexible(
+            // nomic_bert packs Q|K|V into one fused `attn.Wqkv.weight` [h+2*kv_dim, h]
+            // (rows: 0..h = Q, h..h+kv_dim = K, h+kv_dim.. = V), with no biases.
+            // When present, slice each projection out of it; otherwise fall back to
+            // the per-projection tensors below.
+            let fused_wqkv = try_load_2d_flexible(
                 tensors,
-                &[
-                    &format!("{lp}.attention.self.query.weight"),
-                    &format!("{lp_dec}.self_attn.q_proj.weight"),
-                ],
-                h,
+                &[&format!("{lp_nomic}.attn.Wqkv.weight")],
+                h + 2 * kv_dim,
                 h,
             )?;
+
+            let q_weight = if let Some(ref wqkv) = fused_wqkv {
+                wqkv.slice(s![0..h, ..]).to_owned()
+            } else {
+                load_2d_flexible(
+                    tensors,
+                    &[
+                        &format!("{lp}.attention.self.query.weight"),
+                        &format!("{lp_dec}.self_attn.q_proj.weight"),
+                    ],
+                    h,
+                    h,
+                )?
+            };
             let q_bias = try_load_1d_flexible(
                 tensors,
                 &[
@@ -696,15 +748,19 @@ impl BertModel {
                 &[&format!("{lp}.attention.self.layer_norm_q.bias")],
                 h,
             )?;
-            let k_weight = load_2d_flexible(
-                tensors,
-                &[
-                    &format!("{lp}.attention.self.key.weight"),
-                    &format!("{lp_dec}.self_attn.k_proj.weight"),
-                ],
-                kv_dim,
-                h,
-            )?;
+            let k_weight = if let Some(ref wqkv) = fused_wqkv {
+                wqkv.slice(s![h..h + kv_dim, ..]).to_owned()
+            } else {
+                load_2d_flexible(
+                    tensors,
+                    &[
+                        &format!("{lp}.attention.self.key.weight"),
+                        &format!("{lp_dec}.self_attn.k_proj.weight"),
+                    ],
+                    kv_dim,
+                    h,
+                )?
+            };
             let k_bias = try_load_1d_flexible(
                 tensors,
                 &[
@@ -723,15 +779,19 @@ impl BertModel {
                 &[&format!("{lp}.attention.self.layer_norm_k.bias")],
                 h,
             )?;
-            let v_weight = load_2d_flexible(
-                tensors,
-                &[
-                    &format!("{lp}.attention.self.value.weight"),
-                    &format!("{lp_dec}.self_attn.v_proj.weight"),
-                ],
-                kv_dim,
-                h,
-            )?;
+            let v_weight = if let Some(ref wqkv) = fused_wqkv {
+                wqkv.slice(s![h + kv_dim..h + 2 * kv_dim, ..]).to_owned()
+            } else {
+                load_2d_flexible(
+                    tensors,
+                    &[
+                        &format!("{lp}.attention.self.value.weight"),
+                        &format!("{lp_dec}.self_attn.v_proj.weight"),
+                    ],
+                    kv_dim,
+                    h,
+                )?
+            };
             let v_bias = try_load_1d_flexible(
                 tensors,
                 &[
@@ -749,6 +809,7 @@ impl BertModel {
                 &[
                     &format!("{lp}.attention.output.dense.weight"),
                     &format!("{lp_dec}.self_attn.o_proj.weight"),
+                    &format!("{lp_nomic}.attn.out_proj.weight"),
                 ],
                 h,
                 h,
@@ -767,6 +828,7 @@ impl BertModel {
                     &format!("{lp}.layer_norm_1.weight"),
                     &format!("{lp}.attention.output.LayerNorm.weight"),
                     &format!("{lp_dec}.input_layernorm.weight"),
+                    &format!("{lp_nomic}.norm1.weight"),
                 ],
                 h,
             )?;
@@ -776,15 +838,22 @@ impl BertModel {
                     &format!("{lp}.layer_norm_1.bias"),
                     &format!("{lp}.attention.output.LayerNorm.bias"),
                     &format!("{lp_dec}.input_layernorm.bias"),
+                    &format!("{lp_nomic}.norm1.bias"),
                 ],
                 h,
             )?;
 
-            // FFN weights — detect gated vs standard
+            // FFN weights — detect gated vs standard. nomic_bert's gated MLP is
+            // `fc11(x) * silu(fc12(x))`, so fc12 is the activated gate and fc11 is
+            // the linear up-projection — the opposite of Llama's gate_proj/up_proj
+            // naming. Map fc12 → gate (silu) and fc11 → up below.
             let is_glu = config.feed_forward_type.ends_with("glu");
             let ffn_gate_weight = try_load_2d_flexible(
                 tensors,
-                &[&format!("{lp_dec}.mlp.gate_proj.weight")],
+                &[
+                    &format!("{lp_dec}.mlp.gate_proj.weight"),
+                    &format!("{lp_nomic}.mlp.fc12.weight"),
+                ],
                 inter,
                 h,
             )?;
@@ -810,10 +879,14 @@ impl BertModel {
                     h,
                 )?)
             } else if ffn_gate_weight.is_some() {
-                // SwiGLU models have separate up_proj
+                // SwiGLU models have a separate up_proj (nomic_bert: mlp.fc11, the
+                // un-activated linear path).
                 try_load_2d_flexible(
                     tensors,
-                    &[&format!("{lp_dec}.mlp.up_proj.weight")],
+                    &[
+                        &format!("{lp_dec}.mlp.up_proj.weight"),
+                        &format!("{lp_nomic}.mlp.fc11.weight"),
+                    ],
                     inter,
                     h,
                 )?
@@ -834,6 +907,7 @@ impl BertModel {
                     &format!("{lp}.mlp.down_layer.weight"),
                     &format!("{lp}.output.dense.weight"),
                     &format!("{lp_dec}.mlp.down_proj.weight"),
+                    &format!("{lp_nomic}.mlp.fc2.weight"),
                 ],
                 h,
                 inter,
@@ -852,6 +926,7 @@ impl BertModel {
                     &format!("{lp}.layer_norm_2.weight"),
                     &format!("{lp}.output.LayerNorm.weight"),
                     &format!("{lp_dec}.post_attention_layernorm.weight"),
+                    &format!("{lp_nomic}.norm2.weight"),
                 ],
                 h,
             )?;
@@ -861,6 +936,7 @@ impl BertModel {
                     &format!("{lp}.layer_norm_2.bias"),
                     &format!("{lp}.output.LayerNorm.bias"),
                     &format!("{lp_dec}.post_attention_layernorm.bias"),
+                    &format!("{lp_nomic}.norm2.bias"),
                 ],
                 h,
             )?;
@@ -1074,10 +1150,14 @@ impl BertModel {
                 hidden = self.encoder_layer(&hidden, mask, layer, i)?;
             }
 
-            // 4. Mean pooling + L2 normalize
+            // 4. Pooling (CLS or mean) + L2 normalize
             let _pool_span =
                 tracing::info_span!("kin_infer.model.forward.pool_and_normalize").entered();
-            let pooled = mean_pool(&hidden, mask);
+            let pooled = if self.config.uses_cls_pooling() {
+                cls_pool(&hidden)
+            } else {
+                mean_pool(&hidden, mask)
+            };
             let normalized = l2_normalize(&pooled);
             results.push(normalized.to_vec());
         }
@@ -1212,7 +1292,11 @@ impl BertModel {
 
             let attn_input = if pre_ln { &normed_for_attn } else { &hidden };
 
-            let (q, k, v) = self.project_qkv(attn_input, layer, eps);
+            let (mut q, mut k, v) = self.project_qkv(attn_input, layer, eps);
+
+            // Apply RoPE per input (positions restart at 0 for each) before attention.
+            self.rope_batched(&mut q, batch_size, max_len, head_dim);
+            self.rope_batched(&mut k, batch_size, max_len, head_dim);
 
             // --- Fully batched attention: treat batch_size × num_heads as independent heads ---
             let needs_per_head =
@@ -1399,13 +1483,18 @@ impl BertModel {
         let _pool_span =
             tracing::info_span!("kin_infer.model.forward_batched.pool_and_normalize").entered();
         let mut results = Vec::with_capacity(batch_size);
+        let cls_pooling = self.config.uses_cls_pooling();
         for b in 0..batch_size {
             let base = b * max_len;
             let h_b = hidden.slice(s![base..base + max_len, ..]).to_owned();
-            let pooled = mean_pool(
-                &h_b,
-                &masks[b].iter().map(|&m| m as u32).collect::<Vec<_>>(),
-            );
+            let pooled = if cls_pooling {
+                cls_pool(&h_b)
+            } else {
+                mean_pool(
+                    &h_b,
+                    &masks[b].iter().map(|&m| m as u32).collect::<Vec<_>>(),
+                )
+            };
             results.push(l2_normalize(&pooled).to_vec());
         }
         Ok(results)
@@ -1641,6 +1730,27 @@ impl BertModel {
     }
 
     /// Single encoder transformer layer with support for all attention/norm variants.
+    /// Apply RoPE independently to each input in a batched [batch_size * max_len,
+    /// total_dim] tensor, restarting positions at 0 for every input. No-op when the
+    /// model has no RoPE tables.
+    fn rope_batched(
+        &self,
+        x: &mut Array2<f32>,
+        batch_size: usize,
+        max_len: usize,
+        head_dim: usize,
+    ) {
+        if self.rope_cos.is_none() || max_len == 0 {
+            return;
+        }
+        for b in 0..batch_size {
+            let base = b * max_len;
+            let mut block = x.slice(s![base..base + max_len, ..]).to_owned();
+            self.rope(&mut block, 0, max_len, head_dim);
+            x.slice_mut(s![base..base + max_len, ..]).assign(&block);
+        }
+    }
+
     fn encoder_layer(
         &self,
         hidden: &Array2<f32>,
@@ -2869,6 +2979,15 @@ fn mean_pool(hidden: &Array2<f32>, mask: &[u32]) -> Array1<f32> {
         sum /= count;
     }
     sum
+}
+
+/// CLS pooling: the first-token ([CLS]) hidden state. Used by nomic_bert /
+/// SweRank-style sentence encoders whose pooling layer selects the CLS token.
+fn cls_pool(hidden: &Array2<f32>) -> Array1<f32> {
+    if hidden.nrows() == 0 {
+        return Array1::<f32>::zeros(hidden.ncols());
+    }
+    hidden.row(0).to_owned()
 }
 
 fn l2_normalize(v: &Array1<f32>) -> Array1<f32> {
