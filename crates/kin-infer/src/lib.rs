@@ -200,25 +200,6 @@ fn default_true() -> bool {
     true
 }
 
-/// Whether the experimental command-buffer pipelining (fused SwiGLU FFN +
-/// paired RoPE in single GPU submissions) is enabled. Default OFF: the
-/// steady-state forward pass uses the original per-op dispatch path, which is
-/// the proven-stable code at large-repo scale. Enable with `KIN_EMBED_PIPELINE=1`.
-///
-/// The fused path collapses per-op commit+wait round-trips but, until it is
-/// proven not to stall on a cold large embed, it must never be the default —
-/// a feature that can hang at scale stays opt-in. Sampled once per process.
-fn embed_pipeline_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("KIN_EMBED_PIPELINE").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
-    })
-}
-
 impl BertConfig {
     pub fn architecture(&self) -> ModelArchitecture {
         self.model_type
@@ -1818,22 +1799,20 @@ impl BertModel {
             backend = %self.backend()
         )
         .entered();
-        if embed_pipeline_enabled() {
-            if let Some(ref gpu) = self.gpu {
-                if down_bias.is_none() {
-                    if let (Some(xs), Some(gw), Some(uw), Some(dw)) = (
-                        x.as_slice(),
-                        gate_w.as_slice(),
-                        up_w.as_slice(),
-                        down_w.as_slice(),
-                    ) {
-                        let rows = x.nrows();
-                        let hidden = x.ncols();
-                        let inter = gate_w.nrows();
-                        let out = gpu.fused_ffn_swiglu(xs, gw, uw, dw, rows, hidden, inter);
-                        return Array2::from_shape_vec((rows, hidden), out)
-                            .expect("fused_ffn_swiglu shape");
-                    }
+        if let Some(ref gpu) = self.gpu {
+            if down_bias.is_none() {
+                if let (Some(xs), Some(gw), Some(uw), Some(dw)) = (
+                    x.as_slice(),
+                    gate_w.as_slice(),
+                    up_w.as_slice(),
+                    down_w.as_slice(),
+                ) {
+                    let rows = x.nrows();
+                    let hidden = x.ncols();
+                    let inter = gate_w.nrows();
+                    let out = gpu.fused_ffn_swiglu(xs, gw, uw, dw, rows, hidden, inter);
+                    return Array2::from_shape_vec((rows, hidden), out)
+                        .expect("fused_ffn_swiglu shape");
                 }
             }
         }
@@ -1869,13 +1848,6 @@ impl BertModel {
     /// are mutually independent), halving the RoPE round-trips per layer. Falls
     /// back to two independent `rope` calls otherwise. No-op without RoPE tables.
     fn rope_qk(&self, q: &mut Array2<f32>, k: &mut Array2<f32>, seq_len: usize, head_dim: usize) {
-        // Default-off: take the original two-submission path unless the fused
-        // command-buffer pipeline is explicitly enabled.
-        if !embed_pipeline_enabled() {
-            self.rope(q, 0, seq_len, head_dim);
-            self.rope(k, 0, seq_len, head_dim);
-            return;
-        }
         let (Some(cos), Some(sin)) = (&self.rope_cos, &self.rope_sin) else {
             return;
         };
