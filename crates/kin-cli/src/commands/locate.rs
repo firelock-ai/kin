@@ -1147,7 +1147,11 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                     *score *= weight;
                 }
             }
-            reciprocal_rank_fusion(&ranked_lists, 60.0)
+            reciprocal_rank_fusion_weighted(
+                &ranked_lists,
+                60.0,
+                &rrf_rank_lift_weights(ranked_lists.len()),
+            )
         }
         ScoringTrack::EntityDominant => {
             // Conditional scoring: when entity_resolve produces few unique
@@ -1184,7 +1188,11 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                         }
                     }
                 }
-                reciprocal_rank_fusion(&ranked_lists, 60.0)
+                reciprocal_rank_fusion_weighted(
+                    &ranked_lists,
+                    60.0,
+                    &rrf_rank_lift_weights(ranked_lists.len()),
+                )
             } else {
                 // Rich entity results — trust entity_resolve ordering directly.
                 // Normalize scores to a bounded range and supplement with other
@@ -1238,7 +1246,11 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         ScoringTrack::GraphStructural => {
             // No entity resolve — rely on graph expansion signals.
             // Boost multihop and imports, suppress test/snippet noise.
-            reciprocal_rank_fusion(&ranked_lists, 60.0)
+            reciprocal_rank_fusion_weighted(
+                &ranked_lists,
+                60.0,
+                &rrf_rank_lift_weights(ranked_lists.len()),
+            )
         }
         ScoringTrack::BroadBlend => {
             // Mixed signals — standard RRF blend, but penalize test files
@@ -1254,7 +1266,11 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                     }
                 }
             }
-            reciprocal_rank_fusion(&ranked_lists, 60.0)
+            reciprocal_rank_fusion_weighted(
+                &ranked_lists,
+                60.0,
+                &rrf_rank_lift_weights(ranked_lists.len()),
+            )
         }
     };
 
@@ -7536,7 +7552,47 @@ fn resolve_relation_origin_priority(origin: kin_model::RelationOrigin) -> u8 {
 // 9. Reciprocal Rank Fusion (hybrid: RRF + raw score bonus + cross-signal bonus)
 // ---------------------------------------------------------------------------
 
+/// Per-list multipliers on the rank-based RRF term, indexed by signal list
+/// position (0=traceback … 7=entity_resolve, 8=source_text, 9=embedding).
+///
+/// Classic RRF (and every default-OFF run) uses an implicit weight of `1.0` for
+/// every list, so [`reciprocal_rank_fusion`] is exactly equivalent to passing an
+/// empty slice here. The uniform per-signal `signal_confidence_weights` applied
+/// upstream scale each list's raw scores, but RRF's dominant term is rank-only
+/// (`1/(k+rank+1)`) and its raw term normalizes by each list's own max, so a
+/// uniform per-list score multiplier is largely inert for fused RANK. Lifting a
+/// semantically-strong but lexically-buried gold therefore requires weighting
+/// the rank term itself, which is what these multipliers do.
+///
+/// Defaults are all `1.0` (see [`rrf_rank_lift_weights`]); the lift only engages
+/// when the operator sets `KIN_LOCATE_RRF_WEIGHT_*`, so OFF stays byte-identical.
+fn rrf_rank_lift_weights(num_lists: usize) -> Vec<f32> {
+    let mut weights = vec![1.0f32; num_lists];
+    if num_lists > 7 {
+        weights[7] = locate_env_f32("KIN_LOCATE_RRF_WEIGHT_RESOLVE", 1.0);
+    }
+    if num_lists > 9 {
+        weights[9] = locate_env_f32("KIN_LOCATE_RRF_WEIGHT_EMBEDDING", 1.0);
+    }
+    weights
+}
+
 fn reciprocal_rank_fusion(ranked_lists: &[Vec<(String, f32)>], k: f32) -> Vec<(String, f32)> {
+    // Empty weight slice == classic unweighted RRF (every list weighted 1.0).
+    reciprocal_rank_fusion_weighted(ranked_lists, k, &[])
+}
+
+/// Weighted reciprocal rank fusion. Identical to classic RRF when every entry of
+/// `list_weights` is `1.0` (or the slice is shorter than `ranked_lists`, in which
+/// case missing entries default to `1.0`) — `w / (k+rank+1)` with `w == 1.0` is
+/// bit-identical to the unweighted `1.0 / (k+rank+1)`, so default-OFF callers are
+/// byte-for-byte unchanged. Only the rank term is weighted; the normalized raw,
+/// cross-signal, and graph-neighborhood terms are untouched.
+fn reciprocal_rank_fusion_weighted(
+    ranked_lists: &[Vec<(String, f32)>],
+    k: f32,
+    list_weights: &[f32],
+) -> Vec<(String, f32)> {
     let _span = tracing::info_span!(
         "locate.reciprocal_rank_fusion",
         lists = ranked_lists.len(),
@@ -7555,6 +7611,7 @@ fn reciprocal_rank_fusion(ranked_lists: &[Vec<(String, f32)>], k: f32) -> Vec<(S
     for (list_idx, list) in ranked_lists.iter().enumerate() {
         // Compute max score in this list for normalization
         let max_score = list.iter().map(|(_, s)| *s).fold(0.0f32, f32::max).max(1.0);
+        let rank_weight = list_weights.get(list_idx).copied().unwrap_or(1.0);
 
         let mut files_in_list = HashSet::new();
         for (rank, (file, score)) in list.iter().enumerate() {
@@ -7562,7 +7619,7 @@ fn reciprocal_rank_fusion(ranked_lists: &[Vec<(String, f32)>], k: f32) -> Vec<(S
             if is_vendored_path(file) {
                 continue;
             }
-            *rrf_scores.entry(file.clone()).or_default() += 1.0 / (k + rank as f32 + 1.0);
+            *rrf_scores.entry(file.clone()).or_default() += rank_weight / (k + rank as f32 + 1.0);
             // Accumulate normalized raw scores
             *raw_scores.entry(file.clone()).or_default() += score / max_score;
             files_in_list.insert(file.clone());
@@ -10368,6 +10425,65 @@ mod tests {
             score,
             spans: vec![],
         }]
+    }
+
+    #[test]
+    fn weighted_rrf_all_ones_matches_unweighted() {
+        // Default-OFF guarantee: weighting every list by 1.0 (or passing an empty
+        // weight slice) is bit-identical to classic unweighted RRF.
+        let lists = vec![
+            vec![
+                ("src/a.rs".to_string(), 3.0),
+                ("src/b.rs".to_string(), 2.0),
+                ("src/c.rs".to_string(), 1.0),
+            ],
+            vec![("src/b.rs".to_string(), 5.0), ("src/d.rs".to_string(), 4.0)],
+        ];
+        let base = reciprocal_rank_fusion(&lists, 60.0);
+        let empty = reciprocal_rank_fusion_weighted(&lists, 60.0, &[]);
+        let ones = reciprocal_rank_fusion_weighted(&lists, 60.0, &[1.0, 1.0]);
+        assert_eq!(base, empty);
+        assert_eq!(base, ones);
+    }
+
+    #[test]
+    fn weighted_rrf_lifts_semantic_only_file_above_lexical_peer() {
+        // 10 signal lists; the competitor appears only in source_text (idx 8), the
+        // gold only in embedding (idx 9), both at rank 0 with equal score. Classic
+        // RRF ties on the rank term and breaks by name (the competitor sorts
+        // first); a >1.0 embedding rank weight lifts the semantic-only gold above
+        // its lexical peer — the buried-gold rank-lift lever.
+        let mut lists: Vec<Vec<(String, f32)>> = vec![Vec::new(); 10];
+        lists[8] = vec![("src/aaa_comp.rs".to_string(), 1.0)];
+        lists[9] = vec![("src/zzz_gold.rs".to_string(), 1.0)];
+
+        let unweighted = reciprocal_rank_fusion(&lists, 60.0);
+        assert_eq!(
+            unweighted.first().map(|(p, _)| p.as_str()),
+            Some("src/aaa_comp.rs"),
+            "classic RRF should tie-break to the name-first competitor"
+        );
+
+        let mut weights = vec![1.0f32; 10];
+        weights[9] = 2.0;
+        let weighted = reciprocal_rank_fusion_weighted(&lists, 60.0, &weights);
+        assert_eq!(
+            weighted.first().map(|(p, _)| p.as_str()),
+            Some("src/zzz_gold.rs"),
+            "embedding rank weight should lift the semantic-only gold to the top"
+        );
+    }
+
+    #[test]
+    fn rrf_rank_lift_weights_default_to_unweighted() {
+        // With no KIN_LOCATE_RRF_WEIGHT_* env set, every list weight is 1.0, so the
+        // lift is a no-op and fused ranking is unchanged (OFF == classic RRF).
+        let w = rrf_rank_lift_weights(10);
+        assert_eq!(w.len(), 10);
+        assert!(
+            w.iter().all(|x| (*x - 1.0).abs() < f32::EPSILON),
+            "default rank-lift weights must all be 1.0 when env is unset"
+        );
     }
 
     #[test]
