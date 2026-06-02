@@ -162,7 +162,32 @@ fn validate_prepared_state(prepared_dir: &Path, expected_manifest: &Value) -> Re
         }
     }
 
+    // When the prepared state declares an embeddings-capable runtime, the
+    // vector sidecar is part of the graph-native truth a reuse must restore.
+    // Without this check a vector-blind prepared dir (graph.kndb but no
+    // graph.kvec) validates as "good" and reuse silently re-opens with an empty
+    // index — the dormant-index trap. Non-embedded runtimes
+    // (embeddings_enabled = false) are valid and skip this requirement.
+    if prepared_state_expects_vectors(&actual_manifest) {
+        for relative_path in required_vector_entries() {
+            if !prepared_dir.join(relative_path).exists() {
+                bail!(
+                    "prepared artifact missing {} (manifest declares embeddings enabled; \
+                     reuse would run with an empty vector index)",
+                    relative_path.display()
+                );
+            }
+        }
+    }
+
     Ok(actual_manifest)
+}
+
+/// Whether a prepared-state manifest declares an embeddings-capable runtime,
+/// meaning the vector sidecar must be present for the reuse to be vector-sound.
+fn prepared_state_expects_vectors(manifest: &Value) -> bool {
+    let flag = |key: &str| manifest.get(key).and_then(Value::as_bool).unwrap_or(false);
+    flag("embeddings_enabled") && flag("vector_enabled")
 }
 
 fn required_prepared_entries() -> &'static [PathBuf] {
@@ -176,6 +201,22 @@ fn required_prepared_entries() -> &'static [PathBuf] {
                 PathBuf::from(".kin/version"),
                 PathBuf::from(".kin/kindb/graph.kndb"),
                 PathBuf::from(".kin/kindb/text-index"),
+            ]
+        })
+        .as_slice()
+}
+
+/// Vector-sidecar artifacts required only when the manifest declares embeddings
+/// are enabled (see `prepared_state_expects_vectors`).
+fn required_vector_entries() -> &'static [PathBuf] {
+    use std::sync::OnceLock;
+
+    static REQUIRED: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    REQUIRED
+        .get_or_init(|| {
+            vec![
+                PathBuf::from(".kin/kindb/graph.kvec"),
+                PathBuf::from(".kin/kindb/graph.kvec.meta.json"),
             ]
         })
         .as_slice()
@@ -265,4 +306,98 @@ fn manifest_string(manifest: &Value, key: &str) -> Result<String> {
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .with_context(|| format!("prepared manifest missing string field {key}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Build a prepared dir with the always-required base artifacts and a
+    /// manifest. `with_vectors` controls whether the optional vector sidecar is
+    /// written; the manifest flags control whether validation should require it.
+    fn make_prepared_dir(
+        dir: &Path,
+        embeddings_enabled: bool,
+        vector_enabled: bool,
+        with_vectors: bool,
+    ) -> Value {
+        let kindb = dir.join(".kin/kindb");
+        fs::create_dir_all(kindb.join("text-index")).unwrap();
+        fs::write(dir.join(".kin/version"), "1").unwrap();
+        fs::write(kindb.join("graph.kndb"), b"kndb").unwrap();
+        if with_vectors {
+            fs::write(kindb.join("graph.kvec"), b"kvec").unwrap();
+            fs::write(kindb.join("graph.kvec.meta.json"), b"{}").unwrap();
+        }
+
+        let mut manifest = json!({
+            "schema": PREPARED_MANIFEST_SCHEMA,
+            "embeddings_enabled": embeddings_enabled,
+            "vector_enabled": vector_enabled,
+        });
+        // Every validation key must be present (and matched) for the
+        // expected/actual comparison to pass; fill the rest with stable stubs.
+        for key in VALIDATION_KEYS {
+            manifest
+                .as_object_mut()
+                .unwrap()
+                .entry(*key)
+                .or_insert(json!("stub"));
+        }
+        fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        manifest
+    }
+
+    #[test]
+    fn expects_vectors_only_when_both_flags_true() {
+        assert!(prepared_state_expects_vectors(
+            &json!({"embeddings_enabled": true, "vector_enabled": true})
+        ));
+        assert!(!prepared_state_expects_vectors(
+            &json!({"embeddings_enabled": true, "vector_enabled": false})
+        ));
+        assert!(!prepared_state_expects_vectors(
+            &json!({"embeddings_enabled": false, "vector_enabled": true})
+        ));
+        assert!(!prepared_state_expects_vectors(&json!({})));
+    }
+
+    #[test]
+    fn validation_rejects_vector_blind_prepared_state_when_embeddings_expected() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = make_prepared_dir(dir.path(), true, true, /* with_vectors */ false);
+
+        let err = validate_prepared_state(dir.path(), &manifest)
+            .expect_err("vector-blind prepared state must be rejected when embeddings expected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("graph.kvec"),
+            "error should name the missing vector sidecar, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validation_accepts_prepared_state_with_vectors_when_embeddings_expected() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = make_prepared_dir(dir.path(), true, true, /* with_vectors */ true);
+
+        validate_prepared_state(dir.path(), &manifest)
+            .expect("prepared state with a vector sidecar must validate when embeddings expected");
+    }
+
+    #[test]
+    fn validation_accepts_vectorless_prepared_state_when_embeddings_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        // embeddings_enabled = false: a vector-less prepared dir is legitimate.
+        let manifest = make_prepared_dir(dir.path(), false, true, /* with_vectors */ false);
+
+        validate_prepared_state(dir.path(), &manifest).expect(
+            "non-embedded prepared state must validate without a vector sidecar",
+        );
+    }
 }
