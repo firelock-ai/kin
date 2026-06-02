@@ -752,6 +752,63 @@ kernel void batched_matmul_ab(
     }
 }
 
+// ---- Attention layout reshape (host-scatter elimination, "Lever A") ----
+// The forward pass holds Q/K/V position-major: [num_groups*seq, heads_per_group*head_dim]
+// (i.e. [batch*seq, hidden]). The batched attention kernels above consume
+// head-major: [(num_groups*heads_per_group), seq, head_dim]. These two kernels
+// do that transpose on-device so the per-layer scatter never round-trips to the
+// host. Pure data movement — every output element is written exactly once from
+// the matching input element, so the result is bit-identical to the host loop.
+
+// Position-major Q/K/V -> head-major qf/kf/vf, all three in one dispatch.
+// Grid: (head_dim, seq, num_groups*heads_per_group).
+kernel void reshape_qkv_pos_to_head(
+    device const float* qsrc        [[buffer(0)]],
+    device const float* ksrc        [[buffer(1)]],
+    device const float* vsrc        [[buffer(2)]],
+    device float*       qdst        [[buffer(3)]],
+    device float*       kdst        [[buffer(4)]],
+    device float*       vdst        [[buffer(5)]],
+    constant uint& heads_per_group  [[buffer(6)]],
+    constant uint& seq              [[buffer(7)]],
+    constant uint& dim              [[buffer(8)]],
+    uint3 gid                       [[thread_position_in_grid]]
+) {
+    uint d = gid.x;   // [0, dim)
+    uint s = gid.y;   // [0, seq)
+    uint h = gid.z;   // [0, num_groups*heads_per_group)
+    if (d >= dim || s >= seq) return;
+    uint b        = h / heads_per_group;
+    uint hd_local = h % heads_per_group;
+    uint total_dim = heads_per_group * dim;
+    uint src = (b * seq + s) * total_dim + hd_local * dim + d;
+    uint dst = (h * seq + s) * dim + d;
+    qdst[dst] = qsrc[src];
+    kdst[dst] = ksrc[src];
+    vdst[dst] = vsrc[src];
+}
+
+// Head-major attention output -> position-major. Grid same as above.
+kernel void reshape_head_to_pos(
+    device const float* src         [[buffer(0)]],
+    device float*       dst         [[buffer(1)]],
+    constant uint& heads_per_group  [[buffer(2)]],
+    constant uint& seq              [[buffer(3)]],
+    constant uint& dim              [[buffer(4)]],
+    uint3 gid                       [[thread_position_in_grid]]
+) {
+    uint d = gid.x;
+    uint s = gid.y;
+    uint h = gid.z;
+    if (d >= dim || s >= seq) return;
+    uint b        = h / heads_per_group;
+    uint hd_local = h % heads_per_group;
+    uint total_dim = heads_per_group * dim;
+    uint srci = (h * seq + s) * dim + d;
+    uint dsti = (b * seq + s) * total_dim + hd_local * dim + d;
+    dst[dsti] = src[srci];
+}
+
 // ---- Scale + ALiBi + mask (fused, in-place on scores) ----
 // scores is [num_heads, seq_len, seq_len] flattened
 // alibi_slopes is [num_heads] (or empty if no ALiBi)
@@ -949,6 +1006,25 @@ impl BufferPool {
         }
     }
 
+    /// Acquire a buffer of at least `bytes` with UNSPECIFIED contents. For
+    /// intermediates a kernel fully overwrites before any read (e.g. the
+    /// on-device attention reshape targets) — skips the re-zero `acquire_zeroed`
+    /// pays. The caller is responsible for ensuring every byte read downstream
+    /// was written by the producing kernel first.
+    fn acquire_uninit(self: &Arc<Self>, bytes: usize) -> PooledBuffer {
+        let class = size_class(bytes);
+        let buf = self.free.lock().get_mut(&class).and_then(|v| v.pop());
+        let buf = buf.unwrap_or_else(|| {
+            self.device
+                .new_buffer(class as u64, MTLResourceOptions::StorageModeShared)
+        });
+        PooledBuffer {
+            buf,
+            class,
+            pool: Arc::clone(self),
+        }
+    }
+
     fn recycle(&self, class: usize, buf: Buffer) {
         self.free.lock().entry(class).or_default().push(buf);
     }
@@ -1032,6 +1108,8 @@ impl MetalCompute {
             "matmul_transb",
             "batched_matmul_transb",
             "batched_matmul_ab",
+            "reshape_qkv_pos_to_head",
+            "reshape_head_to_pos",
             "scale_mask_alibi",
             "scale_mask_alibi_grouped",
             "softmax_rows",
@@ -1137,6 +1215,15 @@ impl MetalCompute {
     #[inline]
     fn buf_slice_pooled(&self, data: &[f32]) -> PooledBuffer {
         time_phase(Phase::Copy, || self.pool.acquire_with(data))
+    }
+
+    /// Acquire a transient buffer of `count` floats with UNSPECIFIED contents.
+    /// For intermediates that a kernel fully overwrites before any read.
+    #[inline]
+    fn buf_uninit_pooled(&self, count: usize) -> PooledBuffer {
+        time_phase(Phase::Copy, || {
+            self.pool.acquire_uninit(count * std::mem::size_of::<f32>())
+        })
     }
 
     /// Create a buffer containing a single u32 value.
@@ -2606,6 +2693,257 @@ impl GpuCompute for MetalCompute {
         out
     }
 
+    /// Position-major fused attention ("Lever A"): consume Q/K/V straight from
+    /// the `[num_groups*seq, heads_per_group*head_dim]` (i.e. `[batch*seq,
+    /// hidden]`) forward-pass layout and return the attention output in the same
+    /// position-major layout — the per-layer head-major scatter that
+    /// `fused_attention_batched` requires the host to build never round-trips to
+    /// the CPU. Two on-device reshape kernels bracket the *unchanged* QK^T →
+    /// scale/mask → softmax → ×V pipeline, so the GEMM bytes (and thus parity)
+    /// are identical to the head-major path; only the data movement moves to the
+    /// GPU. Everything stays inside one command buffer / one autorelease pool.
+    fn fused_attention_batched_posmajor(
+        &self,
+        q_pos: &[f32],
+        k_pos: &[f32],
+        v_pos: &[f32],
+        num_groups: usize,
+        heads_per_group: usize,
+        seq_len: usize,
+        head_dim: usize,
+        scale: f32,
+        alibi_slopes: &[f32],
+        masks: &[u32],
+    ) -> Vec<f32> {
+        let _span = tracing::info_span!(
+            "kin_infer.metal.fused_attention_batched_posmajor",
+            num_groups = num_groups,
+            heads_per_group = heads_per_group,
+            seq_len = seq_len,
+            head_dim = head_dim,
+            has_alibi = !alibi_slopes.is_empty()
+        )
+        .entered();
+        let total_heads = num_groups * heads_per_group;
+        // head-major elem count == position-major elem count (same tensor, two views)
+        let elems = total_heads * seq_len * head_dim;
+
+        // Position-major operands uploaded once (contiguous copy, no host scatter).
+        let buf_q_pos = self.buf_slice_pooled(q_pos);
+        let buf_k_pos = self.buf_slice_pooled(k_pos);
+        let buf_v_pos = self.buf_slice_pooled(v_pos);
+        // Head-major reshape targets — fully overwritten by the reshape kernel.
+        let buf_q = self.buf_uninit_pooled(elems);
+        let buf_k = self.buf_uninit_pooled(elems);
+        let buf_v = self.buf_uninit_pooled(elems);
+        let buf_scores = self.buf_zeros_pooled(total_heads * seq_len * seq_len);
+        let buf_out = self.buf_zeros_pooled(elems);
+        // Position-major output — fully overwritten by the un-reshape kernel.
+        let buf_out_pos = self.buf_uninit_pooled(elems);
+
+        let buf_seq = self.buf_u32(seq_len as u32);
+        let buf_dim = self.buf_u32(head_dim as u32);
+        let buf_hpg = self.buf_u32(heads_per_group as u32);
+        let buf_scale = self.buf_f32(scale);
+        let has_alibi = !alibi_slopes.is_empty();
+        let buf_alibi = if has_alibi {
+            self.buf_cached(alibi_slopes)
+        } else {
+            self.buf_from_slice(&[0.0f32])
+        };
+        let buf_masks = self.buf_cached_u32(masks);
+        let buf_has_alibi = self.buf_u32(has_alibi as u32);
+        let buf_heads_per_group = self.buf_u32(heads_per_group as u32);
+
+        let out = autoreleasepool(|_| {
+            let cmd = self.queue.new_command_buffer();
+
+            // (0) Reshape position-major Q/K/V -> head-major qf/kf/vf on-device.
+            {
+                let _op_span = tracing::info_span!(
+                    "kin_infer.metal.fused_attention_batched_posmajor.reshape_in"
+                )
+                .entered();
+                let p = &self.pipelines["reshape_qkv_pos_to_head"];
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(p);
+                enc.set_buffer(0, Some(buf_q_pos.buffer()), 0);
+                enc.set_buffer(1, Some(buf_k_pos.buffer()), 0);
+                enc.set_buffer(2, Some(buf_v_pos.buffer()), 0);
+                enc.set_buffer(3, Some(buf_q.buffer()), 0);
+                enc.set_buffer(4, Some(buf_k.buffer()), 0);
+                enc.set_buffer(5, Some(buf_v.buffer()), 0);
+                enc.set_buffer(6, Some(&buf_hpg), 0);
+                enc.set_buffer(7, Some(&buf_seq), 0);
+                enc.set_buffer(8, Some(&buf_dim), 0);
+                let threads =
+                    MTLSize::new(head_dim as u64, seq_len as u64, total_heads as u64);
+                let tg = MTLSize::new(
+                    8.min(head_dim) as u64,
+                    8.min(seq_len) as u64,
+                    1.min(total_heads) as u64,
+                );
+                enc.dispatch_threads(threads, tg);
+                enc.end_encoding();
+            }
+
+            {
+                let _op_span = tracing::info_span!(
+                    "kin_infer.metal.fused_attention_batched_posmajor.qk_scores"
+                )
+                .entered();
+                let qk_bufs = [
+                    buf_q.buffer(),
+                    buf_k.buffer(),
+                    buf_scores.buffer(),
+                    &buf_seq,
+                    &buf_dim,
+                ];
+                if use_mma(seq_len, seq_len, head_dim) {
+                    Self::encode_mma(
+                        cmd,
+                        &self.pipelines["batched_matmul_transb_simdgroup"],
+                        &qk_bufs,
+                        seq_len,
+                        seq_len,
+                        total_heads,
+                    );
+                } else {
+                    let p = &self.pipelines["batched_matmul_transb"];
+                    let enc = cmd.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(p);
+                    for (i, b) in qk_bufs.iter().enumerate() {
+                        enc.set_buffer(i as u64, Some(*b), 0);
+                    }
+                    let threads = MTLSize::new(seq_len as u64, seq_len as u64, total_heads as u64);
+                    let tg = MTLSize::new(16.min(seq_len) as u64, 16.min(seq_len) as u64, 1);
+                    enc.dispatch_threads(threads, tg);
+                    enc.end_encoding();
+                }
+            }
+
+            {
+                let _op_span = tracing::info_span!(
+                    "kin_infer.metal.fused_attention_batched_posmajor.scale_mask"
+                )
+                .entered();
+                let p = &self.pipelines["scale_mask_alibi_grouped"];
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(p);
+                enc.set_buffer(0, Some(buf_scores.buffer()), 0);
+                enc.set_buffer(1, Some(&buf_alibi), 0);
+                enc.set_buffer(2, Some(&buf_masks), 0);
+                enc.set_buffer(3, Some(&buf_scale), 0);
+                enc.set_buffer(4, Some(&buf_seq), 0);
+                enc.set_buffer(5, Some(&buf_has_alibi), 0);
+                enc.set_buffer(6, Some(&buf_heads_per_group), 0);
+                let threads = MTLSize::new(seq_len as u64, seq_len as u64, total_heads as u64);
+                let tg = MTLSize::new(8.min(seq_len) as u64, 8.min(seq_len) as u64, 1);
+                enc.dispatch_threads(threads, tg);
+                enc.end_encoding();
+            }
+
+            {
+                let _op_span = tracing::info_span!(
+                    "kin_infer.metal.fused_attention_batched_posmajor.softmax_rows"
+                )
+                .entered();
+                let p = &self.pipelines["softmax_rows"];
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(p);
+                enc.set_buffer(0, Some(buf_scores.buffer()), 0);
+                let buf_cols = self.buf_u32(seq_len as u32);
+                enc.set_buffer(1, Some(&buf_cols), 0);
+                let total_rows = total_heads * seq_len;
+                let tw = p.thread_execution_width() as usize;
+                let threads = MTLSize::new(total_rows as u64, 1, 1);
+                let tg = MTLSize::new(tw.min(total_rows) as u64, 1, 1);
+                enc.dispatch_threads(threads, tg);
+                enc.end_encoding();
+            }
+
+            {
+                let _op_span = tracing::info_span!(
+                    "kin_infer.metal.fused_attention_batched_posmajor.value_mix"
+                )
+                .entered();
+                let av_bufs = [
+                    buf_scores.buffer(),
+                    buf_v.buffer(),
+                    buf_out.buffer(),
+                    &buf_seq,
+                    &buf_dim,
+                ];
+                if use_mma(seq_len, head_dim, seq_len) {
+                    Self::encode_mma(
+                        cmd,
+                        &self.pipelines["batched_matmul_ab_simdgroup"],
+                        &av_bufs,
+                        seq_len,
+                        head_dim,
+                        total_heads,
+                    );
+                } else {
+                    let p = &self.pipelines["batched_matmul_ab"];
+                    let enc = cmd.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(p);
+                    for (i, b) in av_bufs.iter().enumerate() {
+                        enc.set_buffer(i as u64, Some(*b), 0);
+                    }
+                    let threads = MTLSize::new(head_dim as u64, seq_len as u64, total_heads as u64);
+                    let tg = MTLSize::new(16.min(head_dim) as u64, 16.min(seq_len) as u64, 1);
+                    enc.dispatch_threads(threads, tg);
+                    enc.end_encoding();
+                }
+            }
+
+            // (5) Un-reshape head-major attention output -> position-major.
+            {
+                let _op_span = tracing::info_span!(
+                    "kin_infer.metal.fused_attention_batched_posmajor.reshape_out"
+                )
+                .entered();
+                let p = &self.pipelines["reshape_head_to_pos"];
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(p);
+                enc.set_buffer(0, Some(buf_out.buffer()), 0);
+                enc.set_buffer(1, Some(buf_out_pos.buffer()), 0);
+                enc.set_buffer(2, Some(&buf_hpg), 0);
+                enc.set_buffer(3, Some(&buf_seq), 0);
+                enc.set_buffer(4, Some(&buf_dim), 0);
+                let threads =
+                    MTLSize::new(head_dim as u64, seq_len as u64, total_heads as u64);
+                let tg = MTLSize::new(
+                    8.min(head_dim) as u64,
+                    8.min(seq_len) as u64,
+                    1.min(total_heads) as u64,
+                );
+                enc.dispatch_threads(threads, tg);
+                enc.end_encoding();
+            }
+
+            {
+                let _commit_span = tracing::info_span!(
+                    "kin_infer.metal.fused_attention_batched_posmajor.commit_wait"
+                )
+                .entered();
+                time_phase(Phase::Attention, || {
+                    self.commit_bounded(cmd, Vec::new());
+                    cmd.wait_until_completed();
+                });
+            }
+
+            Self::read_buf(buf_out_pos.buffer(), elems)
+        });
+        Self::count_nonfinite(
+            &format!(
+                "fused_attention_batched_posmajor seq_len={seq_len} total_heads={total_heads}"
+            ),
+            &out,
+        );
+        out
+    }
+
     fn backend(&self) -> GpuBackend {
         GpuBackend::Metal
     }
@@ -2937,6 +3275,77 @@ mod tests {
         assert!(
             max_err < 5e-3,
             "fused_attention_batched max err: {}",
+            max_err
+        );
+    }
+
+    #[test]
+    fn test_metal_fused_attention_batched_posmajor_matches_head_major() {
+        // Lever A parity: the on-device position-major reshape path must be a
+        // pure relayout of the head-major path — same GPU kernels, same input
+        // bytes — so the (un-reshaped) outputs must match bit-for-bit.
+        let Some(metal) = get_metal() else { return };
+
+        let num_groups = 3;
+        let heads_per_group = 2;
+        let seq_len = 7;
+        let head_dim = 16;
+        let total_dim = heads_per_group * head_dim;
+        let total_heads = num_groups * heads_per_group;
+        let elems = total_heads * seq_len * head_dim;
+
+        let qh: Vec<f32> = (0..elems).map(|i| ((i % 89) as f32 - 44.0) * 0.01).collect();
+        let kh: Vec<f32> = (0..elems).map(|i| ((i % 73) as f32 - 36.0) * 0.01).collect();
+        let vh: Vec<f32> = (0..elems).map(|i| ((i % 61) as f32 - 30.0) * 0.01).collect();
+        let masks = vec![
+            1, 1, 1, 1, 1, 0, 0, // group 0
+            1, 1, 1, 1, 1, 1, 1, // group 1
+            1, 1, 1, 0, 0, 0, 0, // group 2
+        ];
+        let alibi = vec![0.0, 0.0625];
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        // Scatter head-major -> position-major to feed the posmajor entry point.
+        let mut qp = vec![0.0f32; elems];
+        let mut kp = vec![0.0f32; elems];
+        let mut vp = vec![0.0f32; elems];
+        for b in 0..num_groups {
+            for s in 0..seq_len {
+                for hd in 0..heads_per_group {
+                    let src = (b * heads_per_group + hd) * seq_len * head_dim + s * head_dim;
+                    let dst = (b * seq_len + s) * total_dim + hd * head_dim;
+                    qp[dst..dst + head_dim].copy_from_slice(&qh[src..src + head_dim]);
+                    kp[dst..dst + head_dim].copy_from_slice(&kh[src..src + head_dim]);
+                    vp[dst..dst + head_dim].copy_from_slice(&vh[src..src + head_dim]);
+                }
+            }
+        }
+
+        let out_pos = metal.fused_attention_batched_posmajor(
+            &qp, &kp, &vp, num_groups, heads_per_group, seq_len, head_dim, scale, &alibi, &masks,
+        );
+        let out_head = metal.fused_attention_batched(
+            &qh, &kh, &vh, num_groups, heads_per_group, seq_len, head_dim, scale, &alibi, &masks,
+        );
+
+        assert_eq!(out_pos.len(), elems);
+        let mut max_err = 0.0f32;
+        for b in 0..num_groups {
+            for s in 0..seq_len {
+                for hd in 0..heads_per_group {
+                    let pos = (b * seq_len + s) * total_dim + hd * head_dim;
+                    let head = (b * heads_per_group + hd) * seq_len * head_dim + s * head_dim;
+                    for d in 0..head_dim {
+                        max_err = max_err.max((out_pos[pos + d] - out_head[head + d]).abs());
+                    }
+                }
+            }
+        }
+        // Pure data movement — identical kernels, identical inputs — so the
+        // result is bit-identical; allow only float-noise slack.
+        assert!(
+            max_err < 1e-6,
+            "fused_attention_batched_posmajor vs head-major max err: {}",
             max_err
         );
     }

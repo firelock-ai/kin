@@ -201,6 +201,26 @@ fn default_true() -> bool {
     true
 }
 
+/// Whether the batched attention path passes Q/K/V to the accelerator in the
+/// native position-major `[batch*seq, hidden]` layout ("Lever A"), letting the
+/// backend do the head-major reshape on-device instead of the host scattering
+/// `qf`/`kf`/`vf` every layer. Sampled once per process.
+///
+/// Opt-in for now (`KIN_INFER_RESHAPE_GPU=1`): OFF reproduces the original host
+/// scatter byte-for-byte. Flip the default to ON once the GPU reshape clears the
+/// cosine/swerank parity gate, keeping the OFF env override as the safe
+/// fallback — the pattern used for the MMA flip.
+fn reshape_on_gpu() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("KIN_INFER_RESHAPE_GPU").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
 impl BertConfig {
     pub fn architecture(&self) -> ModelArchitecture {
         self.model_type
@@ -1324,9 +1344,8 @@ impl BertModel {
 
             let attn_output = if !needs_per_head && self.has_accelerator_backend() {
                 let gpu = self.gpu.as_ref().unwrap();
+                let base_alibi = alibi_slopes.as_deref().unwrap_or(&[]);
 
-                // Reshape Q,K,V from [batch_size * max_len, num_heads * head_dim]
-                // to [(batch_size * num_heads), max_len, head_dim] head-major flat
                 let q_data: Cow<'_, [f32]> = q
                     .as_slice()
                     .map(Cow::Borrowed)
@@ -1340,54 +1359,88 @@ impl BertModel {
                     .map(Cow::Borrowed)
                     .unwrap_or_else(|| Cow::Owned(v.iter().copied().collect()));
 
-                let mut qf = vec![0.0f32; all_heads * max_len * head_dim];
-                let mut kf = vec![0.0f32; all_heads * max_len * head_dim];
-                let mut vf = vec![0.0f32; all_heads * max_len * head_dim];
+                if reshape_on_gpu() {
+                    // Lever A: hand Q/K/V to the backend in the native
+                    // position-major [batch*seq, hidden] layout. The accelerator
+                    // does the head-major reshape + un-reshape on-device, so the
+                    // per-layer host scatter never runs. The output already comes
+                    // back position-major, ready to wrap as [total_rows, h].
+                    let out_flat = gpu.fused_attention_batched_posmajor(
+                        q_data.as_ref(),
+                        k_data.as_ref(),
+                        v_data.as_ref(),
+                        batch_size,
+                        num_heads,
+                        max_len,
+                        head_dim,
+                        scale,
+                        base_alibi,
+                        &flat_masks,
+                    );
+                    Array2::from_shape_vec((total_rows, h), out_flat)
+                        .expect("posmajor attention output is [total_rows, h]")
+                } else {
+                    // Reshape Q,K,V from [batch_size * max_len, num_heads * head_dim]
+                    // to [(batch_size * num_heads), max_len, head_dim] head-major flat
+                    let mut qf = vec![0.0f32; all_heads * max_len * head_dim];
+                    let mut kf = vec![0.0f32; all_heads * max_len * head_dim];
+                    let mut vf = vec![0.0f32; all_heads * max_len * head_dim];
 
-                for b in 0..batch_size {
-                    for s in 0..max_len {
-                        for hd in 0..num_heads {
-                            let src = (b * max_len + s) * total_dim + hd * head_dim;
-                            let dst = (b * num_heads + hd) * max_len * head_dim + s * head_dim;
-                            qf[dst..dst + head_dim]
-                                .copy_from_slice(&q_data.as_ref()[src..src + head_dim]);
-                            kf[dst..dst + head_dim]
-                                .copy_from_slice(&k_data.as_ref()[src..src + head_dim]);
-                            vf[dst..dst + head_dim]
-                                .copy_from_slice(&v_data.as_ref()[src..src + head_dim]);
+                    // Position-major [batch*seq, heads*head_dim] -> head-major
+                    // [(batch*heads), seq, head_dim]. Each (b, head) owns a disjoint
+                    // [max_len*head_dim] output block, so the scatter parallelizes
+                    // cleanly over the head-major chunks (measured ~10% of batched
+                    // wall single-threaded; this spreads it over the rayon pool).
+                    use rayon::prelude::*;
+                    let block = max_len * head_dim;
+                    let (qs, ks, vs) = (q_data.as_ref(), k_data.as_ref(), v_data.as_ref());
+                    qf.par_chunks_mut(block)
+                        .zip(kf.par_chunks_mut(block))
+                        .zip(vf.par_chunks_mut(block))
+                        .enumerate()
+                        .for_each(|(blk, ((qchunk, kchunk), vchunk))| {
+                            let b = blk / num_heads;
+                            let hd = blk % num_heads;
+                            for s in 0..max_len {
+                                let src = (b * max_len + s) * total_dim + hd * head_dim;
+                                let dst = s * head_dim;
+                                qchunk[dst..dst + head_dim]
+                                    .copy_from_slice(&qs[src..src + head_dim]);
+                                kchunk[dst..dst + head_dim]
+                                    .copy_from_slice(&ks[src..src + head_dim]);
+                                vchunk[dst..dst + head_dim]
+                                    .copy_from_slice(&vs[src..src + head_dim]);
+                            }
+                        });
+
+                    let out_flat = gpu.fused_attention_batched(
+                        &qf,
+                        &kf,
+                        &vf,
+                        batch_size,
+                        num_heads,
+                        max_len,
+                        head_dim,
+                        scale,
+                        base_alibi,
+                        &flat_masks,
+                    );
+
+                    // Reshape back to [batch_size * max_len, num_heads * head_dim]
+                    let mut out = Array2::<f32>::zeros((total_rows, h));
+                    let out_s = out.as_slice_mut().unwrap();
+                    for b in 0..batch_size {
+                        for s in 0..max_len {
+                            for hd in 0..num_heads {
+                                let src = (b * num_heads + hd) * max_len * head_dim + s * head_dim;
+                                let dst = (b * max_len + s) * total_dim + hd * head_dim;
+                                out_s[dst..dst + head_dim]
+                                    .copy_from_slice(&out_flat[src..src + head_dim]);
+                            }
                         }
                     }
+                    out
                 }
-
-                let base_alibi = alibi_slopes.as_deref().unwrap_or(&[]);
-
-                let out_flat = gpu.fused_attention_batched(
-                    &qf,
-                    &kf,
-                    &vf,
-                    batch_size,
-                    num_heads,
-                    max_len,
-                    head_dim,
-                    scale,
-                    base_alibi,
-                    &flat_masks,
-                );
-
-                // Reshape back to [batch_size * max_len, num_heads * head_dim]
-                let mut out = Array2::<f32>::zeros((total_rows, h));
-                let out_s = out.as_slice_mut().unwrap();
-                for b in 0..batch_size {
-                    for s in 0..max_len {
-                        for hd in 0..num_heads {
-                            let src = (b * num_heads + hd) * max_len * head_dim + s * head_dim;
-                            let dst = (b * max_len + s) * total_dim + hd * head_dim;
-                            out_s[dst..dst + head_dim]
-                                .copy_from_slice(&out_flat[src..src + head_dim]);
-                        }
-                    }
-                }
-                out
             } else {
                 // CPU fallback per-input per-head
                 let mut out = Array2::<f32>::zeros((total_rows, h));

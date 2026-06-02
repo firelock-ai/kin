@@ -390,6 +390,80 @@ pub trait GpuCompute: Send + Sync {
         self.batched_attn_values(&scores, v, total_heads, seq_len, head_dim)
     }
 
+    /// Position-major fused attention ("Lever A").
+    ///
+    /// Consumes `q`/`k`/`v` in the forward-pass position-major layout
+    /// `[num_groups*seq_len, heads_per_group*head_dim]` (i.e. `[batch*seq,
+    /// hidden]`) and returns the attention output in the *same* position-major
+    /// layout. A GPU backend that overrides this can do the head-major reshape
+    /// on-device so the per-layer scatter never round-trips to host memory.
+    ///
+    /// The default implementation reproduces the host scatter exactly: reshape
+    /// to head-major, run [`fused_attention_batched`], reshape back. It is the
+    /// byte-for-byte reference and the path CPU/non-Metal backends take.
+    #[allow(clippy::too_many_arguments)]
+    fn fused_attention_batched_posmajor(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        num_groups: usize,
+        heads_per_group: usize,
+        seq_len: usize,
+        head_dim: usize,
+        scale: f32,
+        alibi_slopes: &[f32],
+        masks: &[u32],
+    ) -> Vec<f32> {
+        let total_heads = num_groups * heads_per_group;
+        let total_dim = heads_per_group * head_dim;
+        let elems = total_heads * seq_len * head_dim;
+
+        // Position-major [group*seq, total_dim] -> head-major
+        // [(group*heads), seq, head_dim].
+        let mut qf = vec![0.0f32; elems];
+        let mut kf = vec![0.0f32; elems];
+        let mut vf = vec![0.0f32; elems];
+        for b in 0..num_groups {
+            for s in 0..seq_len {
+                for hd in 0..heads_per_group {
+                    let src = (b * seq_len + s) * total_dim + hd * head_dim;
+                    let dst = (b * heads_per_group + hd) * seq_len * head_dim + s * head_dim;
+                    qf[dst..dst + head_dim].copy_from_slice(&q[src..src + head_dim]);
+                    kf[dst..dst + head_dim].copy_from_slice(&k[src..src + head_dim]);
+                    vf[dst..dst + head_dim].copy_from_slice(&v[src..src + head_dim]);
+                }
+            }
+        }
+
+        let out_head = self.fused_attention_batched(
+            &qf,
+            &kf,
+            &vf,
+            num_groups,
+            heads_per_group,
+            seq_len,
+            head_dim,
+            scale,
+            alibi_slopes,
+            masks,
+        );
+
+        // Head-major [(group*heads), seq, head_dim] -> position-major
+        // [group*seq, total_dim].
+        let mut out = vec![0.0f32; elems];
+        for b in 0..num_groups {
+            for s in 0..seq_len {
+                for hd in 0..heads_per_group {
+                    let src = (b * heads_per_group + hd) * seq_len * head_dim + s * head_dim;
+                    let dst = (b * seq_len + s) * total_dim + hd * head_dim;
+                    out[dst..dst + head_dim].copy_from_slice(&out_head[src..src + head_dim]);
+                }
+            }
+        }
+        out
+    }
+
     /// Fused SwiGLU feed-forward + residual + LayerNorm in a single GPU
     /// submission — the post-LN FFN block:
     ///
@@ -960,6 +1034,73 @@ mod tests {
         assert!((out[5] - 0.26894143).abs() < 1e-5);
         assert!((out[6] - 0.26894143).abs() < 1e-5);
         assert!((out[7] - 0.7310586).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_cpu_fused_attention_batched_posmajor_matches_head_major() {
+        // The position-major entry point must be a pure relayout of the
+        // head-major path: feed it the position-major view of the same tensors
+        // and the (un-reshaped) output must match `fused_attention_batched`
+        // bit-for-bit. Guards the reshape index math (Lever A) without a GPU.
+        let cpu = CpuCompute;
+        let num_groups = 3;
+        let heads_per_group = 2;
+        let seq_len = 5;
+        let head_dim = 4;
+        let total_dim = heads_per_group * head_dim;
+        let total_heads = num_groups * heads_per_group;
+        let elems = total_heads * seq_len * head_dim;
+
+        // Head-major reference inputs.
+        let qh: Vec<f32> = (0..elems).map(|i| ((i % 89) as f32 - 44.0) * 0.01).collect();
+        let kh: Vec<f32> = (0..elems).map(|i| ((i % 73) as f32 - 36.0) * 0.01).collect();
+        let vh: Vec<f32> = (0..elems).map(|i| ((i % 61) as f32 - 30.0) * 0.01).collect();
+        let masks = vec![
+            1, 1, 1, 1, 0, // group 0
+            1, 1, 1, 1, 1, // group 1
+            1, 1, 0, 0, 0, // group 2
+        ];
+        let alibi = vec![0.0, 0.0625]; // per-head within a group
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        // Scatter head-major -> position-major to feed the posmajor entry point.
+        let mut qp = vec![0.0f32; elems];
+        let mut kp = vec![0.0f32; elems];
+        let mut vp = vec![0.0f32; elems];
+        for b in 0..num_groups {
+            for s in 0..seq_len {
+                for hd in 0..heads_per_group {
+                    let src = (b * heads_per_group + hd) * seq_len * head_dim + s * head_dim;
+                    let dst = (b * seq_len + s) * total_dim + hd * head_dim;
+                    qp[dst..dst + head_dim].copy_from_slice(&qh[src..src + head_dim]);
+                    kp[dst..dst + head_dim].copy_from_slice(&kh[src..src + head_dim]);
+                    vp[dst..dst + head_dim].copy_from_slice(&vh[src..src + head_dim]);
+                }
+            }
+        }
+
+        let out_pos = cpu.fused_attention_batched_posmajor(
+            &qp, &kp, &vp, num_groups, heads_per_group, seq_len, head_dim, scale, &alibi, &masks,
+        );
+        let out_head = cpu.fused_attention_batched(
+            &qh, &kh, &vh, num_groups, heads_per_group, seq_len, head_dim, scale, &alibi, &masks,
+        );
+
+        assert_eq!(out_pos.len(), elems);
+        // Un-reshape out_pos -> head-major and compare exactly (deterministic CPU).
+        for b in 0..num_groups {
+            for s in 0..seq_len {
+                for hd in 0..heads_per_group {
+                    let pos = (b * seq_len + s) * total_dim + hd * head_dim;
+                    let head = (b * heads_per_group + hd) * seq_len * head_dim + s * head_dim;
+                    assert_eq!(
+                        &out_pos[pos..pos + head_dim],
+                        &out_head[head..head + head_dim],
+                        "posmajor mismatch at group={b} seq={s} head={hd}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
