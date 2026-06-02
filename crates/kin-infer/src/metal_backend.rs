@@ -1611,11 +1611,14 @@ impl MetalCompute {
         // fp16-operand MMA (Lever #4) — OPTIONAL, compiled as a SEPARATE library
         // so a toolchain that rejects the half*half->float `simdgroup_matrix`
         // overload only loses the fp16 path (this whole library fails to build),
-        // never the main library or Metal. Only attempted when the fp32 MMA
-        // built. If the library compiles, register its three kernels; any
-        // failure (compile, lookup, or pipeline) leaves FP16_MMA_AVAILABLE false.
+        // never the main library or Metal. Only compiled when fp16 is opt-in
+        // enabled AND the fp32 MMA built — so the default (flag-off) scoring path
+        // never even attempts the extra library compile (zero added startup cost,
+        // zero fp16 risk surface). If the library compiles, register its three
+        // kernels; any failure (compile, lookup, or pipeline) leaves
+        // FP16_MMA_AVAILABLE false and every GEMM uses the fp32 MMA.
         let mut fp16_mma_available = false;
-        if mma_available {
+        if mma_available && mma_fp16_enabled() {
             match device.new_library_with_source(FP16_SHADER_SOURCE, &opts) {
                 Ok(fp16_library) => {
                     let fp16_kernel_names: &[&str] = &[
