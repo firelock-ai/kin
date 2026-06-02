@@ -213,5 +213,46 @@ fn metal_embed_forward_profile() {
             "VERDICT: batching gives only {speedup:.2}x -> batch=1 already near-occupies the GPU at this shape."
         );
     }
+
+    // --- Daemon-regime per-phase breakdown (forward_batched at batch ~100) ---
+    // The daemon embeds in large batches (~192), where per-forward submission
+    // overhead is amortized — so the bottleneck may differ from batch=1. Profile
+    // ONE batched forward and attribute wall-clock to kernel class so we target
+    // the MEASURED bottleneck (matmul / attention / norm-softmax / activation /
+    // host-copy+readback), not an assumed one.
+    eprintln!("\n=== Daemon-regime per-phase breakdown (forward_batched) ===");
+    let mut bt: Vec<Vec<u32>> = Vec::new();
+    let mut bm: Vec<Vec<u32>> = Vec::new();
+    for (bucket, &len) in seq_lens.iter().enumerate() {
+        for j in 0..20 {
+            let (ids, mask) = synth_sequence(len, (bucket * 97 + j) as u32);
+            bt.push(ids);
+            bm.push(mask);
+        }
+    }
+    let _ = model.forward_batched(&bt, &bm).expect("warm batched"); // warm
+    metal_backend::reset_profile();
+    let t_b = Instant::now();
+    let _ = model.forward_batched(&bt, &bm).expect("batched fwd");
+    let bw = t_b.elapsed().as_secs_f64();
+    let (mm, attn, norm, act, copy): (u64, u64, u64, u64, u64) =
+        metal_backend::profile_phase_nanos();
+    let tot = (mm + attn + norm + act + copy).max(1) as f64;
+    let subs_b = metal_backend::profile_submissions();
+    eprintln!(
+        "BATCHED({}) {:.1} ent/s  |  subs={subs_b}  ({:.1} per forward over {} layers)",
+        bt.len(),
+        bt.len() as f64 / bw.max(1e-9),
+        subs_b as f64,
+        layers,
+    );
+    eprintln!(
+        "phase split: matmul {:.0}% / attention {:.0}% / norm-softmax {:.0}% / activation {:.0}% / copy-readback {:.0}%",
+        mm as f64 / tot * 100.0,
+        attn as f64 / tot * 100.0,
+        norm as f64 / tot * 100.0,
+        act as f64 / tot * 100.0,
+        copy as f64 / tot * 100.0,
+    );
     eprintln!();
 }
