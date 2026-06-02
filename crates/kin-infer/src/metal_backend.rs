@@ -90,29 +90,41 @@ fn profile_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("KIN_INFER_METAL_PROFILE").is_some())
 }
 
-/// Whether the simdgroup_matrix MMA GEMM kernels are enabled. Default OFF: the
-/// proven scalar tile stays the default path until the MMA kernels pass the
-/// Metal-vs-CPU cosine + swerank parity gate on this machine. Enable with
-/// `KIN_INFER_MMA=1`. Sampled once per process. Once gated green the default
-/// flips here with zero call-site change.
+/// Whether the simdgroup_matrix MMA GEMM kernels are enabled. Default ON: the
+/// kernels pass the Metal-vs-CPU cosine + swerank parity gate on Apple Silicon
+/// and are the throughput path. Disable with `KIN_INFER_MMA=0` to force the
+/// proven scalar tile. Sampled once per process.
 fn mma_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("KIN_INFER_MMA").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
+            Some("0") | Some("false") | Some("no") | Some("off")
         )
     })
 }
 
+/// Whether the simdgroup MMA pipelines actually compiled on this device. Set
+/// once by `MetalCompute::try_new`. The MMA kernels require the
+/// `simdgroup_matrix` intrinsics; if a target's Metal toolchain fails to build
+/// them, this stays false and `use_mma` routes every GEMM to the scalar tile —
+/// Metal stays alive (the scalar path is always built), only the MMA fast path
+/// is disabled. Defaults to true so a process that never constructs a Metal
+/// context (e.g. CPU-only) still honors the `mma_enabled` gate.
+static MMA_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 /// Route a GEMM of shape (m, n, k) to the simdgroup MMA kernel only when it is
-/// enabled AND the shape fills the 32x32 register tile usefully — small or
-/// ragged-only shapes (e.g. very short attention) waste the MMA on zero-pad and
-/// stay on the scalar kernel.
+/// enabled, the MMA pipelines compiled on this device, AND the shape fills the
+/// 32x32 register tile usefully — small or ragged-only shapes (e.g. very short
+/// attention) waste the MMA on zero-pad and stay on the scalar kernel.
 #[inline]
 fn use_mma(m: usize, n: usize, k: usize) -> bool {
-    mma_enabled() && m >= 32 && n >= 32 && k >= 16
+    mma_enabled()
+        && MMA_AVAILABLE.load(Ordering::Relaxed)
+        && m >= 32
+        && n >= 32
+        && k >= 16
 }
 
 /// Total nanoseconds the host spent blocked in `wait_until_completed` since the
@@ -1002,13 +1014,12 @@ impl MetalCompute {
             }
         };
 
+        // Required scalar kernels — Metal cannot run without these, so a build
+        // failure here disables the backend (caller falls back to CPU).
         let kernel_names: &[&str] = &[
             "matmul_transb",
-            "matmul_transb_simdgroup",
             "batched_matmul_transb",
-            "batched_matmul_transb_simdgroup",
             "batched_matmul_ab",
-            "batched_matmul_ab_simdgroup",
             "scale_mask_alibi",
             "scale_mask_alibi_grouped",
             "softmax_rows",
@@ -1041,6 +1052,36 @@ impl MetalCompute {
             };
             pipelines.insert(name, pipeline);
         }
+
+        // simdgroup MMA fast-path kernels — OPTIONAL. They require the
+        // `simdgroup_matrix` intrinsics; if a target's toolchain fails to build
+        // any one of them, leave them out and disable the MMA route process-wide
+        // so every GEMM falls back to the scalar tile above. Metal stays alive.
+        let mma_kernel_names: &[&str] = &[
+            "matmul_transb_simdgroup",
+            "batched_matmul_transb_simdgroup",
+            "batched_matmul_ab_simdgroup",
+        ];
+        let mut mma_available = true;
+        for &name in mma_kernel_names {
+            let pipeline = library
+                .get_function(name, None)
+                .and_then(|func| device.new_compute_pipeline_state_with_function(&func));
+            match pipeline {
+                Ok(pipeline) => {
+                    pipelines.insert(name, pipeline);
+                }
+                Err(err) => {
+                    eprintln!(
+                        "kin-infer: Metal MMA kernel {name} unavailable ({err}); \
+                         falling back to scalar GEMM (Metal stays enabled)"
+                    );
+                    mma_available = false;
+                    break;
+                }
+            }
+        }
+        MMA_AVAILABLE.store(mma_available, Ordering::Relaxed);
 
         let pool = Arc::new(BufferPool::new(device.clone()));
         Some(Self {
