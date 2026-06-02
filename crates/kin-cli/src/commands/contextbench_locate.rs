@@ -29,6 +29,14 @@ struct ContextbenchTrajectory {
     files: Vec<WrapperFileEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     debug: Option<serde_json::Value>,
+    /// Per-gold rank trace: for each gold file in the task, where it ranked in
+    /// the pre-cap candidate pool, where it ranked in the final emitted list,
+    /// and — when it didn't make the final cut — why (COVERAGE / RANKING / CAP).
+    /// The "why did we win/lose this task" answer, emitted automatically under
+    /// `--debug` for every task and granularity. Zero extra retrieval compute:
+    /// it reads gold from the task file and the existing pipeline debug stages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gold_trace: Option<GoldTrace>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -70,6 +78,53 @@ struct PredStep {
 struct Span {
     start: u32,
     end: u32,
+}
+
+/// Top-level per-gold rank trace for one task. Summarizes how many gold files
+/// were emitted vs missed, then carries a per-file record for each gold.
+#[derive(Debug, Serialize, Clone)]
+struct GoldTrace {
+    gold_files: usize,
+    emitted: usize,
+    /// Gold present in the pre-cap pool but dropped before the final list.
+    missed_ranking: usize,
+    /// Gold dropped specifically by the adaptive cap / cluster prune.
+    missed_cap: usize,
+    /// Gold absent from the pre-cap pool entirely (a coverage failure).
+    missed_coverage: usize,
+    files: Vec<GoldFileTrace>,
+}
+
+/// Per-gold-file trace record. Classifies the outcome and, for each granularity
+/// the pipeline exposes, records where the gold ranked.
+#[derive(Debug, Serialize, Clone)]
+struct GoldFileTrace {
+    file: String,
+    /// FOUND | RANKING | CAP | COVERAGE — the outcome classification.
+    outcome: String,
+    /// 1-based rank in the final emitted list, if present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    emitted_rank: Option<usize>,
+    /// 1-based rank in the `pre_cap_full` candidate pool, if present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pre_cap_rank: Option<usize>,
+    /// Fused score in the `pre_cap_full` pool, if present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pre_cap_score: Option<f32>,
+    /// Earliest pipeline stage (other than `pre_cap_full`) the gold appeared in,
+    /// to localize where coverage was won — `None` if never seen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_seen_stage: Option<String>,
+    /// Reason recorded by `adaptive_cap` when this gold was pruned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pruned_reason: Option<String>,
+    /// Gold line range from the task (`gold_context` start/end line).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gold_span: Option<Span>,
+    /// Whether any emitted span for this file overlaps the gold line range.
+    /// Only meaningful when the file was emitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span_overlap: Option<bool>,
 }
 
 pub async fn run(task_file: PathBuf, json: bool, debug: bool) -> Result<()> {
@@ -155,6 +210,16 @@ pub async fn run(task_file: PathBuf, json: bool, debug: bool) -> Result<()> {
         });
     }
 
+    // Capture the emitted rank order and per-file spans before they are moved
+    // into the trajectory, so the gold trace can locate each gold in the final
+    // list and check span overlap.
+    let gold_trace = if debug {
+        let gold = parse_gold(&task);
+        build_gold_trace(&gold, &pred_files, &pred_spans, locate_result.debug.as_ref())
+    } else {
+        None
+    };
+
     let traj_data = TrajData {
         pred_steps: vec![PredStep {
             files: pred_files.clone(),
@@ -187,6 +252,7 @@ pub async fn run(task_file: PathBuf, json: bool, debug: bool) -> Result<()> {
         query_truncated: query_len > CONTEXTBENCH_QUERY_CHAR_LIMIT,
         files: wrapper_files,
         debug: debug_value,
+        gold_trace,
     };
 
     if json {
@@ -333,6 +399,184 @@ fn normalize_path(path: &str) -> String {
         .to_string()
 }
 
+/// One gold-context entry parsed from the task file: the gold file and the
+/// line range the gold span covers (ContextBench `gold_context` carries
+/// `{file, start_line, end_line, content}` — no symbol names).
+#[derive(Debug, Clone)]
+struct GoldEntry {
+    file: String,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
+}
+
+/// Parse the task's `gold_context` (a JSON array, or a JSON-encoded string of
+/// one) into normalized gold entries. Paths are run through `normalize_path` so
+/// they line up with the predicted file paths. Returns an empty vec when the
+/// task carries no gold (e.g. blind submission inputs) — the trace is then a
+/// no-op rather than an error.
+fn parse_gold(task: &Value) -> Vec<GoldEntry> {
+    let raw = match task.get("gold_context") {
+        Some(Value::Array(arr)) => arr.clone(),
+        Some(Value::String(s)) => {
+            serde_json::from_str::<Vec<Value>>(s).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut entries = Vec::new();
+    for item in &raw {
+        let Some(file) = item.get("file").and_then(Value::as_str) else {
+            continue;
+        };
+        let normalized = normalize_path(file);
+        if normalized.is_empty() {
+            continue;
+        }
+        let start_line = item.get("start_line").and_then(Value::as_u64).map(|v| v as u32);
+        let end_line = item.get("end_line").and_then(Value::as_u64).map(|v| v as u32);
+        // Dedup by (file, span) so the same file with distinct gold ranges is
+        // kept (each is a separate gold target), but exact repeats collapse.
+        if seen.insert((normalized.clone(), start_line, end_line)) {
+            entries.push(GoldEntry {
+                file: normalized,
+                start_line,
+                end_line,
+            });
+        }
+    }
+    entries
+}
+
+/// Build the per-gold rank trace from the task gold, the emitted (final) file
+/// list and spans, and the locate pipeline debug info. Classifies each gold:
+///
+/// - `FOUND`    — gold is in the final emitted list.
+/// - `CAP`      — gold was pruned by the adaptive cap / cluster prune
+///                (`debug.pruned_files` carries the reason).
+/// - `RANKING`  — gold reached the pre-cap pool but was ranked below the kept
+///                set without an explicit prune reason.
+/// - `COVERAGE` — gold never reached the pre-cap pool (a retrieval gap, not a
+///                ranking/cap one). This is the most actionable miss class.
+///
+/// Returns `None` only when the task carries no gold at all.
+fn build_gold_trace(
+    gold: &[GoldEntry],
+    pred_files: &[String],
+    pred_spans: &std::collections::HashMap<String, Vec<Span>>,
+    debug: Option<&crate::commands::locate::LocateDebugInfo>,
+) -> Option<GoldTrace> {
+    if gold.is_empty() {
+        return None;
+    }
+
+    // Final emitted rank: 1-based position of each file in the kept list.
+    let emitted_rank: std::collections::HashMap<&str, usize> = pred_files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.as_str(), i + 1))
+        .collect();
+
+    // pre_cap_full pool: 1-based rank + score per file. The full fused pool the
+    // pipeline recorded just before the adaptive cap ran.
+    let mut pre_cap_rank: std::collections::HashMap<String, (usize, f32)> =
+        std::collections::HashMap::new();
+    // First non-pre_cap stage each path was seen in, to localize coverage.
+    let mut first_seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Some(debug) = debug {
+        for stage in &debug.stages {
+            if stage.name == "pre_cap_full" {
+                for (idx, fs) in stage.files.iter().enumerate() {
+                    pre_cap_rank
+                        .entry(normalize_path(&fs.path))
+                        .or_insert((idx + 1, fs.score));
+                }
+            } else {
+                for fs in &stage.files {
+                    first_seen
+                        .entry(normalize_path(&fs.path))
+                        .or_insert_with(|| stage.name.clone());
+                }
+            }
+        }
+    }
+
+    // pruned_files: reason the adaptive cap dropped a candidate.
+    let mut pruned: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Some(debug) = debug {
+        for pf in &debug.pruned_files {
+            pruned
+                .entry(normalize_path(&pf.path))
+                .or_insert_with(|| pf.reason.clone());
+        }
+    }
+
+    let mut files = Vec::with_capacity(gold.len());
+    let (mut emitted, mut missed_ranking, mut missed_cap, mut missed_coverage) = (0, 0, 0, 0);
+
+    for entry in gold {
+        let in_final = emitted_rank.get(entry.file.as_str()).copied();
+        let in_pool = pre_cap_rank.get(&entry.file).copied();
+        let pruned_reason = pruned.get(&entry.file).cloned();
+
+        let outcome = if in_final.is_some() {
+            emitted += 1;
+            "FOUND"
+        } else if pruned_reason.is_some() {
+            missed_cap += 1;
+            "CAP"
+        } else if in_pool.is_some() {
+            missed_ranking += 1;
+            "RANKING"
+        } else {
+            missed_coverage += 1;
+            "COVERAGE"
+        };
+
+        let gold_span = match (entry.start_line, entry.end_line) {
+            (Some(start), Some(end)) => Some(Span { start, end }),
+            _ => None,
+        };
+
+        // Span overlap is only meaningful for emitted files: did any emitted
+        // span intersect the gold line range?
+        let span_overlap = if in_final.is_some() {
+            match (entry.start_line, entry.end_line) {
+                (Some(gs), Some(ge)) => Some(
+                    pred_spans
+                        .get(&entry.file)
+                        .map(|spans| spans.iter().any(|s| s.start <= ge && s.end >= gs))
+                        .unwrap_or(false),
+                ),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        files.push(GoldFileTrace {
+            file: entry.file.clone(),
+            outcome: outcome.to_string(),
+            emitted_rank: in_final,
+            pre_cap_rank: in_pool.map(|(r, _)| r),
+            pre_cap_score: in_pool.map(|(_, s)| s),
+            first_seen_stage: first_seen.get(&entry.file).cloned(),
+            pruned_reason,
+            gold_span,
+            span_overlap,
+        });
+    }
+
+    Some(GoldTrace {
+        gold_files: gold.len(),
+        emitted,
+        missed_ranking,
+        missed_cap,
+        missed_coverage,
+        files,
+    })
+}
+
 /// Symbol names Kin should emit so the ContextBench evaluator can match them.
 ///
 /// Kin attributes some entities with a path-qualified name (e.g. Rust
@@ -379,10 +623,13 @@ fn symbol_match_candidates(name: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        augment_query_with_test_patch, contextbench_max_files, extract_test_patch_hints, normalize_path,
-        parse_contextbench_max_files, select_query, suggested_contextbench_max_files,
-        CONTEXTBENCH_DEFAULT_MAX_FILES, CONTEXTBENCH_MULTI_FILE_MAX_FILES,
-        CONTEXTBENCH_QUERY_CHAR_LIMIT,
+        augment_query_with_test_patch, build_gold_trace, contextbench_max_files,
+        extract_test_patch_hints, normalize_path, parse_contextbench_max_files, parse_gold,
+        select_query, suggested_contextbench_max_files, Span, CONTEXTBENCH_DEFAULT_MAX_FILES,
+        CONTEXTBENCH_MULTI_FILE_MAX_FILES, CONTEXTBENCH_QUERY_CHAR_LIMIT,
+    };
+    use crate::commands::locate::{
+        LocateDebugFileScore, LocateDebugInfo, LocateDebugStage, PrunedFile,
     };
     use serde_json::json;
 
@@ -496,5 +743,145 @@ mod tests {
         assert!(hints.contains(&"test/libponyc/lexer.cc".to_string()));
         assert!(hints.contains(&"TripleStringOnlyWhitespace".to_string()));
         assert!(hints.contains(&"test_triple_string_without_newline".to_string()));
+    }
+
+    #[test]
+    fn parse_gold_decodes_json_string_and_normalizes_paths() {
+        let task = json!({
+            "gold_context": "[{\"file\": \"/workspace/repo__name/src/lib.rs\", \"start_line\": 10, \"end_line\": 20}, {\"file\": \"./pkg/util.rs\", \"start_line\": 5, \"end_line\": 7}]"
+        });
+        let gold = parse_gold(&task);
+        assert_eq!(gold.len(), 2);
+        assert_eq!(gold[0].file, "src/lib.rs");
+        assert_eq!(gold[0].start_line, Some(10));
+        assert_eq!(gold[0].end_line, Some(20));
+        assert_eq!(gold[1].file, "pkg/util.rs");
+    }
+
+    #[test]
+    fn parse_gold_accepts_array_and_dedups_repeats() {
+        let task = json!({
+            "gold_context": [
+                {"file": "a.py", "start_line": 1, "end_line": 2},
+                {"file": "a.py", "start_line": 1, "end_line": 2},
+                {"file": "a.py", "start_line": 30, "end_line": 40}
+            ]
+        });
+        let gold = parse_gold(&task);
+        // Same file, distinct span -> two; exact repeat collapses.
+        assert_eq!(gold.len(), 2);
+    }
+
+    #[test]
+    fn parse_gold_empty_when_missing() {
+        assert!(parse_gold(&json!({})).is_empty());
+        assert!(parse_gold(&json!({"gold_context": "not json"})).is_empty());
+    }
+
+    fn stage(name: &str, files: &[(&str, f32)]) -> LocateDebugStage {
+        LocateDebugStage {
+            name: name.to_string(),
+            files: files
+                .iter()
+                .map(|(p, s)| LocateDebugFileScore {
+                    path: p.to_string(),
+                    score: *s,
+                    reasons: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn build_gold_trace_classifies_found_ranking_cap_coverage() {
+        let task = json!({
+            "gold_context": [
+                {"file": "found.py",    "start_line": 10, "end_line": 20},
+                {"file": "ranking.py",  "start_line": 1,  "end_line": 5},
+                {"file": "capped.py",   "start_line": 1,  "end_line": 5},
+                {"file": "missing.py",  "start_line": 1,  "end_line": 5}
+            ]
+        });
+        let gold = parse_gold(&task);
+
+        // Final emitted list contains only found.py.
+        let pred_files = vec!["found.py".to_string()];
+        let mut pred_spans = std::collections::HashMap::new();
+        pred_spans.insert(
+            "found.py".to_string(),
+            vec![Span { start: 12, end: 18 }], // overlaps gold 10..20
+        );
+
+        let debug = LocateDebugInfo {
+            stages: vec![
+                stage("base_track", &[("ranking.py", 0.2)]),
+                stage(
+                    "pre_cap_full",
+                    &[("found.py", 1.0), ("capped.py", 0.5), ("ranking.py", 0.1)],
+                ),
+            ],
+            pruned_files: vec![PrunedFile {
+                path: "capped.py".to_string(),
+                score: 0.5,
+                reason: "adaptive_cap".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        let trace = build_gold_trace(&gold, &pred_files, &pred_spans, Some(&debug)).unwrap();
+        assert_eq!(trace.gold_files, 4);
+        assert_eq!(trace.emitted, 1);
+        assert_eq!(trace.missed_cap, 1);
+        assert_eq!(trace.missed_ranking, 1);
+        assert_eq!(trace.missed_coverage, 1);
+
+        let by_file: std::collections::HashMap<_, _> =
+            trace.files.iter().map(|f| (f.file.as_str(), f)).collect();
+
+        let found = by_file["found.py"];
+        assert_eq!(found.outcome, "FOUND");
+        assert_eq!(found.emitted_rank, Some(1));
+        assert_eq!(found.pre_cap_rank, Some(1));
+        assert_eq!(found.span_overlap, Some(true));
+
+        let ranking = by_file["ranking.py"];
+        assert_eq!(ranking.outcome, "RANKING");
+        assert_eq!(ranking.pre_cap_rank, Some(3));
+        assert_eq!(ranking.first_seen_stage.as_deref(), Some("base_track"));
+        assert!(ranking.emitted_rank.is_none());
+
+        let capped = by_file["capped.py"];
+        assert_eq!(capped.outcome, "CAP");
+        assert_eq!(capped.pruned_reason.as_deref(), Some("adaptive_cap"));
+
+        let missing = by_file["missing.py"];
+        assert_eq!(missing.outcome, "COVERAGE");
+        assert!(missing.pre_cap_rank.is_none());
+        assert!(missing.first_seen_stage.is_none());
+    }
+
+    #[test]
+    fn build_gold_trace_none_without_gold() {
+        let pred_files: Vec<String> = vec![];
+        let pred_spans = std::collections::HashMap::new();
+        assert!(build_gold_trace(&[], &pred_files, &pred_spans, None).is_none());
+    }
+
+    #[test]
+    fn build_gold_trace_span_overlap_false_when_disjoint() {
+        let task = json!({
+            "gold_context": [{"file": "f.py", "start_line": 100, "end_line": 110}]
+        });
+        let gold = parse_gold(&task);
+        let pred_files = vec!["f.py".to_string()];
+        let mut pred_spans = std::collections::HashMap::new();
+        pred_spans.insert("f.py".to_string(), vec![Span { start: 1, end: 5 }]);
+        let debug = LocateDebugInfo {
+            stages: vec![stage("pre_cap_full", &[("f.py", 1.0)])],
+            ..Default::default()
+        };
+        let trace = build_gold_trace(&gold, &pred_files, &pred_spans, Some(&debug)).unwrap();
+        assert_eq!(trace.files[0].outcome, "FOUND");
+        assert_eq!(trace.files[0].span_overlap, Some(false));
     }
 }
