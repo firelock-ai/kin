@@ -10126,17 +10126,32 @@ fn entity_span_pair(entity: &kin_model::Entity) -> Vec<[u32; 2]> {
             // raw 0-indexed domain, then shift to 1-based on emit so emitted
             // spans line up with gold (and with the already-1-indexed traceback
             // spans) instead of landing one line short.
-            let (start, end) = if is_class_like {
+            let (start, end, end_is_real) = if is_class_like {
                 let len = s.end_line.saturating_sub(s.start_line);
                 if len > 30 {
-                    (s.start_line, (s.start_line + 4).min(s.end_line))
+                    // Synthetic head window; `end` is start+4, not the node's
+                    // real end row, so the trailing-newline adjustment below
+                    // must not apply to it.
+                    (s.start_line, (s.start_line + 4).min(s.end_line), false)
                 } else {
-                    (s.start_line, s.end_line)
+                    (s.start_line, s.end_line, true)
                 }
             } else {
-                (s.start_line, s.end_line)
+                (s.start_line, s.end_line, true)
             };
-            vec![[start.saturating_add(1), end.saturating_add(1)]]
+            // tree-sitter `end_position()` is exclusive (just past the last
+            // byte). When a node's text ends with a newline, that exclusive end
+            // lands at column 0 of the FOLLOWING row, so `end_line` is already
+            // the 1-based last-content line and must not be incremented again —
+            // otherwise the inclusive end overshoots by one (worst on tight gold
+            // spans where it can flip overlap). For an end mid-line (`end_col >
+            // 0`) the row holds content and the +1 shift is correct.
+            let end_1 = if end_is_real && s.end_col == 0 && s.end_line > s.start_line {
+                end
+            } else {
+                end.saturating_add(1)
+            };
+            vec![[start.saturating_add(1), end_1]]
         })
         .unwrap_or_default()
 }
@@ -10498,6 +10513,7 @@ mod tests {
     fn entity_span_pair_emits_one_based_inclusive_lines() {
         // tree-sitter rows are 0-indexed; emitted spans are 1-based inclusive to
         // match LocateSymbol::span and ContextBench's 1-indexed gold ranges.
+        // test_entity sets end_col=1 (>0), the mid-line case -> end shifts +1.
         let func = test_entity("f", "src/a.py", 10, 20);
         assert_eq!(entity_span_pair(&func), vec![[11, 21]]);
 
@@ -10511,6 +10527,27 @@ mod tests {
         let mut no_span = test_entity("g", "src/a.py", 0, 0);
         no_span.span = None;
         assert!(entity_span_pair(&no_span).is_empty());
+    }
+
+    #[test]
+    fn entity_span_pair_end_boundary_does_not_overshoot_on_trailing_newline() {
+        // tree-sitter end_position() is exclusive: a def whose text ends with a
+        // newline reports end row = first row AFTER the last content line, at
+        // column 0. The last content line is 0-indexed row 20 -> 1-based 21, so
+        // the inclusive end must stay 21, not jump to 22.
+        let mut trailing_nl = test_entity("h", "src/a.py", 10, 21);
+        if let Some(span) = trailing_nl.span.as_mut() {
+            span.end_col = 0;
+        }
+        assert_eq!(entity_span_pair(&trailing_nl), vec![[11, 21]]);
+
+        // Same node ending mid-line (end_col > 0) keeps the +1 shift: 0-indexed
+        // row 21 holds content -> 1-based 22.
+        let mut mid_line = test_entity("h", "src/a.py", 10, 21);
+        if let Some(span) = mid_line.span.as_mut() {
+            span.end_col = 7;
+        }
+        assert_eq!(entity_span_pair(&mid_line), vec![[11, 22]]);
     }
 
     #[test]
