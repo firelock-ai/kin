@@ -1,3 +1,5 @@
+> **Umbrella guidance:** the workspace-root `AGENTS.md` is the source of truth for cross-repo thesis, boundaries, and rules. This file is the repo-specific authority for `kin-infer`.
+
 # kin-infer
 
 Universal transformer inference engine in pure Rust. Custom GPU compute shaders, no external ML frameworks.
