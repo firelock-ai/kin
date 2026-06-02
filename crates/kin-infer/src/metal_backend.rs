@@ -153,13 +153,22 @@ kernel void matmul_transb(
 // register tile of 8x8 fragments. The threadgroup stage is zero-padded on ragged
 // edges so the MMA always runs full 8x8 fragments, and the epilogue bounds-guards
 // the store — no separate tail kernel.
+// MMA block tile constants (shared by the kernels that declare the threadgroup
+// stage and the helper that consumes it).
+constant uint MMA_BM = 32, MMA_BN = 32, MMA_BK = 16, MMA_WM = 2, MMA_WN = 2, MMA_F = 8;
+
+// `As`/`Bs`/`store_tile` are declared in the calling KERNEL (threadgroup-address
+// variables cannot be declared in a non-kernel helper) and passed in by pointer.
 template <bool TRANSB>
 static inline void block_mma(
     device const float* A,
     device const float* B,
     device float* C,
     uint M, uint N, uint K,
-    uint3 tgid, uint sgid, uint lane)
+    uint3 tgid, uint sgid, uint lane,
+    threadgroup float (*As)[MMA_BK],
+    threadgroup float (*Bs)[MMA_BK],
+    threadgroup float (*store_tile)[MMA_F][MMA_F])
 {
     constexpr uint BM = 32, BN = 32, BK = 16, WM = 2, WN = 2, F = 8;
     constexpr uint TM = BM / (F * WM);   // 2 fragment-rows per simdgroup
@@ -170,11 +179,6 @@ static inline void block_mma(
     const uint block_row = tgid.y * BM;  // M offset of this block
     const uint block_col = tgid.x * BN;  // N offset of this block
     const uint tid = sgid * 32u + lane;  // flat thread index 0..127
-
-    // Threadgroup stage. A tile is BM x BK; B tile is staged as BN x BK so the
-    // K-contraction column is contiguous (matches the [N,K] / transposed load).
-    threadgroup float As[BM][BK];
-    threadgroup float Bs[BN][BK];
 
     simdgroup_float8x8 acc[TM][TN];
     for (uint i = 0; i < TM; i++)
@@ -221,7 +225,6 @@ static inline void block_mma(
     // Epilogue: store each fragment, bounds-guarded on ragged edges. Each
     // simdgroup gets its OWN scratch row (indexed by sgid) so the ragged-tile
     // staging never races across the 4 simdgroups in the threadgroup.
-    threadgroup float store_tile[WM * WN][F][F];
     for (uint i = 0; i < TM; i++) {
         for (uint j = 0; j < TN; j++) {
             uint cr = block_row + sm * F * TM + i * F;
@@ -259,7 +262,10 @@ kernel void matmul_transb_simdgroup(
     uint  sgid             [[simdgroup_index_in_threadgroup]],
     uint  lane             [[thread_index_in_simdgroup]])
 {
-    block_mma<true>(A, B, C, M, N, K, tgid, sgid, lane);
+    threadgroup float As[MMA_BM][MMA_BK];
+    threadgroup float Bs[MMA_BN][MMA_BK];
+    threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
+    block_mma<true>(A, B, C, M, N, K, tgid, sgid, lane, As, Bs, store_tile);
 }
 
 // Batched QK^T: per head (gid.z) C[h] = Q[h][seq,dim] * K[h][seq,dim]^T.
@@ -278,7 +284,10 @@ kernel void batched_matmul_transb_simdgroup(
     device const float* Ah = Q  + h * seq * dim;
     device const float* Bh = Kk + h * seq * dim;
     device float*       Ch = C  + h * seq * seq;
-    block_mma<true>(Ah, Bh, Ch, seq, seq, dim, uint3(tgid.x, tgid.y, 0), sgid, lane);
+    threadgroup float As[MMA_BM][MMA_BK];
+    threadgroup float Bs[MMA_BN][MMA_BK];
+    threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
+    block_mma<true>(Ah, Bh, Ch, seq, seq, dim, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
 }
 
 // Batched scores*V: per head (gid.z) C[h] = S[h][seq,seq] * V[h][seq,dim].
@@ -297,7 +306,10 @@ kernel void batched_matmul_ab_simdgroup(
     device const float* Ah = S + h * seq * seq;
     device const float* Bh = V + h * seq * dim;
     device float*       Ch = C + h * seq * dim;
-    block_mma<false>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane);
+    threadgroup float As[MMA_BM][MMA_BK];
+    threadgroup float Bs[MMA_BN][MMA_BK];
+    threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
+    block_mma<false>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
 }
 
 // ---- Softmax over rows ----
