@@ -10119,16 +10119,24 @@ fn entity_span_pair(entity: &kin_model::Entity) -> Vec<[u32; 2]> {
                     | EntityKind::Interface
                     | EntityKind::Module
             );
-            if is_class_like {
+            // `SourceSpan` carries tree-sitter rows, which are 0-indexed; the
+            // emitted `[u32; 2]` is the documented 1-based inclusive line span
+            // (see `LocateSymbol::span`) consumed by ContextBench against
+            // 1-indexed gold `gold_context` ranges. Compute the window in the
+            // raw 0-indexed domain, then shift to 1-based on emit so emitted
+            // spans line up with gold (and with the already-1-indexed traceback
+            // spans) instead of landing one line short.
+            let (start, end) = if is_class_like {
                 let len = s.end_line.saturating_sub(s.start_line);
                 if len > 30 {
-                    vec![[s.start_line, (s.start_line + 4).min(s.end_line)]]
+                    (s.start_line, (s.start_line + 4).min(s.end_line))
                 } else {
-                    vec![[s.start_line, s.end_line]]
+                    (s.start_line, s.end_line)
                 }
             } else {
-                vec![[s.start_line, s.end_line]]
-            }
+                (s.start_line, s.end_line)
+            };
+            vec![[start.saturating_add(1), end.saturating_add(1)]]
         })
         .unwrap_or_default()
 }
@@ -10484,6 +10492,25 @@ mod tests {
             w.iter().all(|x| (*x - 1.0).abs() < f32::EPSILON),
             "default rank-lift weights must all be 1.0 when env is unset"
         );
+    }
+
+    #[test]
+    fn entity_span_pair_emits_one_based_inclusive_lines() {
+        // tree-sitter rows are 0-indexed; emitted spans are 1-based inclusive to
+        // match LocateSymbol::span and ContextBench's 1-indexed gold ranges.
+        let func = test_entity("f", "src/a.py", 10, 20);
+        assert_eq!(entity_span_pair(&func), vec![[11, 21]]);
+
+        // Class-like spans longer than 30 lines truncate to a short head window,
+        // still emitted 1-based inclusive (0-indexed [0,4] -> [1,5]).
+        let mut big_class = test_entity("C", "src/a.py", 0, 100);
+        big_class.kind = EntityKind::Class;
+        assert_eq!(entity_span_pair(&big_class), vec![[1, 5]]);
+
+        // Missing span -> no emission.
+        let mut no_span = test_entity("g", "src/a.py", 0, 0);
+        no_span.span = None;
+        assert!(entity_span_pair(&no_span).is_empty());
     }
 
     #[test]
