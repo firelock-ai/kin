@@ -349,9 +349,20 @@ impl DaemonClient {
         &self,
         request: &crate::commands::embed::EmbedRequest,
     ) -> Result<crate::commands::embed::EmbedResponse> {
+        // A full-repo cold embed can run for many minutes (large graphs, GPU
+        // throughput), far longer than the shared 300s client default. Allow a
+        // per-request override via KIN_EMBED_HTTP_TIMEOUT_SECS so the CLI waits
+        // for the daemon to finish instead of timing the request out mid-embed.
+        // Default preserves the existing 300s; only the embed RPC is affected.
+        let embed_timeout = std::env::var("KIN_EMBED_HTTP_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(300));
         let resp = self
             .client
             .post(format!("{}/embed", self.base_url))
+            .timeout(embed_timeout)
             .json(request)
             .send()
             .await
