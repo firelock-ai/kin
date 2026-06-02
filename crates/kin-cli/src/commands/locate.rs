@@ -4408,6 +4408,49 @@ fn extract_search_signals(
         }
     }
 
+    // Step 3 (gated KIN_LOCATE_BODY_SEED_FILE, default OFF): body-relevance
+    // seeding for file-rank lift. Steps 1-2 are name-keyed (curate_search_terms
+    // caps to ~6 name-ish identifiers; Step 1's name gate drops name-mismatched
+    // defs), so a def whose NAME matches nothing but whose BODY implements the
+    // change never seeds — it can't file-rank, resolve, or emit. Search the BM25
+    // body index with the full topic vocabulary and seed definitional matches at
+    // a low body weight, tagged "body" so KIN_LOCATE_BODY_SEED_PROTECT can shield
+    // them from the seed gap-cut. OFF == byte-identical.
+    if locate_env_bool("KIN_LOCATE_BODY_SEED_FILE", false) {
+        let body_limit = locate_env_usize("KIN_LOCATE_BODY_SEED_LIMIT", 20);
+        let body_weight = locate_env_f32("KIN_LOCATE_BODY_SEED_WEIGHT", 0.5);
+        for term in tracked_text_query_terms(text) {
+            if term.len() < 4 {
+                continue;
+            }
+            let Ok(hits) = graph.text_search(&term, body_limit) else {
+                continue;
+            };
+            for (rank, (retrieval_key, _score)) in hits.into_iter().enumerate() {
+                let Some(entity_id) = entity_id_from_retrieval_key(&retrieval_key) else {
+                    continue;
+                };
+                let Some(entity) = graph.get_entity(&entity_id)? else {
+                    continue;
+                };
+                if !is_definitional_kind(entity.kind) {
+                    continue;
+                }
+                let role_mult = if !test_query && entity.role == EntityRole::Test {
+                    0.1
+                } else {
+                    1.0
+                };
+                let score = body_weight * role_mult / ((rank + 1) as f32).sqrt();
+                let entry = entity_seeds.entry(entity.id).or_default();
+                entry.score += score;
+                if !entry.signals.contains(&"body") {
+                    entry.signals.push("body");
+                }
+            }
+        }
+    }
+
     // Conjunctive multi-term bonus: ENTITIES matching multiple search terms get a boost.
     // This is entity-level, not file-level — an entity whose name or context contains
     // multiple query terms is more likely to be the right target.
@@ -7296,6 +7339,20 @@ fn resolve_entities_to_files(
                         || diversity_added >= diversity_tail_limit
                     {
                         break;
+                    }
+                }
+            }
+            // BODY_SEED_PROTECT (default OFF): a weak body-relevance seed can fall
+            // past the gap-cut even when its file is the gold. When enabled,
+            // retain any body-tagged seed the cut would drop so it survives to
+            // resolve into symbols and file support. Deduped against the already-
+            // retained set so it never double-counts an entity.
+            if locate_env_bool("KIN_LOCATE_BODY_SEED_PROTECT", false) {
+                let retained_ids: HashSet<kin_model::EntityId> =
+                    retained.iter().map(|pair| pair.0.clone()).collect();
+                for seed in seeds[cut_at..].iter() {
+                    if seed.1.signals.contains(&"body") && !retained_ids.contains(seed.0) {
+                        retained.push(*seed);
                     }
                 }
             }
