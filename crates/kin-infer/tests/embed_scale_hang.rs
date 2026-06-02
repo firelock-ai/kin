@@ -49,7 +49,15 @@ fn synth_sequence(len: usize, salt: u32) -> (Vec<u32>, Vec<u32>) {
     (ids, mask)
 }
 
+// IGNORED by default. This is a HEAVY GPU scale test (150 batches of ~16k-token
+// forward_batched) that pins the GPU for minutes and — if its parent process is
+// killed (e.g. an agent's `cargo test` is interrupted) — orphans and keeps the
+// GPU busy until it finishes. Running it via the bare `cargo test` suite is what
+// previously left a stray test binary holding the GPU. Run it EXPLICITLY, always
+// behind a timeout:
+//   timeout 300 cargo test -p kin-infer --features metal --test embed_scale_hang -- --ignored --nocapture
 #[test]
+#[ignore = "heavy GPU scale repro; run explicitly with a timeout (see header)"]
 fn metal_fused_pipeline_survives_many_forwards() {
     let dir = Path::new(MODEL_DIR);
     if !dir.join("model.safetensors").exists() {
@@ -106,13 +114,33 @@ fn metal_fused_pipeline_survives_many_forwards() {
             .and_then(|s| s.parse().ok())
             .unwrap_or(60),
     );
+    // Hard total-runtime ceiling. The stall watchdog only fires on ZERO progress;
+    // a slow-but-progressing run (or an orphaned process whose parent was killed)
+    // would otherwise pin the GPU for the whole 150-batch workload. This makes the
+    // process SELF-TERMINATE and release the GPU after the cap, so a stray run
+    // can never hold the device indefinitely. Override with KIN_SCALE_MAX_SECS.
+    let max_total = Duration::from_secs(
+        std::env::var("KIN_SCALE_MAX_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300),
+    );
     let watchdog = std::thread::spawn(move || {
+        let wd_start = Instant::now();
         let mut last = 0usize;
         let mut last_change = Instant::now();
         loop {
             std::thread::sleep(Duration::from_millis(250));
             if watch_done.load(Ordering::Relaxed) == 1 {
                 return;
+            }
+            if wd_start.elapsed() > max_total {
+                eprintln!(
+                    "\n!!! SCALE TEST EXCEEDED MAX RUNTIME {:?} — aborting to release the GPU \
+                     (orphaned or pathologically slow run). Set KIN_SCALE_MAX_SECS to extend.",
+                    max_total
+                );
+                std::process::abort();
             }
             let cur = watch_progress.load(Ordering::Relaxed);
             if cur != last {
