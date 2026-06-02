@@ -27,6 +27,8 @@ struct ContextbenchTrajectory {
     max_files: usize,
     query_truncated: bool,
     files: Vec<WrapperFileEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    debug: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -37,6 +39,16 @@ struct WrapperFileEntry {
     normalized_file: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    debug: Option<WrapperFileDebug>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct WrapperFileDebug {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signal_scores: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    score_breakdown: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -60,7 +72,7 @@ struct Span {
     end: u32,
 }
 
-pub async fn run(task_file: PathBuf, json: bool) -> Result<()> {
+pub async fn run(task_file: PathBuf, json: bool, debug: bool) -> Result<()> {
     let task: Value = serde_json::from_str(
         &std::fs::read_to_string(&task_file)
             .with_context(|| format!("read task payload {}", task_file.display()))?,
@@ -119,12 +131,27 @@ pub async fn run(task_file: PathBuf, json: bool) -> Result<()> {
         }
 
         let prov_val = entry.provenance.as_ref().and_then(|p| serde_json::to_value(p).ok());
+        let file_debug = if debug {
+            Some(WrapperFileDebug {
+                signal_scores: entry
+                    .signal_scores
+                    .as_ref()
+                    .and_then(|s| serde_json::to_value(s).ok()),
+                score_breakdown: entry
+                    .score_breakdown
+                    .as_ref()
+                    .and_then(|s| serde_json::to_value(s).ok()),
+            })
+        } else {
+            None
+        };
         wrapper_files.push(WrapperFileEntry {
             file: normalized_path.clone(),
             path: normalized_path.clone(),
             file_path: normalized_path.clone(),
             normalized_file: normalized_path.clone(),
             provenance: prov_val,
+            debug: file_debug,
         });
     }
 
@@ -137,6 +164,12 @@ pub async fn run(task_file: PathBuf, json: bool) -> Result<()> {
         pred_files,
         pred_symbols,
         pred_spans,
+    };
+
+    let debug_value = if debug {
+        serde_json::to_value(&locate_result.debug).ok()
+    } else {
+        None
     };
 
     let query_len = query.chars().count();
@@ -153,6 +186,7 @@ pub async fn run(task_file: PathBuf, json: bool) -> Result<()> {
         max_files,
         query_truncated: query_len > CONTEXTBENCH_QUERY_CHAR_LIMIT,
         files: wrapper_files,
+        debug: debug_value,
     };
 
     if json {
@@ -345,7 +379,7 @@ fn symbol_match_candidates(name: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        contextbench_max_files, extract_test_patch_hints, normalize_path,
+        augment_query_with_test_patch, contextbench_max_files, extract_test_patch_hints, normalize_path,
         parse_contextbench_max_files, select_query, suggested_contextbench_max_files,
         CONTEXTBENCH_DEFAULT_MAX_FILES, CONTEXTBENCH_MULTI_FILE_MAX_FILES,
         CONTEXTBENCH_QUERY_CHAR_LIMIT,
@@ -365,16 +399,27 @@ mod tests {
     }
 
     #[test]
-    fn select_query_appends_test_patch_hints_when_present() {
+    fn select_query_omits_test_patch_hints_by_default() {
         let payload = json!({
             "description": "Fix parser edge case",
             "test_patch": "diff --git a/tests/src/unit-reference_access.cpp b/tests/src/unit-reference_access.cpp\n@@\n+TEST_F(JsonEdgeCase, KeepsReferenceAccess)\n"
         });
         let (field, query) = select_query(&payload).unwrap();
         assert_eq!(field, "description");
-        assert!(query.contains("Fix parser edge case"));
-        assert!(query.contains("tests/src/unit-reference_access.cpp"));
-        assert!(query.contains("KeepsReferenceAccess"));
+        assert_eq!(query, "Fix parser edge case");
+        assert!(!query.contains("tests/src/unit-reference_access.cpp"));
+        assert!(!query.contains("KeepsReferenceAccess"));
+    }
+
+    #[test]
+    fn augment_query_with_test_patch_appends_hints_when_opted_in() {
+        let task = json!({
+            "test_patch": "diff --git a/tests/src/unit-reference_access.cpp b/tests/src/unit-reference_access.cpp\n@@\n+TEST_F(JsonEdgeCase, KeepsReferenceAccess)\n"
+        });
+        let augmented = augment_query_with_test_patch("Fix parser edge case", &task);
+        assert!(augmented.contains("Fix parser edge case"));
+        assert!(augmented.contains("tests/src/unit-reference_access.cpp"));
+        assert!(augmented.contains("KeepsReferenceAccess"));
     }
 
     #[test]

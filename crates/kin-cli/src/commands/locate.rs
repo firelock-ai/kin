@@ -72,6 +72,14 @@ pub struct LocateSymbol {
     /// True when Kin resolved this entity as a definition (has a body) rather
     /// than a bare reference/re-export.
     pub definition: bool,
+    /// Resolution origin: which seed pool surfaced this symbol ("text",
+    /// "vector", or empty when unattributed). Populated under --explain.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin: String,
+    /// Raw embedding cosine of the seed that surfaced this symbol, when it came
+    /// from the vector pool. Recorded under --explain only; never affects rank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cosine: Option<f32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -98,6 +106,24 @@ pub struct LocateDebugInfo {
     pub resolved_files: Vec<LocateDebugResolvedFile>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stages: Vec<LocateDebugStage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pruned_files: Vec<PrunedFile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_cap: Option<SymbolCapTrace>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PrunedFile {
+    pub path: String,
+    pub score: f32,
+    pub reason: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct SymbolCapTrace {
+    pub cap: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped: Vec<LocateSymbol>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -178,6 +204,10 @@ struct PriorityFileTrace {
 struct EntityDiscovery {
     score: f32,
     signals: Vec<&'static str>,
+    /// Raw embedding cosine relevance (pre score-multiply) when this seed was
+    /// surfaced via the vector pool. Recorded for --explain observability only;
+    /// never participates in ranking. `None` for text-only seeds.
+    cosine: Option<f32>,
 }
 
 #[derive(Clone)]
@@ -762,7 +792,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             (Vec::new(), HashMap::new(), HashMap::new(), HashMap::new())
         } else {
             let phase_start = std::time::Instant::now();
-            let result = resolve_entities_to_files(&all_entity_seeds, graph, explain)?;
+            let result = resolve_entities_to_files(&all_entity_seeds, graph, explain, "text")?;
             if phase_start.elapsed().as_secs_f64()
                 > budget
                     .phase_budgets
@@ -801,7 +831,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     } else {
         let phase_start = std::time::Instant::now();
         let (embed_files, _embed_explain, _embed_signal_scores, embed_symbols) =
-            resolve_entities_to_files(&embedding_entity_seeds, graph, false)?;
+            resolve_entities_to_files(&embedding_entity_seeds, graph, explain, "vector")?;
         if phase_start.elapsed().as_secs_f64()
             > budget
                 .phase_budgets
@@ -1281,6 +1311,8 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 })
                 .collect(),
             stages: Vec::new(),
+            pruned_files: Vec::new(),
+            symbol_cap: None,
         })
     } else {
         None
@@ -1985,7 +2017,12 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         );
     }
 
+    if explain {
+        record_full_debug_stage(&mut debug_info, &fused, "pre_cap_full");
+    }
+
     // Adaptive cap
+    let mut pruned_files: Vec<PrunedFile> = Vec::new();
     let results = adaptive_cap(
         &fused,
         &all_hits,
@@ -1993,7 +2030,17 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         max_files_explicit,
         &cochange_seed_paths,
         &retained_priority_paths,
+        if explain {
+            Some(&mut pruned_files)
+        } else {
+            None
+        },
     );
+    if explain {
+        if let Some(debug) = debug_info.as_mut() {
+            debug.pruned_files = pruned_files;
+        }
+    }
     if legacy_debug {
         let stage_count = debug_info
             .as_ref()
@@ -2481,6 +2528,32 @@ fn record_debug_stage(
     record_stage_scores(score_breakdown, fused, stage);
     if let Some(debug_info) = debug_info.as_mut() {
         capture_stage_snapshot(&mut debug_info.stages, fused, stage);
+    }
+}
+
+/// Snapshot the full fused list as a debug stage, bypassing the per-stage clip
+/// used by [`capture_stage_snapshot`] so a reader sees EVERY pre-cap candidate.
+/// Honors `KIN_LOCATE_DEBUG_PRECAP_LIMIT` (default: unlimited).
+fn record_full_debug_stage(
+    debug_info: &mut Option<LocateDebugInfo>,
+    fused: &[(String, f32)],
+    stage: &str,
+) {
+    if let Some(debug_info) = debug_info.as_mut() {
+        let limit = locate_env_usize("KIN_LOCATE_DEBUG_PRECAP_LIMIT", usize::MAX);
+        let files = fused
+            .iter()
+            .take(limit)
+            .map(|(path, score)| LocateDebugFileScore {
+                path: path.clone(),
+                score: *score,
+                reasons: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        debug_info.stages.push(LocateDebugStage {
+            name: stage.to_string(),
+            files,
+        });
     }
 }
 
@@ -6751,6 +6824,7 @@ fn extract_embedding_signals(
             let score = relevance * kind_mult * 10.0 * *query_weight * role_mult;
             let entry = entity_seeds.entry(entity.id).or_default();
             entry.score += score;
+            entry.cosine = Some(entry.cosine.map_or(relevance, |c| c.max(relevance)));
             if !entry.signals.contains(&"embeddings") {
                 entry.signals.push("embeddings");
             }
@@ -7021,6 +7095,7 @@ fn resolve_entities_to_files(
     entity_seeds: &HashMap<kin_model::EntityId, EntityDiscovery>,
     graph: &kin_db::InMemoryGraph,
     explain: bool,
+    origin: &str,
 ) -> Result<(
     Vec<(String, f32)>,
     HashMap<String, Vec<String>>,
@@ -7223,6 +7298,12 @@ fn resolve_entities_to_files(
                         score,
                         kind: format!("{:?}", entity.kind).to_lowercase(),
                         definition: has_body,
+                        origin: if explain {
+                            origin.to_string()
+                        } else {
+                            String::new()
+                        },
+                        cosine: if explain { discovery.cosine } else { None },
                     });
                 if explain {
                     let body_tag = if has_body { "definition" } else { "reference" };
@@ -7747,6 +7828,7 @@ fn adaptive_cap(
     max_files_explicit: bool,
     cochange_seed_paths: &HashSet<String>,
     priority_retention_paths: &HashSet<String>,
+    mut pruned: Option<&mut Vec<PrunedFile>>,
 ) -> Vec<(String, f32)> {
     let _span = tracing::info_span!(
         "locate.adaptive_cap",
@@ -7755,6 +7837,16 @@ fn adaptive_cap(
         max_files_explicit = max_files_explicit,
     )
     .entered();
+    let want_pruned = pruned.is_some();
+    let mut record_pruned = |path: &str, score: f32, reason: &str| {
+        if let Some(sink) = pruned.as_deref_mut() {
+            sink.push(PrunedFile {
+                path: path.to_string(),
+                score,
+                reason: reason.to_string(),
+            });
+        }
+    };
     if fused.is_empty() {
         return vec![];
     }
@@ -7790,9 +7882,11 @@ fn adaptive_cap(
         let score = fused[i].1;
         let prev_score = fused[i - 1].1;
         if score <= 0.0 || score < floor {
+            record_pruned(&fused[i].0, score, "cluster_gap");
             break;
         }
         if prev_score > 0.0 && prev_score / score > gap_threshold {
+            record_pruned(&fused[i].0, score, "cluster_gap");
             break;
         }
         cluster_size += 1;
@@ -7844,6 +7938,7 @@ fn adaptive_cap(
             support_floor_pct
         };
         if !is_priority_retained && *score < top_score * floor_pct {
+            record_pruned(path, *score, "below_support_floor");
             continue;
         }
         if has_entity_resolve || multi_signal || is_priority_retained || is_cochange_seed {
@@ -7884,7 +7979,17 @@ fn adaptive_cap(
             result.push(fused[i].clone());
         }
     }
+    if want_pruned {
+        for (path, score) in fused.iter() {
+            if !result_set.contains(path.as_str()) {
+                record_pruned(path, *score, "over_cap");
+            }
+        }
+    }
     if max_files_explicit && result.len() > max_files {
+        for (path, score) in result.iter().skip(max_files) {
+            record_pruned(path, *score, "over_max_files");
+        }
         result.truncate(max_files);
     }
     result
@@ -9988,18 +10093,34 @@ fn entity_span_pair(entity: &kin_model::Entity) -> Vec<[u32; 2]> {
 /// ContextBench scorer derives a file's predicted symbol set from this list.
 const DEFAULT_SYMBOL_CAP: usize = 10;
 
-/// Rank a file's candidate symbols and keep the top-K, reading the cap from
-/// `KIN_LOCATE_SYMBOL_CAP` (default [`DEFAULT_SYMBOL_CAP`], `0` = uncapped).
+/// Effective per-file symbol cap from `KIN_LOCATE_SYMBOL_CAP`
+/// (default [`DEFAULT_SYMBOL_CAP`], `0` = uncapped).
 ///
 /// Read directly rather than via `locate_env_usize` because that helper treats
 /// `0` as "unset" and falls back to the default; here `0` is a meaningful value
 /// (uncapped) and must be honored.
-fn rank_and_cap_symbols(symbols: Vec<LocateSymbol>) -> Vec<LocateSymbol> {
-    let cap = std::env::var("KIN_LOCATE_SYMBOL_CAP")
+fn symbol_cap() -> usize {
+    std::env::var("KIN_LOCATE_SYMBOL_CAP")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_SYMBOL_CAP);
-    rank_and_cap_symbols_with(symbols, cap)
+        .unwrap_or(DEFAULT_SYMBOL_CAP)
+}
+
+/// Like [`rank_and_cap_symbols_with`] but also returns the symbols dropped by
+/// the cap (in ranked order), for --explain symbol-cap tracing. The kept set is
+/// byte-identical to [`rank_and_cap_symbols_with`].
+fn rank_and_cap_symbols_capturing(
+    symbols: Vec<LocateSymbol>,
+    cap: usize,
+) -> (Vec<LocateSymbol>, Vec<LocateSymbol>) {
+    let ranked = rank_and_cap_symbols_with(symbols.clone(), 0);
+    let kept = rank_and_cap_symbols_with(symbols, cap);
+    let dropped = if cap > 0 && ranked.len() > kept.len() {
+        ranked[kept.len()..].to_vec()
+    } else {
+        Vec::new()
+    };
+    (kept, dropped)
 }
 
 /// Ranking is definition-before-reference, then composite score descending,
@@ -10139,9 +10260,11 @@ fn build_result(
     file_provenance: &HashMap<String, LocateFileProvenance>,
     per_file_signals: &HashMap<String, HashMap<String, f32>>,
     score_breakdown: &HashMap<String, HashMap<String, f32>>,
-    debug: Option<LocateDebugInfo>,
+    mut debug: Option<LocateDebugInfo>,
     explain: bool,
 ) -> LocateResult {
+    let cap = symbol_cap();
+    let mut dropped_symbols: Vec<LocateSymbol> = Vec::new();
     let files: Vec<LocateFileEntry> = results
         .iter()
         .map(|(path, score)| LocateFileEntry {
@@ -10151,7 +10274,16 @@ fn build_result(
             spans: collect_spans_for_file(path, all_hits),
             symbols: projection_symbols
                 .get(path)
-                .map(|syms| rank_and_cap_symbols(syms.clone()))
+                .map(|syms| {
+                    if explain {
+                        let (kept, dropped) =
+                            rank_and_cap_symbols_capturing(syms.clone(), cap);
+                        dropped_symbols.extend(dropped);
+                        kept
+                    } else {
+                        rank_and_cap_symbols_with(syms.clone(), cap)
+                    }
+                })
                 .unwrap_or_default(),
             explain: if explain {
                 collect_explain_for_file(path, projection_explain, all_hits)
@@ -10175,6 +10307,16 @@ fn build_result(
             },
         })
         .collect();
+
+    if explain {
+        if let Some(debug) = debug.as_mut() {
+            dropped_symbols = rank_and_cap_symbols_with(dropped_symbols, 0);
+            debug.symbol_cap = Some(SymbolCapTrace {
+                cap,
+                dropped: dropped_symbols,
+            });
+        }
+    }
 
     LocateResult { files, debug }
 }
@@ -10253,6 +10395,7 @@ mod tests {
             false,
             &HashSet::new(),
             &HashSet::new(),
+            None,
         );
         assert_eq!(capped.len(), 1);
         assert_eq!(capped[0].0, "src/main.py");
@@ -10297,6 +10440,7 @@ mod tests {
             false,
             &HashSet::new(),
             &HashSet::new(),
+            None,
         );
         assert!(capped.len() >= 3, "cap was {}", capped.len());
     }
@@ -10320,6 +10464,31 @@ mod tests {
         assert!(parsed.files[0].symbols.is_empty());
     }
 
+    #[test]
+    fn locate_symbol_omits_explain_only_fields_when_unset() {
+        let symbol = LocateSymbol {
+            name: "handle".to_string(),
+            span: Some([1, 2]),
+            score: 1.0,
+            kind: "function".to_string(),
+            definition: true,
+            origin: String::new(),
+            cosine: None,
+        };
+        let json = serde_json::to_string(&symbol).unwrap();
+        assert!(!json.contains("origin"), "non-explain symbol leaked origin: {json}");
+        assert!(!json.contains("cosine"), "non-explain symbol leaked cosine: {json}");
+
+        let tagged = LocateSymbol {
+            origin: "vector".to_string(),
+            cosine: Some(0.87),
+            ..symbol
+        };
+        let json = serde_json::to_string(&tagged).unwrap();
+        assert!(json.contains("\"origin\":\"vector\""));
+        assert!(json.contains("\"cosine\":0.87"));
+    }
+
     fn sym(name: &str, score: f32, definition: bool) -> LocateSymbol {
         LocateSymbol {
             name: name.to_string(),
@@ -10327,6 +10496,8 @@ mod tests {
             score,
             kind: "function".to_string(),
             definition,
+            origin: String::new(),
+            cosine: None,
         }
     }
 
@@ -10452,6 +10623,7 @@ mod tests {
             false,
             &HashSet::new(),
             &HashSet::new(),
+            None,
         );
         assert!(capped.len() >= 4, "cap was {}", capped.len());
     }
@@ -10482,7 +10654,7 @@ mod tests {
         ];
         let retention = HashSet::from([String::from("src/builtin.c")]);
 
-        let capped = adaptive_cap(&fused, &all_hits, 10, false, &retention, &HashSet::new());
+        let capped = adaptive_cap(&fused, &all_hits, 10, false, &retention, &HashSet::new(), None);
 
         assert!(capped.iter().any(|(path, _)| path == "src/builtin.c"));
     }
@@ -10518,6 +10690,7 @@ mod tests {
             true,
             &HashSet::new(),
             &priority_retention,
+            None,
         );
 
         assert_eq!(
@@ -10572,6 +10745,7 @@ mod tests {
             false,
             &HashSet::new(),
             &priority_retention,
+            None,
         );
 
         assert!(capped
@@ -10617,6 +10791,7 @@ mod tests {
             false,
             &HashSet::new(),
             &priority_retention,
+            None,
         );
 
         assert_eq!(
@@ -10639,7 +10814,7 @@ mod tests {
             .map(|i| (format!("src/f{i}.py"), 10.0 - i as f32 * 0.5))
             .collect();
         let all_hits: Vec<HashMap<String, Vec<FileHit>>> = (0..8).map(|_| HashMap::new()).collect();
-        let capped = adaptive_cap(&fused, &all_hits, 3, true, &HashSet::new(), &HashSet::new());
+        let capped = adaptive_cap(&fused, &all_hits, 3, true, &HashSet::new(), &HashSet::new(), None);
         assert_eq!(capped.len(), 3);
     }
 
@@ -10679,6 +10854,7 @@ mod tests {
             true,
             &HashSet::new(),
             &HashSet::new(),
+            None,
         );
 
         assert_eq!(
@@ -10704,6 +10880,7 @@ mod tests {
             false,
             &HashSet::new(),
             &HashSet::new(),
+            None,
         );
         assert!(
             capped_adaptive.len() <= 10,
@@ -10717,6 +10894,7 @@ mod tests {
             true,
             &HashSet::new(),
             &HashSet::new(),
+            None,
         );
         assert_eq!(
             capped_explicit.len(),
@@ -10755,6 +10933,7 @@ mod tests {
             false,
             &HashSet::new(),
             &HashSet::new(),
+            None,
         );
 
         assert_eq!(
@@ -12031,13 +12210,14 @@ mod tests {
             EntityDiscovery {
                 score: 12.0,
                 signals: vec!["search"],
+                cosine: None,
             },
         )]);
 
         let (_, _, signal_scores_without_explain, _) =
-            resolve_entities_to_files(&seeds, &graph, false).unwrap();
+            resolve_entities_to_files(&seeds, &graph, false, "text").unwrap();
         let (_, _, signal_scores_with_explain, _) =
-            resolve_entities_to_files(&seeds, &graph, true).unwrap();
+            resolve_entities_to_files(&seeds, &graph, true, "text").unwrap();
 
         assert_eq!(
             signal_scores_without_explain, signal_scores_with_explain,
@@ -12110,10 +12290,11 @@ mod tests {
             EntityDiscovery {
                 score: 20.0,
                 signals: vec!["search"],
+                cosine: None,
             },
         )]);
 
-        let (resolved, _, _, _) = resolve_entities_to_files(&seeds, &graph, false).unwrap();
+        let (resolved, _, _, _) = resolve_entities_to_files(&seeds, &graph, false, "text").unwrap();
 
         assert!(
             resolved
