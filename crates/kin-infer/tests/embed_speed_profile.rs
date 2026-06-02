@@ -59,6 +59,43 @@ fn embed_one(model: &BertModel, ids: &[u32], mask: &[u32]) -> Vec<f32> {
         .expect("one embedding")
 }
 
+/// Resolve the kin-infer git HEAD short-sha at runtime so every emitted number is
+/// pinned to an auditable commit. `cargo test` runs with the package root as CWD,
+/// so `git rev-parse` resolves against the kin-infer working tree. Falls back to
+/// "unknown" if git is unavailable (tarball/CI checkout) — the BUILD/opt-level
+/// stamp is still emitted, which is the load-bearing part.
+fn head_short_sha() -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// One-line build-provenance stamp printed at the top of EVERY profile run so any
+/// quoted ent/s number is pinned to an auditable (build, opt-level, commit) triple.
+/// BUILD is the load-bearing field: numbers from a debug build are meaningless, so
+/// the run refuses to emit any throughput unless this reads `release`.
+///
+/// `OPT_LEVEL` is only injected by Cargo for build scripts, not for the test crate
+/// itself, so `option_env!` is almost always `None` here — fall back to the cargo
+/// profile default (Cargo.toml defines no `[profile.*]` overrides, so dev=0,
+/// release=3). The fallback is documented so a future profile override that drifts
+/// from these defaults is an obvious place to look.
+fn build_stamp() -> String {
+    let build = if cfg!(debug_assertions) { "debug" } else { "release" };
+    let opt = option_env!("OPT_LEVEL")
+        .unwrap_or(if cfg!(debug_assertions) { "0" } else { "3" });
+    format!(
+        "BUILD={build}  opt-level={opt}  kin-infer-HEAD={}",
+        head_short_sha()
+    )
+}
+
 #[test]
 fn metal_embed_forward_profile() {
     let dir = Path::new(MODEL_DIR);
@@ -66,6 +103,26 @@ fn metal_embed_forward_profile() {
         eprintln!(
             "SKIP: model not found at {MODEL_DIR} (model.safetensors absent); \
              skipping embed-speed profile."
+        );
+        return;
+    }
+
+    // Build-provenance stamp on EVERY run so any number that escapes this test is
+    // pinned to an auditable (build, opt-level, commit) triple. Printed BEFORE the
+    // debug refusal so even a refused debug run leaves the stamp on the record.
+    eprintln!("\n[embed-speed] {}", build_stamp());
+
+    // HARD refusal in debug builds. Perf numbers from an unoptimized build are
+    // meaningless — a debug-build ent/s figure (the infamous "1.9 ent/s") once
+    // leaked into discussion as if it were real. Emit a LOUD refusal and return
+    // BEFORE any timing runs so no throughput number can EVER be emitted from a
+    // debug build.
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "\n!!! REFUSING: perf numbers are meaningless in a debug build — \
+             rerun with --release !!!\n    \
+             cargo test -p kin-infer --release --features metal \
+             --test embed_speed_profile -- --nocapture\n"
         );
         return;
     }
