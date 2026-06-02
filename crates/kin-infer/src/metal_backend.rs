@@ -571,6 +571,44 @@ kernel void rope_apply(
     data[base + head_dim / 2 + d] = x1 * cos_val + x0 * sin_val;
 }
 
+// ---- Batched RoPE: all inputs in [batch*max_len, total_dim] in ONE dispatch ----
+// Positions restart at 0 for every input (same cos/sin tables), so the per-row
+// sequence position is (global_row % max_len). This collapses the per-batch-
+// element RoPE loop (~batch_size submissions/layer) into a single submission.
+kernel void rope_apply_batched(
+    device float* data              [[buffer(0)]],
+    device const float* cos_table   [[buffer(1)]],
+    device const float* sin_table   [[buffer(2)]],
+    constant uint& max_len          [[buffer(3)]],
+    constant uint& head_dim         [[buffer(4)]],
+    constant uint& total_dim        [[buffer(5)]],
+    constant uint& half_dim         [[buffer(6)]],
+    constant uint& actual           [[buffer(7)]],
+    uint2 gid                       [[thread_position_in_grid]]
+) {
+    // gid.y = global row over the whole batch, gid.x = pair index within total_dim.
+    uint row = gid.y;
+    uint pos = row % max_len;   // position resets per input block
+    // Match the per-element path: only positions covered by the cos/sin table
+    // (< actual) are rotated; later positions of a block are left untouched.
+    if (pos >= actual) {
+        return;
+    }
+    uint pair = gid.x;
+    uint head = pair / (head_dim / 2);
+    uint d = pair % (head_dim / 2);
+    uint base = row * total_dim + head * head_dim;
+
+    uint table_off = pos * half_dim + d;
+    float cos_val = cos_table[table_off];
+    float sin_val = sin_table[table_off];
+
+    float x0 = data[base + d];
+    float x1 = data[base + head_dim / 2 + d];
+    data[base + d]              = x0 * cos_val - x1 * sin_val;
+    data[base + head_dim / 2 + d] = x1 * cos_val + x0 * sin_val;
+}
+
 // ---- Batched matmul: C[h] = A[h] × B[h]^T for all heads ----
 // A is [num_heads, seq_len, head_dim] flattened (head-major)
 // B is [num_heads, seq_len, head_dim] flattened (head-major)
@@ -982,6 +1020,7 @@ impl MetalCompute {
             "swiglu_activation_fat",
             "elementwise_mul",
             "rope_apply",
+            "rope_apply_batched",
         ];
 
         let mut pipelines = HashMap::new();
@@ -1897,6 +1936,72 @@ impl GpuCompute for MetalCompute {
         Self::read_buf_into(buf_k.buffer(), k);
     }
 
+    fn rope_pair_batched(
+        &self,
+        q: &mut [f32],
+        k: &mut [f32],
+        cos_table: &[f32],
+        sin_table: &[f32],
+        batch_size: usize,
+        max_len: usize,
+        actual: usize,
+        head_dim: usize,
+        total_dim: usize,
+    ) {
+        let _span = tracing::info_span!(
+            "kin_infer.metal.rope_pair_batched",
+            batch_size = batch_size,
+            max_len = max_len,
+            actual = actual,
+            head_dim = head_dim,
+            total_dim = total_dim
+        )
+        .entered();
+        let half = head_dim / 2;
+        let num_pairs = total_dim / head_dim * half;
+        let total_rows = batch_size * max_len;
+
+        // Whole-batch Q and K in one submission: the position resets per `max_len`
+        // inside the kernel (row % max_len), so all inputs' RoPE is one dispatch
+        // each for Q and K instead of one per input.
+        let buf_q = self.buf_slice_pooled(q);
+        let buf_k = self.buf_slice_pooled(k);
+        let buf_cos = self.buf_cached(cos_table);
+        let buf_sin = self.buf_cached(sin_table);
+        let buf_max_len = self.buf_u32(max_len as u32);
+        let buf_head_dim = self.buf_u32(head_dim as u32);
+        let buf_total_dim = self.buf_u32(total_dim as u32);
+        let buf_half = self.buf_u32(half as u32);
+        let buf_actual = self.buf_u32(actual as u32);
+
+        let pipeline = &self.pipelines["rope_apply_batched"];
+        autoreleasepool(|_| {
+            let cmd = self.queue.new_command_buffer();
+            for data_buf in [buf_q.buffer(), buf_k.buffer()] {
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipeline);
+                enc.set_buffer(0, Some(data_buf), 0);
+                enc.set_buffer(1, Some(&buf_cos), 0);
+                enc.set_buffer(2, Some(&buf_sin), 0);
+                enc.set_buffer(3, Some(&buf_max_len), 0);
+                enc.set_buffer(4, Some(&buf_head_dim), 0);
+                enc.set_buffer(5, Some(&buf_total_dim), 0);
+                enc.set_buffer(6, Some(&buf_half), 0);
+                enc.set_buffer(7, Some(&buf_actual), 0);
+                let threads = MTLSize::new(num_pairs as u64, total_rows as u64, 1);
+                let tg = MTLSize::new(16.min(num_pairs) as u64, 16.min(total_rows) as u64, 1);
+                enc.dispatch_threads(threads, tg);
+                enc.end_encoding();
+            }
+            time_phase(Phase::Activation, || {
+                self.commit_bounded(cmd, Vec::new());
+                cmd.wait_until_completed();
+            });
+        });
+        Self::read_buf_into(buf_q.buffer(), q);
+        Self::read_buf_into(buf_k.buffer(), k);
+    }
+
     fn fused_attention(
         &self,
         q: &[f32],
@@ -2291,6 +2396,70 @@ mod tests {
             assert!(!devices.is_empty(), "No Metal devices found on macOS");
             println!("Metal device: {}", devices[0]);
         }
+    }
+
+    #[test]
+    fn test_rope_pair_batched_matches_per_block() {
+        let Some(metal) = get_metal() else { return };
+        let batch_size = 3usize;
+        let max_len = 5usize;
+        let head_dim = 4usize;
+        let total_dim = 8usize; // 2 heads
+        let half = head_dim / 2;
+        let actual = max_len;
+        // Compact cos/sin tables [actual, half].
+        let mut cos = vec![0.0f32; actual * half];
+        let mut sin = vec![0.0f32; actual * half];
+        for p in 0..actual {
+            for d in 0..half {
+                let theta = (p as f32 + 1.0) * 0.1 + d as f32 * 0.3;
+                cos[p * half + d] = theta.cos();
+                sin[p * half + d] = theta.sin();
+            }
+        }
+        // Synthetic q/k over the whole batch.
+        let n = batch_size * max_len * total_dim;
+        let q0: Vec<f32> = (0..n).map(|i| (i as f32 * 0.017).sin()).collect();
+        let k0: Vec<f32> = (0..n).map(|i| (i as f32 * 0.013).cos()).collect();
+
+        // Reference: per-block rope_pair (the proven path).
+        let mut q_ref = q0.clone();
+        let mut k_ref = k0.clone();
+        for b in 0..batch_size {
+            let base = b * max_len * total_dim;
+            let rows = actual * total_dim;
+            let mut qb = q_ref[base..base + rows].to_vec();
+            let mut kb = k_ref[base..base + rows].to_vec();
+            metal.rope_pair(&mut qb, &mut kb, &cos, &sin, 0, actual, head_dim, total_dim);
+            q_ref[base..base + rows].copy_from_slice(&qb);
+            k_ref[base..base + rows].copy_from_slice(&kb);
+        }
+
+        // Candidate: single-dispatch rope_pair_batched.
+        let mut q_bat = q0.clone();
+        let mut k_bat = k0.clone();
+        metal.rope_pair_batched(
+            &mut q_bat, &mut k_bat, &cos, &sin, batch_size, max_len, actual, head_dim, total_dim,
+        );
+
+        let max_q = q_ref
+            .iter()
+            .zip(&q_bat)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let max_k = k_ref
+            .iter()
+            .zip(&k_bat)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let first_diff = q_ref
+            .iter()
+            .zip(&q_bat)
+            .position(|(a, b)| (a - b).abs() > 1e-4);
+        eprintln!(
+            "[rope_pair_batched] max_q_err={max_q:.3e} max_k_err={max_k:.3e} first_diff_idx={first_diff:?}"
+        );
+        assert!(max_q < 1e-4 && max_k < 1e-4, "rope_pair_batched diverges from per-block: q={max_q} k={max_k}");
     }
 
     #[test]

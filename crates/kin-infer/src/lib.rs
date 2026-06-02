@@ -1971,39 +1971,85 @@ impl BertModel {
             }
         }
 
-        for b in 0..batch_size {
-            let base = b * max_len;
-            // RoPE only touches the first `actual` positions of each input block;
-            // own the q/k slices, pair them in one submission, write back.
-            let mut q_block: Vec<f32> = q
-                .slice(s![base..base + actual, ..])
-                .iter()
-                .copied()
-                .collect();
-            let mut k_block: Vec<f32> = k
-                .slice(s![base..base + actual, ..])
-                .iter()
-                .copied()
-                .collect();
-            gpu.rope_pair(
-                &mut q_block,
-                &mut k_block,
-                &cos_compact,
-                &sin_compact,
-                0,
-                actual,
-                head_dim,
-                total_dim,
-            );
-            q.slice_mut(s![base..base + actual, ..])
-                .iter_mut()
-                .zip(q_block)
-                .for_each(|(dst, src)| *dst = src);
-            k.slice_mut(s![base..base + actual, ..])
-                .iter_mut()
-                .zip(k_block)
-                .for_each(|(dst, src)| *dst = src);
+        // Escape hatch / parity reference: `KIN_ROPE_PERELEM` forces the
+        // per-input RoPE path (one submission per input) instead of the single
+        // whole-batch dispatch. Used by the batched-RoPE parity test to A/B the
+        // two strategies through the identical forward_batched path.
+        if std::env::var_os("KIN_ROPE_PERELEM").is_some() {
+            for b in 0..batch_size {
+                let base = b * max_len;
+                self.rope_batched_one(
+                    q, k, base, actual, head_dim, &cos_compact, &sin_compact, total_dim,
+                );
+            }
+            return;
         }
+
+        // One GPU submission for the whole batch (Q and K), positions reset per
+        // input inside the kernel. Requires contiguous [batch*max_len, total_dim]
+        // q/k; otherwise fall back to the per-input path.
+        let k_vec = k.as_slice().map(|s| s.to_vec());
+        let (Some(q_slice), Some(mut k_vec)) = (q.as_slice_mut(), k_vec) else {
+            for b in 0..batch_size {
+                let base = b * max_len;
+                self.rope_batched_one(
+                    q, k, base, actual, head_dim, &cos_compact, &sin_compact, total_dim,
+                );
+            }
+            return;
+        };
+        gpu.rope_pair_batched(
+            q_slice,
+            &mut k_vec,
+            &cos_compact,
+            &sin_compact,
+            batch_size,
+            max_len,
+            actual,
+            head_dim,
+            total_dim,
+        );
+        k.as_slice_mut()
+            .expect("k contiguous")
+            .copy_from_slice(&k_vec);
+    }
+
+    /// Per-input RoPE fallback for the batched path when q/k aren't contiguous.
+    #[allow(clippy::too_many_arguments)]
+    fn rope_batched_one(
+        &self,
+        q: &mut Array2<f32>,
+        k: &mut Array2<f32>,
+        base: usize,
+        actual: usize,
+        head_dim: usize,
+        cos_compact: &[f32],
+        sin_compact: &[f32],
+        total_dim: usize,
+    ) {
+        let Some(gpu) = self.gpu.as_ref() else {
+            return;
+        };
+        let mut q_block: Vec<f32> = q.slice(s![base..base + actual, ..]).iter().copied().collect();
+        let mut k_block: Vec<f32> = k.slice(s![base..base + actual, ..]).iter().copied().collect();
+        gpu.rope_pair(
+            &mut q_block,
+            &mut k_block,
+            cos_compact,
+            sin_compact,
+            0,
+            actual,
+            head_dim,
+            total_dim,
+        );
+        q.slice_mut(s![base..base + actual, ..])
+            .iter_mut()
+            .zip(q_block)
+            .for_each(|(dst, src)| *dst = src);
+        k.slice_mut(s![base..base + actual, ..])
+            .iter_mut()
+            .zip(k_block)
+            .for_each(|(dst, src)| *dst = src);
     }
 
     fn encoder_layer(
@@ -3344,6 +3390,71 @@ fn dot_product_scalar(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Validate that the single-dispatch batched RoPE (`rope_qk_batched` →
+    /// `rope_pair_batched`, used by `forward_batched`) is numerically identical to
+    /// the proven per-element RoPE path (`rope_qk`, used by `forward`). Embeds the
+    /// SAME inputs through both paths and asserts the embeddings match. Uses the
+    /// real SweRank model (nomic_bert, the only RoPE arm); auto-skips if absent.
+    #[test]
+    fn batched_rope_matches_per_element_forward() {
+        let dir = std::path::Path::new("/tmp/swerank");
+        if !dir.join("model.safetensors").exists() {
+            eprintln!("SKIP: SweRank model absent at /tmp/swerank; batched-RoPE parity test skipped.");
+            return;
+        }
+        let cfg_json =
+            std::fs::read_to_string(dir.join("config.json")).expect("read config.json");
+        let config: BertConfig = serde_json::from_str(&cfg_json).expect("parse config.json");
+        let vocab = config.vocab_size.max(2);
+        let model =
+            BertModel::load(&dir.join("model.safetensors"), config).expect("load model");
+
+        // Synthetic mixed-length batch (RoPE positions differ per length).
+        let lens = [5usize, 17, 32, 48];
+        let mut token_ids: Vec<Vec<u32>> = Vec::new();
+        let mut masks: Vec<Vec<u32>> = Vec::new();
+        for (i, &len) in lens.iter().enumerate() {
+            let ids: Vec<u32> = (0..len).map(|j| ((i * 131 + j * 7 + 3) % vocab) as u32).collect();
+            masks.push(vec![1u32; len]);
+            token_ids.push(ids);
+        }
+
+        // Compare the SAME forward_batched path with single-dispatch RoPE vs the
+        // per-element RoPE fallback (KIN_ROPE_PERELEM). This isolates MY batched
+        // RoPE kernel from the legitimate forward-vs-forward_batched path/padding
+        // differences and from the pre-existing shared-GPU nondeterminism — only
+        // the RoPE dispatch strategy differs between the two runs here.
+        std::env::set_var("KIN_ROPE_PERELEM", "1");
+        let per_elem = model.forward_batched(&token_ids, &masks).expect("forward_batched perelem");
+        std::env::remove_var("KIN_ROPE_PERELEM");
+        let batched = model.forward_batched(&token_ids, &masks).expect("forward_batched single");
+
+        assert_eq!(per_elem.len(), batched.len(), "embedding count mismatch");
+        let mut max_abs = 0.0f32;
+        let mut min_cos = 1.0f32;
+        for (a, b) in per_elem.iter().zip(batched.iter()) {
+            assert_eq!(a.len(), b.len(), "embedding dim mismatch");
+            let mut dot = 0.0f32;
+            let (mut na, mut nb) = (0.0f32, 0.0f32);
+            for (&x, &y) in a.iter().zip(b.iter()) {
+                max_abs = max_abs.max((x - y).abs());
+                dot += x * y;
+                na += x * x;
+                nb += y * y;
+            }
+            let cos = dot / (na.sqrt() * nb.sqrt()).max(1e-12);
+            min_cos = min_cos.min(cos);
+        }
+        eprintln!(
+            "[batched-rope parity] max_abs_err={max_abs:.3e}  min_cosine={min_cos:.12}  ({} embeddings)",
+            per_elem.len()
+        );
+        assert!(
+            min_cos >= 1.0 - 1e-5,
+            "batched RoPE diverges from per-element: min_cosine={min_cos} (max_abs={max_abs})"
+        );
+    }
 
     #[test]
     fn test_gelu_zero() {

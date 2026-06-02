@@ -272,6 +272,38 @@ pub trait GpuCompute: Send + Sync {
         self.rope(k, cos_table, sin_table, seq_offset, seq_len, head_dim, total_dim);
     }
 
+    /// Apply RoPE to Q and K for a WHOLE BATCH in one submission. `q`/`k` are
+    /// `[batch_size * max_len, total_dim]`; positions restart at 0 for every input
+    /// (so the per-row position is `row % max_len`), and only positions `< actual`
+    /// are rotated (matching the table-bounded per-element path). `cos_table`/
+    /// `sin_table` are the compact `[actual, head_dim/2]` tables. The default
+    /// applies the batch per-element via `rope_pair` (one submission per input).
+    #[allow(clippy::too_many_arguments)]
+    fn rope_pair_batched(
+        &self,
+        q: &mut [f32],
+        k: &mut [f32],
+        cos_table: &[f32],
+        sin_table: &[f32],
+        batch_size: usize,
+        max_len: usize,
+        actual: usize,
+        head_dim: usize,
+        total_dim: usize,
+    ) {
+        for b in 0..batch_size {
+            let base = b * max_len * total_dim;
+            let rows = actual * total_dim;
+            let (q_block, k_block) = (
+                &mut q[base..base + rows],
+                &mut k[base..base + rows],
+            );
+            self.rope_pair(
+                q_block, k_block, cos_table, sin_table, 0, actual, head_dim, total_dim,
+            );
+        }
+    }
+
     /// Fused attention: Q×K^T → scale+ALiBi+mask → softmax → scores×V
     /// in a single GPU submission. Returns [num_heads, seq_len, head_dim].
     /// `alibi_slopes`: per-head slopes, or empty slice for no ALiBi.
