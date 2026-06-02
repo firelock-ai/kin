@@ -1790,18 +1790,50 @@ async fn register_repo_daemon_with_supervisor(
         endpoint: daemon_url.to_string(),
         graph_entity_count: health.graph_entity_count,
     };
+
+    // The shared supervisor self-terminates after an idle window and deletes its
+    // port file. A long, passive init (no supervisor traffic) can outlive it, so
+    // by the time we register the daemon the supervisor port may be dead and the
+    // POST fails with a connection error. Respawn the supervisor and retry once
+    // so a slow large-repo init doesn't drop the daemon registration entirely.
+    match post_supervisor_registration(supervisor_url, &registration).await {
+        Ok(()) => Ok(()),
+        Err(err) if is_connection_error(&err) => {
+            let fresh_supervisor_url = ensure_supervisor_running()
+                .await
+                .context("respawn supervisor after registration connection error")?;
+            post_supervisor_registration(&fresh_supervisor_url, &registration)
+                .await
+                .context("register repo daemon with supervisor (after respawn)")
+        }
+        Err(err) => Err(err).context("register repo daemon with supervisor"),
+    }
+}
+
+/// POST a daemon registration to the supervisor. Returns the raw reqwest error
+/// on transport failure so the caller can distinguish a dead-supervisor
+/// connection error (retryable) from a rejection.
+async fn post_supervisor_registration(
+    supervisor_url: &str,
+    registration: &SupervisorRegistration,
+) -> Result<(), reqwest::Error> {
     daemon_health_client()
         .post(format!(
             "{}/daemons/register",
             supervisor_url.trim_end_matches('/')
         ))
-        .json(&registration)
+        .json(registration)
         .send()
-        .await
-        .context("register repo daemon with supervisor")?
-        .error_for_status()
-        .context("supervisor rejected repo daemon registration")?;
+        .await?
+        .error_for_status()?;
     Ok(())
+}
+
+/// True when a reqwest error reflects a failure to reach the endpoint at all
+/// (connection refused / transport-level), as opposed to an HTTP status error.
+/// Used to retry supervisor registration after the idle supervisor has exited.
+fn is_connection_error(err: &reqwest::Error) -> bool {
+    err.is_connect() || err.is_request() || err.is_timeout()
 }
 
 pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String> {

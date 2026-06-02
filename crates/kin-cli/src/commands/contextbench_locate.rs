@@ -9,8 +9,8 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 const CONTEXTBENCH_QUERY_CHAR_LIMIT: usize = 4000;
-const CONTEXTBENCH_DEFAULT_MAX_FILES: usize = 25;
-const CONTEXTBENCH_MULTI_FILE_MAX_FILES: usize = 40;
+const CONTEXTBENCH_DEFAULT_MAX_FILES: usize = 10;
+const CONTEXTBENCH_MULTI_FILE_MAX_FILES: usize = 18;
 
 #[derive(Debug, Serialize)]
 struct ContextbenchTrajectory {
@@ -174,7 +174,15 @@ fn select_query(task: &Value) -> Result<(&'static str, String)> {
         if let Some(text) = value.and_then(Value::as_str) {
             let trimmed = text.trim();
             if !trimmed.is_empty() {
-                return Ok((field, augment_query_with_test_patch(trimmed, task)));
+                // test_patch hints leak ContextBench gold (the patch's own test files) and are
+                // forbidden for submission; default OFF, opt-in only via KIN_CONTEXTBENCH_TEST_HINTS=1
+                // for internal upper-bound experiments.
+                let query = if std::env::var("KIN_CONTEXTBENCH_TEST_HINTS").as_deref() == Ok("1") {
+                    augment_query_with_test_patch(trimmed, task)
+                } else {
+                    trimmed.to_string()
+                };
+                return Ok((field, query));
             }
         }
     }
