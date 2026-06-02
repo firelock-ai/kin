@@ -79,8 +79,6 @@ pub async fn run(task_file: PathBuf, json: bool) -> Result<()> {
     let mut pred_spans = std::collections::HashMap::new();
     let mut wrapper_files = Vec::new();
 
-    let re_def = Regex::new(r"entity\s+`([^`]+)`\s+definition\b").expect("regex compilation failed");
-
     for entry in locate_result.files {
         let normalized_path = normalize_path(&entry.path);
         if normalized_path.is_empty() {
@@ -89,26 +87,30 @@ pub async fn run(task_file: PathBuf, json: bool) -> Result<()> {
 
         pred_files.push(normalized_path.clone());
 
+        // Consume the Rust-ranked, capped symbol list directly instead of
+        // re-deriving symbols by regex-scraping the `explain` prose. Keep only
+        // definitions (the scorer's predicted-symbol set) and take their spans
+        // from the same capped list so symbols and lines stay coherent — this
+        // is what retires the uncapped Python def-harvest explosion.
         let mut names = Vec::new();
         let mut seen_names = std::collections::HashSet::new();
-        for line in &entry.explain {
-            if let Some(caps) = re_def.captures(line) {
-                let name = caps.get(1).unwrap().as_str().trim().to_string();
-                if seen_names.insert(name.clone()) {
-                    names.push(name);
-                }
+        let mut spans = Vec::new();
+        for sym in &entry.symbols {
+            if !sym.definition {
+                continue;
+            }
+            if seen_names.insert(sym.name.clone()) {
+                names.push(sym.name.clone());
+            }
+            if let Some(span) = sym.span {
+                spans.push(Span {
+                    start: span[0],
+                    end: span[1],
+                });
             }
         }
         if !names.is_empty() {
             pred_symbols.insert(normalized_path.clone(), names);
-        }
-
-        let mut spans = Vec::new();
-        for span in &entry.spans {
-            spans.push(Span {
-                start: span[0],
-                end: span[1],
-            });
         }
         if !spans.is_empty() {
             pred_spans.insert(normalized_path.clone(), spans);

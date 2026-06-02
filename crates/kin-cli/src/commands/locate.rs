@@ -37,6 +37,14 @@ pub struct LocateFileEntry {
     pub signals: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spans: Vec<[u32; 2]>,
+    /// Ranked, capped per-entity symbols Kin is most confident define this file.
+    /// Structured replacement for regex-scraping definitions out of `explain`:
+    /// ranked by (definition-before-reference, then composite score) and capped
+    /// by `KIN_LOCATE_SYMBOL_CAP`. Emitted unconditionally so both the native
+    /// ContextBench trajectory and agent surfaces consume the same Rust-ranked
+    /// list instead of re-deriving symbols from prose.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub symbols: Vec<LocateSymbol>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub explain: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -47,6 +55,23 @@ pub struct LocateFileEntry {
     /// Per-stage score breakdown (only with --explain).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score_breakdown: Option<std::collections::HashMap<String, f32>>,
+}
+
+/// A single ranked symbol (graph entity) attributed to a file by `kin locate`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LocateSymbol {
+    /// Entity name (the symbol identifier).
+    pub name: String,
+    /// 1-based inclusive line span of the entity, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<[u32; 2]>,
+    /// Composite resolution score; higher means more confident.
+    pub score: f32,
+    /// Entity kind (function, class, …), lowercased.
+    pub kind: String,
+    /// True when Kin resolved this entity as a definition (has a body) rather
+    /// than a bare reference/re-export.
+    pub definition: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -732,9 +757,9 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // LSP-resolved relations carry 2× weight (type-resolved, high confidence).
     // ═══════════════════════════════════════════════════════════════════════
 
-    let (resolved_files, resolve_explain, resolve_signal_scores) =
+    let (resolved_files, resolve_explain, resolve_signal_scores, resolve_symbols) =
         if budget.phase_should_skip("entity_resolution") {
-            (Vec::new(), HashMap::new(), HashMap::new())
+            (Vec::new(), HashMap::new(), HashMap::new(), HashMap::new())
         } else {
             let phase_start = std::time::Instant::now();
             let result = resolve_entities_to_files(&all_entity_seeds, graph, explain)?;
@@ -768,31 +793,33 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // ranked_lists) so they can survive even when they don't overlap with
     // text-search entity_resolve hits. Skip when there are no seeds or when
     // the entity_resolution budget is already exhausted.
-    let embedding_hits: HashMap<String, Vec<FileHit>> =
-        if embedding_entity_seeds.is_empty() || budget.phase_should_skip("entity_resolution") {
-            HashMap::new()
-        } else {
-            let phase_start = std::time::Instant::now();
-            let (embed_files, _embed_explain, _embed_signal_scores) =
-                resolve_entities_to_files(&embedding_entity_seeds, graph, false)?;
-            if phase_start.elapsed().as_secs_f64()
-                > budget
-                    .phase_budgets
-                    .get("entity_resolution")
-                    .copied()
-                    .unwrap_or(30.0)
-            {
-                budget.warn_phase_timeout("entity_resolution", phase_start.elapsed());
-            }
-            let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
-            for (path, score) in embed_files {
-                hits.entry(path).or_default().push(FileHit {
-                    score,
-                    spans: vec![],
-                });
-            }
-            hits
-        };
+    let (embedding_hits, embedding_symbols): (
+        HashMap<String, Vec<FileHit>>,
+        HashMap<String, Vec<LocateSymbol>>,
+    ) = if embedding_entity_seeds.is_empty() || budget.phase_should_skip("entity_resolution") {
+        (HashMap::new(), HashMap::new())
+    } else {
+        let phase_start = std::time::Instant::now();
+        let (embed_files, _embed_explain, _embed_signal_scores, embed_symbols) =
+            resolve_entities_to_files(&embedding_entity_seeds, graph, false)?;
+        if phase_start.elapsed().as_secs_f64()
+            > budget
+                .phase_budgets
+                .get("entity_resolution")
+                .copied()
+                .unwrap_or(30.0)
+        {
+            budget.warn_phase_timeout("entity_resolution", phase_start.elapsed());
+        }
+        let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
+        for (path, score) in embed_files {
+            hits.entry(path).or_default().push(FileHit {
+                score,
+                spans: vec![],
+            });
+        }
+        (hits, embed_symbols)
+    };
 
     let fast_traceback_top = to_ranked(&traceback)
         .first()
@@ -947,6 +974,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         return Ok(build_result(
             &fallback_files,
             &[],
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -1606,6 +1634,12 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         embedding_hits,
     ];
     let projection_explain = resolve_explain;
+    // Merge text-resolved and embedding-resolved symbols per file. Ranking and
+    // capping happen later in `build_result`, once the file set is final.
+    let mut projection_symbols = resolve_symbols;
+    for (path, syms) in embedding_symbols {
+        projection_symbols.entry(path).or_default().extend(syms);
+    }
     let projection_provenance: HashMap<String, LocateFileProvenance> = HashMap::new();
 
     demote_cochange_only_outliers(&mut fused, &all_hits);
@@ -1991,6 +2025,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         &results,
         &all_hits,
         &projection_explain,
+        &projection_symbols,
         &file_provenance,
         &per_file_signals,
         &score_breakdown,
@@ -6990,6 +7025,7 @@ fn resolve_entities_to_files(
     Vec<(String, f32)>,
     HashMap<String, Vec<String>>,
     HashMap<String, HashMap<String, f32>>,
+    HashMap<String, Vec<LocateSymbol>>,
 )> {
     let _span = tracing::info_span!(
         "locate.resolve_entities_to_files",
@@ -7023,6 +7059,7 @@ fn resolve_entities_to_files(
     let mut direct_scores: FxHashMap<String, f32> = FxHashMap::default();
     let mut graph_scores: FxHashMap<String, f32> = FxHashMap::default();
     let mut file_explain: HashMap<String, Vec<String>> = HashMap::new();
+    let mut file_symbols: HashMap<String, Vec<LocateSymbol>> = HashMap::new();
     let mut file_signal_scores: HashMap<String, HashMap<String, f32>> = HashMap::new();
     let mut file_entity_counts: FxHashMap<String, usize> = FxHashMap::default();
     let mut direct_entity_counts: FxHashMap<String, usize> = FxHashMap::default();
@@ -7177,6 +7214,16 @@ fn resolve_entities_to_files(
                     .entry("entity_resolve".to_string())
                     .and_modify(|s| *s += score)
                     .or_insert(score);
+                file_symbols
+                    .entry(path.clone())
+                    .or_default()
+                    .push(LocateSymbol {
+                        name: entity.name.clone(),
+                        span: entity_span_pair(&entity).into_iter().next(),
+                        score,
+                        kind: format!("{:?}", entity.kind).to_lowercase(),
+                        definition: has_body,
+                    });
                 if explain {
                     let body_tag = if has_body { "definition" } else { "reference" };
                     push_projection_reason(
@@ -7381,7 +7428,7 @@ fn resolve_entities_to_files(
             .then_with(|| a.0.cmp(&b.0))
     });
 
-    Ok((result, file_explain, file_signal_scores))
+    Ok((result, file_explain, file_signal_scores, file_symbols))
 }
 
 fn resolve_relation_kind_priority(kind: RelationKind) -> u8 {
@@ -9934,6 +9981,51 @@ fn entity_span_pair(entity: &kin_model::Entity) -> Vec<[u32; 2]> {
 /// scoreless lines (the noisiest graph-walk `via` neighbors) once the threshold
 /// is exceeded. `KIN_LOCATE_EXPLAIN_DEF_TOPK=0` (default) preserves the previous
 /// uncapped behavior, so this is a no-op unless explicitly enabled.
+/// Default cap on ranked symbols emitted per file. Tunable via
+/// `KIN_LOCATE_SYMBOL_CAP`; `0` means uncapped. Set near the gold symbol-set
+/// median (~12) so the cap trims a hub file's dozens of touched entities for
+/// precision without clipping recall on genuinely symbol-dense files. The
+/// ContextBench scorer derives a file's predicted symbol set from this list.
+const DEFAULT_SYMBOL_CAP: usize = 10;
+
+/// Rank a file's candidate symbols and keep the top-K, reading the cap from
+/// `KIN_LOCATE_SYMBOL_CAP` (default [`DEFAULT_SYMBOL_CAP`], `0` = uncapped).
+///
+/// Read directly rather than via `locate_env_usize` because that helper treats
+/// `0` as "unset" and falls back to the default; here `0` is a meaningful value
+/// (uncapped) and must be honored.
+fn rank_and_cap_symbols(symbols: Vec<LocateSymbol>) -> Vec<LocateSymbol> {
+    let cap = std::env::var("KIN_LOCATE_SYMBOL_CAP")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SYMBOL_CAP);
+    rank_and_cap_symbols_with(symbols, cap)
+}
+
+/// Ranking is definition-before-reference, then composite score descending,
+/// then name for determinism. De-duplicates by name (keeping the highest-ranked
+/// occurrence) and truncates to `cap` (`0` = uncapped).
+fn rank_and_cap_symbols_with(mut symbols: Vec<LocateSymbol>, cap: usize) -> Vec<LocateSymbol> {
+    symbols.sort_by(|a, b| {
+        b.definition
+            .cmp(&a.definition)
+            .then_with(|| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    let mut seen = HashSet::new();
+    symbols.retain(|s| seen.insert(s.name.clone()));
+
+    if cap > 0 && symbols.len() > cap {
+        symbols.truncate(cap);
+    }
+    symbols
+}
+
 fn explain_line_score(reason: &str) -> f32 {
     if let Some(idx) = reason.find("(score ") {
         let rest = &reason[idx + 7..];
@@ -10043,6 +10135,7 @@ fn build_result(
     results: &[(String, f32)],
     all_hits: &[HashMap<String, Vec<FileHit>>],
     projection_explain: &HashMap<String, Vec<String>>,
+    projection_symbols: &HashMap<String, Vec<LocateSymbol>>,
     file_provenance: &HashMap<String, LocateFileProvenance>,
     per_file_signals: &HashMap<String, HashMap<String, f32>>,
     score_breakdown: &HashMap<String, HashMap<String, f32>>,
@@ -10056,6 +10149,10 @@ fn build_result(
             score: *score,
             signals: collect_signals_for_file(path, all_hits),
             spans: collect_spans_for_file(path, all_hits),
+            symbols: projection_symbols
+                .get(path)
+                .map(|syms| rank_and_cap_symbols(syms.clone()))
+                .unwrap_or_default(),
             explain: if explain {
                 collect_explain_for_file(path, projection_explain, all_hits)
             } else {
@@ -10220,6 +10317,77 @@ mod tests {
         assert_eq!(parsed.files.len(), 1);
         assert!(parsed.files[0].spans.is_empty());
         assert!(parsed.files[0].explain.is_empty());
+        assert!(parsed.files[0].symbols.is_empty());
+    }
+
+    fn sym(name: &str, score: f32, definition: bool) -> LocateSymbol {
+        LocateSymbol {
+            name: name.to_string(),
+            span: Some([1, 2]),
+            score,
+            kind: "function".to_string(),
+            definition,
+        }
+    }
+
+    #[test]
+    fn rank_and_cap_orders_definitions_first_then_score() {
+        let ranked = rank_and_cap_symbols_with(
+            vec![
+                sym("ref_high", 100.0, false),
+                sym("def_low", 1.0, true),
+                sym("def_high", 50.0, true),
+            ],
+            0,
+        );
+        let names: Vec<&str> = ranked.iter().map(|s| s.name.as_str()).collect();
+        // Definitions rank above references regardless of raw score, and within
+        // definitions higher score wins.
+        assert_eq!(names, vec!["def_high", "def_low", "ref_high"]);
+    }
+
+    #[test]
+    fn rank_and_cap_dedupes_by_name_keeping_best() {
+        let ranked = rank_and_cap_symbols_with(
+            vec![
+                sym("dup", 10.0, true),
+                sym("dup", 99.0, true),
+                sym("other", 5.0, true),
+            ],
+            0,
+        );
+        assert_eq!(ranked.len(), 2, "duplicate names collapse to one");
+        let dup = ranked.iter().find(|s| s.name == "dup").unwrap();
+        assert_eq!(dup.score, 99.0, "the higher-ranked duplicate is kept");
+    }
+
+    #[test]
+    fn rank_and_cap_truncates_to_cap() {
+        let ranked = rank_and_cap_symbols_with(
+            vec![
+                sym("a", 5.0, true),
+                sym("b", 4.0, true),
+                sym("c", 3.0, true),
+                sym("d", 2.0, true),
+            ],
+            2,
+        );
+        assert_eq!(ranked.len(), 2);
+        let names: Vec<&str> = ranked.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"], "keeps the top-K by rank");
+    }
+
+    #[test]
+    fn rank_and_cap_zero_means_uncapped() {
+        let ranked = rank_and_cap_symbols_with(
+            vec![
+                sym("a", 5.0, true),
+                sym("b", 4.0, true),
+                sym("c", 3.0, true),
+            ],
+            0,
+        );
+        assert_eq!(ranked.len(), 3, "cap=0 disables truncation");
     }
 
     #[test]
@@ -11866,9 +12034,9 @@ mod tests {
             },
         )]);
 
-        let (_, _, signal_scores_without_explain) =
+        let (_, _, signal_scores_without_explain, _) =
             resolve_entities_to_files(&seeds, &graph, false).unwrap();
-        let (_, _, signal_scores_with_explain) =
+        let (_, _, signal_scores_with_explain, _) =
             resolve_entities_to_files(&seeds, &graph, true).unwrap();
 
         assert_eq!(
@@ -11945,7 +12113,7 @@ mod tests {
             },
         )]);
 
-        let (resolved, _, _) = resolve_entities_to_files(&seeds, &graph, false).unwrap();
+        let (resolved, _, _, _) = resolve_entities_to_files(&seeds, &graph, false).unwrap();
 
         assert!(
             resolved
