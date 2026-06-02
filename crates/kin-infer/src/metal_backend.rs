@@ -230,6 +230,42 @@ fn use_wide_mma(m: usize, n: usize, k: usize) -> bool {
         && n >= 64
 }
 
+/// Whether the fp16-operand MMA path (Lever #4) is selected. OPT-IN
+/// (`KIN_INFER_GEMM_FP16=1`): default OFF keeps every GEMM on the proven
+/// fp32-operand MMA so the strict cosine gate stays green untouched. fp16
+/// operands lose ~half the mantissa, so this is EXPECTED to lower cosine and may
+/// fail the strict 1e-7 floor on projection GEMMs — it is measured on its own and
+/// only flipped on (or restricted to error-absorbing GEMMs) once a parity number
+/// exists. Sampled once per process.
+fn mma_fp16_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("KIN_INFER_GEMM_FP16").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
+/// Whether the fp16 MMA pipelines compiled on this device. Set once by `try_new`
+/// after compiling the SEPARATE fp16 shader library. Defaults false: if the
+/// heterogeneous half*half->float overload is rejected by the toolchain (the
+/// fp16 library fails to build), this stays false and every GEMM uses the fp32
+/// MMA — Metal and the main library are unaffected.
+static FP16_MMA_AVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Route a GEMM to the fp16-operand MMA tile only when it is opt-in enabled, the
+/// fp16 pipelines compiled, AND the standard MMA gate already passes. The fp16
+/// variants are 32x32 (the wider tile composes with fp16 only in Lever #5 phase
+/// 2), so when both `KIN_INFER_GEMM_FP16` and `KIN_INFER_MMA_WIDE` are set the
+/// fp16 32x32 path takes precedence — they are alternative experiments for now.
+#[inline]
+fn use_fp16_mma(m: usize, n: usize, k: usize) -> bool {
+    mma_fp16_enabled() && FP16_MMA_AVAILABLE.load(Ordering::Relaxed) && use_mma(m, n, k)
+}
+
 /// Total nanoseconds the host spent blocked in `wait_until_completed` since the
 /// last `reset_profile`. Only meaningful when `KIN_INFER_METAL_PROFILE` is set.
 pub fn profile_stall_nanos() -> u64 {
@@ -1083,6 +1119,167 @@ kernel void scale_mask_alibi_grouped(
 "#;
 
 // ---------------------------------------------------------------------------
+// fp16-operand / fp32-accumulate MMA GEMM (Lever #4) — SEPARATE shader library
+// ---------------------------------------------------------------------------
+// Compiled in its own `new_library_with_source` call so that if a toolchain
+// rejects the heterogeneous half*half->float `simdgroup_multiply_accumulate`
+// overload (it is MSL-version dependent), ONLY this library fails to build — the
+// main library and Metal itself stay alive, and FP16_MMA_AVAILABLE just stays
+// false. A/B are read from the existing fp32 device buffers and narrowed to half
+// on the threadgroup stage (no Rust buffer-plumbing change); the MMA fragments
+// are `simdgroup_half8x8` for the faster half issue rate + halved stage
+// footprint, but the ACCUMULATOR stays `simdgroup_float8x8`. fp32 accumulate is
+// the load-bearing parity invariant and is deliberately NOT changed here.
+const FP16_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint MMA_BK = 16, MMA_F = 8;
+
+// 32x32 tile, 4 simdgroups / 128 threads — same geometry as the fp32
+// `block_mma`; the only differences are the half stage/operands (see header).
+template <bool TRANSB>
+static inline void block_mma_fp16(
+    device const float* A,
+    device const float* B,
+    device float* C,
+    uint M, uint N, uint K,
+    uint3 tgid, uint sgid, uint lane,
+    threadgroup half (*As)[MMA_BK],
+    threadgroup half (*Bs)[MMA_BK],
+    threadgroup float (*store_tile)[MMA_F][MMA_F])
+{
+    constexpr uint BM = 32, BN = 32, BK = 16, WM = 2, WN = 2, F = 8;
+    constexpr uint TM = BM / (F * WM);
+    constexpr uint TN = BN / (F * WN);
+
+    const uint sm = sgid / WN;
+    const uint sn = sgid % WN;
+    const uint block_row = tgid.y * BM;
+    const uint block_col = tgid.x * BN;
+    const uint tid = sgid * 32u + lane;
+
+    // fp32 accumulator — the parity invariant. Do NOT switch to half.
+    simdgroup_float8x8 acc[TM][TN];
+    for (uint i = 0; i < TM; i++)
+        for (uint j = 0; j < TN; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k0 = 0; k0 < K; k0 += BK) {
+        // Read A/B from fp32 device memory, narrow to half on the stage.
+        for (uint idx = tid; idx < BM * BK; idx += 128u) {
+            uint r = idx / BK, c = idx % BK;
+            uint gr = block_row + r, gc = k0 + c;
+            As[r][c] = (half)((gr < M && gc < K) ? A[gr * K + gc] : 0.0f);
+        }
+        for (uint idx = tid; idx < BN * BK; idx += 128u) {
+            uint r = idx / BK, c = idx % BK;
+            uint gn = block_col + r, gk = k0 + c;
+            if (TRANSB) {
+                Bs[r][c] = (half)((gn < N && gk < K) ? B[gn * K + gk] : 0.0f);
+            } else {
+                Bs[r][c] = (half)((gn < N && gk < K) ? B[gk * N + gn] : 0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0; kk < BK; kk += F) {
+            simdgroup_half8x8 a_frag[TM];
+            simdgroup_half8x8 b_frag[TN];
+            for (uint i = 0; i < TM; i++)
+                simdgroup_load(a_frag[i], &As[sm * F * TM + i * F][kk], BK, ulong2(0, 0), false);
+            for (uint j = 0; j < TN; j++)
+                simdgroup_load(b_frag[j], &Bs[sn * F * TN + j * F][kk], BK, ulong2(0, 0), true);
+            // half * half -> fp32 accumulate (acc stays simdgroup_float8x8).
+            for (uint i = 0; i < TM; i++)
+                for (uint j = 0; j < TN; j++)
+                    simdgroup_multiply_accumulate(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0; i < TM; i++) {
+        for (uint j = 0; j < TN; j++) {
+            uint cr = block_row + sm * F * TM + i * F;
+            uint cc = block_col + sn * F * TN + j * F;
+            if (cr + F <= M && cc + F <= N) {
+                simdgroup_store(acc[i][j], &C[cr * N + cc], N, ulong2(0, 0), false);
+            } else {
+                threadgroup float* scratch = &store_tile[sgid][0][0];
+                simdgroup_store(acc[i][j], scratch, F, ulong2(0, 0), false);
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint e = lane; e < F * F; e += 32u) {
+                    uint er = e / F, ec = e % F;
+                    uint gr = cr + er, gc = cc + ec;
+                    if (gr < M && gc < N) {
+                        C[gr * N + gc] = scratch[er * F + ec];
+                    }
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+    }
+}
+
+kernel void matmul_transb_simdgroup_fp16(
+    device const float* A   [[buffer(0)]],
+    device const float* B   [[buffer(1)]],
+    device float*       C   [[buffer(2)]],
+    constant uint& M        [[buffer(3)]],
+    constant uint& N        [[buffer(4)]],
+    constant uint& K        [[buffer(5)]],
+    uint3 tgid              [[threadgroup_position_in_grid]],
+    uint  sgid             [[simdgroup_index_in_threadgroup]],
+    uint  lane             [[thread_index_in_simdgroup]])
+{
+    threadgroup half As[32][MMA_BK];
+    threadgroup half Bs[32][MMA_BK];
+    threadgroup float store_tile[2 * 2][MMA_F][MMA_F];
+    block_mma_fp16<true>(A, B, C, M, N, K, tgid, sgid, lane, As, Bs, store_tile);
+}
+
+kernel void batched_matmul_transb_simdgroup_fp16(
+    device const float* Q   [[buffer(0)]],
+    device const float* Kk  [[buffer(1)]],
+    device float*       C   [[buffer(2)]],
+    constant uint& seq      [[buffer(3)]],
+    constant uint& dim      [[buffer(4)]],
+    uint3 tgid              [[threadgroup_position_in_grid]],
+    uint  sgid             [[simdgroup_index_in_threadgroup]],
+    uint  lane             [[thread_index_in_simdgroup]])
+{
+    uint h = tgid.z;
+    device const float* Ah = Q  + h * seq * dim;
+    device const float* Bh = Kk + h * seq * dim;
+    device float*       Ch = C  + h * seq * seq;
+    threadgroup half As[32][MMA_BK];
+    threadgroup half Bs[32][MMA_BK];
+    threadgroup float store_tile[2 * 2][MMA_F][MMA_F];
+    block_mma_fp16<true>(Ah, Bh, Ch, seq, seq, dim, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+}
+
+kernel void batched_matmul_ab_simdgroup_fp16(
+    device const float* S   [[buffer(0)]],
+    device const float* V   [[buffer(1)]],
+    device float*       C   [[buffer(2)]],
+    constant uint& seq      [[buffer(3)]],
+    constant uint& dim      [[buffer(4)]],
+    uint3 tgid              [[threadgroup_position_in_grid]],
+    uint  sgid             [[simdgroup_index_in_threadgroup]],
+    uint  lane             [[thread_index_in_simdgroup]])
+{
+    uint h = tgid.z;
+    device const float* Ah = S + h * seq * seq;
+    device const float* Bh = V + h * seq * dim;
+    device float*       Ch = C + h * seq * dim;
+    threadgroup half As[32][MMA_BK];
+    threadgroup half Bs[32][MMA_BK];
+    threadgroup float store_tile[2 * 2][MMA_F][MMA_F];
+    block_mma_fp16<false>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+}
+"#;
+
+// ---------------------------------------------------------------------------
 // Bounded in-flight submission
 // ---------------------------------------------------------------------------
 //
@@ -1404,6 +1601,54 @@ impl MetalCompute {
             }
         }
         WIDE_MMA_AVAILABLE.store(wide_mma_available, Ordering::Relaxed);
+
+        // fp16-operand MMA (Lever #4) — OPTIONAL, compiled as a SEPARATE library
+        // so a toolchain that rejects the half*half->float `simdgroup_matrix`
+        // overload only loses the fp16 path (this whole library fails to build),
+        // never the main library or Metal. Only attempted when the fp32 MMA
+        // built. If the library compiles, register its three kernels; any
+        // failure (compile, lookup, or pipeline) leaves FP16_MMA_AVAILABLE false.
+        let mut fp16_mma_available = false;
+        if mma_available {
+            match device.new_library_with_source(FP16_SHADER_SOURCE, &opts) {
+                Ok(fp16_library) => {
+                    let fp16_kernel_names: &[&str] = &[
+                        "matmul_transb_simdgroup_fp16",
+                        "batched_matmul_transb_simdgroup_fp16",
+                        "batched_matmul_ab_simdgroup_fp16",
+                    ];
+                    let mut ok = true;
+                    for &name in fp16_kernel_names {
+                        let pipeline = fp16_library
+                            .get_function(name, None)
+                            .and_then(|func| {
+                                device.new_compute_pipeline_state_with_function(&func)
+                            });
+                        match pipeline {
+                            Ok(pipeline) => {
+                                pipelines.insert(name, pipeline);
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "kin-infer: Metal fp16 MMA kernel {name} unavailable \
+                                     ({err}); fp16 GEMM disabled (fp32 MMA stays enabled)"
+                                );
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    fp16_mma_available = ok;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "kin-infer: Metal fp16 shader library failed to compile ({err}); \
+                         fp16 GEMM disabled (fp32 MMA stays enabled)"
+                    );
+                }
+            }
+        }
+        FP16_MMA_AVAILABLE.store(fp16_mma_available, Ordering::Relaxed);
 
         let pool = Arc::new(BufferPool::new(device.clone()));
         Some(Self {
@@ -1809,7 +2054,11 @@ impl MetalCompute {
         k: usize,
         depth: usize,
     ) {
-        let (pipeline, block) = if use_wide_mma(m, n, k) {
+        let (pipeline, block) = if use_fp16_mma(m, n, k) {
+            // fp16 operands, fp32 accumulate (32x32 tile). Takes precedence over
+            // the wider tile — they don't compose until Lever #5 phase 2.
+            (&self.pipelines[fp16_mma_name(base_name)], 32usize)
+        } else if use_wide_mma(m, n, k) {
             (&self.pipelines[wide_mma_name(base_name)], 64usize)
         } else {
             (&self.pipelines[base_name], 32usize)
@@ -1866,6 +2115,17 @@ fn wide_mma_name(base: &str) -> &str {
         "matmul_transb_simdgroup" => "matmul_transb_simdgroup_wide",
         "batched_matmul_transb_simdgroup" => "batched_matmul_transb_simdgroup_wide",
         "batched_matmul_ab_simdgroup" => "batched_matmul_ab_simdgroup_wide",
+        other => other,
+    }
+}
+
+/// Map a base `*_simdgroup` MMA kernel name to its `*_fp16` variant (Lever #4).
+#[inline]
+fn fp16_mma_name(base: &str) -> &str {
+    match base {
+        "matmul_transb_simdgroup" => "matmul_transb_simdgroup_fp16",
+        "batched_matmul_transb_simdgroup" => "batched_matmul_transb_simdgroup_fp16",
+        "batched_matmul_ab_simdgroup" => "batched_matmul_ab_simdgroup_fp16",
         other => other,
     }
 }
@@ -3680,6 +3940,62 @@ mod tests {
             .map(|(x, y)| (x - y).abs() / x.abs().max(y.abs()).max(1e-6))
             .fold(0.0f32, f32::max);
         assert!(max_err < 5e-3, "wide MMA vs CPU matmul max err: {}", max_err);
+    }
+
+    #[test]
+    fn test_metal_fp16_mma_close_to_cpu() {
+        // Lever #4: the fp16-operand MMA must compute the right GEMM to within
+        // fp16 precision (NOT the strict fp32 gate — fp16 operands lose ~half the
+        // mantissa). Direct-dispatch the `*_fp16` kernel (flag-independent) and
+        // assert it lands CLOSE to the CPU fp32 reference — this guards against
+        // gross index/overload bugs (which would blow up far past fp16 noise or
+        // produce NaN), not the embedding-level cosine (profiler #7 measures
+        // that). Skips if the fp16 library didn't build on this device.
+        let Some(metal) = get_metal() else { return };
+        if !FP16_MMA_AVAILABLE.load(Ordering::Relaxed) {
+            return;
+        }
+        let cpu = crate::gpu::CpuCompute;
+
+        let (m, n, k) = (40usize, 48usize, 64usize);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 89) as f32 - 44.0) * 0.01).collect();
+        let b: Vec<f32> = (0..n * k).map(|i| ((i % 73) as f32 - 36.0) * 0.01).collect();
+
+        let buf_a = metal.buf_slice_pooled(&a);
+        let buf_b = metal.buf_cached(&b);
+        let buf_c = metal.buf_zeros_pooled(m * n);
+        let buf_m = metal.buf_u32(m as u32);
+        let buf_n = metal.buf_u32(n as u32);
+        let buf_k = metal.buf_u32(k as u32);
+        let bufs = [buf_a.buffer(), &buf_b, buf_c.buffer(), &buf_m, &buf_n, &buf_k];
+        autoreleasepool(|_| {
+            let cmd = metal.queue.new_command_buffer();
+            let pipeline = &metal.pipelines["matmul_transb_simdgroup_fp16"];
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(pipeline);
+            for (i, bb) in bufs.iter().enumerate() {
+                enc.set_buffer(i as u64, Some(*bb), 0);
+            }
+            let groups = MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(32) as u64, 1);
+            enc.dispatch_thread_groups(groups, MTLSize::new(128, 1, 1));
+            enc.end_encoding();
+            metal.commit_wait(cmd);
+        });
+        let fp16_out = MetalCompute::read_buf(buf_c.buffer(), m * n);
+        let cpu_out = cpu.matmul(&a, &b, m, n, k);
+
+        assert_eq!(fp16_out.len(), m * n);
+        assert!(
+            fp16_out.iter().all(|x| x.is_finite()),
+            "fp16 MMA produced non-finite output"
+        );
+        // Loose: fp16 operands (11-bit mantissa) over a K=64 contraction.
+        let max_err: f32 = fp16_out
+            .iter()
+            .zip(cpu_out.iter())
+            .map(|(x, y)| (x - y).abs() / x.abs().max(y.abs()).max(1e-6))
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 5e-2, "fp16 MMA vs CPU matmul max err: {}", max_err);
     }
 
     #[test]
