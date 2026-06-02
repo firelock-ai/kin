@@ -402,7 +402,13 @@ kernel void matmul_transb(
 // threads; the wide tile only grows the per-simdgroup fragment grid (TM=TN: 2->4)
 // and the As/Bs stage rows (32->64), raising C-reuse per loaded A/B element.
 constant uint MMA_BM = 32, MMA_BN = 32, MMA_BK = 16, MMA_WM = 2, MMA_WN = 2, MMA_F = 8;
-constant uint MMA_BM_WIDE = 64, MMA_BN_WIDE = 64;
+// The wide tile uses literal 64 for both the stage array sizes and the block_mma
+// template args (NOT a `constant`-address-space symbol): a literal is an
+// unambiguous core-constant-expression in every MSL version, so it is always a
+// valid non-type template argument. The proven code only ever used `constant`
+// vars as array sizes, never as template args — keeping the wide tile on literals
+// removes any risk that the MAIN shader library fails to compile (which would
+// disable Metal entirely).
 
 // `As`/`Bs`/`store_tile` are declared in the calling KERNEL (threadgroup-address
 // variables cannot be declared in a non-kernel helper) and passed in by pointer.
@@ -581,10 +587,10 @@ kernel void matmul_transb_simdgroup_wide(
     uint  sgid             [[simdgroup_index_in_threadgroup]],
     uint  lane             [[thread_index_in_simdgroup]])
 {
-    threadgroup float As[MMA_BM_WIDE][MMA_BK];
-    threadgroup float Bs[MMA_BN_WIDE][MMA_BK];
+    threadgroup float As[64][MMA_BK];
+    threadgroup float Bs[64][MMA_BK];
     threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
-    block_mma<true, MMA_BM_WIDE, MMA_BN_WIDE>(A, B, C, M, N, K, tgid, sgid, lane, As, Bs, store_tile);
+    block_mma<true, 64, 64>(A, B, C, M, N, K, tgid, sgid, lane, As, Bs, store_tile);
 }
 
 kernel void batched_matmul_transb_simdgroup_wide(
@@ -601,10 +607,10 @@ kernel void batched_matmul_transb_simdgroup_wide(
     device const float* Ah = Q  + h * seq * dim;
     device const float* Bh = Kk + h * seq * dim;
     device float*       Ch = C  + h * seq * seq;
-    threadgroup float As[MMA_BM_WIDE][MMA_BK];
-    threadgroup float Bs[MMA_BN_WIDE][MMA_BK];
+    threadgroup float As[64][MMA_BK];
+    threadgroup float Bs[64][MMA_BK];
     threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
-    block_mma<true, MMA_BM_WIDE, MMA_BN_WIDE>(Ah, Bh, Ch, seq, seq, dim, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+    block_mma<true, 64, 64>(Ah, Bh, Ch, seq, seq, dim, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
 }
 
 kernel void batched_matmul_ab_simdgroup_wide(
@@ -621,10 +627,10 @@ kernel void batched_matmul_ab_simdgroup_wide(
     device const float* Ah = S + h * seq * seq;
     device const float* Bh = V + h * seq * dim;
     device float*       Ch = C + h * seq * dim;
-    threadgroup float As[MMA_BM_WIDE][MMA_BK];
-    threadgroup float Bs[MMA_BN_WIDE][MMA_BK];
+    threadgroup float As[64][MMA_BK];
+    threadgroup float Bs[64][MMA_BK];
     threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
-    block_mma<false, MMA_BM_WIDE, MMA_BN_WIDE>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+    block_mma<false, 64, 64>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
 }
 
 // ---- Softmax over rows ----
