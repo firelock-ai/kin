@@ -1419,77 +1419,115 @@ impl BertModel {
                 out
             };
 
-            // --- Batched output projection + residual ---
-            let attn_proj = self.linear(
-                &attn_output,
-                &layer.attn_out_weight,
-                layer.attn_out_bias.as_ref(),
-            );
-            let mut post_attn = &hidden + &attn_proj;
-            if !pre_ln {
-                self.norm(
-                    &mut post_attn,
+            // --- Batched output projection + residual (+ post-LN norm1) ---
+            // Post-LN LayerNorm folds the projection, residual, and norm into one
+            // resident GPU submission; the pre-LN / RMSNorm cases keep the per-op
+            // path (their norm1 already ran before attention, or is RMS-shaped).
+            let post_attn = if !pre_ln && !use_rms {
+                self.linear_add_norm(
+                    &attn_output,
+                    &layer.attn_out_weight,
+                    layer.attn_out_bias.as_ref(),
+                    &hidden,
                     &layer.norm1_weight,
-                    layer.norm1_bias.as_ref().or(Some(&zero_bias)),
-                    if use_rms { rms_eps } else { eps },
-                    use_rms,
-                );
-            }
-
-            // --- Batched FFN ---
-            let ffn_input = if pre_ln {
-                let mut n = post_attn.clone();
-                self.norm(
-                    &mut n,
-                    &layer.norm2_weight,
-                    layer.norm2_bias.as_ref().or(Some(&zero_bias)),
-                    if use_rms { rms_eps } else { eps },
-                    use_rms,
-                );
-                n
+                    layer.norm1_bias.as_ref().unwrap_or(&zero_bias),
+                    eps,
+                )
             } else {
-                post_attn.clone()
+                let attn_proj = self.linear(
+                    &attn_output,
+                    &layer.attn_out_weight,
+                    layer.attn_out_bias.as_ref(),
+                );
+                let mut post_attn = &hidden + &attn_proj;
+                if !pre_ln {
+                    self.norm(
+                        &mut post_attn,
+                        &layer.norm1_weight,
+                        layer.norm1_bias.as_ref().or(Some(&zero_bias)),
+                        rms_eps,
+                        use_rms,
+                    );
+                }
+                post_attn
             };
 
-            let ffn_down = if let Some(ref gate_weight) = layer.ffn_gate_weight {
-                self.ffn_swiglu(
-                    &ffn_input,
-                    gate_weight,
+            // --- Batched FFN (+ post-LN residual + norm2) ---
+            // Post-LN + gated SwiGLU with no down-projection bias folds the FFN,
+            // the residual, and norm2 into one resident GPU submission. The
+            // pre-LN / non-gated / RMSNorm cases keep the per-op path.
+            let post_ln_swiglu_fold = !pre_ln
+                && !use_rms
+                && layer.ffn_gate_weight.is_some()
+                && layer.ffn_down_bias.is_none();
+
+            if post_ln_swiglu_fold {
+                hidden = self.ffn_swiglu_add_norm(
+                    &post_attn,
+                    layer.ffn_gate_weight.as_ref().expect("ffn_gate_weight missing"),
                     layer.ffn_up_weight.as_ref().expect("ffn_up_weight missing"),
                     &layer.ffn_down_weight,
                     layer.ffn_down_bias.as_ref(),
-                )
-            } else if let Some(ref up_gated_weight) = layer.ffn_up_gated_weight {
-                let up_gated = self.linear(&ffn_input, up_gated_weight, None);
-                let gated = if self.config.feed_forward_type == "reglu" {
-                    reglu_2d(&up_gated, self.config.intermediate_size)
+                    &post_attn,
+                    &layer.norm2_weight,
+                    layer.norm2_bias.as_ref().unwrap_or(&zero_bias),
+                    eps,
+                );
+            } else {
+                let ffn_input = if pre_ln {
+                    let mut n = post_attn.clone();
+                    self.norm(
+                        &mut n,
+                        &layer.norm2_weight,
+                        layer.norm2_bias.as_ref().or(Some(&zero_bias)),
+                        if use_rms { rms_eps } else { eps },
+                        use_rms,
+                    );
+                    n
                 } else {
-                    geglu_2d(&up_gated, self.config.intermediate_size)
+                    post_attn.clone()
                 };
-                self.linear(&gated, &layer.ffn_down_weight, layer.ffn_down_bias.as_ref())
-            } else {
-                let ffn_up = self.linear(
-                    &ffn_input,
-                    layer.ffn_up_weight.as_ref().expect("ffn_up_weight missing"),
-                    layer.ffn_up_bias.as_ref(),
-                );
-                let ffn_activated = self.gelu(&ffn_up);
-                self.linear(
-                    &ffn_activated,
-                    &layer.ffn_down_weight,
-                    layer.ffn_down_bias.as_ref(),
-                )
-            };
 
-            hidden = &post_attn + &ffn_down;
-            if !pre_ln {
-                self.norm(
-                    &mut hidden,
-                    &layer.norm2_weight,
-                    layer.norm2_bias.as_ref().or(Some(&zero_bias)),
-                    if use_rms { rms_eps } else { eps },
-                    use_rms,
-                );
+                let ffn_down = if let Some(ref gate_weight) = layer.ffn_gate_weight {
+                    self.ffn_swiglu(
+                        &ffn_input,
+                        gate_weight,
+                        layer.ffn_up_weight.as_ref().expect("ffn_up_weight missing"),
+                        &layer.ffn_down_weight,
+                        layer.ffn_down_bias.as_ref(),
+                    )
+                } else if let Some(ref up_gated_weight) = layer.ffn_up_gated_weight {
+                    let up_gated = self.linear(&ffn_input, up_gated_weight, None);
+                    let gated = if self.config.feed_forward_type == "reglu" {
+                        reglu_2d(&up_gated, self.config.intermediate_size)
+                    } else {
+                        geglu_2d(&up_gated, self.config.intermediate_size)
+                    };
+                    self.linear(&gated, &layer.ffn_down_weight, layer.ffn_down_bias.as_ref())
+                } else {
+                    let ffn_up = self.linear(
+                        &ffn_input,
+                        layer.ffn_up_weight.as_ref().expect("ffn_up_weight missing"),
+                        layer.ffn_up_bias.as_ref(),
+                    );
+                    let ffn_activated = self.gelu(&ffn_up);
+                    self.linear(
+                        &ffn_activated,
+                        &layer.ffn_down_weight,
+                        layer.ffn_down_bias.as_ref(),
+                    )
+                };
+
+                hidden = &post_attn + &ffn_down;
+                if !pre_ln {
+                    self.norm(
+                        &mut hidden,
+                        &layer.norm2_weight,
+                        layer.norm2_bias.as_ref().or(Some(&zero_bias)),
+                        if use_rms { rms_eps } else { eps },
+                        use_rms,
+                    );
+                }
             }
         }
 
@@ -1820,6 +1858,114 @@ impl BertModel {
         let up = self.linear(x, up_w, None);
         let activated = self.swiglu(&gate, &up);
         self.linear(&activated, down_w, down_bias)
+    }
+
+    /// Post-LN projection + residual + LayerNorm: `layer_norm(residual + x @ w^T)`.
+    ///
+    /// On an accelerator backend with no projection bias and contiguous inputs the
+    /// whole chain is fused into one GPU submission (matmul + residual add + norm),
+    /// keeping the projection result resident so the intermediate never round-trips
+    /// through host memory. Otherwise it falls back to the per-op `linear` + add +
+    /// `norm` path, which is the numerical reference.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_add_norm(
+        &self,
+        x: &Array2<f32>,
+        weight: &Array2<f32>,
+        bias: Option<&Array1<f32>>,
+        residual: &Array2<f32>,
+        norm_gamma: &Array1<f32>,
+        norm_beta: &Array1<f32>,
+        eps: f32,
+    ) -> Array2<f32> {
+        let _span = tracing::info_span!(
+            "kin_infer.model.linear_add_norm",
+            rows = x.nrows(),
+            cols = x.ncols(),
+            hidden = weight.nrows(),
+            backend = %self.backend()
+        )
+        .entered();
+        if let Some(ref gpu) = self.gpu {
+            if bias.is_none() {
+                if let (Some(xs), Some(ws), Some(rs), Some(gs), Some(bs)) = (
+                    x.as_slice(),
+                    weight.as_slice(),
+                    residual.as_slice(),
+                    norm_gamma.as_slice(),
+                    norm_beta.as_slice(),
+                ) {
+                    let rows = x.nrows();
+                    let cols = x.ncols();
+                    let hidden = weight.nrows();
+                    let out = gpu.fused_linear_add_norm(
+                        xs, ws, rs, gs, bs, rows, cols, hidden, eps,
+                    );
+                    return Array2::from_shape_vec((rows, hidden), out)
+                        .expect("fused_linear_add_norm shape");
+                }
+            }
+        }
+        let proj = self.linear(x, weight, bias);
+        let mut sum = residual + &proj;
+        self.norm(&mut sum, norm_gamma, Some(norm_beta), eps, false);
+        sum
+    }
+
+    /// Post-LN SwiGLU FFN block: `layer_norm(residual + ffn_swiglu(x))`.
+    ///
+    /// On an accelerator backend with no down-projection bias and contiguous
+    /// inputs the residual add and norm2 fold into the FFN's single GPU
+    /// submission, so the down-projection never round-trips to host memory
+    /// un-normed. Otherwise it falls back to the per-op `ffn_swiglu` + add +
+    /// `norm` path, the numerical reference.
+    #[allow(clippy::too_many_arguments)]
+    fn ffn_swiglu_add_norm(
+        &self,
+        x: &Array2<f32>,
+        gate_w: &Array2<f32>,
+        up_w: &Array2<f32>,
+        down_w: &Array2<f32>,
+        down_bias: Option<&Array1<f32>>,
+        residual: &Array2<f32>,
+        norm_gamma: &Array1<f32>,
+        norm_beta: &Array1<f32>,
+        eps: f32,
+    ) -> Array2<f32> {
+        let _span = tracing::info_span!(
+            "kin_infer.model.ffn_swiglu_add_norm",
+            rows = x.nrows(),
+            hidden = x.ncols(),
+            inter = gate_w.nrows(),
+            backend = %self.backend()
+        )
+        .entered();
+        if let Some(ref gpu) = self.gpu {
+            if down_bias.is_none() {
+                if let (Some(xs), Some(gw), Some(uw), Some(dw), Some(rs), Some(gs), Some(bs)) = (
+                    x.as_slice(),
+                    gate_w.as_slice(),
+                    up_w.as_slice(),
+                    down_w.as_slice(),
+                    residual.as_slice(),
+                    norm_gamma.as_slice(),
+                    norm_beta.as_slice(),
+                ) {
+                    let rows = x.nrows();
+                    let hidden = x.ncols();
+                    let inter = gate_w.nrows();
+                    let out = gpu.fused_ffn_swiglu_add_norm(
+                        xs, gw, uw, dw, rs, gs, bs, rows, hidden, inter, eps,
+                    );
+                    return Array2::from_shape_vec((rows, hidden), out)
+                        .expect("fused_ffn_swiglu_add_norm shape");
+                }
+            }
+        }
+        let down = self.ffn_swiglu(x, gate_w, up_w, down_w, down_bias);
+        let mut sum = residual + &down;
+        self.norm(&mut sum, norm_gamma, Some(norm_beta), eps, false);
+        sum
     }
 
     /// GPU-accelerated RoPE helper.

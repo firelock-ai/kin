@@ -237,6 +237,171 @@ fn metal_matmul_shapes_match_cpu_at_bert_dims() {
     }
 }
 
+/// Parity for the post-LN residency fold `fused_linear_add_norm`.
+///
+/// The fold keeps the projection result resident on-device between the matmul,
+/// the residual add, and the LayerNorm — one command buffer, one readback —
+/// instead of a readback + re-upload between each. The oracle is the SAME Metal
+/// backend's per-op primitives (`matmul` + host add + `layer_norm`), i.e. exactly
+/// what the trait's default `fused_linear_add_norm` does. Any divergence is
+/// therefore purely an artifact of the fused encoding (a buffer read before the
+/// GPU finished writing, a wrong residual offset, a stale norm) — not GPU-vs-CPU
+/// float-order noise. We also check the CPU reference as a secondary anchor.
+///
+/// Shapes are BERT/SweRank post-attention: rows = batch*seq, cols = hidden,
+/// out = hidden (the attn out-projection is square `[hidden, hidden]`).
+#[test]
+fn metal_fused_linear_add_norm_matches_per_op() {
+    let Some(metal) = MetalCompute::try_new() else {
+        eprintln!("Metal device not available, skipping");
+        return;
+    };
+    let cpu = CpuCompute;
+
+    // (rows, cols, hidden) — SweRank/BGE post-attn projection at a few batch×seq
+    // shapes, including a ragged row count that does not divide the 32-wide MMA
+    // block, to exercise the epilogue bounds-guard through the fold.
+    let cases = [
+        (64usize, 768usize, 768usize),
+        (100, 768, 768),   // ragged: 100 rows is not a multiple of 32
+        (512, 384, 384),   // BGE-small dims
+        (37, 384, 384),    // ragged + small
+    ];
+
+    for &(rows, cols, hidden) in &cases {
+        let x: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i as i32 % 257 - 128) as f32) * 0.01)
+            .collect();
+        let w: Vec<f32> = (0..hidden * cols)
+            .map(|i| ((i as i32 % 263 - 131) as f32) * 0.01)
+            .collect();
+        let residual: Vec<f32> = (0..rows * hidden)
+            .map(|i| ((i as i32 % 251 - 125) as f32) * 0.02)
+            .collect();
+        let gamma: Vec<f32> = (0..hidden).map(|i| 1.0 + (i as f32) * 1e-4).collect();
+        let beta: Vec<f32> = (0..hidden).map(|i| (i as f32) * 1e-4 - 0.05).collect();
+        let eps = 1e-12f32;
+
+        // Candidate: the fused residency path.
+        let fused = metal.fused_linear_add_norm(
+            &x, &w, &residual, &gamma, &beta, rows, cols, hidden, eps,
+        );
+
+        // Oracle A: same Metal primitives, per-op (matmul -> host add -> layer_norm).
+        let mut ref_metal = metal.matmul(&x, &w, rows, hidden, cols);
+        for (s, r) in ref_metal.iter_mut().zip(residual.iter()) {
+            *s += *r;
+        }
+        metal.layer_norm(&mut ref_metal, &gamma, &beta, rows, hidden, eps);
+
+        // Oracle B: CPU primitives end-to-end.
+        let mut ref_cpu = cpu.matmul(&x, &w, rows, hidden, cols);
+        for (s, r) in ref_cpu.iter_mut().zip(residual.iter()) {
+            *s += *r;
+        }
+        cpu.layer_norm(&mut ref_cpu, &gamma, &beta, rows, hidden, eps);
+
+        let err_metal = max_abs_err(&fused, &ref_metal);
+        let err_cpu = max_abs_err(&fused, &ref_cpu);
+        let nan = count_nonfinite(&fused);
+        eprintln!(
+            "fused_linear_add_norm rows={rows:>4} cols={cols:>4} hidden={hidden:>4} \
+             err_vs_metal_perop={err_metal:.3e} err_vs_cpu={err_cpu:.3e} nan={nan}"
+        );
+        assert_eq!(nan, 0, "fused_linear_add_norm produced {nan} non-finite");
+        // vs same-backend per-op: must be bit-tight (same kernels, same float
+        // order) — the only difference is residency, which must not change values.
+        assert!(
+            err_metal < 1e-4,
+            "fused vs Metal per-op rows={rows} cols={cols} hidden={hidden}: {err_metal} >= 1e-4"
+        );
+        // vs CPU: LayerNorm output is well-conditioned; 1e-4 is a tight anchor.
+        assert!(
+            err_cpu < 1e-4,
+            "fused vs CPU rows={rows} cols={cols} hidden={hidden}: {err_cpu} >= 1e-4"
+        );
+    }
+}
+
+/// Parity for the post-LN FFN residency fold `fused_ffn_swiglu_add_norm`.
+///
+/// The fold appends the residual add and norm2 to the FFN's own command buffer,
+/// so the down-projection never round-trips un-normed. Oracle is the SAME Metal
+/// backend's `fused_ffn_swiglu` + host add + `layer_norm` (the trait default), so
+/// any divergence is the fold's own encoding, not GPU/CPU float-order noise.
+#[test]
+fn metal_fused_ffn_swiglu_add_norm_matches_per_op() {
+    let Some(metal) = MetalCompute::try_new() else {
+        eprintln!("Metal device not available, skipping");
+        return;
+    };
+    let cpu = CpuCompute;
+
+    // (rows, hidden, inter) — SweRank/nomic dims (hidden=768, inter=3072) plus a
+    // ragged row count to exercise the MMA epilogue through the fold.
+    let cases = [
+        (64usize, 768usize, 3072usize),
+        (100, 768, 3072), // ragged rows
+        (37, 768, 3072),  // ragged + small
+    ];
+
+    for &(rows, hidden, inter) in &cases {
+        let x: Vec<f32> = (0..rows * hidden)
+            .map(|i| ((i as i32 % 257 - 128) as f32) * 0.01)
+            .collect();
+        let w_gate: Vec<f32> = (0..inter * hidden)
+            .map(|i| ((i as i32 % 263 - 131) as f32) * 0.005)
+            .collect();
+        let w_up: Vec<f32> = (0..inter * hidden)
+            .map(|i| ((i as i32 % 251 - 125) as f32) * 0.005)
+            .collect();
+        let w_down: Vec<f32> = (0..hidden * inter)
+            .map(|i| ((i as i32 % 241 - 120) as f32) * 0.005)
+            .collect();
+        let residual: Vec<f32> = (0..rows * hidden)
+            .map(|i| ((i as i32 % 239 - 119) as f32) * 0.02)
+            .collect();
+        let gamma: Vec<f32> = (0..hidden).map(|i| 1.0 + (i as f32) * 1e-4).collect();
+        let beta: Vec<f32> = (0..hidden).map(|i| (i as f32) * 1e-4 - 0.05).collect();
+        let eps = 1e-12f32;
+
+        let fused = metal.fused_ffn_swiglu_add_norm(
+            &x, &w_gate, &w_up, &w_down, &residual, &gamma, &beta, rows, hidden, inter, eps,
+        );
+
+        // Oracle A: same Metal primitives, per-op.
+        let mut ref_metal = metal.fused_ffn_swiglu(&x, &w_gate, &w_up, &w_down, rows, hidden, inter);
+        for (s, r) in ref_metal.iter_mut().zip(residual.iter()) {
+            *s += *r;
+        }
+        metal.layer_norm(&mut ref_metal, &gamma, &beta, rows, hidden, eps);
+
+        // Oracle B: CPU primitives end-to-end.
+        let mut ref_cpu = cpu.fused_ffn_swiglu(&x, &w_gate, &w_up, &w_down, rows, hidden, inter);
+        for (s, r) in ref_cpu.iter_mut().zip(residual.iter()) {
+            *s += *r;
+        }
+        cpu.layer_norm(&mut ref_cpu, &gamma, &beta, rows, hidden, eps);
+
+        let err_metal = max_abs_err(&fused, &ref_metal);
+        let err_cpu = max_abs_err(&fused, &ref_cpu);
+        let nan = count_nonfinite(&fused);
+        eprintln!(
+            "fused_ffn_swiglu_add_norm rows={rows:>4} hidden={hidden:>4} inter={inter:>4} \
+             err_vs_metal_perop={err_metal:.3e} err_vs_cpu={err_cpu:.3e} nan={nan}"
+        );
+        assert_eq!(nan, 0, "fused_ffn_swiglu_add_norm produced {nan} non-finite");
+        assert!(
+            err_metal < 1e-4,
+            "fused vs Metal per-op rows={rows} hidden={hidden} inter={inter}: {err_metal} >= 1e-4"
+        );
+        assert!(
+            err_cpu < 1e-4,
+            "fused vs CPU rows={rows} hidden={hidden} inter={inter}: {err_cpu} >= 1e-4"
+        );
+    }
+}
+
 /// Locate the HuggingFace-cached BGE-small-en-v1.5 snapshot directory. Returns
 /// `None` if the weights have not been downloaded on this machine — the test
 /// will skip rather than fail, mirroring the Metal-availability skip pattern

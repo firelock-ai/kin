@@ -518,6 +518,18 @@ kernel void elementwise_mul(
     a[gid] *= b[gid];
 }
 
+// ---- Element-wise add (in-place): a += b ----
+// Used by the residency folds to apply the residual connection on-device,
+// keeping the activation resident between the projection matmul and the norm
+// so the residual sum never round-trips through host memory.
+kernel void elementwise_add(
+    device float* a             [[buffer(0)]],
+    device const float* b       [[buffer(1)]],
+    uint gid                    [[thread_position_in_grid]]
+) {
+    a[gid] += b[gid];
+}
+
 // ---- Fused SwiGLU activation: out = silu(gate) * up ----
 // Single pass over the gate/up intermediates, writing the activated product.
 // silu(x) = x / (1 + e^-x); identical math to the two-step silu-then-mul path
@@ -1030,6 +1042,7 @@ impl MetalCompute {
             "swiglu_activation",
             "swiglu_activation_fat",
             "elementwise_mul",
+            "elementwise_add",
             "rope_apply",
             "rope_apply_batched",
         ];
@@ -1867,6 +1880,211 @@ impl GpuCompute for MetalCompute {
             Self::read_buf(buf_out.buffer(), rows * hidden)
         });
         Self::count_nonfinite(&format!("fused_ffn_swiglu rows={rows} hidden={hidden} inter={inter}"), &out);
+        out
+    }
+
+    fn fused_ffn_swiglu_add_norm(
+        &self,
+        x: &[f32],
+        w_gate: &[f32],
+        w_up: &[f32],
+        w_down: &[f32],
+        residual: &[f32],
+        gamma: &[f32],
+        beta: &[f32],
+        rows: usize,
+        hidden: usize,
+        inter: usize,
+        eps: f32,
+    ) -> Vec<f32> {
+        let _span = tracing::info_span!(
+            "kin_infer.metal.fused_ffn_swiglu_add_norm",
+            rows = rows,
+            hidden = hidden,
+            inter = inter
+        )
+        .entered();
+
+        // Identical to `fused_ffn_swiglu` up to the down-projection, then the
+        // residual add and LayerNorm are appended to the SAME command buffer so
+        // the FFN output never round-trips to host memory un-normed — the post-LN
+        // norm2 boundary folds into the FFN's existing single submission.
+        let buf_x = self.buf_slice_pooled(x);
+        let buf_wgateup = self.buf_cached_concat(&[w_gate, w_up]);
+        let buf_wdown = self.buf_cached(w_down);
+        let buf_residual = self.buf_slice_pooled(residual);
+        let buf_gateup = self.buf_zeros_pooled(rows * 2 * inter);
+        let buf_act = self.buf_zeros_pooled(rows * inter);
+        let buf_out = self.buf_zeros_pooled(rows * hidden);
+        let buf_gamma = self.buf_cached(gamma);
+        let buf_beta = self.buf_cached(beta);
+        let buf_rows = self.buf_u32(rows as u32);
+        let buf_inter = self.buf_u32(inter as u32);
+        let buf_two_inter = self.buf_u32((2 * inter) as u32);
+        let buf_hidden = self.buf_u32(hidden as u32);
+        let buf_eps = self.buf_f32(eps);
+
+        let mm = &self.pipelines["matmul_transb"];
+        let mm_mma = &self.pipelines["matmul_transb_simdgroup"];
+        let swi = &self.pipelines["swiglu_activation_fat"];
+        let add = &self.pipelines["elementwise_add"];
+        let ln = &self.pipelines["layer_norm"];
+        let gateup_mma = use_mma(rows, 2 * inter, hidden);
+        let down_mma = use_mma(rows, hidden, inter);
+
+        let out = autoreleasepool(|_| {
+            let cmd = self.queue.new_command_buffer();
+
+            // gateup = x @ [w_gate|w_up]^T -> [rows, 2*inter]
+            if gateup_mma {
+                Self::encode_mma(cmd, mm_mma, &[buf_x.buffer(), &buf_wgateup, buf_gateup.buffer(), &buf_rows, &buf_two_inter, &buf_hidden], rows, 2 * inter, 1);
+            } else {
+                Self::encode_matmul(cmd, mm, buf_x.buffer(), &buf_wgateup, buf_gateup.buffer(), &buf_rows, &buf_two_inter, &buf_hidden, 2 * inter, rows);
+            }
+
+            // act = silu(gate) * up -> [rows, inter]
+            {
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(swi);
+                enc.set_buffer(0, Some(buf_gateup.buffer()), 0);
+                enc.set_buffer(1, Some(buf_act.buffer()), 0);
+                enc.set_buffer(2, Some(&buf_inter), 0);
+                let total = (rows * inter) as u64;
+                let tw = swi.thread_execution_width() as u64;
+                enc.dispatch_threads(MTLSize::new(total, 1, 1), MTLSize::new(tw.min(total).max(1), 1, 1));
+                enc.end_encoding();
+            }
+
+            // out = act @ w_down^T -> [rows, hidden]
+            if down_mma {
+                Self::encode_mma(cmd, mm_mma, &[buf_act.buffer(), &buf_wdown, buf_out.buffer(), &buf_rows, &buf_hidden, &buf_inter], rows, hidden, 1);
+            } else {
+                Self::encode_matmul(cmd, mm, buf_act.buffer(), &buf_wdown, buf_out.buffer(), &buf_rows, &buf_hidden, &buf_inter, hidden, rows);
+            }
+
+            // out += residual (resident)
+            {
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(add);
+                enc.set_buffer(0, Some(buf_out.buffer()), 0);
+                enc.set_buffer(1, Some(buf_residual.buffer()), 0);
+                let total = (rows * hidden) as u64;
+                let tw = add.thread_execution_width() as u64;
+                enc.dispatch_threads(MTLSize::new(total, 1, 1), MTLSize::new(tw.min(total).max(1), 1, 1));
+                enc.end_encoding();
+            }
+
+            // out = layer_norm(out, gamma, beta, eps) (in-place, one row per thread)
+            {
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(ln);
+                enc.set_buffer(0, Some(buf_out.buffer()), 0);
+                enc.set_buffer(1, Some(&buf_gamma), 0);
+                enc.set_buffer(2, Some(&buf_beta), 0);
+                enc.set_buffer(3, Some(&buf_hidden), 0);
+                enc.set_buffer(4, Some(&buf_eps), 0);
+                let tw = ln.thread_execution_width() as u64;
+                let rows_u = rows as u64;
+                enc.dispatch_threads(MTLSize::new(rows_u, 1, 1), MTLSize::new(tw.min(rows_u).max(1), 1, 1));
+                enc.end_encoding();
+            }
+
+            time_phase(Phase::Matmul, || {
+                self.commit_bounded(cmd, Vec::new());
+                cmd.wait_until_completed();
+            });
+            Self::read_buf(buf_out.buffer(), rows * hidden)
+        });
+        Self::count_nonfinite(&format!("fused_ffn_swiglu_add_norm rows={rows} hidden={hidden} inter={inter}"), &out);
+        out
+    }
+
+    fn fused_linear_add_norm(
+        &self,
+        x: &[f32],
+        weight: &[f32],
+        residual: &[f32],
+        gamma: &[f32],
+        beta: &[f32],
+        rows: usize,
+        cols: usize,
+        hidden: usize,
+        eps: f32,
+    ) -> Vec<f32> {
+        let _span = tracing::info_span!(
+            "kin_infer.metal.fused_linear_add_norm",
+            rows = rows,
+            cols = cols,
+            hidden = hidden
+        )
+        .entered();
+
+        // x uploaded once; weight/gamma/beta hit the persistent cache. The
+        // projection output stays resident, the residual is added on-device, and
+        // the LayerNorm runs in-place on the same buffer — one command buffer, one
+        // readback. The proj buffer is a pooled transient that recycles after the
+        // readback below.
+        let buf_x = self.buf_slice_pooled(x);
+        let buf_w = self.buf_cached(weight);
+        let buf_residual = self.buf_slice_pooled(residual);
+        let buf_proj = self.buf_zeros_pooled(rows * hidden);
+        let buf_gamma = self.buf_cached(gamma);
+        let buf_beta = self.buf_cached(beta);
+        let buf_rows = self.buf_u32(rows as u32);
+        let buf_hidden = self.buf_u32(hidden as u32);
+        let buf_cols = self.buf_u32(cols as u32);
+        let buf_eps = self.buf_f32(eps);
+
+        let mm = &self.pipelines["matmul_transb"];
+        let mm_mma = &self.pipelines["matmul_transb_simdgroup"];
+        let add = &self.pipelines["elementwise_add"];
+        let ln = &self.pipelines["layer_norm"];
+        let proj_mma = use_mma(rows, hidden, cols);
+
+        let out = autoreleasepool(|_| {
+            let cmd = self.queue.new_command_buffer();
+
+            // proj = x @ weight^T -> [rows, hidden]  (M=rows, N=hidden, K=cols)
+            if proj_mma {
+                Self::encode_mma(cmd, mm_mma, &[buf_x.buffer(), &buf_w, buf_proj.buffer(), &buf_rows, &buf_hidden, &buf_cols], rows, hidden, 1);
+            } else {
+                Self::encode_matmul(cmd, mm, buf_x.buffer(), &buf_w, buf_proj.buffer(), &buf_rows, &buf_hidden, &buf_cols, hidden, rows);
+            }
+
+            // proj += residual (in-place on the resident projection buffer)
+            {
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(add);
+                enc.set_buffer(0, Some(buf_proj.buffer()), 0);
+                enc.set_buffer(1, Some(buf_residual.buffer()), 0);
+                let total = (rows * hidden) as u64;
+                let tw = add.thread_execution_width() as u64;
+                enc.dispatch_threads(MTLSize::new(total, 1, 1), MTLSize::new(tw.min(total).max(1), 1, 1));
+                enc.end_encoding();
+            }
+
+            // out = layer_norm(proj, gamma, beta, eps) (in-place, one row per thread)
+            {
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(ln);
+                enc.set_buffer(0, Some(buf_proj.buffer()), 0);
+                enc.set_buffer(1, Some(&buf_gamma), 0);
+                enc.set_buffer(2, Some(&buf_beta), 0);
+                enc.set_buffer(3, Some(&buf_hidden), 0);
+                enc.set_buffer(4, Some(&buf_eps), 0);
+                let tw = ln.thread_execution_width() as u64;
+                let rows_u = rows as u64;
+                enc.dispatch_threads(MTLSize::new(rows_u, 1, 1), MTLSize::new(tw.min(rows_u).max(1), 1, 1));
+                enc.end_encoding();
+            }
+
+            time_phase(Phase::Matmul, || {
+                self.commit_bounded(cmd, Vec::new());
+                cmd.wait_until_completed();
+            });
+            Self::read_buf(buf_proj.buffer(), rows * hidden)
+        });
+        Self::count_nonfinite(&format!("fused_linear_add_norm rows={rows} hidden={hidden}"), &out);
         out
     }
 

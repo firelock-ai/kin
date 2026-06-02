@@ -390,6 +390,82 @@ pub trait GpuCompute: Send + Sync {
         self.batched_attn_values(&scores, v, total_heads, seq_len, head_dim)
     }
 
+    /// Fused SwiGLU feed-forward + residual + LayerNorm in a single GPU
+    /// submission — the post-LN FFN block:
+    ///
+    /// ```text
+    /// down = fused_ffn_swiglu(x, w_gate, w_up, w_down)   // [rows, hidden]
+    /// sum  = residual + down                              // residual add
+    /// out  = layer_norm(sum, gamma, beta, eps)
+    /// ```
+    ///
+    /// Same shapes as `fused_ffn_swiglu`, plus `residual`/`gamma`/`beta` of
+    /// `[rows, hidden]` / `[hidden]`. Folds the residual add and norm2 into the
+    /// FFN's own command buffer so the down-projection never round-trips to host
+    /// memory un-normed. The default chains the primitives and is the reference.
+    #[allow(clippy::too_many_arguments)]
+    fn fused_ffn_swiglu_add_norm(
+        &self,
+        x: &[f32],
+        w_gate: &[f32],
+        w_up: &[f32],
+        w_down: &[f32],
+        residual: &[f32],
+        gamma: &[f32],
+        beta: &[f32],
+        rows: usize,
+        hidden: usize,
+        inter: usize,
+        eps: f32,
+    ) -> Vec<f32> {
+        let mut sum = self.fused_ffn_swiglu(x, w_gate, w_up, w_down, rows, hidden, inter);
+        for (s, r) in sum.iter_mut().zip(residual.iter()) {
+            *s += *r;
+        }
+        self.layer_norm(&mut sum, gamma, beta, rows, hidden, eps);
+        sum
+    }
+
+    /// Fused projection + residual + LayerNorm in a single GPU submission:
+    ///
+    /// ```text
+    /// proj = x @ weight^T              // [rows, hidden]
+    /// sum  = residual + proj           // [rows, hidden]  (residual add)
+    /// out  = layer_norm(sum, gamma, beta, eps)
+    /// ```
+    ///
+    /// `x` is `[rows, cols]` row-major; `weight` is `[hidden, cols]` (matmul-`B^T`
+    /// convention); `residual`, `gamma`, `beta`, and the output are `[rows, hidden]`
+    /// / `[hidden]`. This is the post-attention output-projection block of a
+    /// post-LN transformer (and the structurally identical post-FFN block), folded
+    /// so the projection result and the residual sum stay RESIDENT on-device — the
+    /// intermediate never round-trips through host memory between the matmul and
+    /// the norm.
+    ///
+    /// The default chains the existing primitives and is the numerical reference;
+    /// accelerator backends override it to keep the chain resident with a single
+    /// host synchronization.
+    #[allow(clippy::too_many_arguments)]
+    fn fused_linear_add_norm(
+        &self,
+        x: &[f32],
+        weight: &[f32],
+        residual: &[f32],
+        gamma: &[f32],
+        beta: &[f32],
+        rows: usize,
+        cols: usize,
+        hidden: usize,
+        eps: f32,
+    ) -> Vec<f32> {
+        let mut sum = self.matmul(x, weight, rows, hidden, cols);
+        for (s, r) in sum.iter_mut().zip(residual.iter()) {
+            *s += *r;
+        }
+        self.layer_norm(&mut sum, gamma, beta, rows, hidden, eps);
+        sum
+    }
+
     /// Which backend this compute instance uses.
     fn backend(&self) -> GpuBackend;
 
