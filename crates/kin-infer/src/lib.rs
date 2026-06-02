@@ -221,6 +221,98 @@ fn reshape_on_gpu() -> bool {
     })
 }
 
+/// Length-bucketing gate for `forward_batched`. When ON, mixed-length batches are
+/// split into coarse length bins so the projection/FFN GEMMs stop running short
+/// sequences padded to the batch's global `max_len`; when OFF the default
+/// single-encode path is byte-for-byte unchanged. Sampled once per process.
+///
+/// Opt-in for now (`KIN_INFER_BUCKET=1`): the bucketed path is bit-identical per
+/// entity (see `forward_batched_bucketed`), so the default flips ON once the
+/// parity gate confirms it, keeping the OFF override as the safe fallback — the
+/// pattern used for the MMA flip.
+fn bucket_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("KIN_INFER_BUCKET").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
+/// Diagnostic gate (`KIN_INFER_NO_FOLD`): when ON, the batched forward skips the
+/// fused residency folds (`linear_add_norm`, `ffn_swiglu_add_norm`) and routes
+/// the attention-output and FFN blocks through the same per-op
+/// linear+add+norm / ffn+add+norm path the single-`forward` (batch=1) path uses.
+/// Pure routing — the per-op branches are the existing fallbacks, so the result
+/// is numerically the unfused computation. Default OFF leaves the folded path
+/// byte-for-byte unchanged. Used to A/B whether the fused folds are the source of
+/// the intermittent batched nondeterminism. Sampled once per process.
+fn no_fold_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("KIN_INFER_NO_FOLD").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
+/// Per-layer divergence trace gate (`KIN_INFER_DUMP_LAYER`). OFF by default — zero
+/// effect on the runtime path. When set, both `forward` (batch=1) and
+/// `encode_batched` print a stable fingerprint of one chosen entity's hidden state
+/// after the embedding and after each transformer layer, so a single-forward
+/// trajectory and a batched trajectory for the SAME tokens can be diffed
+/// layer-by-layer to localize the first divergent op. Sampled once per process.
+fn dump_layer_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("KIN_INFER_DUMP_LAYER").is_some())
+}
+
+/// Which entity to trace for the per-layer dump (`KIN_INFER_DUMP_ENTITY`, default 0).
+fn dump_entity_index() -> usize {
+    use std::sync::OnceLock;
+    static IDX: OnceLock<usize> = OnceLock::new();
+    *IDX.get_or_init(|| {
+        std::env::var("KIN_INFER_DUMP_ENTITY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Print an l2/sum/first4 fingerprint of `rows` (a flattened slice of one entity's
+/// hidden state). Same format on both paths so single vs batched DUMP lines diff
+/// cleanly. `layer` 0 = post-embedding, `1..=num_layers` = after each transformer
+/// layer; `sub` is "embed", "attn" (post-attention output), or "ffn" (layer output).
+fn dump_hidden(path: &str, layer: i32, sub: &str, rows: &[f32]) {
+    let sum: f64 = rows.iter().map(|&x| x as f64).sum();
+    let l2: f64 = rows.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+    let g = |i: usize| rows.get(i).copied().unwrap_or(0.0);
+    eprintln!(
+        "DUMP path={path} layer={layer} sub={sub} rows={n} l2={l2:.6} sum={sum:.6} first4=[{:.5},{:.5},{:.5},{:.5}]",
+        g(0), g(1), g(2), g(3), n = rows.len()
+    );
+}
+
+/// Coarse length bin used to group inputs for length-bucketed batching: the
+/// smallest standard cap that still fits `len`, or 2048 for anything longer. This
+/// is only a grouping key — `encode_batched` still pads each group to its real
+/// longest member, so the bin merely keeps near-length inputs together without
+/// over-fragmenting the batch.
+fn length_bin(len: usize) -> usize {
+    const BINS: [usize; 5] = [64, 128, 256, 512, 1024];
+    for &b in BINS.iter() {
+        if len <= b {
+            return b;
+        }
+    }
+    2048
+}
+
 impl BertConfig {
     pub fn architecture(&self) -> ModelArchitecture {
         self.model_type
@@ -1182,6 +1274,10 @@ impl BertModel {
                 self.config.layer_norm_eps as f32,
             );
 
+            if dump_layer_enabled() && b == dump_entity_index() {
+                dump_hidden("single", 0, "embed", hidden.as_slice().unwrap_or(&[]));
+            }
+
             // 3. Transformer layers (ALBERT: reuse layers[i % num_groups]).
             // Each Metal op drains its own autoreleased command buffer/encoders
             // (see the per-op `autoreleasepool` wraps in metal_backend.rs), so no
@@ -1190,6 +1286,9 @@ impl BertModel {
             for i in 0..self.config.num_hidden_layers {
                 let layer = &self.weights.layers[i % num_groups];
                 hidden = self.encoder_layer(&hidden, mask, layer, i)?;
+                if dump_layer_enabled() && b == dump_entity_index() {
+                    dump_hidden("single", (i + 1) as i32, "ffn", hidden.as_slice().unwrap_or(&[]));
+                }
             }
 
             // 4. Pooling (CLS or mean) + L2 normalize
@@ -1289,6 +1388,19 @@ impl BertModel {
             self.weights.embed_ln_bias.as_ref(),
             self.config.layer_norm_eps as f32,
         );
+
+        if dump_layer_enabled() {
+            let e = dump_entity_index();
+            if e < batch_size {
+                let real = token_ids[e].len();
+                let block: Vec<f32> = hidden
+                    .slice(ndarray::s![e * max_len..e * max_len + real, ..])
+                    .iter()
+                    .copied()
+                    .collect();
+                dump_hidden("batched", 0, "embed", &block);
+            }
+        }
 
         // 3. Transformer layers
         let num_groups = self.weights.layers.len();
@@ -1477,7 +1589,7 @@ impl BertModel {
             // Post-LN LayerNorm folds the projection, residual, and norm into one
             // resident GPU submission; the pre-LN / RMSNorm cases keep the per-op
             // path (their norm1 already ran before attention, or is RMS-shaped).
-            let post_attn = if !pre_ln && !use_rms {
+            let post_attn = if !pre_ln && !use_rms && !no_fold_enabled() {
                 self.linear_add_norm(
                     &attn_output,
                     &layer.attn_out_weight,
@@ -1506,12 +1618,26 @@ impl BertModel {
                 post_attn
             };
 
+            if dump_layer_enabled() {
+                let e = dump_entity_index();
+                if e < batch_size {
+                    let real = token_ids[e].len();
+                    let block: Vec<f32> = post_attn
+                        .slice(ndarray::s![e * max_len..e * max_len + real, ..])
+                        .iter()
+                        .copied()
+                        .collect();
+                    dump_hidden("batched", (i + 1) as i32, "attn", &block);
+                }
+            }
+
             // --- Batched FFN (+ post-LN residual + norm2) ---
             // Post-LN + gated SwiGLU with no down-projection bias folds the FFN,
             // the residual, and norm2 into one resident GPU submission. The
             // pre-LN / non-gated / RMSNorm cases keep the per-op path.
             let post_ln_swiglu_fold = !pre_ln
                 && !use_rms
+                && !no_fold_enabled()
                 && layer.ffn_gate_weight.is_some()
                 && layer.ffn_down_bias.is_none();
 
@@ -1583,6 +1709,19 @@ impl BertModel {
                     );
                 }
             }
+
+            if dump_layer_enabled() {
+                let e = dump_entity_index();
+                if e < batch_size {
+                    let real = token_ids[e].len();
+                    let block: Vec<f32> = hidden
+                        .slice(ndarray::s![e * max_len..e * max_len + real, ..])
+                        .iter()
+                        .copied()
+                        .collect();
+                    dump_hidden("batched", (i + 1) as i32, "ffn", &block);
+                }
+            }
         }
 
             Ok((hidden, masks, max_len))
@@ -1603,11 +1742,35 @@ impl BertModel {
             return self.forward(token_ids, attention_masks);
         }
 
+        // Length-bucketing (opt-in via KIN_INFER_BUCKET): split mixed-length
+        // inputs into coarse length bins so the projection/FFN GEMMs stop running
+        // short sequences padded to the batch's global max_len. Bit-identical per
+        // entity to the default path below; see `forward_batched_bucketed`.
+        if bucket_enabled() {
+            return self.forward_batched_bucketed(token_ids, attention_masks);
+        }
+
         let (hidden, masks, max_len) = self.encode_batched(token_ids, attention_masks)?;
 
-        // 4. Per-input mean pooling + L2 normalize
+        // 4. Per-input mean/CLS pooling + L2 normalize
         let _pool_span =
             tracing::info_span!("kin_infer.model.forward_batched.pool_and_normalize").entered();
+        Ok(self.pool_and_normalize(&hidden, &masks, max_len))
+    }
+
+    /// Per-input mean/CLS pooling + L2 normalize over an encoded batch.
+    ///
+    /// `hidden` is the `[batch * max_len, hidden]` block from `encode_batched`,
+    /// `masks[b]` is input `b`'s padded attention mask, and `max_len` is the row
+    /// stride. Returns one L2-normalized embedding per input, in input order.
+    /// Pooling is mask-aware, so padding rows contribute nothing.
+    fn pool_and_normalize(
+        &self,
+        hidden: &Array2<f32>,
+        masks: &[Vec<u8>],
+        max_len: usize,
+    ) -> Vec<Vec<f32>> {
+        let batch_size = masks.len();
         let mut results = Vec::with_capacity(batch_size);
         let cls_pooling = self.config.uses_cls_pooling();
         for b in 0..batch_size {
@@ -1622,6 +1785,59 @@ impl BertModel {
                 )
             };
             results.push(l2_normalize(&pooled).to_vec());
+        }
+        results
+    }
+
+    /// Length-bucketed `forward_batched` (gated by `KIN_INFER_BUCKET`).
+    ///
+    /// Groups inputs by coarse length bin (`length_bin`) and encodes each group
+    /// independently, so every `encode_batched` call pads only to its group's
+    /// longest member instead of the whole batch's global `max_len`. This removes
+    /// the padding rows the projection/FFN GEMMs would otherwise process for short
+    /// sequences that share a batch with a long one.
+    ///
+    /// Output is bit-identical, per entity, to the unbucketed path: a GEMM output
+    /// row depends only on the matching input row (rows are independent and the
+    /// kernel's K-accumulation order is fixed regardless of batch composition),
+    /// attention masks padded columns to -inf, and pooling is mask-aware. Only the
+    /// batch each entity rides in — and thus the amount of wasted padding —
+    /// changes; the math for a real token row does not. Results are reassembled
+    /// into the original input order before returning.
+    fn forward_batched_bucketed(
+        &self,
+        token_ids: &[Vec<u32>],
+        attention_masks: &[Vec<u32>],
+    ) -> Result<Vec<Vec<f32>>, InferError> {
+        use std::collections::BTreeMap;
+        let batch_size = token_ids.len();
+
+        // Group original input indices by coarse length bin (deterministic order).
+        let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (idx, ids) in token_ids.iter().enumerate() {
+            groups.entry(length_bin(ids.len())).or_default().push(idx);
+        }
+
+        let _span = tracing::info_span!(
+            "kin_infer.model.forward_batched.bucketed",
+            batch_size = batch_size,
+            groups = groups.len()
+        )
+        .entered();
+
+        // One empty slot per input; every index lands in exactly one group and
+        // every group writes its results back, so all slots are filled.
+        let mut results: Vec<Vec<f32>> = vec![Vec::new(); batch_size];
+        for indices in groups.values() {
+            let group_ids: Vec<Vec<u32>> =
+                indices.iter().map(|&i| token_ids[i].clone()).collect();
+            let group_masks: Vec<Vec<u32>> =
+                indices.iter().map(|&i| attention_masks[i].clone()).collect();
+            let (hidden, masks, max_len) = self.encode_batched(&group_ids, &group_masks)?;
+            let pooled = self.pool_and_normalize(&hidden, &masks, max_len);
+            for (slot, &orig) in indices.iter().enumerate() {
+                results[orig] = pooled[slot].clone();
+            }
         }
         Ok(results)
     }
@@ -2476,6 +2692,14 @@ impl BertModel {
                 layer.norm1_bias.as_ref().or(Some(&Array1::zeros(h))),
                 if use_rms { rms_eps } else { eps },
                 use_rms,
+            );
+        }
+        if dump_layer_enabled() {
+            dump_hidden(
+                "single",
+                (layer_idx + 1) as i32,
+                "attn",
+                post_attn.as_slice().unwrap_or(&[]),
             );
         }
 

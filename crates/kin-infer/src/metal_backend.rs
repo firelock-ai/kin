@@ -266,6 +266,43 @@ fn use_fp16_mma(m: usize, n: usize, k: usize) -> bool {
     mma_fp16_enabled() && FP16_MMA_AVAILABLE.load(Ordering::Relaxed) && use_mma(m, n, k)
 }
 
+/// Whether the steel double-buffered K-loop MMA path (Step 1) is selected. OPT-IN
+/// (`KIN_INFER_STEEL=1`): default OFF keeps every GEMM on the proven single-buffer
+/// 32x32 MMA so the parity gate stays green untouched. The steel kernels overlap
+/// the next K-tile's global load with the current tile's MMA (2-stage software
+/// pipeline) but are numerically IDENTICAL to the single-buffer path (same fp32
+/// accumulate, same per-fragment 8-wide reduction order — only WHEN the loads are
+/// issued changes), so the cosine/swerank gate should be unchanged; any drift is a
+/// barrier/ordering bug, not precision. Flip the default ON only after the gate is
+/// green AND a measured ent/s win — the MMA-flip pattern. Sampled once per process.
+fn steel_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("KIN_INFER_STEEL").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
+/// Whether the steel double-buffered MMA pipelines actually compiled on this
+/// device. Set once by `try_new` after attempting to build the `*_steel` kernels.
+/// Defaults false: if they fail to build, `use_steel` stays off and every GEMM
+/// uses the single-buffer 32x32 MMA — a bad steel overload can NEVER disable the
+/// main library or Metal (the whole point of the fallback flag).
+static STEEL_MMA_AVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Route a GEMM to the steel double-buffered 32x32 MMA tile only when it is opt-in
+/// enabled, the steel pipelines compiled, AND the standard 32x32 MMA gate already
+/// passes. Same tile geometry as the single-buffer MMA (BM=BN=32, 128 threads), so
+/// `use_mma`'s shape floor is exactly the right gate — no extra floor needed.
+#[inline]
+fn use_steel(m: usize, n: usize, k: usize) -> bool {
+    steel_enabled() && STEEL_MMA_AVAILABLE.load(Ordering::Relaxed) && use_mma(m, n, k)
+}
+
 /// Total nanoseconds the host spent blocked in `wait_until_completed` since the
 /// last `reset_profile`. Only meaningful when `KIN_INFER_METAL_PROFILE` is set.
 pub fn profile_stall_nanos() -> u64 {
@@ -631,6 +668,205 @@ kernel void batched_matmul_ab_simdgroup_wide(
     threadgroup float Bs[64][MMA_BK];
     threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
     block_mma<false, 64, 64>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+}
+
+// ---- Steel double-buffered K-loop MMA (Step 1) ----
+// Same proven 32x32 tile as block_mma (128 threads, 4 simdgroups, TM=TN=2 -> 4
+// fp32 accumulators per simdgroup; NO register-pressure change vs the wide tile
+// that spilled). The only structural change is the K-loop: the stage tiles are
+// 2-deep ping-pong [2][32][MMA_BK], and each iteration issues the NEXT K-tile's
+// global loads into the OTHER buffer BEFORE the MMA — so the load latency overlaps
+// the MMA instead of being fully exposed by a pre-MMA barrier. Net: 2 barriers per
+// K-iteration -> 1. Numerically IDENTICAL to the single-buffer block_mma (same
+// fp32 accumulate, same per-fragment 8-wide reduction order) — only WHEN the loads
+// are issued changes, so parity is preserved by construction; any drift is a
+// barrier/ordering bug, not precision. Selected behind KIN_INFER_STEEL.
+//
+// As/Bs/store_tile are declared in the calling KERNEL (threadgroup-address
+// variables cannot be declared in a non-kernel helper) and passed in by pointer.
+// The stage arrays are 2-deep with a LITERAL outer dim (2) and LITERAL tile dim
+// (32) — never a `constant`-address symbol as an array bound — so the helper
+// signature is unambiguous in every MSL version.
+template <bool TRANSB>
+static inline void block_mma_db(
+    device const float* A,
+    device const float* B,
+    device float* C,
+    uint M, uint N, uint K,
+    uint3 tgid, uint sgid, uint lane,
+    threadgroup float (*As)[32][MMA_BK],      // As[2][32][MMA_BK] ping-pong
+    threadgroup float (*Bs)[32][MMA_BK],      // Bs[2][32][MMA_BK] ping-pong
+    threadgroup float (*store_tile)[MMA_F][MMA_F])
+{
+    constexpr uint BM = 32, BN = 32, BK = 16, WM = 2, WN = 2, F = 8;
+    constexpr uint TM = BM / (F * WM);   // fragment-rows per simdgroup (2)
+    constexpr uint TN = BN / (F * WN);   // fragment-cols per simdgroup (2)
+
+    const uint sm = sgid / WN;           // simdgroup row in the 2x2 grid
+    const uint sn = sgid % WN;           // simdgroup col
+    const uint block_row = tgid.y * BM;  // M offset of this block
+    const uint block_col = tgid.x * BN;  // N offset of this block
+    const uint tid = sgid * 32u + lane;  // flat thread index 0..127
+
+    simdgroup_float8x8 acc[TM][TN];
+    for (uint i = 0; i < TM; i++)
+        for (uint j = 0; j < TN; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    // PROLOGUE: cooperatively stage K-tile 0 into buffer 0, zero-padding past
+    // M/N/K. Identical staging math to block_mma; only the buffer index (0) and
+    // the 2-deep array shape differ.
+    for (uint idx = tid; idx < BM * BK; idx += 128u) {
+        uint r = idx / BK, c = idx % BK;
+        uint gr = block_row + r, gc = c;
+        As[0][r][c] = (gr < M && gc < K) ? A[gr * K + gc] : 0.0f;
+    }
+    for (uint idx = tid; idx < BN * BK; idx += 128u) {
+        uint r = idx / BK, c = idx % BK;
+        uint gn = block_col + r, gk = c;
+        if (TRANSB) {
+            Bs[0][r][c] = (gn < N && gk < K) ? B[gn * K + gk] : 0.0f;
+        } else {
+            Bs[0][r][c] = (gn < N && gk < K) ? B[gk * N + gn] : 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint cur = 0;
+    for (uint k0 = 0; k0 < K; k0 += BK) {
+        uint nxt = cur ^ 1u;
+        uint k1 = k0 + BK;
+
+        // Issue the NEXT K-tile's global loads into the OTHER buffer FIRST. No
+        // barrier before the MMA: the MMA reads As[cur]/Bs[cur] (filled and
+        // barrier'd by the prologue or the previous iteration), which the writes
+        // to buffer `nxt` never touch — so the loads are in flight while the MMA
+        // computes. WAR on `cur` is safe: `cur` is only overwritten two iters
+        // later, after a barrier, by which point this iter's reads are long done.
+        if (k1 < K) {
+            for (uint idx = tid; idx < BM * BK; idx += 128u) {
+                uint r = idx / BK, c = idx % BK;
+                uint gr = block_row + r, gc = k1 + c;
+                As[nxt][r][c] = (gr < M && gc < K) ? A[gr * K + gc] : 0.0f;
+            }
+            for (uint idx = tid; idx < BN * BK; idx += 128u) {
+                uint r = idx / BK, c = idx % BK;
+                uint gn = block_col + r, gk = k1 + c;
+                if (TRANSB) {
+                    Bs[nxt][r][c] = (gn < N && gk < K) ? B[gn * K + gk] : 0.0f;
+                } else {
+                    Bs[nxt][r][c] = (gn < N && gk < K) ? B[gk * N + gn] : 0.0f;
+                }
+            }
+        }
+
+        // MMA on the CURRENT buffer, over this BK in 8-wide K-slices. Identical to
+        // block_mma's inner loop, just indexed through the ping-pong `cur` buffer.
+        for (uint kk = 0; kk < BK; kk += F) {
+            simdgroup_float8x8 a_frag[TM];
+            simdgroup_float8x8 b_frag[TN];
+            for (uint i = 0; i < TM; i++)
+                simdgroup_load(a_frag[i], &As[cur][sm * F * TM + i * F][kk], BK, ulong2(0, 0), false);
+            // Bs is staged as [n][k]; load with transpose=true to read the k-major
+            // view of each n-block (same as block_mma).
+            for (uint j = 0; j < TN; j++)
+                simdgroup_load(b_frag[j], &Bs[cur][sn * F * TN + j * F][kk], BK, ulong2(0, 0), true);
+            for (uint i = 0; i < TM; i++)
+                for (uint j = 0; j < TN; j++)
+                    simdgroup_multiply_accumulate(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);
+        }
+
+        // ONE barrier per iteration (was two in block_mma): (a) publishes the
+        // next-tile writes to buffer `nxt` before the next iter reads them as
+        // `cur` (RAW), AND (b) ensures this iter's MMA reads of buffer `cur`
+        // finished before a future iter overwrites it (WAR).
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        cur = nxt;
+    }
+
+    // EPILOGUE: identical to block_mma — store each fragment, bounds-guarded on
+    // ragged edges, ragged path via this simdgroup's own store_tile scratch row.
+    for (uint i = 0; i < TM; i++) {
+        for (uint j = 0; j < TN; j++) {
+            uint cr = block_row + sm * F * TM + i * F;
+            uint cc = block_col + sn * F * TN + j * F;
+            if (cr + F <= M && cc + F <= N) {
+                simdgroup_store(acc[i][j], &C[cr * N + cc], N, ulong2(0, 0), false);
+            } else {
+                threadgroup float* scratch = &store_tile[sgid][0][0];
+                simdgroup_store(acc[i][j], scratch, F, ulong2(0, 0), false);
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint e = lane; e < F * F; e += 32u) {
+                    uint er = e / F, ec = e % F;
+                    uint gr = cr + er, gc = cc + ec;
+                    if (gr < M && gc < N) {
+                        C[gr * N + gc] = scratch[er * F + ec];
+                    }
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+    }
+}
+
+// C[M,N] = A[M,K] * B[N,K]^T (transb projection convention), double-buffered.
+kernel void matmul_transb_simdgroup_steel(
+    device const float* A   [[buffer(0)]],
+    device const float* B   [[buffer(1)]],
+    device float*       C   [[buffer(2)]],
+    constant uint& M        [[buffer(3)]],
+    constant uint& N        [[buffer(4)]],
+    constant uint& K        [[buffer(5)]],
+    uint3 tgid              [[threadgroup_position_in_grid]],
+    uint  sgid             [[simdgroup_index_in_threadgroup]],
+    uint  lane             [[thread_index_in_simdgroup]])
+{
+    threadgroup float As[2][32][MMA_BK];
+    threadgroup float Bs[2][32][MMA_BK];
+    threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
+    block_mma_db<true>(A, B, C, M, N, K, tgid, sgid, lane, As, Bs, store_tile);
+}
+
+// Batched QK^T per head, double-buffered (see batched_matmul_transb_simdgroup).
+kernel void batched_matmul_transb_simdgroup_steel(
+    device const float* Q   [[buffer(0)]],
+    device const float* Kk  [[buffer(1)]],
+    device float*       C   [[buffer(2)]],
+    constant uint& seq      [[buffer(3)]],
+    constant uint& dim      [[buffer(4)]],
+    uint3 tgid              [[threadgroup_position_in_grid]],
+    uint  sgid             [[simdgroup_index_in_threadgroup]],
+    uint  lane             [[thread_index_in_simdgroup]])
+{
+    uint h = tgid.z;
+    device const float* Ah = Q  + h * seq * dim;
+    device const float* Bh = Kk + h * seq * dim;
+    device float*       Ch = C  + h * seq * seq;
+    threadgroup float As[2][32][MMA_BK];
+    threadgroup float Bs[2][32][MMA_BK];
+    threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
+    block_mma_db<true>(Ah, Bh, Ch, seq, seq, dim, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+}
+
+// Batched scores*V per head, double-buffered (see batched_matmul_ab_simdgroup).
+kernel void batched_matmul_ab_simdgroup_steel(
+    device const float* S   [[buffer(0)]],
+    device const float* V   [[buffer(1)]],
+    device float*       C   [[buffer(2)]],
+    constant uint& seq      [[buffer(3)]],
+    constant uint& dim      [[buffer(4)]],
+    uint3 tgid              [[threadgroup_position_in_grid]],
+    uint  sgid             [[simdgroup_index_in_threadgroup]],
+    uint  lane             [[thread_index_in_simdgroup]])
+{
+    uint h = tgid.z;
+    device const float* Ah = S + h * seq * seq;
+    device const float* Bh = V + h * seq * dim;
+    device float*       Ch = C + h * seq * dim;
+    threadgroup float As[2][32][MMA_BK];
+    threadgroup float Bs[2][32][MMA_BK];
+    threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
+    block_mma_db<false>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
 }
 
 // ---- Softmax over rows ----
@@ -1336,6 +1572,32 @@ fn size_class(bytes: usize) -> usize {
     }
 }
 
+/// Diagnostic gate (`KIN_INFER_NO_POOL_REUSE`): when ON, the pool never recycles
+/// — every acquire allocates a fresh buffer, so no buffer is ever reused while a
+/// prior command buffer might still be retiring. Default OFF (normal recycling).
+/// Used to test whether the intermittent batched-embed corruption is a
+/// buffer-reuse-timing race.
+fn no_pool_reuse() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("KIN_INFER_NO_POOL_REUSE").is_some())
+}
+
+/// Diagnostic gate (`KIN_INFER_ZERO_ALL`): force `acquire_with` to also zero its
+/// size-class tail and `acquire_uninit` to zero the whole buffer, so no read can
+/// observe stale recycled/dirty bytes. Default OFF (byte-identical). A/B test for
+/// whether a stale / under-written buffer read is the corruption source.
+fn zero_all_buffers() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        matches!(
+            std::env::var("KIN_INFER_ZERO_ALL").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
 impl BufferPool {
     fn new(device: Device) -> Self {
         Self {
@@ -1347,21 +1609,24 @@ impl BufferPool {
     /// Acquire a buffer of at least `bytes`, zero-filled. Pops a recycled buffer
     /// of the matching size-class and re-zeros it (preserving the `buf_zeros`
     /// determinism guarantee), else allocates a fresh `StorageModeShared` buffer
-    /// of the class size.
+    /// of the class size — also zeroed, because Metal does NOT guarantee
+    /// `new_buffer` memory is zero (small allocations come back from Metal's
+    /// recycled internal heap holding a previous allocation's bytes). Without this
+    /// the FIRST use of any new size-class returns dirty memory while every warm
+    /// reuse is zeroed — a shape-dependent cold-start corruption for any consumer
+    /// that relies on the zero fill.
     fn acquire_zeroed(self: &Arc<Self>, bytes: usize) -> PooledBuffer {
         let class = size_class(bytes);
         let buf = self.free.lock().get_mut(&class).and_then(|v| v.pop());
         let buf = match buf {
-            Some(buf) => {
-                unsafe {
-                    std::ptr::write_bytes(buf.contents() as *mut u8, 0, class);
-                }
-                buf
-            }
+            Some(buf) => buf,
             None => self
                 .device
                 .new_buffer(class as u64, MTLResourceOptions::StorageModeShared),
         };
+        unsafe {
+            std::ptr::write_bytes(buf.contents() as *mut u8, 0, class);
+        }
         PooledBuffer {
             buf,
             class,
@@ -1370,36 +1635,27 @@ impl BufferPool {
     }
 
     /// Acquire a buffer initialised from `data`. Pops a recycled buffer of the
-    /// matching size-class and copies `data` into its head, else allocates.
+    /// matching size-class (or allocates) and copies `data` into its head.
     fn acquire_with(self: &Arc<Self>, data: &[f32]) -> PooledBuffer {
         let bytes = std::mem::size_of_val(data);
         let class = size_class(bytes);
         let buf = self.free.lock().get_mut(&class).and_then(|v| v.pop());
         let buf = match buf {
-            Some(buf) => {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr() as *const u8,
-                        buf.contents() as *mut u8,
-                        bytes,
-                    );
-                }
-                buf
-            }
-            None => {
-                let buf = self
-                    .device
-                    .new_buffer(class as u64, MTLResourceOptions::StorageModeShared);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr() as *const u8,
-                        buf.contents() as *mut u8,
-                        bytes,
-                    );
-                }
-                buf
-            }
+            Some(buf) => buf,
+            None => self
+                .device
+                .new_buffer(class as u64, MTLResourceOptions::StorageModeShared),
         };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr() as *const u8,
+                buf.contents() as *mut u8,
+                bytes,
+            );
+            if zero_all_buffers() && class > bytes {
+                std::ptr::write_bytes((buf.contents() as *mut u8).add(bytes), 0, class - bytes);
+            }
+        }
         PooledBuffer {
             buf,
             class,
@@ -1419,6 +1675,9 @@ impl BufferPool {
             self.device
                 .new_buffer(class as u64, MTLResourceOptions::StorageModeShared)
         });
+        if zero_all_buffers() {
+            unsafe { std::ptr::write_bytes(buf.contents() as *mut u8, 0, class); }
+        }
         PooledBuffer {
             buf,
             class,
@@ -1427,6 +1686,9 @@ impl BufferPool {
     }
 
     fn recycle(&self, class: usize, buf: Buffer) {
+        if no_pool_reuse() {
+            return;
+        }
         self.free.lock().entry(class).or_default().push(buf);
     }
 }
@@ -1469,9 +1731,6 @@ pub struct MetalCompute {
     /// are the same across all forward passes, so allocating once and reusing
     /// eliminates ~100GB of redundant copies for a typical embedding run.
     weight_cache: Mutex<HashMap<(usize, usize), Buffer>>,
-    /// Cache stable u32 buffers like flattened masks that are reused across
-    /// every layer in a batch.
-    u32_cache: Mutex<HashMap<(usize, usize), Buffer>>,
     /// Cache row-concatenated weight buffers (e.g. q|k|v, gate|up) keyed by the
     /// component weights' stable (ptr, len) pairs, so the fat GEMM uploads the
     /// concatenation once and reuses it across every forward pass.
@@ -1608,6 +1867,46 @@ impl MetalCompute {
         }
         WIDE_MMA_AVAILABLE.store(wide_mma_available, Ordering::Relaxed);
 
+        // Steel double-buffered K-loop MMA (Step 1) — OPTIONAL, only attempted
+        // when the standard MMA built. The `*_steel` kernels live in the SAME main
+        // library (already compiled above — no extra library compile, just three
+        // pipeline-creation calls), so attempting them is cheap. Same fallback
+        // discipline as `*_wide`: if any `*_steel` kernel fails to build (e.g. a
+        // bad MSL overload or a threadgroup-memory overflow on a constrained
+        // target — the pipeline-state creation returns Err), leave
+        // STEEL_MMA_AVAILABLE false and every GEMM stays on the proven
+        // single-buffer MMA. A bad steel overload can NEVER disable Metal or the
+        // main library — that is the whole point of the flag. Built unconditionally
+        // (independent of `steel_enabled()`) so the pipelines are ready the instant
+        // KIN_INFER_STEEL flips on and the direct-dispatch parity test can run.
+        let steel_mma_kernel_names: &[&str] = &[
+            "matmul_transb_simdgroup_steel",
+            "batched_matmul_transb_simdgroup_steel",
+            "batched_matmul_ab_simdgroup_steel",
+        ];
+        let mut steel_mma_available = mma_available;
+        if mma_available {
+            for &name in steel_mma_kernel_names {
+                let pipeline = library
+                    .get_function(name, None)
+                    .and_then(|func| device.new_compute_pipeline_state_with_function(&func));
+                match pipeline {
+                    Ok(pipeline) => {
+                        pipelines.insert(name, pipeline);
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "kin-infer: Metal steel-MMA kernel {name} unavailable ({err}); \
+                             falling back to single-buffer MMA (Metal stays enabled)"
+                        );
+                        steel_mma_available = false;
+                        break;
+                    }
+                }
+            }
+        }
+        STEEL_MMA_AVAILABLE.store(steel_mma_available, Ordering::Relaxed);
+
         // fp16-operand MMA (Lever #4) — OPTIONAL, compiled as a SEPARATE library
         // so a toolchain that rejects the half*half->float `simdgroup_matrix`
         // overload only loses the fp16 path (this whole library fails to build),
@@ -1666,7 +1965,6 @@ impl MetalCompute {
             pipelines,
             device_name,
             weight_cache: Mutex::new(HashMap::new()),
-            u32_cache: Mutex::new(HashMap::new()),
             concat_cache: Mutex::new(HashMap::new()),
             inflight: Arc::new((Mutex::new(0), Condvar::new())),
             pool,
@@ -1769,21 +2067,21 @@ impl MetalCompute {
         buf
     }
 
-    /// Get or create a cached buffer for stable u32 payloads.
-    fn buf_cached_u32(&self, data: &[u32]) -> Buffer {
-        let key = (data.as_ptr() as usize, data.len());
-        let mut cache = self.u32_cache.lock();
-        if let Some(buf) = cache.get(&key) {
-            return buf.clone();
-        }
+    /// Upload a fresh device buffer for a TRANSIENT u32 payload (e.g. an
+    /// attention mask). Deliberately NOT cached: the previous `(ptr, len)` cache
+    /// keyed on the slice's heap address, which is only valid for stable weight
+    /// pointers (`buf_cached`). Attention masks are rebuilt every call as a fresh
+    /// `Vec<u32>` whose pointer the allocator recycles, so a later call landing on
+    /// the same `(ptr, len)` would alias an earlier call's stale mask buffer and
+    /// silently apply the WRONG mask. Masks are tiny (`batch*max_len` u32s), so a
+    /// fresh upload per attention call is negligible and strictly correct.
+    fn buf_u32_slice(&self, data: &[u32]) -> Buffer {
         let bytes = data.len() * std::mem::size_of::<u32>();
-        let buf = self.device.new_buffer_with_data(
+        self.device.new_buffer_with_data(
             data.as_ptr() as *const _,
             bytes as u64,
             MTLResourceOptions::StorageModeShared,
-        );
-        cache.insert(key, buf.clone());
-        buf
+        )
     }
 
     /// Read floats back from a Metal buffer. Timed into the copy/readback phase.
@@ -2069,6 +2367,12 @@ impl MetalCompute {
             (&self.pipelines[fp16_mma_name(base_name)], 32usize)
         } else if use_wide_mma(m, n, k) {
             (&self.pipelines[wide_mma_name(base_name)], 64usize)
+        } else if use_steel(m, n, k) {
+            // Steel double-buffered K-loop, same proven 32x32 tile/grid as the
+            // single-buffer MMA — only the K-loop staging differs (fp32 accumulate
+            // unchanged). Distinct experiment from fp16/wide; routed when only
+            // KIN_INFER_STEEL is set.
+            (&self.pipelines[steel_mma_name(base_name)], 32usize)
         } else {
             (&self.pipelines[base_name], 32usize)
         };
@@ -2135,6 +2439,20 @@ fn fp16_mma_name(base: &str) -> &str {
         "matmul_transb_simdgroup" => "matmul_transb_simdgroup_fp16",
         "batched_matmul_transb_simdgroup" => "batched_matmul_transb_simdgroup_fp16",
         "batched_matmul_ab_simdgroup" => "batched_matmul_ab_simdgroup_fp16",
+        other => other,
+    }
+}
+
+/// Map a base `*_simdgroup` MMA kernel name to its `*_steel` double-buffered
+/// variant (Step 1). The three steel kernels mirror the three single-buffer
+/// shapes; the fallback returns the input unchanged (only the three known names
+/// reach here via `use_steel`'s shape gate).
+#[inline]
+fn steel_mma_name(base: &str) -> &str {
+    match base {
+        "matmul_transb_simdgroup" => "matmul_transb_simdgroup_steel",
+        "batched_matmul_transb_simdgroup" => "batched_matmul_transb_simdgroup_steel",
+        "batched_matmul_ab_simdgroup" => "batched_matmul_ab_simdgroup_steel",
         other => other,
     }
 }
@@ -2920,7 +3238,7 @@ impl GpuCompute for MetalCompute {
             self.buf_from_slice(&[0.0f32])
         };
         let mask_u32: Vec<u32> = mask.to_vec();
-        let buf_mask = self.buf_cached_u32(&mask_u32);
+        let buf_mask = self.buf_u32_slice(&mask_u32);
         let buf_has_alibi = self.buf_u32(has_alibi as u32);
 
         // All four ops + commit + readback inside one autorelease pool: the
@@ -3092,7 +3410,7 @@ impl GpuCompute for MetalCompute {
         } else {
             self.buf_from_slice(&[0.0f32])
         };
-        let buf_masks = self.buf_cached_u32(masks);
+        let buf_masks = self.buf_u32_slice(masks);
         let buf_has_alibi = self.buf_u32(has_alibi as u32);
         let buf_heads_per_group = self.buf_u32(heads_per_group as u32);
 
@@ -3289,7 +3607,7 @@ impl GpuCompute for MetalCompute {
         } else {
             self.buf_from_slice(&[0.0f32])
         };
-        let buf_masks = self.buf_cached_u32(masks);
+        let buf_masks = self.buf_u32_slice(masks);
         let buf_has_alibi = self.buf_u32(has_alibi as u32);
         let buf_heads_per_group = self.buf_u32(heads_per_group as u32);
 
@@ -3829,6 +4147,187 @@ mod tests {
         );
     }
 
+    /// Production-shape `fused_attention_batched` localizer for the intermittent
+    /// batched-path nondeterminism. The existing matches-cpu test runs num_groups=3,
+    /// seq=7, head_dim=16 — tiny AND below the MMA gate (use_mma needs ≥32/32/16),
+    /// so it exercises only the scalar tile at seq 7 and never the production shape
+    /// (batch 40 × seq 64 × head_dim 64 = total_heads 480, MMA path) where the
+    /// corruption fires. This test reproduces that shape with a mixed len-32/len-64
+    /// mask and asserts BOTH determinism (20× Metal must be bit-identical) AND
+    /// correctness vs CPU. If it fails, the bug is inside fused_attention_batched at
+    /// scale; if it passes, the bug is cross-layer/cross-op in forward_batched.
+    #[test]
+    fn test_metal_fused_attention_batched_production_dims() {
+        let Some(metal) = get_metal() else { return };
+        let cpu = crate::gpu::CpuCompute;
+
+        let num_groups = 40; // batch_size (bin-64 corrupting shape)
+        let heads_per_group = 12;
+        let seq_len = 64;
+        let head_dim = 64;
+        let total_heads = num_groups * heads_per_group;
+        let elems = total_heads * seq_len * head_dim;
+
+        let q: Vec<f32> = (0..elems).map(|i| ((i % 257) as f32 - 128.0) * 0.003).collect();
+        let k: Vec<f32> = (0..elems).map(|i| ((i % 251) as f32 - 125.0) * 0.003).collect();
+        let v: Vec<f32> = (0..elems).map(|i| ((i % 241) as f32 - 120.0) * 0.003).collect();
+
+        // Mixed mask: even groups are len-32 padded to 64, odd groups are full 64
+        // (the len-32-padded-into-a-small-max_len case that corrupts).
+        let mut masks = vec![0u32; num_groups * seq_len];
+        for b in 0..num_groups {
+            let real = if b % 2 == 0 { 32 } else { 64 };
+            for s in 0..real {
+                masks[b * seq_len + s] = 1;
+            }
+        }
+        let alibi: Vec<f32> = vec![]; // RoPE model → no ALiBi
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let first = metal.fused_attention_batched(
+            &q, &k, &v, num_groups, heads_per_group, seq_len, head_dim, scale, &alibi, &masks,
+        );
+        assert_eq!(first.len(), elems);
+
+        // Determinism: 20 repeats must be bit-identical to the first run.
+        for run in 0..20 {
+            let out = metal.fused_attention_batched(
+                &q, &k, &v, num_groups, heads_per_group, seq_len, head_dim, scale, &alibi, &masks,
+            );
+            let max_abs: f32 = first
+                .iter()
+                .zip(out.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs == 0.0,
+                "fused_attention_batched NONDETERMINISTIC at production dims (run {run}): max_abs_diff {max_abs}"
+            );
+        }
+
+        // Correctness vs CPU reference.
+        let out_cpu = cpu.fused_attention_batched(
+            &q, &k, &v, num_groups, heads_per_group, seq_len, head_dim, scale, &alibi, &masks,
+        );
+        let max_err: f32 = first
+            .iter()
+            .zip(out_cpu.iter())
+            .map(|(a, b)| (a - b).abs() / a.abs().max(b.abs()).max(1e-6))
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_err < 5e-3,
+            "fused_attention_batched Metal vs CPU mismatch at production dims: max_err {max_err}"
+        );
+    }
+
+    // ---- Per-kernel determinism at PRODUCTION SCALE (rows=2560) ----
+    // Non-perturbing localizers for the batched Heisenbug: a tight 20× loop with
+    // the SAME inputs and NO inter-op host work, so nothing changes GPU occupancy
+    // between runs (unlike the per-layer dump / zero / no-reuse probes, which
+    // suppressed the race). These exercise the SHARED per-op kernels at the
+    // batched rows=2560 single-forward never reaches (it runs rows≤512). Run each
+    // under BOTH KIN_INFER_MMA=1 (block_mma) and KIN_INFER_MMA=0 (scalar tile) —
+    // the env is OnceLock-sampled per process, so the harness toggles it across
+    // separate invocations. If a kernel is bit-nondeterministic here, it is the
+    // batched corruption source; the MMA-on/off split says whether it's a
+    // block_mma-vs-scalar-common (occupancy/barrier) issue or one kernel.
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// Projection GEMM at production scale: C[m,n] = A[m,k]·B[n,k]^T, m=2560
+    /// (batch40 × max_len64), depth=1 — the shape the per-head attention test
+    /// (depth=480, m=n=seq=64) never covered.
+    #[test]
+    fn test_metal_matmul_determinism_prod_scale() {
+        let Some(metal) = get_metal() else { return };
+        let (m, n, k) = (2560usize, 768usize, 768usize);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 257) as f32 - 128.0) * 0.003).collect();
+        let b: Vec<f32> = (0..n * k).map(|i| ((i % 251) as f32 - 125.0) * 0.003).collect();
+        let first = metal.matmul(&a, &b, m, n, k);
+        assert_eq!(first.len(), m * n);
+        for run in 0..20 {
+            let out = metal.matmul(&a, &b, m, n, k);
+            let d = max_abs_diff(&first, &out);
+            assert!(
+                d == 0.0,
+                "matmul NONDETERMINISTIC at m={m},n={n},k={k} (run {run}; MMA per KIN_INFER_MMA): max_abs_diff {d}"
+            );
+        }
+    }
+
+    /// Fat QKV GEMM (matmul_many) at production scale: 3 weights concatenated.
+    #[test]
+    fn test_metal_matmul_many_determinism_prod_scale() {
+        let Some(metal) = get_metal() else { return };
+        let (m, k) = (2560usize, 768usize);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 257) as f32 - 128.0) * 0.003).collect();
+        let w: Vec<f32> = (0..768 * k).map(|i| ((i % 251) as f32 - 125.0) * 0.003).collect();
+        let weights: Vec<&[f32]> = vec![&w, &w, &w];
+        let ns = vec![768usize, 768, 768];
+        let first = metal.matmul_many(&a, &weights, m, &ns, k);
+        for run in 0..20 {
+            let out = metal.matmul_many(&a, &weights, m, &ns, k);
+            let mut d = 0.0f32;
+            for (fo, oo) in first.iter().zip(out.iter()) {
+                d = d.max(max_abs_diff(fo, oo));
+            }
+            assert!(
+                d == 0.0,
+                "matmul_many NONDETERMINISTIC at m={m},k={k} (run {run}; MMA per KIN_INFER_MMA): max_abs_diff {d}"
+            );
+        }
+    }
+
+    /// Fused SwiGLU FFN at production scale (the multi-encoder chained op).
+    #[test]
+    fn test_metal_fused_ffn_swiglu_determinism_prod_scale() {
+        let Some(metal) = get_metal() else { return };
+        let (rows, hidden, inter) = (2560usize, 768usize, 3072usize);
+        let x: Vec<f32> = (0..rows * hidden).map(|i| ((i % 257) as f32 - 128.0) * 0.003).collect();
+        let wg: Vec<f32> = (0..inter * hidden).map(|i| ((i % 251) as f32 - 125.0) * 0.002).collect();
+        let wu: Vec<f32> = (0..inter * hidden).map(|i| ((i % 241) as f32 - 120.0) * 0.002).collect();
+        let wd: Vec<f32> = (0..hidden * inter).map(|i| ((i % 239) as f32 - 119.0) * 0.002).collect();
+        let first = metal.fused_ffn_swiglu(&x, &wg, &wu, &wd, rows, hidden, inter);
+        assert_eq!(first.len(), rows * hidden);
+        for run in 0..20 {
+            let out = metal.fused_ffn_swiglu(&x, &wg, &wu, &wd, rows, hidden, inter);
+            let d = max_abs_diff(&first, &out);
+            assert!(
+                d == 0.0,
+                "fused_ffn_swiglu NONDETERMINISTIC at rows={rows},hidden={hidden},inter={inter} (run {run}; MMA per KIN_INFER_MMA): max_abs_diff {d}"
+            );
+        }
+    }
+
+    /// CONTROL: layer_norm at production scale — it is one-thread-per-row,
+    /// register-only (no threadgroup memory/barrier), so it SHOULD be deterministic.
+    /// If this fails, the "register-only ⇒ race-free" reasoning is wrong.
+    #[test]
+    fn test_metal_layer_norm_determinism_prod_scale() {
+        let Some(metal) = get_metal() else { return };
+        let (rows, cols) = (2560usize, 768usize);
+        let base: Vec<f32> = (0..rows * cols).map(|i| ((i % 257) as f32 - 128.0) * 0.01).collect();
+        let gamma: Vec<f32> = (0..cols).map(|i| 1.0 + (i % 13) as f32 * 0.01).collect();
+        let beta: Vec<f32> = (0..cols).map(|i| (i % 7) as f32 * 0.01).collect();
+        let eps = 1e-12f32;
+        let mut first = base.clone();
+        metal.layer_norm(&mut first, &gamma, &beta, rows, cols, eps);
+        for run in 0..20 {
+            let mut out = base.clone();
+            metal.layer_norm(&mut out, &gamma, &beta, rows, cols, eps);
+            let d = max_abs_diff(&first, &out);
+            assert!(
+                d == 0.0,
+                "layer_norm NONDETERMINISTIC at rows={rows},cols={cols} (run {run}): max_abs_diff {d}"
+            );
+        }
+    }
+
     #[test]
     fn test_metal_fused_attention_batched_posmajor_matches_head_major() {
         // Lever A parity: the on-device position-major reshape path must be a
@@ -3949,6 +4448,68 @@ mod tests {
             .map(|(x, y)| (x - y).abs() / x.abs().max(y.abs()).max(1e-6))
             .fold(0.0f32, f32::max);
         assert!(max_err < 5e-3, "wide MMA vs CPU matmul max err: {}", max_err);
+    }
+
+    #[test]
+    fn test_metal_steel_mma_matches_cpu() {
+        // Step 1: the steel double-buffered K-loop must compute the SAME GEMM as
+        // the reference — it is fp32-accumulate identical to the single-buffer MMA,
+        // so the only thing that can break is a barrier/ordering bug in the
+        // ping-pong, which would corrupt the result (not just add fp noise).
+        // Direct-dispatch the `*_steel` kernel (bypassing KIN_INFER_STEEL, which is
+        // OnceLock-sampled and can't be toggled mid-process) on a ragged shape
+        // spanning multiple K-tiles, and compare against CPU. K=80 -> 5 K-tiles of
+        // BK=16, so the loop runs the ping-pong ≥3 times; M=80,N=96 leave ragged
+        // remainders past the 32x32 blocks to exercise the bounds-guarded epilogue.
+        // A single-K-tile shape would never trip a double-buffer bug. Skips if the
+        // steel pipelines didn't build on this device.
+        let Some(metal) = get_metal() else { return };
+        if !STEEL_MMA_AVAILABLE.load(Ordering::Relaxed) {
+            return;
+        }
+        let cpu = crate::gpu::CpuCompute;
+
+        // matmul_transb: C[M,N] = A[M,K] * B[N,K]^T.
+        let (m, n, k) = (80usize, 96usize, 80usize);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 89) as f32 - 44.0) * 0.01).collect();
+        let b: Vec<f32> = (0..n * k).map(|i| ((i % 73) as f32 - 36.0) * 0.01).collect();
+
+        let buf_a = metal.buf_slice_pooled(&a);
+        let buf_b = metal.buf_cached(&b);
+        let buf_c = metal.buf_zeros_pooled(m * n);
+        let buf_m = metal.buf_u32(m as u32);
+        let buf_n = metal.buf_u32(n as u32);
+        let buf_k = metal.buf_u32(k as u32);
+        let bufs = [buf_a.buffer(), &buf_b, buf_c.buffer(), &buf_m, &buf_n, &buf_k];
+        autoreleasepool(|_| {
+            let cmd = metal.queue.new_command_buffer();
+            let pipeline = &metal.pipelines["matmul_transb_simdgroup_steel"];
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(pipeline);
+            for (i, bb) in bufs.iter().enumerate() {
+                enc.set_buffer(i as u64, Some(*bb), 0);
+            }
+            let groups = MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(32) as u64, 1);
+            enc.dispatch_thread_groups(groups, MTLSize::new(128, 1, 1));
+            enc.end_encoding();
+            metal.commit_wait(cmd);
+        });
+        let steel_out = MetalCompute::read_buf(buf_c.buffer(), m * n);
+        let cpu_out = cpu.matmul(&a, &b, m, n, k);
+
+        assert_eq!(steel_out.len(), m * n);
+        assert!(
+            steel_out.iter().all(|x| x.is_finite()),
+            "steel MMA produced non-finite output"
+        );
+        // Tight: fp32 accumulate, same reduction order as the single-buffer MMA —
+        // matches the wide-tile bound (same numeric path, only K-staging differs).
+        let max_err: f32 = steel_out
+            .iter()
+            .zip(cpu_out.iter())
+            .map(|(x, y)| (x - y).abs() / x.abs().max(y.abs()).max(1e-6))
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 5e-3, "steel MMA vs CPU matmul max err: {}", max_err);
     }
 
     #[test]
