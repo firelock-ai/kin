@@ -99,8 +99,10 @@ pub async fn run(task_file: PathBuf, json: bool) -> Result<()> {
             if !sym.definition {
                 continue;
             }
-            if seen_names.insert(sym.name.clone()) {
-                names.push(sym.name.clone());
+            for candidate in symbol_match_candidates(&sym.name) {
+                if seen_names.insert(candidate.clone()) {
+                    names.push(candidate);
+                }
             }
             if let Some(span) = sym.span {
                 spans.push(Span {
@@ -289,6 +291,49 @@ fn normalize_path(path: &str) -> String {
         .to_string()
 }
 
+/// Symbol names Kin should emit so the ContextBench evaluator can match them.
+///
+/// Kin attributes some entities with a path-qualified name (e.g. Rust
+/// `Usage<'cmd>::create_usage_no_title`, C++ `Context::getResultCapture`),
+/// but the evaluator resolves predicted symbols against *bare* tree-sitter
+/// definition names and only strips a `.` receiver — never `::` or generics.
+/// So a `::`-qualified name can never match gold. Emit the qualified name (kept
+/// for surfaces that want it) plus the bare last segment with generic params
+/// stripped, mirroring the evaluator's own `name.split('.')[-1]` candidate.
+fn symbol_match_candidates(name: &str) -> Vec<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = vec![trimmed.to_string()];
+
+    // Drop generic/lifetime params (`<'cmd>`, `<T>`) before taking the segment
+    // so `Usage<'cmd>::create_usage` yields `create_usage`, not a `<...>` tail.
+    let without_generics: String = {
+        let mut out = String::with_capacity(trimmed.len());
+        let mut depth: i32 = 0;
+        for ch in trimmed.chars() {
+            match ch {
+                '<' => depth += 1,
+                '>' => depth = (depth - 1).max(0),
+                _ if depth == 0 => out.push(ch),
+                _ => {}
+            }
+        }
+        out
+    };
+
+    if let Some(bare) = without_generics.rsplit("::").next() {
+        let bare = bare.trim();
+        if !bare.is_empty() && bare != trimmed && !candidates.iter().any(|c| c == bare) {
+            candidates.push(bare.to_string());
+        }
+    }
+
+    candidates
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -360,6 +405,34 @@ mod tests {
             suggested_contextbench_max_files("[Autocomplete] Warn when value is invalid"),
             CONTEXTBENCH_DEFAULT_MAX_FILES
         );
+    }
+
+    #[test]
+    fn symbol_match_candidates_strips_path_qualifiers_and_generics() {
+        use super::symbol_match_candidates;
+        // Rust: generics + `::` receiver -> keep full, add bare segment.
+        assert_eq!(
+            symbol_match_candidates("Usage<'cmd>::create_usage_no_title"),
+            vec![
+                "Usage<'cmd>::create_usage_no_title".to_string(),
+                "create_usage_no_title".to_string()
+            ]
+        );
+        // C++: plain `::` receiver.
+        assert_eq!(
+            symbol_match_candidates("Context::getResultCapture"),
+            vec![
+                "Context::getResultCapture".to_string(),
+                "getResultCapture".to_string()
+            ]
+        );
+        // Already-bare name: single candidate, no duplicate.
+        assert_eq!(
+            symbol_match_candidates("allowThrows"),
+            vec!["allowThrows".to_string()]
+        );
+        // Empty/whitespace -> no candidates.
+        assert!(symbol_match_candidates("   ").is_empty());
     }
 
     #[test]
