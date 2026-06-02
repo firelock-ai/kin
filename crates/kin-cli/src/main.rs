@@ -117,6 +117,9 @@ enum Command {
         /// Output machine-readable JSON
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Persist the full locate debug payload and per-file signal/score breakdowns
+        #[arg(long, default_value_t = false)]
+        debug: bool,
     },
     /// Trace a focal entity in one shot: resolve it, show the body, and summarize nearby context
     Trace {
@@ -1569,9 +1572,11 @@ fn main() -> Result<()> {
                     budget,
                     assistant,
                 } => commands::context::run(entity, budget, assistant).await,
-                Command::ContextbenchLocate { task_file, json } => {
-                    commands::contextbench_locate::run(task_file, json).await
-                }
+                Command::ContextbenchLocate {
+                    task_file,
+                    json,
+                    debug,
+                } => commands::contextbench_locate::run(task_file, json, debug).await,
                 Command::Trace {
                     entity,
                     json,
