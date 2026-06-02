@@ -45,6 +45,27 @@ static NORM_NANOS: AtomicU64 = AtomicU64::new(0);
 static ACTIVATION_NANOS: AtomicU64 = AtomicU64::new(0);
 static COPY_NANOS: AtomicU64 = AtomicU64::new(0);
 
+// Per-phase GPU-execution accumulators (ns), measured from each command
+// buffer's MTLCommandBuffer.GPUStartTime/GPUEndTime (the actual on-GPU window,
+// valid after completion). Unlike the host wall-clock buckets above, these are
+// build-INVARIANT — debug vs release shifts host dispatch/encode overhead but
+// not how long the GPU spends executing a kernel — so a profiler arm can trust
+// them across an unoptimized test binary and an optimized embed. Only written
+// when `profile_enabled()`; relaxed atomics, zero cost when off.
+static GPU_MATMUL_NANOS: AtomicU64 = AtomicU64::new(0);
+static GPU_ATTENTION_NANOS: AtomicU64 = AtomicU64::new(0);
+static GPU_NORM_NANOS: AtomicU64 = AtomicU64::new(0);
+static GPU_ACTIVATION_NANOS: AtomicU64 = AtomicU64::new(0);
+static GPU_COPY_NANOS: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    // The phase whose GPU command buffers should be attributed at the next
+    // commit/wait boundary. Set by `time_phase` for the duration of its closure
+    // (save/restore so nested phases compose), read by `commit_wait`. Only
+    // touched when `profile_enabled()`.
+    static CURRENT_PHASE: std::cell::Cell<Option<Phase>> = const { std::cell::Cell::new(None) };
+}
+
 /// Kernel-class buckets for per-phase profiling.
 #[derive(Clone, Copy)]
 enum Phase {
@@ -66,6 +87,17 @@ impl Phase {
             Phase::Copy => &COPY_NANOS,
         }
     }
+
+    #[inline]
+    fn gpu_counter(self) -> &'static AtomicU64 {
+        match self {
+            Phase::Matmul => &GPU_MATMUL_NANOS,
+            Phase::Attention => &GPU_ATTENTION_NANOS,
+            Phase::Norm => &GPU_NORM_NANOS,
+            Phase::Activation => &GPU_ACTIVATION_NANOS,
+            Phase::Copy => &GPU_COPY_NANOS,
+        }
+    }
 }
 
 /// Run `f`, attributing its wall-clock to `phase` when profiling is enabled.
@@ -73,14 +105,48 @@ impl Phase {
 #[inline]
 fn time_phase<T>(phase: Phase, f: impl FnOnce() -> T) -> T {
     if profile_enabled() {
+        // Publish this phase so any command buffer committed inside `f` is
+        // attributed to it by GPU timestamp (see `commit_wait`). Save/restore
+        // the outer phase so nested `time_phase` calls compose correctly.
+        let prev = CURRENT_PHASE.with(|p| p.replace(Some(phase)));
         let start = std::time::Instant::now();
         let out = f();
         phase
             .counter()
             .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        CURRENT_PHASE.with(|p| p.set(prev));
         out
     } else {
         f()
+    }
+}
+
+/// GPU-execution nanoseconds of a *completed* command buffer, from its
+/// `GPUStartTime`/`GPUEndTime` (CFTimeInterval, seconds). Returns 0 if the window
+/// is unavailable/degenerate (e.g. a command buffer that never ran GPU work).
+#[inline]
+fn cmd_gpu_nanos(cmd: &CommandBufferRef) -> u64 {
+    // `metal` 0.29 wraps no timing accessor, so message the live ObjC object
+    // directly. Use the modern `objc2` runtime (already a dep) rather than the
+    // `objc` 0.2 the `metal` crate re-exports — the legacy `sel_impl!` macro
+    // trips rustc's check-cfg lint. `cmd.as_ptr()` is the underlying
+    // MTLCommandBuffer; reinterpret it as an `AnyObject` for the send.
+    use metal::foreign_types::ForeignTypeRef;
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    let obj = cmd.as_ptr() as *const AnyObject;
+    if obj.is_null() {
+        return 0;
+    }
+    let (start, end): (f64, f64) = unsafe {
+        let obj = &*obj;
+        (msg_send![obj, GPUStartTime], msg_send![obj, GPUEndTime])
+    };
+    let dt = end - start;
+    if dt.is_finite() && dt > 0.0 {
+        (dt * 1.0e9) as u64
+    } else {
+        0
     }
 }
 
@@ -153,6 +219,24 @@ pub fn profile_phase_nanos() -> (u64, u64, u64, u64, u64) {
     )
 }
 
+/// Per-phase GPU-execution breakdown (ns) since the last reset, tagged by kernel
+/// class. Measured from each command buffer's `GPUStartTime`/`GPUEndTime`, so the
+/// numbers reflect actual on-GPU time and are build-INVARIANT (debug vs release
+/// changes host overhead, not GPU kernel execution) — the contract a profiler
+/// arm consumes to compare an unoptimized test binary against an optimized embed
+/// without the debug-vs-release skew that misdirects host wall-clock numbers.
+/// Only meaningful when `KIN_INFER_METAL_PROFILE` is set. `"copy"` reads ~0: host
+/// memcpy on unified memory commits no command buffer, so it is not GPU-timed.
+pub fn profile_gpu_phase_nanos() -> Vec<(&'static str, u64)> {
+    vec![
+        ("matmul", GPU_MATMUL_NANOS.load(Ordering::Relaxed)),
+        ("attention", GPU_ATTENTION_NANOS.load(Ordering::Relaxed)),
+        ("norm", GPU_NORM_NANOS.load(Ordering::Relaxed)),
+        ("activation", GPU_ACTIVATION_NANOS.load(Ordering::Relaxed)),
+        ("copy", GPU_COPY_NANOS.load(Ordering::Relaxed)),
+    ]
+}
+
 /// Zero the host-stall and per-phase accumulators. Call before a timed region.
 pub fn reset_profile() {
     STALL_NANOS.store(0, Ordering::Relaxed);
@@ -162,6 +246,11 @@ pub fn reset_profile() {
     NORM_NANOS.store(0, Ordering::Relaxed);
     ACTIVATION_NANOS.store(0, Ordering::Relaxed);
     COPY_NANOS.store(0, Ordering::Relaxed);
+    GPU_MATMUL_NANOS.store(0, Ordering::Relaxed);
+    GPU_ATTENTION_NANOS.store(0, Ordering::Relaxed);
+    GPU_NORM_NANOS.store(0, Ordering::Relaxed);
+    GPU_ACTIVATION_NANOS.store(0, Ordering::Relaxed);
+    GPU_COPY_NANOS.store(0, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -1407,6 +1496,26 @@ impl MetalCompute {
         }
     }
 
+    /// Commit `cmd` (bounded) and block until the GPU finishes — the synchronous
+    /// boundary every per-op dispatch uses before reading its output back. When
+    /// profiling is on, attribute the command buffer's *GPU-execution* window
+    /// (`GPUStartTime`/`GPUEndTime`, valid only after completion) to the phase
+    /// published by the enclosing `time_phase`. Behaviour is byte-identical to
+    /// the inlined `commit_bounded(cmd, Vec::new()); wait_until_completed()` it
+    /// replaces; the timestamp read is gated and side-effect-free.
+    #[inline]
+    fn commit_wait(&self, cmd: &CommandBufferRef) {
+        self.commit_bounded(cmd, Vec::new());
+        cmd.wait_until_completed();
+        if profile_enabled() {
+            if let Some(phase) = CURRENT_PHASE.with(|p| p.get()) {
+                phase
+                    .gpu_counter()
+                    .fetch_add(cmd_gpu_nanos(cmd), Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Dispatch a 1D compute kernel.
     fn dispatch_1d(&self, pipeline_name: &str, buffers: &[&Buffer], total_threads: usize) {
         let _span = tracing::info_span!(
@@ -1438,8 +1547,7 @@ impl MetalCompute {
             // The buffers are caller-owned (read back after this returns), so no
             // pooled buffers to retain; commit bounded-async then sync at the
             // data-consuming boundary.
-            self.commit_bounded(cmd, Vec::new());
-            cmd.wait_until_completed();
+            self.commit_wait(cmd);
         });
     }
 
@@ -1478,8 +1586,7 @@ impl MetalCompute {
             );
             enc.dispatch_threads(threads, tg_size);
             enc.end_encoding();
-            self.commit_bounded(cmd, Vec::new());
-            cmd.wait_until_completed();
+            self.commit_wait(cmd);
         });
     }
 
@@ -1536,8 +1643,7 @@ impl MetalCompute {
             let tg_size = MTLSize::new(16.min(width) as u64, 16.min(height) as u64, 1);
             enc.dispatch_threads(threads, tg_size);
             enc.end_encoding();
-            self.commit_bounded(cmd, Vec::new());
-            cmd.wait_until_completed();
+            self.commit_wait(cmd);
         });
     }
 
@@ -1594,8 +1700,7 @@ impl MetalCompute {
         autoreleasepool(|_| {
             let cmd = self.queue.new_command_buffer();
             Self::encode_mma(cmd, pipeline, bufs, m, n, depth);
-            self.commit_bounded(cmd, Vec::new());
-            cmd.wait_until_completed();
+            self.commit_wait(cmd);
         });
     }
 }
@@ -1961,8 +2066,7 @@ impl GpuCompute for MetalCompute {
             }
 
             time_phase(Phase::Matmul, || {
-                self.commit_bounded(cmd, Vec::new());
-                cmd.wait_until_completed();
+                self.commit_wait(cmd);
             });
             Self::read_buf(buf_out.buffer(), rows * hidden)
         });
@@ -2077,8 +2181,7 @@ impl GpuCompute for MetalCompute {
             }
 
             time_phase(Phase::Matmul, || {
-                self.commit_bounded(cmd, Vec::new());
-                cmd.wait_until_completed();
+                self.commit_wait(cmd);
             });
             Self::read_buf(buf_out.buffer(), rows * hidden)
         });
@@ -2166,8 +2269,7 @@ impl GpuCompute for MetalCompute {
             }
 
             time_phase(Phase::Matmul, || {
-                self.commit_bounded(cmd, Vec::new());
-                cmd.wait_until_completed();
+                self.commit_wait(cmd);
             });
             Self::read_buf(buf_proj.buffer(), rows * hidden)
         });
@@ -2274,8 +2376,7 @@ impl GpuCompute for MetalCompute {
                 enc.end_encoding();
             }
             time_phase(Phase::Activation, || {
-                self.commit_bounded(cmd, Vec::new());
-                cmd.wait_until_completed();
+                self.commit_wait(cmd);
             });
         });
         Self::read_buf_into(buf_q.buffer(), q);
@@ -2340,8 +2441,7 @@ impl GpuCompute for MetalCompute {
                 enc.end_encoding();
             }
             time_phase(Phase::Activation, || {
-                self.commit_bounded(cmd, Vec::new());
-                cmd.wait_until_completed();
+                self.commit_wait(cmd);
             });
         });
         Self::read_buf_into(buf_q.buffer(), q);
@@ -2504,8 +2604,7 @@ impl GpuCompute for MetalCompute {
                 let _commit_span =
                     tracing::info_span!("kin_infer.metal.fused_attention.commit_wait").entered();
                 time_phase(Phase::Attention, || {
-                    self.commit_bounded(cmd, Vec::new());
-                    cmd.wait_until_completed();
+                    self.commit_wait(cmd);
                 });
             }
 
@@ -2677,8 +2776,7 @@ impl GpuCompute for MetalCompute {
                     tracing::info_span!("kin_infer.metal.fused_attention_batched.commit_wait")
                         .entered();
                 time_phase(Phase::Attention, || {
-                    self.commit_bounded(cmd, Vec::new());
-                    cmd.wait_until_completed();
+                    self.commit_wait(cmd);
                 });
             }
 
@@ -2928,8 +3026,7 @@ impl GpuCompute for MetalCompute {
                 )
                 .entered();
                 time_phase(Phase::Attention, || {
-                    self.commit_bounded(cmd, Vec::new());
-                    cmd.wait_until_completed();
+                    self.commit_wait(cmd);
                 });
             }
 
@@ -2993,6 +3090,17 @@ mod tests {
             assert!(!devices.is_empty(), "No Metal devices found on macOS");
             println!("Metal device: {}", devices[0]);
         }
+    }
+
+    #[test]
+    fn test_profile_gpu_phase_nanos_contract() {
+        // Interface contract consumed by the profile harness (#8): exactly the
+        // five kernel-class buckets, in this order, with these tags. Shape only —
+        // the values depend on whether KIN_INFER_METAL_PROFILE was set this
+        // process and on prior GPU work in the suite.
+        let phases = profile_gpu_phase_nanos();
+        let tags: Vec<&str> = phases.iter().map(|(t, _)| *t).collect();
+        assert_eq!(tags, vec!["matmul", "attention", "norm", "activation", "copy"]);
     }
 
     #[test]
