@@ -110,6 +110,7 @@ pub fn build_embed_response(
     layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,
     request: &EmbedRequest,
+    mut persist_batch: impl FnMut() -> std::result::Result<(), kin_db::KinDbError>,
 ) -> Result<EmbedResponse> {
     let deadline = request
         .max_seconds
@@ -164,6 +165,7 @@ pub fn build_embed_response(
                     break;
                 }
                 total_embedded_entities += processed;
+                persist_batch()?;
             }
             Err(e) => {
                 return Err(e.into());
@@ -188,6 +190,7 @@ pub fn build_embed_response(
                     break;
                 }
                 total_embedded_artifacts += processed;
+                persist_batch()?;
             }
             Err(e) => {
                 return Err(e.into());

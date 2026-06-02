@@ -2830,10 +2830,43 @@ async fn embed(
             .embedding_work
             .lock()
             .map_err(|_| "embedding work lock poisoned".to_string())?;
+
+        // Pin graph.kndb on disk at the current root hash H before embedding so
+        // the per-batch kvec flushes (which tag metadata with H) match on reopen.
+        // The vector index is a pure sidecar (not in the merkle root), so
+        // embedding never changes H; this only closes the mutated-but-unsaved
+        // window. Cost: one snapshot write up front.
+        {
+            let _persist = state_for_embed
+                .persist_lock
+                .lock()
+                .map_err(|_| "persist lock poisoned".to_string())?;
+            state_for_embed
+                .save_snapshot()
+                .map_err(|error| format!("embed pre-persist save failed: {error:#}"))?;
+        }
+
+        // Persist the kvec sidecar after every batch so a long embed survives a
+        // mid-run kill/OOM with the completed vectors intact, instead of losing
+        // all progress when only the final save_snapshot would have run. Each
+        // flush takes persist_lock so it never interleaves with the background
+        // persistence loop or idle-shutdown flush.
+        let persist_state = Arc::clone(&state_for_embed);
+        let persist_batch = || -> Result<(), kin_db::KinDbError> {
+            let _persist = persist_state.persist_lock.lock().map_err(|_| {
+                kin_db::KinDbError::ConcurrentAccessError("persist lock poisoned".to_string())
+            })?;
+            kin_db::SnapshotManager::save_vector_index_for_graph(
+                persist_state.layout.kindb_snapshot_path(),
+                persist_state.graph.as_ref(),
+            )
+        };
+
         let result = kin_cli::commands::embed::build_embed_response(
             &state_for_embed.layout,
             state_for_embed.graph.as_ref(),
             &req,
+            persist_batch,
         )
         .map_err(|error| format!("embed build failed: {error:#}"))?;
         if result.result.total_entities > 0 || result.result.total_artifacts > 0 {
