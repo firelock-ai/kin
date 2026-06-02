@@ -7294,7 +7294,27 @@ fn resolve_entities_to_files(
                     .and_then(|v| v.as_str())
                     .map_or(false, |s| !s.is_empty());
 
-                let def_mult = if has_body { definition_authority } else { 1.0 };
+                // KIND-FLOOR lever (default OFF == current bytes): the definition
+                // flag (and its `definition_authority` score multiplier) key only
+                // on a non-empty `embedding_body_preview`. That preview is set at
+                // parse time from the node's source bytes, so it is BOTH over-broad
+                // (a re-export with bytes reads as a definition) AND, conversely,
+                // demotes a genuine definition whose preview is missing/degenerate
+                // below every body-bearing entity while also stripping its 2x
+                // authority — a double penalty that can push a real gold def past
+                // the symbol cap. When KIN_LOCATE_SYMBOL_DEF_KIND_FLOOR=1, a
+                // definitional entity kind counts as a definition even without a
+                // preview. Default false leaves the original `has_body` flag, so
+                // unset is byte-identical.
+                let is_definition = has_body
+                    || (locate_env_bool("KIN_LOCATE_SYMBOL_DEF_KIND_FLOOR", false)
+                        && is_definitional_kind(entity.kind));
+
+                let def_mult = if is_definition {
+                    definition_authority
+                } else {
+                    1.0
+                };
                 let score = discovery.score * def_mult;
 
                 *direct_scores.entry(path.clone()).or_default() += score;
@@ -7313,7 +7333,7 @@ fn resolve_entities_to_files(
                         span: entity_span_pair(&entity).into_iter().next(),
                         score,
                         kind: format!("{:?}", entity.kind).to_lowercase(),
-                        definition: has_body,
+                        definition: is_definition,
                         origin: if explain {
                             origin.to_string()
                         } else {
@@ -7322,7 +7342,7 @@ fn resolve_entities_to_files(
                         cosine: if explain { discovery.cosine } else { None },
                     });
                 if explain {
-                    let body_tag = if has_body { "definition" } else { "reference" };
+                    let body_tag = if is_definition { "definition" } else { "reference" };
                     push_projection_reason(
                         &mut file_explain,
                         path,
@@ -10108,52 +10128,82 @@ fn extract_negation_penalties(text: &str, graph: &kin_db::InMemoryGraph) -> Hash
     excluded
 }
 
+/// Entity kinds that genuinely DEFINE a named symbol (have a declaration/body),
+/// used by the `KIN_LOCATE_SYMBOL_DEF_KIND_FLOOR` lever so a real definition is
+/// not demoted just because its `embedding_body_preview` is missing. Deliberately
+/// excludes container/alias/noise kinds (Module, TypeAlias, Constant, …) so the
+/// floor only protects true defs.
+fn is_definitional_kind(kind: EntityKind) -> bool {
+    matches!(
+        kind,
+        EntityKind::Function
+            | EntityKind::Method
+            | EntityKind::Class
+            | EntityKind::Interface
+            | EntityKind::TraitDef
+            | EntityKind::EnumDef
+    )
+}
+
 fn entity_span_pair(entity: &kin_model::Entity) -> Vec<[u32; 2]> {
-    entity
-        .span
-        .as_ref()
-        .map(|s| {
-            let is_class_like = matches!(
-                entity.kind,
-                EntityKind::Class
-                    | EntityKind::Interface
-                    | EntityKind::Module
-            );
-            // `SourceSpan` carries tree-sitter rows, which are 0-indexed; the
-            // emitted `[u32; 2]` is the documented 1-based inclusive line span
-            // (see `LocateSymbol::span`) consumed by ContextBench against
-            // 1-indexed gold `gold_context` ranges. Compute the window in the
-            // raw 0-indexed domain, then shift to 1-based on emit so emitted
-            // spans line up with gold (and with the already-1-indexed traceback
-            // spans) instead of landing one line short.
-            let (start, end, end_is_real) = if is_class_like {
-                let len = s.end_line.saturating_sub(s.start_line);
-                if len > 30 {
-                    // Synthetic head window; `end` is start+4, not the node's
-                    // real end row, so the trailing-newline adjustment below
-                    // must not apply to it.
-                    (s.start_line, (s.start_line + 4).min(s.end_line), false)
-                } else {
-                    (s.start_line, s.end_line, true)
-                }
-            } else {
-                (s.start_line, s.end_line, true)
-            };
-            // tree-sitter `end_position()` is exclusive (just past the last
-            // byte). When a node's text ends with a newline, that exclusive end
-            // lands at column 0 of the FOLLOWING row, so `end_line` is already
-            // the 1-based last-content line and must not be incremented again —
-            // otherwise the inclusive end overshoots by one (worst on tight gold
-            // spans where it can flip overlap). For an end mid-line (`end_col >
-            // 0`) the row holds content and the +1 shift is correct.
-            let end_1 = if end_is_real && s.end_col == 0 && s.end_line > s.start_line {
-                end
-            } else {
-                end.saturating_add(1)
-            };
-            vec![[start.saturating_add(1), end_1]]
-        })
-        .unwrap_or_default()
+    let Some(s) = entity.span.as_ref() else {
+        return Vec::new();
+    };
+    let is_class_like = matches!(
+        entity.kind,
+        EntityKind::Class | EntityKind::Interface | EntityKind::Module
+    );
+    // SPAN-WIDTH lever (default OFF == current bytes): class-like entities with
+    // long bodies are truncated to a short head window for symbol/line
+    // PRECISION, but that caps line RECALL against multi-line gold regions (gold
+    // spans run 34-210 lines; a 5-line head can cover at most ~0.15 of them).
+    // KIN_LOCATE_SPAN_FULL_EXTENT=1 emits the full node extent;
+    // KIN_LOCATE_SPAN_CLASS_HEAD_THRESHOLD raises the length bound above which
+    // truncation applies. Both default to the historical 30-line threshold /
+    // 5-line head, so unset is byte-identical and the lead can A/B the
+    // precision/recall tradeoff.
+    let full_extent = locate_env_bool("KIN_LOCATE_SPAN_FULL_EXTENT", false);
+    let head_threshold = locate_env_usize("KIN_LOCATE_SPAN_CLASS_HEAD_THRESHOLD", 30) as u32;
+    vec![entity_span_lines(s, is_class_like, full_extent, head_threshold)]
+}
+
+/// Pure 1-based-inclusive line-span computation behind [`entity_span_pair`],
+/// separated so the indexing/truncation/end-boundary logic is testable without
+/// mutating process env. `SourceSpan` carries tree-sitter rows (0-indexed); the
+/// returned `[u32; 2]` is the documented 1-based inclusive line span consumed by
+/// ContextBench against 1-indexed gold ranges, so the window is computed in the
+/// raw 0-indexed domain and shifted to 1-based on return (matching the already-
+/// 1-indexed traceback spans instead of landing one line short).
+fn entity_span_lines(
+    s: &kin_model::SourceSpan,
+    is_class_like: bool,
+    full_extent: bool,
+    head_threshold: u32,
+) -> [u32; 2] {
+    let (start, end, end_is_real) = if is_class_like && !full_extent {
+        let len = s.end_line.saturating_sub(s.start_line);
+        if len > head_threshold {
+            // Synthetic head window; `end` is start+4, not the node's real end
+            // row, so the trailing-newline adjustment below must not apply to it.
+            (s.start_line, (s.start_line + 4).min(s.end_line), false)
+        } else {
+            (s.start_line, s.end_line, true)
+        }
+    } else {
+        (s.start_line, s.end_line, true)
+    };
+    // tree-sitter `end_position()` is exclusive (just past the last byte). When a
+    // node's text ends with a newline, that exclusive end lands at column 0 of
+    // the FOLLOWING row, so `end_line` is already the 1-based last-content line
+    // and must not be incremented again — otherwise the inclusive end overshoots
+    // by one (worst on tight gold spans where it can flip overlap). For an end
+    // mid-line (`end_col > 0`) the row holds content and the +1 shift is correct.
+    let end_1 = if end_is_real && s.end_col == 0 && s.end_line > s.start_line {
+        end
+    } else {
+        end.saturating_add(1)
+    };
+    [start.saturating_add(1), end_1]
 }
 
 
@@ -10548,6 +10598,53 @@ mod tests {
             span.end_col = 7;
         }
         assert_eq!(entity_span_pair(&mid_line), vec![[11, 22]]);
+    }
+
+    #[test]
+    fn entity_span_lines_width_lever_controls_class_truncation() {
+        let span = |start, end| SourceSpan {
+            file: FilePathId::new("src/a.ts"),
+            start_byte: 0,
+            end_byte: 0,
+            start_line: start,
+            start_col: 1,
+            end_line: end,
+            end_col: 7, // mid-line end so the +1 shift applies to the real end
+        };
+        // OFF (default): a long class (len 100 > 30) truncates to a 5-line head.
+        assert_eq!(entity_span_lines(&span(0, 100), true, false, 30), [1, 5]);
+        // FULL_EXTENT on: emit the whole node extent, 1-based inclusive.
+        assert_eq!(entity_span_lines(&span(0, 100), true, true, 30), [1, 101]);
+        // Raising the head threshold above the span length also keeps full extent.
+        assert_eq!(entity_span_lines(&span(0, 100), true, false, 200), [1, 101]);
+        // Non-class entities are never truncated regardless of the knobs.
+        assert_eq!(entity_span_lines(&span(0, 100), false, false, 30), [1, 101]);
+        // Short class (len <= threshold) is not truncated even with OFF.
+        assert_eq!(entity_span_lines(&span(0, 10), true, false, 30), [1, 11]);
+    }
+
+    #[test]
+    fn is_definitional_kind_covers_real_defs_only() {
+        for k in [
+            EntityKind::Function,
+            EntityKind::Method,
+            EntityKind::Class,
+            EntityKind::Interface,
+            EntityKind::TraitDef,
+            EntityKind::EnumDef,
+        ] {
+            assert!(is_definitional_kind(k), "{k:?} should be definitional");
+        }
+        for k in [
+            EntityKind::Module,
+            EntityKind::TypeAlias,
+            EntityKind::Constant,
+            EntityKind::StaticVar,
+            EntityKind::EnumVariant,
+            EntityKind::Package,
+        ] {
+            assert!(!is_definitional_kind(k), "{k:?} should not be definitional");
+        }
     }
 
     #[test]
