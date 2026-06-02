@@ -847,7 +847,15 @@ mod tests {
         fs::create_dir_all(session_dir.join("src")).unwrap();
         fs::write(session_dir.join("src/lib.rs"), updated).unwrap();
 
-        let blocked_tmp_path = crate::backend::kindb_snapshot_path(&layout).with_extension("tmp");
+        // Block the snapshot's atomic-write tmp path so the persist fails. The
+        // tmp name is the full snapshot path with `.tmp` APPENDED (graph.kndb ->
+        // graph.kndb.tmp), not the extension replaced — `with_extension` would
+        // yield `graph.tmp`, which no longer collides with the real tmp path
+        // since distinct per-file tmp suffixes were introduced, so the write
+        // would silently succeed and this failure-injection would be a no-op.
+        let mut blocked_tmp_name = crate::backend::kindb_snapshot_path(&layout).into_os_string();
+        blocked_tmp_name.push(".tmp");
+        let blocked_tmp_path = std::path::PathBuf::from(blocked_tmp_name);
         fs::create_dir_all(&blocked_tmp_path).unwrap();
 
         let err = reconcile_session_dir_sync(&layout, &session_dir)
