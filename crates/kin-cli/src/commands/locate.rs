@@ -2127,6 +2127,20 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         );
     }
 
+    // BODY_SEED lever (default OFF == byte-identical): additively emit a found
+    // file's defs whose BODY matches the query, recovering name-blocked gold
+    // defs the seed name-gate dropped (emitted alongside resolved siblings).
+    if locate_env_bool("KIN_LOCATE_BODY_SEED", false) {
+        let body_terms = tracked_text_query_terms(text);
+        emit_body_relevant_symbols(
+            graph,
+            &results,
+            &mut projection_symbols,
+            &body_terms,
+            test_query,
+        );
+    }
+
     Ok(build_result(
         &results,
         &all_hits,
@@ -10470,6 +10484,133 @@ fn emit_inner_methods(
     }
 }
 
+/// Number of distinct query terms (length >= 4) that appear in an entity's
+/// BODY surface — its signature plus the embedding body preview. This is the
+/// signal behind the BODY_SEED lever: name-blocked gold defs (whose NAME matches
+/// no query identifier, so the seed name-gate drops them) overwhelmingly carry
+/// the query terms in their BODY (scorer: 39/39). Name is intentionally excluded
+/// from the surface — name relevance is already handled by the seed name-gate;
+/// here we want body coverage so a fix-implementing def surfaces regardless.
+fn body_relevance_score(entity: &kin_model::Entity, query_terms: &[String]) -> u32 {
+    let body = entity
+        .metadata
+        .extra
+        .get("embedding_body_preview")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let haystack = format!("{} {}", entity.signature, body).to_ascii_lowercase();
+    let mut hits = 0u32;
+    for term in query_terms {
+        let t = term.to_ascii_lowercase();
+        if t.len() >= 4 && haystack.contains(&t) {
+            hits += 1;
+        }
+    }
+    hits
+}
+
+/// Pure core of the BODY_SEED emission lever: keep only a file's definitions
+/// whose BODY matches the query (relevance > 0), rank by hit count then span
+/// size then name, and build symbols for the top `limit`. Emitted ADDITIVELY
+/// (the caller merges, deduping by name) rather than competitively — the gold
+/// def is surfaced ALONGSIDE any resolved sibling, which is robust because the
+/// symbol cap does not bind on the 1-3 symbol files these misses occur on.
+fn rank_body_relevant_symbols(
+    entities: Vec<kin_model::Entity>,
+    query_terms: &[String],
+    test_query: bool,
+    limit: usize,
+) -> Vec<LocateSymbol> {
+    let mut scored: Vec<(u32, u32, kin_model::Entity)> = entities
+        .into_iter()
+        .filter(|e| {
+            (test_query || e.role != kin_model::EntityRole::Test) && is_definitional_kind(e.kind)
+        })
+        .filter_map(|e| {
+            let hits = body_relevance_score(&e, query_terms);
+            if hits == 0 {
+                return None;
+            }
+            let span_len = e
+                .span
+                .as_ref()
+                .map_or(0, |s| s.end_line.saturating_sub(s.start_line))
+                .min(500);
+            Some((hits, span_len, e))
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(b.1.cmp(&a.1))
+            .then_with(|| a.2.name.cmp(&b.2.name))
+    });
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(hits, _, e)| LocateSymbol {
+            name: e.name.clone(),
+            span: entity_span_pair(&e).into_iter().next(),
+            score: hits as f32,
+            kind: format!("{:?}", e.kind).to_lowercase(),
+            definition: true,
+            origin: String::new(),
+            cosine: None,
+        })
+        .collect()
+}
+
+/// BODY_SEED primary lever (gated `KIN_LOCATE_BODY_SEED`, default OFF). The seed
+/// name-gate (`score_name_match > 0`) drops defs whose NAME matches no query
+/// identifier even when their BODY implements the change, so they never resolve
+/// or emit. For each found result file, additively merge in the top
+/// `KIN_LOCATE_BODY_SEED_TOPK` (default 3) defs whose BODY matches the query,
+/// deduped by name against whatever already emitted. Robust (no rank/gap-cut
+/// contest): the gold is emitted alongside siblings, and the symbol cap does not
+/// bind on these files. OFF is byte-identical.
+fn emit_body_relevant_symbols(
+    graph: &kin_db::InMemoryGraph,
+    results: &[(String, f32)],
+    projection_symbols: &mut HashMap<String, Vec<LocateSymbol>>,
+    query_terms: &[String],
+    test_query: bool,
+) {
+    if query_terms.is_empty() {
+        return;
+    }
+    let topk = locate_env_usize("KIN_LOCATE_BODY_SEED_TOPK", 3);
+    for (path, _) in results {
+        let filter = EntityFilter {
+            file_path: Some(kin_model::FilePathId::new(path)),
+            kinds: Some(vec![
+                EntityKind::Function,
+                EntityKind::Method,
+                EntityKind::Class,
+                EntityKind::Interface,
+                EntityKind::TraitDef,
+                EntityKind::EnumDef,
+            ]),
+            ..Default::default()
+        };
+        let Ok(entities) = graph.query_entities(&filter) else {
+            continue;
+        };
+        if entities.is_empty() {
+            continue;
+        }
+        let body_syms = rank_body_relevant_symbols(entities, query_terms, test_query, topk);
+        if body_syms.is_empty() {
+            continue;
+        }
+        let entry = projection_symbols.entry(path.clone()).or_default();
+        let present: HashSet<String> = entry.iter().map(|s| s.name.clone()).collect();
+        for s in body_syms {
+            if !present.contains(&s.name) {
+                entry.push(s);
+            }
+        }
+    }
+}
+
 fn entity_span_pair(entity: &kin_model::Entity) -> Vec<[u32; 2]> {
     let Some(s) = entity.span.as_ref() else {
         return Vec::new();
@@ -11033,6 +11174,42 @@ mod tests {
             10.0,
         );
         assert!(out2.is_empty(), "non-query-relevant defs are not merged");
+    }
+
+    #[test]
+    fn rank_body_relevant_symbols_keeps_only_body_matches_ranked_by_hits() {
+        // Name-blocked gold whose BODY carries two query terms.
+        let mut two_hit = test_entity("indexSitesFixesConfig", "src/parse.ts", 98, 161);
+        two_hit.metadata.extra.insert(
+            "embedding_body_preview".to_string(),
+            serde_json::Value::String("decode base64 padding here".to_string()),
+        );
+        // Body carries one query term.
+        let mut one_hit = test_entity("decoder", "src/parse.ts", 40, 60);
+        one_hit.metadata.extra.insert(
+            "embedding_body_preview".to_string(),
+            serde_json::Value::String("handle padding only".to_string()),
+        );
+        // No body match at all -> filtered out.
+        let no_hit = test_entity("helper", "src/parse.ts", 5, 9);
+        let terms = vec!["base64".to_string(), "padding".to_string()];
+
+        let out = rank_body_relevant_symbols(
+            vec![no_hit.clone(), one_hit.clone(), two_hit.clone()],
+            &terms,
+            false,
+            5,
+        );
+        assert_eq!(out.len(), 2, "only body-matching defs emitted");
+        assert_eq!(out[0].name, "indexSitesFixesConfig"); // 2 hits
+        assert_eq!(out[1].name, "decoder"); // 1 hit
+        assert!(out.iter().all(|s| s.definition));
+        assert_eq!(out[0].span, Some([99, 162])); // 1-based inclusive
+
+        // topk truncates to the strongest body match.
+        let top1 = rank_body_relevant_symbols(vec![no_hit, one_hit, two_hit], &terms, false, 1);
+        assert_eq!(top1.len(), 1);
+        assert_eq!(top1[0].name, "indexSitesFixesConfig");
     }
 
     #[test]
