@@ -442,6 +442,7 @@ dependencies = [
 name = "kin-infer"
 version = "0.2.0"
 dependencies = [
+ "block",
  "half",
  "hashbrown",
  "metal",

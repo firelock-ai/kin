@@ -14,9 +14,10 @@ use metal::{
     MTLResourceOptions, MTLSize,
 };
 use objc2::rc::autoreleasepool;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Host-stall profiling (opt-in, zero-overhead when off)
