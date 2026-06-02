@@ -2099,6 +2099,20 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         );
     }
 
+    // C_misrank lever (default OFF == byte-identical): boost emitted symbols by
+    // query proximity and merge in any query-relevant file def that wasn't
+    // resolved, so the actually-edited def ranks over its siblings.
+    if locate_env_bool("KIN_LOCATE_SYMBOL_QUERY_PROXIMITY", false) {
+        let proximity_terms = tracked_text_query_terms(text);
+        boost_symbol_query_relevance(
+            graph,
+            &results,
+            &mut projection_symbols,
+            &proximity_terms,
+            test_query,
+        );
+    }
+
     Ok(build_result(
         &results,
         &all_hits,
@@ -10292,6 +10306,107 @@ fn enrich_empty_file_symbols(
     }
 }
 
+/// Pure core of the C_misrank lever (see [`boost_symbol_query_relevance`]):
+/// given a file's already-emitted symbols and ALL its definitional entities,
+/// (a) add a query-proximity boost to every emitted symbol's score, and (b)
+/// merge in any query-RELEVANT (proximity > 0) definition that wasn't emitted —
+/// so the actually-edited def surfaces over its resolved siblings. Only defs the
+/// query points at are merged, bounding the precision hit. Returned unsorted;
+/// `rank_and_cap_symbols_with` does the final ordering. Separated from graph IO
+/// so it is unit-testable.
+fn apply_query_relevance(
+    mut existing: Vec<LocateSymbol>,
+    file_entities: Vec<kin_model::Entity>,
+    query_terms: &[String],
+    test_query: bool,
+    boost_weight: f32,
+) -> Vec<LocateSymbol> {
+    // Highest-proximity definitional entity per name in this file.
+    let mut prox_by_name: HashMap<String, (f32, kin_model::Entity)> = HashMap::new();
+    for e in file_entities {
+        if !is_definitional_kind(e.kind) || !(test_query || e.role != kin_model::EntityRole::Test) {
+            continue;
+        }
+        let p = query_proximity_score(&e, query_terms);
+        match prox_by_name.get(&e.name) {
+            Some((existing_p, _)) if *existing_p >= p => {}
+            _ => {
+                prox_by_name.insert(e.name.clone(), (p, e));
+            }
+        }
+    }
+    let mut present: HashSet<String> = HashSet::new();
+    for s in existing.iter_mut() {
+        present.insert(s.name.clone());
+        let prox = prox_by_name.get(&s.name).map(|(p, _)| *p).unwrap_or_else(|| {
+            let mut np = 0.0f32;
+            for t in query_terms {
+                np = np.max(score_name_match(t, &s.name));
+            }
+            np
+        });
+        s.score += prox * boost_weight;
+    }
+    for (name, (p, e)) in &prox_by_name {
+        if present.contains(name) || *p <= 0.0 {
+            continue;
+        }
+        existing.push(LocateSymbol {
+            name: e.name.clone(),
+            span: entity_span_pair(e).into_iter().next(),
+            score: *p * boost_weight,
+            kind: format!("{:?}", e.kind).to_lowercase(),
+            definition: true,
+            origin: String::new(),
+            cosine: None,
+        });
+    }
+    existing
+}
+
+/// C_misrank lever (gated `KIN_LOCATE_SYMBOL_QUERY_PROXIMITY`, default OFF).
+/// scorer sized ~44 golds where the correct named gold def IS present in the
+/// right file+kind but Kin emits a resolved SIBLING instead. For each result
+/// file, boost every emitted symbol by its query proximity and merge in any
+/// query-relevant file definition that wasn't resolved, so the edited def ranks
+/// over its siblings. GPU-free (lexical name + body-preview proximity); the
+/// embedding-cosine variant is a separate, embed-window lever. OFF is
+/// byte-identical (no boost, no merge).
+fn boost_symbol_query_relevance(
+    graph: &kin_db::InMemoryGraph,
+    results: &[(String, f32)],
+    projection_symbols: &mut HashMap<String, Vec<LocateSymbol>>,
+    query_terms: &[String],
+    test_query: bool,
+) {
+    let boost_weight = locate_env_f32("KIN_LOCATE_SYMBOL_PROXIMITY_BOOST", 10.0);
+    for (path, _) in results {
+        let existing = projection_symbols.get(path).cloned().unwrap_or_default();
+        let filter = EntityFilter {
+            file_path: Some(kin_model::FilePathId::new(path)),
+            kinds: Some(vec![
+                EntityKind::Function,
+                EntityKind::Method,
+                EntityKind::Class,
+                EntityKind::Interface,
+                EntityKind::TraitDef,
+                EntityKind::EnumDef,
+            ]),
+            ..Default::default()
+        };
+        let Ok(entities) = graph.query_entities(&filter) else {
+            continue;
+        };
+        if existing.is_empty() && entities.is_empty() {
+            continue;
+        }
+        let boosted = apply_query_relevance(existing, entities, query_terms, test_query, boost_weight);
+        if !boosted.is_empty() {
+            projection_symbols.insert(path.clone(), boosted);
+        }
+    }
+}
+
 fn entity_span_pair(entity: &kin_model::Entity) -> Vec<[u32; 2]> {
     let Some(s) = entity.span.as_ref() else {
         return Vec::new();
@@ -10821,6 +10936,40 @@ mod tests {
         let top1 = rank_enriched_symbols(vec![small, medium, topic], &terms, false, 1);
         assert_eq!(top1.len(), 1);
         assert_eq!(top1[0].name, "indexSitesFixesConfig");
+    }
+
+    #[test]
+    fn apply_query_relevance_surfaces_edited_def_over_siblings() {
+        // Resolved siblings the query does NOT name, with modest scores.
+        let existing = vec![sym("render_usage", 5.0, true), sym("render_version", 4.0, true)];
+        // The file also contains the actually-edited gold fn (query names it)
+        // plus one of the resolved siblings.
+        let gold = test_entity("printHelpInner", "src/help.rs", 759, 767);
+        let sib = test_entity("render_usage", "src/help.rs", 100, 110);
+        let terms = vec!["printHelpInner".to_string()];
+
+        let out = apply_query_relevance(existing, vec![gold, sib], &terms, false, 10.0);
+        let gold_s = out
+            .iter()
+            .find(|s| s.name == "printHelpInner")
+            .expect("gold merged");
+        let usage_s = out
+            .iter()
+            .find(|s| s.name == "render_usage")
+            .expect("sibling kept");
+        assert!(gold_s.score > usage_s.score, "edited def must outrank siblings");
+        assert!(out.iter().any(|s| s.name == "render_version")); // siblings preserved
+        assert_eq!(out.len(), 3);
+
+        // A def the query does NOT point at is not merged (precision guard).
+        let out2 = apply_query_relevance(
+            vec![],
+            vec![test_entity("unrelated", "src/help.rs", 1, 3)],
+            &terms,
+            false,
+            10.0,
+        );
+        assert!(out2.is_empty(), "non-query-relevant defs are not merged");
     }
 
     #[test]
