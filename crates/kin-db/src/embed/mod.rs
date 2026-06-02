@@ -3,6 +3,8 @@
 
 #[cfg(feature = "embeddings")]
 mod inference;
+#[cfg(feature = "embeddings")]
+pub mod rerank;
 
 #[cfg(feature = "embeddings")]
 use directories::BaseDirs;
@@ -38,10 +40,10 @@ use kin_model::{
 
 /// Default HuggingFace model ID.
 ///
-/// BGE small keeps semantic search local while bringing embedding build time
+/// SweRank small keeps semantic search local while bringing embedding build time
 /// down enough for repo-scale indexing to stay practical on developer
 /// machines.
-const DEFAULT_MODEL_ID: &str = "BAAI/bge-small-en-v1.5";
+const DEFAULT_MODEL_ID: &str = "Salesforce/SweRankEmbed-Small";
 /// Asymmetric query instruction for SweRankEmbed / nomic_bert code retrievers.
 ///
 /// SweRankEmbed-Small prepends this exact string (trailing space included) to
@@ -1663,8 +1665,8 @@ mod tests {
         LanguageId, SemanticFingerprint, Visibility,
     };
 
-    /// Default embedding dimensions for BGE-small-en-v1.5.
-    const DEFAULT_EMBED_DIMS: usize = 384;
+    /// Default embedding dimensions for SweRankEmbed-Small.
+    const DEFAULT_EMBED_DIMS: usize = 768;
 
     #[test]
     fn format_entity_text_joins_parts() {

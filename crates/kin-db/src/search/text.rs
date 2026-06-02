@@ -519,6 +519,8 @@ fn artifact_kind_label(kind: ArtifactKind) -> &'static str {
 mod tests {
     use super::*;
     use crate::types::*;
+    use std::sync::Mutex;
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     fn make_entity(name: &str, file: &str, kind: EntityKind) -> Entity {
         Entity {
@@ -609,6 +611,7 @@ mod tests {
 
     #[test]
     fn search_by_file_path_disabled_by_default() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         // With WEIGHT_FILE_PATH=0.0 (default), file path text is not indexed.
         // Searching for a term that only appears in the path should find nothing.
         let idx = TextIndex::new().unwrap();
@@ -626,6 +629,7 @@ mod tests {
 
     #[test]
     fn search_by_file_path_when_enabled() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         // With WEIGHT_FILE_PATH > 0, file path text IS indexed.
         std::env::set_var("KIN_LOCATE_WEIGHT_FILE_PATH", "2.0");
         let idx = TextIndex::new().unwrap();
