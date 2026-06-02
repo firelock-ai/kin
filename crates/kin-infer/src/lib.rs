@@ -1313,9 +1313,9 @@ impl BertModel {
 
             let (mut q, mut k, v) = self.project_qkv(attn_input, layer, eps);
 
-            // Apply RoPE per input (positions restart at 0 for each) before attention.
-            self.rope_batched(&mut q, batch_size, max_len, head_dim);
-            self.rope_batched(&mut k, batch_size, max_len, head_dim);
+            // Apply RoPE per input (positions restart at 0 for each) before
+            // attention; Q+K for each input share one GPU submission.
+            self.rope_qk_batched(&mut q, &mut k, batch_size, max_len, head_dim);
 
             // --- Fully batched attention: treat batch_size × num_heads as independent heads ---
             let needs_per_head =
@@ -1924,6 +1924,85 @@ impl BertModel {
             let mut block = x.slice(s![base..base + max_len, ..]).to_owned();
             self.rope(&mut block, 0, max_len, head_dim);
             x.slice_mut(s![base..base + max_len, ..]).assign(&block);
+        }
+    }
+
+    /// Apply RoPE to Q and K together in the batched path: positions restart at 0
+    /// for every input, and Q+K for each input share one GPU submission via
+    /// `rope_pair` (halving the RoPE round-trips per layer vs two `rope_batched`
+    /// calls). Falls back to the two-call path when there is no accelerator or the
+    /// shared compact tables can't be built. No-op without RoPE tables.
+    fn rope_qk_batched(
+        &self,
+        q: &mut Array2<f32>,
+        k: &mut Array2<f32>,
+        batch_size: usize,
+        max_len: usize,
+        head_dim: usize,
+    ) {
+        let (Some(cos), Some(sin)) = (&self.rope_cos, &self.rope_sin) else {
+            return;
+        };
+        let Some(gpu) = self.gpu.as_ref() else {
+            self.rope_batched(q, batch_size, max_len, head_dim);
+            self.rope_batched(k, batch_size, max_len, head_dim);
+            return;
+        };
+        if max_len == 0 || batch_size == 0 {
+            return;
+        }
+        let total_dim = q.ncols();
+        let half = head_dim / 2;
+        let actual = cos.nrows().min(sin.nrows()).min(max_len);
+        if actual == 0 || k.ncols() != total_dim {
+            self.rope_batched(q, batch_size, max_len, head_dim);
+            self.rope_batched(k, batch_size, max_len, head_dim);
+            return;
+        }
+
+        // Positions restart at 0 per input, so the compact cos/sin tables are the
+        // same for every batch element — build them once.
+        let mut cos_compact = Vec::with_capacity(actual * half);
+        let mut sin_compact = Vec::with_capacity(actual * half);
+        for pos in 0..actual {
+            for d in 0..half {
+                cos_compact.push(cos[[pos, d]]);
+                sin_compact.push(sin[[pos, d]]);
+            }
+        }
+
+        for b in 0..batch_size {
+            let base = b * max_len;
+            // RoPE only touches the first `actual` positions of each input block;
+            // own the q/k slices, pair them in one submission, write back.
+            let mut q_block: Vec<f32> = q
+                .slice(s![base..base + actual, ..])
+                .iter()
+                .copied()
+                .collect();
+            let mut k_block: Vec<f32> = k
+                .slice(s![base..base + actual, ..])
+                .iter()
+                .copied()
+                .collect();
+            gpu.rope_pair(
+                &mut q_block,
+                &mut k_block,
+                &cos_compact,
+                &sin_compact,
+                0,
+                actual,
+                head_dim,
+                total_dim,
+            );
+            q.slice_mut(s![base..base + actual, ..])
+                .iter_mut()
+                .zip(q_block)
+                .for_each(|(dst, src)| *dst = src);
+            k.slice_mut(s![base..base + actual, ..])
+                .iter_mut()
+                .zip(k_block)
+                .for_each(|(dst, src)| *dst = src);
         }
     }
 
