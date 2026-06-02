@@ -1230,26 +1230,25 @@ fn default_max_batch_tokens(backend: GpuBackend) -> usize {
     }
 }
 
-/// Conservative seq_len threshold for auto dispatch. The Metal batched
-/// attention kernel begins producing NaN in the ~500-token regime; 256 keeps
-/// the chunked path well below that zone. Irrelevant when
-/// `EMBED_AUTO_PREFERS_CPU` is true (current state — Metal is unreliable
-/// even at short sequences in the daemon process).
+/// Conservative seq_len threshold for auto dispatch. The Metal GELU NaN is
+/// fixed (kin-infer d8df3cc) and the seq-len regression is green to 1024, but
+/// 256 is retained as a belt-and-suspenders cap so the chunked path stays in
+/// the regime exercised most heavily by the parity tests; longer chunks fall
+/// back to CPU. Active again now that `EMBED_AUTO_PREFERS_CPU` is `false`.
 #[cfg(feature = "embeddings")]
 const EMBED_CPU_SEQ_THRESHOLD: usize = 256;
 
 /// When auto dispatch resolves, should it prefer CPU unconditionally?
 ///
-/// Empirically, kin-infer's Metal attention produces NaN through both
-/// `forward_batched` and single-input `forward` in the running daemon for
-/// BGE-small even at seq_len=8. Until the Metal kernel bug is root-caused
-/// and fixed (see `planning/metal-bert-nan-bug.md`), auto dispatch routes
-/// everything through the CPU BertModel twin. When the fix lands and the
-/// `metal_seq_len_regression` tests pass with `KIN_EMBED_BACKEND=metal`,
-/// flip this to `false` (or remove it) to re-enable threshold-based
-/// Metal routing for short sequences.
+/// The Metal BERT NaN was root-caused to GELU's tanh argument overflowing
+/// (`sinh/cosh` → inf → NaN) at long sequences; the fix clamps the argument
+/// in `gelu_activation` (kin-infer commit d8df3cc). With that landed, the
+/// `metal_seq_len_regression` suite is green end-to-end (BGE-small Metal-vs-CPU
+/// parity, cosine ≈ 1.0, zero NaN from seq_len 7..1024) and the SwiGLU/SiLU
+/// path is verified clean by `swerank_self_retrieval` (top-1 correct, margin
+/// 0.19). Auto dispatch may therefore use threshold-based Metal routing again.
 #[cfg(feature = "embeddings")]
-const EMBED_AUTO_PREFERS_CPU: bool = true;
+const EMBED_AUTO_PREFERS_CPU: bool = false;
 
 #[cfg(feature = "embeddings")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1856,16 +1855,16 @@ mod tests {
         let prev = std::env::var("KIN_EMBED_BACKEND").ok();
 
         std::env::set_var("KIN_EMBED_BACKEND", "auto");
-        // `EMBED_AUTO_PREFERS_CPU` is currently `true`: auto routes
-        // everything through CPU regardless of seq_len. Both short and long
-        // sequences must land on Cpu until Metal is patched.
+        // `EMBED_AUTO_PREFERS_CPU` is `false`: auto routes by seq_len. Short
+        // sequences (<= EMBED_CPU_SEQ_THRESHOLD) go to Metal; longer ones fall
+        // back to CPU at the conservative threshold.
         assert!(matches!(
             resolve_embed_backend(8),
-            EmbedBackendChoice::Cpu { .. }
+            EmbedBackendChoice::Metal { .. }
         ));
         assert!(matches!(
             resolve_embed_backend(128),
-            EmbedBackendChoice::Cpu { .. }
+            EmbedBackendChoice::Metal { .. }
         ));
         assert!(matches!(
             resolve_embed_backend(EMBED_CPU_SEQ_THRESHOLD + 1),
