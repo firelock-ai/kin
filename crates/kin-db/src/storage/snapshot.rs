@@ -172,13 +172,35 @@ fn write_vector_index_metadata(
     let encoded = serde_json::to_vec_pretty(metadata).map_err(|err| {
         KinDbError::StorageError(format!("failed to encode vector index metadata: {err}"))
     })?;
+    // Crash-safe write: fsync the temp file before the atomic rename, then
+    // fsync the parent directory so the rename itself is durable. This matches
+    // the discipline used for the graph snapshot (mmap::atomic_write_bytes) and
+    // the kvec sidecar (kin-vector atomic_save_bytes). The metadata gates whether
+    // the kvec loads on reopen, so it must be at least as durable as the index it
+    // describes: an incremental kvec flush that survives a crash must never be
+    // paired with a metadata write that silently evaporated.
     let tmp_path = path.with_extension("tmp");
-    std::fs::write(&tmp_path, encoded).map_err(|err| {
-        KinDbError::StorageError(format!(
-            "failed to write vector index metadata {}: {err}",
-            tmp_path.display()
-        ))
-    })?;
+    {
+        use std::io::Write as _;
+        let mut tmp = File::create(&tmp_path).map_err(|err| {
+            KinDbError::StorageError(format!(
+                "failed to create vector index metadata temp {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+        tmp.write_all(&encoded).map_err(|err| {
+            KinDbError::StorageError(format!(
+                "failed to write vector index metadata {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+        tmp.sync_all().map_err(|err| {
+            KinDbError::StorageError(format!(
+                "failed to fsync vector index metadata {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+    }
     std::fs::rename(&tmp_path, path).map_err(|err| {
         KinDbError::StorageError(format!(
             "failed to promote vector index metadata {} -> {}: {err}",
@@ -186,6 +208,11 @@ fn write_vector_index_metadata(
             path.display()
         ))
     })?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 
@@ -1859,6 +1886,69 @@ mod tests {
 
         let reopened = SnapshotManager::open_read_only(&snapshot_path).unwrap();
         assert_eq!(reopened.graph().embedding_status().indexed, 2);
+    }
+
+    /// Grounds the crash-safety contract the incremental-embed flush depends on:
+    /// an incremental kvec persist (`save_vector_index_for_graph`, with no full
+    /// graph re-save) is durable and reloads on a cold reopen, and a hard process
+    /// exit between that flush and any further graph write leaves `graph.kndb`
+    /// intact. The vector index is a pure sidecar (not part of the graph merkle
+    /// root), so embedding never changes the root hash — a flush that persists
+    /// only the kvec writes metadata whose root hash still matches the persisted
+    /// graph snapshot, so reopen loads it. This is exactly what lets a long embed
+    /// survive interruption without losing the vectors written so far.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn incremental_kvec_persist_survives_crash_with_graph_intact() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+
+        let first = test_entity("incremental_first");
+        let second = test_entity("incremental_second");
+        let root_hash_before;
+        {
+            let mgr = SnapshotManager::new(&snapshot_path);
+            let graph = mgr.graph();
+            graph.upsert_entity(&first).unwrap();
+            graph.upsert_entity(&second).unwrap();
+
+            // Initial graph + kvec persisted together (root hash H, one vector).
+            let vectors = VectorIndex::new(4).unwrap();
+            vectors.upsert(first.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+            vectors.save(&vector_path).unwrap();
+            graph.load_vector_index(&vector_path).unwrap();
+            mgr.save().unwrap();
+            root_hash_before = compute_graph_root_hash(&graph.to_snapshot());
+
+            // Simulate the next embed batch: add a second vector and persist ONLY
+            // the kvec sidecar (no full graph re-save), exactly as a per-batch
+            // incremental flush would. Then "crash" by dropping the manager with
+            // no further save.
+            let updated = VectorIndex::new(4).unwrap();
+            updated.upsert(first.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+            updated.upsert(second.id, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+            updated.save(&vector_path).unwrap();
+            graph.load_vector_index(&vector_path).unwrap();
+            SnapshotManager::save_vector_index_for_graph(&snapshot_path, graph.as_ref()).unwrap();
+            // `mgr` dropped here — models a process exit right after a flush.
+        }
+
+        // Cold reopen: fresh manager, no shared in-memory state.
+        let reopened = SnapshotManager::open(&snapshot_path).unwrap();
+        let graph = reopened.graph();
+        assert_eq!(graph.entity_count(), 2, "graph snapshot must survive intact");
+        assert_eq!(
+            compute_graph_root_hash(&graph.to_snapshot()),
+            root_hash_before,
+            "embedding must not change the graph merkle root"
+        );
+        assert_eq!(
+            graph.embedding_status().indexed,
+            2,
+            "incremental kvec flush must be durable and reload on reopen"
+        );
+        assert_eq!(graph.pending_embeddings(), 0);
     }
 
     #[test]
