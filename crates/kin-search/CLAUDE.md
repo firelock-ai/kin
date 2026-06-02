@@ -1,3 +1,5 @@
+> **Umbrella guidance:** the workspace-root `AGENTS.md` is the source of truth for cross-repo thesis, boundaries, and rules. This file is the repo-specific authority for `kin-search`.
+
 # kin-search
 
 Lightweight in-memory BM25 text search with code-aware tokenization. Zero external search engine dependencies.
