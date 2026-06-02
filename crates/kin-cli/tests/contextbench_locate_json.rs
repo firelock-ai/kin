@@ -95,7 +95,7 @@ fn contextbench_locate_keeps_query_selection_and_normalization_inside_kin() {
     assert_eq!(payload["schema"], "kin.contextbench-locate.v1");
     assert_eq!(payload["selected_query_field"], "problem_statement");
     assert_eq!(payload["query_char_limit"], 4000);
-    assert_eq!(payload["max_files"], 25);
+    assert_eq!(payload["max_files"], 10);
     assert_eq!(payload["query_truncated"], false);
 
     let files = payload["files"].as_array().expect("files array");
