@@ -2084,6 +2084,21 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         );
     }
 
+    // D_empty lever (default OFF == byte-identical): files located by a
+    // file-level/lexical signal with no resolved entity emit zero symbols and
+    // are a guaranteed symbol+line miss. When enabled, backfill their symbol
+    // list from the file's graph definitions, ranked by query proximity.
+    if locate_env_bool("KIN_LOCATE_ENRICH_EMPTY_FILES", false) {
+        let enrich_terms = tracked_text_query_terms(text);
+        enrich_empty_file_symbols(
+            graph,
+            &results,
+            &mut projection_symbols,
+            &enrich_terms,
+            test_query,
+        );
+    }
+
     Ok(build_result(
         &results,
         &all_hits,
@@ -10145,6 +10160,138 @@ fn is_definitional_kind(kind: EntityKind) -> bool {
     )
 }
 
+/// GPU-free query proximity for symbol enrichment/relevance: how strongly an
+/// entity matches the query, by NAME (exact/part match, weighted high) plus a
+/// substring hit in its signature/body preview (weighted low). The body term
+/// lets a definition whose BODY handles the query topic surface even when its
+/// NAME does not match it — e.g. an `indexSitesFixesConfig` fn that handles
+/// "base64 padding" for a "parser should ignore Base64 padding" query. Returns
+/// 0.0 when nothing matches.
+fn query_proximity_score(entity: &kin_model::Entity, query_terms: &[String]) -> f32 {
+    if query_terms.is_empty() {
+        return 0.0;
+    }
+    let mut name_score = 0.0f32;
+    for term in query_terms {
+        name_score = name_score.max(score_name_match(term, &entity.name));
+    }
+    let body = entity
+        .metadata
+        .extra
+        .get("embedding_body_preview")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let haystack = format!("{} {}", entity.signature, body).to_ascii_lowercase();
+    let mut body_hits = 0u32;
+    for term in query_terms {
+        let t = term.to_ascii_lowercase();
+        if t.len() >= 3 && haystack.contains(&t) {
+            body_hits += 1;
+        }
+    }
+    name_score * 2.0 + body_hits as f32 * 0.5
+}
+
+/// Rank a file's definitional entities for the D_empty enrichment lever: query
+/// proximity first, then a kind preference (fn/method over container), then
+/// larger span, then name for determinism. The composite is baked into `score`
+/// so the downstream `rank_and_cap_symbols_with` (which sorts by definition then
+/// score) preserves this order. Truncates to `limit`.
+fn rank_enriched_symbols(
+    entities: Vec<kin_model::Entity>,
+    query_terms: &[String],
+    test_query: bool,
+    limit: usize,
+) -> Vec<LocateSymbol> {
+    let mut syms: Vec<LocateSymbol> = entities
+        .into_iter()
+        .filter(|e| {
+            (test_query || e.role != kin_model::EntityRole::Test) && is_definitional_kind(e.kind)
+        })
+        .map(|e| {
+            let prox = query_proximity_score(&e, query_terms);
+            let kind_w = if matches!(e.kind, EntityKind::Function | EntityKind::Method) {
+                2.0
+            } else {
+                1.0
+            };
+            let span_len = e
+                .span
+                .as_ref()
+                .map_or(0, |s| s.end_line.saturating_sub(s.start_line))
+                .min(500);
+            // proximity dominates, kind breaks proximity ties, span size breaks
+            // kind ties — keeps the score monotonic with the intended ranking.
+            let score = prox * 100.0 + kind_w + span_len as f32 / 1000.0;
+            LocateSymbol {
+                name: e.name.clone(),
+                span: entity_span_pair(&e).into_iter().next(),
+                score,
+                kind: format!("{:?}", e.kind).to_lowercase(),
+                definition: true,
+                origin: String::new(),
+                cosine: None,
+            }
+        })
+        .collect();
+    syms.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    syms.truncate(limit);
+    syms
+}
+
+/// D_empty lever (gated `KIN_LOCATE_ENRICH_EMPTY_FILES`, default OFF). For final
+/// result files that surfaced via a file-level/lexical signal but had NO entity
+/// resolved to them — so their per-file symbol list is empty and the symbol+line
+/// metrics are a guaranteed miss even though the FILE was located correctly —
+/// enumerate the file's definitions from the graph and emit the top
+/// query-relevant ones (`KIN_LOCATE_ENRICH_TOPK`, default 3). GPU-free; only
+/// touches files that currently emit nothing, so OFF (and any file that already
+/// has resolved symbols) is byte-identical.
+fn enrich_empty_file_symbols(
+    graph: &kin_db::InMemoryGraph,
+    results: &[(String, f32)],
+    projection_symbols: &mut HashMap<String, Vec<LocateSymbol>>,
+    query_terms: &[String],
+    test_query: bool,
+) {
+    let limit = locate_env_usize("KIN_LOCATE_ENRICH_TOPK", 3);
+    for (path, _) in results {
+        if projection_symbols
+            .get(path)
+            .map_or(false, |syms| !syms.is_empty())
+        {
+            continue;
+        }
+        let filter = EntityFilter {
+            file_path: Some(kin_model::FilePathId::new(path)),
+            kinds: Some(vec![
+                EntityKind::Function,
+                EntityKind::Method,
+                EntityKind::Class,
+                EntityKind::Interface,
+                EntityKind::TraitDef,
+                EntityKind::EnumDef,
+            ]),
+            ..Default::default()
+        };
+        let Ok(entities) = graph.query_entities(&filter) else {
+            continue;
+        };
+        if entities.is_empty() {
+            continue;
+        }
+        let syms = rank_enriched_symbols(entities, query_terms, test_query, limit);
+        if !syms.is_empty() {
+            projection_symbols.insert(path.clone(), syms);
+        }
+    }
+}
+
 fn entity_span_pair(entity: &kin_model::Entity) -> Vec<[u32; 2]> {
     let Some(s) = entity.span.as_ref() else {
         return Vec::new();
@@ -10645,6 +10792,35 @@ mod tests {
         ] {
             assert!(!is_definitional_kind(k), "{k:?} should not be definitional");
         }
+    }
+
+    #[test]
+    fn rank_enriched_symbols_prioritizes_query_match_then_size() {
+        // Big fn whose NAME matches nothing but whose BODY mentions query terms.
+        let mut topic = test_entity("indexSitesFixesConfig", "src/parse.ts", 98, 161);
+        topic.metadata.extra.insert(
+            "embedding_body_preview".to_string(),
+            serde_json::Value::String("strip base64 padding from css".to_string()),
+        );
+        // Unrelated helpers, no name/body match -> ranked by span size.
+        let small = test_entity("helper", "src/parse.ts", 5, 9);
+        let medium = test_entity("formatValue", "src/parse.ts", 40, 70);
+        let terms = vec!["base64".to_string(), "padding".to_string()];
+
+        let ranked =
+            rank_enriched_symbols(vec![small.clone(), medium.clone(), topic.clone()], &terms, false, 3);
+        assert_eq!(ranked.len(), 3);
+        assert_eq!(ranked[0].name, "indexSitesFixesConfig"); // body match dominates
+        assert_eq!(ranked[1].name, "formatValue"); // larger span than helper
+        assert_eq!(ranked[2].name, "helper");
+        assert!(ranked.iter().all(|s| s.definition));
+        // Enriched spans are 1-based inclusive via entity_span_pair.
+        assert_eq!(ranked[0].span, Some([99, 162]));
+
+        // limit truncates to the top query-relevant def.
+        let top1 = rank_enriched_symbols(vec![small, medium, topic], &terms, false, 1);
+        assert_eq!(top1.len(), 1);
+        assert_eq!(top1[0].name, "indexSitesFixesConfig");
     }
 
     #[test]
