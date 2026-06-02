@@ -304,12 +304,42 @@ fn metal_embed_forward_profile() {
         layers,
     );
     eprintln!(
-        "phase split: matmul {:.0}% / attention {:.0}% / norm-softmax {:.0}% / activation {:.0}% / copy-readback {:.0}%",
+        "host-wall phase split: matmul {:.0}% / attention {:.0}% / norm-softmax {:.0}% / activation {:.0}% / copy-readback {:.0}%",
         mm as f64 / tot * 100.0,
         attn as f64 / tot * 100.0,
         norm as f64 / tot * 100.0,
         act as f64 / tot * 100.0,
         copy as f64 / tot * 100.0,
     );
+
+    // --- GPU-timestamp phase distribution (build-invariant) ---
+    // The host-wall split above attributes async wall-clock on the HOST and so
+    // carries debug-vs-release skew. This distribution is measured from each
+    // command buffer's GPUStartTime/GPUEndTime (profile_gpu_phase_nanos), so its
+    // SHAPE is invariant across build profiles — it is what lets the team choose
+    // fp16-operands vs MMA-tiling by MEASUREMENT instead of host-skewed wall-clock.
+    // Framing: absolute throughput = release async wall-clock; distribution =
+    // GPU-timestamp, build-invariant.
+    let gpu_phases = metal_backend::profile_gpu_phase_nanos();
+    let gpu_tot: u64 = gpu_phases.iter().map(|(_, ns)| *ns).sum();
+    if gpu_tot == 0 {
+        eprintln!(
+            "GPU-timestamp dist: 0 ns recorded -> set KIN_INFER_METAL_PROFILE=1 to enable \
+             GPU-timestamp phase profiling (host-wall split above is still valid)."
+        );
+    } else {
+        let denom = gpu_tot as f64;
+        let dist = gpu_phases
+            .iter()
+            .map(|(name, ns)| format!("{name} {:.0}%", *ns as f64 / denom * 100.0))
+            .collect::<Vec<_>>()
+            .join(" / ");
+        eprintln!("GPU-timestamp dist (build-invariant): {dist}");
+        eprintln!(
+            "  (copy~0: host memcpy on unified memory commits no command buffer, so it is \
+             not GPU-timed; absolute throughput = release async wall-clock, distribution = \
+             GPU-timestamp, build-invariant)"
+        );
+    }
     eprintln!();
 }
