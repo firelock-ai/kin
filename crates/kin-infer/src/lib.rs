@@ -200,6 +200,25 @@ fn default_true() -> bool {
     true
 }
 
+/// Whether the experimental command-buffer pipelining (fused SwiGLU FFN +
+/// paired RoPE in single GPU submissions) is enabled. Default OFF: the
+/// steady-state forward pass uses the original per-op dispatch path, which is
+/// the proven-stable code at large-repo scale. Enable with `KIN_EMBED_PIPELINE=1`.
+///
+/// The fused path collapses per-op commit+wait round-trips but, until it is
+/// proven not to stall on a cold large embed, it must never be the default —
+/// a feature that can hang at scale stays opt-in. Sampled once per process.
+fn embed_pipeline_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("KIN_EMBED_PIPELINE").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
 impl BertConfig {
     pub fn architecture(&self) -> ModelArchitecture {
         self.model_type
@@ -1161,7 +1180,10 @@ impl BertModel {
                 self.config.layer_norm_eps as f32,
             );
 
-            // 3. Transformer layers (ALBERT: reuse layers[i % num_groups])
+            // 3. Transformer layers (ALBERT: reuse layers[i % num_groups]).
+            // Each Metal op drains its own autoreleased command buffer/encoders
+            // (see the per-op `autoreleasepool` wraps in metal_backend.rs), so no
+            // ObjC temporaries survive a forward even on a pool-less worker thread.
             let num_groups = self.weights.layers.len();
             for i in 0..self.config.num_hidden_layers {
                 let layer = &self.weights.layers[i % num_groups];
@@ -1449,15 +1471,10 @@ impl BertModel {
             };
 
             let ffn_down = if let Some(ref gate_weight) = layer.ffn_gate_weight {
-                let gate = self.linear(&ffn_input, gate_weight, None);
-                let up = self.linear(
+                self.ffn_swiglu(
                     &ffn_input,
+                    gate_weight,
                     layer.ffn_up_weight.as_ref().expect("ffn_up_weight missing"),
-                    None,
-                );
-                let activated = self.swiglu(&gate, &up);
-                self.linear(
-                    &activated,
                     &layer.ffn_down_weight,
                     layer.ffn_down_bias.as_ref(),
                 )
@@ -1778,6 +1795,54 @@ impl BertModel {
         }
     }
 
+    /// Full SwiGLU feed-forward block: `down( silu(x@gate^T) * (x@up^T) )`.
+    ///
+    /// On an accelerator backend with no down-projection bias and contiguous
+    /// inputs, the whole chain is fused into one GPU submission (3 matmuls + the
+    /// SwiGLU activation), collapsing the per-op commit+wait round-trips that
+    /// dominate embedding latency. Otherwise it falls back to the per-op path,
+    /// which is the numerical reference.
+    fn ffn_swiglu(
+        &self,
+        x: &Array2<f32>,
+        gate_w: &Array2<f32>,
+        up_w: &Array2<f32>,
+        down_w: &Array2<f32>,
+        down_bias: Option<&Array1<f32>>,
+    ) -> Array2<f32> {
+        let _span = tracing::info_span!(
+            "kin_infer.model.ffn_swiglu",
+            rows = x.nrows(),
+            hidden = x.ncols(),
+            inter = gate_w.nrows(),
+            backend = %self.backend()
+        )
+        .entered();
+        if embed_pipeline_enabled() {
+            if let Some(ref gpu) = self.gpu {
+                if down_bias.is_none() {
+                    if let (Some(xs), Some(gw), Some(uw), Some(dw)) = (
+                        x.as_slice(),
+                        gate_w.as_slice(),
+                        up_w.as_slice(),
+                        down_w.as_slice(),
+                    ) {
+                        let rows = x.nrows();
+                        let hidden = x.ncols();
+                        let inter = gate_w.nrows();
+                        let out = gpu.fused_ffn_swiglu(xs, gw, uw, dw, rows, hidden, inter);
+                        return Array2::from_shape_vec((rows, hidden), out)
+                            .expect("fused_ffn_swiglu shape");
+                    }
+                }
+            }
+        }
+        let gate = self.linear(x, gate_w, None);
+        let up = self.linear(x, up_w, None);
+        let activated = self.swiglu(&gate, &up);
+        self.linear(&activated, down_w, down_bias)
+    }
+
     /// GPU-accelerated RoPE helper.
     fn rope(&self, x: &mut Array2<f32>, seq_offset: usize, seq_len: usize, head_dim: usize) {
         let _span = tracing::info_span!(
@@ -1797,6 +1862,75 @@ impl BertModel {
                 apply_rope(x, cos, sin, seq_offset, seq_len, head_dim);
             }
         }
+    }
+
+    /// Apply RoPE to Q and K together. On an accelerator backend both rotations
+    /// are submitted in one command buffer (they share the cos/sin tables and
+    /// are mutually independent), halving the RoPE round-trips per layer. Falls
+    /// back to two independent `rope` calls otherwise. No-op without RoPE tables.
+    fn rope_qk(&self, q: &mut Array2<f32>, k: &mut Array2<f32>, seq_len: usize, head_dim: usize) {
+        // Default-off: take the original two-submission path unless the fused
+        // command-buffer pipeline is explicitly enabled.
+        if !embed_pipeline_enabled() {
+            self.rope(q, 0, seq_len, head_dim);
+            self.rope(k, 0, seq_len, head_dim);
+            return;
+        }
+        let (Some(cos), Some(sin)) = (&self.rope_cos, &self.rope_sin) else {
+            return;
+        };
+        let gpu = match &self.gpu {
+            Some(gpu) => gpu.as_ref(),
+            None => {
+                self.rope(q, 0, seq_len, head_dim);
+                self.rope(k, 0, seq_len, head_dim);
+                return;
+            }
+        };
+        let total_dim = q.ncols();
+        let half = head_dim / 2;
+        let max_rows = cos.nrows().min(sin.nrows());
+        let actual = max_rows.min(seq_len);
+        if actual == 0 {
+            return;
+        }
+
+        // Both Q and K must be contiguous and same-width to share one submission.
+        let q_contig = q.as_slice().is_some();
+        let k_owned = if k.ncols() == total_dim {
+            k.as_slice().map(|s| s.to_vec())
+        } else {
+            None
+        };
+        let (true, Some(mut k_vec)) = (q_contig, k_owned) else {
+            self.rope(q, 0, seq_len, head_dim);
+            self.rope(k, 0, seq_len, head_dim);
+            return;
+        };
+
+        let mut cos_compact = Vec::with_capacity(actual * half);
+        let mut sin_compact = Vec::with_capacity(actual * half);
+        for pos in 0..actual {
+            for d in 0..half {
+                cos_compact.push(cos[[pos, d]]);
+                sin_compact.push(sin[[pos, d]]);
+            }
+        }
+
+        let q_slice = q.as_slice_mut().expect("q contiguous");
+        gpu.rope_pair(
+            q_slice,
+            &mut k_vec,
+            &cos_compact,
+            &sin_compact,
+            0,
+            actual,
+            head_dim,
+            total_dim,
+        );
+        k.as_slice_mut()
+            .expect("k contiguous")
+            .copy_from_slice(&k_vec);
     }
 
     /// Single encoder transformer layer with support for all attention/norm variants.
@@ -1863,10 +1997,9 @@ impl BertModel {
 
         let (mut q, mut k, v) = self.project_qkv(attn_input, layer, eps);
 
-        // Apply RoPE if configured.
+        // Apply RoPE if configured (Q and K in one GPU submission).
         let seq_len = q.nrows();
-        self.rope(&mut q, 0, seq_len, self.head_dim);
-        self.rope(&mut k, 0, seq_len, self.head_dim);
+        self.rope_qk(&mut q, &mut k, seq_len, self.head_dim);
 
         // GQA: repeat K/V heads if needed
         let (k_full, v_full) = if num_kv_heads < num_heads {
@@ -2065,19 +2198,14 @@ impl BertModel {
         };
 
         let ffn_down = if let Some(ref gate_weight) = layer.ffn_gate_weight {
-            // SwiGLU: silu(gate) * up (GPU-accelerated matmuls)
-            let gate = self.linear(&ffn_input, gate_weight, None);
-            let up = self.linear(
+            // SwiGLU: silu(gate) * up (fused GPU FFN when no down-bias)
+            self.ffn_swiglu(
                 &ffn_input,
+                gate_weight,
                 layer
                     .ffn_up_weight
                     .as_ref()
                     .expect("ffn_up_weight missing for SwiGLU"),
-                None,
-            );
-            let activated = self.swiglu(&gate, &up);
-            self.linear(
-                &activated,
                 &layer.ffn_down_weight,
                 layer.ffn_down_bias.as_ref(),
             )
@@ -2279,14 +2407,13 @@ impl BertModel {
             );
 
             let ffn_out = if let Some(ref gate_w) = layer.ffn_gate_weight {
-                let gate = self.linear(&normed2, gate_w, None);
-                let up = self.linear(
+                self.ffn_swiglu(
                     &normed2,
+                    gate_w,
                     layer.ffn_up_weight.as_ref().expect("ffn_up_weight missing"),
-                    None,
-                );
-                let act = self.swiglu(&gate, &up);
-                self.linear(&act, &layer.ffn_down_weight, layer.ffn_down_bias.as_ref())
+                    &layer.ffn_down_weight,
+                    layer.ffn_down_bias.as_ref(),
+                )
             } else {
                 let up = self.linear(
                     &normed2,

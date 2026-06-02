@@ -207,6 +207,39 @@ pub trait GpuCompute: Send + Sync {
     /// Element-wise multiply: out[i] = a[i] * b[i].
     fn elementwise_mul(&self, a: &mut [f32], b: &[f32]);
 
+    /// Fused SwiGLU feed-forward block in a single GPU submission:
+    ///
+    /// ```text
+    /// gate = x @ w_gate^T          // [rows, inter]
+    /// up   = x @ w_up^T            // [rows, inter]
+    /// act  = silu(gate) * up       // [rows, inter]
+    /// out  = act @ w_down^T        // [rows, hidden]
+    /// ```
+    ///
+    /// `x` is `[rows, hidden]` row-major; `w_gate`/`w_up` are `[inter, hidden]`,
+    /// `w_down` is `[hidden, inter]` (all row-major, matmul-`B^T` convention).
+    /// Returns the `[rows, hidden]` down-projection.
+    ///
+    /// The default implementation chains the existing primitives and is the
+    /// numerical reference; accelerator backends override this to keep the whole
+    /// chain resident on-device with a single host synchronization.
+    fn fused_ffn_swiglu(
+        &self,
+        x: &[f32],
+        w_gate: &[f32],
+        w_up: &[f32],
+        w_down: &[f32],
+        rows: usize,
+        hidden: usize,
+        inter: usize,
+    ) -> Vec<f32> {
+        let mut gate = self.matmul(x, w_gate, rows, inter, hidden);
+        let up = self.matmul(x, w_up, rows, inter, hidden);
+        self.silu(&mut gate);
+        self.elementwise_mul(&mut gate, &up);
+        self.matmul(&gate, w_down, rows, hidden, inter)
+    }
+
     /// RoPE: apply rotary position encoding in-place.
     fn rope(
         &self,
@@ -218,6 +251,26 @@ pub trait GpuCompute: Send + Sync {
         head_dim: usize,
         total_dim: usize,
     );
+
+    /// Apply RoPE to two tensors (typically Q and K) sharing the same cos/sin
+    /// tables, in a single GPU submission. Q and K are independent, so a backend
+    /// can encode both rotations into one command buffer and synchronize once.
+    /// The default applies them sequentially via `rope`.
+    #[allow(clippy::too_many_arguments)]
+    fn rope_pair(
+        &self,
+        q: &mut [f32],
+        k: &mut [f32],
+        cos_table: &[f32],
+        sin_table: &[f32],
+        seq_offset: usize,
+        seq_len: usize,
+        head_dim: usize,
+        total_dim: usize,
+    ) {
+        self.rope(q, cos_table, sin_table, seq_offset, seq_len, head_dim, total_dim);
+        self.rope(k, cos_table, sin_table, seq_offset, seq_len, head_dim, total_dim);
+    }
 
     /// Fused attention: Q×K^T → scale+ALiBi+mask → softmax → scores×V
     /// in a single GPU submission. Returns [num_heads, seq_len, head_dim].
@@ -346,7 +399,12 @@ pub fn create_compute() -> Box<dyn GpuCompute> {
 }
 
 fn should_parallelize(work_items: usize) -> bool {
-    rayon::current_num_threads() > 1 && work_items >= 8_192
+    // Parallelize once there is enough work to amortize rayon's per-task dispatch.
+    // The heavy kernels (matmul m*n*k) are millions of items and always cross this;
+    // the floor only governs the cheap element-wise/norm ops. 4096 is below a
+    // single short-sequence LayerNorm/softmax (so those engage the cores too) while
+    // still keeping trivially small tensors single-threaded.
+    rayon::current_num_threads() > 1 && work_items >= 4_096
 }
 
 // ---------------------------------------------------------------------------
@@ -395,19 +453,21 @@ impl GpuCompute for CpuCompute {
         let out_stride = seq_len * seq_len;
 
         if should_parallelize(num_heads * seq_len * seq_len * head_dim) {
+            // Parallelize over (head x query-row): num_heads*seq_len work units, so
+            // all cores engage even when num_heads (e.g. 12) < core count (18).
+            // One output score-row [seq_len] per unit.
             scores
-                .par_chunks_mut(out_stride)
+                .par_chunks_mut(seq_len)
                 .enumerate()
-                .for_each(|(h, head_scores)| {
+                .for_each(|(unit, row)| {
+                    let h = unit / seq_len;
+                    let i = unit % seq_len;
                     let q_head = &q[h * head_stride..(h + 1) * head_stride];
                     let k_head = &k[h * head_stride..(h + 1) * head_stride];
-                    for i in 0..seq_len {
-                        let q_row = &q_head[i * head_dim..(i + 1) * head_dim];
-                        let row = &mut head_scores[i * seq_len..(i + 1) * seq_len];
-                        for (j, slot) in row.iter_mut().enumerate() {
-                            let k_row = &k_head[j * head_dim..(j + 1) * head_dim];
-                            *slot = crate::dot_product(q_row, k_row);
-                        }
+                    let q_row = &q_head[i * head_dim..(i + 1) * head_dim];
+                    for (j, slot) in row.iter_mut().enumerate() {
+                        let k_row = &k_head[j * head_dim..(j + 1) * head_dim];
+                        *slot = crate::dot_product(q_row, k_row);
                     }
                 });
         } else {
@@ -441,20 +501,21 @@ impl GpuCompute for CpuCompute {
         let mut result = vec![0.0f32; num_heads * v_stride];
 
         if should_parallelize(num_heads * seq_len * seq_len * head_dim) {
+            // Parallelize over (head x query-row): one output row [head_dim] per
+            // unit, so all cores engage even when num_heads < core count.
             result
-                .par_chunks_mut(v_stride)
+                .par_chunks_mut(head_dim)
                 .enumerate()
-                .for_each(|(h, head_out)| {
-                    for i in 0..seq_len {
-                        let row = &mut head_out[i * head_dim..(i + 1) * head_dim];
-                        for (j, slot) in row.iter_mut().enumerate() {
-                            let mut sum = 0.0f32;
-                            for k_idx in 0..seq_len {
-                                sum += scores[h * s_stride + i * seq_len + k_idx]
-                                    * v[h * v_stride + k_idx * head_dim + j];
-                            }
-                            *slot = sum;
+                .for_each(|(unit, row)| {
+                    let h = unit / seq_len;
+                    let i = unit % seq_len;
+                    for (j, slot) in row.iter_mut().enumerate() {
+                        let mut sum = 0.0f32;
+                        for k_idx in 0..seq_len {
+                            sum += scores[h * s_stride + i * seq_len + k_idx]
+                                * v[h * v_stride + k_idx * head_dim + j];
                         }
+                        *slot = sum;
                     }
                 });
         } else {
