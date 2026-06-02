@@ -1,3 +1,5 @@
+> **Umbrella guidance:** the workspace-root `AGENTS.md` is the source of truth for cross-repo thesis, boundaries, and rules. This file is the repo-specific authority for `kin-blobs`.
+
 # kin-blobs
 
 Content-addressable blob store in Rust. SHA-256 hashing, Git-style sharding, atomic writes.
