@@ -536,6 +536,11 @@ impl BertEmbedder {
             .filter(|value| *value > 0)
             .unwrap_or_else(|| default_max_batch_tokens(self.model.backend()));
 
+        let mode = hybrid_mode();
+        if mode != HybridMode::Off {
+            return self.embed_hybrid(encoded, dimensions, max_batch_tokens, texts.len(), mode);
+        }
+
         let mut results: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
         let mut start = 0usize;
         while start < encoded.len() {
@@ -662,6 +667,221 @@ impl BertEmbedder {
                 })
             })
             .collect()
+    }
+
+    fn embed_hybrid(
+        &self,
+        encoded: Vec<Encoded>,
+        dimensions: usize,
+        max_batch_tokens: usize,
+        total: usize,
+        mode: HybridMode,
+    ) -> Result<Vec<Vec<f32>>, KinDbError> {
+        let placed = match mode {
+            HybridMode::Off => unreachable!("embed_hybrid is only called for enabled modes"),
+            HybridMode::SeqFloor => {
+                let split =
+                    encoded.partition_point(|(_, ids, _)| ids.len() <= EMBED_CPU_SEQ_THRESHOLD);
+                let (short, long) = encoded.split_at(split);
+                self.dispatch_concurrent(short, long, dimensions, max_batch_tokens)?
+            }
+            HybridMode::Balanced { gpu_tput_ratio } => {
+                let (metal_subset, cpu_subset) = balanced_partition(&encoded, gpu_tput_ratio);
+                let metal_tokens: usize = metal_subset.iter().map(|(_, ids, _)| ids.len()).sum();
+                let cpu_tokens: usize = cpu_subset.iter().map(|(_, ids, _)| ids.len()).sum();
+                tracing::info!(
+                    target: "kindb.embed.dispatch",
+                    metal_entities = metal_subset.len(),
+                    cpu_entities = cpu_subset.len(),
+                    metal_tokens = metal_tokens,
+                    cpu_tokens = cpu_tokens,
+                    gpu_tput_ratio = gpu_tput_ratio,
+                    cpu_threads = rayon::current_num_threads(),
+                    "embed_hybrid_balance"
+                );
+                self.dispatch_concurrent(&metal_subset, &cpu_subset, dimensions, max_batch_tokens)?
+            }
+        };
+
+        let mut results: Vec<Option<Vec<f32>>> = vec![None; total];
+        for (original_idx, vector) in placed {
+            results[original_idx] = Some(vector);
+        }
+        results
+            .into_iter()
+            .map(|vector| {
+                vector.ok_or_else(|| {
+                    KinDbError::IndexError("embedding batch result order mismatch".into())
+                })
+            })
+            .collect()
+    }
+
+    fn process_encoded_subset(
+        &self,
+        encoded: &[(usize, Vec<u32>, Vec<u32>)],
+        dimensions: usize,
+        max_batch_tokens: usize,
+        backend_override: Option<EmbedBackendChoice>,
+    ) -> Result<Vec<(usize, Vec<f32>)>, KinDbError> {
+        let mut placed: Vec<(usize, Vec<f32>)> = Vec::with_capacity(encoded.len());
+        let mut start = 0usize;
+        while start < encoded.len() {
+            let mut end = start;
+            let mut longest = 0usize;
+
+            while end < encoded.len() {
+                let candidate_len = encoded[end].1.len().max(1);
+                let projected_longest = longest.max(candidate_len);
+                let projected_tokens = projected_longest * (end - start + 1);
+                if end > start && projected_tokens > max_batch_tokens {
+                    break;
+                }
+                longest = projected_longest;
+                end += 1;
+            }
+
+            let batch = &encoded[start..end];
+            let token_ids: Vec<Vec<u32>> = batch.iter().map(|(_, ids, _)| ids.clone()).collect();
+            let attention_masks: Vec<Vec<u32>> =
+                batch.iter().map(|(_, _, mask)| mask.clone()).collect();
+
+            let backend_choice = backend_override.unwrap_or_else(|| resolve_embed_backend(longest));
+            let vectors = match backend_choice {
+                EmbedBackendChoice::Metal { reason } => {
+                    tracing::info!(
+                        target: "kindb.embed.dispatch",
+                        batch_size = batch.len(),
+                        max_seq = longest,
+                        backend = "metal",
+                        reason = reason,
+                        "embed_dispatch"
+                    );
+                    let _span = tracing::info_span!(
+                        "kindb.embedder.forward_batch",
+                        batch = batch.len(),
+                        longest = longest
+                    )
+                    .entered();
+                    self.model
+                        .forward_batched(&token_ids, &attention_masks)
+                        .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))?
+                }
+                EmbedBackendChoice::Cpu { reason } => {
+                    tracing::info!(
+                        target: "kindb.embed.dispatch",
+                        batch_size = batch.len(),
+                        max_seq = longest,
+                        backend = "cpu",
+                        reason = reason,
+                        "embed_dispatch"
+                    );
+                    let _span = tracing::info_span!(
+                        "kindb.embedder.forward_cpu_path",
+                        batch = batch.len(),
+                        longest = longest
+                    )
+                    .entered();
+                    let cpu_model = match self.cpu_model() {
+                        Ok(m) => Some(m),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "cpu_model unavailable; falling back to primary model for this chunk"
+                            );
+                            None
+                        }
+                    };
+                    let model = cpu_model.unwrap_or(&self.model);
+                    model
+                        .forward_batched(&token_ids, &attention_masks)
+                        .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))?
+                }
+            };
+
+            let vectors = if vectors.iter().any(|v| !v.iter().all(|x| x.is_finite())) {
+                tracing::warn!(
+                    batch = batch.len(),
+                    longest = longest,
+                    "dispatched path produced non-finite vectors; retrying via single-input forward path"
+                );
+                let mut retried = Vec::with_capacity(batch.len());
+                for (ids, mask) in token_ids.iter().zip(attention_masks.iter()) {
+                    let out = self
+                        .model
+                        .forward(std::slice::from_ref(ids), std::slice::from_ref(mask))
+                        .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))?;
+                    retried.push(out.into_iter().next().ok_or_else(|| {
+                        KinDbError::IndexError("forward returned empty batch".into())
+                    })?);
+                }
+                retried
+            } else {
+                vectors
+            };
+
+            for ((original_idx, _, _), vector) in batch.iter().zip(vectors.into_iter()) {
+                if vector.len() != dimensions {
+                    return Err(KinDbError::IndexError(format!(
+                        "embedding returned {} dimensions, expected {}",
+                        vector.len(),
+                        dimensions
+                    )));
+                }
+                placed.push((*original_idx, vector));
+            }
+            start = end;
+        }
+
+        Ok(placed)
+    }
+
+    fn dispatch_concurrent(
+        &self,
+        metal_side: &[Encoded],
+        cpu_side: &[Encoded],
+        dimensions: usize,
+        max_batch_tokens: usize,
+    ) -> Result<Vec<(usize, Vec<f32>)>, KinDbError> {
+        if metal_side.is_empty() {
+            return self.process_encoded_subset(cpu_side, dimensions, max_batch_tokens, None);
+        }
+        if cpu_side.is_empty() {
+            return self.process_encoded_subset(metal_side, dimensions, max_batch_tokens, None);
+        }
+
+        if let Err(e) = self.cpu_model() {
+            tracing::warn!(
+                error = %e,
+                "cpu_model prewarm failed before hybrid dispatch; cpu subset will fall back to primary model"
+            );
+        }
+
+        let (metal_res, cpu_res) = rayon::join(
+            || {
+                self.process_encoded_subset(
+                    metal_side,
+                    dimensions,
+                    max_batch_tokens,
+                    Some(EmbedBackendChoice::Metal {
+                        reason: "hybrid_metal",
+                    }),
+                )
+            },
+            || {
+                self.process_encoded_subset(
+                    cpu_side,
+                    dimensions,
+                    max_batch_tokens,
+                    Some(EmbedBackendChoice::Cpu {
+                        reason: "hybrid_cpu",
+                    }),
+                )
+            },
+        );
+        let mut merged = metal_res?;
+        merged.extend(cpu_res?);
+        Ok(merged)
     }
 
     /// Lazily construct (or return) the CPU-only BertModel twin.
@@ -1259,6 +1479,96 @@ const EMBED_AUTO_PREFERS_CPU: bool = false;
 enum EmbedBackendChoice {
     Metal { reason: &'static str },
     Cpu { reason: &'static str },
+}
+
+#[cfg(feature = "embeddings")]
+const HYBRID_DEFAULT_GPU_TPUT_RATIO: f64 = 4.0;
+
+#[cfg(feature = "embeddings")]
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HybridMode {
+    Off,
+    SeqFloor,
+    Balanced { gpu_tput_ratio: f64 },
+}
+
+#[cfg(feature = "embeddings")]
+fn hybrid_mode() -> HybridMode {
+    let raw = match std::env::var("KIN_EMBED_HYBRID") {
+        Ok(v) => v.trim().to_ascii_lowercase(),
+        Err(_) => return HybridMode::Off,
+    };
+    let enabled = !matches!(raw.as_str(), "" | "0" | "false" | "off" | "no");
+    if !enabled || EMBED_AUTO_PREFERS_CPU {
+        return HybridMode::Off;
+    }
+    let backend = std::env::var("KIN_EMBED_BACKEND")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "auto".to_string());
+    if !matches!(backend.as_str(), "auto" | "") {
+        return HybridMode::Off;
+    }
+    if matches!(raw.as_str(), "seq" | "floor" | "seqfloor" | "seq_floor") {
+        return HybridMode::SeqFloor;
+    }
+    let gpu_tput_ratio = std::env::var("KIN_EMBED_HYBRID_GPU_TPUT_RATIO")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(HYBRID_DEFAULT_GPU_TPUT_RATIO);
+    HybridMode::Balanced { gpu_tput_ratio }
+}
+
+#[cfg(feature = "embeddings")]
+type Encoded = (usize, Vec<u32>, Vec<u32>);
+
+#[cfg(feature = "embeddings")]
+fn balanced_partition(encoded: &[Encoded], gpu_tput_ratio: f64) -> (Vec<Encoded>, Vec<Encoded>) {
+    let ceiling_split = encoded.partition_point(|(_, ids, _)| ids.len() <= EMBED_CPU_SEQ_THRESHOLD);
+    let short = &encoded[..ceiling_split];
+    let long = &encoded[ceiling_split..];
+
+    let work = |ids: &[u32]| ids.len().max(1) as f64;
+    let w_short: f64 = short.iter().map(|(_, ids, _)| work(ids)).sum();
+    let w_long: f64 = long.iter().map(|(_, ids, _)| work(ids)).sum();
+
+    let target_metal =
+        ((gpu_tput_ratio * w_short - w_long) / (gpu_tput_ratio + 1.0)).clamp(0.0, w_short);
+
+    let mut order: Vec<usize> = (0..short.len()).collect();
+    order.sort_by(|&a, &b| {
+        short[b]
+            .1
+            .len()
+            .cmp(&short[a].1.len())
+            .then(short[a].0.cmp(&short[b].0))
+    });
+
+    let mut to_metal = vec![false; short.len()];
+    let mut metal_work = 0.0;
+    let mut metal_count = 0usize;
+    for pos in order {
+        let w = work(&short[pos].1);
+        if target_metal > 0.0 && (metal_work + w <= target_metal || metal_count == 0) {
+            metal_work += w;
+            metal_count += 1;
+            to_metal[pos] = true;
+        }
+    }
+
+    let mut metal_subset: Vec<Encoded> = Vec::with_capacity(metal_count);
+    let mut cpu_subset: Vec<Encoded> = Vec::with_capacity(encoded.len() - metal_count);
+    for (pos, entry) in short.iter().enumerate() {
+        if to_metal[pos] {
+            metal_subset.push(entry.clone());
+        } else {
+            cpu_subset.push(entry.clone());
+        }
+    }
+    cpu_subset.extend(long.iter().cloned());
+
+    (metal_subset, cpu_subset)
 }
 
 /// Pick the inference path for a chunk based on `KIN_EMBED_BACKEND` and the
