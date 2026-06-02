@@ -2084,11 +2084,13 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         );
     }
 
-    // D_empty lever (default OFF == byte-identical): files located by a
-    // file-level/lexical signal with no resolved entity emit zero symbols and
-    // are a guaranteed symbol+line miss. When enabled, backfill their symbol
-    // list from the file's graph definitions, ranked by query proximity.
-    if locate_env_bool("KIN_LOCATE_ENRICH_EMPTY_FILES", false) {
+    // D_empty lever (default ON — measurement-backed: 51/51 official scorer,
+    // symbol-F1 +17% with precision EXACTLY flat, a clean Pareto win). Files
+    // located by a file-level/lexical signal with no resolved entity emit zero
+    // symbols and are a guaranteed symbol+line miss; backfill their symbol list
+    // from the file's graph definitions, ranked by query proximity. Set
+    // KIN_LOCATE_ENRICH_EMPTY_FILES=0 to disable.
+    if locate_env_bool("KIN_LOCATE_ENRICH_EMPTY_FILES", true) {
         let enrich_terms = tracked_text_query_terms(text);
         enrich_empty_file_symbols(
             graph,
@@ -10343,14 +10345,14 @@ fn rank_enriched_symbols(
     syms
 }
 
-/// D_empty lever (gated `KIN_LOCATE_ENRICH_EMPTY_FILES`, default OFF). For final
-/// result files that surfaced via a file-level/lexical signal but had NO entity
-/// resolved to them — so their per-file symbol list is empty and the symbol+line
-/// metrics are a guaranteed miss even though the FILE was located correctly —
-/// enumerate the file's definitions from the graph and emit the top
-/// query-relevant ones (`KIN_LOCATE_ENRICH_TOPK`, default 3). GPU-free; only
-/// touches files that currently emit nothing, so OFF (and any file that already
-/// has resolved symbols) is byte-identical.
+/// D_empty lever (`KIN_LOCATE_ENRICH_EMPTY_FILES`, default ON — set to 0 to
+/// disable). For final result files that surfaced via a file-level/lexical
+/// signal but had NO entity resolved to them — so their per-file symbol list is
+/// empty and the symbol+line metrics are a guaranteed miss even though the FILE
+/// was located correctly — enumerate the file's definitions from the graph and
+/// emit the top query-relevant ones (`KIN_LOCATE_ENRICH_TOPK`, default 3).
+/// GPU-free; only touches files that currently emit nothing, so files that
+/// already have resolved symbols are unaffected.
 fn enrich_empty_file_symbols(
     graph: &kin_db::InMemoryGraph,
     results: &[(String, f32)],
@@ -10676,17 +10678,15 @@ fn entity_span_pair(entity: &kin_model::Entity) -> Vec<[u32; 2]> {
         entity.kind,
         EntityKind::Class | EntityKind::Interface | EntityKind::Module
     );
-    // SPAN-WIDTH lever (default OFF == current bytes): class-like entities with
-    // long bodies are truncated to a short head window for symbol/line
-    // PRECISION, but that caps line RECALL against multi-line gold regions (gold
-    // spans run 34-210 lines; a 5-line head can cover at most ~0.15 of them).
-    // KIN_LOCATE_SPAN_FULL_EXTENT=1 emits the full node extent;
-    // KIN_LOCATE_SPAN_CLASS_HEAD_THRESHOLD raises the length bound above which
-    // truncation applies. Both default to the historical 30-line threshold /
-    // 5-line head, so unset is byte-identical and the lead can A/B the
-    // precision/recall tradeoff.
+    // SPAN-WIDTH lever: class-like entities with long bodies are truncated to a
+    // short head window for symbol/line PRECISION, but that caps line RECALL
+    // against multi-line gold regions (gold spans run 34-210 lines; a 5-line head
+    // can cover at most ~0.15 of them). KIN_LOCATE_SPAN_CLASS_HEAD_THRESHOLD is
+    // the length bound above which truncation applies — default 60
+    // (measurement-backed line lever; was 30), env-overridable.
+    // KIN_LOCATE_SPAN_FULL_EXTENT=1 emits the full node extent instead.
     let full_extent = locate_env_bool("KIN_LOCATE_SPAN_FULL_EXTENT", false);
-    let head_threshold = locate_env_usize("KIN_LOCATE_SPAN_CLASS_HEAD_THRESHOLD", 30) as u32;
+    let head_threshold = locate_env_usize("KIN_LOCATE_SPAN_CLASS_HEAD_THRESHOLD", 60) as u32;
     vec![entity_span_lines(s, is_class_like, full_extent, head_threshold)]
 }
 
