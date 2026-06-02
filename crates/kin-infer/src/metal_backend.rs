@@ -500,6 +500,158 @@ kernel void scale_mask_alibi_grouped(
 "#;
 
 // ---------------------------------------------------------------------------
+// Bounded in-flight submission
+// ---------------------------------------------------------------------------
+//
+// The naive per-op path commits a command buffer and immediately blocks in
+// `wait_until_completed`, so ~145 of these round-trips serialize the host
+// against the GPU per forward pass (measured ~69% of wall on M5 Max). The
+// bounded submitter instead commits WITHOUT waiting and registers a completion
+// handler; a depth counter capped at `MAX_INFLIGHT` keeps at most a few command
+// buffers (and their resident intermediates) outstanding. When the cap is hit
+// the submitter PARKS on a condvar — it does not busy-spin (the unbounded
+// busy-spin pile-up is exactly what hung large cold embeds). This caps resident
+// intermediate memory at ~MAX_INFLIGHT× a layer's working set regardless of
+// repo size.
+
+/// Maximum number of committed-but-incomplete command buffers. 2–3 is the
+/// documented sweet spot: low enough to bound resident memory, high enough to
+/// overlap host encoding with GPU execution.
+const MAX_INFLIGHT: u32 = 3;
+
+/// Shared in-flight depth counter + condvar. The submitter increments on commit
+/// and parks while depth ≥ MAX_INFLIGHT; the completion handler decrements and
+/// notifies — on BOTH success and Error, so an errored buffer can never deadlock
+/// the submitter.
+type InflightGate = Arc<(Mutex<u32>, Condvar)>;
+
+/// A size-classed free-list of `StorageModeShared` buffers. Recycling a buffer
+/// back onto the list avoids the per-op `new_buffer` churn that otherwise mints
+/// a fresh MTLBuffer for every activation/output tensor. Buffers only return to
+/// the list once the GPU is done with them (recycling is tied to the completion
+/// handler that owns the `PooledBuffer`, never to Rust scope exit while the
+/// buffer may still be GPU-resident).
+struct BufferPool {
+    device: Device,
+    free: Mutex<HashMap<usize, Vec<Buffer>>>,
+}
+
+/// Round a byte count up to its allocation size-class. Powers of two up to 64KB,
+/// then 64KB-aligned, so distinct-but-similar tensor sizes share a free-list slot
+/// without unbounded class fragmentation.
+#[inline]
+fn size_class(bytes: usize) -> usize {
+    let bytes = bytes.max(1);
+    const CHUNK: usize = 64 * 1024;
+    if bytes <= CHUNK {
+        bytes.next_power_of_two()
+    } else {
+        bytes.div_ceil(CHUNK) * CHUNK
+    }
+}
+
+impl BufferPool {
+    fn new(device: Device) -> Self {
+        Self {
+            device,
+            free: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Acquire a buffer of at least `bytes`, zero-filled. Pops a recycled buffer
+    /// of the matching size-class and re-zeros it (preserving the `buf_zeros`
+    /// determinism guarantee), else allocates a fresh `StorageModeShared` buffer
+    /// of the class size.
+    fn acquire_zeroed(self: &Arc<Self>, bytes: usize) -> PooledBuffer {
+        let class = size_class(bytes);
+        let buf = self.free.lock().get_mut(&class).and_then(|v| v.pop());
+        let buf = match buf {
+            Some(buf) => {
+                unsafe {
+                    std::ptr::write_bytes(buf.contents() as *mut u8, 0, class);
+                }
+                buf
+            }
+            None => self
+                .device
+                .new_buffer(class as u64, MTLResourceOptions::StorageModeShared),
+        };
+        PooledBuffer {
+            buf,
+            class,
+            pool: Arc::clone(self),
+        }
+    }
+
+    /// Acquire a buffer initialised from `data`. Pops a recycled buffer of the
+    /// matching size-class and copies `data` into its head, else allocates.
+    fn acquire_with(self: &Arc<Self>, data: &[f32]) -> PooledBuffer {
+        let bytes = std::mem::size_of_val(data);
+        let class = size_class(bytes);
+        let buf = self.free.lock().get_mut(&class).and_then(|v| v.pop());
+        let buf = match buf {
+            Some(buf) => {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr() as *const u8,
+                        buf.contents() as *mut u8,
+                        bytes,
+                    );
+                }
+                buf
+            }
+            None => {
+                let buf = self
+                    .device
+                    .new_buffer(class as u64, MTLResourceOptions::StorageModeShared);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr() as *const u8,
+                        buf.contents() as *mut u8,
+                        bytes,
+                    );
+                }
+                buf
+            }
+        };
+        PooledBuffer {
+            buf,
+            class,
+            pool: Arc::clone(self),
+        }
+    }
+
+    fn recycle(&self, class: usize, buf: Buffer) {
+        self.free.lock().entry(class).or_default().push(buf);
+    }
+}
+
+/// RAII handle to a pooled buffer. On drop the underlying `Buffer` returns to
+/// the free-list. Drop is the recycling point, but pooled buffers used by an
+/// async-committed command buffer are MOVED into the completion-handler closure
+/// (`commit_bounded`'s `retain` vec), so they only drop — and only recycle —
+/// after the GPU signals completion. Buffers read back synchronously drop after
+/// the method's own `wait_until_completed`, which is likewise GPU-safe.
+struct PooledBuffer {
+    buf: Buffer,
+    class: usize,
+    pool: Arc<BufferPool>,
+}
+
+impl PooledBuffer {
+    #[inline]
+    fn buffer(&self) -> &Buffer {
+        &self.buf
+    }
+}
+
+impl Drop for PooledBuffer {
+    fn drop(&mut self) {
+        self.pool.recycle(self.class, self.buf.clone());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Metal compute context
 // ---------------------------------------------------------------------------
 
@@ -515,6 +667,10 @@ pub struct MetalCompute {
     /// Cache stable u32 buffers like flattened masks that are reused across
     /// every layer in a batch.
     u32_cache: Mutex<HashMap<(usize, usize), Buffer>>,
+    /// Bounded in-flight depth gate shared with completion handlers.
+    inflight: InflightGate,
+    /// Size-classed activation/output buffer pool.
+    pool: Arc<BufferPool>,
 }
 
 impl MetalCompute {
@@ -569,6 +725,7 @@ impl MetalCompute {
             pipelines.insert(name, pipeline);
         }
 
+        let pool = Arc::new(BufferPool::new(device.clone()));
         Some(Self {
             device,
             queue,
@@ -576,6 +733,8 @@ impl MetalCompute {
             device_name,
             weight_cache: Mutex::new(HashMap::new()),
             u32_cache: Mutex::new(HashMap::new()),
+            inflight: Arc::new((Mutex::new(0), Condvar::new())),
+            pool,
         })
     }
 
@@ -692,6 +851,60 @@ impl MetalCompute {
         let ptr = buf.contents() as *const f32;
         let src = unsafe { std::slice::from_raw_parts(ptr, dst.len()) };
         dst.copy_from_slice(src);
+    }
+
+    /// Commit `cmd` for asynchronous GPU execution under a bounded in-flight cap.
+    ///
+    /// Unlike `commit_and_wait`, this does NOT block on `wait_until_completed`:
+    /// it registers a completion handler that decrements the in-flight depth and
+    /// recycles the `retain`ed pooled buffers once the GPU is done, then commits.
+    /// The submitter parks (does not spin) when depth reaches `MAX_INFLIGHT`, so
+    /// at most a few command buffers — and their resident intermediates — are
+    /// outstanding at once. `retain` must hold every pooled buffer the command
+    /// buffer reads or writes, so none is recycled while still GPU-resident.
+    fn commit_bounded(&self, cmd: &CommandBufferRef, retain: Vec<PooledBuffer>) {
+        // Backpressure: park until an in-flight slot frees. parking_lot's Condvar
+        // parks the OS thread (idle-detectable) rather than busy-spinning.
+        let blocked_start = profile_enabled().then(std::time::Instant::now);
+        {
+            let (lock, cvar) = &*self.inflight;
+            let mut depth = lock.lock();
+            while *depth >= MAX_INFLIGHT {
+                cvar.wait(&mut depth);
+            }
+            *depth += 1;
+        }
+        if let Some(start) = blocked_start {
+            STALL_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+
+        // Completion handler: runs on a GPU-driver thread when the buffer
+        // finishes. Decrement + notify on BOTH success and Error so an errored
+        // buffer can never deadlock the submitter; dropping `retain` here returns
+        // the pooled buffers to the free-list only after the GPU is done. The
+        // `block` 0.1 crate requires a `Fn` closure, so the once-fired `take` of
+        // the retained buffers goes through a Mutex for interior mutability.
+        let inflight = Arc::clone(&self.inflight);
+        let retain = Mutex::new(Some(retain));
+        let handler = block::ConcreteBlock::new(move |cb: &CommandBufferRef| {
+            if cb.status() == metal::MTLCommandBufferStatus::Error {
+                tracing::warn!("kin_infer.metal.commit_bounded: command buffer completed in Error state");
+            }
+            // Recycle retained buffers (drop returns them to the pool) before
+            // releasing the in-flight slot.
+            retain.lock().take();
+            let (lock, cvar) = &*inflight;
+            let mut depth = lock.lock();
+            *depth = depth.saturating_sub(1);
+            cvar.notify_one();
+        })
+        .copy();
+        cmd.add_completed_handler(&handler);
+
+        cmd.commit();
+        if profile_enabled() {
+            SUBMISSIONS.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Dispatch a 1D compute kernel.
