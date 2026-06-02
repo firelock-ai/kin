@@ -290,6 +290,9 @@ pub struct ModelWeights {
     /// LM head for decoder-only generation (None = tied to word_embeddings).
     lm_head_weight: Option<Array2<f32>>,
     lm_head_bias: Option<Array1<f32>>,
+    /// Classification head for cross-encoder models.
+    classifier_weight: Option<Array2<f32>>,
+    classifier_bias: Option<Array1<f32>>,
 }
 
 /// The loaded, ready-to-run model.
@@ -1014,6 +1017,19 @@ impl BertModel {
         let lm_head_weight = try_load_2d_flexible(tensors, &["lm_head.weight"], vocab, h)?;
         let lm_head_bias = try_load_1d_flexible(tensors, &["lm_head.bias"], vocab)?;
 
+        // Classification head (for cross-encoders)
+        let classifier_weight = try_load_2d_flexible(
+            tensors,
+            &["classifier.dense.weight", "classifier.weight"],
+            1,
+            h,
+        )?;
+        let classifier_bias = try_load_1d_flexible(
+            tensors,
+            &["classifier.dense.bias", "classifier.bias"],
+            1,
+        )?;
+
         let head_dim = h / config.num_attention_heads;
         let kv_head_dim = h / config.num_attention_heads;
 
@@ -1041,6 +1057,8 @@ impl BertModel {
                 final_norm_bias,
                 lm_head_weight,
                 lm_head_bias,
+                classifier_weight,
+                classifier_bias,
             },
             head_dim,
             kv_head_dim,
@@ -1167,18 +1185,16 @@ impl BertModel {
 
     /// Batched forward pass: all inputs processed together for projections/FFN,
     /// split only for per-input attention. Reduces GPU dispatches by batch_size×.
-    pub fn forward_batched(
+    pub fn encode_batched(
         &self,
         token_ids: &[Vec<u32>],
         attention_masks: &[Vec<u32>],
-    ) -> Result<Vec<Vec<f32>>, InferError> {
+    ) -> Result<(Array2<f32>, Vec<Vec<u8>>, usize), InferError> {
         let batch_size = token_ids.len();
         if batch_size == 0 {
-            return Ok(vec![]);
+            return Ok((ndarray::Array2::zeros((0, self.config.hidden_size)), vec![], 0));
         }
-        if batch_size == 1 {
-            return self.forward(token_ids, attention_masks);
-        }
+        
 
         let h = self.config.hidden_size;
         let embed_dim = self.config.embedding_size.unwrap_or(h);
@@ -1479,6 +1495,26 @@ impl BertModel {
             }
         }
 
+            Ok((hidden, masks, max_len))
+    }
+
+    /// Batched forward pass: all inputs processed together for projections/FFN,
+    /// split only for per-input attention. Reduces GPU dispatches by batch_size×.
+    pub fn forward_batched(
+        &self,
+        token_ids: &[Vec<u32>],
+        attention_masks: &[Vec<u32>],
+    ) -> Result<Vec<Vec<f32>>, InferError> {
+        let batch_size = token_ids.len();
+        if batch_size == 0 {
+            return Ok(vec![]);
+        }
+        if batch_size == 1 {
+            return self.forward(token_ids, attention_masks);
+        }
+
+        let (hidden, masks, max_len) = self.encode_batched(token_ids, attention_masks)?;
+
         // 4. Per-input mean pooling + L2 normalize
         let _pool_span =
             tracing::info_span!("kin_infer.model.forward_batched.pool_and_normalize").entered();
@@ -1486,7 +1522,7 @@ impl BertModel {
         let cls_pooling = self.config.uses_cls_pooling();
         for b in 0..batch_size {
             let base = b * max_len;
-            let h_b = hidden.slice(s![base..base + max_len, ..]).to_owned();
+            let h_b = hidden.slice(ndarray::s![base..base + max_len, ..]).to_owned();
             let pooled = if cls_pooling {
                 cls_pool(&h_b)
             } else {
@@ -1499,6 +1535,40 @@ impl BertModel {
         }
         Ok(results)
     }
+
+    /// Batched cross-encoder forward pass. Extracts the `[CLS]` token (index 0) from each
+    /// sequence and applies the linear classification head.
+    pub fn forward_cross_encoder_batched(
+        &self,
+        token_ids: &[Vec<u32>],
+        attention_masks: &[Vec<u32>],
+    ) -> Result<Vec<f32>, InferError> {
+        let batch_size = token_ids.len();
+        if batch_size == 0 {
+            return Ok(vec![]);
+        }
+        let (hidden, _masks, max_len) = self.encode_batched(token_ids, attention_masks)?;
+
+        let mut cls_tokens = ndarray::Array2::<f32>::zeros((batch_size, self.config.hidden_size));
+        for b in 0..batch_size {
+            let base = b * max_len;
+            let cls = hidden.row(base);
+            cls_tokens.row_mut(b).assign(&cls);
+        }
+
+        let weight = self.weights.classifier_weight.as_ref().ok_or_else(|| {
+            InferError::ModelError("cross-encoder requires classifier_weight".into())
+        })?;
+        let bias = self.weights.classifier_bias.as_ref();
+        
+        let logits = self.linear(&cls_tokens, weight, bias);
+        let mut results = Vec::with_capacity(batch_size);
+        for b in 0..batch_size {
+            results.push(logits[[b, 0]]);
+        }
+        Ok(results)
+    }
+
 
     /// GPU-accelerated linear projection helper.
     fn linear(
