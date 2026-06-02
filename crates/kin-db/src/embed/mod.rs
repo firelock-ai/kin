@@ -1230,13 +1230,17 @@ fn default_max_batch_tokens(backend: GpuBackend) -> usize {
     }
 }
 
-/// Conservative seq_len threshold for auto dispatch. The Metal GELU NaN is
-/// fixed (kin-infer d8df3cc) and the seq-len regression is green to 1024, but
-/// 256 is retained as a belt-and-suspenders cap so the chunked path stays in
-/// the regime exercised most heavily by the parity tests; longer chunks fall
-/// back to CPU. Active again now that `EMBED_AUTO_PREFERS_CPU` is `false`.
+/// Seq_len threshold for auto dispatch: at or below this, route to Metal;
+/// above it, fall back to CPU. Set to 1024 because the Metal GELU NaN is
+/// fixed (kin-infer d8df3cc) and `metal_seq_len_regression` is green with
+/// zero NaN and CPU-parity cosine ≈ 1.0 across seq_len 7..1024 — the full
+/// range the suite exercises. The old 256 cap left real code entities
+/// (context-augmented bodies routinely exceed 256 tokens) on the slow CPU
+/// twin on the AUTO path, which timed out before any vectors persisted.
+/// Entities beyond 1024 still CPU-fall-back as belt-and-suspenders, since
+/// the regression does not assert finiteness past 1024.
 #[cfg(feature = "embeddings")]
-const EMBED_CPU_SEQ_THRESHOLD: usize = 256;
+const EMBED_CPU_SEQ_THRESHOLD: usize = 1024;
 
 /// When auto dispatch resolves, should it prefer CPU unconditionally?
 ///
@@ -1887,9 +1891,11 @@ mod tests {
             EmbedBackendChoice::Metal { .. }
         ));
 
+        // An unrecognized value falls through to the auto path, so a sequence
+        // above the threshold still routes to CPU.
         std::env::set_var("KIN_EMBED_BACKEND", "nonsense-value");
         assert!(matches!(
-            resolve_embed_backend(1024),
+            resolve_embed_backend(EMBED_CPU_SEQ_THRESHOLD + 1),
             EmbedBackendChoice::Cpu { .. }
         ));
 
