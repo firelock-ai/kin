@@ -1988,15 +1988,17 @@ impl InMemoryGraph {
             })?;
         }
 
+        // Only a graph that holds a populated index in memory writes the
+        // sidecar. An in-memory `None` means the index was never loaded for
+        // this graph (e.g. it was skipped as stale on reopen) — it does NOT
+        // mean the repo has no vectors. Deleting the on-disk sidecar here would
+        // silently destroy graph-owned truth that a later embed pass or a
+        // matching reopen could have reused, so an unloaded index leaves the
+        // persisted sidecar untouched. A genuinely stale sidecar is rejected on
+        // load by `load_vector_index_if_valid` (root-hash check) and rebuilt
+        // from the embedding queue, never by a destructive write here.
         if let Some(ref index) = *self.vector_index.lock() {
             index.save(path)?;
-        } else if path.exists() {
-            std::fs::remove_file(path).map_err(|e| {
-                KinDbError::StorageError(format!(
-                    "failed to remove stale vector index {}: {e}",
-                    path.display()
-                ))
-            })?;
         }
 
         Ok(())
@@ -2030,8 +2032,19 @@ impl InMemoryGraph {
             limit = limit
         )
         .entered();
+
+        // An unpopulated vector index is a valid graph state, not an error:
+        // `kin init` only queues embeddings, so the index can legitimately be
+        // missing or empty until an explicit embed pass runs. Degrade to an
+        // empty result here (callers fall back to text search) instead of
+        // loading the embedder and failing. A populated index that then fails
+        // to embed/search the query still surfaces the error via `?`.
+        let vi = match &*self.vector_index.lock() {
+            Some(vi) if !vi.is_empty() => Arc::clone(vi),
+            _ => return Ok(Vec::new()),
+        };
+
         let embedder = self.get_embedder()?;
-        let vi = self.get_vector_index()?;
         let vector = embedder.embed_text(query)?;
         vi.search_similar(&vector, limit)
     }
@@ -2070,8 +2083,14 @@ impl InMemoryGraph {
             return Ok(Vec::new());
         }
 
+        // Mirror `semantic_search`: an empty/unpopulated index degrades to one
+        // empty result per query rather than loading the embedder and failing.
+        let vi = match &*self.vector_index.lock() {
+            Some(vi) if !vi.is_empty() => Arc::clone(vi),
+            _ => return Ok(vec![Vec::new(); queries.len()]),
+        };
+
         let embedder = self.get_embedder()?;
-        let vi = self.get_vector_index()?;
 
         let texts: Vec<String> = queries.iter().map(|q| q.to_string()).collect();
         let vectors = embedder.embed_batch(&texts)?;
@@ -5583,6 +5602,39 @@ mod tests {
             context.iter().any(|line| line == "co_changes: registry"),
             "co-change labels should be preserved in embedding text"
         );
+    }
+
+    /// An unpopulated vector index is a valid graph state (`kin init` only
+    /// queues embeddings), so semantic search degrades to an empty result and
+    /// lets callers fall back to text search. Crucially it must NOT load the
+    /// embedder — if it did, this test would attempt a model download. A fast,
+    /// network-free `Ok(empty)` proves the degrade path avoids the fail-fast
+    /// that made `kin search --semantic` error 100% of the time on a fresh repo.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
+    fn semantic_search_on_unpopulated_index_degrades_to_empty() {
+        let graph = InMemoryGraph::new();
+        graph
+            .upsert_entity(&test_entity("router", "src/router.rs"))
+            .unwrap();
+
+        let results = graph
+            .semantic_search("anything", 10)
+            .expect("unpopulated semantic search must degrade, not error");
+        assert!(
+            results.is_empty(),
+            "unpopulated index should yield no semantic hits"
+        );
+
+        let batch = graph
+            .semantic_search_batch(&["a", "b"], 10)
+            .expect("unpopulated batch semantic search must degrade, not error");
+        assert_eq!(
+            batch.len(),
+            2,
+            "batch search must return one (empty) result per query"
+        );
+        assert!(batch.iter().all(|hits| hits.is_empty()));
     }
 
     #[test]

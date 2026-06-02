@@ -438,14 +438,12 @@ impl SnapshotManager {
                 embedding_pipeline_epoch: pipeline_epoch,
             };
             write_vector_index_metadata(&metadata_path, &metadata)?;
-        } else if metadata_path.exists() {
-            std::fs::remove_file(&metadata_path).map_err(|err| {
-                KinDbError::StorageError(format!(
-                    "failed to remove stale vector index metadata {}: {err}",
-                    metadata_path.display()
-                ))
-            })?;
         }
+        // When `vector_index_stats()` is `None` the index is not loaded for this
+        // graph; the sidecar bytes are preserved by `save_vector_index`, so the
+        // matching metadata is preserved alongside them rather than deleted. A
+        // metadata file whose root hash no longer matches is rejected on the
+        // next load, not destroyed here.
 
         Ok(())
     }
@@ -1938,6 +1936,68 @@ mod tests {
         assert_eq!(reloaded.graph().embedding_status().indexed, 0);
         assert_eq!(reloaded.graph().pending_embeddings(), 1);
         assert_eq!(reloaded.graph().pending_artifact_embeddings(), 1);
+    }
+
+    /// A save from a graph that never loaded the vector index (e.g. it was
+    /// skipped on reopen because the sidecar metadata no longer matched the
+    /// graph root hash) must NOT delete the on-disk sidecar. An unloaded
+    /// in-memory index means "not loaded", never "the repo has no vectors", so
+    /// deleting graph-owned truth here would be silent data loss — the exact
+    /// prepared-state kvec-drop regression.
+    #[test]
+    fn save_with_unloaded_index_preserves_on_disk_vector_sidecar() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+        let metadata_path = vector_index_metadata_path_for(&snapshot_path);
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let entity = test_entity("preserved_vector");
+        graph.upsert_entity(&entity).unwrap();
+        mgr.save().unwrap();
+
+        // Write a sidecar whose metadata root hash does not match the graph, so
+        // the next reopen skips loading it and leaves the in-memory index None.
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        vectors.save(&vector_path).unwrap();
+        write_vector_index_metadata(
+            &metadata_path,
+            &VectorIndexMetadata {
+                version: VectorIndexMetadata::VERSION,
+                graph_root_hash: hex::encode([42u8; 32]),
+                dimensions: 4,
+                indexed: 1,
+                embedding_provider: None,
+                embedding_model_id: None,
+                embedding_model_revision: None,
+                embedding_pipeline_epoch: None,
+            },
+        )
+        .unwrap();
+        let bytes_before = std::fs::metadata(&vector_path).unwrap().len();
+        assert!(bytes_before > 0, "seeded sidecar should be non-empty");
+
+        // Reopen (index skipped as stale -> in-memory None) and save again. The
+        // sidecar and its metadata must survive the save untouched.
+        let reloaded = SnapshotManager::open(&snapshot_path).unwrap();
+        assert_eq!(reloaded.graph().embedding_status().indexed, 0);
+        reloaded.save().unwrap();
+
+        assert!(
+            vector_path.exists(),
+            "save with unloaded index must preserve graph.kvec, not delete it"
+        );
+        assert!(
+            metadata_path.exists(),
+            "save with unloaded index must preserve graph.kvec.meta.json"
+        );
+        assert_eq!(
+            std::fs::metadata(&vector_path).unwrap().len(),
+            bytes_before,
+            "preserved sidecar bytes must be unchanged by a save that never loaded it"
+        );
     }
 
     #[test]
