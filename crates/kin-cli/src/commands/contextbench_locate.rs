@@ -8,19 +8,56 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-const CONTEXTBENCH_LOCATE_SCHEMA: &str = "kin.contextbench-locate.v1";
 const CONTEXTBENCH_QUERY_CHAR_LIMIT: usize = 4000;
 const CONTEXTBENCH_DEFAULT_MAX_FILES: usize = 25;
 const CONTEXTBENCH_MULTI_FILE_MAX_FILES: usize = 40;
 
 #[derive(Debug, Serialize)]
-struct ContextbenchLocateResult {
-    schema: &'static str,
+struct ContextbenchTrajectory {
+    instance_id: Option<String>,
+    original_inst_id: Option<String>,
+    repo_url: Option<String>,
+    commit: Option<String>,
+    model_patch: String,
+    traj_data: TrajData,
+
+    schema: String,
     selected_query_field: String,
     query_char_limit: usize,
-    query_truncated: bool,
     max_files: usize,
-    files: Vec<Value>,
+    query_truncated: bool,
+    files: Vec<WrapperFileEntry>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct WrapperFileEntry {
+    file: String,
+    path: String,
+    file_path: String,
+    normalized_file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct TrajData {
+    pred_steps: Vec<PredStep>,
+    pred_files: Vec<String>,
+    pred_symbols: std::collections::HashMap<String, Vec<String>>,
+    pred_spans: std::collections::HashMap<String, Vec<Span>>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct PredStep {
+    files: Vec<String>,
+    symbols: std::collections::HashMap<String, Vec<String>>,
+    spans: std::collections::HashMap<String, Vec<Span>>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct Span {
+    start: u32,
+    end: u32,
 }
 
 pub async fn run(task_file: PathBuf, json: bool) -> Result<()> {
@@ -31,30 +68,91 @@ pub async fn run(task_file: PathBuf, json: bool) -> Result<()> {
     .with_context(|| format!("parse task payload {}", task_file.display()))?;
 
     let (selected_query_field, query) = select_query(&task)?;
-    let query_truncated = query.chars().count() > CONTEXTBENCH_QUERY_CHAR_LIMIT;
     let bounded_query: String = query.chars().take(CONTEXTBENCH_QUERY_CHAR_LIMIT).collect();
     let max_files = contextbench_max_files(&bounded_query);
 
     let locate_result =
         crate::commands::locate::capture(&bounded_query, true, max_files, true, None).await?;
 
-    let normalized_files = locate_result
-        .files
-        .iter()
-        .filter_map(normalize_locate_entry)
-        .collect::<Result<Vec<_>>>()?;
+    let mut pred_files = Vec::new();
+    let mut pred_symbols = std::collections::HashMap::new();
+    let mut pred_spans = std::collections::HashMap::new();
+    let mut wrapper_files = Vec::new();
 
-    let result = ContextbenchLocateResult {
-        schema: CONTEXTBENCH_LOCATE_SCHEMA,
+    let re_def = Regex::new(r"entity\s+`([^`]+)`\s+definition\b").expect("regex compilation failed");
+
+    for entry in locate_result.files {
+        let normalized_path = normalize_path(&entry.path);
+        if normalized_path.is_empty() {
+            continue;
+        }
+
+        pred_files.push(normalized_path.clone());
+
+        let mut names = Vec::new();
+        let mut seen_names = std::collections::HashSet::new();
+        for line in &entry.explain {
+            if let Some(caps) = re_def.captures(line) {
+                let name = caps.get(1).unwrap().as_str().trim().to_string();
+                if seen_names.insert(name.clone()) {
+                    names.push(name);
+                }
+            }
+        }
+        if !names.is_empty() {
+            pred_symbols.insert(normalized_path.clone(), names);
+        }
+
+        let mut spans = Vec::new();
+        for span in &entry.spans {
+            spans.push(Span {
+                start: span[0],
+                end: span[1],
+            });
+        }
+        if !spans.is_empty() {
+            pred_spans.insert(normalized_path.clone(), spans);
+        }
+
+        let prov_val = entry.provenance.as_ref().and_then(|p| serde_json::to_value(p).ok());
+        wrapper_files.push(WrapperFileEntry {
+            file: normalized_path.clone(),
+            path: normalized_path.clone(),
+            file_path: normalized_path.clone(),
+            normalized_file: normalized_path.clone(),
+            provenance: prov_val,
+        });
+    }
+
+    let traj_data = TrajData {
+        pred_steps: vec![PredStep {
+            files: pred_files.clone(),
+            symbols: pred_symbols.clone(),
+            spans: pred_spans.clone(),
+        }],
+        pred_files,
+        pred_symbols,
+        pred_spans,
+    };
+
+    let query_len = query.chars().count();
+    let result = ContextbenchTrajectory {
+        instance_id: task.get("instance_id").and_then(Value::as_str).map(String::from).or_else(|| task.get("original_inst_id").and_then(Value::as_str).map(String::from)),
+        original_inst_id: task.get("original_inst_id").and_then(Value::as_str).map(String::from),
+        repo_url: task.get("repo_url").and_then(Value::as_str).map(String::from).or_else(|| Some(String::from(""))),
+        commit: task.get("base_commit").and_then(Value::as_str).map(String::from).or_else(|| Some(String::from(""))),
+        model_patch: String::new(),
+        traj_data,
+        schema: "kin.contextbench-locate.v1".to_string(),
         selected_query_field: selected_query_field.to_string(),
         query_char_limit: CONTEXTBENCH_QUERY_CHAR_LIMIT,
-        query_truncated,
         max_files,
-        files: normalized_files,
+        query_truncated: query_len > CONTEXTBENCH_QUERY_CHAR_LIMIT,
+        files: wrapper_files,
     };
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        println!("{}", serde_json::to_string(&result)?);
     } else {
         println!("{}", serde_json::to_string_pretty(&result)?);
     }
@@ -180,24 +278,6 @@ fn suggested_contextbench_max_files(query: &str) -> usize {
     } else {
         CONTEXTBENCH_DEFAULT_MAX_FILES
     }
-}
-
-fn normalize_locate_entry(
-    entry: &crate::commands::locate::LocateFileEntry,
-) -> Option<Result<Value>> {
-    let normalized = normalize_path(&entry.path);
-    if normalized.is_empty() {
-        return None;
-    }
-    let mut normalized_entry = match serde_json::to_value(entry).ok()? {
-        Value::Object(object) => object,
-        _ => return None,
-    };
-    normalized_entry.insert("file".into(), Value::String(normalized.clone()));
-    normalized_entry.insert("path".into(), Value::String(normalized.clone()));
-    normalized_entry.insert("file_path".into(), Value::String(normalized.clone()));
-    normalized_entry.insert("normalized_file".into(), Value::String(normalized));
-    Some(Ok(Value::Object(normalized_entry)))
 }
 
 fn normalize_path(path: &str) -> String {

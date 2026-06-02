@@ -197,7 +197,7 @@ fn env_flag(name: &str) -> bool {
 
 fn idle_timeout_from_env() -> Result<Option<Duration>, String> {
     let Some(raw) = env::var("KIN_DAEMON_IDLE_TIMEOUT_SECS").ok() else {
-        return Ok(None);
+        return Ok(Some(Duration::from_secs(3600))); // Default to 1 hour auto-cleanup
     };
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed == "0" {
@@ -211,7 +211,7 @@ fn idle_timeout_from_env() -> Result<Option<Duration>, String> {
 
 fn supervisor_idle_timeout_from_env() -> Result<Option<Duration>, String> {
     let Some(raw) = env::var("KIN_SUPERVISOR_IDLE_TIMEOUT_SECS").ok() else {
-        return Ok(None);
+        return Ok(Some(Duration::from_secs(3600))); // Default to 1 hour auto-cleanup
     };
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed == "0" {

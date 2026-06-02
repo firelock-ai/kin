@@ -1887,149 +1887,43 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         eprintln!("=== END DEBUG ===");
     }
 
-    // ── Optional LTR reranking ──
-    // If a trained model exists and profile allows, use it to rerank the fused results.
-    if profile.ltr_enabled() && locate_env_bool("KIN_LOCATE_LTR_ENABLED", true) {
-        let model_path = std::env::var("KIN_LOCATE_LTR_MODEL_PATH").unwrap_or_else(|_| {
-            let layout =
-                kin_core::KinLayout::discover(&std::env::current_dir().unwrap_or_default());
-            layout.map_or_else(
-                || ".kin/models/ltr_v1.json".to_string(),
-                |l| {
-                    l.root()
-                        .join(".kin/models/ltr_v1.json")
-                        .to_string_lossy()
-                        .to_string()
-                },
-            )
-        });
+    // ── Optional Cross-Encoder reranking ──
+    if profile.ltr_enabled() && locate_env_bool("KIN_LOCATE_CROSS_ENCODER_ENABLED", false) {
+        let ltr_window = locate_env_usize("KIN_LOCATE_LTR_WINDOW", 20).min(fused.len());
+        if ltr_window > 0 {
+            let model_id = std::env::var("KIN_LOCATE_CROSS_ENCODER_MODEL")
+                .unwrap_or_else(|_| "BAAI/bge-reranker-base".to_string());
+            let revision = std::env::var("KIN_LOCATE_CROSS_ENCODER_REVISION")
+                .unwrap_or_else(|_| "main".to_string());
 
-        if let Ok(model) =
-            kin_ranking::ltr::GradientBoostedRanker::load(std::path::Path::new(&model_path))
-        {
-            let ltr_window = locate_env_usize("KIN_LOCATE_LTR_WINDOW", 30).min(fused.len());
-            let search_terms = extract_search_terms(text);
-            let search_terms_count = search_terms.len();
-            let query_has_traceback = if text.contains("Traceback") || text.contains("File \"") {
-                1.0
-            } else {
-                0.0
-            };
-            let query_has_path = if !extract_file_paths(text).is_empty() {
-                1.0
-            } else {
-                0.0
-            };
-            let is_test_q = is_test_query(text);
+            if let Ok(encoder) = kin_db::embed::rerank::CrossEncoder::new(&model_id, &revision) {
+                let mut docs = Vec::new();
+                let mut candidates = Vec::new();
 
-            let signal_score_names = [
-                "traceback_score",
-                "search_score",
-                "multihop_score",
-                "test_score",
-                "snippet_score",
-                "import_score",
-                "error_score",
-                "embedding_score",
-                "cochange_score",
-                "projection_score",
-            ];
-            let _ = signal_score_names; // used for documentation, scores accessed by index
+                for (path, score) in fused.iter().take(ltr_window) {
+                    let file_path = workspace_root.map(|w| w.join(path)).unwrap_or_else(|| std::path::PathBuf::from(path));
+                    let content = std::fs::read_to_string(&file_path).unwrap_or_default();
+                    docs.push(content);
+                    candidates.push((path.clone(), *score));
+                }
 
-            let mut ltr_candidates: Vec<(String, f32, kin_ranking::features::LocateFeatureVector)> =
-                Vec::new();
+                let doc_refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
+                if let Ok(scores) = encoder.rerank(text, &doc_refs) {
+                    for (i, score) in scores.into_iter().enumerate() {
+                        candidates[i].1 = score;
+                    }
+                    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-            for (rank, (path, score)) in fused.iter().take(ltr_window).enumerate() {
-                let mut fv = kin_ranking::features::LocateFeatureVector::zeros();
-
-                let signal_score = |idx: usize| {
-                    all_hits
-                        .get(idx)
-                        .and_then(|hits_map| hits_map.get(path))
-                        .map_or(0.0, |h| h.iter().map(|fh| fh.score).sum())
-                };
-
-                // Runtime all_hits order:
-                // [traceback, multihop, tests, snippets, imports, errors,
-                //  cochange, resolved_hits, source_text]
-                fv.traceback_score = signal_score(0);
-                fv.search_score = signal_score(8);
-                fv.multihop_score = signal_score(1);
-                fv.test_score = signal_score(2);
-                fv.snippet_score = signal_score(3);
-                fv.import_score = signal_score(4);
-                fv.error_score = signal_score(5);
-                fv.embedding_score = signal_score(9);
-                fv.cochange_score = signal_score(6);
-                fv.projection_score = signal_score(7);
-
-                let per_signal_scores = [
-                    fv.traceback_score,
-                    fv.search_score,
-                    fv.multihop_score,
-                    fv.test_score,
-                    fv.snippet_score,
-                    fv.import_score,
-                    fv.error_score,
-                    fv.embedding_score,
-                    fv.cochange_score,
-                    fv.projection_score,
-                ];
-
-                fv.traceback_present = if fv.traceback_score > 0.0 { 1.0 } else { 0.0 };
-                fv.search_present = if fv.search_score > 0.0 { 1.0 } else { 0.0 };
-                fv.multihop_present = if fv.multihop_score > 0.0 { 1.0 } else { 0.0 };
-                fv.test_present = if fv.test_score > 0.0 { 1.0 } else { 0.0 };
-                fv.snippet_present = if fv.snippet_score > 0.0 { 1.0 } else { 0.0 };
-                fv.import_present = if fv.import_score > 0.0 { 1.0 } else { 0.0 };
-                fv.error_present = if fv.error_score > 0.0 { 1.0 } else { 0.0 };
-                fv.embedding_present = if fv.embedding_score > 0.0 { 1.0 } else { 0.0 };
-                fv.cochange_present = if fv.cochange_score > 0.0 { 1.0 } else { 0.0 };
-                fv.projection_present = if fv.projection_score > 0.0 { 1.0 } else { 0.0 };
-
-                fv.signal_count = per_signal_scores.iter().filter(|&&s| s > 0.0).count() as f32;
-                fv.fused_rrf_score = *score;
-                fv.rrf_rank = rank as f32;
-                fv.path_depth = path.matches('/').count() as f32;
-                let path_role = role_from_path(path);
-                fv.is_test = if path_role == EntityRole::Test {
-                    1.0
-                } else {
-                    0.0
-                };
-                fv.is_source = if path_role == EntityRole::Source {
-                    1.0
-                } else {
-                    0.0
-                };
-                fv.is_external = if matches!(path_role, EntityRole::External | EntityRole::Vendored)
-                {
-                    1.0
-                } else {
-                    0.0
-                };
-                fv.file_tier = file_tier(path, is_test_q) as f32;
-                fv.query_term_count = search_terms_count as f32;
-                fv.query_has_traceback = query_has_traceback;
-                fv.query_has_path = query_has_path;
-                fv.query_length = text.len() as f32;
-
-                ltr_candidates.push((path.clone(), *score, fv));
-            }
-
-            model.rerank(&mut ltr_candidates);
-
-            // Replace fused with LTR-reranked results, appending remaining files
-            let mut new_fused: Vec<(String, f32)> = ltr_candidates
-                .into_iter()
-                .map(|(path, score, _)| (path, score))
-                .collect();
-            for (path, score) in fused.iter().skip(ltr_window) {
-                new_fused.push((path.clone(), *score));
-            }
-            fused = new_fused;
-            if explain {
-                record_debug_stage(&mut score_breakdown, &mut debug_info, &fused, "after_ltr");
+                    let mut new_fused: Vec<(String, f32)> = candidates;
+                    for (path, score) in fused.iter().skip(ltr_window) {
+                        new_fused.push((path.clone(), *score));
+                    }
+                    fused = new_fused;
+                    
+                    if explain {
+                        record_debug_stage(&mut score_breakdown, &mut debug_info, &fused, "after_cross_encoder");
+                    }
+                }
             }
         }
     }
@@ -10009,9 +9903,27 @@ fn entity_span_pair(entity: &kin_model::Entity) -> Vec<[u32; 2]> {
     entity
         .span
         .as_ref()
-        .map(|s| vec![[s.start_line, s.end_line]])
+        .map(|s| {
+            let is_class_like = matches!(
+                entity.kind,
+                EntityKind::Class
+                    | EntityKind::Interface
+                    | EntityKind::Module
+            );
+            if is_class_like {
+                let len = s.end_line.saturating_sub(s.start_line);
+                if len > 30 {
+                    vec![[s.start_line, (s.start_line + 4).min(s.end_line)]]
+                } else {
+                    vec![[s.start_line, s.end_line]]
+                }
+            } else {
+                vec![[s.start_line, s.end_line]]
+            }
+        })
         .unwrap_or_default()
 }
+
 
 /// Graph-truth precision cap for a file's `explain` lines. The ContextBench
 /// scorer derives a file's predicted SYMBOL set from these lines, so emitting
