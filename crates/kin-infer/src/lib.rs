@@ -18,6 +18,7 @@ pub mod cuda_backend;
 pub mod gpu;
 #[cfg(feature = "metal")]
 pub mod metal_backend;
+pub mod watchdog;
 
 use half::{bf16, f16};
 use ndarray::{s, Array1, Array2};

@@ -445,6 +445,7 @@ dependencies = [
  "block",
  "half",
  "hashbrown",
+ "libc",
  "metal",
  "ndarray",
  "objc2",

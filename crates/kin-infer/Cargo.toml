@@ -34,6 +34,12 @@ parking_lot = "0.12"
 rayon = "1"
 tracing = "0.1"
 
+# Unix-only: getppid() for the embed parent-death watchdog (orphan self-exit).
+# Already present transitively (metal/objc2); named directly so the watchdog can
+# poll for reparent-to-init without a platform shim.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Metal GPU (macOS only)
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = { version = "0.29", optional = true }

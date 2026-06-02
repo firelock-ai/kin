@@ -26,10 +26,9 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use kin_infer::watchdog::{EmbedConfig, EmbedWatchdog};
 use kin_infer::{BertConfig, BertModel};
 
 const MODEL_DIR: &str = "/tmp/swerank";
@@ -100,66 +99,48 @@ fn metal_fused_pipeline_survives_many_forwards() {
         std::env::var("KIN_EMBED_PIPELINE").unwrap_or_else(|_| "<unset>".into())
     );
 
-    // Watchdog: a background thread that aborts the process if no forward pass
-    // completes within the stall window. A hung `new_command_buffer()` blocks
-    // the worker thread indefinitely, so the watchdog is what turns a deadlock
-    // into a loud, actionable failure instead of a frozen suite.
-    let progress = Arc::new(AtomicUsize::new(0));
-    let done = Arc::new(AtomicUsize::new(0));
-    let watch_progress = Arc::clone(&progress);
-    let watch_done = Arc::clone(&done);
-    let stall_window = Duration::from_secs(
-        std::env::var("KIN_SCALE_STALL_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(60),
-    );
-    // Hard total-runtime ceiling. The stall watchdog only fires on ZERO progress;
-    // a slow-but-progressing run (or an orphaned process whose parent was killed)
-    // would otherwise pin the GPU for the whole 150-batch workload. This makes the
-    // process SELF-TERMINATE and release the GPU after the cap, so a stray run
-    // can never hold the device indefinitely. Override with KIN_SCALE_MAX_SECS.
+    // The production embed watchdog (kin_infer::watchdog), wrapping this loop
+    // exactly as the daemon embed driver should. It aborts the process — releasing
+    // the GPU — on parent death (orphan), a hard wall cap, or a sustained
+    // below-floor throughput keyed on the PERSISTED-batch delta. The persisted
+    // delta is the honest liveness signal the old per-forward stall watchdog
+    // missed: a busy-spin that trickles forwards keeps a per-forward timer alive,
+    // but if nothing is persisted the floor still trips. We bump `wd` per batch.
+    //
+    // Env knobs map onto the library config: the legacy KIN_SCALE_MAX_SECS still
+    // sets the wall cap (default 300s here for the bounded test), and the floor is
+    // derived from the workload's expected rate so a real stall is caught without
+    // flagging a slow-but-progressing run.
     let max_total = Duration::from_secs(
         std::env::var("KIN_SCALE_MAX_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(300),
     );
-    let watchdog = std::thread::spawn(move || {
-        let wd_start = Instant::now();
-        let mut last = 0usize;
-        let mut last_change = Instant::now();
-        loop {
-            std::thread::sleep(Duration::from_millis(250));
-            if watch_done.load(Ordering::Relaxed) == 1 {
-                return;
-            }
-            if wd_start.elapsed() > max_total {
-                eprintln!(
-                    "\n!!! SCALE TEST EXCEEDED MAX RUNTIME {:?} — aborting to release the GPU \
-                     (orphaned or pathologically slow run). Set KIN_SCALE_MAX_SECS to extend.",
-                    max_total
-                );
-                std::process::abort();
-            }
-            let cur = watch_progress.load(Ordering::Relaxed);
-            if cur != last {
-                last = cur;
-                last_change = Instant::now();
-            } else if last_change.elapsed() > stall_window {
-                eprintln!(
-                    "\n!!! SCALE-HANG REPRODUCED: no forward completed for {:?}; \
-                     stalled at forward #{cur}. The fused command-buffer pipeline \
-                     deadlocked the Metal queue.",
-                    stall_window
-                );
-                // Abort hard — the worker is blocked inside Metal and cannot be
-                // joined. A non-zero exit makes the hang a deterministic test
-                // failure rather than a frozen process.
-                std::process::abort();
-            }
-        }
-    });
+    let stall_window = Duration::from_secs(
+        std::env::var("KIN_SCALE_STALL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60),
+    );
+    let wd_cfg = EmbedConfig {
+        enabled: true,
+        poll: Duration::from_millis(250),
+        // Off by default: a live cargo/test parent keeps ppid != 1, but a wifi
+        // blip that orphans the binary flips it to 1 and self-exits. Opt out with
+        // KIN_EMBED_ORPHAN_CHECK=0 if a harness intentionally reparents the test.
+        orphan_check: !std::env::var("KIN_EMBED_ORPHAN_CHECK")
+            .map(|v| v == "0")
+            .unwrap_or(false),
+        wall_cap: Some(max_total),
+        // Persisted-batch floor: require at least one batch every `stall_window`.
+        // 1 batch / window seconds is the rate floor; a busy-spin persisting
+        // nothing trips it, a healthy run never does.
+        throughput_floor: Some(1.0 / stall_window.as_secs_f64().max(1.0)),
+        floor_window: stall_window,
+        floor_grace: Duration::from_secs(15),
+    };
+    let wd = EmbedWatchdog::spawn::<fn(_)>(wd_cfg, None);
 
     // The REAL embed runs inside `tokio::task::spawn_blocking` — a worker thread
     // with NO autorelease pool (only the main thread gets one). Autoreleased
@@ -182,7 +163,7 @@ fn metal_fused_pipeline_survives_many_forwards() {
 
     let start = Instant::now();
     let workload = {
-        let progress = Arc::clone(&progress);
+        let progress = wd.progress_handle();
         move || -> (f64, usize) {
             let mut checksum = 0.0f64;
             let mut total_entities = 0usize;
@@ -207,7 +188,10 @@ fn metal_fused_pipeline_survives_many_forwards() {
                 );
                 checksum += out[0][0] as f64;
                 total_entities += per_batch;
-                progress.store(n + 1, Ordering::Relaxed);
+                // Persisted-batch progress — the liveness signal the watchdog's
+                // throughput floor watches (a busy-spin that persists nothing
+                // trips it; a healthy run keeps it satisfied).
+                progress.bump(1);
                 if (n + 1) % 10 == 0 {
                     eprintln!(
                         "  batch {}/{}  ({} entities, {:.1} ent/s)",
@@ -227,8 +211,9 @@ fn metal_fused_pipeline_survives_many_forwards() {
     } else {
         workload()
     };
-    done.store(1, Ordering::Relaxed);
-    let _ = watchdog.join();
+    // Clean end-of-loop: dropping the watchdog signals its poller to exit and
+    // joins it. No abort on a normal completion.
+    drop(wd);
 
     let wall = start.elapsed().as_secs_f64();
     eprintln!(
