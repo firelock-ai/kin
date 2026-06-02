@@ -894,15 +894,28 @@ impl MetalCompute {
     /// buffer reads or writes, so none is recycled while still GPU-resident.
     fn commit_bounded(&self, cmd: &CommandBufferRef, retain: Vec<PooledBuffer>) {
         // Backpressure: park until an in-flight slot frees. parking_lot's Condvar
-        // parks the OS thread (idle-detectable) rather than busy-spinning.
+        // parks the OS thread (idle-detectable) rather than busy-spinning. A
+        // 30s watchdog turns a leaked completion handler (which would otherwise
+        // deadlock the submitter forever) into an observable warning instead of
+        // a silent hang.
         let blocked_start = profile_enabled().then(std::time::Instant::now);
         {
             let (lock, cvar) = &*self.inflight;
             let mut depth = lock.lock();
             while *depth >= MAX_INFLIGHT {
-                cvar.wait(&mut depth);
+                let timed_out = cvar
+                    .wait_for(&mut depth, std::time::Duration::from_secs(30))
+                    .timed_out();
+                if timed_out && *depth >= MAX_INFLIGHT {
+                    tracing::warn!(
+                        depth = *depth,
+                        max_inflight = MAX_INFLIGHT,
+                        "kin_infer.metal.commit_bounded: in-flight depth has not drained for 30s — a completion handler may have failed to fire"
+                    );
+                }
             }
             *depth += 1;
+            debug_assert!(*depth <= MAX_INFLIGHT, "in-flight depth exceeded the cap");
         }
         if let Some(start) = blocked_start {
             STALL_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
