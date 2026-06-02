@@ -2113,6 +2113,20 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         );
     }
 
+    // A_spanwidth lever (default OFF == byte-identical): when a file surfaced a
+    // class-like symbol but the gold edit is an inner method, emit the file's
+    // methods (finer spans) instead of widening the class.
+    if locate_env_bool("KIN_LOCATE_EMIT_INNER_METHODS", false) {
+        let method_terms = tracked_text_query_terms(text);
+        emit_inner_methods(
+            graph,
+            &results,
+            &mut projection_symbols,
+            &method_terms,
+            test_query,
+        );
+    }
+
     Ok(build_result(
         &results,
         &all_hits,
@@ -10403,6 +10417,55 @@ fn boost_symbol_query_relevance(
         let boosted = apply_query_relevance(existing, entities, query_terms, test_query, boost_weight);
         if !boosted.is_empty() {
             projection_symbols.insert(path.clone(), boosted);
+        }
+    }
+}
+
+/// A_spanwidth lever (gated `KIN_LOCATE_EMIT_INNER_METHODS`, default OFF).
+/// scorer sized ~30 golds where Kin emitted the enclosing CLASS but the gold
+/// edit is an inner METHOD — so the coarse class span never overlaps the few
+/// edited lines. Rather than widen the class span (which would tank line
+/// PRECISION on large classes), emit the file's methods (finer, correctly-bounded
+/// spans), ranked by query proximity then size, for any file that surfaced a
+/// class-like symbol. Methods already present by name are left untouched, so the
+/// class and its methods coexist. OFF is byte-identical.
+fn emit_inner_methods(
+    graph: &kin_db::InMemoryGraph,
+    results: &[(String, f32)],
+    projection_symbols: &mut HashMap<String, Vec<LocateSymbol>>,
+    query_terms: &[String],
+    test_query: bool,
+) {
+    let topk = locate_env_usize("KIN_LOCATE_INNER_METHOD_TOPK", 5);
+    for (path, _) in results {
+        let has_class_like = projection_symbols.get(path).map_or(false, |syms| {
+            syms.iter()
+                .any(|s| matches!(s.kind.as_str(), "class" | "interface" | "module"))
+        });
+        if !has_class_like {
+            continue;
+        }
+        let filter = EntityFilter {
+            file_path: Some(kin_model::FilePathId::new(path)),
+            kinds: Some(vec![EntityKind::Method]),
+            ..Default::default()
+        };
+        let Ok(methods) = graph.query_entities(&filter) else {
+            continue;
+        };
+        if methods.is_empty() {
+            continue;
+        }
+        let method_syms = rank_enriched_symbols(methods, query_terms, test_query, topk);
+        if method_syms.is_empty() {
+            continue;
+        }
+        let entry = projection_symbols.entry(path.clone()).or_default();
+        let present: HashSet<String> = entry.iter().map(|s| s.name.clone()).collect();
+        for ms in method_syms {
+            if !present.contains(&ms.name) {
+                entry.push(ms);
+            }
         }
     }
 }
