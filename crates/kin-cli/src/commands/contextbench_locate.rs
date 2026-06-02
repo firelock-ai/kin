@@ -580,12 +580,18 @@ fn build_gold_trace(
 /// Symbol names Kin should emit so the ContextBench evaluator can match them.
 ///
 /// Kin attributes some entities with a path-qualified name (e.g. Rust
-/// `Usage<'cmd>::create_usage_no_title`, C++ `Context::getResultCapture`),
-/// but the evaluator resolves predicted symbols against *bare* tree-sitter
-/// definition names and only strips a `.` receiver — never `::` or generics.
-/// So a `::`-qualified name can never match gold. Emit the qualified name (kept
-/// for surfaces that want it) plus the bare last segment with generic params
-/// stripped, mirroring the evaluator's own `name.split('.')[-1]` candidate.
+/// `Usage<'cmd>::create_usage_no_title`, C++ `Context::getResultCapture`,
+/// JS/TS `Dayjs.localeData`), but the evaluator resolves predicted symbols
+/// against *bare* tree-sitter definition names. The official ContextBench
+/// scorer's own candidate generation is `[name, name.split('.')[-1]]`
+/// (`extractors/treesitter.py::extract_def_set_from_symbol_names`): it strips a
+/// `.` receiver but never `::` or generics. So a `::`- or generic-qualified
+/// name can never match gold, and a `.`-qualified one only matches via the
+/// evaluator's split. Emit the qualified name (kept for surfaces that want it)
+/// plus the bare last segment — generics dropped and the rightmost `::`/`.`
+/// segment taken — mirroring the evaluator's canonical normalization. This is
+/// the benchmark's own intent, not a loosening: the bare name only matches when
+/// it resolves through tree-sitter to a real definition byte-range in the file.
 fn symbol_match_candidates(name: &str) -> Vec<String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -610,10 +616,22 @@ fn symbol_match_candidates(name: &str) -> Vec<String> {
         out
     };
 
-    if let Some(bare) = without_generics.rsplit("::").next() {
-        let bare = bare.trim();
-        if !bare.is_empty() && bare != trimmed && !candidates.iter().any(|c| c == bare) {
-            candidates.push(bare.to_string());
+    // Strip a `::` path qualifier (Rust/C++) and then a `.` receiver (JS/TS
+    // member access). Both forms are added, additively: the `::`-stripped name
+    // preserves the prior behavior, and the further `.`-stripped name is the
+    // fully bare identifier the evaluator matches against. Identifiers never
+    // contain `.`/`::`, so the rightmost segment is always the definition name.
+    let after_colons = without_generics
+        .rsplit("::")
+        .next()
+        .unwrap_or(without_generics.as_str());
+    let fully_bare = after_colons.rsplit('.').next().unwrap_or(after_colons);
+    for candidate in [after_colons.trim(), fully_bare.trim()] {
+        if !candidate.is_empty()
+            && candidate != trimmed
+            && !candidates.iter().any(|c| c == candidate)
+        {
+            candidates.push(candidate.to_string());
         }
     }
 
@@ -730,6 +748,44 @@ mod tests {
         assert_eq!(
             symbol_match_candidates("allowThrows"),
             vec!["allowThrows".to_string()]
+        );
+        // JS/TS dot-receiver: keep qualified, add bare member (mirrors the
+        // evaluator's own `name.split('.')[-1]` candidate).
+        assert_eq!(
+            symbol_match_candidates("Dayjs.localeData"),
+            vec!["Dayjs.localeData".to_string(), "localeData".to_string()]
+        );
+        // Multiple dots -> rightmost segment only.
+        assert_eq!(
+            symbol_match_candidates("Dayjs.prototype.localeData"),
+            vec![
+                "Dayjs.prototype.localeData".to_string(),
+                "localeData".to_string()
+            ]
+        );
+        // Mixed `::` then `.`: keep the qualified name, the `::`-stripped form,
+        // and the fully bare identifier (additive, no candidate dropped).
+        assert_eq!(
+            symbol_match_candidates("ns::Outer.inner"),
+            vec![
+                "ns::Outer.inner".to_string(),
+                "Outer.inner".to_string(),
+                "inner".to_string()
+            ]
+        );
+        // Generics + `::` + `.` together resolve to the final identifier.
+        assert_eq!(
+            symbol_match_candidates("Wrapper<T>::Inner.method"),
+            vec![
+                "Wrapper<T>::Inner.method".to_string(),
+                "Inner.method".to_string(),
+                "method".to_string()
+            ]
+        );
+        // Trailing dot -> no empty candidate, no panic.
+        assert_eq!(
+            symbol_match_candidates("localeData."),
+            vec!["localeData.".to_string()]
         );
         // Empty/whitespace -> no candidates.
         assert!(symbol_match_candidates("   ").is_empty());
