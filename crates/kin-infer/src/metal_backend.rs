@@ -193,6 +193,43 @@ fn use_mma(m: usize, n: usize, k: usize) -> bool {
         && k >= 16
 }
 
+/// Whether the wider 64x64 MMA tile (Lever #5 phase 1) is selected. OPT-IN for
+/// now (`KIN_INFER_MMA_WIDE=1`): default OFF keeps every GEMM on the proven 32x32
+/// MMA so the parity gate stays green untouched. Flip the default ON only after
+/// the wider tile clears the cosine/swerank gate (it is numerically identical, so
+/// it should), keeping the OFF override as the safe fallback — the MMA-flip
+/// pattern. Sampled once per process.
+fn mma_wide_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("KIN_INFER_MMA_WIDE").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
+/// Whether the wider-tile MMA pipelines actually compiled on this device. Set
+/// once by `try_new` after attempting to build the `*_wide` kernels. Defaults
+/// false: if they fail to build (or were never built), `use_wide_mma` stays off
+/// and every GEMM uses the standard 32x32 MMA — no Metal-dead state.
+static WIDE_MMA_AVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Route a GEMM to the wider 64x64 MMA tile only when it is opt-in enabled, the
+/// wide pipelines compiled, the standard MMA gate already passes, AND the output
+/// is large enough to fill the 64x64 tile usefully (else the wider tile wastes
+/// more on zero-pad than the 32x32 — keep those on the standard MMA).
+#[inline]
+fn use_wide_mma(m: usize, n: usize, k: usize) -> bool {
+    mma_wide_enabled()
+        && WIDE_MMA_AVAILABLE.load(Ordering::Relaxed)
+        && use_mma(m, n, k)
+        && m >= 64
+        && n >= 64
+}
+
 /// Total nanoseconds the host spent blocked in `wait_until_completed` since the
 /// last `reset_profile`. Only meaningful when `KIN_INFER_METAL_PROFILE` is set.
 pub fn profile_stall_nanos() -> u64 {
@@ -324,12 +361,19 @@ kernel void matmul_transb(
 // edges so the MMA always runs full 8x8 fragments, and the epilogue bounds-guards
 // the store — no separate tail kernel.
 // MMA block tile constants (shared by the kernels that declare the threadgroup
-// stage and the helper that consumes it).
+// stage and the helper that consumes it). The default 32x32 tile and the wider
+// 64x64 tile (Lever #5 phase 1) both run WM*WN = 2*2 = 4 simdgroups = 128
+// threads; the wide tile only grows the per-simdgroup fragment grid (TM=TN: 2->4)
+// and the As/Bs stage rows (32->64), raising C-reuse per loaded A/B element.
 constant uint MMA_BM = 32, MMA_BN = 32, MMA_BK = 16, MMA_WM = 2, MMA_WN = 2, MMA_F = 8;
+constant uint MMA_BM_WIDE = 64, MMA_BN_WIDE = 64;
 
 // `As`/`Bs`/`store_tile` are declared in the calling KERNEL (threadgroup-address
 // variables cannot be declared in a non-kernel helper) and passed in by pointer.
-template <bool TRANSB>
+// BM/BN are template parameters (default to the 32x32 tile) so the same body
+// serves both the standard kernels and the wider-tile variants; the codegen for
+// `block_mma<TRANSB>` is byte-identical to the pre-templatization 32x32 form.
+template <bool TRANSB, uint BM = 32, uint BN = 32>
 static inline void block_mma(
     device const float* A,
     device const float* B,
@@ -340,9 +384,9 @@ static inline void block_mma(
     threadgroup float (*Bs)[MMA_BK],
     threadgroup float (*store_tile)[MMA_F][MMA_F])
 {
-    constexpr uint BM = 32, BN = 32, BK = 16, WM = 2, WN = 2, F = 8;
-    constexpr uint TM = BM / (F * WM);   // 2 fragment-rows per simdgroup
-    constexpr uint TN = BN / (F * WN);   // 2 fragment-cols per simdgroup
+    constexpr uint BK = 16, WM = 2, WN = 2, F = 8;
+    constexpr uint TM = BM / (F * WM);   // fragment-rows per simdgroup (2 @32, 4 @64)
+    constexpr uint TN = BN / (F * WN);   // fragment-cols per simdgroup (2 @32, 4 @64)
 
     const uint sm = sgid / WN;           // simdgroup row in the 2x2 grid
     const uint sn = sgid % WN;           // simdgroup col
@@ -480,6 +524,71 @@ kernel void batched_matmul_ab_simdgroup(
     threadgroup float Bs[MMA_BN][MMA_BK];
     threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
     block_mma<false>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+}
+
+// ---- Wider 64x64 MMA tile variants (Lever #5 phase 1) ----
+// Same 128-thread / 4-simdgroup threadgroup as the 32x32 kernels, but each
+// simdgroup owns a 4x4 fragment grid (TM=TN=4) over a 64x64 output block, raising
+// arithmetic intensity per loaded A/B element. Numerically identical to the
+// 32x32 path (same fp32 accumulate, same per-fragment 8-wide reduction order) —
+// the only difference is how the output is blocked, so parity is preserved by
+// construction. Selected behind KIN_INFER_MMA_WIDE for shapes that fill 64x64;
+// the dispatch grid uses BM=BN=64.
+kernel void matmul_transb_simdgroup_wide(
+    device const float* A   [[buffer(0)]],
+    device const float* B   [[buffer(1)]],
+    device float*       C   [[buffer(2)]],
+    constant uint& M        [[buffer(3)]],
+    constant uint& N        [[buffer(4)]],
+    constant uint& K        [[buffer(5)]],
+    uint3 tgid              [[threadgroup_position_in_grid]],
+    uint  sgid             [[simdgroup_index_in_threadgroup]],
+    uint  lane             [[thread_index_in_simdgroup]])
+{
+    threadgroup float As[MMA_BM_WIDE][MMA_BK];
+    threadgroup float Bs[MMA_BN_WIDE][MMA_BK];
+    threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
+    block_mma<true, MMA_BM_WIDE, MMA_BN_WIDE>(A, B, C, M, N, K, tgid, sgid, lane, As, Bs, store_tile);
+}
+
+kernel void batched_matmul_transb_simdgroup_wide(
+    device const float* Q   [[buffer(0)]],
+    device const float* Kk  [[buffer(1)]],
+    device float*       C   [[buffer(2)]],
+    constant uint& seq      [[buffer(3)]],
+    constant uint& dim      [[buffer(4)]],
+    uint3 tgid              [[threadgroup_position_in_grid]],
+    uint  sgid             [[simdgroup_index_in_threadgroup]],
+    uint  lane             [[thread_index_in_simdgroup]])
+{
+    uint h = tgid.z;
+    device const float* Ah = Q  + h * seq * dim;
+    device const float* Bh = Kk + h * seq * dim;
+    device float*       Ch = C  + h * seq * seq;
+    threadgroup float As[MMA_BM_WIDE][MMA_BK];
+    threadgroup float Bs[MMA_BN_WIDE][MMA_BK];
+    threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
+    block_mma<true, MMA_BM_WIDE, MMA_BN_WIDE>(Ah, Bh, Ch, seq, seq, dim, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+}
+
+kernel void batched_matmul_ab_simdgroup_wide(
+    device const float* S   [[buffer(0)]],
+    device const float* V   [[buffer(1)]],
+    device float*       C   [[buffer(2)]],
+    constant uint& seq      [[buffer(3)]],
+    constant uint& dim      [[buffer(4)]],
+    uint3 tgid              [[threadgroup_position_in_grid]],
+    uint  sgid             [[simdgroup_index_in_threadgroup]],
+    uint  lane             [[thread_index_in_simdgroup]])
+{
+    uint h = tgid.z;
+    device const float* Ah = S + h * seq * seq;
+    device const float* Bh = V + h * seq * dim;
+    device float*       Ch = C + h * seq * dim;
+    threadgroup float As[MMA_BM_WIDE][MMA_BK];
+    threadgroup float Bs[MMA_BN_WIDE][MMA_BK];
+    threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
+    block_mma<false, MMA_BM_WIDE, MMA_BN_WIDE>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
 }
 
 // ---- Softmax over rows ----
@@ -1263,6 +1372,39 @@ impl MetalCompute {
         }
         MMA_AVAILABLE.store(mma_available, Ordering::Relaxed);
 
+        // Wider 64x64 MMA tile (Lever #5 phase 1) — OPTIONAL, only attempted when
+        // the standard MMA built. Same fallback discipline: if any `*_wide` kernel
+        // fails to compile (e.g. register-spill rejection on a constrained
+        // target), leave WIDE_MMA_AVAILABLE false and every GEMM stays on the
+        // proven 32x32 MMA. Metal stays alive.
+        let wide_mma_kernel_names: &[&str] = &[
+            "matmul_transb_simdgroup_wide",
+            "batched_matmul_transb_simdgroup_wide",
+            "batched_matmul_ab_simdgroup_wide",
+        ];
+        let mut wide_mma_available = mma_available;
+        if mma_available {
+            for &name in wide_mma_kernel_names {
+                let pipeline = library
+                    .get_function(name, None)
+                    .and_then(|func| device.new_compute_pipeline_state_with_function(&func));
+                match pipeline {
+                    Ok(pipeline) => {
+                        pipelines.insert(name, pipeline);
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "kin-infer: Metal wide-MMA kernel {name} unavailable ({err}); \
+                             falling back to 32x32 MMA (Metal stays enabled)"
+                        );
+                        wide_mma_available = false;
+                        break;
+                    }
+                }
+            }
+        }
+        WIDE_MMA_AVAILABLE.store(wide_mma_available, Ordering::Relaxed);
+
         let pool = Arc::new(BufferPool::new(device.clone()));
         Some(Self {
             device,
@@ -1647,30 +1789,39 @@ impl MetalCompute {
         });
     }
 
-    /// Encode one MMA GEMM (`pipeline` is a `*_simdgroup` kernel) into `cmd`
-    /// without committing. The MMA kernels REQUIRE full 32-lane simdgroups, so
-    /// this uses `dispatch_thread_groups` with one 128-thread threadgroup per
-    /// 32x32 output block, NOT `dispatch_threads`. `m`/`n`/`k` are the matmul
-    /// dimensions; `depth` is the batch (head) count (1 for the 2D projections).
+    /// Encode one MMA GEMM into `cmd` without committing. `base_name` is the
+    /// standard `*_simdgroup` kernel; when `use_wide_mma(m,n,k)` holds this
+    /// transparently routes to its `*_wide` 64x64 variant (Lever #5 phase 1) and
+    /// blocks the grid at 64 instead of 32 — otherwise the proven 32x32 tile with
+    /// an identical grid to the pre-Lever-#5 code (so the flag-OFF path is
+    /// byte-identical). The MMA kernels REQUIRE full 32-lane simdgroups, so this
+    /// uses `dispatch_thread_groups` with one 128-thread threadgroup per output
+    /// block, NOT `dispatch_threads`. `m`/`n`/`k` are the matmul dimensions;
+    /// `depth` is the batch (head) count (1 for the 2D projections).
     #[allow(clippy::too_many_arguments)]
     fn encode_mma(
+        &self,
         cmd: &CommandBufferRef,
-        pipeline: &ComputePipelineState,
+        base_name: &str,
         bufs: &[&Buffer],
         m: usize,
         n: usize,
+        k: usize,
         depth: usize,
     ) {
-        const BM: usize = 32;
-        const BN: usize = 32;
+        let (pipeline, block) = if use_wide_mma(m, n, k) {
+            (&self.pipelines[wide_mma_name(base_name)], 64usize)
+        } else {
+            (&self.pipelines[base_name], 32usize)
+        };
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(pipeline);
         for (i, buf) in bufs.iter().enumerate() {
             enc.set_buffer(i as u64, Some(buf), 0);
         }
         let groups = MTLSize::new(
-            n.div_ceil(BN) as u64,
-            m.div_ceil(BM) as u64,
+            n.div_ceil(block) as u64,
+            m.div_ceil(block) as u64,
             depth as u64,
         );
         let tg = MTLSize::new(128, 1, 1);
@@ -1682,26 +1833,40 @@ impl MetalCompute {
     /// before the caller reads `bufs[2]` (the C output).
     fn dispatch_mma(
         &self,
-        pipeline_name: &str,
+        base_name: &str,
         bufs: &[&Buffer],
         m: usize,
         n: usize,
+        k: usize,
         depth: usize,
     ) {
         let _span = tracing::info_span!(
             "kin_infer.metal.dispatch_mma",
-            pipeline = pipeline_name,
+            pipeline = base_name,
             m = m,
             n = n,
             depth = depth
         )
         .entered();
-        let pipeline = &self.pipelines[pipeline_name];
         autoreleasepool(|_| {
             let cmd = self.queue.new_command_buffer();
-            Self::encode_mma(cmd, pipeline, bufs, m, n, depth);
+            self.encode_mma(cmd, base_name, bufs, m, n, k, depth);
             self.commit_wait(cmd);
         });
+    }
+}
+
+/// Map a base `*_simdgroup` MMA kernel name to its `*_wide` 64x64 variant.
+/// Lever #5 phase 1 registers exactly these three wide kernels; the fallback
+/// returns the input unchanged (only the three known names ever reach here via
+/// `use_wide_mma`'s shape gate).
+#[inline]
+fn wide_mma_name(base: &str) -> &str {
+    match base {
+        "matmul_transb_simdgroup" => "matmul_transb_simdgroup_wide",
+        "batched_matmul_transb_simdgroup" => "batched_matmul_transb_simdgroup_wide",
+        "batched_matmul_ab_simdgroup" => "batched_matmul_ab_simdgroup_wide",
+        other => other,
     }
 }
 
@@ -1726,7 +1891,7 @@ impl GpuCompute for MetalCompute {
         ];
         time_phase(Phase::Matmul, || {
             if use_mma(m, n, k) {
-                self.dispatch_mma("matmul_transb_simdgroup", &bufs, m, n, 1);
+                self.dispatch_mma("matmul_transb_simdgroup", &bufs, m, n, k, 1);
             } else {
                 self.dispatch_2d("matmul_transb", &bufs, n, m);
             }
@@ -1780,7 +1945,7 @@ impl GpuCompute for MetalCompute {
         ];
         time_phase(Phase::Matmul, || {
             if use_mma(m, total_n, k) {
-                self.dispatch_mma("matmul_transb_simdgroup", &bufs, m, total_n, 1);
+                self.dispatch_mma("matmul_transb_simdgroup", &bufs, m, total_n, k, 1);
             } else {
                 self.dispatch_2d("matmul_transb", &bufs, total_n, m);
             }
@@ -1839,6 +2004,7 @@ impl GpuCompute for MetalCompute {
                     &bufs,
                     seq_len,
                     seq_len,
+                    head_dim,
                     num_heads,
                 );
             } else {
@@ -1886,6 +2052,7 @@ impl GpuCompute for MetalCompute {
                     &bufs,
                     seq_len,
                     head_dim,
+                    seq_len,
                     num_heads,
                 );
             } else {
@@ -2024,7 +2191,7 @@ impl GpuCompute for MetalCompute {
         let buf_hidden = self.buf_u32(hidden as u32);
 
         let mm = &self.pipelines["matmul_transb"];
-        let mm_mma = &self.pipelines["matmul_transb_simdgroup"];
+        let mm_mma = "matmul_transb_simdgroup";
         let swi = &self.pipelines["swiglu_activation_fat"];
         let gateup_mma = use_mma(rows, 2 * inter, hidden);
         let down_mma = use_mma(rows, hidden, inter);
@@ -2040,7 +2207,7 @@ impl GpuCompute for MetalCompute {
 
             // gateup = x @ [w_gate|w_up]^T -> [rows, 2*inter]  (M=rows, N=2*inter, K=hidden)
             if gateup_mma {
-                Self::encode_mma(cmd, mm_mma, &[buf_x.buffer(), &buf_wgateup, buf_gateup.buffer(), &buf_rows, &buf_two_inter, &buf_hidden], rows, 2 * inter, 1);
+                self.encode_mma(cmd, mm_mma, &[buf_x.buffer(), &buf_wgateup, buf_gateup.buffer(), &buf_rows, &buf_two_inter, &buf_hidden], rows, 2 * inter, hidden, 1);
             } else {
                 Self::encode_matmul(cmd, mm, buf_x.buffer(), &buf_wgateup, buf_gateup.buffer(), &buf_rows, &buf_two_inter, &buf_hidden, 2 * inter, rows);
             }
@@ -2060,7 +2227,7 @@ impl GpuCompute for MetalCompute {
 
             // out = act @ w_down^T -> [rows, hidden]  (M=rows, N=hidden, K=inter)
             if down_mma {
-                Self::encode_mma(cmd, mm_mma, &[buf_act.buffer(), &buf_wdown, buf_out.buffer(), &buf_rows, &buf_hidden, &buf_inter], rows, hidden, 1);
+                self.encode_mma(cmd, mm_mma, &[buf_act.buffer(), &buf_wdown, buf_out.buffer(), &buf_rows, &buf_hidden, &buf_inter], rows, hidden, inter, 1);
             } else {
                 Self::encode_matmul(cmd, mm, buf_act.buffer(), &buf_wdown, buf_out.buffer(), &buf_rows, &buf_hidden, &buf_inter, hidden, rows);
             }
@@ -2116,7 +2283,7 @@ impl GpuCompute for MetalCompute {
         let buf_eps = self.buf_f32(eps);
 
         let mm = &self.pipelines["matmul_transb"];
-        let mm_mma = &self.pipelines["matmul_transb_simdgroup"];
+        let mm_mma = "matmul_transb_simdgroup";
         let swi = &self.pipelines["swiglu_activation_fat"];
         let add = &self.pipelines["elementwise_add"];
         let ln = &self.pipelines["layer_norm"];
@@ -2128,7 +2295,7 @@ impl GpuCompute for MetalCompute {
 
             // gateup = x @ [w_gate|w_up]^T -> [rows, 2*inter]
             if gateup_mma {
-                Self::encode_mma(cmd, mm_mma, &[buf_x.buffer(), &buf_wgateup, buf_gateup.buffer(), &buf_rows, &buf_two_inter, &buf_hidden], rows, 2 * inter, 1);
+                self.encode_mma(cmd, mm_mma, &[buf_x.buffer(), &buf_wgateup, buf_gateup.buffer(), &buf_rows, &buf_two_inter, &buf_hidden], rows, 2 * inter, hidden, 1);
             } else {
                 Self::encode_matmul(cmd, mm, buf_x.buffer(), &buf_wgateup, buf_gateup.buffer(), &buf_rows, &buf_two_inter, &buf_hidden, 2 * inter, rows);
             }
@@ -2148,7 +2315,7 @@ impl GpuCompute for MetalCompute {
 
             // out = act @ w_down^T -> [rows, hidden]
             if down_mma {
-                Self::encode_mma(cmd, mm_mma, &[buf_act.buffer(), &buf_wdown, buf_out.buffer(), &buf_rows, &buf_hidden, &buf_inter], rows, hidden, 1);
+                self.encode_mma(cmd, mm_mma, &[buf_act.buffer(), &buf_wdown, buf_out.buffer(), &buf_rows, &buf_hidden, &buf_inter], rows, hidden, inter, 1);
             } else {
                 Self::encode_matmul(cmd, mm, buf_act.buffer(), &buf_wdown, buf_out.buffer(), &buf_rows, &buf_hidden, &buf_inter, hidden, rows);
             }
@@ -2226,7 +2393,7 @@ impl GpuCompute for MetalCompute {
         let buf_eps = self.buf_f32(eps);
 
         let mm = &self.pipelines["matmul_transb"];
-        let mm_mma = &self.pipelines["matmul_transb_simdgroup"];
+        let mm_mma = "matmul_transb_simdgroup";
         let add = &self.pipelines["elementwise_add"];
         let ln = &self.pipelines["layer_norm"];
         let proj_mma = use_mma(rows, hidden, cols);
@@ -2236,7 +2403,7 @@ impl GpuCompute for MetalCompute {
 
             // proj = x @ weight^T -> [rows, hidden]  (M=rows, N=hidden, K=cols)
             if proj_mma {
-                Self::encode_mma(cmd, mm_mma, &[buf_x.buffer(), &buf_w, buf_proj.buffer(), &buf_rows, &buf_hidden, &buf_cols], rows, hidden, 1);
+                self.encode_mma(cmd, mm_mma, &[buf_x.buffer(), &buf_w, buf_proj.buffer(), &buf_rows, &buf_hidden, &buf_cols], rows, hidden, cols, 1);
             } else {
                 Self::encode_matmul(cmd, mm, buf_x.buffer(), &buf_w, buf_proj.buffer(), &buf_rows, &buf_hidden, &buf_cols, hidden, rows);
             }
@@ -2505,12 +2672,13 @@ impl GpuCompute for MetalCompute {
                     &buf_dim,
                 ];
                 if use_mma(seq_len, seq_len, head_dim) {
-                    Self::encode_mma(
+                    self.encode_mma(
                         cmd,
-                        &self.pipelines["batched_matmul_transb_simdgroup"],
+                        "batched_matmul_transb_simdgroup",
                         &qk_bufs,
                         seq_len,
                         seq_len,
+                        head_dim,
                         num_heads,
                     );
                 } else {
@@ -2576,12 +2744,13 @@ impl GpuCompute for MetalCompute {
                     &buf_dim,
                 ];
                 if use_mma(seq_len, head_dim, seq_len) {
-                    Self::encode_mma(
+                    self.encode_mma(
                         cmd,
-                        &self.pipelines["batched_matmul_ab_simdgroup"],
+                        "batched_matmul_ab_simdgroup",
                         &av_bufs,
                         seq_len,
                         head_dim,
+                        seq_len,
                         num_heads,
                     );
                 } else {
@@ -2677,12 +2846,13 @@ impl GpuCompute for MetalCompute {
                     &buf_dim,
                 ];
                 if use_mma(seq_len, seq_len, head_dim) {
-                    Self::encode_mma(
+                    self.encode_mma(
                         cmd,
-                        &self.pipelines["batched_matmul_transb_simdgroup"],
+                        "batched_matmul_transb_simdgroup",
                         &qk_bufs,
                         seq_len,
                         seq_len,
+                        head_dim,
                         total_heads,
                     );
                 } else {
@@ -2749,12 +2919,13 @@ impl GpuCompute for MetalCompute {
                     &buf_dim,
                 ];
                 if use_mma(seq_len, head_dim, seq_len) {
-                    Self::encode_mma(
+                    self.encode_mma(
                         cmd,
-                        &self.pipelines["batched_matmul_ab_simdgroup"],
+                        "batched_matmul_ab_simdgroup",
                         &av_bufs,
                         seq_len,
                         head_dim,
+                        seq_len,
                         total_heads,
                     );
                 } else {
@@ -2898,12 +3069,13 @@ impl GpuCompute for MetalCompute {
                     &buf_dim,
                 ];
                 if use_mma(seq_len, seq_len, head_dim) {
-                    Self::encode_mma(
+                    self.encode_mma(
                         cmd,
-                        &self.pipelines["batched_matmul_transb_simdgroup"],
+                        "batched_matmul_transb_simdgroup",
                         &qk_bufs,
                         seq_len,
                         seq_len,
+                        head_dim,
                         total_heads,
                     );
                 } else {
@@ -2973,12 +3145,13 @@ impl GpuCompute for MetalCompute {
                     &buf_dim,
                 ];
                 if use_mma(seq_len, head_dim, seq_len) {
-                    Self::encode_mma(
+                    self.encode_mma(
                         cmd,
-                        &self.pipelines["batched_matmul_ab_simdgroup"],
+                        "batched_matmul_ab_simdgroup",
                         &av_bufs,
                         seq_len,
                         head_dim,
+                        seq_len,
                         total_heads,
                     );
                 } else {
@@ -3456,6 +3629,57 @@ mod tests {
             "fused_attention_batched_posmajor vs head-major max err: {}",
             max_err
         );
+    }
+
+    #[test]
+    fn test_metal_wide_mma_matches_cpu() {
+        // Lever #5 phase 1: the wider 64x64 MMA tile must compute the same GEMM
+        // as the reference. Direct-dispatch the `*_wide` kernel (bypassing the
+        // KIN_INFER_MMA_WIDE flag, which is OnceLock-sampled and can't be toggled
+        // mid-process) on a shape that fills the 64x64 tile, and compare against
+        // CPU. Skips if the wide pipelines didn't build on this device.
+        let Some(metal) = get_metal() else { return };
+        if !WIDE_MMA_AVAILABLE.load(Ordering::Relaxed) {
+            return;
+        }
+        let cpu = crate::gpu::CpuCompute;
+
+        // matmul_transb: C[M,N] = A[M,K] * B[N,K]^T; M,N > 64 to exercise both a
+        // full 64x64 block and a ragged remainder.
+        let (m, n, k) = (80usize, 96usize, 64usize);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 89) as f32 - 44.0) * 0.01).collect();
+        let b: Vec<f32> = (0..n * k).map(|i| ((i % 73) as f32 - 36.0) * 0.01).collect();
+
+        let buf_a = metal.buf_slice_pooled(&a);
+        let buf_b = metal.buf_cached(&b);
+        let buf_c = metal.buf_zeros_pooled(m * n);
+        let buf_m = metal.buf_u32(m as u32);
+        let buf_n = metal.buf_u32(n as u32);
+        let buf_k = metal.buf_u32(k as u32);
+        let bufs = [buf_a.buffer(), &buf_b, buf_c.buffer(), &buf_m, &buf_n, &buf_k];
+        autoreleasepool(|_| {
+            let cmd = metal.queue.new_command_buffer();
+            let pipeline = &metal.pipelines["matmul_transb_simdgroup_wide"];
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(pipeline);
+            for (i, bb) in bufs.iter().enumerate() {
+                enc.set_buffer(i as u64, Some(*bb), 0);
+            }
+            let groups = MTLSize::new(n.div_ceil(64) as u64, m.div_ceil(64) as u64, 1);
+            enc.dispatch_thread_groups(groups, MTLSize::new(128, 1, 1));
+            enc.end_encoding();
+            metal.commit_wait(cmd);
+        });
+        let wide_out = MetalCompute::read_buf(buf_c.buffer(), m * n);
+        let cpu_out = cpu.matmul(&a, &b, m, n, k);
+
+        assert_eq!(wide_out.len(), m * n);
+        let max_err: f32 = wide_out
+            .iter()
+            .zip(cpu_out.iter())
+            .map(|(x, y)| (x - y).abs() / x.abs().max(y.abs()).max(1e-6))
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 5e-3, "wide MMA vs CPU matmul max err: {}", max_err);
     }
 
     #[test]
