@@ -2836,15 +2836,12 @@ async fn embed(
         // The vector index is a pure sidecar (not in the merkle root), so
         // embedding never changes H; this only closes the mutated-but-unsaved
         // window. Cost: one snapshot write up front.
-        {
-            let _persist = state_for_embed
-                .persist_lock
-                .lock()
-                .map_err(|_| "persist lock poisoned".to_string())?;
-            state_for_embed
-                .save_snapshot()
-                .map_err(|error| format!("embed pre-persist save failed: {error:#}"))?;
-        }
+        // save_snapshot() acquires persist_lock internally; the non-reentrant std
+        // Mutex self-deadlocks if we hold persist_lock across this call (this was
+        // the daemon embed hang — the worker wedged here before embedding started).
+        state_for_embed
+            .save_snapshot()
+            .map_err(|error| format!("embed pre-persist save failed: {error:#}"))?;
 
         // Persist the kvec sidecar after every batch so a long embed survives a
         // mid-run kill/OOM with the completed vectors intact, instead of losing
