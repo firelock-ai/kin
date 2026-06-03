@@ -8,7 +8,7 @@
 
 #![cfg(feature = "metal")]
 
-use crate::gpu::{GpuBackend, GpuCompute, GpuDeviceInfo};
+use crate::gpu::{GpuBackend, GpuCompute, GpuDeviceInfo, LayerTensors, LayerConfig};
 use metal::{
     Buffer, CommandBufferRef, CommandQueue, CompileOptions, ComputePipelineState, Device,
     MTLLanguageVersion, MTLResourceOptions, MTLSize,
@@ -1006,6 +1006,34 @@ kernel void elementwise_add(
     a[gid] += b[gid];
 }
 
+
+// ---- Split packed QKV into separate head-major chunks ----
+// Packed input QKV layout: [batch*seq, q_dim + k_dim + v_dim]
+// Separates the columns for Q, K, and V into dedicated buffers for reshaping.
+kernel void split_qkv_packed(
+    device const float* qkv     [[buffer(0)]],
+    device float* q             [[buffer(1)]],
+    device float* k             [[buffer(2)]],
+    device float* v             [[buffer(3)]],
+    constant uint& q_dim        [[buffer(4)]],
+    constant uint& k_dim        [[buffer(5)]],
+    constant uint& v_dim        [[buffer(6)]],
+    uint2 gid                   [[thread_position_in_grid]]
+) {
+    uint col = gid.x;
+    uint row = gid.y;
+    uint total_dim = q_dim + k_dim + v_dim;
+    uint src_idx = row * total_dim + col;
+    
+    if (col < q_dim) {
+        q[row * q_dim + col] = qkv[src_idx];
+    } else if (col < q_dim + k_dim) {
+        k[row * k_dim + (col - q_dim)] = qkv[src_idx];
+    } else if (col < total_dim) {
+        v[row * v_dim + (col - q_dim - k_dim)] = qkv[src_idx];
+    }
+}
+
 // ---- Fused SwiGLU activation: out = silu(gate) * up ----
 // Single pass over the gate/up intermediates, writing the activated product.
 // silu(x) = x / (1 + e^-x); identical math to the two-step silu-then-mul path
@@ -1795,6 +1823,7 @@ impl MetalCompute {
             "elementwise_add",
             "rope_apply",
             "rope_apply_batched",
+            "split_qkv_packed",
         ];
 
         let mut pipelines = HashMap::new();
@@ -2223,6 +2252,53 @@ impl MetalCompute {
     }
 
     /// Dispatch a 1D compute kernel.
+
+    fn encode_1d(
+        &self,
+        cmd: &CommandBufferRef,
+        pipeline_name: &str,
+        buffers: &[&Buffer],
+        total_threads: usize,
+    ) {
+        let pipeline = &self.pipelines[pipeline_name];
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(pipeline);
+        for (i, buf) in buffers.iter().enumerate() {
+            enc.set_buffer(i as u64, Some(buf), 0);
+        }
+        let thread_w = pipeline.thread_execution_width() as usize;
+        let threads = MTLSize::new(total_threads as u64, 1, 1);
+        let tg_size = MTLSize::new(thread_w.min(total_threads) as u64, 1, 1);
+        enc.dispatch_threads(threads, tg_size);
+        enc.end_encoding();
+    }
+
+    fn encode_3d(
+        &self,
+        cmd: &CommandBufferRef,
+        pipeline_name: &str,
+        buffers: &[&Buffer],
+        width: usize,
+        height: usize,
+        depth: usize,
+    ) {
+        let pipeline = &self.pipelines[pipeline_name];
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(pipeline);
+        for (i, buf) in buffers.iter().enumerate() {
+            enc.set_buffer(i as u64, Some(buf), 0);
+        }
+        let threads = MTLSize::new(width as u64, height as u64, depth as u64);
+        let tg_size = MTLSize::new(
+            8.min(width) as u64,
+            8.min(height) as u64,
+            1.min(depth) as u64,
+        );
+        enc.dispatch_threads(threads, tg_size);
+        enc.end_encoding();
+    }
+
+    /// Dispatch a 1D compute kernel.
     fn dispatch_1d(&self, pipeline_name: &str, buffers: &[&Buffer], total_threads: usize) {
         let _span = tracing::info_span!(
             "kin_infer.metal.dispatch_1d",
@@ -2470,6 +2546,239 @@ fn steel_mma_name(base: &str) -> &str {
 }
 
 impl GpuCompute for MetalCompute {
+
+    fn forward_layer_batched(
+        &self,
+        hidden: &[f32],
+        masks: &[u32],
+        weights: &LayerTensors,
+        config: &LayerConfig,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> Option<Vec<f32>> {
+        // Fast-path only for standard LLaMA-style architectures
+        if !config.use_rms || !config.pre_ln || weights.q_weight.is_none() || weights.ffn_gate_weight.is_none() {
+            return None;
+        }
+
+        let _span = tracing::info_span!("kin_infer.metal.forward_layer_batched").entered();
+
+        let batch_size = config.batch_size;
+        let max_len = config.max_len;
+        let total_rows = batch_size * max_len;
+        let h = config.hidden_size;
+        let heads = config.num_heads;
+        let head_dim = config.head_dim;
+        let inter = config.inter_size;
+        let kv_heads = weights.k_weight.unwrap().len() / (h * head_dim);
+        if kv_heads != heads {
+            // Simplify for now: only full attention, no GQA yet, fallback to lib.rs
+            return None;
+        }
+
+        let mut current_hidden = self.buf_slice_pooled(hidden);
+        
+        // ---------------------------------------------------------
+        // Command Buffer 1: RMSNorm 1 + QKV Projections
+        // ---------------------------------------------------------
+        let cmd1 = self.queue.new_command_buffer();
+        let mut retains1 = Vec::new();
+        
+        let buf_norm1_w = self.buf_cached(weights.norm1_weight);
+        let buf_normed1 = self.pool.acquire_uninit(total_rows * h * 4);
+        let buf_rows = self.buf_u32(total_rows as u32);
+        let buf_h = self.buf_u32(h as u32);
+        let buf_eps = self.buf_f32(config.rms_eps);
+        
+        {
+            let blit = cmd1.new_blit_command_encoder();
+            blit.copy_from_buffer(current_hidden.buffer(), 0, buf_normed1.buffer(), 0, (total_rows * h * 4) as u64);
+            blit.end_encoding();
+        }
+        self.encode_1d(cmd1, "rms_norm", &[buf_normed1.buffer(), &buf_norm1_w, &buf_h, &buf_eps], total_rows);
+        
+        let q_dim = heads * head_dim;
+        let buf_q_dim = self.buf_u32(q_dim as u32);
+        let buf_q = self.pool.acquire_uninit(total_rows * q_dim * 4);
+        let buf_k = self.pool.acquire_uninit(total_rows * q_dim * 4);
+        let buf_v = self.pool.acquire_uninit(total_rows * q_dim * 4);
+        let buf_qw = self.buf_cached(weights.q_weight.unwrap());
+        let buf_kw = self.buf_cached(weights.k_weight.unwrap());
+        let buf_vw = self.buf_cached(weights.v_weight.unwrap());
+        
+        if use_mma(total_rows, q_dim, h) {
+            self.encode_mma(cmd1, "matmul_transb_simdgroup", &[buf_normed1.buffer(), &buf_qw, buf_q.buffer(), &buf_rows, &buf_q_dim, &buf_h], total_rows, q_dim, h, 1);
+            self.encode_mma(cmd1, "matmul_transb_simdgroup", &[buf_normed1.buffer(), &buf_kw, buf_k.buffer(), &buf_rows, &buf_q_dim, &buf_h], total_rows, q_dim, h, 1);
+            self.encode_mma(cmd1, "matmul_transb_simdgroup", &[buf_normed1.buffer(), &buf_vw, buf_v.buffer(), &buf_rows, &buf_q_dim, &buf_h], total_rows, q_dim, h, 1);
+        } else {
+            Self::encode_matmul(cmd1, &self.pipelines["matmul_transb"], buf_normed1.buffer(), &buf_qw, buf_q.buffer(), &buf_rows, &buf_q_dim, &buf_h, q_dim, total_rows);
+            Self::encode_matmul(cmd1, &self.pipelines["matmul_transb"], buf_normed1.buffer(), &buf_kw, buf_k.buffer(), &buf_rows, &buf_q_dim, &buf_h, q_dim, total_rows);
+            Self::encode_matmul(cmd1, &self.pipelines["matmul_transb"], buf_normed1.buffer(), &buf_vw, buf_v.buffer(), &buf_rows, &buf_q_dim, &buf_h, q_dim, total_rows);
+        }
+        
+        retains1.push(buf_normed1);
+        self.commit_bounded(cmd1, retains1);
+        
+        // ---------------------------------------------------------
+        // Command Buffer 2: RoPE + Fused Attention Posmajor + Attn Out Projection + Add Residual
+        // ---------------------------------------------------------
+        let cmd2 = self.queue.new_command_buffer();
+        let mut retains2 = Vec::new();
+        
+        let buf_cos = self.buf_cached(rope_cos);
+        let buf_sin = self.buf_cached(rope_sin);
+        let buf_max_len = self.buf_u32(max_len as u32);
+        let buf_head_dim = self.buf_u32(head_dim as u32);
+        let buf_total_dim = self.buf_u32(q_dim as u32);
+        let buf_half = self.buf_u32((head_dim / 2) as u32);
+        let buf_actual = self.buf_u32(max_len as u32);
+        let num_pairs = q_dim / head_dim * (head_dim / 2);
+        
+        let rope_p = &self.pipelines["rope_apply_batched"];
+        for data_buf in [buf_q.buffer(), buf_k.buffer()] {
+            let enc = cmd2.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(rope_p);
+            enc.set_buffer(0, Some(data_buf), 0);
+            enc.set_buffer(1, Some(&buf_cos), 0);
+            enc.set_buffer(2, Some(&buf_sin), 0);
+            enc.set_buffer(3, Some(&buf_max_len), 0);
+            enc.set_buffer(4, Some(&buf_head_dim), 0);
+            enc.set_buffer(5, Some(&buf_total_dim), 0);
+            enc.set_buffer(6, Some(&buf_half), 0);
+            enc.set_buffer(7, Some(&buf_actual), 0);
+            let threads = metal::MTLSize::new(num_pairs as u64, total_rows as u64, 1);
+            let tg = metal::MTLSize::new(16.min(num_pairs) as u64, 16.min(total_rows) as u64, 1);
+            enc.dispatch_threads(threads, tg);
+            enc.end_encoding();
+        }
+        
+        let buf_attn_out = self.pool.acquire_uninit(total_rows * q_dim * 4);
+        
+        // Inline fused_attention_batched_posmajor
+        let elems = heads * max_len * head_dim; // wait seq_len -> max_len
+        let buf_q_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4);
+        let buf_k_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4);
+        let buf_v_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4);
+        let buf_hpg = self.buf_u32(1 as u32); // no groups
+        let buf_seq = self.buf_u32(max_len as u32);
+        
+        self.encode_3d(cmd2, "reshape_qkv_pos_to_head", &[
+            buf_q.buffer(), buf_k.buffer(), buf_v.buffer(),
+            buf_q_reshaped.buffer(), buf_k_reshaped.buffer(), buf_v_reshaped.buffer(),
+            &buf_hpg, &buf_seq, &buf_head_dim
+        ], head_dim, max_len, heads);
+        
+        let buf_scores = self.pool.acquire_uninit(heads * max_len * max_len * 4);
+        let buf_scale = self.buf_f32(config.scale);
+        let buf_masks = self.buf_u32_slice(masks);
+        let buf_has_alibi = self.buf_u32(0);
+        let buf_alibi = self.buf_slice_pooled(&[0.0f32]);
+        let buf_out_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4);
+        
+        self.encode_3d(cmd2, "batched_matmul_transb", &[
+            buf_q_reshaped.buffer(), buf_k_reshaped.buffer(), buf_scores.buffer(), &buf_seq, &buf_head_dim
+        ], max_len, max_len, heads);
+        
+        self.encode_3d(cmd2, "softmax_scale_mask", &[
+            buf_scores.buffer(), &buf_masks, &buf_scale, buf_alibi.buffer(), &buf_has_alibi, &buf_hpg, &buf_seq
+        ], max_len, heads, 1);
+        
+        self.encode_3d(cmd2, "batched_matmul_ab", &[
+            buf_scores.buffer(), buf_v_reshaped.buffer(), buf_out_reshaped.buffer(), &buf_seq, &buf_head_dim
+        ], head_dim, max_len, heads);
+        
+        self.encode_3d(cmd2, "reshape_out_head_to_pos", &[
+            buf_out_reshaped.buffer(), buf_attn_out.buffer(), &buf_hpg, &buf_seq, &buf_head_dim
+        ], head_dim, max_len, heads);
+        
+        // Attn Out Projection -> buf_proj_out
+        let buf_proj_out = self.pool.acquire_uninit(total_rows * h * 4);
+        let buf_attn_w = self.buf_cached(weights.attn_out_weight);
+        if use_mma(total_rows, h, q_dim) {
+            self.encode_mma(cmd2, "matmul_transb_simdgroup", &[buf_attn_out.buffer(), &buf_attn_w, buf_proj_out.buffer(), &buf_rows, &buf_h, &buf_q_dim], total_rows, h, q_dim, 1);
+        } else {
+            Self::encode_matmul(cmd2, &self.pipelines["matmul_transb"], buf_attn_out.buffer(), &buf_attn_w, buf_proj_out.buffer(), &buf_rows, &buf_h, &buf_q_dim, h, total_rows);
+        }
+        
+        // Add Residual: current_hidden += buf_proj_out
+        self.encode_1d(cmd2, "add_vectors", &[current_hidden.buffer(), buf_proj_out.buffer(), current_hidden.buffer()], total_rows * h);
+        
+        retains2.push(buf_q);
+        retains2.push(buf_k);
+        retains2.push(buf_v);
+        retains2.push(buf_q_reshaped);
+        retains2.push(buf_k_reshaped);
+        retains2.push(buf_v_reshaped);
+        retains2.push(buf_scores);
+        retains2.push(buf_out_reshaped);
+        retains2.push(buf_attn_out);
+        retains2.push(buf_proj_out);
+        self.commit_bounded(cmd2, retains2);
+        
+        // ---------------------------------------------------------
+        // Command Buffer 3: RMSNorm 2 + FFN SwiGLU + Add Residual
+        // ---------------------------------------------------------
+        let cmd3 = self.queue.new_command_buffer();
+        let mut retains3 = Vec::new();
+        
+        let buf_norm2_w = self.buf_cached(weights.norm2_weight);
+        let buf_normed2 = self.pool.acquire_uninit(total_rows * h * 4);
+        
+        {
+            let blit = cmd3.new_blit_command_encoder();
+            blit.copy_from_buffer(current_hidden.buffer(), 0, buf_normed2.buffer(), 0, (total_rows * h * 4) as u64);
+            blit.end_encoding();
+        }
+        self.encode_1d(cmd3, "rms_norm", &[buf_normed2.buffer(), &buf_norm2_w, &buf_h, &buf_eps], total_rows);
+        
+        let buf_wgateup = self.buf_cached_concat(&[weights.ffn_gate_weight.unwrap(), weights.ffn_up_weight.unwrap()]);
+        let buf_wdown = self.buf_cached(weights.ffn_down_weight);
+        let buf_gateup = self.pool.acquire_uninit(total_rows * 2 * inter * 4);
+        let buf_act = self.pool.acquire_uninit(total_rows * inter * 4);
+        let buf_ffn_out = self.pool.acquire_uninit(total_rows * h * 4);
+        let buf_inter = self.buf_u32(inter as u32);
+        let buf_two_inter = self.buf_u32((2 * inter) as u32);
+        
+        if use_mma(total_rows, 2 * inter, h) {
+            self.encode_mma(cmd3, "matmul_transb_simdgroup", &[buf_normed2.buffer(), &buf_wgateup, buf_gateup.buffer(), &buf_rows, &buf_two_inter, &buf_h], total_rows, 2 * inter, h, 1);
+        } else {
+            Self::encode_matmul(cmd3, &self.pipelines["matmul_transb"], buf_normed2.buffer(), &buf_wgateup, buf_gateup.buffer(), &buf_rows, &buf_two_inter, &buf_h, 2 * inter, total_rows);
+        }
+        
+        {
+            let swi = &self.pipelines["swiglu_activation_fat"];
+            let enc = cmd3.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(swi);
+            enc.set_buffer(0, Some(buf_gateup.buffer()), 0);
+            enc.set_buffer(1, Some(buf_act.buffer()), 0);
+            enc.set_buffer(2, Some(&buf_inter), 0);
+            let total = (total_rows * inter) as u64;
+            let tw = swi.thread_execution_width() as u64;
+            enc.dispatch_threads(metal::MTLSize::new(total, 1, 1), metal::MTLSize::new(tw.min(total).max(1), 1, 1));
+            enc.end_encoding();
+        }
+        
+        if use_mma(total_rows, h, inter) {
+            self.encode_mma(cmd3, "matmul_transb_simdgroup", &[buf_act.buffer(), &buf_wdown, buf_ffn_out.buffer(), &buf_rows, &buf_h, &buf_inter], total_rows, h, inter, 1);
+        } else {
+            Self::encode_matmul(cmd3, &self.pipelines["matmul_transb"], buf_act.buffer(), &buf_wdown, buf_ffn_out.buffer(), &buf_rows, &buf_h, &buf_inter, h, total_rows);
+        }
+        
+        // Add Residual: current_hidden += ffn_out
+        self.encode_1d(cmd3, "add_vectors", &[current_hidden.buffer(), buf_ffn_out.buffer(), current_hidden.buffer()], total_rows * h);
+        
+        retains3.push(buf_normed2);
+        retains3.push(buf_gateup);
+        retains3.push(buf_act);
+        retains3.push(buf_ffn_out);
+        // Wait, current_hidden MUST be waited for since we read it back immediately!
+        // We will just commit_wait for cmd3!
+        self.commit_wait(&cmd3);
+        
+        let out = Self::read_buf(current_hidden.buffer(), total_rows * h);
+        Some(out)
+    }
+
     fn matmul(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
         let _span = tracing::info_span!("kin_infer.metal.matmul", m = m, n = n, k = k).entered();
         let buf_a = self.buf_slice_pooled(a);

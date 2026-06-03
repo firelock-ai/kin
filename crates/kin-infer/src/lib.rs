@@ -1426,6 +1426,94 @@ impl BertModel {
         for i in 0..self.config.num_hidden_layers {
             let layer = &self.weights.layers[i % num_groups];
 
+            if let Some(gpu) = self.gpu.as_ref() {
+                let layer_tensors = crate::gpu::LayerTensors {
+                    norm1_weight: layer.norm1_weight.as_slice().unwrap(),
+                    norm1_bias: layer.norm1_bias.as_ref().and_then(|x| x.as_slice()),
+                    
+                    qkv_weight: layer.qkv_weight.as_ref().and_then(|x| x.as_slice()),
+                    qkv_bias: layer.qkv_bias.as_ref().and_then(|x| x.as_slice()),
+                    q_weight: layer.q_weight.as_slice(),
+                    q_bias: layer.q_bias.as_ref().and_then(|x| x.as_slice()),
+                    k_weight: layer.k_weight.as_slice(),
+                    k_bias: layer.k_bias.as_ref().and_then(|x| x.as_slice()),
+                    v_weight: layer.v_weight.as_slice(),
+                    v_bias: layer.v_bias.as_ref().and_then(|x| x.as_slice()),
+                    q_ln_weight: layer.q_ln_weight.as_ref().and_then(|x| x.as_slice()),
+                    q_ln_bias: layer.q_ln_bias.as_ref().and_then(|x| x.as_slice()),
+                    k_ln_weight: layer.k_ln_weight.as_ref().and_then(|x| x.as_slice()),
+                    k_ln_bias: layer.k_ln_bias.as_ref().and_then(|x| x.as_slice()),
+
+                    attn_out_weight: layer.attn_out_weight.as_slice().unwrap(),
+                    attn_out_bias: layer.attn_out_bias.as_ref().and_then(|x| x.as_slice()),
+                    
+                    norm2_weight: layer.norm2_weight.as_slice().unwrap(),
+                    norm2_bias: layer.norm2_bias.as_ref().and_then(|x| x.as_slice()),
+                    
+                    ffn_gate_weight: layer.ffn_gate_weight.as_ref().and_then(|x| x.as_slice()),
+                    ffn_up_weight: layer.ffn_up_weight.as_ref().and_then(|x| x.as_slice()),
+                    ffn_up_bias: layer.ffn_up_bias.as_ref().and_then(|x| x.as_slice()),
+                    ffn_down_weight: layer.ffn_down_weight.as_slice().unwrap(),
+                    ffn_down_bias: layer.ffn_down_bias.as_ref().and_then(|x| x.as_slice()),
+                    ffn_up_gated_weight: layer.ffn_up_gated_weight.as_ref().and_then(|x| x.as_slice()),
+
+                    relative_attention_bias: layer.relative_attention_bias.as_ref().and_then(|x| x.as_slice()),
+                    rel_pos_embeddings: layer.rel_pos_embeddings.as_ref().and_then(|x| x.as_slice()),
+                };
+
+                let layer_config = crate::gpu::LayerConfig {
+                    batch_size,
+                    max_len,
+                    hidden_size: h,
+                    num_heads,
+                    head_dim,
+                    inter_size: self.config.intermediate_size,
+                    eps,
+                    rms_eps,
+                    use_rms,
+                    pre_ln,
+                    scale,
+                    alibi_slopes: alibi_slopes.as_deref(),
+                };
+
+                let rope_cos_slice = if self.weights.position_embeddings.is_none() {
+                    self.rope_cos.as_ref().and_then(|x| x.as_slice()).unwrap_or(&[])
+                } else {
+                    &[]
+                };
+                let rope_sin_slice = if self.weights.position_embeddings.is_none() {
+                    self.rope_sin.as_ref().and_then(|x| x.as_slice()).unwrap_or(&[])
+                } else {
+                    &[]
+                };
+
+                if let Some(fused_out) = gpu.forward_layer_batched(
+                    hidden.as_slice().unwrap(),
+                    &flat_masks,
+                    &layer_tensors,
+                    &layer_config,
+                    rope_cos_slice,
+                    rope_sin_slice,
+                ) {
+                    hidden = Array2::from_shape_vec((total_rows, h), fused_out)
+                        .expect("fused layer output dimension mismatch");
+                    
+                    if dump_layer_enabled() {
+                        let e = dump_entity_index();
+                        if e < batch_size {
+                            let real = token_ids[e].len();
+                            let block: Vec<f32> = hidden
+                                .slice(ndarray::s![e * max_len..e * max_len + real, ..])
+                                .iter()
+                                .copied()
+                                .collect();
+                            dump_hidden("batched", (i + 1) as i32, "ffn", &block);
+                        }
+                    }
+                    continue;
+                }
+            }
+
             // --- Batched pre-LN norm [total_rows, h] ---
             let normed_for_attn = if pre_ln {
                 let mut n = hidden.clone();

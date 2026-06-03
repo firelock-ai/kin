@@ -132,6 +132,65 @@ fn discover_cuda_devices() -> Vec<GpuDeviceInfo> {
 // Compute operations trait
 // ---------------------------------------------------------------------------
 
+/// References to all tensor slices for a single transformer layer.
+#[derive(Default, Clone)]
+pub struct LayerTensors<'a> {
+    pub norm1_weight: &'a [f32],
+    pub norm1_bias: Option<&'a [f32]>,
+    
+    // QKV Projection
+    pub qkv_weight: Option<&'a [f32]>,
+    pub qkv_bias: Option<&'a [f32]>,
+    pub q_weight: Option<&'a [f32]>,
+    pub q_bias: Option<&'a [f32]>,
+    pub k_weight: Option<&'a [f32]>,
+    pub k_bias: Option<&'a [f32]>,
+    pub v_weight: Option<&'a [f32]>,
+    pub v_bias: Option<&'a [f32]>,
+    pub q_ln_weight: Option<&'a [f32]>,
+    pub q_ln_bias: Option<&'a [f32]>,
+    pub k_ln_weight: Option<&'a [f32]>,
+    pub k_ln_bias: Option<&'a [f32]>,
+
+    // Attention Output Projection
+    pub attn_out_weight: &'a [f32],
+    pub attn_out_bias: Option<&'a [f32]>,
+    
+    pub norm2_weight: &'a [f32],
+    pub norm2_bias: Option<&'a [f32]>,
+    
+    // FFN
+    pub ffn_gate_weight: Option<&'a [f32]>,
+    pub ffn_up_weight: Option<&'a [f32]>,
+    pub ffn_up_bias: Option<&'a [f32]>,
+    pub ffn_down_weight: &'a [f32],
+    pub ffn_down_bias: Option<&'a [f32]>,
+    pub ffn_up_gated_weight: Option<&'a [f32]>,
+
+    // Advanced Position Embeddings
+    pub relative_attention_bias: Option<&'a [f32]>,
+    pub rel_pos_embeddings: Option<&'a [f32]>,
+}
+
+/// Scalar parameters and dimensions for a single transformer layer.
+#[derive(Clone)]
+pub struct LayerConfig<'a> {
+    pub batch_size: usize,
+    pub max_len: usize,
+    pub hidden_size: usize,
+    pub num_heads: usize,
+    pub head_dim: usize,
+    pub inter_size: usize,
+    
+    pub eps: f32,
+    pub rms_eps: f32,
+    pub use_rms: bool,
+    pub pre_ln: bool,
+    pub scale: f32,
+    
+    pub alibi_slopes: Option<&'a [f32]>,
+}
+
 /// GPU-accelerated tensor operations for transformer inference.
 ///
 /// Each method mirrors a CPU operation in lib.rs. Implementations
@@ -538,6 +597,29 @@ pub trait GpuCompute: Send + Sync {
         }
         self.layer_norm(&mut sum, gamma, beta, rows, hidden, eps);
         sum
+    }
+
+    /// Evaluates an entire Transformer layer in a single GPU submission, keeping
+    /// intermediate activations resident on-device.
+    ///
+    /// Accepts a position-major input `hidden` of shape `[batch_size * max_len, hidden_size]`.
+    /// `masks` is the flattened per-batch mask `[batch_size * max_len]`.
+    ///
+    /// Returns `Some(Vec<f32>)` containing the position-major output if the backend 
+    /// supports fusing this specific layer configuration. 
+    /// Returns `None` to signal the caller to fall back to the per-operation path 
+    /// (which acts as both the fallback and the CPU parity reference).
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layer_batched(
+        &self,
+        _hidden: &[f32],
+        _masks: &[u32],
+        _weights: &LayerTensors,
+        _config: &LayerConfig,
+        _rope_cos: &[f32],
+        _rope_sin: &[f32],
+    ) -> Option<Vec<f32>> {
+        None
     }
 
     /// Which backend this compute instance uses.
