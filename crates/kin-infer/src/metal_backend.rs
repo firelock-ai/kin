@@ -569,13 +569,15 @@ kernel void batched_matmul_transb_simdgroup(
     device float*       C   [[buffer(2)]],
     constant uint& seq      [[buffer(3)]],
     constant uint& dim      [[buffer(4)]],
+    constant uint& hpg      [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
     uint  lane             [[thread_index_in_simdgroup]])
 {
     uint h = tgid.z;
+    uint kv_h = h / hpg;
     device const float* Ah = Q  + h * seq * dim;
-    device const float* Bh = Kk + h * seq * dim;
+    device const float* Bh = Kk + kv_h * seq * dim;
     device float*       Ch = C  + h * seq * seq;
     threadgroup float As[MMA_BM][MMA_BK];
     threadgroup float Bs[MMA_BN][MMA_BK];
@@ -591,13 +593,15 @@ kernel void batched_matmul_ab_simdgroup(
     device float*       C   [[buffer(2)]],
     constant uint& seq      [[buffer(3)]],
     constant uint& dim      [[buffer(4)]],
+    constant uint& hpg      [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
     uint  lane             [[thread_index_in_simdgroup]])
 {
     uint h = tgid.z;
+    uint kv_h = h / hpg;
     device const float* Ah = S + h * seq * seq;
-    device const float* Bh = V + h * seq * dim;
+    device const float* Bh = V + kv_h * seq * dim;
     device float*       Ch = C + h * seq * dim;
     threadgroup float As[MMA_BM][MMA_BK];
     threadgroup float Bs[MMA_BN][MMA_BK];
@@ -636,13 +640,15 @@ kernel void batched_matmul_transb_simdgroup_wide(
     device float*       C   [[buffer(2)]],
     constant uint& seq      [[buffer(3)]],
     constant uint& dim      [[buffer(4)]],
+    constant uint& hpg      [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
     uint  lane             [[thread_index_in_simdgroup]])
 {
     uint h = tgid.z;
+    uint kv_h = h / hpg;
     device const float* Ah = Q  + h * seq * dim;
-    device const float* Bh = Kk + h * seq * dim;
+    device const float* Bh = Kk + kv_h * seq * dim;
     device float*       Ch = C  + h * seq * seq;
     threadgroup float As[64][MMA_BK];
     threadgroup float Bs[64][MMA_BK];
@@ -656,13 +662,15 @@ kernel void batched_matmul_ab_simdgroup_wide(
     device float*       C   [[buffer(2)]],
     constant uint& seq      [[buffer(3)]],
     constant uint& dim      [[buffer(4)]],
+    constant uint& hpg      [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
     uint  lane             [[thread_index_in_simdgroup]])
 {
     uint h = tgid.z;
+    uint kv_h = h / hpg;
     device const float* Ah = S + h * seq * seq;
-    device const float* Bh = V + h * seq * dim;
+    device const float* Bh = V + kv_h * seq * dim;
     device float*       Ch = C + h * seq * dim;
     threadgroup float As[64][MMA_BK];
     threadgroup float Bs[64][MMA_BK];
@@ -834,13 +842,15 @@ kernel void batched_matmul_transb_simdgroup_steel(
     device float*       C   [[buffer(2)]],
     constant uint& seq      [[buffer(3)]],
     constant uint& dim      [[buffer(4)]],
+    constant uint& hpg      [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
     uint  lane             [[thread_index_in_simdgroup]])
 {
     uint h = tgid.z;
+    uint kv_h = h / hpg;
     device const float* Ah = Q  + h * seq * dim;
-    device const float* Bh = Kk + h * seq * dim;
+    device const float* Bh = Kk + kv_h * seq * dim;
     device float*       Ch = C  + h * seq * seq;
     threadgroup float As[2][32][MMA_BK];
     threadgroup float Bs[2][32][MMA_BK];
@@ -855,13 +865,15 @@ kernel void batched_matmul_ab_simdgroup_steel(
     device float*       C   [[buffer(2)]],
     constant uint& seq      [[buffer(3)]],
     constant uint& dim      [[buffer(4)]],
+    constant uint& hpg      [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
     uint  lane             [[thread_index_in_simdgroup]])
 {
     uint h = tgid.z;
+    uint kv_h = h / hpg;
     device const float* Ah = S + h * seq * seq;
-    device const float* Bh = V + h * seq * dim;
+    device const float* Bh = V + kv_h * seq * dim;
     device float*       Ch = C + h * seq * dim;
     threadgroup float As[2][32][MMA_BK];
     threadgroup float Bs[2][32][MMA_BK];
@@ -1161,6 +1173,7 @@ kernel void batched_matmul_transb(
     device float* C             [[buffer(2)]],
     constant uint& seq_len      [[buffer(3)]],
     constant uint& head_dim     [[buffer(4)]],
+    constant uint& hpg          [[buffer(5)]],
     uint3 gid                   [[thread_position_in_grid]],
     uint3 tid                   [[thread_position_in_threadgroup]],
     uint3 tgs                   [[threads_per_threadgroup]]
@@ -1172,16 +1185,19 @@ kernel void batched_matmul_transb(
     uint col  = gid.x;  // j in [0, seq_len)
     uint row  = gid.y;  // i in [0, seq_len)
     uint head = gid.z;  // h in [0, num_heads)
+    uint kv_head = head / hpg;
 
-    uint head_off = head * seq_len * head_dim;
-    uint c_off = head * seq_len * seq_len + row * seq_len + col;
+    device const float* A_head = A + head * seq_len * head_dim;
+    device const float* B_head = B + kv_head * seq_len * head_dim;
+    device float* C_head = C + head * seq_len * seq_len;
+    uint c_off = row * seq_len + col;
 
     float sum = 0.0;
     for (uint tile = 0; tile < head_dim; tile += TILE) {
         for (uint a_local = tid.x; a_local < TILE; a_local += tgs.x) {
             uint d = tile + a_local;
             if (row < seq_len && d < head_dim) {
-                a_tile[tid.y][a_local] = A[head_off + row * head_dim + d];
+                a_tile[tid.y][a_local] = A_head[row * head_dim + d];
             } else {
                 a_tile[tid.y][a_local] = 0.0;
             }
@@ -1190,7 +1206,7 @@ kernel void batched_matmul_transb(
         for (uint b_local = tid.y; b_local < TILE; b_local += tgs.y) {
             uint d = tile + b_local;
             if (col < seq_len && d < head_dim) {
-                b_tile[b_local][tid.x] = B[head_off + col * head_dim + d];
+                b_tile[b_local][tid.x] = B_head[col * head_dim + d];
             } else {
                 b_tile[b_local][tid.x] = 0.0;
             }
@@ -1204,7 +1220,7 @@ kernel void batched_matmul_transb(
     }
 
     if (row < seq_len && col < seq_len) {
-        C[c_off] = sum;
+        C_head[c_off] = sum;
     }
 }
 
@@ -1219,6 +1235,7 @@ kernel void batched_matmul_ab(
     device float* C             [[buffer(2)]],
     constant uint& seq_len      [[buffer(3)]],
     constant uint& head_dim     [[buffer(4)]],
+    constant uint& hpg          [[buffer(5)]],
     uint3 gid                   [[thread_position_in_grid]],
     uint3 tid                   [[thread_position_in_threadgroup]],
     uint3 tgs                   [[threads_per_threadgroup]]
@@ -1230,17 +1247,19 @@ kernel void batched_matmul_ab(
     uint col  = gid.x;  // j in [0, head_dim)
     uint row  = gid.y;  // i in [0, seq_len)
     uint head = gid.z;  // h in [0, num_heads)
+    uint kv_head = head / hpg;
 
-    uint a_head_off = head * seq_len * seq_len;
-    uint b_head_off = head * seq_len * head_dim;
-    uint c_off = b_head_off + row * head_dim + col;
+    device const float* A_head = A + head * seq_len * seq_len;
+    device const float* B_head = B + kv_head * seq_len * head_dim;
+    device float* C_head = C + head * seq_len * head_dim;
+    uint c_off = row * head_dim + col;
 
     float sum = 0.0;
     for (uint tile = 0; tile < seq_len; tile += TILE) {
         for (uint a_local = tid.x; a_local < TILE; a_local += tgs.x) {
             uint k = tile + a_local;
             if (row < seq_len && k < seq_len) {
-                a_tile[tid.y][a_local] = A[a_head_off + row * seq_len + k];
+                a_tile[tid.y][a_local] = A_head[row * seq_len + k];
             } else {
                 a_tile[tid.y][a_local] = 0.0;
             }
@@ -1249,7 +1268,7 @@ kernel void batched_matmul_ab(
         for (uint b_local = tid.y; b_local < TILE; b_local += tgs.y) {
             uint k = tile + b_local;
             if (col < head_dim && k < seq_len) {
-                b_tile[b_local][tid.x] = B[b_head_off + k * head_dim + col];
+                b_tile[b_local][tid.x] = B_head[k * head_dim + col];
             } else {
                 b_tile[b_local][tid.x] = 0.0;
             }
@@ -1263,7 +1282,7 @@ kernel void batched_matmul_ab(
     }
 
     if (row < seq_len && col < head_dim) {
-        C[c_off] = sum;
+        C_head[c_off] = sum;
     }
 }
 
@@ -1532,7 +1551,7 @@ static inline void block_mma_fp16(
                         C[gr * N + gc] = scratch[er * F + ec];
                     }
                 }
-                simdgroup_barrier(mem_flags::mem_threadgroup);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
             }
         }
     }
@@ -2639,26 +2658,26 @@ impl GpuCompute for MetalCompute {
         let buf_h = self.buf_u32(h as u32);
         let buf_eps = self.buf_f32(if config.use_rms { config.rms_eps } else { config.eps });
         
-        let buf_normed1 = if config.pre_ln {
-            let b = self.pool.acquire_uninit(total_rows * h * 4);
-            let buf_norm1_w = self.buf_cached(weights.norm1_weight);
+        // Layer norm 1
+        let mut buf_normed1 = None;
+        let mut qkv_in = current_hidden.buffer();
+        if config.pre_ln {
+            let buf = self.pool.acquire_uninit(total_rows * h * 4);
             {
                 let blit = cmd1.new_blit_command_encoder();
-                blit.copy_from_buffer(current_hidden.buffer(), 0, b.buffer(), 0, (total_rows * h * 4) as u64);
+                blit.copy_from_buffer(current_hidden.buffer(), 0, buf.buffer(), 0, (total_rows * h * 4) as u64);
                 blit.end_encoding();
             }
+            let buf_norm1_w = self.buf_cached(weights.norm1_weight);
             if config.use_rms {
-                self.encode_1d(cmd1, "rms_norm", &[b.buffer(), &buf_norm1_w, &buf_h, &buf_eps], total_rows);
+                self.encode_1d(cmd1, "rms_norm", &[buf.buffer(), &buf_norm1_w, &buf_h, &buf_eps], total_rows);
             } else {
                 let buf_norm1_b = self.buf_cached(weights.norm1_bias.unwrap_or(&[]));
-                self.encode_1d(cmd1, "layer_norm", &[b.buffer(), &buf_norm1_w, &buf_norm1_b, &buf_rows, &buf_h, &buf_eps], total_rows);
+                self.encode_1d(cmd1, "layer_norm", &[buf.buffer(), &buf_norm1_w, &buf_norm1_b, &buf_h, &buf_eps], total_rows);
             }
-            Some(b)
-        } else {
-            None
-        };
-        
-        let qkv_in = if let Some(ref b) = buf_normed1 { b.buffer() } else { current_hidden.buffer() };
+            buf_normed1 = Some(buf);
+            qkv_in = buf_normed1.as_ref().unwrap().buffer();
+        }
         
         let buf_q_dim = self.buf_u32(q_dim as u32);
         let buf_kv_dim = self.buf_u32(kv_dim as u32);
@@ -2702,12 +2721,12 @@ impl GpuCompute for MetalCompute {
             if let Some(q_ln_w) = weights.q_ln_weight {
                 let q_ln_w_buf = self.buf_cached(q_ln_w);
                 let q_ln_b_buf = self.buf_cached(weights.q_ln_bias.unwrap_or(&[]));
-                self.encode_1d(cmd1, "layer_norm", &[buf_q.buffer(), &q_ln_w_buf, &q_ln_b_buf, &buf_rows, &buf_q_dim, &buf_eps], total_rows);
+                self.encode_1d(cmd1, "layer_norm", &[buf_q.buffer(), &q_ln_w_buf, &q_ln_b_buf, &buf_q_dim, &buf_eps], total_rows);
             }
             if let Some(k_ln_w) = weights.k_ln_weight {
                 let k_ln_w_buf = self.buf_cached(k_ln_w);
                 let k_ln_b_buf = self.buf_cached(weights.k_ln_bias.unwrap_or(&[]));
-                self.encode_1d(cmd1, "layer_norm", &[buf_k.buffer(), &k_ln_w_buf, &k_ln_b_buf, &buf_rows, &buf_kv_dim, &buf_eps], total_rows);
+                self.encode_1d(cmd1, "layer_norm", &[buf_k.buffer(), &k_ln_w_buf, &k_ln_b_buf, &buf_kv_dim, &buf_eps], total_rows);
             }
             retains1.push(buf_qkv);
         } else {
@@ -2804,20 +2823,20 @@ impl GpuCompute for MetalCompute {
         let buf_q_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4);
         let buf_k_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4);
         let buf_v_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4);
-        let buf_hpg = self.buf_u32(1 as u32);
+        let hpg = heads / kv_heads;
+        let buf_hpg = self.buf_u32(hpg as u32);
         let buf_seq = self.buf_u32(max_len as u32);
         let buf_head_dim = self.buf_u32(head_dim as u32);
+        let total_q_heads = batch_size * heads;
+        let total_kv_heads = batch_size * kv_heads;
         
         if kv_heads == heads {
             self.encode_3d(cmd2, "reshape_qkv_pos_to_head", &[
                 buf_q.buffer(), buf_k.buffer(), buf_v.buffer(),
                 buf_q_reshaped.buffer(), buf_k_reshaped.buffer(), buf_v_reshaped.buffer(),
                 &buf_hpg, &buf_seq, &buf_head_dim
-            ], head_dim, max_len, heads);
+            ], head_dim, max_len, total_q_heads);
         } else {
-            let buf_kv_heads_pg = self.buf_u32(1); // MQA/GQA on batch logic treats hpg as heads actually. 
-            // Wait, encode_3d passes heads as the Z dimension grid size.
-            // In our GQA kernel, heads_per_group is Z dimension. 
             let buf_heads = self.buf_u32(heads as u32);
             let buf_kv_heads = self.buf_u32(kv_heads as u32);
             let p = &self.pipelines["reshape_qkv_pos_to_head_gqa"];
@@ -2834,13 +2853,13 @@ impl GpuCompute for MetalCompute {
             enc.set_buffer(8, Some(&buf_head_dim), 0);
             enc.set_buffer(9, Some(&buf_kv_heads), 0);
             
-            let threads = metal::MTLSize::new(head_dim as u64, max_len as u64, heads as u64);
+            let threads = metal::MTLSize::new(head_dim as u64, max_len as u64, total_q_heads as u64);
             let tg = metal::MTLSize::new(16.min(head_dim) as u64, 16.min(max_len) as u64, 1);
             enc.dispatch_threads(threads, tg);
             enc.end_encoding();
         }
         
-        let buf_scores = self.pool.acquire_uninit(heads * max_len * max_len * 4);
+        let buf_scores = self.pool.acquire_uninit(total_q_heads * max_len * max_len * 4);
         let buf_scale = self.buf_f32(config.scale);
         let buf_masks = self.buf_u32_slice(masks);
         let buf_has_alibi = self.buf_u32(0);
@@ -2848,35 +2867,35 @@ impl GpuCompute for MetalCompute {
         let buf_out_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4);
         
         let qk_bufs = [
-            buf_q_reshaped.buffer(), buf_k_reshaped.buffer(), buf_scores.buffer(), &buf_seq, &buf_head_dim
+            buf_q_reshaped.buffer(), buf_k_reshaped.buffer(), buf_scores.buffer(), &buf_seq, &buf_head_dim, &self.buf_u32(hpg as u32)
         ];
         if use_mma(max_len, max_len, head_dim) {
-            self.encode_mma(cmd2, "batched_matmul_transb_simdgroup", &qk_bufs, max_len, max_len, head_dim, heads);
+            self.encode_mma(cmd2, "batched_matmul_transb_simdgroup", &qk_bufs, max_len, max_len, head_dim, total_q_heads);
         } else {
-            self.encode_3d(cmd2, "batched_matmul_transb", &qk_bufs, max_len, max_len, heads);
+            self.encode_3d(cmd2, "batched_matmul_transb", &qk_bufs, max_len, max_len, total_q_heads);
         }
         
-        self.encode_3d(cmd2, "scale_mask_alibi", &[
-            buf_scores.buffer(), &buf_masks, buf_alibi.buffer(), &buf_scale, &buf_seq, &buf_has_alibi
-        ], max_len, max_len, heads);
+        self.encode_3d(cmd2, "scale_mask_alibi_grouped", &[
+            buf_scores.buffer(), buf_alibi.buffer(), &buf_masks, &buf_scale, &buf_seq, &buf_has_alibi, &buf_hpg
+        ], max_len, max_len, total_q_heads);
         
-        self.encode_3d(cmd2, "softmax_rows", &[
+        self.encode_1d(cmd2, "softmax_rows", &[
             buf_scores.buffer(), &buf_seq
-        ], max_len, max_len, heads);
+        ], total_q_heads * max_len);
         
         let sv_bufs = [
-            buf_scores.buffer(), buf_v_reshaped.buffer(), buf_out_reshaped.buffer(), &buf_seq, &buf_head_dim
+            buf_scores.buffer(), buf_v_reshaped.buffer(), buf_out_reshaped.buffer(), &buf_seq, &buf_head_dim, &self.buf_u32(hpg as u32)
         ];
         if use_mma(max_len, head_dim, max_len) {
-            self.encode_mma(cmd2, "batched_matmul_ab_simdgroup", &sv_bufs, max_len, head_dim, max_len, heads);
+            self.encode_mma(cmd2, "batched_matmul_ab_simdgroup", &sv_bufs, max_len, head_dim, max_len, total_q_heads);
         } else {
-            self.encode_3d(cmd2, "batched_matmul_ab", &sv_bufs, head_dim, max_len, heads);
+            self.encode_3d(cmd2, "batched_matmul_ab", &sv_bufs, head_dim, max_len, total_q_heads);
         }
         
         let buf_attn_out = self.pool.acquire_uninit(total_rows * q_dim * 4);
         self.encode_3d(cmd2, "reshape_head_to_pos", &[
             buf_out_reshaped.buffer(), buf_attn_out.buffer(), &buf_hpg, &buf_seq, &buf_head_dim
-        ], head_dim, max_len, heads);
+        ], head_dim, max_len, total_q_heads);
         
         let buf_proj_out = self.pool.acquire_uninit(total_rows * h * 4);
         let buf_out_w = self.buf_cached(weights.attn_out_weight);
@@ -2900,7 +2919,7 @@ impl GpuCompute for MetalCompute {
                 self.encode_1d(cmd2, "rms_norm", &[current_hidden.buffer(), &buf_norm1_w, &buf_h, &buf_eps], total_rows);
             } else {
                 let buf_norm1_b = self.buf_cached(weights.norm1_bias.unwrap_or(&[]));
-                self.encode_1d(cmd2, "layer_norm", &[current_hidden.buffer(), &buf_norm1_w, &buf_norm1_b, &buf_rows, &buf_h, &buf_eps], total_rows);
+                self.encode_1d(cmd2, "layer_norm", &[current_hidden.buffer(), &buf_norm1_w, &buf_norm1_b, &buf_h, &buf_eps], total_rows);
             }
         }
         
@@ -2923,24 +2942,24 @@ impl GpuCompute for MetalCompute {
         let cmd3 = self.queue.new_command_buffer();
         let mut retains3 = Vec::new();
         
-        let buf_normed2 = if config.pre_ln {
-            let buf_norm2_w = self.buf_cached(weights.norm2_weight);
-            let b = self.pool.acquire_uninit(total_rows * h * 4);
+        // Layer norm 2
+        let mut buf_normed2 = None;
+        if config.pre_ln {
+            let buf = self.pool.acquire_uninit(total_rows * h * 4);
             {
                 let blit = cmd3.new_blit_command_encoder();
-                blit.copy_from_buffer(current_hidden.buffer(), 0, b.buffer(), 0, (total_rows * h * 4) as u64);
+                blit.copy_from_buffer(current_hidden.buffer(), 0, buf.buffer(), 0, (total_rows * h * 4) as u64);
                 blit.end_encoding();
             }
+            let buf_norm2_w = self.buf_cached(weights.norm2_weight);
             if config.use_rms {
-                self.encode_1d(cmd3, "rms_norm", &[b.buffer(), &buf_norm2_w, &buf_h, &buf_eps], total_rows);
+                self.encode_1d(cmd3, "rms_norm", &[buf.buffer(), &buf_norm2_w, &buf_h, &buf_eps], total_rows);
             } else {
                 let buf_norm2_b = self.buf_cached(weights.norm2_bias.unwrap_or(&[]));
-                self.encode_1d(cmd3, "layer_norm", &[b.buffer(), &buf_norm2_w, &buf_norm2_b, &buf_rows, &buf_h, &buf_eps], total_rows);
+                self.encode_1d(cmd3, "layer_norm", &[buf.buffer(), &buf_norm2_w, &buf_norm2_b, &buf_h, &buf_eps], total_rows);
             }
-            Some(b)
-        } else {
-            None
-        };
+            buf_normed2 = Some(buf);
+        }
         
         let ffn_in = if let Some(ref b) = buf_normed2 { b.buffer() } else { current_hidden.buffer() };
         let buf_inter = self.buf_u32(inter as u32);
@@ -2969,24 +2988,13 @@ impl GpuCompute for MetalCompute {
             let buf_act = self.pool.acquire_uninit(total_rows * inter * 4);
             let buf_two_inter = self.buf_u32((2 * inter) as u32);
             
-            if use_mma(total_rows, 2 * inter, h) {
+            if use_mma(total_rows, inter, h) {
                 self.encode_mma(cmd3, "matmul_transb_simdgroup", &[ffn_in, &buf_wgateup, buf_gateup.buffer(), &buf_rows, &buf_two_inter, &buf_h], total_rows, 2 * inter, h, 1);
             } else {
                 Self::encode_matmul(cmd3, &self.pipelines["matmul_transb"], ffn_in, &buf_wgateup, buf_gateup.buffer(), &buf_rows, &buf_two_inter, &buf_h, 2 * inter, total_rows);
             }
             
-            {
-                let swi = &self.pipelines["swiglu_activation_fat"];
-                let enc = cmd3.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(swi);
-                enc.set_buffer(0, Some(buf_gateup.buffer()), 0);
-                enc.set_buffer(1, Some(buf_act.buffer()), 0);
-                enc.set_buffer(2, Some(&buf_inter), 0);
-                let total = (total_rows * inter) as u64;
-                let tw = swi.thread_execution_width() as u64;
-                enc.dispatch_threads(metal::MTLSize::new(total, 1, 1), metal::MTLSize::new(tw.min(total).max(1), 1, 1));
-                enc.end_encoding();
-            }
+            self.encode_1d(cmd3, "swiglu_activation_fat", &[buf_gateup.buffer(), buf_act.buffer(), &buf_inter], total_rows * inter);
             
             if use_mma(total_rows, h, inter) {
                 self.encode_mma(cmd3, "matmul_transb_simdgroup", &[buf_act.buffer(), &buf_wdown, buf_ffn_out.buffer(), &buf_rows, &buf_h, &buf_inter], total_rows, h, inter, 1);
@@ -3036,7 +3044,7 @@ impl GpuCompute for MetalCompute {
                 self.encode_1d(cmd3, "rms_norm", &[current_hidden.buffer(), &buf_norm2_w, &buf_h, &buf_eps], total_rows);
             } else {
                 let buf_norm2_b = self.buf_cached(weights.norm2_bias.unwrap_or(&[]));
-                self.encode_1d(cmd3, "layer_norm", &[current_hidden.buffer(), &buf_norm2_w, &buf_norm2_b, &buf_rows, &buf_h, &buf_eps], total_rows);
+                self.encode_1d(cmd3, "layer_norm", &[current_hidden.buffer(), &buf_norm2_w, &buf_norm2_b, &buf_h, &buf_eps], total_rows);
             }
         }
         
@@ -3511,7 +3519,7 @@ impl GpuCompute for MetalCompute {
                 enc.end_encoding();
             }
 
-            // out = layer_norm(out, gamma, beta, eps) (in-place, one row per thread)
+            // out = layer_norm(out, gamma, beta, eps) (in-place)
             {
                 let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(ln);
@@ -3599,7 +3607,7 @@ impl GpuCompute for MetalCompute {
                 enc.end_encoding();
             }
 
-            // out = layer_norm(proj, gamma, beta, eps) (in-place, one row per thread)
+            // out = layer_norm(proj, gamma, beta, eps) (in-place)
             {
                 let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(ln);
@@ -3846,6 +3854,7 @@ impl GpuCompute for MetalCompute {
                     buf_scores.buffer(),
                     &buf_seq,
                     &buf_dim,
+                    &self.buf_u32(1), // hpg=1
                 ];
                 if use_mma(seq_len, seq_len, head_dim) {
                     self.encode_mma(
@@ -3918,6 +3927,7 @@ impl GpuCompute for MetalCompute {
                     buf_out.buffer(),
                     &buf_seq,
                     &buf_dim,
+                    &self.buf_u32(1), // hpg=1
                 ];
                 if use_mma(seq_len, head_dim, seq_len) {
                     self.encode_mma(
@@ -4017,6 +4027,7 @@ impl GpuCompute for MetalCompute {
                     buf_scores.buffer(),
                     &buf_seq,
                     &buf_dim,
+                    &buf_heads_per_group,
                 ];
                 if use_mma(seq_len, seq_len, head_dim) {
                     self.encode_mma(
@@ -4090,6 +4101,7 @@ impl GpuCompute for MetalCompute {
                     buf_out.buffer(),
                     &buf_seq,
                     &buf_dim,
+                    &buf_heads_per_group,
                 ];
                 if use_mma(seq_len, head_dim, seq_len) {
                     self.encode_mma(
