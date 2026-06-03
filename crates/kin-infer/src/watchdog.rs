@@ -266,7 +266,7 @@ impl EmbedWatchdog {
                     *below_floor_since = None;
                 } else {
                     let since = below_floor_since.get_or_insert_with(Instant::now);
-                    if since.elapsed() > cfg.floor_window {
+                    if since.elapsed() >= cfg.floor_window {
                         return Some(TripReason::ThroughputFloor);
                     }
                 }

@@ -10,7 +10,8 @@ cargo build                          # CPU only
 cargo build --features metal         # macOS: Apple Metal GPU
 cargo build --features cuda          # Linux/Windows: NVIDIA CUDA GPU
 cargo build --features accelerate    # macOS: Accelerate BLAS (CPU)
-cargo test --features metal          # run all tests including Metal GPU
+cargo test --features metal          # run all tests including Metal GPU (Warning: can hit stale binary bugs)
+./scripts/run-tests.sh               # RECOMMENDED: runs tests with clean environment (cleans stale binaries + GPU sweep)
 ```
 
 ## Architecture
