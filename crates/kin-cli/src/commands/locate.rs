@@ -2115,6 +2115,18 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         );
     }
 
+    // EMBED_RELEVANCE lever (default OFF == byte-identical): boost emitted
+    // symbols by their query↔def embedding cosine so the def the query is
+    // SEMANTICALLY about outranks a lexical look-alike sibling that merely shares
+    // more query tokens. Symbol-level twin of the file-level weighted-RRF
+    // embedding weight; consumes the cosine the semantic phase already recorded
+    // (no re-embedding). Requires `KIN_LOCATE_SYMBOL_EMBED_RELEVANCE` to be set
+    // both here and in resolve_entities_to_files (where it gates carrying the
+    // cosine onto each symbol), so the two reads share one flag.
+    if locate_env_bool("KIN_LOCATE_SYMBOL_EMBED_RELEVANCE", false) {
+        boost_symbol_embed_relevance(&results, &mut projection_symbols);
+    }
+
     // A_spanwidth lever (default OFF == byte-identical): when a file surfaced a
     // class-like symbol but the gold edit is an inner method, emit the file's
     // methods (finer spans) instead of widening the class.
@@ -7232,6 +7244,14 @@ fn resolve_entities_to_files(
     let definition_authority = locate_env_f32("KIN_LOCATE_DEFINITION_AUTHORITY", 2.0);
     let max_graph_hops = locate_env_usize("KIN_LOCATE_RESOLVE_MAX_HOPS", 2);
 
+    // EMBED_RELEVANCE lever (gated, default OFF): when set, the query↔def
+    // embedding cosine the semantic phase already computed is carried onto every
+    // emitted symbol (not just under --explain) so the post-pass
+    // `boost_symbol_embed_relevance` can re-rank by semantic relevance. Reading
+    // the flag here keeps it out of the per-entity hot loop. Unset leaves the
+    // cosine gated on `explain` exactly as before, so OFF is byte-identical.
+    let embed_relevance_on = locate_env_bool("KIN_LOCATE_SYMBOL_EMBED_RELEVANCE", false);
+
     // Detect whether the graph has LSP-enriched relations. If not (e.g., init
     // ran with --no-lsp), the LSP-only filter would block ALL graph traversal
     // since every relation is Parsed origin. Auto-disable it in that case.
@@ -7455,7 +7475,11 @@ fn resolve_entities_to_files(
                         } else {
                             String::new()
                         },
-                        cosine: if explain { discovery.cosine } else { None },
+                        cosine: if explain || embed_relevance_on {
+                            discovery.cosine
+                        } else {
+                            None
+                        },
                     });
                 if explain {
                     let body_tag = if is_definition { "definition" } else { "reference" };
@@ -10457,8 +10481,9 @@ fn apply_query_relevance(
 /// file, boost every emitted symbol by its query proximity and merge in any
 /// query-relevant file definition that wasn't resolved, so the edited def ranks
 /// over its siblings. GPU-free (lexical name + body-preview proximity); the
-/// embedding-cosine variant is a separate, embed-window lever. OFF is
-/// byte-identical (no boost, no merge).
+/// embedding-cosine variant is a separate, embed-window lever
+/// ([`boost_symbol_embed_relevance`], `KIN_LOCATE_SYMBOL_EMBED_RELEVANCE`). OFF
+/// is byte-identical (no boost, no merge).
 fn boost_symbol_query_relevance(
     graph: &kin_db::InMemoryGraph,
     results: &[(String, f32)],
@@ -10490,6 +10515,50 @@ fn boost_symbol_query_relevance(
         let boosted = apply_query_relevance(existing, entities, query_terms, test_query, boost_weight);
         if !boosted.is_empty() {
             projection_symbols.insert(path.clone(), boosted);
+        }
+    }
+}
+
+/// Pure core of the EMBED_RELEVANCE lever (see [`boost_symbol_embed_relevance`]):
+/// add a query↔definition embedding-cosine boost to every emitted symbol that
+/// carries a cosine. The cosine is the relevance the semantic phase already
+/// computed (query embedding vs. each candidate def's embedding) — no
+/// re-embedding here. Symbols with no cosine (text-only seeds the embedder did
+/// not surface) are left untouched, so the boost only ever lifts a
+/// semantically-matched def, never penalises a lexical-only one below zero.
+/// Mutates in place; `rank_and_cap_symbols_with` does the final ordering.
+/// Separated from env/IO so it is unit-testable.
+fn apply_embed_relevance(symbols: &mut [LocateSymbol], boost_weight: f32) {
+    for s in symbols.iter_mut() {
+        if let Some(cosine) = s.cosine {
+            s.score += cosine * boost_weight;
+        }
+    }
+}
+
+/// EMBED_RELEVANCE lever (gated `KIN_LOCATE_SYMBOL_EMBED_RELEVANCE`, default
+/// OFF). The embedding-cosine twin of the C_misrank proximity lever
+/// ([`boost_symbol_query_relevance`]) and the SYMBOL-level analog of the
+/// file-level weighted-RRF embedding weight (`KIN_LOCATE_RRF_WEIGHT_EMBEDDING`).
+///
+/// Lexical ranking picks the WRONG sibling when it shares more query TOKENS than
+/// the gold — e.g. an sklearn fix that lives in `strip_accents_ascii` loses to
+/// `strip_accents_unicode` because "unicode" matches more query words, or a clap
+/// gold fn loses to `render_usage`. When embeddings are present and correct, the
+/// def the query is SEMANTICALLY about carries the higher query↔def cosine;
+/// boosting each emitted symbol by that cosine (weight
+/// `KIN_LOCATE_SYMBOL_EMBED_BOOST`, default 10.0, matching the proximity lever)
+/// lifts the gold over its lexical look-alike. Reuses the cosine the semantic
+/// phase already recorded on each symbol — GPU-free here, no re-embedding. OFF
+/// is byte-identical (no boost).
+fn boost_symbol_embed_relevance(
+    results: &[(String, f32)],
+    projection_symbols: &mut HashMap<String, Vec<LocateSymbol>>,
+) {
+    let boost_weight = locate_env_f32("KIN_LOCATE_SYMBOL_EMBED_BOOST", 10.0);
+    for (path, _) in results {
+        if let Some(syms) = projection_symbols.get_mut(path) {
+            apply_embed_relevance(syms, boost_weight);
         }
     }
 }
@@ -11231,6 +11300,78 @@ mod tests {
             10.0,
         );
         assert!(out2.is_empty(), "non-query-relevant defs are not merged");
+    }
+
+    fn sym_with_cosine(name: &str, score: f32, cosine: Option<f32>) -> LocateSymbol {
+        LocateSymbol {
+            cosine,
+            ..sym(name, score, true)
+        }
+    }
+
+    #[test]
+    fn apply_embed_relevance_lifts_semantic_match_over_lexical_lookalike() {
+        // The precision wall: the lexical look-alike sibling outscores the gold
+        // at emission because it shares more query TOKENS, but the gold carries
+        // the higher query↔def embedding cosine (it is what the query is about).
+        let mut syms = vec![
+            sym_with_cosine("strip_accents_unicode", 30.0, Some(0.40)),
+            sym_with_cosine("strip_accents_ascii", 28.0, Some(0.95)),
+        ];
+        // Lexical-only ordering puts the wrong sibling first.
+        assert!(syms[0].score > syms[1].score);
+
+        apply_embed_relevance(&mut syms, 10.0);
+
+        let ranked = rank_and_cap_symbols_with(syms, 0);
+        // gold: 28.0 + 0.95*10 = 37.5; sibling: 30.0 + 0.40*10 = 34.0 -> gold flips ahead.
+        assert_eq!(
+            ranked[0].name, "strip_accents_ascii",
+            "the higher-cosine semantic match must outrank the lexical look-alike"
+        );
+        assert!((ranked[0].score - 37.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn apply_embed_relevance_weight_dials_cosine_dominance() {
+        // With a large enough weight the cosine dominates the lexical token gap,
+        // which is the dial the operator sweeps via KIN_LOCATE_SYMBOL_EMBED_BOOST.
+        let mut syms = vec![
+            sym_with_cosine("lexical_lookalike", 30.0, Some(0.40)),
+            sym_with_cosine("semantic_gold", 25.0, Some(0.85)),
+        ];
+        apply_embed_relevance(&mut syms, 50.0);
+        let ranked = rank_and_cap_symbols_with(syms, 0);
+        assert_eq!(ranked[0].name, "semantic_gold");
+        // 25 + 0.85*50 = 67.5 vs 30 + 0.40*50 = 50.0
+        assert!((ranked[0].score - 67.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn apply_embed_relevance_leaves_cosineless_symbols_untouched() {
+        // Text-only seeds carry no cosine and must be byte-identical after the
+        // boost — the lever only ever lifts defs the embedder actually scored.
+        let mut syms = vec![
+            sym_with_cosine("text_only", 12.0, None),
+            sym_with_cosine("vector_seed", 12.0, Some(0.5)),
+        ];
+        apply_embed_relevance(&mut syms, 10.0);
+        let text_only = syms.iter().find(|s| s.name == "text_only").unwrap();
+        let vector_seed = syms.iter().find(|s| s.name == "vector_seed").unwrap();
+        assert_eq!(text_only.score, 12.0, "no cosine -> no boost");
+        assert!((vector_seed.score - 17.0).abs() < 1e-4, "12 + 0.5*10");
+    }
+
+    #[test]
+    fn apply_embed_relevance_zero_weight_is_byte_identical() {
+        let mut syms = vec![
+            sym_with_cosine("a", 10.0, Some(0.9)),
+            sym_with_cosine("b", 8.0, None),
+        ];
+        let before: Vec<f32> = syms.iter().map(|s| s.score).collect();
+        apply_embed_relevance(&mut syms, 0.0);
+        let after: Vec<f32> = syms.iter().map(|s| s.score).collect();
+        assert_eq!(before, after, "weight 0 leaves every score untouched");
     }
 
     #[test]
