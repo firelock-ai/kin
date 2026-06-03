@@ -850,11 +850,35 @@ impl BertEmbedder {
             return self.process_encoded_subset(metal_side, dimensions, max_batch_tokens, None);
         }
 
+        // Hybrid concurrency is only safe when the CPU arm runs on its OWN model
+        // (the CPU twin) — a different backend than the primary Metal model. If the
+        // twin is unavailable, process_encoded_subset's CPU path falls back to
+        // &self.model, so BOTH rayon::join arms would submit to the single Metal
+        // model concurrently; on unified memory that races the shared command queue
+        // and buffer pool and corrupts embeddings. In that case process the whole
+        // set SERIALLY on the primary model instead (slower, but correct).
         if let Err(e) = self.cpu_model() {
             tracing::warn!(
                 error = %e,
-                "cpu_model prewarm failed before hybrid dispatch; cpu subset will fall back to primary model"
+                "cpu twin unavailable; processing hybrid set serially on the primary model to avoid concurrent shared-model submission"
             );
+            let mut merged = self.process_encoded_subset(
+                metal_side,
+                dimensions,
+                max_batch_tokens,
+                Some(EmbedBackendChoice::Metal {
+                    reason: "hybrid_serial_primary",
+                }),
+            )?;
+            merged.extend(self.process_encoded_subset(
+                cpu_side,
+                dimensions,
+                max_batch_tokens,
+                Some(EmbedBackendChoice::Metal {
+                    reason: "hybrid_serial_primary",
+                }),
+            )?);
+            return Ok(merged);
         }
 
         let (metal_res, cpu_res) = rayon::join(
