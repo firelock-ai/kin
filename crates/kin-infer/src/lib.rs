@@ -226,17 +226,16 @@ fn reshape_on_gpu() -> bool {
 /// sequences padded to the batch's global `max_len`; when OFF the default
 /// single-encode path is byte-for-byte unchanged. Sampled once per process.
 ///
-/// Opt-in for now (`KIN_INFER_BUCKET=1`): the bucketed path is bit-identical per
-/// entity (see `forward_batched_bucketed`), so the default flips ON once the
-/// parity gate confirms it, keeping the OFF override as the safe fallback — the
-/// pattern used for the MMA flip.
+/// Opt-out (`KIN_INFER_BUCKET=0`): the bucketed path is bit-identical per
+/// entity (see `forward_batched_bucketed`), keeping the OFF override as the
+/// safe fallback — the pattern used for the MMA flip.
 fn bucket_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("KIN_INFER_BUCKET").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
+            Some("0") | Some("false") | Some("no") | Some("off")
         )
     })
 }

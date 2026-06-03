@@ -1753,7 +1753,19 @@ impl MetalCompute {
         // MSL 2.4 guarantees the `simdgroup_matrix` intrinsics (simdgroup_float8x8,
         // simdgroup_multiply_accumulate, make_filled_simdgroup_matrix) the MMA
         // GEMM kernels use, independent of the toolchain's default version.
-        opts.set_language_version(MTLLanguageVersion::V2_4);
+        // KIN_INFER_MSL_VERSION lets us exercise a different runtime-compiler codegen
+        // path (driver-miscompile probe); unset = V2_4 default (byte-identical).
+        let lang = match std::env::var("KIN_INFER_MSL_VERSION").as_deref() {
+            Ok("30") => MTLLanguageVersion::V3_0,
+            Ok("31") => MTLLanguageVersion::V3_1,
+            _ => MTLLanguageVersion::V2_4,
+        };
+        opts.set_language_version(lang);
+        // KIN_INFER_FAST_MATH=0 disables MSL fast-math (no float reassociation /
+        // assume-finite); unset = toolchain default (fast-math on, byte-identical).
+        if std::env::var("KIN_INFER_FAST_MATH").as_deref() == Ok("0") {
+            opts.set_fast_math_enabled(false);
+        }
         let library = match device.new_library_with_source(SHADER_SOURCE, &opts) {
             Ok(library) => library,
             Err(err) => {
@@ -3053,8 +3065,8 @@ impl GpuCompute for MetalCompute {
         let num_pairs = total_dim / head_dim * half;
 
         let buf = self.buf_slice_pooled(data);
-        let buf_cos = self.buf_cached(cos_table);
-        let buf_sin = self.buf_cached(sin_table);
+        let buf_cos = self.buf_slice_pooled(cos_table);
+        let buf_sin = self.buf_slice_pooled(sin_table);
         let buf_offset = self.buf_u32(seq_offset as u32);
         let buf_head_dim = self.buf_u32(head_dim as u32);
         let buf_total_dim = self.buf_u32(total_dim as u32);
@@ -3065,8 +3077,8 @@ impl GpuCompute for MetalCompute {
                 "rope_apply",
                 &[
                     buf.buffer(),
-                    &buf_cos,
-                    &buf_sin,
+                    buf_cos.buffer(),
+                    buf_sin.buffer(),
                     &buf_offset,
                     &buf_head_dim,
                     &buf_total_dim,
@@ -3104,8 +3116,8 @@ impl GpuCompute for MetalCompute {
         // Shared scalar + table buffers; Q and K differ only in the data buffer.
         let buf_q = self.buf_slice_pooled(q);
         let buf_k = self.buf_slice_pooled(k);
-        let buf_cos = self.buf_cached(cos_table);
-        let buf_sin = self.buf_cached(sin_table);
+        let buf_cos = self.buf_slice_pooled(cos_table);
+        let buf_sin = self.buf_slice_pooled(sin_table);
         let buf_offset = self.buf_u32(seq_offset as u32);
         let buf_head_dim = self.buf_u32(head_dim as u32);
         let buf_total_dim = self.buf_u32(total_dim as u32);
@@ -3118,8 +3130,8 @@ impl GpuCompute for MetalCompute {
                 let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(pipeline);
                 enc.set_buffer(0, Some(data_buf), 0);
-                enc.set_buffer(1, Some(&buf_cos), 0);
-                enc.set_buffer(2, Some(&buf_sin), 0);
+                enc.set_buffer(1, Some(buf_cos.buffer()), 0);
+                enc.set_buffer(2, Some(buf_sin.buffer()), 0);
                 enc.set_buffer(3, Some(&buf_offset), 0);
                 enc.set_buffer(4, Some(&buf_head_dim), 0);
                 enc.set_buffer(5, Some(&buf_total_dim), 0);
@@ -3167,8 +3179,8 @@ impl GpuCompute for MetalCompute {
         // each for Q and K instead of one per input.
         let buf_q = self.buf_slice_pooled(q);
         let buf_k = self.buf_slice_pooled(k);
-        let buf_cos = self.buf_cached(cos_table);
-        let buf_sin = self.buf_cached(sin_table);
+        let buf_cos = self.buf_slice_pooled(cos_table);
+        let buf_sin = self.buf_slice_pooled(sin_table);
         let buf_max_len = self.buf_u32(max_len as u32);
         let buf_head_dim = self.buf_u32(head_dim as u32);
         let buf_total_dim = self.buf_u32(total_dim as u32);
@@ -3182,8 +3194,8 @@ impl GpuCompute for MetalCompute {
                 let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(pipeline);
                 enc.set_buffer(0, Some(data_buf), 0);
-                enc.set_buffer(1, Some(&buf_cos), 0);
-                enc.set_buffer(2, Some(&buf_sin), 0);
+                enc.set_buffer(1, Some(buf_cos.buffer()), 0);
+                enc.set_buffer(2, Some(buf_sin.buffer()), 0);
                 enc.set_buffer(3, Some(&buf_max_len), 0);
                 enc.set_buffer(4, Some(&buf_head_dim), 0);
                 enc.set_buffer(5, Some(&buf_total_dim), 0);
@@ -3232,11 +3244,8 @@ impl GpuCompute for MetalCompute {
         let buf_dim = self.buf_u32(head_dim as u32);
         let buf_scale = self.buf_f32(scale);
         let has_alibi = !alibi_slopes.is_empty();
-        let buf_alibi = if has_alibi {
-            self.buf_cached(alibi_slopes)
-        } else {
-            self.buf_from_slice(&[0.0f32])
-        };
+        let alibi_ref = if has_alibi { alibi_slopes } else { &[0.0f32] };
+        let pooled_alibi = self.buf_slice_pooled(alibi_ref);
         let mask_u32: Vec<u32> = mask.to_vec();
         let buf_mask = self.buf_u32_slice(&mask_u32);
         let buf_has_alibi = self.buf_u32(has_alibi as u32);
@@ -3290,7 +3299,7 @@ impl GpuCompute for MetalCompute {
                 let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(p);
                 enc.set_buffer(0, Some(buf_scores.buffer()), 0);
-                enc.set_buffer(1, Some(&buf_alibi), 0);
+                enc.set_buffer(1, Some(pooled_alibi.buffer()), 0);
                 enc.set_buffer(2, Some(&buf_mask), 0);
                 enc.set_buffer(3, Some(&buf_scale), 0);
                 enc.set_buffer(4, Some(&buf_seq), 0);
@@ -3405,11 +3414,8 @@ impl GpuCompute for MetalCompute {
         let buf_dim = self.buf_u32(head_dim as u32);
         let buf_scale = self.buf_f32(scale);
         let has_alibi = !alibi_slopes.is_empty();
-        let buf_alibi = if has_alibi {
-            self.buf_cached(alibi_slopes)
-        } else {
-            self.buf_from_slice(&[0.0f32])
-        };
+        let alibi_ref = if has_alibi { alibi_slopes } else { &[0.0f32] };
+        let pooled_alibi = self.buf_slice_pooled(alibi_ref);
         let buf_masks = self.buf_u32_slice(masks);
         let buf_has_alibi = self.buf_u32(has_alibi as u32);
         let buf_heads_per_group = self.buf_u32(heads_per_group as u32);
@@ -3464,7 +3470,7 @@ impl GpuCompute for MetalCompute {
                 let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(p);
                 enc.set_buffer(0, Some(buf_scores.buffer()), 0);
-                enc.set_buffer(1, Some(&buf_alibi), 0);
+                enc.set_buffer(1, Some(pooled_alibi.buffer()), 0);
                 enc.set_buffer(2, Some(&buf_masks), 0);
                 enc.set_buffer(3, Some(&buf_scale), 0);
                 enc.set_buffer(4, Some(&buf_seq), 0);
@@ -3602,11 +3608,8 @@ impl GpuCompute for MetalCompute {
         let buf_hpg = self.buf_u32(heads_per_group as u32);
         let buf_scale = self.buf_f32(scale);
         let has_alibi = !alibi_slopes.is_empty();
-        let buf_alibi = if has_alibi {
-            self.buf_cached(alibi_slopes)
-        } else {
-            self.buf_from_slice(&[0.0f32])
-        };
+        let alibi_ref = if has_alibi { alibi_slopes } else { &[0.0f32] };
+        let pooled_alibi = self.buf_slice_pooled(alibi_ref);
         let buf_masks = self.buf_u32_slice(masks);
         let buf_has_alibi = self.buf_u32(has_alibi as u32);
         let buf_heads_per_group = self.buf_u32(heads_per_group as u32);
@@ -3688,7 +3691,7 @@ impl GpuCompute for MetalCompute {
                 let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(p);
                 enc.set_buffer(0, Some(buf_scores.buffer()), 0);
-                enc.set_buffer(1, Some(&buf_alibi), 0);
+                enc.set_buffer(1, Some(pooled_alibi.buffer()), 0);
                 enc.set_buffer(2, Some(&buf_masks), 0);
                 enc.set_buffer(3, Some(&buf_scale), 0);
                 enc.set_buffer(4, Some(&buf_seq), 0);
