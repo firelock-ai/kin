@@ -15,6 +15,7 @@ doctest = false
 default = ["vector", "embeddings"]
 vector = ["kin-db/vector"]
 embeddings = ["kin-db/embeddings"]
+metal = ["embeddings", "kin-db/metal"]
 gcs = ["kin-db/gcs"]
 firestore = ["kin-spine/firestore"]
 
