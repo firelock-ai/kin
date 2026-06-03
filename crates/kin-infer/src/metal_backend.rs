@@ -2847,9 +2847,14 @@ impl GpuCompute for MetalCompute {
         let buf_alibi = self.buf_slice_pooled(&[0.0f32]);
         let buf_out_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4);
         
-        self.encode_3d(cmd2, "batched_matmul_transb", &[
+        let qk_bufs = [
             buf_q_reshaped.buffer(), buf_k_reshaped.buffer(), buf_scores.buffer(), &buf_seq, &buf_head_dim
-        ], max_len, max_len, heads);
+        ];
+        if use_mma(max_len, max_len, head_dim) {
+            self.encode_mma(cmd2, "batched_matmul_transb_simdgroup", &qk_bufs, max_len, max_len, head_dim, heads);
+        } else {
+            self.encode_3d(cmd2, "batched_matmul_transb", &qk_bufs, max_len, max_len, heads);
+        }
         
         self.encode_3d(cmd2, "scale_mask_alibi", &[
             buf_scores.buffer(), &buf_masks, buf_alibi.buffer(), &buf_scale, &buf_seq, &buf_has_alibi
@@ -2859,9 +2864,14 @@ impl GpuCompute for MetalCompute {
             buf_scores.buffer(), &buf_seq
         ], max_len, max_len, heads);
         
-        self.encode_3d(cmd2, "batched_matmul_ab", &[
+        let sv_bufs = [
             buf_scores.buffer(), buf_v_reshaped.buffer(), buf_out_reshaped.buffer(), &buf_seq, &buf_head_dim
-        ], head_dim, max_len, heads);
+        ];
+        if use_mma(max_len, head_dim, max_len) {
+            self.encode_mma(cmd2, "batched_matmul_ab_simdgroup", &sv_bufs, max_len, head_dim, max_len, heads);
+        } else {
+            self.encode_3d(cmd2, "batched_matmul_ab", &sv_bufs, head_dim, max_len, heads);
+        }
         
         let buf_attn_out = self.pool.acquire_uninit(total_rows * q_dim * 4);
         self.encode_3d(cmd2, "reshape_head_to_pos", &[
@@ -2882,7 +2892,7 @@ impl GpuCompute for MetalCompute {
             self.encode_1d(cmd2, "elementwise_add_broadcast", &[buf_proj_out.buffer(), &b, &buf_h], total_rows * h);
         }
         
-        self.encode_1d(cmd2, "add_vectors", &[current_hidden.buffer(), buf_proj_out.buffer(), current_hidden.buffer()], total_rows * h);
+        self.encode_1d(cmd2, "elementwise_add", &[current_hidden.buffer(), buf_proj_out.buffer(), current_hidden.buffer()], total_rows * h);
         
         if !config.pre_ln {
             let buf_norm1_w = self.buf_cached(weights.norm1_weight);
@@ -3018,7 +3028,7 @@ impl GpuCompute for MetalCompute {
             self.encode_1d(cmd3, "elementwise_add_broadcast", &[buf_ffn_out.buffer(), &b, &buf_h], total_rows * h);
         }
         
-        self.encode_1d(cmd3, "add_vectors", &[current_hidden.buffer(), buf_ffn_out.buffer(), current_hidden.buffer()], total_rows * h);
+        self.encode_1d(cmd3, "elementwise_add", &[current_hidden.buffer(), buf_ffn_out.buffer(), current_hidden.buffer()], total_rows * h);
         
         if !config.pre_ln {
             let buf_norm2_w = self.buf_cached(weights.norm2_weight);
