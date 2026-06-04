@@ -357,10 +357,18 @@ pub async fn run(
                 warm_requeued_embeddings: delta.queued_embeddings.len(),
             }
         } else {
-            phase!("warm_cache_miss");
-            let summary = parse_and_index(snap.graph().as_ref(), &blob_store, &indexable_files)?;
-            phase!("parse_and_index");
-            summary
+            match try_warm_init_from_cache(&dir, &layout, &snap, &blob_store, &indexable_files) {
+                Ok(Some(summary)) => {
+                    phase!("warm_cache_path (full)");
+                    summary
+                }
+                Ok(None) | Err(_) => {
+                    phase!("warm_cache_miss");
+                    let summary = parse_and_index(snap.graph().as_ref(), &blob_store, &indexable_files)?;
+                    phase!("parse_and_index");
+                    summary
+                }
+            }
         }
     } else {
         InitIndexSummary::default()
@@ -714,16 +722,16 @@ pub async fn run(
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "schema": "kin.init-result.v1",
-                "repo_root": layout.root().display().to_string(),
-                "kindb_snapshot_path": layout.kindb_snapshot_path().display().to_string(),
-                "objects_dir": layout.objects_dir().display().to_string(),
-                "genesis_change": genesis_id.to_string(),
-                "indexed_embeddings": embed_status.indexed,
-                "pending_embeddings": embed_status.pending,
-                "summary": init_summary,
-            }))?
+            serde_json::to_string_pretty(&InitResultPayload {
+                schema: "kin.init-result.v1",
+                repo_root: layout.root().display().to_string(),
+                kindb_snapshot_path: layout.kindb_snapshot_path().display().to_string(),
+                objects_dir: layout.objects_dir().display().to_string(),
+                genesis_change: genesis_id.to_string(),
+                indexed_embeddings: embed_status.indexed,
+                pending_embeddings: embed_status.pending,
+                summary: init_summary,
+            })?
         );
     }
 
