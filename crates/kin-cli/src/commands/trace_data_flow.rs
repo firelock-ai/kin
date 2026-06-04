@@ -201,10 +201,7 @@ pub fn build_trace_data_flow_response(
     if trimmed.is_empty() {
         anyhow::bail!("trace_data_flow requires a non-empty focal");
     }
-    let depth = request
-        .depth
-        .unwrap_or(DEFAULT_DEPTH)
-        .clamp(1, MAX_DEPTH);
+    let depth = request.depth.unwrap_or(DEFAULT_DEPTH).clamp(1, MAX_DEPTH);
     let direction = request.direction.unwrap_or_default();
     let limit_per_step = request
         .limit_per_step
@@ -249,11 +246,9 @@ pub fn build_trace_data_flow_response(
                 .context("read relations for trace step")?;
 
             // Expand outgoing edges (parent calls these) when direction allows.
-            let want_callees =
-                matches!(direction, TraceDirection::Calls | TraceDirection::Both);
+            let want_callees = matches!(direction, TraceDirection::Calls | TraceDirection::Both);
             // Expand incoming edges (these call parent) when direction allows.
-            let want_callers =
-                matches!(direction, TraceDirection::Callers | TraceDirection::Both);
+            let want_callers = matches!(direction, TraceDirection::Callers | TraceDirection::Both);
 
             // Independent budgets per direction so `direction=both` doesn't
             // starve callers when callees are listed first (or vice versa).
@@ -395,8 +390,7 @@ fn source_record_or_none(
     graph: &kin_db::InMemoryGraph,
     entity: &Entity,
 ) -> Option<GraphSourceRecord> {
-    let response =
-        build_graph_source_response(layout, graph, &entity.id.to_string()).ok()?;
+    let response = build_graph_source_response(layout, graph, &entity.id.to_string()).ok()?;
     response.source
 }
 
@@ -606,7 +600,11 @@ mod tests {
             response.chain.iter().all(|step| step.role == "caller"),
             "all steps must be callers in callers-only direction"
         );
-        let names: Vec<_> = response.chain.iter().map(|s| s.entity_name.clone()).collect();
+        let names: Vec<_> = response
+            .chain
+            .iter()
+            .map(|s| s.entity_name.clone())
+            .collect();
         assert!(names.contains(&"caller_a".to_string()));
         assert!(names.contains(&"caller_b".to_string()));
     }
@@ -658,10 +656,7 @@ mod tests {
             TraceDirection::parse("caller").unwrap(),
             TraceDirection::Callers
         );
-        assert_eq!(
-            TraceDirection::parse("BOTH").unwrap(),
-            TraceDirection::Both
-        );
+        assert_eq!(TraceDirection::parse("BOTH").unwrap(), TraceDirection::Both);
         assert!(TraceDirection::parse("sideways").is_err());
     }
 }

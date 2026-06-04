@@ -367,7 +367,10 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(count, 1, "should count the single caller, not the self-loop");
+        assert_eq!(
+            count, 1,
+            "should count the single caller, not the self-loop"
+        );
     }
 
     #[test]

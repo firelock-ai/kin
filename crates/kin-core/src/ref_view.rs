@@ -13,9 +13,9 @@ use kin_index::{
     FileParseData, IndexPipeline,
 };
 use kin_model::{
-    ArtifactDeltaKind, ChangeStore, EntityId, EntityKind, FileLayout, FilePathId,
-    GraphStore, Hash256, ImportSection, OpaqueArtifact, ParseCompleteness, RelationKind,
-    SemanticChange, SemanticChangeId, ShallowTrackedFile, SourceRegion, StructuredArtifact,
+    ArtifactDeltaKind, ChangeStore, EntityId, EntityKind, FileLayout, FilePathId, GraphStore,
+    Hash256, ImportSection, OpaqueArtifact, ParseCompleteness, RelationKind, SemanticChange,
+    SemanticChangeId, ShallowTrackedFile, SourceRegion, StructuredArtifact,
 };
 use kin_parser::extract::{EMBEDDING_BODY_PREVIEW_KEY, FILE_SURFACE_CONTEXT_KEY};
 

@@ -193,7 +193,10 @@ pub async fn run(task_file: PathBuf, json: bool, debug: bool) -> Result<()> {
             pred_spans.insert(normalized_path.clone(), spans);
         }
 
-        let prov_val = entry.provenance.as_ref().and_then(|p| serde_json::to_value(p).ok());
+        let prov_val = entry
+            .provenance
+            .as_ref()
+            .and_then(|p| serde_json::to_value(p).ok());
         let file_debug = if debug {
             Some(WrapperFileDebug {
                 signal_scores: entry
@@ -223,7 +226,12 @@ pub async fn run(task_file: PathBuf, json: bool, debug: bool) -> Result<()> {
     // list and check span overlap.
     let gold_trace = if debug {
         let gold = parse_gold(&task);
-        build_gold_trace(&gold, &pred_files, &pred_spans, locate_result.debug.as_ref())
+        build_gold_trace(
+            &gold,
+            &pred_files,
+            &pred_spans,
+            locate_result.debug.as_ref(),
+        )
     } else {
         None
     };
@@ -247,10 +255,29 @@ pub async fn run(task_file: PathBuf, json: bool, debug: bool) -> Result<()> {
 
     let query_len = query.chars().count();
     let result = ContextbenchTrajectory {
-        instance_id: task.get("instance_id").and_then(Value::as_str).map(String::from).or_else(|| task.get("original_inst_id").and_then(Value::as_str).map(String::from)),
-        original_inst_id: task.get("original_inst_id").and_then(Value::as_str).map(String::from),
-        repo_url: task.get("repo_url").and_then(Value::as_str).map(String::from).or_else(|| Some(String::from(""))),
-        commit: task.get("base_commit").and_then(Value::as_str).map(String::from).or_else(|| Some(String::from(""))),
+        instance_id: task
+            .get("instance_id")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .or_else(|| {
+                task.get("original_inst_id")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+            }),
+        original_inst_id: task
+            .get("original_inst_id")
+            .and_then(Value::as_str)
+            .map(String::from),
+        repo_url: task
+            .get("repo_url")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .or_else(|| Some(String::from(""))),
+        commit: task
+            .get("base_commit")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .or_else(|| Some(String::from(""))),
         model_patch: String::new(),
         traj_data,
         schema: "kin.contextbench-locate.v1".to_string(),
@@ -425,9 +452,7 @@ struct GoldEntry {
 fn parse_gold(task: &Value) -> Vec<GoldEntry> {
     let raw = match task.get("gold_context") {
         Some(Value::Array(arr)) => arr.clone(),
-        Some(Value::String(s)) => {
-            serde_json::from_str::<Vec<Value>>(s).unwrap_or_default()
-        }
+        Some(Value::String(s)) => serde_json::from_str::<Vec<Value>>(s).unwrap_or_default(),
         _ => Vec::new(),
     };
 
@@ -441,8 +466,14 @@ fn parse_gold(task: &Value) -> Vec<GoldEntry> {
         if normalized.is_empty() {
             continue;
         }
-        let start_line = item.get("start_line").and_then(Value::as_u64).map(|v| v as u32);
-        let end_line = item.get("end_line").and_then(Value::as_u64).map(|v| v as u32);
+        let start_line = item
+            .get("start_line")
+            .and_then(Value::as_u64)
+            .map(|v| v as u32);
+        let end_line = item
+            .get("end_line")
+            .and_then(Value::as_u64)
+            .map(|v| v as u32);
         // Dedup by (file, span) so the same file with distinct gold ranges is
         // kept (each is a separate gold target), but exact repeats collapse.
         if seen.insert((normalized.clone(), start_line, end_line)) {
@@ -490,9 +521,12 @@ fn build_gold_trace(
     let mut pre_cap_rank: std::collections::HashMap<String, (usize, f32)> =
         std::collections::HashMap::new();
     // First non-pre_cap stage each path was seen in, to localize coverage.
-    let mut first_seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut embedding_rank: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut lexical_rank: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut first_seen: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut embedding_rank: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut lexical_rank: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     if let Some(debug) = debug {
         for stage in &debug.stages {
             match stage.name.as_str() {

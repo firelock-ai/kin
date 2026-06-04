@@ -2041,8 +2041,7 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("entity_id".into(), serde_json::json!(entity.id.to_string()));
 
-        let result =
-            entities::handle_trace_computation(&args, &store, &sessions).unwrap();
+        let result = entities::handle_trace_computation(&args, &store, &sessions).unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -2074,8 +2073,7 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("query".into(), serde_json::json!(entity.name.clone()));
 
-        let result =
-            entities::handle_trace_computation(&args, &store, &sessions).unwrap();
+        let result = entities::handle_trace_computation(&args, &store, &sessions).unwrap();
         let text = match &result.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
