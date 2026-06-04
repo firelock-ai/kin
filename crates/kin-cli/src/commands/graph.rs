@@ -706,14 +706,14 @@ fn read_entity_file_bytes_from_graph(
         }
     };
 
-    let genesis = kin_core::build_genesis_change();
-    let tree = kin_core::build_file_tree(graph, &genesis.id, &branch.head)?;
-    let hash = match tree.get(file_id) {
-        Some(h) => *h,
-        None => {
-            if let Ok(Some(h)) = graph.get_file_hash(file_id) {
-                h
-            } else {
+    let hash = if let Ok(Some(h)) = graph.get_file_hash(file_id) {
+        h
+    } else {
+        let genesis = kin_core::build_genesis_change();
+        let tree = kin_core::build_file_tree(graph, &genesis.id, &branch.head)?;
+        match tree.get(file_id) {
+            Some(h) => *h,
+            None => {
                 anyhow::bail!("file '{}' not found in graph file tree", file_id.0);
             }
         }
