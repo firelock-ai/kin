@@ -7810,6 +7810,27 @@ fn reciprocal_rank_fusion_weighted(
         }
     }
 
+    // Semantic-primacy term (gated, default 0.0 = byte-identical OFF). The combine
+    // below rewards breadth (many signals) + raw score, so a file found mainly by a
+    // strong EMBEDDING match (signal list index 9) is drowned — measured: a gold at
+    // embedding rank #11 landed at fused rank #249. When enabled, add a direct
+    // contribution for a top embedding rank with a SMALL k so top ranks dominate
+    // (RRF's large k compresses rank differences). Ship only if F1 improves.
+    let semantic_weight = locate_env_f32("KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT", 0.0);
+    let semantic_k = locate_env_f32("KIN_LOCATE_SEMANTIC_PRIMACY_K", 8.0);
+    let embed_rank: FxHashMap<&str, usize> = if semantic_weight > 0.0 {
+        ranked_lists
+            .get(9)
+            .map(|l| {
+                l.iter()
+                    .enumerate()
+                    .map(|(r, (f, _))| (f.as_str(), r))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        FxHashMap::default()
+    };
     // Combine: RRF + normalized raw scores + cross-signal bonus + graph tiebreaker
     let mut combined: FxHashMap<String, f32> = FxHashMap::default();
     for (file, rrf) in &rrf_scores {
@@ -7827,9 +7848,17 @@ fn reciprocal_rank_fusion_weighted(
         let graph_count = graph_signal_counts.get(file).copied().unwrap_or(0);
         let graph_bonus = if graph_count >= 2 { 0.01 } else { 0.0 };
         let raw_weight = locate_env_f32("KIN_LOCATE_RRF_RAW_WEIGHT", 0.05);
+        let semantic = if semantic_weight > 0.0 {
+            embed_rank
+                .get(file.as_str())
+                .map(|&r| semantic_weight / (semantic_k + r as f32 + 1.0))
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
         combined.insert(
             file.clone(),
-            rrf + raw * raw_weight + cross_bonus + graph_bonus,
+            rrf + raw * raw_weight + cross_bonus + graph_bonus + semantic,
         );
     }
 
