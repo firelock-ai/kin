@@ -6942,7 +6942,7 @@ fn extract_embedding_signals(
         base_limit * 3
     } else {
         base_limit
-    };
+    }.max(locate_env_usize("KIN_LOCATE_SEMANTIC_FETCH_LIMIT", 250));
     let query_strings: Vec<&str> = queries.iter().map(|(q, _)| q.as_str()).collect();
     let all_results = match search_graph.semantic_search_batch(&query_strings, fetch_limit) {
         Ok(r) => r,
@@ -7278,7 +7278,6 @@ fn resolve_entities_to_files(
         seed_count = entity_seeds.len(),
     )
     .entered();
-    tracing::info!("resolve_entities_to_files CALLED with {} seeds for origin {}", entity_seeds.len(), origin);
 
     let lsp_boost = locate_env_f32("KIN_LOCATE_LSP_ORIGIN_BOOST", 2.0);
     let parsed_weight = locate_env_f32("KIN_LOCATE_PARSED_ORIGIN_WEIGHT", 1.0);
