@@ -2319,23 +2319,42 @@ impl InMemoryGraph {
             }
         };
 
-        // Drain up to batch_size IDs from the queue.
-        let ids: Vec<EntityId> = {
+        // Drain ALL IDs from the queue to sort them deterministically
+        let mut all_ids: Vec<EntityId> = {
             let mut queue = self.embedding_queue.lock();
-            let mut drained = Vec::with_capacity(batch_size.min(queue.len()));
-            let mut iter = queue.iter().copied();
-            for _ in 0..batch_size {
-                if let Some(id) = iter.next() {
-                    drained.push(id);
-                } else {
-                    break;
-                }
-            }
-            for id in &drained {
-                queue.remove(id);
-            }
-            drained
+            queue.drain().collect()
         };
+
+        if all_ids.is_empty() {
+            return Ok(0);
+        }
+
+        // Sort IDs deterministically to ensure stable HNSW insertion order across re-embeds
+        {
+            let ent = self.entities.read();
+            let mut keys: Vec<_> = all_ids.iter().map(|&id| {
+                let e = ent.entities.get(&id);
+                (
+                    e.and_then(|e| e.file_origin.as_ref().map(|p| p.0.as_str())),
+                    e.map(|e| e.name.as_str()),
+                    e.map(|e| e.signature.as_str()),
+                    id
+                )
+            }).collect();
+            keys.sort_unstable();
+            all_ids = keys.into_iter().map(|k| k.3).collect();
+        }
+
+        let take_count = batch_size.min(all_ids.len());
+        let ids: Vec<EntityId> = all_ids.drain(0..take_count).collect();
+
+        // Put the rest back
+        if !all_ids.is_empty() {
+            let mut queue = self.embedding_queue.lock();
+            for id in all_ids {
+                queue.insert(id);
+            }
+        }
 
         if ids.is_empty() {
             return Ok(0);
