@@ -2501,6 +2501,14 @@ async fn locate(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let session_id = extract_session_id_from_headers(&headers)?;
 
+    tracing::info!(">>> LOCATE: state.graph.embedding_status().indexed={}, graph root hash={:?}", state.graph.embedding_status().indexed, state.graph.compute_root_hash());
+    let kvec_meta_path = state.layout.kindb_dir().join("graph.kvec.meta.json");
+    if let Ok(content) = std::fs::read_to_string(kvec_meta_path) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+            tracing::info!(">>> LOCATE: kvec hash={:?}", json.get("graph_root_hash"));
+        }
+    }
+
     let result = if let Some(reference) = req.reference.as_deref() {
         // Explicit --ref always takes precedence over session scope.
         let resolved = kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate_with_report(
@@ -2557,7 +2565,26 @@ async fn locate(
         // vector_source provides the same index — but extract_embedding_signals
         // only uses vector_source when the primary graph has no embeddings,
         // so there's no double-query.
-        let vector_source = Some(state.graph.as_ref());
+        
+        let kvec_path = state.layout.root().join(".kin/kindb/graph.kvec.meta.json");
+        let mut kvec_hash = String::new();
+        if kvec_path.exists() {
+            if let Ok(meta) = std::fs::read_to_string(&kvec_path) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&meta) {
+                    if let Some(h) = json.get("graph_root_hash").and_then(|v| v.as_str()) {
+                        kvec_hash = h.to_string();
+                    }
+                }
+            }
+        }
+        tracing::info!(
+            indexed = state.graph.embedding_status().indexed,
+            current_graph_hash = hex::encode(state.graph.compute_root_hash()),
+            kvec_hash,
+            "LOCATE DIAGNOSTIC: checking graph vs kvec hashes for #38"
+        );
+
+        let vector_source = Some(graph.as_ref());
         kin_cli::commands::locate::run_with_graph_capture_with_priority_files_and_vector_source(
             graph.as_ref(),
             Some(state.layout.working_dir()),
