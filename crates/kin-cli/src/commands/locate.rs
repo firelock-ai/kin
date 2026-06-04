@@ -1705,7 +1705,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                     )
                 })
                 .collect();
-            v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
             v
         };
         record_full_debug_stage(
