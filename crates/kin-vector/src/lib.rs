@@ -867,6 +867,18 @@ impl<Id: VectorId> VectorIndex<Id> {
         self.graph.read().id_to_idx.contains_key(entity_id)
     }
 
+    /// Get the embedding vector for the given entity, if present.
+    pub fn get(&self, entity_id: &Id) -> Option<Vec<f32>> {
+        let graph = self.graph.read();
+        let idx = graph.id_to_idx.get(entity_id)?;
+        let node = graph.nodes.get(*idx)?;
+        if node.vector.is_empty() {
+            None
+        } else {
+            Some(node.vector.clone())
+        }
+    }
+
     /// Add or update the embedding for an entity.
     ///
     /// The embedding slice must have exactly `dimensions` elements.
