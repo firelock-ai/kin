@@ -2383,7 +2383,8 @@ impl InMemoryGraph {
             let vectors = match embedder.embed_batch(&texts) {
                 Ok(vectors) => vectors,
                 Err(err) => {
-                    let remaining_ids: Vec<EntityId> = entity_data[chunk_idx * embed_batch_size..]
+                    let start_idx = (chunk_idx * embed_batch_size).min(entity_data.len());
+                    let remaining_ids: Vec<EntityId> = entity_data[start_idx..]
                         .iter()
                         .map(|(id, _)| *id)
                         .collect();
@@ -2397,8 +2398,10 @@ impl InMemoryGraph {
                         .iter()
                         .map(|(rest_id, _)| *rest_id)
                         .collect();
+                    
+                    let next_chunk_start = ((chunk_idx + 1) * embed_batch_size).min(entity_data.len());
                     remaining_ids.extend(
-                        entity_data[(chunk_idx + 1) * embed_batch_size..]
+                        entity_data[next_chunk_start..]
                             .iter()
                             .map(|(rest_id, _)| *rest_id),
                     );
