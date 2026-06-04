@@ -6946,7 +6946,10 @@ fn extract_embedding_signals(
     let query_strings: Vec<&str> = queries.iter().map(|(q, _)| q.as_str()).collect();
     let all_results = match search_graph.semantic_search_batch(&query_strings, fetch_limit) {
         Ok(r) => r,
-        Err(_) => return Ok(entity_seeds),
+        Err(e) => {
+            tracing::error!("semantic_search_batch failed: {:?}", e);
+            return Ok(entity_seeds);
+        }
     };
 
     for ((_, query_weight), results) in queries.iter().zip(all_results) {
@@ -7275,6 +7278,7 @@ fn resolve_entities_to_files(
         seed_count = entity_seeds.len(),
     )
     .entered();
+    tracing::info!("resolve_entities_to_files CALLED with {} seeds for origin {}", entity_seeds.len(), origin);
 
     let lsp_boost = locate_env_f32("KIN_LOCATE_LSP_ORIGIN_BOOST", 2.0);
     let parsed_weight = locate_env_f32("KIN_LOCATE_PARSED_ORIGIN_WEIGHT", 1.0);
@@ -7368,6 +7372,7 @@ fn resolve_entities_to_files(
             let diversity_floor = top_score * diversity_floor_pct;
             let mut diversity_added = 0usize;
             let mut rescued_file_counts: HashMap<String, usize> = HashMap::new();
+            tracing::info!("resolve_entities_to_files origin {} cut_at: {}, retained_files: {}, diversity_target: {}", origin, cut_at, retained_files.len(), diversity_target);
             if retained_files.len() < diversity_target {
                 for seed in seeds[cut_at..].iter() {
                     let (&entity_id, discovery) = *seed;
@@ -7727,6 +7732,7 @@ fn resolve_entities_to_files(
             .then_with(|| a.0.cmp(&b.0))
     });
 
+    tracing::info!("resolve_entities_to_files origin {} RETURNING {} files", origin, result.len());
     Ok((result, file_explain, file_signal_scores, file_symbols))
 }
 
