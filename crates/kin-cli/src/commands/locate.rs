@@ -1698,13 +1698,26 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         let rank_signal = |sig: &HashMap<String, Vec<FileHit>>| {
             let mut v: Vec<(String, f32)> = sig
                 .iter()
-                .map(|(p, hits)| (p.clone(), hits.iter().map(|h| h.score).fold(f32::MIN, f32::max)))
+                .map(|(p, hits)| {
+                    (
+                        p.clone(),
+                        hits.iter().map(|h| h.score).fold(f32::MIN, f32::max),
+                    )
+                })
                 .collect();
             v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             v
         };
-        record_full_debug_stage(&mut debug_info, &rank_signal(&all_hits[9]), "raw_embedding_signal");
-        record_full_debug_stage(&mut debug_info, &rank_signal(&all_hits[8]), "raw_lexical_signal");
+        record_full_debug_stage(
+            &mut debug_info,
+            &rank_signal(&all_hits[9]),
+            "raw_embedding_signal",
+        );
+        record_full_debug_stage(
+            &mut debug_info,
+            &rank_signal(&all_hits[8]),
+            "raw_lexical_signal",
+        );
     }
 
     demote_cochange_only_outliers(&mut fused, &all_hits);
@@ -2000,7 +2013,9 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 let mut candidates = Vec::new();
 
                 for (path, score) in fused.iter().take(ltr_window) {
-                    let file_path = workspace_root.map(|w| w.join(path)).unwrap_or_else(|| std::path::PathBuf::from(path));
+                    let file_path = workspace_root
+                        .map(|w| w.join(path))
+                        .unwrap_or_else(|| std::path::PathBuf::from(path));
                     let content = std::fs::read_to_string(&file_path).unwrap_or_default();
                     docs.push(content);
                     candidates.push((path.clone(), *score));
@@ -2011,16 +2026,22 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                     for (i, score) in scores.into_iter().enumerate() {
                         candidates[i].1 = score;
                     }
-                    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    candidates
+                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
                     let mut new_fused: Vec<(String, f32)> = candidates;
                     for (path, score) in fused.iter().skip(ltr_window) {
                         new_fused.push((path.clone(), *score));
                     }
                     fused = new_fused;
-                    
+
                     if explain {
-                        record_debug_stage(&mut score_breakdown, &mut debug_info, &fused, "after_cross_encoder");
+                        record_debug_stage(
+                            &mut score_breakdown,
+                            &mut debug_info,
+                            &fused,
+                            "after_cross_encoder",
+                        );
                     }
                 }
             }
@@ -7499,7 +7520,11 @@ fn resolve_entities_to_files(
                         },
                     });
                 if explain {
-                    let body_tag = if is_definition { "definition" } else { "reference" };
+                    let body_tag = if is_definition {
+                        "definition"
+                    } else {
+                        "reference"
+                    };
                     push_projection_reason(
                         &mut file_explain,
                         path,
@@ -10528,13 +10553,16 @@ fn apply_query_relevance(
     let mut present: HashSet<String> = HashSet::new();
     for s in existing.iter_mut() {
         present.insert(s.name.clone());
-        let prox = prox_by_name.get(&s.name).map(|(p, _)| *p).unwrap_or_else(|| {
-            let mut np = 0.0f32;
-            for t in query_terms {
-                np = np.max(score_name_match(t, &s.name));
-            }
-            np
-        });
+        let prox = prox_by_name
+            .get(&s.name)
+            .map(|(p, _)| *p)
+            .unwrap_or_else(|| {
+                let mut np = 0.0f32;
+                for t in query_terms {
+                    np = np.max(score_name_match(t, &s.name));
+                }
+                np
+            });
         s.score += prox * boost_weight;
     }
     for (name, (p, e)) in &prox_by_name {
@@ -10591,7 +10619,8 @@ fn boost_symbol_query_relevance(
         if existing.is_empty() && entities.is_empty() {
             continue;
         }
-        let boosted = apply_query_relevance(existing, entities, query_terms, test_query, boost_weight);
+        let boosted =
+            apply_query_relevance(existing, entities, query_terms, test_query, boost_weight);
         if !boosted.is_empty() {
             projection_symbols.insert(path.clone(), boosted);
         }
@@ -10835,7 +10864,12 @@ fn entity_span_pair(entity: &kin_model::Entity) -> Vec<[u32; 2]> {
     // KIN_LOCATE_SPAN_FULL_EXTENT=1 emits the full node extent instead.
     let full_extent = locate_env_bool("KIN_LOCATE_SPAN_FULL_EXTENT", false);
     let head_threshold = locate_env_usize("KIN_LOCATE_SPAN_CLASS_HEAD_THRESHOLD", 60) as u32;
-    vec![entity_span_lines(s, is_class_like, full_extent, head_threshold)]
+    vec![entity_span_lines(
+        s,
+        is_class_like,
+        full_extent,
+        head_threshold,
+    )]
 }
 
 /// Pure 1-based-inclusive line-span computation behind [`entity_span_pair`],
@@ -10876,7 +10910,6 @@ fn entity_span_lines(
     };
     [start.saturating_add(1), end_1]
 }
-
 
 /// Graph-truth precision cap for a file's `explain` lines. The ContextBench
 /// scorer derives a file's predicted SYMBOL set from these lines, so emitting
@@ -11077,8 +11110,7 @@ fn build_result(
                 .get(path)
                 .map(|syms| {
                     if explain {
-                        let (kept, dropped) =
-                            rank_and_cap_symbols_capturing(syms.clone(), cap);
+                        let (kept, dropped) = rank_and_cap_symbols_capturing(syms.clone(), cap);
                         dropped_symbols.extend(dropped);
                         kept
                     } else {
@@ -11331,8 +11363,12 @@ mod tests {
         let medium = test_entity("formatValue", "src/parse.ts", 40, 70);
         let terms = vec!["base64".to_string(), "padding".to_string()];
 
-        let ranked =
-            rank_enriched_symbols(vec![small.clone(), medium.clone(), topic.clone()], &terms, false, 3);
+        let ranked = rank_enriched_symbols(
+            vec![small.clone(), medium.clone(), topic.clone()],
+            &terms,
+            false,
+            3,
+        );
         assert_eq!(ranked.len(), 3);
         assert_eq!(ranked[0].name, "indexSitesFixesConfig"); // body match dominates
         assert_eq!(ranked[1].name, "formatValue"); // larger span than helper
@@ -11350,7 +11386,10 @@ mod tests {
     #[test]
     fn apply_query_relevance_surfaces_edited_def_over_siblings() {
         // Resolved siblings the query does NOT name, with modest scores.
-        let existing = vec![sym("render_usage", 5.0, true), sym("render_version", 4.0, true)];
+        let existing = vec![
+            sym("render_usage", 5.0, true),
+            sym("render_version", 4.0, true),
+        ];
         // The file also contains the actually-edited gold fn (query names it)
         // plus one of the resolved siblings.
         let gold = test_entity("printHelpInner", "src/help.rs", 759, 767);
@@ -11366,7 +11405,10 @@ mod tests {
             .iter()
             .find(|s| s.name == "render_usage")
             .expect("sibling kept");
-        assert!(gold_s.score > usage_s.score, "edited def must outrank siblings");
+        assert!(
+            gold_s.score > usage_s.score,
+            "edited def must outrank siblings"
+        );
         assert!(out.iter().any(|s| s.name == "render_version")); // siblings preserved
         assert_eq!(out.len(), 3);
 
@@ -11595,8 +11637,14 @@ mod tests {
             cosine: None,
         };
         let json = serde_json::to_string(&symbol).unwrap();
-        assert!(!json.contains("origin"), "non-explain symbol leaked origin: {json}");
-        assert!(!json.contains("cosine"), "non-explain symbol leaked cosine: {json}");
+        assert!(
+            !json.contains("origin"),
+            "non-explain symbol leaked origin: {json}"
+        );
+        assert!(
+            !json.contains("cosine"),
+            "non-explain symbol leaked cosine: {json}"
+        );
 
         let tagged = LocateSymbol {
             origin: "vector".to_string(),
@@ -11773,7 +11821,15 @@ mod tests {
         ];
         let retention = HashSet::from([String::from("src/builtin.c")]);
 
-        let capped = adaptive_cap(&fused, &all_hits, 10, false, &retention, &HashSet::new(), None);
+        let capped = adaptive_cap(
+            &fused,
+            &all_hits,
+            10,
+            false,
+            &retention,
+            &HashSet::new(),
+            None,
+        );
 
         assert!(capped.iter().any(|(path, _)| path == "src/builtin.c"));
     }
@@ -11933,7 +11989,15 @@ mod tests {
             .map(|i| (format!("src/f{i}.py"), 10.0 - i as f32 * 0.5))
             .collect();
         let all_hits: Vec<HashMap<String, Vec<FileHit>>> = (0..8).map(|_| HashMap::new()).collect();
-        let capped = adaptive_cap(&fused, &all_hits, 3, true, &HashSet::new(), &HashSet::new(), None);
+        let capped = adaptive_cap(
+            &fused,
+            &all_hits,
+            3,
+            true,
+            &HashSet::new(),
+            &HashSet::new(),
+            None,
+        );
         assert_eq!(capped.len(), 3);
     }
 

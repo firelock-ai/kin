@@ -396,8 +396,7 @@ mod tests {
         // embeddings_enabled = false: a vector-less prepared dir is legitimate.
         let manifest = make_prepared_dir(dir.path(), false, true, /* with_vectors */ false);
 
-        validate_prepared_state(dir.path(), &manifest).expect(
-            "non-embedded prepared state must validate without a vector sidecar",
-        );
+        validate_prepared_state(dir.path(), &manifest)
+            .expect("non-embedded prepared state must validate without a vector sidecar");
     }
 }

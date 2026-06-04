@@ -257,8 +257,7 @@ fn extract_ts_node(
                         // filtered even when named (avoids config-token bloat).
                         if kind == EntityKind::Constant {
                             if let Some(ref value) = value_node {
-                                let rescue =
-                                    is_named_constant(&name) && is_scalar_literal(value);
+                                let rescue = is_named_constant(&name) && is_scalar_literal(value);
                                 if is_trivial_reexport(value, source) && !rescue {
                                     continue;
                                 }

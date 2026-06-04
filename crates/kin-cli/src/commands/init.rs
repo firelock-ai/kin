@@ -283,12 +283,14 @@ pub async fn run(
         // We look up the current head of the default branch to use as the parent
         // for the new auto-parse change.
         let config = kin_core::KinConfig::load(&layout.config_path())?;
-        let parent_id = snap.graph().get_branch(&kin_model::BranchName::new(&config.default_branch))
+        let parent_id = snap
+            .graph()
+            .get_branch(&kin_model::BranchName::new(&config.default_branch))
             .ok()
             .flatten()
             .map(|b| b.head)
             .unwrap_or_else(|| kin_core::build_genesis_change().id);
-        
+
         if !json {
             println!(
                 "Reusing existing Kin repository at {}",
@@ -303,10 +305,7 @@ pub async fn run(
         let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
             .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
         if !json {
-            println!(
-                "Initialized Kin repository at {}",
-                layout.root().display()
-            );
+            println!("Initialized Kin repository at {}", layout.root().display());
             println!("  KinDB: {}", layout.kindb_snapshot_path().display());
             println!("  Blobs: {}", layout.objects_dir().display());
             println!("  Genesis change: {}", result.genesis_id);
@@ -332,8 +331,9 @@ pub async fn run(
                 .map(|file| (file.rel_path.clone(), file.hash))
                 .collect();
             let diff = kin_db::engine::compute_diff(graph.as_ref(), &current_files);
-            
-            let delta = apply_warm_cache_delta(graph.as_ref(), &blob_store, &indexable_files, &diff)?;
+
+            let delta =
+                apply_warm_cache_delta(graph.as_ref(), &blob_store, &indexable_files, &diff)?;
             let scrubbed_paths = scrub_internal_graph_truth(graph.as_ref())?;
             if !scrubbed_paths.is_empty() {
                 warn!(
@@ -342,9 +342,9 @@ pub async fn run(
                 );
             }
             // We just reuse the existing text/vector indexes implicitly since we're in-place.
-            
+
             phase!("native_warm_cache_diff");
-            
+
             InitIndexSummary {
                 total_entity_count: graph.entity_count(),
                 total_files: graph.indexed_file_paths().len(),

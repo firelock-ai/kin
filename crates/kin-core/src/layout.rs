@@ -43,7 +43,6 @@ impl KinLayout {
         }
     }
 
-
     /// The `.kin/` root directory.
     pub fn root(&self) -> &Path {
         &self.root

@@ -698,7 +698,10 @@ fn read_entity_file_bytes_from_graph(
                         )
                     });
                 }
-                anyhow::bail!("current branch '{}' not found in graph and no fallback branch available", branch_name);
+                anyhow::bail!(
+                    "current branch '{}' not found in graph and no fallback branch available",
+                    branch_name
+                );
             }
         }
     };

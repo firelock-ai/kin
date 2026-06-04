@@ -1217,8 +1217,8 @@ pub fn handle_find_dead_code_seeded<G: GraphStore>(
             "query must be a non-empty string".into(),
         ));
     }
-    let limit = (get_optional_u64(args, "limit", DEFAULT_LIMIT as u64) as usize)
-        .clamp(1, MAX_LIMIT);
+    let limit =
+        (get_optional_u64(args, "limit", DEFAULT_LIMIT as u64) as usize).clamp(1, MAX_LIMIT);
 
     let filter = kin_model::graph::EntityFilter {
         name_pattern: Some(trimmed.to_string()),
@@ -1235,8 +1235,7 @@ pub fn handle_find_dead_code_seeded<G: GraphStore>(
         reference_kinds.iter().copied().collect();
 
     let mut candidates: Vec<serde_json::Value> = Vec::new();
-    let mut seen: std::collections::HashSet<kin_model::EntityId> =
-        std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<kin_model::EntityId> = std::collections::HashSet::new();
 
     for entity in entities.into_iter().take(limit) {
         if !seen.insert(entity.id) {
@@ -1385,8 +1384,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     visited.insert(focal_entity.id);
     let mut truncated = false;
 
-    let mut frontier: Vec<(usize, kin_model::ids::EntityId, usize)> =
-        vec![(0, focal_entity.id, 0)];
+    let mut frontier: Vec<(usize, kin_model::ids::EntityId, usize)> = vec![(0, focal_entity.id, 0)];
 
     while !frontier.is_empty() {
         let mut next_frontier: Vec<(usize, kin_model::ids::EntityId, usize)> = Vec::new();
@@ -1701,7 +1699,10 @@ mod tests {
             .unwrap();
         assert_eq!(live_row["has_references"], true);
         assert_eq!(live_row["reference_count"], 2);
-        assert!(live_row.get("name").is_none(), "compact mode must omit name");
+        assert!(
+            live_row.get("name").is_none(),
+            "compact mode must omit name"
+        );
         let dead_row = rows
             .iter()
             .find(|r| r["entity_id"] == serde_json::json!(dead_id))
@@ -1736,11 +1737,7 @@ mod tests {
         store.upsert_entity(&caller).unwrap();
         store.upsert_entity(&target).unwrap();
         store
-            .upsert_relation(&make_relation(
-                caller_id,
-                target_id,
-                RelationKind::Imports,
-            ))
+            .upsert_relation(&make_relation(caller_id, target_id, RelationKind::Imports))
             .unwrap();
 
         let mut args = HashMap::new();

@@ -6,7 +6,8 @@ use kin_model::{Branch, BranchName, GraphStore, SemanticChangeId};
 
 #[derive(Debug)]
 pub(crate) struct EnsuredBranch {
-    #[allow(dead_code)] // read by tests and reserved for future callers that need the resolved head
+    #[allow(dead_code)]
+    // read by tests and reserved for future callers that need the resolved head
     pub(crate) head: SemanticChangeId,
     pub(crate) bootstrapped: bool,
 }

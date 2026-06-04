@@ -1932,7 +1932,9 @@ fn main() -> Result<()> {
                     limit,
                     name_pattern,
                 } => match seed {
-                    Some(query) => commands::dead_code::run_seeded(query, limit, name_pattern).await,
+                    Some(query) => {
+                        commands::dead_code::run_seeded(query, limit, name_pattern).await
+                    }
                     None => commands::dead_code::run().await,
                 },
                 Command::TraceDataFlow {
@@ -2139,7 +2141,9 @@ fn main() -> Result<()> {
                 Command::Graph { action } => match action {
                     GraphAction::Status => commands::graph::status().await,
                     GraphAction::Validate => commands::graph::validate().await,
-                    GraphAction::Inspect { name, json } => commands::graph::inspect(name, json).await,
+                    GraphAction::Inspect { name, json } => {
+                        commands::graph::inspect(name, json).await
+                    }
                     GraphAction::Source { entity, json } => {
                         commands::graph::source(entity, json).await
                     }

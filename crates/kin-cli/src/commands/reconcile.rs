@@ -129,7 +129,10 @@ pub fn execute_reconcile_session_dir_scoped(
 
     ensure_session_dir_exists(session_dir)?;
 
-    println!("Reconciling session workspace (scoped): {}", session_dir.display());
+    println!(
+        "Reconciling session workspace (scoped): {}",
+        session_dir.display()
+    );
     println!("Against source: {}", source.display());
 
     let changes = diff_directories(session_dir, &source)?;
@@ -185,9 +188,7 @@ pub fn execute_reconcile_session_dir_scoped(
                         total_removed += removed.len();
                         files_indexed += 1;
                     }
-                    Ok(ReconcileOutcome::BrokenAst { file_id, .. })
-                        if strict_semantic_guard =>
-                    {
+                    Ok(ReconcileOutcome::BrokenAst { file_id, .. }) if strict_semantic_guard => {
                         anyhow::bail!(
                             "reconcile aborted for {}: broken AST retained LKG state for {}",
                             change.relative_path.display(),
@@ -273,7 +274,6 @@ pub fn execute_reconcile_session_dir_scoped(
         total_removed,
     })
 }
-
 
 pub fn execute_reconcile_session_dir_with_persist<F>(
     layout: &kin_core::KinLayout,

@@ -956,9 +956,10 @@ impl DaemonState {
         // Without this, two concurrent saves race on the shared tmp paths and
         // can leave a torn kndb/kidx pair. Held only for this synchronous body
         // (no `.await` inside), so a std Mutex is sound.
-        let _persist_guard = self.persist_lock.lock().map_err(|_| {
-            DaemonError::Io(std::io::Error::other("persist lock poisoned"))
-        })?;
+        let _persist_guard = self
+            .persist_lock
+            .lock()
+            .map_err(|_| DaemonError::Io(std::io::Error::other("persist lock poisoned")))?;
 
         let repo_id = self.cached_repo_id.as_str();
 
