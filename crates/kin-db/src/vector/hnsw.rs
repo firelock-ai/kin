@@ -56,6 +56,17 @@ impl VectorIndex {
         self.inner.contains(key)
     }
 
+    /// Get the embedding vector for this entity if present.
+    pub fn get(&self, entity_id: &EntityId) -> Option<Vec<f32>> {
+        let key = RetrievalKey::from(*entity_id);
+        self.inner.get(&key)
+    }
+
+    /// Get the embedding vector for this retrieval key if present.
+    pub fn get_retrievable(&self, key: &RetrievalKey) -> Option<Vec<f32>> {
+        self.inner.get(key)
+    }
+
     /// Add or update the embedding for an entity.
     ///
     /// The embedding slice must have exactly `dimensions` elements.

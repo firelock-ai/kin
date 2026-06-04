@@ -2004,6 +2004,172 @@ impl InMemoryGraph {
         Ok(())
     }
 
+    #[cfg(feature = "embeddings")]
+    pub fn share_embedder_from(&self, source: &InMemoryGraph) {
+        let source_embedder = source.embedder.lock().clone();
+        if let Some(e) = source_embedder {
+            *self.embedder.lock() = Some(e);
+        }
+    }
+
+    /// Reconstructs the vector index for a scoped graph by copying unchanged embeddings from
+    /// a source graph (HEAD) and queueing/embedding any modified or new entities/artifacts.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    pub fn reconstruct_vector_index_from(&self, source: &InMemoryGraph) -> Result<(), KinDbError> {
+        let _span = tracing::info_span!("kindb.reconstruct_vector_index_from").entered();
+
+        // Share the embedder first to avoid reload cost
+        self.share_embedder_from(source);
+
+        let source_vi_opt = source.vector_index.lock().clone();
+        let source_vi = match source_vi_opt {
+            Some(vi) => vi,
+            None => {
+                // If source has no vector index, there's nothing to copy, but we still need to initialize ours
+                self.get_vector_index()?;
+                return Ok(());
+            }
+        };
+
+        let our_vi = self.get_vector_index()?;
+
+        // Get file hashes to compare content identity between self (scoped) and source (HEAD)
+        let our_file_hashes = {
+            let ent = self.entities.read();
+            ent.file_hashes.clone()
+        };
+        let source_file_hashes = {
+            let ent = source.entities.read();
+            ent.file_hashes.clone()
+        };
+
+        let ent = self.entities.read();
+        let mut modified_count = 0;
+        let mut copied_count = 0;
+
+        // 1. Process entities
+        for (id, entity) in &ent.entities {
+            let is_identical = if let Some(ref file_origin) = entity.file_origin {
+                let our_hash = our_file_hashes.get(&file_origin.0);
+                let source_hash = source_file_hashes.get(&file_origin.0);
+                our_hash.is_some() && our_hash == source_hash
+            } else {
+                false
+            };
+
+            let key = RetrievalKey::Entity(*id);
+            if is_identical {
+                if let Some(vec) = source_vi.get_retrievable(&key) {
+                    our_vi.upsert_retrievable(key, &vec)?;
+                    copied_count += 1;
+                } else {
+                    self.embedding_queue.lock().insert(*id);
+                    modified_count += 1;
+                }
+            } else {
+                self.embedding_queue.lock().insert(*id);
+                modified_count += 1;
+            }
+        }
+
+        // 2. Process artifacts (shallow files, structured artifacts, opaque artifacts)
+        let mut modified_artifacts = 0;
+        let mut copied_artifacts = 0;
+
+        for (file_id, sf) in &ent.shallow_files {
+            let artifact_id = ArtifactId::from_file_id(file_id);
+            let key = RetrievalKey::Artifact(artifact_id);
+
+            let is_identical = if let Some(source_sf) = source.entities.read().shallow_files.get(file_id) {
+                sf.syntax_hash == source_sf.syntax_hash
+            } else {
+                false
+            };
+
+            if is_identical {
+                if let Some(vec) = source_vi.get_retrievable(&key) {
+                    our_vi.upsert_retrievable(key, &vec)?;
+                    copied_artifacts += 1;
+                } else {
+                    self.artifact_embedding_queue.lock().insert(artifact_id);
+                    modified_artifacts += 1;
+                }
+            } else {
+                self.artifact_embedding_queue.lock().insert(artifact_id);
+                modified_artifacts += 1;
+            }
+        }
+
+        for (file_id, sa) in &ent.structured_artifacts {
+            let artifact_id = ArtifactId::from_file_id(file_id);
+            let key = RetrievalKey::Artifact(artifact_id);
+
+            let is_identical = if let Some(source_sa) = source.entities.read().structured_artifacts.get(file_id) {
+                sa.content_hash == source_sa.content_hash
+            } else {
+                false
+            };
+
+            if is_identical {
+                if let Some(vec) = source_vi.get_retrievable(&key) {
+                    our_vi.upsert_retrievable(key, &vec)?;
+                    copied_artifacts += 1;
+                } else {
+                    self.artifact_embedding_queue.lock().insert(artifact_id);
+                    modified_artifacts += 1;
+                }
+            } else {
+                self.artifact_embedding_queue.lock().insert(artifact_id);
+                modified_artifacts += 1;
+            }
+        }
+
+        for (file_id, oa) in &ent.opaque_artifacts {
+            let artifact_id = ArtifactId::from_file_id(file_id);
+            let key = RetrievalKey::Artifact(artifact_id);
+
+            let is_identical = if let Some(source_oa) = source.entities.read().opaque_artifacts.get(file_id) {
+                oa.content_hash == source_oa.content_hash
+            } else {
+                false
+            };
+
+            if is_identical {
+                if let Some(vec) = source_vi.get_retrievable(&key) {
+                    our_vi.upsert_retrievable(key, &vec)?;
+                    copied_artifacts += 1;
+                } else {
+                    self.artifact_embedding_queue.lock().insert(artifact_id);
+                    modified_artifacts += 1;
+                }
+            } else {
+                self.artifact_embedding_queue.lock().insert(artifact_id);
+                modified_artifacts += 1;
+            }
+        }
+
+        tracing::info!(
+            copied_entities = copied_count,
+            to_embed_entities = modified_count,
+            copied_artifacts = copied_artifacts,
+            to_embed_artifacts = modified_artifacts,
+            "reconstructed scoped vector index"
+        );
+
+        // Process any queued entities immediately
+        while !self.embedding_queue.lock().is_empty() {
+            self.process_embedding_queue(128)?;
+        }
+
+        // Process any queued artifacts immediately
+        while !self.artifact_embedding_queue.lock().is_empty() {
+            self.process_artifact_embedding_queue(128)?;
+        }
+
+        Ok(())
+    }
+
+
     #[cfg(feature = "vector")]
     pub fn vector_index_stats(&self) -> Option<(usize, usize)> {
         self.vector_index
