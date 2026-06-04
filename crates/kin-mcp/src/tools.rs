@@ -371,6 +371,79 @@ pub fn tool_definitions() -> ToolsListResult {
                 }),
             },
             ToolDefinition {
+                name: "kin_transaction_begin".into(),
+                description: "Begin a new semantic graph mutation transaction. Transactions allow you to stage multiple mutations (inserts, updates, deletes) and commit them atomically. Returns a unique transaction_id.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string", "description": "Session UUID owning the transaction" },
+                        "scope": { "type": "string", "description": "Target scope (e.g. filename, module, etc.)" }
+                    },
+                    "required": ["session_id", "scope"]
+                }),
+            },
+            ToolDefinition {
+                name: "kin_transaction_stage".into(),
+                description: "Stage one or more mutation operations onto an active transaction. Operations are queued in memory and can be validated or committed together.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "transaction_id": { "type": "string", "description": "Transaction UUID" },
+                        "operations": {
+                            "type": "array",
+                            "description": "Array of mutation operations to stage",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "verb": { "type": "string", "description": "Operation verb: create, update, delete, upsert" },
+                                    "target": { "type": "string", "description": "Legacy compat target (optional)", "default": "" },
+                                    "payload": {
+                                        "type": "object",
+                                        "description": "Detailed mutation payload: {\"Entity\": { ... }} or {\"Relation\": {\"from\": \"...\", \"to\": \"...\", \"kind\": \"...\"}} or {\"Blob\": [...]}"
+                                    },
+                                    "description": { "type": "string", "description": "Human-readable explanation of this change" }
+                                },
+                                "required": ["verb", "description"]
+                            }
+                        }
+                    },
+                    "required": ["transaction_id", "operations"]
+                }),
+            },
+            ToolDefinition {
+                name: "kin_transaction_validate".into(),
+                description: "Validate staged mutations on an active transaction. Runs semantic and structural schema validation on the staged deltas without committing them.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "transaction_id": { "type": "string", "description": "Transaction UUID" }
+                    },
+                    "required": ["transaction_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "kin_transaction_commit".into(),
+                description: "Commit all staged mutations in the transaction atomically to the graph. Returns the new Merkle root hash of the graph.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "transaction_id": { "type": "string", "description": "Transaction UUID" }
+                    },
+                    "required": ["transaction_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "kin_transaction_abort".into(),
+                description: "Abort the transaction and discard all staged mutations.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "transaction_id": { "type": "string", "description": "Transaction UUID" }
+                    },
+                    "required": ["transaction_id"]
+                }),
+            },
+            ToolDefinition {
                 name: "explore_codebase".into(),
                 description: crate::handlers::entities::EXPLORE_CODEBASE_DESC.into(),
                 input_schema: serde_json::json!({
@@ -812,15 +885,19 @@ mod tests {
         assert!(json.contains("kin_register_intent"));
         assert!(json.contains("kin_release_intent"));
         assert!(json.contains("kin_check_traffic"));
+        // Transaction tools
+        assert!(json.contains("kin_transaction_begin"));
+        assert!(json.contains("kin_transaction_stage"));
+        assert!(json.contains("kin_transaction_validate"));
+        assert!(json.contains("kin_transaction_commit"));
+        assert!(json.contains("kin_transaction_abort"));
     }
 
     #[test]
     fn expected_tool_count() {
         let list = tool_definitions();
-        // 12 original + 1 explore_codebase + 2 entity source aliases + 6 Phase 7 + 12 Phase 8
-        // + 6 Phase 9-10 + 1 graph_status + 10 Phase 11 review + 1 bulk_check_references
-        // + 1 trace_computation + 1 find_dead_code_seeded + 1 trace_data_flow = 54
-        assert_eq!(list.tools.len(), 54);
+        // 54 + 5 new transaction tools = 59
+        assert_eq!(list.tools.len(), 59);
     }
 
     #[test]

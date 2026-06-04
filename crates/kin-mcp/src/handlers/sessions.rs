@@ -4,8 +4,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use kin_model::graph::GraphStore;
 use kin_model::ids::EntityId;
 use kin_model::timestamp::Timestamp;
+use crate::session::{McpMutationPayload, McpMutationOperation};
 
 use crate::error::Result;
 use crate::server::SessionAuthorityMode;
@@ -419,5 +421,260 @@ fn intent_scope_to_string(scope: &kin_model::session::IntentScope) -> String {
         IntentScope::Entity(id) => format!("entity:{id}"),
         IntentScope::Contract(id) => format!("contract:{id}"),
         IntentScope::Artifact(id) => format!("file:{id}"),
+    }
+}
+
+pub const TRANSACTION_BEGIN_DESC: &str = "\
+Begin a new semantic graph mutation transaction. Transactions allow you to stage \
+multiple mutations (inserts, updates, deletes) and commit them atomically. Returns \
+a unique transaction_id.";
+
+pub async fn handle_transaction_begin(
+    args: &HashMap<String, serde_json::Value>,
+    sessions: &SessionRegistry,
+    session_authority_mode: SessionAuthorityMode,
+) -> Result<ToolCallResult> {
+    let session_id = get_string_param(args, "session_id")?;
+    let scope = get_string_param(args, "scope")?;
+
+    if session_authority_mode.uses_daemon() {
+        match crate::daemon_delegate::forward_tool_call("kin_transaction_begin", args).await {
+            Ok(Some(value)) => return Ok(value),
+            Ok(None) if session_authority_mode.requires_daemon() => {
+                return Ok(daemon_required_unavailable("transaction begin"));
+            }
+            Ok(None) => {}
+            Err(err) => return Ok(ToolCallResult::error(err)),
+        }
+    }
+
+    match sessions.begin_transaction(&session_id, &scope) {
+        Ok(tx) => {
+            let result = serde_json::json!({
+                "transaction_id": tx.transaction_id,
+                "session_id": tx.session_id,
+                "scope": tx.scope,
+                "state": tx.state,
+            });
+            let json = serde_json::to_string_pretty(&result).map_err(crate::error::McpError::Json)?;
+            Ok(ToolCallResult::text(json))
+        }
+        Err(err) => Ok(ToolCallResult::error(err)),
+    }
+}
+
+pub const TRANSACTION_STAGE_DESC: &str = "\
+Stage one or more mutation operations onto an active transaction. Operations are \
+queued in memory and can be validated or committed together.";
+
+pub async fn handle_transaction_stage(
+    args: &HashMap<String, serde_json::Value>,
+    sessions: &SessionRegistry,
+    session_authority_mode: SessionAuthorityMode,
+) -> Result<ToolCallResult> {
+    let transaction_id = get_string_param(args, "transaction_id")?;
+    let operations_val = args.get("operations").ok_or_else(|| {
+        crate::error::McpError::InvalidParams("missing required parameter: operations".into())
+    })?;
+
+    let operations: Vec<McpMutationOperation> = serde_json::from_value(operations_val.clone())
+        .map_err(|e| crate::error::McpError::InvalidParams(format!("invalid operations array: {e}")))?;
+
+    if session_authority_mode.uses_daemon() {
+        match crate::daemon_delegate::forward_tool_call("kin_transaction_stage", args).await {
+            Ok(Some(value)) => return Ok(value),
+            Ok(None) if session_authority_mode.requires_daemon() => {
+                return Ok(daemon_required_unavailable("transaction stage"));
+            }
+            Ok(None) => {}
+            Err(err) => return Ok(ToolCallResult::error(err)),
+        }
+    }
+
+    match sessions.stage_transaction(&transaction_id, operations) {
+        Ok(tx) => {
+            let result = serde_json::json!({
+                "transaction_id": tx.transaction_id,
+                "state": tx.state,
+                "staged_count": tx.staged_operations.len(),
+            });
+            let json = serde_json::to_string_pretty(&result).map_err(crate::error::McpError::Json)?;
+            Ok(ToolCallResult::text(json))
+        }
+        Err(err) => Ok(ToolCallResult::error(err)),
+    }
+}
+
+pub const TRANSACTION_VALIDATE_DESC: &str = "\
+Validate staged mutations on an active transaction. Runs semantic and structural \
+schema validation on the staged deltas without committing them.";
+
+pub async fn handle_transaction_validate(
+    args: &HashMap<String, serde_json::Value>,
+    sessions: &SessionRegistry,
+    session_authority_mode: SessionAuthorityMode,
+) -> Result<ToolCallResult> {
+    let transaction_id = get_string_param(args, "transaction_id")?;
+
+    if session_authority_mode.uses_daemon() {
+        match crate::daemon_delegate::forward_tool_call("kin_transaction_validate", args).await {
+            Ok(Some(value)) => return Ok(value),
+            Ok(None) if session_authority_mode.requires_daemon() => {
+                return Ok(daemon_required_unavailable("transaction validate"));
+            }
+            Ok(None) => {}
+            Err(err) => return Ok(ToolCallResult::error(err)),
+        }
+    }
+
+    match sessions.validate_transaction(&transaction_id) {
+        Ok(tx) => {
+            let result = serde_json::json!({
+                "transaction_id": tx.transaction_id,
+                "state": tx.state,
+                "status": "valid",
+            });
+            let json = serde_json::to_string_pretty(&result).map_err(crate::error::McpError::Json)?;
+            Ok(ToolCallResult::text(json))
+        }
+        Err(err) => Ok(ToolCallResult::error(err)),
+    }
+}
+
+pub const TRANSACTION_COMMIT_DESC: &str = "\
+Commit all staged mutations in the transaction atomically to the graph. Returns \
+the new Merkle root hash of the graph.";
+
+pub async fn handle_transaction_commit<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+    sessions: &SessionRegistry,
+    session_authority_mode: SessionAuthorityMode,
+) -> Result<ToolCallResult> {
+    let transaction_id = get_string_param(args, "transaction_id")?;
+
+    if session_authority_mode.uses_daemon() {
+        match crate::daemon_delegate::forward_tool_call("kin_transaction_commit", args).await {
+            Ok(Some(value)) => return Ok(value),
+            Ok(None) if session_authority_mode.requires_daemon() => {
+                return Ok(daemon_required_unavailable("transaction commit"));
+            }
+            Ok(None) => {}
+            Err(err) => return Ok(ToolCallResult::error(err)),
+        }
+    }
+
+    let tx = match sessions.get_transaction(&transaction_id) {
+        Some(t) => t,
+        None => return Ok(ToolCallResult::error(format!("Transaction not found: {}", transaction_id))),
+    };
+
+    if tx.state != "active" && tx.state != "validated" {
+        return Ok(ToolCallResult::error(format!(
+            "Cannot commit transaction {} in state: {}",
+            transaction_id, tx.state
+        )));
+    }
+
+    let mut entity_deltas = Vec::new();
+    let mut relation_deltas = Vec::new();
+
+    for op in tx.staged_operations {
+        let verb = op.verb.to_lowercase();
+        if let Some(payload) = op.payload {
+            match payload {
+                McpMutationPayload::Entity(entity) => {
+                    if verb == "create" || verb == "add" || verb == "upsert" || verb == "insert" {
+                        entity_deltas.push(kin_model::change::EntityDelta::Added(entity));
+                    } else if verb == "update" || verb == "modify" {
+                        let old = store.get_entity(&entity.id).ok().flatten().unwrap_or_else(|| entity.clone());
+                        entity_deltas.push(kin_model::change::EntityDelta::Modified { old, new: entity });
+                    } else if verb == "delete" || verb == "remove" {
+                        entity_deltas.push(kin_model::change::EntityDelta::Removed(entity.id));
+                    }
+                }
+                McpMutationPayload::Relation { from, to, kind } => {
+                    if verb == "create" || verb == "add" || verb == "upsert" || verb == "insert" {
+                        let relation = kin_model::relation::Relation {
+                            id: kin_model::ids::RelationId::new(),
+                            kind,
+                            src: kin_model::relation::GraphNodeId::Entity(from),
+                            dst: kin_model::relation::GraphNodeId::Entity(to),
+                            confidence: 1.0,
+                            origin: kin_model::relation::RelationOrigin::Manual,
+                            created_in: None,
+                            import_source: None,
+                        };
+                        relation_deltas.push(kin_model::change::RelationDelta::Added(relation));
+                    } else if verb == "delete" || verb == "remove" {
+                        let matching_relation = store.get_all_relations_for_entity(&from)
+                            .ok()
+                            .and_then(|rels| {
+                                rels.into_iter().find(|r| {
+                                    r.kind == kind && r.src == kin_model::relation::GraphNodeId::Entity(from) && r.dst == kin_model::relation::GraphNodeId::Entity(to)
+                                })
+                            });
+                        if let Some(rel) = matching_relation {
+                            relation_deltas.push(kin_model::change::RelationDelta::Removed(rel.id));
+                        }
+                    }
+                }
+                McpMutationPayload::Blob(_) => {}
+            }
+        }
+    }
+
+    let delta = kin_model::change::TransactionDelta {
+        entity_deltas,
+        relation_deltas,
+    };
+
+    if let Err(err) = store.apply_transaction_delta(&delta) {
+        return Ok(ToolCallResult::error(format!("Failed to commit transaction delta: {err}")));
+    }
+
+    let committed_tx = sessions.commit_transaction(&transaction_id)
+        .map_err(|e| crate::error::McpError::InvalidParams(e))?;
+
+    let result = serde_json::json!({
+        "transaction_id": committed_tx.transaction_id,
+        "state": committed_tx.state,
+        "status": "committed",
+    });
+    let json = serde_json::to_string_pretty(&result).map_err(crate::error::McpError::Json)?;
+    Ok(ToolCallResult::text(json))
+}
+
+pub const TRANSACTION_ABORT_DESC: &str = "\
+Abort the transaction and discard all staged mutations.";
+
+pub async fn handle_transaction_abort(
+    args: &HashMap<String, serde_json::Value>,
+    sessions: &SessionRegistry,
+    session_authority_mode: SessionAuthorityMode,
+) -> Result<ToolCallResult> {
+    let transaction_id = get_string_param(args, "transaction_id")?;
+
+    if session_authority_mode.uses_daemon() {
+        match crate::daemon_delegate::forward_tool_call("kin_transaction_abort", args).await {
+            Ok(Some(value)) => return Ok(value),
+            Ok(None) if session_authority_mode.requires_daemon() => {
+                return Ok(daemon_required_unavailable("transaction abort"));
+            }
+            Ok(None) => {}
+            Err(err) => return Ok(ToolCallResult::error(err)),
+        }
+    }
+
+    match sessions.abort_transaction(&transaction_id) {
+        Ok(tx) => {
+            let result = serde_json::json!({
+                "transaction_id": tx.transaction_id,
+                "state": tx.state,
+            });
+            let json = serde_json::to_string_pretty(&result).map_err(crate::error::McpError::Json)?;
+            Ok(ToolCallResult::text(json))
+        }
+        Err(err) => Ok(ToolCallResult::error(err)),
     }
 }
