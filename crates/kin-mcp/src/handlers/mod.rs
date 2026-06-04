@@ -73,6 +73,21 @@ pub async fn handle_tool_call<G: GraphStore>(
         "kin_check_traffic" => {
             sessions::handle_check_traffic(arguments, sessions, session_authority_mode).await
         }
+        "kin_transaction_begin" => {
+            sessions::handle_transaction_begin(arguments, sessions, session_authority_mode).await
+        }
+        "kin_transaction_stage" => {
+            sessions::handle_transaction_stage(arguments, sessions, session_authority_mode).await
+        }
+        "kin_transaction_validate" => {
+            sessions::handle_transaction_validate(arguments, sessions, session_authority_mode).await
+        }
+        "kin_transaction_commit" => {
+            sessions::handle_transaction_commit(arguments, store, sessions, session_authority_mode).await
+        }
+        "kin_transaction_abort" => {
+            sessions::handle_transaction_abort(arguments, sessions, session_authority_mode).await
+        }
         // Work graph and annotations
         "kin_work_create" => work::handle_work_create(arguments, store),
         "kin_work_list" => work::handle_work_list(arguments, store),
@@ -2095,5 +2110,94 @@ mod tests {
         let err = entities::handle_trace_computation(&args, &store, &sessions)
             .expect_err("missing entity_id and query should error");
         assert!(matches!(err, McpError::InvalidParams(_)));
+    }
+
+    #[tokio::test]
+    async fn handle_transaction_handlers_lifecycle() {
+        use kin_db::InMemoryGraph;
+        use kin_model::graph::EntityStore;
+        use crate::session::{McpMutationOperation, McpMutationPayload};
+        use kin_model::ids::{LanguageId, Hash256};
+        use kin_model::entity::{SemanticFingerprint, FingerprintAlgorithm};
+
+        let store = InMemoryGraph::default();
+        let sessions = SessionRegistry::new();
+        let session_authority = SessionAuthorityMode::OfflineFallback;
+
+        // 1. Begin transaction
+        let mut begin_args = HashMap::new();
+        begin_args.insert("session_id".into(), serde_json::json!("sess-test"));
+        begin_args.insert("scope".into(), serde_json::json!("src/lib.rs"));
+        let begin_res = sessions::handle_transaction_begin(&begin_args, &sessions, session_authority).await.unwrap();
+        let begin_text = match &begin_res.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let begin_val: serde_json::Value = serde_json::from_str(&begin_text).unwrap();
+        let tx_id = begin_val["transaction_id"].as_str().unwrap().to_string();
+
+        // 2. Stage mutation (add entity)
+        let entity = kin_model::Entity {
+            id: EntityId::new(),
+            kind: kin_model::entity::EntityKind::Function,
+            name: "test_fn".into(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([0; 32]),
+                behavior_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: None,
+            span: None,
+            signature: "fn test_fn()".into(),
+            visibility: kin_model::entity::Visibility::Public,
+            role: kin_model::entity::EntityRole::Source,
+            doc_summary: None,
+            metadata: kin_model::entity::EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        };
+        let op = McpMutationOperation {
+            verb: "create".into(),
+            target: "".into(),
+            payload: Some(McpMutationPayload::Entity(entity.clone())),
+            description: "add test function".into(),
+        };
+
+        let mut stage_args = HashMap::new();
+        stage_args.insert("transaction_id".into(), serde_json::json!(tx_id));
+        stage_args.insert("operations".into(), serde_json::json!(vec![op]));
+        let stage_res = sessions::handle_transaction_stage(&stage_args, &sessions, session_authority).await.unwrap();
+        let stage_text = match &stage_res.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let stage_val: serde_json::Value = serde_json::from_str(&stage_text).unwrap();
+        assert_eq!(stage_val["staged_count"].as_u64().unwrap(), 1);
+
+        // 3. Validate transaction
+        let mut val_args = HashMap::new();
+        val_args.insert("transaction_id".into(), serde_json::json!(tx_id));
+        let val_res = sessions::handle_transaction_validate(&val_args, &sessions, session_authority).await.unwrap();
+        let val_text = match &val_res.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let val_val: serde_json::Value = serde_json::from_str(&val_text).unwrap();
+        assert_eq!(val_val["state"].as_str().unwrap(), "validated");
+
+        // 4. Commit transaction
+        let mut commit_args = HashMap::new();
+        commit_args.insert("transaction_id".into(), serde_json::json!(tx_id));
+        let commit_res = sessions::handle_transaction_commit(&commit_args, &store, &sessions, session_authority).await.unwrap();
+        let commit_text = match &commit_res.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let commit_val: serde_json::Value = serde_json::from_str(&commit_text).unwrap();
+        assert_eq!(commit_val["state"].as_str().unwrap(), "committed");
+
+        // Verify entity was added to the store
+        let retrieved = store.get_entity(&entity.id).unwrap().unwrap();
+        assert_eq!(retrieved.name, "test_fn");
     }
 }

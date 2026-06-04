@@ -21,6 +21,34 @@ pub struct AssistantSession {
     pub registered_at: Timestamp,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum McpMutationPayload {
+    Entity(kin_model::Entity),
+    Relation {
+        from: kin_model::ids::EntityId,
+        to: kin_model::ids::EntityId,
+        kind: kin_model::relation::RelationKind,
+    },
+    Blob(Vec<u8>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpMutationOperation {
+    pub verb: String,
+    pub target: String,
+    pub payload: Option<McpMutationPayload>,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpTransaction {
+    pub transaction_id: String,
+    pub session_id: String,
+    pub scope: String,
+    pub state: String,
+    pub staged_operations: Vec<McpMutationOperation>,
+}
+
 /// Thread-safe registry for agent sessions and intents.
 ///
 /// This is the in-process coordination hub. The daemon would host this
@@ -33,6 +61,8 @@ pub struct SessionRegistry {
     agent_sessions: Mutex<HashMap<SessionId, AgentSession>>,
     /// Active intents keyed by IntentId.
     intents: Mutex<HashMap<IntentId, Intent>>,
+    /// Active transactions keyed by TransactionId.
+    transactions: Mutex<HashMap<String, McpTransaction>>,
 }
 
 impl SessionRegistry {
@@ -41,6 +71,7 @@ impl SessionRegistry {
             sessions: Mutex::new(HashMap::new()),
             agent_sessions: Mutex::new(HashMap::new()),
             intents: Mutex::new(HashMap::new()),
+            transactions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -332,6 +363,112 @@ impl SessionRegistry {
             })
             .collect()
     }
+
+    // ── Transaction API ──
+
+    pub fn begin_transaction(
+        &self,
+        session_id: &str,
+        scope: &str,
+    ) -> std::result::Result<McpTransaction, String> {
+        let transaction_id = EntityId::new().to_string();
+        let transaction = McpTransaction {
+            transaction_id: transaction_id.clone(),
+            session_id: session_id.to_string(),
+            scope: scope.to_string(),
+            state: "active".to_string(),
+            staged_operations: Vec::new(),
+        };
+
+        self.transactions
+            .lock()
+            .expect("transactions lock poisoned")
+            .insert(transaction_id, transaction.clone());
+
+        Ok(transaction)
+    }
+
+    pub fn stage_transaction(
+        &self,
+        transaction_id: &str,
+        operations: Vec<McpMutationOperation>,
+    ) -> std::result::Result<McpTransaction, String> {
+        let mut map = self
+            .transactions
+            .lock()
+            .expect("transactions lock poisoned");
+        if let Some(tx) = map.get_mut(transaction_id) {
+            if tx.state != "active" {
+                return Err(format!(
+                    "Cannot stage operations on transaction {} in state: {}",
+                    transaction_id, tx.state
+                ));
+            }
+            tx.staged_operations.extend(operations);
+            Ok(tx.clone())
+        } else {
+            Err(format!("Transaction not found: {}", transaction_id))
+        }
+    }
+
+    pub fn validate_transaction(&self, transaction_id: &str) -> std::result::Result<McpTransaction, String> {
+        let mut map = self
+            .transactions
+            .lock()
+            .expect("transactions lock poisoned");
+        if let Some(tx) = map.get_mut(transaction_id) {
+            if tx.state != "active" {
+                return Err(format!(
+                    "Cannot validate transaction {} in state: {}",
+                    transaction_id, tx.state
+                ));
+            }
+            tx.state = "validated".to_string();
+            Ok(tx.clone())
+        } else {
+            Err(format!("Transaction not found: {}", transaction_id))
+        }
+    }
+
+    pub fn commit_transaction(&self, transaction_id: &str) -> std::result::Result<McpTransaction, String> {
+        let mut map = self
+            .transactions
+            .lock()
+            .expect("transactions lock poisoned");
+        if let Some(tx) = map.get_mut(transaction_id) {
+            if tx.state != "active" && tx.state != "validated" {
+                return Err(format!(
+                    "Cannot commit transaction {} in state: {}",
+                    transaction_id, tx.state
+                ));
+            }
+            tx.state = "committed".to_string();
+            Ok(tx.clone())
+        } else {
+            Err(format!("Transaction not found: {}", transaction_id))
+        }
+    }
+
+    pub fn abort_transaction(&self, transaction_id: &str) -> std::result::Result<McpTransaction, String> {
+        let mut map = self
+            .transactions
+            .lock()
+            .expect("transactions lock poisoned");
+        if let Some(tx) = map.get_mut(transaction_id) {
+            tx.state = "aborted".to_string();
+            Ok(tx.clone())
+        } else {
+            Err(format!("Transaction not found: {}", transaction_id))
+        }
+    }
+
+    pub fn get_transaction(&self, transaction_id: &str) -> Option<McpTransaction> {
+        self.transactions
+            .lock()
+            .expect("transactions lock poisoned")
+            .get(transaction_id)
+            .cloned()
+    }
 }
 
 impl Default for SessionRegistry {
@@ -610,5 +747,33 @@ mod tests {
 
         let sessions = registry.list_agent_sessions();
         assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn transaction_lifecycle() {
+        let registry = SessionRegistry::new();
+        let tx = registry.begin_transaction("sess-1", "src/lib.rs").unwrap();
+        assert_eq!(tx.session_id, "sess-1");
+        assert_eq!(tx.scope, "src/lib.rs");
+        assert_eq!(tx.state, "active");
+        assert!(tx.staged_operations.is_empty());
+
+        let op = McpMutationOperation {
+            verb: "create".to_string(),
+            target: "function".to_string(),
+            payload: None,
+            description: "add dummy function".to_string(),
+        };
+        let tx_staged = registry.stage_transaction(&tx.transaction_id, vec![op]).unwrap();
+        assert_eq!(tx_staged.staged_operations.len(), 1);
+
+        let tx_validated = registry.validate_transaction(&tx.transaction_id).unwrap();
+        assert_eq!(tx_validated.state, "validated");
+
+        let tx_committed = registry.commit_transaction(&tx.transaction_id).unwrap();
+        assert_eq!(tx_committed.state, "committed");
+
+        // Cannot stage on committed
+        assert!(registry.stage_transaction(&tx.transaction_id, vec![]).is_err());
     }
 }
