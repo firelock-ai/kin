@@ -1105,7 +1105,7 @@ async fn set_scope(
 
     // Resolve the ref string to a SemanticChangeId
     let resolved =
-        kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate_with_report(
+        kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_with_report(
             state.graph.as_ref(),
             &state.layout,
             Some(&req.ref_string),
@@ -1151,6 +1151,11 @@ async fn set_scope(
     let changes = kin_core::collect_changes_at_ref(&historical, &head)
         .map_err(|err| internal_error(err.to_string()))?;
     let _ = kin_cli::commands::cochange::refresh_from_changes(&historical, &changes);
+
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    historical
+        .reconstruct_vector_index_from(state.graph.as_ref())
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
     let cached_graph = Arc::new(historical);
     state
@@ -1891,6 +1896,10 @@ async fn command_commit(
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<CommandCommitRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Force a filesystem sync to guarantee the daemon has reconciled all offline changes
+    // before building the commit deltas.
+    let _ = crate::loop_runner::sync_filesystem_with_graph(&state).await;
+
     let graph = &*state.graph;
 
     // Read current branch from the .kin/HEAD file.
@@ -2511,7 +2520,7 @@ async fn locate(
 
     let result = if let Some(reference) = req.reference.as_deref() {
         // Explicit --ref always takes precedence over session scope.
-        let resolved = kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate_with_report(
+        let resolved = kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_with_report(
             state.graph.as_ref(),
             &state.layout,
             Some(reference),

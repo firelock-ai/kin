@@ -315,6 +315,9 @@ fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
     )
     .expect("write renamed source");
 
+    // Sleep briefly to ensure notify events propagate to the daemon before we run commit
+    std::thread::sleep(Duration::from_millis(250));
+
     let commit = kin_command()
         .arg("commit")
         .arg("-m")

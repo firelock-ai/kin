@@ -182,11 +182,21 @@ pub fn execute_reconcile_session_dir_scoped(
                         added,
                         modified,
                         removed,
+                        file_id,
                         ..
                     }) => {
                         total_upserted += added.len() + modified.len();
                         total_removed += removed.len();
                         files_indexed += 1;
+
+                        use kin_model::EntityStore;
+                        if let Some(layout) = reconciler.projection().get_layout(&file_id) {
+                            graph.upsert_file_layout(layout)?;
+                        }
+                        if let Some(content) = reconciler.projection().get_content(&file_id) {
+                            let hash = kin_blobs::digest_bytes(content);
+                            graph.set_file_hash(&file_id.0, hash);
+                        }
                     }
                     Ok(ReconcileOutcome::BrokenAst { file_id, .. }) if strict_semantic_guard => {
                         anyhow::bail!(
@@ -240,8 +250,11 @@ pub fn execute_reconcile_session_dir_scoped(
             ChangeKind::Deleted => {
                 let event = FileEvent::Removed(session_file.clone());
                 match reconciler.reconcile_file_change(&event, &blob_store, graph, &mut overlay) {
-                    Ok(ReconcileOutcome::FileRemoved { removed, .. }) => {
+                    Ok(ReconcileOutcome::FileRemoved { removed, file_id, .. }) => {
                         total_removed += removed.len();
+                        use kin_model::EntityStore;
+                        graph.delete_file_layout(&file_id)?;
+                        graph.remove_entities_for_file(&file_id.0);
                     }
                     Ok(_) if strict_semantic_guard => {
                         anyhow::bail!(
@@ -416,8 +429,13 @@ where
                     let event = FileEvent::Removed(session_file.clone());
                     match reconciler.reconcile_file_change(&event, &blob_store, graph, &mut overlay)
                     {
-                        Ok(ReconcileOutcome::FileRemoved { removed, .. }) => {
+                        Ok(ReconcileOutcome::FileRemoved { removed, file_id, .. }) => {
                             total_removed += removed.len();
+                            use kin_model::EntityStore;
+                            graph.delete_file_layout(&file_id)?;
+                            graph.remove_entities_for_file(&file_id.0);
+                            graph.delete_structured_artifact(&file_id)?;
+                            graph.delete_opaque_artifact(&file_id)?;
                         }
                         Ok(_) if strict_semantic_guard => {
                             anyhow::bail!(

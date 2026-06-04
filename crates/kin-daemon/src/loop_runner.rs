@@ -58,6 +58,10 @@ pub async fn run_loop(
         "reconciliation loop started"
     );
 
+    if let Err(e) = sync_filesystem_with_graph(&state).await {
+        error!(error = %e, "initial filesystem sync failed");
+    }
+
     let interval = Duration::from_millis(config.poll_interval_ms);
     let mut cancel = cancel;
     // Track the effective batch size for backpressure catch-up.
@@ -233,7 +237,7 @@ pub async fn run_loop(
                             };
                             lsp_changed.push((path, changed_ids));
                         }
-                    } else if let ReconcileOutcome::FileRemoved { removed, .. } = &outcome {
+                    } else if let ReconcileOutcome::FileRemoved { removed, file_id, .. } = &outcome {
                         let file_path = match event {
                             FileEvent::Changed(p) | FileEvent::Removed(p) => {
                                 p.to_string_lossy().to_string()
@@ -246,6 +250,13 @@ pub async fn run_loop(
                                 file_path: Some(file_path.clone()),
                             });
                         }
+                        
+                        use kin_model::EntityStore;
+                        let _ = state.graph.delete_file_layout(file_id);
+                        state.graph.remove_entities_for_file(&file_id.0);
+                        let _ = state.graph.delete_structured_artifact(file_id);
+                        let _ = state.graph.delete_opaque_artifact(file_id);
+
                         state.bump_version();
                     }
                 }
@@ -388,4 +399,161 @@ mod tests {
         let deduped = dedup_file_events(vec![]);
         assert!(deduped.is_empty());
     }
+}
+
+#[tracing::instrument(skip(state))]
+pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
+    let working_dir = state.layout.working_dir();
+    let extensions = kin_index::watcher::supported_extensions();
+
+    // 1. Scan filesystem for all files recursively
+    let mut files_on_disk = std::collections::HashMap::new();
+    let mut stack = vec![working_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+
+            if path.is_dir() {
+                if kin_index::should_skip_dir(&name_str) {
+                    continue;
+                }
+                stack.push(path);
+            } else if path.is_file() {
+                let is_relevant = path.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|ext| extensions.iter().any(|e| e == ext))
+                    .unwrap_or(false);
+                if is_relevant {
+                    // Read file to compute content hash
+                    if let Ok(content) = std::fs::read(&path) {
+                        let hash = kin_blobs::digest_bytes(&content);
+                        files_on_disk.insert(path, hash);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Scan the graph for all indexed files
+    let files_in_graph = state.graph.indexed_file_paths();
+
+    let mut events = Vec::new();
+
+    // 3. Find deleted files: files in graph that are NOT on disk
+    for file_path_str in &files_in_graph {
+        let abs_path = working_dir.join(file_path_str);
+        if !files_on_disk.contains_key(&abs_path) {
+            events.push(FileEvent::Removed(abs_path));
+        }
+    }
+
+    // 4. Find added/modified files: files on disk that are NOT in graph or have different hash
+    for (path, disk_hash) in &files_on_disk {
+        let rel_path = path.strip_prefix(working_dir).unwrap_or(path).to_string_lossy().to_string();
+        
+        let in_graph = files_in_graph.iter().any(|p| p == &rel_path);
+        let hash_matches = if in_graph {
+            if let Some(graph_hash) = state.graph.get_file_hash(&rel_path) {
+                graph_hash == *disk_hash
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !in_graph || !hash_matches {
+            events.push(FileEvent::Changed(path.clone()));
+        }
+    }
+
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    info!(
+        count = events.len(),
+        "found outstanding filesystem changes to sync on daemon tick/startup"
+    );
+
+    // 5. Reconcile changes
+    let mut reconciler = state.reconciler.write().await;
+    let mut working_copy = state.working_copy.write().await;
+    let mut graph_changed = false;
+
+    for event in events {
+        match reconciler.reconcile_file_change(
+            &event,
+            &state.blobs,
+            state.graph.as_ref(),
+            &mut working_copy.uncommitted_mutations,
+        ) {
+            Ok(outcome) => {
+                use kin_reconcile::ReconcileOutcome;
+                let should_apply = matches!(
+                    &outcome,
+                    ReconcileOutcome::Updated { .. } | ReconcileOutcome::FileRemoved { .. }
+                );
+                if should_apply {
+                    if let Err(e) = apply_overlay_to_graph(
+                        state.graph.as_ref(),
+                        &mut working_copy.uncommitted_mutations,
+                    ) {
+                        warn!(error = %e, "failed to apply synced mutations into primary graph");
+                        continue;
+                    }
+                    if let Err(e) =
+                        state.persist_projection_truth_from_reconcile(&reconciler, &outcome)
+                    {
+                        warn!(error = %e, "failed to persist projection truth after sync");
+                    }
+                    
+                    // Call the cleanup if it's a FileRemoved outcome!
+                    if let ReconcileOutcome::FileRemoved { removed, file_id, .. } = &outcome {
+                        use kin_model::EntityStore;
+                        let _ = state.graph.delete_file_layout(file_id);
+                        state.graph.remove_entities_for_file(&file_id.0);
+                        let _ = state.graph.delete_structured_artifact(file_id);
+                        let _ = state.graph.delete_opaque_artifact(file_id);
+                        
+                        for id in removed {
+                            state.emit_event(DaemonEvent::EntityChanged {
+                                entity_id: *id,
+                                change_type: ChangeType::Deleted,
+                                file_path: Some(file_id.0.clone()),
+                            });
+                        }
+                    }
+                    
+                    graph_changed = true;
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "sync reconciliation error for event, skipping");
+            }
+        }
+    }
+
+    drop(working_copy);
+    drop(reconciler);
+
+    if graph_changed {
+        state.mark_dirty();
+        state.bump_version();
+        if let Err(e) = state.rebuild_projection().await {
+            error!(error = %e, "failed to rebuild projection after sync");
+        }
+    }
+
+    Ok(())
 }
