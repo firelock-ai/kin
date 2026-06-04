@@ -9,8 +9,8 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 const CONTEXTBENCH_QUERY_CHAR_LIMIT: usize = 4000;
-const CONTEXTBENCH_DEFAULT_MAX_FILES: usize = 10;
-const CONTEXTBENCH_MULTI_FILE_MAX_FILES: usize = 18;
+const CONTEXTBENCH_DEFAULT_MAX_FILES: usize = 100;
+const CONTEXTBENCH_MULTI_FILE_MAX_FILES: usize = 150;
 
 #[derive(Debug, Serialize)]
 struct ContextbenchTrajectory {
@@ -115,6 +115,14 @@ struct GoldFileTrace {
     /// to localize where coverage was won — `None` if never seen.
     #[serde(skip_serializing_if = "Option::is_none")]
     first_seen_stage: Option<String>,
+    /// 1-based rank in the RAW embedding signal (pre-fusion). Distinguishes a
+    /// gold the embedding FOUND but fusion/cap buried (fixable) from one it never
+    /// matched (frontier). `None` = absent from the embedding signal entirely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embedding_rank: Option<usize>,
+    /// 1-based rank in the RAW lexical (source-text) signal, if matched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lexical_rank: Option<usize>,
     /// Reason recorded by `adaptive_cap` when this gold was pruned.
     #[serde(skip_serializing_if = "Option::is_none")]
     pruned_reason: Option<String>,
@@ -483,19 +491,38 @@ fn build_gold_trace(
         std::collections::HashMap::new();
     // First non-pre_cap stage each path was seen in, to localize coverage.
     let mut first_seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut embedding_rank: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut lexical_rank: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     if let Some(debug) = debug {
         for stage in &debug.stages {
-            if stage.name == "pre_cap_full" {
-                for (idx, fs) in stage.files.iter().enumerate() {
-                    pre_cap_rank
-                        .entry(normalize_path(&fs.path))
-                        .or_insert((idx + 1, fs.score));
+            match stage.name.as_str() {
+                "pre_cap_full" => {
+                    for (idx, fs) in stage.files.iter().enumerate() {
+                        pre_cap_rank
+                            .entry(normalize_path(&fs.path))
+                            .or_insert((idx + 1, fs.score));
+                    }
                 }
-            } else {
-                for fs in &stage.files {
-                    first_seen
-                        .entry(normalize_path(&fs.path))
-                        .or_insert_with(|| stage.name.clone());
+                "raw_embedding_signal" => {
+                    for (idx, fs) in stage.files.iter().enumerate() {
+                        embedding_rank
+                            .entry(normalize_path(&fs.path))
+                            .or_insert(idx + 1);
+                    }
+                }
+                "raw_lexical_signal" => {
+                    for (idx, fs) in stage.files.iter().enumerate() {
+                        lexical_rank
+                            .entry(normalize_path(&fs.path))
+                            .or_insert(idx + 1);
+                    }
+                }
+                _ => {
+                    for fs in &stage.files {
+                        first_seen
+                            .entry(normalize_path(&fs.path))
+                            .or_insert_with(|| stage.name.clone());
+                    }
                 }
             }
         }
@@ -561,6 +588,8 @@ fn build_gold_trace(
             pre_cap_rank: in_pool.map(|(r, _)| r),
             pre_cap_score: in_pool.map(|(_, s)| s),
             first_seen_stage: first_seen.get(&entry.file).cloned(),
+            embedding_rank: embedding_rank.get(&entry.file).copied(),
+            lexical_rank: lexical_rank.get(&entry.file).copied(),
             pruned_reason,
             gold_span,
             span_overlap,

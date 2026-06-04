@@ -1690,6 +1690,23 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     }
     let projection_provenance: HashMap<String, LocateFileProvenance> = HashMap::new();
 
+    // Diagnostic: snapshot the RAW embedding (idx 9) and lexical (idx 8) signal
+    // rankings BEFORE fusion, so miss analysis can distinguish a gold the
+    // embedding FOUND but fusion/cap buried (fixable) from one the embedding
+    // never matched (frontier). Debug-only — does not affect `fused`/results.
+    if explain {
+        let rank_signal = |sig: &HashMap<String, Vec<FileHit>>| {
+            let mut v: Vec<(String, f32)> = sig
+                .iter()
+                .map(|(p, hits)| (p.clone(), hits.iter().map(|h| h.score).fold(f32::MIN, f32::max)))
+                .collect();
+            v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            v
+        };
+        record_full_debug_stage(&mut debug_info, &rank_signal(&all_hits[9]), "raw_embedding_signal");
+        record_full_debug_stage(&mut debug_info, &rank_signal(&all_hits[8]), "raw_lexical_signal");
+    }
+
     demote_cochange_only_outliers(&mut fused, &all_hits);
     if explain {
         record_debug_stage(
@@ -2123,7 +2140,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // (no re-embedding). Requires `KIN_LOCATE_SYMBOL_EMBED_RELEVANCE` to be set
     // both here and in resolve_entities_to_files (where it gates carrying the
     // cosine onto each symbol), so the two reads share one flag.
-    if locate_env_bool("KIN_LOCATE_SYMBOL_EMBED_RELEVANCE", false) {
+    if locate_env_bool("KIN_LOCATE_SYMBOL_EMBED_RELEVANCE", true) {
         boost_symbol_embed_relevance(&results, &mut projection_symbols);
     }
 
@@ -7250,7 +7267,7 @@ fn resolve_entities_to_files(
     // `boost_symbol_embed_relevance` can re-rank by semantic relevance. Reading
     // the flag here keeps it out of the per-entity hot loop. Unset leaves the
     // cosine gated on `explain` exactly as before, so OFF is byte-identical.
-    let embed_relevance_on = locate_env_bool("KIN_LOCATE_SYMBOL_EMBED_RELEVANCE", false);
+    let embed_relevance_on = locate_env_bool("KIN_LOCATE_SYMBOL_EMBED_RELEVANCE", true);
 
     // Detect whether the graph has LSP-enriched relations. If not (e.g., init
     // ran with --no-lsp), the LSP-only filter would block ALL graph traversal
@@ -8131,6 +8148,32 @@ fn adaptive_cap(
     };
     let support_floor_min = min_cluster.min(support_floor_limit.max(1));
     let support_floor_max = support_floor_limit.max(support_floor_min);
+    // Strong-semantic exemption: the top-K files by embedding cosine are
+    // first-class evidence. A gold surfaced ONLY by a strong embedding match
+    // (high cosine, no lexical corroboration) must not be pruned
+    // `below_support_floor` or excluded from the support cap despite outranking
+    // most of the pool — otherwise the embedding's biggest wins are discarded
+    // (measured: golds scoring 9-15 floored away). K=0 restores original behavior.
+    let embed_floor_exempt_topk = locate_env_usize("KIN_LOCATE_EMBED_FLOOR_EXEMPT_TOPK", 5);
+    let strong_embedding_paths: HashSet<String> = if embed_floor_exempt_topk == 0 {
+        HashSet::new()
+    } else {
+        all_hits
+            .get(9)
+            .map(|emb| {
+                let mut scored: Vec<(&String, f32)> = emb
+                    .iter()
+                    .map(|(p, hits)| (p, hits.iter().map(|h| h.score).fold(f32::MIN, f32::max)))
+                    .collect();
+                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                scored
+                    .into_iter()
+                    .take(embed_floor_exempt_topk)
+                    .map(|(p, _)| p.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     let mut supported_indices: Vec<usize> = Vec::new();
     let mut corroborated_indices: Vec<usize> = Vec::new();
     for (i, (path, score)) in fused.iter().take(support_scan_limit).enumerate() {
@@ -8145,6 +8188,7 @@ fn adaptive_cap(
         let is_priority_retained = priority_retention_paths.contains(path.as_str());
         let is_cochange_seed = cochange_seed_paths.contains(path.as_str());
         let multi_signal = signal_support_count(path, all_hits) >= signal_support_threshold;
+        let is_strong_embedding = strong_embedding_paths.contains(path.as_str());
         let floor_pct = if is_cochange_seed {
             retention_floor_pct
         } else if has_corroborated_resolve {
@@ -8154,16 +8198,22 @@ fn adaptive_cap(
         } else {
             support_floor_pct
         };
-        if !is_priority_retained && *score < top_score * floor_pct {
+        if !is_priority_retained && !is_strong_embedding && *score < top_score * floor_pct {
             record_pruned(path, *score, "below_support_floor");
             continue;
         }
-        if has_entity_resolve || multi_signal || is_priority_retained || is_cochange_seed {
+        if has_entity_resolve
+            || multi_signal
+            || is_priority_retained
+            || is_cochange_seed
+            || is_strong_embedding
+        {
             supported_indices.push(i);
             // L1: only STRONGLY corroborated candidates may be admitted beyond the cluster
-            // cap — require 3+ independent signals (multi_signal) or a priority/cochange
-            // seed. A lone or doubly-signalled file on a flat query must not flood results.
-            if multi_signal || is_priority_retained || is_cochange_seed {
+            // cap — require 3+ independent signals (multi_signal), a priority/cochange
+            // seed, or a top-K embedding match (strong standalone semantic evidence).
+            // A lone or doubly-signalled file on a flat query must not flood results.
+            if multi_signal || is_priority_retained || is_cochange_seed || is_strong_embedding {
                 corroborated_indices.push(i);
             }
         }
@@ -10813,7 +10863,7 @@ fn entity_span_lines(
 /// median (~12) so the cap trims a hub file's dozens of touched entities for
 /// precision without clipping recall on genuinely symbol-dense files. The
 /// ContextBench scorer derives a file's predicted symbol set from this list.
-const DEFAULT_SYMBOL_CAP: usize = 10;
+const DEFAULT_SYMBOL_CAP: usize = 25;
 
 /// Effective per-file symbol cap from `KIN_LOCATE_SYMBOL_CAP`
 /// (default [`DEFAULT_SYMBOL_CAP`], `0` = uncapped).

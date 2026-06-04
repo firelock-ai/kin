@@ -271,27 +271,49 @@ pub async fn run(
     let (tmp_snapshot, snapshot_manifest) = snapshot_repo(&dir)?;
     phase!("snapshot_repo");
 
-    let result = kin_core::init(&dir)?;
+    let kin_dir = dir.join(".kin");
+    let is_warm = kin_dir.exists();
+    let (layout, snap, blob_store, genesis_id) = if is_warm {
+        let layout = kin_core::KinLayout::discover(&dir)
+            .ok_or_else(|| anyhow::anyhow!("layout not found in existing .kin"))?;
+        let snap = crate::backend::open_kindb_snapshot(&layout)?;
+        let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
+            .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
+        // For a warm cache hit, the genesis change isn't created anew.
+        // We look up the current head of the default branch to use as the parent
+        // for the new auto-parse change.
+        let config = kin_core::KinConfig::load(&layout.config_path())?;
+        let parent_id = snap.graph().get_branch(&kin_model::BranchName::new(&config.default_branch))
+            .ok()
+            .flatten()
+            .map(|b| b.head)
+            .unwrap_or_else(|| kin_core::build_genesis_change().id);
+        
+        if !json {
+            println!(
+                "Reusing existing Kin repository at {}",
+                layout.root().display()
+            );
+        }
+        (layout, snap, blob_store, parent_id)
+    } else {
+        let result = kin_core::init(&dir)?;
+        let layout = result.layout;
+        let snap = crate::backend::open_kindb_snapshot(&layout)?;
+        let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
+            .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
+        if !json {
+            println!(
+                "Initialized Kin repository at {}",
+                layout.root().display()
+            );
+            println!("  KinDB: {}", layout.kindb_snapshot_path().display());
+            println!("  Blobs: {}", layout.objects_dir().display());
+            println!("  Genesis change: {}", result.genesis_id);
+        }
+        (layout, snap, blob_store, result.genesis_id)
+    };
     phase!("kin_core::init");
-
-    if !json {
-        println!(
-            "Initialized Kin repository at {}",
-            result.layout.root().display()
-        );
-        println!("  KinDB: {}", result.layout.kindb_snapshot_path().display());
-        println!("  Blobs: {}", result.layout.objects_dir().display());
-        println!("  Genesis change: {}", result.genesis_id);
-    }
-
-    let layout = &result.layout;
-    // Intentionally offline-only: `kin init` must seed repo truth from the
-    // freshly created local snapshot, never from daemon bootstrap state owned
-    // by some other repo/session. Do not replace with open_snapshot_daemon_first.
-    let snap = crate::backend::open_kindb_snapshot(layout)?;
-    let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
-        .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
-    phase!("open_snapshot+blobstore");
 
     let all_files = collect_source_files(&tmp_snapshot)?;
     phase!("collect_source_files");
@@ -302,26 +324,43 @@ pub async fn run(
         count_supported_source_inputs(&indexable_files);
 
     let init_summary = if !all_files.is_empty() {
-        match try_warm_init_from_cache(&dir, layout, &snap, &blob_store, &indexable_files) {
-            Ok(Some(summary)) => {
-                phase!("warm_cache_path (full)");
-                summary
+        if is_warm {
+            // NATIVE WARM CACHE: Run the diff directly against the existing graph!
+            let graph = snap.graph();
+            let current_files: Vec<(String, [u8; 32])> = indexable_files
+                .iter()
+                .map(|file| (file.rel_path.clone(), file.hash))
+                .collect();
+            let diff = kin_db::engine::compute_diff(graph.as_ref(), &current_files);
+            
+            let delta = apply_warm_cache_delta(graph.as_ref(), &blob_store, &indexable_files, &diff)?;
+            let scrubbed_paths = scrub_internal_graph_truth(graph.as_ref())?;
+            if !scrubbed_paths.is_empty() {
+                warn!(
+                    count = scrubbed_paths.len(),
+                    "scrubbed internal control-plane paths from native warm cache"
+                );
             }
-            Ok(None) => {
-                phase!("warm_cache_miss");
-                let graph = snap.graph();
-                let summary = parse_and_index(graph.as_ref(), &blob_store, &indexable_files)?;
-                phase!("parse_and_index");
-                summary
+            // We just reuse the existing text/vector indexes implicitly since we're in-place.
+            
+            phase!("native_warm_cache_diff");
+            
+            InitIndexSummary {
+                total_entity_count: graph.entity_count(),
+                total_files: graph.indexed_file_paths().len(),
+                linked_relations: graph.relation_count(),
+                warm_cache_hit: true,
+                warm_text_index_reused: true,
+                warm_vector_index_reused: true,
+                warm_changed_files: diff.changed_count(),
+                warm_reparsed_files: delta.reparsed_files,
+                warm_requeued_embeddings: delta.queued_embeddings.len(),
             }
-            Err(err) => {
-                warn!(error = %err, "warm init cache failed; falling back to full reindex");
-                phase!("warm_cache_error");
-                let graph = snap.graph();
-                let summary = parse_and_index(graph.as_ref(), &blob_store, &indexable_files)?;
-                phase!("parse_and_index");
-                summary
-            }
+        } else {
+            phase!("warm_cache_miss");
+            let summary = parse_and_index(snap.graph().as_ref(), &blob_store, &indexable_files)?;
+            phase!("parse_and_index");
+            summary
         }
     } else {
         InitIndexSummary::default()
@@ -357,9 +396,8 @@ pub async fn run(
         // Build a semantic change for the initial parse.
         // Include artifact_deltas for every file so that the VFS tree
         // (built from the change DAG) knows which files exist.
-        let branch_name = kin_core::read_current_branch(layout)?;
-        let parent_id = result.genesis_id;
-        let change_id = compute_init_change_id(&parent_id);
+        let branch_name = kin_core::read_current_branch(&layout)?;
+        let change_id = compute_init_change_id(&genesis_id);
 
         // Ensure every tracked file has its blob in the store.
         // The warm-cache path may skip unchanged files, leaving blobs missing.
@@ -401,7 +439,7 @@ pub async fn run(
 
         let change = SemanticChange {
             id: change_id,
-            parents: vec![parent_id],
+            parents: vec![genesis_id],
             timestamp: Timestamp::now(),
             author: AuthorId::new(whoami()),
             message: "kin init: auto-parse".to_string(),
@@ -443,7 +481,7 @@ pub async fn run(
 
                 match kin_git::import_git_history_with_blobs(
                     &dir,
-                    result.genesis_id,
+                    genesis_id,
                     &import_opts,
                     Some(&blob_store),
                 ) {
@@ -676,16 +714,16 @@ pub async fn run(
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&InitResultPayload {
-                schema: "kin.init-result.v1",
-                repo_root: result.layout.root().display().to_string(),
-                kindb_snapshot_path: result.layout.kindb_snapshot_path().display().to_string(),
-                objects_dir: result.layout.objects_dir().display().to_string(),
-                genesis_change: result.genesis_id.to_string(),
-                indexed_embeddings: embed_status.indexed,
-                pending_embeddings: embed_status.pending,
-                summary: init_summary,
-            })?
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema": "kin.init-result.v1",
+                "repo_root": layout.root().display().to_string(),
+                "kindb_snapshot_path": layout.kindb_snapshot_path().display().to_string(),
+                "objects_dir": layout.objects_dir().display().to_string(),
+                "genesis_change": genesis_id.to_string(),
+                "indexed_embeddings": embed_status.indexed,
+                "pending_embeddings": embed_status.pending,
+                "summary": init_summary,
+            }))?
         );
     }
 
