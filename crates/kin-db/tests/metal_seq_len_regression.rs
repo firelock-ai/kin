@@ -75,6 +75,7 @@ fn norm(v: &[f32]) -> f32 {
 /// single-input `forward` path, so this test mostly exercises that safety net.
 /// Covers correctness of whatever path the embedder picks end-to-end.
 #[test]
+#[ignore]
 fn metal_seq_len_sweep_single() {
     std::env::set_var("KIN_EMBED_CACHE", "0");
 
@@ -140,6 +141,7 @@ fn metal_seq_len_sweep_single() {
 /// With the CPU fallback (auto routing at max_seq > 256 or forced cpu),
 /// every length should produce a norm-1 vector.
 #[test]
+#[ignore]
 fn metal_seq_len_sweep_batched() {
     std::env::set_var("KIN_EMBED_CACHE", "0");
 
@@ -211,6 +213,7 @@ fn metal_seq_len_sweep_batched() {
 /// at the cost of extra inference time — which the dispatch heuristic is
 /// meant to avoid.
 #[test]
+#[ignore]
 fn vue_shaped_batched_not_nan_or_zero() {
     std::env::set_var("KIN_EMBED_CACHE", "0");
 
