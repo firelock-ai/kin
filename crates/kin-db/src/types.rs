@@ -23,9 +23,10 @@ pub use kin_model::{
 // Relation types
 pub use kin_model::{GraphNodeId, Relation, RelationKind, RelationOrigin, RelationRevision};
 
-// Change types
 pub use kin_model::ArtifactRevision;
-pub use kin_model::{ArtifactDelta, ArtifactDeltaKind, EntityDelta, RelationDelta, SemanticChange};
+pub use kin_model::{
+    ArtifactDelta, ArtifactDeltaKind, EntityDelta, RelationDelta, SemanticChange, TransactionDelta,
+};
 
 // Branch types
 pub use kin_model::{Branch, GraphOverlay, MergeState, WorkingCopy};

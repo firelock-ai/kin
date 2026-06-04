@@ -3797,6 +3797,117 @@ impl EntityStore for InMemoryGraph {
         Ok(())
     }
 
+    fn apply_transaction_delta(&self, delta: &TransactionDelta) -> Result<(), KinDbError> {
+        let mut affected = HashSet::new();
+        let mut deleted_entities = Vec::new();
+
+        {
+            let mut ent = self.entities.write();
+
+            // 1. Process entity deltas
+            for ent_delta in &delta.entity_deltas {
+                match ent_delta {
+                    EntityDelta::Added(entity) | EntityDelta::Modified { new: entity, .. } => {
+                        if let Some(old) = ent.entities.remove(&entity.id) {
+                            let name_changed = old.name != entity.name;
+                            let file_changed = old.file_origin != entity.file_origin;
+                            let kind_changed = old.kind != entity.kind;
+
+                            if name_changed || file_changed || kind_changed {
+                                ent.indexes.remove(&old.id, &old.name, old.file_origin.as_ref(), old.kind);
+                                ent.indexes.insert(entity.id, &entity.name, entity.file_origin.as_ref(), entity.kind);
+                            }
+                        } else {
+                            ent.indexes.insert(entity.id, &entity.name, entity.file_origin.as_ref(), entity.kind);
+                        }
+
+                        ent.entities.insert(entity.id, entity.clone());
+                        affected.insert(entity.id);
+                    }
+                    EntityDelta::Removed(id) => {
+                        deleted_entities.push(*id);
+                        if let Some(entity) = ent.entities.remove(id) {
+                            ent.indexes.remove(
+                                &entity.id,
+                                &entity.name,
+                                entity.file_origin.as_ref(),
+                                entity.kind,
+                            );
+                            if let Some(ref ti) = self.text_index {
+                                let _ = ti.remove(id);
+                                self.text_dirty.store(true, Ordering::Release);
+                            }
+
+                            if let Some(outgoing) = ent.outgoing.get(id) {
+                                for rel_id in outgoing {
+                                    if let Some(rel) = ent.relations.get(rel_id) {
+                                        if let Some(neighbor) = entity_neighbor_for_relation(rel, id) {
+                                            affected.insert(neighbor);
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(incoming) = ent.incoming.get(id) {
+                                for rel_id in incoming {
+                                    if let Some(rel) = ent.relations.get(rel_id) {
+                                        if let Some(neighbor) = entity_neighbor_for_relation(rel, id) {
+                                            affected.insert(neighbor);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        remove_relations_for_entity(&mut ent, id);
+                    }
+                }
+            }
+
+            // 2. Process relation deltas
+            for rel_delta in &delta.relation_deltas {
+                match rel_delta {
+                    RelationDelta::Added(relation) => {
+                        if let Some(old) = ent.relations.remove(&relation.id) {
+                            affected.extend(entity_ids_for_relation(&old));
+                            remove_relation_indexes(&mut ent, &old);
+                        }
+                        insert_relation_indexes(&mut ent, relation);
+                        ent.relations.insert(relation.id, relation.clone());
+                        affected.extend(entity_ids_for_relation(relation));
+                    }
+                    RelationDelta::Removed(id) => {
+                        if let Some(rel) = ent.relations.remove(id) {
+                            affected.extend(entity_ids_for_relation(&rel));
+                            remove_relation_indexes(&mut ent, &rel);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Clean up deleted entities from the embedding queue / vector index
+        #[cfg(feature = "vector")]
+        {
+            let mut eq = self.embedding_queue.lock();
+            let vi_lock = self.vector_index.lock();
+            for id in &deleted_entities {
+                eq.remove(id);
+                if let Some(ref vi) = *vi_lock {
+                    let _ = vi.remove(id);
+                }
+            }
+        }
+
+        // 4. Invalidate / refresh text index & embeddings for affected entities
+        let affected_list: Vec<EntityId> = affected.into_iter().collect();
+        if !affected_list.is_empty() {
+            self.refresh_text_index_for_entities(&affected_list);
+            self.invalidate_entities_for_embedding(&affected_list)?;
+        }
+
+        self.invalidate_snapshot_root_hash();
+        Ok(())
+    }
+
     fn upsert_entities_batch(&self, entities: &[Entity]) -> Result<(), KinDbError> {
         if entities.is_empty() {
             return Ok(());
