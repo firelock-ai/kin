@@ -9,6 +9,7 @@
 #![cfg(feature = "metal")]
 
 use crate::gpu::{GpuBackend, GpuCompute, GpuDeviceInfo, LayerTensors, LayerConfig};
+use crate::InferError;
 use metal::{
     Buffer, CommandBufferRef, CommandQueue, CompileOptions, ComputePipelineState, Device,
     MTLLanguageVersion, MTLResourceOptions, MTLSize,
@@ -1692,6 +1693,46 @@ fn zero_all_buffers() -> bool {
     })
 }
 
+/// Fallibly allocate a `StorageModeShared` Metal buffer of `length` bytes.
+///
+/// `metal` 0.29's `Device::new_buffer*` wrap the raw `id` straight into a
+/// non-null `Buffer`, so an out-of-memory `nil` return becomes undefined
+/// behaviour on first use rather than a recoverable error. Messaging the device
+/// directly (the objc2 path `cmd_gpu_nanos` already uses) makes a `nil`
+/// allocation observable: `None` here surfaces as `InferError::OutOfMemory` and
+/// lets the embedding dispatcher degrade to CPU instead of corrupting the
+/// process. Contents are uninitialised, exactly like `new_buffer` — callers zero
+/// or copy in as before.
+fn try_new_buffer(device: &Device, length: u64) -> Option<Buffer> {
+    use metal::foreign_types::ForeignType;
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    let dev = device.as_ptr() as *const AnyObject;
+    if dev.is_null() {
+        return None;
+    }
+    let options = MTLResourceOptions::StorageModeShared.bits();
+    let raw: *mut AnyObject =
+        unsafe { msg_send![&*dev, newBufferWithLength: length, options: options] };
+    if raw.is_null() {
+        None
+    } else {
+        // `newBuffer…` returns a +1-retained object; `from_ptr` takes that
+        // ownership without an extra retain, so it balances on drop.
+        Some(unsafe { Buffer::from_ptr(raw as *mut _) })
+    }
+}
+
+/// Allocate a `StorageModeShared` buffer of `bytes` bytes and copy `bytes` from
+/// `src` into its head. Returns `None` on allocation failure.
+fn try_new_buffer_with_bytes(device: &Device, src: *const u8, bytes: usize) -> Option<Buffer> {
+    let buf = try_new_buffer(device, bytes as u64)?;
+    unsafe {
+        std::ptr::copy_nonoverlapping(src, buf.contents() as *mut u8, bytes);
+    }
+    Some(buf)
+}
+
 impl BufferPool {
     fn new(device: Device) -> Self {
         Self {
@@ -1709,36 +1750,34 @@ impl BufferPool {
     /// the FIRST use of any new size-class returns dirty memory while every warm
     /// reuse is zeroed — a shape-dependent cold-start corruption for any consumer
     /// that relies on the zero fill.
-    fn acquire_zeroed(self: &Arc<Self>, bytes: usize) -> PooledBuffer {
+    fn acquire_zeroed(self: &Arc<Self>, bytes: usize) -> Result<PooledBuffer, InferError> {
         let class = size_class(bytes);
         let buf = self.free.lock().get_mut(&class).and_then(|v| v.pop());
         let buf = match buf {
             Some(buf) => buf,
-            None => self
-                .device
-                .new_buffer(class as u64, MTLResourceOptions::StorageModeShared),
+            None => try_new_buffer(&self.device, class as u64)
+                .ok_or_else(|| InferError::OutOfMemory(format!("metal buffer alloc failed: {class} bytes")))?,
         };
         unsafe {
             std::ptr::write_bytes(buf.contents() as *mut u8, 0, class);
         }
-        PooledBuffer {
+        Ok(PooledBuffer {
             buf,
             class,
             pool: Arc::clone(self),
-        }
+        })
     }
 
     /// Acquire a buffer initialised from `data`. Pops a recycled buffer of the
     /// matching size-class (or allocates) and copies `data` into its head.
-    fn acquire_with(self: &Arc<Self>, data: &[f32]) -> PooledBuffer {
+    fn acquire_with(self: &Arc<Self>, data: &[f32]) -> Result<PooledBuffer, InferError> {
         let bytes = std::mem::size_of_val(data);
         let class = size_class(bytes);
         let buf = self.free.lock().get_mut(&class).and_then(|v| v.pop());
         let buf = match buf {
             Some(buf) => buf,
-            None => self
-                .device
-                .new_buffer(class as u64, MTLResourceOptions::StorageModeShared),
+            None => try_new_buffer(&self.device, class as u64)
+                .ok_or_else(|| InferError::OutOfMemory(format!("metal buffer alloc failed: {class} bytes")))?,
         };
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -1750,11 +1789,11 @@ impl BufferPool {
                 std::ptr::write_bytes((buf.contents() as *mut u8).add(bytes), 0, class - bytes);
             }
         }
-        PooledBuffer {
+        Ok(PooledBuffer {
             buf,
             class,
             pool: Arc::clone(self),
-        }
+        })
     }
 
     /// Acquire a buffer of at least `bytes` with UNSPECIFIED contents. For
@@ -1762,21 +1801,22 @@ impl BufferPool {
     /// on-device attention reshape targets) — skips the re-zero `acquire_zeroed`
     /// pays. The caller is responsible for ensuring every byte read downstream
     /// was written by the producing kernel first.
-    fn acquire_uninit(self: &Arc<Self>, bytes: usize) -> PooledBuffer {
+    fn acquire_uninit(self: &Arc<Self>, bytes: usize) -> Result<PooledBuffer, InferError> {
         let class = size_class(bytes);
         let buf = self.free.lock().get_mut(&class).and_then(|v| v.pop());
-        let buf = buf.unwrap_or_else(|| {
-            self.device
-                .new_buffer(class as u64, MTLResourceOptions::StorageModeShared)
-        });
+        let buf = match buf {
+            Some(buf) => buf,
+            None => try_new_buffer(&self.device, class as u64)
+                .ok_or_else(|| InferError::OutOfMemory(format!("metal buffer alloc failed: {class} bytes")))?,
+        };
         if zero_all_buffers() {
             unsafe { std::ptr::write_bytes(buf.contents() as *mut u8, 0, class); }
         }
-        PooledBuffer {
+        Ok(PooledBuffer {
             buf,
             class,
             pool: Arc::clone(self),
-        }
+        })
     }
 
     fn recycle(&self, class: usize, buf: Buffer) {
@@ -2081,13 +2121,10 @@ impl MetalCompute {
     }
 
     /// Create a Metal buffer from a slice and copy data in.
-    fn buf_from_slice(&self, data: &[f32]) -> Buffer {
+    fn buf_from_slice(&self, data: &[f32]) -> Result<Buffer, InferError> {
         let bytes = data.len() * std::mem::size_of::<f32>();
-        self.device.new_buffer_with_data(
-            data.as_ptr() as *const _,
-            bytes as u64,
-            MTLResourceOptions::StorageModeShared,
-        )
+        try_new_buffer_with_bytes(&self.device, data.as_ptr() as *const u8, bytes)
+            .ok_or_else(|| InferError::OutOfMemory(format!("metal buffer alloc failed: {bytes} bytes")))
     }
 
     /// Acquire a zero-filled transient buffer of `count` floats from the pool.
@@ -2096,7 +2133,7 @@ impl MetalCompute {
     /// readback / scope-exit). Re-zeroed on reuse, preserving the determinism
     /// guarantee `buf_zeros` documents.
     #[inline]
-    fn buf_zeros_pooled(&self, count: usize) -> PooledBuffer {
+    fn buf_zeros_pooled(&self, count: usize) -> Result<PooledBuffer, InferError> {
         time_phase(Phase::Copy, || {
             self.pool.acquire_zeroed(count * std::mem::size_of::<f32>())
         })
@@ -2105,51 +2142,53 @@ impl MetalCompute {
     /// Acquire a transient buffer initialised from `data` from the pool. The
     /// host→device copy is timed into the copy/readback phase.
     #[inline]
-    fn buf_slice_pooled(&self, data: &[f32]) -> PooledBuffer {
+    fn buf_slice_pooled(&self, data: &[f32]) -> Result<PooledBuffer, InferError> {
         time_phase(Phase::Copy, || self.pool.acquire_with(data))
     }
 
     /// Acquire a transient buffer of `count` floats with UNSPECIFIED contents.
     /// For intermediates that a kernel fully overwrites before any read.
     #[inline]
-    fn buf_uninit_pooled(&self, count: usize) -> PooledBuffer {
+    fn buf_uninit_pooled(&self, count: usize) -> Result<PooledBuffer, InferError> {
         time_phase(Phase::Copy, || {
             self.pool.acquire_uninit(count * std::mem::size_of::<f32>())
         })
     }
 
     /// Create a buffer containing a single u32 value.
-    fn buf_u32(&self, val: u32) -> Buffer {
+    fn buf_u32(&self, val: u32) -> Result<Buffer, InferError> {
         let data = [val];
-        self.device.new_buffer_with_data(
-            data.as_ptr() as *const _,
-            std::mem::size_of::<u32>() as u64,
-            MTLResourceOptions::StorageModeShared,
+        try_new_buffer_with_bytes(
+            &self.device,
+            data.as_ptr() as *const u8,
+            std::mem::size_of::<u32>(),
         )
+        .ok_or_else(|| InferError::OutOfMemory("metal scalar u32 buffer alloc failed".into()))
     }
 
     /// Create a buffer containing a single f32 value.
-    fn buf_f32(&self, val: f32) -> Buffer {
+    fn buf_f32(&self, val: f32) -> Result<Buffer, InferError> {
         let data = [val];
-        self.device.new_buffer_with_data(
-            data.as_ptr() as *const _,
-            std::mem::size_of::<f32>() as u64,
-            MTLResourceOptions::StorageModeShared,
+        try_new_buffer_with_bytes(
+            &self.device,
+            data.as_ptr() as *const u8,
+            std::mem::size_of::<f32>(),
         )
+        .ok_or_else(|| InferError::OutOfMemory("metal scalar f32 buffer alloc failed".into()))
     }
 
     /// Get or create a cached buffer for persistent data (weight matrices).
     /// Keyed by (pointer, len) — weight Array2 data pointers are stable
     /// across forward passes, so this hits on every call after the first.
-    fn buf_cached(&self, data: &[f32]) -> Buffer {
+    fn buf_cached(&self, data: &[f32]) -> Result<Buffer, InferError> {
         let key = (data.as_ptr() as usize, data.len());
         let mut cache = self.weight_cache.lock();
         if let Some(buf) = cache.get(&key) {
-            return buf.clone();
+            return Ok(buf.clone());
         }
-        let buf = self.buf_from_slice(data);
+        let buf = self.buf_from_slice(data)?;
         cache.insert(key, buf.clone());
-        buf
+        Ok(buf)
     }
 
     /// Get or create a cached GPU buffer holding `weights` concatenated
@@ -2157,23 +2196,23 @@ impl MetalCompute {
     /// forward passes, so the concatenation — built once — is keyed by the
     /// component (ptr, len) pairs and reused on every subsequent call. Used to
     /// fold the q/k/v (and gate/up) projections into one fat GEMM.
-    fn buf_cached_concat(&self, weights: &[&[f32]]) -> Buffer {
+    fn buf_cached_concat(&self, weights: &[&[f32]]) -> Result<Buffer, InferError> {
         let key: Vec<(usize, usize)> = weights
             .iter()
             .map(|w| (w.as_ptr() as usize, w.len()))
             .collect();
         let mut cache = self.concat_cache.lock();
         if let Some(buf) = cache.get(&key) {
-            return buf.clone();
+            return Ok(buf.clone());
         }
         let total: usize = weights.iter().map(|w| w.len()).sum();
         let mut concat = Vec::with_capacity(total);
         for w in weights {
             concat.extend_from_slice(w);
         }
-        let buf = self.buf_from_slice(&concat);
+        let buf = self.buf_from_slice(&concat)?;
         cache.insert(key, buf.clone());
-        buf
+        Ok(buf)
     }
 
     /// Upload a fresh device buffer for a TRANSIENT u32 payload (e.g. an
@@ -2184,13 +2223,10 @@ impl MetalCompute {
     /// the same `(ptr, len)` would alias an earlier call's stale mask buffer and
     /// silently apply the WRONG mask. Masks are tiny (`batch*max_len` u32s), so a
     /// fresh upload per attention call is negligible and strictly correct.
-    fn buf_u32_slice(&self, data: &[u32]) -> Buffer {
+    fn buf_u32_slice(&self, data: &[u32]) -> Result<Buffer, InferError> {
         let bytes = data.len() * std::mem::size_of::<u32>();
-        self.device.new_buffer_with_data(
-            data.as_ptr() as *const _,
-            bytes as u64,
-            MTLResourceOptions::StorageModeShared,
-        )
+        try_new_buffer_with_bytes(&self.device, data.as_ptr() as *const u8, bytes)
+            .ok_or_else(|| InferError::OutOfMemory(format!("metal u32 buffer alloc failed: {bytes} bytes")))
     }
 
     /// Read floats back from a Metal buffer. Timed into the copy/readback phase.
@@ -2623,7 +2659,7 @@ impl GpuCompute for MetalCompute {
         config: &LayerConfig,
         rope_cos: &[f32],
         rope_sin: &[f32],
-    ) -> Option<Vec<f32>> {
+    ) -> Result<Option<Vec<f32>>, InferError> {
         let kv_heads = if let Some(k) = weights.k_weight {
             k.len() / (config.hidden_size * config.head_dim)
         } else if let Some(qkv) = weights.qkv_weight {
@@ -2646,7 +2682,7 @@ impl GpuCompute for MetalCompute {
         let q_dim = heads * head_dim;
         let kv_dim = kv_heads * head_dim;
 
-        let current_hidden = self.buf_slice_pooled(hidden);
+        let current_hidden = self.buf_slice_pooled(hidden)?;
         
         // ---------------------------------------------------------
         // Command Buffer 1: Norm 1 + QKV Projections
@@ -2654,42 +2690,42 @@ impl GpuCompute for MetalCompute {
         let cmd1 = self.queue.new_command_buffer();
         let mut retains1 = Vec::new();
         
-        let buf_rows = self.buf_u32(total_rows as u32);
-        let buf_h = self.buf_u32(h as u32);
-        let buf_eps = self.buf_f32(if config.use_rms { config.rms_eps } else { config.eps });
+        let buf_rows = self.buf_u32(total_rows as u32)?;
+        let buf_h = self.buf_u32(h as u32)?;
+        let buf_eps = self.buf_f32(if config.use_rms { config.rms_eps } else { config.eps })?;
         
         // Layer norm 1
         let mut buf_normed1 = None;
         let mut qkv_in = current_hidden.buffer();
         if config.pre_ln {
-            let buf = self.pool.acquire_uninit(total_rows * h * 4);
+            let buf = self.pool.acquire_uninit(total_rows * h * 4)?;
             {
                 let blit = cmd1.new_blit_command_encoder();
                 blit.copy_from_buffer(current_hidden.buffer(), 0, buf.buffer(), 0, (total_rows * h * 4) as u64);
                 blit.end_encoding();
             }
-            let buf_norm1_w = self.buf_cached(weights.norm1_weight);
+            let buf_norm1_w = self.buf_cached(weights.norm1_weight)?;
             if config.use_rms {
                 self.encode_1d(cmd1, "rms_norm", &[buf.buffer(), &buf_norm1_w, &buf_h, &buf_eps], total_rows);
             } else {
-                let buf_norm1_b = self.buf_cached(weights.norm1_bias.unwrap_or(&[]));
+                let buf_norm1_b = self.buf_cached(weights.norm1_bias.unwrap_or(&[]))?;
                 self.encode_1d(cmd1, "layer_norm", &[buf.buffer(), &buf_norm1_w, &buf_norm1_b, &buf_h, &buf_eps], total_rows);
             }
             buf_normed1 = Some(buf);
             qkv_in = buf_normed1.as_ref().unwrap().buffer();
         }
         
-        let buf_q_dim = self.buf_u32(q_dim as u32);
-        let buf_kv_dim = self.buf_u32(kv_dim as u32);
-        let buf_q = self.pool.acquire_uninit(total_rows * q_dim * 4);
-        let buf_k = self.pool.acquire_uninit(total_rows * kv_dim * 4);
-        let buf_v = self.pool.acquire_uninit(total_rows * kv_dim * 4);
+        let buf_q_dim = self.buf_u32(q_dim as u32)?;
+        let buf_kv_dim = self.buf_u32(kv_dim as u32)?;
+        let buf_q = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
+        let buf_k = self.pool.acquire_uninit(total_rows * kv_dim * 4)?;
+        let buf_v = self.pool.acquire_uninit(total_rows * kv_dim * 4)?;
         
         if let Some(qkv_weight) = weights.qkv_weight {
             let total_qkv = q_dim + 2 * kv_dim;
-            let buf_qkv_dim = self.buf_u32(total_qkv as u32);
-            let buf_qkv = self.pool.acquire_uninit(total_rows * total_qkv * 4);
-            let buf_qkv_w = self.buf_cached(qkv_weight);
+            let buf_qkv_dim = self.buf_u32(total_qkv as u32)?;
+            let buf_qkv = self.pool.acquire_uninit(total_rows * total_qkv * 4)?;
+            let buf_qkv_w = self.buf_cached(qkv_weight)?;
             
             if use_mma(total_rows, total_qkv, h) {
                 self.encode_mma(cmd1, "matmul_transb_simdgroup", &[qkv_in, &buf_qkv_w, buf_qkv.buffer(), &buf_rows, &buf_qkv_dim, &buf_h], total_rows, total_qkv, h, 1);
@@ -2698,7 +2734,7 @@ impl GpuCompute for MetalCompute {
             }
 
             if let Some(qkv_bias) = weights.qkv_bias {
-                let b_bias = self.buf_cached(qkv_bias);
+                let b_bias = self.buf_cached(qkv_bias)?;
                 self.encode_1d(cmd1, "elementwise_add_broadcast", &[buf_qkv.buffer(), &b_bias, &buf_qkv_dim], total_rows * total_qkv);
             }
             
@@ -2719,20 +2755,20 @@ impl GpuCompute for MetalCompute {
             enc.end_encoding();
 
             if let Some(q_ln_w) = weights.q_ln_weight {
-                let q_ln_w_buf = self.buf_cached(q_ln_w);
-                let q_ln_b_buf = self.buf_cached(weights.q_ln_bias.unwrap_or(&[]));
+                let q_ln_w_buf = self.buf_cached(q_ln_w)?;
+                let q_ln_b_buf = self.buf_cached(weights.q_ln_bias.unwrap_or(&[]))?;
                 self.encode_1d(cmd1, "layer_norm", &[buf_q.buffer(), &q_ln_w_buf, &q_ln_b_buf, &buf_q_dim, &buf_eps], total_rows);
             }
             if let Some(k_ln_w) = weights.k_ln_weight {
-                let k_ln_w_buf = self.buf_cached(k_ln_w);
-                let k_ln_b_buf = self.buf_cached(weights.k_ln_bias.unwrap_or(&[]));
+                let k_ln_w_buf = self.buf_cached(k_ln_w)?;
+                let k_ln_b_buf = self.buf_cached(weights.k_ln_bias.unwrap_or(&[]))?;
                 self.encode_1d(cmd1, "layer_norm", &[buf_k.buffer(), &k_ln_w_buf, &k_ln_b_buf, &buf_kv_dim, &buf_eps], total_rows);
             }
             retains1.push(buf_qkv);
         } else {
-            let buf_qw = self.buf_cached(weights.q_weight.unwrap());
-            let buf_kw = self.buf_cached(weights.k_weight.unwrap());
-            let buf_vw = self.buf_cached(weights.v_weight.unwrap());
+            let buf_qw = self.buf_cached(weights.q_weight.unwrap())?;
+            let buf_kw = self.buf_cached(weights.k_weight.unwrap())?;
+            let buf_vw = self.buf_cached(weights.v_weight.unwrap())?;
             if use_mma(total_rows, q_dim, h) {
                 self.encode_mma(cmd1, "matmul_transb_simdgroup", &[qkv_in, &buf_qw, buf_q.buffer(), &buf_rows, &buf_q_dim, &buf_h], total_rows, q_dim, h, 1);
             } else {
@@ -2746,15 +2782,15 @@ impl GpuCompute for MetalCompute {
                 Self::encode_matmul(cmd1, &self.pipelines["matmul_transb"], qkv_in, &buf_vw, buf_v.buffer(), &buf_rows, &buf_kv_dim, &buf_h, kv_dim, total_rows);
             }
             if let Some(q_bias) = weights.q_bias {
-                let b = self.buf_cached(q_bias);
+                let b = self.buf_cached(q_bias)?;
                 self.encode_1d(cmd1, "elementwise_add_broadcast", &[buf_q.buffer(), &b, &buf_q_dim], total_rows * q_dim);
             }
             if let Some(k_bias) = weights.k_bias {
-                let b = self.buf_cached(k_bias);
+                let b = self.buf_cached(k_bias)?;
                 self.encode_1d(cmd1, "elementwise_add_broadcast", &[buf_k.buffer(), &b, &buf_kv_dim], total_rows * kv_dim);
             }
             if let Some(v_bias) = weights.v_bias {
-                let b = self.buf_cached(v_bias);
+                let b = self.buf_cached(v_bias)?;
                 self.encode_1d(cmd1, "elementwise_add_broadcast", &[buf_v.buffer(), &b, &buf_kv_dim], total_rows * kv_dim);
             }
         }
@@ -2772,11 +2808,11 @@ impl GpuCompute for MetalCompute {
         
         // Only apply RoPE if cos/sin are provided
         if !rope_cos.is_empty() {
-            let buf_cos = self.buf_cached(rope_cos);
-            let buf_sin = self.buf_cached(rope_sin);
-            let buf_max_len = self.buf_u32(max_len as u32);
-            let buf_head_dim = self.buf_u32(head_dim as u32);
-            let buf_actual = self.buf_u32(max_len as u32);
+            let buf_cos = self.buf_cached(rope_cos)?;
+            let buf_sin = self.buf_cached(rope_sin)?;
+            let buf_max_len = self.buf_u32(max_len as u32)?;
+            let buf_head_dim = self.buf_u32(head_dim as u32)?;
+            let buf_actual = self.buf_u32(max_len as u32)?;
             
             let rope_p = &self.pipelines["rope_apply_batched"];
             
@@ -2819,12 +2855,12 @@ impl GpuCompute for MetalCompute {
             }
         }
         
-        let buf_q_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4);
-        let buf_k_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4);
-        let buf_v_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4);
-        let buf_heads = self.buf_u32(heads as u32);
-        let buf_seq = self.buf_u32(max_len as u32);
-        let buf_head_dim = self.buf_u32(head_dim as u32);
+        let buf_q_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
+        let buf_k_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
+        let buf_v_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
+        let buf_heads = self.buf_u32(heads as u32)?;
+        let buf_seq = self.buf_u32(max_len as u32)?;
+        let buf_head_dim = self.buf_u32(head_dim as u32)?;
         let total_q_heads = batch_size * heads;
         
         if kv_heads == heads {
@@ -2834,7 +2870,7 @@ impl GpuCompute for MetalCompute {
                 &buf_heads, &buf_seq, &buf_head_dim
             ], head_dim, max_len, total_q_heads);
         } else {
-            let buf_kv_heads = self.buf_u32(kv_heads as u32);
+            let buf_kv_heads = self.buf_u32(kv_heads as u32)?;
             let p = &self.pipelines["reshape_qkv_pos_to_head_gqa"];
             let enc = cmd2.new_compute_command_encoder();
             enc.set_compute_pipeline_state(p);
@@ -2855,15 +2891,15 @@ impl GpuCompute for MetalCompute {
             enc.end_encoding();
         }
         
-        let buf_scores = self.pool.acquire_uninit(total_q_heads * max_len * max_len * 4);
-        let buf_scale = self.buf_f32(config.scale);
-        let buf_masks = self.buf_u32_slice(masks);
-        let buf_has_alibi = self.buf_u32(0);
-        let buf_alibi = self.buf_slice_pooled(&[0.0f32]);
-        let buf_out_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4);
+        let buf_scores = self.pool.acquire_uninit(total_q_heads * max_len * max_len * 4)?;
+        let buf_scale = self.buf_f32(config.scale)?;
+        let buf_masks = self.buf_u32_slice(masks)?;
+        let buf_has_alibi = self.buf_u32(0)?;
+        let buf_alibi = self.buf_slice_pooled(&[0.0f32])?;
+        let buf_out_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
         
         let qk_bufs = [
-            buf_q_reshaped.buffer(), buf_k_reshaped.buffer(), buf_scores.buffer(), &buf_seq, &buf_head_dim, &self.buf_u32(1)
+            buf_q_reshaped.buffer(), buf_k_reshaped.buffer(), buf_scores.buffer(), &buf_seq, &buf_head_dim, &self.buf_u32(1)?
         ];
         if use_mma(max_len, max_len, head_dim) {
             self.encode_mma(cmd2, "batched_matmul_transb_simdgroup", &qk_bufs, max_len, max_len, head_dim, total_q_heads);
@@ -2880,7 +2916,7 @@ impl GpuCompute for MetalCompute {
         ], total_q_heads * max_len);
         
         let sv_bufs = [
-            buf_scores.buffer(), buf_v_reshaped.buffer(), buf_out_reshaped.buffer(), &buf_seq, &buf_head_dim, &self.buf_u32(1)
+            buf_scores.buffer(), buf_v_reshaped.buffer(), buf_out_reshaped.buffer(), &buf_seq, &buf_head_dim, &self.buf_u32(1)?
         ];
         if use_mma(max_len, head_dim, max_len) {
             self.encode_mma(cmd2, "batched_matmul_ab_simdgroup", &sv_bufs, max_len, head_dim, max_len, total_q_heads);
@@ -2888,13 +2924,13 @@ impl GpuCompute for MetalCompute {
             self.encode_3d(cmd2, "batched_matmul_ab", &sv_bufs, head_dim, max_len, total_q_heads);
         }
         
-        let buf_attn_out = self.pool.acquire_uninit(total_rows * q_dim * 4);
+        let buf_attn_out = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
         self.encode_3d(cmd2, "reshape_head_to_pos", &[
             buf_out_reshaped.buffer(), buf_attn_out.buffer(), &buf_heads, &buf_seq, &buf_head_dim
         ], head_dim, max_len, total_q_heads);
         
-        let buf_proj_out = self.pool.acquire_uninit(total_rows * h * 4);
-        let buf_out_w = self.buf_cached(weights.attn_out_weight);
+        let buf_proj_out = self.pool.acquire_uninit(total_rows * h * 4)?;
+        let buf_out_w = self.buf_cached(weights.attn_out_weight)?;
         
         if use_mma(total_rows, h, q_dim) {
             self.encode_mma(cmd2, "matmul_transb_simdgroup", &[buf_attn_out.buffer(), &buf_out_w, buf_proj_out.buffer(), &buf_rows, &buf_h, &buf_q_dim], total_rows, h, q_dim, 1);
@@ -2903,18 +2939,18 @@ impl GpuCompute for MetalCompute {
         }
 
         if let Some(attn_out_bias) = weights.attn_out_bias {
-            let b = self.buf_cached(attn_out_bias);
+            let b = self.buf_cached(attn_out_bias)?;
             self.encode_1d(cmd2, "elementwise_add_broadcast", &[buf_proj_out.buffer(), &b, &buf_h], total_rows * h);
         }
         
         self.encode_1d(cmd2, "elementwise_add", &[current_hidden.buffer(), buf_proj_out.buffer()], total_rows * h);
         
         if !config.pre_ln {
-            let buf_norm1_w = self.buf_cached(weights.norm1_weight);
+            let buf_norm1_w = self.buf_cached(weights.norm1_weight)?;
             if config.use_rms {
                 self.encode_1d(cmd2, "rms_norm", &[current_hidden.buffer(), &buf_norm1_w, &buf_h, &buf_eps], total_rows);
             } else {
-                let buf_norm1_b = self.buf_cached(weights.norm1_bias.unwrap_or(&[]));
+                let buf_norm1_b = self.buf_cached(weights.norm1_bias.unwrap_or(&[]))?;
                 self.encode_1d(cmd2, "layer_norm", &[current_hidden.buffer(), &buf_norm1_w, &buf_norm1_b, &buf_h, &buf_eps], total_rows);
             }
         }
@@ -2941,48 +2977,53 @@ impl GpuCompute for MetalCompute {
         // Layer norm 2
         let mut buf_normed2 = None;
         if config.pre_ln {
-            let buf = self.pool.acquire_uninit(total_rows * h * 4);
+            let buf = self.pool.acquire_uninit(total_rows * h * 4)?;
             {
                 let blit = cmd3.new_blit_command_encoder();
                 blit.copy_from_buffer(current_hidden.buffer(), 0, buf.buffer(), 0, (total_rows * h * 4) as u64);
                 blit.end_encoding();
             }
-            let buf_norm2_w = self.buf_cached(weights.norm2_weight);
+            let buf_norm2_w = self.buf_cached(weights.norm2_weight)?;
             if config.use_rms {
                 self.encode_1d(cmd3, "rms_norm", &[buf.buffer(), &buf_norm2_w, &buf_h, &buf_eps], total_rows);
             } else {
-                let buf_norm2_b = self.buf_cached(weights.norm2_bias.unwrap_or(&[]));
+                let buf_norm2_b = self.buf_cached(weights.norm2_bias.unwrap_or(&[]))?;
                 self.encode_1d(cmd3, "layer_norm", &[buf.buffer(), &buf_norm2_w, &buf_norm2_b, &buf_h, &buf_eps], total_rows);
             }
             buf_normed2 = Some(buf);
         }
         
         let ffn_in = if let Some(ref b) = buf_normed2 { b.buffer() } else { current_hidden.buffer() };
-        let buf_inter = self.buf_u32(inter as u32);
-        let buf_ffn_out = self.pool.acquire_uninit(total_rows * h * 4);
-        let buf_wdown = self.buf_cached(weights.ffn_down_weight);
+        let buf_inter = self.buf_u32(inter as u32)?;
+        let buf_ffn_out = self.pool.acquire_uninit(total_rows * h * 4)?;
+        let buf_wdown = self.buf_cached(weights.ffn_down_weight)?;
 
         if let Some(gate_weight) = weights.ffn_gate_weight {
             // SwiGLU FFN
             let up_weight = weights.ffn_up_weight.unwrap();
             let buf_wgateup = {
-                let mut guard = self.concat_cache.lock();
-                guard.entry(vec![
+                let key = vec![
                     (gate_weight.as_ptr() as usize, gate_weight.len()),
                     (up_weight.as_ptr() as usize, up_weight.len()),
-                ]).or_insert_with(|| {
+                ];
+                let mut guard = self.concat_cache.lock();
+                if let Some(buf) = guard.get(&key) {
+                    buf.clone()
+                } else {
                     let mut cat = Vec::with_capacity(gate_weight.len() + up_weight.len());
                     for row in 0..h {
                         cat.extend_from_slice(&gate_weight[row * inter..(row + 1) * inter]);
                         cat.extend_from_slice(&up_weight[row * inter..(row + 1) * inter]);
                     }
-                    self.buf_from_slice(&cat)
-                }).clone()
+                    let buf = self.buf_from_slice(&cat)?;
+                    guard.insert(key, buf.clone());
+                    buf
+                }
             };
             
-            let buf_gateup = self.pool.acquire_uninit(total_rows * 2 * inter * 4);
-            let buf_act = self.pool.acquire_uninit(total_rows * inter * 4);
-            let buf_two_inter = self.buf_u32((2 * inter) as u32);
+            let buf_gateup = self.pool.acquire_uninit(total_rows * 2 * inter * 4)?;
+            let buf_act = self.pool.acquire_uninit(total_rows * inter * 4)?;
+            let buf_two_inter = self.buf_u32((2 * inter) as u32)?;
             
             if use_mma(total_rows, inter, h) {
                 self.encode_mma(cmd3, "matmul_transb_simdgroup", &[ffn_in, &buf_wgateup, buf_gateup.buffer(), &buf_rows, &buf_two_inter, &buf_h], total_rows, 2 * inter, h, 1);
@@ -3003,8 +3044,8 @@ impl GpuCompute for MetalCompute {
         } else {
             // Standard GELU FFN
             let up_weight = weights.ffn_up_weight.unwrap();
-            let buf_wup = self.buf_cached(up_weight);
-            let buf_up = self.pool.acquire_uninit(total_rows * inter * 4);
+            let buf_wup = self.buf_cached(up_weight)?;
+            let buf_up = self.pool.acquire_uninit(total_rows * inter * 4)?;
             
             if use_mma(total_rows, inter, h) {
                 self.encode_mma(cmd3, "matmul_transb_simdgroup", &[ffn_in, &buf_wup, buf_up.buffer(), &buf_rows, &buf_inter, &buf_h], total_rows, inter, h, 1);
@@ -3013,7 +3054,7 @@ impl GpuCompute for MetalCompute {
             }
             
             if let Some(up_bias) = weights.ffn_up_bias {
-                let b = self.buf_cached(up_bias);
+                let b = self.buf_cached(up_bias)?;
                 self.encode_1d(cmd3, "elementwise_add_broadcast", &[buf_up.buffer(), &b, &buf_inter], total_rows * inter);
             }
             
@@ -3028,18 +3069,18 @@ impl GpuCompute for MetalCompute {
         }
         
         if let Some(down_bias) = weights.ffn_down_bias {
-            let b = self.buf_cached(down_bias);
+            let b = self.buf_cached(down_bias)?;
             self.encode_1d(cmd3, "elementwise_add_broadcast", &[buf_ffn_out.buffer(), &b, &buf_h], total_rows * h);
         }
         
         self.encode_1d(cmd3, "elementwise_add", &[current_hidden.buffer(), buf_ffn_out.buffer()], total_rows * h);
         
         if !config.pre_ln {
-            let buf_norm2_w = self.buf_cached(weights.norm2_weight);
+            let buf_norm2_w = self.buf_cached(weights.norm2_weight)?;
             if config.use_rms {
                 self.encode_1d(cmd3, "rms_norm", &[current_hidden.buffer(), &buf_norm2_w, &buf_h, &buf_eps], total_rows);
             } else {
-                let buf_norm2_b = self.buf_cached(weights.norm2_bias.unwrap_or(&[]));
+                let buf_norm2_b = self.buf_cached(weights.norm2_bias.unwrap_or(&[]))?;
                 self.encode_1d(cmd3, "layer_norm", &[current_hidden.buffer(), &buf_norm2_w, &buf_norm2_b, &buf_h, &buf_eps], total_rows);
             }
         }
@@ -3052,17 +3093,17 @@ impl GpuCompute for MetalCompute {
         self.commit_wait(&cmd3);
         
         let out = Self::read_buf(current_hidden.buffer(), total_rows * h);
-        Some(out)
+        Ok(Some(out))
     }
-    fn matmul(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    fn matmul(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Result<Vec<f32>, InferError> {
         let _span = tracing::info_span!("kin_infer.metal.matmul", m = m, n = n, k = k).entered();
-        let buf_a = self.buf_slice_pooled(a);
+        let buf_a = self.buf_slice_pooled(a)?;
         // Cache B (weight matrix): stable pointers across forward passes
-        let buf_b = self.buf_cached(b);
-        let buf_c = self.buf_zeros_pooled(m * n);
-        let buf_m = self.buf_u32(m as u32);
-        let buf_n = self.buf_u32(n as u32);
-        let buf_k = self.buf_u32(k as u32);
+        let buf_b = self.buf_cached(b)?;
+        let buf_c = self.buf_zeros_pooled(m * n)?;
+        let buf_m = self.buf_u32(m as u32)?;
+        let buf_n = self.buf_u32(n as u32)?;
+        let buf_k = self.buf_u32(k as u32)?;
 
         let bufs = [
             buf_a.buffer(),
@@ -3082,7 +3123,7 @@ impl GpuCompute for MetalCompute {
 
         let out = Self::read_buf(buf_c.buffer(), m * n);
         Self::count_nonfinite(&format!("matmul m={m} n={n} k={k}"), &out);
-        out
+        Ok(out)
     }
 
     fn matmul_many(
@@ -3092,7 +3133,7 @@ impl GpuCompute for MetalCompute {
         m: usize,
         ns: &[usize],
         k: usize,
-    ) -> Vec<Vec<f32>> {
+    ) -> Result<Vec<Vec<f32>>, InferError> {
         let _span = tracing::info_span!(
             "kin_infer.metal.matmul_many",
             m = m,
@@ -3101,7 +3142,7 @@ impl GpuCompute for MetalCompute {
         )
         .entered();
         if weights.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // Fat GEMM: concatenate the weights row-major into one [sum_n, k] matrix
@@ -3111,12 +3152,12 @@ impl GpuCompute for MetalCompute {
         // but it fills the GPU with one wide dispatch instead of several thin
         // ones. The concatenation is cached on the device by component pointers.
         let total_n: usize = ns.iter().sum();
-        let buf_a = self.buf_slice_pooled(a);
-        let buf_b = self.buf_cached_concat(weights);
-        let buf_c = self.buf_zeros_pooled(m * total_n);
-        let buf_m = self.buf_u32(m as u32);
-        let buf_n = self.buf_u32(total_n as u32);
-        let buf_k = self.buf_u32(k as u32);
+        let buf_a = self.buf_slice_pooled(a)?;
+        let buf_b = self.buf_cached_concat(weights)?;
+        let buf_c = self.buf_zeros_pooled(m * total_n)?;
+        let buf_m = self.buf_u32(m as u32)?;
+        let buf_n = self.buf_u32(total_n as u32)?;
+        let buf_k = self.buf_u32(k as u32)?;
 
         let bufs = [
             buf_a.buffer(),
@@ -3147,7 +3188,7 @@ impl GpuCompute for MetalCompute {
             outputs.push(out);
             col_off += n;
         }
-        outputs
+        Ok(outputs)
     }
 
     fn batched_matmul(
@@ -3157,7 +3198,7 @@ impl GpuCompute for MetalCompute {
         num_heads: usize,
         seq_len: usize,
         head_dim: usize,
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, InferError> {
         let _span = tracing::info_span!(
             "kin_infer.metal.batched_matmul",
             num_heads = num_heads,
@@ -3166,13 +3207,13 @@ impl GpuCompute for MetalCompute {
         )
         .entered();
         // Single 3D dispatch: all heads computed in one GPU submission.
-        let buf_q = self.buf_slice_pooled(q);
-        let buf_k = self.buf_slice_pooled(k);
-        let buf_c = self.buf_zeros_pooled(num_heads * seq_len * seq_len);
-        let buf_seq = self.buf_u32(seq_len as u32);
-        let buf_dim = self.buf_u32(head_dim as u32);
+        let buf_q = self.buf_slice_pooled(q)?;
+        let buf_k = self.buf_slice_pooled(k)?;
+        let buf_c = self.buf_zeros_pooled(num_heads * seq_len * seq_len)?;
+        let buf_seq = self.buf_u32(seq_len as u32)?;
+        let buf_dim = self.buf_u32(head_dim as u32)?;
 
-        let buf_hpg = self.buf_u32(1);
+        let buf_hpg = self.buf_u32(1)?;
 
         // QK^T: m=seq, n=seq, k=head_dim.
         let bufs = [
@@ -3198,7 +3239,7 @@ impl GpuCompute for MetalCompute {
             }
         });
 
-        Self::read_buf(buf_c.buffer(), num_heads * seq_len * seq_len)
+        Ok(Self::read_buf(buf_c.buffer(), num_heads * seq_len * seq_len))
     }
 
     fn batched_attn_values(
@@ -3208,7 +3249,7 @@ impl GpuCompute for MetalCompute {
         num_heads: usize,
         seq_len: usize,
         head_dim: usize,
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, InferError> {
         let _span = tracing::info_span!(
             "kin_infer.metal.batched_attn_values",
             num_heads = num_heads,
@@ -3217,12 +3258,12 @@ impl GpuCompute for MetalCompute {
         )
         .entered();
         // Single 3D dispatch: scores[h] × V[h] for all heads.
-        let buf_s = self.buf_slice_pooled(scores);
-        let buf_v = self.buf_slice_pooled(v);
-        let buf_c = self.buf_zeros_pooled(num_heads * seq_len * head_dim);
-        let buf_seq = self.buf_u32(seq_len as u32);
-        let buf_dim = self.buf_u32(head_dim as u32);
-        let buf_hpg = self.buf_u32(1);
+        let buf_s = self.buf_slice_pooled(scores)?;
+        let buf_v = self.buf_slice_pooled(v)?;
+        let buf_c = self.buf_zeros_pooled(num_heads * seq_len * head_dim)?;
+        let buf_seq = self.buf_u32(seq_len as u32)?;
+        let buf_dim = self.buf_u32(head_dim as u32)?;
+        let buf_hpg = self.buf_u32(1)?;
 
         // scores*V: m=seq, n=head_dim, k=seq.
         let bufs = [
@@ -3248,20 +3289,21 @@ impl GpuCompute for MetalCompute {
             }
         });
 
-        Self::read_buf(buf_c.buffer(), num_heads * seq_len * head_dim)
+        Ok(Self::read_buf(buf_c.buffer(), num_heads * seq_len * head_dim))
     }
 
-    fn softmax(&self, data: &mut [f32], rows: usize, cols: usize) {
+    fn softmax(&self, data: &mut [f32], rows: usize, cols: usize) -> Result<(), InferError> {
         let _span =
             tracing::info_span!("kin_infer.metal.softmax", rows = rows, cols = cols).entered();
         Self::count_nonfinite(&format!("softmax_in rows={rows} cols={cols}"), data);
-        let buf = self.buf_slice_pooled(data);
-        let buf_cols = self.buf_u32(cols as u32);
+        let buf = self.buf_slice_pooled(data)?;
+        let buf_cols = self.buf_u32(cols as u32)?;
         time_phase(Phase::Norm, || {
             self.dispatch_1d("softmax_rows", &[buf.buffer(), &buf_cols], rows)
         });
         Self::read_buf_into(buf.buffer(), data);
         Self::count_nonfinite(&format!("softmax_out rows={rows} cols={cols}"), data);
+        Ok(())
     }
 
     fn layer_norm(
@@ -3272,7 +3314,7 @@ impl GpuCompute for MetalCompute {
         rows: usize,
         cols: usize,
         eps: f32,
-    ) {
+    ) -> Result<(), InferError> {
         let _span = tracing::info_span!(
             "kin_infer.metal.layer_norm",
             rows = rows,
@@ -3280,11 +3322,11 @@ impl GpuCompute for MetalCompute {
             eps = eps
         )
         .entered();
-        let buf = self.buf_slice_pooled(data);
-        let buf_gamma = self.buf_cached(gamma);
-        let buf_beta = self.buf_cached(beta);
-        let buf_cols = self.buf_u32(cols as u32);
-        let buf_eps = self.buf_f32(eps);
+        let buf = self.buf_slice_pooled(data)?;
+        let buf_gamma = self.buf_cached(gamma)?;
+        let buf_beta = self.buf_cached(beta)?;
+        let buf_cols = self.buf_u32(cols as u32)?;
+        let buf_eps = self.buf_f32(eps)?;
         time_phase(Phase::Norm, || {
             self.dispatch_1d(
                 "layer_norm",
@@ -3294,9 +3336,10 @@ impl GpuCompute for MetalCompute {
         });
         Self::read_buf_into(buf.buffer(), data);
         Self::count_nonfinite(&format!("layer_norm rows={rows} cols={cols}"), data);
+        Ok(())
     }
 
-    fn rms_norm(&self, data: &mut [f32], weight: &[f32], rows: usize, cols: usize, eps: f32) {
+    fn rms_norm(&self, data: &mut [f32], weight: &[f32], rows: usize, cols: usize, eps: f32) -> Result<(), InferError> {
         let _span = tracing::info_span!(
             "kin_infer.metal.rms_norm",
             rows = rows,
@@ -3304,44 +3347,48 @@ impl GpuCompute for MetalCompute {
             eps = eps
         )
         .entered();
-        let buf = self.buf_slice_pooled(data);
-        let buf_weight = self.buf_cached(weight);
-        let buf_cols = self.buf_u32(cols as u32);
-        let buf_eps = self.buf_f32(eps);
+        let buf = self.buf_slice_pooled(data)?;
+        let buf_weight = self.buf_cached(weight)?;
+        let buf_cols = self.buf_u32(cols as u32)?;
+        let buf_eps = self.buf_f32(eps)?;
         time_phase(Phase::Norm, || {
             self.dispatch_1d("rms_norm", &[buf.buffer(), &buf_weight, &buf_cols, &buf_eps], rows)
         });
         Self::read_buf_into(buf.buffer(), data);
+        Ok(())
     }
 
-    fn gelu(&self, data: &mut [f32]) {
+    fn gelu(&self, data: &mut [f32]) -> Result<(), InferError> {
         let _span = tracing::info_span!("kin_infer.metal.gelu", len = data.len()).entered();
         Self::count_nonfinite(&format!("gelu_in len={}", data.len()), data);
-        let buf = self.buf_slice_pooled(data);
+        let buf = self.buf_slice_pooled(data)?;
         time_phase(Phase::Activation, || {
             self.dispatch_1d("gelu_activation", &[buf.buffer()], data.len())
         });
         Self::read_buf_into(buf.buffer(), data);
         Self::count_nonfinite(&format!("gelu_out len={}", data.len()), data);
+        Ok(())
     }
 
-    fn silu(&self, data: &mut [f32]) {
+    fn silu(&self, data: &mut [f32]) -> Result<(), InferError> {
         let _span = tracing::info_span!("kin_infer.metal.silu", len = data.len()).entered();
-        let buf = self.buf_slice_pooled(data);
+        let buf = self.buf_slice_pooled(data)?;
         time_phase(Phase::Activation, || {
             self.dispatch_1d("silu_activation", &[buf.buffer()], data.len())
         });
         Self::read_buf_into(buf.buffer(), data);
+        Ok(())
     }
 
-    fn elementwise_mul(&self, a: &mut [f32], b: &[f32]) {
+    fn elementwise_mul(&self, a: &mut [f32], b: &[f32]) -> Result<(), InferError> {
         let _span = tracing::info_span!("kin_infer.metal.elementwise_mul", len = a.len()).entered();
-        let buf_a = self.buf_slice_pooled(a);
-        let buf_b = self.buf_slice_pooled(b);
+        let buf_a = self.buf_slice_pooled(a)?;
+        let buf_b = self.buf_slice_pooled(b)?;
         time_phase(Phase::Activation, || {
             self.dispatch_1d("elementwise_mul", &[buf_a.buffer(), buf_b.buffer()], a.len())
         });
         Self::read_buf_into(buf_a.buffer(), a);
+        Ok(())
     }
 
     fn fused_ffn_swiglu(
@@ -3353,7 +3400,7 @@ impl GpuCompute for MetalCompute {
         rows: usize,
         hidden: usize,
         inter: usize,
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, InferError> {
         let _span = tracing::info_span!(
             "kin_infer.metal.fused_ffn_swiglu",
             rows = rows,
@@ -3367,16 +3414,16 @@ impl GpuCompute for MetalCompute {
         // w_gate|w_up), then a strided swiglu reads both halves. The
         // gate-up/activated/down intermediates are pooled transients that stay
         // resident across the chain and recycle after the readback below.
-        let buf_x = self.buf_slice_pooled(x);
-        let buf_wgateup = self.buf_cached_concat(&[w_gate, w_up]);
-        let buf_wdown = self.buf_cached(w_down);
-        let buf_gateup = self.buf_zeros_pooled(rows * 2 * inter);
-        let buf_act = self.buf_zeros_pooled(rows * inter);
-        let buf_out = self.buf_zeros_pooled(rows * hidden);
-        let buf_rows = self.buf_u32(rows as u32);
-        let buf_inter = self.buf_u32(inter as u32);
-        let buf_two_inter = self.buf_u32((2 * inter) as u32);
-        let buf_hidden = self.buf_u32(hidden as u32);
+        let buf_x = self.buf_slice_pooled(x)?;
+        let buf_wgateup = self.buf_cached_concat(&[w_gate, w_up])?;
+        let buf_wdown = self.buf_cached(w_down)?;
+        let buf_gateup = self.buf_zeros_pooled(rows * 2 * inter)?;
+        let buf_act = self.buf_zeros_pooled(rows * inter)?;
+        let buf_out = self.buf_zeros_pooled(rows * hidden)?;
+        let buf_rows = self.buf_u32(rows as u32)?;
+        let buf_inter = self.buf_u32(inter as u32)?;
+        let buf_two_inter = self.buf_u32((2 * inter) as u32)?;
+        let buf_hidden = self.buf_u32(hidden as u32)?;
 
         let mm = &self.pipelines["matmul_transb"];
         let mm_mma = "matmul_transb_simdgroup";
@@ -3426,7 +3473,7 @@ impl GpuCompute for MetalCompute {
             Self::read_buf(buf_out.buffer(), rows * hidden)
         });
         Self::count_nonfinite(&format!("fused_ffn_swiglu rows={rows} hidden={hidden} inter={inter}"), &out);
-        out
+        Ok(out)
     }
 
     fn fused_ffn_swiglu_add_norm(
@@ -3442,7 +3489,7 @@ impl GpuCompute for MetalCompute {
         hidden: usize,
         inter: usize,
         eps: f32,
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, InferError> {
         let _span = tracing::info_span!(
             "kin_infer.metal.fused_ffn_swiglu_add_norm",
             rows = rows,
@@ -3455,20 +3502,20 @@ impl GpuCompute for MetalCompute {
         // residual add and LayerNorm are appended to the SAME command buffer so
         // the FFN output never round-trips to host memory un-normed — the post-LN
         // norm2 boundary folds into the FFN's existing single submission.
-        let buf_x = self.buf_slice_pooled(x);
-        let buf_wgateup = self.buf_cached_concat(&[w_gate, w_up]);
-        let buf_wdown = self.buf_cached(w_down);
-        let buf_residual = self.buf_slice_pooled(residual);
-        let buf_gateup = self.buf_zeros_pooled(rows * 2 * inter);
-        let buf_act = self.buf_zeros_pooled(rows * inter);
-        let buf_out = self.buf_zeros_pooled(rows * hidden);
-        let buf_gamma = self.buf_cached(gamma);
-        let buf_beta = self.buf_cached(beta);
-        let buf_rows = self.buf_u32(rows as u32);
-        let buf_inter = self.buf_u32(inter as u32);
-        let buf_two_inter = self.buf_u32((2 * inter) as u32);
-        let buf_hidden = self.buf_u32(hidden as u32);
-        let buf_eps = self.buf_f32(eps);
+        let buf_x = self.buf_slice_pooled(x)?;
+        let buf_wgateup = self.buf_cached_concat(&[w_gate, w_up])?;
+        let buf_wdown = self.buf_cached(w_down)?;
+        let buf_residual = self.buf_slice_pooled(residual)?;
+        let buf_gateup = self.buf_zeros_pooled(rows * 2 * inter)?;
+        let buf_act = self.buf_zeros_pooled(rows * inter)?;
+        let buf_out = self.buf_zeros_pooled(rows * hidden)?;
+        let buf_gamma = self.buf_cached(gamma)?;
+        let buf_beta = self.buf_cached(beta)?;
+        let buf_rows = self.buf_u32(rows as u32)?;
+        let buf_inter = self.buf_u32(inter as u32)?;
+        let buf_two_inter = self.buf_u32((2 * inter) as u32)?;
+        let buf_hidden = self.buf_u32(hidden as u32)?;
+        let buf_eps = self.buf_f32(eps)?;
 
         let mm = &self.pipelines["matmul_transb"];
         let mm_mma = "matmul_transb_simdgroup";
@@ -3541,7 +3588,7 @@ impl GpuCompute for MetalCompute {
             Self::read_buf(buf_out.buffer(), rows * hidden)
         });
         Self::count_nonfinite(&format!("fused_ffn_swiglu_add_norm rows={rows} hidden={hidden} inter={inter}"), &out);
-        out
+        Ok(out)
     }
 
     fn fused_linear_add_norm(
@@ -3555,7 +3602,7 @@ impl GpuCompute for MetalCompute {
         cols: usize,
         hidden: usize,
         eps: f32,
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, InferError> {
         let _span = tracing::info_span!(
             "kin_infer.metal.fused_linear_add_norm",
             rows = rows,
@@ -3569,16 +3616,16 @@ impl GpuCompute for MetalCompute {
         // the LayerNorm runs in-place on the same buffer — one command buffer, one
         // readback. The proj buffer is a pooled transient that recycles after the
         // readback below.
-        let buf_x = self.buf_slice_pooled(x);
-        let buf_w = self.buf_cached(weight);
-        let buf_residual = self.buf_slice_pooled(residual);
-        let buf_proj = self.buf_zeros_pooled(rows * hidden);
-        let buf_gamma = self.buf_cached(gamma);
-        let buf_beta = self.buf_cached(beta);
-        let buf_rows = self.buf_u32(rows as u32);
-        let buf_hidden = self.buf_u32(hidden as u32);
-        let buf_cols = self.buf_u32(cols as u32);
-        let buf_eps = self.buf_f32(eps);
+        let buf_x = self.buf_slice_pooled(x)?;
+        let buf_w = self.buf_cached(weight)?;
+        let buf_residual = self.buf_slice_pooled(residual)?;
+        let buf_proj = self.buf_zeros_pooled(rows * hidden)?;
+        let buf_gamma = self.buf_cached(gamma)?;
+        let buf_beta = self.buf_cached(beta)?;
+        let buf_rows = self.buf_u32(rows as u32)?;
+        let buf_hidden = self.buf_u32(hidden as u32)?;
+        let buf_cols = self.buf_u32(cols as u32)?;
+        let buf_eps = self.buf_f32(eps)?;
 
         let mm = &self.pipelines["matmul_transb"];
         let mm_mma = "matmul_transb_simdgroup";
@@ -3629,7 +3676,7 @@ impl GpuCompute for MetalCompute {
             Self::read_buf(buf_proj.buffer(), rows * hidden)
         });
         Self::count_nonfinite(&format!("fused_linear_add_norm rows={rows} hidden={hidden}"), &out);
-        out
+        Ok(out)
     }
 
     fn rope(
@@ -3641,7 +3688,7 @@ impl GpuCompute for MetalCompute {
         seq_len: usize,
         head_dim: usize,
         total_dim: usize,
-    ) {
+    ) -> Result<(), InferError> {
         let _span = tracing::info_span!(
             "kin_infer.metal.rope",
             seq_offset = seq_offset,
@@ -3653,13 +3700,13 @@ impl GpuCompute for MetalCompute {
         let half = head_dim / 2;
         let num_pairs = total_dim / head_dim * half;
 
-        let buf = self.buf_slice_pooled(data);
-        let buf_cos = self.buf_slice_pooled(cos_table);
-        let buf_sin = self.buf_slice_pooled(sin_table);
-        let buf_offset = self.buf_u32(seq_offset as u32);
-        let buf_head_dim = self.buf_u32(head_dim as u32);
-        let buf_total_dim = self.buf_u32(total_dim as u32);
-        let buf_half = self.buf_u32(half as u32);
+        let buf = self.buf_slice_pooled(data)?;
+        let buf_cos = self.buf_slice_pooled(cos_table)?;
+        let buf_sin = self.buf_slice_pooled(sin_table)?;
+        let buf_offset = self.buf_u32(seq_offset as u32)?;
+        let buf_head_dim = self.buf_u32(head_dim as u32)?;
+        let buf_total_dim = self.buf_u32(total_dim as u32)?;
+        let buf_half = self.buf_u32(half as u32)?;
 
         time_phase(Phase::Activation, || {
             self.dispatch_2d(
@@ -3678,6 +3725,7 @@ impl GpuCompute for MetalCompute {
             )
         });
         Self::read_buf_into(buf.buffer(), data);
+        Ok(())
     }
 
     fn rope_pair(
@@ -3690,7 +3738,7 @@ impl GpuCompute for MetalCompute {
         seq_len: usize,
         head_dim: usize,
         total_dim: usize,
-    ) {
+    ) -> Result<(), InferError> {
         let _span = tracing::info_span!(
             "kin_infer.metal.rope_pair",
             seq_offset = seq_offset,
@@ -3703,14 +3751,14 @@ impl GpuCompute for MetalCompute {
         let num_pairs = total_dim / head_dim * half;
 
         // Shared scalar + table buffers; Q and K differ only in the data buffer.
-        let buf_q = self.buf_slice_pooled(q);
-        let buf_k = self.buf_slice_pooled(k);
-        let buf_cos = self.buf_slice_pooled(cos_table);
-        let buf_sin = self.buf_slice_pooled(sin_table);
-        let buf_offset = self.buf_u32(seq_offset as u32);
-        let buf_head_dim = self.buf_u32(head_dim as u32);
-        let buf_total_dim = self.buf_u32(total_dim as u32);
-        let buf_half = self.buf_u32(half as u32);
+        let buf_q = self.buf_slice_pooled(q)?;
+        let buf_k = self.buf_slice_pooled(k)?;
+        let buf_cos = self.buf_slice_pooled(cos_table)?;
+        let buf_sin = self.buf_slice_pooled(sin_table)?;
+        let buf_offset = self.buf_u32(seq_offset as u32)?;
+        let buf_head_dim = self.buf_u32(head_dim as u32)?;
+        let buf_total_dim = self.buf_u32(total_dim as u32)?;
+        let buf_half = self.buf_u32(half as u32)?;
 
         let pipeline = &self.pipelines["rope_apply"];
         autoreleasepool(|_| {
@@ -3736,6 +3784,7 @@ impl GpuCompute for MetalCompute {
         });
         Self::read_buf_into(buf_q.buffer(), q);
         Self::read_buf_into(buf_k.buffer(), k);
+        Ok(())
     }
 
     fn rope_pair_batched(
@@ -3749,7 +3798,7 @@ impl GpuCompute for MetalCompute {
         actual: usize,
         head_dim: usize,
         total_dim: usize,
-    ) {
+    ) -> Result<(), InferError> {
         let _span = tracing::info_span!(
             "kin_infer.metal.rope_pair_batched",
             batch_size = batch_size,
@@ -3766,15 +3815,15 @@ impl GpuCompute for MetalCompute {
         // Whole-batch Q and K in one submission: the position resets per `max_len`
         // inside the kernel (row % max_len), so all inputs' RoPE is one dispatch
         // each for Q and K instead of one per input.
-        let buf_q = self.buf_slice_pooled(q);
-        let buf_k = self.buf_slice_pooled(k);
-        let buf_cos = self.buf_slice_pooled(cos_table);
-        let buf_sin = self.buf_slice_pooled(sin_table);
-        let buf_max_len = self.buf_u32(max_len as u32);
-        let buf_head_dim = self.buf_u32(head_dim as u32);
-        let buf_total_dim = self.buf_u32(total_dim as u32);
-        let buf_half = self.buf_u32(half as u32);
-        let buf_actual = self.buf_u32(actual as u32);
+        let buf_q = self.buf_slice_pooled(q)?;
+        let buf_k = self.buf_slice_pooled(k)?;
+        let buf_cos = self.buf_slice_pooled(cos_table)?;
+        let buf_sin = self.buf_slice_pooled(sin_table)?;
+        let buf_max_len = self.buf_u32(max_len as u32)?;
+        let buf_head_dim = self.buf_u32(head_dim as u32)?;
+        let buf_total_dim = self.buf_u32(total_dim as u32)?;
+        let buf_half = self.buf_u32(half as u32)?;
+        let buf_actual = self.buf_u32(actual as u32)?;
 
         let pipeline = &self.pipelines["rope_apply_batched"];
         autoreleasepool(|_| {
@@ -3801,6 +3850,7 @@ impl GpuCompute for MetalCompute {
         });
         Self::read_buf_into(buf_q.buffer(), q);
         Self::read_buf_into(buf_k.buffer(), k);
+        Ok(())
     }
 
     fn fused_attention(
@@ -3814,7 +3864,7 @@ impl GpuCompute for MetalCompute {
         scale: f32,
         alibi_slopes: &[f32],
         mask: &[u32],
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, InferError> {
         let _span = tracing::info_span!(
             "kin_infer.metal.fused_attention",
             num_heads = num_heads,
@@ -3824,25 +3874,25 @@ impl GpuCompute for MetalCompute {
         )
         .entered();
         // All 4 ops in ONE command buffer — 1 commit+wait instead of 4.
-        let buf_q = self.buf_slice_pooled(q);
-        let buf_k = self.buf_slice_pooled(k);
-        let buf_v = self.buf_slice_pooled(v);
-        let buf_scores = self.buf_zeros_pooled(num_heads * seq_len * seq_len);
-        let buf_out = self.buf_zeros_pooled(num_heads * seq_len * head_dim);
-        let buf_seq = self.buf_u32(seq_len as u32);
-        let buf_dim = self.buf_u32(head_dim as u32);
-        let buf_scale = self.buf_f32(scale);
+        let buf_q = self.buf_slice_pooled(q)?;
+        let buf_k = self.buf_slice_pooled(k)?;
+        let buf_v = self.buf_slice_pooled(v)?;
+        let buf_scores = self.buf_zeros_pooled(num_heads * seq_len * seq_len)?;
+        let buf_out = self.buf_zeros_pooled(num_heads * seq_len * head_dim)?;
+        let buf_seq = self.buf_u32(seq_len as u32)?;
+        let buf_dim = self.buf_u32(head_dim as u32)?;
+        let buf_scale = self.buf_f32(scale)?;
         let has_alibi = !alibi_slopes.is_empty();
         let alibi_ref = if has_alibi { alibi_slopes } else { &[0.0f32] };
-        let pooled_alibi = self.buf_slice_pooled(alibi_ref);
+        let pooled_alibi = self.buf_slice_pooled(alibi_ref)?;
         let mask_u32: Vec<u32> = mask.to_vec();
-        let buf_mask = self.buf_u32_slice(&mask_u32);
-        let buf_has_alibi = self.buf_u32(has_alibi as u32);
+        let buf_mask = self.buf_u32_slice(&mask_u32)?;
+        let buf_has_alibi = self.buf_u32(has_alibi as u32)?;
 
         // All four ops + commit + readback inside one autorelease pool: the
         // command buffer and its encoders are autoreleased (+0) and would
         // otherwise accumulate on a pool-less worker thread across every layer.
-        let out = autoreleasepool(|_| {
+        let out = autoreleasepool(|_| -> Result<Vec<f32>, InferError> {
             let cmd = self.queue.new_command_buffer();
 
             // Op 1: Q × K^T → scores
@@ -3855,7 +3905,7 @@ impl GpuCompute for MetalCompute {
                     buf_scores.buffer(),
                     &buf_seq,
                     &buf_dim,
-                    &self.buf_u32(1), // hpg=1
+                    &self.buf_u32(1)?, // hpg=1
                 ];
                 if use_mma(seq_len, seq_len, head_dim) {
                     self.encode_mma(
@@ -3908,7 +3958,7 @@ impl GpuCompute for MetalCompute {
                 let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(p);
                 enc.set_buffer(0, Some(buf_scores.buffer()), 0);
-                let buf_cols = self.buf_u32(seq_len as u32);
+                let buf_cols = self.buf_u32(seq_len as u32)?;
                 enc.set_buffer(1, Some(&buf_cols), 0);
                 let total_rows = num_heads * seq_len;
                 let tw = p.thread_execution_width() as usize;
@@ -3928,7 +3978,7 @@ impl GpuCompute for MetalCompute {
                     buf_out.buffer(),
                     &buf_seq,
                     &buf_dim,
-                    &self.buf_u32(1), // hpg=1
+                    &self.buf_u32(1)?, // hpg=1
                 ];
                 if use_mma(seq_len, head_dim, seq_len) {
                     self.encode_mma(
@@ -3964,13 +4014,13 @@ impl GpuCompute for MetalCompute {
                 });
             }
 
-            Self::read_buf(buf_out.buffer(), num_heads * seq_len * head_dim)
-        });
+            Ok(Self::read_buf(buf_out.buffer(), num_heads * seq_len * head_dim))
+        })?;
         Self::count_nonfinite(
             &format!("fused_attention seq_len={seq_len} num_heads={num_heads}"),
             &out,
         );
-        out
+        Ok(out)
     }
 
     fn fused_attention_batched(
@@ -3985,7 +4035,7 @@ impl GpuCompute for MetalCompute {
         scale: f32,
         alibi_slopes: &[f32],
         masks: &[u32],
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, InferError> {
         let _span = tracing::info_span!(
             "kin_infer.metal.fused_attention_batched",
             num_groups = num_groups,
@@ -3996,26 +4046,26 @@ impl GpuCompute for MetalCompute {
         )
         .entered();
         let total_heads = num_groups * heads_per_group;
-        let buf_q = self.buf_slice_pooled(q);
-        let buf_k = self.buf_slice_pooled(k);
-        let buf_v = self.buf_slice_pooled(v);
-        let buf_scores = self.buf_zeros_pooled(total_heads * seq_len * seq_len);
-        let buf_out = self.buf_zeros_pooled(total_heads * seq_len * head_dim);
-        let buf_seq = self.buf_u32(seq_len as u32);
-        let buf_dim = self.buf_u32(head_dim as u32);
-        let buf_scale = self.buf_f32(scale);
+        let buf_q = self.buf_slice_pooled(q)?;
+        let buf_k = self.buf_slice_pooled(k)?;
+        let buf_v = self.buf_slice_pooled(v)?;
+        let buf_scores = self.buf_zeros_pooled(total_heads * seq_len * seq_len)?;
+        let buf_out = self.buf_zeros_pooled(total_heads * seq_len * head_dim)?;
+        let buf_seq = self.buf_u32(seq_len as u32)?;
+        let buf_dim = self.buf_u32(head_dim as u32)?;
+        let buf_scale = self.buf_f32(scale)?;
         let has_alibi = !alibi_slopes.is_empty();
         let alibi_ref = if has_alibi { alibi_slopes } else { &[0.0f32] };
-        let pooled_alibi = self.buf_slice_pooled(alibi_ref);
-        let buf_masks = self.buf_u32_slice(masks);
-        let buf_has_alibi = self.buf_u32(has_alibi as u32);
-        let buf_heads_per_group = self.buf_u32(heads_per_group as u32);
+        let pooled_alibi = self.buf_slice_pooled(alibi_ref)?;
+        let buf_masks = self.buf_u32_slice(masks)?;
+        let buf_has_alibi = self.buf_u32(has_alibi as u32)?;
+        let buf_heads_per_group = self.buf_u32(heads_per_group as u32)?;
 
         // All four ops + commit + readback inside one autorelease pool: the
         // command buffer and its encoders are autoreleased (+0) and would
         // otherwise accumulate on a pool-less worker thread across every layer
         // of every batch — the heaviest contributor in a large cold embed.
-        let out = autoreleasepool(|_| {
+        let out = autoreleasepool(|_| -> Result<Vec<f32>, InferError> {
             let cmd = self.queue.new_command_buffer();
 
             {
@@ -4028,7 +4078,7 @@ impl GpuCompute for MetalCompute {
                     buf_scores.buffer(),
                     &buf_seq,
                     &buf_dim,
-                    &self.buf_u32(1),
+                    &self.buf_u32(1)?,
                 ];
                 if use_mma(seq_len, seq_len, head_dim) {
                     self.encode_mma(
@@ -4082,7 +4132,7 @@ impl GpuCompute for MetalCompute {
                 let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(p);
                 enc.set_buffer(0, Some(buf_scores.buffer()), 0);
-                let buf_cols = self.buf_u32(seq_len as u32);
+                let buf_cols = self.buf_u32(seq_len as u32)?;
                 enc.set_buffer(1, Some(&buf_cols), 0);
                 let total_rows = total_heads * seq_len;
                 let tw = p.thread_execution_width() as usize;
@@ -4102,7 +4152,7 @@ impl GpuCompute for MetalCompute {
                     buf_out.buffer(),
                     &buf_seq,
                     &buf_dim,
-                    &self.buf_u32(1),
+                    &self.buf_u32(1)?,
                 ];
                 if use_mma(seq_len, head_dim, seq_len) {
                     self.encode_mma(
@@ -4137,15 +4187,15 @@ impl GpuCompute for MetalCompute {
                 });
             }
 
-            Self::read_buf(buf_out.buffer(), total_heads * seq_len * head_dim)
-        });
+            Ok(Self::read_buf(buf_out.buffer(), total_heads * seq_len * head_dim))
+        })?;
         Self::count_nonfinite(
             &format!(
                 "fused_attention_batched seq_len={seq_len} total_heads={total_heads}"
             ),
             &out,
         );
-        out
+        Ok(out)
     }
 
     /// Position-major fused attention ("Lever A"): consume Q/K/V straight from
@@ -4169,7 +4219,7 @@ impl GpuCompute for MetalCompute {
         scale: f32,
         alibi_slopes: &[f32],
         masks: &[u32],
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, InferError> {
         let _span = tracing::info_span!(
             "kin_infer.metal.fused_attention_batched_posmajor",
             num_groups = num_groups,
@@ -4184,30 +4234,30 @@ impl GpuCompute for MetalCompute {
         let elems = total_heads * seq_len * head_dim;
 
         // Position-major operands uploaded once (contiguous copy, no host scatter).
-        let buf_q_pos = self.buf_slice_pooled(q_pos);
-        let buf_k_pos = self.buf_slice_pooled(k_pos);
-        let buf_v_pos = self.buf_slice_pooled(v_pos);
+        let buf_q_pos = self.buf_slice_pooled(q_pos)?;
+        let buf_k_pos = self.buf_slice_pooled(k_pos)?;
+        let buf_v_pos = self.buf_slice_pooled(v_pos)?;
         // Head-major reshape targets — fully overwritten by the reshape kernel.
-        let buf_q = self.buf_uninit_pooled(elems);
-        let buf_k = self.buf_uninit_pooled(elems);
-        let buf_v = self.buf_uninit_pooled(elems);
-        let buf_scores = self.buf_zeros_pooled(total_heads * seq_len * seq_len);
-        let buf_out = self.buf_zeros_pooled(elems);
+        let buf_q = self.buf_uninit_pooled(elems)?;
+        let buf_k = self.buf_uninit_pooled(elems)?;
+        let buf_v = self.buf_uninit_pooled(elems)?;
+        let buf_scores = self.buf_zeros_pooled(total_heads * seq_len * seq_len)?;
+        let buf_out = self.buf_zeros_pooled(elems)?;
         // Position-major output — fully overwritten by the un-reshape kernel.
-        let buf_out_pos = self.buf_uninit_pooled(elems);
+        let buf_out_pos = self.buf_uninit_pooled(elems)?;
 
-        let buf_seq = self.buf_u32(seq_len as u32);
-        let buf_dim = self.buf_u32(head_dim as u32);
-        let buf_hpg = self.buf_u32(heads_per_group as u32);
-        let buf_scale = self.buf_f32(scale);
+        let buf_seq = self.buf_u32(seq_len as u32)?;
+        let buf_dim = self.buf_u32(head_dim as u32)?;
+        let buf_hpg = self.buf_u32(heads_per_group as u32)?;
+        let buf_scale = self.buf_f32(scale)?;
         let has_alibi = !alibi_slopes.is_empty();
         let alibi_ref = if has_alibi { alibi_slopes } else { &[0.0f32] };
-        let pooled_alibi = self.buf_slice_pooled(alibi_ref);
-        let buf_masks = self.buf_u32_slice(masks);
-        let buf_has_alibi = self.buf_u32(has_alibi as u32);
-        let buf_heads_per_group = self.buf_u32(heads_per_group as u32);
+        let pooled_alibi = self.buf_slice_pooled(alibi_ref)?;
+        let buf_masks = self.buf_u32_slice(masks)?;
+        let buf_has_alibi = self.buf_u32(has_alibi as u32)?;
+        let buf_heads_per_group = self.buf_u32(heads_per_group as u32)?;
 
-        let out = autoreleasepool(|_| {
+        let out = autoreleasepool(|_| -> Result<Vec<f32>, InferError> {
             let cmd = self.queue.new_command_buffer();
 
             // (0) Reshape position-major Q/K/V -> head-major qf/kf/vf on-device.
@@ -4250,7 +4300,7 @@ impl GpuCompute for MetalCompute {
                     buf_scores.buffer(),
                     &buf_seq,
                     &buf_dim,
-                    &self.buf_u32(1),
+                    &self.buf_u32(1)?,
                 ];
                 if use_mma(seq_len, seq_len, head_dim) {
                     self.encode_mma(
@@ -4306,7 +4356,7 @@ impl GpuCompute for MetalCompute {
                 let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(p);
                 enc.set_buffer(0, Some(buf_scores.buffer()), 0);
-                let buf_cols = self.buf_u32(seq_len as u32);
+                let buf_cols = self.buf_u32(seq_len as u32)?;
                 enc.set_buffer(1, Some(&buf_cols), 0);
                 let total_rows = total_heads * seq_len;
                 let tw = p.thread_execution_width() as usize;
@@ -4327,7 +4377,7 @@ impl GpuCompute for MetalCompute {
                     buf_out.buffer(),
                     &buf_seq,
                     &buf_dim,
-                    &self.buf_u32(1),
+                    &self.buf_u32(1)?,
                 ];
                 if use_mma(seq_len, head_dim, seq_len) {
                     self.encode_mma(
@@ -4388,15 +4438,15 @@ impl GpuCompute for MetalCompute {
                 });
             }
 
-            Self::read_buf(buf_out_pos.buffer(), elems)
-        });
+            Ok(Self::read_buf(buf_out_pos.buffer(), elems))
+        })?;
         Self::count_nonfinite(
             &format!(
                 "fused_attention_batched_posmajor seq_len={seq_len} total_heads={total_heads}"
             ),
             &out,
         );
-        out
+        Ok(out)
     }
 
     fn backend(&self) -> GpuBackend {
@@ -4493,7 +4543,7 @@ mod tests {
             let rows = actual * total_dim;
             let mut qb = q_ref[base..base + rows].to_vec();
             let mut kb = k_ref[base..base + rows].to_vec();
-            metal.rope_pair(&mut qb, &mut kb, &cos, &sin, 0, actual, head_dim, total_dim);
+            metal.rope_pair(&mut qb, &mut kb, &cos, &sin, 0, actual, head_dim, total_dim).unwrap();
             q_ref[base..base + rows].copy_from_slice(&qb);
             k_ref[base..base + rows].copy_from_slice(&kb);
         }
@@ -4503,7 +4553,7 @@ mod tests {
         let mut k_bat = k0.clone();
         metal.rope_pair_batched(
             &mut q_bat, &mut k_bat, &cos, &sin, batch_size, max_len, actual, head_dim, total_dim,
-        );
+        ).unwrap();
 
         let max_q = q_ref
             .iter()
@@ -4530,7 +4580,7 @@ mod tests {
         let Some(metal) = get_metal() else { return };
         let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let b = vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
-        let c = metal.matmul(&a, &b, 2, 2, 3);
+        let c = metal.matmul(&a, &b, 2, 2, 3).unwrap();
         assert!((c[0] - 50.0).abs() < 1e-3, "got {}", c[0]);
         assert!((c[1] - 68.0).abs() < 1e-3, "got {}", c[1]);
         assert!((c[2] - 122.0).abs() < 1e-3, "got {}", c[2]);
@@ -4541,7 +4591,7 @@ mod tests {
     fn test_metal_softmax() {
         let Some(metal) = get_metal() else { return };
         let mut data = vec![1.0, 2.0, 3.0];
-        metal.softmax(&mut data, 1, 3);
+        metal.softmax(&mut data, 1, 3).unwrap();
         let sum: f32 = data.iter().sum();
         assert!((sum - 1.0).abs() < 1e-4, "sum={}", sum);
     }
@@ -4550,7 +4600,7 @@ mod tests {
     fn test_metal_gelu() {
         let Some(metal) = get_metal() else { return };
         let mut data = vec![0.0, 1.0, -1.0];
-        metal.gelu(&mut data);
+        metal.gelu(&mut data).unwrap();
         assert!(data[0].abs() < 1e-5);
         assert!((data[1] - 0.8413).abs() < 0.01);
     }
@@ -4561,7 +4611,7 @@ mod tests {
         let mut data = vec![1.0, 2.0, 3.0, 4.0];
         let gamma = vec![1.0; 4];
         let beta = vec![0.0; 4];
-        metal.layer_norm(&mut data, &gamma, &beta, 1, 4, 1e-5);
+        metal.layer_norm(&mut data, &gamma, &beta, 1, 4, 1e-5).unwrap();
         let mean: f32 = data.iter().sum::<f32>() / 4.0;
         assert!(mean.abs() < 1e-3, "mean={}", mean);
     }
@@ -4570,7 +4620,7 @@ mod tests {
     fn test_metal_silu() {
         let Some(metal) = get_metal() else { return };
         let mut data = vec![0.0, 1.0];
-        metal.silu(&mut data);
+        metal.silu(&mut data).unwrap();
         assert!(data[0].abs() < 1e-5);
         assert!((data[1] - 0.7311).abs() < 0.01);
     }
@@ -4587,8 +4637,8 @@ mod tests {
         let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
         let b: Vec<f32> = (0..n * k).map(|i| (i as f32) * 0.01).collect();
 
-        let c_metal = metal.matmul(&a, &b, m, n, k);
-        let c_cpu = cpu.matmul(&a, &b, m, n, k);
+        let c_metal = metal.matmul(&a, &b, m, n, k).unwrap();
+        let c_cpu = cpu.matmul(&a, &b, m, n, k).unwrap();
 
         // Check relative error — accumulation order differs between GPU and CPU,
         // so absolute diff grows with magnitude. Relative error should be < 1e-4.
@@ -4624,8 +4674,8 @@ mod tests {
             .map(|i| ((i % 83) as f32 - 41.0) * 0.01)
             .collect();
 
-        let scores_metal = metal.batched_matmul(&q, &k, num_heads, seq_len, head_dim);
-        let scores_cpu = cpu.batched_matmul(&q, &k, num_heads, seq_len, head_dim);
+        let scores_metal = metal.batched_matmul(&q, &k, num_heads, seq_len, head_dim).unwrap();
+        let scores_cpu = cpu.batched_matmul(&q, &k, num_heads, seq_len, head_dim).unwrap();
 
         assert_eq!(scores_metal.len(), num_heads * seq_len * seq_len);
         let max_err: f32 = scores_metal
@@ -4666,8 +4716,8 @@ mod tests {
             .map(|i| ((i % 71) as f32 - 35.0) * 0.01)
             .collect();
 
-        let out_metal = metal.batched_attn_values(&scores, &v, num_heads, seq_len, head_dim);
-        let out_cpu = cpu.batched_attn_values(&scores, &v, num_heads, seq_len, head_dim);
+        let out_metal = metal.batched_attn_values(&scores, &v, num_heads, seq_len, head_dim).unwrap();
+        let out_cpu = cpu.batched_attn_values(&scores, &v, num_heads, seq_len, head_dim).unwrap();
 
         assert_eq!(out_metal.len(), num_heads * seq_len * head_dim);
         let max_err: f32 = out_metal
@@ -4718,7 +4768,7 @@ mod tests {
             scale,
             &alibi,
             &masks,
-        );
+        ).unwrap();
         let out_cpu = cpu.fused_attention_batched(
             &q,
             &k,
@@ -4730,7 +4780,7 @@ mod tests {
             scale,
             &alibi,
             &masks,
-        );
+        ).unwrap();
 
         assert_eq!(out_metal.len(), total_heads * seq_len * head_dim);
         let max_err: f32 = out_metal
@@ -4784,14 +4834,14 @@ mod tests {
 
         let first = metal.fused_attention_batched(
             &q, &k, &v, num_groups, heads_per_group, seq_len, head_dim, scale, &alibi, &masks,
-        );
+        ).unwrap();
         assert_eq!(first.len(), elems);
 
         // Determinism: 20 repeats must be bit-identical to the first run.
         for run in 0..20 {
             let out = metal.fused_attention_batched(
                 &q, &k, &v, num_groups, heads_per_group, seq_len, head_dim, scale, &alibi, &masks,
-            );
+            ).unwrap();
             let max_abs: f32 = first
                 .iter()
                 .zip(out.iter())
@@ -4806,7 +4856,7 @@ mod tests {
         // Correctness vs CPU reference.
         let out_cpu = cpu.fused_attention_batched(
             &q, &k, &v, num_groups, heads_per_group, seq_len, head_dim, scale, &alibi, &masks,
-        );
+        ).unwrap();
         let max_err: f32 = first
             .iter()
             .zip(out_cpu.iter())
@@ -4846,10 +4896,10 @@ mod tests {
         let (m, n, k) = (2560usize, 768usize, 768usize);
         let a: Vec<f32> = (0..m * k).map(|i| ((i % 257) as f32 - 128.0) * 0.003).collect();
         let b: Vec<f32> = (0..n * k).map(|i| ((i % 251) as f32 - 125.0) * 0.003).collect();
-        let first = metal.matmul(&a, &b, m, n, k);
+        let first = metal.matmul(&a, &b, m, n, k).unwrap();
         assert_eq!(first.len(), m * n);
         for run in 0..20 {
-            let out = metal.matmul(&a, &b, m, n, k);
+            let out = metal.matmul(&a, &b, m, n, k).unwrap();
             let d = max_abs_diff(&first, &out);
             assert!(
                 d == 0.0,
@@ -4867,9 +4917,9 @@ mod tests {
         let w: Vec<f32> = (0..768 * k).map(|i| ((i % 251) as f32 - 125.0) * 0.003).collect();
         let weights: Vec<&[f32]> = vec![&w, &w, &w];
         let ns = vec![768usize, 768, 768];
-        let first = metal.matmul_many(&a, &weights, m, &ns, k);
+        let first = metal.matmul_many(&a, &weights, m, &ns, k).unwrap();
         for run in 0..20 {
-            let out = metal.matmul_many(&a, &weights, m, &ns, k);
+            let out = metal.matmul_many(&a, &weights, m, &ns, k).unwrap();
             let mut d = 0.0f32;
             for (fo, oo) in first.iter().zip(out.iter()) {
                 d = d.max(max_abs_diff(fo, oo));
@@ -4890,10 +4940,10 @@ mod tests {
         let wg: Vec<f32> = (0..inter * hidden).map(|i| ((i % 251) as f32 - 125.0) * 0.002).collect();
         let wu: Vec<f32> = (0..inter * hidden).map(|i| ((i % 241) as f32 - 120.0) * 0.002).collect();
         let wd: Vec<f32> = (0..hidden * inter).map(|i| ((i % 239) as f32 - 119.0) * 0.002).collect();
-        let first = metal.fused_ffn_swiglu(&x, &wg, &wu, &wd, rows, hidden, inter);
+        let first = metal.fused_ffn_swiglu(&x, &wg, &wu, &wd, rows, hidden, inter).unwrap();
         assert_eq!(first.len(), rows * hidden);
         for run in 0..20 {
-            let out = metal.fused_ffn_swiglu(&x, &wg, &wu, &wd, rows, hidden, inter);
+            let out = metal.fused_ffn_swiglu(&x, &wg, &wu, &wd, rows, hidden, inter).unwrap();
             let d = max_abs_diff(&first, &out);
             assert!(
                 d == 0.0,
@@ -4914,10 +4964,10 @@ mod tests {
         let beta: Vec<f32> = (0..cols).map(|i| (i % 7) as f32 * 0.01).collect();
         let eps = 1e-12f32;
         let mut first = base.clone();
-        metal.layer_norm(&mut first, &gamma, &beta, rows, cols, eps);
+        metal.layer_norm(&mut first, &gamma, &beta, rows, cols, eps).unwrap();
         for run in 0..20 {
             let mut out = base.clone();
-            metal.layer_norm(&mut out, &gamma, &beta, rows, cols, eps);
+            metal.layer_norm(&mut out, &gamma, &beta, rows, cols, eps).unwrap();
             let d = max_abs_diff(&first, &out);
             assert!(
                 d == 0.0,
@@ -4970,10 +5020,10 @@ mod tests {
 
         let out_pos = metal.fused_attention_batched_posmajor(
             &qp, &kp, &vp, num_groups, heads_per_group, seq_len, head_dim, scale, &alibi, &masks,
-        );
+        ).unwrap();
         let out_head = metal.fused_attention_batched(
             &qh, &kh, &vh, num_groups, heads_per_group, seq_len, head_dim, scale, &alibi, &masks,
-        );
+        ).unwrap();
 
         assert_eq!(out_pos.len(), elems);
         let mut max_err = 0.0f32;
@@ -5016,12 +5066,12 @@ mod tests {
         let a: Vec<f32> = (0..m * k).map(|i| ((i % 89) as f32 - 44.0) * 0.01).collect();
         let b: Vec<f32> = (0..n * k).map(|i| ((i % 73) as f32 - 36.0) * 0.01).collect();
 
-        let buf_a = metal.buf_slice_pooled(&a);
-        let buf_b = metal.buf_cached(&b);
-        let buf_c = metal.buf_zeros_pooled(m * n);
-        let buf_m = metal.buf_u32(m as u32);
-        let buf_n = metal.buf_u32(n as u32);
-        let buf_k = metal.buf_u32(k as u32);
+        let buf_a = metal.buf_slice_pooled(&a).unwrap();
+        let buf_b = metal.buf_cached(&b).unwrap();
+        let buf_c = metal.buf_zeros_pooled(m * n).unwrap();
+        let buf_m = metal.buf_u32(m as u32).unwrap();
+        let buf_n = metal.buf_u32(n as u32).unwrap();
+        let buf_k = metal.buf_u32(k as u32).unwrap();
         let bufs = [buf_a.buffer(), &buf_b, buf_c.buffer(), &buf_m, &buf_n, &buf_k];
         autoreleasepool(|_| {
             let cmd = metal.queue.new_command_buffer();
@@ -5037,7 +5087,7 @@ mod tests {
             metal.commit_wait(cmd);
         });
         let wide_out = MetalCompute::read_buf(buf_c.buffer(), m * n);
-        let cpu_out = cpu.matmul(&a, &b, m, n, k);
+        let cpu_out = cpu.matmul(&a, &b, m, n, k).unwrap();
 
         assert_eq!(wide_out.len(), m * n);
         let max_err: f32 = wide_out
@@ -5072,12 +5122,12 @@ mod tests {
         let a: Vec<f32> = (0..m * k).map(|i| ((i % 89) as f32 - 44.0) * 0.01).collect();
         let b: Vec<f32> = (0..n * k).map(|i| ((i % 73) as f32 - 36.0) * 0.01).collect();
 
-        let buf_a = metal.buf_slice_pooled(&a);
-        let buf_b = metal.buf_cached(&b);
-        let buf_c = metal.buf_zeros_pooled(m * n);
-        let buf_m = metal.buf_u32(m as u32);
-        let buf_n = metal.buf_u32(n as u32);
-        let buf_k = metal.buf_u32(k as u32);
+        let buf_a = metal.buf_slice_pooled(&a).unwrap();
+        let buf_b = metal.buf_cached(&b).unwrap();
+        let buf_c = metal.buf_zeros_pooled(m * n).unwrap();
+        let buf_m = metal.buf_u32(m as u32).unwrap();
+        let buf_n = metal.buf_u32(n as u32).unwrap();
+        let buf_k = metal.buf_u32(k as u32).unwrap();
         let bufs = [buf_a.buffer(), &buf_b, buf_c.buffer(), &buf_m, &buf_n, &buf_k];
         autoreleasepool(|_| {
             let cmd = metal.queue.new_command_buffer();
@@ -5093,7 +5143,7 @@ mod tests {
             metal.commit_wait(cmd);
         });
         let steel_out = MetalCompute::read_buf(buf_c.buffer(), m * n);
-        let cpu_out = cpu.matmul(&a, &b, m, n, k);
+        let cpu_out = cpu.matmul(&a, &b, m, n, k).unwrap();
 
         assert_eq!(steel_out.len(), m * n);
         assert!(
@@ -5129,12 +5179,12 @@ mod tests {
         let a: Vec<f32> = (0..m * k).map(|i| ((i % 89) as f32 - 44.0) * 0.01).collect();
         let b: Vec<f32> = (0..n * k).map(|i| ((i % 73) as f32 - 36.0) * 0.01).collect();
 
-        let buf_a = metal.buf_slice_pooled(&a);
-        let buf_b = metal.buf_cached(&b);
-        let buf_c = metal.buf_zeros_pooled(m * n);
-        let buf_m = metal.buf_u32(m as u32);
-        let buf_n = metal.buf_u32(n as u32);
-        let buf_k = metal.buf_u32(k as u32);
+        let buf_a = metal.buf_slice_pooled(&a).unwrap();
+        let buf_b = metal.buf_cached(&b).unwrap();
+        let buf_c = metal.buf_zeros_pooled(m * n).unwrap();
+        let buf_m = metal.buf_u32(m as u32).unwrap();
+        let buf_n = metal.buf_u32(n as u32).unwrap();
+        let buf_k = metal.buf_u32(k as u32).unwrap();
         let bufs = [buf_a.buffer(), &buf_b, buf_c.buffer(), &buf_m, &buf_n, &buf_k];
         autoreleasepool(|_| {
             let cmd = metal.queue.new_command_buffer();
@@ -5150,7 +5200,7 @@ mod tests {
             metal.commit_wait(cmd);
         });
         let fp16_out = MetalCompute::read_buf(buf_c.buffer(), m * n);
-        let cpu_out = cpu.matmul(&a, &b, m, n, k);
+        let cpu_out = cpu.matmul(&a, &b, m, n, k).unwrap();
 
         assert_eq!(fp16_out.len(), m * n);
         assert!(
@@ -5184,11 +5234,11 @@ mod tests {
             .map(|i| ((i % 37) as f32 - 18.0) * 0.01)
             .collect();
 
-        let many = metal.matmul_many(&a, &[&b0, &b1, &b2], m, &[n, n, n], k);
+        let many = metal.matmul_many(&a, &[&b0, &b1, &b2], m, &[n, n, n], k).unwrap();
         let single = vec![
-            metal.matmul(&a, &b0, m, n, k),
-            metal.matmul(&a, &b1, m, n, k),
-            metal.matmul(&a, &b2, m, n, k),
+            metal.matmul(&a, &b0, m, n, k).unwrap(),
+            metal.matmul(&a, &b1, m, n, k).unwrap(),
+            metal.matmul(&a, &b2, m, n, k).unwrap(),
         ];
 
         assert_eq!(many.len(), single.len());

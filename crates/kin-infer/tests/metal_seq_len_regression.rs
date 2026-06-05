@@ -100,7 +100,7 @@ fn metal_fused_attention_batched_seq_len_sweep() {
             scale,
             &alibi,
             &masks,
-        );
+        ).unwrap();
         let out_cpu = cpu.fused_attention_batched(
             &q,
             &k,
@@ -112,7 +112,7 @@ fn metal_fused_attention_batched_seq_len_sweep() {
             scale,
             &alibi,
             &masks,
-        );
+        ).unwrap();
 
         let nan_metal = count_nonfinite(&out_metal);
         let nan_cpu = count_nonfinite(&out_cpu);
@@ -174,8 +174,8 @@ fn metal_gelu_does_not_nan_on_large_inputs() {
     }
     let mut metal_out = data.clone();
     let mut cpu_out = data.clone();
-    metal.gelu(&mut metal_out);
-    cpu.gelu(&mut cpu_out);
+    metal.gelu(&mut metal_out).unwrap();
+    cpu.gelu(&mut cpu_out).unwrap();
 
     eprintln!("input  -> metal | cpu");
     let mut bad = Vec::new();
@@ -219,8 +219,8 @@ fn metal_matmul_shapes_match_cpu_at_bert_dims() {
         let b: Vec<f32> = (0..n * k)
             .map(|i| ((i as i32 % 263 - 131) as f32) * 0.05)
             .collect();
-        let c_metal = metal.matmul(&a, &b, m, n, k);
-        let c_cpu = cpu.matmul(&a, &b, m, n, k);
+        let c_metal = metal.matmul(&a, &b, m, n, k).unwrap();
+        let c_cpu = cpu.matmul(&a, &b, m, n, k).unwrap();
         let err = max_abs_err(&c_metal, &c_cpu);
         let nan = count_nonfinite(&c_metal);
         eprintln!(
@@ -285,21 +285,21 @@ fn metal_fused_linear_add_norm_matches_per_op() {
         // Candidate: the fused residency path.
         let fused = metal.fused_linear_add_norm(
             &x, &w, &residual, &gamma, &beta, rows, cols, hidden, eps,
-        );
+        ).unwrap();
 
         // Oracle A: same Metal primitives, per-op (matmul -> host add -> layer_norm).
-        let mut ref_metal = metal.matmul(&x, &w, rows, hidden, cols);
+        let mut ref_metal = metal.matmul(&x, &w, rows, hidden, cols).unwrap();
         for (s, r) in ref_metal.iter_mut().zip(residual.iter()) {
             *s += *r;
         }
-        metal.layer_norm(&mut ref_metal, &gamma, &beta, rows, hidden, eps);
+        metal.layer_norm(&mut ref_metal, &gamma, &beta, rows, hidden, eps).unwrap();
 
         // Oracle B: CPU primitives end-to-end.
-        let mut ref_cpu = cpu.matmul(&x, &w, rows, hidden, cols);
+        let mut ref_cpu = cpu.matmul(&x, &w, rows, hidden, cols).unwrap();
         for (s, r) in ref_cpu.iter_mut().zip(residual.iter()) {
             *s += *r;
         }
-        cpu.layer_norm(&mut ref_cpu, &gamma, &beta, rows, hidden, eps);
+        cpu.layer_norm(&mut ref_cpu, &gamma, &beta, rows, hidden, eps).unwrap();
 
         let err_metal = max_abs_err(&fused, &ref_metal);
         let err_cpu = max_abs_err(&fused, &ref_cpu);
@@ -367,21 +367,21 @@ fn metal_fused_ffn_swiglu_add_norm_matches_per_op() {
 
         let fused = metal.fused_ffn_swiglu_add_norm(
             &x, &w_gate, &w_up, &w_down, &residual, &gamma, &beta, rows, hidden, inter, eps,
-        );
+        ).unwrap();
 
         // Oracle A: same Metal primitives, per-op.
-        let mut ref_metal = metal.fused_ffn_swiglu(&x, &w_gate, &w_up, &w_down, rows, hidden, inter);
+        let mut ref_metal = metal.fused_ffn_swiglu(&x, &w_gate, &w_up, &w_down, rows, hidden, inter).unwrap();
         for (s, r) in ref_metal.iter_mut().zip(residual.iter()) {
             *s += *r;
         }
-        metal.layer_norm(&mut ref_metal, &gamma, &beta, rows, hidden, eps);
+        metal.layer_norm(&mut ref_metal, &gamma, &beta, rows, hidden, eps).unwrap();
 
         // Oracle B: CPU primitives end-to-end.
-        let mut ref_cpu = cpu.fused_ffn_swiglu(&x, &w_gate, &w_up, &w_down, rows, hidden, inter);
+        let mut ref_cpu = cpu.fused_ffn_swiglu(&x, &w_gate, &w_up, &w_down, rows, hidden, inter).unwrap();
         for (s, r) in ref_cpu.iter_mut().zip(residual.iter()) {
             *s += *r;
         }
-        cpu.layer_norm(&mut ref_cpu, &gamma, &beta, rows, hidden, eps);
+        cpu.layer_norm(&mut ref_cpu, &gamma, &beta, rows, hidden, eps).unwrap();
 
         let err_metal = max_abs_err(&fused, &ref_metal);
         let err_cpu = max_abs_err(&fused, &ref_cpu);
@@ -631,10 +631,10 @@ fn metal_fused_attention_seq_len_sweep() {
 
         let out_metal = metal.fused_attention(
             &q, &k, &v, num_heads, seq_len, head_dim, scale, &alibi, &mask,
-        );
+        ).unwrap();
         let out_cpu = cpu.fused_attention(
             &q, &k, &v, num_heads, seq_len, head_dim, scale, &alibi, &mask,
-        );
+        ).unwrap();
 
         let nan_metal = count_nonfinite(&out_metal);
         let nan_cpu = count_nonfinite(&out_cpu);

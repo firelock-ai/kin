@@ -10,6 +10,7 @@
 #![cfg(feature = "cuda")]
 
 use crate::gpu::{GpuBackend, GpuCompute, GpuDeviceInfo};
+use crate::InferError;
 use std::ffi::{c_void, CStr, CString};
 use std::os::raw::{c_char, c_int, c_uint};
 use std::ptr;
@@ -825,7 +826,7 @@ impl Drop for CudaCompute {
 }
 
 impl GpuCompute for CudaCompute {
-    fn matmul(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    fn matmul(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Result<Vec<f32>, InferError> {
         let func = self.get_function("matmul_transb").unwrap();
         let mut buf_a = CudaBuffer::from_slice(a).unwrap();
         let mut buf_b = CudaBuffer::from_slice(b).unwrap();
@@ -844,7 +845,7 @@ impl GpuCompute for CudaCompute {
         ];
 
         self.launch_2d(func, &mut params, n, m);
-        buf_c.to_vec(m * n)
+        Ok(buf_c.to_vec(m * n))
     }
 
     fn batched_matmul(
@@ -854,7 +855,7 @@ impl GpuCompute for CudaCompute {
         num_heads: usize,
         seq_len: usize,
         head_dim: usize,
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, InferError> {
         let head_stride = seq_len * head_dim;
         let out_stride = seq_len * seq_len;
         let mut result = vec![0.0f32; num_heads * out_stride];
@@ -862,10 +863,10 @@ impl GpuCompute for CudaCompute {
         for h in 0..num_heads {
             let q_head = &q[h * head_stride..(h + 1) * head_stride];
             let k_head = &k[h * head_stride..(h + 1) * head_stride];
-            let head_result = self.matmul(q_head, k_head, seq_len, seq_len, head_dim);
+            let head_result = self.matmul(q_head, k_head, seq_len, seq_len, head_dim)?;
             result[h * out_stride..(h + 1) * out_stride].copy_from_slice(&head_result);
         }
-        result
+        Ok(result)
     }
 
     fn batched_attn_values(
@@ -875,7 +876,7 @@ impl GpuCompute for CudaCompute {
         num_heads: usize,
         seq_len: usize,
         head_dim: usize,
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, InferError> {
         let s_stride = seq_len * seq_len;
         let v_stride = seq_len * head_dim;
         let mut result = vec![0.0f32; num_heads * v_stride];
@@ -893,14 +894,14 @@ impl GpuCompute for CudaCompute {
                 }
             }
 
-            let head_result = self.matmul(scores_head, &v_t, seq_len, head_dim, seq_len);
+            let head_result = self.matmul(scores_head, &v_t, seq_len, head_dim, seq_len)?;
             result[h * v_stride..(h + 1) * v_stride].copy_from_slice(&head_result);
         }
 
-        result
+        Ok(result)
     }
 
-    fn softmax(&self, data: &mut [f32], rows: usize, cols: usize) {
+    fn softmax(&self, data: &mut [f32], rows: usize, cols: usize) -> Result<(), InferError> {
         let func = self.get_function("softmax_rows").unwrap();
         let mut buf = CudaBuffer::from_slice(data).unwrap();
         let mut cols_val = cols as u32;
@@ -912,6 +913,7 @@ impl GpuCompute for CudaCompute {
 
         self.launch_1d(func, &mut params, rows);
         buf.read_into(data);
+        Ok(())
     }
 
     fn layer_norm(
@@ -922,7 +924,7 @@ impl GpuCompute for CudaCompute {
         rows: usize,
         cols: usize,
         eps: f32,
-    ) {
+    ) -> Result<(), InferError> {
         let func = self.get_function("layer_norm").unwrap();
         let mut buf = CudaBuffer::from_slice(data).unwrap();
         let mut buf_gamma = CudaBuffer::from_slice(gamma).unwrap();
@@ -940,9 +942,10 @@ impl GpuCompute for CudaCompute {
 
         self.launch_1d(func, &mut params, rows);
         buf.read_into(data);
+        Ok(())
     }
 
-    fn rms_norm(&self, data: &mut [f32], weight: &[f32], rows: usize, cols: usize, eps: f32) {
+    fn rms_norm(&self, data: &mut [f32], weight: &[f32], rows: usize, cols: usize, eps: f32) -> Result<(), InferError> {
         let func = self.get_function("rms_norm").unwrap();
         let mut buf = CudaBuffer::from_slice(data).unwrap();
         let mut buf_weight = CudaBuffer::from_slice(weight).unwrap();
@@ -958,9 +961,10 @@ impl GpuCompute for CudaCompute {
 
         self.launch_1d(func, &mut params, rows);
         buf.read_into(data);
+        Ok(())
     }
 
-    fn gelu(&self, data: &mut [f32]) {
+    fn gelu(&self, data: &mut [f32]) -> Result<(), InferError> {
         let func = self.get_function("gelu_activation").unwrap();
         let mut buf = CudaBuffer::from_slice(data).unwrap();
         let mut count = data.len() as u32;
@@ -972,9 +976,10 @@ impl GpuCompute for CudaCompute {
 
         self.launch_1d(func, &mut params, data.len());
         buf.read_into(data);
+        Ok(())
     }
 
-    fn silu(&self, data: &mut [f32]) {
+    fn silu(&self, data: &mut [f32]) -> Result<(), InferError> {
         let func = self.get_function("silu_activation").unwrap();
         let mut buf = CudaBuffer::from_slice(data).unwrap();
         let mut count = data.len() as u32;
@@ -986,9 +991,10 @@ impl GpuCompute for CudaCompute {
 
         self.launch_1d(func, &mut params, data.len());
         buf.read_into(data);
+        Ok(())
     }
 
-    fn elementwise_mul(&self, a: &mut [f32], b: &[f32]) {
+    fn elementwise_mul(&self, a: &mut [f32], b: &[f32]) -> Result<(), InferError> {
         let func = self.get_function("elementwise_mul").unwrap();
         let mut buf_a = CudaBuffer::from_slice(a).unwrap();
         let mut buf_b = CudaBuffer::from_slice(b).unwrap();
@@ -1002,6 +1008,7 @@ impl GpuCompute for CudaCompute {
 
         self.launch_1d(func, &mut params, a.len());
         buf_a.read_into(a);
+        Ok(())
     }
 
     fn rope(
@@ -1013,7 +1020,7 @@ impl GpuCompute for CudaCompute {
         seq_len: usize,
         head_dim: usize,
         total_dim: usize,
-    ) {
+    ) -> Result<(), InferError> {
         let func = self.get_function("rope_apply").unwrap();
         let mut buf = CudaBuffer::from_slice(data).unwrap();
         let mut buf_cos = CudaBuffer::from_slice(cos_table).unwrap();
@@ -1038,6 +1045,7 @@ impl GpuCompute for CudaCompute {
         let num_pairs = total_dim / 2;
         self.launch_2d(func, &mut params, num_pairs, seq_len);
         buf.read_into(data);
+        Ok(())
     }
 
     fn backend(&self) -> GpuBackend {

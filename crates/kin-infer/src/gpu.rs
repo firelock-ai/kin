@@ -10,6 +10,8 @@ use std::fmt;
 
 use rayon::prelude::*;
 
+use crate::InferError;
+
 // ---------------------------------------------------------------------------
 // Device discovery and selection
 // ---------------------------------------------------------------------------
@@ -197,7 +199,7 @@ pub struct LayerConfig<'a> {
 /// own their device buffers and handle host↔device transfers.
 pub trait GpuCompute: Send + Sync {
     /// Matrix multiply: C = A × B^T. A is [M, K], B is [N, K], result is [M, N].
-    fn matmul(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32>;
+    fn matmul(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Result<Vec<f32>, InferError>;
 
     /// Matrix multiply against multiple weight matrices sharing the same input A.
     ///
@@ -210,7 +212,7 @@ pub trait GpuCompute: Send + Sync {
         m: usize,
         ns: &[usize],
         k: usize,
-    ) -> Vec<Vec<f32>> {
+    ) -> Result<Vec<Vec<f32>>, InferError> {
         weights
             .iter()
             .zip(ns.iter().copied())
@@ -226,7 +228,7 @@ pub trait GpuCompute: Send + Sync {
         num_heads: usize,
         seq_len: usize,
         head_dim: usize,
-    ) -> Vec<f32>;
+    ) -> Result<Vec<f32>, InferError>;
 
     /// Batched scores × V (non-transposed): output = scores × V per head.
     /// scores is [num_heads, seq_len, seq_len], V is [num_heads, seq_len, head_dim].
@@ -238,10 +240,10 @@ pub trait GpuCompute: Send + Sync {
         num_heads: usize,
         seq_len: usize,
         head_dim: usize,
-    ) -> Vec<f32>;
+    ) -> Result<Vec<f32>, InferError>;
 
     /// Softmax over rows: each row of [M, N] independently normalized.
-    fn softmax(&self, data: &mut [f32], rows: usize, cols: usize);
+    fn softmax(&self, data: &mut [f32], rows: usize, cols: usize) -> Result<(), InferError>;
 
     /// LayerNorm: (x - mean) / sqrt(var + eps) * gamma + beta.
     fn layer_norm(
@@ -252,19 +254,19 @@ pub trait GpuCompute: Send + Sync {
         rows: usize,
         cols: usize,
         eps: f32,
-    );
+    ) -> Result<(), InferError>;
 
     /// RMSNorm: x * rsqrt(mean(x^2) + eps) * weight.
-    fn rms_norm(&self, data: &mut [f32], weight: &[f32], rows: usize, cols: usize, eps: f32);
+    fn rms_norm(&self, data: &mut [f32], weight: &[f32], rows: usize, cols: usize, eps: f32) -> Result<(), InferError>;
 
     /// GELU activation in-place.
-    fn gelu(&self, data: &mut [f32]);
+    fn gelu(&self, data: &mut [f32]) -> Result<(), InferError>;
 
     /// SiLU activation in-place.
-    fn silu(&self, data: &mut [f32]);
+    fn silu(&self, data: &mut [f32]) -> Result<(), InferError>;
 
     /// Element-wise multiply: out[i] = a[i] * b[i].
-    fn elementwise_mul(&self, a: &mut [f32], b: &[f32]);
+    fn elementwise_mul(&self, a: &mut [f32], b: &[f32]) -> Result<(), InferError>;
 
     /// Fused SwiGLU feed-forward block in a single GPU submission:
     ///
@@ -291,11 +293,11 @@ pub trait GpuCompute: Send + Sync {
         rows: usize,
         hidden: usize,
         inter: usize,
-    ) -> Vec<f32> {
-        let mut gate = self.matmul(x, w_gate, rows, inter, hidden);
-        let up = self.matmul(x, w_up, rows, inter, hidden);
-        self.silu(&mut gate);
-        self.elementwise_mul(&mut gate, &up);
+    ) -> Result<Vec<f32>, InferError> {
+        let mut gate = self.matmul(x, w_gate, rows, inter, hidden)?;
+        let up = self.matmul(x, w_up, rows, inter, hidden)?;
+        self.silu(&mut gate)?;
+        self.elementwise_mul(&mut gate, &up)?;
         self.matmul(&gate, w_down, rows, hidden, inter)
     }
 
@@ -309,7 +311,7 @@ pub trait GpuCompute: Send + Sync {
         seq_len: usize,
         head_dim: usize,
         total_dim: usize,
-    );
+    ) -> Result<(), InferError>;
 
     /// Apply RoPE to two tensors (typically Q and K) sharing the same cos/sin
     /// tables, in a single GPU submission. Q and K are independent, so a backend
@@ -326,9 +328,10 @@ pub trait GpuCompute: Send + Sync {
         seq_len: usize,
         head_dim: usize,
         total_dim: usize,
-    ) {
-        self.rope(q, cos_table, sin_table, seq_offset, seq_len, head_dim, total_dim);
-        self.rope(k, cos_table, sin_table, seq_offset, seq_len, head_dim, total_dim);
+    ) -> Result<(), InferError> {
+        self.rope(q, cos_table, sin_table, seq_offset, seq_len, head_dim, total_dim)?;
+        self.rope(k, cos_table, sin_table, seq_offset, seq_len, head_dim, total_dim)?;
+        Ok(())
     }
 
     /// Apply RoPE to Q and K for a WHOLE BATCH in one submission. `q`/`k` are
@@ -349,7 +352,7 @@ pub trait GpuCompute: Send + Sync {
         actual: usize,
         head_dim: usize,
         total_dim: usize,
-    ) {
+    ) -> Result<(), InferError> {
         for b in 0..batch_size {
             let base = b * max_len * total_dim;
             let rows = actual * total_dim;
@@ -359,8 +362,9 @@ pub trait GpuCompute: Send + Sync {
             );
             self.rope_pair(
                 q_block, k_block, cos_table, sin_table, 0, actual, head_dim, total_dim,
-            );
+            )?;
         }
+        Ok(())
     }
 
     /// Fused attention: Q×K^T → scale+ALiBi+mask → softmax → scores×V
@@ -378,9 +382,9 @@ pub trait GpuCompute: Send + Sync {
         scale: f32,
         alibi_slopes: &[f32],
         mask: &[u32],
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, InferError> {
         // Default: fall back to separate operations
-        let mut scores = self.batched_matmul(q, k, num_heads, seq_len, head_dim);
+        let mut scores = self.batched_matmul(q, k, num_heads, seq_len, head_dim)?;
         let has_alibi = !alibi_slopes.is_empty();
         for hd in 0..num_heads {
             let base = hd * seq_len * seq_len;
@@ -398,7 +402,7 @@ pub trait GpuCompute: Send + Sync {
                 }
             }
         }
-        self.softmax(&mut scores, num_heads * seq_len, seq_len);
+        self.softmax(&mut scores, num_heads * seq_len, seq_len)?;
         self.batched_attn_values(&scores, v, num_heads, seq_len, head_dim)
     }
 
@@ -419,9 +423,9 @@ pub trait GpuCompute: Send + Sync {
         scale: f32,
         alibi_slopes: &[f32],
         masks: &[u32],
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, InferError> {
         let total_heads = num_groups * heads_per_group;
-        let mut scores = self.batched_matmul(q, k, total_heads, seq_len, head_dim);
+        let mut scores = self.batched_matmul(q, k, total_heads, seq_len, head_dim)?;
         let has_alibi = !alibi_slopes.is_empty();
 
         for group in 0..num_groups {
@@ -445,7 +449,7 @@ pub trait GpuCompute: Send + Sync {
             }
         }
 
-        self.softmax(&mut scores, total_heads * seq_len, seq_len);
+        self.softmax(&mut scores, total_heads * seq_len, seq_len)?;
         self.batched_attn_values(&scores, v, total_heads, seq_len, head_dim)
     }
 
@@ -473,7 +477,7 @@ pub trait GpuCompute: Send + Sync {
         scale: f32,
         alibi_slopes: &[f32],
         masks: &[u32],
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, InferError> {
         let total_heads = num_groups * heads_per_group;
         let total_dim = heads_per_group * head_dim;
         let elems = total_heads * seq_len * head_dim;
@@ -506,7 +510,7 @@ pub trait GpuCompute: Send + Sync {
             scale,
             alibi_slopes,
             masks,
-        );
+        )?;
 
         // Head-major [(group*heads), seq, head_dim] -> position-major
         // [group*seq, total_dim].
@@ -520,7 +524,7 @@ pub trait GpuCompute: Send + Sync {
                 }
             }
         }
-        out
+        Ok(out)
     }
 
     /// Fused SwiGLU feed-forward + residual + LayerNorm in a single GPU
@@ -550,13 +554,13 @@ pub trait GpuCompute: Send + Sync {
         hidden: usize,
         inter: usize,
         eps: f32,
-    ) -> Vec<f32> {
-        let mut sum = self.fused_ffn_swiglu(x, w_gate, w_up, w_down, rows, hidden, inter);
+    ) -> Result<Vec<f32>, InferError> {
+        let mut sum = self.fused_ffn_swiglu(x, w_gate, w_up, w_down, rows, hidden, inter)?;
         for (s, r) in sum.iter_mut().zip(residual.iter()) {
             *s += *r;
         }
-        self.layer_norm(&mut sum, gamma, beta, rows, hidden, eps);
-        sum
+        self.layer_norm(&mut sum, gamma, beta, rows, hidden, eps)?;
+        Ok(sum)
     }
 
     /// Fused projection + residual + LayerNorm in a single GPU submission:
@@ -590,13 +594,13 @@ pub trait GpuCompute: Send + Sync {
         cols: usize,
         hidden: usize,
         eps: f32,
-    ) -> Vec<f32> {
-        let mut sum = self.matmul(x, weight, rows, hidden, cols);
+    ) -> Result<Vec<f32>, InferError> {
+        let mut sum = self.matmul(x, weight, rows, hidden, cols)?;
         for (s, r) in sum.iter_mut().zip(residual.iter()) {
             *s += *r;
         }
-        self.layer_norm(&mut sum, gamma, beta, rows, hidden, eps);
-        sum
+        self.layer_norm(&mut sum, gamma, beta, rows, hidden, eps)?;
+        Ok(sum)
     }
 
     /// Evaluates an entire Transformer layer in a single GPU submission, keeping
@@ -605,10 +609,12 @@ pub trait GpuCompute: Send + Sync {
     /// Accepts a position-major input `hidden` of shape `[batch_size * max_len, hidden_size]`.
     /// `masks` is the flattened per-batch mask `[batch_size * max_len]`.
     ///
-    /// Returns `Some(Vec<f32>)` containing the position-major output if the backend 
-    /// supports fusing this specific layer configuration. 
-    /// Returns `None` to signal the caller to fall back to the per-operation path 
-    /// (which acts as both the fallback and the CPU parity reference).
+    /// Returns `Ok(Some(Vec<f32>))` containing the position-major output if the
+    /// backend supports fusing this specific layer configuration.
+    /// Returns `Ok(None)` to signal the caller to fall back to the per-operation
+    /// path (which acts as both the fallback and the CPU parity reference).
+    /// Returns `Err` if a backend allocation fails mid-fusion, so the caller can
+    /// degrade to CPU rather than crash.
     #[allow(clippy::too_many_arguments)]
     fn forward_layer_batched(
         &self,
@@ -618,8 +624,8 @@ pub trait GpuCompute: Send + Sync {
         _config: &LayerConfig,
         _rope_cos: &[f32],
         _rope_sin: &[f32],
-    ) -> Option<Vec<f32>> {
-        None
+    ) -> Result<Option<Vec<f32>>, InferError> {
+        Ok(None)
     }
 
     /// Which backend this compute instance uses.
@@ -679,7 +685,7 @@ fn should_parallelize(work_items: usize) -> bool {
 pub struct CpuCompute;
 
 impl GpuCompute for CpuCompute {
-    fn matmul(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    fn matmul(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Result<Vec<f32>, InferError> {
         // A is [M, K] row-major, B is [N, K] row-major (we compute A × B^T)
         let mut c = vec![0.0f32; m * n];
         if should_parallelize(m * n * k) {
@@ -699,7 +705,7 @@ impl GpuCompute for CpuCompute {
                 }
             }
         }
-        c
+        Ok(c)
     }
 
     fn batched_matmul(
@@ -709,7 +715,7 @@ impl GpuCompute for CpuCompute {
         num_heads: usize,
         seq_len: usize,
         head_dim: usize,
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, InferError> {
         // Q, K are [num_heads, seq_len, head_dim] flattened
         // Output is [num_heads, seq_len, seq_len]
         let mut scores = vec![0.0f32; num_heads * seq_len * seq_len];
@@ -747,7 +753,7 @@ impl GpuCompute for CpuCompute {
                 }
             }
         }
-        scores
+        Ok(scores)
     }
 
     fn batched_attn_values(
@@ -757,7 +763,7 @@ impl GpuCompute for CpuCompute {
         num_heads: usize,
         seq_len: usize,
         head_dim: usize,
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, InferError> {
         // scores is [num_heads, seq_len, seq_len], V is [num_heads, seq_len, head_dim]
         // output is [num_heads, seq_len, head_dim]
         let s_stride = seq_len * seq_len;
@@ -796,10 +802,10 @@ impl GpuCompute for CpuCompute {
                 }
             }
         }
-        result
+        Ok(result)
     }
 
-    fn softmax(&self, data: &mut [f32], rows: usize, cols: usize) {
+    fn softmax(&self, data: &mut [f32], rows: usize, cols: usize) -> Result<(), InferError> {
         if should_parallelize(rows * cols) {
             data.par_chunks_mut(cols).for_each(|row| {
                 let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -830,6 +836,7 @@ impl GpuCompute for CpuCompute {
                 }
             }
         }
+        Ok(())
     }
 
     fn layer_norm(
@@ -840,7 +847,7 @@ impl GpuCompute for CpuCompute {
         rows: usize,
         cols: usize,
         eps: f32,
-    ) {
+    ) -> Result<(), InferError> {
         if should_parallelize(rows * cols) {
             data.par_chunks_mut(cols).for_each(|row| {
                 let len = cols as f32;
@@ -863,9 +870,10 @@ impl GpuCompute for CpuCompute {
                 }
             }
         }
+        Ok(())
     }
 
-    fn rms_norm(&self, data: &mut [f32], weight: &[f32], rows: usize, cols: usize, eps: f32) {
+    fn rms_norm(&self, data: &mut [f32], weight: &[f32], rows: usize, cols: usize, eps: f32) -> Result<(), InferError> {
         if should_parallelize(rows * cols) {
             data.par_chunks_mut(cols).for_each(|row| {
                 let len = cols as f32;
@@ -886,9 +894,10 @@ impl GpuCompute for CpuCompute {
                 }
             }
         }
+        Ok(())
     }
 
-    fn gelu(&self, data: &mut [f32]) {
+    fn gelu(&self, data: &mut [f32]) -> Result<(), InferError> {
         if should_parallelize(data.len()) {
             data.par_iter_mut().for_each(|v| {
                 *v = *v * 0.5 * (1.0 + (*v * 0.7978845608 * (1.0 + 0.044715 * *v * *v)).tanh());
@@ -898,9 +907,10 @@ impl GpuCompute for CpuCompute {
                 *v = *v * 0.5 * (1.0 + (*v * 0.7978845608 * (1.0 + 0.044715 * *v * *v)).tanh());
             }
         }
+        Ok(())
     }
 
-    fn silu(&self, data: &mut [f32]) {
+    fn silu(&self, data: &mut [f32]) -> Result<(), InferError> {
         if should_parallelize(data.len()) {
             data.par_iter_mut().for_each(|v| {
                 *v = *v / (1.0 + (-*v).exp());
@@ -910,9 +920,10 @@ impl GpuCompute for CpuCompute {
                 *v = *v / (1.0 + (-*v).exp());
             }
         }
+        Ok(())
     }
 
-    fn elementwise_mul(&self, a: &mut [f32], b: &[f32]) {
+    fn elementwise_mul(&self, a: &mut [f32], b: &[f32]) -> Result<(), InferError> {
         if should_parallelize(a.len()) {
             a.par_iter_mut()
                 .zip(b.par_iter())
@@ -922,6 +933,7 @@ impl GpuCompute for CpuCompute {
                 *x *= y;
             }
         }
+        Ok(())
     }
 
     fn rope(
@@ -933,7 +945,7 @@ impl GpuCompute for CpuCompute {
         seq_len: usize,
         head_dim: usize,
         total_dim: usize,
-    ) {
+    ) -> Result<(), InferError> {
         let half = head_dim / 2;
         if should_parallelize(seq_len * total_dim) {
             data.par_chunks_mut(total_dim)
@@ -975,6 +987,7 @@ impl GpuCompute for CpuCompute {
                 }
             }
         }
+        Ok(())
     }
 
     fn backend(&self) -> GpuBackend {
@@ -1014,7 +1027,7 @@ mod tests {
         // [2,3] × [2,3]^T = [2,2]
         let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let b = vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
-        let c = cpu.matmul(&a, &b, 2, 2, 3);
+        let c = cpu.matmul(&a, &b, 2, 2, 3).unwrap();
         // Row 0: [1,2,3]·[7,8,9]=50, [1,2,3]·[10,11,12]=68
         assert!((c[0] - 50.0).abs() < 1e-4);
         assert!((c[1] - 68.0).abs() < 1e-4);
@@ -1030,7 +1043,7 @@ mod tests {
         let b1 = vec![1.0, 0.0, 0.0, 1.0];
         let b2 = vec![2.0, 1.0, 1.0, 2.0];
 
-        let outs = cpu.matmul_many(&a, &[&b1, &b2], 2, &[2, 2], 2);
+        let outs = cpu.matmul_many(&a, &[&b1, &b2], 2, &[2, 2], 2).unwrap();
 
         assert_eq!(outs.len(), 2);
         assert_eq!(outs[0], vec![1.0, 2.0, 3.0, 4.0]);
@@ -1041,7 +1054,7 @@ mod tests {
     fn test_cpu_softmax() {
         let cpu = CpuCompute;
         let mut data = vec![1.0, 2.0, 3.0];
-        cpu.softmax(&mut data, 1, 3);
+        cpu.softmax(&mut data, 1, 3).unwrap();
         let sum: f32 = data.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5);
         assert!(data[0] < data[1]);
@@ -1054,7 +1067,7 @@ mod tests {
         let mut data = vec![1.0, 2.0, 3.0, 4.0];
         let gamma = vec![1.0; 4];
         let beta = vec![0.0; 4];
-        cpu.layer_norm(&mut data, &gamma, &beta, 1, 4, 1e-5);
+        cpu.layer_norm(&mut data, &gamma, &beta, 1, 4, 1e-5).unwrap();
         let mean: f32 = data.iter().sum::<f32>() / 4.0;
         assert!(mean.abs() < 1e-4);
     }
@@ -1064,7 +1077,7 @@ mod tests {
         let cpu = CpuCompute;
         let mut data = vec![1.0, 2.0, 3.0, 4.0];
         let weight = vec![1.0; 4];
-        cpu.rms_norm(&mut data, &weight, 1, 4, 1e-6);
+        cpu.rms_norm(&mut data, &weight, 1, 4, 1e-6).unwrap();
         let rms = (30.0f32 / 4.0).sqrt();
         assert!((data[0] - 1.0 / rms).abs() < 1e-4);
     }
@@ -1073,7 +1086,7 @@ mod tests {
     fn test_cpu_gelu() {
         let cpu = CpuCompute;
         let mut data = vec![0.0, 1.0];
-        cpu.gelu(&mut data);
+        cpu.gelu(&mut data).unwrap();
         assert!(data[0].abs() < 1e-6);
         assert!((data[1] - 0.8413).abs() < 0.01);
     }
@@ -1082,7 +1095,7 @@ mod tests {
     fn test_cpu_silu() {
         let cpu = CpuCompute;
         let mut data = vec![0.0, 1.0];
-        cpu.silu(&mut data);
+        cpu.silu(&mut data).unwrap();
         assert!(data[0].abs() < 1e-6);
         assert!((data[1] - 0.7311).abs() < 0.01);
     }
@@ -1101,7 +1114,7 @@ mod tests {
             1, 1, // group 1 keeps both tokens
         ];
 
-        let out = cpu.fused_attention_batched(&q, &k, &v, 2, 1, 2, 2, 1.0, &[], &masks);
+        let out = cpu.fused_attention_batched(&q, &k, &v, 2, 1, 2, 2, 1.0, &[], &masks).unwrap();
 
         assert_eq!(out.len(), 8);
 
@@ -1163,10 +1176,10 @@ mod tests {
 
         let out_pos = cpu.fused_attention_batched_posmajor(
             &qp, &kp, &vp, num_groups, heads_per_group, seq_len, head_dim, scale, &alibi, &masks,
-        );
+        ).unwrap();
         let out_head = cpu.fused_attention_batched(
             &qh, &kh, &vh, num_groups, heads_per_group, seq_len, head_dim, scale, &alibi, &masks,
-        );
+        ).unwrap();
 
         assert_eq!(out_pos.len(), elems);
         // Un-reshape out_pos -> head-major and compare exactly (deterministic CPU).
@@ -1192,9 +1205,9 @@ mod tests {
         let b0 = vec![1.0, 0.0, 0.0, 1.0];
         let b1 = vec![2.0, 1.0, 1.0, 2.0];
 
-        let many = cpu.matmul_many(&a, &[&b0, &b1], 2, &[2, 2], 2);
-        let single0 = cpu.matmul(&a, &b0, 2, 2, 2);
-        let single1 = cpu.matmul(&a, &b1, 2, 2, 2);
+        let many = cpu.matmul_many(&a, &[&b0, &b1], 2, &[2, 2], 2).unwrap();
+        let single0 = cpu.matmul(&a, &b0, 2, 2, 2).unwrap();
+        let single1 = cpu.matmul(&a, &b1, 2, 2, 2).unwrap();
 
         assert_eq!(many.len(), 2);
         assert_eq!(many[0], single0);
