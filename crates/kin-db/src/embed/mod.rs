@@ -585,9 +585,45 @@ impl BertEmbedder {
                         longest = longest
                     )
                     .entered();
-                    self.model
-                        .forward_batched(&token_ids, &attention_masks)
-                        .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))?
+                    match self.model.forward_batched(&token_ids, &attention_masks) {
+                        Ok(v) => v,
+                        Err(kin_infer::InferError::OutOfMemory(msg)) => {
+                            // Metal ran out of device memory mid-forward. Rather
+                            // than failing the index, degrade this batch to the
+                            // CPU twin (which create_compute builds under
+                            // KIN_INFER_FORCE_CPU) and retry once.
+                            tracing::warn!(
+                                target: "kindb.embed.dispatch",
+                                error = %msg,
+                                batch_size = batch.len(),
+                                max_seq = longest,
+                                "metal embed out-of-memory; retrying batch on CPU"
+                            );
+                            let cpu_model = match self.cpu_model() {
+                                Ok(m) => Some(m),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "cpu_model unavailable after metal OOM; retrying on primary model"
+                                    );
+                                    None
+                                }
+                            };
+                            let model = cpu_model.unwrap_or(&self.model);
+                            model
+                                .forward_batched(&token_ids, &attention_masks)
+                                .map_err(|e| {
+                                    KinDbError::IndexError(format!(
+                                        "inference failed (cpu retry after metal OOM): {e}"
+                                    ))
+                                })?
+                        }
+                        Err(e) => {
+                            return Err(KinDbError::IndexError(format!(
+                                "inference failed: {e}"
+                            )));
+                        }
+                    }
                 }
                 EmbedBackendChoice::Cpu { reason } => {
                     tracing::info!(
@@ -763,9 +799,45 @@ impl BertEmbedder {
                         longest = longest
                     )
                     .entered();
-                    self.model
-                        .forward_batched(&token_ids, &attention_masks)
-                        .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))?
+                    match self.model.forward_batched(&token_ids, &attention_masks) {
+                        Ok(v) => v,
+                        Err(kin_infer::InferError::OutOfMemory(msg)) => {
+                            // Metal ran out of device memory mid-forward. Rather
+                            // than failing the index, degrade this batch to the
+                            // CPU twin (which create_compute builds under
+                            // KIN_INFER_FORCE_CPU) and retry once.
+                            tracing::warn!(
+                                target: "kindb.embed.dispatch",
+                                error = %msg,
+                                batch_size = batch.len(),
+                                max_seq = longest,
+                                "metal embed out-of-memory; retrying batch on CPU"
+                            );
+                            let cpu_model = match self.cpu_model() {
+                                Ok(m) => Some(m),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "cpu_model unavailable after metal OOM; retrying on primary model"
+                                    );
+                                    None
+                                }
+                            };
+                            let model = cpu_model.unwrap_or(&self.model);
+                            model
+                                .forward_batched(&token_ids, &attention_masks)
+                                .map_err(|e| {
+                                    KinDbError::IndexError(format!(
+                                        "inference failed (cpu retry after metal OOM): {e}"
+                                    ))
+                                })?
+                        }
+                        Err(e) => {
+                            return Err(KinDbError::IndexError(format!(
+                                "inference failed: {e}"
+                            )));
+                        }
+                    }
                 }
                 EmbedBackendChoice::Cpu { reason } => {
                     tracing::info!(
