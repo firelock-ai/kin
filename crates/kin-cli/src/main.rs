@@ -248,12 +248,16 @@ enum Command {
     },
     /// Build embeddings for the current repository's entity graph.
     ///
-    /// Generates vector embeddings for all entities using a local BERT model
-    /// (BGE-small-en-v1.5, 384 dimensions). Embeddings enable semantic similarity
+    /// Generates vector embeddings for all entities using a local code retriever
+    /// (SweRankEmbed-Small, 768 dimensions). Embeddings enable semantic similarity
     /// search in `kin locate` and `kin search --semantic`.
     ///
     /// Fast init + progressive embedding: `kin init` builds the graph instantly,
     /// then `kin embed` adds vector search capability as a separate step.
+    ///
+    /// If a repo was indexed with an older model at a different dimension, pass
+    /// `--rebuild` to drop the stale index and re-embed every entity at the
+    /// current model's dimension.
     Embed {
         /// Embedding batch size (entities per inference pass).
         #[arg(long, default_value_t = crate::commands::embed::DEFAULT_BATCH_SIZE)]
@@ -261,6 +265,11 @@ enum Command {
         /// Stop after this many seconds, persist completed vectors, and leave the rest pending.
         #[arg(long, value_name = "SECONDS")]
         max_seconds: Option<u64>,
+        /// Drop the existing vector index and re-embed every entity at the current
+        /// model's dimension. Use this to migrate a repo indexed with an older
+        /// model (e.g. a 384-dim index that fails against the 768-dim default).
+        #[arg(long, visible_alias = "force")]
+        rebuild: bool,
         /// Output JSON status instead of progress text.
         #[arg(long)]
         json: bool,
@@ -1831,8 +1840,9 @@ fn main() -> Result<()> {
                 Command::Embed {
                     batch_size,
                     max_seconds,
+                    rebuild,
                     json,
-                } => commands::embed::run(batch_size, json, max_seconds).await,
+                } => commands::embed::run(batch_size, json, max_seconds, rebuild).await,
                 Command::Rename {
                     symbol,
                     new_name,
