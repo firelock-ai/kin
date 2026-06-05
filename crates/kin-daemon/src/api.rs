@@ -2893,6 +2893,21 @@ async fn embed(
             )
         };
 
+        // Rebuild migration: drop any loaded vector index (which may be sized to
+        // an older model's dimension, e.g. a 384-dim index that rejects the
+        // current 768-dim model) and re-queue every entity/artifact so the embed
+        // pass below recreates the index at the live embedder dimension. The
+        // per-batch persist then overwrites the stale on-disk sidecar. The
+        // explicit re-queue guarantees a FULL rebuild even if the embedding queue
+        // already held a partial set from prior graph mutations (the gated
+        // queue-missing pass in build_embed_response only fires on an empty
+        // queue). A normal embed (rebuild=false) leaves graph state untouched.
+        if req.rebuild {
+            state_for_embed.graph.reset_vector_index();
+            state_for_embed.graph.queue_missing_for_embedding();
+            state_for_embed.graph.queue_missing_artifacts_for_embedding();
+        }
+
         let result = kin_cli::commands::embed::build_embed_response(
             &state_for_embed.layout,
             state_for_embed.graph.as_ref(),
