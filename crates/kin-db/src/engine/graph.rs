@@ -2389,6 +2389,30 @@ impl InMemoryGraph {
     #[cfg(not(feature = "vector"))]
     pub fn queue_missing_artifacts_for_embedding(&self) {}
 
+    /// Drop the in-memory vector index so the next embedding pass rebuilds it
+    /// from scratch at the CURRENT embedder dimension.
+    ///
+    /// This is the migration path for a repo whose persisted index was built at
+    /// a different embedding dimension (e.g. an older 384-dim model) than the
+    /// model now in use (768-dim). A normal embed pass reuses the loaded index
+    /// and upserts fail with a dimension mismatch; clearing the in-memory index
+    /// lets `queue_missing_for_embedding` re-queue every entity/artifact (the
+    /// emptied index reports nothing as indexed) and `get_vector_index` lazily
+    /// recreate the index sized to the live embedder.
+    ///
+    /// The on-disk sidecar is intentionally left untouched here: the per-batch
+    /// persist that follows a rebuild overwrites it with the freshly-sized
+    /// index, so there is no window where graph-owned vector truth is destroyed
+    /// before its replacement exists.
+    #[cfg(feature = "vector")]
+    pub fn reset_vector_index(&self) {
+        let _span = tracing::info_span!("kindb.reset_vector_index").entered();
+        *self.vector_index.lock() = None;
+    }
+
+    #[cfg(not(feature = "vector"))]
+    pub fn reset_vector_index(&self) {}
+
     /// Drain the current pending embedding queue in batches.
     ///
     /// This is the graph-first incremental path: graph mutations enqueue
@@ -8144,6 +8168,51 @@ mod tests {
         graph.embedding_queue.lock().clear();
         graph.queue_missing_for_embedding();
         assert_eq!(graph.pending_embeddings(), 1);
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn reset_vector_index_requeues_every_entity_for_rebuild() {
+        // Simulates the stale-dimension migration: a repo arrives with a loaded
+        // index that already covers every entity, so a normal pass would queue
+        // nothing. Resetting must drop the index and let a full re-queue happen
+        // so the rebuild produces a fresh index at the live embedder dimension.
+        let graph = InMemoryGraph::new();
+        let e1 = test_entity("foo", "src/a.rs");
+        let e2 = test_entity("bar", "src/b.rs");
+        graph.upsert_entity(&e1).unwrap();
+        graph.upsert_entity(&e2).unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let index = crate::VectorIndex::new(2).unwrap();
+        index.upsert(e1.id, &[1.0, 0.0]).unwrap();
+        index.upsert(e2.id, &[0.0, 1.0]).unwrap();
+        index.save(&path).unwrap();
+        graph.load_vector_index(&path).unwrap();
+
+        // Precondition: index is loaded and reports full coverage, so the
+        // incremental path would queue nothing.
+        assert!(graph.vector_index.lock().is_some());
+        assert_eq!(graph.embedding_status().indexed, 2);
+        graph.embedding_queue.lock().clear();
+        graph.queue_missing_for_embedding();
+        assert_eq!(
+            graph.pending_embeddings(),
+            0,
+            "fully-indexed graph should queue nothing without a reset"
+        );
+
+        // Reset drops the in-memory index; a full re-queue now covers all entities.
+        graph.reset_vector_index();
+        assert!(graph.vector_index.lock().is_none());
+        assert_eq!(graph.embedding_status().indexed, 0);
+        graph.queue_missing_for_embedding();
+        assert_eq!(
+            graph.pending_embeddings(),
+            2,
+            "reset must re-queue every entity for a clean dimension rebuild"
+        );
     }
 
     #[cfg(feature = "vector")]
