@@ -151,24 +151,16 @@ pub fn build_embed_response(
         });
     }
 
-    if request.rebuild {
-        // Migration path: drop the loaded index (which may be sized to an older
-        // model's dimension) and re-queue every object so the rebuild produces a
-        // fresh index at the current embedder dimension. After the reset the
-        // emptied index reports nothing as indexed, so the queue-missing calls
-        // cover all entities and artifacts.
-        graph.reset_vector_index();
+    // Rebuild migration (request.rebuild) is handled by the daemon before this
+    // runs: it drops the stale-dimension index and re-queues every object, so
+    // by the time we get here the queue is already populated and this gated
+    // pass is a no-op. A normal embed is unchanged.
+    let status = graph.embedding_status();
+    if should_queue_full_embedding_pass(graph.pending_embeddings(), status.indexed, status.total) {
         graph.queue_missing_for_embedding();
+    }
+    if graph.pending_artifact_embeddings() == 0 {
         graph.queue_missing_artifacts_for_embedding();
-    } else {
-        let status = graph.embedding_status();
-        if should_queue_full_embedding_pass(graph.pending_embeddings(), status.indexed, status.total)
-        {
-            graph.queue_missing_for_embedding();
-        }
-        if graph.pending_artifact_embeddings() == 0 {
-            graph.queue_missing_artifacts_for_embedding();
-        }
     }
     let effective_batch_size = effective_batch_size(request.batch_size);
 
