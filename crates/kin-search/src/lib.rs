@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
@@ -175,9 +175,13 @@ fn remove_doc_from_index<Id: DocId>(
     doc: &IndexedDoc,
     doc_id: &Id,
 ) {
-    for (token, weight) in &doc.tokens_by_field {
+    let mut unique_tokens = HashSet::new();
+    for (token, _) in &doc.tokens_by_field {
+        unique_tokens.insert(token);
+    }
+    for token in unique_tokens {
         if let Some(postings) = index.get_mut(token) {
-            postings.retain(|(eid, w)| !(eid == doc_id && (*w - weight).abs() < f32::EPSILON));
+            postings.retain(|(eid, _)| eid != doc_id);
             if postings.is_empty() {
                 index.remove(token);
             }
@@ -406,6 +410,41 @@ impl<Id: DocId> TextIndex<Id> {
 
         Ok(())
     }
+
+    /// Remove a batch of documents from the text index.
+    ///
+    /// Stages the removals — call [`commit`](Self::commit) to make them visible
+    /// to searches.
+    pub fn remove_batch(&self, ids: &[Id]) -> Result<(), SearchError> {
+        let _span = tracing::info_span!("kin_search.remove_batch", count = ids.len()).entered();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let live_index = self.index.read();
+        let live_docs = self.docs.read();
+        let live_dc = *self.doc_count.read();
+        let live_tdl = *self.total_doc_length.read();
+        let mut staged_guard = self.staged.write();
+
+        let state = Self::ensure_staged(
+            &mut staged_guard,
+            &live_index,
+            &live_docs,
+            live_dc,
+            live_tdl,
+        );
+
+        for id in ids {
+            if let Some(old_doc) = state.docs.remove(id) {
+                remove_doc_from_index(&mut state.index, &old_doc, id);
+                state.doc_count = state.doc_count.saturating_sub(1);
+                state.total_doc_length = state.total_doc_length.saturating_sub(old_doc.doc_length);
+            }
+        }
+
+        Ok(())
+    }
+
 
     /// Rebuild the entire index from scratch with a batch of documents.
     ///
