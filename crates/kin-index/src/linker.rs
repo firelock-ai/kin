@@ -201,7 +201,7 @@ pub fn link_cross_file_against_entities(
         )
         .entered();
         for (file_idx, file) in files.iter().enumerate() {
-            if file_idx % progress_interval == 0 || file_idx + 1 == total_files {
+            if total_files > 50 && (file_idx % progress_interval == 0 || file_idx + 1 == total_files) {
                 eprint!(
                     "\r  Linking: [{}/{}] {}% | {} relations | {:.1}s",
                     file_idx + 1,
@@ -494,11 +494,14 @@ fn stable_relation_id(src: &EntityId, dst: &EntityId, kind: &RelationKind) -> Re
 ///
 /// For non-relative (package) imports like `@vue/shared` or `@mui/utils/foo`,
 /// uses monorepo heuristics to locate workspace packages under `packages/`.
-fn resolve_module_path(
+fn resolve_module_path<S>(
     importer_path: &str,
     module_path: &str,
-    known_files: &HashSet<&str>,
-) -> Option<String> {
+    known_files: &HashSet<S>,
+) -> Option<String>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
     if module_path.starts_with('.') {
         // Relative import resolution
         let importer = Path::new(importer_path);
@@ -547,7 +550,10 @@ fn resolve_module_path(
 /// - `@scope/pkg` → `packages/pkg/`, `packages/scope-pkg/`
 /// - `@scope/pkg/subpath` → `packages/pkg/src/subpath/`, `packages/scope-pkg/src/subpath/`
 /// - `pkg` (unscoped) → `packages/pkg/`
-fn resolve_package_import(module_path: &str, known_files: &HashSet<&str>) -> Option<String> {
+fn resolve_package_import<S>(module_path: &str, known_files: &HashSet<S>) -> Option<String>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
     let (pkg_name, subpath) = parse_package_import(module_path)?;
 
     // Generate candidate directory names for the package
@@ -596,7 +602,10 @@ fn resolve_package_import(module_path: &str, known_files: &HashSet<&str>) -> Opt
 /// Maven/Gradle source roots:
 /// - `com.foo.bar.ClassName` → `src/main/java/com/foo/bar/ClassName.java`
 /// - Also tries `src/test/java/...` and bare `com/foo/bar/ClassName.java`
-fn resolve_java_package_import(module_path: &str, known_files: &HashSet<&str>) -> Option<String> {
+fn resolve_java_package_import<S>(module_path: &str, known_files: &HashSet<S>) -> Option<String>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
     // Must look like a Java package (contains dots, no slashes)
     if !module_path.contains('.') || module_path.contains('/') {
         return None;
@@ -629,8 +638,9 @@ fn resolve_java_package_import(module_path: &str, known_files: &HashSet<&str>) -
     // try each known file that ends with the class path
     let suffix = format!("{}.java", dir_path);
     for file in known_files.iter() {
-        if file.ends_with(&suffix) {
-            return Some(file.to_string());
+        let file_str = file.borrow();
+        if file_str.ends_with(&suffix) {
+            return Some(file_str.to_string());
         }
     }
 
@@ -642,7 +652,10 @@ fn resolve_java_package_import(module_path: &str, known_files: &HashSet<&str>) -
 /// Go imports are package-level (e.g., `github.com/cli/cli/v2/pkg/cmd/create`).
 /// We strip the module prefix and look for the remaining path as a directory
 /// relative to the repo root, returning the first Go file found in it.
-fn resolve_go_module_import(module_path: &str, known_files: &HashSet<&str>) -> Option<String> {
+fn resolve_go_module_import<S>(module_path: &str, known_files: &HashSet<S>) -> Option<String>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
     // Must look like a Go module path (contains slashes, no dots at start)
     if !module_path.contains('/') {
         return None;
@@ -659,12 +672,13 @@ fn resolve_go_module_import(module_path: &str, known_files: &HashSet<&str>) -> O
         }
         // Look for any .go file in this directory
         for file in known_files.iter() {
-            if file.starts_with(&local_path)
-                && file.ends_with(".go")
-                && file[local_path.len()..].starts_with('/')
-                && !file[local_path.len() + 1..].contains('/')
+            let file_str = file.borrow();
+            if file_str.starts_with(&local_path)
+                && file_str.ends_with(".go")
+                && file_str[local_path.len()..].starts_with('/')
+                && !file_str[local_path.len() + 1..].contains('/')
             {
-                return Some(file.to_string());
+                return Some(file_str.to_string());
             }
         }
     }
@@ -755,6 +769,323 @@ fn resolve_default_export(target_file: &str, universe_entities: &[Entity]) -> Op
         }
     }
     first_in_file
+}
+
+/// Incremental cross-file relation linker state.
+///
+/// Keeps entity indices in-memory to avoid O(N) universe cloning and map rebuilding
+/// per commit during history hydration.
+pub struct IncrementalLinker {
+    /// file_path -> entity_name -> EntityId
+    pub entity_by_file_name: HashMap<String, HashMap<String, EntityId>>,
+    /// entity_name -> Vec<(file_path, EntityId)>
+    pub entity_by_name: HashMap<String, Vec<(String, EntityId)>>,
+    /// Set of all known files
+    pub known_files: HashSet<String>,
+    /// file_path -> Vec<(EntityId, Visibility)>
+    pub entities_by_file: HashMap<String, Vec<(EntityId, Visibility)>>,
+}
+
+impl IncrementalLinker {
+    pub fn new() -> Self {
+        Self {
+            entity_by_file_name: HashMap::new(),
+            entity_by_name: HashMap::new(),
+            known_files: HashSet::new(),
+            entities_by_file: HashMap::new(),
+        }
+    }
+
+    /// Remove a file and all its associated entities from the indexes.
+    pub fn remove_file(&mut self, file_path: &str) {
+        self.known_files.remove(file_path);
+
+        if let Some(file_entities) = self.entity_by_file_name.remove(file_path) {
+            for entity_name in file_entities.keys() {
+                if let Some(candidates) = self.entity_by_name.get_mut(entity_name) {
+                    candidates.retain(|(fp, _)| fp != file_path);
+                    if candidates.is_empty() {
+                        self.entity_by_name.remove(entity_name);
+                    }
+                }
+            }
+        }
+
+        self.entities_by_file.remove(file_path);
+    }
+
+    /// Add or update a file and its entities in the indexes.
+    pub fn add_file(&mut self, file_path: &str, entities: &[Entity]) {
+        self.remove_file(file_path);
+
+        self.known_files.insert(file_path.to_string());
+
+        let mut file_entities_map = HashMap::new();
+        let mut file_entities_list = Vec::new();
+
+        for entity in entities {
+            file_entities_map.insert(entity.name.clone(), entity.id);
+
+            self.entity_by_name
+                .entry(entity.name.clone())
+                .or_default()
+                .push((file_path.to_string(), entity.id));
+
+            file_entities_list.push((entity.id, entity.visibility));
+        }
+
+        if !file_entities_map.is_empty() {
+            self.entity_by_file_name.insert(file_path.to_string(), file_entities_map);
+        }
+        if !file_entities_list.is_empty() {
+            self.entities_by_file.insert(file_path.to_string(), file_entities_list);
+        }
+    }
+}
+
+/// Resolve a default export from a target file using the incremental index.
+fn resolve_default_export_incremental(
+    target_file: &str,
+    entities_by_file: &HashMap<String, Vec<(EntityId, Visibility)>>,
+) -> Option<EntityId> {
+    let entities = entities_by_file.get(target_file)?;
+    let mut first_in_file: Option<EntityId> = None;
+    for &(id, visibility) in entities {
+        if first_in_file.is_none() {
+            first_in_file = Some(id);
+        }
+        if visibility == Visibility::Public {
+            return Some(id);
+        }
+    }
+    first_in_file
+}
+
+/// Resolve cross-file relations using the incrementally updated linker state.
+pub fn link_cross_file_incremental(
+    files: &[FileParseData],
+    linker: &IncrementalLinker,
+) -> Vec<Relation> {
+    let _span = tracing::info_span!(
+        "kin.index.link_cross_file_incremental",
+        files = files.len()
+    )
+    .entered();
+
+    // Step 2: Build import map per file
+    let import_map: HashMap<&str, HashMap<&str, (&str, &str)>> = {
+        let mut import_map: HashMap<&str, HashMap<&str, (&str, &str)>> = HashMap::new();
+        for file in files {
+            let mut file_imports: HashMap<&str, (&str, &str)> = HashMap::new();
+            for imp in &file.imports {
+                for spec in &imp.specifiers {
+                    let original = spec.original_name.as_deref().unwrap_or(&spec.local_name);
+                    file_imports.insert(&spec.local_name, (&imp.module_path, original));
+                }
+            }
+            if !file_imports.is_empty() {
+                import_map.insert(&file.file_path, file_imports);
+            }
+        }
+        import_map
+    };
+
+    let mut resolved = Vec::new();
+    let mut seen: HashSet<(EntityId, EntityId, RelationKind)> = HashSet::new();
+
+    let total_files = files.len();
+    let progress_interval = std::cmp::max(total_files / 50, 1);
+    let link_start = std::time::Instant::now();
+
+    for (file_idx, file) in files.iter().enumerate() {
+        if total_files > 50 && (file_idx % progress_interval == 0 || file_idx + 1 == total_files) {
+            eprint!(
+                "\r  Linking: [{}/{}] {}% | {} relations | {:.1}s",
+                file_idx + 1,
+                total_files,
+                ((file_idx + 1) * 100) / total_files,
+                resolved.len(),
+                link_start.elapsed().as_secs_f64()
+            );
+        }
+        for rel in &file.relations {
+            let src_id = linker.entity_by_file_name
+                .get(&file.file_path)
+                .and_then(|m| m.get(&rel.src_name))
+                .copied();
+            let dst_same_file = linker.entity_by_file_name
+                .get(&file.file_path)
+                .and_then(|m| m.get(&rel.dst_name))
+                .copied();
+
+            let src_id = match src_id {
+                Some(id) => id,
+                None => {
+                    debug!(
+                        src = %rel.src_name,
+                        dst = %rel.dst_name,
+                        file = %file.file_path,
+                        "linker: src entity not found, skipping"
+                    );
+                    continue;
+                }
+            };
+
+            // (a) Same-file resolution
+            if let Some(dst_id) = dst_same_file {
+                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                    resolved.push(make_relation(rel.kind, src_id, dst_id, 1.0));
+                }
+                continue;
+            }
+
+            // (b) Import-based cross-file resolution
+            if let Some(file_imports) = import_map.get(file.file_path.as_str()) {
+                if let Some(&(module_path, original_name)) =
+                    file_imports.get(rel.dst_name.as_str())
+                {
+                    if let Some(target_file) =
+                        resolve_module_path(&file.file_path, module_path, &linker.known_files)
+                    {
+                        let direct = linker.entity_by_file_name
+                            .get(&target_file)
+                            .and_then(|m| m.get(original_name))
+                            .copied();
+                        let dst_id = if direct.is_some() {
+                            direct
+                        } else if original_name == "default" {
+                            resolve_default_export_incremental(&target_file, &linker.entities_by_file)
+                        } else {
+                            None
+                        };
+                        if let Some(dst_id) = dst_id {
+                            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                                resolved.push(make_relation(rel.kind, src_id, dst_id, 0.95));
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                // (b2) Namespace/package import member resolution
+                if let Some((import_name, member_name)) =
+                    split_member_access(rel.dst_name.as_str())
+                {
+                    if let Some(&(module_path, _original_name)) = file_imports.get(import_name)
+                    {
+                        if let Some(target_file) =
+                            resolve_module_path(&file.file_path, module_path, &linker.known_files)
+                        {
+                            if let Some(&dst_id) = linker.entity_by_file_name
+                                .get(&target_file)
+                                .and_then(|m| m.get(member_name))
+                            {
+                                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                                    resolved.push(make_relation(rel.kind, src_id, dst_id, 0.9));
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // (c) Global name-match fallback
+            if let Some(candidates) = linker.entity_by_name.get(&rel.dst_name) {
+                let other_file_match = candidates
+                    .iter()
+                    .find(|(fp, _)| fp != &file.file_path);
+
+                if let Some((_, dst_id)) = other_file_match {
+                    if add_deduped(&mut seen, src_id, *dst_id, rel.kind) {
+                        resolved.push(make_relation(rel.kind, src_id, *dst_id, 0.7));
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 4: Create Imports edges from import declarations.
+    for file in files {
+        let Some(first_entity) = file.entities.first() else {
+            continue;
+        };
+        let src_id = first_entity.id;
+
+        for imp in &file.imports {
+            let target_file =
+                resolve_module_path(&file.file_path, &imp.module_path, &linker.known_files);
+
+            for spec in &imp.specifiers {
+                let original = spec.original_name.as_deref().unwrap_or(&spec.local_name);
+
+                if original == "*" {
+                    continue;
+                }
+
+                let dst_id = if let Some(ref target) = target_file {
+                    let direct = linker.entity_by_file_name
+                        .get(target)
+                        .and_then(|m| m.get(original))
+                        .copied();
+                    if direct.is_some() {
+                        direct
+                    } else if original == "default" {
+                        resolve_default_export_incremental(target, &linker.entities_by_file)
+                    } else {
+                        None
+                    }
+                } else {
+                    let java_combined = if imp.module_path.contains('.')
+                        && !imp.module_path.contains('/')
+                        && original != "*"
+                    {
+                        let full_path = format!("{}.{}", imp.module_path, original);
+                        resolve_java_package_import(&full_path, &linker.known_files).and_then(
+                            |file_path| {
+                                linker.entity_by_file_name
+                                    .get(&file_path)
+                                    .and_then(|m| m.get(original))
+                                    .copied()
+                                    .or_else(|| {
+                                        let qualified = format!("{}", original);
+                                        linker.entity_by_file_name
+                                            .get(&file_path)
+                                            .and_then(|m| m.get(qualified.as_str()))
+                                            .copied()
+                                    })
+                                    .or_else(|| {
+                                        resolve_default_export_incremental(&file_path, &linker.entities_by_file)
+                                    })
+                            },
+                        )
+                    } else {
+                        None
+                    };
+                    java_combined.or_else(|| {
+                        linker.entity_by_name
+                            .get(original)
+                            .and_then(|candidates| {
+                                candidates
+                                    .iter()
+                                    .find(|(fp, _)| fp != &file.file_path)
+                            })
+                            .map(|(_, id)| *id)
+                    })
+                };
+
+                if let Some(dst_id) = dst_id {
+                    if add_deduped(&mut seen, src_id, dst_id, RelationKind::Imports) {
+                        let mut rel = make_relation(RelationKind::Imports, src_id, dst_id, 1.0);
+                        rel.import_source = Some(imp.module_path.clone());
+                        resolved.push(rel);
+                    }
+                }
+            }
+        }
+    }
+
+    resolved
 }
 
 /// Normalize a path by resolving `.` and `..` components without touching the filesystem.

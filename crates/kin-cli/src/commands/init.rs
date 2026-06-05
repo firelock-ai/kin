@@ -877,8 +877,30 @@ pub(crate) fn enrich_imported_changes_with_semantics(
     let mut current_files = HashMap::<String, ImportedSemanticFileState>::new();
     let mut current_relations = HashMap::<RelationId, Relation>::new();
     let mut relations_by_src = HashMap::<EntityId, HashSet<RelationId>>::new();
+    let mut incremental_linker = kin_index::IncrementalLinker::new();
 
-    for imported_change in imported {
+    // Profiling timers
+    let mut total_blob_read_time = std::time::Duration::ZERO;
+    let mut total_parsing_time = std::time::Duration::ZERO;
+    let mut total_linking_time = std::time::Duration::ZERO;
+    let mut total_closure_diffing_time = std::time::Duration::ZERO;
+
+    let total_commits = imported.len();
+    let start_time = std::time::Instant::now();
+
+    for (i, imported_change) in imported.iter_mut().enumerate() {
+        if total_commits > 0 {
+            let percent = ((i + 1) * 100) / total_commits;
+            let short_oid: String = imported_change.git_oid.chars().take(7).collect();
+            eprint!(
+                "\r  Hydrating History: [{}/{}] {}% | Commit: {} | {:.1}s",
+                i + 1,
+                total_commits,
+                percent,
+                short_oid,
+                start_time.elapsed().as_secs_f64()
+            );
+        }
         let mut entity_deltas = Vec::new();
         let mut relation_deltas = Vec::new();
         let mut changed_source_files = BTreeSet::<String>::new();
@@ -901,7 +923,8 @@ pub(crate) fn enrich_imported_changes_with_semantics(
                     &mut current_files,
                     &mut entity_deltas,
                 ) {
-                    changed_source_files.insert(file_path);
+                    changed_source_files.insert(file_path.clone());
+                    incremental_linker.remove_file(&file_path);
                 }
                 continue;
             }
@@ -913,16 +936,23 @@ pub(crate) fn enrich_imported_changes_with_semantics(
                     &mut current_files,
                     &mut entity_deltas,
                 ) {
-                    changed_source_files.insert(file_path);
+                    changed_source_files.insert(file_path.clone());
+                    incremental_linker.remove_file(&file_path);
                 }
                 continue;
             };
 
             let file_id = FilePathId::new(&file_path);
             let blob_hash = kin_blobs::Hash256::from_bytes(*new_hash.as_bytes());
+
+            let blob_start_time = std::time::Instant::now();
             let content = match blob_store.read(&blob_hash) {
-                Ok(content) => content,
+                Ok(content) => {
+                    total_blob_read_time += blob_start_time.elapsed();
+                    content
+                }
                 Err(err) => {
+                    total_blob_read_time += blob_start_time.elapsed();
                     warn!(
                         file = %file_path,
                         hash = %new_hash,
@@ -935,17 +965,23 @@ pub(crate) fn enrich_imported_changes_with_semantics(
                         &mut current_files,
                         &mut entity_deltas,
                     ) {
-                        changed_source_files.insert(file_path);
+                        changed_source_files.insert(file_path.clone());
+                        incremental_linker.remove_file(&file_path);
                     }
                     continue;
                 }
             };
 
+            let parse_start_time = std::time::Instant::now();
             let indexed = match pipeline
                 .index_file_content_with_tests(&file_id, &content, blob_hash)
             {
-                Ok(indexed) => indexed,
+                Ok(indexed) => {
+                    total_parsing_time += parse_start_time.elapsed();
+                    indexed
+                }
                 Err(err) => {
+                    total_parsing_time += parse_start_time.elapsed();
                     warn!(
                         file = %file_path,
                         hash = %new_hash,
@@ -958,7 +994,8 @@ pub(crate) fn enrich_imported_changes_with_semantics(
                         &mut current_files,
                         &mut entity_deltas,
                     ) {
-                        changed_source_files.insert(file_path);
+                        changed_source_files.insert(file_path.clone());
+                        incremental_linker.remove_file(&file_path);
                     }
                     continue;
                 }
@@ -972,6 +1009,8 @@ pub(crate) fn enrich_imported_changes_with_semantics(
                 reconcile_imported_file_entities(old_entities, indexed.indexed_file.entities);
             entity_deltas.extend(file_entity_deltas);
 
+            incremental_linker.add_file(&file_path, &stabilized_entities);
+
             current_files.insert(
                 file_path.clone(),
                 ImportedSemanticFileState {
@@ -984,6 +1023,7 @@ pub(crate) fn enrich_imported_changes_with_semantics(
             changed_source_files.insert(file_path);
         }
 
+        let closure_diff_start = std::time::Instant::now();
         let semantic_entities_by_file =
             build_imported_semantic_entities_by_file(&current_files, &previous_file_states);
         let impacted_files = imported_reverse_dependency_closure(
@@ -1010,19 +1050,19 @@ pub(crate) fn enrich_imported_changes_with_semantics(
                 old_relations.insert(*relation_id, old_relation);
             }
         }
+        total_closure_diffing_time += closure_diff_start.elapsed();
 
         if !changed_parse_data.is_empty() {
-            let universe_entities = current_files
-                .values()
-                .flat_map(|state| state.entities.iter().cloned())
-                .collect::<Vec<_>>();
+            let link_start_time = std::time::Instant::now();
             let mut new_relations_by_id = HashMap::<RelationId, Relation>::new();
             for relation in
-                kin_index::link_cross_file_against_entities(&changed_parse_data, &universe_entities)
+                kin_index::link_cross_file_incremental(&changed_parse_data, &incremental_linker)
             {
                 new_relations_by_id.insert(relation.id, relation);
             }
+            total_linking_time += link_start_time.elapsed();
 
+            let post_link_start = std::time::Instant::now();
             for old_relation_id in old_relations.keys() {
                 if !new_relations_by_id.contains_key(old_relation_id) {
                     relation_deltas.push(RelationDelta::Removed(*old_relation_id));
@@ -1050,12 +1090,43 @@ pub(crate) fn enrich_imported_changes_with_semantics(
                     }
                 }
             }
+            total_closure_diffing_time += post_link_start.elapsed();
         } else {
+            let post_link_start = std::time::Instant::now();
             relation_deltas.extend(old_relations.keys().copied().map(RelationDelta::Removed));
+            total_closure_diffing_time += post_link_start.elapsed();
         }
 
         imported_change.change.entity_deltas = entity_deltas;
         imported_change.change.relation_deltas = relation_deltas;
+    }
+
+    if total_commits > 0 {
+        eprintln!();
+        let total_time_sec = start_time.elapsed().as_secs_f64();
+        eprintln!("  Hydration Profiling Summary:");
+        eprintln!("    Total Commits: {}", total_commits);
+        eprintln!("    Total Time: {:.1}s", total_time_sec);
+        eprintln!(
+            "    - Blob Read: {:.1}s ({:.1}%)",
+            total_blob_read_time.as_secs_f64(),
+            (total_blob_read_time.as_secs_f64() * 100.0) / total_time_sec.max(0.001)
+        );
+        eprintln!(
+            "    - Parsing/Indexing: {:.1}s ({:.1}%)",
+            total_parsing_time.as_secs_f64(),
+            (total_parsing_time.as_secs_f64() * 100.0) / total_time_sec.max(0.001)
+        );
+        eprintln!(
+            "    - Cross-file Linking: {:.1}s ({:.1}%)",
+            total_linking_time.as_secs_f64(),
+            (total_linking_time.as_secs_f64() * 100.0) / total_time_sec.max(0.001)
+        );
+        eprintln!(
+            "    - Closure & Diffing: {:.1}s ({:.1}%)",
+            total_closure_diffing_time.as_secs_f64(),
+            (total_closure_diffing_time.as_secs_f64() * 100.0) / total_time_sec.max(0.001)
+        );
     }
 
     Ok(())
