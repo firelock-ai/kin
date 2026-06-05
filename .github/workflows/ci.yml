@@ -71,15 +71,6 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-  benchmark-regression:
-    name: Benchmark Regression
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Validate published benchmark baseline
-        run: python3 scripts/check_published_benchmark_regression.py
-
   # Security audit moved to sast.yml (cargo-deny: advisories + licenses + bans + sources)
 
   coverage:

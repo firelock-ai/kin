@@ -245,7 +245,10 @@ fn package_metadata(state: &NpmRegistryState, package: &str) -> Response {
         }
     }
 
-    let latest = versions.last().expect("versions is not empty");
+    let latest = match versions.last() {
+        Some(latest) => latest,
+        None => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
     let latest_document = match npm_version_document(state, package, latest) {
         Ok(document) => document,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),

@@ -284,14 +284,16 @@ pub fn register_launch_agent(kin_root: &Path) -> Result<(), String> {
     // Unload old version if it exists (idempotent).
     if plist_path.exists() {
         let _ = std::process::Command::new("launchctl")
-            .args(["unload", plist_path.to_str().unwrap()])
+            .arg("unload")
+            .arg(&plist_path)
             .output();
     }
 
     std::fs::write(&plist_path, &plist).map_err(|e| format!("write plist: {e}"))?;
 
     let output = std::process::Command::new("launchctl")
-        .args(["load", plist_path.to_str().unwrap()])
+        .arg("load")
+        .arg(&plist_path)
         .output()
         .map_err(|e| format!("launchctl load: {e}"))?;
 
@@ -326,7 +328,8 @@ pub fn unregister_launch_agent(kin_root: &Path) {
             .join(format!("{label}.plist"));
         if plist_path.exists() {
             let _ = std::process::Command::new("launchctl")
-                .args(["unload", plist_path.to_str().unwrap()])
+                .arg("unload")
+                .arg(&plist_path)
                 .output();
             let _ = std::fs::remove_file(&plist_path);
             info!(label = %label, "unregistered macOS Launch Agent");

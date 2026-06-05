@@ -405,15 +405,40 @@ async fn handle_tools_call<G: PersistableMcpStore>(
         }
     }
 
-    match handle_tool_call(
+    let mut handler = std::pin::pin!(handle_tool_call(
         &call_params.name,
         &call_params.arguments,
         store,
         sessions,
         config.session_authority_mode,
-    )
-    .await
-    {
+    ));
+    let outcome = std::future::poll_fn(|cx| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::future::Future::poll(handler.as_mut(), cx)
+        })) {
+            Ok(poll) => poll.map(Ok),
+            Err(panic) => std::task::Poll::Ready(Err(panic)),
+        }
+    })
+    .await;
+
+    let call_result = match outcome {
+        Ok(call_result) => call_result,
+        Err(panic) => {
+            let detail = panic
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "tool handler panicked".to_string());
+            return JsonRpcResponse::error(
+                id,
+                -32603,
+                format!("Internal error: tool '{}' panicked: {detail}", call_params.name),
+            );
+        }
+    };
+
+    match call_result {
         Ok(result) => {
             if tool_requires_persist(&call_params.name) {
                 if let Err(error) = store.persist_primary_snapshot(config.snapshot_path.as_deref())

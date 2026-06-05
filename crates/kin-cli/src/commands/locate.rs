@@ -10969,7 +10969,7 @@ fn cap_symbols_by_score(symbols: Vec<LocateSymbol>) -> Vec<LocateSymbol> {
         return symbols;
     }
 
-    let (mut defs, mut refs): (Vec<LocateSymbol>, Vec<LocateSymbol>) = symbols
+    let (defs, mut refs): (Vec<LocateSymbol>, Vec<LocateSymbol>) = symbols
         .into_iter()
         .partition(|s| s.definition);
 
