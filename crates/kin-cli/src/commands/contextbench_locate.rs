@@ -146,8 +146,9 @@ pub async fn run(task_file: PathBuf, json: bool, debug: bool) -> Result<()> {
     let bounded_query: String = query.chars().take(CONTEXTBENCH_QUERY_CHAR_LIMIT).collect();
     let max_files = contextbench_max_files(&bounded_query);
 
+    let max_files_explicit = std::env::var("KIN_CONTEXTBENCH_MAX_FILES").is_ok();
     let locate_result =
-        crate::commands::locate::capture(&bounded_query, true, max_files, true, None).await?;
+        crate::commands::locate::capture(&bounded_query, true, max_files, max_files_explicit, None).await?;
 
     let mut pred_files = Vec::new();
     let mut pred_symbols = std::collections::HashMap::new();

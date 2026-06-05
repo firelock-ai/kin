@@ -1384,38 +1384,42 @@ pub fn parse_scopes(value: &serde_json::Value) -> Result<Vec<IntentScope>> {
     Ok(scopes)
 }
 
+pub fn get_json_object<'a>(args: &'a HashMap<String, serde_json::Value>, key: &str) -> Result<&'a serde_json::Map<String, serde_json::Value>> {
+    args.get(key)
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| McpError::InvalidParams(format!("{} must be a valid JSON object", key)))
+}
+
 pub fn parse_capabilities(args: &HashMap<String, serde_json::Value>) -> SessionCapabilities {
-    match args.get("capabilities") {
-        Some(v) if v.is_object() => {
-            let obj = v.as_object().unwrap();
-            SessionCapabilities {
-                can_read: obj
-                    .get("can_read")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true),
-                can_write: obj
-                    .get("can_write")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-                can_execute: obj
-                    .get("can_execute")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-                can_branch: obj
-                    .get("can_branch")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-                can_commit: obj
-                    .get("can_commit")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-                max_concurrent_intents: obj
-                    .get("max_concurrent_intents")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1) as usize,
-            }
-        }
-        _ => SessionCapabilities::default(),
+    let Some(obj) = args.get("capabilities").and_then(|v| v.as_object()) else {
+        return SessionCapabilities::default();
+    };
+
+    SessionCapabilities {
+        can_read: obj
+            .get("can_read")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
+        can_write: obj
+            .get("can_write")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        can_execute: obj
+            .get("can_execute")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        can_branch: obj
+            .get("can_branch")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        can_commit: obj
+            .get("can_commit")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        max_concurrent_intents: obj
+            .get("max_concurrent_intents")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as usize,
     }
 }
 
