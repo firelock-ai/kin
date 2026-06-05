@@ -56,7 +56,7 @@ fn max_abs_err(a: &[f32], b: &[f32]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
-fn print_diff_details(a: &[f32], b: &[f32], rows: usize, cols: usize, label: &str) {
+fn print_diff_details(a: &[f32], b: &[f32], _rows: usize, cols: usize, label: &str) {
     assert_eq!(a.len(), b.len());
     let mut count = 0;
     for i in 0..a.len() {
