@@ -48,6 +48,15 @@ where
     build_relations_from_change_sets(graph, &change_sets)
 }
 
+fn open_repo(path: &Path) -> std::result::Result<gix::Repository, gix::open::Error> {
+    let dot_git = path.join(".git");
+    if dot_git.is_dir() {
+        gix::open(dot_git)
+    } else {
+        gix::open(path)
+    }
+}
+
 pub fn mine_from_git_log<G>(repo_path: &Path, graph: &G) -> Result<Vec<Relation>>
 where
     G: EntityStore + Sync,
@@ -71,7 +80,7 @@ where
         max_commits = max_commits
     )
     .entered();
-    let repo = gix::open(repo_path).map_err(|e| GitError::Git(e.to_string()))?;
+    let repo = open_repo(repo_path).map_err(|e| GitError::Git(e.to_string()))?;
     let head_id = match repo.head_ref() {
         Ok(Some(head)) => head.id().detach(),
         Ok(None) => {

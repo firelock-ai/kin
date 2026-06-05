@@ -90,6 +90,15 @@ where
     export_changes(blob_store, &changes, branch_name, output_path)
 }
 
+fn open_repo(path: &Path) -> std::result::Result<gix::Repository, gix::open::Error> {
+    let dot_git = path.join(".git");
+    if dot_git.is_dir() {
+        gix::open(dot_git)
+    } else {
+        gix::open(path)
+    }
+}
+
 /// Export a list of SemanticChanges to a Git repository.
 ///
 /// Changes must be in topological order (parents before children).
@@ -102,7 +111,7 @@ pub fn export_changes(
 ) -> Result<ExportResult> {
     // Initialize or open the Git repository.
     let git_repo = if output_path.join(".git").exists() || output_path.join("HEAD").exists() {
-        gix::open(output_path).map_err(|e| GitError::Git(e.to_string()))?
+        open_repo(output_path).map_err(|e| GitError::Git(e.to_string()))?
     } else {
         gix::init_bare(output_path).map_err(|e| GitError::Git(e.to_string()))?
     };

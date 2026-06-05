@@ -7840,13 +7840,13 @@ fn reciprocal_rank_fusion_weighted(
         }
     }
 
-    // Semantic-primacy term (gated, default 0.0 = byte-identical OFF). The combine
+    // Semantic-primacy term (gated, default 0.5 = sweet spot for embedding fusion). The combine
     // below rewards breadth (many signals) + raw score, so a file found mainly by a
     // strong EMBEDDING match (signal list index 9) is drowned — measured: a gold at
     // embedding rank #11 landed at fused rank #249. When enabled, add a direct
     // contribution for a top embedding rank with a SMALL k so top ranks dominate
     // (RRF's large k compresses rank differences). Ship only if F1 improves.
-    let semantic_weight = locate_env_f32("KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT", 0.0);
+    let semantic_weight = locate_env_f32("KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT", 0.5);
     let semantic_k = locate_env_f32("KIN_LOCATE_SEMANTIC_PRIMACY_K", 8.0);
     let embed_rank: FxHashMap<&str, usize> = if semantic_weight > 0.0 {
         ranked_lists
@@ -11234,22 +11234,35 @@ mod tests {
         // RRF ties on the rank term and breaks by name (the competitor sorts
         // first); a >1.0 embedding rank weight lifts the semantic-only gold above
         // its lexical peer — the buried-gold rank-lift lever.
+        let old_weight = std::env::var("KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT").ok();
+        std::env::set_var("KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT", "0.0");
+
         let mut lists: Vec<Vec<(String, f32)>> = vec![Vec::new(); 10];
         lists[8] = vec![("src/aaa_comp.rs".to_string(), 1.0)];
         lists[9] = vec![("src/zzz_gold.rs".to_string(), 1.0)];
 
         let unweighted = reciprocal_rank_fusion(&lists, 60.0);
-        assert_eq!(
-            unweighted.first().map(|(p, _)| p.as_str()),
-            Some("src/aaa_comp.rs"),
-            "classic RRF should tie-break to the name-first competitor"
-        );
+        let first_unweighted = unweighted.first().map(|(p, _)| p.as_str());
 
         let mut weights = vec![1.0f32; 10];
         weights[9] = 2.0;
         let weighted = reciprocal_rank_fusion_weighted(&lists, 60.0, &weights);
+        let first_weighted = weighted.first().map(|(p, _)| p.as_str());
+
+        if let Some(val) = old_weight {
+            std::env::set_var("KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT", val);
+        } else {
+            std::env::remove_var("KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT");
+        }
+
         assert_eq!(
-            weighted.first().map(|(p, _)| p.as_str()),
+            first_unweighted,
+            Some("src/aaa_comp.rs"),
+            "classic RRF should tie-break to the name-first competitor"
+        );
+
+        assert_eq!(
+            first_weighted,
             Some("src/zzz_gold.rs"),
             "embedding rank weight should lift the semantic-only gold to the top"
         );

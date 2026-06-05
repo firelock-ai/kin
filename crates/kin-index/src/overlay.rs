@@ -224,20 +224,22 @@ fn remove_stale_entities<G: GraphStore>(
         .query_entities(&filter)
         .map_err(|e| IndexError::Graph(e.to_string()))?;
 
-    let mut removed = 0;
+    let mut to_remove = Vec::new();
     for entity in existing {
         if !current_ids.contains(&entity.id) {
-            // This entity was in the file before but is gone now
-            graph
-                .remove_entity(&entity.id)
-                .map_err(|e| IndexError::Graph(e.to_string()))?;
-            debug!(
-                entity = %entity.name,
-                id = %entity.id,
-                "removed stale entity"
-            );
-            removed += 1;
+            to_remove.push(entity.id);
         }
+    }
+
+    let removed = to_remove.len();
+    if !to_remove.is_empty() {
+        graph
+            .remove_entities_batch(&to_remove)
+            .map_err(|e| IndexError::Graph(e.to_string()))?;
+        debug!(
+            count = removed,
+            "removed stale entities batch"
+        );
     }
 
     Ok(removed)
@@ -253,12 +255,12 @@ pub fn apply_file_removal<G: GraphStore>(graph: &G, file_id: &FilePathId) -> Res
         .query_entities(&filter)
         .map_err(|e| IndexError::Graph(e.to_string()))?;
 
-    let mut entities_removed = 0;
-    for entity in existing {
+    let to_remove: Vec<EntityId> = existing.iter().map(|e| e.id).collect();
+    let entities_removed = to_remove.len();
+    if !to_remove.is_empty() {
         graph
-            .remove_entity(&entity.id)
+            .remove_entities_batch(&to_remove)
             .map_err(|e| IndexError::Graph(e.to_string()))?;
-        entities_removed += 1;
     }
     graph
         .delete_file_layout(file_id)
@@ -269,6 +271,7 @@ pub fn apply_file_removal<G: GraphStore>(graph: &G, file_id: &FilePathId) -> Res
         removed = entities_removed,
         "removed all entities for deleted file"
     );
+
 
     Ok(ApplyResult {
         file_id: file_id.clone(),

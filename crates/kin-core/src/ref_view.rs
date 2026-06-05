@@ -303,6 +303,15 @@ struct GitBlobRepair {
     tree_id: gix::ObjectId,
 }
 
+fn open_repo(path: &Path) -> std::result::Result<gix::Repository, gix::open::Error> {
+    let dot_git = path.join(".git");
+    if dot_git.is_dir() {
+        gix::open(dot_git)
+    } else {
+        gix::open(path)
+    }
+}
+
 impl GitBlobRepair {
     fn new(
         repo_path: &Path,
@@ -310,7 +319,7 @@ impl GitBlobRepair {
         _changes: &[SemanticChange],
         oid_cache: Option<&ChangeOidCache>,
     ) -> std::result::Result<Self, String> {
-        let repo = gix::open(repo_path).map_err(|e| e.to_string())?;
+        let repo = open_repo(repo_path).map_err(|e| e.to_string())?;
         let git_oid = find_git_oid_for_change(&repo, head, oid_cache)?;
         let tree_id = {
             let commit = repo.find_commit(git_oid).map_err(|e| e.to_string())?;
@@ -465,11 +474,8 @@ struct HistoricalPathResolver {
     /// Maps a path that may appear in legacy entity records (origin or span)
     /// to its current canonical path in the reconstructed file tree.
     canonical_for_legacy: HashMap<String, FilePathId>,
-    /// Targets indexed by basename for last-resort lookup when a path doesn't
-    /// match any rename chain. `None` means the basename is ambiguous.
-    basename_targets: HashMap<String, Option<FilePathId>>,
-    /// Sorted list of tree paths for suffix matching.
-    tree_paths: Vec<String>,
+    /// Map from basename to all paths in the reconstructed file tree sharing that basename.
+    basename_to_paths: HashMap<String, Vec<FilePathId>>,
 }
 
 impl HistoricalPathResolver {
@@ -526,27 +532,22 @@ impl HistoricalPathResolver {
             }
         }
 
-        let mut basename_targets: HashMap<String, Option<FilePathId>> = HashMap::new();
+        let mut basename_to_paths: HashMap<String, Vec<FilePathId>> = HashMap::new();
         for file_id in file_tree.keys() {
-            let Some(basename) = Path::new(&file_id.0)
+            if let Some(basename) = Path::new(&file_id.0)
                 .file_name()
                 .and_then(|name| name.to_str())
-                .map(str::to_string)
-            else {
-                continue;
-            };
-            basename_targets
-                .entry(basename)
-                .and_modify(|entry| *entry = None)
-                .or_insert_with(|| Some(file_id.clone()));
+            {
+                basename_to_paths
+                    .entry(basename.to_string())
+                    .or_default()
+                    .push(file_id.clone());
+            }
         }
-
-        let tree_paths: Vec<String> = file_tree.keys().map(|id| id.0.clone()).collect();
 
         Self {
             canonical_for_legacy,
-            basename_targets,
-            tree_paths,
+            basename_to_paths,
         }
     }
 
@@ -566,32 +567,75 @@ impl HistoricalPathResolver {
             }
         }
 
-        // Prefer longest-path suffix match — for two candidates ending in the
-        // same basename, the deeper match disambiguates if its prefix matches
-        // the legacy path.
+        let basename = Path::new(&file_id.0).file_name()?.to_str()?;
+        let candidates = self.basename_to_paths.get(basename)?;
+
+        // 1. Strict suffix match (longest-path suffix match)
         let suffix = format!("/{}", file_id.0);
-        let mut suffix_matches: Vec<&str> = self
-            .tree_paths
+        let mut suffix_matches: Vec<&FilePathId> = candidates
             .iter()
-            .map(String::as_str)
-            .filter(|path| path.ends_with(&suffix) || *path == file_id.0)
+            .filter(|path| {
+                path.0 == file_id.0
+                    || path.0.ends_with(&suffix)
+                    || file_id.0.ends_with(&format!("/{}", path.0))
+            })
             .collect();
+
         if !suffix_matches.is_empty() {
-            suffix_matches.sort_by_key(|p| std::cmp::Reverse(p.len()));
-            if suffix_matches.len() == 1 || suffix_matches[0].len() > suffix_matches[1].len() {
-                return Some(FilePathId::new(suffix_matches[0]));
+            suffix_matches.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
+            if suffix_matches.len() == 1 || suffix_matches[0].0.len() > suffix_matches[1].0.len() {
+                return Some(suffix_matches[0].clone());
             }
         }
 
-        if let Some(Some(canonical)) = self
-            .basename_targets
-            .get(Path::new(&file_id.0).file_name()?.to_str()?)
-        {
-            return Some(canonical.clone());
+        // 2. Component-wise suffix match: try matching candidates that share a common suffix of
+        // at least 2 components, picking the one with the longest matching suffix if it is unique.
+        let mut best_candidate: Option<(&FilePathId, usize)> = None;
+        let mut second_best_len = 0;
+        for path in candidates {
+            let len = common_component_suffix_len(&file_id.0, &path.0);
+            if len >= 2 {
+                if let Some((_, best_len)) = best_candidate {
+                    if len > best_len {
+                        second_best_len = best_len;
+                        best_candidate = Some((path, len));
+                    } else if len == best_len {
+                        second_best_len = len;
+                    } else if len > second_best_len {
+                        second_best_len = len;
+                    }
+                } else {
+                    best_candidate = Some((path, len));
+                }
+            }
+        }
+        if let Some((path, best_len)) = best_candidate {
+            if best_len > second_best_len {
+                return Some(path.clone());
+            }
+        }
+
+        // 3. Last-resort basename match (if unique)
+        if candidates.len() == 1 {
+            return Some(candidates[0].clone());
         }
 
         None
     }
+}
+
+fn common_component_suffix_len(a: &str, b: &str) -> usize {
+    let a_parts: Vec<&str> = a.split('/').collect();
+    let b_parts: Vec<&str> = b.split('/').collect();
+    let mut count = 0;
+    for (ap, bp) in a_parts.iter().rev().zip(b_parts.iter().rev()) {
+        if ap == bp {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count
 }
 
 pub fn collect_changes_at_ref<G>(graph: &G, head: &SemanticChangeId) -> Result<Vec<SemanticChange>>
@@ -2406,6 +2450,49 @@ def uri_encoder(value):\n    return value\n",
             FilePathId::new("path-c"),
             "intermediate path b should also resolve to canonical c"
         );
+    }
+
+    #[test]
+    fn historical_path_resolver_resolves_nested_monorepo_paths() {
+        let resolver_blob = Hash256::from_bytes([0xaa; 32]);
+        let mut file_tree = HashMap::new();
+        // The tree has the inner path (like in old commit)
+        file_tree.insert(FilePathId::new("src/compiler/phases/css.js"), resolver_blob);
+
+        let resolver = HistoricalPathResolver::from_changes(&[], &file_tree);
+
+        // Resolving a query/HEAD path that is nested (monorepo layout)
+        let resolved = resolver
+            .resolve(&FilePathId::new("packages/svelte/src/compiler/phases/css.js"), &file_tree)
+            .expect("should resolve nested query path to inner tree path");
+        assert_eq!(resolved, FilePathId::new("src/compiler/phases/css.js"));
+
+        // Resolving an inner path when tree has a nested path (the other way around)
+        let mut file_tree_nested = HashMap::new();
+        file_tree_nested.insert(FilePathId::new("packages/svelte/src/compiler/phases/css.js"), resolver_blob);
+
+        let resolver_nested = HistoricalPathResolver::from_changes(&[], &file_tree_nested);
+        let resolved_nested = resolver_nested
+            .resolve(&FilePathId::new("src/compiler/phases/css.js"), &file_tree_nested)
+            .expect("should resolve inner query path to nested tree path");
+        assert_eq!(resolved_nested, FilePathId::new("packages/svelte/src/compiler/phases/css.js"));
+    }
+
+    #[test]
+    fn historical_path_resolver_resolves_renamed_packages() {
+        let resolver_blob = Hash256::from_bytes([0xaa; 32]);
+        let mut file_tree = HashMap::new();
+        // The tree has the historical path: packages/material-ui/src/useAutocomplete/index.js
+        file_tree.insert(FilePathId::new("packages/material-ui/src/useAutocomplete/index.js"), resolver_blob);
+        file_tree.insert(FilePathId::new("packages/material-ui/src/index.js"), resolver_blob);
+
+        let resolver = HistoricalPathResolver::from_changes(&[], &file_tree);
+
+        // Resolving a legacy path that had its package renamed: packages/mui-material/src/useAutocomplete/index.js
+        let resolved = resolver
+            .resolve(&FilePathId::new("packages/mui-material/src/useAutocomplete/index.js"), &file_tree)
+            .expect("should resolve renamed package path via common suffix");
+        assert_eq!(resolved, FilePathId::new("packages/material-ui/src/useAutocomplete/index.js"));
     }
 
     /// Gap 2 (audit follow-up): mixed binding — when only some persisted

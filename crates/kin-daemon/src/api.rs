@@ -1084,6 +1084,15 @@ async fn session_heartbeat(
     }))
 }
 
+fn open_repo(path: &std::path::Path) -> std::result::Result<gix::Repository, gix::open::Error> {
+    let dot_git = path.join(".git");
+    if dot_git.is_dir() {
+        gix::open(dot_git)
+    } else {
+        gix::open(path)
+    }
+}
+
 /// POST /session/{session_id}/scope — set a temporal scope for a session.
 async fn set_scope(
     Path(session_id): Path<String>,
@@ -1110,7 +1119,7 @@ async fn set_scope(
             &state.layout,
             Some(&req.ref_string),
         )
-        .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+        .map_err(|err| (StatusCode::BAD_REQUEST, format!("{:#}", err)))?;
     if resolved.hydrated_git_history {
         state.bump_version();
         state.save_snapshot().map_err(internal_error)?;
@@ -1123,7 +1132,7 @@ async fn set_scope(
     let oid_cache: Option<kin_core::ChangeOidCache> = {
         let needs_build = state.change_oid_cache.read().unwrap().is_none();
         if needs_build {
-            if let Ok(repo) = gix::open(state.layout.working_dir()) {
+            if let Ok(repo) = open_repo(state.layout.working_dir()) {
                 match kin_core::build_change_oid_cache(&repo) {
                     Ok(cache) => {
                         info!("built change OID cache for fast scope switching");
@@ -1152,12 +1161,20 @@ async fn set_scope(
         .map_err(|err| internal_error(err.to_string()))?;
     let _ = kin_cli::commands::cochange::refresh_from_changes(&historical, &changes);
 
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
-    historical
-        .reconstruct_vector_index_from(state.graph.as_ref())
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-
     let cached_graph = Arc::new(historical);
+
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    {
+        let graph_for_embed = Arc::clone(&cached_graph);
+        let source_graph = Arc::clone(&state.graph);
+        tokio::task::spawn_blocking(move || {
+            graph_for_embed.reconstruct_vector_index_from(&source_graph)
+        })
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn_blocking failed: {}", err)))?
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    }
+
     state
         .set_session_scope(&session_id, req.ref_string.clone(), head, cached_graph)
         .await;

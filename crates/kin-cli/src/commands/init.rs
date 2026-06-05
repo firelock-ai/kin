@@ -1998,8 +1998,9 @@ fn entities_for_file(graph: &kin_db::InMemoryGraph, path: &str) -> Result<Vec<En
 
 fn clear_file_semantic_state(graph: &kin_db::InMemoryGraph, path: &str) -> Result<()> {
     let entities = entities_for_file(graph, path)?;
-    for entity in entities {
-        graph.remove_entity(&entity.id)?;
+    if !entities.is_empty() {
+        let ids: Vec<EntityId> = entities.iter().map(|e| e.id).collect();
+        graph.remove_entities_batch(&ids)?;
     }
     let _ = graph.remove_entities_for_file(path);
     let file_id = FilePathId::new(path);
