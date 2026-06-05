@@ -13,6 +13,13 @@ pub struct EmbedRequest {
     pub json: bool,
     #[serde(default)]
     pub max_seconds: Option<u64>,
+    /// Drop the existing vector index and rebuild it at the current model's
+    /// dimension. Required to migrate a repo whose persisted index was built at
+    /// a different embedding dimension (e.g. an older 384-dim model). Defaults
+    /// to false so a normal embed pass is unchanged and the field is optional on
+    /// the daemon wire protocol.
+    #[serde(default)]
+    pub rebuild: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,12 +65,18 @@ fn effective_batch_size(requested: usize) -> usize {
 }
 
 /// Ask the repo daemon to build embeddings for the current repo's graph.
-pub async fn run(batch_size: usize, json: bool, max_seconds: Option<u64>) -> Result<()> {
+pub async fn run(
+    batch_size: usize,
+    json: bool,
+    max_seconds: Option<u64>,
+    rebuild: bool,
+) -> Result<()> {
     let _span = tracing::info_span!(
         "kin.embed",
         batch_size = batch_size,
         json = json,
-        max_seconds = max_seconds
+        max_seconds = max_seconds,
+        rebuild = rebuild
     )
     .entered();
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
@@ -74,6 +87,7 @@ pub async fn run(batch_size: usize, json: bool, max_seconds: Option<u64>) -> Res
             batch_size,
             json,
             max_seconds,
+            rebuild,
         },
     )
     .await?;
@@ -137,12 +151,24 @@ pub fn build_embed_response(
         });
     }
 
-    let status = graph.embedding_status();
-    if should_queue_full_embedding_pass(graph.pending_embeddings(), status.indexed, status.total) {
+    if request.rebuild {
+        // Migration path: drop the loaded index (which may be sized to an older
+        // model's dimension) and re-queue every object so the rebuild produces a
+        // fresh index at the current embedder dimension. After the reset the
+        // emptied index reports nothing as indexed, so the queue-missing calls
+        // cover all entities and artifacts.
+        graph.reset_vector_index();
         graph.queue_missing_for_embedding();
-    }
-    if graph.pending_artifact_embeddings() == 0 {
         graph.queue_missing_artifacts_for_embedding();
+    } else {
+        let status = graph.embedding_status();
+        if should_queue_full_embedding_pass(graph.pending_embeddings(), status.indexed, status.total)
+        {
+            graph.queue_missing_for_embedding();
+        }
+        if graph.pending_artifact_embeddings() == 0 {
+            graph.queue_missing_artifacts_for_embedding();
+        }
     }
     let effective_batch_size = effective_batch_size(request.batch_size);
 
