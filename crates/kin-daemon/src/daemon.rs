@@ -568,7 +568,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
         info!("embedding worker started");
         let mut consecutive_panics: u32 = 0;
         const MAX_CONSECUTIVE_PANICS: u32 = 3;
-        loop {
+        'wake: loop {
             tokio::select! {
                 _ = tokio::time::sleep(embed_interval) => {}
                 _ = embed_cancel.changed() => {
@@ -579,81 +579,106 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
             if *embed_cancel.borrow() {
                 break;
             }
-            let pending = embed_state.graph.pending_embeddings();
-            if pending == 0 {
-                continue;
-            }
-            let batch = embed_batch_size;
-            let state_for_embed = Arc::clone(&embed_state);
-            match tokio::task::spawn_blocking(move || {
-                let _guard = state_for_embed.embedding_work.lock().map_err(|_| {
-                    kin_db::KinDbError::ConcurrentAccessError(
-                        "embedding work lock poisoned".to_string(),
-                    )
-                })?;
-                state_for_embed.graph.process_embedding_queue(batch)
-            })
-            .await
-            {
-                Ok(Ok(count)) if count > 0 => {
-                    consecutive_panics = 0;
-                    info!(
-                        count,
-                        remaining = pending.saturating_sub(count),
-                        "embedded entities"
-                    );
-                    // Persist the vector index under the shared persist lock so
-                    // this kvec write can never interleave with a snapshot save
-                    // running in the persistence loop or idle-shutdown flush.
-                    // Run inside spawn_blocking so the std persist Mutex is held
-                    // only across the synchronous write, never across an await.
-                    let state_for_persist = Arc::clone(&embed_state);
-                    let persist_result = tokio::task::spawn_blocking(move || {
-                        let _persist_guard =
-                            state_for_persist.persist_lock.lock().map_err(|_| {
-                                kin_db::KinDbError::ConcurrentAccessError(
-                                    "persist lock poisoned".to_string(),
-                                )
-                            })?;
-                        kin_db::SnapshotManager::save_vector_index_for_graph(
-                            state_for_persist.layout.kindb_snapshot_path(),
-                            state_for_persist.graph.as_ref(),
+
+            // Drain the pending backlog continuously within this wake rather than
+            // one batch per `embed_interval`. A fresh central-graph embed (or an
+            // explicit `kin embed --rebuild`) enqueues thousands of entities;
+            // trickling a single batch per interval would cap throughput at
+            // `embed_batch_size / embed_interval` (e.g. 160 / 5s ≈ 32 ent/s) no
+            // matter how fast the GPU runs. We yield between batches so locate,
+            // persistence, and cancellation stay responsive, then fall back to the
+            // idle sleep once the queue is empty. Incremental trickle (a handful of
+            // newly-reconciled entities) drains in a single pass and is unchanged.
+            loop {
+                if *embed_cancel.borrow() {
+                    break 'wake;
+                }
+                let pending = embed_state.graph.pending_embeddings();
+                if pending == 0 {
+                    break;
+                }
+                let batch = embed_batch_size;
+                let state_for_embed = Arc::clone(&embed_state);
+                match tokio::task::spawn_blocking(move || {
+                    let _guard = state_for_embed.embedding_work.lock().map_err(|_| {
+                        kin_db::KinDbError::ConcurrentAccessError(
+                            "embedding work lock poisoned".to_string(),
                         )
-                    })
-                    .await;
-                    match persist_result {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            error!(error = %e, "failed to persist vector index");
-                        }
-                        Err(e) => {
-                            error!(error = %e, "vector index persist task panicked");
+                    })?;
+                    state_for_embed.graph.process_embedding_queue(batch)
+                })
+                .await
+                {
+                    Ok(Ok(count)) if count > 0 => {
+                        consecutive_panics = 0;
+                        info!(
+                            count,
+                            remaining = pending.saturating_sub(count),
+                            "embedded entities"
+                        );
+                        // Persist the vector index under the shared persist lock so
+                        // this kvec write can never interleave with a snapshot save
+                        // running in the persistence loop or idle-shutdown flush.
+                        // Run inside spawn_blocking so the std persist Mutex is held
+                        // only across the synchronous write, never across an await.
+                        let state_for_persist = Arc::clone(&embed_state);
+                        let persist_result = tokio::task::spawn_blocking(move || {
+                            let _persist_guard =
+                                state_for_persist.persist_lock.lock().map_err(|_| {
+                                    kin_db::KinDbError::ConcurrentAccessError(
+                                        "persist lock poisoned".to_string(),
+                                    )
+                                })?;
+                            kin_db::SnapshotManager::save_vector_index_for_graph(
+                                state_for_persist.layout.kindb_snapshot_path(),
+                                state_for_persist.graph.as_ref(),
+                            )
+                        })
+                        .await;
+                        match persist_result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                error!(error = %e, "failed to persist vector index");
+                            }
+                            Err(e) => {
+                                error!(error = %e, "vector index persist task panicked");
+                            }
                         }
                     }
-                }
-                Ok(Ok(_)) => {
-                    consecutive_panics = 0;
-                }
-                Ok(Err(e)) => {
-                    error!(error = %e, "embedding worker error");
-                }
-                Err(e) => {
-                    consecutive_panics += 1;
-                    if consecutive_panics >= MAX_CONSECUTIVE_PANICS {
+                    Ok(Ok(_)) => {
+                        // Queue drained out from under us (e.g. an explicit
+                        // `/embed` request raced ahead). Stop draining and return
+                        // to the idle sleep.
+                        consecutive_panics = 0;
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        error!(error = %e, "embedding worker error");
+                        break;
+                    }
+                    Err(e) => {
+                        consecutive_panics += 1;
+                        if consecutive_panics >= MAX_CONSECUTIVE_PANICS {
+                            error!(
+                                error = %e,
+                                consecutive_panics,
+                                "embedding worker permanently failed — vector index will not update until daemon restart"
+                            );
+                            break 'wake;
+                        }
                         error!(
                             error = %e,
                             consecutive_panics,
-                            "embedding worker permanently failed — vector index will not update until daemon restart"
+                            "embedding task panicked, respawning after 1s"
                         );
+                        tokio::time::sleep(Duration::from_secs(1)).await;
                         break;
                     }
-                    error!(
-                        error = %e,
-                        consecutive_panics,
-                        "embedding task panicked, respawning after 1s"
-                    );
-                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
+
+                // Cooperative yield: let locate, persistence, and other daemon
+                // tasks interleave between embedding batches during a long drain.
+                tokio::task::yield_now().await;
             }
         }
     });
