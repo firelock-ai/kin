@@ -671,6 +671,12 @@ const REAPER_DEFAULT_CPU_PINNED_SWEEPS: u32 = 2;
 /// Default slack (in seconds) a daemon's start_time may lag the deployed binary
 /// mtime before it counts as stale — absorbs clock/filesystem timestamp jitter.
 const REDEPLOY_DEFAULT_GRACE_SECS: u64 = 2;
+/// Sentinel env var carried across the self-re-exec boundary, recording the
+/// binary mtime the supervisor already re-execed into. Breaks the re-exec loop:
+/// execve preserves the process start_time, so a supervisor that predates its
+/// rebuilt binary stays stale after re-exec; without this sentinel it would
+/// re-exec on every sweep forever.
+const SUPERVISOR_REEXECED_FOR_MTIME_ENV: &str = "KIN_SUPERVISOR_REEXECED_FOR_MTIME";
 
 /// Health classification of a discovered repo daemon.
 #[derive(Debug, Clone, PartialEq)]
@@ -845,6 +851,24 @@ fn env_flag_truthy(key: &str) -> bool {
 /// false when the deployed mtime is unknown (cannot prove staleness).
 fn is_daemon_stale(start_time: u64, deployed_mtime: Option<u64>, grace_secs: u64) -> bool {
     deployed_mtime.is_some_and(|m| m > start_time.saturating_add(grace_secs))
+}
+
+/// Whether the supervisor should re-exec into its own freshly built binary. True
+/// only when the binary is stale AND we have not already re-execed into this
+/// exact mtime. execve preserves the process start_time, so a stale supervisor
+/// stays stale after re-exec; `reexeced_for_mtime` (the
+/// `KIN_SUPERVISOR_REEXECED_FOR_MTIME` sentinel inherited across the exec) records
+/// the mtime we last re-execed into, so a match means the fresh build is already
+/// running and we must stop — otherwise the supervisor re-execs every sweep. A
+/// later rebuild bumps the mtime past the sentinel, re-arming a single re-exec.
+fn should_reexec_self(
+    start_time: u64,
+    self_exe_mtime: u64,
+    grace_secs: u64,
+    reexeced_for_mtime: Option<u64>,
+) -> bool {
+    is_daemon_stale(start_time, Some(self_exe_mtime), grace_secs)
+        && reexeced_for_mtime != Some(self_exe_mtime)
 }
 
 /// Observed facts about one discovered repo daemon, fed to the classifier.
@@ -1034,9 +1058,12 @@ async fn reaper_sweep(
     // and fall through to best-effort child redeploy on the still-running old image.
     if policy.reexec_enabled {
         if let (Some(start), Some(mtime)) = (self_start, self_exe_mtime) {
-            if is_daemon_stale(start, Some(mtime), policy.redeploy_grace_secs) {
+            let reexeced_for_mtime = std::env::var(SUPERVISOR_REEXECED_FOR_MTIME_ENV)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            if should_reexec_self(start, mtime, policy.redeploy_grace_secs, reexeced_for_mtime) {
                 warn!("supervisor binary is stale — re-execing into new build");
-                let error = reexec_self();
+                let error = reexec_self(mtime);
                 warn!(error = %error, "supervisor self-re-exec failed; continuing on current binary");
             }
         }
@@ -1365,17 +1392,23 @@ async fn redeploy_daemon(observation: &DaemonObservation, reason: RedeployReason
 
 /// Replace the supervisor's process image in place (same PID) with a fresh exec
 /// of its own binary and original arguments. On success this never returns; the
-/// returned `io::Error` is the exec failure. Loop-free: the re-execed process has
-/// a start_time newer than the binary mtime, so it is no longer stale.
+/// returned `io::Error` is the exec failure. Loop-free: execve preserves the
+/// process start_time, so the re-execed image stays stale against `self_exe_mtime`
+/// — to avoid re-execing every sweep we stamp `self_exe_mtime` into the
+/// `KIN_SUPERVISOR_REEXECED_FOR_MTIME` sentinel, which the fresh process inherits
+/// and `should_reexec_self` reads to skip a redundant re-exec.
 #[cfg(unix)]
-fn reexec_self() -> std::io::Error {
+fn reexec_self(self_exe_mtime: u64) -> std::io::Error {
     use std::os::unix::process::CommandExt;
     let exe = match std::env::current_exe() {
         Ok(path) => path,
         Err(error) => return error,
     };
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    std::process::Command::new(exe).args(args).exec()
+    std::process::Command::new(exe)
+        .args(args)
+        .env(SUPERVISOR_REEXECED_FOR_MTIME_ENV, self_exe_mtime.to_string())
+        .exec()
 }
 
 #[cfg(test)]
@@ -1955,6 +1988,32 @@ mod tests {
         assert!(is_daemon_stale(100, Some(105), 2));
         assert!(!is_daemon_stale(100, Some(105), 5));
         assert!(!is_daemon_stale(100, Some(105), 10));
+    }
+
+    #[test]
+    fn reexec_when_stale_and_no_sentinel() {
+        // First encounter of a fresh build: stale, sentinel absent -> re-exec.
+        assert!(should_reexec_self(100, 105, 2, None));
+    }
+
+    #[test]
+    fn no_reexec_when_sentinel_matches_current_mtime() {
+        // Loop break: execve preserved start_time so we are still stale, but the
+        // sentinel proves we already re-execed into this exact build -> stop.
+        assert!(!should_reexec_self(100, 105, 2, Some(105)));
+    }
+
+    #[test]
+    fn reexec_again_after_a_newer_rebuild() {
+        // A later rebuild bumps the mtime past the sentinel -> re-arm one re-exec.
+        assert!(should_reexec_self(100, 110, 2, Some(105)));
+    }
+
+    #[test]
+    fn no_reexec_when_not_stale_regardless_of_sentinel() {
+        // Binary not newer than start + grace: never re-exec, sentinel or not.
+        assert!(!should_reexec_self(100, 101, 2, None));
+        assert!(!should_reexec_self(100, 101, 2, Some(50)));
     }
 
     #[test]
