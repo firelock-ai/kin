@@ -699,10 +699,37 @@ enum ReapReason {
     DuplicateOrphanTwin,
 }
 
+/// Why a healthy-but-invisible daemon is being adopted into the registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdoptReason {
+    /// No registry entry existed for this repo root.
+    Unregistered,
+    /// A registry entry for this repo root existed but named a dead pid; the live
+    /// healthy daemon replaces it.
+    HealStaleEntry,
+}
+
+/// How a discovered daemon relates to the supervisor's registry entry (if any)
+/// for the same repo root. Computed per sweep from a registry snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistryRelation {
+    /// No registry entry exists for this repo root.
+    Unregistered,
+    /// The registry entry for this repo root names THIS pid.
+    RegisteredSelf,
+    /// A registry entry exists for this repo root but names a *different* pid that
+    /// is no longer alive — a stale entry to heal.
+    StaleDifferentPid,
+    /// A registry entry exists for this repo root naming a *different*, still-alive
+    /// pid — a live twin owns the route.
+    LiveTwin,
+}
+
 #[derive(Debug, Clone, PartialEq)]
-enum ReapDecision {
+enum DaemonDecision {
     Keep,
     Reap(ReapReason),
+    Adopt(AdoptReason),
 }
 
 /// Which heuristics beyond the always-on safe criterion are enabled, and how the
@@ -711,6 +738,8 @@ enum ReapDecision {
 struct ReapPolicy {
     cpu_heuristic_enabled: bool,
     duplicate_reap_enabled: bool,
+    /// Self-healing adoption of healthy-but-invisible daemons. On by default.
+    adopt_enabled: bool,
     cpu_pinned_percent: f32,
     cpu_pinned_min_sweeps: u32,
 }
@@ -720,6 +749,7 @@ impl Default for ReapPolicy {
         Self {
             cpu_heuristic_enabled: true,
             duplicate_reap_enabled: true,
+            adopt_enabled: true,
             cpu_pinned_percent: REAPER_DEFAULT_CPU_PINNED_PERCENT,
             cpu_pinned_min_sweeps: REAPER_DEFAULT_CPU_PINNED_SWEEPS,
         }
@@ -734,6 +764,9 @@ impl ReapPolicy {
         }
         if env_flag_falsey("KIN_SUPERVISOR_REAP_DUPLICATE") {
             policy.duplicate_reap_enabled = false;
+        }
+        if env_flag_truthy("KIN_SUPERVISOR_ADOPT_DISABLE") {
+            policy.adopt_enabled = false;
         }
         if let Some(percent) = std::env::var("KIN_SUPERVISOR_REAP_CPU_PERCENT")
             .ok()
@@ -779,51 +812,82 @@ struct DaemonObservation {
     health: DaemonHealth,
     /// Consecutive sweeps this pid has been CPU-pinned.
     cpu_pinned_sweeps: u32,
-    /// A *different*, registered, alive daemon owns the same repo root.
-    has_registered_twin: bool,
+    /// How this daemon relates to the registry entry for its repo root.
+    registry: RegistryRelation,
 }
 
-/// Decide whether a discovered daemon is demonstrably misbehaving and should be
-/// reaped. Pure function over observed facts — the unit-tested core.
+/// Decide what to do with a discovered daemon: reap a demonstrably-misbehaving
+/// one, adopt a healthy-but-invisible one to restore registry visibility, or keep
+/// it untouched. Pure function over observed facts — the unit-tested core.
 ///
 /// Invariants:
 /// - A daemon doing real work (active clients or active reconciliation) is NEVER
-///   reaped, even if unregistered.
-/// - The safe criterion (orphaned + unhealthy) is always enabled.
-/// - The CPU-pinned and duplicate-twin criteria are policy-gated.
-fn classify_daemon(obs: &DaemonObservation, policy: &ReapPolicy) -> ReapDecision {
-    // Absolute guard: never reap a daemon that is serving clients or actively
-    // reconciling, regardless of registration or orphan status.
-    if let DaemonHealth::Healthy(activity) = &obs.health {
-        if activity.has_clients || activity.reconciling {
-            return ReapDecision::Keep;
+///   reaped, even if unregistered — but it MAY still be adopted to restore
+///   visibility (adoption never reaps).
+/// - The safe reap criterion (orphaned + unhealthy) is always enabled.
+/// - The CPU-pinned and duplicate-twin reap criteria are policy-gated.
+/// - Reaping always wins over adoption. The only healthy reap path is the
+///   orphaned idle busy-spinner; a daemon matching it is reaped, not adopted.
+/// - Adoption only ever targets a HEALTHY daemon with a non-empty repo root, and
+///   never clobbers a live twin that owns the route (split-brain safety).
+fn classify_daemon(obs: &DaemonObservation, policy: &ReapPolicy) -> DaemonDecision {
+    // Absolute guard (#4): a daemon serving clients or actively reconciling is
+    // never a reap candidate, regardless of registration or orphan status. It can
+    // still fall through to the adoption path below to restore visibility.
+    let active = matches!(
+        &obs.health,
+        DaemonHealth::Healthy(activity) if activity.has_clients || activity.reconciling
+    );
+
+    if !active {
+        // (a) Safe criterion, always on: orphaned and its health probe failed.
+        if obs.orphaned && obs.health == DaemonHealth::Unhealthy {
+            return DaemonDecision::Reap(ReapReason::OrphanedUnhealthy);
+        }
+
+        // (c) Orphaned, IDLE duplicate twin of a registered, alive daemon on the
+        //     same repo root. Split-brain safety: active twins were already
+        //     excluded by the `!active` guard, so only the idle twin is reaped.
+        if policy.duplicate_reap_enabled
+            && obs.orphaned
+            && obs.registry == RegistryRelation::LiveTwin
+        {
+            return DaemonDecision::Reap(ReapReason::DuplicateOrphanTwin);
+        }
+
+        // (b) Orphaned busy-spinner: healthy but idle (guaranteed by `!active`)
+        //     and CPU-pinned across enough consecutive sweeps.
+        if policy.cpu_heuristic_enabled
+            && obs.orphaned
+            && matches!(obs.health, DaemonHealth::Healthy(_))
+            && obs.cpu_pinned_sweeps >= policy.cpu_pinned_min_sweeps
+        {
+            return DaemonDecision::Reap(ReapReason::OrphanedBusyNoClients);
         }
     }
 
-    // (a) Safe criterion, always on: orphaned and its health probe failed.
-    if obs.orphaned && obs.health == DaemonHealth::Unhealthy {
-        return ReapDecision::Reap(ReapReason::OrphanedUnhealthy);
-    }
-
-    // (c) Orphaned duplicate twin of a registered, healthy daemon.
-    if policy.duplicate_reap_enabled && obs.orphaned && obs.has_registered_twin {
-        return ReapDecision::Reap(ReapReason::DuplicateOrphanTwin);
-    }
-
-    // (b) Orphaned busy-spinner: healthy but idle (no clients, not reconciling)
-    //     and CPU-pinned across enough consecutive sweeps.
-    if policy.cpu_heuristic_enabled && obs.orphaned {
-        if let DaemonHealth::Healthy(activity) = &obs.health {
-            if !activity.has_clients
-                && !activity.reconciling
-                && obs.cpu_pinned_sweeps >= policy.cpu_pinned_min_sweeps
-            {
-                return ReapDecision::Reap(ReapReason::OrphanedBusyNoClients);
+    // Self-healing adoption: a HEALTHY daemon with a valid repo root that the
+    // registry does not already track as itself becomes visible again. Recovers
+    // after a supervisor restart that lost its in-memory registry while daemons
+    // keep serving. Unhealthy/Unknown daemons are never adopted.
+    if policy.adopt_enabled
+        && matches!(obs.health, DaemonHealth::Healthy(_))
+        && !obs.repo_root.trim().is_empty()
+    {
+        match obs.registry {
+            RegistryRelation::Unregistered => {
+                return DaemonDecision::Adopt(AdoptReason::Unregistered);
             }
+            RegistryRelation::StaleDifferentPid => {
+                return DaemonDecision::Adopt(AdoptReason::HealStaleEntry);
+            }
+            // Already tracked as itself, or a live twin owns the route: leave the
+            // registry untouched. Never clobber a live twin — both stay alive.
+            RegistryRelation::RegisteredSelf | RegistryRelation::LiveTwin => {}
         }
     }
 
-    ReapDecision::Keep
+    DaemonDecision::Keep
 }
 
 #[cfg(unix)]
@@ -911,24 +975,104 @@ async fn reaper_sweep(
             Some(port) => probe_daemon_health(client, port).await,
             None => DaemonHealth::Unknown,
         };
-        let has_registered_twin = registry
-            .get(&daemon.repo_root)
-            .is_some_and(|&registered_pid| {
-                registered_pid != daemon.pid && is_process_alive(registered_pid)
-            });
+        // Classify this daemon's relationship to the registry entry (if any) for
+        // its repo root: itself, a live twin, a stale (dead-pid) entry, or absent.
+        let registry_relation = match registry.get(&daemon.repo_root) {
+            None => RegistryRelation::Unregistered,
+            Some(&registered_pid) if registered_pid == daemon.pid => {
+                RegistryRelation::RegisteredSelf
+            }
+            Some(&registered_pid) if is_process_alive(registered_pid) => {
+                RegistryRelation::LiveTwin
+            }
+            Some(_) => RegistryRelation::StaleDifferentPid,
+        };
         let observation = DaemonObservation {
             pid: daemon.pid,
             repo_root: daemon.repo_root.clone(),
             orphaned: daemon.ppid == Some(1),
             health,
             cpu_pinned_sweeps: pinned_sweeps.get(&daemon.pid).copied().unwrap_or(0),
-            has_registered_twin,
+            registry: registry_relation,
         };
-        if let ReapDecision::Reap(reason) = classify_daemon(&observation, &policy) {
-            reap_daemon(&observation, reason).await;
-            pinned_sweeps.remove(&daemon.pid);
+        match classify_daemon(&observation, &policy) {
+            DaemonDecision::Reap(reason) => {
+                reap_daemon(&observation, reason).await;
+                pinned_sweeps.remove(&daemon.pid);
+            }
+            DaemonDecision::Adopt(reason) => {
+                adopt_daemon(state, daemon, reason).await;
+            }
+            DaemonDecision::Keep => {
+                // Surface a persistent split-brain: two live daemons claim one
+                // repo root and at least one is actively serving. We keep both
+                // alive (never reap an active daemon) but the operator should know.
+                if registry_relation == RegistryRelation::LiveTwin {
+                    if let DaemonHealth::Healthy(activity) = &observation.health {
+                        if activity.has_clients || activity.reconciling {
+                            warn!(
+                                pid = daemon.pid,
+                                repo = %daemon.repo_root,
+                                "two live daemons claim one repo_root; keeping both (split-brain) — not reaping active daemon"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
+}
+
+/// Adopt a healthy, routable daemon into the registry so the supervisor can route
+/// to it again. Restores visibility after a supervisor restart drops the in-memory
+/// registry while daemons keep serving, or replaces a stale (dead-pid) entry with
+/// the live daemon now serving the same repo root.
+///
+/// The synthesized `instance_id` matches what the daemon's own registration loop
+/// produces (`pid-<pid>-port-<port>`), so the daemon's next heartbeat reconciles
+/// with the adopted entry instead of conflicting with it.
+#[cfg(unix)]
+async fn adopt_daemon(state: &SupervisorState, daemon: &DiscoveredDaemon, reason: AdoptReason) {
+    // A routable entry needs a port. Health is only `Healthy` when a port was
+    // probed, so an Adopt decision implies `Some` here; guard defensively anyway.
+    let Some(port) = daemon.port else {
+        return;
+    };
+    let repo_root = daemon.repo_root.clone();
+    let repo_id = repo_route_id_for_path(Path::new(&repo_root));
+    let now = chrono::Utc::now().to_rfc3339();
+    let heartbeat_ms = state.elapsed_ms();
+
+    let mut repos = state.repo_daemons.write().await;
+    // Re-check under the write lock: a fresh self-registration (or another live
+    // daemon) may have raced in since the registry snapshot. Never clobber a live
+    // entry owned by a different pid.
+    if let Some(existing) = repos.get(&repo_id) {
+        if existing.pid != daemon.pid && is_process_alive(existing.pid) {
+            return;
+        }
+    }
+    let record = RegisteredRepoDaemon {
+        repo_id: repo_id.clone(),
+        display_name: repo_display_name_for_path(Path::new(&repo_root)),
+        instance_id: instance_id_for(daemon.pid, port),
+        repo_root: repo_root.clone(),
+        pid: daemon.pid,
+        port,
+        endpoint: format!("http://127.0.0.1:{port}"),
+        graph_entity_count: None,
+        registered_at: now.clone(),
+        last_heartbeat_at: now,
+        last_heartbeat_elapsed_ms: heartbeat_ms,
+    };
+    info!(
+        pid = daemon.pid,
+        repo = %repo_root,
+        repo_id = %repo_id,
+        reason = ?reason,
+        "adopting healthy repo daemon into supervisor registry"
+    );
+    repos.insert(repo_id, record);
 }
 
 /// Enumerate repo-scoped kin-daemon processes (those with `--repo`), excluding
@@ -1301,6 +1445,9 @@ mod tests {
         assert_eq!(registered.graph_entity_count, Some(99));
     }
 
+    /// Default observation: an already-registered daemon (the neutral case that
+    /// triggers neither reaping nor adoption). Individual tests override
+    /// `registry` to exercise the unregistered/stale/twin paths.
     fn observation(health: DaemonHealth, orphaned: bool) -> DaemonObservation {
         DaemonObservation {
             pid: 4242,
@@ -1308,7 +1455,7 @@ mod tests {
             orphaned,
             health,
             cpu_pinned_sweeps: 0,
-            has_registered_twin: false,
+            registry: RegistryRelation::RegisteredSelf,
         }
     }
 
@@ -1321,12 +1468,14 @@ mod tests {
 
     #[test]
     fn reaper_never_reaps_daemon_with_active_clients() {
-        // Active clients win over every reap criterion, registration aside.
+        // Active clients win over every reap criterion. Even a live twin claiming
+        // the same repo root is kept (split-brain safety: never reap an active
+        // daemon, and never clobber the live twin that owns the route).
         let policy = ReapPolicy::default();
         let mut obs = observation(healthy(true, false), true);
         obs.cpu_pinned_sweeps = 10;
-        obs.has_registered_twin = true;
-        assert_eq!(classify_daemon(&obs, &policy), ReapDecision::Keep);
+        obs.registry = RegistryRelation::LiveTwin;
+        assert_eq!(classify_daemon(&obs, &policy), DaemonDecision::Keep);
     }
 
     #[test]
@@ -1334,7 +1483,7 @@ mod tests {
         let policy = ReapPolicy::default();
         let mut obs = observation(healthy(false, true), true);
         obs.cpu_pinned_sweeps = 10;
-        assert_eq!(classify_daemon(&obs, &policy), ReapDecision::Keep);
+        assert_eq!(classify_daemon(&obs, &policy), DaemonDecision::Keep);
     }
 
     #[test]
@@ -1343,7 +1492,7 @@ mod tests {
         let obs = observation(DaemonHealth::Unhealthy, true);
         assert_eq!(
             classify_daemon(&obs, &policy),
-            ReapDecision::Reap(ReapReason::OrphanedUnhealthy)
+            DaemonDecision::Reap(ReapReason::OrphanedUnhealthy)
         );
     }
 
@@ -1353,7 +1502,7 @@ mod tests {
         // even if its health probe momentarily fails.
         let policy = ReapPolicy::default();
         let obs = observation(DaemonHealth::Unhealthy, false);
-        assert_eq!(classify_daemon(&obs, &policy), ReapDecision::Keep);
+        assert_eq!(classify_daemon(&obs, &policy), DaemonDecision::Keep);
     }
 
     #[test]
@@ -1363,7 +1512,7 @@ mod tests {
         obs.cpu_pinned_sweeps = REAPER_DEFAULT_CPU_PINNED_SWEEPS;
         assert_eq!(
             classify_daemon(&obs, &policy),
-            ReapDecision::Reap(ReapReason::OrphanedBusyNoClients)
+            DaemonDecision::Reap(ReapReason::OrphanedBusyNoClients)
         );
     }
 
@@ -1372,7 +1521,7 @@ mod tests {
         let policy = ReapPolicy::default();
         let mut obs = observation(healthy(false, false), true);
         obs.cpu_pinned_sweeps = REAPER_DEFAULT_CPU_PINNED_SWEEPS - 1;
-        assert_eq!(classify_daemon(&obs, &policy), ReapDecision::Keep);
+        assert_eq!(classify_daemon(&obs, &policy), DaemonDecision::Keep);
     }
 
     #[test]
@@ -1383,7 +1532,7 @@ mod tests {
         };
         let mut obs = observation(healthy(false, false), true);
         obs.cpu_pinned_sweeps = 99;
-        assert_eq!(classify_daemon(&obs, &policy), ReapDecision::Keep);
+        assert_eq!(classify_daemon(&obs, &policy), DaemonDecision::Keep);
     }
 
     #[test]
@@ -1392,17 +1541,17 @@ mod tests {
         let policy = ReapPolicy::default();
         let mut obs = observation(healthy(false, false), false);
         obs.cpu_pinned_sweeps = 99;
-        assert_eq!(classify_daemon(&obs, &policy), ReapDecision::Keep);
+        assert_eq!(classify_daemon(&obs, &policy), DaemonDecision::Keep);
     }
 
     #[test]
     fn reaper_reaps_orphaned_duplicate_twin() {
         let policy = ReapPolicy::default();
         let mut obs = observation(DaemonHealth::Unknown, true);
-        obs.has_registered_twin = true;
+        obs.registry = RegistryRelation::LiveTwin;
         assert_eq!(
             classify_daemon(&obs, &policy),
-            ReapDecision::Reap(ReapReason::DuplicateOrphanTwin)
+            DaemonDecision::Reap(ReapReason::DuplicateOrphanTwin)
         );
     }
 
@@ -1413,8 +1562,8 @@ mod tests {
             ..ReapPolicy::default()
         };
         let mut obs = observation(DaemonHealth::Unknown, true);
-        obs.has_registered_twin = true;
-        assert_eq!(classify_daemon(&obs, &policy), ReapDecision::Keep);
+        obs.registry = RegistryRelation::LiveTwin;
+        assert_eq!(classify_daemon(&obs, &policy), DaemonDecision::Keep);
     }
 
     #[test]
@@ -1423,15 +1572,157 @@ mod tests {
         // daemon is orphaned by design, so default to keep.
         let policy = ReapPolicy::default();
         let obs = observation(DaemonHealth::Unknown, true);
-        assert_eq!(classify_daemon(&obs, &policy), ReapDecision::Keep);
+        assert_eq!(classify_daemon(&obs, &policy), DaemonDecision::Keep);
     }
 
     #[test]
     fn reaper_keeps_healthy_registered_daemon() {
-        // The registered, healthy, idle daemon itself (no twin, not pinned).
+        // The registered (RegisteredSelf), healthy, idle daemon itself: not a
+        // reap candidate and already tracked, so neither reaped nor adopted.
         let policy = ReapPolicy::default();
         let obs = observation(healthy(false, false), true);
-        assert_eq!(classify_daemon(&obs, &policy), ReapDecision::Keep);
+        assert_eq!(classify_daemon(&obs, &policy), DaemonDecision::Keep);
+    }
+
+    #[test]
+    fn reaper_adopts_unregistered_healthy_daemon() {
+        // Healthy daemon serving but absent from the registry (e.g. supervisor
+        // restarted and lost its in-memory map): adopt to restore visibility.
+        let policy = ReapPolicy::default();
+        let mut obs = observation(healthy(false, false), true);
+        obs.registry = RegistryRelation::Unregistered;
+        assert_eq!(
+            classify_daemon(&obs, &policy),
+            DaemonDecision::Adopt(AdoptReason::Unregistered)
+        );
+    }
+
+    #[test]
+    fn reaper_adopts_unregistered_healthy_daemon_even_when_not_orphaned() {
+        // Orphan status only gates reaping, not adoption: a live-parented healthy
+        // daemon missing from the registry is still adopted.
+        let policy = ReapPolicy::default();
+        let mut obs = observation(healthy(false, false), false);
+        obs.registry = RegistryRelation::Unregistered;
+        assert_eq!(
+            classify_daemon(&obs, &policy),
+            DaemonDecision::Adopt(AdoptReason::Unregistered)
+        );
+    }
+
+    #[test]
+    fn reaper_adopts_active_unregistered_daemon() {
+        // An active (serving) unregistered daemon is adopted, never reaped: the
+        // active guard blocks reaping while adoption restores its route.
+        let policy = ReapPolicy::default();
+        let mut obs = observation(healthy(true, false), true);
+        obs.registry = RegistryRelation::Unregistered;
+        assert_eq!(
+            classify_daemon(&obs, &policy),
+            DaemonDecision::Adopt(AdoptReason::Unregistered)
+        );
+    }
+
+    #[test]
+    fn reaper_heals_stale_dead_registry_entry() {
+        // Registry entry for this repo root names a dead pid; the live healthy
+        // daemon serving the same root replaces it.
+        let policy = ReapPolicy::default();
+        let mut obs = observation(healthy(false, false), true);
+        obs.registry = RegistryRelation::StaleDifferentPid;
+        assert_eq!(
+            classify_daemon(&obs, &policy),
+            DaemonDecision::Adopt(AdoptReason::HealStaleEntry)
+        );
+    }
+
+    #[test]
+    fn reaper_keeps_already_registered_healthy_daemon() {
+        // Already tracked as itself: no adoption (idempotent), no reaping.
+        let policy = ReapPolicy::default();
+        let mut obs = observation(healthy(false, false), true);
+        obs.registry = RegistryRelation::RegisteredSelf;
+        assert_eq!(classify_daemon(&obs, &policy), DaemonDecision::Keep);
+    }
+
+    #[test]
+    fn reaper_does_not_adopt_unhealthy_daemon() {
+        // Unhealthy, unregistered, but NOT orphaned: not adopted (adoption needs
+        // a healthy probe) and not reaped (reaping needs orphan + unhealthy).
+        let policy = ReapPolicy::default();
+        let mut obs = observation(DaemonHealth::Unhealthy, false);
+        obs.registry = RegistryRelation::Unregistered;
+        assert_eq!(classify_daemon(&obs, &policy), DaemonDecision::Keep);
+    }
+
+    #[test]
+    fn reaper_does_not_adopt_unknown_health_daemon() {
+        // Unknown health (no probeable port): never adopted, even if unregistered.
+        let policy = ReapPolicy::default();
+        let mut obs = observation(DaemonHealth::Unknown, true);
+        obs.registry = RegistryRelation::Unregistered;
+        assert_eq!(classify_daemon(&obs, &policy), DaemonDecision::Keep);
+    }
+
+    #[test]
+    fn reaper_reaps_rather_than_adopts_orphaned_unhealthy_unregistered() {
+        // Reaping wins over adoption: an orphaned, unhealthy, unregistered daemon
+        // is reaped (and unhealthy is not adoptable anyway).
+        let policy = ReapPolicy::default();
+        let mut obs = observation(DaemonHealth::Unhealthy, true);
+        obs.registry = RegistryRelation::Unregistered;
+        assert_eq!(
+            classify_daemon(&obs, &policy),
+            DaemonDecision::Reap(ReapReason::OrphanedUnhealthy)
+        );
+    }
+
+    #[test]
+    fn reaper_reaps_rather_than_adopts_orphaned_idle_spinner_unregistered() {
+        // Reaping wins over adoption for the one healthy reap path: an orphaned,
+        // idle, CPU-pinned unregistered daemon is reaped, not adopted.
+        let policy = ReapPolicy::default();
+        let mut obs = observation(healthy(false, false), true);
+        obs.registry = RegistryRelation::Unregistered;
+        obs.cpu_pinned_sweeps = REAPER_DEFAULT_CPU_PINNED_SWEEPS;
+        assert_eq!(
+            classify_daemon(&obs, &policy),
+            DaemonDecision::Reap(ReapReason::OrphanedBusyNoClients)
+        );
+    }
+
+    #[test]
+    fn reaper_does_not_adopt_when_disabled() {
+        let policy = ReapPolicy {
+            adopt_enabled: false,
+            ..ReapPolicy::default()
+        };
+        let mut obs = observation(healthy(false, false), true);
+        obs.registry = RegistryRelation::Unregistered;
+        assert_eq!(classify_daemon(&obs, &policy), DaemonDecision::Keep);
+    }
+
+    #[test]
+    fn reaper_does_not_adopt_empty_repo_root() {
+        // A valid repo root is required to synthesize a routable registration.
+        let policy = ReapPolicy::default();
+        let mut obs = observation(healthy(false, false), true);
+        obs.registry = RegistryRelation::Unregistered;
+        obs.repo_root = String::new();
+        assert_eq!(classify_daemon(&obs, &policy), DaemonDecision::Keep);
+    }
+
+    #[test]
+    fn reaper_keeps_idle_live_twin_when_duplicate_reap_disabled() {
+        // Idle orphaned live twin, but duplicate reap disabled: not reaped, and a
+        // live twin owns the route so it is not adopted either.
+        let policy = ReapPolicy {
+            duplicate_reap_enabled: false,
+            ..ReapPolicy::default()
+        };
+        let mut obs = observation(healthy(false, false), true);
+        obs.registry = RegistryRelation::LiveTwin;
+        assert_eq!(classify_daemon(&obs, &policy), DaemonDecision::Keep);
     }
 
     #[test]
@@ -1439,6 +1730,7 @@ mod tests {
         let policy = ReapPolicy::default();
         assert!(policy.cpu_heuristic_enabled);
         assert!(policy.duplicate_reap_enabled);
+        assert!(policy.adopt_enabled);
         assert_eq!(policy.cpu_pinned_min_sweeps, REAPER_DEFAULT_CPU_PINNED_SWEEPS);
         assert_eq!(policy.cpu_pinned_percent, REAPER_DEFAULT_CPU_PINNED_PERCENT);
     }
