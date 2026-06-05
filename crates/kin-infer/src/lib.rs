@@ -182,6 +182,28 @@ pub struct BertConfig {
     /// Whether to tie word embeddings with LM head.
     #[serde(default = "default_true")]
     pub tie_word_embeddings: bool,
+    /// The sequence length the model was actually *trained* on. Long-context
+    /// RoPE models (e.g. nomic_bert / arctic-embed-m-long) advertise a much
+    /// larger positional ceiling via `n_positions` (`max_position_embeddings`)
+    /// that is reached only by RoPE extrapolation — quality degrades and cost
+    /// grows O(seq²) past this point. When present we cap tokenization here so
+    /// we never feed the model beyond its trained range.
+    #[serde(default)]
+    pub max_trained_positions: Option<usize>,
+}
+
+impl BertConfig {
+    /// The maximum sequence length tokenization should produce. Prefer the
+    /// model's trained range (`max_trained_positions`) over the advertised
+    /// positional ceiling (`max_position_embeddings` / `n_positions`), which on
+    /// long-context RoPE models overstates the usable window. Falls back to the
+    /// positional ceiling when the config does not declare a trained range.
+    pub fn effective_max_seq_len(&self) -> usize {
+        self.max_trained_positions
+            .filter(|trained| *trained > 0)
+            .map(|trained| trained.min(self.max_position_embeddings))
+            .unwrap_or(self.max_position_embeddings)
+    }
 }
 
 fn default_eps() -> f64 {
@@ -3915,6 +3937,42 @@ fn dot_product_scalar(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_max_seq_len_prefers_trained_range() {
+        // Long-context RoPE model: the positional ceiling (n_positions) far
+        // exceeds the trained range, so we must cap at the trained range.
+        let json = r#"{
+            "n_embd": 768, "n_layer": 12, "n_head": 12, "n_inner": 3072,
+            "n_positions": 8192, "vocab_size": 30528, "max_trained_positions": 2048
+        }"#;
+        let config: BertConfig = serde_json::from_str(json).expect("parse config");
+        assert_eq!(config.max_position_embeddings, 8192);
+        assert_eq!(config.effective_max_seq_len(), 2048);
+    }
+
+    #[test]
+    fn effective_max_seq_len_falls_back_to_positional_ceiling() {
+        // No declared trained range → fall back to the positional ceiling.
+        let json = r#"{
+            "n_embd": 768, "n_layer": 12, "n_head": 12, "n_inner": 3072,
+            "n_positions": 512, "vocab_size": 30528
+        }"#;
+        let config: BertConfig = serde_json::from_str(json).expect("parse config");
+        assert_eq!(config.effective_max_seq_len(), 512);
+    }
+
+    #[test]
+    fn effective_max_seq_len_never_exceeds_positional_ceiling() {
+        // A trained range larger than the positional ceiling is clamped down so
+        // we never index past addressable positions.
+        let json = r#"{
+            "n_embd": 768, "n_layer": 12, "n_head": 12, "n_inner": 3072,
+            "n_positions": 1024, "vocab_size": 30528, "max_trained_positions": 4096
+        }"#;
+        let config: BertConfig = serde_json::from_str(json).expect("parse config");
+        assert_eq!(config.effective_max_seq_len(), 1024);
+    }
 
     /// Validate that the single-dispatch batched RoPE (`rope_qk_batched` →
     /// `rope_pair_batched`, used by `forward_batched`) is numerically identical to
