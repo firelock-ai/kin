@@ -7,7 +7,7 @@
 //! discovery and routing for repo-scoped graph daemons, while each repo daemon
 //! remains the single writer for its repo graph.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -608,6 +608,12 @@ pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::i
         });
     }
 
+    // Machine-wide rogue/misbehaving daemon reaper. Runs independently of idle
+    // shutdown: even a long-lived supervisor backstops the machine by reaping
+    // demonstrably-misbehaving repo daemons it never spawned. Disabled entirely
+    // via KIN_SUPERVISOR_REAP_DISABLE.
+    spawn_rogue_daemon_reaper(Arc::clone(&state), shutdown_rx.clone());
+
     #[cfg(unix)]
     {
         let signal_shutdown = shutdown_tx.clone();
@@ -641,6 +647,410 @@ pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::i
         .await;
     remove_supervisor_endpoint_files_if_current_process();
     result
+}
+
+// ===== Machine-wide rogue/misbehaving daemon reaper =====
+//
+// The supervisor backstops the whole machine: it sweeps for repo-scoped
+// kin-daemon processes (regardless of who launched them) and reaps only the
+// demonstrably-misbehaving ones, always logging pid + repo + reason. The
+// graceful step is SIGTERM (the daemon flushes and exits cleanly on it), then
+// SIGKILL if it does not exit within the grace window.
+
+/// How often the reaper sweeps the machine.
+const REAPER_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
+/// Timeout for a single repo-daemon `/health` probe.
+const REAPER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Grace period between SIGTERM and SIGKILL when reaping.
+const REAPER_SIGTERM_GRACE: Duration = Duration::from_secs(5);
+/// CPU usage percent (may exceed 100 on multicore) above which a daemon counts
+/// as "pinned" for a sweep.
+const REAPER_DEFAULT_CPU_PINNED_PERCENT: f32 = 80.0;
+/// Default consecutive pinned sweeps before the CPU heuristic fires.
+const REAPER_DEFAULT_CPU_PINNED_SWEEPS: u32 = 2;
+
+/// Health classification of a discovered repo daemon.
+#[derive(Debug, Clone, PartialEq)]
+enum DaemonHealth {
+    /// `/health` responded 2xx; carries observed activity.
+    Healthy(DaemonActivity),
+    /// `/health` failed, timed out, or returned non-2xx.
+    Unhealthy,
+    /// No port was discoverable, so health could not be probed.
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DaemonActivity {
+    /// In-flight requests, event subscribers, or external (non-daemon) sessions.
+    has_clients: bool,
+    /// Reconciliation is actively running (not idle).
+    reconciling: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReapReason {
+    /// Orphaned (reparented to init) and the health probe failed/timed out.
+    OrphanedUnhealthy,
+    /// Orphaned, healthy but idle (no clients, not reconciling), and CPU-pinned
+    /// across enough consecutive sweeps — the busy-spinner case.
+    OrphanedBusyNoClients,
+    /// Orphaned duplicate of a registered, healthy daemon on the same repo root.
+    DuplicateOrphanTwin,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ReapDecision {
+    Keep,
+    Reap(ReapReason),
+}
+
+/// Which heuristics beyond the always-on safe criterion are enabled, and how the
+/// CPU heuristic is tuned. Controlled by `KIN_SUPERVISOR_REAP_*`.
+#[derive(Debug, Clone, Copy)]
+struct ReapPolicy {
+    cpu_heuristic_enabled: bool,
+    duplicate_reap_enabled: bool,
+    cpu_pinned_percent: f32,
+    cpu_pinned_min_sweeps: u32,
+}
+
+impl Default for ReapPolicy {
+    fn default() -> Self {
+        Self {
+            cpu_heuristic_enabled: true,
+            duplicate_reap_enabled: true,
+            cpu_pinned_percent: REAPER_DEFAULT_CPU_PINNED_PERCENT,
+            cpu_pinned_min_sweeps: REAPER_DEFAULT_CPU_PINNED_SWEEPS,
+        }
+    }
+}
+
+impl ReapPolicy {
+    fn from_env() -> Self {
+        let mut policy = Self::default();
+        if env_flag_falsey("KIN_SUPERVISOR_REAP_CPU") {
+            policy.cpu_heuristic_enabled = false;
+        }
+        if env_flag_falsey("KIN_SUPERVISOR_REAP_DUPLICATE") {
+            policy.duplicate_reap_enabled = false;
+        }
+        if let Some(percent) = std::env::var("KIN_SUPERVISOR_REAP_CPU_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| *v > 0.0)
+        {
+            policy.cpu_pinned_percent = percent;
+        }
+        if let Some(sweeps) = std::env::var("KIN_SUPERVISOR_REAP_CPU_SWEEPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|v| *v >= 1)
+        {
+            policy.cpu_pinned_min_sweeps = sweeps;
+        }
+        policy
+    }
+}
+
+/// True when `key` is set to an explicitly falsey value (`0/false/no/off`).
+fn env_flag_falsey(key: &str) -> bool {
+    matches!(
+        std::env::var(key).ok().as_deref().map(str::trim),
+        Some("0") | Some("false") | Some("no") | Some("off")
+    )
+}
+
+/// True when `key` is set to an explicitly truthy value (`1/true/yes/on`).
+fn env_flag_truthy(key: &str) -> bool {
+    matches!(
+        std::env::var(key).ok().as_deref().map(str::trim),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+/// Observed facts about one discovered repo daemon, fed to the classifier.
+#[derive(Debug, Clone)]
+struct DaemonObservation {
+    pid: u32,
+    repo_root: String,
+    /// Reparented to init (ppid == 1): its launching CLI has exited.
+    orphaned: bool,
+    health: DaemonHealth,
+    /// Consecutive sweeps this pid has been CPU-pinned.
+    cpu_pinned_sweeps: u32,
+    /// A *different*, registered, alive daemon owns the same repo root.
+    has_registered_twin: bool,
+}
+
+/// Decide whether a discovered daemon is demonstrably misbehaving and should be
+/// reaped. Pure function over observed facts — the unit-tested core.
+///
+/// Invariants:
+/// - A daemon doing real work (active clients or active reconciliation) is NEVER
+///   reaped, even if unregistered.
+/// - The safe criterion (orphaned + unhealthy) is always enabled.
+/// - The CPU-pinned and duplicate-twin criteria are policy-gated.
+fn classify_daemon(obs: &DaemonObservation, policy: &ReapPolicy) -> ReapDecision {
+    // Absolute guard: never reap a daemon that is serving clients or actively
+    // reconciling, regardless of registration or orphan status.
+    if let DaemonHealth::Healthy(activity) = &obs.health {
+        if activity.has_clients || activity.reconciling {
+            return ReapDecision::Keep;
+        }
+    }
+
+    // (a) Safe criterion, always on: orphaned and its health probe failed.
+    if obs.orphaned && obs.health == DaemonHealth::Unhealthy {
+        return ReapDecision::Reap(ReapReason::OrphanedUnhealthy);
+    }
+
+    // (c) Orphaned duplicate twin of a registered, healthy daemon.
+    if policy.duplicate_reap_enabled && obs.orphaned && obs.has_registered_twin {
+        return ReapDecision::Reap(ReapReason::DuplicateOrphanTwin);
+    }
+
+    // (b) Orphaned busy-spinner: healthy but idle (no clients, not reconciling)
+    //     and CPU-pinned across enough consecutive sweeps.
+    if policy.cpu_heuristic_enabled && obs.orphaned {
+        if let DaemonHealth::Healthy(activity) = &obs.health {
+            if !activity.has_clients
+                && !activity.reconciling
+                && obs.cpu_pinned_sweeps >= policy.cpu_pinned_min_sweeps
+            {
+                return ReapDecision::Reap(ReapReason::OrphanedBusyNoClients);
+            }
+        }
+    }
+
+    ReapDecision::Keep
+}
+
+#[cfg(unix)]
+fn spawn_rogue_daemon_reaper(
+    state: Arc<SupervisorState>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    if env_flag_truthy("KIN_SUPERVISOR_REAP_DISABLE") {
+        info!("rogue-daemon reaper disabled via KIN_SUPERVISOR_REAP_DISABLE");
+        return;
+    }
+    let policy = ReapPolicy::from_env();
+    info!(?policy, "rogue-daemon reaper enabled");
+    tokio::spawn(async move {
+        let self_pid = std::process::id();
+        let client = reqwest::Client::new();
+        let mut sys = sysinfo::System::new();
+        // pid -> consecutive CPU-pinned sweep count.
+        let mut pinned_sweeps: HashMap<u32, u32> = HashMap::new();
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(REAPER_SWEEP_INTERVAL) => {}
+                _ = shutdown_rx.changed() => break,
+            }
+            if *shutdown_rx.borrow() {
+                break;
+            }
+            reaper_sweep(&state, &client, &mut sys, &mut pinned_sweeps, self_pid, policy).await;
+        }
+        info!("rogue-daemon reaper shutting down");
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_rogue_daemon_reaper(
+    _state: Arc<SupervisorState>,
+    _shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+}
+
+/// One discovered repo-scoped daemon process from the machine-wide scan.
+#[cfg(unix)]
+struct DiscoveredDaemon {
+    pid: u32,
+    ppid: Option<u32>,
+    repo_root: String,
+    port: Option<u16>,
+    cpu_usage: f32,
+}
+
+#[cfg(unix)]
+async fn reaper_sweep(
+    state: &SupervisorState,
+    client: &reqwest::Client,
+    sys: &mut sysinfo::System,
+    pinned_sweeps: &mut HashMap<u32, u32>,
+    self_pid: u32,
+    policy: ReapPolicy,
+) {
+    let discovered = enumerate_repo_daemons(sys, self_pid);
+
+    // Update CPU-pinned streaks; forget pids that vanished.
+    let live_pids: HashSet<u32> = discovered.iter().map(|d| d.pid).collect();
+    pinned_sweeps.retain(|pid, _| live_pids.contains(pid));
+    for daemon in &discovered {
+        let counter = pinned_sweeps.entry(daemon.pid).or_insert(0);
+        if daemon.cpu_usage >= policy.cpu_pinned_percent {
+            *counter = counter.saturating_add(1);
+        } else {
+            *counter = 0;
+        }
+    }
+
+    // Snapshot the registry as canonical repo_root -> registered pid.
+    let registry: HashMap<String, u32> = {
+        let repos = state.repo_daemons.read().await;
+        repos
+            .values()
+            .map(|d| (canonical_path_string(Path::new(&d.repo_root)), d.pid))
+            .collect()
+    };
+
+    for daemon in &discovered {
+        let health = match daemon.port {
+            Some(port) => probe_daemon_health(client, port).await,
+            None => DaemonHealth::Unknown,
+        };
+        let has_registered_twin = registry
+            .get(&daemon.repo_root)
+            .is_some_and(|&registered_pid| {
+                registered_pid != daemon.pid && is_process_alive(registered_pid)
+            });
+        let observation = DaemonObservation {
+            pid: daemon.pid,
+            repo_root: daemon.repo_root.clone(),
+            orphaned: daemon.ppid == Some(1),
+            health,
+            cpu_pinned_sweeps: pinned_sweeps.get(&daemon.pid).copied().unwrap_or(0),
+            has_registered_twin,
+        };
+        if let ReapDecision::Reap(reason) = classify_daemon(&observation, &policy) {
+            reap_daemon(&observation, reason).await;
+            pinned_sweeps.remove(&daemon.pid);
+        }
+    }
+}
+
+/// Enumerate repo-scoped kin-daemon processes (those with `--repo`), excluding
+/// the supervisor itself and the current process.
+#[cfg(unix)]
+fn enumerate_repo_daemons(sys: &mut sysinfo::System, self_pid: u32) -> Vec<DiscoveredDaemon> {
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let mut found = Vec::new();
+    for (pid, process) in sys.processes() {
+        let pid = pid.as_u32();
+        if pid == self_pid {
+            continue;
+        }
+        let args: Vec<&str> = process.cmd().iter().filter_map(|arg| arg.to_str()).collect();
+        let name = process.name().to_str().unwrap_or_default();
+        let looks_like_daemon = name.contains("kin-daemon")
+            || args.first().is_some_and(|arg| arg.contains("kin-daemon"));
+        if !looks_like_daemon {
+            continue;
+        }
+        if args.iter().any(|arg| *arg == "--supervisor") {
+            continue;
+        }
+        let Some(repo_root) = arg_value(&args, "--repo") else {
+            continue;
+        };
+        let port = arg_value(&args, "--port").and_then(|value| value.parse::<u16>().ok());
+        found.push(DiscoveredDaemon {
+            pid,
+            ppid: process.parent().map(|parent| parent.as_u32()),
+            repo_root: canonical_path_string(Path::new(repo_root)),
+            port,
+            cpu_usage: process.cpu_usage(),
+        });
+    }
+    found
+}
+
+/// Extract a CLI flag value, supporting both `--flag value` and `--flag=value`.
+#[cfg(unix)]
+fn arg_value<'a>(args: &'a [&'a str], flag: &str) -> Option<&'a str> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if *arg == flag {
+            return iter.next().copied();
+        }
+        if let Some(value) = arg
+            .strip_prefix(flag)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Probe a repo daemon's unauthenticated `/health` endpoint and classify it.
+#[cfg(unix)]
+async fn probe_daemon_health(client: &reqwest::Client, port: u16) -> DaemonHealth {
+    let url = format!("http://127.0.0.1:{port}/health");
+    let response = match client
+        .get(&url)
+        .timeout(REAPER_HEALTH_PROBE_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => response,
+        Ok(_) => return DaemonHealth::Unhealthy,
+        Err(_) => return DaemonHealth::Unhealthy,
+    };
+    let Ok(body) = response.json::<serde_json::Value>().await else {
+        return DaemonHealth::Unhealthy;
+    };
+    let count = |key: &str| body.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let has_clients =
+        count("active_request_count") + count("event_subscriber_count") + count("external_session_count")
+            > 0;
+    let reconciling = body
+        .get("reconciliation_status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|status| !status.eq_ignore_ascii_case("idle"));
+    DaemonHealth::Healthy(DaemonActivity {
+        has_clients,
+        reconciling,
+    })
+}
+
+/// Reap a daemon: graceful SIGTERM, then SIGKILL if it survives the grace window.
+#[cfg(unix)]
+async fn reap_daemon(observation: &DaemonObservation, reason: ReapReason) {
+    warn!(
+        pid = observation.pid,
+        repo = %observation.repo_root,
+        reason = ?reason,
+        "reaping misbehaving repo daemon (SIGTERM)"
+    );
+    unsafe {
+        libc::kill(observation.pid as libc::pid_t, libc::SIGTERM);
+    }
+    let start = Instant::now();
+    while start.elapsed() < REAPER_SIGTERM_GRACE {
+        if !is_process_alive(observation.pid) {
+            info!(
+                pid = observation.pid,
+                repo = %observation.repo_root,
+                "reaped daemon exited gracefully after SIGTERM"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    if is_process_alive(observation.pid) {
+        warn!(
+            pid = observation.pid,
+            repo = %observation.repo_root,
+            reason = ?reason,
+            "daemon survived SIGTERM grace — sending SIGKILL"
+        );
+        unsafe {
+            libc::kill(observation.pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -889,5 +1299,147 @@ mod tests {
         let registered = repos.get("demo").unwrap();
         assert!(registered.last_heartbeat_elapsed_ms > previous_heartbeat);
         assert_eq!(registered.graph_entity_count, Some(99));
+    }
+
+    fn observation(health: DaemonHealth, orphaned: bool) -> DaemonObservation {
+        DaemonObservation {
+            pid: 4242,
+            repo_root: "/tmp/demo".to_string(),
+            orphaned,
+            health,
+            cpu_pinned_sweeps: 0,
+            has_registered_twin: false,
+        }
+    }
+
+    fn healthy(has_clients: bool, reconciling: bool) -> DaemonHealth {
+        DaemonHealth::Healthy(DaemonActivity {
+            has_clients,
+            reconciling,
+        })
+    }
+
+    #[test]
+    fn reaper_never_reaps_daemon_with_active_clients() {
+        // Active clients win over every reap criterion, registration aside.
+        let policy = ReapPolicy::default();
+        let mut obs = observation(healthy(true, false), true);
+        obs.cpu_pinned_sweeps = 10;
+        obs.has_registered_twin = true;
+        assert_eq!(classify_daemon(&obs, &policy), ReapDecision::Keep);
+    }
+
+    #[test]
+    fn reaper_never_reaps_reconciling_daemon() {
+        let policy = ReapPolicy::default();
+        let mut obs = observation(healthy(false, true), true);
+        obs.cpu_pinned_sweeps = 10;
+        assert_eq!(classify_daemon(&obs, &policy), ReapDecision::Keep);
+    }
+
+    #[test]
+    fn reaper_reaps_orphaned_unhealthy_by_default() {
+        let policy = ReapPolicy::default();
+        let obs = observation(DaemonHealth::Unhealthy, true);
+        assert_eq!(
+            classify_daemon(&obs, &policy),
+            ReapDecision::Reap(ReapReason::OrphanedUnhealthy)
+        );
+    }
+
+    #[test]
+    fn reaper_keeps_non_orphaned_unhealthy() {
+        // A daemon with a live parent (not reparented to init) is left alone
+        // even if its health probe momentarily fails.
+        let policy = ReapPolicy::default();
+        let obs = observation(DaemonHealth::Unhealthy, false);
+        assert_eq!(classify_daemon(&obs, &policy), ReapDecision::Keep);
+    }
+
+    #[test]
+    fn reaper_reaps_orphaned_idle_cpu_spinner() {
+        let policy = ReapPolicy::default();
+        let mut obs = observation(healthy(false, false), true);
+        obs.cpu_pinned_sweeps = REAPER_DEFAULT_CPU_PINNED_SWEEPS;
+        assert_eq!(
+            classify_daemon(&obs, &policy),
+            ReapDecision::Reap(ReapReason::OrphanedBusyNoClients)
+        );
+    }
+
+    #[test]
+    fn reaper_keeps_spinner_below_sweep_threshold() {
+        let policy = ReapPolicy::default();
+        let mut obs = observation(healthy(false, false), true);
+        obs.cpu_pinned_sweeps = REAPER_DEFAULT_CPU_PINNED_SWEEPS - 1;
+        assert_eq!(classify_daemon(&obs, &policy), ReapDecision::Keep);
+    }
+
+    #[test]
+    fn reaper_keeps_spinner_when_cpu_heuristic_disabled() {
+        let policy = ReapPolicy {
+            cpu_heuristic_enabled: false,
+            ..ReapPolicy::default()
+        };
+        let mut obs = observation(healthy(false, false), true);
+        obs.cpu_pinned_sweeps = 99;
+        assert_eq!(classify_daemon(&obs, &policy), ReapDecision::Keep);
+    }
+
+    #[test]
+    fn reaper_keeps_non_orphaned_cpu_spinner() {
+        // Busy but with a live parent: not a runaway orphan, leave it alone.
+        let policy = ReapPolicy::default();
+        let mut obs = observation(healthy(false, false), false);
+        obs.cpu_pinned_sweeps = 99;
+        assert_eq!(classify_daemon(&obs, &policy), ReapDecision::Keep);
+    }
+
+    #[test]
+    fn reaper_reaps_orphaned_duplicate_twin() {
+        let policy = ReapPolicy::default();
+        let mut obs = observation(DaemonHealth::Unknown, true);
+        obs.has_registered_twin = true;
+        assert_eq!(
+            classify_daemon(&obs, &policy),
+            ReapDecision::Reap(ReapReason::DuplicateOrphanTwin)
+        );
+    }
+
+    #[test]
+    fn reaper_keeps_duplicate_twin_when_disabled() {
+        let policy = ReapPolicy {
+            duplicate_reap_enabled: false,
+            ..ReapPolicy::default()
+        };
+        let mut obs = observation(DaemonHealth::Unknown, true);
+        obs.has_registered_twin = true;
+        assert_eq!(classify_daemon(&obs, &policy), ReapDecision::Keep);
+    }
+
+    #[test]
+    fn reaper_keeps_unknown_health_without_twin() {
+        // Orphaned but unprobeable and not a duplicate — a healthy persistent
+        // daemon is orphaned by design, so default to keep.
+        let policy = ReapPolicy::default();
+        let obs = observation(DaemonHealth::Unknown, true);
+        assert_eq!(classify_daemon(&obs, &policy), ReapDecision::Keep);
+    }
+
+    #[test]
+    fn reaper_keeps_healthy_registered_daemon() {
+        // The registered, healthy, idle daemon itself (no twin, not pinned).
+        let policy = ReapPolicy::default();
+        let obs = observation(healthy(false, false), true);
+        assert_eq!(classify_daemon(&obs, &policy), ReapDecision::Keep);
+    }
+
+    #[test]
+    fn reap_policy_defaults_enable_all_criteria() {
+        let policy = ReapPolicy::default();
+        assert!(policy.cpu_heuristic_enabled);
+        assert!(policy.duplicate_reap_enabled);
+        assert_eq!(policy.cpu_pinned_min_sweeps, REAPER_DEFAULT_CPU_PINNED_SWEEPS);
+        assert_eq!(policy.cpu_pinned_percent, REAPER_DEFAULT_CPU_PINNED_PERCENT);
     }
 }
