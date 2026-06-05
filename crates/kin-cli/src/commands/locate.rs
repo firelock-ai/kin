@@ -10962,6 +10962,35 @@ fn rank_and_cap_symbols_capturing(
     (kept, dropped)
 }
 
+fn cap_symbols_by_score(symbols: Vec<LocateSymbol>) -> Vec<LocateSymbol> {
+    let topk = locate_env_usize("KIN_LOCATE_EXPLAIN_DEF_TOPK", 0);
+    let floor_pct = locate_env_f32("KIN_LOCATE_EXPLAIN_DEF_FLOOR_PCT", 0.0);
+    if topk == 0 && floor_pct <= 0.0 {
+        return symbols;
+    }
+
+    let (mut defs, mut refs): (Vec<LocateSymbol>, Vec<LocateSymbol>) = symbols
+        .into_iter()
+        .partition(|s| s.definition);
+
+    let top_score = defs.first().map(|x| x.score).unwrap_or(0.0);
+    let floor = if floor_pct > 0.0 && top_score > 0.0 {
+        top_score * floor_pct
+    } else {
+        f32::NEG_INFINITY
+    };
+
+    let limit = if topk == 0 { defs.len() } else { topk };
+    let mut kept_defs: Vec<LocateSymbol> = defs
+        .into_iter()
+        .take(limit)
+        .filter(|s| s.score >= floor)
+        .collect();
+
+    kept_defs.append(&mut refs);
+    kept_defs
+}
+
 /// Ranking is definition-before-reference, then composite score descending,
 /// then name for determinism. De-duplicates by name (keeping the highest-ranked
 /// occurrence) and truncates to `cap` (`0` = uncapped).
@@ -10979,6 +11008,8 @@ fn rank_and_cap_symbols_with(mut symbols: Vec<LocateSymbol>, cap: usize) -> Vec<
 
     let mut seen = HashSet::new();
     symbols.retain(|s| seen.insert(s.name.clone()));
+
+    let mut symbols = cap_symbols_by_score(symbols);
 
     if cap > 0 && symbols.len() > cap {
         symbols.truncate(cap);
