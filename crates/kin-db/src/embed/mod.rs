@@ -72,6 +72,24 @@ pub const EMBEDDING_BODY_PREVIEW_KEY: &str = "embedding_body_preview";
 const FILE_IMPORT_CONTEXT_KEY: &str = "file_import_context";
 const FILE_SURFACE_CONTEXT_KEY: &str = "file_surface_context";
 
+/// Practical per-entity tokenization ceiling for embeddings. Bounded *below* the
+/// model's trained range so a single entity can never dominate GPU cost: the
+/// naive scalar Metal attention is O(seq²), so a 2982-token entity (e.g. a
+/// scikit-learn class whose numpy docstring alone is ~3700 tokens) costs ~30×
+/// a typical ~500-token entity for negligible retrieval gain. The entity embed
+/// text is front-loaded with the discriminating signal (kind, path, name,
+/// signature, doc summary, body preview), so right-truncation past this length
+/// drops boilerplate (Parameters/Examples/References prose), not semantics.
+const EMBED_MAX_SEQ_LEN: usize = 1024;
+
+/// Maximum characters of an entity's docstring (`doc_summary`) folded into its
+/// embedding text. NumPy/PEP-257 docstrings are front-loaded — the summary line
+/// and first paragraph carry the semantics; the long Parameters/Attributes/
+/// Examples/References sections add tokens (and O(seq²) GPU cost) without
+/// retrieval signal. The full docstring stays in graph truth for display/blame;
+/// only the embed projection is bounded. Mirrors the 800-char body preview.
+const EMBED_DOC_SUMMARY_MAX_CHARS: usize = 800;
+
 #[cfg(feature = "embeddings")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbeddingRuntimeConfig {
@@ -249,10 +267,11 @@ impl CodeEmbedder {
             .id_to_token(pad_id)
             .unwrap_or_else(|| "<pad>".to_string());
 
+        let max_length = config.effective_max_seq_len().min(EMBED_MAX_SEQ_LEN);
         tokenizer
             .with_truncation(Some(TruncationParams {
                 direction: TruncationDirection::Right,
-                max_length: config.max_position_embeddings,
+                max_length,
                 strategy: TruncationStrategy::LongestFirst,
                 stride: 0,
             }))
@@ -1786,6 +1805,18 @@ pub fn format_graph_entity_text(entity: &Entity) -> String {
     format_graph_entity_text_with_context(entity, &[])
 }
 
+/// Bound a single embed-text field to `max_chars`, on a UTF-8 char boundary.
+/// Right-truncation keeps the front of the field, which for docstrings is the
+/// summary line and first paragraph (the discriminating signal); the trailing
+/// boilerplate that is dropped carries little retrieval value but heavy cost.
+fn bounded_embed_field(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        text.chars().take(max_chars).collect()
+    }
+}
+
 /// Build the text representation for a persisted graph entity with additional
 /// graph-derived neighborhood context lines.
 pub fn format_graph_entity_text_with_context(entity: &Entity, context_lines: &[String]) -> String {
@@ -1803,8 +1834,9 @@ pub fn format_graph_entity_text_with_context(entity: &Entity, context_lines: &[S
         parts.push(entity.signature.clone());
     }
     if let Some(doc_summary) = entity.doc_summary.as_deref() {
+        let doc_summary = doc_summary.trim();
         if !doc_summary.is_empty() {
-            parts.push(doc_summary.to_string());
+            parts.push(bounded_embed_field(doc_summary, EMBED_DOC_SUMMARY_MAX_CHARS));
         }
     }
     if let Some(body_preview) = entity
@@ -2183,6 +2215,71 @@ mod tests {
         assert!(formatted.contains("fn parse_config(path: &str) -> Config { ... }"));
         assert!(formatted.contains("@vue/runtime-core"));
         assert!(formatted.contains("runtime dom"));
+    }
+
+    #[test]
+    fn format_graph_entity_text_caps_long_doc_summary() {
+        // A numpy-style docstring far exceeds the embed cap (cf. scikit-learn's
+        // RandomForestClassifier, whose docstring alone is ~3700 tokens). Only
+        // the front — the semantic summary — should be folded into embed text;
+        // the trailing Parameters/Examples prose is dropped.
+        let head = "A random forest classifier. ";
+        let long_doc = format!(
+            "{head}{}",
+            "Parameters ---------- n_estimators int default 100. ".repeat(200)
+        );
+        assert!(long_doc.chars().count() > EMBED_DOC_SUMMARY_MAX_CHARS);
+
+        let entity = Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: "RandomForestClassifier".into(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256([0; 32]),
+                signature_hash: Hash256([0; 32]),
+                behavior_hash: Hash256([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new("sklearn/ensemble/_forest.py")),
+            span: None,
+            signature: "class RandomForestClassifier".into(),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: Some(long_doc.clone()),
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        };
+
+        let formatted = format_graph_entity_text(&entity);
+        // The summary head is retained.
+        assert!(formatted.contains("A random forest classifier."));
+        // The full docstring is NOT folded in verbatim.
+        assert!(!formatted.contains(&long_doc));
+        // Total embed text stays within the cap plus the short header fields
+        // (kind/path/name/signature), proving the docstring no longer dominates.
+        assert!(
+            formatted.chars().count() <= EMBED_DOC_SUMMARY_MAX_CHARS + 256,
+            "doc summary not capped: {} chars",
+            formatted.chars().count()
+        );
+    }
+
+    #[test]
+    fn bounded_embed_field_passes_through_short_text() {
+        assert_eq!(bounded_embed_field("short text", 100), "short text");
+    }
+
+    #[test]
+    fn bounded_embed_field_truncates_on_char_boundary() {
+        // Multi-byte chars must not panic at the truncation boundary.
+        let text: String = "é".repeat(50);
+        let bounded = bounded_embed_field(&text, 10);
+        assert_eq!(bounded.chars().count(), 10);
+        assert!(bounded.chars().all(|c| c == 'é'));
     }
 
     #[test]
