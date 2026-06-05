@@ -85,7 +85,7 @@ pub struct EmbeddingRuntimeConfig {
 /// Generates code embeddings using a local BERT model via a custom inference
 /// runtime. Pure Rust, zero framework dependencies (ndarray + safetensors).
 ///
-/// Uses BGE-small-en-v1.5 by default (384 dimensions, ~130 MB).
+/// Uses SweRankEmbed-Small by default (768 dimensions).
 /// The model is downloaded from HuggingFace Hub on first use and cached locally.
 pub struct CodeEmbedder {
     #[cfg(feature = "embeddings")]
