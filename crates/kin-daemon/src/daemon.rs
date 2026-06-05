@@ -95,6 +95,33 @@ async fn save_snapshot_blocking(state: Arc<DaemonState>) -> Result<()> {
         .map_err(|error| DaemonError::Io(std::io::Error::other(error.to_string())))?
 }
 
+/// How often the watched-PID watchdog checks whether the watched process is
+/// still alive.
+const WATCH_PID_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Is the process with this PID still alive?
+///
+/// Sends signal 0 — this delivers no signal and only checks for existence. A
+/// return of 0 means the process exists. A non-zero return with `ESRCH` (no
+/// such process) means it is gone; any other error (e.g. `EPERM`, the process
+/// exists but is owned by another user) is treated as still alive so the
+/// watchdog never shuts down on a process that is merely out of reach.
+#[cfg(unix)]
+fn watched_process_is_alive(pid: i32) -> bool {
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    !matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    )
+}
+
+#[cfg(not(unix))]
+fn watched_process_is_alive(_pid: i32) -> bool {
+    true
+}
+
 async fn run_idle_monitor(
     state: Arc<DaemonState>,
     idle_timeout: Option<Duration>,
@@ -287,6 +314,42 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
     let idle_handle = tokio::spawn(async move {
         run_idle_monitor(idle_state, idle_timeout, idle_cancel_tx, idle_cancel).await
     });
+
+    // Opt-in watched-PID watchdog. A harness (e.g. the benchmark driver) sets
+    // KIN_DAEMON_WATCH_PID to its own PID; if that process dies — leaving this
+    // daemon orphaned and potentially busy-spinning on a shared repo — the
+    // daemon shuts itself down gracefully via the same cancel channel the idle
+    // path uses. Unset/empty/<= 1 disables it entirely, so normal persistent
+    // daemons (which legitimately outlive and reparent away from their launcher)
+    // are completely unaffected.
+    if let Some(watch_pid) = std::env::var("KIN_DAEMON_WATCH_PID")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i32>().ok())
+        .filter(|pid| *pid > 1)
+    {
+        info!(watch_pid, "daemon watched-PID shutdown enabled");
+        let watch_cancel_tx = cancel_tx.clone();
+        let mut watch_cancel_rx = cancel_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(WATCH_PID_CHECK_INTERVAL) => {}
+                    _ = watch_cancel_rx.changed() => return,
+                }
+                if *watch_cancel_rx.borrow() {
+                    return;
+                }
+                if !watched_process_is_alive(watch_pid) {
+                    warn!(
+                        watch_pid,
+                        "watched process is gone — shutting down orphaned daemon"
+                    );
+                    let _ = watch_cancel_tx.send(true);
+                    return;
+                }
+            }
+        });
+    }
 
     // Spawn the reconciliation loop.
     let loop_state = Arc::clone(&state);
@@ -1403,4 +1466,25 @@ async fn select_with_signals(
     )
     .await;
     result
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::watched_process_is_alive;
+
+    #[test]
+    fn watched_process_liveness() {
+        // The current process is obviously alive.
+        assert!(watched_process_is_alive(std::process::id() as i32));
+
+        // A child that has exited and been reaped no longer exists, so its PID
+        // reads as gone (barring a near-instant PID recycle, which is not a
+        // realistic risk inside this test window).
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id() as i32;
+        child.wait().expect("reap child");
+        assert!(!watched_process_is_alive(pid));
+    }
 }

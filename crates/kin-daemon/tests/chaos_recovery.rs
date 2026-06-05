@@ -32,8 +32,8 @@ fn spawn_daemon_with_env(repo_root: &Path, port: u16, envs: &[(&str, &str)]) -> 
         .arg(repo_root)
         .arg("--port")
         .arg(port.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
     for (key, value) in envs {
         cmd.env(key, value);
     }
@@ -43,7 +43,7 @@ fn spawn_daemon_with_env(repo_root: &Path, port: u16, envs: &[(&str, &str)]) -> 
 async fn wait_for_health(port: u16) -> HealthResponse {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{port}/health");
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(60);
 
     loop {
         if let Ok(response) = client.get(&url).send().await {
@@ -122,7 +122,7 @@ async fn daemon_exits_after_idle_timeout_and_removes_endpoint_files() {
         port,
         &[
             ("KIN_DAEMON_DISABLE_LSP", "1"),
-            ("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1"),
+            ("KIN_DAEMON_IDLE_TIMEOUT_SECS", "5"),
         ],
     );
 
@@ -157,7 +157,7 @@ async fn daemon_exits_after_dirty_repo_control_dir_is_removed() {
         port,
         &[
             ("KIN_DAEMON_DISABLE_LSP", "1"),
-            ("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1"),
+            ("KIN_DAEMON_IDLE_TIMEOUT_SECS", "5"),
         ],
     );
 

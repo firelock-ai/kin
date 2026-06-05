@@ -2537,7 +2537,7 @@ async fn locate(
 
     let result = if let Some(reference) = req.reference.as_deref() {
         // Explicit --ref always takes precedence over session scope.
-        let resolved = kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_with_report(
+        let resolved = kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate_with_report(
             state.graph.as_ref(),
             &state.layout,
             Some(reference),
