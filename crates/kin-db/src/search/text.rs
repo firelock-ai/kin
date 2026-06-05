@@ -166,6 +166,24 @@ impl TextIndex {
             .map_err(|e| KinDbError::IndexError(e.to_string()))
     }
 
+    /// Remove a batch of entities from the text index.
+    ///
+    /// Stages the removals — call `commit()` to make them visible to searches.
+    pub fn remove_batch(&self, entity_ids: &[EntityId]) -> Result<(), KinDbError> {
+        let keys: Vec<RetrievalKey> = entity_ids.iter().map(|id| RetrievalKey::Entity(*id)).collect();
+        self.remove_retrievable_batch(&keys)
+    }
+
+    /// Remove any batch of retrieval keys from the text index.
+    ///
+    /// Stages the removals — call `commit()` to make them visible to searches.
+    pub fn remove_retrievable_batch(&self, keys: &[RetrievalKey]) -> Result<(), KinDbError> {
+        self.inner
+            .remove_batch(keys)
+            .map_err(|e| KinDbError::IndexError(e.to_string()))
+    }
+
+
     /// Rebuild the entire index from pre-built field vectors.
     ///
     /// Avoids clone-on-write overhead of per-doc upsert by building the

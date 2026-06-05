@@ -3792,6 +3792,80 @@ impl EntityStore for InMemoryGraph {
         Ok(())
     }
 
+    fn remove_entities_batch(&self, ids: &[EntityId]) -> Result<(), KinDbError> {
+        let mut ent = self.entities.write();
+        let id_set: hashbrown::HashSet<EntityId> = ids.iter().copied().collect();
+        let mut affected_neighbors = Vec::new();
+
+        for id in ids {
+            if let Some(entity) = ent.entities.remove(id) {
+                ent.indexes.remove(
+                    &entity.id,
+                    &entity.name,
+                    entity.file_origin.as_ref(),
+                    entity.kind,
+                );
+
+                if let Some(outgoing) = ent.outgoing.get(id) {
+                    for rel_id in outgoing {
+                        if let Some(rel) = ent.relations.get(rel_id) {
+                            if let Some(neighbor) = entity_neighbor_for_relation(rel, id) {
+                                if !id_set.contains(&neighbor) {
+                                    affected_neighbors.push(neighbor);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(incoming) = ent.incoming.get(id) {
+                    for rel_id in incoming {
+                        if let Some(rel) = ent.relations.get(rel_id) {
+                            if let Some(neighbor) = entity_neighbor_for_relation(rel, id) {
+                                if !id_set.contains(&neighbor) {
+                                    affected_neighbors.push(neighbor);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Clean up all connected relations and edge maps
+        for id in ids {
+            remove_relations_for_entity(&mut ent, id);
+        }
+        drop(ent);
+
+        // Keep text index in sync (commit is deferred — call flush_text_index())
+        if let Some(ref ti) = self.text_index {
+            let _ = ti.remove_batch(ids)?;
+            self.text_dirty.store(true, Ordering::Release);
+        }
+
+        // Remove vectors for deleted entities.
+        #[cfg(feature = "vector")]
+        {
+            let mut eq = self.embedding_queue.lock();
+            for id in ids {
+                eq.remove(id);
+            }
+            if let Some(ref vi) = *self.vector_index.lock() {
+                let _ = vi.remove_batch(ids)?;
+            }
+        }
+
+        affected_neighbors.sort_unstable();
+        affected_neighbors.dedup();
+
+        self.refresh_text_index_for_entities(&affected_neighbors);
+        self.invalidate_entities_for_embedding(&affected_neighbors)?;
+        self.invalidate_snapshot_root_hash();
+
+        Ok(())
+    }
+
+
     fn remove_relation(&self, id: &RelationId) -> Result<(), KinDbError> {
         let mut ent = self.entities.write();
         let mut affected = Vec::new();
