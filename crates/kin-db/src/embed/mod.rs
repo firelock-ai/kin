@@ -235,7 +235,7 @@ impl CodeEmbedder {
             .map_err(|e| KinDbError::IndexError(format!("failed to parse model config: {e}")))?;
 
         let dimensions = config.hidden_size;
-        let query_prefix = local_query_prefix(config.model_type.as_deref());
+        let query_prefix = local_query_prefix(model_id, config.model_type.as_deref());
 
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| KinDbError::IndexError(format!("failed to load tokenizer: {e}")))?;
@@ -1476,10 +1476,15 @@ fn resolve_local_model_artifacts(dir: &Path) -> Result<(PathBuf, PathBuf, PathBu
 }
 
 #[cfg(feature = "embeddings")]
-fn local_query_prefix(model_type: Option<&str>) -> String {
-    match model_type.map(str::trim) {
-        Some("nomic_bert") | Some("nomic-bert") => SWERANK_QUERY_PREFIX.to_string(),
-        _ => String::new(),
+fn local_query_prefix(model_id: &str, model_type: Option<&str>) -> String {
+    let lower_id = model_id.to_ascii_lowercase();
+    if lower_id.contains("swerank") {
+        SWERANK_QUERY_PREFIX.to_string()
+    } else {
+        match model_type.map(str::trim) {
+            Some("nomic_bert") | Some("nomic-bert") => SWERANK_QUERY_PREFIX.to_string(),
+            _ => String::new(),
+        }
     }
 }
 

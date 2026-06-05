@@ -2157,14 +2157,10 @@ impl InMemoryGraph {
         );
 
         // Process any queued entities immediately
-        while !self.embedding_queue.lock().is_empty() {
-            self.process_embedding_queue(128)?;
-        }
+        self.process_all_pending_embeddings(128)?;
 
         // Process any queued artifacts immediately
-        while !self.artifact_embedding_queue.lock().is_empty() {
-            self.process_artifact_embedding_queue(128)?;
-        }
+        self.process_all_pending_artifact_embeddings(128)?;
 
         Ok(())
     }
@@ -2405,6 +2401,8 @@ impl InMemoryGraph {
         )
         .entered();
         let mut total = 0usize;
+        let initial_pending = self.pending_embeddings();
+        let start_time = std::time::Instant::now();
         loop {
             let pending = self.pending_embeddings();
             if pending == 0 {
@@ -2415,6 +2413,19 @@ impl InMemoryGraph {
                 break;
             }
             total += processed;
+            if initial_pending > 0 {
+                let percent = (total * 100) / initial_pending;
+                eprint!(
+                    "\r  Embedding Entities: [{}/{}] {}% | {:.1}s",
+                    total,
+                    initial_pending,
+                    percent,
+                    start_time.elapsed().as_secs_f64()
+                );
+            }
+        }
+        if initial_pending > 0 {
+            eprintln!();
         }
         Ok(total)
     }
@@ -2436,6 +2447,8 @@ impl InMemoryGraph {
         )
         .entered();
         let mut total = 0usize;
+        let initial_pending = self.pending_artifact_embeddings();
+        let start_time = std::time::Instant::now();
         loop {
             let pending = self.pending_artifact_embeddings();
             if pending == 0 {
@@ -2446,6 +2459,19 @@ impl InMemoryGraph {
                 break;
             }
             total += processed;
+            if initial_pending > 0 {
+                let percent = (total * 100) / initial_pending;
+                eprint!(
+                    "\r  Embedding Artifacts: [{}/{}] {}% | {:.1}s",
+                    total,
+                    initial_pending,
+                    percent,
+                    start_time.elapsed().as_secs_f64()
+                );
+            }
+        }
+        if initial_pending > 0 {
+            eprintln!();
         }
         Ok(total)
     }
