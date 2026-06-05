@@ -530,7 +530,7 @@ static inline void block_mma(
                 // in-bounds elements out per lane.
                 threadgroup float* scratch = &store_tile[sgid][0][0];
                 simdgroup_store(acc[i][j], scratch, F, ulong2(0, 0), false);
-                simdgroup_barrier(mem_flags::mem_threadgroup);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
                 for (uint e = lane; e < F * F; e += 32u) {
                     uint er = e / F, ec = e % F;
                     uint gr = cr + er, gc = cc + ec;
@@ -538,7 +538,7 @@ static inline void block_mma(
                         C[gr * N + gc] = scratch[er * F + ec];
                     }
                 }
-                simdgroup_barrier(mem_flags::mem_threadgroup);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
             }
         }
     }
@@ -804,7 +804,7 @@ static inline void block_mma_db(
             } else {
                 threadgroup float* scratch = &store_tile[sgid][0][0];
                 simdgroup_store(acc[i][j], scratch, F, ulong2(0, 0), false);
-                simdgroup_barrier(mem_flags::mem_threadgroup);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
                 for (uint e = lane; e < F * F; e += 32u) {
                     uint er = e / F, ec = e % F;
                     uint gr = cr + er, gc = cc + ec;
@@ -812,7 +812,7 @@ static inline void block_mma_db(
                         C[gr * N + gc] = scratch[er * F + ec];
                     }
                 }
-                simdgroup_barrier(mem_flags::mem_threadgroup);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
             }
         }
     }
@@ -1544,7 +1544,7 @@ static inline void block_mma_fp16(
             } else {
                 threadgroup float* scratch = &store_tile[sgid][0][0];
                 simdgroup_store(acc[i][j], scratch, F, ulong2(0, 0), false);
-                simdgroup_barrier(mem_flags::mem_threadgroup);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
                 for (uint e = lane; e < F * F; e += 32u) {
                     uint er = e / F, ec = e % F;
                     uint gr = cr + er, gc = cc + ec;
