@@ -56,9 +56,28 @@ fn max_abs_err(a: &[f32], b: &[f32]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
+fn print_diff_details(a: &[f32], b: &[f32], rows: usize, cols: usize, label: &str) {
+    assert_eq!(a.len(), b.len());
+    let mut count = 0;
+    for i in 0..a.len() {
+        let diff = (a[i] - b[i]).abs();
+        if diff > 1e-4 {
+            let r = i / cols;
+            let c = i % cols;
+            eprintln!("[{label}] diff at row {r}, col {c} (index {i}): candidate={:.6e}, ref={:.6e}, diff={:.6e}", a[i], b[i], diff);
+            count += 1;
+            if count >= 15 {
+                eprintln!("[{label}] ... truncated after 15 differences");
+                break;
+            }
+        }
+    }
+}
+
 fn count_nonfinite(v: &[f32]) -> usize {
     v.iter().filter(|x| !x.is_finite()).count()
 }
+
 
 /// Sweep over seq_len for the grouped (batched) attention path used by
 /// BertModel::forward_batched. Mirrors the existing seq_len=7 test setup,
@@ -210,6 +229,7 @@ fn metal_matmul_shapes_match_cpu_at_bert_dims() {
         (512, 384, 384),                   // QKV proj at seq=512
         (512, 1536, 384),                  // FFN intermediate at seq=512
         (512, 384, 1536),                  // FFN out at seq=512
+        (48, 768, 768),                    // Divergent shape
     ];
 
     for &(m, n, k) in &cases {
@@ -316,12 +336,16 @@ fn metal_fused_linear_add_norm_matches_per_op() {
             "fused vs Metal per-op rows={rows} cols={cols} hidden={hidden}: {err_metal} >= 1e-4"
         );
         // vs CPU: LayerNorm output is well-conditioned; 1e-4 is a tight anchor.
+        if err_cpu >= 1e-4 {
+            print_diff_details(&fused, &ref_cpu, rows, hidden, "fused_linear_add_norm vs CPU");
+        }
         assert!(
             err_cpu < 1e-4,
             "fused vs CPU rows={rows} cols={cols} hidden={hidden}: {err_cpu} >= 1e-4"
         );
     }
 }
+
 
 /// Parity for the post-LN FFN residency fold `fused_ffn_swiglu_add_norm`.
 ///
@@ -395,12 +419,16 @@ fn metal_fused_ffn_swiglu_add_norm_matches_per_op() {
             err_metal < 1e-4,
             "fused vs Metal per-op rows={rows} hidden={hidden} inter={inter}: {err_metal} >= 1e-4"
         );
+        if err_cpu >= 1e-4 {
+            print_diff_details(&fused, &ref_cpu, rows, hidden, "fused_ffn_swiglu_add_norm vs CPU");
+        }
         assert!(
             err_cpu < 1e-4,
             "fused vs CPU rows={rows} hidden={hidden} inter={inter}: {err_cpu} >= 1e-4"
         );
     }
 }
+
 
 /// Locate the HuggingFace-cached BGE-small-en-v1.5 snapshot directory. Returns
 /// `None` if the weights have not been downloaded on this machine — the test

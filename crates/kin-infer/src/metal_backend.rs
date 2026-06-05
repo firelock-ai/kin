@@ -519,15 +519,22 @@ static inline void block_mma(
     // Epilogue: store each fragment, bounds-guarded on ragged edges. Each
     // simdgroup gets its OWN scratch row (indexed by sgid) so the ragged-tile
     // staging never races across the 4 simdgroups in the threadgroup.
-    for (uint i = 0; i < TM; i++) {
-        for (uint j = 0; j < TN; j++) {
-            uint cr = block_row + sm * F * TM + i * F;
-            uint cc = block_col + sn * F * TN + j * F;
-            if (cr + F <= M && cc + F <= N) {
+    // Epilogue: store each fragment. If the entire threadgroup tile is fully
+    // in-bounds, we use the fast path (simdgroup_store directly to C, no barriers).
+    // Otherwise, we take the ragged path uniformly across the threadgroup.
+    if (block_row + BM <= M && block_col + BN <= N) {
+        for (uint i = 0; i < TM; i++) {
+            for (uint j = 0; j < TN; j++) {
+                uint cr = block_row + sm * F * TM + i * F;
+                uint cc = block_col + sn * F * TN + j * F;
                 simdgroup_store(acc[i][j], &C[cr * N + cc], N, ulong2(0, 0), false);
-            } else {
-                // Ragged tile: store to this simdgroup's scratch then copy the
-                // in-bounds elements out per lane.
+            }
+        }
+    } else {
+        for (uint i = 0; i < TM; i++) {
+            for (uint j = 0; j < TN; j++) {
+                uint cr = block_row + sm * F * TM + i * F;
+                uint cc = block_col + sn * F * TN + j * F;
                 threadgroup float* scratch = &store_tile[sgid][0][0];
                 simdgroup_store(acc[i][j], scratch, F, ulong2(0, 0), false);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -795,13 +802,19 @@ static inline void block_mma_db(
 
     // EPILOGUE: identical to block_mma — store each fragment, bounds-guarded on
     // ragged edges, ragged path via this simdgroup's own store_tile scratch row.
-    for (uint i = 0; i < TM; i++) {
-        for (uint j = 0; j < TN; j++) {
-            uint cr = block_row + sm * F * TM + i * F;
-            uint cc = block_col + sn * F * TN + j * F;
-            if (cr + F <= M && cc + F <= N) {
+    if (block_row + BM <= M && block_col + BN <= N) {
+        for (uint i = 0; i < TM; i++) {
+            for (uint j = 0; j < TN; j++) {
+                uint cr = block_row + sm * F * TM + i * F;
+                uint cc = block_col + sn * F * TN + j * F;
                 simdgroup_store(acc[i][j], &C[cr * N + cc], N, ulong2(0, 0), false);
-            } else {
+            }
+        }
+    } else {
+        for (uint i = 0; i < TM; i++) {
+            for (uint j = 0; j < TN; j++) {
+                uint cr = block_row + sm * F * TM + i * F;
+                uint cc = block_col + sn * F * TN + j * F;
                 threadgroup float* scratch = &store_tile[sgid][0][0];
                 simdgroup_store(acc[i][j], scratch, F, ulong2(0, 0), false);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1535,13 +1548,19 @@ static inline void block_mma_fp16(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    for (uint i = 0; i < TM; i++) {
-        for (uint j = 0; j < TN; j++) {
-            uint cr = block_row + sm * F * TM + i * F;
-            uint cc = block_col + sn * F * TN + j * F;
-            if (cr + F <= M && cc + F <= N) {
+    if (block_row + BM <= M && block_col + BN <= N) {
+        for (uint i = 0; i < TM; i++) {
+            for (uint j = 0; j < TN; j++) {
+                uint cr = block_row + sm * F * TM + i * F;
+                uint cc = block_col + sn * F * TN + j * F;
                 simdgroup_store(acc[i][j], &C[cr * N + cc], N, ulong2(0, 0), false);
-            } else {
+            }
+        }
+    } else {
+        for (uint i = 0; i < TM; i++) {
+            for (uint j = 0; j < TN; j++) {
+                uint cr = block_row + sm * F * TM + i * F;
+                uint cc = block_col + sn * F * TN + j * F;
                 threadgroup float* scratch = &store_tile[sgid][0][0];
                 simdgroup_store(acc[i][j], scratch, F, ulong2(0, 0), false);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
