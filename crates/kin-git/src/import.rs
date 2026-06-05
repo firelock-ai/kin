@@ -14,6 +14,16 @@ use tracing::{debug, info};
 
 use crate::error::{GitError, Result};
 
+
+fn open_repo(path: &Path) -> std::result::Result<gix::Repository, gix::open::Error> {
+    let dot_git = path.join(".git");
+    if dot_git.is_dir() {
+        gix::open(dot_git)
+    } else {
+        gix::open(path)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CommitFileDelta {
     pub path: String,
@@ -101,7 +111,7 @@ pub fn import_git_history_with_blobs(
         blobs = blob_store.is_some()
     )
     .entered();
-    let repo = gix::open(repo_path).map_err(|e| GitError::Git(e.to_string()))?;
+    let repo = open_repo(repo_path).map_err(|e| GitError::Git(e.to_string()))?;
 
     // Find the starting commit.
     let head_ref = if let Some(branch) = &opts.branch {
@@ -136,7 +146,7 @@ pub fn import_git_history_to_commit_with_blobs(
         blobs = blob_store.is_some()
     )
     .entered();
-    let repo = gix::open(repo_path).map_err(|e| GitError::Git(e.to_string()))?;
+    let repo = open_repo(repo_path).map_err(|e| GitError::Git(e.to_string()))?;
     let target_id = gix::ObjectId::from_hex(git_oid_hex.as_bytes())
         .map_err(|err| GitError::Git(format!("invalid git oid '{}': {}", git_oid_hex, err)))?;
     repo.find_commit(target_id)
@@ -425,6 +435,13 @@ fn blob_hash(
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn test_open_repo_resolves_git_suffix_directories() {
+        let path = Path::new("/Users/troyfortinjr/GitHub/kin-ecosystem/kin-bench/.bench/contextbench-official/repos/master_svelte.git");
+        let repo = open_repo(path).expect("open_repo should succeed even on .git-suffixed directories");
+        assert!(!repo.is_bare());
+    }
 
     fn init_git_repo(dir: &std::path::Path) -> bool {
         let git_init = Command::new("git").args(["init"]).current_dir(dir).output();
