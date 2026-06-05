@@ -571,13 +571,27 @@ impl HistoricalPathResolver {
         let candidates = self.basename_to_paths.get(basename)?;
 
         // 1. Strict suffix match (longest-path suffix match)
-        let suffix = format!("/{}", file_id.0);
         let mut suffix_matches: Vec<&FilePathId> = candidates
             .iter()
             .filter(|path| {
-                path.0 == file_id.0
-                    || path.0.ends_with(&suffix)
-                    || file_id.0.ends_with(&format!("/{}", path.0))
+                if path.0 == file_id.0 {
+                    return true;
+                }
+                // path.0 ends with / + file_id.0
+                if path.0.len() > file_id.0.len() && path.0.ends_with(&file_id.0) {
+                    let prefix_len = path.0.len() - file_id.0.len();
+                    if path.0.as_bytes()[prefix_len - 1] == b'/' {
+                        return true;
+                    }
+                }
+                // file_id.0 ends with / + path.0
+                if file_id.0.len() > path.0.len() && file_id.0.ends_with(&path.0) {
+                    let prefix_len = file_id.0.len() - path.0.len();
+                    if file_id.0.as_bytes()[prefix_len - 1] == b'/' {
+                        return true;
+                    }
+                }
+                false
             })
             .collect();
 
@@ -625,17 +639,7 @@ impl HistoricalPathResolver {
 }
 
 fn common_component_suffix_len(a: &str, b: &str) -> usize {
-    let a_parts: Vec<&str> = a.split('/').collect();
-    let b_parts: Vec<&str> = b.split('/').collect();
-    let mut count = 0;
-    for (ap, bp) in a_parts.iter().rev().zip(b_parts.iter().rev()) {
-        if ap == bp {
-            count += 1;
-        } else {
-            break;
-        }
-    }
-    count
+    a.rsplit('/').zip(b.rsplit('/')).take_while(|(ap, bp)| ap == bp).count()
 }
 
 pub fn collect_changes_at_ref<G>(graph: &G, head: &SemanticChangeId) -> Result<Vec<SemanticChange>>
