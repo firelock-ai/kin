@@ -12,7 +12,7 @@ description = "Background daemon service for Kin"
 doctest = false
 
 [features]
-default = ["vector", "embeddings"]
+default = ["vector", "embeddings", "metal"]
 vector = ["kin-db/vector"]
 embeddings = ["kin-db/embeddings"]
 metal = ["embeddings", "kin-db/metal"]
