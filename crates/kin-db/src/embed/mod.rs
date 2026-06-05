@@ -585,7 +585,14 @@ impl BertEmbedder {
                         longest = longest
                     )
                     .entered();
-                    match self.model.forward_batched(&token_ids, &attention_masks) {
+                    let metal_forward = if metal_oom_injection_armed() {
+                        Err(kin_infer::InferError::OutOfMemory(
+                            "synthetic Metal OOM (KIN_EMBED_TEST_FORCE_METAL_OOM)".to_string(),
+                        ))
+                    } else {
+                        self.model.forward_batched(&token_ids, &attention_masks)
+                    };
+                    match metal_forward {
                         Ok(v) => v,
                         Err(kin_infer::InferError::OutOfMemory(msg)) => {
                             // Metal ran out of device memory mid-forward. Rather
@@ -1722,6 +1729,41 @@ fn auto_choice(max_seq: usize) -> EmbedBackendChoice {
             reason: "auto_short_seq",
         }
     }
+}
+
+/// Test-only fault injection for the Metal embedding dispatch arm.
+///
+/// When `KIN_EMBED_TEST_FORCE_METAL_OOM` is set to a positive integer `N`, the
+/// first `N` Metal `forward_batched` dispatches in this process are replaced
+/// with a synthetic `kin_infer::InferError::OutOfMemory`, so the CPU-degrade
+/// retry path can be exercised end-to-end without putting the device under real
+/// memory pressure. The kin-infer side already proves `try_new_buffer` surfaces
+/// a real `OutOfMemory`; this lets the kin-db side prove the dispatcher handles
+/// that error value by retrying the batch on the CPU twin.
+///
+/// In production the variable is unset: the budget initializes to `0` exactly
+/// once and every subsequent check is a single relaxed atomic load that returns
+/// `false`, so the embedding hot path is unaffected.
+#[cfg(feature = "embeddings")]
+fn metal_oom_injection_armed() -> bool {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::OnceLock;
+
+    static BUDGET: OnceLock<AtomicI64> = OnceLock::new();
+    let budget = BUDGET.get_or_init(|| {
+        let remaining = std::env::var("KIN_EMBED_TEST_FORCE_METAL_OOM")
+            .ok()
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(0);
+        AtomicI64::new(remaining)
+    });
+
+    if budget.load(Ordering::Relaxed) <= 0 {
+        return false;
+    }
+    // fetch_sub returns the PREVIOUS value; inject while it was still positive.
+    budget.fetch_sub(1, Ordering::Relaxed) > 0
 }
 
 /// Build the text representation fed to the embedding model.
