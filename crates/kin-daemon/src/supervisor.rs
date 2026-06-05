@@ -668,6 +668,9 @@ const REAPER_SIGTERM_GRACE: Duration = Duration::from_secs(5);
 const REAPER_DEFAULT_CPU_PINNED_PERCENT: f32 = 80.0;
 /// Default consecutive pinned sweeps before the CPU heuristic fires.
 const REAPER_DEFAULT_CPU_PINNED_SWEEPS: u32 = 2;
+/// Default slack (in seconds) a daemon's start_time may lag the deployed binary
+/// mtime before it counts as stale — absorbs clock/filesystem timestamp jitter.
+const REDEPLOY_DEFAULT_GRACE_SECS: u64 = 2;
 
 /// Health classification of a discovered repo daemon.
 #[derive(Debug, Clone, PartialEq)]
@@ -709,6 +712,14 @@ enum AdoptReason {
     HealStaleEntry,
 }
 
+/// Why a healthy idle daemon is being rolled over to pick up a fresh build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedeployReason {
+    /// The on-disk binary was rebuilt after this process started (its start_time
+    /// predates the binary mtime), so the daemon is running stale code.
+    StaleBinary,
+}
+
 /// How a discovered daemon relates to the supervisor's registry entry (if any)
 /// for the same repo root. Computed per sweep from a registry snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -730,6 +741,7 @@ enum DaemonDecision {
     Keep,
     Reap(ReapReason),
     Adopt(AdoptReason),
+    Redeploy(RedeployReason),
 }
 
 /// Which heuristics beyond the always-on safe criterion are enabled, and how the
@@ -740,8 +752,17 @@ struct ReapPolicy {
     duplicate_reap_enabled: bool,
     /// Self-healing adoption of healthy-but-invisible daemons. On by default.
     adopt_enabled: bool,
+    /// Build-aware rolling redeploy of healthy idle daemons running a stale
+    /// binary. On by default.
+    redeploy_enabled: bool,
+    /// Supervisor self-re-exec into a freshly built binary when its own image is
+    /// stale. On by default.
+    reexec_enabled: bool,
     cpu_pinned_percent: f32,
     cpu_pinned_min_sweeps: u32,
+    /// Slack allowed between a daemon's start_time and the deployed binary mtime
+    /// before it counts as stale.
+    redeploy_grace_secs: u64,
 }
 
 impl Default for ReapPolicy {
@@ -750,8 +771,11 @@ impl Default for ReapPolicy {
             cpu_heuristic_enabled: true,
             duplicate_reap_enabled: true,
             adopt_enabled: true,
+            redeploy_enabled: true,
+            reexec_enabled: true,
             cpu_pinned_percent: REAPER_DEFAULT_CPU_PINNED_PERCENT,
             cpu_pinned_min_sweeps: REAPER_DEFAULT_CPU_PINNED_SWEEPS,
+            redeploy_grace_secs: REDEPLOY_DEFAULT_GRACE_SECS,
         }
     }
 }
@@ -767,6 +791,18 @@ impl ReapPolicy {
         }
         if env_flag_truthy("KIN_SUPERVISOR_ADOPT_DISABLE") {
             policy.adopt_enabled = false;
+        }
+        if env_flag_truthy("KIN_SUPERVISOR_REDEPLOY_DISABLE") {
+            policy.redeploy_enabled = false;
+        }
+        if env_flag_truthy("KIN_SUPERVISOR_REEXEC_DISABLE") {
+            policy.reexec_enabled = false;
+        }
+        if let Some(grace) = std::env::var("KIN_SUPERVISOR_REDEPLOY_GRACE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            policy.redeploy_grace_secs = grace;
         }
         if let Some(percent) = std::env::var("KIN_SUPERVISOR_REAP_CPU_PERCENT")
             .ok()
@@ -802,6 +838,15 @@ fn env_flag_truthy(key: &str) -> bool {
     )
 }
 
+/// True when the deployed binary mtime is strictly newer than the process
+/// start_time plus `grace_secs` — i.e. the binary was rebuilt after the process
+/// started and the slack window has elapsed. The boundary is exclusive: a
+/// daemon whose mtime equals `start_time + grace_secs` is NOT stale. Returns
+/// false when the deployed mtime is unknown (cannot prove staleness).
+fn is_daemon_stale(start_time: u64, deployed_mtime: Option<u64>, grace_secs: u64) -> bool {
+    deployed_mtime.is_some_and(|m| m > start_time.saturating_add(grace_secs))
+}
+
 /// Observed facts about one discovered repo daemon, fed to the classifier.
 #[derive(Debug, Clone)]
 struct DaemonObservation {
@@ -814,11 +859,15 @@ struct DaemonObservation {
     cpu_pinned_sweeps: u32,
     /// How this daemon relates to the registry entry for its repo root.
     registry: RegistryRelation,
+    /// The deployed binary was rebuilt after this process started — it is running
+    /// stale code and is a redeploy candidate.
+    stale_binary: bool,
 }
 
 /// Decide what to do with a discovered daemon: reap a demonstrably-misbehaving
-/// one, adopt a healthy-but-invisible one to restore registry visibility, or keep
-/// it untouched. Pure function over observed facts — the unit-tested core.
+/// one, redeploy a healthy idle one running a stale binary, adopt a
+/// healthy-but-invisible one to restore registry visibility, or keep it
+/// untouched. Pure function over observed facts — the unit-tested core.
 ///
 /// Invariants:
 /// - A daemon doing real work (active clients or active reconciliation) is NEVER
@@ -826,8 +875,14 @@ struct DaemonObservation {
 ///   visibility (adoption never reaps).
 /// - The safe reap criterion (orphaned + unhealthy) is always enabled.
 /// - The CPU-pinned and duplicate-twin reap criteria are policy-gated.
-/// - Reaping always wins over adoption. The only healthy reap path is the
-///   orphaned idle busy-spinner; a daemon matching it is reaped, not adopted.
+/// - Reaping always wins over redeploy, which wins over adoption. The only
+///   healthy reap path is the orphaned idle busy-spinner; a daemon matching it is
+///   reaped, not redeployed or adopted.
+/// - Only a HEALTHY, IDLE daemon running a stale binary is redeployed. An ACTIVE
+///   stale daemon is deferred (never redeployed) — killing it would interrupt
+///   live work; it rolls over once it goes idle. Redeploy is independent of
+///   registry relation, so it wins over adoption for an idle stale daemon (no
+///   point adopting one we are about to roll over).
 /// - Adoption only ever targets a HEALTHY daemon with a non-empty repo root, and
 ///   never clobbers a live twin that owns the route (split-brain safety).
 fn classify_daemon(obs: &DaemonObservation, policy: &ReapPolicy) -> DaemonDecision {
@@ -863,6 +918,17 @@ fn classify_daemon(obs: &DaemonObservation, policy: &ReapPolicy) -> DaemonDecisi
             && obs.cpu_pinned_sweeps >= policy.cpu_pinned_min_sweeps
         {
             return DaemonDecision::Reap(ReapReason::OrphanedBusyNoClients);
+        }
+
+        // Build-aware rolling redeploy: a healthy IDLE daemon (idleness guaranteed
+        // by `!active`) running a stale binary is killed so it respawns on demand
+        // into the fresh build. Reaped above first, so reap wins; placed before the
+        // adopt block below, so redeploy wins over adoption for idle stale daemons.
+        if policy.redeploy_enabled
+            && obs.stale_binary
+            && matches!(obs.health, DaemonHealth::Healthy(_))
+        {
+            return DaemonDecision::Redeploy(RedeployReason::StaleBinary);
         }
     }
 
@@ -936,6 +1002,10 @@ struct DiscoveredDaemon {
     repo_root: String,
     port: Option<u16>,
     cpu_usage: f32,
+    /// Process start time, seconds since the Unix epoch.
+    start_time: u64,
+    /// Path to the executable image this process is running, if discoverable.
+    exe_path: Option<std::path::PathBuf>,
 }
 
 #[cfg(unix)]
@@ -948,6 +1018,29 @@ async fn reaper_sweep(
     policy: ReapPolicy,
 ) {
     let discovered = enumerate_repo_daemons(sys, self_pid);
+
+    // Supervisor self-identity, read from the just-refreshed process table: the
+    // binary it is executing, that binary's mtime, and its own start_time. These
+    // scope the redeploy decision to the supervisor's OWN build lineage so a
+    // release supervisor never rolls over unrelated debug daemons (and vice versa).
+    let self_proc = sys.process(sysinfo::Pid::from_u32(self_pid));
+    let self_exe = self_proc.and_then(|p| p.exe()).map(|p| p.to_path_buf());
+    let self_exe_mtime = self_exe.as_deref().and_then(file_mtime_secs);
+    let self_start = self_proc.map(|p| p.start_time());
+
+    // Self-re-exec: if the supervisor's own binary was rebuilt after it started,
+    // replace its process image in place (same PID) with the fresh build before
+    // touching any child. `reexec_self` only returns on failure; on error we log
+    // and fall through to best-effort child redeploy on the still-running old image.
+    if policy.reexec_enabled {
+        if let (Some(start), Some(mtime)) = (self_start, self_exe_mtime) {
+            if is_daemon_stale(start, Some(mtime), policy.redeploy_grace_secs) {
+                warn!("supervisor binary is stale — re-execing into new build");
+                let error = reexec_self();
+                warn!(error = %error, "supervisor self-re-exec failed; continuing on current binary");
+            }
+        }
+    }
 
     // Update CPU-pinned streaks; forget pids that vanished.
     let live_pids: HashSet<u32> = discovered.iter().map(|d| d.pid).collect();
@@ -987,6 +1080,17 @@ async fn reaper_sweep(
             }
             Some(_) => RegistryRelation::StaleDifferentPid,
         };
+        // Scope staleness to the supervisor's own binary lineage: only compare
+        // against the deployed mtime when the child runs the SAME binary the
+        // supervisor does. A child on a different build is never our redeploy
+        // target (deployed_mtime stays None, so it is never stale).
+        let deployed_mtime = if same_binary(daemon.exe_path.as_deref(), self_exe.as_deref()) {
+            self_exe_mtime
+        } else {
+            None
+        };
+        let stale_binary =
+            is_daemon_stale(daemon.start_time, deployed_mtime, policy.redeploy_grace_secs);
         let observation = DaemonObservation {
             pid: daemon.pid,
             repo_root: daemon.repo_root.clone(),
@@ -994,10 +1098,15 @@ async fn reaper_sweep(
             health,
             cpu_pinned_sweeps: pinned_sweeps.get(&daemon.pid).copied().unwrap_or(0),
             registry: registry_relation,
+            stale_binary,
         };
         match classify_daemon(&observation, &policy) {
             DaemonDecision::Reap(reason) => {
                 reap_daemon(&observation, reason).await;
+                pinned_sweeps.remove(&daemon.pid);
+            }
+            DaemonDecision::Redeploy(reason) => {
+                redeploy_daemon(&observation, reason).await;
                 pinned_sweeps.remove(&daemon.pid);
             }
             DaemonDecision::Adopt(reason) => {
@@ -1106,6 +1215,8 @@ fn enumerate_repo_daemons(sys: &mut sysinfo::System, self_pid: u32) -> Vec<Disco
             repo_root: canonical_path_string(Path::new(repo_root)),
             port,
             cpu_usage: process.cpu_usage(),
+            start_time: process.start_time(),
+            exe_path: process.exe().map(|p| p.to_path_buf()),
         });
     }
     found
@@ -1127,6 +1238,34 @@ fn arg_value<'a>(args: &'a [&'a str], flag: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+/// Modification time of `path` as whole seconds since the Unix epoch. `None` if
+/// the file is unreadable or has an unrepresentable timestamp.
+#[cfg(unix)]
+fn file_mtime_secs(path: &std::path::Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// Whether two executable paths resolve to the same on-disk binary, comparing by
+/// canonicalized path (falling back to the raw path when canonicalization fails).
+/// `None` on either side is treated as "not the same binary".
+#[cfg(unix)]
+fn same_binary(a: Option<&std::path::Path>, b: Option<&std::path::Path>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let ca = std::fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
+            let cb = std::fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
+            ca == cb
+        }
+        _ => false,
+    }
 }
 
 /// Probe a repo daemon's unauthenticated `/health` endpoint and classify it.
@@ -1160,41 +1299,83 @@ async fn probe_daemon_health(client: &reqwest::Client, port: u16) -> DaemonHealt
     })
 }
 
-/// Reap a daemon: graceful SIGTERM, then SIGKILL if it survives the grace window.
+/// Gracefully terminate a daemon: SIGTERM, then SIGKILL if it survives the grace
+/// window. Shared by reaping (misbehaving daemons) and redeploy (stale idle
+/// daemons that respawn on demand). `action` names the intent for the logs.
 #[cfg(unix)]
-async fn reap_daemon(observation: &DaemonObservation, reason: ReapReason) {
+async fn graceful_terminate(pid: u32, repo_root: &str, action: &str, reason: &str) {
     warn!(
-        pid = observation.pid,
-        repo = %observation.repo_root,
-        reason = ?reason,
-        "reaping misbehaving repo daemon (SIGTERM)"
+        pid,
+        repo = %repo_root,
+        reason,
+        "{action} (SIGTERM)"
     );
     unsafe {
-        libc::kill(observation.pid as libc::pid_t, libc::SIGTERM);
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
     }
     let start = Instant::now();
     while start.elapsed() < REAPER_SIGTERM_GRACE {
-        if !is_process_alive(observation.pid) {
+        if !is_process_alive(pid) {
             info!(
-                pid = observation.pid,
-                repo = %observation.repo_root,
-                "reaped daemon exited gracefully after SIGTERM"
+                pid,
+                repo = %repo_root,
+                "daemon exited gracefully after SIGTERM"
             );
             return;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    if is_process_alive(observation.pid) {
+    if is_process_alive(pid) {
         warn!(
-            pid = observation.pid,
-            repo = %observation.repo_root,
-            reason = ?reason,
+            pid,
+            repo = %repo_root,
+            reason,
             "daemon survived SIGTERM grace — sending SIGKILL"
         );
         unsafe {
-            libc::kill(observation.pid as libc::pid_t, libc::SIGKILL);
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
         }
     }
+}
+
+/// Reap a daemon: graceful SIGTERM, then SIGKILL if it survives the grace window.
+#[cfg(unix)]
+async fn reap_daemon(observation: &DaemonObservation, reason: ReapReason) {
+    graceful_terminate(
+        observation.pid,
+        &observation.repo_root,
+        "reaping misbehaving repo daemon",
+        &format!("{reason:?}"),
+    )
+    .await;
+}
+
+/// Redeploy a stale idle daemon: terminate it so it respawns on demand into the
+/// fresh build. Uses the same graceful ladder as reaping.
+#[cfg(unix)]
+async fn redeploy_daemon(observation: &DaemonObservation, reason: RedeployReason) {
+    graceful_terminate(
+        observation.pid,
+        &observation.repo_root,
+        "redeploying stale repo daemon",
+        &format!("{reason:?}"),
+    )
+    .await;
+}
+
+/// Replace the supervisor's process image in place (same PID) with a fresh exec
+/// of its own binary and original arguments. On success this never returns; the
+/// returned `io::Error` is the exec failure. Loop-free: the re-execed process has
+/// a start_time newer than the binary mtime, so it is no longer stale.
+#[cfg(unix)]
+fn reexec_self() -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    std::process::Command::new(exe).args(args).exec()
 }
 
 #[cfg(test)]
@@ -1456,6 +1637,7 @@ mod tests {
             health,
             cpu_pinned_sweeps: 0,
             registry: RegistryRelation::RegisteredSelf,
+            stale_binary: false,
         }
     }
 
@@ -1733,5 +1915,183 @@ mod tests {
         assert!(policy.adopt_enabled);
         assert_eq!(policy.cpu_pinned_min_sweeps, REAPER_DEFAULT_CPU_PINNED_SWEEPS);
         assert_eq!(policy.cpu_pinned_percent, REAPER_DEFAULT_CPU_PINNED_PERCENT);
+    }
+
+    #[test]
+    fn reap_policy_defaults_enable_redeploy_and_reexec() {
+        let policy = ReapPolicy::default();
+        assert!(policy.redeploy_enabled);
+        assert!(policy.reexec_enabled);
+        assert_eq!(policy.redeploy_grace_secs, REDEPLOY_DEFAULT_GRACE_SECS);
+    }
+
+    #[test]
+    fn stale_when_binary_newer_than_start_plus_grace() {
+        // mtime strictly past start + grace: rebuilt after the process started.
+        assert!(is_daemon_stale(100, Some(103), 2));
+    }
+
+    #[test]
+    fn not_stale_at_exact_grace_boundary() {
+        // mtime == start + grace is the exclusive boundary: not yet stale.
+        assert!(!is_daemon_stale(100, Some(102), 2));
+    }
+
+    #[test]
+    fn not_stale_when_binary_older_than_start() {
+        // The running process is newer than the on-disk binary: never stale.
+        assert!(!is_daemon_stale(100, Some(50), 2));
+    }
+
+    #[test]
+    fn not_stale_when_deployed_mtime_unknown() {
+        // Staleness cannot be proven without a deployed mtime.
+        assert!(!is_daemon_stale(100, None, 2));
+    }
+
+    #[test]
+    fn grace_shifts_staleness_boundary() {
+        // Same start/mtime: stale under a small grace, absorbed by a larger one.
+        assert!(is_daemon_stale(100, Some(105), 2));
+        assert!(!is_daemon_stale(100, Some(105), 5));
+        assert!(!is_daemon_stale(100, Some(105), 10));
+    }
+
+    #[test]
+    fn redeploy_healthy_idle_stale_daemon() {
+        // (a) The core case: healthy, idle, stale binary -> rolled over.
+        let policy = ReapPolicy::default();
+        let mut obs = observation(healthy(false, false), false);
+        obs.stale_binary = true;
+        assert_eq!(
+            classify_daemon(&obs, &policy),
+            DaemonDecision::Redeploy(RedeployReason::StaleBinary)
+        );
+    }
+
+    #[test]
+    fn does_not_redeploy_active_stale_daemon() {
+        // (b) An active (serving) stale daemon is deferred: killing it would
+        // interrupt live work. RegisteredSelf -> neither reaped, redeployed, nor
+        // adopted; it rolls over once it goes idle.
+        let policy = ReapPolicy::default();
+        let mut obs = observation(healthy(true, false), false);
+        obs.stale_binary = true;
+        assert_eq!(classify_daemon(&obs, &policy), DaemonDecision::Keep);
+    }
+
+    #[test]
+    fn active_stale_unregistered_is_adopted_not_redeployed() {
+        // (b) An active stale daemon is never redeployed, but an unregistered one
+        // is still adopted to restore its route.
+        let policy = ReapPolicy::default();
+        let mut obs = observation(healthy(true, false), false);
+        obs.registry = RegistryRelation::Unregistered;
+        obs.stale_binary = true;
+        assert_eq!(
+            classify_daemon(&obs, &policy),
+            DaemonDecision::Adopt(AdoptReason::Unregistered)
+        );
+    }
+
+    #[test]
+    fn reap_wins_over_redeploy_for_orphaned_unhealthy_stale() {
+        // (c) Reaping precedence: an orphaned, unhealthy, stale daemon is reaped.
+        let policy = ReapPolicy::default();
+        let mut obs = observation(DaemonHealth::Unhealthy, true);
+        obs.stale_binary = true;
+        assert_eq!(
+            classify_daemon(&obs, &policy),
+            DaemonDecision::Reap(ReapReason::OrphanedUnhealthy)
+        );
+    }
+
+    #[test]
+    fn reap_wins_over_redeploy_for_orphaned_idle_spinner_stale() {
+        // (c) Reaping precedence on the one healthy reap path: an orphaned, idle,
+        // CPU-pinned, stale daemon is reaped, not redeployed.
+        let policy = ReapPolicy::default();
+        let mut obs = observation(healthy(false, false), true);
+        obs.cpu_pinned_sweeps = REAPER_DEFAULT_CPU_PINNED_SWEEPS;
+        obs.stale_binary = true;
+        assert_eq!(
+            classify_daemon(&obs, &policy),
+            DaemonDecision::Reap(ReapReason::OrphanedBusyNoClients)
+        );
+    }
+
+    #[test]
+    fn does_not_redeploy_when_disabled() {
+        // (d) Redeploy gated off: a healthy idle stale daemon is left alone.
+        let policy = ReapPolicy {
+            redeploy_enabled: false,
+            ..ReapPolicy::default()
+        };
+        let mut obs = observation(healthy(false, false), false);
+        obs.stale_binary = true;
+        assert_eq!(classify_daemon(&obs, &policy), DaemonDecision::Keep);
+    }
+
+    #[test]
+    fn does_not_redeploy_unhealthy_stale_daemon() {
+        // (e) Redeploy requires a healthy probe; an unhealthy (non-orphan) stale
+        // daemon is kept (and is not reapable: reaping needs orphan + unhealthy).
+        let policy = ReapPolicy::default();
+        let mut obs = observation(DaemonHealth::Unhealthy, false);
+        obs.stale_binary = true;
+        assert_eq!(classify_daemon(&obs, &policy), DaemonDecision::Keep);
+    }
+
+    #[test]
+    fn redeploy_independent_of_registry_registered_self() {
+        // (f) Redeploy ignores registry relation: a healthy idle stale daemon
+        // already tracked as itself is still rolled over.
+        let policy = ReapPolicy::default();
+        let mut obs = observation(healthy(false, false), false);
+        obs.registry = RegistryRelation::RegisteredSelf;
+        obs.stale_binary = true;
+        assert_eq!(
+            classify_daemon(&obs, &policy),
+            DaemonDecision::Redeploy(RedeployReason::StaleBinary)
+        );
+    }
+
+    #[test]
+    fn redeploy_wins_over_adopt_for_unregistered_idle_stale() {
+        // (g) Redeploy precedence over adoption: no point adopting an idle stale
+        // daemon we are about to roll over.
+        let policy = ReapPolicy::default();
+        let mut obs = observation(healthy(false, false), false);
+        obs.registry = RegistryRelation::Unregistered;
+        obs.stale_binary = true;
+        assert_eq!(
+            classify_daemon(&obs, &policy),
+            DaemonDecision::Redeploy(RedeployReason::StaleBinary)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_binary_true_for_equal_paths() {
+        let path = std::path::Path::new("/usr/bin/kin-daemon");
+        assert!(same_binary(Some(path), Some(path)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_binary_false_for_different_paths() {
+        assert!(!same_binary(
+            Some(std::path::Path::new("/usr/bin/kin-daemon")),
+            Some(std::path::Path::new("/usr/local/bin/kin-daemon")),
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_binary_false_when_either_side_is_none() {
+        let path = std::path::Path::new("/usr/bin/kin-daemon");
+        assert!(!same_binary(None, Some(path)));
+        assert!(!same_binary(Some(path), None));
+        assert!(!same_binary(None, None));
     }
 }
