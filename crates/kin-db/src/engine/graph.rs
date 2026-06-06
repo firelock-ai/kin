@@ -2033,42 +2033,52 @@ impl InMemoryGraph {
 
         let our_vi = self.get_vector_index()?;
 
-        // Get file hashes to compare content identity between self (scoped) and source (HEAD)
-        let our_file_hashes = {
-            let ent = self.entities.read();
-            ent.file_hashes.clone()
-        };
-        let source_file_hashes = {
-            let ent = source.entities.read();
-            ent.file_hashes.clone()
-        };
-
         let ent = self.entities.read();
         let mut modified_count = 0;
         let mut copied_count = 0;
 
-        // 1. Process entities
-        for (id, entity) in &ent.entities {
-            let is_identical = if let Some(ref file_origin) = entity.file_origin {
-                let our_hash = our_file_hashes.get(&file_origin.0);
-                let source_hash = source_file_hashes.get(&file_origin.0);
-                our_hash.is_some() && our_hash == source_hash
-            } else {
-                false
-            };
+        // Reuse an entity's HEAD embedding when KIN's semantic identity for it is
+        // unchanged — the kin-native unit of reuse is the ENTITY, not the file.
+        // An entity's embedding is fully determined by its embed text (AST shape,
+        // signature, docstring, path), so reuse iff the same entity id exists at
+        // HEAD with an identical content fingerprint, regardless of unrelated churn
+        // elsewhere in its file. The prior file-hash match was file-first and far
+        // too coarse: a single changed line invalidated every entity in the file,
+        // so a historically-distant base_commit re-embedded ~all entities.
+        // KIN_DAEMON_APPROXIMATE_EMBEDS forces blanket reuse (HEAD vectors for every
+        // entity, zero re-embed) for callers that accept approximate historical
+        // embeddings in exchange for instant scope.
+        let use_approx = std::env::var("KIN_DAEMON_APPROXIMATE_EMBEDS").is_ok();
 
-            let key = RetrievalKey::Entity(*id);
-            if is_identical {
-                if let Some(vec) = source_vi.get_retrievable(&key) {
-                    our_vi.upsert_retrievable(key, &vec)?;
-                    copied_count += 1;
+        // 1. Process entities — reuse by per-entity semantic identity.
+        {
+            let source_ent = source.entities.read();
+            for (id, entity) in &ent.entities {
+                let is_identical = if use_approx {
+                    true
+                } else if let Some(head) = source_ent.entities.get(id) {
+                    head.fingerprint.ast_hash == entity.fingerprint.ast_hash
+                        && head.fingerprint.signature_hash == entity.fingerprint.signature_hash
+                        && head.signature == entity.signature
+                        && head.doc_summary == entity.doc_summary
+                        && head.file_origin == entity.file_origin
+                } else {
+                    false
+                };
+
+                let key = RetrievalKey::Entity(*id);
+                if is_identical {
+                    if let Some(vec) = source_vi.get_retrievable(&key) {
+                        our_vi.upsert_retrievable(key, &vec)?;
+                        copied_count += 1;
+                    } else {
+                        self.embedding_queue.lock().insert(*id);
+                        modified_count += 1;
+                    }
                 } else {
                     self.embedding_queue.lock().insert(*id);
                     modified_count += 1;
                 }
-            } else {
-                self.embedding_queue.lock().insert(*id);
-                modified_count += 1;
             }
         }
 
@@ -2080,7 +2090,9 @@ impl InMemoryGraph {
             let artifact_id = ArtifactId::from_file_id(file_id);
             let key = RetrievalKey::Artifact(artifact_id);
 
-            let is_identical = if let Some(source_sf) = source.entities.read().shallow_files.get(file_id) {
+            let is_identical = if use_approx {
+                true
+            } else if let Some(source_sf) = source.entities.read().shallow_files.get(file_id) {
                 sf.syntax_hash == source_sf.syntax_hash
             } else {
                 false
@@ -2104,7 +2116,9 @@ impl InMemoryGraph {
             let artifact_id = ArtifactId::from_file_id(file_id);
             let key = RetrievalKey::Artifact(artifact_id);
 
-            let is_identical = if let Some(source_sa) = source.entities.read().structured_artifacts.get(file_id) {
+            let is_identical = if use_approx {
+                true
+            } else if let Some(source_sa) = source.entities.read().structured_artifacts.get(file_id) {
                 sa.content_hash == source_sa.content_hash
             } else {
                 false
@@ -2128,7 +2142,9 @@ impl InMemoryGraph {
             let artifact_id = ArtifactId::from_file_id(file_id);
             let key = RetrievalKey::Artifact(artifact_id);
 
-            let is_identical = if let Some(source_oa) = source.entities.read().opaque_artifacts.get(file_id) {
+            let is_identical = if use_approx {
+                true
+            } else if let Some(source_oa) = source.entities.read().opaque_artifacts.get(file_id) {
                 oa.content_hash == source_oa.content_hash
             } else {
                 false
