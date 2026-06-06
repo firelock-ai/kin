@@ -2053,28 +2053,42 @@ impl InMemoryGraph {
         // 1. Process entities — reuse by per-entity semantic identity.
         {
             let source_ent = source.entities.read();
+            let mut source_lookup = std::collections::HashMap::new();
+            for (src_id, src_entity) in &source_ent.entities {
+                if let Some(ref origin) = src_entity.file_origin {
+                    source_lookup.insert(
+                        (origin.clone(), src_entity.name.clone(), src_entity.kind),
+                        *src_id,
+                    );
+                }
+            }
+
             for (id, entity) in &ent.entities {
-                let is_identical = if use_approx {
-                    true
-                } else if let Some(head) = source_ent.entities.get(id) {
-                    head.fingerprint.ast_hash == entity.fingerprint.ast_hash
-                        && head.fingerprint.signature_hash == entity.fingerprint.signature_hash
-                        && head.signature == entity.signature
-                        && head.doc_summary == entity.doc_summary
-                        && head.file_origin == entity.file_origin
-                } else {
-                    false
-                };
+                let mut resolved_vec = None;
+                if let Some(ref origin) = entity.file_origin {
+                    if let Some(src_id) = source_lookup.get(&(origin.clone(), entity.name.clone(), entity.kind)) {
+                        let is_identical = if use_approx {
+                            true
+                        } else if let Some(head) = source_ent.entities.get(src_id) {
+                            head.fingerprint.ast_hash == entity.fingerprint.ast_hash
+                                && head.fingerprint.signature_hash == entity.fingerprint.signature_hash
+                                && head.signature == entity.signature
+                                && head.doc_summary == entity.doc_summary
+                                && head.file_origin == entity.file_origin
+                        } else {
+                            false
+                        };
+                        if is_identical {
+                            let src_key = RetrievalKey::Entity(*src_id);
+                            resolved_vec = source_vi.get_retrievable(&src_key);
+                        }
+                    }
+                }
 
                 let key = RetrievalKey::Entity(*id);
-                if is_identical {
-                    if let Some(vec) = source_vi.get_retrievable(&key) {
-                        our_vi.upsert_retrievable(key, &vec)?;
-                        copied_count += 1;
-                    } else {
-                        self.embedding_queue.lock().insert(*id);
-                        modified_count += 1;
-                    }
+                if let Some(vec) = resolved_vec {
+                    our_vi.upsert_retrievable(key, &vec)?;
+                    copied_count += 1;
                 } else {
                     self.embedding_queue.lock().insert(*id);
                     modified_count += 1;
