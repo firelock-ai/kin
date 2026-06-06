@@ -6900,15 +6900,18 @@ fn extract_embedding_signals(
         return Ok(entity_seeds);
     };
 
-    // Build the scoped entity ID set for post-filtering when using HEAD vectors.
-    let scoped_entity_ids: HashSet<kin_model::EntityId> = if needs_scope_filter {
+    // Build the scoped entity map for post-filtering when using HEAD vectors.
+    let scoped_entity_map: HashMap<(String, String, kin_model::EntityKind), kin_model::Entity> = if needs_scope_filter {
         graph
             .query_entities(&EntityFilter::default())?
             .into_iter()
-            .map(|e| e.id)
+            .filter_map(|e| {
+                let path = e.file_origin.as_ref()?.0.clone();
+                Some(((path, e.name.clone(), e.kind), e))
+            })
             .collect()
     } else {
-        HashSet::new()
+        HashMap::new()
     };
 
     let mut queries: Vec<(String, f32)> = Vec::new();
@@ -6957,12 +6960,23 @@ fn extract_embedding_signals(
             let Some(entity_id) = entity_id_from_retrieval_key(retrieval_key) else {
                 continue;
             };
-            // When using HEAD vectors for a scoped graph, skip entities not in scope.
-            if needs_scope_filter && !scoped_entity_ids.contains(&entity_id) {
-                continue;
-            }
-            // Resolve entity from the primary graph (scoped), not the search graph.
-            let Some(entity) = graph.get_entity(&entity_id)? else {
+            // Resolve entity: when needs_scope_filter is true, we must map the HEAD entity
+            // to the scoped entity via the stable key.
+            let entity_opt = if needs_scope_filter {
+                if let Some(head_entity) = search_graph.get_entity(&entity_id)? {
+                    if let Some(ref file_origin) = head_entity.file_origin {
+                        let key = (file_origin.0.clone(), head_entity.name.clone(), head_entity.kind);
+                        scoped_entity_map.get(&key).cloned()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                graph.get_entity(&entity_id)?
+            };
+            let Some(entity) = entity_opt else {
                 continue;
             };
 

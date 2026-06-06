@@ -16,7 +16,7 @@ use kin_projection::build_layout;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1185,11 +1185,10 @@ fn imported_reverse_dependency_closure(
     }
 
     let mut visited = seed_files.clone();
-    let mut queue = seed_files.iter().cloned().collect::<VecDeque<_>>();
 
-    while let Some(file_path) = queue.pop_front() {
+    for file_path in seed_files {
         let entity_ids = semantic_entities_by_file
-            .get(&file_path)
+            .get(file_path)
             .into_iter()
             .flat_map(|entities| entities.iter().map(|entity| entity.id))
             .collect::<HashSet<_>>();
@@ -1210,9 +1209,7 @@ fn imported_reverse_dependency_closure(
             let Some(src_file) = entity_to_file.get(&src_entity_id) else {
                 continue;
             };
-            if visited.insert(src_file.clone()) {
-                queue.push_back(src_file.clone());
-            }
+            visited.insert(src_file.clone());
         }
     }
 
@@ -2025,16 +2022,10 @@ where
 {
     let _span = tracing::info_span!("kin.init.reverse_dependency_closure").entered();
     let mut visited = BTreeSet::new();
-    let mut queue = VecDeque::new();
 
     for file in seed_files {
-        if visited.insert(file.clone()) {
-            queue.push_back(file.clone());
-        }
-    }
-
-    while let Some(file_path) = queue.pop_front() {
-        for entity in entities_for_file(graph, &file_path)? {
+        visited.insert(file.clone());
+        for entity in entities_for_file(graph, &file)? {
             for relation in graph.get_all_relations_for_entity(&entity.id)? {
                 if relation.dst != GraphNodeId::Entity(entity.id) {
                     continue;
@@ -2049,9 +2040,7 @@ where
                 else {
                     continue;
                 };
-                if visited.insert(src_file.clone()) {
-                    queue.push_back(src_file);
-                }
+                visited.insert(src_file);
             }
         }
     }
