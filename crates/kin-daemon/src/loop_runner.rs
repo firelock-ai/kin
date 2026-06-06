@@ -42,15 +42,40 @@ impl Default for LoopConfig {
 /// 3. For each event, runs the reconciler (file -> overlay)
 /// 4. Projects overlay mutations back to files (overlay -> file)
 ///
+fn is_bare_repository(dir: &std::path::Path) -> bool {
+    dir.join("config").is_file()
+        && dir.join("objects").is_dir()
+        && dir.join("refs").is_dir()
+        && !dir.join(".git").exists()
+}
+
+/// Run the reconciliation loop until the cancellation token fires.
+///
+/// This is the main loop of the daemon. It:
+/// 1. Watches the working directory for file changes (via `notify`)
+/// 2. Drains batches of events
+/// 3. For each event, runs the reconciler (file -> overlay)
+/// 4. Projects overlay mutations back to files (overlay -> file)
+///
 /// The loop runs on a tokio task and shares state through `DaemonState`.
 pub async fn run_loop(
     state: Arc<DaemonState>,
     config: LoopConfig,
     cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
+    let working_dir = state.layout.working_dir();
+    if is_bare_repository(working_dir) {
+        info!(working_dir = %working_dir.display(), "working directory is a bare Git repository; reconciliation loop disabled");
+        let mut cancel = cancel;
+        tokio::select! {
+            _ = cancel.changed() => {}
+        }
+        return Ok(());
+    }
+
     let extensions = kin_index::watcher::supported_extensions();
     let watcher =
-        FileWatcher::new(state.layout.working_dir(), extensions).map_err(DaemonError::from)?;
+        FileWatcher::new(working_dir, extensions).map_err(DaemonError::from)?;
 
     info!(
         poll_ms = config.poll_interval_ms,
@@ -404,6 +429,11 @@ mod tests {
 #[tracing::instrument(skip(state))]
 pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
     let working_dir = state.layout.working_dir();
+    if is_bare_repository(working_dir) {
+        debug!(working_dir = %working_dir.display(), "working directory is a bare Git repository; skipping filesystem sync");
+        return Ok(());
+    }
+
     let extensions = kin_index::watcher::supported_extensions();
 
     // 1. Scan filesystem for all files recursively
