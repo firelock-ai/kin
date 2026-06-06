@@ -1116,9 +1116,16 @@ async fn set_scope(
     let state_clone = Arc::clone(&state);
     let ref_string = req.ref_string.clone();
     let (head, cached_graph) = tokio::task::spawn_blocking(move || -> std::result::Result<_, (StatusCode, String)> {
-        // Resolve the ref string to a SemanticChangeId
+        // Resolve the ref to a SemanticChangeId using the LOCATE resolve mode
+        // (enrich_semantics=false). Scope-for-retrieval only needs the
+        // base_commit's tree state; the full per-commit semantic-delta enrichment
+        // of its entire ancestry ("Hydrating History: [n/26747]") re-parses and
+        // re-links every ancestor commit — ~10 min on a deep base_commit — and the
+        // session-scope locate path never reads those deltas (it ranks the scoped
+        // entity set with HEAD vectors via `vector_source`). The /locate ref path
+        // already uses this lighter mode.
         let resolved =
-            kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_with_report(
+            kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate_with_report(
                 state_clone.graph.as_ref(),
                 &state_clone.layout,
                 Some(&ref_string),
