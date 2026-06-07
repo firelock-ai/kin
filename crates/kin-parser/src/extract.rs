@@ -81,7 +81,7 @@ fn embedding_body_preview(source: &[u8], span: &SourceSpan) -> Option<String> {
         return None;
     }
 
-    const MAX_CHARS: usize = 800;
+    const MAX_CHARS: usize = 8000;
     let total_chars = collapsed.chars().count();
     let preview = if total_chars > MAX_CHARS {
         summarize_long_body(&collapsed, total_chars)
@@ -93,9 +93,9 @@ fn embedding_body_preview(source: &[u8], span: &SourceSpan) -> Option<String> {
 }
 
 fn summarize_long_body(text: &str, total_chars: usize) -> String {
-    const HEAD_CHARS: usize = 300;
-    const MID_CHARS: usize = 180;
-    const TAIL_CHARS: usize = 300;
+    const HEAD_CHARS: usize = 3000;
+    const MID_CHARS: usize = 2000;
+    const TAIL_CHARS: usize = 3000;
     const GAP: &str = " ... ";
 
     if total_chars <= HEAD_CHARS + TAIL_CHARS + 40 {
@@ -451,8 +451,8 @@ mod tests {
     fn body_preview_preserves_tail_signal_for_long_entities() {
         let long = format!(
             "{} TARGET_tail_marker {}",
-            "prefix ".repeat(240),
-            "suffix ".repeat(240)
+            "prefix ".repeat(1500),
+            "suffix ".repeat(1500)
         );
         let preview = preview_for(&long);
         assert!(preview.contains("prefix"));
@@ -464,8 +464,8 @@ mod tests {
     fn body_preview_preserves_middle_signal_for_long_entities() {
         let long = format!(
             "{} middle_marker {}",
-            "alpha ".repeat(220),
-            "omega ".repeat(220)
+            "alpha ".repeat(1500),
+            "omega ".repeat(1500)
         );
         let preview = preview_for(&long);
         assert!(preview.contains("alpha"));

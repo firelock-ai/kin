@@ -172,7 +172,14 @@ pub fn execute_reconcile_session_dir_scoped(
 
     for change in &changes {
         let session_file = session_dir.join(&change.relative_path);
-        let strict_semantic_guard = requires_strict_reconcile_guard(&change.relative_path);
+        // Scoped reconcile is a batch operation: it diffs the session worktree
+        // against the base source and re-indexes every changed file. Individual
+        // file failures (broken AST, unsupported extension, semantic conflict)
+        // should be silently handled — retain LKG state or skip — rather than
+        // aborting the entire reconcile. The strict guard is only meaningful for
+        // the interactive daemon file-watcher loop where a developer needs to
+        // know about corrupted edits immediately.
+        let strict_semantic_guard = false;
 
         match change.kind {
             ChangeKind::Modified | ChangeKind::Added => {
@@ -589,9 +596,14 @@ fn prune_empty_parent_dirs(root: &Path, mut current: Option<&Path>) {
 }
 
 fn requires_strict_reconcile_guard(relative_path: &Path) -> bool {
-    !matches!(
+    // Only enforce the strict semantic guard for files that have a real
+    // tree-sitter indexing path (EntitySource, ShallowSyntax). Structured
+    // artifacts (Cargo.toml, pyproject.toml, Dockerfile, …) and opaque blobs
+    // are tracked but do not go through entity extraction, so an "unsupported
+    // file" error from the reconciler is expected and must not abort.
+    matches!(
         FileClassifier::classify(relative_path),
-        FileClassification::OpaqueArtifact { .. }
+        FileClassification::EntitySource | FileClassification::ShallowSyntax { .. }
     )
 }
 
