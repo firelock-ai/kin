@@ -553,7 +553,7 @@ pub struct InMemoryGraph {
     /// by background workers or explicit `process_embedding_queue` calls.
     /// Using HashSet to deduplicate (an entity modified twice only needs one embed).
     #[cfg(feature = "vector")]
-    embedding_queue: parking_lot::Mutex<hashbrown::HashSet<EntityId>>,
+    embedding_queue: parking_lot::Mutex<hashbrown::HashSet<RetrievalKey>>,
     /// Queue of artifact IDs that need embedding. This keeps artifact re-embed
     /// work targeted instead of forcing a full artifact pass on every embed run.
     #[cfg(feature = "vector")]
@@ -1779,6 +1779,13 @@ impl InMemoryGraph {
                 .get(entity_id)
                 .cloned()
                 .map(ResolvedRetrievalItem::Entity),
+            RetrievalKey::EntityRevision(rev_id) => {
+                ent.entity_revisions
+                    .values()
+                    .flat_map(|revisions| revisions.iter())
+                    .find(|rev| rev.revision_id == *rev_id)
+                    .map(|rev| ResolvedRetrievalItem::Entity(rev.entity.clone()))
+            }
             RetrievalKey::Artifact(artifact_id) => ent
                 .shallow_files
                 .values()
@@ -1803,6 +1810,29 @@ impl InMemoryGraph {
                         .cloned()
                         .map(ResolvedRetrievalItem::OpaqueArtifact)
                 }),
+            RetrievalKey::ArtifactRevision(rev_id) => {
+                let chg = self.changes.read();
+                for change in chg.changes.values() {
+                    for delta in &change.artifact_deltas {
+                        if let Some(hash) = delta.new_hash {
+                            let derived_id = ArtifactRevisionId::for_artifact_change(&delta.file_id, &change.id, &hash);
+                            if derived_id == *rev_id {
+                                return Some(ResolvedRetrievalItem::ShallowFile(ShallowTrackedFile {
+                                    file_id: delta.file_id.clone(),
+                                    language_hint: String::new(),
+                                    declaration_count: 0,
+                                    import_count: 0,
+                                    syntax_hash: hash,
+                                    signature_hash: None,
+                                    declaration_names: vec![],
+                                    import_paths: vec![],
+                                }));
+                            }
+                        }
+                    }
+                }
+                None
+            }
         }
     }
 
@@ -2015,185 +2045,7 @@ impl InMemoryGraph {
     /// Reconstructs the vector index for a scoped graph by copying unchanged embeddings from
     /// a source graph (HEAD) and queueing/embedding any modified or new entities/artifacts.
     #[cfg(all(feature = "embeddings", feature = "vector"))]
-    pub fn reconstruct_vector_index_from(&self, source: &InMemoryGraph) -> Result<(), KinDbError> {
-        let _span = tracing::info_span!("kindb.reconstruct_vector_index_from").entered();
 
-        // Share the embedder first to avoid reload cost
-        self.share_embedder_from(source);
-
-        let source_vi_opt = source.vector_index.lock().clone();
-        let source_vi = match source_vi_opt {
-            Some(vi) => vi,
-            None => {
-                // If source has no vector index, there's nothing to copy, but we still need to initialize ours
-                self.get_vector_index()?;
-                return Ok(());
-            }
-        };
-
-        let our_vi = self.get_vector_index()?;
-
-        let ent = self.entities.read();
-        let mut modified_count = 0;
-        let mut copied_count = 0;
-
-        // Reuse an entity's HEAD embedding when KIN's semantic identity for it is
-        // unchanged — the kin-native unit of reuse is the ENTITY, not the file.
-        // An entity's embedding is fully determined by its embed text (AST shape,
-        // signature, docstring, path), so reuse iff the same entity id exists at
-        // HEAD with an identical content fingerprint, regardless of unrelated churn
-        // elsewhere in its file. The prior file-hash match was file-first and far
-        // too coarse: a single changed line invalidated every entity in the file,
-        // so a historically-distant base_commit re-embedded ~all entities.
-        // KIN_DAEMON_APPROXIMATE_EMBEDS forces blanket reuse (HEAD vectors for every
-        // entity, zero re-embed) for callers that accept approximate historical
-        // embeddings in exchange for instant scope.
-        let use_approx = std::env::var("KIN_DAEMON_APPROXIMATE_EMBEDS").is_ok();
-
-        // 1. Process entities — reuse by per-entity semantic identity.
-        {
-            let source_ent = source.entities.read();
-            let mut source_lookup = std::collections::HashMap::new();
-            for (src_id, src_entity) in &source_ent.entities {
-                if let Some(ref origin) = src_entity.file_origin {
-                    source_lookup.insert(
-                        (origin.clone(), src_entity.name.clone(), src_entity.kind),
-                        *src_id,
-                    );
-                }
-            }
-
-            for (id, entity) in &ent.entities {
-                let mut resolved_vec = None;
-                if let Some(ref origin) = entity.file_origin {
-                    if let Some(src_id) = source_lookup.get(&(origin.clone(), entity.name.clone(), entity.kind)) {
-                        let is_identical = if use_approx {
-                            true
-                        } else if let Some(head) = source_ent.entities.get(src_id) {
-                            head.fingerprint.ast_hash == entity.fingerprint.ast_hash
-                                && head.fingerprint.signature_hash == entity.fingerprint.signature_hash
-                                && head.signature == entity.signature
-                                && head.doc_summary == entity.doc_summary
-                                && head.file_origin == entity.file_origin
-                        } else {
-                            false
-                        };
-                        if is_identical {
-                            let src_key = RetrievalKey::Entity(*src_id);
-                            resolved_vec = source_vi.get_retrievable(&src_key);
-                        }
-                    }
-                }
-
-                let key = RetrievalKey::Entity(*id);
-                if let Some(vec) = resolved_vec {
-                    our_vi.upsert_retrievable(key, &vec)?;
-                    copied_count += 1;
-                } else {
-                    self.embedding_queue.lock().insert(*id);
-                    modified_count += 1;
-                }
-            }
-        }
-
-        // 2. Process artifacts (shallow files, structured artifacts, opaque artifacts)
-        let mut modified_artifacts = 0;
-        let mut copied_artifacts = 0;
-
-        for (file_id, sf) in &ent.shallow_files {
-            let artifact_id = ArtifactId::from_file_id(file_id);
-            let key = RetrievalKey::Artifact(artifact_id);
-
-            let is_identical = if use_approx {
-                true
-            } else if let Some(source_sf) = source.entities.read().shallow_files.get(file_id) {
-                sf.syntax_hash == source_sf.syntax_hash
-            } else {
-                false
-            };
-
-            if is_identical {
-                if let Some(vec) = source_vi.get_retrievable(&key) {
-                    our_vi.upsert_retrievable(key, &vec)?;
-                    copied_artifacts += 1;
-                } else {
-                    self.artifact_embedding_queue.lock().insert(artifact_id);
-                    modified_artifacts += 1;
-                }
-            } else {
-                self.artifact_embedding_queue.lock().insert(artifact_id);
-                modified_artifacts += 1;
-            }
-        }
-
-        for (file_id, sa) in &ent.structured_artifacts {
-            let artifact_id = ArtifactId::from_file_id(file_id);
-            let key = RetrievalKey::Artifact(artifact_id);
-
-            let is_identical = if use_approx {
-                true
-            } else if let Some(source_sa) = source.entities.read().structured_artifacts.get(file_id) {
-                sa.content_hash == source_sa.content_hash
-            } else {
-                false
-            };
-
-            if is_identical {
-                if let Some(vec) = source_vi.get_retrievable(&key) {
-                    our_vi.upsert_retrievable(key, &vec)?;
-                    copied_artifacts += 1;
-                } else {
-                    self.artifact_embedding_queue.lock().insert(artifact_id);
-                    modified_artifacts += 1;
-                }
-            } else {
-                self.artifact_embedding_queue.lock().insert(artifact_id);
-                modified_artifacts += 1;
-            }
-        }
-
-        for (file_id, oa) in &ent.opaque_artifacts {
-            let artifact_id = ArtifactId::from_file_id(file_id);
-            let key = RetrievalKey::Artifact(artifact_id);
-
-            let is_identical = if use_approx {
-                true
-            } else if let Some(source_oa) = source.entities.read().opaque_artifacts.get(file_id) {
-                oa.content_hash == source_oa.content_hash
-            } else {
-                false
-            };
-
-            if is_identical {
-                if let Some(vec) = source_vi.get_retrievable(&key) {
-                    our_vi.upsert_retrievable(key, &vec)?;
-                    copied_artifacts += 1;
-                } else {
-                    self.artifact_embedding_queue.lock().insert(artifact_id);
-                    modified_artifacts += 1;
-                }
-            } else {
-                self.artifact_embedding_queue.lock().insert(artifact_id);
-                modified_artifacts += 1;
-            }
-        }
-
-        tracing::info!(
-            copied_entities = copied_count,
-            to_embed_entities = modified_count,
-            copied_artifacts = copied_artifacts,
-            to_embed_artifacts = modified_artifacts,
-            "reconstructed scoped vector index"
-        );
-
-        // Process any queued entities immediately
-        self.process_all_pending_embeddings(128)?;
-
-        // Process any queued artifacts immediately
-        self.process_all_pending_artifact_embeddings(128)?;
-
-        Ok(())
-    }
 
 
     #[cfg(feature = "vector")]
@@ -2294,6 +2146,45 @@ impl InMemoryGraph {
         Ok(results)
     }
 
+    /// Batched semantic similarity search with a predicate filter.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    pub fn semantic_search_batch_filtered<P>(
+        &self,
+        queries: &[&str],
+        limit: usize,
+        predicate: P,
+    ) -> Result<Vec<Vec<(RetrievalKey, f32)>>, KinDbError>
+    where
+        P: Fn(&RetrievalKey) -> bool,
+    {
+        let _span = tracing::info_span!(
+            "kindb.semantic_search_batch_filtered",
+            num_queries = queries.len(),
+            limit = limit
+        )
+        .entered();
+
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let vi = match &*self.vector_index.lock() {
+            Some(vi) if !vi.is_empty() => Arc::clone(vi),
+            _ => return Ok(vec![Vec::new(); queries.len()]),
+        };
+
+        let embedder = self.get_embedder()?;
+
+        let texts: Vec<String> = queries.iter().map(|q| q.to_string()).collect();
+        let vectors = embedder.embed_batch(&texts)?;
+
+        let mut results = Vec::with_capacity(vectors.len());
+        for vector in &vectors {
+            results.push(vi.search_similar_filtered(vector, limit, &predicate)?);
+        }
+        Ok(results)
+    }
+
     /// Batched semantic similarity search (stub when features are disabled).
     #[cfg(not(all(feature = "embeddings", feature = "vector")))]
     pub fn semantic_search_batch(
@@ -2337,7 +2228,16 @@ impl InMemoryGraph {
     pub fn queue_for_embedding(&self, ids: &[EntityId]) {
         let mut queue = self.embedding_queue.lock();
         for id in ids {
-            queue.insert(*id);
+            queue.insert(RetrievalKey::Entity(*id));
+        }
+    }
+
+    /// Manually queue retrieval keys for embedding.
+    #[cfg(feature = "vector")]
+    pub fn queue_keys_for_embedding(&self, keys: &[RetrievalKey]) {
+        let mut queue = self.embedding_queue.lock();
+        for key in keys {
+            queue.insert(*key);
         }
     }
 
@@ -2350,16 +2250,22 @@ impl InMemoryGraph {
         }
     }
 
-    /// Queue ALL entities in the graph for embedding.
+    /// Queue ALL entities in the graph (HEAD and all historical revisions) for embedding.
     #[cfg(feature = "vector")]
     pub fn queue_all_for_embedding(&self) {
-        let ids: Vec<EntityId> = {
-            let ent = self.entities.read();
-            ent.entities.keys().copied().collect()
-        };
         let mut queue = self.embedding_queue.lock();
-        for id in ids {
-            queue.insert(id);
+        let ent = self.entities.read();
+
+        // Queue all historical revisions
+        for revisions in ent.entity_revisions.values() {
+            for rev in revisions {
+                queue.insert(RetrievalKey::EntityRevision(rev.revision_id));
+            }
+        }
+
+        // Queue all current HEAD entities
+        for id in ent.entities.keys() {
+            queue.insert(RetrievalKey::Entity(*id));
         }
     }
 
@@ -2376,24 +2282,149 @@ impl InMemoryGraph {
     #[cfg(not(feature = "vector"))]
     pub fn queue_all_artifacts_for_embedding(&self) {}
 
-    /// Queue only entities that do not already have vectors in the current index.
+    /// Queue only entities and revisions that do not already have vectors in the current index.
     #[cfg(feature = "vector")]
     pub fn queue_missing_for_embedding(&self) {
         let vector_index = self.vector_index.lock().clone();
-        let ids: Vec<EntityId> = {
-            let ent = self.entities.read();
-            ent.entities
-                .keys()
-                .copied()
-                .filter(|id| {
-                    vector_index
-                        .as_ref()
-                        .map(|vi| !vi.contains(id))
-                        .unwrap_or(true)
-                })
-                .collect()
+        let mut queue = self.embedding_queue.lock();
+        let ent = self.entities.read();
+
+        // Queue missing revisions
+        for revisions in ent.entity_revisions.values() {
+            for rev in revisions {
+                let key = RetrievalKey::EntityRevision(rev.revision_id);
+                let missing = vector_index
+                    .as_ref()
+                    .map(|vi| !vi.contains_retrievable(&key))
+                    .unwrap_or(true);
+                if missing {
+                    queue.insert(key);
+                }
+            }
+        }
+
+        // Queue missing HEAD entities
+        for id in ent.entities.keys() {
+            let key = RetrievalKey::Entity(*id);
+            let missing = vector_index
+                .as_ref()
+                .map(|vi| !vi.contains_retrievable(&key))
+                .unwrap_or(true);
+            if missing {
+                queue.insert(key);
+            }
+        }
+    }
+
+    /// Propagate vectors from already-embedded revisions to later revisions with
+    /// identical entity fingerprints, avoiding redundant GPU inference.
+    ///
+    /// Many consecutive revisions of the same entity share identical content —
+    /// they were "modified" only because a neighbouring entity changed in the
+    /// same commit, causing span/line-number shifts. When
+    /// `(ast_hash, signature_hash, behavior_hash)` all match between a revision
+    /// that already has a vector and one that does not, we can safely copy the
+    /// vector instead of re-embedding.
+    ///
+    /// Returns the number of vectors propagated.
+    #[cfg(feature = "vector")]
+    pub fn propagate_revision_vectors(&self) -> usize {
+        let _span = tracing::info_span!("kindb.propagate_revision_vectors").entered();
+
+        // Clone the Arc out of the Mutex so we don't hold the lock during the
+        // (potentially large) iteration.
+        let vi = match self.vector_index.lock().clone() {
+            Some(vi) => vi,
+            None => return 0,
         };
-        self.queue_for_embedding(&ids);
+
+        let ent = self.entities.read();
+
+        // Build a global revision-id → EntityRevision lookup so we can resolve
+        // `previous_revision: Option<EntityRevisionId>` cheaply.
+        let mut rev_by_id: hashbrown::HashMap<EntityRevisionId, &EntityRevision> =
+            hashbrown::HashMap::new();
+        for revisions in ent.entity_revisions.values() {
+            for rev in revisions {
+                rev_by_id.insert(rev.revision_id, rev);
+            }
+        }
+
+        let mut propagated: usize = 0;
+
+        for revisions in ent.entity_revisions.values() {
+            // Walk the chronological revision list. Track the most recent
+            // revision id that is known to have a vector (either because it was
+            // already in the index, or because we just propagated one to it).
+            let mut last_vectored: Option<EntityRevisionId> = None;
+
+            for rev in revisions {
+                let key = RetrievalKey::EntityRevision(rev.revision_id);
+
+                if vi.contains_retrievable(&key) {
+                    // Already embedded — remember it as a potential source.
+                    last_vectored = Some(rev.revision_id);
+                    continue;
+                }
+
+                // Missing vector. Try to propagate from `previous_revision` if
+                // the fingerprints match.
+                if let Some(prev_id) = &rev.previous_revision {
+                    if let Some(prev_rev) = rev_by_id.get(prev_id) {
+                        if prev_rev.entity.fingerprint.ast_hash
+                            == rev.entity.fingerprint.ast_hash
+                            && prev_rev.entity.fingerprint.signature_hash
+                                == rev.entity.fingerprint.signature_hash
+                            && prev_rev.entity.fingerprint.behavior_hash
+                                == rev.entity.fingerprint.behavior_hash
+                        {
+                            let source_key = RetrievalKey::EntityRevision(*prev_id);
+                            if let Some(vector) = vi.get_retrievable(&source_key) {
+                                let _ = vi.upsert_retrievable(key, &vector);
+                                propagated += 1;
+                                last_vectored = Some(rev.revision_id);
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                // Fallback: try the last vectored revision in the same entity's
+                // chronological list (covers cases where `previous_revision` is
+                // None but the prior sibling has an identical fingerprint).
+                if let Some(source_id) = last_vectored {
+                    if let Some(source_rev) = rev_by_id.get(&source_id) {
+                        if source_rev.entity.fingerprint.ast_hash
+                            == rev.entity.fingerprint.ast_hash
+                            && source_rev.entity.fingerprint.signature_hash
+                                == rev.entity.fingerprint.signature_hash
+                            && source_rev.entity.fingerprint.behavior_hash
+                                == rev.entity.fingerprint.behavior_hash
+                        {
+                            let source_key = RetrievalKey::EntityRevision(source_id);
+                            if let Some(vector) = vi.get_retrievable(&source_key) {
+                                let _ = vi.upsert_retrievable(key, &vector);
+                                propagated += 1;
+                                last_vectored = Some(rev.revision_id);
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                // No propagation possible — this revision stays un-vectored and
+                // will be picked up by the normal embedding queue.
+            }
+        }
+
+        tracing::info!(propagated = propagated, "propagate_revision_vectors complete");
+        propagated
+    }
+
+    /// Propagate revision vectors (stub when vector feature is disabled).
+    #[cfg(not(feature = "vector"))]
+    pub fn propagate_revision_vectors(&self) -> usize {
+        0
     }
 
     /// Queue only artifacts that do not already have vectors in the current index.
@@ -2538,89 +2569,109 @@ impl InMemoryGraph {
         Ok(0)
     }
 
-    /// Process up to `batch_size` entities from the embedding queue.
+    /// Process up to `batch_size` items from the embedding queue.
     ///
-    /// Drains entity IDs from the queue, generates embeddings via the
+    /// Drains keys from the queue, generates embeddings via the
     /// CodeEmbedder, and inserts them into the HNSW VectorIndex.
-    /// Returns the number of entities successfully embedded.
-    ///
-    /// This is the main entry point for both:
-    /// - Daemon background worker (called periodically)
-    /// - CLI `kin embed` command (called in a loop until queue is empty)
+    /// Returns the number of items successfully embedded.
     #[cfg(all(feature = "embeddings", feature = "vector"))]
     pub fn process_embedding_queue(&self, batch_size: usize) -> Result<usize, KinDbError> {
         let _span =
             tracing::info_span!("kindb.process_embedding_queue", batch_size = batch_size).entered();
         use crate::embed::format_graph_entity_text_with_context;
+        use crate::embed::format_graph_entity_text;
 
         let batch_size = batch_size.max(1);
 
-        let requeue = |ids: &[EntityId]| {
-            if ids.is_empty() {
+        let requeue = |keys: &[RetrievalKey]| {
+            if keys.is_empty() {
                 return;
             }
             let mut queue = self.embedding_queue.lock();
-            for id in ids {
-                queue.insert(*id);
+            for key in keys {
+                queue.insert(*key);
             }
         };
 
-        // Drain ALL IDs from the queue to sort them deterministically
-        let mut all_ids: Vec<EntityId> = {
+        // Drain ALL keys from the queue to sort them deterministically
+        let mut all_keys: Vec<RetrievalKey> = {
             let mut queue = self.embedding_queue.lock();
             queue.drain().collect()
         };
 
-        if all_ids.is_empty() {
+        if all_keys.is_empty() {
             return Ok(0);
         }
 
-        // Sort IDs deterministically to ensure stable HNSW insertion order across re-embeds
-        {
-            let ent = self.entities.read();
-            let mut keys: Vec<_> = all_ids.iter().map(|&id| {
-                let e = ent.entities.get(&id);
-                (
-                    e.and_then(|e| e.file_origin.as_ref().map(|p| p.0.as_str())),
-                    e.map(|e| e.name.as_str()),
-                    e.map(|e| e.signature.as_str()),
-                    id
-                )
-            }).collect();
-            keys.sort_unstable();
-            all_ids = keys.into_iter().map(|k| k.3).collect();
-        }
+        // Sort keys deterministically to ensure stable HNSW insertion order across re-embeds.
+        // RetrievalKey derives Ord natively — no allocation needed.
+        all_keys.sort_unstable();
 
-        let take_count = batch_size.min(all_ids.len());
-        let ids: Vec<EntityId> = all_ids.drain(0..take_count).collect();
+        let take_count = batch_size.min(all_keys.len());
+        let batch_keys: Vec<RetrievalKey> = all_keys.drain(0..take_count).collect();
 
         // Put the rest back
-        if !all_ids.is_empty() {
+        if !all_keys.is_empty() {
             let mut queue = self.embedding_queue.lock();
-            for id in all_ids {
-                queue.insert(id);
+            for key in all_keys {
+                queue.insert(key);
             }
         }
 
-        if ids.is_empty() {
+        if batch_keys.is_empty() {
             return Ok(0);
         }
 
         // Collect text representations under read lock, then drop before inference.
-        let entity_data: Vec<(EntityId, String)> = {
+        let mut entity_data: Vec<(RetrievalKey, String)> = Vec::with_capacity(batch_keys.len());
+        {
             let ent = self.entities.read();
-            ids.iter()
-                .filter_map(|id| {
-                    ent.entities.get(id).map(|e| {
-                        let context_lines = collect_embedding_context_lines(&ent, id);
-                        (
-                            *id,
-                            format_graph_entity_text_with_context(e, &context_lines),
-                        )
-                    })
-                })
-                .collect()
-        };
+            
+            // Build a lookup map for any EntityRevisionId in the batch
+            let mut rev_ids = hashbrown::HashSet::new();
+            for key in &batch_keys {
+                if let RetrievalKey::EntityRevision(rev_id) = key {
+                    rev_ids.insert(*rev_id);
+                }
+            }
+            
+            let mut rev_lookup = hashbrown::HashMap::new();
+            if !rev_ids.is_empty() {
+                'outer: for revisions_vec in ent.entity_revisions.values() {
+                    for rev in revisions_vec {
+                        if rev_ids.contains(&rev.revision_id) {
+                            rev_lookup.insert(rev.revision_id, rev.clone());
+                            if rev_lookup.len() == rev_ids.len() {
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            }
+
+            for key in &batch_keys {
+                match key {
+                    RetrievalKey::Entity(entity_id) => {
+                        if let Some(e) = ent.entities.get(entity_id) {
+                            let context_lines = collect_embedding_context_lines(&ent, entity_id);
+                            entity_data.push((
+                                *key,
+                                format_graph_entity_text_with_context(e, &context_lines),
+                            ));
+                        }
+                    }
+                    RetrievalKey::EntityRevision(rev_id) => {
+                        if let Some(rev) = rev_lookup.get(rev_id) {
+                            entity_data.push((
+                                *key,
+                                format_graph_entity_text(&rev.entity),
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         if entity_data.is_empty() {
             return Ok(0);
@@ -2629,14 +2680,14 @@ impl InMemoryGraph {
         let embedder = match self.get_embedder() {
             Ok(embedder) => embedder,
             Err(err) => {
-                requeue(&ids);
+                requeue(&batch_keys);
                 return Err(err);
             }
         };
         let vi = match self.get_vector_index() {
             Ok(index) => index,
             Err(err) => {
-                requeue(&ids);
+                requeue(&batch_keys);
                 return Err(err);
             }
         };
@@ -2649,28 +2700,28 @@ impl InMemoryGraph {
                 Ok(vectors) => vectors,
                 Err(err) => {
                     let start_idx = (chunk_idx * embed_batch_size).min(entity_data.len());
-                    let remaining_ids: Vec<EntityId> = entity_data[start_idx..]
+                    let remaining_keys: Vec<RetrievalKey> = entity_data[start_idx..]
                         .iter()
-                        .map(|(id, _)| *id)
+                        .map(|(key, _)| *key)
                         .collect();
-                    requeue(&remaining_ids);
+                    requeue(&remaining_keys);
                     return Err(err);
                 }
             };
-            for (item_idx, ((id, _), vec)) in chunk.iter().zip(vectors.iter()).enumerate() {
-                if let Err(err) = vi.upsert(*id, vec) {
-                    let mut remaining_ids: Vec<EntityId> = chunk[item_idx..]
+            for (item_idx, ((key, _), vec)) in chunk.iter().zip(vectors.iter()).enumerate() {
+                if let Err(err) = vi.upsert_retrievable(*key, vec) {
+                    let mut remaining_keys: Vec<RetrievalKey> = chunk[item_idx..]
                         .iter()
-                        .map(|(rest_id, _)| *rest_id)
+                        .map(|(rest_key, _)| *rest_key)
                         .collect();
                     
                     let next_chunk_start = ((chunk_idx + 1) * embed_batch_size).min(entity_data.len());
-                    remaining_ids.extend(
+                    remaining_keys.extend(
                         entity_data[next_chunk_start..]
                             .iter()
-                            .map(|(rest_id, _)| *rest_id),
+                            .map(|(rest_key, _)| *rest_key),
                     );
-                    requeue(&remaining_ids);
+                    requeue(&remaining_keys);
                     return Err(err);
                 }
                 count += 1;
@@ -2935,7 +2986,7 @@ impl InMemoryGraph {
         {
             let mut queue = self.embedding_queue.lock();
             for id in ids {
-                queue.remove(id);
+                queue.remove(&RetrievalKey::Entity(*id));
             }
             drop(queue);
 
@@ -3859,7 +3910,7 @@ impl EntityStore for InMemoryGraph {
         // Remove vector for deleted entity.
         #[cfg(feature = "vector")]
         {
-            self.embedding_queue.lock().remove(id);
+            self.embedding_queue.lock().remove(&RetrievalKey::Entity(*id));
             if let Some(ref vi) = *self.vector_index.lock() {
                 let _ = vi.remove(id);
             }
@@ -3928,7 +3979,7 @@ impl EntityStore for InMemoryGraph {
         {
             let mut eq = self.embedding_queue.lock();
             for id in ids {
-                eq.remove(id);
+                eq.remove(&RetrievalKey::Entity(*id));
             }
             if let Some(ref vi) = *self.vector_index.lock() {
                 let _ = vi.remove_batch(ids)?;
@@ -4210,7 +4261,7 @@ impl EntityStore for InMemoryGraph {
             let mut eq = self.embedding_queue.lock();
             let vi_lock = self.vector_index.lock();
             for id in &deleted_entities {
-                eq.remove(id);
+                eq.remove(&RetrievalKey::Entity(*id));
                 if let Some(ref vi) = *vi_lock {
                     let _ = vi.remove(id);
                 }
@@ -8310,8 +8361,8 @@ mod tests {
         graph.upsert_entity(&renamed).unwrap();
 
         let queue = graph.embedding_queue.lock();
-        assert!(queue.contains(&caller.id));
-        assert!(queue.contains(&callee.id));
+        assert!(queue.contains(&RetrievalKey::Entity(caller.id)));
+        assert!(queue.contains(&RetrievalKey::Entity(callee.id)));
         drop(queue);
 
         let vector_index = graph.vector_index.lock();
@@ -8344,8 +8395,8 @@ mod tests {
         graph.remove_relation(&rel.id).unwrap();
 
         let queue = graph.embedding_queue.lock();
-        assert!(queue.contains(&caller.id));
-        assert!(queue.contains(&callee.id));
+        assert!(queue.contains(&RetrievalKey::Entity(caller.id)));
+        assert!(queue.contains(&RetrievalKey::Entity(callee.id)));
         drop(queue);
 
         let vector_index = graph.vector_index.lock();
@@ -8383,9 +8434,9 @@ mod tests {
         graph.remove_outgoing_relations(&caller.id).unwrap();
 
         let queue = graph.embedding_queue.lock();
-        assert!(queue.contains(&caller.id));
-        assert!(queue.contains(&callee_a.id));
-        assert!(queue.contains(&callee_b.id));
+        assert!(queue.contains(&RetrievalKey::Entity(caller.id)));
+        assert!(queue.contains(&RetrievalKey::Entity(callee_a.id)));
+        assert!(queue.contains(&RetrievalKey::Entity(callee_b.id)));
         drop(queue);
 
         let vector_index = graph.vector_index.lock();

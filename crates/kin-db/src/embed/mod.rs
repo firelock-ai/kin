@@ -59,11 +59,11 @@ const DEFAULT_OPENAI_EMBED_MODEL_ID: &str = "text-embedding-3-small";
 /// Default model revision.
 const DEFAULT_REVISION: &str = "main";
 #[cfg(feature = "embeddings")]
-const DEFAULT_MAX_BATCH_TOKENS: usize = 12_288;
+const DEFAULT_MAX_BATCH_TOKENS: usize = 32_768;
 #[cfg(feature = "embeddings")]
-const CUDA_MAX_BATCH_TOKENS: usize = 24_576;
+const CUDA_MAX_BATCH_TOKENS: usize = 65_536;
 #[cfg(feature = "embeddings")]
-const METAL_MAX_BATCH_TOKENS: usize = 16_384;
+const METAL_MAX_BATCH_TOKENS: usize = 65_536;
 #[cfg(feature = "embeddings")]
 const EMBEDDING_CACHE_SCHEMA_VERSION: &str = "v2";
 #[cfg(feature = "embeddings")]

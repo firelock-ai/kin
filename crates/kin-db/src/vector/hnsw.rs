@@ -137,6 +137,26 @@ impl VectorIndex {
         Ok(results)
     }
 
+    /// Search for the `limit` most similar entities, filtering by a predicate.
+    pub fn search_similar_filtered(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        predicate: impl Fn(&RetrievalKey) -> bool,
+    ) -> Result<Vec<(RetrievalKey, f32)>, KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.vector_index.search_similar_filtered",
+            dims = embedding.len(),
+            limit = limit
+        )
+        .entered();
+        let results = self
+            .inner
+            .search_similar_filtered(embedding, limit, predicate)
+            .map_err(|e| KinDbError::IndexError(e.to_string()))?;
+        Ok(results)
+    }
+
     /// Search with role enrichment: returns `ScoredHit` results with entity roles attached.
     ///
     /// The `role_lookup` closure resolves an `EntityId` to its `EntityRole`.
@@ -152,6 +172,22 @@ impl VectorIndex {
         F: Fn(&EntityId) -> Option<EntityRole>,
     {
         let raw = self.search_similar(embedding, limit)?;
+        Ok(resolve_roles(raw, role_lookup))
+    }
+
+    /// Search with role enrichment, filtering by a predicate.
+    pub fn search_similar_filtered_with_roles<F, P>(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        predicate: P,
+        role_lookup: F,
+    ) -> Result<Vec<ScoredHit>, KinDbError>
+    where
+        F: Fn(&EntityId) -> Option<EntityRole>,
+        P: Fn(&RetrievalKey) -> bool,
+    {
+        let raw = self.search_similar_filtered(embedding, limit, predicate)?;
         Ok(resolve_roles(raw, role_lookup))
     }
 
