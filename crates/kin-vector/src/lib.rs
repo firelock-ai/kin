@@ -198,6 +198,7 @@ impl<Id: VectorId> HnswGraph<Id> {
         entry: usize,
         ef: usize,
         layer: usize,
+        predicate: Option<&dyn Fn(&Id) -> bool>,
     ) -> Vec<(f32, usize)> {
         let _span = tracing::info_span!(
             "kin_vector.search_layer",
@@ -224,7 +225,9 @@ impl<Id: VectorId> HnswGraph<Id> {
         let mut result: BinaryHeap<(OrderedF32, usize)> = BinaryHeap::new();
 
         candidates.push(Reverse((OrderedF32(entry_dist), entry)));
-        result.push((OrderedF32(entry_dist), entry));
+        if predicate.map_or(true, |p| p(&self.idx_to_id[entry])) {
+            result.push((OrderedF32(entry_dist), entry));
+        }
 
         while let Some(Reverse((OrderedF32(c_dist), c_idx))) = candidates.pop() {
             let worst_dist = result
@@ -261,9 +264,11 @@ impl<Id: VectorId> HnswGraph<Id> {
 
                 if nb_dist < worst_dist || result.len() < ef {
                     candidates.push(Reverse((OrderedF32(nb_dist), nb)));
-                    result.push((OrderedF32(nb_dist), nb));
-                    if result.len() > ef {
-                        result.pop();
+                    if predicate.map_or(true, |p| p(&self.idx_to_id[nb])) {
+                        result.push((OrderedF32(nb_dist), nb));
+                        if result.len() > ef {
+                            result.pop();
+                        }
                     }
                 }
             }
@@ -381,7 +386,7 @@ impl<Id: VectorId> HnswGraph<Id> {
         // Phase 2: insert at each layer from min(level, max_level) down to 0
         let insert_top = level.min(self.max_level);
         for lc in (0..=insert_top).rev() {
-            let neighbors_found = self.search_layer(vector, current, EF_CONSTRUCTION, lc);
+            let neighbors_found = self.search_layer(vector, current, EF_CONSTRUCTION, lc, None);
             let m_max = if lc == 0 { M_MAX_0 } else { M };
             let selected: Vec<usize> = Self::select_neighbors(&neighbors_found, m_max)
                 .into_iter()
@@ -477,7 +482,7 @@ impl<Id: VectorId> HnswGraph<Id> {
     }
 
     /// K-NN search.  Returns (Id, distance) pairs sorted by distance ascending.
-    fn search(&self, query: &[f32], limit: usize) -> Vec<(Id, f32)> {
+    fn search(&self, query: &[f32], limit: usize, predicate: Option<&dyn Fn(&Id) -> bool>) -> Vec<(Id, f32)> {
         let _span =
             tracing::info_span!("kin_vector.search", dims = query.len(), limit = limit).entered();
         let entry = match self.entry_point {
@@ -490,7 +495,7 @@ impl<Id: VectorId> HnswGraph<Id> {
 
         // Phase 2: beam search at layer 0 with ef = max(ef_search, limit)
         let ef = EF_SEARCH.max(limit);
-        let results = self.search_layer(query, current, ef, 0);
+        let results = self.search_layer(query, current, ef, 0, predicate);
 
         results
             .into_iter()
@@ -936,7 +941,40 @@ impl<Id: VectorId> VectorIndex<Id> {
             return Ok(Vec::new());
         }
 
-        Ok(graph.search(embedding, limit))
+        Ok(graph.search(embedding, limit, None))
+    }
+
+    /// Search for the `limit` most similar entities to the given embedding, filtering by a predicate.
+    ///
+    /// Returns pairs of (Id, distance_score) sorted by similarity.
+    pub fn search_similar_filtered(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        predicate: impl Fn(&Id) -> bool,
+    ) -> Result<Vec<(Id, f32)>, VectorError> {
+        let _span = tracing::info_span!(
+            "kin_vector.search_similar_filtered",
+            dims = embedding.len(),
+            limit = limit
+        )
+        .entered();
+        let graph = self.graph.read();
+
+        if embedding.len() != graph.dimensions {
+            return Err(VectorError::IndexError(format!(
+                "query dimension mismatch: expected {}, got {}",
+                graph.dimensions,
+                embedding.len()
+            )));
+        }
+
+        if graph.active_count() == 0 {
+            return Ok(Vec::new());
+        }
+
+        let pred_dyn: &dyn Fn(&Id) -> bool = &predicate;
+        Ok(graph.search(embedding, limit, Some(pred_dyn)))
     }
 
     /// Set the persistence path for this index.
