@@ -602,6 +602,16 @@ where
                     "artifact retrieval seed {artifact_id:?} is missing file_path"
                 )));
             }
+            RetrievalKey::EntityRevision(rev_id) => {
+                return Err(ContextError::Other(format!(
+                    "entity revision retrieval seed {rev_id:?} is missing file_path"
+                )));
+            }
+            RetrievalKey::ArtifactRevision(rev_id) => {
+                return Err(ContextError::Other(format!(
+                    "artifact revision retrieval seed {rev_id:?} is missing file_path"
+                )));
+            }
         }
     }
 
