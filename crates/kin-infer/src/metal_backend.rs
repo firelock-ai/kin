@@ -2679,7 +2679,8 @@ impl GpuCompute for MetalCompute {
         rope_cos: &[f32],
         rope_sin: &[f32],
     ) -> Result<Option<Vec<f32>>, InferError> {
-        let kv_heads = if let Some(k) = weights.k_weight {
+        autoreleasepool(|_| {
+            let kv_heads = if let Some(k) = weights.k_weight {
             k.len() / (config.hidden_size * config.head_dim)
         } else if let Some(qkv) = weights.qkv_weight {
             let total_qkv_dim = qkv.len() / config.hidden_size;
@@ -3111,8 +3112,9 @@ impl GpuCompute for MetalCompute {
         
         self.commit_wait(&cmd3);
         
-        let out = Self::read_buf(current_hidden.buffer(), total_rows * h);
-        Ok(Some(out))
+            let out = Self::read_buf(current_hidden.buffer(), total_rows * h);
+            Ok(Some(out))
+        })
     }
     fn matmul(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Result<Vec<f32>, InferError> {
         let _span = tracing::info_span!("kin_infer.metal.matmul", m = m, n = n, k = k).entered();
