@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 
 /// Content-addressed 256-bit hash.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Hash256(pub [u8; 32]);
 
