@@ -43,7 +43,7 @@ use kin_model::{
 /// SweRank small keeps semantic search local while bringing embedding build time
 /// down enough for repo-scale indexing to stay practical on developer
 /// machines.
-const DEFAULT_MODEL_ID: &str = "Salesforce/SweRankEmbed-Small";
+const DEFAULT_MODEL_ID: &str = "nomic-ai/nomic-embed-text-v1.5";
 /// Asymmetric query instruction for SweRankEmbed / nomic_bert code retrievers.
 ///
 /// SweRankEmbed-Small prepends this exact string (trailing space included) to
@@ -80,7 +80,7 @@ const FILE_SURFACE_CONTEXT_KEY: &str = "file_surface_context";
 /// text is front-loaded with the discriminating signal (kind, path, name,
 /// signature, doc summary, body preview), so right-truncation past this length
 /// drops boilerplate (Parameters/Examples/References prose), not semantics.
-const EMBED_MAX_SEQ_LEN: usize = 1024;
+const EMBED_MAX_SEQ_LEN: usize = 8192;
 
 /// Maximum characters of an entity's docstring (`doc_summary`) folded into its
 /// embedding text. NumPy/PEP-257 docstrings are front-loaded — the summary line
@@ -88,7 +88,7 @@ const EMBED_MAX_SEQ_LEN: usize = 1024;
 /// Examples/References sections add tokens (and O(seq²) GPU cost) without
 /// retrieval signal. The full docstring stays in graph truth for display/blame;
 /// only the embed projection is bounded. Mirrors the 800-char body preview.
-const EMBED_DOC_SUMMARY_MAX_CHARS: usize = 800;
+const EMBED_DOC_SUMMARY_MAX_CHARS: usize = 8000;
 
 #[cfg(feature = "embeddings")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
