@@ -497,6 +497,8 @@ fn entity_id_from_retrieval_key(key: &kin_db::RetrievalKey) -> Option<kin_model:
     match key {
         kin_db::RetrievalKey::Entity(entity_id) => Some(*entity_id),
         kin_db::RetrievalKey::Artifact(_) => None,
+        kin_db::RetrievalKey::EntityRevision(_) => None,
+        kin_db::RetrievalKey::ArtifactRevision(_) => None,
     }
 }
 
@@ -504,10 +506,10 @@ fn entity_from_retrieval_key(
     graph: &kin_db::InMemoryGraph,
     key: &kin_db::RetrievalKey,
 ) -> Result<Option<kin_model::Entity>> {
-    let Some(entity_id) = entity_id_from_retrieval_key(key) else {
-        return Ok(None);
-    };
-    Ok(graph.get_entity(&entity_id)?)
+    match graph.resolve_retrieval_key(key) {
+        Some(kin_db::ResolvedRetrievalItem::Entity(entity)) => Ok(Some(entity)),
+        _ => Ok(None),
+    }
 }
 
 fn file_path_from_retrieval_key(
@@ -6947,11 +6949,34 @@ fn extract_embedding_signals(
         base_limit
     }.max(locate_env_usize("KIN_LOCATE_SEMANTIC_FETCH_LIMIT", 250));
     let query_strings: Vec<&str> = queries.iter().map(|(q, _)| q.as_str()).collect();
-    let all_results = match search_graph.semantic_search_batch(&query_strings, fetch_limit) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("semantic_search_batch failed: {:?}", e);
-            return Ok(entity_seeds);
+    let all_results = if needs_scope_filter {
+        // We know we are querying the HEAD graph (vector_source).
+        // Only return hits that have a matching topological entity in the scoped graph.
+        match search_graph.semantic_search_batch_filtered(&query_strings, fetch_limit, |retrieval_key| {
+            if let Some(entity_id) = entity_id_from_retrieval_key(retrieval_key) {
+                // Use get_entity to avoid accessing private fields
+                if let Some(head_entity) = search_graph.get_entity(&entity_id).ok().flatten() {
+                    if let Some(ref file_origin) = head_entity.file_origin {
+                        let key = (file_origin.0.clone(), head_entity.name.clone(), head_entity.kind);
+                        return scoped_entity_map.contains_key(&key);
+                    }
+                }
+            }
+            false
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("semantic_search_batch_filtered failed: {:?}", e);
+                return Ok(entity_seeds);
+            }
+        }
+    } else {
+        match search_graph.semantic_search_batch(&query_strings, fetch_limit) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("semantic_search_batch failed: {:?}", e);
+                return Ok(entity_seeds);
+            }
         }
     };
 

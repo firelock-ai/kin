@@ -1174,16 +1174,6 @@ async fn set_scope(
 
         let cached_graph = Arc::new(historical);
 
-        #[cfg(all(feature = "embeddings", feature = "vector"))]
-        {
-            if std::env::var("KIN_DAEMON_NO_EMBED").is_err() {
-                let graph_for_embed = Arc::clone(&cached_graph);
-                let source_graph = Arc::clone(&state_clone.graph);
-                graph_for_embed.reconstruct_vector_index_from(&source_graph)
-                    .map_err(internal_error)?;
-            }
-        }
-
         Ok((head, cached_graph))
     })
     .await
