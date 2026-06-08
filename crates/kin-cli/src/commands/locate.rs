@@ -494,15 +494,6 @@ fn disqualifies_entity_dominant_top_path(path: &str) -> bool {
         || is_contrib_port_path(path)
 }
 
-fn entity_id_from_retrieval_key(key: &kin_db::RetrievalKey) -> Option<kin_model::EntityId> {
-    match key {
-        kin_db::RetrievalKey::Entity(entity_id) => Some(*entity_id),
-        kin_db::RetrievalKey::Artifact(_) => None,
-        kin_db::RetrievalKey::EntityRevision(_) => None,
-        kin_db::RetrievalKey::ArtifactRevision(_) => None,
-    }
-}
-
 fn entity_stable_key(entity: &kin_model::Entity) -> Option<EntityStableKey> {
     let path = entity.file_origin.as_ref()?.0.clone();
     Some((path, entity.name.clone(), entity.kind))
@@ -526,6 +517,52 @@ fn entity_from_retrieval_key(
         Some(kin_db::ResolvedRetrievalItem::Entity(entity)) => Ok(Some(entity)),
         _ => Ok(None),
     }
+}
+
+fn embedding_status_complete(status: &kin_db::EmbeddingStatus) -> bool {
+    status.total == 0 || (status.indexed == status.total && status.pending == 0)
+}
+
+fn embedding_status_summary(status: &kin_db::EmbeddingStatus) -> String {
+    format!(
+        "{}/{} indexed, {} unindexed, {} pending",
+        status.indexed,
+        status.total,
+        status.total.saturating_sub(status.indexed),
+        status.pending
+    )
+}
+
+fn require_complete_embedding_coverage(
+    graph: &kin_db::InMemoryGraph,
+    vector_source: Option<&kin_db::InMemoryGraph>,
+) -> Result<()> {
+    let primary_status = graph.embedding_status();
+    if primary_status.total == 0 || primary_status.indexed > 0 {
+        if embedding_status_complete(&primary_status) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "semantic locate requires complete embeddings; primary graph has {}. Run `kin embed` until `kin status --json` reports embeddingsIndexed == embeddingsTotal and embeddingsPending == 0.",
+            embedding_status_summary(&primary_status)
+        );
+    }
+
+    if let Some(source) = vector_source.filter(|source| !std::ptr::eq(*source, graph)) {
+        let source_status = source.embedding_status();
+        if embedding_status_complete(&source_status) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "semantic locate requires complete embeddings; vector source graph has {}. Run `kin embed` on the central graph until `kin status --json` reports embeddingsIndexed == embeddingsTotal and embeddingsPending == 0.",
+            embedding_status_summary(&source_status)
+        );
+    }
+
+    anyhow::bail!(
+        "semantic locate requires complete embeddings; primary graph has {} and no complete vector source was provided. Run `kin embed` until `kin status --json` reports embeddingsIndexed == embeddingsTotal and embeddingsPending == 0.",
+        embedding_status_summary(&primary_status)
+    );
 }
 
 fn file_path_from_retrieval_key(
@@ -725,6 +762,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     .entered();
     // Strip HTML comments from issue text
     let text = &clean_issue_text(text);
+    require_complete_embedding_coverage(graph, vector_source)?;
 
     let mut budget = LocateBudget::new();
     let pipeline_report = std::env::var("KIN_LOCATE_PIPELINE_REPORT").is_ok();
@@ -2243,7 +2281,7 @@ pub fn run_with_graph_capture_at_ref(
     let _ = crate::commands::cochange::refresh_from_changes(&historical, &changes);
     let extra_priority_files =
         discover_historical_test_artifact_priority_files(layout, reference, text);
-    run_with_graph_capture_with_priority_files(
+    run_with_graph_capture_with_priority_files_and_vector_source(
         &historical,
         Some(layout.working_dir()),
         text,
@@ -2251,6 +2289,7 @@ pub fn run_with_graph_capture_at_ref(
         max_files,
         max_files_explicit,
         extra_priority_files,
+        Some(graph),
     )
 }
 
@@ -4450,29 +4489,26 @@ fn extract_search_signals(
             }
             let text_hits = all_text_hits;
             for (rank, (retrieval_key, _score)) in text_hits.into_iter().enumerate() {
-                if let Some(entity_id) = entity_id_from_retrieval_key(&retrieval_key) {
-                    // Entity result → entity seed score
-                    if let Some(entity) = graph.get_entity(&entity_id)? {
-                        let name_match = score_name_match(ident, &entity.name);
-                        let field_weight = if name_match >= 2.0 {
-                            bm25f_name_weight
-                        } else {
-                            bm25f_body_weight
-                        };
-                        let role_mult = if !test_query && entity.role == EntityRole::Test {
-                            0.1
-                        } else {
-                            1.0
-                        };
-                        let score =
-                            field_weight * title_mult * role_mult / ((rank + 1) as f32).sqrt();
-                        {
-                            let entry = entity_seeds.entry(entity.id).or_default();
-                            entry.score += score;
-                            if seen.insert(entity.id) && !entry.signals.contains(&"search") {
-                                entry.signals.push("search");
-                            }
-                        }
+                let Some(entity) = entity_from_retrieval_key(graph, &retrieval_key)? else {
+                    continue;
+                };
+                let name_match = score_name_match(ident, &entity.name);
+                let field_weight = if name_match >= 2.0 {
+                    bm25f_name_weight
+                } else {
+                    bm25f_body_weight
+                };
+                let role_mult = if !test_query && entity.role == EntityRole::Test {
+                    0.1
+                } else {
+                    1.0
+                };
+                let score = field_weight * title_mult * role_mult / ((rank + 1) as f32).sqrt();
+                {
+                    let entry = entity_seeds.entry(entity.id).or_default();
+                    entry.score += score;
+                    if seen.insert(entity.id) && !entry.signals.contains(&"search") {
+                        entry.signals.push("search");
                     }
                 }
             }
@@ -4498,10 +4534,7 @@ fn extract_search_signals(
                 continue;
             };
             for (rank, (retrieval_key, _score)) in hits.into_iter().enumerate() {
-                let Some(entity_id) = entity_id_from_retrieval_key(&retrieval_key) else {
-                    continue;
-                };
-                let Some(entity) = graph.get_entity(&entity_id)? else {
+                let Some(entity) = entity_from_retrieval_key(graph, &retrieval_key)? else {
                     continue;
                 };
                 if !is_definitional_kind(entity.kind) {
@@ -11293,6 +11326,33 @@ mod tests {
         }]
     }
 
+    #[cfg(feature = "vector")]
+    fn load_complete_test_vectors(graph: &kin_db::InMemoryGraph, entities: &[Entity]) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let index = kin_db::VectorIndex::new(2).unwrap();
+        for (idx, entity) in entities.iter().enumerate() {
+            let x = 1.0f32 / ((idx + 1) as f32);
+            index.upsert(entity.id, &[x, 1.0 - x]).unwrap();
+            for revision in graph.get_entity_revisions(&entity.id).unwrap() {
+                index
+                    .upsert_retrievable(
+                        kin_db::RetrievalKey::EntityRevision(revision.revision_id),
+                        &[x, 1.0 - x],
+                    )
+                    .unwrap();
+            }
+        }
+        index.save(&path).unwrap();
+        graph.load_vector_index(&path).unwrap();
+        let status = graph.embedding_status();
+        assert_eq!(
+            status.indexed, status.total,
+            "test graph must have complete vector coverage"
+        );
+        assert_eq!(status.pending, 0, "test graph must have no pending vectors");
+    }
+
     #[test]
     fn weighted_rrf_all_ones_matches_unweighted() {
         // Default-OFF guarantee: weighting every list by 1.0 (or passing an empty
@@ -11310,6 +11370,22 @@ mod tests {
         let ones = reciprocal_rank_fusion_weighted(&lists, 60.0, &[1.0, 1.0], &[]);
         assert_eq!(base, empty);
         assert_eq!(base, ones);
+    }
+
+    #[test]
+    fn locate_rejects_incomplete_embeddings() {
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = test_entity("handler", "src/lib.py", 1, 5);
+        graph.upsert_entity(&entity).unwrap();
+
+        let err = match run_with_graph_capture(&graph, "handler failure", true, 10, true) {
+            Ok(_) => panic!("locate should reject incomplete embeddings"),
+            Err(err) => err,
+        };
+        assert!(
+            format!("{err}").contains("semantic locate requires complete embeddings"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]
@@ -14841,6 +14917,9 @@ mod tests {
                 authored_on: None,
             })
             .unwrap();
+
+        #[cfg(feature = "vector")]
+        load_complete_test_vectors(&graph, &[entity_v2.clone()]);
 
         let historical = run_with_graph_capture_at_ref(
             &layout,
