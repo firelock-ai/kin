@@ -368,20 +368,23 @@ fn migrate_legacy_verification_relations(snapshot: &mut GraphSnapshot) {
 /// Progress of the background embedding pipeline.
 ///
 /// `pending` reports outstanding embedding work, defined as
-/// `max(queue_length, total - indexed)`. This deliberately covers both
-/// queued-but-unembedded entities and unindexed entities that have not yet
-/// been queued (the latter is the steady state after loading a graph whose
-/// embedding queue does not persist across restarts). Coverage gates that
-/// only inspect this field stay correct without also reading `indexed` and
-/// `total`. Callers that need the raw runtime queue length specifically
-/// should use [`InMemoryGraph::pending_embeddings`] instead.
+/// `max(queue_length, total - indexed)`. `total` covers retrievable graph
+/// objects that participate in semantic embedding: current entities,
+/// historical entity revisions, and current artifacts. This deliberately covers
+/// both queued-but-unembedded work and unindexed objects that have not yet been
+/// queued (the latter is the steady state after loading a graph whose embedding
+/// queues do not persist across restarts). Coverage gates that only inspect this
+/// field stay correct without also reading `indexed` and `total`. Callers that
+/// need the raw runtime queue length specifically should use
+/// [`InMemoryGraph::pending_embeddings`] and
+/// [`InMemoryGraph::pending_artifact_embeddings`] instead.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EmbeddingStatus {
     /// Outstanding embedding work: `max(queue_length, total - indexed)`.
     pub pending: usize,
-    /// Entities currently in the HNSW vector index.
+    /// Retrievable graph objects currently in the HNSW vector index.
     pub indexed: usize,
-    /// Total entities in the graph.
+    /// Total retrievable graph objects that require embeddings.
     pub total: usize,
 }
 
@@ -2875,22 +2878,42 @@ impl InMemoryGraph {
     /// whose embedding queue does not persist across restarts).
     pub fn embedding_status(&self) -> EmbeddingStatus {
         #[cfg(feature = "vector")]
-        let (queue_len, indexed) = {
-            let queue_len = self.embedding_queue.lock().len();
-            let indexed = {
+        let (queue_len, indexed, total) = {
+            let queue_len =
+                self.embedding_queue.lock().len() + self.artifact_embedding_queue.lock().len();
+            let retrievable_keys = {
                 let ent = self.entities.read();
-                self.vector_index
-                    .lock()
-                    .as_ref()
-                    .map(|vi| ent.entities.keys().filter(|id| vi.contains(id)).count())
-                    .unwrap_or(0)
+                let mut keys = Vec::new();
+                for revisions in ent.entity_revisions.values() {
+                    for rev in revisions {
+                        keys.push(RetrievalKey::EntityRevision(rev.revision_id));
+                    }
+                }
+                keys.extend(ent.entities.keys().map(|id| RetrievalKey::Entity(*id)));
+                keys.extend(
+                    collect_artifact_ids(&ent)
+                        .into_iter()
+                        .map(RetrievalKey::Artifact),
+                );
+                keys
             };
-            (queue_len, indexed)
+            let total = retrievable_keys.len();
+            let indexed = self
+                .vector_index
+                .lock()
+                .as_ref()
+                .map(|vi| {
+                    retrievable_keys
+                        .iter()
+                        .filter(|key| vi.contains_retrievable(key))
+                        .count()
+                })
+                .unwrap_or(0);
+            (queue_len, indexed, total)
         };
         #[cfg(not(feature = "vector"))]
-        let (queue_len, indexed) = (0usize, 0usize);
+        let (queue_len, indexed, total) = (0usize, 0usize, self.entity_count());
 
-        let total = self.entity_count();
         let pending = queue_len.max(total.saturating_sub(indexed));
         EmbeddingStatus {
             pending,
@@ -8513,6 +8536,41 @@ mod tests {
         assert_eq!(
             status.pending, 2,
             "pending must report outstanding work, not raw queue length"
+        );
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn embedding_status_counts_unindexed_artifacts_when_queue_drained() {
+        let graph = InMemoryGraph::new();
+        let e1 = test_entity("foo", "src/a.rs");
+        graph.upsert_entity(&e1).unwrap();
+        let artifact = StructuredArtifact {
+            file_id: FilePathId::new("Makefile"),
+            kind: ArtifactKind::Makefile,
+            content_hash: Hash256::from_bytes([0x45; 32]),
+            text_preview: Some("build".into()),
+        };
+        graph.upsert_structured_artifact(&artifact).unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.usearch");
+        let index = crate::VectorIndex::new(2).unwrap();
+        index.upsert(e1.id, &[1.0, 0.0]).unwrap();
+        index.save(&path).unwrap();
+        graph.load_vector_index(&path).unwrap();
+
+        graph.embedding_queue.lock().clear();
+        graph.artifact_embedding_queue.lock().clear();
+        assert_eq!(graph.pending_embeddings(), 0);
+        assert_eq!(graph.pending_artifact_embeddings(), 0);
+
+        let status = graph.embedding_status();
+        assert_eq!(status.total, 2);
+        assert_eq!(status.indexed, 1);
+        assert_eq!(
+            status.pending, 1,
+            "pending must include unindexed artifacts even after queue state is lost"
         );
     }
 
