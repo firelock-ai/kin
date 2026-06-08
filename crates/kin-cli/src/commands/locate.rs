@@ -1153,6 +1153,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 &ranked_lists,
                 60.0,
                 &rrf_rank_lift_weights(ranked_lists.len()),
+                &[],
             )
         }
         ScoringTrack::EntityDominant => {
@@ -1183,17 +1184,11 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 for idx in [2, 3, 4, 5] {
                     entity_dom_weights[idx] *= 0.3;
                 }
-                for (list, weight) in ranked_lists.iter_mut().zip(entity_dom_weights.iter()) {
-                    if *weight != 1.0 {
-                        for (_, score) in list.iter_mut() {
-                            *score *= weight;
-                        }
-                    }
-                }
                 reciprocal_rank_fusion_weighted(
                     &ranked_lists,
                     60.0,
                     &rrf_rank_lift_weights(ranked_lists.len()),
+                    &entity_dom_weights,
                 )
             } else {
                 // Rich entity results — trust entity_resolve ordering directly.
@@ -1252,6 +1247,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 &ranked_lists,
                 60.0,
                 &rrf_rank_lift_weights(ranked_lists.len()),
+                &[],
             )
         }
         ScoringTrack::BroadBlend => {
@@ -1272,6 +1268,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 &ranked_lists,
                 60.0,
                 &rrf_rank_lift_weights(ranked_lists.len()),
+                &[],
             )
         }
     };
@@ -7349,13 +7346,11 @@ fn resolve_entities_to_files(
     // These are normalized independently then blended so that graph traversal
     // (which inflates hub files via many paths) cannot drown direct attribution
     // (which tells us the entity IS in this specific file).
-    let mut direct_scores: FxHashMap<String, f32> = FxHashMap::default();
-    let mut graph_scores: FxHashMap<String, f32> = FxHashMap::default();
+    let mut direct_scores: FxHashMap<String, Vec<f32>> = FxHashMap::default();
+    let mut graph_scores: FxHashMap<String, Vec<f32>> = FxHashMap::default();
     let mut file_explain: HashMap<String, Vec<String>> = HashMap::new();
     let mut file_symbols: HashMap<String, Vec<LocateSymbol>> = HashMap::new();
     let mut file_signal_scores: HashMap<String, HashMap<String, f32>> = HashMap::new();
-    let mut file_entity_counts: FxHashMap<String, usize> = FxHashMap::default();
-    let mut direct_entity_counts: FxHashMap<String, usize> = FxHashMap::default();
 
     // Sort seeds by score descending, then use greedy gap detection to find the
     // natural cluster boundary between relevant entities and noise.
@@ -7534,8 +7529,7 @@ fn resolve_entities_to_files(
                 };
                 let score = discovery.score * def_mult;
 
-                *direct_scores.entry(path.clone()).or_default() += score;
-                *direct_entity_counts.entry(path.clone()).or_default() += 1;
+                direct_scores.entry(path.clone()).or_default().push(score);
                 file_signal_scores
                     .entry(path.clone())
                     .or_default()
@@ -7680,8 +7674,7 @@ fn resolve_entities_to_files(
                 let score = discovery.score * origin_mult * kind_mult * def_mult * hop_decay
                     / ((depth + 2) as f32);
 
-                *graph_scores.entry(path.clone()).or_default() += score;
-                *file_entity_counts.entry(path.clone()).or_default() += 1;
+                graph_scores.entry(path.clone()).or_default().push(score);
                 file_signal_scores
                     .entry(path.clone())
                     .or_default()
@@ -7716,21 +7709,30 @@ fn resolve_entities_to_files(
         }
     }
 
-    // Hub dampening for graph traversal only: files with many entity
-    // contributions from graph BFS are hubs. Dampen by sqrt(entity_count).
-    for (path, score) in graph_scores.iter_mut() {
-        let entity_count = file_entity_counts.get(path).copied().unwrap_or(1) as f32;
-        if entity_count > 2.0 {
-            *score /= entity_count.sqrt();
+    let mut final_direct_scores: FxHashMap<String, f32> = FxHashMap::default();
+    for (path, mut scores) in direct_scores.into_iter() {
+        scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let mut sum = 0.0;
+        for (i, &score) in scores.iter().enumerate() {
+            sum += score * 0.5_f32.powi(i as i32);
         }
+        final_direct_scores.insert(path, sum);
     }
 
-    for (path, score) in direct_scores.iter_mut() {
-        let entity_count = direct_entity_counts.get(path).copied().unwrap_or(1) as f32;
-        if entity_count > 1.0 {
-            *score *=
-                1.0 + entity_count.ln_1p() * locate_env_f32("KIN_LOCATE_DIRECT_MULTI_BONUS", 0.35);
+    // Hub dampening for graph traversal only: files with many entity
+    // contributions from graph BFS are hubs. Dampen by sqrt(entity_count).
+    let mut final_graph_scores: FxHashMap<String, f32> = FxHashMap::default();
+    for (path, mut scores) in graph_scores.into_iter() {
+        scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let mut sum = 0.0;
+        for (i, &score) in scores.iter().enumerate() {
+            sum += score * 0.5_f32.powi(i as i32);
         }
+        let entity_count = scores.len() as f32;
+        if entity_count > 2.0 {
+            sum /= entity_count.sqrt();
+        }
+        final_graph_scores.insert(path, sum);
     }
 
     // Normalize direct and graph scores INDEPENDENTLY, then blend.
@@ -7739,26 +7741,26 @@ fn resolve_entities_to_files(
     let direct_blend = locate_env_f32("KIN_LOCATE_DIRECT_BLEND", 0.90);
     let graph_blend = locate_env_f32("KIN_LOCATE_GRAPH_BLEND", 0.10);
 
-    let direct_max = direct_scores
+    let direct_max = final_direct_scores
         .values()
         .copied()
         .fold(0.0f32, f32::max)
         .max(0.001);
-    let graph_max = graph_scores
+    let graph_max = final_graph_scores
         .values()
         .copied()
         .fold(0.0f32, f32::max)
         .max(0.001);
 
-    let all_files: HashSet<String> = direct_scores
+    let all_files: HashSet<String> = final_direct_scores
         .keys()
-        .chain(graph_scores.keys())
+        .chain(final_graph_scores.keys())
         .cloned()
         .collect();
     let mut file_scores: FxHashMap<String, f32> = FxHashMap::default();
     for path in all_files {
-        let direct_norm = direct_scores.get(&path).copied().unwrap_or(0.0) / direct_max;
-        let graph_norm = graph_scores.get(&path).copied().unwrap_or(0.0) / graph_max;
+        let direct_norm = final_direct_scores.get(&path).copied().unwrap_or(0.0) / direct_max;
+        let graph_norm = final_graph_scores.get(&path).copied().unwrap_or(0.0) / graph_max;
         let blended = direct_norm * direct_blend + graph_norm * graph_blend;
         file_scores.insert(path, blended * 100.0);
     }
@@ -7825,7 +7827,7 @@ fn rrf_rank_lift_weights(num_lists: usize) -> Vec<f32> {
 
 fn reciprocal_rank_fusion(ranked_lists: &[Vec<(String, f32)>], k: f32) -> Vec<(String, f32)> {
     // Empty weight slice == classic unweighted RRF (every list weighted 1.0).
-    reciprocal_rank_fusion_weighted(ranked_lists, k, &[])
+    reciprocal_rank_fusion_weighted(ranked_lists, k, &[], &[])
 }
 
 /// Weighted reciprocal rank fusion. Identical to classic RRF when every entry of
@@ -7838,6 +7840,7 @@ fn reciprocal_rank_fusion_weighted(
     ranked_lists: &[Vec<(String, f32)>],
     k: f32,
     list_weights: &[f32],
+    raw_weights: &[f32],
 ) -> Vec<(String, f32)> {
     let _span = tracing::info_span!(
         "locate.reciprocal_rank_fusion",
@@ -7858,6 +7861,7 @@ fn reciprocal_rank_fusion_weighted(
         // Compute max score in this list for normalization
         let max_score = list.iter().map(|(_, s)| *s).fold(0.0f32, f32::max).max(1.0);
         let rank_weight = list_weights.get(list_idx).copied().unwrap_or(1.0);
+        let raw_weight = raw_weights.get(list_idx).copied().unwrap_or(1.0);
 
         let mut files_in_list = HashSet::new();
         for (rank, (file, score)) in list.iter().enumerate() {
@@ -7867,7 +7871,7 @@ fn reciprocal_rank_fusion_weighted(
             }
             *rrf_scores.entry(file.clone()).or_default() += rank_weight / (k + rank as f32 + 1.0);
             // Accumulate normalized raw scores
-            *raw_scores.entry(file.clone()).or_default() += score / max_score;
+            *raw_scores.entry(file.clone()).or_default() += (score * raw_weight) / max_score;
             files_in_list.insert(file.clone());
         }
         // Count how many signal sources contributed to each file
@@ -11296,8 +11300,8 @@ mod tests {
             vec![("src/b.rs".to_string(), 5.0), ("src/d.rs".to_string(), 4.0)],
         ];
         let base = reciprocal_rank_fusion(&lists, 60.0);
-        let empty = reciprocal_rank_fusion_weighted(&lists, 60.0, &[]);
-        let ones = reciprocal_rank_fusion_weighted(&lists, 60.0, &[1.0, 1.0]);
+        let empty = reciprocal_rank_fusion_weighted(&lists, 60.0, &[], &[]);
+        let ones = reciprocal_rank_fusion_weighted(&lists, 60.0, &[1.0, 1.0], &[]);
         assert_eq!(base, empty);
         assert_eq!(base, ones);
     }
@@ -11321,7 +11325,7 @@ mod tests {
 
         let mut weights = vec![1.0f32; 10];
         weights[9] = 2.0;
-        let weighted = reciprocal_rank_fusion_weighted(&lists, 60.0, &weights);
+        let weighted = reciprocal_rank_fusion_weighted(&lists, 60.0, &weights, &[]);
         let first_weighted = weighted.first().map(|(p, _)| p.as_str());
 
         if let Some(val) = old_weight {
