@@ -10229,6 +10229,8 @@ fn is_docs_path(path: &str) -> bool {
         || lower.contains("/demo/")
         || lower.starts_with("benchmarking/")
         || lower.contains("/benchmarking/")
+        || lower.starts_with("benchmarks/")
+        || lower.contains("/benchmarks/")
         || lower.starts_with("site/")
         || lower.contains("/site/")
         || lower.starts_with("sites/")
