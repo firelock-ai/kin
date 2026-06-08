@@ -2474,6 +2474,20 @@ impl InMemoryGraph {
     #[cfg(not(feature = "vector"))]
     pub fn reset_vector_index(&self) {}
 
+    /// Share another graph's vector index by cloning its `Arc`. The scoped
+    /// graph can then search the HEAD index directly; callers filter results
+    /// for scope membership (stable-key filtering in locate already does this).
+    #[cfg(feature = "vector")]
+    pub fn share_vector_index_from(&self, source: &InMemoryGraph) {
+        let src_guard = source.vector_index.lock();
+        if let Some(ref vi) = *src_guard {
+            *self.vector_index.lock() = Some(Arc::clone(vi));
+        }
+    }
+
+    #[cfg(not(feature = "vector"))]
+    pub fn share_vector_index_from(&self, _source: &InMemoryGraph) {}
+
     /// Drain the current pending embedding queue in batches.
     ///
     /// This is the graph-first incremental path: graph mutations enqueue
