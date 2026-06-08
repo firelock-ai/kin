@@ -1174,6 +1174,17 @@ async fn set_scope(
 
         let cached_graph = Arc::new(historical);
 
+        // Share the HEAD graph's vector index with the scoped graph so that
+        // embedding search works in scoped sessions.  This is a lightweight
+        // Arc clone — locate already filters results for scope membership
+        // via stable-key filtering.
+        #[cfg(all(feature = "embeddings", feature = "vector"))]
+        {
+            if std::env::var("KIN_DAEMON_NO_EMBED").is_err() {
+                cached_graph.share_vector_index_from(&state_clone.graph);
+            }
+        }
+
         Ok((head, cached_graph))
     })
     .await
@@ -1791,6 +1802,7 @@ async fn command_branch(
 
 /// POST /commands/checkout — restore files through daemon-owned graph state.
 async fn command_checkout(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::checkout::CheckoutRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
@@ -1804,9 +1816,12 @@ async fn command_checkout(
         ));
     }
 
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+
     let response = kin_cli::commands::checkout::execute_checkout_request(
         &state.layout,
-        state.graph.as_ref(),
+        graph.as_ref(),
         &request,
     )
     .map_err(internal_error)?;
