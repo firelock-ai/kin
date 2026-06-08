@@ -51,6 +51,24 @@ async fn announce_active_scope(
     Ok(scope)
 }
 
+fn embedding_status_complete(status: &kin_db::EmbeddingStatus) -> bool {
+    status.total == 0 || (status.indexed == status.total && status.pending == 0)
+}
+
+fn require_complete_semantic_embeddings(graph: &kin_db::InMemoryGraph) -> Result<()> {
+    let status = graph.embedding_status();
+    if embedding_status_complete(&status) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "semantic search requires complete embeddings; graph has {}/{} indexed, {} unindexed, {} pending. Run `kin embed` until `kin status --json` reports embeddingsIndexed == embeddingsTotal and embeddingsPending == 0.",
+        status.indexed,
+        status.total,
+        status.total.saturating_sub(status.indexed),
+        status.pending
+    );
+}
+
 #[derive(Serialize)]
 struct SearchJsonEntity {
     id: String,
@@ -375,18 +393,9 @@ fn collect_daemon_semantic_search_response(
     graph: &kin_db::InMemoryGraph,
     request: &DaemonSearchRequest,
 ) -> Result<DaemonSearchResponse> {
-    let mut response = collect_daemon_search_response(
-        graph,
-        &DaemonSearchRequest {
-            semantic: false,
-            show_body: false,
-            body_limit: None,
-            ..request.clone()
-        },
-    )?;
-    response.semantic = true;
-    response.text_fallback = true;
-    Ok(response)
+    let _ = graph;
+    let _ = request;
+    anyhow::bail!("semantic search requires vector-enabled Kin embeddings")
 }
 
 #[cfg(feature = "vector")]
@@ -394,6 +403,7 @@ fn collect_daemon_semantic_search_response(
     graph: &kin_db::InMemoryGraph,
     request: &DaemonSearchRequest,
 ) -> Result<DaemonSearchResponse> {
+    require_complete_semantic_embeddings(graph)?;
     let limit = request.limit.unwrap_or(10);
     let vector_results = graph.semantic_search(&request.query, limit)?;
 
