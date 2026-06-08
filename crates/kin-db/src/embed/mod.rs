@@ -1955,6 +1955,7 @@ fn entity_kind_label(kind: EntityKind) -> &'static str {
         EntityKind::EnumVariant => "enum_variant",
         EntityKind::Constant => "constant",
         EntityKind::StaticVar => "static_var",
+        EntityKind::Macro => "macro",
     }
 }
 
