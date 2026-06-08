@@ -65,6 +65,9 @@ pub async fn publish(target: PathBuf, json: bool) -> Result<()> {
     }
 
     let manifest = expected_manifest(&repo_path)?;
+    if prepared_state_expects_vectors(&manifest) {
+        require_complete_prepared_embeddings(&kin_dir)?;
+    }
     publish_prepared_state_from_kin_dir(&kin_dir, &target, &manifest)?;
 
     let result = PublishResult {
@@ -178,9 +181,32 @@ fn validate_prepared_state(prepared_dir: &Path, expected_manifest: &Value) -> Re
                 );
             }
         }
+        require_complete_prepared_embeddings(&prepared_dir.join(".kin"))?;
     }
 
     Ok(actual_manifest)
+}
+
+fn require_complete_prepared_embeddings(kin_dir: &Path) -> Result<()> {
+    let graph_path = kin_dir.join("kindb/graph.kndb");
+    let vector_path = kin_dir.join("kindb/graph.kvec");
+    let snapshot = kin_db::SnapshotManager::open_read_only(&graph_path)
+        .with_context(|| format!("open prepared graph {}", graph_path.display()))?;
+    let graph = snapshot.graph();
+    graph
+        .load_vector_index(&vector_path)
+        .with_context(|| format!("load prepared vector index {}", vector_path.display()))?;
+    let status = graph.embedding_status();
+    if status.indexed != status.total || status.pending != 0 {
+        bail!(
+            "prepared embeddings incomplete: {}/{} indexed, {} unindexed, {} pending",
+            status.indexed,
+            status.total,
+            status.total.saturating_sub(status.indexed),
+            status.pending
+        );
+    }
+    Ok(())
 }
 
 /// Whether a prepared-state manifest declares an embeddings-capable runtime,
@@ -382,12 +408,17 @@ mod tests {
     }
 
     #[test]
-    fn validation_accepts_prepared_state_with_vectors_when_embeddings_expected() {
+    fn validation_rejects_invalid_vector_sidecar_when_embeddings_expected() {
         let dir = tempfile::tempdir().unwrap();
         let manifest = make_prepared_dir(dir.path(), true, true, /* with_vectors */ true);
 
-        validate_prepared_state(dir.path(), &manifest)
-            .expect("prepared state with a vector sidecar must validate when embeddings expected");
+        let err = validate_prepared_state(dir.path(), &manifest)
+            .expect_err("invalid vector sidecar must be rejected when embeddings expected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("open prepared graph") || msg.contains("load prepared vector index"),
+            "error should explain coverage validation failed, got: {msg}"
+        );
     }
 
     #[test]

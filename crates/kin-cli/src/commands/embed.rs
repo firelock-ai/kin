@@ -48,18 +48,14 @@ pub(crate) fn invalidate_vector_index(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Decide whether the embed loop should queue a full pass of missing entities.
+/// Decide whether the embed loop should enqueue missing retrievable objects.
 ///
-/// This intentionally inspects the raw embedding-queue length rather than
-/// `EmbeddingStatus::pending`, because `pending` now reports outstanding work
-/// as `max(queue_length, total - indexed)` (so coverage gates remain correct
-/// when entities exist that have not yet been queued). The "queue is empty
-/// but indexed < total" decision the embed loop needs to make is specifically
-/// about the runtime queue, not about outstanding work.
-fn should_queue_full_embedding_pass(queue_len: usize, indexed: usize, total: usize) -> bool {
-    queue_len == 0 && indexed < total
+/// Reopened graphs may have a stale or partially useful queue while the vector
+/// sidecar is missing revision/artifact keys. Coverage, not raw queue length,
+/// is the authority for whether `kin embed` has backfill work to enqueue.
+fn should_queue_missing_embedding_pass(indexed: usize, total: usize) -> bool {
+    indexed < total
 }
-
 
 fn effective_batch_size(requested: usize) -> usize {
     requested.max(1)
@@ -158,18 +154,20 @@ pub fn build_embed_response(
     // revisions where the entity content didn't actually change.
     let propagated = graph.propagate_revision_vectors();
     if propagated > 0 {
-        tracing::info!(propagated = propagated, "propagated revision vectors via fingerprint match");
+        tracing::info!(
+            propagated = propagated,
+            "propagated revision vectors via fingerprint match"
+        );
     }
 
     // Rebuild migration (request.rebuild) is handled by the daemon before this
-    // runs: it drops the stale-dimension index and re-queues every object, so
-    // by the time we get here the queue is already populated and this gated
-    // pass is a no-op. A normal embed is unchanged.
+    // runs: it drops the stale-dimension index and re-queues every object. For
+    // normal embeds, always enqueue missing retrievable keys when coverage is
+    // incomplete; HashSet queues make this idempotent and prevent stale queue
+    // entries from masking real backfill work.
     let status = graph.embedding_status();
-    if should_queue_full_embedding_pass(graph.pending_embeddings(), status.indexed, status.total) {
+    if should_queue_missing_embedding_pass(status.indexed, status.total) {
         graph.queue_missing_for_embedding();
-    }
-    if graph.pending_artifact_embeddings() == 0 {
         graph.queue_missing_artifacts_for_embedding();
     }
     let effective_batch_size = effective_batch_size(request.batch_size);
@@ -266,7 +264,7 @@ pub fn build_embed_response(
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_batch_size, should_queue_full_embedding_pass};
+    use super::{effective_batch_size, should_queue_missing_embedding_pass};
 
     #[test]
     fn effective_batch_size_respects_nonzero_request() {
@@ -279,18 +277,18 @@ mod tests {
     }
 
     #[test]
-    fn queues_full_pass_when_index_missing_and_queue_empty() {
-        assert!(should_queue_full_embedding_pass(0, 3, 5));
+    fn queues_missing_pass_when_index_incomplete() {
+        assert!(should_queue_missing_embedding_pass(3, 5));
     }
 
     #[test]
-    fn reuses_existing_pending_queue() {
-        assert!(!should_queue_full_embedding_pass(2, 3, 5));
+    fn queues_missing_pass_even_when_stale_queue_may_exist() {
+        assert!(should_queue_missing_embedding_pass(3, 5));
     }
 
     #[test]
     fn skips_full_queue_when_embeddings_are_current() {
-        assert!(!should_queue_full_embedding_pass(0, 5, 5));
+        assert!(!should_queue_missing_embedding_pass(5, 5));
     }
 
     #[test]
