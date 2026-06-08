@@ -1553,14 +1553,20 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         .map(|(path, _)| path.clone())
         .chain(boosted_test_artifact_paths.iter().cloned())
         .collect();
+    let direct_priority_paths = direct_query_priority_paths(&priority_traces);
     for (path, score) in fused.iter_mut() {
         let is_priority_backed = priority_backed_paths.contains(path);
+        let priority_applies_for_penalty = priority_backing_applies_for_path(
+            path,
+            is_priority_backed,
+            direct_priority_paths.contains(path),
+        );
         *score *= post_rrf_path_penalty(
             path,
             source_files.contains(path.as_str()),
-            tracked_artifact_paths.contains(path) || is_priority_backed,
+            tracked_artifact_paths.contains(path) || priority_applies_for_penalty,
             test_query,
-            is_priority_backed,
+            priority_applies_for_penalty,
         );
     }
 
@@ -2063,7 +2069,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     }
 
     // ── Optional Cross-Encoder reranking ──
-    if profile.ltr_enabled() && locate_env_bool("KIN_LOCATE_CROSS_ENCODER_ENABLED", false) {
+    if profile.ltr_enabled() && locate_env_bool("KIN_LOCATE_CROSS_ENCODER_ENABLED", true) {
         let ltr_window = locate_env_usize("KIN_LOCATE_LTR_WINDOW", 20).min(fused.len());
         if ltr_window > 0 {
             let model_id = std::env::var("KIN_LOCATE_CROSS_ENCODER_MODEL")
@@ -2573,6 +2579,26 @@ fn retained_priority_paths(
         allow_test_paths,
     ));
     retained
+}
+
+fn direct_query_priority_paths(
+    priority_traces: &HashMap<String, PriorityFileTrace>,
+) -> HashSet<String> {
+    priority_traces
+        .iter()
+        .filter_map(|(path, trace)| {
+            trace
+                .reasons
+                .iter()
+                .any(|reason| {
+                    matches!(
+                        reason.kind.as_str(),
+                        "explicit_path" | "tracked_explicit_name"
+                    )
+                })
+                .then(|| path.clone())
+        })
+        .collect()
 }
 
 fn injectable_priority_paths(
@@ -9990,10 +10016,26 @@ fn post_rrf_path_penalty(
     // These high-centrality files match nearly every query but rarely represent
     // the actual change locus. Demoting them sharply improves precision.
     if is_amalgamated_or_generated_path(path) {
-        penalty *= locate_env_f32("KIN_LOCATE_AMALGAM_PENALTY", 0.1);
+        penalty *= if is_priority_backed {
+            locate_env_f32("KIN_LOCATE_PRIORITY_AMALGAM_PENALTY", 0.7)
+        } else {
+            locate_env_f32("KIN_LOCATE_AMALGAM_PENALTY", 0.1)
+        };
     }
 
     penalty
+}
+
+fn priority_backing_applies_for_path(
+    path: &str,
+    is_priority_backed: bool,
+    has_direct_query_priority: bool,
+) -> bool {
+    if !is_priority_backed {
+        return false;
+    }
+
+    !is_amalgamated_or_generated_path(path) || has_direct_query_priority
 }
 
 fn is_vendored_path(path: &str) -> bool {
@@ -12487,14 +12529,34 @@ mod tests {
     }
 
     #[test]
-    fn priority_backed_amalgamated_projection_stays_heavily_demoted() {
+    fn direct_priority_backed_amalgamated_projection_keeps_soft_penalty() {
         let regular =
             post_rrf_path_penalty("single_include/nlohmann/json.hpp", true, true, false, false);
         let priority =
             post_rrf_path_penalty("single_include/nlohmann/json.hpp", true, true, false, true);
 
-        assert_eq!(priority, regular);
-        assert!(priority <= 0.1);
+        assert!(priority > regular);
+        assert!(regular <= 0.1);
+        assert!(priority >= 0.6);
+    }
+
+    #[test]
+    fn non_direct_amalgamated_projection_loses_priority_backing() {
+        assert!(!priority_backing_applies_for_path(
+            "single_include/nlohmann/json.hpp",
+            true,
+            false
+        ));
+        assert!(priority_backing_applies_for_path(
+            "single_include/nlohmann/json.hpp",
+            true,
+            true
+        ));
+        assert!(priority_backing_applies_for_path(
+            "include/nlohmann/detail/json_pointer.hpp",
+            true,
+            false
+        ));
     }
 
     #[test]
