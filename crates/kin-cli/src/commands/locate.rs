@@ -8332,13 +8332,18 @@ fn adaptive_cap(
     // (previously only priority paths were re-admitted), bounded to avoid flooding.
     let support_max_total = cap.saturating_add(locate_env_usize("KIN_LOCATE_SUPPORT_EXTRA", 3));
     for &i in &corroborated_indices {
-        if result.len() >= support_max_total {
-            break;
-        }
         if i >= cap {
             let (ref path, _) = fused[i];
             if result_set.contains(path.as_str()) {
                 continue;
+            }
+            // Priority retention paths always get admitted — they have strong
+            // prior evidence (explicit mention, historical co-change).  General
+            // corroborated files are bounded by support_max_total.
+            let is_priority = priority_retention_paths.contains(path.as_str())
+                || cochange_seed_paths.contains(path.as_str());
+            if !is_priority && result.len() >= support_max_total {
+                break;
             }
             result_set.insert(path.clone());
             result.push(fused[i].clone());
