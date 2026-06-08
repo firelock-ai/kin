@@ -474,27 +474,25 @@ fn extract_c_include(
             .to_string();
 
         if !module_path.is_empty() {
-            relations.push(ExtractedRelation {
-                kind: kin_model::RelationKind::Imports,
-                src_name: file_id.to_string(),
-                dst_name: module_path.clone(),
-                import_source: None,
-            });
-
-            // Derive a local name from the header filename (e.g., "stdio" from "stdio.h")
             let local_name = module_path
                 .rsplit('/')
                 .next()
                 .unwrap_or(&module_path)
-                .trim_end_matches(".h")
                 .to_string();
+
+            relations.push(ExtractedRelation {
+                kind: kin_model::RelationKind::Imports,
+                src_name: file_id.to_string(),
+                dst_name: local_name.clone(),
+                import_source: None,
+            });
 
             imports.push(FileImport {
                 module_path,
                 specifiers: vec![ImportedName {
                     local_name,
-                    original_name: None,
-                    is_default: false,
+                    original_name: Some("default".to_string()),
+                    is_default: true,
                 }],
             });
         }
@@ -652,14 +650,19 @@ mod tests {
             .iter()
             .find(|i| i.module_path == "stdio.h")
             .expect("should have stdio.h import");
-        assert_eq!(stdio.specifiers[0].local_name, "stdio");
+        assert_eq!(stdio.specifiers[0].local_name, "stdio.h");
+        assert_eq!(
+            stdio.specifiers[0].original_name.as_deref(),
+            Some("default")
+        );
+        assert!(stdio.specifiers[0].is_default);
 
         let myheader = output
             .imports
             .iter()
             .find(|i| i.module_path == "myheader.h")
             .expect("should have myheader.h import");
-        assert_eq!(myheader.specifiers[0].local_name, "myheader");
+        assert_eq!(myheader.specifiers[0].local_name, "myheader.h");
 
         // Also check import relations
         let import_rels: Vec<_> = output
@@ -668,6 +671,9 @@ mod tests {
             .filter(|r| r.kind == kin_model::RelationKind::Imports)
             .collect();
         assert_eq!(import_rels.len(), 2);
+        let dst_names: Vec<&str> = import_rels.iter().map(|r| r.dst_name.as_str()).collect();
+        assert!(dst_names.contains(&"stdio.h"));
+        assert!(dst_names.contains(&"myheader.h"));
     }
 
     #[test]
@@ -762,6 +768,28 @@ int compute(Point p) { return internal_helper() + p.x; }
         // Verify include import
         assert_eq!(output.imports.len(), 1);
         assert_eq!(output.imports[0].module_path, "stdlib.h");
+    }
+
+    #[test]
+    fn extract_preprocessor_macros_as_entities() {
+        let adapter = CAdapter;
+        let source = br#"
+#define JSON_DIAGNOSTICS 1
+#define JSON_ASSERT(x) do { if (!(x)) abort(); } while (0)
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("include/nlohmann/detail/macro_scope.h");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let macros: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Macro)
+            .collect();
+        let names: Vec<&str> = macros.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(names.contains(&"JSON_DIAGNOSTICS"), "macros={names:?}");
+        assert!(names.contains(&"JSON_ASSERT"), "macros={names:?}");
     }
 
     #[test]

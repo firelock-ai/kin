@@ -681,18 +681,13 @@ fn extract_include(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImport
                 if path.is_empty() {
                     return None;
                 }
-                // Split into directory (module_path) and filename (local_name).
-                let (module_path, local_name) = if let Some(pos) = path.rfind('/') {
-                    (path[..pos].to_string(), path[pos + 1..].to_string())
-                } else {
-                    (String::new(), path)
-                };
+                let local_name = path.rsplit('/').next().unwrap_or(&path).to_string();
                 return Some(FileImport {
-                    module_path,
+                    module_path: path,
                     specifiers: vec![ImportedName {
                         local_name,
-                        original_name: None,
-                        is_default: false,
+                        original_name: Some("default".to_string()),
+                        is_default: true,
                     }],
                 });
             }
@@ -895,6 +890,7 @@ public:
         let source = br#"
 #include <iostream>
 #include "myheader.h"
+#include <nlohmann/detail/input/binary_reader.hpp>
 
 int main() { return 0; }
 "#;
@@ -904,7 +900,7 @@ int main() { return 0; }
 
         assert_eq!(
             output.imports.len(),
-            2,
+            3,
             "expected 2 imports, got {:?}",
             output.imports
         );
@@ -920,6 +916,19 @@ int main() { return 0; }
             .iter()
             .find(|i| i.specifiers.iter().any(|s| s.local_name == "myheader.h"));
         assert!(myheader.is_some(), "should find myheader.h import");
+        assert_eq!(myheader.unwrap().module_path, "myheader.h");
+
+        let binary_reader = output
+            .imports
+            .iter()
+            .find(|i| i.module_path == "nlohmann/detail/input/binary_reader.hpp")
+            .expect("should keep full include path");
+        assert_eq!(binary_reader.specifiers[0].local_name, "binary_reader.hpp");
+        assert_eq!(
+            binary_reader.specifiers[0].original_name.as_deref(),
+            Some("default")
+        );
+        assert!(binary_reader.specifiers[0].is_default);
 
         // Check that Imports relations were emitted
         let import_rels: Vec<_> = output
@@ -927,7 +936,11 @@ int main() { return 0; }
             .iter()
             .filter(|r| r.kind == kin_model::RelationKind::Imports)
             .collect();
-        assert_eq!(import_rels.len(), 2);
+        assert_eq!(import_rels.len(), 3);
+        let dst_names: Vec<&str> = import_rels.iter().map(|r| r.dst_name.as_str()).collect();
+        assert!(dst_names.contains(&"iostream"));
+        assert!(dst_names.contains(&"myheader.h"));
+        assert!(dst_names.contains(&"binary_reader.hpp"));
     }
 
     #[test]
@@ -1143,6 +1156,31 @@ public:
             .find(|e| e.name == "bare")
             .expect("should find bare");
         assert!(func.doc_summary.is_none());
+    }
+
+    #[test]
+    fn extract_preprocessor_macros_as_entities() {
+        let adapter = CppAdapter;
+        let source = br#"
+#define NLOHMANN_JSON_NAMESPACE_BEGIN namespace nlohmann {
+#define JSON_HEDLEY_NON_NULL(...) __attribute__((nonnull(__VA_ARGS__)))
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("include/nlohmann/detail/macro_scope.hpp");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let macros: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Macro)
+            .collect();
+        let names: Vec<&str> = macros.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(
+            names.contains(&"NLOHMANN_JSON_NAMESPACE_BEGIN"),
+            "macros={names:?}"
+        );
+        assert!(names.contains(&"JSON_HEDLEY_NON_NULL"), "macros={names:?}");
     }
 
     #[test]

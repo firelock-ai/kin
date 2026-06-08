@@ -9990,11 +9990,7 @@ fn post_rrf_path_penalty(
     // These high-centrality files match nearly every query but rarely represent
     // the actual change locus. Demoting them sharply improves precision.
     if is_amalgamated_or_generated_path(path) {
-        penalty *= if is_priority_backed {
-            locate_env_f32("KIN_LOCATE_PRIORITY_AMALGAM_PENALTY", 0.7)
-        } else {
-            locate_env_f32("KIN_LOCATE_AMALGAM_PENALTY", 0.1)
-        };
+        penalty *= locate_env_f32("KIN_LOCATE_AMALGAM_PENALTY", 0.1);
     }
 
     penalty
@@ -12488,6 +12484,17 @@ mod tests {
 
         assert!(priority > regular);
         assert!(priority > 0.7);
+    }
+
+    #[test]
+    fn priority_backed_amalgamated_projection_stays_heavily_demoted() {
+        let regular =
+            post_rrf_path_penalty("single_include/nlohmann/json.hpp", true, true, false, false);
+        let priority =
+            post_rrf_path_penalty("single_include/nlohmann/json.hpp", true, true, false, true);
+
+        assert_eq!(priority, regular);
+        assert!(priority <= 0.1);
     }
 
     #[test]

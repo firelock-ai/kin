@@ -78,7 +78,9 @@ impl FileParseDataWithTests {
 }
 
 /// Extensions to try when resolving a bare module path.
-const MODULE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "py", "rs", "go"];
+const MODULE_EXTENSIONS: &[&str] = &[
+    "ts", "tsx", "js", "jsx", "py", "rs", "go", "h", "hh", "hpp", "hxx",
+];
 
 /// Index filenames to try when resolving a directory module path.
 const INDEX_FILENAMES: &[&str] = &["index.ts", "index.tsx", "index.js", "index.jsx", "mod.rs"];
@@ -201,7 +203,9 @@ pub fn link_cross_file_against_entities(
         )
         .entered();
         for (file_idx, file) in files.iter().enumerate() {
-            if total_files > 50 && (file_idx % progress_interval == 0 || file_idx + 1 == total_files) {
+            if total_files > 50
+                && (file_idx % progress_interval == 0 || file_idx + 1 == total_files)
+            {
                 eprint!(
                     "\r  Linking: [{}/{}] {}% | {} relations | {:.1}s",
                     file_idx + 1,
@@ -532,13 +536,52 @@ where
 
         None
     } else {
-        // Non-relative (package) import — try monorepo heuristic resolution
-        resolve_package_import(module_path, known_files)
+        // Non-relative import. Header includes are often written relative to an
+        // include root (e.g. nlohmann/detail/foo.hpp) while known files carry
+        // repo paths such as include/nlohmann/detail/foo.hpp.
+        resolve_repo_local_header(module_path, known_files)
+            // Package import — try monorepo heuristic resolution.
+            .or_else(|| resolve_package_import(module_path, known_files))
             // Java package resolution: com.foo.bar.ClassName → src/main/java/com/foo/bar/ClassName.java
             .or_else(|| resolve_java_package_import(module_path, known_files))
             // Go module resolution: github.com/org/repo/v2/pkg/foo → pkg/foo/*.go
             .or_else(|| resolve_go_module_import(module_path, known_files))
     }
+}
+
+fn resolve_repo_local_header<S>(module_path: &str, known_files: &HashSet<S>) -> Option<String>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    if !is_header_like_module_path(module_path) {
+        return None;
+    }
+
+    if known_files.contains(module_path) {
+        return Some(module_path.to_string());
+    }
+
+    for prefix in ["include/", "src/", "lib/"] {
+        let candidate = format!("{prefix}{module_path}");
+        if known_files.contains(candidate.as_str()) {
+            return Some(candidate);
+        }
+    }
+
+    let suffix = format!("/{module_path}");
+    for file in known_files.iter() {
+        let file_str = file.borrow();
+        if file_str.ends_with(&suffix) {
+            return Some(file_str.to_string());
+        }
+    }
+
+    None
+}
+
+fn is_header_like_module_path(module_path: &str) -> bool {
+    let lower = module_path.to_ascii_lowercase();
+    matches!(lower.rsplit('.').next(), Some("h" | "hh" | "hpp" | "hxx"))
 }
 
 /// Resolve a non-relative package import using monorepo heuristics.
@@ -835,10 +878,12 @@ impl IncrementalLinker {
         }
 
         if !file_entities_map.is_empty() {
-            self.entity_by_file_name.insert(file_path.to_string(), file_entities_map);
+            self.entity_by_file_name
+                .insert(file_path.to_string(), file_entities_map);
         }
         if !file_entities_list.is_empty() {
-            self.entities_by_file.insert(file_path.to_string(), file_entities_list);
+            self.entities_by_file
+                .insert(file_path.to_string(), file_entities_list);
         }
     }
 }
@@ -866,11 +911,8 @@ pub fn link_cross_file_incremental(
     files: &[FileParseData],
     linker: &IncrementalLinker,
 ) -> Vec<Relation> {
-    let _span = tracing::info_span!(
-        "kin.index.link_cross_file_incremental",
-        files = files.len()
-    )
-    .entered();
+    let _span =
+        tracing::info_span!("kin.index.link_cross_file_incremental", files = files.len()).entered();
 
     // Step 2: Build import map per file
     let import_map: HashMap<&str, HashMap<&str, (&str, &str)>> = {
@@ -909,11 +951,13 @@ pub fn link_cross_file_incremental(
             );
         }
         for rel in &file.relations {
-            let src_id = linker.entity_by_file_name
+            let src_id = linker
+                .entity_by_file_name
                 .get(&file.file_path)
                 .and_then(|m| m.get(&rel.src_name))
                 .copied();
-            let dst_same_file = linker.entity_by_file_name
+            let dst_same_file = linker
+                .entity_by_file_name
                 .get(&file.file_path)
                 .and_then(|m| m.get(&rel.dst_name))
                 .copied();
@@ -941,20 +985,23 @@ pub fn link_cross_file_incremental(
 
             // (b) Import-based cross-file resolution
             if let Some(file_imports) = import_map.get(file.file_path.as_str()) {
-                if let Some(&(module_path, original_name)) =
-                    file_imports.get(rel.dst_name.as_str())
+                if let Some(&(module_path, original_name)) = file_imports.get(rel.dst_name.as_str())
                 {
                     if let Some(target_file) =
                         resolve_module_path(&file.file_path, module_path, &linker.known_files)
                     {
-                        let direct = linker.entity_by_file_name
+                        let direct = linker
+                            .entity_by_file_name
                             .get(&target_file)
                             .and_then(|m| m.get(original_name))
                             .copied();
                         let dst_id = if direct.is_some() {
                             direct
                         } else if original_name == "default" {
-                            resolve_default_export_incremental(&target_file, &linker.entities_by_file)
+                            resolve_default_export_incremental(
+                                &target_file,
+                                &linker.entities_by_file,
+                            )
                         } else {
                             None
                         };
@@ -968,15 +1015,14 @@ pub fn link_cross_file_incremental(
                 }
 
                 // (b2) Namespace/package import member resolution
-                if let Some((import_name, member_name)) =
-                    split_member_access(rel.dst_name.as_str())
+                if let Some((import_name, member_name)) = split_member_access(rel.dst_name.as_str())
                 {
-                    if let Some(&(module_path, _original_name)) = file_imports.get(import_name)
-                    {
+                    if let Some(&(module_path, _original_name)) = file_imports.get(import_name) {
                         if let Some(target_file) =
                             resolve_module_path(&file.file_path, module_path, &linker.known_files)
                         {
-                            if let Some(&dst_id) = linker.entity_by_file_name
+                            if let Some(&dst_id) = linker
+                                .entity_by_file_name
                                 .get(&target_file)
                                 .and_then(|m| m.get(member_name))
                             {
@@ -992,9 +1038,7 @@ pub fn link_cross_file_incremental(
 
             // (c) Global name-match fallback
             if let Some(candidates) = linker.entity_by_name.get(&rel.dst_name) {
-                let other_file_match = candidates
-                    .iter()
-                    .find(|(fp, _)| fp != &file.file_path);
+                let other_file_match = candidates.iter().find(|(fp, _)| fp != &file.file_path);
 
                 if let Some((_, dst_id)) = other_file_match {
                     if add_deduped(&mut seen, src_id, *dst_id, rel.kind) {
@@ -1024,7 +1068,8 @@ pub fn link_cross_file_incremental(
                 }
 
                 let dst_id = if let Some(ref target) = target_file {
-                    let direct = linker.entity_by_file_name
+                    let direct = linker
+                        .entity_by_file_name
                         .get(target)
                         .and_then(|m| m.get(original))
                         .copied();
@@ -1043,19 +1088,24 @@ pub fn link_cross_file_incremental(
                         let full_path = format!("{}.{}", imp.module_path, original);
                         resolve_java_package_import(&full_path, &linker.known_files).and_then(
                             |file_path| {
-                                linker.entity_by_file_name
+                                linker
+                                    .entity_by_file_name
                                     .get(&file_path)
                                     .and_then(|m| m.get(original))
                                     .copied()
                                     .or_else(|| {
                                         let qualified = format!("{}", original);
-                                        linker.entity_by_file_name
+                                        linker
+                                            .entity_by_file_name
                                             .get(&file_path)
                                             .and_then(|m| m.get(qualified.as_str()))
                                             .copied()
                                     })
                                     .or_else(|| {
-                                        resolve_default_export_incremental(&file_path, &linker.entities_by_file)
+                                        resolve_default_export_incremental(
+                                            &file_path,
+                                            &linker.entities_by_file,
+                                        )
                                     })
                             },
                         )
@@ -1063,12 +1113,11 @@ pub fn link_cross_file_incremental(
                         None
                     };
                     java_combined.or_else(|| {
-                        linker.entity_by_name
+                        linker
+                            .entity_by_name
                             .get(original)
                             .and_then(|candidates| {
-                                candidates
-                                    .iter()
-                                    .find(|(fp, _)| fp != &file.file_path)
+                                candidates.iter().find(|(fp, _)| fp != &file.file_path)
                             })
                             .map(|(_, id)| *id)
                     })
@@ -1457,6 +1506,24 @@ mod tests {
     }
 
     #[test]
+    fn resolve_repo_local_header_include_path() {
+        let known: HashSet<&str> = ["include/nlohmann/detail/input/binary_reader.hpp"]
+            .into_iter()
+            .collect();
+
+        let result = resolve_module_path(
+            "src/main.cpp",
+            "nlohmann/detail/input/binary_reader.hpp",
+            &known,
+        );
+
+        assert_eq!(
+            result,
+            Some("include/nlohmann/detail/input/binary_reader.hpp".to_string())
+        );
+    }
+
+    #[test]
     fn renamed_import_resolution() {
         let caller = make_entity("handler", "src/api.ts");
         let callee = make_entity("doWork", "src/utils.ts");
@@ -1540,6 +1607,47 @@ mod tests {
         assert_eq!(result[0].src, kin_model::GraphNodeId::Entity(importer.id));
         assert_eq!(result[0].dst, kin_model::GraphNodeId::Entity(target.id));
         assert_eq!(result[0].import_source.as_deref(), Some("../utils/tools"));
+    }
+
+    #[test]
+    fn header_include_creates_default_import_relation() {
+        let importer = make_entity("main", "src/main.cpp");
+        let target = make_entity(
+            "binary_reader",
+            "include/nlohmann/detail/input/binary_reader.hpp",
+        );
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/main.cpp".to_string(),
+                entities: vec![importer.clone()],
+                relations: vec![],
+                imports: vec![FileImport {
+                    module_path: "nlohmann/detail/input/binary_reader.hpp".to_string(),
+                    specifiers: vec![kin_parser::ImportedName {
+                        local_name: "binary_reader.hpp".to_string(),
+                        original_name: Some("default".to_string()),
+                        is_default: true,
+                    }],
+                }],
+            },
+            FileParseData {
+                file_path: "include/nlohmann/detail/input/binary_reader.hpp".to_string(),
+                entities: vec![target.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].kind, RelationKind::Imports);
+        assert_eq!(result[0].src, kin_model::GraphNodeId::Entity(importer.id));
+        assert_eq!(result[0].dst, kin_model::GraphNodeId::Entity(target.id));
+        assert_eq!(
+            result[0].import_source.as_deref(),
+            Some("nlohmann/detail/input/binary_reader.hpp")
+        );
     }
 
     #[test]
