@@ -190,6 +190,8 @@ pub struct DaemonState {
     /// concurrency those reads contend and surface as opaque "Core error"
     /// shutdown-save failures (SP-20).
     pub cached_repo_id: String,
+    /// True when the daemon is shutting down.
+    pub is_shutdown: AtomicBool,
 }
 
 impl DaemonState {
@@ -369,6 +371,7 @@ impl DaemonState {
             lsp_enrichment_tx: None,
             change_oid_cache: std::sync::RwLock::new(None),
             cached_repo_id,
+            is_shutdown: AtomicBool::new(false),
         };
         Ok(state)
     }
@@ -477,6 +480,7 @@ impl DaemonState {
             lsp_enrichment_tx: None,
             change_oid_cache: std::sync::RwLock::new(None),
             cached_repo_id: repo_id.to_string(),
+            is_shutdown: AtomicBool::new(false),
         };
 
         // Pre-load repos into the map BEFORE any async context.
@@ -1232,6 +1236,7 @@ mod tests {
             lsp_enrichment_tx: None,
             change_oid_cache: std::sync::RwLock::new(None),
             cached_repo_id: "test-repo".to_string(),
+            is_shutdown: AtomicBool::new(false),
         }
     }
 

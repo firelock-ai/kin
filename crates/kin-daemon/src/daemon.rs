@@ -421,6 +421,22 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
         }
     });
 
+    // Spawn task to propagate shutdown signals to state.is_shutdown.
+    let shutdown_state = Arc::clone(&state);
+    let mut shutdown_cancel = cancel_rx.clone();
+    tokio::spawn(async move {
+        while !*shutdown_cancel.borrow() {
+            if shutdown_cancel.changed().await.is_err() {
+                break;
+            }
+        }
+        if *shutdown_cancel.borrow() {
+            shutdown_state
+                .is_shutdown
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+
     // Spawn projection rebuild in background — VFS needs it but locate doesn't.
     // The reconcile loop and API server can start immediately.
     let projection_state = Arc::clone(&state);
@@ -594,27 +610,41 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                     break 'wake;
                 }
                 let pending = embed_state.graph.pending_embeddings();
-                if pending == 0 {
+                let pending_artifacts = embed_state.graph.pending_artifact_embeddings();
+                if pending == 0 && pending_artifacts == 0 {
                     break;
                 }
                 let batch = embed_batch_size;
                 let state_for_embed = Arc::clone(&embed_state);
-                match tokio::task::spawn_blocking(move || {
+                let is_artifact = pending == 0;
+                let label = if is_artifact { "embedded artifacts" } else { "embedded entities" };
+                let remaining = if is_artifact {
+                    pending_artifacts
+                } else {
+                    pending
+                };
+
+                let embed_result = tokio::task::spawn_blocking(move || {
                     let _guard = state_for_embed.embedding_work.lock().map_err(|_| {
                         kin_db::KinDbError::ConcurrentAccessError(
                             "embedding work lock poisoned".to_string(),
                         )
                     })?;
-                    state_for_embed.graph.process_embedding_queue(batch)
+                    if is_artifact {
+                        state_for_embed.graph.process_artifact_embedding_queue(batch)
+                    } else {
+                        state_for_embed.graph.process_embedding_queue(batch)
+                    }
                 })
-                .await
-                {
+                .await;
+
+                match embed_result {
                     Ok(Ok(count)) if count > 0 => {
                         consecutive_panics = 0;
                         info!(
                             count,
-                            remaining = pending.saturating_sub(count),
-                            "embedded entities"
+                            remaining = remaining.saturating_sub(count),
+                            label
                         );
                         // Persist the vector index under the shared persist lock so
                         // this kvec write can never interleave with a snapshot save

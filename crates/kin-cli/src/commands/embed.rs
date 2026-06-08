@@ -122,6 +122,7 @@ pub fn build_embed_response(
     graph: &kin_db::InMemoryGraph,
     request: &EmbedRequest,
     mut persist_batch: impl FnMut() -> std::result::Result<(), kin_db::KinDbError>,
+    is_cancelled: impl Fn() -> bool,
 ) -> Result<EmbedResponse> {
     let deadline = request
         .max_seconds
@@ -177,6 +178,10 @@ pub fn build_embed_response(
     let mut total_embedded_entities = 0usize;
     let mut time_limited = false;
     loop {
+        if is_cancelled() {
+            tracing::info!("Embedding cancelled due to shutdown");
+            break;
+        }
         if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
             time_limited = true;
             break;
@@ -202,6 +207,10 @@ pub fn build_embed_response(
     // Embed artifacts with per-batch progress
     let mut total_embedded_artifacts = 0usize;
     loop {
+        if is_cancelled() {
+            tracing::info!("Embedding cancelled due to shutdown");
+            break;
+        }
         if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
             time_limited = true;
             break;
