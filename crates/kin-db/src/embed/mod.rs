@@ -1577,15 +1577,12 @@ fn default_max_batch_tokens(backend: GpuBackend) -> usize {
     }
 }
 
-/// Seq_len threshold for auto dispatch: at or below this, route to Metal;
-/// above it, fall back to CPU. Set to 1024 because the Metal GELU NaN is
-/// fixed (kin-infer d8df3cc) and `metal_seq_len_regression` is green with
-/// zero NaN and CPU-parity cosine ≈ 1.0 across seq_len 7..1024 — the full
-/// range the suite exercises. The old 256 cap left real code entities
-/// (context-augmented bodies routinely exceed 256 tokens) on the slow CPU
-/// twin on the AUTO path, which timed out before any vectors persisted.
-/// Entities beyond 1024 still CPU-fall-back as belt-and-suspenders, since
-/// the regression does not assert finiteness past 1024.
+/// Seq_len partition used only by opt-in hybrid dispatch.
+///
+/// Plain `auto` no longer CPU-falls back above this threshold. The nlohmann/json
+/// backfill probe showed forced Metal cleanly embedding max_seq=2048 batches
+/// while the previous threshold routed those same long, context-augmented
+/// entities through the slow CPU path.
 #[cfg(feature = "embeddings")]
 const EMBED_CPU_SEQ_THRESHOLD: usize = 1024;
 
@@ -1595,9 +1592,11 @@ const EMBED_CPU_SEQ_THRESHOLD: usize = 1024;
 /// (`sinh/cosh` → inf → NaN) at long sequences; the fix clamps the argument
 /// in `gelu_activation` (kin-infer commit d8df3cc). With that landed, the
 /// `metal_seq_len_regression` suite is green end-to-end (BGE-small Metal-vs-CPU
-/// parity, cosine ≈ 1.0, zero NaN from seq_len 7..1024) and the SwiGLU/SiLU
-/// path is verified clean by `swerank_self_retrieval` (top-1 correct, margin
-/// 0.19). Auto dispatch may therefore use threshold-based Metal routing again.
+/// parity, cosine ≈ 1.0, zero NaN from seq_len 7..1024), the SwiGLU/SiLU path is
+/// verified clean by `swerank_self_retrieval` (top-1 correct, margin 0.19), and
+/// the ContextBench nlohmann/json backfill probe validated max_seq=2048 forced
+/// Metal batches. Auto dispatch should therefore stay on Metal by default; CPU
+/// remains available through `KIN_EMBED_BACKEND=cpu`.
 #[cfg(feature = "embeddings")]
 const EMBED_AUTO_PREFERS_CPU: bool = false;
 
@@ -1706,8 +1705,8 @@ fn balanced_partition(encoded: &[Encoded], gpu_tput_ratio: f64) -> (Vec<Encoded>
 /// - `cpu` (forced): always route through per-sample `forward`, which on
 ///   Metal uses the non-broken fused_attention kernel and on pure-CPU builds
 ///   is the SIMD path. Debug escape hatch.
-/// - `auto` (default): route long sequences through the per-sample path
-///   (max_seq > EMBED_CPU_SEQ_THRESHOLD), short ones through batched Metal.
+/// - `auto` (default): use batched Metal. CPU is an explicit escape hatch via
+///   `KIN_EMBED_BACKEND=cpu`, not a hidden fallback for long code entities.
 #[cfg(feature = "embeddings")]
 fn resolve_embed_backend(max_seq: usize) -> EmbedBackendChoice {
     let mode = std::env::var("KIN_EMBED_BACKEND")
@@ -1734,18 +1733,14 @@ fn resolve_embed_backend(max_seq: usize) -> EmbedBackendChoice {
 }
 
 #[cfg(feature = "embeddings")]
-fn auto_choice(max_seq: usize) -> EmbedBackendChoice {
+fn auto_choice(_max_seq: usize) -> EmbedBackendChoice {
     if EMBED_AUTO_PREFERS_CPU {
         EmbedBackendChoice::Cpu {
             reason: "auto_metal_unreliable",
         }
-    } else if max_seq > EMBED_CPU_SEQ_THRESHOLD {
-        EmbedBackendChoice::Cpu {
-            reason: "seq_threshold",
-        }
     } else {
         EmbedBackendChoice::Metal {
-            reason: "auto_short_seq",
+            reason: "auto_metal_default",
         }
     }
 }
@@ -2403,15 +2398,14 @@ mod tests {
 
     #[cfg(feature = "embeddings")]
     #[test]
-    fn resolve_embed_backend_honors_env_and_threshold() {
+    fn resolve_embed_backend_honors_env_and_metal_default() {
         // Use a unique env var sequence; reset at the end to avoid bleed
         // into sibling tests that share process env.
         let prev = std::env::var("KIN_EMBED_BACKEND").ok();
 
         std::env::set_var("KIN_EMBED_BACKEND", "auto");
-        // `EMBED_AUTO_PREFERS_CPU` is `false`: auto routes by seq_len. Short
-        // sequences (<= EMBED_CPU_SEQ_THRESHOLD) go to Metal; longer ones fall
-        // back to CPU at the conservative threshold.
+        // `EMBED_AUTO_PREFERS_CPU` is `false`: auto stays on Metal. CPU is an
+        // explicit debug escape hatch via KIN_EMBED_BACKEND=cpu.
         assert!(matches!(
             resolve_embed_backend(8),
             EmbedBackendChoice::Metal { .. }
@@ -2422,7 +2416,7 @@ mod tests {
         ));
         assert!(matches!(
             resolve_embed_backend(EMBED_CPU_SEQ_THRESHOLD + 1),
-            EmbedBackendChoice::Cpu { .. }
+            EmbedBackendChoice::Metal { .. }
         ));
 
         std::env::set_var("KIN_EMBED_BACKEND", "cpu");
@@ -2441,12 +2435,12 @@ mod tests {
             EmbedBackendChoice::Metal { .. }
         ));
 
-        // An unrecognized value falls through to the auto path, so a sequence
-        // above the threshold still routes to CPU.
+        // An unrecognized value falls through to the auto path, which now keeps
+        // long code entities on Metal.
         std::env::set_var("KIN_EMBED_BACKEND", "nonsense-value");
         assert!(matches!(
             resolve_embed_backend(EMBED_CPU_SEQ_THRESHOLD + 1),
-            EmbedBackendChoice::Cpu { .. }
+            EmbedBackendChoice::Metal { .. }
         ));
 
         match prev {
