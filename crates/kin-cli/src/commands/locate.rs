@@ -17,6 +17,7 @@ use crate::capability::LocateProfile;
 /// hashing keeps fusion/resolution iteration order stable across processes so
 /// float score accumulation and tie-breaks are bit-reproducible.
 type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
+type EntityStableKey = (String, String, EntityKind);
 
 // ---------------------------------------------------------------------------
 // JSON output types
@@ -499,6 +500,21 @@ fn entity_id_from_retrieval_key(key: &kin_db::RetrievalKey) -> Option<kin_model:
         kin_db::RetrievalKey::Artifact(_) => None,
         kin_db::RetrievalKey::EntityRevision(_) => None,
         kin_db::RetrievalKey::ArtifactRevision(_) => None,
+    }
+}
+
+fn entity_stable_key(entity: &kin_model::Entity) -> Option<EntityStableKey> {
+    let path = entity.file_origin.as_ref()?.0.clone();
+    Some((path, entity.name.clone(), entity.kind))
+}
+
+fn entity_stable_key_from_retrieval_key(
+    graph: &kin_db::InMemoryGraph,
+    key: &kin_db::RetrievalKey,
+) -> Option<EntityStableKey> {
+    match graph.resolve_retrieval_key(key) {
+        Some(kin_db::ResolvedRetrievalItem::Entity(entity)) => entity_stable_key(&entity),
+        _ => None,
     }
 }
 
@@ -1704,7 +1720,11 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                     )
                 })
                 .collect();
-            v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
+            v.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
             v
         };
         record_full_debug_stage(
@@ -6900,14 +6920,11 @@ fn extract_embedding_signals(
     };
 
     // Build the scoped entity map for post-filtering when using HEAD vectors.
-    let scoped_entity_map: HashMap<(String, String, kin_model::EntityKind), kin_model::Entity> = if needs_scope_filter {
+    let scoped_entity_map: HashMap<EntityStableKey, kin_model::Entity> = if needs_scope_filter {
         graph
             .query_entities(&EntityFilter::default())?
             .into_iter()
-            .filter_map(|e| {
-                let path = e.file_origin.as_ref()?.0.clone();
-                Some(((path, e.name.clone(), e.kind), e))
-            })
+            .filter_map(|e| entity_stable_key(&e).map(|key| (key, e)))
             .collect()
     } else {
         HashMap::new()
@@ -6944,23 +6961,20 @@ fn extract_embedding_signals(
         base_limit * 3
     } else {
         base_limit
-    }.max(locate_env_usize("KIN_LOCATE_SEMANTIC_FETCH_LIMIT", 250));
+    }
+    .max(locate_env_usize("KIN_LOCATE_SEMANTIC_FETCH_LIMIT", 250));
     let query_strings: Vec<&str> = queries.iter().map(|(q, _)| q.as_str()).collect();
     let all_results = if needs_scope_filter {
         // We know we are querying the HEAD graph (vector_source).
         // Only return hits that have a matching topological entity in the scoped graph.
-        match search_graph.semantic_search_batch_filtered(&query_strings, fetch_limit, |retrieval_key| {
-            if let Some(entity_id) = entity_id_from_retrieval_key(retrieval_key) {
-                // Use get_entity to avoid accessing private fields
-                if let Some(head_entity) = search_graph.get_entity(&entity_id).ok().flatten() {
-                    if let Some(ref file_origin) = head_entity.file_origin {
-                        let key = (file_origin.0.clone(), head_entity.name.clone(), head_entity.kind);
-                        return scoped_entity_map.contains_key(&key);
-                    }
-                }
-            }
-            false
-        }) {
+        match search_graph.semantic_search_batch_filtered(
+            &query_strings,
+            fetch_limit,
+            |retrieval_key| {
+                entity_stable_key_from_retrieval_key(search_graph, retrieval_key)
+                    .is_some_and(|key| scoped_entity_map.contains_key(&key))
+            },
+        ) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("semantic_search_batch_filtered failed: {:?}", e);
@@ -6979,24 +6993,13 @@ fn extract_embedding_signals(
 
     for ((_, query_weight), results) in queries.iter().zip(all_results) {
         for (retrieval_key, distance) in &results {
-            let Some(entity_id) = entity_id_from_retrieval_key(retrieval_key) else {
-                continue;
-            };
             // Resolve entity: when needs_scope_filter is true, we must map the HEAD entity
             // to the scoped entity via the stable key.
             let entity_opt = if needs_scope_filter {
-                if let Some(head_entity) = search_graph.get_entity(&entity_id)? {
-                    if let Some(ref file_origin) = head_entity.file_origin {
-                        let key = (file_origin.0.clone(), head_entity.name.clone(), head_entity.kind);
-                        scoped_entity_map.get(&key).cloned()
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+                entity_stable_key_from_retrieval_key(search_graph, retrieval_key)
+                    .and_then(|key| scoped_entity_map.get(&key).cloned())
             } else {
-                graph.get_entity(&entity_id)?
+                entity_from_retrieval_key(graph, retrieval_key)?
             };
             let Some(entity) = entity_opt else {
                 continue;
@@ -7772,7 +7775,11 @@ fn resolve_entities_to_files(
             .then_with(|| a.0.cmp(&b.0))
     });
 
-    tracing::info!("resolve_entities_to_files origin {} RETURNING {} files", origin, result.len());
+    tracing::info!(
+        "resolve_entities_to_files origin {} RETURNING {} files",
+        origin,
+        result.len()
+    );
     Ok((result, file_explain, file_signal_scores, file_symbols))
 }
 
@@ -11017,9 +11024,8 @@ fn cap_symbols_by_score(symbols: Vec<LocateSymbol>) -> Vec<LocateSymbol> {
         return symbols;
     }
 
-    let (defs, mut refs): (Vec<LocateSymbol>, Vec<LocateSymbol>) = symbols
-        .into_iter()
-        .partition(|s| s.definition);
+    let (defs, mut refs): (Vec<LocateSymbol>, Vec<LocateSymbol>) =
+        symbols.into_iter().partition(|s| s.definition);
 
     let top_score = defs.first().map(|x| x.score).unwrap_or(0.0);
     let floor = if floor_pct > 0.0 && top_score > 0.0 {

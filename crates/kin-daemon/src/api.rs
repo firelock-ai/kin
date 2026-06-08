@@ -1174,17 +1174,6 @@ async fn set_scope(
 
         let cached_graph = Arc::new(historical);
 
-        // Share the HEAD graph's vector index with the scoped graph so that
-        // embedding search works in scoped sessions.  This is a lightweight
-        // Arc clone — locate already filters results for scope membership
-        // via stable-key filtering.
-        #[cfg(all(feature = "embeddings", feature = "vector"))]
-        {
-            if std::env::var("KIN_DAEMON_NO_EMBED").is_err() {
-                cached_graph.share_vector_index_from(&state_clone.graph);
-            }
-        }
-
         Ok((head, cached_graph))
     })
     .await
@@ -2546,7 +2535,11 @@ async fn locate(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let session_id = extract_session_id_from_headers(&headers)?;
 
-    tracing::info!(">>> LOCATE: state.graph.embedding_status().indexed={}, graph root hash={:?}", state.graph.embedding_status().indexed, state.graph.compute_root_hash());
+    tracing::info!(
+        ">>> LOCATE: state.graph.embedding_status().indexed={}, graph root hash={:?}",
+        state.graph.embedding_status().indexed,
+        state.graph.compute_root_hash()
+    );
     let kvec_meta_path = state.layout.kindb_dir().join("graph.kvec.meta.json");
     if let Ok(content) = std::fs::read_to_string(kvec_meta_path) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -2924,7 +2917,9 @@ async fn embed(
         if req.rebuild {
             state_for_embed.graph.reset_vector_index();
             state_for_embed.graph.queue_missing_for_embedding();
-            state_for_embed.graph.queue_missing_artifacts_for_embedding();
+            state_for_embed
+                .graph
+                .queue_missing_artifacts_for_embedding();
         }
 
         let result = kin_cli::commands::embed::build_embed_response(
