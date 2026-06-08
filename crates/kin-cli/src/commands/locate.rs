@@ -9976,6 +9976,16 @@ fn post_rrf_path_penalty(
             locate_env_f32("KIN_LOCATE_MODULE_INFRA_PENALTY", 0.15)
         };
     }
+    // Amalgamated / single-include / generated headers and build tool scripts.
+    // These high-centrality files match nearly every query but rarely represent
+    // the actual change locus. Demoting them sharply improves precision.
+    if is_amalgamated_or_generated_path(path) {
+        penalty *= if is_priority_backed {
+            locate_env_f32("KIN_LOCATE_PRIORITY_AMALGAM_PENALTY", 0.7)
+        } else {
+            locate_env_f32("KIN_LOCATE_AMALGAM_PENALTY", 0.1)
+        };
+    }
 
     penalty
 }
@@ -10339,6 +10349,36 @@ fn is_module_infrastructure_path(path: &str) -> bool {
     }
 
     false
+}
+
+fn is_amalgamated_or_generated_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    // Amalgamated / single-include headers (e.g. single_include/nlohmann/json.hpp)
+    if lower.starts_with("single_include/")
+        || lower.contains("/single_include/")
+        || lower.contains("_amalgamation")
+        || lower.contains("/amalgamated/")
+    {
+        return true;
+    }
+    // Forward-declaration-only headers
+    if lower.ends_with("_fwd.hpp")
+        || lower.ends_with("_fwd.h")
+        || lower.ends_with("/fwd.hpp")
+        || lower.ends_with("/fwd.h")
+    {
+        return true;
+    }
+    // Build tool / linting scripts that are not implementation code
+    let basename = lower.rsplit('/').next().unwrap_or(&lower);
+    matches!(
+        basename,
+        "cpplint.py"
+            | "amalgamate.py"
+            | "serve_header.py"
+            | "check_structure.py"
+            | "run_benchmarks.py"
+    )
 }
 
 fn is_cli_surface_path(path: &str) -> bool {
