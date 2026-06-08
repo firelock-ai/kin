@@ -153,6 +153,22 @@ fn extract_c_node(
                 extract_c_node(&child, source, file_id, entities, relations);
             }
         }
+        "preproc_def" | "preproc_function_def" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = name_node.utf8_text(source).unwrap_or("").to_string();
+                if !name.is_empty() {
+                    entities.push(ExtractedEntity {
+                        kind: EntityKind::Macro,
+                        name,
+                        signature: node_signature(node, source),
+                        visibility: Visibility::Public,
+                        doc_summary: extract_preceding_comment(node, source),
+                        fingerprint: compute_fingerprint(node, source),
+                        span: span_from_node(node, file_id),
+                    });
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -461,7 +477,7 @@ fn extract_c_include(
             relations.push(ExtractedRelation {
                 kind: kin_model::RelationKind::Imports,
                 src_name: file_id.to_string(),
-                dst_name: raw_path.clone(),
+                dst_name: module_path.clone(),
                 import_source: None,
             });
 

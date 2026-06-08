@@ -60,17 +60,19 @@ impl LanguageAdapter for CppAdapter {
             );
             if child.kind() == "preproc_include" {
                 if let Some(file_import) = extract_include(&child, source) {
+                    // Also emit an Imports relation using the resolved local_name
+                    if let Some(spec) = file_import.specifiers.first() {
+                        let text = spec.local_name.clone();
+                        if !text.is_empty() {
+                            relations.push(ExtractedRelation {
+                                kind: kin_model::RelationKind::Imports,
+                                src_name: file_id.to_string(),
+                                dst_name: text,
+                                import_source: None,
+                            });
+                        }
+                    }
                     imports.push(file_import);
-                }
-                // Also emit an Imports relation
-                let text = child.utf8_text(source).unwrap_or("").to_string();
-                if !text.is_empty() {
-                    relations.push(ExtractedRelation {
-                        kind: kin_model::RelationKind::Imports,
-                        src_name: file_id.to_string(),
-                        dst_name: text,
-                        import_source: None,
-                    });
                 }
             }
         }
@@ -309,6 +311,22 @@ fn extract_cpp_node(
                     entities,
                     relations,
                 );
+            }
+        }
+        "preproc_def" | "preproc_function_def" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = name_node.utf8_text(source).unwrap_or("").to_string();
+                if !name.is_empty() {
+                    entities.push(ExtractedEntity {
+                        kind: EntityKind::Macro,
+                        name,
+                        signature: node_signature(node, source),
+                        visibility: Visibility::Public,
+                        doc_summary: extract_preceding_comment(node, source),
+                        fingerprint: compute_fingerprint(node, source),
+                        span: span_from_node(node, file_id),
+                    });
+                }
             }
         }
         _ => {}

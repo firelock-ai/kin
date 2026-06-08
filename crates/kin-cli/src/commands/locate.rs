@@ -537,7 +537,10 @@ fn require_complete_embedding_coverage(
     graph: &kin_db::InMemoryGraph,
     vector_source: Option<&kin_db::InMemoryGraph>,
 ) -> Result<()> {
-    if std::env::var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK").map(|v| v == "1" || v == "true" || v == "TRUE").unwrap_or(false) {
+    if std::env::var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK")
+        .map(|v| v == "1" || v == "true" || v == "TRUE")
+        .unwrap_or(false)
+    {
         return Ok(());
     }
     let primary_status = graph.embedding_status();
@@ -5204,7 +5207,7 @@ fn term_has_graph_support(
         if !seen_files.insert(path.clone()) {
             continue;
         }
-        let signal_bearing = tracked_file_support_is_signal_bearing(path);
+        let signal_bearing = tracked_file_support_is_signal_bearing(path.as_str());
         match entity.role {
             EntityRole::Docs => docs_hits += 1,
             EntityRole::Source if signal_bearing => source_hits += 1,
@@ -5229,25 +5232,32 @@ fn term_has_graph_support(
     }
 
     for (retrieval_key, _) in hits {
-        let Some(entity) = entity_from_retrieval_key(graph, &retrieval_key)? else {
+        let item = graph.resolve_retrieval_key(&retrieval_key);
+        let Some(path) = item
+            .as_ref()
+            .and_then(|item| item.file_path())
+            .map(|file_id| file_id.0)
+        else {
             continue;
         };
-        let Some(file_origin) = entity.file_origin.as_ref() else {
-            continue;
-        };
-        let path = &file_origin.0;
         if !seen_files.insert(path.clone()) {
             continue;
         }
-        let signal_bearing = tracked_file_support_is_signal_bearing(path);
-        match entity.role {
-            EntityRole::Docs => docs_hits += 1,
-            EntityRole::Source if signal_bearing => source_hits += 1,
-            EntityRole::Test
-            | EntityRole::External
-            | EntityRole::Vendored
-            | EntityRole::Generated
-            | EntityRole::Source => other_hits += 1,
+        let signal_bearing = tracked_file_support_is_signal_bearing(path.as_str());
+        match item {
+            Some(kin_db::ResolvedRetrievalItem::Entity(entity)) => match entity.role {
+                EntityRole::Docs => docs_hits += 1,
+                EntityRole::Source if signal_bearing => source_hits += 1,
+                EntityRole::Test
+                | EntityRole::External
+                | EntityRole::Vendored
+                | EntityRole::Generated
+                | EntityRole::Source => other_hits += 1,
+            },
+            Some(_) if signal_bearing => source_hits += 1,
+            Some(_) if is_docs_or_locale_path(path.as_str()) => docs_hits += 1,
+            Some(_) => other_hits += 1,
+            None => {}
         }
     }
 
@@ -12930,6 +12940,65 @@ mod tests {
         assert!(terms
             .iter()
             .any(|term| term.eq_ignore_ascii_case("autocomplete")));
+    }
+
+    #[test]
+    fn curate_search_terms_keeps_source_artifact_backed_macro_terms() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("include/nlohmann/detail/macro_scope.hpp"),
+                content_hash: Hash256::from_bytes([47; 32]),
+                mime_type: Some("text/x-c++hdr".into()),
+                text_preview: Some(
+                    "#define NLOHMANN_JSON_NAMESPACE_BEGIN namespace nlohmann {".into(),
+                ),
+            })
+            .unwrap();
+
+        let terms = curate_search_terms(
+            "Add namespace scope macros, i.e., `NLOHMANN_JSON_NAMESPACE_BEGIN`.",
+            &graph,
+        )
+        .unwrap();
+
+        assert!(
+            terms
+                .iter()
+                .any(|term| term == "NLOHMANN_JSON_NAMESPACE_BEGIN"),
+            "terms={terms:?}"
+        );
+    }
+
+    #[test]
+    fn curate_search_terms_keeps_source_artifact_backed_qualified_terms() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("include/nlohmann/detail/meta/detected.hpp"),
+                content_hash: Hash256::from_bytes([48; 32]),
+                mime_type: Some("text/x-c++hdr".into()),
+                text_preview: Some(
+                    "template<class T> using detected_t = std::filesystem::path;".into(),
+                ),
+            })
+            .unwrap();
+
+        let terms = curate_search_terms(
+            "fix std::filesystem::path regression\n\n\
+             Antiquated type traits performed an incorrect check for `std::filesystem::path`.",
+            &graph,
+        )
+        .unwrap();
+
+        assert!(
+            terms
+                .iter()
+                .any(|term| term.eq_ignore_ascii_case("filesystem")),
+            "terms={terms:?}"
+        );
     }
 
     #[test]
