@@ -652,8 +652,9 @@ impl SessionCoordinator {
     /// Sweep stale sessions.
     ///
     /// A session is stale if:
-    /// - It has missed two heartbeat intervals, OR
-    /// - Its PID is set and the process is no longer alive
+    /// - Its PID is set and the process is no longer alive, OR
+    /// - It has missed two heartbeat intervals and no live PID can prove the
+    ///   owning process is still active.
     ///
     /// Returns the number of sessions reaped.
     pub fn sweep_stale_sessions(&self) -> Result<usize> {
@@ -664,30 +665,43 @@ impl SessionCoordinator {
 
         for session in &sessions {
             let mut is_stale = false;
+            let pid_alive = session.pid.map(|pid| (pid, is_process_alive(pid)));
+
+            // Check if PID is alive first. A live PID is stronger evidence
+            // than a missed heartbeat because long-running scoped operations
+            // can legitimately block heartbeats for more than two intervals.
+            if let Some((pid, false)) = pid_alive {
+                debug!(
+                    session_id = %session.session_id,
+                    pid = pid,
+                    "session PID is no longer alive"
+                );
+                is_stale = true;
+            }
 
             // Check heartbeat staleness.
             if let Some(age) = timestamp_age(&session.last_heartbeat, &now) {
                 if age > stale_threshold {
-                    debug!(
-                        session_id = %session.session_id,
-                        vendor = %session.vendor,
-                        age_secs = age.as_secs(),
-                        "session heartbeat is stale"
-                    );
-                    is_stale = true;
-                }
-            }
-
-            // Check if PID is alive (Unix-only).
-            if !is_stale {
-                if let Some(pid) = session.pid {
-                    if !is_process_alive(pid) {
-                        debug!(
-                            session_id = %session.session_id,
-                            pid = pid,
-                            "session PID is no longer alive"
-                        );
-                        is_stale = true;
+                    match pid_alive {
+                        Some((pid, true)) => {
+                            debug!(
+                                session_id = %session.session_id,
+                                vendor = %session.vendor,
+                                age_secs = age.as_secs(),
+                                pid = pid,
+                                "session heartbeat is stale but PID is alive"
+                            );
+                        }
+                        Some((_, false)) => {}
+                        None => {
+                            debug!(
+                                session_id = %session.session_id,
+                                vendor = %session.vendor,
+                                age_secs = age.as_secs(),
+                                "session heartbeat is stale and no PID is available"
+                            );
+                            is_stale = true;
+                        }
                     }
                 }
             }
@@ -1678,6 +1692,30 @@ mod tests {
         // On macOS, kill -0 on invalid PID fails, marking it stale
         assert_eq!(reaped, 1);
         assert!(coord.get_session(&sid).unwrap().is_none());
+    }
+
+    #[test]
+    fn sweep_with_stale_heartbeat_keeps_live_pid() {
+        let coord = SessionCoordinator::with_heartbeat_interval(
+            Arc::new(kin_db::InMemoryGraph::new()),
+            Duration::from_millis(1),
+        );
+        let sid = coord
+            .register_session(
+                "claude-code",
+                "slow-scope",
+                SessionTransport::Mcp,
+                Some(std::process::id()),
+                PathBuf::from("/"),
+                SessionCapabilities::default(),
+            )
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(10));
+
+        let reaped = coord.sweep_stale_sessions().unwrap();
+        assert_eq!(reaped, 0);
+        assert!(coord.get_session(&sid).unwrap().is_some());
     }
 
     #[test]

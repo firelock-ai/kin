@@ -2922,11 +2922,18 @@ async fn embed(
                 .queue_missing_artifacts_for_embedding();
         }
 
+        let is_cancelled = || {
+            state_for_embed
+                .is_shutdown
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+
         let result = kin_cli::commands::embed::build_embed_response(
             &state_for_embed.layout,
             state_for_embed.graph.as_ref(),
             &req,
             persist_batch,
+            is_cancelled,
         )
         .map_err(|error| format!("embed build failed: {error:#}"))?;
         if result.result.total_entities > 0 || result.result.total_artifacts > 0 {
@@ -5667,6 +5674,7 @@ mod tests {
 
     #[tokio::test]
     async fn locate_endpoint_resolves_historical_ref_queries() {
+        std::env::set_var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", "true");
         let state = test_state();
         let graph = state.graph.as_ref();
         let add_git_ref = "1111111111111111111111111111111111111111";
@@ -5804,6 +5812,7 @@ mod tests {
                 .all(|file| file.path != "src/lib.py"),
             "current locate should not match the historical symbol name"
         );
+        std::env::remove_var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
     }
 
     #[tokio::test]
