@@ -2069,7 +2069,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     }
 
     // ── Optional Cross-Encoder reranking ──
-    if profile.ltr_enabled() && locate_env_bool("KIN_LOCATE_CROSS_ENCODER_ENABLED", true) {
+    if locate_env_bool("KIN_LOCATE_CROSS_ENCODER_ENABLED", true) {
         let ltr_window = locate_env_usize("KIN_LOCATE_LTR_WINDOW", 20).min(fused.len());
         if ltr_window > 0 {
             let model_id = std::env::var("KIN_LOCATE_CROSS_ENCODER_MODEL")
@@ -2077,8 +2077,9 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             let revision = std::env::var("KIN_LOCATE_CROSS_ENCODER_REVISION")
                 .unwrap_or_else(|_| "main".to_string());
 
-            if let Ok(encoder) = kin_db::embed::rerank::CrossEncoder::new(&model_id, &revision) {
-                let mut docs = Vec::new();
+            match kin_db::embed::rerank::CrossEncoder::new(&model_id, &revision) {
+                Ok(encoder) => {
+                    let mut docs = Vec::new();
                 let mut candidates = Vec::new();
 
                 for (path, score) in fused.iter().take(ltr_window) {
@@ -2112,6 +2113,10 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                             "after_cross_encoder",
                         );
                     }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("⚠ CrossEncoder init failed: {}", e);
                 }
             }
         }
