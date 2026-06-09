@@ -192,6 +192,12 @@ pub struct DaemonState {
     pub cached_repo_id: String,
     /// True when the daemon is shutting down.
     pub is_shutdown: AtomicBool,
+    /// Latch set by the background embedding worker when it hits a vector-index
+    /// error (e.g. a stale on-disk index dimension vs the live embedder) that a
+    /// one-shot reset could not recover. While set, the shutdown persistence
+    /// flush is skipped so degraded in-memory state can never overwrite the good
+    /// on-disk snapshot (the graph-wipe-on-kill class).
+    pub embed_index_fatal: AtomicBool,
 }
 
 impl DaemonState {
@@ -372,6 +378,7 @@ impl DaemonState {
             change_oid_cache: std::sync::RwLock::new(None),
             cached_repo_id,
             is_shutdown: AtomicBool::new(false),
+            embed_index_fatal: AtomicBool::new(false),
         };
         Ok(state)
     }
@@ -481,6 +488,7 @@ impl DaemonState {
             change_oid_cache: std::sync::RwLock::new(None),
             cached_repo_id: repo_id.to_string(),
             is_shutdown: AtomicBool::new(false),
+            embed_index_fatal: AtomicBool::new(false),
         };
 
         // Pre-load repos into the map BEFORE any async context.
@@ -1075,6 +1083,24 @@ impl DaemonState {
         self.dirty.load(Ordering::SeqCst)
     }
 
+    /// Latch a fatal embed/index condition. Set by the embedding worker when a
+    /// vector-index error persists past its one-shot reset/re-queue recovery.
+    /// While set, the shutdown persistence flush is skipped so the good on-disk
+    /// snapshot is never overwritten by degraded in-memory state.
+    pub fn set_embed_index_fatal(&self) {
+        self.embed_index_fatal.store(true, Ordering::SeqCst);
+    }
+
+    /// Clear the embed/index fatal latch (the worker embedded successfully).
+    pub fn clear_embed_index_fatal(&self) {
+        self.embed_index_fatal.store(false, Ordering::SeqCst);
+    }
+
+    /// True when a fatal embed/index error is currently active.
+    pub fn has_embed_index_fatal(&self) -> bool {
+        self.embed_index_fatal.load(Ordering::SeqCst)
+    }
+
     /// Duration since the last successful save.
     pub fn time_since_save(&self) -> Duration {
         self.last_save
@@ -1237,6 +1263,7 @@ mod tests {
             change_oid_cache: std::sync::RwLock::new(None),
             cached_repo_id: "test-repo".to_string(),
             is_shutdown: AtomicBool::new(false),
+            embed_index_fatal: AtomicBool::new(false),
         }
     }
 

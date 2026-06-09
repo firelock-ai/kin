@@ -51,6 +51,13 @@ fn idle_check_interval(idle_timeout: Duration) -> Duration {
     Duration::from_millis(millis)
 }
 
+/// Next backoff after a persistent embedding-worker error. Doubles the previous
+/// backoff (starting from `base` on the first failure) and caps at `max`. Kept
+/// pure so the no-tight-spin guarantee is unit-testable.
+fn next_embed_error_backoff(current: Option<Duration>, base: Duration, max: Duration) -> Duration {
+    current.unwrap_or(base).saturating_mul(2).min(max)
+}
+
 fn endpoint_files_missing(state: &DaemonState) -> bool {
     let root = state.layout.root();
     !root.join("daemon.pid").exists() || !root.join("daemon.port").exists()
@@ -274,6 +281,28 @@ async fn enrich_single_entity(
 ///
 /// All run concurrently. Any shutting down causes the others to stop.
 pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
+    // Singleton guard: at most one daemon per repo. Acquire an exclusive OS
+    // lock on `.kin/daemon.lock` before any side effects (no LSP discovery, no
+    // pid/port files, no bound port). If another live daemon already owns this
+    // repo, refuse to start a second process that would fight over the same
+    // graph/kindb state — exit cleanly so the caller treats it as a no-op. The
+    // kernel releases the lock on process death (including SIGKILL), so it can
+    // never go stale.
+    //
+    // Held in `_daemon_lock` for the whole body of `run()`; it is dropped only
+    // after the final endpoint-file cleanup below, releasing the lock last.
+    let _daemon_lock = match crate::lifecycle::acquire_singleton_lock(state.layout.root()) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            warn!(
+                repo = %state.layout.root().display(),
+                "another kin daemon already owns this repo — refusing to start a second daemon"
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(DaemonError::Io(error)),
+    };
+
     // Set up LSP enrichment channel before wrapping state in Arc.
     let lsp_rx = if config.lsp_enabled {
         let discovered = kin_lsp::discovery::discover_servers();
@@ -496,11 +525,23 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                 _ = tokio::time::sleep(current_interval) => {}
                 _ = persist_cancel.changed() => {
                     if persist_state.is_dirty() {
-                        info!("final persistence flush on shutdown");
-                        if let Err(e) = save_snapshot_blocking(Arc::clone(&persist_state)).await {
-                            error!(error = %e, "shutdown save failed");
+                        if persist_state.has_embed_index_fatal() {
+                            // A fatal embed/index error is active (e.g. a stale
+                            // on-disk index dimension the one-shot reset could not
+                            // recover). Skip the final flush so degraded in-memory
+                            // state never overwrites the good on-disk snapshot —
+                            // the graph-wipe-on-kill class. The daemon reloads the
+                            // intact snapshot and re-attempts embedding on restart.
+                            warn!(
+                                "skipping final persistence flush on shutdown — fatal embed/index error active; preserving on-disk snapshot"
+                            );
                         } else {
-                            persist_state.mark_clean();
+                            info!("final persistence flush on shutdown");
+                            if let Err(e) = save_snapshot_blocking(Arc::clone(&persist_state)).await {
+                                error!(error = %e, "shutdown save failed");
+                            } else {
+                                persist_state.mark_clean();
+                            }
                         }
                     }
                     break;
@@ -584,9 +625,20 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
         info!("embedding worker started");
         let mut consecutive_panics: u32 = 0;
         const MAX_CONSECUTIVE_PANICS: u32 = 3;
+        // Recovery + backoff state for vector-index errors (e.g. a stale on-disk
+        // index dimension vs the live embedder). We trigger the kin-db
+        // reset/re-queue contract exactly ONCE; if the error persists, we back
+        // off exponentially so the worker can never busy-spin requeuing a batch
+        // that keeps failing — the 100% CPU / 5s requeue-fail loop class.
+        let mut index_reset_triggered = false;
+        let mut error_backoff: Option<Duration> = None;
+        const EMBED_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(60);
         'wake: loop {
+            // While an embed/index error is being retried, sleep for the current
+            // backoff instead of the normal idle interval (no tight-spin).
+            let idle = error_backoff.unwrap_or(embed_interval);
             tokio::select! {
-                _ = tokio::time::sleep(embed_interval) => {}
+                _ = tokio::time::sleep(idle) => {}
                 _ = embed_cancel.changed() => {
                     info!("embedding worker shutting down");
                     break;
@@ -647,6 +699,11 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                 match embed_result {
                     Ok(Ok(count)) if count > 0 => {
                         consecutive_panics = 0;
+                        // A successful batch means the index now matches the
+                        // embedder — clear any error backoff / reset latch.
+                        index_reset_triggered = false;
+                        error_backoff = None;
+                        embed_state.clear_embed_index_fatal();
                         info!(count, remaining = remaining.saturating_sub(count), label);
                         // Persist the vector index under the shared persist lock so
                         // this kvec write can never interleave with a snapshot save
@@ -682,10 +739,56 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                         // `/embed` request raced ahead). Stop draining and return
                         // to the idle sleep.
                         consecutive_panics = 0;
+                        index_reset_triggered = false;
+                        error_backoff = None;
+                        embed_state.clear_embed_index_fatal();
                         break;
                     }
                     Ok(Err(e)) => {
-                        error!(error = %e, "embedding worker error");
+                        // Distinguish a persistent vector-index error (a stale
+                        // loaded index dimension vs the live embedder) from a
+                        // transient one. On the FIRST index error, trigger the
+                        // kin-db reset/re-queue contract exactly once and retry at
+                        // the normal interval — the rebuilt index is sized to the
+                        // live embedder and should succeed next pass. If the error
+                        // persists (reset already attempted) or it is some other
+                        // error, back off exponentially so the worker never
+                        // busy-spins.
+                        let is_index_error = matches!(e, kin_db::KinDbError::IndexError(_));
+                        if is_index_error && !index_reset_triggered {
+                            warn!(
+                                error = %e,
+                                "embedding worker hit a vector-index error — resetting vector index and re-queueing once"
+                            );
+                            embed_state.graph.reset_vector_index();
+                            embed_state.graph.queue_missing_for_embedding();
+                            embed_state.graph.queue_missing_artifacts_for_embedding();
+                            index_reset_triggered = true;
+                            error_backoff = None;
+                            error!(
+                                error = %e,
+                                "embedding worker error — reset vector index, retrying next interval"
+                            );
+                        } else {
+                            let next = next_embed_error_backoff(
+                                error_backoff,
+                                embed_interval,
+                                EMBED_ERROR_BACKOFF_MAX,
+                            );
+                            error_backoff = Some(next);
+                            if is_index_error {
+                                // The one-shot reset did not clear the error: flag
+                                // a fatal embed/index condition so the shutdown
+                                // flush won't overwrite the good on-disk snapshot
+                                // with degraded in-memory state.
+                                embed_state.set_embed_index_fatal();
+                            }
+                            error!(
+                                error = %e,
+                                backoff_s = next.as_secs(),
+                                "embedding worker error — backing off"
+                            );
+                        }
                         break;
                     }
                     Err(e) => {
@@ -1530,11 +1633,36 @@ async fn select_with_signals(
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{watched_process_is_alive, DaemonConfig};
+    use super::{next_embed_error_backoff, watched_process_is_alive, DaemonConfig};
+    use std::time::Duration;
 
     #[test]
     fn default_embed_batch_is_backlog_friendly() {
         assert_eq!(DaemonConfig::default().embed_batch_size, 512);
+    }
+
+    #[test]
+    fn embed_error_backoff_doubles_then_caps() {
+        let base = Duration::from_secs(5);
+        let max = Duration::from_secs(60);
+
+        // First failure starts from the base interval and doubles it.
+        let b1 = next_embed_error_backoff(None, base, max);
+        assert_eq!(b1, Duration::from_secs(10));
+        // Subsequent failures keep doubling…
+        let b2 = next_embed_error_backoff(Some(b1), base, max);
+        assert_eq!(b2, Duration::from_secs(20));
+        let b3 = next_embed_error_backoff(Some(b2), base, max);
+        assert_eq!(b3, Duration::from_secs(40));
+        // …until they saturate at the cap and never grow unbounded.
+        let b4 = next_embed_error_backoff(Some(b3), base, max);
+        assert_eq!(b4, max);
+        let b5 = next_embed_error_backoff(Some(b4), base, max);
+        assert_eq!(b5, max, "backoff must stay clamped at the cap");
+
+        // The backoff is always strictly greater than the idle interval, so a
+        // persistent error can never tight-spin at the 5s idle cadence.
+        assert!(b1 > base);
     }
 
     #[test]
