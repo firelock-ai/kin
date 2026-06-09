@@ -13,8 +13,9 @@
 use std::collections::BinaryHeap;
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
-use std::{cmp::Reverse, fs, fs::File};
+use std::{cmp::Reverse, fs, fs::File, fs::OpenOptions};
 
+use fs2::FileExt;
 use hashbrown::{HashMap, HashSet};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -482,7 +483,12 @@ impl<Id: VectorId> HnswGraph<Id> {
     }
 
     /// K-NN search.  Returns (Id, distance) pairs sorted by distance ascending.
-    fn search(&self, query: &[f32], limit: usize, predicate: Option<&dyn Fn(&Id) -> bool>) -> Vec<(Id, f32)> {
+    fn search(
+        &self,
+        query: &[f32],
+        limit: usize,
+        predicate: Option<&dyn Fn(&Id) -> bool>,
+    ) -> Vec<(Id, f32)> {
         let _span =
             tracing::info_span!("kin_vector.search", dims = query.len(), limit = limit).entered();
         let entry = match self.entry_point {
@@ -567,6 +573,35 @@ fn recovery_marker_path(path: &Path) -> PathBuf {
         Some(ext) if !ext.is_empty() => path.with_extension(format!("{ext}.tmp.meta")),
         _ => path.with_extension("tmp.meta"),
     }
+}
+
+fn write_lock_path(path: &Path) -> PathBuf {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) if !ext.is_empty() => path.with_extension(format!("{ext}.write.lock")),
+        _ => path.with_extension("write.lock"),
+    }
+}
+
+fn acquire_write_lock(path: &Path, label: &str) -> Result<File, VectorError> {
+    let lock_path = write_lock_path(path);
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| {
+            VectorError::IndexError(format!(
+                "failed to open {label} write lock {}: {e}",
+                lock_path.display()
+            ))
+        })?;
+    lock.lock_exclusive().map_err(|e| {
+        VectorError::IndexError(format!(
+            "failed to acquire {label} write lock {}: {e}",
+            lock_path.display()
+        ))
+    })?;
+    Ok(lock)
 }
 
 fn fsync_and_rename(tmp_path: &Path, path: &Path) -> Result<(), VectorError> {
@@ -748,6 +783,7 @@ fn load_proven_recovery_bytes(path: &Path, label: &str) -> Result<Vec<u8>, Vecto
 }
 
 fn atomic_save_bytes(path: &Path, bytes: &[u8], label: &str) -> Result<(), VectorError> {
+    let _lock = acquire_write_lock(path, label)?;
     write_bytes_recovery_candidate(path, bytes, label)?;
     promote_recovery_candidate(path)
 }
@@ -1208,7 +1244,9 @@ mod tests {
         graph.insert(newcomer, &[0.5]).unwrap();
 
         let newcomer_idx = graph.id_to_idx[&newcomer];
-        assert!(graph.nodes[newcomer_idx].connections[1].iter().all(|&nb| nb != 0));
+        assert!(graph.nodes[newcomer_idx].connections[1]
+            .iter()
+            .all(|&nb| nb != 0));
     }
 
     #[test]
@@ -1357,6 +1395,33 @@ mod tests {
         assert_eq!(results[0].0, entity_id);
         assert!(!tmp_path.exists());
         assert!(!marker_path.exists());
+    }
+
+    #[test]
+    fn atomic_save_serializes_concurrent_writers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = std::sync::Arc::new(dir.path().join("vectors.hnsw"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+
+        for idx in 0..4u8 {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                let bytes = vec![idx; 4096];
+                barrier.wait();
+                atomic_save_bytes(&path, &bytes, "vector index")
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        let bytes = fs::read(path.as_ref()).unwrap();
+        assert_eq!(bytes.len(), 4096);
+        assert!(!recovery_tmp_path(path.as_ref()).exists());
+        assert!(!recovery_marker_path(path.as_ref()).exists());
     }
 
     #[test]
