@@ -30,16 +30,46 @@ fn daemon_base_url() -> Option<String> {
 
 /// Bearer token the daemon expects on non-public routes.
 ///
-/// The daemon enables auth when `KIN_DAEMON_AUTH_TOKEN` is set (see
-/// `auth_token_from_env` in kin-daemon); when it is, every route except the
-/// health/readiness probes requires `Authorization: Bearer <token>`. The MCP
-/// transport forwards graph and session tools to those protected routes, so it
-/// must present the same token or the daemon answers 401.
+/// Resolution mirrors the daemon and CLI client exactly so all three agree in
+/// every case: an explicit `KIN_DAEMON_AUTH_TOKEN` env override wins, otherwise
+/// the auto-provisioned per-install loopback token at `.kin/daemon.token`
+/// (which the daemon writes via `ensure_loopback_token`). When neither is
+/// present we send no header — harmless while enforcement is flag-gated, and
+/// correct once it is enabled.
 fn daemon_auth_token() -> Option<String> {
-    std::env::var("KIN_DAEMON_AUTH_TOKEN")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    if let Ok(env_token) = std::env::var("KIN_DAEMON_AUTH_TOKEN") {
+        let env_token = env_token.trim().to_string();
+        if !env_token.is_empty() {
+            return Some(env_token);
+        }
+    }
+    let token_path = discover_kin_dir()?.join("daemon.token");
+    let contents = std::fs::read_to_string(token_path).ok()?;
+    let token = contents.trim().to_string();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
+/// Walk up from the working directory to the repo's `.kin` directory.
+///
+/// This intentionally does not use `KinLayout::discover`, whose `KIN_DAEMON_URL`
+/// short-circuit assumes the cwd is the repo root; the token file lives in the
+/// repo `.kin` even when an agent runs from a subdirectory, so we walk up to
+/// find it.
+fn discover_kin_dir() -> Option<std::path::PathBuf> {
+    let mut current = std::env::current_dir().ok()?;
+    loop {
+        let candidate = current.join(".kin");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
 }
 
 /// Attach the daemon bearer token to a request when auth is configured.
@@ -278,57 +308,12 @@ pub async fn forward_tool_call(
                 .map(text_result_from_value)
                 .transpose()
         }
-        // Coverage exposure: surface embedding-index coverage to MCP agents.
-        // The generic graph tool dispatcher only knows entity_count; the
-        // daemon's status command computes embedding coverage from the live
-        // graph (`graph.embedding_status()`), so forward there and project the
-        // fields MCP agents need.
-        "kin_graph_status" => forward_graph_status(arguments).await,
+        // `kin_graph_status` (incl. embedding coverage) flows through the
+        // generic forwarder: the daemon special-cases it in /mcp/tools/call to
+        // merge `graph.embedding_status()` into the response, keeping a single
+        // graph-owned source of truth for coverage.
         _ => forward_mcp_tool_call(name, arguments).await,
     }
-}
-
-/// Forward `kin_graph_status` to the daemon's status command and project the
-/// graph/embedding coverage fields agents care about.
-///
-/// In product mode coverage is otherwise CLI-only (`kin status`); this gives
-/// MCP agents the same embedding-index visibility without leaving graph-owned
-/// truth — the daemon computes the counts from its live graph.
-async fn forward_graph_status(
-    arguments: &HashMap<String, serde_json::Value>,
-) -> Result<Option<ToolCallResult>, String> {
-    let Some(client) = daemon_client().await else {
-        return Ok(None);
-    };
-    let Some(base) = daemon_base_url() else {
-        return Ok(None);
-    };
-    let request = client
-        .post(format!("{}/commands/status", base))
-        .json(&serde_json::json!({ "json": false }));
-    let request = with_session_header(with_auth(request), arguments);
-    let resp = request
-        .send()
-        .await
-        .map_err(|e| format!("daemon graph status failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("daemon graph status failed: HTTP {}", resp.status()));
-    }
-    let value: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("daemon graph status response parse failed: {e}"))?;
-    let summary = value.get("summary").unwrap_or(&value);
-    let field_u64 = |key: &str| summary.get(key).and_then(serde_json::Value::as_u64);
-    let result = serde_json::json!({
-        "entity_count": field_u64("entities").unwrap_or(0),
-        "embeddings_indexed": field_u64("embeddings_indexed").unwrap_or(0),
-        "embeddings_total": field_u64("embeddings_total").unwrap_or(0),
-        "embeddings_pending": field_u64("embeddings_pending").unwrap_or(0),
-        "authority": "repo-daemon",
-        "note": "Embedding coverage is computed from the daemon-owned live graph."
-    });
-    text_result_from_value(result).map(Some)
 }
 
 pub fn daemon_unavailable_tool_result(name: &str) -> ToolCallResult {
