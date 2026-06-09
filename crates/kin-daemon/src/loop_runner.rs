@@ -426,6 +426,30 @@ mod tests {
         let deduped = dedup_file_events(vec![]);
         assert!(deduped.is_empty());
     }
+
+    #[test]
+    fn mass_deletion_guard_blocks_drastic_removals_only() {
+        assert!(should_block_mass_deletion(80, 100, false)); // 80% gone -> blocked
+        assert!(should_block_mass_deletion(100, 100, false)); // total wipe -> blocked
+        assert!(!should_block_mass_deletion(75, 100, false)); // 25 survive (25*4==100): boundary, allowed
+        assert!(!should_block_mass_deletion(40, 100, false)); // moderate deletion -> allowed
+        assert!(!should_block_mass_deletion(0, 100, false)); // nothing removed -> allowed
+        assert!(!should_block_mass_deletion(10, 10, false)); // tiny repo (baseline < 16) -> allowed
+        assert!(!should_block_mass_deletion(100, 100, true)); // operator override -> allowed
+    }
+}
+
+/// Decide whether a filesystem-sync tick's bulk deletions should be WITHHELD as
+/// a suspected mass-wipe. Returns true to block. Delegates the collapse
+/// threshold to the shared `graph_collapse_is_wipe` predicate so the fs-sync
+/// guard and the shutdown guard stay consistent (>75% gone, baseline ≥ 16). An
+/// explicit operator override (`allow_override`) always permits the deletions.
+fn should_block_mass_deletion(removed: u64, total_graph_files: u64, allow_override: bool) -> bool {
+    if allow_override {
+        return false;
+    }
+    let surviving = total_graph_files.saturating_sub(removed);
+    crate::state::graph_collapse_is_wipe(surviving, total_graph_files)
 }
 
 #[tracing::instrument(skip(state))]
@@ -482,12 +506,42 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
 
     let mut events = Vec::new();
 
-    // 3. Find deleted files: files in graph that are NOT on disk
+    // 3. Find deleted files: files in graph that are NOT on disk.
+    let mut removed_events = Vec::new();
     for file_path_str in &files_in_graph {
         let abs_path = working_dir.join(file_path_str);
         if !files_on_disk.contains_key(&abs_path) {
-            events.push(FileEvent::Removed(abs_path));
+            removed_events.push(FileEvent::Removed(abs_path));
         }
+    }
+
+    // Mass-deletion anti-wipe guard: a transient empty/incomplete checkout (or a
+    // mid-clone/unmount) makes this sync read every tracked file as "deleted",
+    // which would wipe the graph on the next reconcile. Refuse a tick whose
+    // deletions would collapse the file set past the SAME anti-wipe threshold the
+    // shutdown guard uses (>75% gone, baseline ≥ 16) — kept consistent via the
+    // shared `graph_collapse_is_wipe` predicate. Added/modified files still apply;
+    // only the suspicious bulk removals are withheld. An operator can confirm a
+    // genuine mass deletion with KIN_ALLOW_MASS_DELETION=1.
+    let total_graph_files = files_in_graph.len() as u64;
+    let allow_mass_deletion = std::env::var("KIN_ALLOW_MASS_DELETION")
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false);
+    if should_block_mass_deletion(
+        removed_events.len() as u64,
+        total_graph_files,
+        allow_mass_deletion,
+    ) {
+        state.mass_deletion_blocked.store(true, Ordering::Relaxed);
+        warn!(
+            total_graph_files,
+            removed_count = removed_events.len(),
+            "refusing filesystem-sync deletions: they would wipe >75% of graph-known files (likely a transient empty/incomplete checkout). Set KIN_ALLOW_MASS_DELETION=1 to confirm an intentional mass deletion"
+        );
+    } else {
+        state.mass_deletion_blocked.store(false, Ordering::Relaxed);
+        events.extend(removed_events);
     }
 
     // 4. Find added/modified files: files on disk that are NOT in graph or have different hash
