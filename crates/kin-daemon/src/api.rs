@@ -482,6 +482,22 @@ async fn daemon_activity(
     next.run(request).await
 }
 
+/// Strip an optional `:port` suffix from a Host/authority value, correctly
+/// handling bracketed IPv6 literals like `[::1]:4219` (returns `::1`).
+fn host_without_port(value: &str) -> &str {
+    let value = value.trim();
+    if let Some(rest) = value.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &rest[..end];
+        }
+        return value;
+    }
+    match value.split_once(':') {
+        Some((host, _port)) => host,
+        None => value,
+    }
+}
+
 fn is_host_allowed(host: &str) -> bool {
     let host = host.trim();
     if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]" {
@@ -506,11 +522,7 @@ async fn validate_host_and_origin(
     // 1. Validate Host header if present
     if let Some(host_val) = request.headers().get(header::HOST) {
         if let Ok(host_str) = host_val.to_str() {
-            let host_part = if let Some(idx) = host_str.find(':') {
-                &host_str[..idx]
-            } else {
-                host_str
-            };
+            let host_part = host_without_port(host_str);
             if !is_host_allowed(host_part) {
                 return (
                     StatusCode::FORBIDDEN,
@@ -2005,6 +2017,22 @@ async fn command_session_workspace(
 }
 
 /// POST /commands/exec — execute inside a daemon-materialized graph workspace.
+/// Whether the daemon is permitted to run shell command execution
+/// (`POST /commands/exec`, which spawns `sh -c`). This is a high-risk
+/// capability (local RCE if an unauthorized caller reaches the loopback
+/// daemon), so it stays disabled unless the operator explicitly opts in via
+/// `KIN_DAEMON_ALLOW_EXEC`. Being initialized is necessary but NOT sufficient.
+fn exec_capability_enabled() -> bool {
+    std::env::var("KIN_DAEMON_ALLOW_EXEC")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 async fn command_exec(
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::exec::ExecRequest>,
@@ -2016,6 +2044,13 @@ async fn command_exec(
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    if !exec_capability_enabled() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "command execution is disabled; set KIN_DAEMON_ALLOW_EXEC=1 to opt in to daemon-side `sh -c` execution".to_string(),
         ));
     }
 
@@ -3434,6 +3469,125 @@ fn mcp_session_registry_snapshot(
 ///
 /// MCP stdio processes are transport shims only. They forward graph-backed
 /// tools here so query and mutation authority remains in the repo daemon.
+/// Build the `semantic_locate` response from the daemon's real vector index.
+///
+/// Contract (shared verbatim with the MCP server): args
+/// `{query, limit?=20, granularity?="entity"|"file"}`; response object with a
+/// ranked `results: [{entity_id, name, file, score}]` array plus a
+/// `semantic_coverage` float (`indexed / total`). `score` is cosine similarity
+/// (`1.0 - distance`), higher is better; results are already rank-ordered.
+fn build_semantic_locate_result(
+    graph: &kin_db::InMemoryGraph,
+    arguments: &HashMap<String, serde_json::Value>,
+) -> kin_mcp::ToolCallResult {
+    let query = match arguments.get("query").and_then(serde_json::Value::as_str) {
+        Some(value) if !value.trim().is_empty() => value.to_string(),
+        _ => {
+            return kin_mcp::ToolCallResult::error(
+                "missing required parameter: query".to_string(),
+            );
+        }
+    };
+    let limit = arguments
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value as usize)
+        .filter(|value| *value > 0)
+        .unwrap_or(20);
+    let file_granularity = arguments
+        .get("granularity")
+        .and_then(serde_json::Value::as_str)
+        .map(|value| value.eq_ignore_ascii_case("file"))
+        .unwrap_or(false);
+
+    // Coverage is reported, never gated: a partially-embedded graph still
+    // returns whatever the index can answer (graceful degradation per R5).
+    let status = graph.embedding_status();
+    let semantic_coverage = if status.total == 0 {
+        0.0_f32
+    } else {
+        status.indexed as f32 / status.total as f32
+    };
+
+    // For file granularity, over-fetch so dedupe-by-file can still fill `limit`.
+    let fetch_limit = if file_granularity {
+        limit.saturating_mul(8).max(limit)
+    } else {
+        limit
+    };
+
+    let raw = match graph.semantic_search(&query, fetch_limit) {
+        Ok(hits) => hits,
+        Err(error) => {
+            return kin_mcp::ToolCallResult::error(format!("semantic search failed: {error}"));
+        }
+    };
+
+    let mut results = Vec::with_capacity(limit);
+    let mut seen_files: HashSet<String> = HashSet::new();
+    for (key, distance) in raw {
+        if results.len() >= limit {
+            break;
+        }
+        let Some(item) = graph.resolve_retrieval_key(&key) else {
+            continue;
+        };
+        let (entity_id, name, file) = match &item {
+            kin_db::ResolvedRetrievalItem::Entity(entity) => (
+                entity.id.to_string(),
+                entity.name.clone(),
+                entity.file_origin.as_ref().map(|origin| origin.0.clone()),
+            ),
+            other => {
+                let file = other.file_path().map(|path| path.0.clone());
+                let name = file
+                    .as_deref()
+                    .and_then(|path| {
+                        FsPath::new(path)
+                            .file_name()
+                            .and_then(|component| component.to_str())
+                    })
+                    .unwrap_or_default()
+                    .to_string();
+                let id = file.clone().unwrap_or_else(|| name.clone());
+                (id, name, file)
+            }
+        };
+
+        if file_granularity {
+            match &file {
+                Some(path) => {
+                    if !seen_files.insert(path.clone()) {
+                        continue;
+                    }
+                }
+                // File granularity requires a file path; skip pathless hits.
+                None => continue,
+            }
+        }
+
+        let score = 1.0_f32 - distance;
+        results.push(json!({
+            "entity_id": entity_id,
+            "name": name,
+            "file": file,
+            "score": score,
+        }));
+    }
+
+    let payload = json!({
+        "query": query,
+        "granularity": if file_granularity { "file" } else { "entity" },
+        "semantic_coverage": semantic_coverage,
+        "results": results,
+    });
+
+    match serde_json::to_string_pretty(&payload) {
+        Ok(text) => kin_mcp::ToolCallResult::text(text),
+        Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
+    }
+}
+
 async fn mcp_tools_call(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
@@ -3598,6 +3752,18 @@ async fn mcp_tools_call(
             Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
         };
         return Ok(Json(result));
+    }
+
+    // R14 — `semantic_locate`: route to the daemon's REAL vector pipeline
+    // (`graph.semantic_search`, the same HNSW path `kin search --semantic`
+    // uses) instead of the metadata-filter handler. Returns partial results
+    // plus a `semantic_coverage` field rather than hard-gating on full
+    // embedding coverage (graceful degradation per R5).
+    if request.name == "semantic_locate" {
+        return Ok(Json(build_semantic_locate_result(
+            graph.as_ref(),
+            &request.arguments,
+        )));
     }
 
     let sessions = mcp_session_registry_snapshot(&state)?;
@@ -5564,7 +5730,7 @@ pub async fn serve_with_shutdown(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let bind_host = bind_host_from_env();
-    let auth_token = auth_token_from_env();
+    let auth_token = resolve_serve_auth_token(&state.layout);
     let app = router_with_auth(state, auth_token.clone());
     let listener = bind_listener(&bind_host, port, auth_token.is_some())?;
 
@@ -5600,6 +5766,57 @@ fn resolve_auth_token(auth_token: Option<String>) -> Option<String> {
 
 fn auth_token_from_env() -> Option<String> {
     resolve_auth_token(std::env::var("KIN_DAEMON_AUTH_TOKEN").ok())
+}
+
+/// `.kin/daemon.token` — auto-provisioned per-install loopback token.
+fn loopback_token_path(layout: &kin_core::KinLayout) -> PathBuf {
+    layout.root().join("daemon.token")
+}
+
+/// Load the per-install loopback token, generating and persisting one (mode
+/// 0600 on unix) on first run. This token defends the loopback daemon against
+/// non-browser local processes (browser cross-origin is already blocked by
+/// `validate_host_and_origin`); local clients read the same file and send it
+/// as `Authorization: Bearer <token>`.
+fn ensure_loopback_token(layout: &kin_core::KinLayout) -> std::io::Result<String> {
+    let path = loopback_token_path(layout);
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let trimmed = existing.trim().to_string();
+        if !trimmed.is_empty() {
+            return Ok(trimmed);
+        }
+    }
+    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, &token)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(token)
+}
+
+/// Resolve the auth token the serving daemon enforces: an explicit
+/// `KIN_DAEMON_AUTH_TOKEN` override wins, otherwise the auto-provisioned
+/// per-install loopback token. If provisioning fails the daemon still starts
+/// (loopback Host/Origin validation remains active) but logs a warning.
+fn resolve_serve_auth_token(layout: &kin_core::KinLayout) -> Option<String> {
+    if let Some(env_token) = auth_token_from_env() {
+        return Some(env_token);
+    }
+    match ensure_loopback_token(layout) {
+        Ok(token) => Some(token),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "failed to provision loopback auth token; daemon will run without bearer auth"
+            );
+            None
+        }
+    }
 }
 
 fn parse_bind_host(bind_host: &str) -> std::io::Result<IpAddr> {
@@ -6313,8 +6530,18 @@ mod tests {
         );
     }
 
+    /// Serializes the two tests that toggle the process-global
+    /// `KIN_DAEMON_ALLOW_EXEC` so their opposite expectations never race.
+    fn exec_cap_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[tokio::test]
     async fn exec_endpoint_runs_against_live_graph_workspace() {
+        let _env = exec_cap_env_lock();
+        std::env::set_var("KIN_DAEMON_ALLOW_EXEC", "1");
+
         let state = test_state();
         install_branch_file(&state, "src/lib.py", b"daemon exec\n");
         state
@@ -6354,6 +6581,8 @@ mod tests {
         assert_eq!(result.stdout, "daemon exec\n");
         assert_eq!(result.exit_code, 0);
         assert!(!std::path::Path::new(&result.workspace_path).exists());
+
+        std::env::remove_var("KIN_DAEMON_ALLOW_EXEC");
     }
 
     #[tokio::test]
@@ -8018,5 +8247,185 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn host_without_port_handles_ipv6_and_ports() {
+        assert_eq!(host_without_port("localhost"), "localhost");
+        assert_eq!(host_without_port("127.0.0.1:4219"), "127.0.0.1");
+        assert_eq!(host_without_port("[::1]:4219"), "::1");
+        assert_eq!(host_without_port("[::1]"), "::1");
+        assert!(is_host_allowed(host_without_port("[::1]:4219")));
+        assert!(!is_host_allowed(host_without_port("evil.example.com:4219")));
+    }
+
+    #[tokio::test]
+    async fn host_validation_protects_non_public_routes_and_accepts_ipv6_loopback() {
+        let state = test_state();
+        let app = router(state);
+
+        // A non-public route (POST /search) with a rebound Host is rejected
+        // before the handler runs.
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::post("/search")
+                    .header(header::HOST, "attacker.com")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "query": "x" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+        // A bracketed IPv6 loopback Host with a port is accepted (not 403/400).
+        let allowed = app
+            .oneshot(
+                Request::get("/status")
+                    .header(header::HOST, "[::1]:4219")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(allowed.status(), StatusCode::FORBIDDEN);
+        assert_ne!(allowed.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn command_exec_requires_capability_optin() {
+        // Default install (no KIN_DAEMON_ALLOW_EXEC) must refuse shell exec even
+        // for an initialized daemon — being initialized is not sufficient.
+        let _env = exec_cap_env_lock();
+        std::env::remove_var("KIN_DAEMON_ALLOW_EXEC");
+
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::post("/commands/exec")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "command": "echo hi" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn loopback_token_provisioned_persisted_and_accepted() {
+        let dir = std::env::temp_dir().join(format!("kin-daemon-token-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join(".kin")).unwrap();
+        let layout = kin_core::KinLayout::new(dir.join(".kin"));
+
+        let token = ensure_loopback_token(&layout).unwrap();
+        assert!(!token.is_empty());
+        // Re-provisioning returns the SAME persisted token, not a fresh one.
+        assert_eq!(ensure_loopback_token(&layout).unwrap(), token);
+        let on_disk = std::fs::read_to_string(loopback_token_path(&layout)).unwrap();
+        assert_eq!(on_disk.trim(), token);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(loopback_token_path(&layout))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "token file must be 0600");
+        }
+
+        // A request carrying the provisioned token is accepted; a tokenless one
+        // is rejected on non-public routes.
+        let state = test_state();
+        let app = router_with_auth(state, Some(token.clone()));
+        let accepted = app
+            .clone()
+            .oneshot(
+                Request::get("/status")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+
+        let rejected = app
+            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mcp_semantic_locate_reports_coverage_without_hard_gate() {
+        let state = test_state();
+        let entity = test_entity("handler", "src/lib.py");
+        state.graph.upsert_entity(&entity).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+
+        // No vector index is populated. The handler must still return a valid
+        // payload with a coverage field instead of hard-gating to an error.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/mcp/tools/call")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "semantic_locate",
+                            "arguments": { "query": "handler", "limit": 5 }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let result: kin_mcp::ToolCallResult = serde_json::from_slice(&body).unwrap();
+        assert_ne!(result.is_error, Some(true));
+        let text = match result.content.first().unwrap() {
+            kin_mcp::ContentBlock::Text { text } => text,
+        };
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(
+            parsed.get("semantic_coverage").is_some(),
+            "response must carry semantic_coverage"
+        );
+        assert!(
+            parsed.get("results").and_then(|v| v.as_array()).is_some(),
+            "response must carry a results array"
+        );
+
+        // A missing query is a per-call error, not a panic / 500.
+        let bad = app
+            .oneshot(
+                Request::post("/mcp/tools/call")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "name": "semantic_locate", "arguments": {} }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::OK);
+        let bad_body = axum::body::to_bytes(bad.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let bad_result: kin_mcp::ToolCallResult = serde_json::from_slice(&bad_body).unwrap();
+        assert_eq!(bad_result.is_error, Some(true));
     }
 }
