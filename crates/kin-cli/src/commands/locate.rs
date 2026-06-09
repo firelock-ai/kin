@@ -9402,7 +9402,7 @@ fn graph_corroborated_semantic_retention_paths(
     multihop_hits: &HashMap<String, Vec<FileHit>>,
     import_hits: &HashMap<String, Vec<FileHit>>,
 ) -> HashSet<String> {
-    let max_paths = locate_env_usize("KIN_LOCATE_STRONG_SEMANTIC_RETAIN_MAX", 0);
+    let max_paths = locate_env_usize("KIN_LOCATE_STRONG_SEMANTIC_RETAIN_MAX", 5);
     graph_corroborated_semantic_retention_paths_with_limit(
         fused,
         resolved_hits,
