@@ -115,6 +115,30 @@ pub struct LocateRequest {
     pub reference: Option<String>,
 }
 
+/// Resolve the bearer token the daemon expects on non-public routes.
+///
+/// Matches the daemon's own `resolve_serve_auth_token` order:
+/// `KIN_DAEMON_AUTH_TOKEN` env if set, else the auto-provisioned per-install
+/// `.kin/daemon.token` file, else none. When the daemon is not enforcing a
+/// token (the default), an absent value just means no header is sent and the
+/// request is still accepted.
+fn resolve_daemon_auth_token() -> Option<String> {
+    if let Ok(token) = std::env::var("KIN_DAEMON_AUTH_TOKEN") {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+    let layout = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| KinLayout::discover(&cwd))?;
+    let token = std::fs::read_to_string(layout.root().join("daemon.token"))
+        .ok()?
+        .trim()
+        .to_string();
+    (!token.is_empty()).then_some(token)
+}
+
 impl DaemonClient {
     pub fn from_base_url(base_url: impl Into<String>) -> Result<Self> {
         let base_url = base_url.into();
@@ -124,6 +148,14 @@ impl DaemonClient {
                 if let Ok(header_val) = reqwest::header::HeaderValue::from_str(&session_id) {
                     headers.insert("X-Kin-Session", header_val);
                 }
+            }
+        }
+        if let Some(token) = resolve_daemon_auth_token() {
+            if let Ok(mut value) =
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            {
+                value.set_sensitive(true);
+                headers.insert(reqwest::header::AUTHORIZATION, value);
             }
         }
         let client = reqwest::Client::builder()
