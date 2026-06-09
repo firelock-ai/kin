@@ -23,6 +23,24 @@ pub fn tool_definitions() -> ToolsListResult {
                 }),
             },
             ToolDefinition {
+                name: "semantic_locate".into(),
+                description: crate::handlers::entities::SEMANTIC_LOCATE_DESC.into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Natural-language description of the code to find" },
+                        "limit": { "type": "integer", "description": "Max ranked results to return", "default": 20 },
+                        "granularity": {
+                            "type": "string",
+                            "enum": ["file", "entity"],
+                            "description": "Rank entities ('entity', default) or roll up to files ('file')",
+                            "default": "entity"
+                        }
+                    },
+                    "required": ["query"]
+                }),
+            },
+            ToolDefinition {
                 name: "get_entity".into(),
                 description: crate::handlers::entities::GET_ENTITY_DESC.into(),
                 input_schema: serde_json::json!({
@@ -873,6 +891,7 @@ mod tests {
         let list = tool_definitions();
         let json = serde_json::to_string(&list).unwrap();
         assert!(json.contains("semantic_search"));
+        assert!(json.contains("semantic_locate"));
         assert!(json.contains("get_entity_source"));
         assert!(json.contains("find_references"));
         assert!(json.contains("bulk_check_references"));
@@ -896,8 +915,8 @@ mod tests {
     #[test]
     fn expected_tool_count() {
         let list = tool_definitions();
-        // 54 + 5 new transaction tools = 59
-        assert_eq!(list.tools.len(), 59);
+        // 54 + 5 transaction tools + 1 semantic_locate = 60
+        assert_eq!(list.tools.len(), 60);
     }
 
     #[test]
