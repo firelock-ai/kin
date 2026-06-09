@@ -3661,6 +3661,7 @@ dependencies = [
 name = "kin-vector"
 version = "0.1.0"
 dependencies = [
+ "fs2",
  "hashbrown 0.15.5",
  "parking_lot",
  "rmp-serde",

@@ -494,6 +494,24 @@ fn fast_entity_dominant_enabled(
         && !resolve_top_is_disqualified
 }
 
+fn entity_dominant_decision_metrics(ranked: &[(String, f32)]) -> (f32, f32, bool) {
+    let decision_scores = ranked
+        .iter()
+        .filter(|(path, score)| *score > 0.0 && !disqualifies_entity_dominant_top_path(path))
+        .map(|(_, score)| *score)
+        .collect::<Vec<_>>();
+    let Some(first) = decision_scores.first().copied() else {
+        return (0.0, 0.0, true);
+    };
+    let gap = decision_scores
+        .get(1)
+        .copied()
+        .filter(|_| first > 0.001)
+        .map(|second| (first - second) / first)
+        .unwrap_or(1.0);
+    (first, gap, false)
+}
+
 fn rich_symbolic_body_query(text: &str) -> bool {
     let body = text.lines().skip(1).collect::<Vec<_>>().join("\n");
     if body.is_empty() {
@@ -537,6 +555,7 @@ fn disqualifies_entity_dominant_top_path(path: &str) -> bool {
         || is_docs_or_locale_path(path)
         || is_non_code_ext(path)
         || is_contrib_port_path(path)
+        || is_amalgamated_or_generated_path(path)
 }
 
 fn entity_stable_key(entity: &kin_model::Entity) -> Option<EntityStableKey> {
@@ -991,25 +1010,8 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         .first()
         .map(|(_, score)| *score)
         .unwrap_or(0.0);
-    let fast_resolve_top = resolved_files
-        .first()
-        .map(|(_, score)| *score)
-        .unwrap_or(0.0);
-    let fast_resolve_gap = if resolved_files.len() >= 2 {
-        let first = resolved_files[0].1;
-        let second = resolved_files[1].1;
-        if first > 0.001 {
-            (first - second) / first
-        } else {
-            0.0
-        }
-    } else {
-        0.0
-    };
-    let resolve_top_is_disqualified = resolved_files
-        .first()
-        .map(|(path, _)| disqualifies_entity_dominant_top_path(path))
-        .unwrap_or(false);
+    let (fast_decision_resolve_top, fast_resolve_gap, resolve_top_is_disqualified) =
+        entity_dominant_decision_metrics(&resolved_files);
     let tb_threshold = locate_env_f32("KIN_LOCATE_TRACEBACK_DOMINANT_THRESHOLD", 5.0);
     let ed_resolve_min = locate_env_f32("KIN_LOCATE_ENTITY_DOMINANT_RESOLVE_MIN", 20.0);
     let ed_gap_min = locate_env_f32("KIN_LOCATE_ENTITY_DOMINANT_GAP_MIN", 0.15);
@@ -1019,7 +1021,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         test_query,
         has_rich_symbolic_body,
         fast_traceback_top,
-        fast_resolve_top,
+        fast_decision_resolve_top,
         fast_resolve_gap,
         resolve_top_is_disqualified,
         tb_threshold,
@@ -1248,18 +1250,8 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // idx 0=traceback, 1=multihop, 2=tests, 3=snippets,
     // 4=imports, 5=errors, 6=cochange, 7=entity_resolve, 8=source_text
     let traceback_top = ranked_lists[0].first().map(|(_, s)| *s).unwrap_or(0.0);
-    let resolve_top = ranked_lists[7].first().map(|(_, s)| *s).unwrap_or(0.0);
-    let resolve_gap = if ranked_lists[7].len() >= 2 {
-        let first = ranked_lists[7][0].1;
-        let second = ranked_lists[7][1].1;
-        if first > 0.001 {
-            (first - second) / first
-        } else {
-            0.0
-        }
-    } else {
-        0.0
-    };
+    let (resolve_top, resolve_gap, resolve_top_is_disqualified) =
+        entity_dominant_decision_metrics(&ranked_lists[7]);
     let multihop_top = ranked_lists[1].first().map(|(_, s)| *s).unwrap_or(0.0);
 
     #[derive(Debug, Clone, Copy)]
@@ -9410,7 +9402,27 @@ fn graph_corroborated_semantic_retention_paths(
     multihop_hits: &HashMap<String, Vec<FileHit>>,
     import_hits: &HashMap<String, Vec<FileHit>>,
 ) -> HashSet<String> {
-    let max_paths = locate_env_usize("KIN_LOCATE_STRONG_SEMANTIC_RETAIN_MAX", 8);
+    let max_paths = locate_env_usize("KIN_LOCATE_STRONG_SEMANTIC_RETAIN_MAX", 0);
+    graph_corroborated_semantic_retention_paths_with_limit(
+        fused,
+        resolved_hits,
+        source_text_hits,
+        embedding_hits,
+        multihop_hits,
+        import_hits,
+        max_paths,
+    )
+}
+
+fn graph_corroborated_semantic_retention_paths_with_limit(
+    fused: &[(String, f32)],
+    resolved_hits: &HashMap<String, Vec<FileHit>>,
+    source_text_hits: &HashMap<String, Vec<FileHit>>,
+    embedding_hits: &HashMap<String, Vec<FileHit>>,
+    multihop_hits: &HashMap<String, Vec<FileHit>>,
+    import_hits: &HashMap<String, Vec<FileHit>>,
+    max_paths: usize,
+) -> HashSet<String> {
     if max_paths == 0 || fused.is_empty() {
         return HashSet::new();
     }
@@ -13245,9 +13257,40 @@ mod tests {
             "lib/gbenchmark/mingw.py"
         ));
         assert!(disqualifies_entity_dominant_top_path("docs/help.md"));
+        assert!(disqualifies_entity_dominant_top_path(
+            "tools/cpplint/cpplint.py"
+        ));
+        assert!(disqualifies_entity_dominant_top_path(
+            "single_include/nlohmann/json.hpp"
+        ));
         assert!(!disqualifies_entity_dominant_top_path(
             "src/libponyc/options/options.c"
         ));
+    }
+
+    #[test]
+    fn entity_dominant_decision_metrics_ignore_generated_tool_anchors() {
+        let ranked = vec![
+            ("tools/cpplint/cpplint.py".to_string(), 100.0),
+            ("single_include/nlohmann/json.hpp".to_string(), 87.79497),
+            (
+                "include/nlohmann/detail/meta/type_traits.hpp".to_string(),
+                83.52,
+            ),
+            (
+                "include/nlohmann/detail/abi_macros.hpp".to_string(),
+                31.285044,
+            ),
+        ];
+
+        let (top, gap, disqualified) = entity_dominant_decision_metrics(&ranked);
+
+        assert!(!disqualified);
+        assert_eq!(top, 83.52);
+        assert!(
+            gap > 0.15,
+            "real semantic headers should drive the entity-dominant decision, gap={gap}"
+        );
     }
 
     #[test]
@@ -13514,13 +13557,27 @@ mod tests {
         ]);
         let imports = HashMap::new();
 
-        let retained = graph_corroborated_semantic_retention_paths(
+        assert!(
+            graph_corroborated_semantic_retention_paths(
+                &fused,
+                &resolved_hits,
+                &source_text,
+                &embedding_hits,
+                &multihop,
+                &imports,
+            )
+            .is_empty(),
+            "strong semantic retention should be opt-in by default"
+        );
+
+        let retained = graph_corroborated_semantic_retention_paths_with_limit(
             &fused,
             &resolved_hits,
             &source_text,
             &embedding_hits,
             &multihop,
             &imports,
+            8,
         );
 
         assert!(retained.contains("include/nlohmann/detail/macro_scope.hpp"));
