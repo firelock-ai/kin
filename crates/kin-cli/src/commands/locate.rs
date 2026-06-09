@@ -1702,11 +1702,20 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         );
     }
 
+    let graph_semantic_retention_paths = graph_corroborated_semantic_retention_paths(
+        &fused,
+        &resolved_hits,
+        &source_text,
+        &embedding_hits,
+        &multihop,
+        &imports,
+    );
     compress_secondary_files_under_dominant_direct_source(
         &mut fused,
         &resolve_signal_scores,
         &source_text,
         &priority_backed_paths,
+        &graph_semantic_retention_paths,
     );
     if explain {
         record_debug_stage(
@@ -1746,14 +1755,6 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         );
     }
 
-    let graph_semantic_retention_paths = graph_corroborated_semantic_retention_paths(
-        &fused,
-        &resolved_hits,
-        &source_text,
-        &embedding_hits,
-        &multihop,
-        &imports,
-    );
     apply_resolve_boundary_compression(
         &mut fused,
         &resolved_hits,
@@ -10914,6 +10915,7 @@ fn compress_secondary_files_under_dominant_direct_source(
     resolve_signal_scores: &HashMap<String, HashMap<String, f32>>,
     source_text_hits: &HashMap<String, Vec<FileHit>>,
     priority_backed_paths: &HashSet<String>,
+    semantic_retention_paths: &HashSet<String>,
 ) {
     if fused.len() <= 1 {
         return;
@@ -10972,6 +10974,7 @@ fn compress_secondary_files_under_dominant_direct_source(
         if *path == top_path
             || is_test_path(path)
             || priority_backed_paths.contains(path)
+            || semantic_retention_paths.contains(path)
             || source_text_score >= top_source_text * 0.5
         {
             continue;
@@ -14592,6 +14595,7 @@ mod tests {
             &resolve_signal_scores,
             &source_text_hits,
             &HashSet::new(),
+            &HashSet::new(),
         );
 
         assert_eq!(fused[0].0, "lib/compress/zstd_compress.c");
@@ -14603,6 +14607,48 @@ mod tests {
                     .iter()
                     .position(|(path, _)| path == "lib/decompress/zstd_decompress.c")
         );
+    }
+
+    #[test]
+    fn compress_secondary_files_preserves_graph_semantic_retention_paths() {
+        let mut fused = vec![
+            (
+                "include/nlohmann/detail/string_concat.hpp".to_string(),
+                17.0,
+            ),
+            ("include/nlohmann/detail/macro_scope.hpp".to_string(), 6.75),
+        ];
+        let resolve_signal_scores = HashMap::from([
+            (
+                String::from("include/nlohmann/detail/string_concat.hpp"),
+                HashMap::from([(String::from("entity_resolve"), 20_000.0)]),
+            ),
+            (
+                String::from("include/nlohmann/detail/macro_scope.hpp"),
+                HashMap::from([(String::from("entity_resolve"), 40.0)]),
+            ),
+        ]);
+        let source_text_hits = HashMap::from([(
+            String::from("include/nlohmann/detail/string_concat.hpp"),
+            hit(70.0),
+        )]);
+        let semantic_retention =
+            HashSet::from([String::from("include/nlohmann/detail/macro_scope.hpp")]);
+
+        compress_secondary_files_under_dominant_direct_source(
+            &mut fused,
+            &resolve_signal_scores,
+            &source_text_hits,
+            &HashSet::new(),
+            &semantic_retention,
+        );
+
+        let score = fused
+            .iter()
+            .find(|(path, _)| path == "include/nlohmann/detail/macro_scope.hpp")
+            .map(|(_, score)| *score)
+            .unwrap_or_default();
+        assert_eq!(score, 6.75);
     }
 
     #[test]
