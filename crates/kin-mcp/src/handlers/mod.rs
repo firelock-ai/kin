@@ -154,6 +154,7 @@ mod tests {
         relations_by_entity: HashMap<EntityId, Vec<Relation>>,
         dead_entities: Vec<Entity>,
         live_entity_ids: HashSet<EntityId>,
+        file_hashes: HashMap<FilePathId, Hash256>,
     }
 
     impl kin_model::graph::EntityStore for EmptyStore {
@@ -343,9 +344,9 @@ mod tests {
         }
         fn get_file_hash(
             &self,
-            _: &FilePathId,
+            file_id: &FilePathId,
         ) -> std::result::Result<Option<kin_model::Hash256>, Self::Error> {
-            Ok(None)
+            Ok(self.file_hashes.get(file_id).copied())
         }
     }
 
@@ -1463,7 +1464,7 @@ mod tests {
         let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  if (value < minVal) {\n    return false;\n  }\n  return value <= maxVal;\n}\n";
         let (_dir, entity) = make_source_backed_entity(content);
 
-        let value = entity_response_json(&entity).unwrap();
+        let value = entity_response_json(&EmptyStore::default(), &entity).unwrap();
         let object = value.as_object().unwrap();
         let excerpt = object
             .get("source_excerpt")
@@ -1491,7 +1492,7 @@ mod tests {
             content: entity.signature.clone(),
         };
 
-        let value = focal_context_json(&entry, &entity, false);
+        let value = focal_context_json(&EmptyStore::default(), &entry, &entity, false);
         let object = value.as_object().unwrap();
         let body = object.get("body").and_then(|value| value.as_str()).unwrap();
 
@@ -1510,7 +1511,7 @@ mod tests {
             content: entity.signature.clone(),
         };
 
-        let value = focal_context_json(&entry, &entity, false);
+        let value = focal_context_json(&EmptyStore::default(), &entry, &entity, false);
         let object = value.as_object().unwrap();
         let body = object.get("body").and_then(|value| value.as_str()).unwrap();
 
@@ -2213,5 +2214,245 @@ mod tests {
         // Verify entity was added to the store
         let retrieved = store.get_entity(&entity.id).unwrap().unwrap();
         assert_eq!(retrieved.name, "test_fn");
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        old_val: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, val: &std::path::Path) -> Self {
+            let old_val = std::env::var_os(key);
+            std::env::set_var(key, val);
+            Self { key, old_val }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(ref val) = self.old_val {
+                std::env::set_var(self.key, val);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    use std::sync::{Mutex, OnceLock};
+    static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn test_entity_served_from_blob_store_file_deleted() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        fs::create_dir_all(&kin_dir).unwrap();
+        let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+
+        let objects_dir = kin_dir.join("objects");
+        let blob_store = kin_blobs::BlobStore::new(objects_dir).unwrap();
+
+        let content = "export function test_blob() { return 42; }";
+        let hash = blob_store.write(content.as_bytes()).unwrap();
+
+        let file_path = "src/lib.rs";
+        let file_id = FilePathId::new(file_path);
+
+        let entity = Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: "test_blob".into(),
+            language: LanguageId::TypeScript,
+            fingerprint: kin_model::entity::SemanticFingerprint {
+                algorithm: kin_model::entity::FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: hash,
+                signature_hash: hash,
+                behavior_hash: hash,
+                stability_score: 1.0,
+            },
+            file_origin: Some(file_id.clone()),
+            span: Some(kin_model::entity::SourceSpan {
+                file: file_id.clone(),
+                start_byte: 0,
+                end_byte: content.len(),
+                start_line: 1,
+                start_col: 0,
+                end_line: 1,
+                end_col: content.len() as u32,
+            }),
+            signature: "export function test_blob()".into(),
+            visibility: Visibility::Public,
+            role: kin_model::entity::EntityRole::Source,
+            doc_summary: None,
+            metadata: kin_model::entity::EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        };
+
+        let mut store = EmptyStore::default();
+        store.file_hashes.insert(file_id, hash);
+
+        let value = entity_response_json(&store, &entity).unwrap();
+        let object = value.as_object().unwrap();
+        let excerpt = object
+            .get("source_excerpt")
+            .and_then(|v| v.as_str())
+            .unwrap();
+
+        assert_eq!(excerpt, content);
+        assert_eq!(object.get("stale").unwrap().as_bool().unwrap(), false);
+    }
+
+    #[test]
+    fn test_disk_fallback_stale_flag() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir().unwrap();
+        let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+
+        let file_path = "src/lib.rs";
+        let full_path = dir.path().join(file_path);
+        fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+
+        let disk_content = "export function test_disk() { return 99; }";
+        fs::write(&full_path, disk_content).unwrap();
+
+        let file_id = FilePathId::new(file_path);
+        let graph_content = "export function test_disk() { return 42; }";
+        let graph_hash = kin_blobs::digest(graph_content.as_bytes());
+
+        let entity = Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: "test_disk".into(),
+            language: LanguageId::TypeScript,
+            fingerprint: kin_model::entity::SemanticFingerprint {
+                algorithm: kin_model::entity::FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: graph_hash,
+                signature_hash: graph_hash,
+                behavior_hash: graph_hash,
+                stability_score: 1.0,
+            },
+            file_origin: Some(file_id.clone()),
+            span: Some(kin_model::entity::SourceSpan {
+                file: file_id.clone(),
+                start_byte: 0,
+                end_byte: disk_content.len(),
+                start_line: 1,
+                start_col: 0,
+                end_line: 1,
+                end_col: disk_content.len() as u32,
+            }),
+            signature: "export function test_disk()".into(),
+            visibility: Visibility::Public,
+            role: kin_model::entity::EntityRole::Source,
+            doc_summary: None,
+            metadata: kin_model::entity::EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        };
+
+        let mut store = EmptyStore::default();
+        store.file_hashes.insert(file_id, graph_hash);
+
+        let before_misses = GRAPH_MISS_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+
+        let value = entity_response_json(&store, &entity).unwrap();
+        let object = value.as_object().unwrap();
+        let excerpt = object
+            .get("source_excerpt")
+            .and_then(|v| v.as_str())
+            .unwrap();
+
+        assert_eq!(excerpt, disk_content);
+        assert_eq!(object.get("stale").unwrap().as_bool().unwrap(), true);
+
+        let after_misses = GRAPH_MISS_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(after_misses >= before_misses + 1);
+    }
+
+    #[test]
+    fn test_hash_mismatch_falls_back_to_disk() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        fs::create_dir_all(&kin_dir).unwrap();
+        let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+
+        let objects_dir = kin_dir.join("objects");
+        let blob_store = kin_blobs::BlobStore::new(objects_dir).unwrap();
+
+        // correct content
+        let content = "export function test_mismatch() { return 42; }";
+        let correct_hash = kin_blobs::digest(content.as_bytes());
+
+        // Write incorrect bytes to the correct hash path to simulate corrupt/mismatched blob
+        let bad_content = "corrupt content";
+        let hex = correct_hash.to_string();
+        let shard_dir = blob_store.root().join(&hex[..2]);
+        fs::create_dir_all(&shard_dir).unwrap();
+        let blob_file = shard_dir.join(&hex[2..]);
+        fs::write(&blob_file, bad_content.as_bytes()).unwrap();
+
+        // Write the correct file on disk
+        let file_path = "src/lib.rs";
+        let full_path = dir.path().join(file_path);
+        fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+        fs::write(&full_path, content).unwrap();
+
+        let file_id = FilePathId::new(file_path);
+        let entity = Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: "test_mismatch".into(),
+            language: LanguageId::TypeScript,
+            fingerprint: kin_model::entity::SemanticFingerprint {
+                algorithm: kin_model::entity::FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: correct_hash,
+                signature_hash: correct_hash,
+                behavior_hash: correct_hash,
+                stability_score: 1.0,
+            },
+            file_origin: Some(file_id.clone()),
+            span: Some(kin_model::entity::SourceSpan {
+                file: file_id.clone(),
+                start_byte: 0,
+                end_byte: content.len(),
+                start_line: 1,
+                start_col: 0,
+                end_line: 1,
+                end_col: content.len() as u32,
+            }),
+            signature: "export function test_mismatch()".into(),
+            visibility: Visibility::Public,
+            role: kin_model::entity::EntityRole::Source,
+            doc_summary: None,
+            metadata: kin_model::entity::EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        };
+
+        let mut store = EmptyStore::default();
+        store.file_hashes.insert(file_id, correct_hash);
+
+        let before_misses = GRAPH_MISS_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+
+        let value = entity_response_json(&store, &entity).unwrap();
+        let object = value.as_object().unwrap();
+        let excerpt = object
+            .get("source_excerpt")
+            .and_then(|v| v.as_str())
+            .unwrap();
+
+        // It should verify incorrect blob, discard it, fall back to disk, which has the correct content
+        assert_eq!(excerpt, content);
+        // Since disk matches correct_hash, it should NOT be stale
+        assert_eq!(object.get("stale").unwrap().as_bool().unwrap(), false);
+
+        let after_misses = GRAPH_MISS_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(after_misses >= before_misses + 1);
     }
 }

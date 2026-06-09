@@ -90,7 +90,7 @@ pub fn handle_get_entity<G: GraphStore>(
 
     match store.get_entity(&entity_id).map_err(McpError::graph)? {
         Some(entity) => {
-            let value = entity_response_json(&entity)?;
+            let value = entity_response_json(store, &entity)?;
             let json = serde_json::to_string_pretty(&value).map_err(McpError::Json)?;
             Ok(ToolCallResult::text(json))
         }
@@ -209,7 +209,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
     let focal_entity = store.get_entity(&entity_id).map_err(McpError::graph)?;
 
     let focal_json = if let (Some(entry), Some(entity)) = (focal_entry, &focal_entity) {
-        focal_context_json(entry, entity, compact)
+        focal_context_json(store, entry, entity, compact)
     } else {
         serde_json::json!(null)
     };
@@ -837,7 +837,7 @@ pub fn handle_explore_codebase<G: GraphStore>(
 
                         let outgoing_calls =
                             outgoing_related_entities(store, &step.id, &[RelationKind::Calls])?;
-                        let step_body = trace_body(step);
+                        let step_body = trace_body(store, step);
                         let constants = trace_constants_for_step(store, step, &step_body)?;
 
                         if !push_with_budget(
@@ -901,7 +901,7 @@ pub fn handle_explore_codebase<G: GraphStore>(
                                     &mut output,
                                     &mut tokens_used,
                                     token_budget,
-                                    &trace_body(constant),
+                                    &trace_body(store, constant),
                                 ) {
                                     output.push_str("       ... [truncated]\n");
                                     break;
