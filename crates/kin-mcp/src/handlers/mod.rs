@@ -2303,6 +2303,7 @@ mod tests {
 
         assert_eq!(excerpt, content);
         assert_eq!(object.get("stale").unwrap().as_bool().unwrap(), false);
+        assert_eq!(object.get("source").unwrap().as_str().unwrap(), "graph");
     }
 
     #[test]
@@ -2368,6 +2369,7 @@ mod tests {
 
         assert_eq!(excerpt, disk_content);
         assert_eq!(object.get("stale").unwrap().as_bool().unwrap(), true);
+        assert_eq!(object.get("source").unwrap().as_str().unwrap(), "disk");
 
         let after_misses = GRAPH_MISS_COUNT.load(std::sync::atomic::Ordering::SeqCst);
         assert!(after_misses >= before_misses + 1);
@@ -2451,6 +2453,7 @@ mod tests {
         assert_eq!(excerpt, content);
         // Since disk matches correct_hash, it should NOT be stale
         assert_eq!(object.get("stale").unwrap().as_bool().unwrap(), false);
+        assert_eq!(object.get("source").unwrap().as_str().unwrap(), "disk");
 
         let after_misses = GRAPH_MISS_COUNT.load(std::sync::atomic::Ordering::SeqCst);
         assert!(after_misses >= before_misses + 1);
