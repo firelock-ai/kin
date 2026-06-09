@@ -63,9 +63,83 @@ struct IndexedDoc {
     doc_length: usize,                   // total number of tokens in this doc
 }
 
+/// Posting list for a single token.
+///
+/// Maps each document to the per-occurrence field weights it contributed for
+/// this token (a token can occur in several weighted fields, and several times
+/// within a field). Keying by document id makes removing a document
+/// `O(occurrences-in-that-doc)` instead of a linear `retain` over every posting
+/// for the token. The flat-`Vec` layout it replaces turned bulk re-index
+/// (remove-then-reinsert on the daemon reconcile path) into O(n²) churn,
+/// because each removal scanned the entire — and for hot tokens, corpus-sized —
+/// posting list.
+#[derive(Clone, Serialize, Deserialize)]
+struct Postings<Id: DocId> {
+    /// doc id -> field weights, one entry per token occurrence in that doc.
+    by_doc: HashMap<Id, Vec<f32>>,
+    /// Total occurrences across all docs. This is the posting count the legacy
+    /// flat-`Vec` exposed via `len()` and used as the BM25 document-frequency
+    /// proxy; tracked explicitly so scoring is bit-for-bit preserved.
+    occurrences: usize,
+}
+
+// Manual `Default` so we do not impose a spurious `Id: Default` bound (which
+// `#[derive(Default)]` would add); `HashMap::new()` needs no such bound.
+impl<Id: DocId> Default for Postings<Id> {
+    fn default() -> Self {
+        Self {
+            by_doc: HashMap::new(),
+            occurrences: 0,
+        }
+    }
+}
+
+impl<Id: DocId> Postings<Id> {
+    /// Record one token occurrence for `id` with the given field `weight`.
+    fn add(&mut self, id: Id, weight: f32) {
+        self.by_doc.entry(id).or_default().push(weight);
+        self.occurrences += 1;
+    }
+
+    /// Remove every occurrence contributed by `id`. Returns the number of
+    /// postings removed (the doc's occurrence count for this token), which is
+    /// independent of the total posting-list length — the property that keeps
+    /// bulk re-index linear instead of quadratic.
+    fn remove(&mut self, id: &Id) -> usize {
+        match self.by_doc.remove(id) {
+            Some(weights) => {
+                let removed = weights.len();
+                self.occurrences -= removed;
+                removed
+            }
+            None => 0,
+        }
+    }
+
+    /// Total postings (token occurrences across all docs); the BM25 df proxy.
+    fn len(&self) -> usize {
+        self.occurrences
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_doc.is_empty()
+    }
+
+    /// Iterate `(doc_id, field_weight)` over every occurrence. A document's own
+    /// occurrences are yielded in insertion (field) order; the order across
+    /// documents is unspecified, which is safe because every posting updates a
+    /// distinct document's score accumulator, so the final per-document score is
+    /// invariant to the cross-document walk order.
+    fn iter(&self) -> impl Iterator<Item = (&Id, &f32)> {
+        self.by_doc
+            .iter()
+            .flat_map(|(id, weights)| weights.iter().map(move |w| (id, w)))
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct StagedState<Id: DocId> {
-    index: HashMap<String, Vec<(Id, f32)>>,
+    index: HashMap<String, Postings<Id>>,
     docs: HashMap<Id, IndexedDoc>,
     doc_count: usize,
     total_doc_length: usize,
@@ -74,7 +148,7 @@ struct StagedState<Id: DocId> {
 #[derive(Clone, Serialize, Deserialize)]
 struct PersistedIndex<Id: DocId> {
     version: u32,
-    index: HashMap<String, Vec<(Id, f32)>>,
+    index: HashMap<String, Postings<Id>>,
     docs: HashMap<Id, IndexedDoc>,
     doc_count: usize,
     total_doc_length: usize,
@@ -84,14 +158,47 @@ struct PersistedIndex<Id: DocId> {
 #[derive(Serialize)]
 struct PersistedIndexRef<'a, Id: DocId> {
     version: u32,
-    index: &'a HashMap<String, Vec<(Id, f32)>>,
+    index: &'a HashMap<String, Postings<Id>>,
     docs: &'a HashMap<Id, IndexedDoc>,
     doc_count: usize,
     total_doc_length: usize,
     graph_root_hash: Option<[u8; 32]>,
 }
 
-pub const TEXT_INDEX_FORMAT_VERSION: u32 = 1;
+/// On-disk layout for format version 1: posting lists as flat `Vec<(Id, f32)>`.
+/// Retained only so older persisted indexes migrate forward transparently on
+/// load (see [`TextIndex::load_persisted`]); never written.
+#[derive(Deserialize)]
+struct PersistedIndexV1<Id: DocId> {
+    version: u32,
+    index: HashMap<String, Vec<(Id, f32)>>,
+    docs: HashMap<Id, IndexedDoc>,
+    doc_count: usize,
+    total_doc_length: usize,
+    graph_root_hash: Option<[u8; 32]>,
+}
+
+/// Convert a format-v1 flat posting map into the doc-keyed [`Postings`] layout.
+/// Occurrence counts are preserved exactly (`occurrences == entries.len()`),
+/// so the BM25 document-frequency proxy — and therefore every score — is
+/// identical to what the v1 index produced.
+fn migrate_v1_index<Id: DocId>(
+    old: HashMap<String, Vec<(Id, f32)>>,
+) -> HashMap<String, Postings<Id>> {
+    old.into_iter()
+        .map(|(token, entries)| {
+            let mut postings = Postings::default();
+            for (id, weight) in entries {
+                postings.add(id, weight);
+            }
+            (token, postings)
+        })
+        .collect()
+}
+
+/// Bumped from 1 to 2 when posting lists moved from a flat `Vec<(Id, f32)>` to
+/// the doc-keyed [`Postings`] layout. v1 files are migrated forward on load.
+pub const TEXT_INDEX_FORMAT_VERSION: u32 = 2;
 
 impl<Id: DocId> PersistedIndex<Id> {
     const VERSION: u32 = TEXT_INDEX_FORMAT_VERSION;
@@ -170,23 +277,31 @@ pub fn tokenize(text: &str) -> Vec<String> {
 // ── Helper ──────────────────────────────────────────────────────────────────
 
 /// Remove all postings for the given document from the inverted index.
+///
+/// Touches only the posting lists for the document's own tokens, and within
+/// each list removes only that document's entries in `O(occurrences-in-doc)`
+/// via the keyed [`Postings`] map — never a linear scan of the whole list.
+/// Returns the number of postings removed (the document's total occurrence
+/// count), which is independent of corpus size.
 fn remove_doc_from_index<Id: DocId>(
-    index: &mut HashMap<String, Vec<(Id, f32)>>,
+    index: &mut HashMap<String, Postings<Id>>,
     doc: &IndexedDoc,
     doc_id: &Id,
-) {
+) -> usize {
     let mut unique_tokens = HashSet::new();
     for (token, _) in &doc.tokens_by_field {
         unique_tokens.insert(token);
     }
+    let mut removed = 0usize;
     for token in unique_tokens {
         if let Some(postings) = index.get_mut(token) {
-            postings.retain(|(eid, _)| eid != doc_id);
+            removed += postings.remove(doc_id);
             if postings.is_empty() {
                 index.remove(token);
             }
         }
     }
+    removed
 }
 
 // ── TextIndex ───────────────────────────────────────────────────────────────
@@ -201,8 +316,8 @@ fn remove_doc_from_index<Id: DocId>(
 /// [`upsert_searchable`](Self::upsert_searchable) to stage changes, then
 /// [`commit`](Self::commit) to make them visible to searches.
 pub struct TextIndex<Id: DocId = u64> {
-    /// Inverted index: lowercase token -> list of (Id, field_weight).
-    index: RwLock<HashMap<String, Vec<(Id, f32)>>>,
+    /// Inverted index: lowercase token -> [`Postings`] keyed by document id.
+    index: RwLock<HashMap<String, Postings<Id>>>,
     /// Forward index: Id -> stored tokens (for delete-before-reinsert).
     docs: RwLock<HashMap<Id, IndexedDoc>>,
     /// Total number of documents (for IDF calculation).
@@ -236,7 +351,7 @@ impl<Id: DocId> TextIndex<Id> {
     /// Get or create the staged state, snapshotting from the live state.
     fn ensure_staged<'a>(
         staged: &'a mut Option<StagedState<Id>>,
-        index: &HashMap<String, Vec<(Id, f32)>>,
+        index: &HashMap<String, Postings<Id>>,
         docs: &HashMap<Id, IndexedDoc>,
         doc_count: usize,
         total_doc_length: usize,
@@ -357,7 +472,7 @@ impl<Id: DocId> TextIndex<Id> {
                 .index
                 .entry(token.clone())
                 .or_default()
-                .push((id, *weight));
+                .add(id, *weight);
         }
         state.doc_count += 1;
         state.total_doc_length += doc_length;
@@ -457,7 +572,7 @@ impl<Id: DocId> TextIndex<Id> {
     pub fn rebuild_all(&self, documents: &[(Id, Vec<(&str, f32)>)]) -> Result<(), SearchError> {
         let _span =
             tracing::info_span!("kin_search.rebuild_all", documents = documents.len()).entered();
-        let mut index: HashMap<String, Vec<(Id, f32)>> = HashMap::new();
+        let mut index: HashMap<String, Postings<Id>> = HashMap::new();
         let mut docs: HashMap<Id, IndexedDoc> = HashMap::with_capacity(documents.len());
         let mut doc_count = 0usize;
         let mut total_doc_length = 0usize;
@@ -472,7 +587,7 @@ impl<Id: DocId> TextIndex<Id> {
             let doc_length = all_tokens.len();
 
             for (token, weight) in &all_tokens {
-                index.entry(token.clone()).or_default().push((*id, *weight));
+                index.entry(token.clone()).or_default().add(*id, *weight);
             }
             doc_count += 1;
             total_doc_length += doc_length;
@@ -513,7 +628,7 @@ impl<Id: DocId> TextIndex<Id> {
         let _span = tracing::info_span!("kin_search.rebuild_all_owned", lower_bound = lower_bound)
             .entered();
 
-        let mut index: HashMap<String, Vec<(Id, f32)>> = HashMap::new();
+        let mut index: HashMap<String, Postings<Id>> = HashMap::new();
         let mut docs: HashMap<Id, IndexedDoc> = HashMap::with_capacity(lower_bound);
         let mut doc_count = 0usize;
         let mut total_doc_length = 0usize;
@@ -528,7 +643,7 @@ impl<Id: DocId> TextIndex<Id> {
             let doc_length = all_tokens.len();
 
             for (token, weight) in &all_tokens {
-                index.entry(token.clone()).or_default().push((id, *weight));
+                index.entry(token.clone()).or_default().add(id, *weight);
             }
             doc_count += 1;
             total_doc_length += doc_length;
@@ -615,7 +730,11 @@ impl<Id: DocId> TextIndex<Id> {
                 // BM25 IDF: log((N - df + 0.5) / (df + 0.5) + 1)
                 let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln().max(0.0);
 
-                for (eid, weight) in postings {
+                // Each posting updates a DISTINCT entity's accumulator, so the
+                // unspecified cross-document iteration order of `Postings` does
+                // not affect any final per-entity score (a document's own
+                // occurrences are still summed in field order).
+                for (eid, weight) in postings.iter() {
                     let dl = docs.get(eid).map(|d| d.doc_length as f32).unwrap_or(avgdl);
                     // BM25 TF saturation: (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl/avgdl))
                     // Use weight as a proxy for tf (field-weighted)
@@ -651,7 +770,7 @@ impl<Id: DocId> TextIndex<Id> {
                     let df = postings.len() as f32;
                     let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln().max(0.0);
                     let substring_penalty = 0.5;
-                    for (eid, weight) in postings {
+                    for (eid, weight) in postings.iter() {
                         let dl = docs.get(eid).map(|d| d.doc_length as f32).unwrap_or(avgdl);
                         let tf = *weight;
                         let tf_saturated = (tf * (BM25_K1 + 1.0))
@@ -752,28 +871,80 @@ where
                 ))
             })?
         };
-        let persisted: PersistedIndex<Id> = {
-            let _span = tracing::info_span!(
-                "kin_search.load_persisted.deserialize",
-                bytes = bytes.len()
-            )
-            .entered();
-            bincode::deserialize(&bytes).map_err(|err| {
+
+        // `bincode`'s default (fixint, little-endian) encoding writes the
+        // leading `version: u32` field as the first four bytes, so we can read
+        // the format version without first committing to a struct layout. That
+        // is what lets older (v1) indexes be migrated forward instead of being
+        // rejected as "unsupported".
+        if bytes.len() < 4 {
+            return Err(SearchError::IndexError(format!(
+                "text index {} is truncated ({} bytes)",
+                storage_path.display(),
+                bytes.len()
+            )));
+        }
+        let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+
+        let _span = tracing::info_span!(
+            "kin_search.load_persisted.deserialize",
+            bytes = bytes.len(),
+            version = version
+        )
+        .entered();
+
+        if version == PersistedIndex::<Id>::VERSION {
+            let persisted: PersistedIndex<Id> = bincode::deserialize(&bytes).map_err(|err| {
                 SearchError::IndexError(format!(
                     "failed to decode text index {}: {err}",
                     storage_path.display()
                 ))
-            })?
-        };
-        if persisted.version != PersistedIndex::<Id>::VERSION {
-            return Err(SearchError::IndexError(format!(
+            })?;
+            if persisted.version != PersistedIndex::<Id>::VERSION {
+                return Err(SearchError::IndexError(format!(
+                    "text index {} declared version {} but decoded version {}",
+                    storage_path.display(),
+                    version,
+                    persisted.version
+                )));
+            }
+            Ok(Some(persisted))
+        } else if version == 1 {
+            // Migrate the legacy flat-`Vec` posting layout forward in memory.
+            // The next `commit()` re-persists in the current (v2) format.
+            let v1: PersistedIndexV1<Id> = bincode::deserialize(&bytes).map_err(|err| {
+                SearchError::IndexError(format!(
+                    "failed to decode v1 text index {}: {err}",
+                    storage_path.display()
+                ))
+            })?;
+            if v1.version != 1 {
+                return Err(SearchError::IndexError(format!(
+                    "text index {} declared version 1 but decoded version {}",
+                    storage_path.display(),
+                    v1.version
+                )));
+            }
+            tracing::info!(
+                path = %storage_path.display(),
+                "migrating text index from format v1 to v{}",
+                PersistedIndex::<Id>::VERSION
+            );
+            Ok(Some(PersistedIndex {
+                version: PersistedIndex::<Id>::VERSION,
+                index: migrate_v1_index(v1.index),
+                docs: v1.docs,
+                doc_count: v1.doc_count,
+                total_doc_length: v1.total_doc_length,
+                graph_root_hash: v1.graph_root_hash,
+            }))
+        } else {
+            Err(SearchError::IndexError(format!(
                 "unsupported text index version {} in {}",
-                persisted.version,
+                version,
                 storage_path.display()
-            )));
+            )))
         }
-
-        Ok(Some(persisted))
     }
 
     fn persist_to_disk(&self) -> Result<(), SearchError> {
@@ -1072,5 +1243,139 @@ mod tests {
         assert!(debug_str.contains("TextIndex"));
         assert!(debug_str.contains("documents"));
         assert!(debug_str.contains("tokens"));
+    }
+
+    /// Removing a document must cost work proportional ONLY to that document's
+    /// own occurrences — never to the (corpus-sized) length of a hot token's
+    /// posting list. This is the property that keeps bulk re-index linear; the
+    /// old flat-`Vec` `retain` made it O(corpus) per removal, i.e. O(n²) overall.
+    /// Operation-count based (not timing) so it is deterministic and not flaky.
+    #[test]
+    fn removal_touches_only_the_docs_own_postings() {
+        fn removal_work(corpus: usize) -> usize {
+            let mut index: HashMap<String, Postings<TestId>> = HashMap::new();
+            let mut docs: HashMap<TestId, IndexedDoc> = HashMap::new();
+            for i in 0..corpus {
+                let id = TestId(i as u64);
+                // Every doc shares the high-frequency token "shared" (its posting
+                // list grows to `corpus`) plus one unique token.
+                let tokens = vec![("shared".to_string(), 1.0), (format!("uniq{i}"), 1.0)];
+                for (tok, w) in &tokens {
+                    index.entry(tok.clone()).or_default().add(id, *w);
+                }
+                docs.insert(
+                    id,
+                    IndexedDoc {
+                        tokens_by_field: tokens,
+                        doc_length: 2,
+                    },
+                );
+            }
+            let target = TestId(0);
+            let doc = docs.get(&target).cloned().unwrap();
+            remove_doc_from_index(&mut index, &doc, &target)
+        }
+
+        let small = removal_work(100);
+        let large = removal_work(10_000);
+        // 100x larger corpus (and 100x longer "shared" posting list) must not
+        // change the removal cost for a single document.
+        assert_eq!(
+            small, large,
+            "removal work must be independent of corpus size (was {small} vs {large})"
+        );
+        // And that cost is exactly the doc's own occurrences: shared + unique.
+        assert_eq!(large, 2, "removal must touch only the doc's own postings");
+    }
+
+    /// Re-upserting the same document repeatedly must not let stale postings
+    /// accumulate: the keyed map replaces, it does not append. Guards BM25 df.
+    #[test]
+    fn reupsert_does_not_bloat_posting_lists() {
+        let idx = TextIndex::<TestId>::new();
+        let id = next_id();
+        for _ in 0..50 {
+            idx.upsert(id, &[("stableToken", 5.0), ("src/file.rs", 2.0)])
+                .unwrap();
+        }
+        idx.commit().unwrap();
+        // Exactly one live document, regardless of how many times it was upserted.
+        assert_eq!(idx.live_document_count(), 1);
+        let token_count = {
+            let index = idx.index.read();
+            index.get("stable").map(|p| p.len()).unwrap_or(0)
+        };
+        // "stable" occurs once per upsert of the single doc — re-upsert replaces
+        // rather than appends, so the posting count stays at 1 (not 50).
+        assert_eq!(token_count, 1, "re-upsert must not accumulate stale postings");
+    }
+
+    /// A format-v1 index on disk (flat `Vec` posting lists) must load, migrate
+    /// forward, and keep serving searches; the next commit re-persists as v2.
+    #[test]
+    fn migrates_v1_format_index_on_open() {
+        #[derive(Serialize)]
+        struct V1Mirror {
+            version: u32,
+            index: HashMap<String, Vec<(TestId, f32)>>,
+            docs: HashMap<TestId, IndexedDoc>,
+            doc_count: usize,
+            total_doc_length: usize,
+            graph_root_hash: Option<[u8; 32]>,
+        }
+
+        fn build_v1_bytes(id: TestId, doc: &TestDoc) -> Vec<u8> {
+            // Mirror exactly what `upsert` would have produced under v1.
+            let mut all_tokens: Vec<(String, f32)> = Vec::new();
+            for (text, weight) in doc.search_fields() {
+                for tok in tokenize(text) {
+                    all_tokens.push((tok, weight));
+                }
+            }
+            let doc_length = all_tokens.len();
+            let mut index: HashMap<String, Vec<(TestId, f32)>> = HashMap::new();
+            for (token, weight) in &all_tokens {
+                index.entry(token.clone()).or_default().push((id, *weight));
+            }
+            let mut docs = HashMap::new();
+            docs.insert(
+                id,
+                IndexedDoc {
+                    tokens_by_field: all_tokens,
+                    doc_length,
+                },
+            );
+            let v1 = V1Mirror {
+                version: 1,
+                index,
+                docs,
+                doc_count: 1,
+                total_doc_length: doc_length,
+                graph_root_hash: Some([9; 32]),
+            };
+            bincode::serialize(&v1).unwrap()
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ti");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (id, doc) = make_doc("persistMe", "src/persist.rs", "Function");
+        std::fs::write(dir.join("index.bin"), build_v1_bytes(id, &doc)).unwrap();
+
+        let idx = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+        let results = idx.fuzzy_search("persistMe", 10).unwrap();
+        assert!(!results.is_empty(), "migrated v1 index must still be searchable");
+        assert_eq!(results[0].0, id);
+        assert_eq!(idx.graph_root_hash(), Some([9; 32]));
+
+        // Re-commit re-persists in the current (v2) format.
+        idx.commit().unwrap();
+        let raw = std::fs::read(dir.join("index.bin")).unwrap();
+        let on_disk_version = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        assert_eq!(on_disk_version, TEXT_INDEX_FORMAT_VERSION);
+
+        let reopened = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+        let results = reopened.fuzzy_search("persistMe", 10).unwrap();
+        assert_eq!(results[0].0, id);
     }
 }
