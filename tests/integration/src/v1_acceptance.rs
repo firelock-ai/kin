@@ -272,6 +272,7 @@ fn context_pack_fits_token_budget() {
         origin: kin_model::RelationOrigin::Parsed,
         created_in: None,
         import_source: None,
+        evidence: Vec::new(),
     };
     graph.upsert_relation(&relation).unwrap();
 

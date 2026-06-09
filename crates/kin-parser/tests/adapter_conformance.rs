@@ -175,6 +175,112 @@ fn conformance_parse_valid_source() {
     }
 }
 
+#[test]
+fn conformance_imports_are_file_imports_not_file_id_relations() {
+    let cases: Vec<(&str, Box<dyn LanguageAdapter>, &str, &[u8])> = vec![
+        (
+            "python",
+            Box::new(PythonAdapter),
+            "py",
+            b"import os\nfrom pathlib import Path\ndef f():\n    return Path('.')\n",
+        ),
+        (
+            "javascript",
+            Box::new(JavaScriptAdapter),
+            "js",
+            b"import util from './util.js';\nfunction f() { return util(); }\n",
+        ),
+        (
+            "typescript",
+            Box::new(TypeScriptAdapter),
+            "ts",
+            b"import { util } from './util';\nexport function f() { return util(); }\n",
+        ),
+        (
+            "go",
+            Box::new(GoAdapter),
+            "go",
+            b"package main\nimport \"fmt\"\nfunc main() { fmt.Println(\"x\") }\n",
+        ),
+        (
+            "rust",
+            Box::new(RustAdapter),
+            "rs",
+            b"use crate::util::run;\npub fn f() { run(); }\n",
+        ),
+        (
+            "kotlin",
+            Box::new(KotlinAdapter),
+            "kt",
+            b"import foo.Bar\nclass Baz { fun f() = Bar() }\n",
+        ),
+        (
+            "swift",
+            Box::new(SwiftAdapter),
+            "swift",
+            b"import Foundation\nclass Foo { func f() {} }\n",
+        ),
+        (
+            "c",
+            Box::new(CAdapter),
+            "c",
+            b"#include <stdio.h>\nint main(void) { return 0; }\n",
+        ),
+        (
+            "cpp",
+            Box::new(CppAdapter),
+            "cpp",
+            b"#include <vector>\nint main() { return 0; }\n",
+        ),
+        (
+            "java",
+            Box::new(JavaAdapter),
+            "java",
+            b"import java.util.List;\npublic class Foo { List<String> names; }\n",
+        ),
+        (
+            "csharp",
+            Box::new(CSharpAdapter),
+            "cs",
+            b"using System;\npublic class Foo { }\n",
+        ),
+        (
+            "ruby",
+            Box::new(RubyAdapter),
+            "rb",
+            b"require 'json'\nclass Foo\nend\n",
+        ),
+        (
+            "php",
+            Box::new(PhpAdapter),
+            "php",
+            b"<?php\nuse Foo\\Bar;\nclass Baz { }\n",
+        ),
+    ];
+
+    for (lang, adapter, ext, source) in cases {
+        let tree = adapter
+            .parse(source)
+            .unwrap_or_else(|err| panic!("parse failed for {lang}: {err}"));
+        let file_id = FilePathId(format!("test/import_fixture.{ext}"));
+        let output = adapter
+            .extract(&tree, source, &file_id)
+            .unwrap_or_else(|err| panic!("extract failed for {lang}: {err}"));
+        assert!(
+            !output.imports.is_empty(),
+            "{lang} import/include syntax should be carried as FileImport"
+        );
+        let file_source = file_id.to_string();
+        assert!(
+            output
+                .relations
+                .iter()
+                .all(|relation| relation.src_name != file_source),
+            "{lang} emitted a fake file-id relation source"
+        );
+    }
+}
+
 // ---- Conformance Requirement 4: parse handles invalid source ----
 
 #[test]

@@ -1342,7 +1342,7 @@ fn is_preceded_by_define(source: &[u8], idx: usize) -> bool {
         if c == b'\n' || c == b'\r' {
             return false;
         }
-        if p >= 5 && &source[p-5..p+1] == b"define" {
+        if p >= 5 && &source[p - 5..p + 1] == b"define" {
             p -= 5;
             while p > 0 {
                 p -= 1;

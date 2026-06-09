@@ -236,10 +236,7 @@ fn remove_stale_entities<G: GraphStore>(
         graph
             .remove_entities_batch(&to_remove)
             .map_err(|e| IndexError::Graph(e.to_string()))?;
-        debug!(
-            count = removed,
-            "removed stale entities batch"
-        );
+        debug!(count = removed, "removed stale entities batch");
     }
 
     Ok(removed)
@@ -271,7 +268,6 @@ pub fn apply_file_removal<G: GraphStore>(graph: &G, file_id: &FilePathId) -> Res
         removed = entities_removed,
         "removed all entities for deleted file"
     );
-
 
     Ok(ApplyResult {
         file_id: file_id.clone(),

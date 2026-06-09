@@ -639,7 +639,10 @@ impl HistoricalPathResolver {
 }
 
 fn common_component_suffix_len(a: &str, b: &str) -> usize {
-    a.rsplit('/').zip(b.rsplit('/')).take_while(|(ap, bp)| ap == bp).count()
+    a.rsplit('/')
+        .zip(b.rsplit('/'))
+        .take_while(|(ap, bp)| ap == bp)
+        .count()
 }
 
 pub fn collect_changes_at_ref<G>(graph: &G, head: &SemanticChangeId) -> Result<Vec<SemanticChange>>
@@ -2467,19 +2470,31 @@ def uri_encoder(value):\n    return value\n",
 
         // Resolving a query/HEAD path that is nested (monorepo layout)
         let resolved = resolver
-            .resolve(&FilePathId::new("packages/svelte/src/compiler/phases/css.js"), &file_tree)
+            .resolve(
+                &FilePathId::new("packages/svelte/src/compiler/phases/css.js"),
+                &file_tree,
+            )
             .expect("should resolve nested query path to inner tree path");
         assert_eq!(resolved, FilePathId::new("src/compiler/phases/css.js"));
 
         // Resolving an inner path when tree has a nested path (the other way around)
         let mut file_tree_nested = HashMap::new();
-        file_tree_nested.insert(FilePathId::new("packages/svelte/src/compiler/phases/css.js"), resolver_blob);
+        file_tree_nested.insert(
+            FilePathId::new("packages/svelte/src/compiler/phases/css.js"),
+            resolver_blob,
+        );
 
         let resolver_nested = HistoricalPathResolver::from_changes(&[], &file_tree_nested);
         let resolved_nested = resolver_nested
-            .resolve(&FilePathId::new("src/compiler/phases/css.js"), &file_tree_nested)
+            .resolve(
+                &FilePathId::new("src/compiler/phases/css.js"),
+                &file_tree_nested,
+            )
             .expect("should resolve inner query path to nested tree path");
-        assert_eq!(resolved_nested, FilePathId::new("packages/svelte/src/compiler/phases/css.js"));
+        assert_eq!(
+            resolved_nested,
+            FilePathId::new("packages/svelte/src/compiler/phases/css.js")
+        );
     }
 
     #[test]
@@ -2487,16 +2502,28 @@ def uri_encoder(value):\n    return value\n",
         let resolver_blob = Hash256::from_bytes([0xaa; 32]);
         let mut file_tree = HashMap::new();
         // The tree has the historical path: packages/material-ui/src/useAutocomplete/index.js
-        file_tree.insert(FilePathId::new("packages/material-ui/src/useAutocomplete/index.js"), resolver_blob);
-        file_tree.insert(FilePathId::new("packages/material-ui/src/index.js"), resolver_blob);
+        file_tree.insert(
+            FilePathId::new("packages/material-ui/src/useAutocomplete/index.js"),
+            resolver_blob,
+        );
+        file_tree.insert(
+            FilePathId::new("packages/material-ui/src/index.js"),
+            resolver_blob,
+        );
 
         let resolver = HistoricalPathResolver::from_changes(&[], &file_tree);
 
         // Resolving a legacy path that had its package renamed: packages/mui-material/src/useAutocomplete/index.js
         let resolved = resolver
-            .resolve(&FilePathId::new("packages/mui-material/src/useAutocomplete/index.js"), &file_tree)
+            .resolve(
+                &FilePathId::new("packages/mui-material/src/useAutocomplete/index.js"),
+                &file_tree,
+            )
             .expect("should resolve renamed package path via common suffix");
-        assert_eq!(resolved, FilePathId::new("packages/material-ui/src/useAutocomplete/index.js"));
+        assert_eq!(
+            resolved,
+            FilePathId::new("packages/material-ui/src/useAutocomplete/index.js")
+        );
     }
 
     /// Gap 2 (audit follow-up): mixed binding — when only some persisted

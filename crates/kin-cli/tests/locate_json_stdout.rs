@@ -31,7 +31,8 @@ fn kin_command() -> Command {
     cmd.env("KIN_DAEMON_DISABLE_LSP", "1")
         .env("KIN_DAEMON_BIN", daemon_bin)
         .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1")
-        .env("KIN_DAEMON_READY_TIMEOUT_SECS", "30");
+        .env("KIN_DAEMON_READY_TIMEOUT_SECS", "30")
+        .env("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", "1");
     cmd
 }
 

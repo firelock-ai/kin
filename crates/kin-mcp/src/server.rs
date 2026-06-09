@@ -433,7 +433,10 @@ async fn handle_tools_call<G: PersistableMcpStore>(
             return JsonRpcResponse::error(
                 id,
                 -32603,
-                format!("Internal error: tool '{}' panicked: {detail}", call_params.name),
+                format!(
+                    "Internal error: tool '{}' panicked: {detail}",
+                    call_params.name
+                ),
             );
         }
     };

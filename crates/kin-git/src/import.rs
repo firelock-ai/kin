@@ -14,7 +14,6 @@ use tracing::{debug, info};
 
 use crate::error::{GitError, Result};
 
-
 fn open_repo(path: &Path) -> std::result::Result<gix::Repository, gix::open::Error> {
     let dot_git = path.join(".git");
     if dot_git.is_dir() {
@@ -439,7 +438,8 @@ mod tests {
     #[test]
     fn test_open_repo_resolves_git_suffix_directories() {
         let path = Path::new("/Users/troyfortinjr/GitHub/kin-ecosystem/kin-bench/.bench/contextbench-official/repos/master_svelte.git");
-        let repo = open_repo(path).expect("open_repo should succeed even on .git-suffixed directories");
+        let repo =
+            open_repo(path).expect("open_repo should succeed even on .git-suffixed directories");
         assert!(!repo.is_bare());
     }
 

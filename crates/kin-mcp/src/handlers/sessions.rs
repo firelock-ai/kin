@@ -4,10 +4,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::session::{McpMutationOperation, McpMutationPayload};
 use kin_model::graph::GraphStore;
 use kin_model::ids::EntityId;
 use kin_model::timestamp::Timestamp;
-use crate::session::{McpMutationPayload, McpMutationOperation};
 
 use crate::error::Result;
 use crate::server::SessionAuthorityMode;
@@ -456,7 +456,8 @@ pub async fn handle_transaction_begin(
                 "scope": tx.scope,
                 "state": tx.state,
             });
-            let json = serde_json::to_string_pretty(&result).map_err(crate::error::McpError::Json)?;
+            let json =
+                serde_json::to_string_pretty(&result).map_err(crate::error::McpError::Json)?;
             Ok(ToolCallResult::text(json))
         }
         Err(err) => Ok(ToolCallResult::error(err)),
@@ -478,7 +479,9 @@ pub async fn handle_transaction_stage(
     })?;
 
     let operations: Vec<McpMutationOperation> = serde_json::from_value(operations_val.clone())
-        .map_err(|e| crate::error::McpError::InvalidParams(format!("invalid operations array: {e}")))?;
+        .map_err(|e| {
+            crate::error::McpError::InvalidParams(format!("invalid operations array: {e}"))
+        })?;
 
     if session_authority_mode.uses_daemon() {
         match crate::daemon_delegate::forward_tool_call("kin_transaction_stage", args).await {
@@ -498,7 +501,8 @@ pub async fn handle_transaction_stage(
                 "state": tx.state,
                 "staged_count": tx.staged_operations.len(),
             });
-            let json = serde_json::to_string_pretty(&result).map_err(crate::error::McpError::Json)?;
+            let json =
+                serde_json::to_string_pretty(&result).map_err(crate::error::McpError::Json)?;
             Ok(ToolCallResult::text(json))
         }
         Err(err) => Ok(ToolCallResult::error(err)),
@@ -534,7 +538,8 @@ pub async fn handle_transaction_validate(
                 "state": tx.state,
                 "status": "valid",
             });
-            let json = serde_json::to_string_pretty(&result).map_err(crate::error::McpError::Json)?;
+            let json =
+                serde_json::to_string_pretty(&result).map_err(crate::error::McpError::Json)?;
             Ok(ToolCallResult::text(json))
         }
         Err(err) => Ok(ToolCallResult::error(err)),
@@ -566,7 +571,12 @@ pub async fn handle_transaction_commit<G: GraphStore>(
 
     let tx = match sessions.get_transaction(&transaction_id) {
         Some(t) => t,
-        None => return Ok(ToolCallResult::error(format!("Transaction not found: {}", transaction_id))),
+        None => {
+            return Ok(ToolCallResult::error(format!(
+                "Transaction not found: {}",
+                transaction_id
+            )))
+        }
     };
 
     if tx.state != "active" && tx.state != "validated" {
@@ -587,8 +597,13 @@ pub async fn handle_transaction_commit<G: GraphStore>(
                     if verb == "create" || verb == "add" || verb == "upsert" || verb == "insert" {
                         entity_deltas.push(kin_model::change::EntityDelta::Added(entity));
                     } else if verb == "update" || verb == "modify" {
-                        let old = store.get_entity(&entity.id).ok().flatten().unwrap_or_else(|| entity.clone());
-                        entity_deltas.push(kin_model::change::EntityDelta::Modified { old, new: entity });
+                        let old = store
+                            .get_entity(&entity.id)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| entity.clone());
+                        entity_deltas
+                            .push(kin_model::change::EntityDelta::Modified { old, new: entity });
                     } else if verb == "delete" || verb == "remove" {
                         entity_deltas.push(kin_model::change::EntityDelta::Removed(entity.id));
                     }
@@ -608,11 +623,14 @@ pub async fn handle_transaction_commit<G: GraphStore>(
                         };
                         relation_deltas.push(kin_model::change::RelationDelta::Added(relation));
                     } else if verb == "delete" || verb == "remove" {
-                        let matching_relation = store.get_all_relations_for_entity(&from)
+                        let matching_relation = store
+                            .get_all_relations_for_entity(&from)
                             .ok()
                             .and_then(|rels| {
                                 rels.into_iter().find(|r| {
-                                    r.kind == kind && r.src == kin_model::relation::GraphNodeId::Entity(from) && r.dst == kin_model::relation::GraphNodeId::Entity(to)
+                                    r.kind == kind
+                                        && r.src == kin_model::relation::GraphNodeId::Entity(from)
+                                        && r.dst == kin_model::relation::GraphNodeId::Entity(to)
                                 })
                             });
                         if let Some(rel) = matching_relation {
@@ -631,10 +649,13 @@ pub async fn handle_transaction_commit<G: GraphStore>(
     };
 
     if let Err(err) = store.apply_transaction_delta(&delta) {
-        return Ok(ToolCallResult::error(format!("Failed to commit transaction delta: {err}")));
+        return Ok(ToolCallResult::error(format!(
+            "Failed to commit transaction delta: {err}"
+        )));
     }
 
-    let committed_tx = sessions.commit_transaction(&transaction_id)
+    let committed_tx = sessions
+        .commit_transaction(&transaction_id)
         .map_err(|e| crate::error::McpError::InvalidParams(e))?;
 
     let result = serde_json::json!({
@@ -673,7 +694,8 @@ pub async fn handle_transaction_abort(
                 "transaction_id": tx.transaction_id,
                 "state": tx.state,
             });
-            let json = serde_json::to_string_pretty(&result).map_err(crate::error::McpError::Json)?;
+            let json =
+                serde_json::to_string_pretty(&result).map_err(crate::error::McpError::Json)?;
             Ok(ToolCallResult::text(json))
         }
         Err(err) => Ok(ToolCallResult::error(err)),

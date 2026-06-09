@@ -257,7 +257,9 @@ pub fn execute_reconcile_session_dir_scoped(
             ChangeKind::Deleted => {
                 let event = FileEvent::Removed(session_file.clone());
                 match reconciler.reconcile_file_change(&event, &blob_store, graph, &mut overlay) {
-                    Ok(ReconcileOutcome::FileRemoved { removed, file_id, .. }) => {
+                    Ok(ReconcileOutcome::FileRemoved {
+                        removed, file_id, ..
+                    }) => {
                         total_removed += removed.len();
                         use kin_model::EntityStore;
                         graph.delete_file_layout(&file_id)?;
@@ -436,7 +438,9 @@ where
                     let event = FileEvent::Removed(session_file.clone());
                     match reconciler.reconcile_file_change(&event, &blob_store, graph, &mut overlay)
                     {
-                        Ok(ReconcileOutcome::FileRemoved { removed, file_id, .. }) => {
+                        Ok(ReconcileOutcome::FileRemoved {
+                            removed, file_id, ..
+                        }) => {
                             total_removed += removed.len();
                             use kin_model::EntityStore;
                             graph.delete_file_layout(&file_id)?;
