@@ -119,6 +119,7 @@ mod tests {
             origin: RelationOrigin::Parsed,
             created_in: None,
             import_source: None,
+            evidence: Vec::new(),
         }
     }
 

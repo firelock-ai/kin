@@ -105,7 +105,9 @@ impl VectorIndex {
 
     /// Remove a batch of entity embeddings from the index.
     pub fn remove_batch(&self, entity_ids: &[EntityId]) -> Result<(), KinDbError> {
-        let _span = tracing::info_span!("kindb.vector_index.remove_batch", count = entity_ids.len()).entered();
+        let _span =
+            tracing::info_span!("kindb.vector_index.remove_batch", count = entity_ids.len())
+                .entered();
         for id in entity_ids {
             let key = RetrievalKey::from(*id);
             self.inner
@@ -114,7 +116,6 @@ impl VectorIndex {
         }
         Ok(())
     }
-
 
     /// Search for the `limit` most similar entities to the given embedding.
     ///

@@ -180,10 +180,7 @@ fn verify_destination_magic(path: &Path, expected: &[u8; 4]) -> Result<(), KinDb
     })?;
     let mut magic = [0u8; 4];
     file.read_exact(&mut magic).map_err(|e| {
-        KinDbError::StorageError(format!(
-            "failed to read magic from {}: {e}",
-            path.display()
-        ))
+        KinDbError::StorageError(format!("failed to read magic from {}: {e}", path.display()))
     })?;
     if &magic != expected {
         return Err(KinDbError::StorageError(format!(

@@ -170,7 +170,10 @@ impl TextIndex {
     ///
     /// Stages the removals — call `commit()` to make them visible to searches.
     pub fn remove_batch(&self, entity_ids: &[EntityId]) -> Result<(), KinDbError> {
-        let keys: Vec<RetrievalKey> = entity_ids.iter().map(|id| RetrievalKey::Entity(*id)).collect();
+        let keys: Vec<RetrievalKey> = entity_ids
+            .iter()
+            .map(|id| RetrievalKey::Entity(*id))
+            .collect();
         self.remove_retrievable_batch(&keys)
     }
 
@@ -182,7 +185,6 @@ impl TextIndex {
             .remove_batch(keys)
             .map_err(|e| KinDbError::IndexError(e.to_string()))
     }
-
 
     /// Rebuild the entire index from pre-built field vectors.
     ///

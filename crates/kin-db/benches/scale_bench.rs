@@ -105,6 +105,7 @@ fn generate_graph(n: usize, rels_per_entity: usize) -> InMemoryGraph {
                     origin: RelationOrigin::Parsed,
                     created_in: None,
                     import_source: None,
+                    evidence: Vec::new(),
                 },
             );
             outgoing.entry(*src_id).or_default().push(rel_id);

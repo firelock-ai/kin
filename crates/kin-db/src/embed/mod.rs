@@ -221,31 +221,29 @@ impl CodeEmbedder {
             revision = %revision
         )
         .entered();
-        let (config_path, tokenizer_path, weights_path) =
-            if let Some(dir) = local_model_dir(model_id) {
-                resolve_local_model_artifacts(&dir)?
-            } else {
-                let repo = Repo::with_revision(
-                    model_id.to_string(),
-                    RepoType::Model,
-                    revision.to_string(),
-                );
-                let api = Api::new().map_err(|e| {
-                    KinDbError::IndexError(format!("failed to initialise HuggingFace API: {e}"))
-                })?;
-                let api = api.repo(repo);
+        let (config_path, tokenizer_path, weights_path) = if let Some(dir) =
+            local_model_dir(model_id)
+        {
+            resolve_local_model_artifacts(&dir)?
+        } else {
+            let repo =
+                Repo::with_revision(model_id.to_string(), RepoType::Model, revision.to_string());
+            let api = Api::new().map_err(|e| {
+                KinDbError::IndexError(format!("failed to initialise HuggingFace API: {e}"))
+            })?;
+            let api = api.repo(repo);
 
-                let config_path = api.get("config.json").map_err(|e| {
-                    KinDbError::IndexError(format!("failed to download model config: {e}"))
-                })?;
-                let tokenizer_path = api.get("tokenizer.json").map_err(|e| {
-                    KinDbError::IndexError(format!("failed to download tokenizer: {e}"))
-                })?;
-                let weights_path = api.get("model.safetensors").map_err(|e| {
-                    KinDbError::IndexError(format!("failed to download model weights: {e}"))
-                })?;
-                (config_path, tokenizer_path, weights_path)
-            };
+            let config_path = api.get("config.json").map_err(|e| {
+                KinDbError::IndexError(format!("failed to download model config: {e}"))
+            })?;
+            let tokenizer_path = api.get("tokenizer.json").map_err(|e| {
+                KinDbError::IndexError(format!("failed to download tokenizer: {e}"))
+            })?;
+            let weights_path = api.get("model.safetensors").map_err(|e| {
+                KinDbError::IndexError(format!("failed to download model weights: {e}"))
+            })?;
+            (config_path, tokenizer_path, weights_path)
+        };
 
         let config_data = std::fs::read_to_string(&config_path)
             .map_err(|e| KinDbError::IndexError(format!("failed to read config: {e}")))?;
@@ -509,6 +507,22 @@ impl CodeEmbedder {
     pub fn dimensions(&self) -> usize {
         self.dimensions
     }
+
+    /// Local inference backend used by the embedder, when this is a local model.
+    #[cfg(feature = "embeddings")]
+    pub fn local_backend(&self) -> Option<GpuBackend> {
+        match &self.backend {
+            CodeEmbedderBackend::Bert(embedder) => Some(embedder.model.backend()),
+            CodeEmbedderBackend::OpenAiCompat(_) => None,
+        }
+    }
+
+    /// Whether the local embedder is actually using an accelerator.
+    #[cfg(feature = "embeddings")]
+    pub fn uses_local_accelerator(&self) -> bool {
+        self.local_backend()
+            .is_some_and(|backend| backend != GpuBackend::Cpu)
+    }
 }
 
 #[cfg(feature = "embeddings")]
@@ -645,9 +659,7 @@ impl BertEmbedder {
                                 })?
                         }
                         Err(e) => {
-                            return Err(KinDbError::IndexError(format!(
-                                "inference failed: {e}"
-                            )));
+                            return Err(KinDbError::IndexError(format!("inference failed: {e}")));
                         }
                     }
                 }
@@ -859,9 +871,7 @@ impl BertEmbedder {
                                 })?
                         }
                         Err(e) => {
-                            return Err(KinDbError::IndexError(format!(
-                                "inference failed: {e}"
-                            )));
+                            return Err(KinDbError::IndexError(format!("inference failed: {e}")));
                         }
                     }
                 }
@@ -1831,7 +1841,10 @@ pub fn format_graph_entity_text_with_context(entity: &Entity, context_lines: &[S
     if let Some(doc_summary) = entity.doc_summary.as_deref() {
         let doc_summary = doc_summary.trim();
         if !doc_summary.is_empty() {
-            parts.push(bounded_embed_field(doc_summary, EMBED_DOC_SUMMARY_MAX_CHARS));
+            parts.push(bounded_embed_field(
+                doc_summary,
+                EMBED_DOC_SUMMARY_MAX_CHARS,
+            ));
         }
     }
     if let Some(body_preview) = entity

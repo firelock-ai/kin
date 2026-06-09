@@ -25,6 +25,7 @@ pub fn migrate(
         data = match version {
             5 => migrate_v5_to_v6(&data)?,
             6 => migrate_v6_to_v7(&data)?,
+            7 => migrate_v7_to_v8(&data)?,
             _ => {
                 return Err(KinDbError::StorageError(format!(
                     "no migration path from snapshot version {version}"
@@ -116,6 +117,39 @@ fn migrate_v6_to_v7(body: &[u8]) -> Result<Vec<u8>, KinDbError> {
     snapshot.version = 7;
     rmp_serde::to_vec(&snapshot).map_err(|e| {
         KinDbError::StorageError(format!("v6→v7 migration: re-serialization failed: {e}"))
+    })
+}
+
+/// Migrate v7 → v8: Populate the `artifact_index` map from artifact lists.
+///
+/// v8 introduces graph-assigned `ArtifactId`s (stored in `artifact_index`)
+/// so artifact identity survives file renames. Existing paths are mapped
+/// to deterministic v5 UUIDs to preserve legacy graph links.
+fn migrate_v7_to_v8(body: &[u8]) -> Result<Vec<u8>, KinDbError> {
+    let mut snapshot: GraphSnapshot = rmp_serde::from_slice(body).map_err(|e| {
+        KinDbError::StorageError(format!("v7→v8 migration: deserialization failed: {e}"))
+    })?;
+
+    // Build deterministic index mappings from paths
+    #[allow(deprecated)]
+    for file in &snapshot.shallow_files {
+        let id = kin_model::ArtifactId::from_file_id(&file.file_id);
+        snapshot.artifact_index.insert(file.file_id.clone(), id);
+    }
+    #[allow(deprecated)]
+    for artifact in &snapshot.structured_artifacts {
+        let id = kin_model::ArtifactId::from_file_id(&artifact.file_id);
+        snapshot.artifact_index.insert(artifact.file_id.clone(), id);
+    }
+    #[allow(deprecated)]
+    for artifact in &snapshot.opaque_artifacts {
+        let id = kin_model::ArtifactId::from_file_id(&artifact.file_id);
+        snapshot.artifact_index.insert(artifact.file_id.clone(), id);
+    }
+
+    snapshot.version = 8;
+    rmp_serde::to_vec(&snapshot).map_err(|e| {
+        KinDbError::StorageError(format!("v7→v8 migration: re-serialization failed: {e}"))
     })
 }
 
@@ -295,6 +329,33 @@ mod tests {
         let migrated = migrate(&body, 6, 7).unwrap();
         let loaded: GraphSnapshot = rmp_serde::from_slice(&migrated).unwrap();
         assert_eq!(loaded.version, 7);
+    }
+
+    #[test]
+    fn migrate_v7_to_v8_populates_artifact_index() {
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.version = 7;
+        let file_id = FilePathId::new("src/test.rs");
+        snapshot.shallow_files.push(ShallowTrackedFile {
+            file_id: file_id.clone(),
+            language_hint: "rust".to_string(),
+            declaration_count: 1,
+            import_count: 0,
+            syntax_hash: Hash256::from_bytes([1; 32]),
+            signature_hash: None,
+            declaration_names: vec!["test".to_string()],
+            import_paths: Vec::new(),
+        });
+
+        let body = rmp_serde::to_vec(&snapshot).unwrap();
+        let migrated = migrate(&body, 7, 8).unwrap();
+        let loaded: GraphSnapshot = rmp_serde::from_slice(&migrated).unwrap();
+
+        assert_eq!(loaded.version, 8);
+        assert!(loaded.artifact_index.contains_key(&file_id));
+        #[allow(deprecated)]
+        let expected_id = kin_model::ArtifactId::from_file_id(&file_id);
+        assert_eq!(loaded.artifact_index[&file_id], expected_id);
     }
 
     #[test]

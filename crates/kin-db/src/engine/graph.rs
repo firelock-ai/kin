@@ -56,6 +56,36 @@ fn coverage_percent(indexed: usize, total: usize) -> f64 {
     (indexed as f64 / total as f64) * 100.0
 }
 
+#[allow(deprecated)]
+fn build_artifact_indexes_from_paths<I>(
+    paths: I,
+) -> (
+    HashMap<FilePathId, ArtifactId>,
+    HashMap<ArtifactId, FilePathId>,
+)
+where
+    I: IntoIterator<Item = FilePathId>,
+{
+    let mut artifact_index = HashMap::new();
+    let mut artifact_reverse = HashMap::new();
+    for path in paths {
+        let id = ArtifactId::from_file_id(&path);
+        artifact_index.entry(path.clone()).or_insert(id);
+        artifact_reverse.entry(id).or_insert(path);
+    }
+    (artifact_index, artifact_reverse)
+}
+
+fn reverse_artifact_index(
+    artifact_index: &HashMap<FilePathId, ArtifactId>,
+) -> HashMap<ArtifactId, FilePathId> {
+    let mut artifact_reverse = HashMap::new();
+    for (path, id) in artifact_index {
+        artifact_reverse.entry(*id).or_insert_with(|| path.clone());
+    }
+    artifact_reverse
+}
+
 fn topologically_order_changes<I>(changes: I) -> Vec<SemanticChange>
 where
     I: IntoIterator<Item = (SemanticChangeId, SemanticChange)>,
@@ -309,6 +339,7 @@ fn verification_relation(kind: RelationKind, src: GraphNodeId, dst: GraphNodeId)
         origin: RelationOrigin::Inferred,
         created_in: None,
         import_source: None,
+        evidence: Vec::new(),
     }
 }
 
@@ -438,6 +469,10 @@ struct EntityData {
     structured_artifacts: HashMap<FilePathId, StructuredArtifact>,
     /// Opaque artifact tracking (C0 tier).
     opaque_artifacts: HashMap<FilePathId, OpaqueArtifact>,
+    /// Forward: FilePathId → ArtifactId (O(1) lookup)
+    artifact_index: HashMap<FilePathId, ArtifactId>,
+    /// Reverse: ArtifactId → FilePathId (O(1) reverse lookup)
+    artifact_reverse: HashMap<ArtifactId, FilePathId>,
 }
 
 impl GraphHashSource for EntityData {
@@ -604,6 +639,8 @@ impl InMemoryGraph {
                 file_layouts: HashMap::new(),
                 structured_artifacts: HashMap::new(),
                 opaque_artifacts: HashMap::new(),
+                artifact_index: HashMap::new(),
+                artifact_reverse: HashMap::new(),
             }),
             changes: RwLock::new(ChangeData {
                 changes: HashMap::new(),
@@ -817,6 +854,7 @@ impl InMemoryGraph {
             entity_tombstones: _,
             relation_tombstones: _,
             change_order: _,
+            artifact_index,
         } = snapshot;
         let entity_revisions: HashMap<EntityId, Vec<EntityRevision>> =
             if entity_revisions.is_empty() && !changes.is_empty() {
@@ -929,6 +967,38 @@ impl InMemoryGraph {
             }
         };
 
+        let shallow_files: HashMap<FilePathId, ShallowTrackedFile> = shallow_files
+            .into_iter()
+            .map(|sf| (sf.file_id.clone(), sf))
+            .collect();
+        let file_layouts: HashMap<FilePathId, FileLayout> = file_layouts
+            .into_iter()
+            .map(|layout| (layout.file_id.clone(), layout))
+            .collect();
+        let structured_artifacts: HashMap<FilePathId, StructuredArtifact> = structured_artifacts
+            .into_iter()
+            .map(|artifact| (artifact.file_id.clone(), artifact))
+            .collect();
+        let opaque_artifacts: HashMap<FilePathId, OpaqueArtifact> = opaque_artifacts
+            .into_iter()
+            .map(|artifact| (artifact.file_id.clone(), artifact))
+            .collect();
+        let persisted_artifact_index: HashMap<FilePathId, ArtifactId> =
+            artifact_index.into_iter().collect();
+        let (artifact_index, artifact_reverse) = if persisted_artifact_index.is_empty() {
+            build_artifact_indexes_from_paths(
+                shallow_files
+                    .keys()
+                    .chain(file_layouts.keys())
+                    .chain(structured_artifacts.keys())
+                    .chain(opaque_artifacts.keys())
+                    .cloned(),
+            )
+        } else {
+            let artifact_reverse = reverse_artifact_index(&persisted_artifact_index);
+            (persisted_artifact_index, artifact_reverse)
+        };
+
         let graph = Self {
             entities: RwLock::new(EntityData {
                 entities: entities.into_iter().collect(),
@@ -940,22 +1010,12 @@ impl InMemoryGraph {
                 node_incoming,
                 indexes,
                 file_hashes: file_hashes.into_iter().collect(),
-                shallow_files: shallow_files
-                    .into_iter()
-                    .map(|sf| (sf.file_id.clone(), sf))
-                    .collect(),
-                file_layouts: file_layouts
-                    .into_iter()
-                    .map(|layout| (layout.file_id.clone(), layout))
-                    .collect(),
-                structured_artifacts: structured_artifacts
-                    .into_iter()
-                    .map(|artifact| (artifact.file_id.clone(), artifact))
-                    .collect(),
-                opaque_artifacts: opaque_artifacts
-                    .into_iter()
-                    .map(|artifact| (artifact.file_id.clone(), artifact))
-                    .collect(),
+                shallow_files,
+                file_layouts,
+                structured_artifacts,
+                opaque_artifacts,
+                artifact_index,
+                artifact_reverse,
             }),
             changes: RwLock::new(ChangeData {
                 changes: changes.into_iter().collect(),
@@ -1032,6 +1092,7 @@ impl InMemoryGraph {
             file_layouts,
             structured_artifacts,
             opaque_artifacts,
+            artifact_index,
         } = snapshot;
         let _span = tracing::info_span!(
             "kindb.graph.from_locate_snapshot",
@@ -1117,6 +1178,38 @@ impl InMemoryGraph {
             }
         };
 
+        let shallow_files: HashMap<FilePathId, ShallowTrackedFile> = shallow_files
+            .into_iter()
+            .map(|sf| (sf.file_id.clone(), sf))
+            .collect();
+        let file_layouts: HashMap<FilePathId, FileLayout> = file_layouts
+            .into_iter()
+            .map(|layout| (layout.file_id.clone(), layout))
+            .collect();
+        let structured_artifacts: HashMap<FilePathId, StructuredArtifact> = structured_artifacts
+            .into_iter()
+            .map(|artifact| (artifact.file_id.clone(), artifact))
+            .collect();
+        let opaque_artifacts: HashMap<FilePathId, OpaqueArtifact> = opaque_artifacts
+            .into_iter()
+            .map(|artifact| (artifact.file_id.clone(), artifact))
+            .collect();
+        let persisted_artifact_index: HashMap<FilePathId, ArtifactId> =
+            artifact_index.into_iter().collect();
+        let (artifact_index, artifact_reverse) = if persisted_artifact_index.is_empty() {
+            build_artifact_indexes_from_paths(
+                shallow_files
+                    .keys()
+                    .chain(file_layouts.keys())
+                    .chain(structured_artifacts.keys())
+                    .chain(opaque_artifacts.keys())
+                    .cloned(),
+            )
+        } else {
+            let artifact_reverse = reverse_artifact_index(&persisted_artifact_index);
+            (persisted_artifact_index, artifact_reverse)
+        };
+
         let graph = Self {
             entities: RwLock::new(EntityData {
                 entities,
@@ -1134,22 +1227,12 @@ impl InMemoryGraph {
                 node_incoming,
                 indexes,
                 file_hashes: HashMap::new(),
-                shallow_files: shallow_files
-                    .into_iter()
-                    .map(|sf| (sf.file_id.clone(), sf))
-                    .collect(),
-                file_layouts: file_layouts
-                    .into_iter()
-                    .map(|layout| (layout.file_id.clone(), layout))
-                    .collect(),
-                structured_artifacts: structured_artifacts
-                    .into_iter()
-                    .map(|artifact| (artifact.file_id.clone(), artifact))
-                    .collect(),
-                opaque_artifacts: opaque_artifacts
-                    .into_iter()
-                    .map(|artifact| (artifact.file_id.clone(), artifact))
-                    .collect(),
+                shallow_files,
+                file_layouts,
+                structured_artifacts,
+                opaque_artifacts,
+                artifact_index,
+                artifact_reverse,
             }),
             changes: RwLock::new(ChangeData {
                 changes,
@@ -1476,6 +1559,45 @@ impl InMemoryGraph {
         Ok((bytes, graph_root_hash))
     }
 
+    /// O(1) lookup: file path → graph-assigned ArtifactId
+    pub fn artifact_id_for_path(&self, path: &FilePathId) -> Option<ArtifactId> {
+        self.entities.read().artifact_index.get(path).copied()
+    }
+
+    /// O(1) reverse lookup: ArtifactId → file path
+    pub fn path_for_artifact_id(&self, id: &ArtifactId) -> Option<FilePathId> {
+        self.entities.read().artifact_reverse.get(id).cloned()
+    }
+
+    /// Idempotent: returns existing ID if tracked, else assigns new one.
+    /// For migration, uses from_path() deterministic derivation so existing
+    /// graph edges remain valid.
+    #[allow(deprecated)]
+    pub fn ensure_artifact_id(&self, path: &FilePathId) -> ArtifactId {
+        let mut ent = self.entities.write();
+        if let Some(id) = ent.artifact_index.get(path) {
+            *id
+        } else {
+            let new_id = ArtifactId::from_path(&path.0);
+            ent.artifact_index.insert(path.clone(), new_id);
+            ent.artifact_reverse.insert(new_id, path.clone());
+            new_id
+        }
+    }
+
+    /// Move artifact identity across paths (file rename).
+    pub fn rename_artifact(
+        &self,
+        old_path: &FilePathId,
+        new_path: &FilePathId,
+    ) -> Option<ArtifactId> {
+        let mut ent = self.entities.write();
+        let id = ent.artifact_index.remove(old_path)?;
+        ent.artifact_index.insert(new_path.clone(), id);
+        ent.artifact_reverse.insert(id, new_path.clone());
+        Some(id)
+    }
+
     /// Return all entity→entity edges in a single lock acquisition.
     ///
     /// Each entry is `(src_entity_id, relation_kind, dst_entity_id, confidence)`.
@@ -1546,6 +1668,7 @@ impl InMemoryGraph {
             entity_tombstones: std::collections::HashMap::new(),
             relation_tombstones: std::collections::HashMap::new(),
             change_order: std::collections::HashMap::new(),
+            artifact_index: ent.artifact_index.into_iter().collect(),
         }
     }
 
@@ -1569,6 +1692,42 @@ impl InMemoryGraph {
     /// Number of relations in the graph.
     pub fn relation_count(&self) -> usize {
         self.entities.read().relations.len()
+    }
+
+    /// Return incoming and outgoing relations for any graph node.
+    ///
+    /// The `EntityStore` relation APIs intentionally expose entity-only edges.
+    /// Locate and graph-native diagnostics also need artifact/module edges such
+    /// as file includes, so they use this concrete mixed-node accessor.
+    pub fn get_all_relations_for_node(
+        &self,
+        node: &GraphNodeId,
+    ) -> Result<Vec<Relation>, KinDbError> {
+        let ent = self.entities.read();
+        let mut result = Vec::new();
+        let mut seen = hashbrown::HashSet::new();
+
+        if let Some(edge_ids) = ent.node_outgoing.get(node) {
+            for rid in edge_ids {
+                if let Some(rel) = ent.relations.get(rid) {
+                    if seen.insert(rel.id) {
+                        result.push(rel.clone());
+                    }
+                }
+            }
+        }
+
+        if let Some(edge_ids) = ent.node_incoming.get(node) {
+            for rid in edge_ids {
+                if let Some(rel) = ent.relations.get(rid) {
+                    if seen.insert(rel.id) {
+                        result.push(rel.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     /// Number of graph-owned non-entity retrievables.
@@ -1782,54 +1941,54 @@ impl InMemoryGraph {
                 .get(entity_id)
                 .cloned()
                 .map(ResolvedRetrievalItem::Entity),
-            RetrievalKey::EntityRevision(rev_id) => {
-                ent.entity_revisions
-                    .values()
-                    .flat_map(|revisions| revisions.iter())
-                    .find(|rev| rev.revision_id == *rev_id)
-                    .map(|rev| ResolvedRetrievalItem::Entity(rev.entity.clone()))
-            }
-            RetrievalKey::Artifact(artifact_id) => ent
-                .shallow_files
+            RetrievalKey::EntityRevision(rev_id) => ent
+                .entity_revisions
                 .values()
-                .find(|file| ArtifactId::from_file_id(&file.file_id) == *artifact_id)
-                .cloned()
-                .map(ResolvedRetrievalItem::ShallowFile)
-                .or_else(|| {
-                    ent.structured_artifacts
-                        .values()
-                        .find(|artifact| {
-                            ArtifactId::from_file_id(&artifact.file_id) == *artifact_id
-                        })
-                        .cloned()
-                        .map(ResolvedRetrievalItem::StructuredArtifact)
-                })
-                .or_else(|| {
-                    ent.opaque_artifacts
-                        .values()
-                        .find(|artifact| {
-                            ArtifactId::from_file_id(&artifact.file_id) == *artifact_id
-                        })
-                        .cloned()
-                        .map(ResolvedRetrievalItem::OpaqueArtifact)
-                }),
+                .flat_map(|revisions| revisions.iter())
+                .find(|rev| rev.revision_id == *rev_id)
+                .map(|rev| ResolvedRetrievalItem::Entity(rev.entity.clone())),
+            RetrievalKey::Artifact(artifact_id) => {
+                let file_path = ent.artifact_reverse.get(artifact_id)?;
+                ent.shallow_files
+                    .get(file_path)
+                    .cloned()
+                    .map(ResolvedRetrievalItem::ShallowFile)
+                    .or_else(|| {
+                        ent.structured_artifacts
+                            .get(file_path)
+                            .cloned()
+                            .map(ResolvedRetrievalItem::StructuredArtifact)
+                    })
+                    .or_else(|| {
+                        ent.opaque_artifacts
+                            .get(file_path)
+                            .cloned()
+                            .map(ResolvedRetrievalItem::OpaqueArtifact)
+                    })
+            }
             RetrievalKey::ArtifactRevision(rev_id) => {
                 let chg = self.changes.read();
                 for change in chg.changes.values() {
                     for delta in &change.artifact_deltas {
                         if let Some(hash) = delta.new_hash {
-                            let derived_id = ArtifactRevisionId::for_artifact_change(&delta.file_id, &change.id, &hash);
+                            let derived_id = ArtifactRevisionId::for_artifact_change(
+                                &delta.file_id,
+                                &change.id,
+                                &hash,
+                            );
                             if derived_id == *rev_id {
-                                return Some(ResolvedRetrievalItem::ShallowFile(ShallowTrackedFile {
-                                    file_id: delta.file_id.clone(),
-                                    language_hint: String::new(),
-                                    declaration_count: 0,
-                                    import_count: 0,
-                                    syntax_hash: hash,
-                                    signature_hash: None,
-                                    declaration_names: vec![],
-                                    import_paths: vec![],
-                                }));
+                                return Some(ResolvedRetrievalItem::ShallowFile(
+                                    ShallowTrackedFile {
+                                        file_id: delta.file_id.clone(),
+                                        language_hint: String::new(),
+                                        declaration_count: 0,
+                                        import_count: 0,
+                                        syntax_hash: hash,
+                                        signature_hash: None,
+                                        declaration_names: vec![],
+                                        import_paths: vec![],
+                                    },
+                                ));
                             }
                         }
                     }
@@ -2048,9 +2207,6 @@ impl InMemoryGraph {
     /// Reconstructs the vector index for a scoped graph by copying unchanged embeddings from
     /// a source graph (HEAD) and queueing/embedding any modified or new entities/artifacts.
     #[cfg(all(feature = "embeddings", feature = "vector"))]
-
-
-
     #[cfg(feature = "vector")]
     pub fn vector_index_stats(&self) -> Option<(usize, usize)> {
         self.vector_index
@@ -2374,8 +2530,7 @@ impl InMemoryGraph {
                 // the fingerprints match.
                 if let Some(prev_id) = &rev.previous_revision {
                     if let Some(prev_rev) = rev_by_id.get(prev_id) {
-                        if prev_rev.entity.fingerprint.ast_hash
-                            == rev.entity.fingerprint.ast_hash
+                        if prev_rev.entity.fingerprint.ast_hash == rev.entity.fingerprint.ast_hash
                             && prev_rev.entity.fingerprint.signature_hash
                                 == rev.entity.fingerprint.signature_hash
                             && prev_rev.entity.fingerprint.behavior_hash
@@ -2397,8 +2552,7 @@ impl InMemoryGraph {
                 // None but the prior sibling has an identical fingerprint).
                 if let Some(source_id) = last_vectored {
                     if let Some(source_rev) = rev_by_id.get(&source_id) {
-                        if source_rev.entity.fingerprint.ast_hash
-                            == rev.entity.fingerprint.ast_hash
+                        if source_rev.entity.fingerprint.ast_hash == rev.entity.fingerprint.ast_hash
                             && source_rev.entity.fingerprint.signature_hash
                                 == rev.entity.fingerprint.signature_hash
                             && source_rev.entity.fingerprint.behavior_hash
@@ -2420,7 +2574,10 @@ impl InMemoryGraph {
             }
         }
 
-        tracing::info!(propagated = propagated, "propagate_revision_vectors complete");
+        tracing::info!(
+            propagated = propagated,
+            "propagate_revision_vectors complete"
+        );
         propagated
     }
 
@@ -2595,8 +2752,8 @@ impl InMemoryGraph {
     pub fn process_embedding_queue(&self, batch_size: usize) -> Result<usize, KinDbError> {
         let _span =
             tracing::info_span!("kindb.process_embedding_queue", batch_size = batch_size).entered();
-        use crate::embed::format_graph_entity_text_with_context;
         use crate::embed::format_graph_entity_text;
+        use crate::embed::format_graph_entity_text_with_context;
 
         let batch_size = batch_size.max(1);
 
@@ -2643,7 +2800,7 @@ impl InMemoryGraph {
         let mut entity_data: Vec<(RetrievalKey, String)> = Vec::with_capacity(batch_keys.len());
         {
             let ent = self.entities.read();
-            
+
             // Build a lookup map for any EntityRevisionId in the batch
             let mut rev_ids = hashbrown::HashSet::new();
             for key in &batch_keys {
@@ -2651,7 +2808,7 @@ impl InMemoryGraph {
                     rev_ids.insert(*rev_id);
                 }
             }
-            
+
             let mut rev_lookup = hashbrown::HashMap::new();
             if !rev_ids.is_empty() {
                 'outer: for revisions_vec in ent.entity_revisions.values() {
@@ -2679,10 +2836,7 @@ impl InMemoryGraph {
                     }
                     RetrievalKey::EntityRevision(rev_id) => {
                         if let Some(rev) = rev_lookup.get(rev_id) {
-                            entity_data.push((
-                                *key,
-                                format_graph_entity_text(&rev.entity),
-                            ));
+                            entity_data.push((*key, format_graph_entity_text(&rev.entity)));
                         }
                     }
                     _ => {}
@@ -2731,8 +2885,9 @@ impl InMemoryGraph {
                         .iter()
                         .map(|(rest_key, _)| *rest_key)
                         .collect();
-                    
-                    let next_chunk_start = ((chunk_idx + 1) * embed_batch_size).min(entity_data.len());
+
+                    let next_chunk_start =
+                        ((chunk_idx + 1) * embed_batch_size).min(entity_data.len());
                     remaining_keys.extend(
                         entity_data[next_chunk_start..]
                             .iter()
@@ -3069,8 +3224,22 @@ impl InMemoryGraph {
 
     /// Delete a shallow tracked file by file path.
     pub fn delete_shallow_file(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
-        self.entities.write().shallow_files.remove(file_id);
-        let artifact_id = ArtifactId::from_file_id(file_id);
+        let artifact_id = self.artifact_id_for_path(file_id).unwrap_or_else(|| {
+            #[allow(deprecated)]
+            let id = ArtifactId::from_file_id(file_id);
+            id
+        });
+
+        let mut ent = self.entities.write();
+        ent.shallow_files.remove(file_id);
+        if !ent.structured_artifacts.contains_key(file_id)
+            && !ent.opaque_artifacts.contains_key(file_id)
+        {
+            ent.artifact_index.remove(file_id);
+            ent.artifact_reverse.remove(&artifact_id);
+        }
+        drop(ent);
+
         let key = RetrievalKey::Artifact(artifact_id);
         self.remove_retrievable_text_index(&key)?;
         self.remove_retrievable_vector(&key)?;
@@ -3317,46 +3486,40 @@ fn collect_artifact_text_index_docs<'a>(
     ent.shallow_files
         .values()
         .map(|file| {
-            (
-                RetrievalKey::Artifact(ArtifactId::from_file_id(&file.file_id)),
-                shallow_file_fields(file),
-            )
+            #[allow(deprecated)]
+            let id = ent
+                .artifact_index
+                .get(&file.file_id)
+                .copied()
+                .unwrap_or_else(|| ArtifactId::from_file_id(&file.file_id));
+            (RetrievalKey::Artifact(id), shallow_file_fields(file))
         })
         .chain(ent.structured_artifacts.values().map(|artifact| {
+            #[allow(deprecated)]
+            let id = ent
+                .artifact_index
+                .get(&artifact.file_id)
+                .copied()
+                .unwrap_or_else(|| ArtifactId::from_file_id(&artifact.file_id));
             (
-                RetrievalKey::Artifact(ArtifactId::from_file_id(&artifact.file_id)),
+                RetrievalKey::Artifact(id),
                 structured_artifact_fields(artifact),
             )
         }))
         .chain(ent.opaque_artifacts.values().map(|artifact| {
-            (
-                RetrievalKey::Artifact(ArtifactId::from_file_id(&artifact.file_id)),
-                opaque_artifact_fields(artifact),
-            )
+            #[allow(deprecated)]
+            let id = ent
+                .artifact_index
+                .get(&artifact.file_id)
+                .copied()
+                .unwrap_or_else(|| ArtifactId::from_file_id(&artifact.file_id));
+            (RetrievalKey::Artifact(id), opaque_artifact_fields(artifact))
         }))
 }
 
 #[cfg(feature = "vector")]
 fn collect_artifact_ids(ent: &EntityData) -> Vec<ArtifactId> {
-    let mut ids = Vec::with_capacity(
-        ent.shallow_files.len() + ent.structured_artifacts.len() + ent.opaque_artifacts.len(),
-    );
-    ids.extend(
-        ent.shallow_files
-            .values()
-            .map(|file| ArtifactId::from_file_id(&file.file_id)),
-    );
-    ids.extend(
-        ent.structured_artifacts
-            .values()
-            .map(|artifact| ArtifactId::from_file_id(&artifact.file_id)),
-    );
-    ids.extend(
-        ent.opaque_artifacts
-            .values()
-            .map(|artifact| ArtifactId::from_file_id(&artifact.file_id)),
-    );
-    ids
+    ent.artifact_index.values().copied().collect()
 }
 
 #[cfg(all(feature = "embeddings", feature = "vector"))]
@@ -3364,37 +3527,30 @@ fn artifact_embedding_doc(
     ent: &EntityData,
     artifact_id: &ArtifactId,
 ) -> Option<(RetrievalKey, String)> {
-    if let Some(file) = ent
-        .shallow_files
-        .values()
-        .find(|file| ArtifactId::from_file_id(&file.file_id) == *artifact_id)
-    {
+    let file_path = ent.artifact_reverse.get(artifact_id)?;
+
+    if let Some(file) = ent.shallow_files.get(file_path) {
         return Some((
             RetrievalKey::Artifact(*artifact_id),
             crate::embed::format_shallow_text(file),
         ));
     }
 
-    if let Some(artifact) = ent
-        .structured_artifacts
-        .values()
-        .find(|artifact| ArtifactId::from_file_id(&artifact.file_id) == *artifact_id)
-    {
+    if let Some(artifact) = ent.structured_artifacts.get(file_path) {
         return Some((
             RetrievalKey::Artifact(*artifact_id),
             crate::embed::format_artifact_text(artifact),
         ));
     }
 
-    ent.opaque_artifacts
-        .values()
-        .find(|artifact| ArtifactId::from_file_id(&artifact.file_id) == *artifact_id)
-        .map(|artifact| {
-            (
-                RetrievalKey::Artifact(*artifact_id),
-                crate::embed::format_opaque_text(artifact),
-            )
-        })
+    if let Some(artifact) = ent.opaque_artifacts.get(file_path) {
+        return Some((
+            RetrievalKey::Artifact(*artifact_id),
+            crate::embed::format_opaque_text(artifact),
+        ));
+    }
+
+    None
 }
 
 fn collect_text_index_extra_fields(ent: &EntityData, entity_id: &EntityId) -> Vec<(String, f32)> {
@@ -3569,8 +3725,12 @@ fn relation_embedding_label(kind: RelationKind, outgoing: bool) -> &'static str 
         (RelationKind::Calls, false) => "called_by",
         (RelationKind::Imports, true) => "imports",
         (RelationKind::Imports, false) => "imported_by",
+        (RelationKind::Includes, true) => "includes",
+        (RelationKind::Includes, false) => "included_by",
         (RelationKind::References, true) => "references",
         (RelationKind::References, false) => "referenced_by",
+        (RelationKind::UsesMacro, true) => "uses_macro",
+        (RelationKind::UsesMacro, false) => "macro_used_by",
         (RelationKind::Implements, true) => "implements",
         (RelationKind::Implements, false) => "implemented_by",
         (RelationKind::Extends, true) => "extends",
@@ -3947,7 +4107,9 @@ impl EntityStore for InMemoryGraph {
         // Remove vector for deleted entity.
         #[cfg(feature = "vector")]
         {
-            self.embedding_queue.lock().remove(&RetrievalKey::Entity(*id));
+            self.embedding_queue
+                .lock()
+                .remove(&RetrievalKey::Entity(*id));
             if let Some(ref vi) = *self.vector_index.lock() {
                 let _ = vi.remove(id);
             }
@@ -4033,7 +4195,6 @@ impl EntityStore for InMemoryGraph {
         Ok(())
     }
 
-
     fn remove_relation(&self, id: &RelationId) -> Result<(), KinDbError> {
         let mut ent = self.entities.write();
         let mut affected = Vec::new();
@@ -4051,14 +4212,15 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn upsert_shallow_file(&self, shallow: &ShallowTrackedFile) -> Result<(), KinDbError> {
+        let artifact_id = self.ensure_artifact_id(&shallow.file_id);
         self.entities
             .write()
             .shallow_files
             .insert(shallow.file_id.clone(), shallow.clone());
-        let key = RetrievalKey::Artifact(ArtifactId::from_file_id(&shallow.file_id));
+        let key = RetrievalKey::Artifact(artifact_id);
         let fields = shallow_file_fields(shallow);
         self.upsert_retrievable_text_index(key, &fields)?;
-        self.invalidate_artifact_for_embedding(ArtifactId::from_file_id(&shallow.file_id))?;
+        self.invalidate_artifact_for_embedding(artifact_id)?;
         Ok(())
     }
 
@@ -4080,14 +4242,15 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn upsert_structured_artifact(&self, artifact: &StructuredArtifact) -> Result<(), KinDbError> {
+        let artifact_id = self.ensure_artifact_id(&artifact.file_id);
         self.entities
             .write()
             .structured_artifacts
             .insert(artifact.file_id.clone(), artifact.clone());
-        let key = RetrievalKey::Artifact(ArtifactId::from_file_id(&artifact.file_id));
+        let key = RetrievalKey::Artifact(artifact_id);
         let fields = structured_artifact_fields(artifact);
         self.upsert_retrievable_text_index(key, &fields)?;
-        self.invalidate_artifact_for_embedding(ArtifactId::from_file_id(&artifact.file_id))?;
+        self.invalidate_artifact_for_embedding(artifact_id)?;
         Ok(())
     }
 
@@ -4114,8 +4277,21 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn delete_structured_artifact(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
-        self.entities.write().structured_artifacts.remove(file_id);
-        let artifact_id = ArtifactId::from_file_id(file_id);
+        let artifact_id = self.artifact_id_for_path(file_id).unwrap_or_else(|| {
+            #[allow(deprecated)]
+            let id = ArtifactId::from_file_id(file_id);
+            id
+        });
+
+        let mut ent = self.entities.write();
+        ent.structured_artifacts.remove(file_id);
+        // Only remove the index if there are no other artifact types using this path
+        if !ent.shallow_files.contains_key(file_id) && !ent.opaque_artifacts.contains_key(file_id) {
+            ent.artifact_index.remove(file_id);
+            ent.artifact_reverse.remove(&artifact_id);
+        }
+        drop(ent);
+
         let key = RetrievalKey::Artifact(artifact_id);
         self.remove_retrievable_text_index(&key)?;
         self.remove_retrievable_vector(&key)?;
@@ -4127,14 +4303,15 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn upsert_opaque_artifact(&self, artifact: &OpaqueArtifact) -> Result<(), KinDbError> {
+        let artifact_id = self.ensure_artifact_id(&artifact.file_id);
         self.entities
             .write()
             .opaque_artifacts
             .insert(artifact.file_id.clone(), artifact.clone());
-        let key = RetrievalKey::Artifact(ArtifactId::from_file_id(&artifact.file_id));
+        let key = RetrievalKey::Artifact(artifact_id);
         let fields = opaque_artifact_fields(artifact);
         self.upsert_retrievable_text_index(key, &fields)?;
-        self.invalidate_artifact_for_embedding(ArtifactId::from_file_id(&artifact.file_id))?;
+        self.invalidate_artifact_for_embedding(artifact_id)?;
         Ok(())
     }
 
@@ -4156,8 +4333,23 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn delete_opaque_artifact(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
-        self.entities.write().opaque_artifacts.remove(file_id);
-        let artifact_id = ArtifactId::from_file_id(file_id);
+        let artifact_id = self.artifact_id_for_path(file_id).unwrap_or_else(|| {
+            #[allow(deprecated)]
+            let id = ArtifactId::from_file_id(file_id);
+            id
+        });
+
+        let mut ent = self.entities.write();
+        ent.opaque_artifacts.remove(file_id);
+        // Only remove the index if there are no other artifact types using this path
+        if !ent.shallow_files.contains_key(file_id)
+            && !ent.structured_artifacts.contains_key(file_id)
+        {
+            ent.artifact_index.remove(file_id);
+            ent.artifact_reverse.remove(&artifact_id);
+        }
+        drop(ent);
+
         let key = RetrievalKey::Artifact(artifact_id);
         self.remove_retrievable_text_index(&key)?;
         self.remove_retrievable_vector(&key)?;
@@ -4222,11 +4414,26 @@ impl EntityStore for InMemoryGraph {
                             let kind_changed = old.kind != entity.kind;
 
                             if name_changed || file_changed || kind_changed {
-                                ent.indexes.remove(&old.id, &old.name, old.file_origin.as_ref(), old.kind);
-                                ent.indexes.insert(entity.id, &entity.name, entity.file_origin.as_ref(), entity.kind);
+                                ent.indexes.remove(
+                                    &old.id,
+                                    &old.name,
+                                    old.file_origin.as_ref(),
+                                    old.kind,
+                                );
+                                ent.indexes.insert(
+                                    entity.id,
+                                    &entity.name,
+                                    entity.file_origin.as_ref(),
+                                    entity.kind,
+                                );
                             }
                         } else {
-                            ent.indexes.insert(entity.id, &entity.name, entity.file_origin.as_ref(), entity.kind);
+                            ent.indexes.insert(
+                                entity.id,
+                                &entity.name,
+                                entity.file_origin.as_ref(),
+                                entity.kind,
+                            );
                         }
 
                         ent.entities.insert(entity.id, entity.clone());
@@ -4249,7 +4456,9 @@ impl EntityStore for InMemoryGraph {
                             if let Some(outgoing) = ent.outgoing.get(id) {
                                 for rel_id in outgoing {
                                     if let Some(rel) = ent.relations.get(rel_id) {
-                                        if let Some(neighbor) = entity_neighbor_for_relation(rel, id) {
+                                        if let Some(neighbor) =
+                                            entity_neighbor_for_relation(rel, id)
+                                        {
                                             affected.insert(neighbor);
                                         }
                                     }
@@ -4258,7 +4467,9 @@ impl EntityStore for InMemoryGraph {
                             if let Some(incoming) = ent.incoming.get(id) {
                                 for rel_id in incoming {
                                     if let Some(rel) = ent.relations.get(rel_id) {
-                                        if let Some(neighbor) = entity_neighbor_for_relation(rel, id) {
+                                        if let Some(neighbor) =
+                                            entity_neighbor_for_relation(rel, id)
+                                        {
                                             affected.insert(neighbor);
                                         }
                                     }
@@ -5873,6 +6084,7 @@ mod tests {
             origin: RelationOrigin::Parsed,
             created_in: None,
             import_source: None,
+            evidence: Vec::new(),
         }
     }
 
@@ -8681,7 +8893,7 @@ mod tests {
         #[cfg(not(feature = "vector"))]
         assert_eq!(stats.indexed_embedding_count, 0);
         #[cfg(feature = "vector")]
-        assert_eq!(stats.pending_embedding_count, 3);
+        assert_eq!(stats.pending_embedding_count, 6);
         #[cfg(not(feature = "vector"))]
         assert_eq!(stats.pending_embedding_count, 0);
         #[cfg(feature = "vector")]

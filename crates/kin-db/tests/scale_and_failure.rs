@@ -80,6 +80,7 @@ fn generate_snapshot(n: usize, rels_per_entity: usize) -> (GraphSnapshot, Vec<En
                     origin: RelationOrigin::Parsed,
                     created_in: None,
                     import_source: None,
+                    evidence: Vec::new(),
                 },
             );
             outgoing.entry(*src_id).or_default().push(rel_id);
@@ -130,6 +131,7 @@ fn generate_snapshot(n: usize, rels_per_entity: usize) -> (GraphSnapshot, Vec<En
         entity_tombstones: HashMap::new(),
         relation_tombstones: HashMap::new(),
         change_order: HashMap::new(),
+        artifact_index: HashMap::new(),
     };
 
     (snapshot, entity_ids)

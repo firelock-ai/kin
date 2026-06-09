@@ -72,6 +72,7 @@ fn make_relation(src: EntityId, dst: EntityId) -> Relation {
         origin: RelationOrigin::Parsed,
         created_in: None,
         import_source: None,
+        evidence: Vec::new(),
     }
 }
 

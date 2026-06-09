@@ -1200,6 +1200,7 @@ mod tests {
             origin: RelationOrigin::Inferred,
             created_in: Some(change.id),
             import_source: None,
+            evidence: Vec::new(),
         };
 
         graph.upsert_entity(&caller).unwrap();
@@ -1663,6 +1664,7 @@ mod tests {
                 origin: RelationOrigin::Parsed,
                 created_in: None,
                 import_source: None,
+                evidence: Vec::new(),
             })
             .unwrap();
         graph
@@ -1675,6 +1677,7 @@ mod tests {
                 origin: RelationOrigin::Parsed,
                 created_in: None,
                 import_source: None,
+                evidence: Vec::new(),
             })
             .unwrap();
 
@@ -1761,6 +1764,7 @@ mod tests {
                 origin: RelationOrigin::Parsed,
                 created_in: None,
                 import_source: None,
+                evidence: Vec::new(),
             })
             .unwrap();
 
@@ -1937,7 +1941,11 @@ mod tests {
         // Cold reopen: fresh manager, no shared in-memory state.
         let reopened = SnapshotManager::open(&snapshot_path).unwrap();
         let graph = reopened.graph();
-        assert_eq!(graph.entity_count(), 2, "graph snapshot must survive intact");
+        assert_eq!(
+            graph.entity_count(),
+            2,
+            "graph snapshot must survive intact"
+        );
         assert_eq!(
             compute_graph_root_hash(&graph.to_snapshot()),
             root_hash_before,
@@ -2110,6 +2118,7 @@ mod tests {
             origin: RelationOrigin::Parsed,
             created_in: None,
             import_source: None,
+            evidence: Vec::new(),
         };
         graph.upsert_entity(&e1).unwrap();
         graph.upsert_entity(&e2).unwrap();
@@ -2209,6 +2218,7 @@ mod tests {
             origin: RelationOrigin::Parsed,
             created_in: None,
             import_source: None,
+            evidence: Vec::new(),
         };
 
         graph.upsert_entity(&e1).unwrap();
@@ -2245,6 +2255,7 @@ mod tests {
             origin: RelationOrigin::Inferred,
             created_in: None,
             import_source: None,
+            evidence: Vec::new(),
         };
 
         graph.upsert_entity(&e1).unwrap();
@@ -2378,6 +2389,7 @@ mod tests {
                 origin: RelationOrigin::Parsed,
                 created_in: None,
                 import_source: None,
+                evidence: Vec::new(),
             })
             .unwrap();
         graph
@@ -2390,6 +2402,7 @@ mod tests {
                 origin: RelationOrigin::Parsed,
                 created_in: None,
                 import_source: None,
+                evidence: Vec::new(),
             })
             .unwrap();
         graph
@@ -2402,6 +2415,7 @@ mod tests {
                 origin: RelationOrigin::Parsed,
                 created_in: None,
                 import_source: None,
+                evidence: Vec::new(),
             })
             .unwrap();
 
@@ -2513,6 +2527,7 @@ mod tests {
             origin: RelationOrigin::Parsed,
             created_in: None,
             import_source: None,
+            evidence: Vec::new(),
         };
         graph.upsert_relation(&relation).unwrap();
 
@@ -2566,6 +2581,7 @@ mod tests {
                 origin: RelationOrigin::Parsed,
                 created_in: None,
                 import_source: None,
+                evidence: Vec::new(),
             })
             .unwrap();
 

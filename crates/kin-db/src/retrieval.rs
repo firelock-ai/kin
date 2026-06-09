@@ -279,6 +279,7 @@ mod tests {
             origin: RelationOrigin::Parsed,
             created_in: None,
             import_source: None,
+            evidence: Vec::new(),
         };
         graph.upsert_relation(&rel).unwrap();
 
@@ -322,6 +323,7 @@ mod tests {
             origin: RelationOrigin::Parsed,
             created_in: None,
             import_source: None,
+            evidence: Vec::new(),
         };
         graph.upsert_relation(&rel).unwrap();
 

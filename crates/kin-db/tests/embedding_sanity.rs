@@ -33,18 +33,58 @@ fn norm(v: &[f32]) -> f32 {
     v.iter().map(|x| x * x).sum::<f32>().sqrt()
 }
 
+#[cfg(not(feature = "metal"))]
+fn accelerated_embedder_for_embedding_test(test_name: &str) -> Option<CodeEmbedder> {
+    eprintln!(
+        "SKIP: {test_name} requires the kin-db/metal feature; \
+         run `cargo test -p kin-db --features metal --test embedding_sanity` \
+         to exercise the production accelerator path"
+    );
+    None
+}
+
+#[cfg(feature = "metal")]
+fn accelerated_embedder_for_embedding_test(test_name: &str) -> Option<CodeEmbedder> {
+    let embedder = match CodeEmbedder::new() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("SKIP: could not build embedder for {test_name}: {e}");
+            return None;
+        }
+    };
+    if !embedder.uses_local_accelerator() {
+        eprintln!(
+            "SKIP: {test_name} requires an accelerator backend; got {:?}",
+            embedder.local_backend()
+        );
+        return None;
+    }
+    Some(embedder)
+}
+
+#[cfg(not(feature = "metal"))]
+fn metal_feature_enabled_for_embedding_test(test_name: &str) -> bool {
+    eprintln!(
+        "SKIP: {test_name} requires the kin-db/metal feature; \
+         run `cargo test -p kin-db --features metal --test embedding_sanity`"
+    );
+    false
+}
+
+#[cfg(feature = "metal")]
+fn metal_feature_enabled_for_embedding_test(_test_name: &str) -> bool {
+    true
+}
+
 // ---------------------------------------------------------------------------
 // Test 1: query vector out of the embedder must be finite.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn test_query_vector_not_nan() {
-    let embedder = match CodeEmbedder::new() {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("SKIP: could not build embedder: {e}");
-            return;
-        }
+    let Some(embedder) = accelerated_embedder_for_embedding_test("test_query_vector_not_nan")
+    else {
+        return;
     };
 
     let vec = embedder
@@ -179,6 +219,10 @@ fn test_stored_vectors_not_nan() {
 
 #[test]
 fn test_semantic_search_distances_finite() {
+    if !metal_feature_enabled_for_embedding_test("test_semantic_search_distances_finite") {
+        return;
+    }
+
     let kndb = vue_graph_path();
     if !kndb.exists() {
         eprintln!("SKIP: Vue graph not present at {}", kndb.display());
@@ -289,12 +333,9 @@ fn test_cosine_sanity() {
 
 #[test]
 fn test_batched_write_path_not_nan() {
-    let embedder = match CodeEmbedder::new() {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("SKIP: could not build embedder: {e}");
-            return;
-        }
+    let Some(embedder) = accelerated_embedder_for_embedding_test("test_batched_write_path_not_nan")
+    else {
+        return;
     };
 
     let long_body = "x ".repeat(4096);
@@ -385,12 +426,10 @@ fn test_batched_write_path_not_nan() {
 
 #[test]
 fn test_batched_many_long_texts_not_nan() {
-    let embedder = match CodeEmbedder::new() {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("SKIP: could not build embedder: {e}");
-            return;
-        }
+    let Some(embedder) =
+        accelerated_embedder_for_embedding_test("test_batched_many_long_texts_not_nan")
+    else {
+        return;
     };
 
     // Mimic entity-shaped inputs at Vue-like lengths (several hundred to a

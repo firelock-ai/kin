@@ -147,6 +147,8 @@ pub struct GraphSnapshot {
     /// (0 = oldest/genesis, N = newest/head).
     #[serde(default)]
     pub change_order: HashMap<SemanticChangeId, u64>,
+    #[serde(default)]
+    pub artifact_index: HashMap<FilePathId, ArtifactId>,
 }
 
 /// Lightweight snapshot view for locate-only cold starts.
@@ -170,12 +172,16 @@ pub(crate) struct LocateGraphSnapshot {
     pub file_layouts: Vec<FileLayout>,
     pub structured_artifacts: Vec<StructuredArtifact>,
     pub opaque_artifacts: Vec<OpaqueArtifact>,
+    #[serde(default)]
+    pub artifact_index: FastHashMap<FilePathId, ArtifactId>,
 }
 
 fn relation_kind_used_by_locate(kind: RelationKind) -> bool {
     matches!(
         kind,
         RelationKind::Calls
+            | RelationKind::Includes
+            | RelationKind::UsesMacro
             | RelationKind::Imports
             | RelationKind::References
             | RelationKind::Implements
@@ -249,6 +255,7 @@ impl<'de> Deserialize<'de> for FilteredLocateRelation {
                     origin,
                     created_in,
                     import_source,
+                    evidence: Vec::new(),
                 })))
             }
         }
@@ -293,7 +300,7 @@ impl<'de> Deserialize<'de> for FilteredLocateRelationMap {
 
 impl GraphSnapshot {
     /// Current format version.
-    pub const CURRENT_VERSION: u32 = 7;
+    pub const CURRENT_VERSION: u32 = 8;
 
     /// Magic bytes for the file header: "KNDB"
     pub const MAGIC: [u8; 4] = *b"KNDB";
@@ -351,6 +358,7 @@ impl GraphSnapshot {
             entity_tombstones: HashMap::new(),
             relation_tombstones: HashMap::new(),
             change_order: HashMap::new(),
+            artifact_index: HashMap::new(),
         }
     }
 
@@ -609,7 +617,11 @@ impl GraphSnapshot {
                 let migrated = super::migration::migrate(frame.body, 6, Self::CURRENT_VERSION)?;
                 Self::decode_current_snapshot(&migrated)?
             }
-            7 => Self::decode_current_snapshot(frame.body)?,
+            7 => {
+                let migrated = super::migration::migrate(frame.body, 7, Self::CURRENT_VERSION)?;
+                Self::decode_current_snapshot(&migrated)?
+            }
+            8 => Self::decode_current_snapshot(frame.body)?,
             _ => unreachable!("decode_frame validates supported versions"),
         };
 
@@ -724,6 +736,20 @@ impl GraphSnapshot {
                 let checksum_end = Self::require_checksum_slot(data, body_len, "v7")?;
                 let body_checksum = if verify_checksum {
                     Some(Self::verify_checksum(data, body_len, "v7")?)
+                } else {
+                    None
+                };
+                Ok(SnapshotFrame {
+                    version,
+                    body,
+                    body_checksum,
+                    checksum_end,
+                })
+            }
+            8 => {
+                let checksum_end = Self::require_checksum_slot(data, body_len, "v8")?;
+                let body_checksum = if verify_checksum {
+                    Some(Self::verify_checksum(data, body_len, "v8")?)
                 } else {
                     None
                 };
@@ -921,7 +947,12 @@ impl LocateGraphSnapshot {
                     super::migration::migrate(frame.body, 6, GraphSnapshot::CURRENT_VERSION)?;
                 GraphSnapshot::decode_current_snapshot(&migrated)?.into()
             }
-            7 => Self::decode_current_snapshot(frame.body)?,
+            7 => {
+                let migrated =
+                    super::migration::migrate(frame.body, 7, GraphSnapshot::CURRENT_VERSION)?;
+                GraphSnapshot::decode_current_snapshot(&migrated)?.into()
+            }
+            8 => Self::decode_current_snapshot(frame.body)?,
             1 => {
                 let legacy: GraphSnapshotV1 = rmp_serde::from_slice(frame.body).map_err(|e| {
                     crate::error::KinDbError::StorageError(format!("deserialization failed: {e}"))
@@ -980,6 +1011,7 @@ impl From<GraphSnapshot> for LocateGraphSnapshot {
             file_layouts: value.file_layouts,
             structured_artifacts: value.structured_artifacts,
             opaque_artifacts: value.opaque_artifacts,
+            artifact_index: value.artifact_index.into_iter().collect(),
         }
     }
 }
@@ -995,6 +1027,7 @@ impl From<LocateGraphSnapshot> for GraphSnapshot {
         snapshot.file_layouts = value.file_layouts;
         snapshot.structured_artifacts = value.structured_artifacts;
         snapshot.opaque_artifacts = value.opaque_artifacts;
+        snapshot.artifact_index = value.artifact_index.into_iter().collect();
         snapshot
     }
 }
@@ -1058,6 +1091,10 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(33, &self))?;
 
+                // Depending on the snapshot version, artifact_index might be missing or exist.
+                // We map it loosely here.
+                let artifact_index = seq.next_element()?.unwrap_or_default();
+
                 while let Some(_) = seq.next_element::<IgnoredAny>()? {}
 
                 Ok(LocateGraphSnapshot {
@@ -1069,6 +1106,7 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                     file_layouts,
                     structured_artifacts,
                     opaque_artifacts,
+                    artifact_index,
                 })
             }
         }
@@ -1367,6 +1405,7 @@ impl From<LegacyEntityRelation> for Relation {
             origin: value.origin,
             created_in: value.created_in,
             import_source: value.import_source,
+            evidence: Vec::new(),
         }
     }
 }
@@ -1634,6 +1673,7 @@ mod tests {
             origin: RelationOrigin::Parsed,
             created_in: None,
             import_source: None,
+            evidence: Vec::new(),
         }
     }
 
