@@ -4381,6 +4381,7 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn upsert_file_layout(&self, layout: &FileLayout) -> Result<(), KinDbError> {
+        self.ensure_artifact_id(&layout.file_id);
         self.entities
             .write()
             .file_layouts
@@ -4413,7 +4414,21 @@ impl EntityStore for InMemoryGraph {
     }
 
     fn delete_file_layout(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
-        self.entities.write().file_layouts.remove(file_id);
+        let artifact_id = self.artifact_id_for_path(file_id).unwrap_or_else(|| {
+            #[allow(deprecated)]
+            let id = ArtifactId::from_file_id(file_id);
+            id
+        });
+
+        let mut ent = self.entities.write();
+        ent.file_layouts.remove(file_id);
+        if !ent.shallow_files.contains_key(file_id)
+            && !ent.structured_artifacts.contains_key(file_id)
+            && !ent.opaque_artifacts.contains_key(file_id)
+        {
+            ent.artifact_index.remove(file_id);
+            ent.artifact_reverse.remove(&artifact_id);
+        }
         Ok(())
     }
 
@@ -8295,9 +8310,17 @@ mod tests {
         let fetched = graph.get_file_layout(&file_id).unwrap().unwrap();
         assert_eq!(fetched.parse_completeness, layout.parse_completeness);
         assert_eq!(graph.list_file_layouts().unwrap().len(), 1);
+        assert!(
+            graph.artifact_id_for_path(&file_id).is_some(),
+            "source file layouts must register graph artifact IDs for artifact relations"
+        );
 
         graph.delete_file_layout(&file_id).unwrap();
         assert!(graph.get_file_layout(&file_id).unwrap().is_none());
+        assert!(
+            graph.artifact_id_for_path(&file_id).is_none(),
+            "deleting the last file-surface owner should remove the artifact index entry"
+        );
     }
 
     #[test]

@@ -391,10 +391,21 @@ impl GraphSnapshot {
 
         // 1. Remove orphaned relations (missing node on either endpoint)
         let before = self.relations.len();
+        #[allow(deprecated)]
         let artifact_ids: HashSet<ArtifactId> = self
-            .shallow_files
-            .iter()
-            .map(|file| ArtifactId::from_file_id(&file.file_id))
+            .artifact_index
+            .values()
+            .copied()
+            .chain(
+                self.shallow_files
+                    .iter()
+                    .map(|file| ArtifactId::from_file_id(&file.file_id)),
+            )
+            .chain(
+                self.file_layouts
+                    .iter()
+                    .map(|layout| ArtifactId::from_file_id(&layout.file_id)),
+            )
             .chain(
                 self.structured_artifacts
                     .iter()
@@ -1790,6 +1801,47 @@ mod tests {
         assert_eq!(snap.relations.len(), 1);
         assert_eq!(snap.outgoing.len(), 1);
         assert_eq!(snap.incoming.len(), 1);
+    }
+
+    #[test]
+    fn compact_preserves_artifact_relations_with_persisted_artifact_ids() {
+        let mut snap = GraphSnapshot::empty();
+        let generated_path = FilePathId::new("single_include/nlohmann/json.hpp");
+        let source_path = FilePathId::new("include/nlohmann/detail/exceptions.hpp");
+        let generated_id = ArtifactId::new();
+        let source_id = ArtifactId::new();
+
+        for file_id in [&generated_path, &source_path] {
+            snap.file_layouts.push(FileLayout {
+                file_id: file_id.clone(),
+                imports: ImportSection {
+                    byte_range: 0..0,
+                    items: Vec::new(),
+                },
+                regions: Vec::new(),
+                parse_completeness: ParseCompleteness::Full,
+            });
+        }
+        snap.artifact_index
+            .insert(generated_path.clone(), generated_id);
+        snap.artifact_index.insert(source_path.clone(), source_id);
+
+        let relation = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::DerivedFrom,
+            src: GraphNodeId::Artifact(generated_id),
+            dst: GraphNodeId::Artifact(source_id),
+            confidence: 0.9,
+            origin: RelationOrigin::Inferred,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        snap.relations.insert(relation.id, relation);
+
+        let stats = snap.compact();
+        assert_eq!(stats.orphaned_relations_removed, 0);
+        assert_eq!(snap.relations.len(), 1);
     }
 
     #[test]
