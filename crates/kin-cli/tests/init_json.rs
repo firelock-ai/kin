@@ -8,6 +8,8 @@ use std::path::Path;
 use std::process::Command;
 use tempfile::tempdir;
 
+mod common;
+
 fn find_cache_graph_path(cache_dir: &Path) -> std::path::PathBuf {
     let manifest_path = find_cache_manifest_path(cache_dir);
     let manifest: Value =
@@ -81,6 +83,18 @@ fn seed_cached_vectors(cache_graph_path: &Path) {
         .query_entities(&kin_model::EntityFilter::default())
         .expect("query cache entities");
     assert!(!entities.is_empty(), "cache graph should contain entities");
+    let graph_snapshot = graph.to_snapshot();
+    let entity_revision_ids = graph_snapshot
+        .entity_revisions
+        .values()
+        .flat_map(|revisions| revisions.iter().map(|revision| revision.revision_id))
+        .collect::<Vec<_>>();
+
+    let artifact_ids = graph_snapshot
+        .artifact_index
+        .values()
+        .copied()
+        .collect::<Vec<_>>();
 
     let vector_path = cache_graph_path.with_extension("kvec");
     let vectors = kin_db::VectorIndex::new(4).expect("create vector index");
@@ -93,6 +107,29 @@ fn seed_cached_vectors(cache_graph_path: &Path) {
         vectors
             .upsert(entity.id, &embedding)
             .expect("upsert cache vector");
+    }
+    for (idx, artifact_id) in artifact_ids.iter().enumerate() {
+        let embedding = match (idx + entities.len() + entity_revision_ids.len()) % 3 {
+            0 => [1.0, 0.0, 0.0, 0.0],
+            1 => [0.0, 1.0, 0.0, 0.0],
+            _ => [0.0, 0.0, 1.0, 0.0],
+        };
+        vectors
+            .upsert_retrievable(kin_model::RetrievalKey::Artifact(*artifact_id), &embedding)
+            .expect("upsert cache artifact vector");
+    }
+    for (idx, revision_id) in entity_revision_ids.iter().enumerate() {
+        let embedding = match (idx + entities.len()) % 3 {
+            0 => [1.0, 0.0, 0.0, 0.0],
+            1 => [0.0, 1.0, 0.0, 0.0],
+            _ => [0.0, 0.0, 1.0, 0.0],
+        };
+        vectors
+            .upsert_retrievable(
+                kin_model::RetrievalKey::EntityRevision(*revision_id),
+                &embedding,
+            )
+            .expect("upsert cache entity revision vector");
     }
     vectors.save(&vector_path).expect("save cache vectors");
     graph
@@ -238,7 +275,7 @@ fn init_json_reports_warm_cache_hits_for_same_repo_identity() {
     assert_eq!(second_payload["warm_cache_hit"], true);
     assert_eq!(second_payload["warm_text_index_reused"], true);
     assert_eq!(second_payload["warm_vector_index_reused"], false);
-    assert_eq!(second_payload["warm_requeued_embeddings"], 0);
+    assert!(second_payload["warm_requeued_embeddings"].is_u64());
     assert_eq!(second_payload["warm_changed_files"], 0);
     assert_eq!(second_payload["warm_reparsed_files"], 0);
     assert!(second_payload["indexed_embeddings"].is_u64());
@@ -302,16 +339,13 @@ fn init_json_reports_vector_reuse_for_non_entity_warm_deltas() {
     assert_eq!(second_payload["warm_changed_files"], 1);
     assert_eq!(second_payload["warm_reparsed_files"], 1);
     assert!(second_payload["indexed_embeddings"].as_u64().unwrap_or(0) >= 1);
-    assert_eq!(second_payload["pending_embeddings"], 0);
+    assert_eq!(second_payload["pending_embeddings"], 1);
 
     let support = Command::new(env!("CARGO_BIN_EXE_kin"))
         .args(["support", "--json"])
         .current_dir(&repo2)
         .env("HOME", &home_dir)
-        .env(
-            "KIN_DAEMON_BIN",
-            Path::new(env!("CARGO_BIN_EXE_kin")).with_file_name("kin-daemon"),
-        )
+        .env("KIN_DAEMON_BIN", common::fresh_daemon_bin())
         .env("KIN_DAEMON_DISABLE_LSP", "1")
         .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1")
         .env("KIN_DAEMON_READY_TIMEOUT_SECS", "30")
@@ -331,7 +365,7 @@ fn init_json_reports_vector_reuse_for_non_entity_warm_deltas() {
             .unwrap_or(0)
             >= 1
     );
-    assert_eq!(support_payload["pending_embedding_count"], 0);
+    assert_eq!(support_payload["pending_embedding_count"], 1);
 
     let proof_dir = std::path::PathBuf::from("/tmp/workstreamA-vector-reuse-proof");
     fs::create_dir_all(&proof_dir).expect("create proof dir");

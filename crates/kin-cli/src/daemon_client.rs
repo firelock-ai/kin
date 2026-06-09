@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -44,6 +44,11 @@ struct SupervisorHealthResponse {
 #[derive(Debug, Deserialize)]
 struct SupervisorRouteResponse {
     endpoint: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DaemonCompatResponse {
+    graph_snapshot_version: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -1074,7 +1079,7 @@ fn find_free_port() -> Option<u16> {
 }
 
 fn daemon_binary_supports_supervisor(path: &Path) -> bool {
-    let output = match std::process::Command::new(path).arg("--help").output() {
+    let output = match Command::new(path).arg("--help").output() {
         Ok(output) => output,
         Err(error) => {
             warn!(
@@ -1091,17 +1096,76 @@ fn daemon_binary_supports_supervisor(path: &Path) -> bool {
     help.contains("--supervisor")
 }
 
+fn compact_probe_output(output: &std::process::Output) -> String {
+    let mut rendered = String::new();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stdout.trim().is_empty() {
+        rendered.push_str("stdout=");
+        rendered.push_str(stdout.trim());
+    }
+    if !stderr.trim().is_empty() {
+        if !rendered.is_empty() {
+            rendered.push(' ');
+        }
+        rendered.push_str("stderr=");
+        rendered.push_str(stderr.trim());
+    }
+    if rendered.is_empty() {
+        rendered.push_str("<empty output>");
+    }
+    const MAX_LEN: usize = 400;
+    if rendered.len() > MAX_LEN {
+        rendered.truncate(MAX_LEN);
+        rendered.push_str("...");
+    }
+    rendered
+}
+
+fn daemon_binary_matches_cli_graph(path: &Path) -> Result<(), String> {
+    let output = Command::new(path)
+        .arg("--compat-json")
+        .output()
+        .map_err(|error| format!("compat probe failed to execute: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "compat probe exited with {} ({})",
+            output.status,
+            compact_probe_output(&output)
+        ));
+    }
+    let compat: DaemonCompatResponse = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("compat probe returned invalid JSON: {error}"))?;
+    let expected = kin_db::GraphSnapshot::CURRENT_VERSION;
+    if compat.graph_snapshot_version != expected {
+        return Err(format!(
+            "graph snapshot version {} does not match CLI expected version {expected}",
+            compat.graph_snapshot_version
+        ));
+    }
+    Ok(())
+}
+
+fn validate_daemon_binary(path: &Path) -> Result<(), String> {
+    if !daemon_binary_supports_supervisor(path) {
+        return Err("missing --supervisor support".to_string());
+    }
+    daemon_binary_matches_cli_graph(path)
+}
+
 fn find_daemon_binary() -> Result<PathBuf> {
     let mut rejected = Vec::new();
     let mut consider = |path: PathBuf| -> Option<PathBuf> {
         if !path.exists() {
             return None;
         }
-        if daemon_binary_supports_supervisor(&path) {
-            return Some(path);
+        match validate_daemon_binary(&path) {
+            Ok(()) => Some(path),
+            Err(reason) => {
+                rejected.push((path, reason));
+                None
+            }
         }
-        rejected.push(path);
-        None
     };
 
     if let Ok(explicit) = std::env::var("KIN_DAEMON_BIN") {
@@ -1139,10 +1203,12 @@ fn find_daemon_binary() -> Result<PathBuf> {
     }
     let checked = rejected
         .into_iter()
-        .map(|path| path.display().to_string())
+        .map(|(path, reason)| format!("{} ({reason})", path.display()))
         .collect::<Vec<_>>()
         .join(", ");
-    bail!("kin-daemon binary is stale or incompatible; rebuild kin-daemon. Checked: {checked}")
+    bail!(
+        "kin-daemon binary is stale or incompatible with this kin CLI; rebuild kin-daemon. Checked: {checked}"
+    )
 }
 
 /// Readiness wait for a freshly spawned per-repo daemon. Large repositories take

@@ -667,6 +667,32 @@ mod tests {
     }
 
     #[test]
+    fn extracts_lowercase_preprocessor_macro_definitions_without_use_noise() {
+        let adapter = CAdapter;
+        let source = b"#define private public\nstruct Secret { int value; };\n";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("secret.c");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let macro_entity = output
+            .entities
+            .iter()
+            .find(|entity| entity.kind == EntityKind::Macro && entity.name == "private")
+            .expect("lowercase preprocessor definitions should remain graph-visible macros");
+        assert!(
+            macro_entity.signature.contains("#define private public"),
+            "macro signature should preserve the source directive, got {:?}",
+            macro_entity.signature
+        );
+        assert!(
+            output.relations.iter().all(|relation| relation.kind
+                != kin_model::RelationKind::UsesMacro
+                || relation.dst_name != "private"),
+            "lowercase identifiers should not be promoted to macro-use edges"
+        );
+    }
+
+    #[test]
     fn extract_call_relations() {
         let adapter = CAdapter;
         let source = b"void greet() { printf(\"hello\"); helper(); }";
