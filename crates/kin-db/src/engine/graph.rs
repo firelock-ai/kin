@@ -3519,7 +3519,27 @@ fn collect_artifact_text_index_docs<'a>(
 
 #[cfg(feature = "vector")]
 fn collect_artifact_ids(ent: &EntityData) -> Vec<ArtifactId> {
-    ent.artifact_index.values().copied().collect()
+    let mut ids = Vec::with_capacity(
+        ent.shallow_files.len() + ent.structured_artifacts.len() + ent.opaque_artifacts.len(),
+    );
+
+    for file_id in ent.shallow_files.keys() {
+        if let Some(id) = ent.artifact_index.get(file_id) {
+            ids.push(*id);
+        }
+    }
+    for file_id in ent.structured_artifacts.keys() {
+        if let Some(id) = ent.artifact_index.get(file_id) {
+            ids.push(*id);
+        }
+    }
+    for file_id in ent.opaque_artifacts.keys() {
+        if let Some(id) = ent.artifact_index.get(file_id) {
+            ids.push(*id);
+        }
+    }
+
+    ids
 }
 
 #[cfg(all(feature = "embeddings", feature = "vector"))]
@@ -8783,6 +8803,31 @@ mod tests {
         assert_eq!(
             status.pending, 1,
             "pending must include unindexed artifacts even after queue state is lost"
+        );
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn embedding_status_ignores_source_artifact_identities_without_embedding_docs() {
+        let graph = InMemoryGraph::new();
+        let e1 = test_entity("foo", "src/lib.rs");
+        graph.upsert_entity(&e1).unwrap();
+
+        // Source files can have graph-native artifact identities for relations
+        // and projection, but only shallow/structured/opaque artifact records
+        // have document text that the artifact embedder can vectorize.
+        graph.ensure_artifact_id(&FilePathId::new("src/lib.rs"));
+
+        let status = graph.embedding_status();
+        assert_eq!(status.total, 1);
+        assert_eq!(status.indexed, 0);
+        assert_eq!(status.pending, 1);
+
+        graph.artifact_embedding_queue.lock().clear();
+        graph.queue_missing_artifacts_for_embedding();
+        assert!(
+            graph.artifact_embedding_queue.lock().is_empty(),
+            "source-only artifact identities must not become unprocessable pending vectors"
         );
     }
 
