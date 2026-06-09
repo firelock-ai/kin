@@ -764,7 +764,7 @@ fn parse_and_index(
     let _span =
         tracing::info_span!("kin.init.parse_and_index", files = indexable_files.len()).entered();
     let pi_timer = std::time::Instant::now();
-    let (total_entity_count, _total_files, file_parse_data, discovered_tests) =
+    let (total_entity_count, _total_files, file_parse_data, discovered_tests, projection_relations) =
         index_files(graph, blob_store, indexable_files)?;
     eprintln!(
         "  [init-timer] {:>30}: {:.2}s",
@@ -772,7 +772,8 @@ fn parse_and_index(
         pi_timer.elapsed().as_secs_f64()
     );
     // Cross-file relation linking (progress printed by the linker itself)
-    let linked_relations = kin_index::link_cross_file(&file_parse_data);
+    let mut linked_relations = kin_index::link_cross_file(&file_parse_data);
+    linked_relations.extend(projection_relations);
     eprintln!(
         "  [init-timer] {:>30}: {:.2}s",
         "link_cross_file",
@@ -821,22 +822,26 @@ enum ParsedFileResult {
         discovered_tests: Vec<DiscoveredTest>,
         relations: Vec<kin_parser::ExtractedRelation>,
         imports: Vec<kin_parser::FileImport>,
+        projection_markers: Vec<String>,
         layout: FileLayout,
     },
     ShallowSyntax {
         rel_path: String,
         hash: [u8; 32],
         shallow: ShallowTrackedFile,
+        projection_markers: Vec<String>,
     },
     StructuredArtifact {
         rel_path: String,
         hash: [u8; 32],
         artifact: StructuredArtifact,
+        projection_markers: Vec<String>,
     },
     OpaqueArtifact {
         rel_path: String,
         hash: [u8; 32],
         artifact: OpaqueArtifact,
+        projection_markers: Vec<String>,
     },
     Skipped,
 }
@@ -1342,6 +1347,7 @@ fn index_files(
     usize,
     Vec<kin_index::FileParseData>,
     Vec<DiscoveredTest>,
+    Vec<Relation>,
 )> {
     let _span = tracing::info_span!("kin.init.index_files", files = files.len()).entered();
 
@@ -1362,6 +1368,8 @@ fn index_files(
             let _ = blob_store.write(&source);
 
             let file_id = FilePathId::new(&file.rel_path);
+            let projection_markers =
+                kin_index::extract_projection_source_markers(&file.rel_path, &source);
 
             let done = parsed_count.fetch_add(1, Ordering::Relaxed) + 1;
             if done % 100 == 0 || done == total {
@@ -1433,6 +1441,7 @@ fn index_files(
                         discovered_tests,
                         relations: extracted_relations,
                         imports: file_imports,
+                        projection_markers,
                         layout,
                     }
                 }
@@ -1457,6 +1466,7 @@ fn index_files(
                                     shallow.imports.iter().map(|import| import.raw_path.clone()),
                                 ),
                             },
+                            projection_markers,
                         }
                     } else {
                         ParsedFileResult::Skipped
@@ -1475,6 +1485,7 @@ fn index_files(
                         rel_path: file.rel_path.clone(),
                         hash: file.hash,
                         artifact,
+                        projection_markers,
                     }
                 }
                 FileClassification::OpaqueArtifact { mime_hint } => {
@@ -1488,6 +1499,7 @@ fn index_files(
                             mime_type: mime_hint.clone(),
                             text_preview,
                         },
+                        projection_markers,
                     }
                 }
             }
@@ -1503,6 +1515,7 @@ fn index_files(
     let mut file_parse_data = Vec::new();
     let mut discovered_tests = Vec::new();
     let mut all_entities: Vec<Entity> = Vec::new();
+    let mut projection_marker_files: Vec<(String, Vec<String>)> = Vec::new();
 
     for result in &parse_results {
         match result {
@@ -1513,10 +1526,14 @@ fn index_files(
                 discovered_tests: file_tests,
                 relations,
                 imports,
+                projection_markers,
                 layout,
             } => {
                 graph.set_file_hash(rel_path, *hash);
                 total_files += 1;
+                if !projection_markers.is_empty() {
+                    projection_marker_files.push((rel_path.clone(), projection_markers.clone()));
+                }
 
                 for entity in entities {
                     all_entities.push(entity.clone());
@@ -1537,27 +1554,39 @@ fn index_files(
                 rel_path,
                 hash,
                 shallow,
+                projection_markers,
             } => {
                 graph.set_file_hash(rel_path, *hash);
                 total_files += 1;
+                if !projection_markers.is_empty() {
+                    projection_marker_files.push((rel_path.clone(), projection_markers.clone()));
+                }
                 graph.upsert_shallow_file(shallow)?;
             }
             ParsedFileResult::StructuredArtifact {
                 rel_path,
                 hash,
                 artifact,
+                projection_markers,
             } => {
                 graph.set_file_hash(rel_path, *hash);
                 total_files += 1;
+                if !projection_markers.is_empty() {
+                    projection_marker_files.push((rel_path.clone(), projection_markers.clone()));
+                }
                 graph.upsert_structured_artifact(artifact)?;
             }
             ParsedFileResult::OpaqueArtifact {
                 rel_path,
                 hash,
                 artifact,
+                projection_markers,
             } => {
                 graph.set_file_hash(rel_path, *hash);
                 total_files += 1;
+                if !projection_markers.is_empty() {
+                    projection_marker_files.push((rel_path.clone(), projection_markers.clone()));
+                }
                 graph.upsert_opaque_artifact(artifact)?;
             }
             ParsedFileResult::Skipped => {}
@@ -1566,6 +1595,8 @@ fn index_files(
 
     // Batch upsert all entities at once — single lock acquisition, deferred text index.
     graph.upsert_entities_batch(&all_entities)?;
+    let projection_relations =
+        build_projection_relations_from_markers(graph, &projection_marker_files);
 
     info!(
         entities = total_entity_count,
@@ -1580,7 +1611,30 @@ fn index_files(
         total_files,
         file_parse_data,
         discovered_tests,
+        projection_relations,
     ))
+}
+
+fn build_projection_relations_from_markers(
+    graph: &kin_db::InMemoryGraph,
+    projection_marker_files: &[(String, Vec<String>)],
+) -> Vec<Relation> {
+    if projection_marker_files.is_empty() {
+        return Vec::new();
+    }
+
+    let known_files: HashSet<String> = graph.indexed_file_paths().into_iter().collect();
+    projection_marker_files
+        .iter()
+        .flat_map(|(file_path, markers)| {
+            kin_index::build_projection_derived_relations_from_markers(
+                file_path,
+                markers,
+                &known_files,
+                |path| graph.artifact_id_for_path(&FilePathId::new(path)),
+            )
+        })
+        .collect()
 }
 
 fn promote_discovered_tests(
@@ -1985,7 +2039,8 @@ fn apply_warm_cache_delta(
         selected_files.len()
     );
 
-    let (_, _, file_parse_data, _) = index_files(graph, blob_store, &selected_files)?;
+    let (_, _, file_parse_data, _, projection_relations) =
+        index_files(graph, blob_store, &selected_files)?;
     dphase!("index_files (reparse)");
 
     let queued_embeddings = file_parse_data
@@ -1999,7 +2054,9 @@ fn apply_warm_cache_delta(
         universe_entities.len()
     );
 
-    let linked_relations = link_cross_file_against_entities(&file_parse_data, &universe_entities);
+    let mut linked_relations =
+        link_cross_file_against_entities(&file_parse_data, &universe_entities);
+    linked_relations.extend(projection_relations);
     dphase!(
         "link_cross_file_against_entities",
         "relations={}",

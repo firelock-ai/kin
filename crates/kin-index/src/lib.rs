@@ -24,8 +24,10 @@ pub use classifier::{FileClassification, FileClassifier};
 pub use error::{IndexError, Result};
 pub use fingerprint::compute_entity_fingerprint;
 pub use linker::{
-    link_cross_file, link_cross_file_against_entities, link_cross_file_incremental,
-    CrossFileLinker, FileParseData, IncrementalLinker, LinkingOutcome, UnresolvedRelation,
+    build_projection_derived_relations_for_file, build_projection_derived_relations_from_markers,
+    extract_projection_source_markers, link_cross_file, link_cross_file_against_entities,
+    link_cross_file_incremental, CrossFileLinker, FileParseData, IncrementalLinker, LinkingOutcome,
+    UnresolvedRelation,
 };
 pub use overlay::{apply_file_removal, apply_to_graph, ApplyResult};
 pub use pipeline::{

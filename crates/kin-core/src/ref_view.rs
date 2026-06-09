@@ -9,13 +9,14 @@ use std::process::Command;
 use kin_blobs::BlobStore;
 use kin_db::{GraphSnapshot, InMemoryGraph};
 use kin_index::{
-    extract_artifact, link_cross_file_against_entities, FileClassification, FileClassifier,
-    FileParseData, IndexPipeline,
+    build_projection_derived_relations_for_file, extract_artifact,
+    link_cross_file_against_entities, FileClassification, FileClassifier, FileParseData,
+    IndexPipeline,
 };
 use kin_model::{
-    ArtifactDeltaKind, ChangeStore, EntityId, EntityKind, FileLayout, FilePathId, GraphStore,
-    Hash256, ImportSection, OpaqueArtifact, ParseCompleteness, RelationKind, SemanticChange,
-    SemanticChangeId, ShallowTrackedFile, SourceRegion, StructuredArtifact,
+    ArtifactDeltaKind, ArtifactId, ChangeStore, EntityId, EntityKind, FileLayout, FilePathId,
+    GraphStore, Hash256, ImportSection, OpaqueArtifact, ParseCompleteness, RelationKind,
+    SemanticChange, SemanticChangeId, ShallowTrackedFile, SourceRegion, StructuredArtifact,
 };
 use kin_parser::extract::{EMBEDDING_BODY_PREVIEW_KEY, FILE_SURFACE_CONTEXT_KEY};
 
@@ -981,6 +982,8 @@ fn rebuild_entity_source_file_layouts(
     let mut parsed_relations = Vec::new();
     let mut parsed_files = Vec::new();
     let mut parsed_layouts = Vec::new();
+    let mut projection_relations = Vec::new();
+    let known_files: HashSet<String> = file_tree.keys().map(|file_id| file_id.0.clone()).collect();
 
     for (file_id, hash) in file_tree {
         if build_start.elapsed().as_secs_f64() > build_timeout_secs {
@@ -1014,6 +1017,12 @@ fn rebuild_entity_source_file_layouts(
         snapshot
             .opaque_artifacts
             .push(build_historical_source_artifact(file_id, *hash, &content));
+        projection_relations.extend(build_projection_derived_relations_for_file(
+            &file_id.0,
+            &content,
+            &known_files,
+            |path| snapshot_artifact_id_for_path(snapshot, path),
+        ));
 
         let file_entities = snapshot
             .entities
@@ -1121,12 +1130,26 @@ fn rebuild_entity_source_file_layouts(
             &parsed_files,
             &universe_entities,
         ));
-        for relation in parsed_relations {
-            snapshot.relations.insert(relation.id, relation);
-        }
+    }
+
+    parsed_relations.extend(projection_relations);
+    for relation in parsed_relations {
+        snapshot.relations.insert(relation.id, relation);
     }
 
     Ok(())
+}
+
+#[allow(deprecated)]
+fn snapshot_artifact_id_for_path(snapshot: &GraphSnapshot, path: &str) -> Option<ArtifactId> {
+    let file_id = FilePathId::new(path);
+    Some(
+        snapshot
+            .artifact_index
+            .get(&file_id)
+            .copied()
+            .unwrap_or_else(|| ArtifactId::from_file_id(&file_id)),
+    )
 }
 
 fn should_probe_sparse_historical_source(

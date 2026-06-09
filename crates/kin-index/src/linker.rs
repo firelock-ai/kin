@@ -586,6 +586,170 @@ where
     })
 }
 
+/// Build artifact-level provenance edges for generated projection files.
+///
+/// Amalgamated headers and generated bundles often retain their source-file
+/// boundaries as commented include markers, e.g.
+/// `// #include <nlohmann/detail/exceptions.hpp>`. These are not runtime/textual
+/// includes, so they should not be modeled as [`RelationKind::Includes`].
+/// Instead, they are projection provenance: generated artifact derives from
+/// source artifact.
+pub fn build_projection_derived_relations_for_file<S, F>(
+    file_path: &str,
+    source: &[u8],
+    known_files: &HashSet<S>,
+    artifact_id_for_path: F,
+) -> Vec<Relation>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+    F: FnMut(&str) -> Option<ArtifactId>,
+{
+    let markers = extract_projection_source_markers(file_path, source);
+    build_projection_derived_relations_from_markers(
+        file_path,
+        &markers,
+        known_files,
+        artifact_id_for_path,
+    )
+}
+
+pub fn build_projection_derived_relations_from_markers<S, F>(
+    file_path: &str,
+    markers: &[String],
+    known_files: &HashSet<S>,
+    mut artifact_id_for_path: F,
+) -> Vec<Relation>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+    F: FnMut(&str) -> Option<ArtifactId>,
+{
+    if markers.is_empty() {
+        return Vec::new();
+    }
+
+    let Some(src_artifact_id) = artifact_id_for_path(file_path) else {
+        return Vec::new();
+    };
+    let src = GraphNodeId::Artifact(src_artifact_id);
+
+    let mut by_resolved_path: HashMap<String, (String, u32)> = HashMap::new();
+    for marker in markers {
+        let Some(resolved_path) = resolve_module_path(file_path, marker, known_files) else {
+            continue;
+        };
+        if resolved_path == file_path {
+            continue;
+        }
+        by_resolved_path
+            .entry(resolved_path)
+            .and_modify(|(_, count)| *count = count.saturating_add(1))
+            .or_insert((marker.clone(), 1));
+    }
+
+    let mut resolved: Vec<(String, String, u32)> = by_resolved_path
+        .into_iter()
+        .map(|(resolved_path, (source_path, count))| (resolved_path, source_path, count))
+        .collect();
+    resolved.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut relations = Vec::new();
+    for (resolved_path, source_path, occurrence_count) in resolved {
+        let Some(dst_artifact_id) = artifact_id_for_path(&resolved_path) else {
+            continue;
+        };
+        let dst = GraphNodeId::Artifact(dst_artifact_id);
+        let evidence = RelationEvidence {
+            parser_rule: Some("projection_include_marker".to_string()),
+            token: Some("#include".to_string()),
+            source_path: Some(source_path),
+            resolved_path: Some(resolved_path),
+            occurrence_count,
+            ..RelationEvidence::default()
+        };
+        relations.push(Relation {
+            id: stable_relation_node_id(&src, &dst, &RelationKind::DerivedFrom),
+            kind: RelationKind::DerivedFrom,
+            src,
+            dst,
+            confidence: 0.9,
+            origin: RelationOrigin::Inferred,
+            created_in: None,
+            import_source: None,
+            evidence: vec![evidence],
+        });
+    }
+
+    relations
+}
+
+pub fn extract_projection_source_markers(file_path: &str, source: &[u8]) -> Vec<String> {
+    let Ok(text) = std::str::from_utf8(source) else {
+        return Vec::new();
+    };
+
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    for line in text.lines() {
+        let Some(path) = commented_include_marker_path(line) else {
+            continue;
+        };
+        if seen.insert(path.clone()) {
+            paths.push(path);
+        }
+    }
+
+    if paths.is_empty() {
+        return Vec::new();
+    }
+
+    if is_projection_artifact_path(file_path) || paths.len() >= 4 {
+        paths
+    } else {
+        Vec::new()
+    }
+}
+
+fn commented_include_marker_path(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let comment_body = if let Some(rest) = trimmed.strip_prefix("//") {
+        rest.trim_start()
+    } else if let Some(rest) = trimmed.strip_prefix("/*") {
+        rest.trim_start_matches('*').trim_start()
+    } else {
+        return None;
+    };
+
+    let rest = comment_body.strip_prefix("#include")?.trim_start();
+    let path = if let Some(rest) = rest.strip_prefix('<') {
+        rest.split_once('>')?.0
+    } else if let Some(rest) = rest.strip_prefix('"') {
+        rest.split_once('"')?.0
+    } else {
+        return None;
+    };
+
+    let path = path.trim();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
+    }
+}
+
+fn is_projection_artifact_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.starts_with("single_include/")
+        || lower.contains("/single_include/")
+        || lower.contains("_amalgamation")
+        || lower.contains("/amalgamated/")
+        || lower.starts_with("generated/")
+        || lower.contains("/generated/")
+        || lower.starts_with("__generated__/")
+        || lower.contains("/__generated__/")
+        || lower.ends_with(".generated.ts")
+        || lower.ends_with(".generated.rs")
+}
+
 /// Derive a deterministic RelationId from the (src, dst, kind) triple.
 fn stable_relation_id(src: &EntityId, dst: &EntityId, kind: &RelationKind) -> RelationId {
     stable_relation_node_id(&GraphNodeId::Entity(*src), &GraphNodeId::Entity(*dst), kind)
@@ -1537,6 +1701,90 @@ mod tests {
         assert!(
             result.iter().all(|rel| rel.kind != RelationKind::UsesMacro),
             "macro uses must not resolve through the generic global fallback"
+        );
+    }
+
+    #[test]
+    fn projection_markers_emit_derived_from_artifact_edges() {
+        let known_files = HashSet::from([
+            "single_include/nlohmann/json.hpp".to_string(),
+            "include/nlohmann/detail/exceptions.hpp".to_string(),
+            "include/nlohmann/detail/iterators/internal_iterator.hpp".to_string(),
+        ]);
+        let source = br#"
+// #include <nlohmann/detail/exceptions.hpp>
+// #include <nlohmann/detail/iterators/internal_iterator.hpp>
+// #include <vector>
+"#;
+
+        let relations = build_projection_derived_relations_for_file(
+            "single_include/nlohmann/json.hpp",
+            source,
+            &known_files,
+            |path| {
+                if known_files.contains(path) {
+                    Some(ArtifactId::from_path(path))
+                } else {
+                    None
+                }
+            },
+        );
+
+        assert_eq!(relations.len(), 2);
+        assert!(relations.iter().all(|rel| {
+            rel.kind == RelationKind::DerivedFrom
+                && rel.src
+                    == GraphNodeId::Artifact(ArtifactId::from_path(
+                        "single_include/nlohmann/json.hpp",
+                    ))
+        }));
+        let exception_edge = relations
+            .iter()
+            .find(|rel| {
+                rel.dst
+                    == GraphNodeId::Artifact(ArtifactId::from_path(
+                        "include/nlohmann/detail/exceptions.hpp",
+                    ))
+            })
+            .expect("expected exceptions provenance edge");
+        assert_eq!(exception_edge.origin, RelationOrigin::Inferred);
+        assert_eq!(exception_edge.confidence, 0.9);
+        assert_eq!(
+            exception_edge.evidence[0].parser_rule.as_deref(),
+            Some("projection_include_marker")
+        );
+        assert_eq!(
+            exception_edge.evidence[0].source_path.as_deref(),
+            Some("nlohmann/detail/exceptions.hpp")
+        );
+        assert_eq!(
+            exception_edge.evidence[0].resolved_path.as_deref(),
+            Some("include/nlohmann/detail/exceptions.hpp")
+        );
+    }
+
+    #[test]
+    fn projection_markers_require_projection_context_or_density() {
+        let sparse_source = br#"
+// #include <nlohmann/detail/exceptions.hpp>
+void f();
+"#;
+        assert!(
+            extract_projection_source_markers("include/nlohmann/json.hpp", sparse_source)
+                .is_empty(),
+            "ordinary source comments should not become projection provenance"
+        );
+
+        let dense_source = br#"
+// #include <a.hpp>
+// #include <b.hpp>
+// #include <c.hpp>
+// #include <d.hpp>
+"#;
+        assert_eq!(
+            extract_projection_source_markers("include/nlohmann/json.hpp", dense_source).len(),
+            4,
+            "dense source boundary markers are projection evidence even without a generated path"
         );
     }
 
