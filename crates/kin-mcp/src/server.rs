@@ -615,6 +615,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_tools_call_semantic_locate_requires_daemon_offline() {
+        // End-to-end dispatch check: semantic_locate must reach
+        // handle_semantic_locate and report the daemon requirement rather than
+        // silently degrading to a metadata filter when no daemon graph is
+        // present.
+        let mut config = McpServerConfig::default();
+        config.session_authority_mode = SessionAuthorityMode::OfflineFallback;
+        let sessions = SessionRegistry::new();
+        let store = InMemoryGraph::default();
+
+        let msg = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"semantic_locate","arguments":{"query":"where is auth handled"}}}"#;
+        let resp = process_message(msg, &store, &config, &sessions)
+            .await
+            .unwrap();
+        assert!(resp.error.is_none());
+        let result: ToolCallResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(result.is_error, Some(true));
+        let text = match result.content.first().unwrap() {
+            ContentBlock::Text { text } => text,
+        };
+        assert!(
+            text.contains("requires the Kin daemon"),
+            "expected daemon-required message, got: {text}"
+        );
+    }
+
+    #[tokio::test]
     async fn daemon_required_tools_do_not_use_local_handlers() {
         std::env::remove_var("KIN_DAEMON_URL");
         let config = McpServerConfig::default();
