@@ -230,6 +230,23 @@ fn supervisor_idle_timeout_from_env() -> Result<Option<Duration>, String> {
     Ok(Some(Duration::from_secs(seconds)))
 }
 
+fn embed_batch_size_from_env() -> Result<Option<usize>, String> {
+    let Some(raw) = env::var("KIN_DAEMON_EMBED_BATCH_SIZE").ok() else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let size = trimmed
+        .parse::<usize>()
+        .map_err(|_| format!("invalid KIN_DAEMON_EMBED_BATCH_SIZE: {trimmed}"))?;
+    if size == 0 {
+        return Err("invalid KIN_DAEMON_EMBED_BATCH_SIZE: must be > 0".to_string());
+    }
+    Ok(Some(size))
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -301,6 +318,14 @@ async fn main() {
         }
     };
 
+    let embed_batch_size = match embed_batch_size_from_env() {
+        Ok(size) => size.unwrap_or_else(|| DaemonConfig::default().embed_batch_size),
+        Err(error) => {
+            eprintln!("kin-daemon: {error}");
+            process::exit(1);
+        }
+    };
+
     let config = DaemonConfig {
         api_port: args.port,
         lsp_enabled: !env_flag("KIN_DAEMON_DISABLE_LSP"),
@@ -311,6 +336,7 @@ async fn main() {
                 process::exit(1);
             }
         },
+        embed_batch_size,
         ..DaemonConfig::default()
     };
 

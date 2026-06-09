@@ -3,8 +3,8 @@
 
 use anyhow::{Context, Result};
 use kin_model::{
-    ArtifactId, ChangeStore, EntityFilter, EntityKind, EntityRole, EntityStore, GraphNodeId,
-    RelationKind, SemanticChangeId,
+    ChangeStore, EntityFilter, EntityKind, EntityRole, EntityStore, GraphNodeId, RelationKind,
+    SemanticChangeId,
 };
 use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
@@ -743,7 +743,7 @@ pub fn run_with_graph_capture(
     max_files: usize,
     max_files_explicit: bool,
 ) -> Result<LocateResult> {
-    let workspace_root = std::env::current_dir().ok();
+    let workspace_root = locate_workspace_root();
     run_with_graph_capture_in_workspace(
         graph,
         workspace_root.as_deref(),
@@ -752,6 +752,13 @@ pub fn run_with_graph_capture(
         max_files,
         max_files_explicit,
     )
+}
+
+fn locate_workspace_root() -> Option<std::path::PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    kin_core::KinLayout::discover(&cwd)
+        .map(|layout| kin_core::source_dir(&layout))
+        .or(Some(cwd))
 }
 
 pub fn run_with_graph_capture_in_workspace(
@@ -874,6 +881,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // Phase 1b: File-based signals — these bypass entity resolution
     let traceback = extract_traceback_signals(text, graph)?;
     let tests = extract_test_signals(text, graph)?;
+    let private_access_tests = extract_cpp_private_access_test_seed_signals(text, graph)?;
     let snippets = extract_snippet_signals(text, graph)?;
     let imports = extract_import_signals(text, graph)?;
     let errors = extract_error_signals(text, graph)?;
@@ -1043,6 +1051,19 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         }
         source_text
     };
+    let priority_hits: HashMap<String, Vec<FileHit>> = priority_files
+        .iter()
+        .filter(|(path, _)| !is_vendored_path(path))
+        .map(|(path, score)| {
+            (
+                path.clone(),
+                vec![FileHit {
+                    score: *score,
+                    spans: vec![],
+                }],
+            )
+        })
+        .collect();
 
     // Phase 2b: Multihop expansion from resolved files (graph follow-up)
     let multihop = if fast_entity_dominant || budget.phase_should_skip("multihop") {
@@ -1053,7 +1074,9 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             &resolved_hits,
             &traceback,
             &tests,
+            &private_access_tests,
             &source_text,
+            &priority_hits,
             &imports,
             &errors,
         ];
@@ -1079,7 +1102,9 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             &resolved_hits,
             &traceback,
             &tests,
+            &private_access_tests,
             &source_text,
+            &priority_hits,
             &imports,
             &errors,
         ];
@@ -1471,8 +1496,11 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         );
     }
 
-    let retained_priority_paths =
+    let mut retained_priority_paths =
         retained_priority_paths(&priority_traces, text_lower.contains("test"));
+    let priority_relation_paths =
+        priority_relation_retention_paths(graph, &retained_priority_paths)?;
+    retained_priority_paths.extend(priority_relation_paths);
     let injectable_priority_paths = injectable_priority_paths(&priority_traces);
     boost_priority_in_fused(
         &mut fused,
@@ -1546,8 +1574,10 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         &traceback,
         &multihop,
         &tests,
+        &private_access_tests,
         &snippets,
         &source_text,
+        &priority_hits,
         &imports,
         &errors,
         &cochange,
@@ -1844,16 +1874,13 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             });
             v
         };
-        record_full_debug_stage(
-            &mut debug_info,
-            &rank_signal(&all_hits[9]),
-            "raw_embedding_signal",
-        );
-        record_full_debug_stage(
-            &mut debug_info,
-            &rank_signal(&all_hits[8]),
-            "raw_lexical_signal",
-        );
+        for (idx, name) in signal_names.iter().enumerate() {
+            record_full_debug_stage(
+                &mut debug_info,
+                &rank_signal(&all_hits[idx]),
+                &format!("raw_{name}_signal"),
+            );
+        }
     }
 
     demote_cochange_only_outliers(&mut fused, &all_hits);
@@ -2136,56 +2163,60 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     }
 
     // ── Optional Cross-Encoder reranking ──
-    if locate_env_bool("KIN_LOCATE_CROSS_ENCODER_ENABLED", true) {
+    if locate_env_bool("KIN_LOCATE_CROSS_ENCODER_ENABLED", false) {
         let ltr_window = locate_env_usize("KIN_LOCATE_LTR_WINDOW", 20).min(fused.len());
         if ltr_window > 0 {
-            let model_id = std::env::var("KIN_LOCATE_CROSS_ENCODER_MODEL")
-                .unwrap_or_else(|_| "BAAI/bge-reranker-base".to_string());
-            let revision = std::env::var("KIN_LOCATE_CROSS_ENCODER_REVISION")
-                .unwrap_or_else(|_| "main".to_string());
+            if let Some(workspace_root) = workspace_root {
+                let model_id = std::env::var("KIN_LOCATE_CROSS_ENCODER_MODEL")
+                    .unwrap_or_else(|_| "BAAI/bge-reranker-base".to_string());
+                let revision = std::env::var("KIN_LOCATE_CROSS_ENCODER_REVISION")
+                    .unwrap_or_else(|_| "main".to_string());
 
-            match kin_db::embed::rerank::CrossEncoder::new(&model_id, &revision) {
-                Ok(encoder) => {
-                    let mut docs = Vec::new();
-                    let mut candidates = Vec::new();
+                match kin_db::embed::rerank::CrossEncoder::new(&model_id, &revision) {
+                    Ok(encoder) => {
+                        let mut docs = Vec::new();
+                        let mut candidates = Vec::new();
 
-                    for (path, score) in fused.iter().take(ltr_window) {
-                        let file_path = workspace_root
-                            .map(|w| w.join(path))
-                            .unwrap_or_else(|| std::path::PathBuf::from(path));
-                        let content = std::fs::read_to_string(&file_path).unwrap_or_default();
-                        docs.push(content);
-                        candidates.push((path.clone(), *score));
+                        for (path, score) in fused.iter().take(ltr_window) {
+                            let file_path = workspace_root.join(path);
+                            let content = std::fs::read_to_string(&file_path).unwrap_or_default();
+                            docs.push(content);
+                            candidates.push((path.clone(), *score));
+                        }
+
+                        let doc_refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
+                        if let Ok(scores) = encoder.rerank(text, &doc_refs) {
+                            for (i, score) in scores.into_iter().enumerate() {
+                                candidates[i].1 = score;
+                            }
+                            candidates.sort_by(|a, b| {
+                                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+
+                            let mut new_fused: Vec<(String, f32)> = candidates;
+                            for (path, score) in fused.iter().skip(ltr_window) {
+                                new_fused.push((path.clone(), *score));
+                            }
+                            fused = new_fused;
+
+                            if explain {
+                                record_debug_stage(
+                                    &mut score_breakdown,
+                                    &mut debug_info,
+                                    &fused,
+                                    "after_cross_encoder",
+                                );
+                            }
+                        }
                     }
-
-                    let doc_refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
-                    if let Ok(scores) = encoder.rerank(text, &doc_refs) {
-                        for (i, score) in scores.into_iter().enumerate() {
-                            candidates[i].1 = score;
-                        }
-                        candidates.sort_by(|a, b| {
-                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                        });
-
-                        let mut new_fused: Vec<(String, f32)> = candidates;
-                        for (path, score) in fused.iter().skip(ltr_window) {
-                            new_fused.push((path.clone(), *score));
-                        }
-                        fused = new_fused;
-
-                        if explain {
-                            record_debug_stage(
-                                &mut score_breakdown,
-                                &mut debug_info,
-                                &fused,
-                                "after_cross_encoder",
-                            );
-                        }
+                    Err(e) => {
+                        tracing::warn!("CrossEncoder init failed: {}", e);
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("⚠ CrossEncoder init failed: {}", e);
-                }
+            } else {
+                tracing::warn!(
+                    "skipping cross-encoder rerank because no live workspace root is available"
+                );
             }
         }
     }
@@ -2361,14 +2392,31 @@ pub fn run_with_graph_capture_at_ref(
 ) -> Result<LocateResult> {
     let changes = kin_core::collect_changes_at_ref(graph, head)
         .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-    let historical = kin_core::build_graph_at_ref(graph, blob_store, head)
-        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    let historical = if let Some(git_oid) = reference.strip_prefix("git:") {
+        kin_core::build_graph_at_git_ref_with_repo(
+            graph,
+            blob_store,
+            head,
+            layout.working_dir(),
+            git_oid,
+            None,
+        )
+    } else {
+        kin_core::build_graph_at_ref_with_repo(
+            graph,
+            blob_store,
+            head,
+            Some(layout.working_dir()),
+            None,
+        )
+    }
+    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
     let _ = crate::commands::cochange::refresh_from_changes(&historical, &changes);
     let extra_priority_files =
         discover_historical_test_artifact_priority_files(layout, reference, text);
     run_with_graph_capture_with_priority_files_and_vector_source(
         &historical,
-        Some(layout.working_dir()),
+        None,
         text,
         explain,
         max_files,
@@ -2629,6 +2677,7 @@ fn query_priority_retention_paths(
         .into_iter()
         .filter(|(path, trace)| {
             let retainable_path = tracked_file_support_is_signal_bearing(path)
+                && !is_amalgamated_or_generated_path(path)
                 || is_build_surface_path(path)
                 || (allow_test_paths && is_test_path(path));
             retainable_path
@@ -2652,6 +2701,76 @@ fn retained_priority_paths(
         allow_test_paths,
     ));
     retained
+}
+
+fn priority_relation_retention_paths(
+    graph: &kin_db::InMemoryGraph,
+    retained_priority_paths: &HashSet<String>,
+) -> Result<HashSet<String>> {
+    if retained_priority_paths.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let max_per_seed = locate_env_usize("KIN_LOCATE_PRIORITY_RELATION_RETAIN_PER_SEED", 2);
+    if max_per_seed == 0 {
+        return Ok(HashSet::new());
+    }
+    let min_specificity =
+        locate_env_f32("KIN_LOCATE_PRIORITY_RELATION_RETAIN_MIN_SPECIFICITY", 1.1);
+
+    let mut retained = HashSet::new();
+    let mut seed_paths: Vec<&String> = retained_priority_paths.iter().collect();
+    seed_paths.sort();
+    for seed_path in seed_paths {
+        if is_amalgamated_or_generated_path(seed_path) || is_vendored_path(seed_path) {
+            continue;
+        }
+        let Some(seed_artifact_id) =
+            graph.artifact_id_for_path(&kin_model::FilePathId::new(seed_path.as_str()))
+        else {
+            continue;
+        };
+        let seed_node = GraphNodeId::Artifact(seed_artifact_id);
+        let mut candidates: Vec<(String, f32)> = Vec::new();
+        for rel in graph.get_all_relations_for_node(&seed_node)? {
+            if rel.src != seed_node
+                || !matches!(rel.kind, RelationKind::Includes | RelationKind::Imports)
+            {
+                continue;
+            }
+            let Some(path) = relation_projected_artifact_path(&rel, &seed_node) else {
+                continue;
+            };
+            if path == *seed_path || !strong_embedding_release_allowed(&path) {
+                continue;
+            }
+            let specificity = artifact_relation_path_specificity_multiplier(seed_path, &path, 2);
+            if specificity < min_specificity {
+                continue;
+            }
+            let origin_mult = if rel.origin == kin_model::RelationOrigin::Lsp {
+                1.25
+            } else {
+                1.0
+            };
+            candidates.push((path, specificity * origin_mult * rel.confidence.max(0.1)));
+        }
+        candidates.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        retained.extend(
+            candidates
+                .into_iter()
+                .take(max_per_seed)
+                .map(|(path, _)| path),
+        );
+    }
+
+    Ok(retained)
 }
 
 fn direct_query_priority_paths(
@@ -2971,6 +3090,15 @@ fn extract_priority_file_traces(
     let tracked_non_entity_paths: HashSet<String> = tracked_non_entity
         .iter()
         .map(|tracked| tracked.path.clone())
+        .collect();
+    let tracked_non_entity_descriptors: HashMap<String, String> = tracked_non_entity
+        .iter()
+        .map(|tracked| {
+            (
+                tracked.path.clone(),
+                tracked.descriptor.to_ascii_lowercase(),
+            )
+        })
         .collect();
     let text_lower = text.to_ascii_lowercase();
     let test_query = is_test_query(text);
@@ -3372,6 +3500,7 @@ fn extract_priority_file_traces(
         if term_lower.len() < 4 || is_common_english_word(&term_lower) {
             continue;
         }
+        let symbolic_term = is_symbolic_search_term(&term_lower);
 
         let text_hits = match graph.text_search(&term_lower, tracked_text_hit_limit) {
             Ok(hits) => hits,
@@ -3383,6 +3512,13 @@ fn extract_priority_file_traces(
                 continue;
             };
             if !tracked_non_entity_paths.contains(&path) {
+                continue;
+            }
+            if symbolic_term
+                && !tracked_non_entity_descriptors
+                    .get(&path)
+                    .is_some_and(|descriptor| descriptor.contains(&term_lower))
+            {
                 continue;
             }
             if is_license_or_notice_path(&path) {
@@ -4936,10 +5072,16 @@ fn tracked_text_query_terms(text: &str) -> Vec<String> {
     let mut terms = Vec::new();
     let mut seen = HashSet::new();
     let suppressed_terms = suppressed_query_terms(text);
+    let suppress_cpp_modifiers = query_mentions_cpp_access_macro_context(text)
+        && extract_search_terms(text)
+            .iter()
+            .any(|term| is_unresolved_symbolic_code_anchor(term));
 
     for term in extract_search_terms(text) {
         let canonical = term.to_ascii_lowercase();
-        if suppressed_terms.contains(&canonical) {
+        if suppressed_terms.contains(&canonical)
+            || (suppress_cpp_modifiers && is_generic_code_modifier_term(&canonical))
+        {
             continue;
         }
         if seen.insert(canonical) {
@@ -4949,7 +5091,9 @@ fn tracked_text_query_terms(text: &str) -> Vec<String> {
 
     for term in extract_title_terms(text) {
         let canonical = term.to_ascii_lowercase();
-        if suppressed_terms.contains(&canonical) {
+        if suppressed_terms.contains(&canonical)
+            || (suppress_cpp_modifiers && is_generic_code_modifier_term(&canonical))
+        {
             continue;
         }
         if seen.insert(canonical) {
@@ -4970,6 +5114,7 @@ fn tracked_text_query_terms(text: &str) -> Vec<String> {
     for term in extract_loose_query_terms(text) {
         let canonical = term.to_ascii_lowercase();
         if suppressed_terms.contains(&canonical)
+            || (suppress_cpp_modifiers && is_generic_code_modifier_term(&canonical))
             || is_noise_term(&canonical)
             || is_issue_boilerplate_term(&canonical)
         {
@@ -5008,6 +5153,36 @@ fn is_symbolic_search_term(term: &str) -> bool {
         || term.contains('-')
         || term.contains('.')
         || term.chars().filter(|ch| ch.is_ascii_uppercase()).count() >= 2
+}
+
+fn is_generic_code_modifier_term(term_lower: &str) -> bool {
+    matches!(
+        term_lower,
+        "private"
+            | "public"
+            | "protected"
+            | "define"
+            | "defined"
+            | "undef"
+            | "ifdef"
+            | "ifndef"
+            | "endif"
+            | "pragma"
+            | "include"
+    )
+}
+
+fn is_unresolved_symbolic_code_anchor(term: &str) -> bool {
+    term.contains('_') && term.chars().filter(|ch| ch.is_ascii_uppercase()).count() >= 2
+}
+
+fn query_mentions_cpp_access_macro_context(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    (lower.contains("#define") && lower.contains("private") && lower.contains("public"))
+        || (lower.contains("macro")
+            && lower.contains("private")
+            && lower.contains("public")
+            && (lower.contains("defined") || lower.contains("tests")))
 }
 
 fn is_cli_flag_term(term: &str) -> bool {
@@ -5154,12 +5329,43 @@ fn curate_search_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<
     }
 
     let term_limit = locate_env_usize("KIN_LOCATE_CURATED_TERM_LIMIT", 6);
+    let mut graph_support_cache: HashMap<(String, bool), bool> = HashMap::new();
+    let mut has_supported_symbolic_anchor = false;
+    let mut has_symbolic_code_anchor = false;
+    let cpp_access_macro_context = query_mentions_cpp_access_macro_context(text);
+    for (term, from_title) in &candidates {
+        let term_lower = term.to_ascii_lowercase();
+        if !is_symbolic_search_term(term) || is_generic_code_modifier_term(&term_lower) {
+            continue;
+        }
+        if is_unresolved_symbolic_code_anchor(term) {
+            has_symbolic_code_anchor = true;
+        }
+        let cache_key = (term_lower, *from_title);
+        let has_support = match graph_support_cache.get(&cache_key) {
+            Some(has_support) => *has_support,
+            None => {
+                let has_support = term_has_graph_support(graph, term, *from_title)?;
+                graph_support_cache.insert(cache_key, has_support);
+                has_support
+            }
+        };
+        if has_support {
+            has_supported_symbolic_anchor = true;
+            break;
+        }
+    }
 
     let mut compound_terms: Vec<(String, f32, bool)> = Vec::new();
     let mut scored_terms: Vec<(String, f32, bool)> = Vec::new();
     let mut common_terms: Vec<(String, f32, bool)> = Vec::new();
     for (term, from_title) in candidates {
         let term_lower = term.to_ascii_lowercase();
+        if (has_supported_symbolic_anchor || (cpp_access_macro_context && has_symbolic_code_anchor))
+            && is_generic_code_modifier_term(&term_lower)
+        {
+            continue;
+        }
         // Compound identifiers (snake_case, CamelCase, dotted) are almost always
         // real code identifiers, not English prose.
         let upper_count = term.chars().filter(|c| c.is_uppercase()).count();
@@ -5172,11 +5378,29 @@ fn curate_search_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<
         // search on docstrings but aren't real code identifiers.
         let needs_name_match = from_title && !compound && !semantic_anchor;
 
-        if needs_name_match {
-            if !term_has_name_support(graph, &term)? {
+        let cache_key = (term_lower.clone(), from_title);
+        let has_support = if needs_name_match {
+            term_has_name_support(graph, &term)?
+        } else if let Some(has_support) = graph_support_cache.get(&cache_key) {
+            *has_support
+        } else {
+            let has_support = term_has_graph_support(graph, &term, from_title)?;
+            graph_support_cache.insert(cache_key, has_support);
+            has_support
+        };
+        if !has_support {
+            if !has_supported_symbolic_anchor
+                && !has_symbolic_code_anchor
+                && cpp_access_macro_context
+                && is_generic_code_modifier_term(&term_lower)
+            {
+                scored_terms.push((term, 0.45, from_title));
                 continue;
             }
-        } else if !term_has_graph_support(graph, &term, from_title)? {
+            if is_unresolved_symbolic_code_anchor(&term) {
+                let title_boost = if from_title { 3.0 } else { 1.0 };
+                compound_terms.push((term, 0.25 * title_boost, from_title));
+            }
             continue;
         }
 
@@ -5264,6 +5488,12 @@ fn curate_search_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<
         let mut fallback = extract_search_terms(text);
         if fallback.is_empty() {
             fallback = extract_title_terms(text);
+        }
+        if has_supported_symbolic_anchor || (cpp_access_macro_context && has_symbolic_code_anchor) {
+            fallback.retain(|term| {
+                !is_generic_code_modifier_term(&term.to_ascii_lowercase())
+                    || is_symbolic_search_term(term)
+            });
         }
         fallback.truncate(locate_env_usize("KIN_LOCATE_FALLBACK_TERM_LIMIT", 6));
         return Ok(fallback);
@@ -5895,10 +6125,126 @@ fn extract_multihop_signals(
     // Adaptive seed limit: large repos (>10K entities) benefit from fewer
     // seeds to limit hub expansion; small repos use the full budget.
     let default_seed_limit = if graph.entity_count() > 10_000 { 5 } else { 8 };
-    seed_files.truncate(locate_env_usize(
-        "KIN_LOCATE_MULTIHOP_SEED_FILES",
-        default_seed_limit,
-    ));
+    let seed_limit = locate_env_usize("KIN_LOCATE_MULTIHOP_SEED_FILES", default_seed_limit);
+    let mut retained_seed_files = seed_files
+        .iter()
+        .take(seed_limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    if test_query {
+        let test_seed_limit = locate_env_usize("KIN_LOCATE_MULTIHOP_TEST_SEED_FILES", 16);
+        for (path, score) in seed_files.iter().filter(|(path, _)| is_test_path(path)) {
+            if retained_seed_files.iter().any(|(seen, _)| seen == path) {
+                continue;
+            }
+            retained_seed_files.push((path.clone(), *score));
+            if retained_seed_files
+                .iter()
+                .filter(|(candidate, _)| is_test_path(candidate))
+                .count()
+                >= test_seed_limit
+            {
+                break;
+            }
+        }
+    }
+    seed_files = retained_seed_files;
+
+    let default_artifact_hops = if test_query { 2 } else { 1 };
+    let artifact_hops =
+        locate_env_usize("KIN_LOCATE_MULTIHOP_ARTIFACT_HOPS", default_artifact_hops);
+    let artifact_frontier_limit =
+        locate_env_usize("KIN_LOCATE_MULTIHOP_ARTIFACT_FRONTIER_LIMIT", 32);
+    let artifact_hop_decay = locate_env_f32("KIN_LOCATE_MULTIHOP_ARTIFACT_HOP_DECAY", 0.65);
+    if artifact_hops > 0 {
+        for (seed_path, seed_score) in &seed_files {
+            if (!test_query && is_test_path(seed_path)) || is_vendored_path(seed_path) {
+                continue;
+            }
+            let Some(start_artifact_id) =
+                graph.artifact_id_for_path(&kin_model::FilePathId::new(seed_path.as_str()))
+            else {
+                continue;
+            };
+            let start = GraphNodeId::Artifact(start_artifact_id);
+            let mut visited = HashSet::from([start.clone()]);
+            let mut queue = VecDeque::from([(start, seed_path.clone(), 0usize)]);
+            let seed_strength = (*seed_score / 72.0).clamp(0.35, 2.0);
+
+            while let Some((artifact_node, _via_path, depth)) = queue.pop_front() {
+                if depth >= artifact_hops {
+                    continue;
+                }
+                let mut rels = graph.get_all_relations_for_node(&artifact_node)?;
+                rels.sort_by(|left, right| {
+                    let left_kind = resolve_relation_kind_priority(left.kind);
+                    let right_kind = resolve_relation_kind_priority(right.kind);
+                    let left_origin = resolve_relation_origin_priority(left.origin);
+                    let right_origin = resolve_relation_origin_priority(right.origin);
+                    right_kind
+                        .cmp(&left_kind)
+                        .then_with(|| right_origin.cmp(&left_origin))
+                        .then_with(|| format!("{:?}", left.id).cmp(&format!("{:?}", right.id)))
+                });
+
+                for rel in rels
+                    .iter()
+                    .filter(|rel| {
+                        matches!(rel.kind, RelationKind::Includes | RelationKind::Imports)
+                    })
+                    .filter(|rel| rel.src == artifact_node)
+                    .take(artifact_frontier_limit)
+                {
+                    let Some(path) = relation_projected_artifact_path(rel, &artifact_node) else {
+                        continue;
+                    };
+                    if path == *seed_path || is_test_path(&path) || is_vendored_path(&path) {
+                        continue;
+                    }
+
+                    let hop = depth + 1;
+                    let origin_mult = if rel.origin == kin_model::RelationOrigin::Lsp {
+                        locate_env_f32("KIN_LOCATE_LSP_ORIGIN_BOOST", 1.5)
+                    } else {
+                        1.0
+                    };
+                    let kind_mult = match rel.kind {
+                        RelationKind::Includes | RelationKind::Imports => 1.8,
+                        _ => 1.0,
+                    };
+                    let path_specificity =
+                        artifact_relation_path_specificity_multiplier(seed_path, &path, hop);
+                    let score = seed_strength
+                        * origin_mult
+                        * kind_mult
+                        * path_specificity
+                        * artifact_hop_decay.powi(depth as i32)
+                        / (hop as f32);
+                    hits.entry(path.clone()).or_default().push(FileHit {
+                        score,
+                        spans: vec![],
+                    });
+
+                    let next = match &rel.dst {
+                        GraphNodeId::Artifact(artifact_id) => {
+                            GraphNodeId::Artifact(artifact_id.clone())
+                        }
+                        _ => {
+                            let Some(artifact_id) = graph
+                                .artifact_id_for_path(&kin_model::FilePathId::new(path.as_str()))
+                            else {
+                                continue;
+                            };
+                            GraphNodeId::Artifact(artifact_id)
+                        }
+                    };
+                    if visited.insert(next.clone()) {
+                        queue.push_back((next, path, depth + 1));
+                    }
+                }
+            }
+        }
+    }
 
     // Cache entity-count-based hub dampening per file path to avoid repeated queries
     let mut hub_dampening_cache: HashMap<String, f32> = HashMap::new();
@@ -5906,6 +6252,8 @@ fn extract_multihop_signals(
     let allowed_kinds = [
         RelationKind::Calls,
         RelationKind::Imports,
+        RelationKind::Includes,
+        RelationKind::UsesMacro,
         RelationKind::Tests,
         RelationKind::DependsOn,
         RelationKind::Implements,
@@ -5995,7 +6343,10 @@ fn extract_multihop_signals(
                             let base_mult = match rel.kind {
                                 RelationKind::Tests => 2.4,
                                 RelationKind::Calls => 2.0,
-                                RelationKind::Imports | RelationKind::DependsOn => 1.8,
+                                RelationKind::Imports
+                                | RelationKind::Includes
+                                | RelationKind::UsesMacro
+                                | RelationKind::DependsOn => 1.8,
                                 RelationKind::Implements | RelationKind::Extends => 1.5,
                                 RelationKind::References => 1.2,
                                 _ => 1.0,
@@ -6267,6 +6618,104 @@ fn extract_test_signals(
     Ok(hits)
 }
 
+fn extract_cpp_private_access_test_seed_signals(
+    text: &str,
+    graph: &kin_db::InMemoryGraph,
+) -> Result<HashMap<String, Vec<FileHit>>> {
+    let _span = tracing::info_span!(
+        "locate.extract_cpp_private_access_test_seed_signals",
+        text_len = text.len()
+    )
+    .entered();
+    let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
+    if !query_mentions_cpp_access_macro_context(text) {
+        return Ok(hits);
+    }
+
+    let lower = text.to_ascii_lowercase();
+    let mut query_terms = vec!["private".to_string(), "public".to_string()];
+    if lower.contains("#define") || lower.contains("define") {
+        query_terms.push("define".to_string());
+    }
+    if lower.contains("hack") {
+        query_terms.push("hack".to_string());
+    }
+    let mut seen_query_terms = HashSet::new();
+    query_terms.retain(|term| seen_query_terms.insert(term.clone()));
+
+    let hit_limit = locate_env_usize("KIN_LOCATE_PRIVATE_ACCESS_TEST_HIT_LIMIT", 256);
+    let seed_limit = locate_env_usize("KIN_LOCATE_PRIVATE_ACCESS_TEST_SEED_LIMIT", 24);
+    let min_terms = locate_env_usize("KIN_LOCATE_PRIVATE_ACCESS_TEST_MIN_TERMS", 2).max(1);
+    let base_score = locate_env_f32("KIN_LOCATE_PRIVATE_ACCESS_TEST_BASE_SCORE", 72.0);
+    let term_bonus = locate_env_f32("KIN_LOCATE_PRIVATE_ACCESS_TEST_TERM_BONUS", 18.0);
+
+    let mut per_path_scores: HashMap<String, f32> = HashMap::new();
+    let mut per_path_terms: HashMap<String, HashSet<String>> = HashMap::new();
+    for term in &query_terms {
+        let text_hits = match graph.text_search(term, hit_limit) {
+            Ok(hits) => hits,
+            Err(_) => continue,
+        };
+        for (rank, (retrieval_key, _score)) in text_hits.into_iter().enumerate() {
+            let Some(path) = file_path_from_retrieval_key(graph, &retrieval_key) else {
+                continue;
+            };
+            if !is_test_path(&path) || !is_cpp_like_source_path(&path) || is_vendored_path(&path) {
+                continue;
+            }
+            let score = base_score / ((rank + 1) as f32).sqrt();
+            per_path_scores
+                .entry(path.clone())
+                .and_modify(|existing| *existing = existing.max(score))
+                .or_insert(score);
+            per_path_terms.entry(path).or_default().insert(term.clone());
+        }
+    }
+
+    let mut ranked = per_path_scores
+        .into_iter()
+        .filter(|(path, _)| {
+            per_path_terms
+                .get(path)
+                .is_some_and(|terms| terms.len() >= min_terms)
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        let left_terms = per_path_terms.get(&left.0).map_or(0usize, HashSet::len);
+        let right_terms = per_path_terms.get(&right.0).map_or(0usize, HashSet::len);
+        right_terms
+            .cmp(&left_terms)
+            .then_with(|| {
+                right
+                    .1
+                    .partial_cmp(&left.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    for (path, mut score) in ranked.into_iter().take(seed_limit) {
+        let matched_terms = per_path_terms.get(&path).map_or(1usize, HashSet::len);
+        score += term_bonus * matched_terms.saturating_sub(1).min(3) as f32;
+        score += semantic_path_tokens(&path).len().min(3) as f32;
+        hits.entry(path).or_default().push(FileHit {
+            score,
+            spans: vec![],
+        });
+    }
+
+    Ok(hits)
+}
+
+fn is_cpp_like_source_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    [
+        ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".ipp",
+    ]
+    .iter()
+    .any(|suffix| lower.ends_with(suffix))
+}
+
 // ---------------------------------------------------------------------------
 // 5. Code snippet matching
 // ---------------------------------------------------------------------------
@@ -6422,14 +6871,14 @@ fn extract_source_text_signals(
         let max_hits = if cli_flag {
             8
         } else if symbolic {
-            6
+            locate_env_usize("KIN_LOCATE_SOURCE_TEXT_SYMBOLIC_MAX_HITS", 16)
         } else {
             3
         };
         let mut per_path: HashMap<String, f32> = HashMap::new();
+        let term_lower = term.to_ascii_lowercase();
 
         if cli_flag {
-            let flag = term.to_ascii_lowercase();
             let cli_surface_paths = source_paths
                 .iter()
                 .filter(|path| is_cli_surface_path(path))
@@ -6441,7 +6890,19 @@ fn extract_source_text_signals(
                 else {
                     continue;
                 };
-                if source_text.contains(&flag) {
+                if source_text.contains(&term_lower) {
+                    let entry = per_path.entry(path.clone()).or_insert(0.0);
+                    *entry = entry.max(base_score);
+                }
+            }
+        } else if symbolic {
+            for path in &source_paths {
+                let Some(source_text) =
+                    lowercase_source_text(path, &preview_source_texts, workspace_root.as_deref())
+                else {
+                    continue;
+                };
+                if source_text.contains(&term_lower) {
                     let entry = per_path.entry(path.clone()).or_insert(0.0);
                     *entry = entry.max(base_score);
                 }
@@ -6468,7 +6929,7 @@ fn extract_source_text_signals(
             if symbolic
                 && full_source_texts
                     .get(&path)
-                    .is_some_and(|source_text| !source_text.contains(&term.to_ascii_lowercase()))
+                    .is_some_and(|source_text| !source_text.contains(&term_lower))
             {
                 continue;
             }
@@ -7731,7 +8192,12 @@ fn resolve_entities_to_files(
             let artifact_hops = locate_env_usize("KIN_LOCATE_RESOLVE_ARTIFACT_HOPS", 2);
             let artifact_frontier = locate_env_usize("KIN_LOCATE_RESOLVE_ARTIFACT_FRONTIER", 32);
             let artifact_hop_decay = locate_env_f32("KIN_LOCATE_RESOLVE_ARTIFACT_HOP_DECAY", 0.55);
-            let start_artifact = GraphNodeId::Artifact(ArtifactId::from_path(&fo.0));
+            let Some(start_artifact_id) =
+                graph.artifact_id_for_path(&kin_model::FilePathId::new(fo.0.as_str()))
+            else {
+                continue;
+            };
+            let start_artifact = GraphNodeId::Artifact(start_artifact_id);
             let mut visited_artifacts = HashSet::from([start_artifact.clone()]);
             let mut artifact_frontier_queue =
                 VecDeque::from([(start_artifact, fo.0.clone(), 0usize)]);
@@ -7778,8 +8244,11 @@ fn resolve_entities_to_files(
                     let kind_mult = resolve_relation_kind_multiplier(rel.kind);
                     let hop = depth + 1;
                     let hop_decay = artifact_hop_decay.powi(depth as i32);
+                    let path_specificity =
+                        artifact_relation_path_specificity_multiplier(&fo.0, &path, hop);
                     let score =
-                        discovery.score * origin_mult * kind_mult * hop_decay / ((hop + 1) as f32);
+                        discovery.score * origin_mult * kind_mult * path_specificity * hop_decay
+                            / ((hop + 1) as f32);
 
                     candidates.push(ResolveCandidate {
                         id: format!("relation:{}:artifact:{}:hop{}", rel.id, rel.dst, hop),
@@ -7814,7 +8283,14 @@ fn resolve_entities_to_files(
                         GraphNodeId::Artifact(artifact_id) => {
                             GraphNodeId::Artifact(artifact_id.clone())
                         }
-                        _ => GraphNodeId::Artifact(ArtifactId::from_path(&path)),
+                        _ => {
+                            let Some(artifact_id) = graph
+                                .artifact_id_for_path(&kin_model::FilePathId::new(path.as_str()))
+                            else {
+                                continue;
+                            };
+                            GraphNodeId::Artifact(artifact_id)
+                        }
                     };
                     if visited_artifacts.insert(next_artifact.clone()) {
                         artifact_frontier_queue.push_back((next_artifact, path, depth + 1));
@@ -7990,9 +8466,14 @@ fn resolve_entities_to_files(
 
     // Normalize direct and graph scores INDEPENDENTLY, then blend.
     // Direct attribution is the primary authority (entity IS in this file).
-    // Graph traversal is supplementary (entity RELATES to things in this file).
+    // Graph traversal is supplementary when direct evidence exists, but files
+    // reached only through typed graph evidence must retain enough score to
+    // survive projection/cap stages. Otherwise include/import/macro edges are
+    // visible in candidate debug and then artificially suppressed at file cut.
     let direct_blend = locate_env_f32("KIN_LOCATE_DIRECT_BLEND", 0.90);
     let graph_blend = locate_env_f32("KIN_LOCATE_GRAPH_BLEND", 0.10);
+    let graph_only_projection_floor =
+        locate_env_f32("KIN_LOCATE_GRAPH_ONLY_PROJECTION_FLOOR", 0.25);
 
     let direct_max = final_direct_scores
         .values()
@@ -8015,6 +8496,11 @@ fn resolve_entities_to_files(
         let direct_norm = final_direct_scores.get(&path).copied().unwrap_or(0.0) / direct_max;
         let graph_norm = final_graph_scores.get(&path).copied().unwrap_or(0.0) / graph_max;
         let blended = direct_norm * direct_blend + graph_norm * graph_blend;
+        let blended = if direct_norm <= f32::EPSILON && graph_norm > 0.0 {
+            blended.max(graph_norm * graph_only_projection_floor)
+        } else {
+            blended
+        };
         file_scores.insert(path, blended * 100.0);
     }
 
@@ -8173,6 +8659,75 @@ fn relation_projected_artifact_path(
         .find_map(|evidence| evidence.resolved_path.clone())
         .or_else(|| rel.import_source.clone())
         .filter(|path| !path.is_empty())
+}
+
+fn artifact_relation_path_specificity_multiplier(
+    seed_path: &str,
+    target_path: &str,
+    hop: usize,
+) -> f32 {
+    if hop <= 1 {
+        return 1.0;
+    }
+
+    let seed_tokens = semantic_path_tokens(seed_path);
+    if seed_tokens.is_empty() {
+        return 1.0;
+    }
+    let target_tokens = semantic_path_tokens(target_path);
+    if target_tokens.is_empty() {
+        return 1.0;
+    }
+
+    let overlap = seed_tokens.intersection(&target_tokens).count();
+    if overlap > 0 {
+        locate_env_f32("KIN_LOCATE_ARTIFACT_PATH_OVERLAP_BOOST", 1.85)
+    } else {
+        locate_env_f32("KIN_LOCATE_ARTIFACT_HUB_FANOUT_PENALTY", 0.45)
+    }
+}
+
+fn semantic_path_tokens(path: &str) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+    let mut current = String::new();
+    for ch in path.chars() {
+        if ch.is_ascii_alphanumeric() {
+            current.push(ch.to_ascii_lowercase());
+        } else {
+            push_semantic_path_token(&mut tokens, &current);
+            current.clear();
+        }
+    }
+    push_semantic_path_token(&mut tokens, &current);
+    tokens
+}
+
+fn push_semantic_path_token(tokens: &mut HashSet<String>, raw: &str) {
+    let stripped = raw.trim_matches(|ch: char| ch.is_ascii_digit());
+    if stripped.len() < 4 {
+        return;
+    }
+    let singular = stripped.strip_suffix('s').unwrap_or(stripped);
+    if matches!(
+        singular,
+        "test"
+            | "unit"
+            | "src"
+            | "source"
+            | "include"
+            | "detail"
+            | "common"
+            | "class"
+            | "nlohmann"
+            | "json"
+            | "single"
+            | "thirdparty"
+            | "third"
+            | "party"
+    ) {
+        return;
+    }
+    tokens.insert(singular.to_string());
 }
 
 fn resolve_relation_origin_priority(origin: kin_model::RelationOrigin) -> u8 {
@@ -8658,6 +9213,7 @@ fn adaptive_cap(
                 scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 scored
                     .into_iter()
+                    .filter(|(p, _)| strong_embedding_release_allowed(p))
                     .take(embed_floor_exempt_topk)
                     .map(|(p, _)| p.clone())
                     .collect()
@@ -8803,6 +9359,15 @@ fn signal_support_count(path: &str, all_hits: &[HashMap<String, Vec<FileHit>>]) 
         .iter()
         .filter(|signal| signal.contains_key(path))
         .count()
+}
+
+fn strong_embedding_release_allowed(path: &str) -> bool {
+    !is_amalgamated_or_generated_path(path)
+        && !is_vendor_path(path)
+        && !is_docs_or_locale_path(path)
+        && !is_embedded_framework_noise_path(path)
+        && !is_license_or_notice_path(path)
+        && !is_non_code_ext(path)
 }
 
 fn has_corroborated_resolve_signal(path: &str, all_hits: &[HashMap<String, Vec<FileHit>>]) -> bool {
@@ -10581,7 +11146,7 @@ fn tracked_file_support_is_signal_bearing(path: &str) -> bool {
         return false;
     }
 
-    is_source_path(path) || is_build_surface_path(path)
+    is_source_path(path) || is_cpp_like_source_path(path) || is_build_surface_path(path)
 }
 
 fn is_docs_path(path: &str) -> bool {
@@ -11728,6 +12293,7 @@ fn output_text(result: &LocateResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_model::ArtifactId;
     use kin_model::{
         ArtifactDelta, ArtifactDeltaKind, AuthorId, ChangeStore, Entity, EntityDelta, EntityId,
         EntityMetadata, EntityStore, FilePathId, FingerprintAlgorithm, Hash256, LanguageId,
@@ -12527,6 +13093,43 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_cap_does_not_release_amalgamated_strong_embedding_artifacts() {
+        let fused = vec![
+            ("src/top.cpp".to_string(), 1.00),
+            ("src/a.cpp".to_string(), 0.30),
+            ("src/b.cpp".to_string(), 0.29),
+            ("src/c.cpp".to_string(), 0.28),
+            ("src/d.cpp".to_string(), 0.27),
+            ("single_include/nlohmann/json.hpp".to_string(), 0.02),
+        ];
+        let mut all_hits: Vec<HashMap<String, Vec<FileHit>>> =
+            (0..10).map(|_| HashMap::new()).collect();
+        all_hits[9] = HashMap::from([
+            (String::from("single_include/nlohmann/json.hpp"), hit(100.0)),
+            (String::from("src/top.cpp"), hit(90.0)),
+            (String::from("src/a.cpp"), hit(80.0)),
+            (String::from("src/b.cpp"), hit(70.0)),
+            (String::from("src/c.cpp"), hit(60.0)),
+            (String::from("src/d.cpp"), hit(50.0)),
+        ]);
+
+        let capped = adaptive_cap(
+            &fused,
+            &all_hits,
+            10,
+            false,
+            &HashSet::new(),
+            &HashSet::new(),
+            None,
+        );
+
+        assert!(!capped
+            .iter()
+            .any(|(path, _)| path == "single_include/nlohmann/json.hpp"));
+        assert!(capped.iter().any(|(path, _)| path == "src/d.cpp"));
+    }
+
+    #[test]
     fn adaptive_cap_without_explicit_max_can_retain_four_historical_syntax_files() {
         let fused = vec![
             ("src/libponyc/ast/lexer.c".to_string(), 1.10),
@@ -12811,6 +13414,124 @@ mod tests {
         assert!(retained.contains("src/libponyc/type/cap.c"));
         assert!(retained.contains("src/libponyc/type/cap.h"));
         assert!(!retained.contains("lib/gbenchmark/src/sysinfo.cc"));
+    }
+
+    #[test]
+    fn retained_priority_paths_skip_amalgamated_generated_files() {
+        let traces = HashMap::from([
+            (
+                String::from("single_include/nlohmann/json.hpp"),
+                PriorityFileTrace {
+                    score: 140.0,
+                    reasons: vec![LocateDebugPriorityReason {
+                        kind: String::from("tracked_text_search"),
+                        detail: String::from("terms=private"),
+                        score: 140.0,
+                    }],
+                },
+            ),
+            (
+                String::from("include/nlohmann/detail/input/lexer.hpp"),
+                PriorityFileTrace {
+                    score: 120.0,
+                    reasons: vec![LocateDebugPriorityReason {
+                        kind: String::from("tracked_text_search"),
+                        detail: String::from("terms=private"),
+                        score: 120.0,
+                    }],
+                },
+            ),
+            (
+                String::from("include/nlohmann/detail/iterators/iter_impl.hpp"),
+                PriorityFileTrace {
+                    score: 95.0,
+                    reasons: vec![LocateDebugPriorityReason {
+                        kind: String::from("tracked_text_term"),
+                        detail: String::from("previously"),
+                        score: 95.0,
+                    }],
+                },
+            ),
+        ]);
+
+        let retained = retained_priority_paths(&traces, false);
+
+        assert!(!retained.contains("single_include/nlohmann/json.hpp"));
+        assert!(retained.contains("include/nlohmann/detail/input/lexer.hpp"));
+        assert!(retained.contains("include/nlohmann/detail/iterators/iter_impl.hpp"));
+    }
+
+    #[test]
+    fn priority_relation_retention_paths_follow_same_family_includes() {
+        let graph = kin_db::InMemoryGraph::new();
+        for (idx, path) in [
+            "include/nlohmann/detail/iterators/iter_impl.hpp",
+            "include/nlohmann/detail/iterators/internal_iterator.hpp",
+            "include/nlohmann/detail/macro_scope.hpp",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            graph
+                .upsert_opaque_artifact(&OpaqueArtifact {
+                    file_id: FilePathId::new(path),
+                    content_hash: Hash256::from_bytes([idx as u8; 32]),
+                    mime_type: Some("text/x-c++hdr".into()),
+                    text_preview: Some(path.to_string()),
+                })
+                .unwrap();
+        }
+        let iter_artifact = graph
+            .artifact_id_for_path(&FilePathId::new(
+                "include/nlohmann/detail/iterators/iter_impl.hpp",
+            ))
+            .unwrap();
+        let internal_artifact = graph
+            .artifact_id_for_path(&FilePathId::new(
+                "include/nlohmann/detail/iterators/internal_iterator.hpp",
+            ))
+            .unwrap();
+        let macro_artifact = graph
+            .artifact_id_for_path(&FilePathId::new("include/nlohmann/detail/macro_scope.hpp"))
+            .unwrap();
+        for (target_artifact, target_path) in [
+            (
+                internal_artifact,
+                "include/nlohmann/detail/iterators/internal_iterator.hpp",
+            ),
+            (macro_artifact, "include/nlohmann/detail/macro_scope.hpp"),
+        ] {
+            graph
+                .upsert_relation(&Relation {
+                    id: RelationId::new(),
+                    kind: RelationKind::Includes,
+                    src: GraphNodeId::Artifact(iter_artifact.clone()),
+                    dst: GraphNodeId::Artifact(target_artifact),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: Some(target_path.to_string()),
+                    evidence: vec![kin_model::RelationEvidence {
+                        resolved_path: Some(target_path.to_string()),
+                        source_path: Some(target_path.to_string()),
+                        parser_rule: Some("include_directive".to_string()),
+                        occurrence_count: 1,
+                        ..kin_model::RelationEvidence::default()
+                    }],
+                })
+                .unwrap();
+        }
+
+        let retained = priority_relation_retention_paths(
+            &graph,
+            &HashSet::from([String::from(
+                "include/nlohmann/detail/iterators/iter_impl.hpp",
+            )]),
+        )
+        .unwrap();
+
+        assert!(retained.contains("include/nlohmann/detail/iterators/internal_iterator.hpp"));
+        assert!(!retained.contains("include/nlohmann/detail/macro_scope.hpp"));
     }
 
     #[test]
@@ -13364,6 +14085,172 @@ mod tests {
     }
 
     #[test]
+    fn curate_search_terms_keeps_cpp_macro_terms_in_access_modifier_queries() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        let mut private_macro = test_entity(
+            "JSON_HEDLEY_PRIVATE",
+            "include/nlohmann/thirdparty/hedley/hedley.hpp",
+            1,
+            4,
+        );
+        private_macro.kind = EntityKind::Macro;
+        private_macro.language = LanguageId::Cpp;
+        graph.upsert_entity(&private_macro).unwrap();
+
+        let mut public_macro = test_entity(
+            "JSON_HEDLEY_PUBLIC",
+            "include/nlohmann/thirdparty/hedley/hedley.hpp",
+            5,
+            8,
+        );
+        public_macro.kind = EntityKind::Macro;
+        public_macro.language = LanguageId::Cpp;
+        graph.upsert_entity(&public_macro).unwrap();
+
+        let mut define_macro = test_entity(
+            "NLOHMANN_DEFINE_TYPE_INTRUSIVE",
+            "include/nlohmann/detail/macro_scope.hpp",
+            9,
+            12,
+        );
+        define_macro.kind = EntityKind::Macro;
+        define_macro.language = LanguageId::Cpp;
+        graph.upsert_entity(&define_macro).unwrap();
+
+        for (idx, name) in ["JSON_PRIVATE_UNLESS_TESTED", "JSON_TESTS_PRIVATE"]
+            .into_iter()
+            .enumerate()
+        {
+            graph
+                .upsert_opaque_artifact(&OpaqueArtifact {
+                    file_id: FilePathId::new(format!("include/nlohmann/detail/macro_{idx}.hpp")),
+                    content_hash: Hash256::from_bytes([30 + idx as u8; 32]),
+                    mime_type: Some("text/x-c++hdr".into()),
+                    text_preview: Some(format!("#define {name} private")),
+                })
+                .unwrap();
+        }
+
+        let terms = curate_search_terms(
+            "Remove `#define private public` from tests. Add `JSON_PRIVATE_UNLESS_TESTED` controlled by `JSON_TESTS_PRIVATE`.",
+            &graph,
+        )
+        .unwrap();
+
+        assert!(
+            terms
+                .iter()
+                .any(|term| term == "JSON_PRIVATE_UNLESS_TESTED"),
+            "terms={terms:?}"
+        );
+        assert!(
+            terms.iter().any(|term| term == "JSON_TESTS_PRIVATE"),
+            "terms={terms:?}"
+        );
+    }
+
+    #[test]
+    fn curate_search_terms_does_not_use_cpp_modifiers_as_entity_seeds_for_future_macros() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        for (idx, name) in ["private_section", "public_api", "define_macro"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut entity = test_entity(
+                name,
+                &format!("include/example/access_{idx}.hpp"),
+                idx as u32 + 1,
+                idx as u32 + 2,
+            );
+            entity.language = LanguageId::Cpp;
+            graph.upsert_entity(&entity).unwrap();
+        }
+
+        let terms = curate_search_terms(
+            "Remove `#define private public` from tests. Add `JSON_PRIVATE_UNLESS_TESTED` controlled by `JSON_TESTS_PRIVATE`.",
+            &graph,
+        )
+        .unwrap();
+
+        assert!(
+            terms
+                .iter()
+                .any(|term| term == "JSON_PRIVATE_UNLESS_TESTED"),
+            "terms={terms:?}"
+        );
+        assert!(
+            !terms
+                .iter()
+                .any(|term| matches!(term.as_str(), "private" | "public" | "define")),
+            "generic C++ modifier words should support artifact/test search, not primary entity discovery: terms={terms:?}"
+        );
+    }
+
+    #[test]
+    fn source_text_keeps_exact_symbolic_macro_matches_past_small_bm25_caps() {
+        let graph = kin_db::InMemoryGraph::new();
+        let paths = [
+            "include/nlohmann/detail/input/binary_reader.hpp",
+            "include/nlohmann/detail/iterators/iter_impl.hpp",
+            "include/nlohmann/detail/iterators/primitive_iterator.hpp",
+            "include/nlohmann/detail/json_pointer.hpp",
+            "include/nlohmann/detail/output/serializer.hpp",
+            "include/nlohmann/json.hpp",
+            "single_include/nlohmann/json.hpp",
+        ];
+
+        for (idx, path) in paths.iter().enumerate() {
+            graph
+                .upsert_opaque_artifact(&OpaqueArtifact {
+                    file_id: FilePathId::new(*path),
+                    content_hash: Hash256::from_bytes([idx as u8; 32]),
+                    mime_type: Some("text/x-c++hdr".into()),
+                    text_preview: Some(format!(
+                        "class example_{idx} {{\n  JSON_PRIVATE_UNLESS_TESTED:\n    int value = {idx};\n}};"
+                    )),
+                })
+                .unwrap();
+        }
+
+        let hits = extract_source_text_signals(
+            "Add `JSON_PRIVATE_UNLESS_TESTED` for private members used by tests",
+            &graph,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            hits.contains_key("include/nlohmann/detail/iterators/iter_impl.hpp"),
+            "hits={:?}",
+            hits.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            hits.len() >= paths.len(),
+            "exact symbolic source matches should not be truncated to the old six-hit cap: hits={:?}",
+            hits.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn artifact_relation_path_specificity_boosts_matching_module_tokens() {
+        let boosted = artifact_relation_path_specificity_multiplier(
+            "test/src/unit-iterators1.cpp",
+            "include/nlohmann/detail/iterators/internal_iterator.hpp",
+            2,
+        );
+        let damped = artifact_relation_path_specificity_multiplier(
+            "test/src/unit-iterators1.cpp",
+            "include/nlohmann/detail/input/lexer.hpp",
+            2,
+        );
+
+        assert!(boosted > 1.0, "boosted={boosted}");
+        assert!(damped < 1.0, "damped={damped}");
+    }
+
+    #[test]
     fn curate_search_terms_keeps_source_artifact_backed_qualified_terms() {
         let graph = kin_db::InMemoryGraph::new();
 
@@ -13665,6 +14552,27 @@ mod tests {
         assert!(arrow_terms
             .iter()
             .any(|term| term.eq_ignore_ascii_case("immutable")));
+    }
+
+    #[test]
+    fn tracked_text_query_terms_suppress_cpp_access_modifiers_when_symbolic_macro_is_present() {
+        let terms = tracked_text_query_terms(
+            "Remove `#define private public` from tests. Add `JSON_PRIVATE_UNLESS_TESTED` controlled by `JSON_TESTS_PRIVATE`.",
+        );
+
+        assert!(
+            terms
+                .iter()
+                .any(|term| term == "JSON_PRIVATE_UNLESS_TESTED"),
+            "terms={terms:?}"
+        );
+        assert!(
+            !terms.iter().any(|term| matches!(
+                term.to_ascii_lowercase().as_str(),
+                "private" | "public" | "define" | "defined"
+            )),
+            "generic access/preprocessor words should not become tracked artifact priority terms: terms={terms:?}"
+        );
     }
 
     #[test]
@@ -14054,6 +14962,69 @@ mod tests {
     }
 
     #[test]
+    fn extract_multihop_signals_follows_artifact_include_edges_from_file_hits() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("include/nlohmann/detail/iterators/iter_impl.hpp"),
+                content_hash: Hash256::from_bytes([71; 32]),
+                mime_type: Some("text/x-c++hdr".into()),
+                text_preview: Some("JSON_PRIVATE_UNLESS_TESTED:".into()),
+            })
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("include/nlohmann/detail/iterators/internal_iterator.hpp"),
+                content_hash: Hash256::from_bytes([72; 32]),
+                mime_type: Some("text/x-c++hdr".into()),
+                text_preview: Some("struct internal_iterator {};".into()),
+            })
+            .unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Includes,
+                src: GraphNodeId::Artifact(ArtifactId::from_path(
+                    "include/nlohmann/detail/iterators/iter_impl.hpp",
+                )),
+                dst: GraphNodeId::Artifact(ArtifactId::from_path(
+                    "include/nlohmann/detail/iterators/internal_iterator.hpp",
+                )),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: Some("nlohmann/detail/iterators/internal_iterator.hpp".to_string()),
+                evidence: vec![kin_model::RelationEvidence {
+                    resolved_path: Some(
+                        "include/nlohmann/detail/iterators/internal_iterator.hpp".to_string(),
+                    ),
+                    source_path: Some(
+                        "nlohmann/detail/iterators/internal_iterator.hpp".to_string(),
+                    ),
+                    parser_rule: Some("include_directive".to_string()),
+                    occurrence_count: 1,
+                    ..kin_model::RelationEvidence::default()
+                }],
+            })
+            .unwrap();
+
+        let seeds = HashMap::from([(
+            String::from("include/nlohmann/detail/iterators/iter_impl.hpp"),
+            vec![FileHit {
+                score: 120.0,
+                spans: vec![],
+            }],
+        )]);
+
+        let hits =
+            extract_multihop_signals(&[&seeds], &graph, LocateProfile::Standard, false).unwrap();
+        assert!(
+            hits.contains_key("include/nlohmann/detail/iterators/internal_iterator.hpp"),
+            "artifact-level Includes edge should project included headers from file-backed seeds"
+        );
+    }
+
+    #[test]
     fn resolve_entities_to_files_keeps_signal_scores_without_explain() {
         let graph = kin_db::InMemoryGraph::new();
 
@@ -14185,6 +15156,24 @@ mod tests {
 
         let seed = test_entity("load_json", "src/app.cpp", 1, 40);
         graph.upsert_entity(&seed).unwrap();
+        for (idx, path) in [
+            "src/app.cpp",
+            "include/app.hpp",
+            "include/detail/internal.hpp",
+            "tests/test_app.cpp",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            graph
+                .upsert_opaque_artifact(&OpaqueArtifact {
+                    file_id: FilePathId::new(path),
+                    content_hash: Hash256::from_bytes([idx as u8; 32]),
+                    mime_type: Some("text/x-c++hdr".into()),
+                    text_preview: Some(path.to_string()),
+                })
+                .unwrap();
+        }
         graph
             .upsert_relation(&Relation {
                 id: RelationId::new(),
@@ -14253,12 +15242,19 @@ mod tests {
         )]);
 
         let old_frontier = std::env::var("KIN_LOCATE_RESOLVE_ARTIFACT_FRONTIER").ok();
+        let old_graph_floor = std::env::var("KIN_LOCATE_GRAPH_ONLY_PROJECTION_FLOOR").ok();
         std::env::set_var("KIN_LOCATE_RESOLVE_ARTIFACT_FRONTIER", "1");
+        std::env::set_var("KIN_LOCATE_GRAPH_ONLY_PROJECTION_FLOOR", "0.25");
         let result = resolve_entities_to_files(&seeds, &graph, true, "text");
         if let Some(value) = old_frontier {
             std::env::set_var("KIN_LOCATE_RESOLVE_ARTIFACT_FRONTIER", value);
         } else {
             std::env::remove_var("KIN_LOCATE_RESOLVE_ARTIFACT_FRONTIER");
+        }
+        if let Some(value) = old_graph_floor {
+            std::env::set_var("KIN_LOCATE_GRAPH_ONLY_PROJECTION_FLOOR", value);
+        } else {
+            std::env::remove_var("KIN_LOCATE_GRAPH_ONLY_PROJECTION_FLOOR");
         }
         let (resolved, _, _, _, candidate_stages) = result.unwrap();
 
@@ -14271,6 +15267,19 @@ mod tests {
                 .iter()
                 .any(|(path, _)| path == "include/detail/internal.hpp"),
             "bounded include closure should preserve graph-native internal header candidates"
+        );
+        let score_by_path = resolved.iter().cloned().collect::<HashMap<_, _>>();
+        assert!(
+            score_by_path
+                .get("include/app.hpp")
+                .is_some_and(|score| *score > 24.0),
+            "graph-only include projection should retain a material score"
+        );
+        assert!(
+            score_by_path
+                .get("include/detail/internal.hpp")
+                .is_some_and(|score| *score > 8.0),
+            "second-hop include projection should not collapse below cap-relevant score"
         );
         assert!(
             candidate_stages.iter().any(|stage| {
@@ -14618,6 +15627,153 @@ mod tests {
 
         assert!(hits.contains_key("tests/err.rs"));
         assert!(hits.contains_key("src/lib.rs"));
+    }
+
+    #[test]
+    fn extract_cpp_private_access_test_seed_signals_finds_cpp_test_artifacts() {
+        let graph = kin_db::InMemoryGraph::new();
+        for (idx, (path, text)) in [
+            (
+                "tests/src/unit-class_iterator.cpp",
+                "#define private public\n#include <nlohmann/json.hpp>\nTEST_CASE(\"iterator private access\") {}",
+            ),
+            (
+                "docs/private-public.md",
+                "#define private public is discussed in migration notes",
+            ),
+            (
+                "src/private_public.cpp",
+                "#define private public should not make a source file a test seed",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            graph
+                .upsert_opaque_artifact(&OpaqueArtifact {
+                    file_id: FilePathId::new(path),
+                    content_hash: Hash256::from_bytes([80 + idx as u8; 32]),
+                    mime_type: Some("text/x-c++src".into()),
+                    text_preview: Some(text.into()),
+                })
+                .unwrap();
+        }
+        graph.flush_text_index().unwrap();
+
+        let hits = extract_cpp_private_access_test_seed_signals(
+            "Remove `#define private public` from tests. Add `JSON_PRIVATE_UNLESS_TESTED` controlled by `JSON_TESTS_PRIVATE`.",
+            &graph,
+        )
+        .unwrap();
+
+        assert!(hits.contains_key("tests/src/unit-class_iterator.cpp"));
+        assert!(!hits.contains_key("docs/private-public.md"));
+        assert!(!hits.contains_key("src/private_public.cpp"));
+    }
+
+    #[test]
+    fn private_access_test_seeds_follow_include_graph_to_matching_headers() {
+        let graph = kin_db::InMemoryGraph::new();
+        for (idx, (path, text)) in [
+            (
+                "tests/src/unit-class_iterator.cpp",
+                "#define private public\n#include <nlohmann/json.hpp>\nTEST_CASE(\"iterator private access\") {}",
+            ),
+            (
+                "include/nlohmann/json.hpp",
+                "#include <nlohmann/detail/iterators/iter_impl.hpp>\n#include <nlohmann/detail/input/lexer.hpp>",
+            ),
+            (
+                "include/nlohmann/detail/iterators/iter_impl.hpp",
+                "#include <nlohmann/detail/iterators/internal_iterator.hpp>\nclass iter_impl {};",
+            ),
+            (
+                "include/nlohmann/detail/input/lexer.hpp",
+                "class lexer {};",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            graph
+                .upsert_opaque_artifact(&OpaqueArtifact {
+                    file_id: FilePathId::new(path),
+                    content_hash: Hash256::from_bytes([90 + idx as u8; 32]),
+                    mime_type: Some("text/x-c++src".into()),
+                    text_preview: Some(text.into()),
+                })
+                .unwrap();
+        }
+
+        let relation = |src: &str, dst: &str| Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Includes,
+            src: GraphNodeId::Artifact(
+                graph
+                    .artifact_id_for_path(&FilePathId::new(src))
+                    .expect("source artifact should be graph-owned"),
+            ),
+            dst: GraphNodeId::Artifact(
+                graph
+                    .artifact_id_for_path(&FilePathId::new(dst))
+                    .expect("target artifact should be graph-owned"),
+            ),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: Some(dst.to_string()),
+            evidence: vec![kin_model::RelationEvidence {
+                resolved_path: Some(dst.to_string()),
+                source_path: Some(dst.to_string()),
+                parser_rule: Some("include_directive".to_string()),
+                occurrence_count: 1,
+                ..kin_model::RelationEvidence::default()
+            }],
+        };
+        graph
+            .upsert_relation(&relation(
+                "tests/src/unit-class_iterator.cpp",
+                "include/nlohmann/json.hpp",
+            ))
+            .unwrap();
+        graph
+            .upsert_relation(&relation(
+                "include/nlohmann/json.hpp",
+                "include/nlohmann/detail/iterators/iter_impl.hpp",
+            ))
+            .unwrap();
+        graph
+            .upsert_relation(&relation(
+                "include/nlohmann/json.hpp",
+                "include/nlohmann/detail/input/lexer.hpp",
+            ))
+            .unwrap();
+        graph.flush_text_index().unwrap();
+
+        let seeds = extract_cpp_private_access_test_seed_signals(
+            "Remove `#define private public` from tests. Add `JSON_PRIVATE_UNLESS_TESTED` controlled by `JSON_TESTS_PRIVATE`.",
+            &graph,
+        )
+        .unwrap();
+        let hits =
+            extract_multihop_signals(&[&seeds], &graph, LocateProfile::Standard, true).unwrap();
+
+        let iter_score: f32 = hits
+            .get("include/nlohmann/detail/iterators/iter_impl.hpp")
+            .expect("iterator header should be reached through artifact Includes")
+            .iter()
+            .map(|hit| hit.score)
+            .sum();
+        let lexer_score: f32 = hits
+            .get("include/nlohmann/detail/input/lexer.hpp")
+            .expect("lexer header should also be reachable through the same public header")
+            .iter()
+            .map(|hit| hit.score)
+            .sum();
+        assert!(
+            iter_score > lexer_score,
+            "path-specific include traversal should prefer iterator headers for iterator tests: iter={iter_score}, lexer={lexer_score}"
+        );
     }
 
     #[test]
@@ -15077,6 +16233,50 @@ mod tests {
         assert!(priority
             .iter()
             .any(|(path, score)| path == "src/builtin.c" && *score >= 50.0));
+    }
+
+    #[test]
+    fn extract_priority_files_requires_source_confirmation_for_symbolic_text_hits() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        let stale_symbol = test_entity("JSON_PRIVATE_UNLESS_TESTED", "src/lib.cpp", 1, 2);
+        graph.upsert_entity(&stale_symbol).unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("src/lib.cpp"),
+                content_hash: Hash256::from_bytes([44; 32]),
+                mime_type: Some("text/x-source".into()),
+                text_preview: Some("#define private public\n// old source only".into()),
+            })
+            .unwrap();
+        graph.flush_text_index().unwrap();
+        assert!(graph
+            .text_search("json_private_unless_tested", 10)
+            .unwrap()
+            .into_iter()
+            .any(|(key, _)| matches!(key, kin_db::RetrievalKey::Entity(_))));
+
+        let traces = extract_priority_file_traces(
+            "Remove #define private public from tests\n\nThis PR adds JSON_PRIVATE_UNLESS_TESTED for JSON_TESTS_PRIVATE.",
+            &graph,
+        );
+        let stale_reasons = traces
+            .get("src/lib.cpp")
+            .map(|trace| {
+                trace
+                    .reasons
+                    .iter()
+                    .map(|reason| reason.detail.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        assert!(
+            stale_reasons
+                .iter()
+                .all(|detail| !detail.contains("json_private_unless_tested")),
+            "symbolic stale entity text must not become priority evidence without source confirmation: {stale_reasons:?}"
+        );
     }
 
     #[test]
