@@ -1344,6 +1344,21 @@ impl InMemoryGraph {
         *self.snapshot_root_hash.read()
     }
 
+    /// The graph-root hash recorded when this graph was opened from (or saved
+    /// to) a snapshot, if any.
+    ///
+    /// This is the value a persisted vector-index sidecar must match before it
+    /// can be trusted as graph-owned truth. Exposed so out-of-process callers
+    /// (the daemon) can validate a sidecar against the live graph via
+    /// [`SnapshotManager::load_vector_index_into_graph_if_valid`] instead of
+    /// force-loading it unchecked. Returns `None` for a graph that has never
+    /// been associated with a snapshot (e.g. a freshly constructed in-memory
+    /// graph), in which case no sidecar can be validated.
+    #[inline]
+    pub fn snapshot_root_hash(&self) -> Option<[u8; 32]> {
+        *self.snapshot_root_hash.read()
+    }
+
     #[inline]
     pub(crate) fn record_snapshot_root_hash(&self, root_hash: [u8; 32]) {
         *self.snapshot_root_hash.write() = Some(root_hash);
@@ -2013,29 +2028,56 @@ impl InMemoryGraph {
         Ok(embedder)
     }
 
-    /// Get or lazily initialize the HNSW vector index.
+    /// Get or lazily initialize the HNSW vector index, self-healing a
+    /// stale-dimension index in the process.
+    ///
+    /// This is the single sanctioned entry point to the in-memory vector index:
+    /// the embed worker, semantic search, and every other caller reach it only
+    /// through here. That is what lets the dimension-mismatch recovery be
+    /// **exactly once**. When a persisted index of the wrong dimension is loaded
+    /// against the live embedder (e.g. an older 384-dim `graph.kvec` vs a
+    /// 768-dim model), the detect → reset → recreate steps all run under a
+    /// single `vector_index` lock acquisition, so a racing caller can never
+    /// observe the stale index and fire its own reset + full requeue. The old
+    /// drop-the-guard-then-reset pattern allowed exactly that race, churning the
+    /// embedding queue and pinning CPU; keeping the reset atomic is the kin-db
+    /// side of the embed-worker dimension-loop contract.
     #[cfg(all(feature = "embeddings", feature = "vector"))]
     fn get_vector_index(&self) -> Result<Arc<VectorIndex>, KinDbError> {
         let embedder = self.get_embedder()?;
         let mut guard = self.vector_index.lock();
+
+        let mut did_reset = false;
         if let Some(ref vi) = *guard {
-            if vi.dimensions() != embedder.dimensions() {
-                tracing::warn!(
-                    "LOUD WARNING: Vector index dimensions ({}) do not match embedder dimensions ({})! Resetting and re-queueing missing.",
-                    vi.dimensions(),
-                    embedder.dimensions()
-                );
-                drop(guard);
-                self.reset_vector_index();
-                self.queue_missing_for_embedding();
-                self.queue_missing_artifacts_for_embedding();
-                guard = self.vector_index.lock();
-            } else {
+            if vi.dimensions() == embedder.dimensions() {
                 return Ok(Arc::clone(vi));
             }
+            tracing::warn!(
+                "LOUD WARNING: Vector index dimensions ({}) do not match embedder dimensions ({})! Resetting and re-queueing missing.",
+                vi.dimensions(),
+                embedder.dimensions()
+            );
+            // Inline reset under the held guard. Do NOT call
+            // `self.reset_vector_index()` here: it re-locks `self.vector_index`
+            // and would deadlock. Clearing in place keeps the swap atomic.
+            *guard = None;
+            did_reset = true;
         }
+
         let vi = Arc::new(VectorIndex::new(embedder.dimensions())?);
         *guard = Some(Arc::clone(&vi));
+        drop(guard);
+
+        if did_reset {
+            // `queue_missing_*` lock `embedding_queue` + `entities` (never
+            // `vector_index`), so they are safe to call now that the guard is
+            // released. The fresh empty index reports every entity/artifact as
+            // missing, re-queueing a full rebuild at the live embedder
+            // dimension — and this runs once, only on the resetting caller.
+            self.queue_missing_for_embedding();
+            self.queue_missing_artifacts_for_embedding();
+        }
+
         Ok(vi)
     }
 

@@ -475,16 +475,25 @@ impl SnapshotManager {
         Ok(())
     }
 
+    /// Load the persisted vector-index sidecar for `path` into `graph` only if
+    /// its metadata still matches graph truth (root hash + embedding
+    /// provider/model/revision/epoch/dimensions, via
+    /// [`vector_metadata_matches_graph`]). A stale sidecar is skipped, never
+    /// installed, and — when `write_missing_metadata` is set — the missing
+    /// entities/artifacts are queued for a clean rebuild.
+    ///
+    /// Returns `true` if a vector index was installed into the graph, `false`
+    /// if nothing was loaded (no sidecar present, or it was rejected as stale).
     #[cfg(feature = "vector")]
     fn load_vector_index_if_valid(
         path: &Path,
         graph: &InMemoryGraph,
         graph_root_hash: [u8; 32],
         write_missing_metadata: bool,
-    ) -> Result<(), KinDbError> {
+    ) -> Result<bool, KinDbError> {
         let vector_path = vector_index_path_for(path);
         if !vector_path.exists() {
-            return Ok(());
+            return Ok(false);
         }
 
         let metadata_path = vector_index_metadata_path_for(path);
@@ -504,7 +513,7 @@ impl SnapshotManager {
                 graph.queue_missing_for_embedding();
                 graph.queue_missing_artifacts_for_embedding();
             }
-            return Ok(());
+            return Ok(false);
         }
 
         let count = graph.load_vector_index(&vector_path)?;
@@ -528,7 +537,58 @@ impl SnapshotManager {
             tracing::debug!(path = %vector_path.display(), "vector index metadata matched but index was empty");
         }
 
-        Ok(())
+        Ok(true)
+    }
+
+    /// Validate and load a persisted vector-index sidecar into `graph` — the
+    /// sanctioned public alternative to a raw `graph.load_vector_index(path)`.
+    ///
+    /// # Contract for out-of-process callers (e.g. the daemon)
+    ///
+    /// A raw `graph.load_vector_index(path)` installs whatever bytes are on disk
+    /// **unconditionally**, including a sidecar whose embedding dimension/model
+    /// no longer matches the live graph and embedder. Installing a stale index
+    /// is exactly what triggers the embed-worker dimension loop (the in-memory
+    /// `get_vector_index` self-heal then resets and rebuilds it from scratch on
+    /// the next embed pass — wasted work at best, a CPU-pinning loop at worst).
+    ///
+    /// This entry point instead validates the sidecar against graph truth before
+    /// installing it, using the graph's own recorded root hash
+    /// ([`InMemoryGraph::snapshot_root_hash`]) plus the live embedding
+    /// provider/model/revision/epoch/dimensions. It returns `Ok(true)` if a
+    /// valid index was installed and `Ok(false)` if nothing was loaded (no
+    /// sidecar, a stale sidecar, or a graph with no recorded root hash to
+    /// validate against).
+    ///
+    /// `snapshot_path` is the `.kndb` snapshot path (the same value passed to
+    /// [`SnapshotManager::open`]); the `.kvec` / `.kvec.meta.json` sidecar paths
+    /// are derived from it. Note that [`SnapshotManager::open`] and
+    /// `open_read_only_for_locate` already perform this validated load during
+    /// graph construction, so a separate post-open call is only needed for code
+    /// paths that build a graph without going through `SnapshotManager` — and it
+    /// must replace, not supplement, any unchecked `load_vector_index` call.
+    #[cfg(feature = "vector")]
+    pub fn load_vector_index_into_graph_if_valid(
+        graph: &InMemoryGraph,
+        snapshot_path: &Path,
+    ) -> Result<bool, KinDbError> {
+        let Some(graph_root_hash) = graph.snapshot_root_hash() else {
+            tracing::warn!(
+                path = %snapshot_path.display(),
+                "skipping vector index load: graph has no recorded root hash to validate the sidecar against"
+            );
+            return Ok(false);
+        };
+        Self::load_vector_index_if_valid(snapshot_path, graph, graph_root_hash, false)
+    }
+
+    /// Feature-disabled stub: with no vector backend there is nothing to load.
+    #[cfg(not(feature = "vector"))]
+    pub fn load_vector_index_into_graph_if_valid(
+        _graph: &InMemoryGraph,
+        _snapshot_path: &Path,
+    ) -> Result<bool, KinDbError> {
+        Ok(false)
     }
 
     /// Create a new SnapshotManager with an empty in-memory graph.
