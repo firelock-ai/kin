@@ -11021,12 +11021,24 @@ fn projection_contributor_retention_paths(
     text_lower: &str,
     fused: &[(String, f32)],
 ) -> HashSet<String> {
+    let seed_topk = locate_env_usize("KIN_LOCATE_DERIVED_PROJECTION_RETAIN_SEED_TOPK", 3);
+    let max_paths = locate_env_usize("KIN_LOCATE_DERIVED_PROJECTION_RETAIN_MAX", 0);
+    projection_contributor_retention_paths_with_limits(
+        graph, text_lower, fused, seed_topk, max_paths,
+    )
+}
+
+fn projection_contributor_retention_paths_with_limits(
+    graph: &kin_db::InMemoryGraph,
+    text_lower: &str,
+    fused: &[(String, f32)],
+    seed_topk: usize,
+    max_paths: usize,
+) -> HashSet<String> {
     if !query_requests_projection_contributors(text_lower) || fused.is_empty() {
         return HashSet::new();
     }
 
-    let seed_topk = locate_env_usize("KIN_LOCATE_DERIVED_PROJECTION_RETAIN_SEED_TOPK", 3);
-    let max_paths = locate_env_usize("KIN_LOCATE_DERIVED_PROJECTION_RETAIN_MAX", 12);
     if seed_topk == 0 || max_paths == 0 {
         return HashSet::new();
     }
@@ -13907,13 +13919,21 @@ mod tests {
             (unrelated.0.clone(), 0.04),
         ];
 
-        let no_query = projection_contributor_retention_paths(&graph, "fix parser bug", &fused);
+        let no_query = projection_contributor_retention_paths_with_limits(
+            &graph,
+            "fix parser bug",
+            &fused,
+            3,
+            12,
+        );
         assert!(no_query.is_empty());
 
-        let retained = projection_contributor_retention_paths(
+        let retained = projection_contributor_retention_paths_with_limits(
             &graph,
             "rename develop folder and change amalgamate config file",
             &fused,
+            3,
+            12,
         );
         assert!(retained.contains(&source.0));
         assert!(
