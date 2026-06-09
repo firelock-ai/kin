@@ -1746,47 +1746,21 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         );
     }
 
-    // Signal-aware compression: files with weak entity_resolve relative to the
-    // top are compressed so adaptive_cap naturally cuts them off. This handles
-    // both cases: (a) files with NO entity_resolve, and (b) files with low-score
-    // entity_resolve from broad entity resolution.
-    {
-        let resolve_scores: HashMap<&str, f32> = resolved_hits
-            .iter()
-            .map(|(path, hits)| {
-                let max_score = hits.iter().map(|h| h.score).fold(0.0f32, f32::max);
-                (path.as_str(), max_score)
-            })
-            .collect();
-        let priority_set: HashSet<&str> = priority_files
-            .iter()
-            .map(|(path, _)| path.as_str())
-            .collect();
-        let compress_factor = locate_env_f32("KIN_LOCATE_NOISE_TAIL_COMPRESS", 0.4);
-        let resolve_strength_floor = locate_env_f32("KIN_LOCATE_RESOLVE_STRENGTH_FLOOR", 0.25);
-        let top_resolve = fused
-            .first()
-            .and_then(|(p, _)| resolve_scores.get(p.as_str()).copied())
-            .unwrap_or(0.0);
-        if top_resolve > 0.0 {
-            let resolve_threshold = top_resolve * resolve_strength_floor;
-            for (path, score) in fused.iter_mut().skip(1) {
-                let file_resolve = resolve_scores.get(path.as_str()).copied().unwrap_or(0.0);
-                if file_resolve >= resolve_threshold {
-                    continue;
-                }
-                if (test_query && is_test_path(path)) || priority_set.contains(path.as_str()) {
-                    continue;
-                }
-                *score *= compress_factor;
-            }
-            fused.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
-            });
-        }
-    }
+    let graph_semantic_retention_paths = graph_corroborated_semantic_retention_paths(
+        &fused,
+        &resolved_hits,
+        &source_text,
+        &embedding_hits,
+        &multihop,
+        &imports,
+    );
+    apply_resolve_boundary_compression(
+        &mut fused,
+        &resolved_hits,
+        &priority_files,
+        test_query,
+        &graph_semantic_retention_paths,
+    );
     if explain {
         record_debug_stage(
             &mut score_breakdown,
@@ -2262,8 +2236,9 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         record_full_debug_stage(&mut debug_info, &fused, "pre_cap_full");
     }
 
-    let derived_projection_retention_paths =
+    let mut semantic_retention_paths =
         projection_contributor_retention_paths(graph, &text_lower, &fused);
+    semantic_retention_paths.extend(graph_semantic_retention_paths);
 
     // Adaptive cap
     let mut pruned_files: Vec<PrunedFile> = Vec::new();
@@ -2274,7 +2249,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         max_files_explicit,
         &cochange_seed_paths,
         &retained_priority_paths,
-        &derived_projection_retention_paths,
+        &semantic_retention_paths,
         if explain {
             Some(&mut pruned_files)
         } else {
@@ -9426,6 +9401,140 @@ fn demote_zero_signal_files(
     });
 }
 
+fn graph_corroborated_semantic_retention_paths(
+    fused: &[(String, f32)],
+    resolved_hits: &HashMap<String, Vec<FileHit>>,
+    source_text_hits: &HashMap<String, Vec<FileHit>>,
+    embedding_hits: &HashMap<String, Vec<FileHit>>,
+    multihop_hits: &HashMap<String, Vec<FileHit>>,
+    import_hits: &HashMap<String, Vec<FileHit>>,
+) -> HashSet<String> {
+    let max_paths = locate_env_usize("KIN_LOCATE_STRONG_SEMANTIC_RETAIN_MAX", 8);
+    if max_paths == 0 || fused.is_empty() {
+        return HashSet::new();
+    }
+
+    let scan_limit = locate_env_usize("KIN_LOCATE_STRONG_SEMANTIC_SCAN_WINDOW", 40);
+    let floor_pct = locate_env_f32("KIN_LOCATE_STRONG_SEMANTIC_FLOOR_PCT", 0.02);
+    let top_score = fused[0].1.max(0.001);
+    let mut candidates: Vec<(String, f32, usize)> = Vec::new();
+
+    for (rank, (path, score)) in fused.iter().take(scan_limit).enumerate() {
+        if *score < top_score * floor_pct {
+            continue;
+        }
+        if !strong_embedding_release_allowed(path) {
+            continue;
+        }
+
+        let source_score = max_hit_score(source_text_hits, path);
+        let embedding_score = max_hit_score(embedding_hits, path);
+        let resolved_score = max_hit_score(resolved_hits, path);
+        let multihop_score = max_hit_score(multihop_hits, path);
+        let import_score = max_hit_score(import_hits, path);
+
+        let has_query_signal = source_score > 0.0 || embedding_score > 0.0;
+        let has_structural_followup = multihop_score > 0.0 || import_score > 0.0;
+        let has_source_backed_resolve = source_score > 0.0 && resolved_score > 0.0;
+
+        if !has_query_signal || !(has_structural_followup || has_source_backed_resolve) {
+            continue;
+        }
+
+        let support = [
+            resolved_score,
+            source_score,
+            embedding_score,
+            multihop_score,
+            import_score,
+        ]
+        .into_iter()
+        .filter(|score| *score > 0.0)
+        .count();
+        if support < locate_env_usize("KIN_LOCATE_STRONG_SEMANTIC_MIN_SIGNALS", 2) {
+            continue;
+        }
+
+        let query_strength = source_score.max(embedding_score);
+        let graph_strength = resolved_score.max(multihop_score).max(import_score);
+        let rank_bonus = 1.0 / ((rank + 1) as f32);
+        candidates.push((
+            path.clone(),
+            query_strength.sqrt() * graph_strength.sqrt() + rank_bonus,
+            rank,
+        ));
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    candidates
+        .into_iter()
+        .take(max_paths)
+        .map(|(path, _, _)| path)
+        .collect()
+}
+
+fn max_hit_score(hits: &HashMap<String, Vec<FileHit>>, path: &str) -> f32 {
+    hits.get(path)
+        .map(|file_hits| file_hits.iter().map(|hit| hit.score).fold(0.0f32, f32::max))
+        .unwrap_or(0.0)
+}
+
+fn apply_resolve_boundary_compression(
+    fused: &mut Vec<(String, f32)>,
+    resolved_hits: &HashMap<String, Vec<FileHit>>,
+    priority_files: &[(String, f32)],
+    test_query: bool,
+    semantic_retention_paths: &HashSet<String>,
+) {
+    let resolve_scores: HashMap<&str, f32> = resolved_hits
+        .iter()
+        .map(|(path, hits)| {
+            let max_score = hits.iter().map(|h| h.score).fold(0.0f32, f32::max);
+            (path.as_str(), max_score)
+        })
+        .collect();
+    let priority_set: HashSet<&str> = priority_files
+        .iter()
+        .map(|(path, _)| path.as_str())
+        .collect();
+    let compress_factor = locate_env_f32("KIN_LOCATE_NOISE_TAIL_COMPRESS", 0.4);
+    let resolve_strength_floor = locate_env_f32("KIN_LOCATE_RESOLVE_STRENGTH_FLOOR", 0.25);
+    let top_resolve = fused
+        .first()
+        .and_then(|(p, _)| resolve_scores.get(p.as_str()).copied())
+        .unwrap_or(0.0);
+    if top_resolve <= 0.0 {
+        return;
+    }
+
+    let resolve_threshold = top_resolve * resolve_strength_floor;
+    for (path, score) in fused.iter_mut().skip(1) {
+        let file_resolve = resolve_scores.get(path.as_str()).copied().unwrap_or(0.0);
+        if file_resolve >= resolve_threshold {
+            continue;
+        }
+        if semantic_retention_paths.contains(path.as_str())
+            || (test_query && is_test_path(path))
+            || priority_set.contains(path.as_str())
+        {
+            continue;
+        }
+        *score *= compress_factor;
+    }
+    fused.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+}
+
 fn signal_support_count(path: &str, all_hits: &[HashMap<String, Vec<FileHit>>]) -> usize {
     all_hits
         .iter()
@@ -13354,6 +13463,101 @@ mod tests {
         assert!(!capped
             .iter()
             .any(|(path, _)| path == "develop/detail/input/lexer.hpp"));
+    }
+
+    #[test]
+    fn graph_corroborated_semantic_retention_requires_query_and_graph_evidence() {
+        let fused = vec![
+            ("include/nlohmann/json.hpp".to_string(), 100.0),
+            ("include/nlohmann/detail/macro_scope.hpp".to_string(), 6.75),
+            ("include/nlohmann/detail/vector_only.hpp".to_string(), 6.50),
+            ("include/nlohmann/detail/graph_only.hpp".to_string(), 6.25),
+            ("single_include/nlohmann/json.hpp".to_string(), 6.00),
+        ];
+        let resolved_hits = HashMap::from([
+            (String::from("include/nlohmann/json.hpp"), hit(100.0)),
+            (
+                String::from("include/nlohmann/detail/macro_scope.hpp"),
+                hit(12.0),
+            ),
+            (
+                String::from("include/nlohmann/detail/graph_only.hpp"),
+                hit(10.0),
+            ),
+            (String::from("single_include/nlohmann/json.hpp"), hit(60.0)),
+        ]);
+        let source_text = HashMap::new();
+        let embedding_hits = HashMap::from([
+            (
+                String::from("include/nlohmann/detail/macro_scope.hpp"),
+                hit(7.5),
+            ),
+            (
+                String::from("include/nlohmann/detail/vector_only.hpp"),
+                hit(7.4),
+            ),
+            (String::from("single_include/nlohmann/json.hpp"), hit(100.0)),
+        ]);
+        let multihop = HashMap::from([
+            (
+                String::from("include/nlohmann/detail/macro_scope.hpp"),
+                hit(2.7),
+            ),
+            (
+                String::from("include/nlohmann/detail/graph_only.hpp"),
+                hit(2.6),
+            ),
+            (String::from("single_include/nlohmann/json.hpp"), hit(2.5)),
+        ]);
+        let imports = HashMap::new();
+
+        let retained = graph_corroborated_semantic_retention_paths(
+            &fused,
+            &resolved_hits,
+            &source_text,
+            &embedding_hits,
+            &multihop,
+            &imports,
+        );
+
+        assert!(retained.contains("include/nlohmann/detail/macro_scope.hpp"));
+        assert!(!retained.contains("include/nlohmann/detail/vector_only.hpp"));
+        assert!(!retained.contains("include/nlohmann/detail/graph_only.hpp"));
+        assert!(!retained.contains("single_include/nlohmann/json.hpp"));
+    }
+
+    #[test]
+    fn resolve_boundary_compression_preserves_graph_semantic_retention_paths() {
+        let mut fused = vec![
+            ("include/nlohmann/json.hpp".to_string(), 100.0),
+            ("include/nlohmann/detail/macro_scope.hpp".to_string(), 6.75),
+            ("include/nlohmann/detail/noise.hpp".to_string(), 6.70),
+        ];
+        let resolved_hits = HashMap::from([
+            (String::from("include/nlohmann/json.hpp"), hit(100.0)),
+            (
+                String::from("include/nlohmann/detail/macro_scope.hpp"),
+                hit(12.0),
+            ),
+            (String::from("include/nlohmann/detail/noise.hpp"), hit(12.0)),
+        ]);
+        let semantic_retention =
+            HashSet::from([String::from("include/nlohmann/detail/macro_scope.hpp")]);
+
+        apply_resolve_boundary_compression(
+            &mut fused,
+            &resolved_hits,
+            &[],
+            false,
+            &semantic_retention,
+        );
+
+        let scores: HashMap<_, _> = fused
+            .iter()
+            .map(|(path, score)| (path.as_str(), *score))
+            .collect();
+        assert_eq!(scores["include/nlohmann/detail/macro_scope.hpp"], 6.75);
+        assert!(scores["include/nlohmann/detail/noise.hpp"] < 3.0);
     }
 
     #[test]
