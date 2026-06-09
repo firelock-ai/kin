@@ -308,12 +308,57 @@ pub async fn forward_tool_call(
                 .map(text_result_from_value)
                 .transpose()
         }
-        // `kin_graph_status` (incl. embedding coverage) flows through the
-        // generic forwarder: the daemon special-cases it in /mcp/tools/call to
-        // merge `graph.embedding_status()` into the response, keeping a single
-        // graph-owned source of truth for coverage.
+        // Coverage exposure: surface embedding-index coverage to MCP agents.
+        // The generic graph tool dispatcher only knows entity_count; the
+        // daemon's status command computes embedding coverage from the live
+        // graph (`graph.embedding_status()`), so forward there and project the
+        // fields MCP agents need. Self-contained — no daemon-api coordination.
+        "kin_graph_status" => forward_graph_status(arguments).await,
         _ => forward_mcp_tool_call(name, arguments).await,
     }
+}
+
+/// Forward `kin_graph_status` to the daemon's status command and project the
+/// graph/embedding coverage fields agents care about.
+///
+/// In product mode coverage is otherwise CLI-only (`kin status`); this gives
+/// MCP agents the same embedding-index visibility without leaving graph-owned
+/// truth — the daemon computes the counts from its live graph.
+async fn forward_graph_status(
+    arguments: &HashMap<String, serde_json::Value>,
+) -> Result<Option<ToolCallResult>, String> {
+    let Some(client) = daemon_client().await else {
+        return Ok(None);
+    };
+    let Some(base) = daemon_base_url() else {
+        return Ok(None);
+    };
+    let request = client
+        .post(format!("{}/commands/status", base))
+        .json(&serde_json::json!({ "json": false }));
+    let request = with_session_header(with_auth(request), arguments);
+    let resp = request
+        .send()
+        .await
+        .map_err(|e| format!("daemon graph status failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("daemon graph status failed: HTTP {}", resp.status()));
+    }
+    let value: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("daemon graph status response parse failed: {e}"))?;
+    let summary = value.get("summary").unwrap_or(&value);
+    let field_u64 = |key: &str| summary.get(key).and_then(serde_json::Value::as_u64);
+    let result = serde_json::json!({
+        "entity_count": field_u64("entities").unwrap_or(0),
+        "embeddings_indexed": field_u64("embeddings_indexed").unwrap_or(0),
+        "embeddings_total": field_u64("embeddings_total").unwrap_or(0),
+        "embeddings_pending": field_u64("embeddings_pending").unwrap_or(0),
+        "authority": "repo-daemon",
+        "note": "Embedding coverage is computed from the daemon-owned live graph."
+    });
+    text_result_from_value(result).map(Some)
 }
 
 pub fn daemon_unavailable_tool_result(name: &str) -> ToolCallResult {
