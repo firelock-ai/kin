@@ -215,6 +215,7 @@ pub async fn enrich_entity_calls(
                     origin: RelationOrigin::Lsp,
                     created_in: None,
                     import_source: None,
+                    evidence: Vec::new(),
                 });
             }
             None => {
@@ -316,6 +317,7 @@ pub async fn enrich_entity_overrides(
                 origin: RelationOrigin::Lsp,
                 created_in: None,
                 import_source: None,
+                evidence: Vec::new(),
             });
             debug!(
                 method = %method.name,
@@ -421,6 +423,7 @@ pub async fn enrich_entity_uses_type(
                         origin: RelationOrigin::Lsp,
                         created_in: None,
                         import_source: None,
+                        evidence: Vec::new(),
                     });
                     debug!(
                         entity = %entity.name,
@@ -497,6 +500,7 @@ pub async fn enrich_entity_references(
                 origin: RelationOrigin::Lsp,
                 created_in: None,
                 import_source: None,
+                evidence: Vec::new(),
             });
         }
     }

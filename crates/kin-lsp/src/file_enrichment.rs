@@ -165,6 +165,7 @@ pub async fn enrich_file_definitions(
                             origin: RelationOrigin::Lsp,
                             created_in: None,
                             import_source: None,
+                            evidence: Vec::new(),
                         });
                     }
                 }
