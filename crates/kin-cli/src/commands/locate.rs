@@ -2262,6 +2262,9 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         record_full_debug_stage(&mut debug_info, &fused, "pre_cap_full");
     }
 
+    let derived_projection_retention_paths =
+        projection_contributor_retention_paths(graph, &text_lower, &fused);
+
     // Adaptive cap
     let mut pruned_files: Vec<PrunedFile> = Vec::new();
     let results = adaptive_cap(
@@ -2271,6 +2274,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         max_files_explicit,
         &cochange_seed_paths,
         &retained_priority_paths,
+        &derived_projection_retention_paths,
         if explain {
             Some(&mut pruned_files)
         } else {
@@ -9166,6 +9170,7 @@ fn adaptive_cap(
     max_files_explicit: bool,
     cochange_seed_paths: &HashSet<String>,
     priority_retention_paths: &HashSet<String>,
+    semantic_retention_paths: &HashSet<String>,
     mut pruned: Option<&mut Vec<PrunedFile>>,
 ) -> Vec<(String, f32)> {
     let _span = tracing::info_span!(
@@ -9244,6 +9249,7 @@ fn adaptive_cap(
     let default_support_floor_max = locate_env_usize("KIN_LOCATE_MULTI_SIGNAL_FLOOR_MAX", 3);
     let retained_support_floor_max = cluster_size
         .saturating_add(priority_retention_paths.len())
+        .saturating_add(semantic_retention_paths.len())
         .max(default_support_floor_max);
     let support_floor_limit = if max_files_explicit {
         scan_limit.min(max_files.max(1))
@@ -9293,6 +9299,7 @@ fn adaptive_cap(
                     idx != 6 && idx != 7 && signal.contains_key(path.as_str())
                 }));
         let is_priority_retained = priority_retention_paths.contains(path.as_str());
+        let is_semantic_retained = semantic_retention_paths.contains(path.as_str());
         let is_cochange_seed = cochange_seed_paths.contains(path.as_str());
         let multi_signal = signal_support_count(path, all_hits) >= signal_support_threshold;
         let is_strong_embedding = strong_embedding_paths.contains(path.as_str());
@@ -9300,12 +9307,15 @@ fn adaptive_cap(
             retention_floor_pct
         } else if has_corroborated_resolve {
             corroborated_resolve_floor_pct
+        } else if is_semantic_retained {
+            priority_retention_floor_pct
         } else if is_priority_retained {
             priority_retention_floor_pct
         } else {
             support_floor_pct
         };
         if !is_priority_retained
+            && !is_semantic_retained
             && !is_strong_embedding
             && !is_strong_semantic
             && *score < top_score * floor_pct
@@ -9316,6 +9326,7 @@ fn adaptive_cap(
         if has_corroborated_resolve
             || multi_signal
             || is_priority_retained
+            || is_semantic_retained
             || is_cochange_seed
             || is_strong_embedding
             || is_strong_semantic
@@ -9328,6 +9339,7 @@ fn adaptive_cap(
             if has_corroborated_resolve
                 || multi_signal
                 || is_priority_retained
+                || is_semantic_retained
                 || is_cochange_seed
                 || is_strong_embedding
                 || is_strong_semantic
@@ -9361,6 +9373,7 @@ fn adaptive_cap(
             // prior evidence (explicit mention, historical co-change).  General
             // corroborated files are bounded by support_max_total.
             let is_priority = priority_retention_paths.contains(path.as_str())
+                || semantic_retention_paths.contains(path.as_str())
                 || cochange_seed_paths.contains(path.as_str())
                 || strong_semantic_paths.contains(path.as_str());
             if !is_priority && result.len() >= support_max_total {
@@ -11003,6 +11016,111 @@ fn path_has_derived_from_artifact_relation(graph: &kin_db::InMemoryGraph, path: 
         .unwrap_or(false)
 }
 
+fn projection_contributor_retention_paths(
+    graph: &kin_db::InMemoryGraph,
+    text_lower: &str,
+    fused: &[(String, f32)],
+) -> HashSet<String> {
+    if !query_requests_projection_contributors(text_lower) || fused.is_empty() {
+        return HashSet::new();
+    }
+
+    let seed_topk = locate_env_usize("KIN_LOCATE_DERIVED_PROJECTION_RETAIN_SEED_TOPK", 3);
+    let max_paths = locate_env_usize("KIN_LOCATE_DERIVED_PROJECTION_RETAIN_MAX", 12);
+    if seed_topk == 0 || max_paths == 0 {
+        return HashSet::new();
+    }
+
+    let top_score = fused[0].1.max(0.0);
+    let seed_floor =
+        top_score * locate_env_f32("KIN_LOCATE_DERIVED_PROJECTION_RETAIN_SEED_FLOOR_PCT", 0.4);
+    let mut retained: HashMap<String, u32> = HashMap::new();
+
+    for (path, score) in fused.iter().take(seed_topk) {
+        if *score < seed_floor {
+            continue;
+        }
+        let Some(artifact_id) = graph.artifact_id_for_path(&kin_model::FilePathId::new(path))
+        else {
+            continue;
+        };
+        let node = GraphNodeId::Artifact(artifact_id);
+        let Ok(relations) = graph.get_all_relations_for_node(&node) else {
+            continue;
+        };
+
+        for relation in relations {
+            if relation.kind != RelationKind::DerivedFrom
+                || relation.src != node
+                || !relation_has_projection_marker_evidence(&relation)
+            {
+                continue;
+            }
+            let contributor_path = match relation.dst {
+                GraphNodeId::Artifact(dst_id) => graph
+                    .path_for_artifact_id(&dst_id)
+                    .map(|path| path.0)
+                    .or_else(|| relation_projection_resolved_path(&relation)),
+                _ => None,
+            };
+            let Some(contributor_path) = contributor_path else {
+                continue;
+            };
+            if contributor_path == *path
+                || is_vendored_path(&contributor_path)
+                || is_test_path(&contributor_path)
+            {
+                continue;
+            }
+            let occurrence_count = relation
+                .evidence
+                .iter()
+                .map(|evidence| evidence.occurrence_count)
+                .max()
+                .unwrap_or(1);
+            retained
+                .entry(contributor_path)
+                .and_modify(|current| *current = (*current).max(occurrence_count))
+                .or_insert(occurrence_count);
+        }
+    }
+
+    let mut retained: Vec<(String, u32)> = retained.into_iter().collect();
+    retained.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    retained
+        .into_iter()
+        .take(max_paths)
+        .map(|(path, _)| path)
+        .collect()
+}
+
+fn query_requests_projection_contributors(text_lower: &str) -> bool {
+    text_lower.contains("amalgamat")
+        || text_lower.contains("single-header")
+        || text_lower.contains("single header")
+        || text_lower.contains("generated header")
+        || text_lower.contains("generated source")
+        || text_lower.contains("generated file")
+        || (text_lower.contains("rename")
+            && (text_lower.contains("folder") || text_lower.contains("directory"))
+            && (text_lower.contains("header") || text_lower.contains("include")))
+}
+
+fn relation_has_projection_marker_evidence(relation: &kin_model::Relation) -> bool {
+    relation.evidence.iter().any(|evidence| {
+        evidence.parser_rule.as_deref() == Some("projection_include_marker")
+            || evidence.token.as_deref() == Some("#include")
+                && evidence.resolved_path.as_deref().is_some()
+    })
+}
+
+fn relation_projection_resolved_path(relation: &kin_model::Relation) -> Option<String> {
+    relation
+        .evidence
+        .iter()
+        .find_map(|evidence| evidence.resolved_path.clone())
+}
+
 fn priority_backing_applies_for_path(
     path: &str,
     is_priority_backed: bool,
@@ -12390,8 +12508,8 @@ mod tests {
     use kin_model::{
         ArtifactDelta, ArtifactDeltaKind, AuthorId, ChangeStore, Entity, EntityDelta, EntityId,
         EntityMetadata, EntityStore, FilePathId, FingerprintAlgorithm, Hash256, LanguageId,
-        OpaqueArtifact, Relation, RelationId, RelationKind, RelationOrigin, SemanticChange,
-        SemanticChangeId, SemanticFingerprint, SourceSpan, Timestamp, Visibility,
+        OpaqueArtifact, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin,
+        SemanticChange, SemanticChangeId, SemanticFingerprint, SourceSpan, Timestamp, Visibility,
     };
 
     fn hit(score: f32) -> Vec<FileHit> {
@@ -12810,6 +12928,7 @@ mod tests {
             false,
             &HashSet::new(),
             &HashSet::new(),
+            &HashSet::new(),
             None,
         );
         assert_eq!(capped.len(), 1);
@@ -12853,6 +12972,7 @@ mod tests {
             &all_hits,
             10,
             false,
+            &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
             None,
@@ -13044,6 +13164,7 @@ mod tests {
             false,
             &HashSet::new(),
             &HashSet::new(),
+            &HashSet::new(),
             None,
         );
         assert!(capped.len() >= 4, "cap was {}", capped.len());
@@ -13082,6 +13203,7 @@ mod tests {
             false,
             &retention,
             &HashSet::new(),
+            &HashSet::new(),
             None,
         );
 
@@ -13119,6 +13241,7 @@ mod tests {
             true,
             &HashSet::new(),
             &priority_retention,
+            &HashSet::new(),
             None,
         );
 
@@ -13174,6 +13297,7 @@ mod tests {
             false,
             &HashSet::new(),
             &priority_retention,
+            &HashSet::new(),
             None,
         );
 
@@ -13183,6 +13307,41 @@ mod tests {
         assert!(capped
             .iter()
             .any(|(path, _)| path == "src/libponyc/type/cap.h"));
+    }
+
+    #[test]
+    fn adaptive_cap_uses_lower_floor_for_semantic_retention_paths() {
+        let fused = vec![
+            ("src/json.hpp".to_string(), 1.00),
+            ("develop/detail/input/parser.hpp".to_string(), 0.09),
+            ("develop/detail/input/lexer.hpp".to_string(), 0.04),
+        ];
+        let mut all_hits: Vec<HashMap<String, Vec<FileHit>>> =
+            (0..10).map(|_| HashMap::new()).collect();
+        all_hits[1] = HashMap::from([
+            (String::from("src/json.hpp"), hit(3.0)),
+            (String::from("develop/detail/input/parser.hpp"), hit(1.0)),
+            (String::from("develop/detail/input/lexer.hpp"), hit(1.0)),
+        ]);
+        let semantic_retention = HashSet::from([String::from("develop/detail/input/parser.hpp")]);
+
+        let capped = adaptive_cap(
+            &fused,
+            &all_hits,
+            10,
+            false,
+            &HashSet::new(),
+            &HashSet::new(),
+            &semantic_retention,
+            None,
+        );
+
+        assert!(capped
+            .iter()
+            .any(|(path, _)| path == "develop/detail/input/parser.hpp"));
+        assert!(!capped
+            .iter()
+            .any(|(path, _)| path == "develop/detail/input/lexer.hpp"));
     }
 
     #[test]
@@ -13211,6 +13370,7 @@ mod tests {
             &all_hits,
             10,
             false,
+            &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
             None,
@@ -13257,6 +13417,7 @@ mod tests {
             false,
             &HashSet::new(),
             &priority_retention,
+            &HashSet::new(),
             None,
         );
 
@@ -13285,6 +13446,7 @@ mod tests {
             &all_hits,
             3,
             true,
+            &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
             None,
@@ -13328,6 +13490,7 @@ mod tests {
             true,
             &HashSet::new(),
             &HashSet::new(),
+            &HashSet::new(),
             None,
         );
 
@@ -13354,6 +13517,7 @@ mod tests {
             false,
             &HashSet::new(),
             &HashSet::new(),
+            &HashSet::new(),
             None,
         );
         assert!(
@@ -13366,6 +13530,7 @@ mod tests {
             &all_hits,
             10,
             true,
+            &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
             None,
@@ -13405,6 +13570,7 @@ mod tests {
             &all_hits,
             10,
             false,
+            &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
             None,
@@ -13680,6 +13846,80 @@ mod tests {
         )]);
         let backed = graph_projection_backed_generated_paths(&graph, &graph_signal);
         assert!(backed.contains(&generated.0));
+    }
+
+    #[test]
+    fn projection_contributor_retention_requires_query_and_marker_evidence() {
+        let graph = kin_db::InMemoryGraph::new();
+        let generated = FilePathId::new("src/json.hpp");
+        let source = FilePathId::new("develop/detail/input/parser.hpp");
+        let unrelated = FilePathId::new("develop/detail/input/lexer.hpp");
+        for (idx, file_id) in [&generated, &source, &unrelated].iter().enumerate() {
+            graph
+                .upsert_opaque_artifact(&OpaqueArtifact {
+                    file_id: (*file_id).clone(),
+                    content_hash: Hash256::from_bytes([idx as u8 + 11; 32]),
+                    mime_type: Some("text/x-c++hdr".into()),
+                    text_preview: None,
+                })
+                .unwrap();
+        }
+
+        let generated_id = graph.artifact_id_for_path(&generated).unwrap();
+        let source_id = graph.artifact_id_for_path(&source).unwrap();
+        let unrelated_id = graph.artifact_id_for_path(&unrelated).unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::DerivedFrom,
+                src: GraphNodeId::Artifact(generated_id),
+                dst: GraphNodeId::Artifact(source_id),
+                confidence: 0.9,
+                origin: RelationOrigin::Inferred,
+                created_in: None,
+                import_source: None,
+                evidence: vec![RelationEvidence {
+                    parser_rule: Some("projection_include_marker".to_string()),
+                    token: Some("#include".to_string()),
+                    resolved_path: Some(source.0.clone()),
+                    occurrence_count: 1,
+                    ..RelationEvidence::default()
+                }],
+            })
+            .unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::DerivedFrom,
+                src: GraphNodeId::Artifact(generated_id),
+                dst: GraphNodeId::Artifact(unrelated_id),
+                confidence: 0.5,
+                origin: RelationOrigin::Inferred,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        let fused = vec![
+            (generated.0.clone(), 1.0),
+            (source.0.clone(), 0.04),
+            (unrelated.0.clone(), 0.04),
+        ];
+
+        let no_query = projection_contributor_retention_paths(&graph, "fix parser bug", &fused);
+        assert!(no_query.is_empty());
+
+        let retained = projection_contributor_retention_paths(
+            &graph,
+            "rename develop folder and change amalgamate config file",
+            &fused,
+        );
+        assert!(retained.contains(&source.0));
+        assert!(
+            !retained.contains(&unrelated.0),
+            "DerivedFrom without projection marker evidence is not enough"
+        );
     }
 
     #[test]
