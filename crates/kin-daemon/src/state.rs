@@ -200,19 +200,26 @@ pub struct DaemonState {
     /// reconciled as all-deleted). Keyed on the GRAPH, independent of the vector
     /// index, which self-heals on load. Updated after every successful save.
     pub persisted_entity_count: AtomicU64,
+    /// True when the last filesystem-sync tick refused to apply its deletions
+    /// because they would have wiped most of the graph-known files (a transient
+    /// empty/incomplete checkout misread as "delete everything"). Surfaced as a
+    /// daemon-health signal; cleared on the next tick whose deletions are within
+    /// the anti-wipe threshold.
+    pub mass_deletion_blocked: AtomicBool,
 }
 
-/// Minimum persisted entity count before the shutdown anti-wipe guard can fire.
-/// Below this, the on-disk snapshot is small enough that a collapse is not
-/// catastrophic (and fresh-init / tiny-repo states would false-positive).
-const WIPE_GUARD_MIN_BASELINE: u64 = 16;
+/// Minimum baseline count before an anti-wipe guard can fire. Below this, the
+/// set is small enough that a collapse is not catastrophic (and fresh-init /
+/// tiny-repo states would false-positive).
+pub(crate) const WIPE_GUARD_MIN_BASELINE: u64 = 16;
 
-/// Pure predicate for the shutdown anti-wipe guard: does dropping from
-/// `baseline` persisted entities to `current` in-memory entities constitute a
-/// drastic collapse (more than ~75% of the graph vanished) that should block the
-/// final flush? Returns false for trivially small baselines. Kept pure so the
-/// threshold is unit-testable without constructing a full graph.
-fn graph_collapse_is_wipe(current: u64, baseline: u64) -> bool {
+/// Shared anti-wipe predicate: does dropping from a `baseline` count to a
+/// `current` count constitute a drastic collapse (more than ~75% vanished) that
+/// a guard should refuse? Returns false for trivially small baselines. Kept pure
+/// so the threshold is unit-testable, and shared by both the shutdown graph
+/// flush (entity counts) and the fs-sync mass-deletion guard (file counts) so
+/// the two stay consistent.
+pub(crate) fn graph_collapse_is_wipe(current: u64, baseline: u64) -> bool {
     if baseline < WIPE_GUARD_MIN_BASELINE {
         return false;
     }
@@ -220,27 +227,30 @@ fn graph_collapse_is_wipe(current: u64, baseline: u64) -> bool {
 }
 
 impl DaemonState {
-    fn force_load_vector_index_if_present(layout: &KinLayout, graph: &kin_db::InMemoryGraph) {
-        let path = layout.kindb_vector_index_path();
-        if !path.exists() {
-            return;
-        }
-
-        match graph.load_vector_index(&path) {
-            Ok(count) => {
-                if count > 0 {
-                    debug!(
-                        count,
-                        path = %path.display(),
-                        "force-loaded persisted vector index for daemon parity"
-                    );
-                }
+    /// Load a persisted vector-index sidecar into a graph that was NOT built
+    /// through `SnapshotManager` (the storage-backend path uses
+    /// `InMemoryGraph::from_snapshot_with_text_index`, which does not load the
+    /// sidecar). Uses kin-db's sanctioned validated entry point, which checks the
+    /// sidecar against the graph root hash + live embedder before installing —
+    /// never a raw `load_vector_index`, which would install a stale-dimension
+    /// index and trigger the embed-worker reset loop. Safely no-ops when there is
+    /// no sidecar, a stale one, or no recorded root hash to validate against.
+    ///
+    /// The `SnapshotManager::open` / `open_read_only_for_locate` path already
+    /// performs this validated load during construction, so it does not call this.
+    fn load_validated_vector_index(layout: &KinLayout, graph: &kin_db::InMemoryGraph) {
+        let snapshot_path = layout.kindb_snapshot_path();
+        match kin_db::SnapshotManager::load_vector_index_into_graph_if_valid(graph, &snapshot_path)
+        {
+            Ok(true) => {
+                debug!(path = %snapshot_path.display(), "loaded validated persisted vector index");
             }
+            Ok(false) => {}
             Err(error) => {
                 debug!(
                     error = %error,
-                    path = %path.display(),
-                    "failed to force-load persisted vector index"
+                    path = %snapshot_path.display(),
+                    "failed to load persisted vector index"
                 );
             }
         }
@@ -318,7 +328,10 @@ impl DaemonState {
         };
 
         let blobs = BlobStore::new(layout.objects_dir()).map_err(DaemonError::from)?;
-        Self::force_load_vector_index_if_present(&layout, graph.as_ref());
+        // No post-open vector-index load here: `SnapshotManager::open` /
+        // `open_read_only_for_locate` already performed the validated load during
+        // graph construction. A raw force-load on top would re-install a stale
+        // sidecar and trigger the embed-worker reset loop.
 
         // Compute the deterministic genesis change ID.
         let genesis = kin_core::build_genesis_change();
@@ -402,6 +415,7 @@ impl DaemonState {
             cached_repo_id,
             is_shutdown: AtomicBool::new(false),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
+            mass_deletion_blocked: AtomicBool::new(false),
         };
         Ok(state)
     }
@@ -449,7 +463,10 @@ impl DaemonState {
             };
 
         let blobs = BlobStore::new(layout.objects_dir()).map_err(DaemonError::from)?;
-        Self::force_load_vector_index_if_present(&layout, graph.as_ref());
+        // The backend path builds the graph via `from_snapshot_with_text_index`,
+        // which does NOT load the vector-index sidecar — do the validated load
+        // here (no-ops if no/stale sidecar).
+        Self::load_validated_vector_index(&layout, graph.as_ref());
         let genesis = kin_core::build_genesis_change();
         let working_copy = WorkingCopy {
             base_change: genesis.id,
@@ -516,6 +533,7 @@ impl DaemonState {
             cached_repo_id: repo_id.to_string(),
             is_shutdown: AtomicBool::new(false),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
+            mass_deletion_blocked: AtomicBool::new(false),
         };
 
         // Pre-load repos into the map BEFORE any async context.
@@ -1145,6 +1163,13 @@ impl DaemonState {
             .store(self.graph.entity_count() as u64, Ordering::SeqCst);
     }
 
+    /// True when the most recent filesystem-sync tick refused a mass deletion
+    /// (its removals would have wiped most of the graph-known files). Surfaced
+    /// as a daemon-health signal.
+    pub fn is_mass_deletion_blocked(&self) -> bool {
+        self.mass_deletion_blocked.load(Ordering::Relaxed)
+    }
+
     /// Duration since the last successful save.
     pub fn time_since_save(&self) -> Duration {
         self.last_save
@@ -1309,6 +1334,7 @@ mod tests {
             cached_repo_id: "test-repo".to_string(),
             is_shutdown: AtomicBool::new(false),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
+            mass_deletion_blocked: AtomicBool::new(false),
         }
     }
 
@@ -1389,7 +1415,13 @@ mod tests {
     }
 
     #[test]
-    fn open_force_loads_vector_index_even_when_metadata_is_stale() {
+    fn open_rejects_stale_vector_index_sidecar() {
+        // A persisted vector sidecar whose metadata root hash does NOT match the
+        // graph must be REJECTED on open, not installed. Installing a stale-
+        // dimension index is exactly what triggered the embed-worker reset loop;
+        // `DaemonState::open` now relies solely on the validated load that
+        // `SnapshotManager::open` performs during construction (no raw force-load
+        // override). The embed worker rebuilds the index from the live embedder.
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
         let layout = init.layout;
@@ -1403,6 +1435,7 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
         mgr.save().unwrap();
 
+        // Write a sidecar with a deliberately mismatched (stale) root hash.
         let vectors = VectorIndex::new(4).unwrap();
         vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         vectors.save(&vector_path).unwrap();
@@ -1420,7 +1453,11 @@ mod tests {
         drop(mgr);
 
         let state = DaemonState::open(layout).unwrap();
-        assert_eq!(state.graph.embedding_status().indexed, 1);
+        assert_eq!(
+            state.graph.embedding_status().indexed,
+            0,
+            "stale-root-hash vector sidecar must be rejected, not installed"
+        );
     }
 
     fn make_scoped_graph_with_entity(name: &str, file_path: &str) -> Arc<kin_db::InMemoryGraph> {
