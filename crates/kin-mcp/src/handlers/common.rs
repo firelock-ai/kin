@@ -16,6 +16,7 @@ pub static GRAPH_MISS_COUNT: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     pub static LAST_READ_STALE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    pub static LAST_READ_SOURCE: std::cell::Cell<&'static str> = std::cell::Cell::new("unknown");
 }
 
 use crate::error::{McpError, Result};
@@ -1051,6 +1052,7 @@ pub fn read_entity_source_excerpt_detailed<G: GraphStore>(
     max_chars: usize,
 ) -> Option<String> {
     LAST_READ_STALE.with(|f| f.set(false));
+    LAST_READ_SOURCE.with(|f| f.set("unknown"));
 
     let span = entity.span.as_ref()?;
     
@@ -1085,6 +1087,7 @@ pub fn read_entity_source_excerpt_detailed<G: GraphStore>(
     }
 
     if let Some(bytes) = blob_bytes {
+        LAST_READ_SOURCE.with(|f| f.set("graph"));
         let excerpt = excerpt_from_span_bytes(&bytes, span, max_lines, max_chars);
         if let Some(ref excerpt) = excerpt {
             if !should_expand_excerpt(entity, excerpt) {
@@ -1097,6 +1100,7 @@ pub fn read_entity_source_excerpt_detailed<G: GraphStore>(
 
     // Fall back to disk
     GRAPH_MISS_COUNT.fetch_add(1, Ordering::SeqCst);
+    LAST_READ_SOURCE.with(|f| f.set("disk"));
 
     let path = resolve_entity_source_path(entity)?;
     let disk_bytes = std::fs::read(&path).ok()?;
@@ -1437,6 +1441,8 @@ pub fn entity_response_json<G: GraphStore>(store: &G, entity: &Entity) -> Result
 
     let is_stale = LAST_READ_STALE.with(|f| f.get());
     obj.insert("stale".into(), serde_json::json!(is_stale));
+    let source = LAST_READ_SOURCE.with(|f| f.get());
+    obj.insert("source".into(), serde_json::json!(source));
 
     Ok(value)
 }
@@ -1452,6 +1458,7 @@ pub fn focal_context_json<G: GraphStore>(
     let source_excerpt =
         read_entity_source_excerpt_detailed(store, entity, MCP_SOURCE_MAX_LINES, MCP_SOURCE_MAX_CHARS);
     let is_stale = LAST_READ_STALE.with(|f| f.get());
+    let source = LAST_READ_SOURCE.with(|f| f.get());
 
     let mut obj = serde_json::json!({
         "id": entity.id,
@@ -1463,6 +1470,7 @@ pub fn focal_context_json<G: GraphStore>(
         "start_line": start_line,
         "end_line": end_line,
         "stale": is_stale,
+        "source": source,
     });
 
     if !compact {

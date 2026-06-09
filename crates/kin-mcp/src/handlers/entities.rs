@@ -129,6 +129,7 @@ pub fn handle_get_entity_source<G: GraphStore>(
             let body = read_entity_source_excerpt_detailed(store, &entity, 10_000, 1_000_000)
                 .ok_or_else(|| McpError::Context("entity source body unavailable".into()))?;
             let is_stale = LAST_READ_STALE.with(|f| f.get());
+            let source = LAST_READ_SOURCE.with(|f| f.get());
             let span = entity.span.as_ref();
             let value = serde_json::json!({
                 "id": entity.id,
@@ -142,6 +143,7 @@ pub fn handle_get_entity_source<G: GraphStore>(
                 "signature": entity.signature,
                 "body": body,
                 "stale": is_stale,
+                "source": source,
             });
             let json = serde_json::to_string_pretty(&value).map_err(McpError::Json)?;
             Ok(ToolCallResult::text(json))
@@ -238,10 +240,13 @@ pub fn handle_get_context_pack<G: GraphStore>(
                     MCP_SOURCE_MAX_CHARS,
                 );
                 let is_stale = LAST_READ_STALE.with(|f| f.get());
+                let source = LAST_READ_SOURCE.with(|f| f.get());
                 obj["stale"] = serde_json::json!(is_stale);
+                obj["source"] = serde_json::json!(source);
                 obj["body"] = serde_json::json!(body.unwrap_or_else(|| entry.content.clone()));
             } else {
                 obj["stale"] = serde_json::json!(false);
+                obj["source"] = serde_json::json!("unknown");
             }
             obj
         } else {
