@@ -482,6 +482,91 @@ async fn daemon_activity(
     next.run(request).await
 }
 
+fn is_host_allowed(host: &str) -> bool {
+    let host = host.trim();
+    if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]" {
+        return true;
+    }
+    if let Ok(bind_host) = std::env::var("KIN_DAEMON_BIND_HOST") {
+        let bind_host = bind_host.trim();
+        if bind_host == "0.0.0.0" || bind_host == "::" || bind_host == "[::]" {
+            return true;
+        }
+        if !bind_host.is_empty() && host == bind_host {
+            return true;
+        }
+    }
+    false
+}
+
+async fn validate_host_and_origin(
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    // 1. Validate Host header if present
+    if let Some(host_val) = request.headers().get(header::HOST) {
+        if let Ok(host_str) = host_val.to_str() {
+            let host_part = if let Some(idx) = host_str.find(':') {
+                &host_str[..idx]
+            } else {
+                host_str
+            };
+            if !is_host_allowed(host_part) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": format!("Host forbidden: {}", host_str) })),
+                )
+                    .into_response();
+            }
+        } else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Invalid Host header encoding" })),
+            )
+                .into_response();
+        }
+    }
+
+    // 2. Validate Origin header if present
+    if let Some(origin_val) = request.headers().get(header::ORIGIN) {
+        if let Ok(origin_str) = origin_val.to_str() {
+            let origin_str = origin_str.trim();
+            if origin_str == "null" {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "Null origin is forbidden" })),
+                )
+                    .into_response();
+            }
+
+            let mut valid = false;
+            if let Ok(uri) = origin_str.parse::<axum::http::Uri>() {
+                if let Some(host) = uri.host() {
+                    if is_host_allowed(host) {
+                        valid = true;
+                    }
+                }
+            }
+
+            if !valid {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": format!("Origin forbidden: {}", origin_str) })),
+                )
+                    .into_response();
+            }
+        } else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Invalid Origin header encoding" })),
+            )
+                .into_response();
+        }
+    }
+
+    next.run(request).await
+}
+
 fn auth_error(status: StatusCode, message: &str) -> Response {
     let mut response = (status, Json(json!({ "error": message }))).into_response();
     response.headers_mut().insert(
@@ -878,6 +963,7 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
             daemon_activity,
         ))
         .layer(middleware::from_fn(api_version_header))
+        .layer(middleware::from_fn(validate_host_and_origin))
 }
 
 /// Extract an optional session ID from the `X-Kin-Session` header or
@@ -7846,5 +7932,91 @@ mod tests {
         assert_eq!(versions[0].published_by, "builder@firelock.ai");
 
         auth_server.abort();
+    }
+
+    #[tokio::test]
+    async fn host_and_origin_allowlist_validation() {
+        let state = test_state();
+        let app = router_with_auth(state, None);
+
+        // 1. Host is loopback/localhost -> should succeed
+        let res = app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::HOST, "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::HOST, "127.0.0.1:4219")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // 2. Host is forbidden (e.g. attacker.com) -> should fail with FORBIDDEN
+        let res = app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::HOST, "attacker.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // 3. Origin is loopback/localhost -> should succeed
+        let res = app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::HOST, "localhost")
+                    .header(header::ORIGIN, "http://localhost:4219")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // 4. Origin is forbidden (e.g. attacker.com) -> should fail with FORBIDDEN
+        let res = app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::HOST, "localhost")
+                    .header(header::ORIGIN, "http://attacker.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // 5. Origin is null -> should fail with FORBIDDEN
+        let res = app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::HOST, "localhost")
+                    .header(header::ORIGIN, "null")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 }
