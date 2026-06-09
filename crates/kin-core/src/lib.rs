@@ -93,3 +93,10 @@ pub fn write_current_branch(layout: &KinLayout, name: &BranchName) -> Result<()>
     std::fs::write(layout.head_path(), name.to_string())
         .map_err(|e| KinError::io(layout.head_path(), e))
 }
+
+/// Read the raw bytes of a blob from the layout's objects directory by its hash.
+pub fn read_blob_from_layout(layout: &KinLayout, hash: &kin_model::Hash256) -> Option<Vec<u8>> {
+    let store = kin_blobs::BlobStore::new(layout.objects_dir()).ok()?;
+    store.read(hash).ok()
+}
+

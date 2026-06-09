@@ -10,6 +10,13 @@ use kin_model::graph::{EntityFilter, GraphStore};
 use kin_model::ids::{EntityId, Hash256, IntentId, LanguageId, SemanticChangeId, SessionId};
 use kin_model::relation::{GraphNodeId, RelationKind};
 use kin_model::session::{IntentScope, LockType, SessionCapabilities, SessionTransport};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+pub static GRAPH_MISS_COUNT: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    pub static LAST_READ_STALE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
 
 use crate::error::{McpError, Result};
 
@@ -416,8 +423,8 @@ pub fn collect_primary_trace_chain<G: GraphStore>(
     Ok(chain)
 }
 
-pub fn trace_body(entity: &Entity) -> String {
-    read_entity_source_excerpt(entity, MCP_SOURCE_MAX_LINES, MCP_SOURCE_MAX_CHARS)
+pub fn trace_body<G: GraphStore>(store: &G, entity: &Entity) -> String {
+    read_entity_source_excerpt_detailed(store, entity, MCP_SOURCE_MAX_LINES, MCP_SOURCE_MAX_CHARS)
         .unwrap_or_else(|| entity.signature.clone())
 }
 
@@ -788,9 +795,9 @@ pub fn evaluate_trace_chain<G: GraphStore>(
 ) -> Result<Option<Vec<TraceEvaluationStep>>> {
     let mut constant_values = HashMap::new();
     for step in chain {
-        let body = trace_body(step);
+        let body = trace_body(store, step);
         for constant in trace_constants_for_step(store, step, &body)? {
-            if let Some(value) = parse_trace_constant_value(&trace_body(&constant)) {
+            if let Some(value) = parse_trace_constant_value(&trace_body(store, &constant)) {
                 constant_values
                     .entry(constant.name.clone())
                     .or_insert(value);
@@ -802,7 +809,7 @@ pub fn evaluate_trace_chain<G: GraphStore>(
     let mut evaluation = Vec::new();
 
     for step in chain.iter().rev() {
-        let body = trace_body(step);
+        let body = trace_body(store, step);
         let Some((value, detail)) =
             evaluate_trace_step_body(&body, input_literal, &function_values, &constant_values)
         else {
@@ -1035,6 +1042,101 @@ pub fn resolve_entity_source_path(entity: &Entity) -> Option<PathBuf> {
     }
 
     None
+}
+
+pub fn read_entity_source_excerpt_detailed<G: GraphStore>(
+    store: &G,
+    entity: &Entity,
+    max_lines: usize,
+    max_chars: usize,
+) -> Option<String> {
+    LAST_READ_STALE.with(|f| f.set(false));
+
+    let span = entity.span.as_ref()?;
+    
+    // Retrieve graph hash
+    let graph_hash = if let Some(ref file_origin) = entity.file_origin {
+        store.get_file_hash(file_origin).ok().flatten()
+    } else {
+        None
+    };
+
+    let mut blob_bytes = None;
+    if let Some(ref hash) = graph_hash {
+        // Look through candidate source roots for a KinLayout
+        for root in candidate_source_roots() {
+            if let Some(layout) = kin_core::KinLayout::discover(&root) {
+                if let Some(bytes) = kin_core::read_blob_from_layout(&layout, hash) {
+                    let actual_hash = kin_blobs::digest(&bytes);
+                    if actual_hash == *hash {
+                        blob_bytes = Some(bytes);
+                        break;
+                    } else {
+                        tracing::warn!(
+                            "Hash mismatch for blob in layout at {:?}: expected {}, got {}",
+                            layout.objects_dir(),
+                            hash,
+                            actual_hash
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(bytes) = blob_bytes {
+        let excerpt = excerpt_from_span_bytes(&bytes, span, max_lines, max_chars);
+        if let Some(ref excerpt) = excerpt {
+            if !should_expand_excerpt(entity, excerpt) {
+                return Some(excerpt.clone());
+            }
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        return expand_entity_source_excerpt(entity, &text, span.start_byte, max_lines, max_chars).or(excerpt);
+    }
+
+    // Fall back to disk
+    GRAPH_MISS_COUNT.fetch_add(1, Ordering::SeqCst);
+
+    let path = resolve_entity_source_path(entity)?;
+    let disk_bytes = std::fs::read(&path).ok()?;
+
+    // Verify span bounds sanity
+    if span.start_byte > disk_bytes.len() || span.end_byte > disk_bytes.len() {
+        tracing::warn!(
+            "Span bounds sanity check failed for entity {} on file {:?}: start_byte={}, end_byte={}, file size={}",
+            entity.id,
+            path,
+            span.start_byte,
+            span.end_byte,
+            disk_bytes.len()
+        );
+        return None;
+    }
+
+    // Detect if disk content is stale
+    if let Some(ref gh) = graph_hash {
+        let disk_hash = kin_blobs::digest(&disk_bytes);
+        if disk_hash != *gh {
+            LAST_READ_STALE.with(|f| f.set(true));
+            tracing::warn!(
+                "Disk content stale for {:?}: disk hash {} != graph hash {}",
+                path,
+                disk_hash,
+                gh
+            );
+        }
+    }
+
+    let excerpt = excerpt_from_span_bytes(&disk_bytes, span, max_lines, max_chars);
+    if let Some(ref excerpt) = excerpt {
+        if !should_expand_excerpt(entity, excerpt) {
+            return Some(excerpt.clone());
+        }
+    }
+
+    let text = String::from_utf8_lossy(&disk_bytes);
+    expand_entity_source_excerpt(entity, &text, span.start_byte, max_lines, max_chars).or(excerpt)
 }
 
 pub fn read_entity_source_excerpt(
@@ -1314,7 +1416,7 @@ pub fn clip_rendered_text_with_cap(text: &str, max_lines: usize, max_chars: usiz
 
 // ── Entity JSON formatting ──
 
-pub fn entity_response_json(entity: &Entity) -> Result<serde_json::Value> {
+pub fn entity_response_json<G: GraphStore>(store: &G, entity: &Entity) -> Result<serde_json::Value> {
     let mut value = serde_json::to_value(entity).map_err(McpError::Json)?;
     let Some(obj) = value.as_object_mut() else {
         return Ok(value);
@@ -1328,15 +1430,19 @@ pub fn entity_response_json(entity: &Entity) -> Result<serde_json::Value> {
         obj.insert("end_line".into(), serde_json::json!(span.end_line));
     }
     if let Some(source_excerpt) =
-        read_entity_source_excerpt(entity, MCP_SOURCE_MAX_LINES, MCP_SOURCE_MAX_CHARS)
+        read_entity_source_excerpt_detailed(store, entity, MCP_SOURCE_MAX_LINES, MCP_SOURCE_MAX_CHARS)
     {
         obj.insert("source_excerpt".into(), serde_json::json!(source_excerpt));
     }
 
+    let is_stale = LAST_READ_STALE.with(|f| f.get());
+    obj.insert("stale".into(), serde_json::json!(is_stale));
+
     Ok(value)
 }
 
-pub fn focal_context_json(
+pub fn focal_context_json<G: GraphStore>(
+    store: &G,
     entry: &kin_model::ContextEntry,
     entity: &Entity,
     compact: bool,
@@ -1344,7 +1450,8 @@ pub fn focal_context_json(
     let start_line = entity.span.as_ref().map(|span| span.start_line);
     let end_line = entity.span.as_ref().map(|span| span.end_line);
     let source_excerpt =
-        read_entity_source_excerpt(entity, MCP_SOURCE_MAX_LINES, MCP_SOURCE_MAX_CHARS);
+        read_entity_source_excerpt_detailed(store, entity, MCP_SOURCE_MAX_LINES, MCP_SOURCE_MAX_CHARS);
+    let is_stale = LAST_READ_STALE.with(|f| f.get());
 
     let mut obj = serde_json::json!({
         "id": entity.id,
@@ -1355,6 +1462,7 @@ pub fn focal_context_json(
         "read_path": entity_read_path(entity),
         "start_line": start_line,
         "end_line": end_line,
+        "stale": is_stale,
     });
 
     if !compact {
