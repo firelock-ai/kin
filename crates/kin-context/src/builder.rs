@@ -22,12 +22,14 @@ use crate::tokens::estimate_tokens;
 fn relation_weight(kind: &RelationKind) -> f64 {
     match kind {
         RelationKind::Calls => 5.0,
+        RelationKind::UsesMacro => 4.0,
         RelationKind::CoChanges => 3.5,
         RelationKind::DependsOn => 3.0,
         RelationKind::Implements => 3.0,
         RelationKind::Extends => 3.0,
         RelationKind::Tests => 2.5,
         RelationKind::Imports => 2.0,
+        RelationKind::Includes => 1.8,
         RelationKind::DefinesContract => 2.0,
         RelationKind::ConsumesContract => 2.0,
         RelationKind::EmitsEvent => 1.5,
@@ -1437,6 +1439,7 @@ mod tests {
                 origin: RelationOrigin::Parsed,
                 created_in: None,
                 import_source: None,
+                evidence: Vec::new(),
             };
             store.upsert_relation(&rel).unwrap();
         }
@@ -1528,6 +1531,7 @@ mod tests {
             origin: RelationOrigin::Parsed,
             created_in: None,
             import_source: None,
+            evidence: Vec::new(),
         };
         store.upsert_relation(&rel).unwrap();
 
@@ -1559,6 +1563,7 @@ mod tests {
             origin: RelationOrigin::Parsed,
             created_in: None,
             import_source: None,
+            evidence: Vec::new(),
         };
         store.upsert_relation(&rel).unwrap();
 
@@ -1591,6 +1596,7 @@ mod tests {
             origin: RelationOrigin::Parsed,
             created_in: None,
             import_source: None,
+            evidence: Vec::new(),
         };
         store.upsert_relation(&rel).unwrap();
 
@@ -1685,6 +1691,7 @@ mod tests {
             origin: RelationOrigin::Parsed,
             created_in: None,
             import_source: None,
+            evidence: Vec::new(),
         };
         store.upsert_relation(&rel).unwrap();
 

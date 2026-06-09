@@ -8,7 +8,10 @@ use tracing::debug;
 
 use sha2::{Digest, Sha256};
 
-use kin_model::{Entity, EntityId, Relation, RelationId, RelationKind, RelationOrigin, Visibility};
+use kin_model::{
+    ArtifactId, Entity, EntityId, EntityKind, GraphNodeId, Relation, RelationEvidence, RelationId,
+    RelationKind, RelationOrigin, Visibility,
+};
 use kin_parser::{ExtractedRelation, FileImport};
 
 /// Result of resolving a single unresolved relation.
@@ -136,7 +139,7 @@ pub fn link_cross_file_against_entities(
     .entered();
     // Step 1: Build entity indices
     //   (file_path, entity_name) -> EntityId
-    let (entity_by_file_name, entity_by_name, known_files) = {
+    let (entity_by_file_name, entity_by_name, entity_kind_by_id, known_files) = {
         let _span = tracing::info_span!(
             "kin.index.link_cross_file.build_entity_indices",
             universe_entities = universe_entities.len()
@@ -144,9 +147,11 @@ pub fn link_cross_file_against_entities(
         .entered();
         let mut entity_by_file_name: HashMap<(&str, &str), EntityId> = HashMap::new();
         let mut entity_by_name: HashMap<&str, Vec<(&str, EntityId)>> = HashMap::new();
+        let mut entity_kind_by_id: HashMap<EntityId, EntityKind> = HashMap::new();
         let mut known_files: HashSet<&str> = HashSet::new();
 
         for entity in universe_entities {
+            entity_kind_by_id.insert(entity.id, entity.kind);
             let Some(file_path) = entity.file_origin.as_ref().map(|path| path.0.as_str()) else {
                 continue;
             };
@@ -162,7 +167,7 @@ pub fn link_cross_file_against_entities(
             known_files.insert(&file.file_path);
         }
 
-        (entity_by_file_name, entity_by_name, known_files)
+        (entity_by_file_name, entity_by_name, entity_kind_by_id, known_files)
     };
 
     // Step 2: Build import map per file
@@ -191,6 +196,8 @@ pub fn link_cross_file_against_entities(
 
     let mut resolved = Vec::new();
     let mut seen: HashSet<(EntityId, EntityId, RelationKind)> = HashSet::new();
+    let mut seen_artifact: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
+    let include_graph = build_include_graph(files, &known_files);
 
     let total_files = files.len();
     let progress_interval = std::cmp::max(total_files / 50, 1);
@@ -233,6 +240,38 @@ pub fn link_cross_file_against_entities(
                         continue;
                     }
                 };
+
+                if rel.kind == RelationKind::UsesMacro {
+                    if let Some(&dst_id) = dst_same_file {
+                        if entity_kind_by_id.get(&dst_id) == Some(&EntityKind::Macro) {
+                            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                                resolved.push(make_relation(rel.kind, src_id, dst_id, 1.0));
+                            }
+                            continue;
+                        }
+                    }
+
+                    if let Some(dst_id) = resolve_reachable_macro_target(
+                        &file.file_path,
+                        &rel.dst_name,
+                        &include_graph,
+                        &entity_by_file_name,
+                        &entity_kind_by_id,
+                    ) {
+                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                            resolved.push(make_relation(rel.kind, src_id, dst_id, 0.95));
+                        }
+                        continue;
+                    }
+
+                    debug!(
+                        src = %rel.src_name,
+                        dst = %rel.dst_name,
+                        file = %file.file_path,
+                        "linker: macro use unresolved through same-file/include closure"
+                    );
+                    continue;
+                }
 
                 // (a) Same-file resolution
                 if let Some(&dst_id) = dst_same_file {
@@ -321,12 +360,11 @@ pub fn link_cross_file_against_entities(
         }
     }
 
-    // Step 4: Create Imports edges from import declarations.
+    // Step 4: Create artifact-level import/include edges from import declarations.
     //
-    // For each import specifier that resolves to a known entity, emit a
-    // RelationKind::Imports edge. The source is the first entity in the
-    // importing file (acting as a file representative). The import_source
-    // field records the module path for qualified cross-repo resolution.
+    // Import/include syntax belongs to the file/module surface. Do not anchor it
+    // to an arbitrary "first entity" in the file; that makes the graph lie about
+    // which symbol owns the dependency and drops files with no parsed entities.
     {
         let _span = tracing::info_span!(
             "kin.index.link_cross_file.build_import_edges",
@@ -334,86 +372,13 @@ pub fn link_cross_file_against_entities(
         )
         .entered();
         for file in files {
-            // We need a source entity to anchor the import edge.
-            let Some(first_entity) = file.entities.first() else {
-                continue;
-            };
-            let src_id = first_entity.id;
-
             for imp in &file.imports {
-                let target_file =
-                    resolve_module_path(&file.file_path, &imp.module_path, &known_files);
-
-                for spec in &imp.specifiers {
-                    let original = spec.original_name.as_deref().unwrap_or(&spec.local_name);
-
-                    // Skip wildcard imports — they don't resolve to a single entity
-                    if original == "*" {
-                        continue;
-                    }
-
-                    let dst_id = if let Some(ref target) = target_file {
-                        // Relative import: resolve via target file + original name
-                        let direct = entity_by_file_name
-                            .get(&(target.as_str(), original))
-                            .copied();
-                        if direct.is_some() {
-                            direct
-                        } else if original == "default" {
-                            // Default import: fall back to the first entity in the target file
-                            resolve_default_export(target, universe_entities)
-                        } else {
-                            None
-                        }
-                    } else {
-                        // Non-relative (package) import: try several strategies
-                        // (a) Java: combine module_path + specifier to get full
-                        //     class path, then resolve to file
-                        let java_combined = if imp.module_path.contains('.')
-                            && !imp.module_path.contains('/')
-                            && original != "*"
-                        {
-                            let full_path = format!("{}.{}", imp.module_path, original);
-                            resolve_java_package_import(&full_path, &known_files).and_then(
-                                |file_path| {
-                                    entity_by_file_name
-                                        .get(&(file_path.as_str(), original))
-                                        .copied()
-                                        .or_else(|| {
-                                            // Try qualified name: Class.Method
-                                            let qualified = format!("{}", original);
-                                            entity_by_file_name
-                                                .get(&(file_path.as_str(), qualified.as_str()))
-                                                .copied()
-                                        })
-                                        .or_else(|| {
-                                            // Fall back to first entity in the file
-                                            resolve_default_export(&file_path, universe_entities)
-                                        })
-                                },
-                            )
-                        } else {
-                            None
-                        };
-                        java_combined.or_else(|| {
-                            // (b) Global name fallback for all languages
-                            entity_by_name
-                                .get(original)
-                                .and_then(|candidates| {
-                                    candidates
-                                        .iter()
-                                        .find(|(fp, _)| *fp != file.file_path.as_str())
-                                })
-                                .map(|(_, id)| *id)
-                        })
-                    };
-
-                    if let Some(dst_id) = dst_id {
-                        if add_deduped(&mut seen, src_id, dst_id, RelationKind::Imports) {
-                            let mut rel = make_relation(RelationKind::Imports, src_id, dst_id, 1.0);
-                            rel.import_source = Some(imp.module_path.clone());
-                            resolved.push(rel);
-                        }
+                if let Some(rel) =
+                    make_artifact_import_relation(&file.file_path, imp, &known_files)
+                {
+                    let key = (rel.src, rel.dst, rel.kind);
+                    if seen_artifact.insert(key) {
+                        resolved.push(rel);
                     }
                 }
             }
@@ -425,6 +390,106 @@ pub fn link_cross_file_against_entities(
     }
     debug!(resolved = resolved.len(), "cross-file linking complete");
     resolved
+}
+
+fn build_include_graph<S>(
+    files: &[FileParseData],
+    known_files: &HashSet<S>,
+) -> HashMap<String, Vec<String>>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    let mut include_graph: HashMap<String, Vec<String>> = HashMap::new();
+    for file in files {
+        for import in &file.imports {
+            let Some(resolved_path) =
+                resolve_module_path(&file.file_path, &import.module_path, known_files)
+            else {
+                continue;
+            };
+            if is_include_like_path(&import.module_path) || is_include_like_path(&resolved_path) {
+                include_graph
+                    .entry(file.file_path.clone())
+                    .or_default()
+                    .push(resolved_path);
+            }
+        }
+    }
+    for targets in include_graph.values_mut() {
+        targets.sort();
+        targets.dedup();
+    }
+    include_graph
+}
+
+fn is_include_like_path(path: &str) -> bool {
+    is_header_like_module_path(path)
+}
+
+fn reachable_include_files(
+    importer_file: &str,
+    include_graph: &HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut stack = include_graph
+        .get(importer_file)
+        .cloned()
+        .unwrap_or_default();
+
+    while let Some(path) = stack.pop() {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        if let Some(next) = include_graph.get(&path) {
+            stack.extend(next.iter().cloned());
+        }
+    }
+
+    let mut reachable = seen.into_iter().collect::<Vec<_>>();
+    reachable.sort();
+    reachable
+}
+
+fn resolve_reachable_macro_target<'a>(
+    importer_file: &str,
+    macro_name: &str,
+    include_graph: &HashMap<String, Vec<String>>,
+    entity_by_file_name: &HashMap<(&'a str, &'a str), EntityId>,
+    entity_kind_by_id: &HashMap<EntityId, EntityKind>,
+) -> Option<EntityId> {
+    for include_file in reachable_include_files(importer_file, include_graph) {
+        let Some(&candidate_id) =
+            entity_by_file_name.get(&(include_file.as_str(), macro_name))
+        else {
+            continue;
+        };
+        if entity_kind_by_id.get(&candidate_id) == Some(&EntityKind::Macro) {
+            return Some(candidate_id);
+        }
+    }
+    None
+}
+
+fn resolve_reachable_macro_target_incremental(
+    importer_file: &str,
+    macro_name: &str,
+    include_graph: &HashMap<String, Vec<String>>,
+    linker: &IncrementalLinker,
+) -> Option<EntityId> {
+    for include_file in reachable_include_files(importer_file, include_graph) {
+        let Some(candidate_id) = linker
+            .entity_by_file_name
+            .get(&include_file)
+            .and_then(|entities| entities.get(macro_name))
+            .copied()
+        else {
+            continue;
+        };
+        if linker.entity_kind_by_id.get(&candidate_id) == Some(&EntityKind::Macro) {
+            return Some(candidate_id);
+        }
+    }
+    None
 }
 
 /// Try to insert a (src, dst, kind) triple; returns true if it was new.
@@ -472,11 +537,56 @@ fn make_relation(kind: RelationKind, src: EntityId, dst: EntityId, confidence: f
         origin,
         created_in: None,
         import_source: None,
+        evidence: Vec::new(),
     }
+}
+
+fn make_artifact_import_relation<S>(
+    importer_file: &str,
+    import: &FileImport,
+    known_files: &HashSet<S>,
+) -> Option<Relation>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    let resolved_path = resolve_module_path(importer_file, &import.module_path, known_files)?;
+    let kind = if is_header_like_module_path(&import.module_path) {
+        RelationKind::Includes
+    } else {
+        RelationKind::Imports
+    };
+    let src = GraphNodeId::Artifact(ArtifactId::from_path(importer_file));
+    let dst = GraphNodeId::Artifact(ArtifactId::from_path(&resolved_path));
+    let evidence = RelationEvidence {
+        source_path: Some(import.module_path.clone()),
+        resolved_path: Some(resolved_path.clone()),
+        parser_rule: Some(match kind {
+            RelationKind::Includes => "include_directive",
+            _ => "import_declaration",
+        }
+        .to_string()),
+        occurrence_count: 1,
+        ..RelationEvidence::default()
+    };
+    Some(Relation {
+        id: stable_relation_node_id(&src, &dst, &kind),
+        kind,
+        src,
+        dst,
+        confidence: 1.0,
+        origin: RelationOrigin::Parsed,
+        created_in: None,
+        import_source: Some(import.module_path.clone()),
+        evidence: vec![evidence],
+    })
 }
 
 /// Derive a deterministic RelationId from the (src, dst, kind) triple.
 fn stable_relation_id(src: &EntityId, dst: &EntityId, kind: &RelationKind) -> RelationId {
+    stable_relation_node_id(&GraphNodeId::Entity(*src), &GraphNodeId::Entity(*dst), kind)
+}
+
+fn stable_relation_node_id(src: &GraphNodeId, dst: &GraphNodeId, kind: &RelationKind) -> RelationId {
     let mut hasher = Sha256::new();
     hasher.update(b"kin-rel-v1:");
     hasher.update(src.to_string().as_bytes());
@@ -823,6 +933,8 @@ pub struct IncrementalLinker {
     pub entity_by_file_name: HashMap<String, HashMap<String, EntityId>>,
     /// entity_name -> Vec<(file_path, EntityId)>
     pub entity_by_name: HashMap<String, Vec<(String, EntityId)>>,
+    /// entity_id -> kind
+    pub entity_kind_by_id: HashMap<EntityId, EntityKind>,
     /// Set of all known files
     pub known_files: HashSet<String>,
     /// file_path -> Vec<(EntityId, Visibility)>
@@ -834,6 +946,7 @@ impl IncrementalLinker {
         Self {
             entity_by_file_name: HashMap::new(),
             entity_by_name: HashMap::new(),
+            entity_kind_by_id: HashMap::new(),
             known_files: HashSet::new(),
             entities_by_file: HashMap::new(),
         }
@@ -844,11 +957,12 @@ impl IncrementalLinker {
         self.known_files.remove(file_path);
 
         if let Some(file_entities) = self.entity_by_file_name.remove(file_path) {
-            for entity_name in file_entities.keys() {
-                if let Some(candidates) = self.entity_by_name.get_mut(entity_name) {
+            for (entity_name, entity_id) in file_entities {
+                self.entity_kind_by_id.remove(&entity_id);
+                if let Some(candidates) = self.entity_by_name.get_mut(&entity_name) {
                     candidates.retain(|(fp, _)| fp != file_path);
                     if candidates.is_empty() {
-                        self.entity_by_name.remove(entity_name);
+                        self.entity_by_name.remove(&entity_name);
                     }
                 }
             }
@@ -868,6 +982,7 @@ impl IncrementalLinker {
 
         for entity in entities {
             file_entities_map.insert(entity.name.clone(), entity.id);
+            self.entity_kind_by_id.insert(entity.id, entity.kind);
 
             self.entity_by_name
                 .entry(entity.name.clone())
@@ -934,6 +1049,7 @@ pub fn link_cross_file_incremental(
 
     let mut resolved = Vec::new();
     let mut seen: HashSet<(EntityId, EntityId, RelationKind)> = HashSet::new();
+    let include_graph = build_include_graph(files, &linker.known_files);
 
     let total_files = files.len();
     let progress_interval = std::cmp::max(total_files / 50, 1);
@@ -974,6 +1090,37 @@ pub fn link_cross_file_incremental(
                     continue;
                 }
             };
+
+            if rel.kind == RelationKind::UsesMacro {
+                if let Some(dst_id) = dst_same_file {
+                    if linker.entity_kind_by_id.get(&dst_id) == Some(&EntityKind::Macro) {
+                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                            resolved.push(make_relation(rel.kind, src_id, dst_id, 1.0));
+                        }
+                        continue;
+                    }
+                }
+
+                if let Some(dst_id) = resolve_reachable_macro_target_incremental(
+                    &file.file_path,
+                    &rel.dst_name,
+                    &include_graph,
+                    linker,
+                ) {
+                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                        resolved.push(make_relation(rel.kind, src_id, dst_id, 0.95));
+                    }
+                    continue;
+                }
+
+                debug!(
+                    src = %rel.src_name,
+                    dst = %rel.dst_name,
+                    file = %file.file_path,
+                    "linker: macro use unresolved through same-file/include closure"
+                );
+                continue;
+            }
 
             // (a) Same-file resolution
             if let Some(dst_id) = dst_same_file {
@@ -1049,86 +1196,16 @@ pub fn link_cross_file_incremental(
         }
     }
 
-    // Step 4: Create Imports edges from import declarations.
+    // Step 4: Create artifact-level import/include edges from import declarations.
+    let mut seen_artifact: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
     for file in files {
-        let Some(first_entity) = file.entities.first() else {
-            continue;
-        };
-        let src_id = first_entity.id;
-
         for imp in &file.imports {
-            let target_file =
-                resolve_module_path(&file.file_path, &imp.module_path, &linker.known_files);
-
-            for spec in &imp.specifiers {
-                let original = spec.original_name.as_deref().unwrap_or(&spec.local_name);
-
-                if original == "*" {
-                    continue;
-                }
-
-                let dst_id = if let Some(ref target) = target_file {
-                    let direct = linker
-                        .entity_by_file_name
-                        .get(target)
-                        .and_then(|m| m.get(original))
-                        .copied();
-                    if direct.is_some() {
-                        direct
-                    } else if original == "default" {
-                        resolve_default_export_incremental(target, &linker.entities_by_file)
-                    } else {
-                        None
-                    }
-                } else {
-                    let java_combined = if imp.module_path.contains('.')
-                        && !imp.module_path.contains('/')
-                        && original != "*"
-                    {
-                        let full_path = format!("{}.{}", imp.module_path, original);
-                        resolve_java_package_import(&full_path, &linker.known_files).and_then(
-                            |file_path| {
-                                linker
-                                    .entity_by_file_name
-                                    .get(&file_path)
-                                    .and_then(|m| m.get(original))
-                                    .copied()
-                                    .or_else(|| {
-                                        let qualified = format!("{}", original);
-                                        linker
-                                            .entity_by_file_name
-                                            .get(&file_path)
-                                            .and_then(|m| m.get(qualified.as_str()))
-                                            .copied()
-                                    })
-                                    .or_else(|| {
-                                        resolve_default_export_incremental(
-                                            &file_path,
-                                            &linker.entities_by_file,
-                                        )
-                                    })
-                            },
-                        )
-                    } else {
-                        None
-                    };
-                    java_combined.or_else(|| {
-                        linker
-                            .entity_by_name
-                            .get(original)
-                            .and_then(|candidates| {
-                                candidates.iter().find(|(fp, _)| fp != &file.file_path)
-                            })
-                            .map(|(_, id)| *id)
-                    })
-                };
-
-                if let Some(dst_id) = dst_id {
-                    if add_deduped(&mut seen, src_id, dst_id, RelationKind::Imports) {
-                        let mut rel = make_relation(RelationKind::Imports, src_id, dst_id, 1.0);
-                        rel.import_source = Some(imp.module_path.clone());
-                        resolved.push(rel);
-                    }
+            if let Some(rel) =
+                make_artifact_import_relation(&file.file_path, imp, &linker.known_files)
+            {
+                let key = (rel.src, rel.dst, rel.kind);
+                if seen_artifact.insert(key) {
+                    resolved.push(rel);
                 }
             }
         }
@@ -1156,8 +1233,8 @@ fn normalize_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use kin_model::{
-        EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm, GraphNodeId,
-        Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
+        ArtifactId, EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm,
+        GraphNodeId, Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
     };
 
     fn test_fingerprint() -> SemanticFingerprint {
@@ -1198,6 +1275,13 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    fn make_macro_entity(name: &str, file_path: &str) -> Entity {
+        let mut entity = make_entity(name, file_path);
+        entity.kind = EntityKind::Macro;
+        entity.language = LanguageId::Cpp;
+        entity
     }
 
     #[test]
@@ -1257,7 +1341,7 @@ mod tests {
         ];
 
         let result = link_cross_file(&files);
-        // Step 3b produces a Calls edge; Step 4 produces an Imports edge
+        // Step 3b produces a Calls edge; Step 4 produces an artifact-level Imports edge
         assert_eq!(result.len(), 2);
         let calls = result
             .iter()
@@ -1270,8 +1354,14 @@ mod tests {
             .iter()
             .find(|r| r.kind == RelationKind::Imports)
             .expect("expected Imports relation");
-        assert_eq!(imports.src, GraphNodeId::Entity(caller.id));
-        assert_eq!(imports.dst, GraphNodeId::Entity(callee.id));
+        assert_eq!(
+            imports.src,
+            GraphNodeId::Artifact(ArtifactId::from_path("src/routes/api.ts"))
+        );
+        assert_eq!(
+            imports.dst,
+            GraphNodeId::Artifact(ArtifactId::from_path("src/utils/tools.ts"))
+        );
         assert_eq!(imports.import_source.as_deref(), Some("../utils/tools"));
     }
 
@@ -1302,7 +1392,7 @@ mod tests {
         let universe = vec![caller.clone(), callee.clone()];
 
         let result = link_cross_file_against_entities(&reparsed, &universe);
-        // Step 3b produces a Calls edge; Step 4 produces an Imports edge
+        // Step 3b produces a Calls edge; Step 4 produces an artifact-level Imports edge
         assert_eq!(result.len(), 2);
         let calls = result
             .iter()
@@ -1315,8 +1405,14 @@ mod tests {
             .iter()
             .find(|r| r.kind == RelationKind::Imports)
             .expect("expected Imports relation");
-        assert_eq!(imports.src, GraphNodeId::Entity(caller.id));
-        assert_eq!(imports.dst, GraphNodeId::Entity(callee.id));
+        assert_eq!(
+            imports.src,
+            GraphNodeId::Artifact(ArtifactId::from_path("src/routes/api.ts"))
+        );
+        assert_eq!(
+            imports.dst,
+            GraphNodeId::Artifact(ArtifactId::from_path("src/utils/tools.ts"))
+        );
         assert_eq!(imports.import_source.as_deref(), Some("../utils/tools"));
     }
 
@@ -1353,6 +1449,91 @@ mod tests {
     }
 
     #[test]
+    fn macro_use_resolves_through_reachable_include() {
+        let caller = make_entity("main", "src/app.cpp");
+        let macro_def = make_macro_entity("JSON_PRIVATE_UNLESS_TESTED", "include/json/macros.hpp");
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/app.cpp".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![ExtractedRelation {
+                    kind: RelationKind::UsesMacro,
+                    src_name: "main".to_string(),
+                    dst_name: "JSON_PRIVATE_UNLESS_TESTED".to_string(),
+                    import_source: None,
+                }],
+                imports: vec![FileImport {
+                    module_path: "json/macros.hpp".to_string(),
+                    specifiers: vec![kin_parser::ImportedName {
+                        local_name: "macros.hpp".to_string(),
+                        original_name: Some("default".to_string()),
+                        is_default: true,
+                    }],
+                }],
+            },
+            FileParseData {
+                file_path: "include/json/macros.hpp".to_string(),
+                entities: vec![macro_def.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let uses_macro = result
+            .iter()
+            .find(|rel| rel.kind == RelationKind::UsesMacro)
+            .expect("expected reachable macro use relation");
+        assert_eq!(uses_macro.src, GraphNodeId::Entity(caller.id));
+        assert_eq!(uses_macro.dst, GraphNodeId::Entity(macro_def.id));
+        assert_eq!(uses_macro.confidence, 0.95);
+        assert!(
+            result.iter().any(|rel| {
+                rel.kind == RelationKind::Includes
+                    && rel.src == GraphNodeId::Artifact(ArtifactId::from_path("src/app.cpp"))
+                    && rel.dst
+                        == GraphNodeId::Artifact(ArtifactId::from_path(
+                            "include/json/macros.hpp",
+                        ))
+            }),
+            "include directive should be preserved as an artifact edge"
+        );
+    }
+
+    #[test]
+    fn macro_use_does_not_resolve_to_unincluded_global_match() {
+        let caller = make_entity("main", "src/app.cpp");
+        let macro_def = make_macro_entity("JSON_PRIVATE_UNLESS_TESTED", "include/json/macros.hpp");
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/app.cpp".to_string(),
+                entities: vec![caller],
+                relations: vec![ExtractedRelation {
+                    kind: RelationKind::UsesMacro,
+                    src_name: "main".to_string(),
+                    dst_name: "JSON_PRIVATE_UNLESS_TESTED".to_string(),
+                    import_source: None,
+                }],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "include/json/macros.hpp".to_string(),
+                entities: vec![macro_def],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        assert!(
+            result.iter().all(|rel| rel.kind != RelationKind::UsesMacro),
+            "macro uses must not resolve through the generic global fallback"
+        );
+    }
+
+    #[test]
     fn namespace_import_member_resolution() {
         let caller = make_entity("_safeParse", "src/parse.ts");
         let callee = make_entity("finalizeIssue", "src/util.ts");
@@ -1385,10 +1566,15 @@ mod tests {
         ];
 
         let result = link_cross_file(&files);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].src, GraphNodeId::Entity(caller.id));
-        assert_eq!(result[0].dst, GraphNodeId::Entity(callee.id));
-        assert_eq!(result[0].confidence, 0.9);
+        // 1 Calls edge + 1 artifact-level Imports edge
+        assert_eq!(result.len(), 2);
+        let calls = result
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls)
+            .expect("expected Calls relation");
+        assert_eq!(calls.src, GraphNodeId::Entity(caller.id));
+        assert_eq!(calls.dst, GraphNodeId::Entity(callee.id));
+        assert_eq!(calls.confidence, 0.9);
     }
 
     #[test]
@@ -1556,7 +1742,7 @@ mod tests {
         ];
 
         let result = link_cross_file(&files);
-        // Step 3b produces a Calls edge; Step 4 produces an Imports edge
+        // Step 3b produces a Calls edge; Step 4 produces an artifact-level Imports edge
         assert_eq!(result.len(), 2);
         let calls = result
             .iter()
@@ -1569,8 +1755,14 @@ mod tests {
             .iter()
             .find(|r| r.kind == RelationKind::Imports)
             .expect("expected Imports relation");
-        assert_eq!(imports.src, GraphNodeId::Entity(caller.id));
-        assert_eq!(imports.dst, GraphNodeId::Entity(callee.id));
+        assert_eq!(
+            imports.src,
+            GraphNodeId::Artifact(ArtifactId::from_path("src/api.ts"))
+        );
+        assert_eq!(
+            imports.dst,
+            GraphNodeId::Artifact(ArtifactId::from_path("src/utils.ts"))
+        );
         assert_eq!(imports.import_source.as_deref(), Some("./utils"));
     }
 
@@ -1604,15 +1796,21 @@ mod tests {
         let result = link_cross_file(&files);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].kind, RelationKind::Imports);
-        assert_eq!(result[0].src, kin_model::GraphNodeId::Entity(importer.id));
-        assert_eq!(result[0].dst, kin_model::GraphNodeId::Entity(target.id));
+        assert_eq!(
+            result[0].src,
+            GraphNodeId::Artifact(ArtifactId::from_path("src/routes/api.ts"))
+        );
+        assert_eq!(
+            result[0].dst,
+            GraphNodeId::Artifact(ArtifactId::from_path("src/utils/tools.ts"))
+        );
         assert_eq!(result[0].import_source.as_deref(), Some("../utils/tools"));
     }
 
     #[test]
     fn header_include_creates_default_import_relation() {
-        let importer = make_entity("main", "src/main.cpp");
-        let target = make_entity(
+        let _importer = make_entity("main", "src/main.cpp");
+        let _target = make_entity(
             "binary_reader",
             "include/nlohmann/detail/input/binary_reader.hpp",
         );
@@ -1620,7 +1818,7 @@ mod tests {
         let files = vec![
             FileParseData {
                 file_path: "src/main.cpp".to_string(),
-                entities: vec![importer.clone()],
+                entities: vec![_importer.clone()],
                 relations: vec![],
                 imports: vec![FileImport {
                     module_path: "nlohmann/detail/input/binary_reader.hpp".to_string(),
@@ -1633,7 +1831,7 @@ mod tests {
             },
             FileParseData {
                 file_path: "include/nlohmann/detail/input/binary_reader.hpp".to_string(),
-                entities: vec![target.clone()],
+                entities: vec![_target.clone()],
                 relations: vec![],
                 imports: vec![],
             },
@@ -1641,9 +1839,18 @@ mod tests {
 
         let result = link_cross_file(&files);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].kind, RelationKind::Imports);
-        assert_eq!(result[0].src, kin_model::GraphNodeId::Entity(importer.id));
-        assert_eq!(result[0].dst, kin_model::GraphNodeId::Entity(target.id));
+        // Header includes produce Includes edges (artifact-level)
+        assert_eq!(result[0].kind, RelationKind::Includes);
+        assert_eq!(
+            result[0].src,
+            GraphNodeId::Artifact(ArtifactId::from_path("src/main.cpp"))
+        );
+        assert_eq!(
+            result[0].dst,
+            GraphNodeId::Artifact(ArtifactId::from_path(
+                "include/nlohmann/detail/input/binary_reader.hpp"
+            ))
+        );
         assert_eq!(
             result[0].import_source.as_deref(),
             Some("nlohmann/detail/input/binary_reader.hpp")
@@ -1691,7 +1898,9 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_import_skipped() {
+    fn wildcard_import_creates_artifact_edge() {
+        // Wildcard imports now produce artifact-level edges (file imports file)
+        // even though no per-specifier entity resolution occurs.
         let importer = make_entity("handler", "src/api.ts");
         let target = make_entity("helper", "src/util.ts");
 
@@ -1718,7 +1927,20 @@ mod tests {
         ];
 
         let result = link_cross_file(&files);
-        assert_eq!(result.len(), 0, "wildcard imports should not create edges");
+        assert_eq!(
+            result.len(),
+            1,
+            "wildcard imports should create an artifact-level edge"
+        );
+        assert_eq!(result[0].kind, RelationKind::Imports);
+        assert_eq!(
+            result[0].src,
+            GraphNodeId::Artifact(ArtifactId::from_path("src/api.ts"))
+        );
+        assert_eq!(
+            result[0].dst,
+            GraphNodeId::Artifact(ArtifactId::from_path("src/util.ts"))
+        );
     }
 
     #[test]

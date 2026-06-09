@@ -649,6 +649,7 @@ mod tests {
                 origin: RelationOrigin::Parsed,
                 created_in: None,
                 import_source: Some("requests".to_string()),
+                evidence: vec![],
             },
             // Contains edge (should be ignored — not Calls/References)
             Relation {
@@ -660,6 +661,7 @@ mod tests {
                 origin: RelationOrigin::Parsed,
                 created_in: None,
                 import_source: Some("requests".to_string()),
+                evidence: vec![],
             },
             // Calls edge without import_source (should be ignored)
             Relation {
@@ -671,6 +673,7 @@ mod tests {
                 origin: RelationOrigin::Parsed,
                 created_in: None,
                 import_source: None,
+                evidence: vec![],
             },
         ];
 

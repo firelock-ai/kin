@@ -3,8 +3,8 @@
 
 use anyhow::{Context, Result};
 use kin_model::{
-    ChangeStore, EntityFilter, EntityKind, EntityRole, EntityStore, GraphNodeId, RelationKind,
-    SemanticChangeId,
+    ArtifactId, ChangeStore, EntityFilter, EntityKind, EntityRole, EntityStore, GraphNodeId,
+    RelationKind, SemanticChangeId,
 };
 use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,13 @@ use crate::capability::LocateProfile;
 /// float score accumulation and tie-breaks are bit-reproducible.
 type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 type EntityStableKey = (String, String, EntityKind);
+type ResolveEntitiesOutput = (
+    Vec<(String, f32)>,
+    HashMap<String, Vec<String>>,
+    HashMap<String, HashMap<String, f32>>,
+    HashMap<String, Vec<LocateSymbol>>,
+    Vec<LocateDebugCandidateStage>,
+);
 
 // ---------------------------------------------------------------------------
 // JSON output types
@@ -108,6 +115,8 @@ pub struct LocateDebugInfo {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stages: Vec<LocateDebugStage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_stages: Vec<LocateDebugCandidateStage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pruned_files: Vec<PrunedFile>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol_cap: Option<SymbolCapTrace>,
@@ -155,6 +164,25 @@ pub struct LocateDebugResolvedFile {
 pub struct LocateDebugStage {
     pub name: String,
     pub files: Vec<LocateDebugFileScore>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct LocateDebugCandidateStage {
+    pub name: String,
+    pub candidates: Vec<LocateDebugCandidate>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct LocateDebugCandidate {
+    pub id: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub score: f32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -209,6 +237,23 @@ struct EntityDiscovery {
     /// surfaced via the vector pool. Recorded for --explain observability only;
     /// never participates in ranking. `None` for text-only seeds.
     cosine: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolveCandidateSource {
+    Direct,
+    Graph,
+}
+
+#[derive(Clone, Debug)]
+struct ResolveCandidate {
+    id: String,
+    kind: &'static str,
+    path: String,
+    name: Option<String>,
+    score: f32,
+    source: ResolveCandidateSource,
+    reason: String,
 }
 
 #[derive(Clone)]
@@ -849,9 +894,21 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // LSP-resolved relations carry 2× weight (type-resolved, high confidence).
     // ═══════════════════════════════════════════════════════════════════════
 
-    let (resolved_files, resolve_explain, resolve_signal_scores, resolve_symbols) =
+    let (
+        resolved_files,
+        resolve_explain,
+        resolve_signal_scores,
+        resolve_symbols,
+        resolve_candidate_stages,
+    ) =
         if budget.phase_should_skip("entity_resolution") {
-            (Vec::new(), HashMap::new(), HashMap::new(), HashMap::new())
+            (
+                Vec::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                Vec::new(),
+            )
         } else {
             let phase_start = std::time::Instant::now();
             let result = resolve_entities_to_files(&all_entity_seeds, graph, explain, "text")?;
@@ -885,14 +942,21 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // ranked_lists) so they can survive even when they don't overlap with
     // text-search entity_resolve hits. Skip when there are no seeds or when
     // the entity_resolution budget is already exhausted.
-    let (embedding_hits, embedding_symbols): (
+    let (embedding_hits, embedding_symbols, embedding_candidate_stages): (
         HashMap<String, Vec<FileHit>>,
         HashMap<String, Vec<LocateSymbol>>,
+        Vec<LocateDebugCandidateStage>,
     ) = if embedding_entity_seeds.is_empty() || budget.phase_should_skip("entity_resolution") {
-        (HashMap::new(), HashMap::new())
+        (HashMap::new(), HashMap::new(), Vec::new())
     } else {
         let phase_start = std::time::Instant::now();
-        let (embed_files, _embed_explain, _embed_signal_scores, embed_symbols) =
+        let (
+            embed_files,
+            _embed_explain,
+            _embed_signal_scores,
+            embed_symbols,
+            embed_candidate_stages,
+        ) =
             resolve_entities_to_files(&embedding_entity_seeds, graph, explain, "vector")?;
         if phase_start.elapsed().as_secs_f64()
             > budget
@@ -910,7 +974,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 spans: vec![],
             });
         }
-        (hits, embed_symbols)
+        (hits, embed_symbols, embed_candidate_stages)
     };
 
     let fast_traceback_top = to_ranked(&traceback)
@@ -1386,6 +1450,11 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 })
                 .collect(),
             stages: Vec::new(),
+            candidate_stages: {
+                let mut stages = resolve_candidate_stages.clone();
+                stages.extend(embedding_candidate_stages.clone());
+                stages
+            },
             pruned_files: Vec::new(),
             symbol_cap: None,
         })
@@ -7383,12 +7452,7 @@ fn resolve_entities_to_files(
     graph: &kin_db::InMemoryGraph,
     explain: bool,
     origin: &str,
-) -> Result<(
-    Vec<(String, f32)>,
-    HashMap<String, Vec<String>>,
-    HashMap<String, HashMap<String, f32>>,
-    HashMap<String, Vec<LocateSymbol>>,
-)> {
+) -> Result<ResolveEntitiesOutput> {
     let _span = tracing::info_span!(
         "locate.resolve_entities_to_files",
         seed_count = entity_seeds.len(),
@@ -7426,8 +7490,7 @@ fn resolve_entities_to_files(
     // These are normalized independently then blended so that graph traversal
     // (which inflates hub files via many paths) cannot drown direct attribution
     // (which tells us the entity IS in this specific file).
-    let mut direct_scores: FxHashMap<String, Vec<f32>> = FxHashMap::default();
-    let mut graph_scores: FxHashMap<String, Vec<f32>> = FxHashMap::default();
+    let mut candidates: Vec<ResolveCandidate> = Vec::new();
     let mut file_explain: HashMap<String, Vec<String>> = HashMap::new();
     let mut file_symbols: HashMap<String, Vec<LocateSymbol>> = HashMap::new();
     let mut file_signal_scores: HashMap<String, HashMap<String, f32>> = HashMap::new();
@@ -7548,7 +7611,9 @@ fn resolve_entities_to_files(
 
     let allowed_kinds = [
         RelationKind::Calls,
+        RelationKind::UsesMacro,
         RelationKind::Imports,
+        RelationKind::Includes,
         RelationKind::References,
         RelationKind::Implements,
         RelationKind::Extends,
@@ -7609,33 +7674,43 @@ fn resolve_entities_to_files(
                 };
                 let score = discovery.score * def_mult;
 
-                direct_scores.entry(path.clone()).or_default().push(score);
+                candidates.push(ResolveCandidate {
+                    id: format!("entity:{entity_id}"),
+                    kind: "entity",
+                    path: path.clone(),
+                    name: Some(entity.name.clone()),
+                    score,
+                    source: ResolveCandidateSource::Direct,
+                    reason: format!(
+                        "{} seed {}",
+                        origin,
+                        discovery.signals.join("+")
+                    ),
+                });
                 file_signal_scores
                     .entry(path.clone())
                     .or_default()
                     .entry("entity_resolve".to_string())
                     .and_modify(|s| *s += score)
                     .or_insert(score);
-                file_symbols
-                    .entry(path.clone())
-                    .or_default()
-                    .push(LocateSymbol {
-                        name: entity.name.clone(),
-                        span: entity_span_pair(&entity).into_iter().next(),
-                        score,
-                        kind: format!("{:?}", entity.kind).to_lowercase(),
-                        definition: is_definition,
-                        origin: if explain {
-                            origin.to_string()
-                        } else {
-                            String::new()
-                        },
-                        cosine: if explain || embed_relevance_on {
-                            discovery.cosine
-                        } else {
-                            None
-                        },
-                    });
+                let symbol = LocateSymbol {
+                    name: entity.name.clone(),
+                    span: entity_span_pair(&entity).into_iter().next(),
+                    score,
+                    kind: format!("{:?}", entity.kind).to_lowercase(),
+                    definition: is_definition,
+                    origin: if explain {
+                        origin.to_string()
+                    } else {
+                        String::new()
+                    },
+                    cosine: if explain || embed_relevance_on {
+                        discovery.cosine
+                    } else {
+                        None
+                    },
+                };
+                file_symbols.entry(path.clone()).or_default().push(symbol);
                 if explain {
                     let body_tag = if is_definition {
                         "definition"
@@ -7655,6 +7730,70 @@ fn resolve_entities_to_files(
                     );
                 }
             } // else (not test)
+        }
+
+        if let Some(ref fo) = entity.file_origin {
+            let artifact_node = GraphNodeId::Artifact(ArtifactId::from_path(&fo.0));
+            let mut artifact_rels = graph.get_all_relations_for_node(&artifact_node)?;
+            artifact_rels.sort_by(|left, right| {
+                let left_kind = resolve_relation_kind_priority(left.kind);
+                let right_kind = resolve_relation_kind_priority(right.kind);
+                let left_origin = resolve_relation_origin_priority(left.origin);
+                let right_origin = resolve_relation_origin_priority(right.origin);
+                right_kind
+                    .cmp(&left_kind)
+                    .then_with(|| right_origin.cmp(&left_origin))
+                    .then_with(|| format!("{:?}", left.id).cmp(&format!("{:?}", right.id)))
+            });
+            for rel in artifact_rels
+                .iter()
+                .take(locate_env_usize("KIN_LOCATE_RESOLVE_ARTIFACT_FRONTIER", 32))
+            {
+                if !matches!(rel.kind, RelationKind::Includes | RelationKind::Imports) {
+                    continue;
+                }
+                let Some(path) = relation_projected_artifact_path(rel, &artifact_node) else {
+                    continue;
+                };
+                if is_test_path(&path) || is_vendored_path(&path) {
+                    continue;
+                }
+
+                let origin_mult = resolve_relation_origin_multiplier(
+                    rel.origin,
+                    lsp_boost,
+                    parsed_weight,
+                    inferred_weight,
+                );
+                let kind_mult = resolve_relation_kind_multiplier(rel.kind);
+                let score = discovery.score * origin_mult * kind_mult / 2.0;
+
+                candidates.push(ResolveCandidate {
+                    id: format!("relation:{}:artifact:{}", rel.id, rel.dst),
+                    kind: "relation_artifact",
+                    path: path.clone(),
+                    name: None,
+                    score,
+                    source: ResolveCandidateSource::Graph,
+                    reason: format!("{:?} from file artifact {}", rel.kind, fo.0),
+                });
+                file_signal_scores
+                    .entry(path.clone())
+                    .or_default()
+                    .entry("graph_resolve".to_string())
+                    .and_modify(|s| *s += score)
+                    .or_insert(score);
+                if explain {
+                    push_projection_reason(
+                        &mut file_explain,
+                        &path,
+                        format!(
+                            "artifact {:?} from `{}` includes/imports `{}`",
+                            rel.kind, fo.0, path
+                        ),
+                    );
+                }
+            }
         }
 
         // Graph traversal from ALL entities including test entities
@@ -7718,23 +7857,15 @@ fn resolve_entities_to_files(
                     continue;
                 }
 
-                let origin_mult = match rel.origin {
-                    kin_model::RelationOrigin::Lsp => lsp_boost,
-                    kin_model::RelationOrigin::Parsed => parsed_weight,
-                    kin_model::RelationOrigin::Inferred => inferred_weight,
-                    kin_model::RelationOrigin::Manual => 1.0,
-                };
+                let origin_mult = resolve_relation_origin_multiplier(
+                    rel.origin,
+                    lsp_boost,
+                    parsed_weight,
+                    inferred_weight,
+                );
 
                 // Relation kind weighting
-                let kind_mult = match rel.kind {
-                    RelationKind::Calls => 2.0,
-                    RelationKind::References => 1.5,
-                    RelationKind::Implements | RelationKind::Extends => 1.8,
-                    RelationKind::Imports | RelationKind::DependsOn => 1.2,
-                    RelationKind::Contains => 1.0,
-                    RelationKind::Tests => 2.0,
-                    _ => 0.8,
-                };
+                let kind_mult = resolve_relation_kind_multiplier(rel.kind);
 
                 // Definition authority for the neighbor too
                 let neighbor_has_body = neighbor
@@ -7754,7 +7885,15 @@ fn resolve_entities_to_files(
                 let score = discovery.score * origin_mult * kind_mult * def_mult * hop_decay
                     / ((depth + 2) as f32);
 
-                graph_scores.entry(path.clone()).or_default().push(score);
+                candidates.push(ResolveCandidate {
+                    id: format!("relation:{}:entity:{}", rel.id, neighbor_id),
+                    kind: "relation_entity",
+                    path: path.clone(),
+                    name: Some(neighbor.name.clone()),
+                    score,
+                    source: ResolveCandidateSource::Graph,
+                    reason: format!("{:?} via {:?}", rel.kind, rel.origin),
+                });
                 file_signal_scores
                     .entry(path.clone())
                     .or_default()
@@ -7789,30 +7928,37 @@ fn resolve_entities_to_files(
         }
     }
 
-    let mut final_direct_scores: FxHashMap<String, f32> = FxHashMap::default();
-    for (path, mut scores) in direct_scores.into_iter() {
-        scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        let mut sum = 0.0;
-        for (i, &score) in scores.iter().enumerate() {
-            sum += score * 0.5_f32.powi(i as i32);
+    let mut direct_scores: FxHashMap<String, Vec<f32>> = FxHashMap::default();
+    let mut graph_scores: FxHashMap<String, Vec<f32>> = FxHashMap::default();
+    for candidate in &candidates {
+        match candidate.source {
+            ResolveCandidateSource::Direct => {
+                direct_scores
+                    .entry(candidate.path.clone())
+                    .or_default()
+                    .push(candidate.score);
+            }
+            ResolveCandidateSource::Graph => {
+                graph_scores
+                    .entry(candidate.path.clone())
+                    .or_default()
+                    .push(candidate.score);
+            }
         }
-        final_direct_scores.insert(path, sum);
     }
 
-    // Hub dampening for graph traversal only: files with many entity
-    // contributions from graph BFS are hubs. Dampen by sqrt(entity_count).
+    let mut final_direct_scores: FxHashMap<String, f32> = FxHashMap::default();
+    for (path, scores) in direct_scores.into_iter() {
+        let max_score = scores.into_iter().fold(0.0f32, f32::max);
+        final_direct_scores.insert(path, max_score);
+    }
+
+    // Graph scores are also purely max-based now.
+    // Hub dampening is removed because the number of incoming entities no longer drives the file score up.
     let mut final_graph_scores: FxHashMap<String, f32> = FxHashMap::default();
-    for (path, mut scores) in graph_scores.into_iter() {
-        scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        let mut sum = 0.0;
-        for (i, &score) in scores.iter().enumerate() {
-            sum += score * 0.5_f32.powi(i as i32);
-        }
-        let entity_count = scores.len() as f32;
-        if entity_count > 2.0 {
-            sum /= entity_count.sqrt();
-        }
-        final_graph_scores.insert(path, sum);
+    for (path, scores) in graph_scores.into_iter() {
+        let max_score = scores.into_iter().fold(0.0f32, f32::max);
+        final_graph_scores.insert(path, max_score);
     }
 
     // Normalize direct and graph scores INDEPENDENTLY, then blend.
@@ -7857,18 +8003,149 @@ fn resolve_entities_to_files(
         origin,
         result.len()
     );
-    Ok((result, file_explain, file_signal_scores, file_symbols))
+    let candidate_stages = if explain {
+        resolve_candidate_debug_stages(origin, &candidates, &result)
+    } else {
+        Vec::new()
+    };
+    Ok((
+        result,
+        file_explain,
+        file_signal_scores,
+        file_symbols,
+        candidate_stages,
+    ))
+}
+
+fn resolve_candidate_debug_stages(
+    origin: &str,
+    candidates: &[ResolveCandidate],
+    projected: &[(String, f32)],
+) -> Vec<LocateDebugCandidateStage> {
+    let limit = locate_env_usize("KIN_LOCATE_DEBUG_CANDIDATE_LIMIT", 80);
+    let mut stages = Vec::new();
+
+    let seed_candidates = candidates
+        .iter()
+        .filter(|candidate| candidate.source == ResolveCandidateSource::Direct)
+        .cloned()
+        .collect::<Vec<_>>();
+    stages.push(LocateDebugCandidateStage {
+        name: format!("{origin}_seed_candidates"),
+        candidates: resolve_candidates_to_debug(seed_candidates, limit),
+    });
+
+    let relation_candidates = candidates
+        .iter()
+        .filter(|candidate| candidate.source == ResolveCandidateSource::Graph)
+        .cloned()
+        .collect::<Vec<_>>();
+    stages.push(LocateDebugCandidateStage {
+        name: format!("{origin}_relation_paths"),
+        candidates: resolve_candidates_to_debug(relation_candidates, limit),
+    });
+
+    stages.push(LocateDebugCandidateStage {
+        name: format!("{origin}_candidate_pre_projection"),
+        candidates: resolve_candidates_to_debug(candidates.to_vec(), limit),
+    });
+
+    let projected_candidates = projected
+        .iter()
+        .map(|(path, score)| ResolveCandidate {
+            id: format!("file:{path}"),
+            kind: "projected_file",
+            path: path.clone(),
+            name: None,
+            score: *score,
+            source: ResolveCandidateSource::Graph,
+            reason: "candidate projection".to_string(),
+        })
+        .collect::<Vec<_>>();
+    stages.push(LocateDebugCandidateStage {
+        name: format!("{origin}_projected_pre_cap"),
+        candidates: resolve_candidates_to_debug(projected_candidates, limit),
+    });
+
+    stages
+}
+
+fn resolve_candidates_to_debug(
+    mut candidates: Vec<ResolveCandidate>,
+    limit: usize,
+) -> Vec<LocateDebugCandidate> {
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    candidates
+        .into_iter()
+        .take(limit)
+        .map(|candidate| LocateDebugCandidate {
+            id: candidate.id,
+            kind: candidate.kind.to_string(),
+            path: Some(candidate.path),
+            name: candidate.name,
+            score: candidate.score,
+            reason: candidate.reason,
+        })
+        .collect()
 }
 
 fn resolve_relation_kind_priority(kind: RelationKind) -> u8 {
     match kind {
-        RelationKind::Calls | RelationKind::Tests => 5,
+        RelationKind::Calls | RelationKind::UsesMacro | RelationKind::Tests => 5,
         RelationKind::Implements | RelationKind::Extends => 4,
         RelationKind::References => 3,
-        RelationKind::Imports | RelationKind::DependsOn => 2,
+        RelationKind::Imports | RelationKind::Includes | RelationKind::DependsOn => 2,
         RelationKind::Contains => 1,
         _ => 0,
     }
+}
+
+fn resolve_relation_origin_multiplier(
+    origin: kin_model::RelationOrigin,
+    lsp_boost: f32,
+    parsed_weight: f32,
+    inferred_weight: f32,
+) -> f32 {
+    match origin {
+        kin_model::RelationOrigin::Lsp => lsp_boost,
+        kin_model::RelationOrigin::Parsed => parsed_weight,
+        kin_model::RelationOrigin::Inferred => inferred_weight,
+        kin_model::RelationOrigin::Manual => 1.0,
+    }
+}
+
+fn resolve_relation_kind_multiplier(kind: RelationKind) -> f32 {
+    match kind {
+        RelationKind::Calls => 2.0,
+        RelationKind::UsesMacro => 2.0,
+        RelationKind::References => 1.5,
+        RelationKind::Implements | RelationKind::Extends => 1.8,
+        RelationKind::Imports | RelationKind::DependsOn => 1.2,
+        RelationKind::Includes => 1.2,
+        RelationKind::Contains => 1.0,
+        RelationKind::Tests => 2.0,
+        _ => 0.8,
+    }
+}
+
+fn relation_projected_artifact_path(
+    rel: &kin_model::Relation,
+    from_node: &GraphNodeId,
+) -> Option<String> {
+    if rel.src != *from_node {
+        return None;
+    }
+    rel.evidence
+        .iter()
+        .find_map(|evidence| evidence.resolved_path.clone())
+        .or_else(|| rel.import_source.clone())
+        .filter(|path| !path.is_empty())
 }
 
 fn resolve_relation_origin_priority(origin: kin_model::RelationOrigin) -> u8 {
@@ -8360,17 +8637,20 @@ fn adaptive_cap(
             })
             .unwrap_or_default()
     };
+    let strong_semantic_paths: HashSet<String> = HashSet::new();
     let mut supported_indices: Vec<usize> = Vec::new();
     let mut corroborated_indices: Vec<usize> = Vec::new();
     for (i, (path, score)) in fused.iter().take(support_scan_limit).enumerate() {
         let has_entity_resolve = all_hits
             .get(7)
             .is_some_and(|er| er.contains_key(path.as_str()));
+        let is_strong_semantic = strong_semantic_paths.contains(path.as_str());
         let has_corroborated_resolve = has_entity_resolve
-            && all_hits
-                .iter()
-                .enumerate()
-                .any(|(idx, signal)| idx != 6 && idx != 7 && signal.contains_key(path.as_str()));
+            && (is_strong_semantic
+                || all_hits
+                    .iter()
+                    .enumerate()
+                    .any(|(idx, signal)| idx != 6 && idx != 7 && signal.contains_key(path.as_str())));
         let is_priority_retained = priority_retention_paths.contains(path.as_str());
         let is_cochange_seed = cochange_seed_paths.contains(path.as_str());
         let multi_signal = signal_support_count(path, all_hits) >= signal_support_threshold;
@@ -8384,22 +8664,23 @@ fn adaptive_cap(
         } else {
             support_floor_pct
         };
-        if !is_priority_retained && !is_strong_embedding && *score < top_score * floor_pct {
+        if !is_priority_retained && !is_strong_embedding && !is_strong_semantic && *score < top_score * floor_pct {
             record_pruned(path, *score, "below_support_floor");
             continue;
         }
-        if has_entity_resolve
+        if has_corroborated_resolve
             || multi_signal
             || is_priority_retained
             || is_cochange_seed
             || is_strong_embedding
+            || is_strong_semantic
         {
             supported_indices.push(i);
             // L1: only STRONGLY corroborated candidates may be admitted beyond the cluster
             // cap — require 3+ independent signals (multi_signal), a priority/cochange
             // seed, or a top-K embedding match (strong standalone semantic evidence).
             // A lone or doubly-signalled file on a flat query must not flood results.
-            if multi_signal || is_priority_retained || is_cochange_seed || is_strong_embedding {
+            if multi_signal || is_priority_retained || is_cochange_seed || is_strong_embedding || is_strong_semantic {
                 corroborated_indices.push(i);
             }
         }
@@ -8429,7 +8710,8 @@ fn adaptive_cap(
             // prior evidence (explicit mention, historical co-change).  General
             // corroborated files are bounded by support_max_total.
             let is_priority = priority_retention_paths.contains(path.as_str())
-                || cochange_seed_paths.contains(path.as_str());
+                || cochange_seed_paths.contains(path.as_str())
+                || strong_semantic_paths.contains(path.as_str());
             if !is_priority && result.len() >= support_max_total {
                 break;
             }
@@ -10021,11 +10303,7 @@ fn post_rrf_path_penalty(
     // These high-centrality files match nearly every query but rarely represent
     // the actual change locus. Demoting them sharply improves precision.
     if is_amalgamated_or_generated_path(path) {
-        penalty *= if is_priority_backed {
-            locate_env_f32("KIN_LOCATE_PRIORITY_AMALGAM_PENALTY", 0.7)
-        } else {
-            locate_env_f32("KIN_LOCATE_AMALGAM_PENALTY", 0.1)
-        };
+        penalty *= locate_env_f32("KIN_LOCATE_AMALGAM_PENALTY", 0.05);
     }
 
     penalty
@@ -10034,13 +10312,17 @@ fn post_rrf_path_penalty(
 fn priority_backing_applies_for_path(
     path: &str,
     is_priority_backed: bool,
-    has_direct_query_priority: bool,
+    _has_direct_query_priority: bool,
 ) -> bool {
     if !is_priority_backed {
         return false;
     }
 
-    !is_amalgamated_or_generated_path(path) || has_direct_query_priority
+    if is_amalgamated_or_generated_path(path) {
+        return false;
+    }
+
+    true
 }
 
 fn is_vendored_path(path: &str) -> bool {
@@ -12534,25 +12816,25 @@ mod tests {
     }
 
     #[test]
-    fn direct_priority_backed_amalgamated_projection_keeps_soft_penalty() {
+    fn priority_backed_amalgamated_projection_keeps_hard_penalty() {
         let regular =
             post_rrf_path_penalty("single_include/nlohmann/json.hpp", true, true, false, false);
         let priority =
             post_rrf_path_penalty("single_include/nlohmann/json.hpp", true, true, false, true);
 
-        assert!(priority > regular);
+        assert_eq!(priority, regular);
         assert!(regular <= 0.1);
-        assert!(priority >= 0.6);
+        assert!(priority <= 0.1);
     }
 
     #[test]
-    fn non_direct_amalgamated_projection_loses_priority_backing() {
+    fn amalgamated_projection_loses_priority_backing() {
         assert!(!priority_backing_applies_for_path(
             "single_include/nlohmann/json.hpp",
             true,
             false
         ));
-        assert!(priority_backing_applies_for_path(
+        assert!(!priority_backing_applies_for_path(
             "single_include/nlohmann/json.hpp",
             true,
             true
@@ -13704,6 +13986,7 @@ mod tests {
                 origin: RelationOrigin::Parsed,
                 created_in: None,
                 import_source: None,
+                evidence: Vec::new(),
             })
             .unwrap();
         graph
@@ -13716,6 +13999,7 @@ mod tests {
                 origin: RelationOrigin::Parsed,
                 created_in: None,
                 import_source: None,
+                evidence: Vec::new(),
             })
             .unwrap();
 
@@ -13752,6 +14036,7 @@ mod tests {
                 origin: RelationOrigin::Parsed,
                 created_in: None,
                 import_source: None,
+                evidence: Vec::new(),
             })
             .unwrap();
 
@@ -13764,9 +14049,9 @@ mod tests {
             },
         )]);
 
-        let (_, _, signal_scores_without_explain, _) =
+        let (_, _, signal_scores_without_explain, _, _) =
             resolve_entities_to_files(&seeds, &graph, false, "text").unwrap();
-        let (_, _, signal_scores_with_explain, _) =
+        let (_, _, signal_scores_with_explain, _, _) =
             resolve_entities_to_files(&seeds, &graph, true, "text").unwrap();
 
         assert_eq!(
@@ -13818,6 +14103,7 @@ mod tests {
                     origin: RelationOrigin::Parsed,
                     created_in: None,
                     import_source: None,
+                    evidence: Vec::new(),
                 })
                 .unwrap();
         }
@@ -13832,6 +14118,7 @@ mod tests {
                 origin: RelationOrigin::Inferred,
                 created_in: None,
                 import_source: None,
+                evidence: Vec::new(),
             })
             .unwrap();
 
@@ -13844,7 +14131,8 @@ mod tests {
             },
         )]);
 
-        let (resolved, _, _, _) = resolve_entities_to_files(&seeds, &graph, false, "text").unwrap();
+        let (resolved, _, _, _, _) =
+            resolve_entities_to_files(&seeds, &graph, false, "text").unwrap();
 
         assert!(
             resolved
@@ -13874,6 +14162,7 @@ mod tests {
                 origin: RelationOrigin::Inferred,
                 created_in: None,
                 import_source: None,
+                evidence: Vec::new(),
             })
             .unwrap();
 
@@ -14167,6 +14456,7 @@ mod tests {
                 origin: RelationOrigin::Parsed,
                 created_in: None,
                 import_source: None,
+                evidence: Vec::new(),
             })
             .unwrap();
         graph.flush_text_index().unwrap();
@@ -14964,6 +15254,7 @@ mod tests {
                 origin: RelationOrigin::Parsed,
                 created_in: None,
                 import_source: None,
+                evidence: Vec::new(),
             })
             .unwrap();
 

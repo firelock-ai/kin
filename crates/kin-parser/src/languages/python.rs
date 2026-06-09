@@ -260,17 +260,7 @@ fn extract_py_node(
                 }
             }
         }
-        "import_statement" | "import_from_statement" => {
-            let text = node.utf8_text(source).unwrap_or("").to_string();
-            if !text.is_empty() {
-                relations.push(ExtractedRelation {
-                    kind: kin_model::RelationKind::Imports,
-                    src_name: file_id.to_string(),
-                    dst_name: text,
-                    import_source: None,
-                });
-            }
-        }
+        "import_statement" | "import_from_statement" => {}
         "decorated_definition" => {
             // Collect decorator names, then extract the inner definition
             // with decorators prepended to the signature.

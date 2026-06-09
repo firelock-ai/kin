@@ -45,6 +45,7 @@ pub fn link_contract<G: GraphStore>(contract: &Contract, graph: &G) -> Result<Li
                 origin: RelationOrigin::Inferred,
                 created_in: None,
                 import_source: None,
+                evidence: Vec::new(),
             };
             graph
                 .upsert_relation(&relation)
@@ -70,6 +71,7 @@ pub fn link_contract<G: GraphStore>(contract: &Contract, graph: &G) -> Result<Li
                 origin: RelationOrigin::Inferred,
                 created_in: None,
                 import_source: None,
+                evidence: Vec::new(),
             };
             graph
                 .upsert_relation(&relation)

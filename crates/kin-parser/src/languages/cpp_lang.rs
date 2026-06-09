@@ -25,9 +25,10 @@ impl LanguageAdapter for CppAdapter {
     }
 
     fn parse(&self, source: &[u8]) -> Result<Tree> {
+        let preprocessed = preprocess_cpp_source(source);
         let mut parser = make_parser(&tree_sitter_cpp::LANGUAGE)?;
         parser
-            .parse(source, None)
+            .parse(&preprocessed, None)
             .ok_or_else(|| crate::error::ParseError::ParseFailed {
                 file: String::new(),
                 reason: "tree-sitter returned None".into(),
@@ -35,6 +36,8 @@ impl LanguageAdapter for CppAdapter {
     }
 
     fn extract(&self, tree: &Tree, source: &[u8], file_id: &FilePathId) -> Result<ParseOutput> {
+        let preprocessed = preprocess_cpp_source(source);
+        let source = &preprocessed;
         let error_ranges = collect_error_ranges(tree);
         let parse_state = if error_ranges.is_empty() {
             ParseState::Valid
@@ -58,24 +61,10 @@ impl LanguageAdapter for CppAdapter {
                 &mut entities,
                 &mut relations,
             );
-            if child.kind() == "preproc_include" {
-                if let Some(file_import) = extract_include(&child, source) {
-                    // Also emit an Imports relation using the resolved local_name
-                    if let Some(spec) = file_import.specifiers.first() {
-                        let text = spec.local_name.clone();
-                        if !text.is_empty() {
-                            relations.push(ExtractedRelation {
-                                kind: kin_model::RelationKind::Imports,
-                                src_name: file_id.to_string(),
-                                dst_name: text,
-                                import_source: None,
-                            });
-                        }
-                    }
-                    imports.push(file_import);
-                }
-            }
         }
+
+        // Recursively extract all includes and ALL_CAPS macro usages across the whole file
+        extract_includes_and_macros_recursive(&root, source, file_id, &mut imports, &mut relations);
 
         // Build import lookup: local_name -> module_path
         let import_map: std::collections::HashMap<&str, &str> = imports
@@ -469,12 +458,9 @@ fn extract_name_from_declarator(node: &tree_sitter::Node, source: &[u8]) -> Opti
                         }
                     }
                     "qualified_identifier" => {
-                        // e.g., ClassName::methodName — take the last segment.
-                        if let Some(name) = child.child_by_field_name("name") {
-                            let text = name.utf8_text(source).unwrap_or("").to_string();
-                            if !text.is_empty() {
-                                return Some(text);
-                            }
+                        let text = child.utf8_text(source).unwrap_or("").to_string();
+                        if !text.is_empty() {
+                            return Some(text);
                         }
                     }
                     _ => {}
@@ -491,11 +477,9 @@ fn extract_name_from_declarator(node: &tree_sitter::Node, source: &[u8]) -> Opti
             }
         }
         "qualified_identifier" => {
-            if let Some(name) = node.child_by_field_name("name") {
-                let text = name.utf8_text(source).unwrap_or("").to_string();
-                if !text.is_empty() {
-                    return Some(text);
-                }
+            let text = node.utf8_text(source).unwrap_or("").to_string();
+            if !text.is_empty() {
+                return Some(text);
             }
             None
         }
@@ -661,6 +645,92 @@ fn is_valid_callee(name: &str) -> bool {
         && !name.starts_with('"')
         && !name.starts_with('\'')
         && !name.chars().all(|c| c.is_numeric())
+}
+
+fn find_enclosing_entity(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut scopes = Vec::new();
+    let mut curr = *node;
+
+    while let Some(parent) = curr.parent() {
+        match parent.kind() {
+            "function_definition" => {
+                if let Some(name) = extract_function_name(&parent, source) {
+                    scopes.push(name);
+                }
+            }
+            "class_specifier" | "struct_specifier" | "union_specifier" => {
+                if let Some(name_node) = parent.child_by_field_name("name") {
+                    if let Ok(name_text) = name_node.utf8_text(source) {
+                        let name = name_text.trim().to_string();
+                        if !name.is_empty() {
+                            scopes.push(name);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        curr = parent;
+    }
+
+    if scopes.is_empty() {
+        None
+    } else {
+        scopes.reverse();
+        Some(scopes.join("::"))
+    }
+}
+
+fn extract_includes_and_macros_recursive(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    file_id: &FilePathId,
+    imports: &mut Vec<FileImport>,
+    relations: &mut Vec<ExtractedRelation>,
+) {
+    if node.kind() == "preproc_include" {
+        if let Some(file_import) = extract_include(node, source) {
+            imports.push(file_import);
+        }
+    } else if matches!(
+        node.kind(),
+        "identifier" | "type_identifier" | "statement_identifier" | "field_identifier"
+    ) {
+        if let Some(name) = node.utf8_text(source).ok() {
+            if is_all_caps_macro(name) {
+                if let Some(src_name) = find_enclosing_entity(node, source) {
+                    if src_name != name && !src_name.ends_with(&format!("::{}", name)) {
+                        relations.push(ExtractedRelation {
+                            kind: kin_model::RelationKind::UsesMacro,
+                            src_name,
+                            dst_name: name.to_string(),
+                            import_source: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        extract_includes_and_macros_recursive(&child, source, file_id, imports, relations);
+    }
+}
+
+fn is_all_caps_macro(name: &str) -> bool {
+    // Only accept if there is at least one uppercase letter and NO lowercase letters.
+    // Also must not be just numbers/symbols.
+    let mut has_upper = false;
+    for c in name.chars() {
+        if c.is_ascii_lowercase() {
+            return false;
+        }
+        if c.is_ascii_uppercase() {
+            has_upper = true;
+        }
+    }
+    has_upper && name.len() >= 3 // avoid single-letter macros
 }
 
 /// Extract a `#include` directive into a `FileImport`.
@@ -930,17 +1000,13 @@ int main() { return 0; }
         );
         assert!(binary_reader.specifiers[0].is_default);
 
-        // Check that Imports relations were emitted
-        let import_rels: Vec<_> = output
-            .relations
-            .iter()
-            .filter(|r| r.kind == kin_model::RelationKind::Imports)
-            .collect();
-        assert_eq!(import_rels.len(), 3);
-        let dst_names: Vec<&str> = import_rels.iter().map(|r| r.dst_name.as_str()).collect();
-        assert!(dst_names.contains(&"iostream"));
-        assert!(dst_names.contains(&"myheader.h"));
-        assert!(dst_names.contains(&"binary_reader.hpp"));
+        assert!(
+            output
+                .relations
+                .iter()
+                .all(|r| r.kind != kin_model::RelationKind::Imports),
+            "imports should be carried by FileImport, not fake file-sourced relations"
+        );
     }
 
     #[test]
@@ -1203,4 +1269,94 @@ TEST(MySuite, MyTest) {
         assert_eq!(t.name, "MySuite::MyTest");
         assert_eq!(t.runner, "gtest");
     }
+
+    #[test]
+    fn extract_macro_usages_with_enclosing_scope_cpp() {
+        let adapter = CppAdapter;
+        let source = br#"
+namespace ns {
+    class MyClass {
+        void my_method() {
+            MY_MACRO();
+        }
+    };
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.cpp");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let calls: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls && r.dst_name == "MY_MACRO")
+            .collect();
+        assert!(!calls.is_empty());
+        for call in &calls {
+            assert_eq!(call.src_name, "MyClass::my_method");
+        }
+    }
+}
+
+fn preprocess_cpp_source(source: &[u8]) -> Vec<u8> {
+    let mut s = source.to_vec();
+    replace_namespace_macros(&mut s);
+    s
+}
+
+fn replace_namespace_macros(source: &mut [u8]) {
+    let begin_macro = b"NLOHMANN_JSON_NAMESPACE_BEGIN";
+    let begin_repl = b"namespace nlohmann {         ";
+    let end_macro = b"NLOHMANN_JSON_NAMESPACE_END";
+    let end_repl = b"}                          ";
+
+    replace_macro_safe(source, begin_macro, begin_repl);
+    replace_macro_safe(source, end_macro, end_repl);
+}
+
+fn replace_macro_safe(source: &mut [u8], from: &[u8], to: &[u8]) {
+    assert_eq!(from.len(), to.len());
+    let mut i = 0;
+    while i + from.len() <= source.len() {
+        if &source[i..i + from.len()] == from {
+            if is_preceded_by_define(source, i) {
+                i += from.len();
+            } else {
+                source[i..i + from.len()].copy_from_slice(to);
+                i += from.len();
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn is_preceded_by_define(source: &[u8], idx: usize) -> bool {
+    let mut p = idx;
+    while p > 0 {
+        p -= 1;
+        let c = source[p];
+        if c == b' ' || c == b'\t' {
+            continue;
+        }
+        if c == b'\n' || c == b'\r' {
+            return false;
+        }
+        if p >= 5 && &source[p-5..p+1] == b"define" {
+            p -= 5;
+            while p > 0 {
+                p -= 1;
+                let c2 = source[p];
+                if c2 == b' ' || c2 == b'\t' {
+                    continue;
+                }
+                if c2 == b'#' {
+                    return true;
+                }
+                break;
+            }
+        }
+        break;
+    }
+    false
 }

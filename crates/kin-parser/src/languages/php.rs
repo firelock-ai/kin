@@ -471,13 +471,6 @@ fn extract_php_imports(
         if child.kind() == "namespace_use_declaration" {
             let text = child.utf8_text(source).unwrap_or("").to_string();
             if !text.is_empty() {
-                relations.push(ExtractedRelation {
-                    kind: kin_model::RelationKind::Imports,
-                    src_name: file_id.to_string(),
-                    dst_name: text.clone(),
-                    import_source: None,
-                });
-
                 // Parse the use declaration into FileImport
                 if let Some(file_import) = parse_php_use_declaration(&child, source) {
                     imports.push(file_import);

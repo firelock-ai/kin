@@ -330,24 +330,7 @@ fn extract_ts_node(
                 }
             }
         }
-        "import_statement" => {
-            // Extract import relations
-            if let Some(src_node) = node.child_by_field_name("source") {
-                let module = src_node
-                    .utf8_text(source)
-                    .unwrap_or("")
-                    .trim_matches(|c| c == '\'' || c == '"')
-                    .to_string();
-                if !module.is_empty() {
-                    relations.push(ExtractedRelation {
-                        kind: kin_model::RelationKind::Imports,
-                        src_name: file_id.to_string(),
-                        dst_name: module,
-                        import_source: None,
-                    });
-                }
-            }
-        }
+        "import_statement" => {}
         _ => {}
     }
 }

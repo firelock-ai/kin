@@ -404,17 +404,7 @@ fn extract_swift_node(
                 }
             }
         }
-        "import_declaration" => {
-            let text = node.utf8_text(source).unwrap_or("").to_string();
-            if !text.is_empty() {
-                relations.push(ExtractedRelation {
-                    kind: kin_model::RelationKind::Imports,
-                    src_name: file_id.to_string(),
-                    dst_name: text,
-                    import_source: None,
-                });
-            }
-        }
+        "import_declaration" => {}
         _ => {}
     }
 }

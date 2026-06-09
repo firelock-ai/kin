@@ -1736,6 +1736,7 @@ fn materialize_discovered_tests(
                     origin: RelationOrigin::Inferred,
                     created_in: None,
                     import_source: None,
+                    evidence: Vec::new(),
                 })?;
                 created_relations += 1;
             }

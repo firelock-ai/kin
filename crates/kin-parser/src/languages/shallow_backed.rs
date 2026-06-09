@@ -129,12 +129,6 @@ fn extract_csharp_node(
         }
         "using_directive" => {
             if let Some(import) = extract_csharp_import(node, source) {
-                relations.push(ExtractedRelation {
-                    kind: kin_model::RelationKind::Imports,
-                    src_name: file_id.to_string(),
-                    dst_name: import.module_path.clone(),
-                    import_source: None,
-                });
                 imports.push(import);
             }
         }
@@ -660,12 +654,6 @@ fn extract_ruby_node(
                 let method_name = method_name.trim().to_string();
                 if method_name == "require" || method_name == "require_relative" {
                     if let Some(import) = extract_ruby_require(node, source) {
-                        relations.push(ExtractedRelation {
-                            kind: kin_model::RelationKind::Imports,
-                            src_name: file_id.to_string(),
-                            dst_name: import.module_path.clone(),
-                            import_source: None,
-                        });
                         imports.push(import);
                     }
                 } else if (method_name == "include"
