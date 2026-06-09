@@ -5799,16 +5799,37 @@ fn ensure_loopback_token(layout: &kin_core::KinLayout) -> std::io::Result<String
     Ok(token)
 }
 
+/// Whether the daemon should ENFORCE the per-install loopback token.
+///
+/// Enforcement is opt-in (`KIN_DAEMON_REQUIRE_LOOPBACK_TOKEN`) because turning
+/// it on by default would `401` every local client that does not yet send the
+/// token — the CLI (`daemon_client.rs`) and the env-only MCP delegate. The file
+/// is still auto-provisioned so those clients can adopt it; once they read it,
+/// flip this flag to require it. The primary DNS-rebinding defense
+/// (`validate_host_and_origin`) is always active regardless of this flag.
+fn loopback_token_enforced() -> bool {
+    std::env::var("KIN_DAEMON_REQUIRE_LOOPBACK_TOKEN")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// Resolve the auth token the serving daemon enforces: an explicit
-/// `KIN_DAEMON_AUTH_TOKEN` override wins, otherwise the auto-provisioned
-/// per-install loopback token. If provisioning fails the daemon still starts
-/// (loopback Host/Origin validation remains active) but logs a warning.
+/// `KIN_DAEMON_AUTH_TOKEN` override always wins. Otherwise the per-install
+/// loopback token is auto-provisioned under `.kin/` (so local clients can adopt
+/// it) but only returned for enforcement when `KIN_DAEMON_REQUIRE_LOOPBACK_TOKEN`
+/// is set. If provisioning fails the daemon still starts (loopback Host/Origin
+/// validation remains active) but logs a warning.
 fn resolve_serve_auth_token(layout: &kin_core::KinLayout) -> Option<String> {
     if let Some(env_token) = auth_token_from_env() {
         return Some(env_token);
     }
     match ensure_loopback_token(layout) {
-        Ok(token) => Some(token),
+        Ok(token) => loopback_token_enforced().then_some(token),
         Err(error) => {
             tracing::warn!(
                 %error,
@@ -6530,16 +6551,17 @@ mod tests {
         );
     }
 
-    /// Serializes the two tests that toggle the process-global
-    /// `KIN_DAEMON_ALLOW_EXEC` so their opposite expectations never race.
-    fn exec_cap_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    /// Serializes tests that mutate process-global env (`KIN_DAEMON_ALLOW_EXEC`,
+    /// `KIN_DAEMON_AUTH_TOKEN`, `KIN_DAEMON_REQUIRE_LOOPBACK_TOKEN`) so their
+    /// opposite expectations never race under the parallel test runner.
+    fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[tokio::test]
     async fn exec_endpoint_runs_against_live_graph_workspace() {
-        let _env = exec_cap_env_lock();
+        let _env = env_test_lock();
         std::env::set_var("KIN_DAEMON_ALLOW_EXEC", "1");
 
         let state = test_state();
@@ -8297,7 +8319,7 @@ mod tests {
     async fn command_exec_requires_capability_optin() {
         // Default install (no KIN_DAEMON_ALLOW_EXEC) must refuse shell exec even
         // for an initialized daemon — being initialized is not sufficient.
-        let _env = exec_cap_env_lock();
+        let _env = env_test_lock();
         std::env::remove_var("KIN_DAEMON_ALLOW_EXEC");
 
         let state = test_state();
@@ -8360,6 +8382,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn resolve_serve_auth_token_gates_enforcement() {
+        let _env = env_test_lock();
+        std::env::remove_var("KIN_DAEMON_AUTH_TOKEN");
+        std::env::remove_var("KIN_DAEMON_REQUIRE_LOOPBACK_TOKEN");
+
+        let dir = std::env::temp_dir().join(format!("kin-daemon-serve-token-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join(".kin")).unwrap();
+        let layout = kin_core::KinLayout::new(dir.join(".kin"));
+
+        // Default: enforcement is OFF, so no token is enforced — this is what
+        // keeps existing unauthenticated local clients (CLI, integration tests,
+        // env-only MCP delegate) working. The file is still provisioned so they
+        // can adopt it ahead of a future enforcement flip.
+        assert!(resolve_serve_auth_token(&layout).is_none());
+        let provisioned = std::fs::read_to_string(loopback_token_path(&layout)).unwrap();
+        assert!(!provisioned.trim().is_empty());
+
+        // Opt-in: enforcement returns the provisioned loopback token.
+        std::env::set_var("KIN_DAEMON_REQUIRE_LOOPBACK_TOKEN", "1");
+        assert_eq!(
+            resolve_serve_auth_token(&layout).as_deref(),
+            Some(provisioned.trim())
+        );
+
+        // An explicit KIN_DAEMON_AUTH_TOKEN override always wins over the gate.
+        std::env::set_var("KIN_DAEMON_AUTH_TOKEN", "explicit-override");
+        assert_eq!(
+            resolve_serve_auth_token(&layout).as_deref(),
+            Some("explicit-override")
+        );
+
+        std::env::remove_var("KIN_DAEMON_AUTH_TOKEN");
+        std::env::remove_var("KIN_DAEMON_REQUIRE_LOOPBACK_TOKEN");
     }
 
     #[tokio::test]
