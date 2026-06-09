@@ -192,12 +192,31 @@ pub struct DaemonState {
     pub cached_repo_id: String,
     /// True when the daemon is shutting down.
     pub is_shutdown: AtomicBool,
-    /// Latch set by the background embedding worker when it hits a vector-index
-    /// error (e.g. a stale on-disk index dimension vs the live embedder) that a
-    /// one-shot reset could not recover. While set, the shutdown persistence
-    /// flush is skipped so degraded in-memory state can never overwrite the good
-    /// on-disk snapshot (the graph-wipe-on-kill class).
-    pub embed_index_fatal: AtomicBool,
+    /// Entity count of the last graph snapshot successfully written to disk,
+    /// seeded from the snapshot loaded at startup. The shutdown flush compares
+    /// the live in-memory entity count against this baseline and refuses to
+    /// overwrite a large on-disk snapshot with a drastically-collapsed in-memory
+    /// graph (the graph-wipe-on-kill class — e.g. a transient empty/bare checkout
+    /// reconciled as all-deleted). Keyed on the GRAPH, independent of the vector
+    /// index, which self-heals on load. Updated after every successful save.
+    pub persisted_entity_count: AtomicU64,
+}
+
+/// Minimum persisted entity count before the shutdown anti-wipe guard can fire.
+/// Below this, the on-disk snapshot is small enough that a collapse is not
+/// catastrophic (and fresh-init / tiny-repo states would false-positive).
+const WIPE_GUARD_MIN_BASELINE: u64 = 16;
+
+/// Pure predicate for the shutdown anti-wipe guard: does dropping from
+/// `baseline` persisted entities to `current` in-memory entities constitute a
+/// drastic collapse (more than ~75% of the graph vanished) that should block the
+/// final flush? Returns false for trivially small baselines. Kept pure so the
+/// threshold is unit-testable without constructing a full graph.
+fn graph_collapse_is_wipe(current: u64, baseline: u64) -> bool {
+    if baseline < WIPE_GUARD_MIN_BASELINE {
+        return false;
+    }
+    current.saturating_mul(4) < baseline
 }
 
 impl DaemonState {
@@ -348,6 +367,10 @@ impl DaemonState {
             kin_core::manifest::resolve_repo_id(&layout, explicit_repo_id.as_deref())
                 .map_err(DaemonError::from)?;
 
+        // Baseline for the shutdown anti-wipe guard: the entity count loaded
+        // from the on-disk snapshot. Read before `graph` is moved into the state.
+        let loaded_entity_count = graph.entity_count();
+
         let state = Self {
             layout,
             graph,
@@ -378,7 +401,7 @@ impl DaemonState {
             change_oid_cache: std::sync::RwLock::new(None),
             cached_repo_id,
             is_shutdown: AtomicBool::new(false),
-            embed_index_fatal: AtomicBool::new(false),
+            persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
         };
         Ok(state)
     }
@@ -458,6 +481,10 @@ impl DaemonState {
 
         let persisted_vfs_version = Self::load_persisted_vfs_version(&layout);
 
+        // Baseline for the shutdown anti-wipe guard (entity count loaded from
+        // the backend snapshot).
+        let loaded_entity_count = graph.entity_count();
+
         let mut state = Self {
             layout,
             graph: Arc::clone(&graph),
@@ -488,7 +515,7 @@ impl DaemonState {
             change_oid_cache: std::sync::RwLock::new(None),
             cached_repo_id: repo_id.to_string(),
             is_shutdown: AtomicBool::new(false),
-            embed_index_fatal: AtomicBool::new(false),
+            persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
         };
 
         // Pre-load repos into the map BEFORE any async context.
@@ -1002,6 +1029,11 @@ impl DaemonState {
         self.write_generation_marker(new_gen);
         self.save_read_index()?;
 
+        // The on-disk snapshot now reflects the current graph; advance the
+        // anti-wipe baseline so a later shutdown is measured against what was
+        // actually persisted.
+        self.record_persisted_entity_count();
+
         info!(
             repo_id,
             generation = new_gen,
@@ -1083,22 +1115,34 @@ impl DaemonState {
         self.dirty.load(Ordering::SeqCst)
     }
 
-    /// Latch a fatal embed/index condition. Set by the embedding worker when a
-    /// vector-index error persists past its one-shot reset/re-queue recovery.
-    /// While set, the shutdown persistence flush is skipped so the good on-disk
-    /// snapshot is never overwritten by degraded in-memory state.
-    pub fn set_embed_index_fatal(&self) {
-        self.embed_index_fatal.store(true, Ordering::SeqCst);
+    /// Whether persisting the current in-memory graph on shutdown would overwrite
+    /// a substantially larger on-disk snapshot with a drastically-collapsed one.
+    ///
+    /// This is the GRAPH-level anti-wipe guard (mirrors loop_runner's
+    /// mass-deletion principle): if the live entity count has collapsed to less
+    /// than a quarter of the last persisted count, the in-memory graph is most
+    /// likely the victim of a transient wipe (e.g. an empty/bare checkout
+    /// reconciled as all-deleted) rather than a real edit, so the shutdown flush
+    /// must be skipped. It is deliberately independent of the vector index: a
+    /// stale kvec self-heals on load and is not a reason to block the graph flush.
+    ///
+    /// The asymmetry favors skipping: a false positive is cheap (the larger
+    /// snapshot reloads and re-reconciles against the filesystem next startup),
+    /// while a false negative is expensive (a full re-index/re-embed from an
+    /// emptied graph).
+    pub fn shutdown_flush_would_wipe_graph(&self) -> bool {
+        graph_collapse_is_wipe(
+            self.graph.entity_count() as u64,
+            self.persisted_entity_count.load(Ordering::SeqCst),
+        )
     }
 
-    /// Clear the embed/index fatal latch (the worker embedded successfully).
-    pub fn clear_embed_index_fatal(&self) {
-        self.embed_index_fatal.store(false, Ordering::SeqCst);
-    }
-
-    /// True when a fatal embed/index error is currently active.
-    pub fn has_embed_index_fatal(&self) -> bool {
-        self.embed_index_fatal.load(Ordering::SeqCst)
+    /// Record that the on-disk snapshot now holds the current graph's entity
+    /// count. Called after every successful save so the anti-wipe baseline
+    /// tracks what is actually persisted.
+    pub fn record_persisted_entity_count(&self) {
+        self.persisted_entity_count
+            .store(self.graph.entity_count() as u64, Ordering::SeqCst);
     }
 
     /// Duration since the last successful save.
@@ -1232,6 +1276,7 @@ mod tests {
             uncommitted_mutations: GraphOverlay::default(),
         };
         let coordinator = SessionCoordinator::new(Arc::clone(&graph));
+        let loaded_entity_count = graph.entity_count();
 
         DaemonState {
             layout,
@@ -1263,7 +1308,7 @@ mod tests {
             change_oid_cache: std::sync::RwLock::new(None),
             cached_repo_id: "test-repo".to_string(),
             is_shutdown: AtomicBool::new(false),
-            embed_index_fatal: AtomicBool::new(false),
+            persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
         }
     }
 
@@ -1674,5 +1719,54 @@ mod tests {
             entities.iter().any(|e| e.name == "paired_fn"),
             "reloaded snapshot must contain the saved entity"
         );
+    }
+
+    #[test]
+    fn graph_collapse_is_wipe_threshold() {
+        // Below the min baseline: never a wipe, even at total collapse.
+        assert!(!graph_collapse_is_wipe(0, WIPE_GUARD_MIN_BASELINE - 1));
+        // At/above baseline with a >75% collapse → wipe.
+        assert!(graph_collapse_is_wipe(0, 1000)); // total wipe
+        assert!(graph_collapse_is_wipe(100, 1000)); // 90% gone
+        assert!(graph_collapse_is_wipe(249, 1000)); // just over 75% gone (249*4=996<1000)
+                                                    // Exactly a quarter remaining is NOT a wipe (250*4=1000, not < 1000).
+        assert!(!graph_collapse_is_wipe(250, 1000));
+        // Growth or steady state is never a wipe.
+        assert!(!graph_collapse_is_wipe(1000, 1000));
+        assert!(!graph_collapse_is_wipe(2000, 1000));
+    }
+
+    #[tokio::test]
+    async fn shutdown_wipe_guard_blocks_drastic_graph_collapse() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+
+        // Populate a non-trivial graph and record it as the persisted baseline.
+        for i in 0..20 {
+            state
+                .graph
+                .upsert_entity(&test_entity(&format!("fn_{i}"), &format!("src/f{i}.rs")))
+                .unwrap();
+        }
+        let n = state.graph.entity_count() as u64;
+        assert!(
+            n >= WIPE_GUARD_MIN_BASELINE,
+            "test needs a non-trivial graph (got {n})"
+        );
+        state.record_persisted_entity_count();
+        assert_eq!(state.persisted_entity_count.load(Ordering::SeqCst), n);
+
+        // current == baseline → no collapse, flush allowed.
+        assert!(!state.shutdown_flush_would_wipe_graph());
+
+        // A much larger prior on-disk snapshot vs the live graph (>75% collapse)
+        // → guard fires and the flush is skipped.
+        state.persisted_entity_count.store(n * 5, Ordering::SeqCst);
+        assert!(state.shutdown_flush_would_wipe_graph());
+
+        // A moderate drop (50%) is a legitimate edit, NOT a wipe.
+        state.persisted_entity_count.store(n * 2, Ordering::SeqCst);
+        assert!(!state.shutdown_flush_would_wipe_graph());
     }
 }

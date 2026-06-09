@@ -525,15 +525,20 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                 _ = tokio::time::sleep(current_interval) => {}
                 _ = persist_cancel.changed() => {
                     if persist_state.is_dirty() {
-                        if persist_state.has_embed_index_fatal() {
-                            // A fatal embed/index error is active (e.g. a stale
-                            // on-disk index dimension the one-shot reset could not
-                            // recover). Skip the final flush so degraded in-memory
-                            // state never overwrites the good on-disk snapshot —
-                            // the graph-wipe-on-kill class. The daemon reloads the
-                            // intact snapshot and re-attempts embedding on restart.
+                        if persist_state.shutdown_flush_would_wipe_graph() {
+                            // The in-memory graph collapsed to a small fraction of
+                            // the last persisted entity count — almost certainly a
+                            // transient wipe (e.g. an empty/bare checkout
+                            // reconciled as all-deleted), not a real edit. Skip the
+                            // final flush so the larger good snapshot survives; the
+                            // daemon reloads it and re-reconciles against the
+                            // filesystem on restart. (Graph-keyed, not embed-keyed:
+                            // a stale vector index self-heals on load and never
+                            // blocks this flush.)
                             warn!(
-                                "skipping final persistence flush on shutdown — fatal embed/index error active; preserving on-disk snapshot"
+                                persisted = persist_state.persisted_entity_count.load(std::sync::atomic::Ordering::SeqCst),
+                                current = persist_state.graph.entity_count(),
+                                "skipping final graph flush on shutdown — in-memory entity count collapsed vs on-disk snapshot; preserving the larger snapshot"
                             );
                         } else {
                             info!("final persistence flush on shutdown");
@@ -703,7 +708,6 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                         // embedder — clear any error backoff / reset latch.
                         index_reset_triggered = false;
                         error_backoff = None;
-                        embed_state.clear_embed_index_fatal();
                         info!(count, remaining = remaining.saturating_sub(count), label);
                         // Persist the vector index under the shared persist lock so
                         // this kvec write can never interleave with a snapshot save
@@ -741,7 +745,6 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                         consecutive_panics = 0;
                         index_reset_triggered = false;
                         error_backoff = None;
-                        embed_state.clear_embed_index_fatal();
                         break;
                     }
                     Ok(Err(e)) => {
@@ -770,19 +773,19 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                                 "embedding worker error — reset vector index, retrying next interval"
                             );
                         } else {
+                            // The one-shot reset did not clear it (or it is a
+                            // non-index error): back off exponentially so the
+                            // worker never busy-spins. A stale vector index is NOT
+                            // a reason to block the graph snapshot flush — it
+                            // self-heals on load — so shutdown persistence is left
+                            // untouched here; the graph anti-wipe guard is keyed on
+                            // entity-count collapse, not on embed errors.
                             let next = next_embed_error_backoff(
                                 error_backoff,
                                 embed_interval,
                                 EMBED_ERROR_BACKOFF_MAX,
                             );
                             error_backoff = Some(next);
-                            if is_index_error {
-                                // The one-shot reset did not clear the error: flag
-                                // a fatal embed/index condition so the shutdown
-                                // flush won't overwrite the good on-disk snapshot
-                                // with degraded in-memory state.
-                                embed_state.set_embed_index_fatal();
-                            }
                             error!(
                                 error = %e,
                                 backoff_s = next.as_secs(),
