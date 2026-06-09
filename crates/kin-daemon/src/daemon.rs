@@ -617,7 +617,11 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                 let batch = embed_batch_size;
                 let state_for_embed = Arc::clone(&embed_state);
                 let is_artifact = pending == 0;
-                let label = if is_artifact { "embedded artifacts" } else { "embedded entities" };
+                let label = if is_artifact {
+                    "embedded artifacts"
+                } else {
+                    "embedded entities"
+                };
                 let remaining = if is_artifact {
                     pending_artifacts
                 } else {
@@ -631,7 +635,9 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                         )
                     })?;
                     if is_artifact {
-                        state_for_embed.graph.process_artifact_embedding_queue(batch)
+                        state_for_embed
+                            .graph
+                            .process_artifact_embedding_queue(batch)
                     } else {
                         state_for_embed.graph.process_embedding_queue(batch)
                     }
@@ -641,11 +647,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                 match embed_result {
                     Ok(Ok(count)) if count > 0 => {
                         consecutive_panics = 0;
-                        info!(
-                            count,
-                            remaining = remaining.saturating_sub(count),
-                            label
-                        );
+                        info!(count, remaining = remaining.saturating_sub(count), label);
                         // Persist the vector index under the shared persist lock so
                         // this kvec write can never interleave with a snapshot save
                         // running in the persistence loop or idle-shutdown flush.

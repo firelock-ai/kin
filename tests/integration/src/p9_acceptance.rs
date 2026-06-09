@@ -209,6 +209,7 @@ fn context_pack_includes_cross_file_deps() {
         origin: RelationOrigin::Inferred,
         created_in: None,
         import_source: None,
+        evidence: Vec::new(),
     };
     graph.upsert_relation(&relation).unwrap();
 
@@ -261,6 +262,7 @@ fn downstream_impact_surfaces_impacted_proof_targets() {
             origin: RelationOrigin::Parsed,
             created_in: None,
             import_source: None,
+            evidence: Vec::new(),
         })
         .unwrap();
 

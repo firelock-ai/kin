@@ -74,8 +74,7 @@ pub async fn run_loop(
     }
 
     let extensions = kin_index::watcher::supported_extensions();
-    let watcher =
-        FileWatcher::new(working_dir, extensions).map_err(DaemonError::from)?;
+    let watcher = FileWatcher::new(working_dir, extensions).map_err(DaemonError::from)?;
 
     info!(
         poll_ms = config.poll_interval_ms,
@@ -262,7 +261,10 @@ pub async fn run_loop(
                             };
                             lsp_changed.push((path, changed_ids));
                         }
-                    } else if let ReconcileOutcome::FileRemoved { removed, file_id, .. } = &outcome {
+                    } else if let ReconcileOutcome::FileRemoved {
+                        removed, file_id, ..
+                    } = &outcome
+                    {
                         let file_path = match event {
                             FileEvent::Changed(p) | FileEvent::Removed(p) => {
                                 p.to_string_lossy().to_string()
@@ -275,7 +277,7 @@ pub async fn run_loop(
                                 file_path: Some(file_path.clone()),
                             });
                         }
-                        
+
                         use kin_model::EntityStore;
                         let _ = state.graph.delete_file_layout(file_id);
                         state.graph.remove_entities_for_file(&file_id.0);
@@ -459,7 +461,8 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
                 }
                 stack.push(path);
             } else if path.is_file() {
-                let is_relevant = path.extension()
+                let is_relevant = path
+                    .extension()
                     .and_then(|e| e.to_str())
                     .map(|ext| extensions.iter().any(|e| e == ext))
                     .unwrap_or(false);
@@ -489,8 +492,12 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
 
     // 4. Find added/modified files: files on disk that are NOT in graph or have different hash
     for (path, disk_hash) in &files_on_disk {
-        let rel_path = path.strip_prefix(working_dir).unwrap_or(path).to_string_lossy().to_string();
-        
+        let rel_path = path
+            .strip_prefix(working_dir)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+
         let in_graph = files_in_graph.iter().any(|p| p == &rel_path);
         let hash_matches = if in_graph {
             if let Some(graph_hash) = state.graph.get_file_hash(&rel_path) {
@@ -547,15 +554,18 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
                     {
                         warn!(error = %e, "failed to persist projection truth after sync");
                     }
-                    
+
                     // Call the cleanup if it's a FileRemoved outcome!
-                    if let ReconcileOutcome::FileRemoved { removed, file_id, .. } = &outcome {
+                    if let ReconcileOutcome::FileRemoved {
+                        removed, file_id, ..
+                    } = &outcome
+                    {
                         use kin_model::EntityStore;
                         let _ = state.graph.delete_file_layout(file_id);
                         state.graph.remove_entities_for_file(&file_id.0);
                         let _ = state.graph.delete_structured_artifact(file_id);
                         let _ = state.graph.delete_opaque_artifact(file_id);
-                        
+
                         for id in removed {
                             state.emit_event(DaemonEvent::EntityChanged {
                                 entity_id: *id,
@@ -564,7 +574,7 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
                             });
                         }
                     }
-                    
+
                     graph_changed = true;
                 }
             }

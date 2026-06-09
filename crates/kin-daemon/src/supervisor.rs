@@ -1005,7 +1005,15 @@ fn spawn_rogue_daemon_reaper(
             if *shutdown_rx.borrow() {
                 break;
             }
-            reaper_sweep(&state, &client, &mut sys, &mut pinned_sweeps, self_pid, policy).await;
+            reaper_sweep(
+                &state,
+                &client,
+                &mut sys,
+                &mut pinned_sweeps,
+                self_pid,
+                policy,
+            )
+            .await;
         }
         info!("rogue-daemon reaper shutting down");
     });
@@ -1102,9 +1110,7 @@ async fn reaper_sweep(
             Some(&registered_pid) if registered_pid == daemon.pid => {
                 RegistryRelation::RegisteredSelf
             }
-            Some(&registered_pid) if is_process_alive(registered_pid) => {
-                RegistryRelation::LiveTwin
-            }
+            Some(&registered_pid) if is_process_alive(registered_pid) => RegistryRelation::LiveTwin,
             Some(_) => RegistryRelation::StaleDifferentPid,
         };
         // Scope staleness to the supervisor's own binary lineage: only compare
@@ -1116,8 +1122,11 @@ async fn reaper_sweep(
         } else {
             None
         };
-        let stale_binary =
-            is_daemon_stale(daemon.start_time, deployed_mtime, policy.redeploy_grace_secs);
+        let stale_binary = is_daemon_stale(
+            daemon.start_time,
+            deployed_mtime,
+            policy.redeploy_grace_secs,
+        );
         let observation = DaemonObservation {
             pid: daemon.pid,
             repo_root: daemon.repo_root.clone(),
@@ -1222,7 +1231,11 @@ fn enumerate_repo_daemons(sys: &mut sysinfo::System, self_pid: u32) -> Vec<Disco
         if pid == self_pid {
             continue;
         }
-        let args: Vec<&str> = process.cmd().iter().filter_map(|arg| arg.to_str()).collect();
+        let args: Vec<&str> = process
+            .cmd()
+            .iter()
+            .filter_map(|arg| arg.to_str())
+            .collect();
         let name = process.name().to_str().unwrap_or_default();
         let looks_like_daemon = name.contains("kin-daemon")
             || args.first().is_some_and(|arg| arg.contains("kin-daemon"));
@@ -1312,10 +1325,15 @@ async fn probe_daemon_health(client: &reqwest::Client, port: u16) -> DaemonHealt
     let Ok(body) = response.json::<serde_json::Value>().await else {
         return DaemonHealth::Unhealthy;
     };
-    let count = |key: &str| body.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
-    let has_clients =
-        count("active_request_count") + count("event_subscriber_count") + count("external_session_count")
-            > 0;
+    let count = |key: &str| {
+        body.get(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    let has_clients = count("active_request_count")
+        + count("event_subscriber_count")
+        + count("external_session_count")
+        > 0;
     let reconciling = body
         .get("reconciliation_status")
         .and_then(serde_json::Value::as_str)
@@ -1407,7 +1425,10 @@ fn reexec_self(self_exe_mtime: u64) -> std::io::Error {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     std::process::Command::new(exe)
         .args(args)
-        .env(SUPERVISOR_REEXECED_FOR_MTIME_ENV, self_exe_mtime.to_string())
+        .env(
+            SUPERVISOR_REEXECED_FOR_MTIME_ENV,
+            self_exe_mtime.to_string(),
+        )
         .exec()
 }
 
@@ -1946,7 +1967,10 @@ mod tests {
         assert!(policy.cpu_heuristic_enabled);
         assert!(policy.duplicate_reap_enabled);
         assert!(policy.adopt_enabled);
-        assert_eq!(policy.cpu_pinned_min_sweeps, REAPER_DEFAULT_CPU_PINNED_SWEEPS);
+        assert_eq!(
+            policy.cpu_pinned_min_sweeps,
+            REAPER_DEFAULT_CPU_PINNED_SWEEPS
+        );
         assert_eq!(policy.cpu_pinned_percent, REAPER_DEFAULT_CPU_PINNED_PERCENT);
     }
 

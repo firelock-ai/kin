@@ -364,7 +364,8 @@ pub async fn run(
                 }
                 Ok(None) | Err(_) => {
                     phase!("warm_cache_miss");
-                    let summary = parse_and_index(snap.graph().as_ref(), &blob_store, &indexable_files)?;
+                    let summary =
+                        parse_and_index(snap.graph().as_ref(), &blob_store, &indexable_files)?;
                     phase!("parse_and_index");
                     summary
                 }

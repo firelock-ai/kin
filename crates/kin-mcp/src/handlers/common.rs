@@ -1384,7 +1384,10 @@ pub fn parse_scopes(value: &serde_json::Value) -> Result<Vec<IntentScope>> {
     Ok(scopes)
 }
 
-pub fn get_json_object<'a>(args: &'a HashMap<String, serde_json::Value>, key: &str) -> Result<&'a serde_json::Map<String, serde_json::Value>> {
+pub fn get_json_object<'a>(
+    args: &'a HashMap<String, serde_json::Value>,
+    key: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>> {
     args.get(key)
         .and_then(|v| v.as_object())
         .ok_or_else(|| McpError::InvalidParams(format!("{} must be a valid JSON object", key)))

@@ -167,7 +167,12 @@ pub fn link_cross_file_against_entities(
             known_files.insert(&file.file_path);
         }
 
-        (entity_by_file_name, entity_by_name, entity_kind_by_id, known_files)
+        (
+            entity_by_file_name,
+            entity_by_name,
+            entity_kind_by_id,
+            known_files,
+        )
     };
 
     // Step 2: Build import map per file
@@ -373,8 +378,7 @@ pub fn link_cross_file_against_entities(
         .entered();
         for file in files {
             for imp in &file.imports {
-                if let Some(rel) =
-                    make_artifact_import_relation(&file.file_path, imp, &known_files)
+                if let Some(rel) = make_artifact_import_relation(&file.file_path, imp, &known_files)
                 {
                     let key = (rel.src, rel.dst, rel.kind);
                     if seen_artifact.insert(key) {
@@ -458,8 +462,7 @@ fn resolve_reachable_macro_target<'a>(
     entity_kind_by_id: &HashMap<EntityId, EntityKind>,
 ) -> Option<EntityId> {
     for include_file in reachable_include_files(importer_file, include_graph) {
-        let Some(&candidate_id) =
-            entity_by_file_name.get(&(include_file.as_str(), macro_name))
+        let Some(&candidate_id) = entity_by_file_name.get(&(include_file.as_str(), macro_name))
         else {
             continue;
         };
@@ -560,11 +563,13 @@ where
     let evidence = RelationEvidence {
         source_path: Some(import.module_path.clone()),
         resolved_path: Some(resolved_path.clone()),
-        parser_rule: Some(match kind {
-            RelationKind::Includes => "include_directive",
-            _ => "import_declaration",
-        }
-        .to_string()),
+        parser_rule: Some(
+            match kind {
+                RelationKind::Includes => "include_directive",
+                _ => "import_declaration",
+            }
+            .to_string(),
+        ),
         occurrence_count: 1,
         ..RelationEvidence::default()
     };
@@ -586,7 +591,11 @@ fn stable_relation_id(src: &EntityId, dst: &EntityId, kind: &RelationKind) -> Re
     stable_relation_node_id(&GraphNodeId::Entity(*src), &GraphNodeId::Entity(*dst), kind)
 }
 
-fn stable_relation_node_id(src: &GraphNodeId, dst: &GraphNodeId, kind: &RelationKind) -> RelationId {
+fn stable_relation_node_id(
+    src: &GraphNodeId,
+    dst: &GraphNodeId,
+    kind: &RelationKind,
+) -> RelationId {
     let mut hasher = Sha256::new();
     hasher.update(b"kin-rel-v1:");
     hasher.update(src.to_string().as_bytes());
@@ -1493,9 +1502,7 @@ mod tests {
                 rel.kind == RelationKind::Includes
                     && rel.src == GraphNodeId::Artifact(ArtifactId::from_path("src/app.cpp"))
                     && rel.dst
-                        == GraphNodeId::Artifact(ArtifactId::from_path(
-                            "include/json/macros.hpp",
-                        ))
+                        == GraphNodeId::Artifact(ArtifactId::from_path("include/json/macros.hpp"))
             }),
             "include directive should be preserved as an artifact edge"
         );

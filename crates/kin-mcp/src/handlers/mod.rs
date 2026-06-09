@@ -83,7 +83,8 @@ pub async fn handle_tool_call<G: GraphStore>(
             sessions::handle_transaction_validate(arguments, sessions, session_authority_mode).await
         }
         "kin_transaction_commit" => {
-            sessions::handle_transaction_commit(arguments, store, sessions, session_authority_mode).await
+            sessions::handle_transaction_commit(arguments, store, sessions, session_authority_mode)
+                .await
         }
         "kin_transaction_abort" => {
             sessions::handle_transaction_abort(arguments, sessions, session_authority_mode).await
@@ -1443,6 +1444,7 @@ mod tests {
             origin: kin_model::relation::RelationOrigin::Parsed,
             created_in: None,
             import_source: None,
+            evidence: Vec::new(),
         };
         store
             .relations_by_entity
@@ -2114,11 +2116,11 @@ mod tests {
 
     #[tokio::test]
     async fn handle_transaction_handlers_lifecycle() {
-        use kin_db::InMemoryGraph;
-        use kin_model::graph::EntityStore;
         use crate::session::{McpMutationOperation, McpMutationPayload};
-        use kin_model::ids::{LanguageId, Hash256};
-        use kin_model::entity::{SemanticFingerprint, FingerprintAlgorithm};
+        use kin_db::InMemoryGraph;
+        use kin_model::entity::{FingerprintAlgorithm, SemanticFingerprint};
+        use kin_model::graph::EntityStore;
+        use kin_model::ids::{Hash256, LanguageId};
 
         let store = InMemoryGraph::default();
         let sessions = SessionRegistry::new();
@@ -2128,7 +2130,10 @@ mod tests {
         let mut begin_args = HashMap::new();
         begin_args.insert("session_id".into(), serde_json::json!("sess-test"));
         begin_args.insert("scope".into(), serde_json::json!("src/lib.rs"));
-        let begin_res = sessions::handle_transaction_begin(&begin_args, &sessions, session_authority).await.unwrap();
+        let begin_res =
+            sessions::handle_transaction_begin(&begin_args, &sessions, session_authority)
+                .await
+                .unwrap();
         let begin_text = match &begin_res.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -2169,7 +2174,10 @@ mod tests {
         let mut stage_args = HashMap::new();
         stage_args.insert("transaction_id".into(), serde_json::json!(tx_id));
         stage_args.insert("operations".into(), serde_json::json!(vec![op]));
-        let stage_res = sessions::handle_transaction_stage(&stage_args, &sessions, session_authority).await.unwrap();
+        let stage_res =
+            sessions::handle_transaction_stage(&stage_args, &sessions, session_authority)
+                .await
+                .unwrap();
         let stage_text = match &stage_res.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -2179,7 +2187,10 @@ mod tests {
         // 3. Validate transaction
         let mut val_args = HashMap::new();
         val_args.insert("transaction_id".into(), serde_json::json!(tx_id));
-        let val_res = sessions::handle_transaction_validate(&val_args, &sessions, session_authority).await.unwrap();
+        let val_res =
+            sessions::handle_transaction_validate(&val_args, &sessions, session_authority)
+                .await
+                .unwrap();
         let val_text = match &val_res.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };
@@ -2189,7 +2200,10 @@ mod tests {
         // 4. Commit transaction
         let mut commit_args = HashMap::new();
         commit_args.insert("transaction_id".into(), serde_json::json!(tx_id));
-        let commit_res = sessions::handle_transaction_commit(&commit_args, &store, &sessions, session_authority).await.unwrap();
+        let commit_res =
+            sessions::handle_transaction_commit(&commit_args, &store, &sessions, session_authority)
+                .await
+                .unwrap();
         let commit_text = match &commit_res.content[0] {
             crate::types::ContentBlock::Text { text } => text.clone(),
         };

@@ -900,29 +900,28 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         resolve_signal_scores,
         resolve_symbols,
         resolve_candidate_stages,
-    ) =
-        if budget.phase_should_skip("entity_resolution") {
-            (
-                Vec::new(),
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-                Vec::new(),
-            )
-        } else {
-            let phase_start = std::time::Instant::now();
-            let result = resolve_entities_to_files(&all_entity_seeds, graph, explain, "text")?;
-            if phase_start.elapsed().as_secs_f64()
-                > budget
-                    .phase_budgets
-                    .get("entity_resolution")
-                    .copied()
-                    .unwrap_or(30.0)
-            {
-                budget.warn_phase_timeout("entity_resolution", phase_start.elapsed());
-            }
-            result
-        };
+    ) = if budget.phase_should_skip("entity_resolution") {
+        (
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            Vec::new(),
+        )
+    } else {
+        let phase_start = std::time::Instant::now();
+        let result = resolve_entities_to_files(&all_entity_seeds, graph, explain, "text")?;
+        if phase_start.elapsed().as_secs_f64()
+            > budget
+                .phase_budgets
+                .get("entity_resolution")
+                .copied()
+                .unwrap_or(30.0)
+        {
+            budget.warn_phase_timeout("entity_resolution", phase_start.elapsed());
+        }
+        result
+    };
 
     // Convert resolved files to a HashMap<String, Vec<FileHit>> for compatibility
     // with the existing RRF and output infrastructure.
@@ -956,8 +955,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             _embed_signal_scores,
             embed_symbols,
             embed_candidate_stages,
-        ) =
-            resolve_entities_to_files(&embedding_entity_seeds, graph, explain, "vector")?;
+        ) = resolve_entities_to_files(&embedding_entity_seeds, graph, explain, "vector")?;
         if phase_start.elapsed().as_secs_f64()
             > budget
                 .phase_budgets
@@ -2149,39 +2147,40 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             match kin_db::embed::rerank::CrossEncoder::new(&model_id, &revision) {
                 Ok(encoder) => {
                     let mut docs = Vec::new();
-                let mut candidates = Vec::new();
+                    let mut candidates = Vec::new();
 
-                for (path, score) in fused.iter().take(ltr_window) {
-                    let file_path = workspace_root
-                        .map(|w| w.join(path))
-                        .unwrap_or_else(|| std::path::PathBuf::from(path));
-                    let content = std::fs::read_to_string(&file_path).unwrap_or_default();
-                    docs.push(content);
-                    candidates.push((path.clone(), *score));
-                }
-
-                let doc_refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
-                if let Ok(scores) = encoder.rerank(text, &doc_refs) {
-                    for (i, score) in scores.into_iter().enumerate() {
-                        candidates[i].1 = score;
+                    for (path, score) in fused.iter().take(ltr_window) {
+                        let file_path = workspace_root
+                            .map(|w| w.join(path))
+                            .unwrap_or_else(|| std::path::PathBuf::from(path));
+                        let content = std::fs::read_to_string(&file_path).unwrap_or_default();
+                        docs.push(content);
+                        candidates.push((path.clone(), *score));
                     }
-                    candidates
-                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-                    let mut new_fused: Vec<(String, f32)> = candidates;
-                    for (path, score) in fused.iter().skip(ltr_window) {
-                        new_fused.push((path.clone(), *score));
-                    }
-                    fused = new_fused;
+                    let doc_refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
+                    if let Ok(scores) = encoder.rerank(text, &doc_refs) {
+                        for (i, score) in scores.into_iter().enumerate() {
+                            candidates[i].1 = score;
+                        }
+                        candidates.sort_by(|a, b| {
+                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
 
-                    if explain {
-                        record_debug_stage(
-                            &mut score_breakdown,
-                            &mut debug_info,
-                            &fused,
-                            "after_cross_encoder",
-                        );
-                    }
+                        let mut new_fused: Vec<(String, f32)> = candidates;
+                        for (path, score) in fused.iter().skip(ltr_window) {
+                            new_fused.push((path.clone(), *score));
+                        }
+                        fused = new_fused;
+
+                        if explain {
+                            record_debug_stage(
+                                &mut score_breakdown,
+                                &mut debug_info,
+                                &fused,
+                                "after_cross_encoder",
+                            );
+                        }
                     }
                 }
                 Err(e) => {
@@ -7681,11 +7680,7 @@ fn resolve_entities_to_files(
                     name: Some(entity.name.clone()),
                     score,
                     source: ResolveCandidateSource::Direct,
-                    reason: format!(
-                        "{} seed {}",
-                        origin,
-                        discovery.signals.join("+")
-                    ),
+                    reason: format!("{} seed {}", origin, discovery.signals.join("+")),
                 });
                 file_signal_scores
                     .entry(path.clone())
@@ -8647,10 +8642,9 @@ fn adaptive_cap(
         let is_strong_semantic = strong_semantic_paths.contains(path.as_str());
         let has_corroborated_resolve = has_entity_resolve
             && (is_strong_semantic
-                || all_hits
-                    .iter()
-                    .enumerate()
-                    .any(|(idx, signal)| idx != 6 && idx != 7 && signal.contains_key(path.as_str())));
+                || all_hits.iter().enumerate().any(|(idx, signal)| {
+                    idx != 6 && idx != 7 && signal.contains_key(path.as_str())
+                }));
         let is_priority_retained = priority_retention_paths.contains(path.as_str());
         let is_cochange_seed = cochange_seed_paths.contains(path.as_str());
         let multi_signal = signal_support_count(path, all_hits) >= signal_support_threshold;
@@ -8664,7 +8658,11 @@ fn adaptive_cap(
         } else {
             support_floor_pct
         };
-        if !is_priority_retained && !is_strong_embedding && !is_strong_semantic && *score < top_score * floor_pct {
+        if !is_priority_retained
+            && !is_strong_embedding
+            && !is_strong_semantic
+            && *score < top_score * floor_pct
+        {
             record_pruned(path, *score, "below_support_floor");
             continue;
         }
@@ -8680,7 +8678,13 @@ fn adaptive_cap(
             // cap — require 3+ independent signals (multi_signal), a priority/cochange
             // seed, or a top-K embedding match (strong standalone semantic evidence).
             // A lone or doubly-signalled file on a flat query must not flood results.
-            if multi_signal || is_priority_retained || is_cochange_seed || is_strong_embedding || is_strong_semantic {
+            if has_corroborated_resolve
+                || multi_signal
+                || is_priority_retained
+                || is_cochange_seed
+                || is_strong_embedding
+                || is_strong_semantic
+            {
                 corroborated_indices.push(i);
             }
         }
@@ -14140,6 +14144,60 @@ mod tests {
                 .take(5)
                 .any(|(path, _)| path == "src/libponyc/options/options.c"),
             "calls relation should survive the frontier cap ahead of contains-noise neighbors"
+        );
+    }
+
+    #[test]
+    fn resolve_entities_to_files_projects_artifact_include_candidates_with_debug() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        let seed = test_entity("load_json", "src/app.cpp", 1, 40);
+        graph.upsert_entity(&seed).unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Includes,
+                src: GraphNodeId::Artifact(ArtifactId::from_path("src/app.cpp")),
+                dst: GraphNodeId::Artifact(ArtifactId::from_path("include/app.hpp")),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: Some("app.hpp".to_string()),
+                evidence: vec![kin_model::RelationEvidence {
+                    resolved_path: Some("include/app.hpp".to_string()),
+                    source_path: Some("app.hpp".to_string()),
+                    parser_rule: Some("include_directive".to_string()),
+                    occurrence_count: 1,
+                    ..kin_model::RelationEvidence::default()
+                }],
+            })
+            .unwrap();
+
+        let seeds = HashMap::from([(
+            seed.id,
+            EntityDiscovery {
+                score: 20.0,
+                signals: vec!["search"],
+                cosine: None,
+            },
+        )]);
+
+        let (resolved, _, _, _, candidate_stages) =
+            resolve_entities_to_files(&seeds, &graph, true, "text").unwrap();
+
+        assert!(
+            resolved.iter().any(|(path, _)| path == "include/app.hpp"),
+            "included artifact should survive candidate construction and projection"
+        );
+        assert!(
+            candidate_stages.iter().any(|stage| {
+                stage.name == "text_relation_paths"
+                    && stage.candidates.iter().any(|candidate| {
+                        candidate.kind == "relation_artifact"
+                            && candidate.path.as_deref() == Some("include/app.hpp")
+                    })
+            }),
+            "artifact relation candidate should be visible in debug stages"
         );
     }
 

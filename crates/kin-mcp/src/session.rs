@@ -411,7 +411,10 @@ impl SessionRegistry {
         }
     }
 
-    pub fn validate_transaction(&self, transaction_id: &str) -> std::result::Result<McpTransaction, String> {
+    pub fn validate_transaction(
+        &self,
+        transaction_id: &str,
+    ) -> std::result::Result<McpTransaction, String> {
         let mut map = self
             .transactions
             .lock()
@@ -430,7 +433,10 @@ impl SessionRegistry {
         }
     }
 
-    pub fn commit_transaction(&self, transaction_id: &str) -> std::result::Result<McpTransaction, String> {
+    pub fn commit_transaction(
+        &self,
+        transaction_id: &str,
+    ) -> std::result::Result<McpTransaction, String> {
         let mut map = self
             .transactions
             .lock()
@@ -449,7 +455,10 @@ impl SessionRegistry {
         }
     }
 
-    pub fn abort_transaction(&self, transaction_id: &str) -> std::result::Result<McpTransaction, String> {
+    pub fn abort_transaction(
+        &self,
+        transaction_id: &str,
+    ) -> std::result::Result<McpTransaction, String> {
         let mut map = self
             .transactions
             .lock()
@@ -764,7 +773,9 @@ mod tests {
             payload: None,
             description: "add dummy function".to_string(),
         };
-        let tx_staged = registry.stage_transaction(&tx.transaction_id, vec![op]).unwrap();
+        let tx_staged = registry
+            .stage_transaction(&tx.transaction_id, vec![op])
+            .unwrap();
         assert_eq!(tx_staged.staged_operations.len(), 1);
 
         let tx_validated = registry.validate_transaction(&tx.transaction_id).unwrap();
@@ -774,6 +785,8 @@ mod tests {
         assert_eq!(tx_committed.state, "committed");
 
         // Cannot stage on committed
-        assert!(registry.stage_transaction(&tx.transaction_id, vec![]).is_err());
+        assert!(registry
+            .stage_transaction(&tx.transaction_id, vec![])
+            .is_err());
     }
 }
