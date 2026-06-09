@@ -35,6 +35,7 @@ pub async fn handle_tool_call<G: GraphStore>(
     match tool_name {
         // Entities
         "semantic_search" => entities::handle_semantic_search(arguments, store),
+        "semantic_locate" => entities::handle_semantic_locate(arguments, store),
         "get_entity" => entities::handle_get_entity(arguments, store),
         "get_entity_source" | "get_entity_body" => {
             entities::handle_get_entity_source(arguments, store)
@@ -1499,6 +1500,33 @@ mod tests {
         assert!(body.contains("return value <= maxVal;"));
         assert_ne!(body, entity.signature);
         assert_eq!(object.get("start_line").unwrap(), 1);
+    }
+
+    #[test]
+    fn focal_context_json_surfaces_source_and_stale_markers() {
+        // W1-B contract: get_context_pack's focal entity must carry the
+        // graph/disk source marker and staleness flag in the response payload,
+        // matching get_entity_source.
+        let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  return value <= maxVal;\n}\n";
+        let (_dir, entity) = make_source_backed_entity(content);
+        let entry = kin_model::ContextEntry {
+            entity_id: entity.id,
+            projection_level: kin_model::ProjectionLevel::FullBody,
+            content: entity.signature.clone(),
+        };
+
+        let value = focal_context_json(&EmptyStore::default(), &entry, &entity, false);
+        let object = value.as_object().unwrap();
+
+        let source = object.get("source").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            source == "graph" || source == "disk",
+            "focal source marker must reflect the read path, got: {source}"
+        );
+        assert!(
+            object.get("stale").map(|v| v.is_boolean()).unwrap_or(false),
+            "focal payload must include a boolean stale flag"
+        );
     }
 
     #[test]

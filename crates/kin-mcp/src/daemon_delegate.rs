@@ -28,6 +28,45 @@ fn daemon_base_url() -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+/// Bearer token the daemon expects on non-public routes.
+///
+/// The daemon enables auth when `KIN_DAEMON_AUTH_TOKEN` is set (see
+/// `auth_token_from_env` in kin-daemon); when it is, every route except the
+/// health/readiness probes requires `Authorization: Bearer <token>`. The MCP
+/// transport forwards graph and session tools to those protected routes, so it
+/// must present the same token or the daemon answers 401.
+fn daemon_auth_token() -> Option<String> {
+    std::env::var("KIN_DAEMON_AUTH_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Attach the daemon bearer token to a request when auth is configured.
+fn with_auth(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match daemon_auth_token() {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    }
+}
+
+/// Attach the session header (from explicit args or `KIN_SESSION_ID`) to a
+/// forwarded request so the daemon resolves the caller's session graph.
+fn with_session_header(
+    request: reqwest::RequestBuilder,
+    arguments: &HashMap<String, serde_json::Value>,
+) -> reqwest::RequestBuilder {
+    if let Some(session_id) = optional_string(arguments, "session_id") {
+        return request.header("X-Kin-Session", session_id);
+    }
+    if let Ok(session_id) = std::env::var("KIN_SESSION_ID") {
+        if !session_id.trim().is_empty() {
+            return request.header("X-Kin-Session", session_id);
+        }
+    }
+    request
+}
+
 fn daemon_required_unavailable(operation: &str) -> ToolCallResult {
     ToolCallResult::error(format!(
         "Kin daemon is required for {operation}, but the daemon delegate is unavailable"
@@ -133,19 +172,13 @@ async fn forward_mcp_tool_call(
     let Some(base) = daemon_base_url() else {
         return Ok(None);
     };
-    let mut request = client
+    let request = client
         .post(format!("{}/mcp/tools/call", base))
         .json(&serde_json::json!({
             "name": name,
             "arguments": arguments,
         }));
-    if let Some(session_id) = optional_string(arguments, "session_id") {
-        request = request.header("X-Kin-Session", session_id);
-    } else if let Ok(session_id) = std::env::var("KIN_SESSION_ID") {
-        if !session_id.trim().is_empty() {
-            request = request.header("X-Kin-Session", session_id);
-        }
-    }
+    let request = with_session_header(with_auth(request), arguments);
     let resp = request
         .send()
         .await
@@ -245,8 +278,57 @@ pub async fn forward_tool_call(
                 .map(text_result_from_value)
                 .transpose()
         }
+        // Coverage exposure: surface embedding-index coverage to MCP agents.
+        // The generic graph tool dispatcher only knows entity_count; the
+        // daemon's status command computes embedding coverage from the live
+        // graph (`graph.embedding_status()`), so forward there and project the
+        // fields MCP agents need.
+        "kin_graph_status" => forward_graph_status(arguments).await,
         _ => forward_mcp_tool_call(name, arguments).await,
     }
+}
+
+/// Forward `kin_graph_status` to the daemon's status command and project the
+/// graph/embedding coverage fields agents care about.
+///
+/// In product mode coverage is otherwise CLI-only (`kin status`); this gives
+/// MCP agents the same embedding-index visibility without leaving graph-owned
+/// truth — the daemon computes the counts from its live graph.
+async fn forward_graph_status(
+    arguments: &HashMap<String, serde_json::Value>,
+) -> Result<Option<ToolCallResult>, String> {
+    let Some(client) = daemon_client().await else {
+        return Ok(None);
+    };
+    let Some(base) = daemon_base_url() else {
+        return Ok(None);
+    };
+    let request = client
+        .post(format!("{}/commands/status", base))
+        .json(&serde_json::json!({ "json": false }));
+    let request = with_session_header(with_auth(request), arguments);
+    let resp = request
+        .send()
+        .await
+        .map_err(|e| format!("daemon graph status failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("daemon graph status failed: HTTP {}", resp.status()));
+    }
+    let value: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("daemon graph status response parse failed: {e}"))?;
+    let summary = value.get("summary").unwrap_or(&value);
+    let field_u64 = |key: &str| summary.get(key).and_then(serde_json::Value::as_u64);
+    let result = serde_json::json!({
+        "entity_count": field_u64("entities").unwrap_or(0),
+        "embeddings_indexed": field_u64("embeddings_indexed").unwrap_or(0),
+        "embeddings_total": field_u64("embeddings_total").unwrap_or(0),
+        "embeddings_pending": field_u64("embeddings_pending").unwrap_or(0),
+        "authority": "repo-daemon",
+        "note": "Embedding coverage is computed from the daemon-owned live graph."
+    });
+    text_result_from_value(result).map(Some)
 }
 
 pub fn daemon_unavailable_tool_result(name: &str) -> ToolCallResult {
@@ -317,9 +399,7 @@ pub async fn forward_session_start(
     if let Some(p) = pid {
         body["pid"] = serde_json::json!(p);
     }
-    let resp = client
-        .post(format!("{}/session", base))
-        .json(&body)
+    let resp = with_auth(client.post(format!("{}/session", base)).json(&body))
         .send()
         .await
         .map_err(|e| format!("daemon session start failed: {e}"))?;
@@ -346,8 +426,7 @@ pub async fn forward_session_heartbeat(
     let Some(base) = daemon_base_url() else {
         return Ok(None);
     };
-    let resp = client
-        .post(format!("{}/session/{}/heartbeat", base, session_id))
+    let resp = with_auth(client.post(format!("{}/session/{}/heartbeat", base, session_id)))
         .send()
         .await
         .map_err(|e| format!("daemon heartbeat failed: {e}"))?;
@@ -369,8 +448,7 @@ pub async fn forward_session_end(session_id: &str) -> Result<Option<serde_json::
     let Some(base) = daemon_base_url() else {
         return Ok(None);
     };
-    let resp = client
-        .delete(format!("{}/session/{}", base, session_id))
+    let resp = with_auth(client.delete(format!("{}/session/{}", base, session_id)))
         .send()
         .await
         .map_err(|e| format!("daemon session end failed: {e}"))?;
@@ -411,9 +489,7 @@ pub async fn forward_register_intent(
     } else {
         body
     };
-    let resp = client
-        .post(format!("{}/intent/register", base))
-        .json(&body)
+    let resp = with_auth(client.post(format!("{}/intent/register", base)).json(&body))
         .send()
         .await
         .map_err(|e| format!("daemon intent register failed: {e}"))?;
@@ -444,8 +520,7 @@ pub async fn forward_release_intent(
     let Some(base) = daemon_base_url() else {
         return Ok(None);
     };
-    let resp = client
-        .delete(format!("{}/intent/{}", base, intent_id))
+    let resp = with_auth(client.delete(format!("{}/intent/{}", base, intent_id)))
         .send()
         .await
         .map_err(|e| format!("daemon release intent failed: {e}"))?;
@@ -479,8 +554,7 @@ pub async fn forward_check_traffic(
     let mut reports = Vec::new();
     for scope in scope_strings {
         let encoded = scope.replace(':', "%3A");
-        let resp = client
-            .get(format!("{}/traffic/{}", base, encoded))
+        let resp = with_auth(client.get(format!("{}/traffic/{}", base, encoded)))
             .send()
             .await
             .map_err(|e| format!("daemon check traffic failed: {e}"))?;

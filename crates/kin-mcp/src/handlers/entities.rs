@@ -72,6 +72,51 @@ pub fn handle_semantic_search<G: GraphStore>(
     Ok(ToolCallResult::text(json))
 }
 
+pub const SEMANTIC_LOCATE_DESC: &str = "\
+Rank the code most relevant to a natural-language query using Kin's real vector index — \
+the same embedding-backed retrieval that powers `kin locate`, not a name/metadata filter. \
+This is the tool to reach for when you are looking for \"where is the code that does X\" \
+and you only have a description of the behavior, not an exact symbol name. Unlike \
+semantic_search (which matches declarations by name/kind/language and ignores the query \
+for ranking), semantic_locate embeds your query and scores entities by semantic \
+similarity against the graph's vector index, returning a ranked list with relevance \
+scores. Set granularity to \"entity\" (default) for ranked declarations or \"file\" to \
+roll results up to the most relevant files. The response also reports semantic_coverage \
+— the fraction of the graph that has embeddings indexed — so you can tell whether a thin \
+result set means \"not relevant\" or \"not yet embedded\". Requires the Kin daemon: vector \
+search runs against the daemon's live graph and HNSW index, so this tool returns an error \
+in offline/no-daemon mode.";
+
+/// Offline/generic dispatch arm for `semantic_locate`.
+///
+/// Real vector-ranked retrieval requires the daemon's concrete graph and HNSW
+/// index (`embedding_status` and vector search are not part of the generic
+/// `GraphStore` trait). In product mode the daemon's `/mcp/tools/call` route
+/// special-cases this tool before falling through to the generic dispatcher, so
+/// this handler is only reached in offline/no-daemon runs — where it returns a
+/// clear, actionable error instead of silently degrading to a metadata filter.
+pub fn handle_semantic_locate<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    _store: &G,
+) -> Result<ToolCallResult> {
+    // Validate the contract args up front so callers get precise feedback even
+    // when no daemon is present.
+    let _query = get_string_param(args, "query")?;
+    if let Some(granularity) = get_optional_string_param(args, "granularity") {
+        if granularity != "file" && granularity != "entity" {
+            return Err(McpError::InvalidParams(format!(
+                "invalid granularity '{granularity}': expected \"file\" or \"entity\""
+            )));
+        }
+    }
+    Ok(ToolCallResult::error(
+        "semantic_locate requires the Kin daemon for vector search: ranked retrieval runs \
+         against the daemon's live graph and HNSW index, which is unavailable in \
+         offline/no-daemon mode. Start the repo daemon and retry."
+            .to_string(),
+    ))
+}
+
 pub const GET_ENTITY_DESC: &str = "\
 Look up one entity by its ID and return its full metadata: kind, language, file path, \
 line range, signature, visibility, role, and any doc summary — but not the source \
@@ -1581,12 +1626,14 @@ pub fn handle_graph_neighborhood<G: GraphStore>(
 }
 
 pub const GRAPH_STATUS_DESC: &str = "\
-Report the status of the semantic graph that MCP is serving from — currently the live \
-entity count and the authority backing it. In product mode this is answered by the repo \
-daemon, so it reflects the daemon-owned, live graph state rather than a stale \
+Report the status of the semantic graph that MCP is serving from — the live entity \
+count, embedding-index coverage (embeddings_indexed / embeddings_total / \
+embeddings_pending), and the authority backing it. In product mode this is answered by \
+the repo daemon, so it reflects the daemon-owned, live graph state rather than a stale \
 MCP-local snapshot. Reach for it as a quick health/readiness check: confirm the graph \
-is populated and that you're talking to graph-owned truth before relying on the other \
-tools, or sanity-check that the repository has been indexed at all.";
+is populated, check how much of it has embeddings indexed (so you know whether \
+semantic_locate / vector retrieval will be complete or still warming up), and verify \
+you're talking to graph-owned truth before relying on the other tools.";
 
 /// Report the health of the graph visible to this dispatcher.
 ///
@@ -1795,5 +1842,41 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["error"], "invalid entity_id (not a UUID)");
         assert_eq!(rows[1]["error"], "entity not found");
+    }
+
+    #[test]
+    fn semantic_locate_requires_daemon_in_offline_mode() {
+        let store = InMemoryGraph::new();
+        let mut args = HashMap::new();
+        args.insert(
+            "query".to_string(),
+            serde_json::json!("where is auth handled"),
+        );
+
+        let result = handle_semantic_locate(&args, &store).unwrap();
+        assert_eq!(result.is_error, Some(true));
+        let crate::types::ContentBlock::Text { text } = result.content.first().unwrap();
+        assert!(
+            text.contains("requires the Kin daemon"),
+            "offline semantic_locate must explain the daemon requirement, got: {text}"
+        );
+    }
+
+    #[test]
+    fn semantic_locate_rejects_missing_query() {
+        let store = InMemoryGraph::new();
+        let args = HashMap::new();
+        let err = handle_semantic_locate(&args, &store).unwrap_err();
+        assert!(matches!(err, McpError::InvalidParams(_)));
+    }
+
+    #[test]
+    fn semantic_locate_rejects_invalid_granularity() {
+        let store = InMemoryGraph::new();
+        let mut args = HashMap::new();
+        args.insert("query".to_string(), serde_json::json!("q"));
+        args.insert("granularity".to_string(), serde_json::json!("module"));
+        let err = handle_semantic_locate(&args, &store).unwrap_err();
+        assert!(matches!(err, McpError::InvalidParams(_)));
     }
 }
