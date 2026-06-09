@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const PREPARED_PUBLISH_SCHEMA: &str = "kin.prepared-state.publish.v1";
 const PREPARED_MATERIALIZE_SCHEMA: &str = "kin.prepared-state.materialize.v1";
 const PREPARED_MANIFEST_SCHEMA: &str = "kin.prepared-state.v1";
+const EMBEDDED_PREPARED_MANIFEST: &str = ".kin/bench/prepared-manifest.json";
 
 const VALIDATION_KEYS: &[&str] = &[
     "cache_key",
@@ -68,6 +69,7 @@ pub async fn publish(target: PathBuf, json: bool) -> Result<()> {
     if prepared_state_expects_vectors(&manifest) {
         require_complete_prepared_embeddings(&kin_dir)?;
     }
+    write_embedded_prepared_manifest(&kin_dir, &manifest)?;
     publish_prepared_state_from_kin_dir(&kin_dir, &target, &manifest)?;
 
     let result = PublishResult {
@@ -158,6 +160,7 @@ fn validate_prepared_state(prepared_dir: &Path, expected_manifest: &Value) -> Re
             bail!("{} mismatch", key.replace('_', " "));
         }
     }
+    validate_embedded_prepared_manifest(prepared_dir, expected_manifest)?;
 
     for relative_path in required_prepared_entries() {
         if !prepared_dir.join(relative_path).exists() {
@@ -227,6 +230,7 @@ fn required_prepared_entries() -> &'static [PathBuf] {
                 PathBuf::from(".kin/version"),
                 PathBuf::from(".kin/kindb/graph.kndb"),
                 PathBuf::from(".kin/kindb/text-index"),
+                PathBuf::from(EMBEDDED_PREPARED_MANIFEST),
             ]
         })
         .as_slice()
@@ -273,6 +277,7 @@ fn publish_prepared_state_from_kin_dir(
     remove_path_if_exists(&staging_dir)?;
     fs::create_dir_all(&staging_dir)?;
     copy_dir_recursive(source_kin_dir, &staging_dir.join(".kin"))?;
+    write_embedded_prepared_manifest(&staging_dir.join(".kin"), manifest)?;
     fs::write(
         staging_dir.join("manifest.json"),
         serde_json::to_string_pretty(manifest)?,
@@ -290,6 +295,55 @@ fn materialize_prepared_state(source_dir: &Path, repo_path: &Path) -> Result<()>
     let kin_dir = repo_path.join(".kin");
     remove_path_if_exists(&kin_dir)?;
     copy_dir_recursive(&source_dir.join(".kin"), &kin_dir)
+}
+
+fn write_embedded_prepared_manifest(kin_dir: &Path, manifest: &Value) -> Result<()> {
+    let manifest_path = kin_dir
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(EMBEDDED_PREPARED_MANIFEST);
+    if let Some(parent) = manifest_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(manifest_path, serde_json::to_string_pretty(manifest)?)
+        .context("write embedded prepared-state manifest")?;
+    Ok(())
+}
+
+fn validate_embedded_prepared_manifest(
+    prepared_dir: &Path,
+    expected_manifest: &Value,
+) -> Result<()> {
+    let manifest_path = prepared_dir.join(EMBEDDED_PREPARED_MANIFEST);
+    if !manifest_path.exists() {
+        bail!(
+            "prepared artifact missing {} (runtime fingerprint marker required)",
+            EMBEDDED_PREPARED_MANIFEST
+        );
+    }
+
+    let embedded: Value = serde_json::from_str(
+        &fs::read_to_string(&manifest_path)
+            .with_context(|| format!("read embedded manifest {}", manifest_path.display()))?,
+    )
+    .with_context(|| format!("parse embedded manifest {}", manifest_path.display()))?;
+
+    if embedded
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        != PREPARED_MANIFEST_SCHEMA
+    {
+        bail!("embedded prepared manifest schema version mismatch");
+    }
+
+    for key in VALIDATION_KEYS {
+        if embedded.get(*key) != expected_manifest.get(*key) {
+            bail!("embedded {} mismatch", key.replace('_', " "));
+        }
+    }
+
+    Ok(())
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
@@ -376,6 +430,12 @@ mod tests {
             serde_json::to_string_pretty(&manifest).unwrap(),
         )
         .unwrap();
+        fs::create_dir_all(dir.join(".kin/bench")).unwrap();
+        fs::write(
+            dir.join(EMBEDDED_PREPARED_MANIFEST),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
         manifest
     }
 
@@ -404,6 +464,21 @@ mod tests {
         assert!(
             msg.contains("graph.kvec"),
             "error should name the missing vector sidecar, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_prepared_state_without_embedded_runtime_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = make_prepared_dir(dir.path(), false, true, /* with_vectors */ false);
+        fs::remove_file(dir.path().join(EMBEDDED_PREPARED_MANIFEST)).unwrap();
+
+        let err = validate_prepared_state(dir.path(), &manifest)
+            .expect_err("prepared state without embedded runtime manifest must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("runtime fingerprint marker"),
+            "error should explain missing runtime marker, got: {msg}"
         );
     }
 

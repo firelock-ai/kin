@@ -8,7 +8,7 @@ use kin_model::{
 };
 use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::BuildHasherDefault;
 
 use crate::capability::LocateProfile;
@@ -7728,65 +7728,97 @@ fn resolve_entities_to_files(
         }
 
         if let Some(ref fo) = entity.file_origin {
-            let artifact_node = GraphNodeId::Artifact(ArtifactId::from_path(&fo.0));
-            let mut artifact_rels = graph.get_all_relations_for_node(&artifact_node)?;
-            artifact_rels.sort_by(|left, right| {
-                let left_kind = resolve_relation_kind_priority(left.kind);
-                let right_kind = resolve_relation_kind_priority(right.kind);
-                let left_origin = resolve_relation_origin_priority(left.origin);
-                let right_origin = resolve_relation_origin_priority(right.origin);
-                right_kind
-                    .cmp(&left_kind)
-                    .then_with(|| right_origin.cmp(&left_origin))
-                    .then_with(|| format!("{:?}", left.id).cmp(&format!("{:?}", right.id)))
-            });
-            for rel in artifact_rels
-                .iter()
-                .take(locate_env_usize("KIN_LOCATE_RESOLVE_ARTIFACT_FRONTIER", 32))
+            let artifact_hops = locate_env_usize("KIN_LOCATE_RESOLVE_ARTIFACT_HOPS", 2);
+            let artifact_frontier = locate_env_usize("KIN_LOCATE_RESOLVE_ARTIFACT_FRONTIER", 32);
+            let artifact_hop_decay = locate_env_f32("KIN_LOCATE_RESOLVE_ARTIFACT_HOP_DECAY", 0.55);
+            let start_artifact = GraphNodeId::Artifact(ArtifactId::from_path(&fo.0));
+            let mut visited_artifacts = HashSet::from([start_artifact.clone()]);
+            let mut artifact_frontier_queue =
+                VecDeque::from([(start_artifact, fo.0.clone(), 0usize)]);
+
+            while let Some((artifact_node, source_path, depth)) =
+                artifact_frontier_queue.pop_front()
             {
-                if !matches!(rel.kind, RelationKind::Includes | RelationKind::Imports) {
-                    continue;
-                }
-                let Some(path) = relation_projected_artifact_path(rel, &artifact_node) else {
-                    continue;
-                };
-                if is_test_path(&path) || is_vendored_path(&path) {
+                if depth >= artifact_hops {
                     continue;
                 }
 
-                let origin_mult = resolve_relation_origin_multiplier(
-                    rel.origin,
-                    lsp_boost,
-                    parsed_weight,
-                    inferred_weight,
-                );
-                let kind_mult = resolve_relation_kind_multiplier(rel.kind);
-                let score = discovery.score * origin_mult * kind_mult / 2.0;
-
-                candidates.push(ResolveCandidate {
-                    id: format!("relation:{}:artifact:{}", rel.id, rel.dst),
-                    kind: "relation_artifact",
-                    path: path.clone(),
-                    name: None,
-                    score,
-                    source: ResolveCandidateSource::Graph,
-                    reason: format!("{:?} from file artifact {}", rel.kind, fo.0),
+                let mut artifact_rels = graph.get_all_relations_for_node(&artifact_node)?;
+                artifact_rels.sort_by(|left, right| {
+                    let left_kind = resolve_relation_kind_priority(left.kind);
+                    let right_kind = resolve_relation_kind_priority(right.kind);
+                    let left_origin = resolve_relation_origin_priority(left.origin);
+                    let right_origin = resolve_relation_origin_priority(right.origin);
+                    right_kind
+                        .cmp(&left_kind)
+                        .then_with(|| right_origin.cmp(&left_origin))
+                        .then_with(|| format!("{:?}", left.id).cmp(&format!("{:?}", right.id)))
                 });
-                file_signal_scores
-                    .entry(path.clone())
-                    .or_default()
-                    .entry("graph_resolve".to_string())
-                    .and_modify(|s| *s += score)
-                    .or_insert(score);
-                if explain {
-                    push_projection_reason(
-                        &mut file_explain,
-                        &path,
-                        format!(
-                            "artifact {:?} from `{}` includes/imports `{}`",
-                            rel.kind, fo.0, path
-                        ),
+                for rel in artifact_rels
+                    .iter()
+                    .filter(|rel| {
+                        matches!(rel.kind, RelationKind::Includes | RelationKind::Imports)
+                    })
+                    .filter(|rel| rel.src == artifact_node)
+                    .take(artifact_frontier)
+                {
+                    let Some(path) = relation_projected_artifact_path(rel, &artifact_node) else {
+                        continue;
+                    };
+                    if is_test_path(&path) || is_vendored_path(&path) {
+                        continue;
+                    }
+
+                    let origin_mult = resolve_relation_origin_multiplier(
+                        rel.origin,
+                        lsp_boost,
+                        parsed_weight,
+                        inferred_weight,
                     );
+                    let kind_mult = resolve_relation_kind_multiplier(rel.kind);
+                    let hop = depth + 1;
+                    let hop_decay = artifact_hop_decay.powi(depth as i32);
+                    let score =
+                        discovery.score * origin_mult * kind_mult * hop_decay / ((hop + 1) as f32);
+
+                    candidates.push(ResolveCandidate {
+                        id: format!("relation:{}:artifact:{}:hop{}", rel.id, rel.dst, hop),
+                        kind: "relation_artifact",
+                        path: path.clone(),
+                        name: None,
+                        score,
+                        source: ResolveCandidateSource::Graph,
+                        reason: format!(
+                            "{:?} hop {} from file artifact {} via {}",
+                            rel.kind, hop, fo.0, source_path
+                        ),
+                    });
+                    file_signal_scores
+                        .entry(path.clone())
+                        .or_default()
+                        .entry("graph_resolve".to_string())
+                        .and_modify(|s| *s += score)
+                        .or_insert(score);
+                    if explain {
+                        push_projection_reason(
+                            &mut file_explain,
+                            &path,
+                            format!(
+                                "artifact {:?} hop {} from `{}` via `{}` includes/imports `{}`",
+                                rel.kind, hop, fo.0, source_path, path
+                            ),
+                        );
+                    }
+
+                    let next_artifact = match &rel.dst {
+                        GraphNodeId::Artifact(artifact_id) => {
+                            GraphNodeId::Artifact(artifact_id.clone())
+                        }
+                        _ => GraphNodeId::Artifact(ArtifactId::from_path(&path)),
+                    };
+                    if visited_artifacts.insert(next_artifact.clone()) {
+                        artifact_frontier_queue.push_back((next_artifact, path, depth + 1));
+                    }
                 }
             }
         }
@@ -14172,6 +14204,44 @@ mod tests {
                 }],
             })
             .unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::from_bytes([0xff; 16]),
+                kind: RelationKind::Includes,
+                src: GraphNodeId::Artifact(ArtifactId::from_path("include/app.hpp")),
+                dst: GraphNodeId::Artifact(ArtifactId::from_path("include/detail/internal.hpp")),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: Some("detail/internal.hpp".to_string()),
+                evidence: vec![kin_model::RelationEvidence {
+                    resolved_path: Some("include/detail/internal.hpp".to_string()),
+                    source_path: Some("detail/internal.hpp".to_string()),
+                    parser_rule: Some("include_directive".to_string()),
+                    occurrence_count: 1,
+                    ..kin_model::RelationEvidence::default()
+                }],
+            })
+            .unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::from_bytes([0x00; 16]),
+                kind: RelationKind::Includes,
+                src: GraphNodeId::Artifact(ArtifactId::from_path("tests/test_app.cpp")),
+                dst: GraphNodeId::Artifact(ArtifactId::from_path("include/app.hpp")),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: Some("include/app.hpp".to_string()),
+                evidence: vec![kin_model::RelationEvidence {
+                    resolved_path: Some("include/app.hpp".to_string()),
+                    source_path: Some("include/app.hpp".to_string()),
+                    parser_rule: Some("include_directive".to_string()),
+                    occurrence_count: 1,
+                    ..kin_model::RelationEvidence::default()
+                }],
+            })
+            .unwrap();
 
         let seeds = HashMap::from([(
             seed.id,
@@ -14182,12 +14252,25 @@ mod tests {
             },
         )]);
 
-        let (resolved, _, _, _, candidate_stages) =
-            resolve_entities_to_files(&seeds, &graph, true, "text").unwrap();
+        let old_frontier = std::env::var("KIN_LOCATE_RESOLVE_ARTIFACT_FRONTIER").ok();
+        std::env::set_var("KIN_LOCATE_RESOLVE_ARTIFACT_FRONTIER", "1");
+        let result = resolve_entities_to_files(&seeds, &graph, true, "text");
+        if let Some(value) = old_frontier {
+            std::env::set_var("KIN_LOCATE_RESOLVE_ARTIFACT_FRONTIER", value);
+        } else {
+            std::env::remove_var("KIN_LOCATE_RESOLVE_ARTIFACT_FRONTIER");
+        }
+        let (resolved, _, _, _, candidate_stages) = result.unwrap();
 
         assert!(
             resolved.iter().any(|(path, _)| path == "include/app.hpp"),
             "included artifact should survive candidate construction and projection"
+        );
+        assert!(
+            resolved
+                .iter()
+                .any(|(path, _)| path == "include/detail/internal.hpp"),
+            "bounded include closure should preserve graph-native internal header candidates"
         );
         assert!(
             candidate_stages.iter().any(|stage| {
@@ -14198,6 +14281,17 @@ mod tests {
                     })
             }),
             "artifact relation candidate should be visible in debug stages"
+        );
+        assert!(
+            candidate_stages.iter().any(|stage| {
+                stage.name == "text_relation_paths"
+                    && stage.candidates.iter().any(|candidate| {
+                        candidate.kind == "relation_artifact"
+                            && candidate.path.as_deref() == Some("include/detail/internal.hpp")
+                            && candidate.reason.contains("hop 2")
+                    })
+            }),
+            "include-closure candidate should explain the second artifact hop"
         );
     }
 

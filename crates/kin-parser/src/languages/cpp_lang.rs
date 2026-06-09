@@ -263,6 +263,34 @@ fn extract_cpp_node(
                 });
             }
         }
+        "alias_declaration" => {
+            if let Some((alias_name, referenced_types)) = extract_alias_declaration(node, source) {
+                let scoped_alias = class_ctx
+                    .map(|class_name| format!("{class_name}::{alias_name}"))
+                    .unwrap_or_else(|| alias_name.clone());
+                entities.push(ExtractedEntity {
+                    kind: EntityKind::TypeAlias,
+                    name: scoped_alias,
+                    signature: node_signature(node, source),
+                    visibility: default_vis,
+                    doc_summary: extract_preceding_comment(node, source),
+                    fingerprint: compute_fingerprint(node, source),
+                    span: span_from_node(node, file_id),
+                });
+
+                let src_name = class_ctx
+                    .map(str::to_string)
+                    .unwrap_or_else(|| alias_name.clone());
+                for referenced_type in referenced_types {
+                    relations.push(ExtractedRelation {
+                        kind: kin_model::RelationKind::References,
+                        src_name: src_name.clone(),
+                        dst_name: referenced_type,
+                        import_source: None,
+                    });
+                }
+            }
+        }
         "template_declaration" => {
             // Unwrap the template and extract the inner declaration.
             let mut cursor = node.walk();
@@ -373,7 +401,10 @@ fn extract_class_or_struct(
                 "access_specifier" => {
                     current_vis = parse_access_specifier(&member, source);
                 }
-                "function_definition" | "declaration" | "template_declaration" => {
+                "function_definition"
+                | "declaration"
+                | "alias_declaration"
+                | "template_declaration" => {
                     extract_cpp_node(
                         &member,
                         source,
@@ -545,6 +576,146 @@ fn extract_typedef_name(node: &tree_sitter::Node, source: &[u8]) -> Option<Strin
         }
     }
     None
+}
+
+fn extract_alias_declaration(
+    node: &tree_sitter::Node,
+    source: &[u8],
+) -> Option<(String, Vec<String>)> {
+    let alias_name = node
+        .child_by_field_name("name")
+        .and_then(|child| child.utf8_text(source).ok())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .or_else(|| first_alias_type_identifier(node, source))?;
+
+    let mut references =
+        alias_rhs_type_references(node.utf8_text(source).unwrap_or(""), &alias_name);
+    let mut skipped_alias = false;
+    collect_alias_referenced_types(
+        node,
+        source,
+        &alias_name,
+        &mut skipped_alias,
+        &mut references,
+    );
+    references.sort();
+    references.dedup();
+    Some((alias_name, references))
+}
+
+fn alias_rhs_type_references(alias_text: &str, alias_name: &str) -> Vec<String> {
+    let Some((_, rhs)) = alias_text.split_once('=') else {
+        return Vec::new();
+    };
+    let mut references = Vec::new();
+    let mut token = String::new();
+    for ch in rhs.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == ':' {
+            token.push(ch);
+        } else if !token.is_empty() {
+            push_normalized_alias_reference(&token, alias_name, &mut references);
+            token.clear();
+        }
+    }
+    if !token.is_empty() {
+        push_normalized_alias_reference(&token, alias_name, &mut references);
+    }
+    references
+}
+
+fn push_normalized_alias_reference(raw: &str, _alias_name: &str, references: &mut Vec<String>) {
+    if let Some(name) = normalize_cpp_type_reference(raw) {
+        if !is_unhelpful_cpp_type_reference(&name) {
+            references.push(name);
+        }
+    }
+}
+
+fn first_alias_type_identifier(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "type_identifier" {
+            let text = child.utf8_text(source).unwrap_or("").trim().to_string();
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+fn collect_alias_referenced_types(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    alias_name: &str,
+    skipped_alias: &mut bool,
+    references: &mut Vec<String>,
+) {
+    match node.kind() {
+        "qualified_identifier" => {
+            if let Some(name) = normalize_cpp_type_reference(node.utf8_text(source).unwrap_or("")) {
+                if name != alias_name && !is_unhelpful_cpp_type_reference(&name) {
+                    references.push(name);
+                }
+            }
+            return;
+        }
+        "type_identifier" => {
+            if let Some(name) = normalize_cpp_type_reference(node.utf8_text(source).unwrap_or("")) {
+                if name == alias_name && !*skipped_alias {
+                    *skipped_alias = true;
+                    return;
+                }
+                if name != alias_name && !is_unhelpful_cpp_type_reference(&name) {
+                    references.push(name);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_alias_referenced_types(&child, source, alias_name, skipped_alias, references);
+    }
+}
+
+fn normalize_cpp_type_reference(raw: &str) -> Option<String> {
+    let before_template = raw.split('<').next().unwrap_or(raw);
+    let trimmed = before_template
+        .trim()
+        .trim_start_matches("::")
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != ':');
+    let name = trimmed
+        .rsplit("::")
+        .next()
+        .unwrap_or(trimmed)
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn is_unhelpful_cpp_type_reference(name: &str) -> bool {
+    matches!(
+        name,
+        "void"
+            | "bool"
+            | "char"
+            | "short"
+            | "int"
+            | "long"
+            | "float"
+            | "double"
+            | "auto"
+            | "typename"
+            | "class"
+            | "struct"
+    )
 }
 
 /// Detect file-scope visibility. `static` functions are private; otherwise public.
@@ -1006,6 +1177,87 @@ int main() { return 0; }
                 .iter()
                 .all(|r| r.kind != kin_model::RelationKind::Imports),
             "imports should be carried by FileImport, not fake file-sourced relations"
+        );
+    }
+
+    #[test]
+    fn extracts_lowercase_preprocessor_macro_definitions_without_use_noise() {
+        let adapter = CppAdapter;
+        let source = br#"
+#define private public
+class Secret {
+private:
+    int value = 0;
+};
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("secret.cpp");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let macro_entity = output
+            .entities
+            .iter()
+            .find(|entity| entity.kind == EntityKind::Macro && entity.name == "private")
+            .expect("lowercase preprocessor definitions should remain graph-visible macros");
+        assert!(
+            macro_entity.signature.contains("#define private public"),
+            "macro signature should preserve the source directive, got {:?}",
+            macro_entity.signature
+        );
+        assert!(
+            output.relations.iter().all(|relation| relation.kind
+                != kin_model::RelationKind::UsesMacro
+                || relation.dst_name != "private"),
+            "lowercase identifiers should not be promoted to macro-use edges"
+        );
+    }
+
+    #[test]
+    fn alias_declarations_emit_references_to_rhs_types() {
+        let adapter = CppAdapter;
+        let source = br#"
+template<typename BasicJsonType>
+class basic_json {
+private:
+    using internal_iterator = ::nlohmann::detail::internal_iterator<BasicJsonType>;
+    using iter_impl = ::nlohmann::detail::iter_impl<BasicJsonType>;
+};
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("json.hpp");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let aliases: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|entity| entity.kind == EntityKind::TypeAlias)
+            .map(|entity| entity.name.as_str())
+            .collect();
+        assert!(
+            aliases.contains(&"basic_json::internal_iterator"),
+            "class-local alias entity should be scoped, got {aliases:?}"
+        );
+        assert!(
+            aliases.contains(&"basic_json::iter_impl"),
+            "class-local alias entity should be scoped, got {aliases:?}"
+        );
+
+        let references: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|relation| {
+                relation.kind == kin_model::RelationKind::References
+                    && relation.src_name == "basic_json"
+            })
+            .map(|relation| relation.dst_name.as_str())
+            .collect();
+        assert!(
+            references.contains(&"internal_iterator"),
+            "alias RHS should reference internal_iterator, got {references:?}"
+        );
+        assert!(
+            references.contains(&"iter_impl"),
+            "alias RHS should reference iter_impl, got {references:?}"
         );
     }
 

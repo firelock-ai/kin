@@ -30,11 +30,13 @@ struct Args {
     repo_id: Option<String>,
     /// Run the central local supervisor instead of a repo graph daemon.
     supervisor: bool,
+    /// Print daemon/graph compatibility metadata and exit.
+    compat_json: bool,
 }
 
 fn usage(program: &str) {
     eprintln!(
-        "Usage:\n  {program} [--repo <path>] [--port <port>] [--storage local|gcs] [--repo-id <id>]\n  {program} --supervisor [--port <port>]\n\n\
+        "Usage:\n  {program} [--repo <path>] [--port <port>] [--storage local|gcs] [--repo-id <id>]\n  {program} --supervisor [--port <port>]\n  {program} --compat-json\n\n\
          Defaults:\n  --repo     current working directory\n  --port     4219\n  --storage  local (or KIN_STORAGE env var)\n  --repo-id  repo_id from --repo/.kin/manifest.json"
     );
     eprintln!(
@@ -52,12 +54,16 @@ fn parse_args() -> Result<Args, String> {
     let mut storage_str: Option<String> = None;
     let mut repo_id: Option<String> = None;
     let mut supervisor = false;
+    let mut compat_json = false;
     let mut args = env::args().skip(1);
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--supervisor" | "--central" => {
                 supervisor = true;
+            }
+            "--compat-json" => {
+                compat_json = true;
             }
             "--repo" => {
                 let value = args
@@ -127,6 +133,7 @@ fn parse_args() -> Result<Args, String> {
         storage,
         repo_id,
         supervisor,
+        compat_json,
     })
 }
 
@@ -238,6 +245,18 @@ async fn main() {
             process::exit(1);
         }
     };
+
+    if args.compat_json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema": "kin.daemon.compat.v1",
+                "version": env!("CARGO_PKG_VERSION"),
+                "graph_snapshot_version": kin_db::GraphSnapshot::CURRENT_VERSION,
+            })
+        );
+        return;
+    }
 
     if args.supervisor {
         let idle_timeout = match supervisor_idle_timeout_from_env() {

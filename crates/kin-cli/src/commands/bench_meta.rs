@@ -243,9 +243,10 @@ pub(crate) fn build_prepared_manifests(
         "embeddings_enabled": meta.embeddings.embeddings_enabled,
         "vector_enabled": meta.embeddings.vector_enabled,
         "metal_enabled": meta.embeddings.metal_enabled,
-        // kin_binary_sha256 intentionally excluded from cache key —
-        // schema/epoch versions track format compatibility, binary SHA
-        // only changes on recompile which doesn't affect graph format.
+        // Prepared graph truth is parser/linker/runtime output, not only a
+        // storage-format artifact. Bind cache entries to the exact Kin binary
+        // so parser or linker changes cannot silently reuse stale graph state.
+        "kin_binary_sha256": &meta.kin_binary_sha256,
     }));
     let repo_base_key = hash_json(&serde_json::json!({
         "repo_identity": &repo_identity,
@@ -262,6 +263,7 @@ pub(crate) fn build_prepared_manifests(
         "embeddings_enabled": meta.embeddings.embeddings_enabled,
         "vector_enabled": meta.embeddings.vector_enabled,
         "metal_enabled": meta.embeddings.metal_enabled,
+        "kin_binary_sha256": &meta.kin_binary_sha256,
     }));
 
     let prepared = PreparedManifest {
@@ -454,5 +456,51 @@ mod tests {
         assert_eq!(repo_base.schema, "kin.prepared-base.v1");
         assert_eq!(repo_base.repo_base_key, prepared.repo_base_key);
         assert_eq!(repo_base.source_git_head, prepared.git_head);
+    }
+
+    #[test]
+    fn prepared_manifest_cache_keys_track_kin_binary_hash() {
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join("README.md"), "hello\n").unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "kin@example.com"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Kin"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+
+        let meta = build_meta().unwrap();
+        let (prepared_a, repo_base_a) = build_prepared_manifests(&meta, repo.path()).unwrap();
+        let mut meta_b = meta.clone();
+        meta_b.kin_binary_sha256 = format!("{}-changed", meta.kin_binary_sha256);
+        let (prepared_b, repo_base_b) = build_prepared_manifests(&meta_b, repo.path()).unwrap();
+
+        assert_ne!(
+            prepared_a.cache_key, prepared_b.cache_key,
+            "prepared-state cache must miss when the Kin binary changes"
+        );
+        assert_ne!(
+            repo_base_a.repo_base_key, repo_base_b.repo_base_key,
+            "warm init cache must miss when the Kin binary changes"
+        );
     }
 }

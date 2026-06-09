@@ -4,10 +4,11 @@
 use serial_test::serial;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
+
+mod common;
 
 #[cfg(unix)]
 fn wait_for_pid_exit(pid: u32) {
@@ -24,12 +25,8 @@ fn wait_for_pid_exit(pid: u32) {
 
 fn kin_command() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_kin"));
-    let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_kin"))
-        .parent()
-        .expect("kin binary dir")
-        .join("kin-daemon");
     cmd.env("KIN_DAEMON_DISABLE_LSP", "1")
-        .env("KIN_DAEMON_BIN", daemon_bin)
+        .env("KIN_DAEMON_BIN", common::fresh_daemon_bin())
         .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1")
         .env("KIN_DAEMON_READY_TIMEOUT_SECS", "30")
         .env("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", "1");
@@ -147,10 +144,7 @@ fn locate_autostarts_daemon_when_available() {
         String::from_utf8_lossy(&init.stderr)
     );
 
-    let daemon_bin = PathBuf::from(env!("CARGO_BIN_EXE_kin"))
-        .parent()
-        .expect("kin binary dir")
-        .join("kin-daemon");
+    let daemon_bin = common::fresh_daemon_bin();
     assert!(daemon_bin.exists(), "kin-daemon test binary path");
     let daemon_dir = daemon_bin.parent().expect("daemon bin dir");
     let mut path_entries =
