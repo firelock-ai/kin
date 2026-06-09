@@ -2016,11 +2016,24 @@ impl InMemoryGraph {
     /// Get or lazily initialize the HNSW vector index.
     #[cfg(all(feature = "embeddings", feature = "vector"))]
     fn get_vector_index(&self) -> Result<Arc<VectorIndex>, KinDbError> {
+        let embedder = self.get_embedder()?;
         let mut guard = self.vector_index.lock();
         if let Some(ref vi) = *guard {
-            return Ok(Arc::clone(vi));
+            if vi.dimensions() != embedder.dimensions() {
+                tracing::warn!(
+                    "LOUD WARNING: Vector index dimensions ({}) do not match embedder dimensions ({})! Resetting and re-queueing missing.",
+                    vi.dimensions(),
+                    embedder.dimensions()
+                );
+                drop(guard);
+                self.reset_vector_index();
+                self.queue_missing_for_embedding();
+                self.queue_missing_artifacts_for_embedding();
+                guard = self.vector_index.lock();
+            } else {
+                return Ok(Arc::clone(vi));
+            }
         }
-        let embedder = self.get_embedder()?;
         let vi = Arc::new(VectorIndex::new(embedder.dimensions())?);
         *guard = Some(Arc::clone(&vi));
         Ok(vi)
@@ -6082,6 +6095,33 @@ impl RetrievalKeyFileResolver for InMemoryGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn test_vector_index_dimension_mismatch_auto_recovery() {
+        let graph = InMemoryGraph::new();
+        // Setup a vector index with a mismatching dimension (e.g. 100)
+        let mismatched_vi = Arc::new(VectorIndex::new(100).unwrap());
+        *graph.vector_index.lock() = Some(mismatched_vi);
+
+        // Add some entities so we can verify they get queued for embedding
+        let entity = test_entity("foo", "src/main.rs");
+        graph.upsert_entities_batch(&[entity]).unwrap();
+
+        // Clear the queue so we can verify the auto-recovery queues missing items
+        graph.embedding_queue.lock().clear();
+        assert_eq!(graph.pending_embeddings(), 0);
+
+        // Fetch the vector index, which should trigger recovery because the embedder has a different dimension
+        let vi = graph.get_vector_index().unwrap();
+
+        // Dimensions should match the embedder now
+        let embedder = graph.get_embedder().unwrap();
+        assert_eq!(vi.dimensions(), embedder.dimensions());
+
+        // The entity should be queued for embedding now
+        assert_eq!(graph.pending_embeddings(), 1);
+    }
 
     fn test_entity(name: &str, file: &str) -> Entity {
         Entity {
