@@ -2296,7 +2296,7 @@ impl InMemoryGraph {
         let embedder = self.get_embedder()?;
 
         let texts: Vec<String> = queries.iter().map(|q| q.to_string()).collect();
-        let vectors = embedder.embed_batch(&texts)?;
+        let vectors = embedder.embed_query_batch(&texts)?;
 
         let mut results = Vec::with_capacity(vectors.len());
         for vector in &vectors {
@@ -2335,7 +2335,7 @@ impl InMemoryGraph {
         let embedder = self.get_embedder()?;
 
         let texts: Vec<String> = queries.iter().map(|q| q.to_string()).collect();
-        let vectors = embedder.embed_batch(&texts)?;
+        let vectors = embedder.embed_query_batch(&texts)?;
 
         let mut results = Vec::with_capacity(vectors.len());
         for vector in &vectors {

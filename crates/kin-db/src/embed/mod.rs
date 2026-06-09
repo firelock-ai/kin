@@ -380,12 +380,21 @@ impl CodeEmbedder {
         Err(disabled_error())
     }
 
-    /// Batch-embed multiple pre-formatted text strings.
+    /// Batch-embed multiple pre-formatted text strings as document roles.
     #[cfg(feature = "embeddings")]
     pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, KinDbError> {
         let _span =
             tracing::info_span!("kindb.embedder.embed_batch", texts = texts.len()).entered();
         self.embed_batch_for_role(texts, EmbeddingInputRole::Document)
+    }
+
+    /// Batch-embed multiple raw queries as query roles.
+    #[cfg(feature = "embeddings")]
+    pub fn embed_query_batch(&self, queries: &[String]) -> Result<Vec<Vec<f32>>, KinDbError> {
+        let _span =
+            tracing::info_span!("kindb.embedder.embed_query_batch", queries = queries.len())
+                .entered();
+        self.embed_batch_for_role(queries, EmbeddingInputRole::Query)
     }
 
     #[cfg(feature = "embeddings")]
@@ -499,6 +508,12 @@ impl CodeEmbedder {
     /// Batch-embed multiple pre-formatted text strings.
     #[cfg(not(feature = "embeddings"))]
     pub fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, KinDbError> {
+        Err(disabled_error())
+    }
+
+    /// Batch-embed multiple raw queries as query roles.
+    #[cfg(not(feature = "embeddings"))]
+    pub fn embed_query_batch(&self, _queries: &[String]) -> Result<Vec<Vec<f32>>, KinDbError> {
         Err(disabled_error())
     }
 
@@ -1482,7 +1497,7 @@ fn parse_json_object_env(
 /// a local SweRank checkout via `KIN_EMBED_MODEL_ID=/path/to/model` while a bare
 /// repo id (e.g. `BAAI/bge-small-en-v1.5`) still downloads as before.
 #[cfg(feature = "embeddings")]
-fn local_model_dir(model_id: &str) -> Option<PathBuf> {
+pub(crate) fn local_model_dir(model_id: &str) -> Option<PathBuf> {
     let path = Path::new(model_id);
     if path.is_dir() {
         Some(path.to_path_buf())
@@ -1492,7 +1507,9 @@ fn local_model_dir(model_id: &str) -> Option<PathBuf> {
 }
 
 #[cfg(feature = "embeddings")]
-fn resolve_local_model_artifacts(dir: &Path) -> Result<(PathBuf, PathBuf, PathBuf), KinDbError> {
+pub(crate) fn resolve_local_model_artifacts(
+    dir: &Path,
+) -> Result<(PathBuf, PathBuf, PathBuf), KinDbError> {
     let require = |name: &str| -> Result<PathBuf, KinDbError> {
         let candidate = dir.join(name);
         if candidate.is_file() {

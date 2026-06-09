@@ -12,21 +12,29 @@ pub struct CrossEncoder {
 impl CrossEncoder {
     pub fn new(model_id: &str, revision: &str) -> Result<Self, KinDbError> {
         let _span = tracing::info_span!("kindb.cross_encoder.new", model_id = %model_id, revision = %revision).entered();
-        let repo = Repo::with_revision(model_id.to_string(), RepoType::Model, revision.to_string());
-        let api = Api::new().map_err(|e| {
-            KinDbError::IndexError(format!("failed to initialise HuggingFace API: {e}"))
-        })?;
-        let api = api.repo(repo);
+        let (config_path, tokenizer_path, weights_path) = if let Some(dir) =
+            super::local_model_dir(model_id)
+        {
+            super::resolve_local_model_artifacts(&dir)?
+        } else {
+            let repo =
+                Repo::with_revision(model_id.to_string(), RepoType::Model, revision.to_string());
+            let api = Api::new().map_err(|e| {
+                KinDbError::IndexError(format!("failed to initialise HuggingFace API: {e}"))
+            })?;
+            let api = api.repo(repo);
 
-        let config_path = api
-            .get("config.json")
-            .map_err(|e| KinDbError::IndexError(format!("failed to download model config: {e}")))?;
-        let tokenizer_path = api
-            .get("tokenizer.json")
-            .map_err(|e| KinDbError::IndexError(format!("failed to download tokenizer: {e}")))?;
-        let weights_path = api.get("model.safetensors").map_err(|e| {
-            KinDbError::IndexError(format!("failed to download model weights: {e}"))
-        })?;
+            let config_path = api.get("config.json").map_err(|e| {
+                KinDbError::IndexError(format!("failed to download model config: {e}"))
+            })?;
+            let tokenizer_path = api.get("tokenizer.json").map_err(|e| {
+                KinDbError::IndexError(format!("failed to download tokenizer: {e}"))
+            })?;
+            let weights_path = api.get("model.safetensors").map_err(|e| {
+                KinDbError::IndexError(format!("failed to download model weights: {e}"))
+            })?;
+            (config_path, tokenizer_path, weights_path)
+        };
 
         let config_data = std::fs::read_to_string(&config_path)
             .map_err(|e| KinDbError::IndexError(format!("failed to read config: {e}")))?;
