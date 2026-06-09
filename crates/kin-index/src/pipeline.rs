@@ -783,6 +783,7 @@ fn resolve_relations(
                     origin: RelationOrigin::Parsed,
                     created_in: None,
                     import_source: rel.import_source.clone(),
+                    evidence: Vec::new(),
                 });
             }
             (Some(s), None) => {

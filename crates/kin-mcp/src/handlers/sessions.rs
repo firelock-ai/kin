@@ -604,6 +604,7 @@ pub async fn handle_transaction_commit<G: GraphStore>(
                             origin: kin_model::relation::RelationOrigin::Manual,
                             created_in: None,
                             import_source: None,
+                            evidence: Vec::new(),
                         };
                         relation_deltas.push(kin_model::change::RelationDelta::Added(relation));
                     } else if verb == "delete" || verb == "remove" {

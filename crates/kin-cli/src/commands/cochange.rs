@@ -153,6 +153,7 @@ mod tests {
                 origin: RelationOrigin::Inferred,
                 created_in: None,
                 import_source: None,
+                evidence: Vec::new(),
             })
             .unwrap();
 

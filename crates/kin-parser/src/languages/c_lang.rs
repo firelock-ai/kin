@@ -47,10 +47,10 @@ impl LanguageAdapter for CAdapter {
 
         for child in root.children(&mut cursor) {
             extract_c_node(&child, source, file_id, &mut entities, &mut relations);
-            if child.kind() == "preproc_include" {
-                extract_c_include(&child, source, file_id, &mut relations, &mut imports);
-            }
         }
+
+        // Recursively extract all includes and ALL_CAPS macro usages across the whole file
+        extract_includes_and_macros_recursive(&root, source, file_id, &mut imports, &mut relations);
 
         // Build import lookup: local_name -> module_path
         let import_map: std::collections::HashMap<&str, &str> = imports
@@ -452,8 +452,8 @@ fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<
 fn extract_c_include(
     node: &tree_sitter::Node,
     source: &[u8],
-    file_id: &FilePathId,
-    relations: &mut Vec<ExtractedRelation>,
+    _file_id: &FilePathId,
+    _relations: &mut Vec<ExtractedRelation>,
     imports: &mut Vec<FileImport>,
 ) {
     // The path child is either a `system_lib_string` (<stdio.h>) or
@@ -479,13 +479,6 @@ fn extract_c_include(
                 .next()
                 .unwrap_or(&module_path)
                 .to_string();
-
-            relations.push(ExtractedRelation {
-                kind: kin_model::RelationKind::Imports,
-                src_name: file_id.to_string(),
-                dst_name: local_name.clone(),
-                import_source: None,
-            });
 
             imports.push(FileImport {
                 module_path,
@@ -664,16 +657,13 @@ mod tests {
             .expect("should have myheader.h import");
         assert_eq!(myheader.specifiers[0].local_name, "myheader.h");
 
-        // Also check import relations
-        let import_rels: Vec<_> = output
-            .relations
-            .iter()
-            .filter(|r| r.kind == kin_model::RelationKind::Imports)
-            .collect();
-        assert_eq!(import_rels.len(), 2);
-        let dst_names: Vec<&str> = import_rels.iter().map(|r| r.dst_name.as_str()).collect();
-        assert!(dst_names.contains(&"stdio.h"));
-        assert!(dst_names.contains(&"myheader.h"));
+        assert!(
+            output
+                .relations
+                .iter()
+                .all(|r| r.kind != kin_model::RelationKind::Imports),
+            "imports should be carried by FileImport, not fake file-sourced relations"
+        );
     }
 
     #[test]
@@ -836,4 +826,105 @@ int compute(Point p) { return internal_helper() + p.x; }
             .expect("should find bare");
         assert!(func.doc_summary.is_none());
     }
+
+    #[test]
+    fn extract_macro_usages_with_enclosing_scope() {
+        let adapter = CAdapter;
+        let source = b"void my_func() { MY_MACRO(); }";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.c");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let calls: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::UsesMacro && r.dst_name == "MY_MACRO")
+            .collect();
+        assert!(!calls.is_empty());
+        for call in &calls {
+            assert_eq!(call.src_name, "my_func");
+        }
+    }
+}
+
+fn find_enclosing_entity(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut scopes = Vec::new();
+    let mut curr = *node;
+
+    while let Some(parent) = curr.parent() {
+        match parent.kind() {
+            "function_definition" => {
+                if let Some(name) = extract_function_name(&parent, source) {
+                    scopes.push(name);
+                }
+            }
+            "class_specifier" | "struct_specifier" | "union_specifier" => {
+                if let Some(name_node) = parent.child_by_field_name("name") {
+                    if let Ok(name_text) = name_node.utf8_text(source) {
+                        let name = name_text.trim().to_string();
+                        if !name.is_empty() {
+                            scopes.push(name);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        curr = parent;
+    }
+
+    if scopes.is_empty() {
+        None
+    } else {
+        scopes.reverse();
+        Some(scopes.join("::"))
+    }
+}
+
+fn extract_includes_and_macros_recursive(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    file_id: &kin_model::FilePathId,
+    imports: &mut Vec<crate::extract::FileImport>,
+    relations: &mut Vec<crate::extract::ExtractedRelation>,
+) {
+    if node.kind() == "preproc_include" {
+        extract_c_include(node, source, file_id, relations, imports);
+    } else if matches!(
+        node.kind(),
+        "identifier" | "type_identifier" | "statement_identifier" | "field_identifier"
+    ) {
+        if let Some(name) = node.utf8_text(source).ok() {
+            if is_all_caps_macro(name) {
+                if let Some(src_name) = find_enclosing_entity(node, source) {
+                    if src_name != name && !src_name.ends_with(&format!("::{}", name)) {
+                        relations.push(crate::extract::ExtractedRelation {
+                            kind: kin_model::RelationKind::UsesMacro,
+                            src_name,
+                            dst_name: name.to_string(),
+                            import_source: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        extract_includes_and_macros_recursive(&child, source, file_id, imports, relations);
+    }
+}
+
+fn is_all_caps_macro(name: &str) -> bool {
+    let mut has_upper = false;
+    for c in name.chars() {
+        if c.is_ascii_lowercase() {
+            return false;
+        }
+        if c.is_ascii_uppercase() {
+            has_upper = true;
+        }
+    }
+    has_upper && name.len() >= 3
 }
