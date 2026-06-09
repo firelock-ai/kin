@@ -39,7 +39,7 @@ impl Default for DaemonConfig {
             loop_config: LoopConfig::default(),
             sweep_interval: Duration::from_secs(30),
             embed_interval: Duration::from_secs(5),
-            embed_batch_size: 160,
+            embed_batch_size: 512,
             lsp_enabled: true,
             idle_timeout: None,
         }
@@ -600,7 +600,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
             // one batch per `embed_interval`. A fresh central-graph embed (or an
             // explicit `kin embed --rebuild`) enqueues thousands of entities;
             // trickling a single batch per interval would cap throughput at
-            // `embed_batch_size / embed_interval` (e.g. 160 / 5s ≈ 32 ent/s) no
+            // `embed_batch_size / embed_interval` no
             // matter how fast the GPU runs. We yield between batches so locate,
             // persistence, and cancellation stay responsive, then fall back to the
             // idle sleep once the queue is empty. Incremental trickle (a handful of
@@ -708,9 +708,12 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                     }
                 }
 
-                // Cooperative yield: let locate, persistence, and other daemon
-                // tasks interleave between embedding batches during a long drain.
+                // Cooperative pause: let locate, persistence, and explicit
+                // `/embed` requests acquire the embedding lock between background
+                // batches during a long drain. A plain yield can let this worker
+                // immediately reacquire and starve foreground benchmark backfill.
                 tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }
     });
@@ -1527,7 +1530,12 @@ async fn select_with_signals(
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::watched_process_is_alive;
+    use super::{watched_process_is_alive, DaemonConfig};
+
+    #[test]
+    fn default_embed_batch_is_backlog_friendly() {
+        assert_eq!(DaemonConfig::default().embed_batch_size, 512);
+    }
 
     #[test]
     fn watched_process_liveness() {

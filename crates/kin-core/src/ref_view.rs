@@ -53,6 +53,35 @@ pub fn build_graph_at_ref_with_repo(
     repo_path: Option<&Path>,
     oid_cache: Option<&ChangeOidCache>,
 ) -> Result<InMemoryGraph> {
+    build_graph_at_ref_with_repo_inner(graph, blob_store, head, repo_path, oid_cache, None)
+}
+
+pub fn build_graph_at_git_ref_with_repo(
+    graph: &InMemoryGraph,
+    blob_store: &BlobStore,
+    head: &SemanticChangeId,
+    repo_path: &Path,
+    git_oid_hint: &str,
+    oid_cache: Option<&ChangeOidCache>,
+) -> Result<InMemoryGraph> {
+    build_graph_at_ref_with_repo_inner(
+        graph,
+        blob_store,
+        head,
+        Some(repo_path),
+        oid_cache,
+        Some(git_oid_hint),
+    )
+}
+
+fn build_graph_at_ref_with_repo_inner(
+    graph: &InMemoryGraph,
+    blob_store: &BlobStore,
+    head: &SemanticChangeId,
+    repo_path: Option<&Path>,
+    oid_cache: Option<&ChangeOidCache>,
+    git_oid_hint: Option<&str>,
+) -> Result<InMemoryGraph> {
     let build_start = std::time::Instant::now();
     let build_timeout_secs = std::env::var("KIN_BUILD_GRAPH_TIMEOUT_SECS")
         .ok()
@@ -64,9 +93,43 @@ pub fn build_graph_at_ref_with_repo(
         .resolve_graph_at(head)
         .map_err(|err| KinError::Graph(err.to_string()))?;
 
-    let git_repair =
-        repo_path.and_then(|path| GitBlobRepair::new(path, head, &changes, oid_cache).ok());
+    let git_repair = repo_path.and_then(|path| {
+        match GitBlobRepair::new(path, head, &changes, oid_cache, git_oid_hint) {
+            Ok(repair) => Some(repair),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to initialize git-backed historical ref repair"
+                );
+                None
+            }
+        }
+    });
     let reader = BlobReader::new(blob_store, git_repair.as_ref(), repo_path);
+    let ref_file_tree = match git_repair
+        .as_ref()
+        .map(|repair| repair.materialize_file_tree(blob_store))
+    {
+        Some(Ok(git_tree)) if !git_tree.is_empty() => {
+            if git_tree != resolved.file_tree {
+                tracing::warn!(
+                    graph_files = resolved.file_tree.len(),
+                    git_files = git_tree.len(),
+                    "historical ref graph file tree differed from git tree; using git object tree for scoped source truth"
+                );
+            }
+            git_tree
+        }
+        Some(Ok(_)) => resolved.file_tree.clone(),
+        Some(Err(err)) => {
+            tracing::warn!(
+                error = %err,
+                "failed to materialize git tree for historical ref; falling back to graph artifact deltas"
+            );
+            resolved.file_tree.clone()
+        }
+        None => resolved.file_tree.clone(),
+    };
 
     let mut snapshot = GraphSnapshot::empty();
     snapshot.entities = resolved.entities;
@@ -79,8 +142,7 @@ pub fn build_graph_at_ref_with_repo(
         .map(|change| (change.id, change.clone()))
         .collect();
     snapshot.change_children = build_change_children(&changes);
-    snapshot.file_hashes = resolved
-        .file_tree
+    snapshot.file_hashes = ref_file_tree
         .iter()
         .map(|(file_id, hash)| (file_id.0.clone(), *hash.as_bytes()))
         .collect();
@@ -115,16 +177,12 @@ pub fn build_graph_at_ref_with_repo(
     snapshot.branches = branches;
 
     let lifecycle = RefLifecycle::from_changes(&changes);
-    let path_resolver = HistoricalPathResolver::from_changes(&changes, &resolved.file_tree);
+    let path_resolver = HistoricalPathResolver::from_changes(&changes, &ref_file_tree);
 
-    normalize_entity_file_origins_to_historical_tree(
-        &mut snapshot,
-        &resolved.file_tree,
-        &path_resolver,
-    );
+    normalize_entity_file_origins_to_historical_tree(&mut snapshot, &ref_file_tree, &path_resolver);
     rebuild_entity_source_file_layouts(
         &mut snapshot,
-        &resolved.file_tree,
+        &ref_file_tree,
         &reader,
         &lifecycle,
         build_start,
@@ -132,7 +190,7 @@ pub fn build_graph_at_ref_with_repo(
     )?;
     rebuild_non_entity_tracked_files(
         &mut snapshot,
-        &resolved.file_tree,
+        &ref_file_tree,
         &reader,
         build_start,
         build_timeout_secs,
@@ -147,8 +205,11 @@ pub fn build_graph_at_ref_with_repo(
 ///
 /// Vector indices are global (they index the full HEAD graph) and cannot be
 /// cheaply rebuilt for each historical scope. This function compensates by
-/// over-fetching from the global vector index and retaining only keys whose
-/// entity is present in the scoped snapshot.
+/// over-fetching from the global vector index and retaining only entity keys
+/// whose entity is present in the scoped snapshot. Non-entity keys are dropped:
+/// artifact/vector keys are built from HEAD content today, so keeping them for
+/// a historical scope can inject evidence from files that changed after the
+/// scoped ref.
 ///
 /// # Usage
 ///
@@ -163,12 +224,8 @@ pub fn filter_vector_results_to_scope(
 ) -> Vec<(kin_model::RetrievalKey, f32)> {
     results
         .into_iter()
-        .filter(|(key, _score)| match key {
-            kin_model::RetrievalKey::Entity(eid) => scoped_entity_ids.contains(eid),
-            // Non-entity keys (artifacts, shallow files) are kept unconditionally
-            // because they are rebuilt into the snapshot by
-            // rebuild_non_entity_tracked_files.
-            _ => true,
+        .filter(|(key, _score)| {
+            matches!(key, kin_model::RetrievalKey::Entity(eid) if scoped_entity_ids.contains(eid))
         })
         .take(limit)
         .collect()
@@ -300,6 +357,8 @@ fn git_cat_file_blob(repo_path: &Path, hash_hex: &str) -> Option<Vec<u8>> {
 /// with the import.rs fix that persists old blob hashes (commit 244de43).
 struct GitBlobRepair {
     repo: gix::Repository,
+    repo_path: std::path::PathBuf,
+    git_oid: gix::ObjectId,
     tree_id: gix::ObjectId,
 }
 
@@ -318,15 +377,33 @@ impl GitBlobRepair {
         head: &SemanticChangeId,
         _changes: &[SemanticChange],
         oid_cache: Option<&ChangeOidCache>,
+        git_oid_hint: Option<&str>,
     ) -> std::result::Result<Self, String> {
         let repo = open_repo(repo_path).map_err(|e| e.to_string())?;
-        let git_oid = find_git_oid_for_change(&repo, head, oid_cache)?;
+        let git_oid = if let Some(git_oid) = git_oid_hint {
+            let oid = gix::ObjectId::from_hex(git_oid.as_bytes())
+                .map_err(|err| format!("invalid git oid hint '{git_oid}': {err}"))?;
+            let hinted_change = change_id_from_git_oid_for_ref_view(&oid);
+            if hinted_change != *head {
+                return Err(format!(
+                    "git oid hint {git_oid} maps to {hinted_change}, not requested change {head}"
+                ));
+            }
+            oid
+        } else {
+            find_git_oid_for_change(&repo, head, oid_cache)?
+        };
         let tree_id = {
             let commit = repo.find_commit(git_oid).map_err(|e| e.to_string())?;
             let tree = commit.tree().map_err(|e| e.to_string())?;
             tree.id
         };
-        Ok(Self { tree_id, repo })
+        Ok(Self {
+            repo,
+            repo_path: repo_path.to_path_buf(),
+            git_oid,
+            tree_id,
+        })
     }
 
     fn read_blob(&self, file_path: &str) -> Option<Vec<u8>> {
@@ -335,6 +412,84 @@ impl GitBlobRepair {
         let object = entry.object().ok()?;
         Some(object.data.to_vec())
     }
+
+    fn materialize_file_tree(
+        &self,
+        blob_store: &BlobStore,
+    ) -> std::result::Result<HashMap<FilePathId, Hash256>, String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_path)
+            .arg("ls-tree")
+            .arg("-rz")
+            .arg(self.git_oid.to_string())
+            .output()
+            .map_err(|err| format!("git ls-tree failed to start: {err}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "git ls-tree exited with status {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        let mut file_tree = HashMap::new();
+        for raw in output.stdout.split(|byte| *byte == 0) {
+            if raw.is_empty() {
+                continue;
+            }
+            let record =
+                std::str::from_utf8(raw).map_err(|err| format!("non-utf8 git path: {err}"))?;
+            let Some((meta, path)) = record.split_once('\t') else {
+                continue;
+            };
+            let mut meta_parts = meta.split_whitespace();
+            let _mode = meta_parts.next();
+            let Some(kind) = meta_parts.next() else {
+                continue;
+            };
+            let Some(oid) = meta_parts.next() else {
+                continue;
+            };
+            if kind != "blob" {
+                continue;
+            }
+
+            let content = Command::new("git")
+                .arg("-C")
+                .arg(&self.repo_path)
+                .arg("cat-file")
+                .arg("blob")
+                .arg(oid)
+                .output()
+                .map_err(|err| format!("git cat-file failed to start for {path}: {err}"))?;
+            if !content.status.success() {
+                return Err(format!(
+                    "git cat-file failed for {path} ({oid}) with status {}: {}",
+                    content.status,
+                    String::from_utf8_lossy(&content.stderr)
+                ));
+            }
+            let hash = blob_store
+                .write(&content.stdout)
+                .map_err(|err| format!("failed to write git blob for {path}: {err}"))?;
+            file_tree.insert(FilePathId::new(path), hash);
+        }
+
+        Ok(file_tree)
+    }
+}
+
+fn change_id_from_git_oid_for_ref_view(oid: &gix::ObjectId) -> SemanticChangeId {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"kin-git-import-v1:");
+    hasher.update(oid.as_bytes());
+    let result = hasher.finalize();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&result);
+    SemanticChangeId::from_hash(Hash256::from_bytes(bytes))
 }
 
 /// Pre-computed mapping from SemanticChangeId to Git OID.
@@ -1367,6 +1522,34 @@ mod tests {
         }
     }
 
+    fn git_change_id_for_test(git_oid_hex: &str) -> SemanticChangeId {
+        use sha2::{Digest, Sha256};
+
+        let oid = gix::ObjectId::from_hex(git_oid_hex.as_bytes()).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(b"kin-git-import-v1:");
+        hasher.update(oid.as_bytes());
+        let result = hasher.finalize();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&result);
+        SemanticChangeId::from_hash(Hash256::from_bytes(bytes))
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run git {args:?}: {err}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
     #[test]
     fn build_graph_at_ref_reconstructs_historical_tracked_files() {
         let graph = InMemoryGraph::new();
@@ -1437,6 +1620,77 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(historical.text_search("Deployment", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn build_graph_at_ref_with_repo_uses_git_tree_over_stale_artifact_delta() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init"]);
+        run_git(repo.path(), &["config", "user.email", "kin@example.test"]);
+        run_git(repo.path(), &["config", "user.name", "Kin Test"]);
+
+        let source_path = repo.path().join("src/lib.cpp");
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &source_path,
+            "int main() {\n  return 0;\n}\n// OLD_BASE_ONLY\n",
+        )
+        .unwrap();
+        run_git(repo.path(), &["add", "src/lib.cpp"]);
+        run_git(repo.path(), &["commit", "-m", "base"]);
+        let base_oid = run_git(repo.path(), &["rev-parse", "HEAD"]);
+
+        std::fs::write(
+            &source_path,
+            "int main() {\n  return 0;\n}\n// JSON_PRIVATE_UNLESS_TESTED\n",
+        )
+        .unwrap();
+        run_git(repo.path(), &["add", "src/lib.cpp"]);
+        run_git(repo.path(), &["commit", "-m", "future"]);
+
+        let graph = InMemoryGraph::new();
+        let blob_temp = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(blob_temp.path().join("objects")).unwrap();
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x91; 32]));
+        graph
+            .create_change(&change(genesis_id, vec![], vec![]))
+            .unwrap();
+
+        let stale_future_hash = blob_store
+            .write(b"int main() {\n  return 0;\n}\n// JSON_PRIVATE_UNLESS_TESTED\n")
+            .unwrap();
+        let base_id = git_change_id_for_test(&base_oid);
+        graph
+            .create_change(&change(
+                base_id,
+                vec![genesis_id],
+                vec![ArtifactDelta {
+                    file_id: FilePathId::new("src/lib.cpp"),
+                    kind: ArtifactDeltaKind::Added,
+                    old_hash: None,
+                    new_hash: Some(stale_future_hash),
+                }],
+            ))
+            .unwrap();
+
+        let historical = build_graph_at_git_ref_with_repo(
+            &graph,
+            &blob_store,
+            &base_id,
+            repo.path(),
+            &base_oid,
+            None,
+        )
+        .unwrap();
+
+        assert!(!historical
+            .text_search("OLD_BASE_ONLY", 10)
+            .unwrap()
+            .is_empty());
+        assert!(historical
+            .text_search("JSON_PRIVATE_UNLESS_TESTED", 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1906,7 +2160,7 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
     }
 
     #[test]
-    fn filter_vector_results_to_scope_retains_in_scope_entities() {
+    fn filter_vector_results_to_scope_retains_only_in_scope_entities() {
         let e1 = EntityId::new();
         let e2 = EntityId::new();
         let e3 = EntityId::new();
@@ -1925,9 +2179,8 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
         ];
 
         let filtered = filter_vector_results_to_scope(results, &scoped, 10);
-        assert_eq!(filtered.len(), 2); // e1 + artifact (e2, e3 out of scope)
+        assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].0, kin_model::RetrievalKey::Entity(e1));
-        assert_eq!(filtered[1].0, artifact_key);
     }
 
     #[test]

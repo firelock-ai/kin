@@ -4,7 +4,15 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_BATCH_SIZE: usize = 16384;
+/// Default embed command batch.
+///
+/// The embedder already groups individual texts by token budget inside each
+/// queue pass, but the outer batch controls how many graph objects are drained,
+/// formatted, tokenized, and held before progress is persisted. Very large
+/// outer batches can look like a hang and delay vector sidecar creation on
+/// fresh prepared-state builds. Keep the default conservative; callers can
+/// still raise it explicitly for tuned hardware runs.
+pub const DEFAULT_BATCH_SIZE: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbedRequest {
@@ -273,7 +281,12 @@ pub fn build_embed_response(
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_batch_size, should_queue_missing_embedding_pass};
+    use super::{effective_batch_size, should_queue_missing_embedding_pass, DEFAULT_BATCH_SIZE};
+
+    #[test]
+    fn default_batch_size_is_progress_friendly() {
+        assert_eq!(DEFAULT_BATCH_SIZE, 64);
+    }
 
     #[test]
     fn effective_batch_size_respects_nonzero_request() {

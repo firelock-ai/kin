@@ -1093,6 +1093,23 @@ fn open_repo(path: &std::path::Path) -> std::result::Result<gix::Repository, gix
     }
 }
 
+fn resolve_scope_build_timeout(raw: Option<&str>) -> Duration {
+    let seconds = raw
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(870)
+        .max(1);
+    Duration::from_secs(seconds)
+}
+
+fn scope_build_timeout() -> Duration {
+    resolve_scope_build_timeout(
+        std::env::var("KIN_DAEMON_SCOPE_BUILD_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
 /// POST /session/{session_id}/scope — set a temporal scope for a session.
 async fn set_scope(
     Path(session_id): Path<String>,
@@ -1115,69 +1132,105 @@ async fn set_scope(
     // Offload the heavy computation to a blocking thread to keep the main event loop responsive
     let state_clone = Arc::clone(&state);
     let ref_string = req.ref_string.clone();
-    let (head, cached_graph) = tokio::task::spawn_blocking(move || -> std::result::Result<_, (StatusCode, String)> {
-        // Resolve the ref to a SemanticChangeId using the LOCATE resolve mode
-        // (enrich_semantics=false). Scope-for-retrieval only needs the
-        // base_commit's tree state; the full per-commit semantic-delta enrichment
-        // of its entire ancestry ("Hydrating History: [n/26747]") re-parses and
-        // re-links every ancestor commit — ~10 min on a deep base_commit — and the
-        // session-scope locate path never reads those deltas (it ranks the scoped
-        // entity set with HEAD vectors via `vector_source`). The /locate ref path
-        // already uses this lighter mode.
-        let resolved =
+    let timeout = scope_build_timeout();
+    let scope_task = tokio::task::spawn_blocking(
+        move || -> std::result::Result<_, (StatusCode, String)> {
+            // Resolve the ref to a SemanticChangeId using the LOCATE resolve mode
+            // (enrich_semantics=false). Scope-for-retrieval only needs the
+            // base_commit's tree state; the full per-commit semantic-delta enrichment
+            // of its entire ancestry ("Hydrating History: [n/26747]") re-parses and
+            // re-links every ancestor commit — ~10 min on a deep base_commit — and the
+            // session-scope locate path never reads those deltas (it ranks the scoped
+            // entity set with HEAD vectors via `vector_source`). The /locate ref path
+            // already uses this lighter mode.
+            let resolved =
             kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate_with_report(
                 state_clone.graph.as_ref(),
                 &state_clone.layout,
                 Some(&ref_string),
             )
             .map_err(|err| (StatusCode::BAD_REQUEST, format!("{:#}", err)))?;
-        if resolved.hydrated_git_history {
-            state_clone.bump_version();
-            state_clone.save_snapshot().map_err(internal_error)?;
-            state_clone.mark_clean();
-        }
-        let head = resolved.head;
+            if resolved.hydrated_git_history {
+                state_clone.bump_version();
+                state_clone.save_snapshot().map_err(internal_error)?;
+                state_clone.mark_clean();
+            }
+            let head = resolved.head;
 
-        // Build the historical graph at that ref, using cached OID mapping
-        // for fast scope switching without re-walking the commit DAG.
-        let oid_cache: Option<kin_core::ChangeOidCache> = {
-            let needs_build = state_clone.change_oid_cache.read().unwrap().is_none();
-            if needs_build {
-                if let Ok(repo) = open_repo(state_clone.layout.working_dir()) {
-                    match kin_core::build_change_oid_cache(&repo) {
-                        Ok(cache) => {
-                            info!("built change OID cache for fast scope switching");
-                            *state_clone.change_oid_cache.write().unwrap() = Some(cache);
-                        }
-                        Err(err) => {
-                            tracing::warn!(error = %err, "failed to build change OID cache, falling back to per-call lookup");
+            // Build the historical graph at that ref, using cached OID mapping
+            // for fast scope switching without re-walking the commit DAG.
+            let oid_cache: Option<kin_core::ChangeOidCache> = {
+                let needs_build = state_clone.change_oid_cache.read().unwrap().is_none();
+                if needs_build {
+                    if let Ok(repo) = open_repo(state_clone.layout.working_dir()) {
+                        match kin_core::build_change_oid_cache(&repo) {
+                            Ok(cache) => {
+                                info!("built change OID cache for fast scope switching");
+                                *state_clone.change_oid_cache.write().unwrap() = Some(cache);
+                            }
+                            Err(err) => {
+                                tracing::warn!(error = %err, "failed to build change OID cache, falling back to per-call lookup");
+                            }
                         }
                     }
                 }
+                state_clone.change_oid_cache.read().unwrap().clone()
+            };
+            let historical = if let Some(git_oid) = ref_string.strip_prefix("git:") {
+                kin_core::build_graph_at_git_ref_with_repo(
+                    state_clone.graph.as_ref(),
+                    state_clone.blobs.as_ref(),
+                    &head,
+                    state_clone.layout.working_dir(),
+                    git_oid,
+                    oid_cache.as_ref(),
+                )
+            } else {
+                kin_core::build_graph_at_ref_with_repo(
+                    state_clone.graph.as_ref(),
+                    state_clone.blobs.as_ref(),
+                    &head,
+                    Some(state_clone.layout.working_dir()),
+                    oid_cache.as_ref(),
+                )
             }
-            state_clone.change_oid_cache.read().unwrap().clone()
-        };
-        let historical = kin_core::build_graph_at_ref_with_repo(
-            state_clone.graph.as_ref(),
-            state_clone.blobs.as_ref(),
-            &head,
-            Some(state_clone.layout.working_dir()),
-            oid_cache.as_ref(),
-        )
-        .map_err(internal_error)?;
+            .map_err(internal_error)?;
 
-        // Refresh cochange relations from the historical change set so the
-        // cached graph matches what run_with_graph_capture_at_ref() produces.
-        let changes = kin_core::collect_changes_at_ref(&historical, &head)
-            .map_err(|err| internal_error(err.to_string()))?;
-        let _ = kin_cli::commands::cochange::refresh_from_changes(&historical, &changes);
+            // Refresh cochange relations from the historical change set so the
+            // cached graph matches what run_with_graph_capture_at_ref() produces.
+            let changes = kin_core::collect_changes_at_ref(&historical, &head)
+                .map_err(|err| internal_error(err.to_string()))?;
+            let _ = kin_cli::commands::cochange::refresh_from_changes(&historical, &changes);
 
-        let cached_graph = Arc::new(historical);
+            let cached_graph = Arc::new(historical);
 
-        Ok((head, cached_graph))
-    })
-    .await
-    .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn_blocking failed: {}", err)))??;
+            Ok((head, cached_graph))
+        },
+    );
+    let (head, cached_graph) = match tokio::time::timeout(timeout, scope_task).await {
+        Ok(joined) => joined.map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("spawn_blocking failed: {err}"),
+            )
+        })??,
+        Err(_) => {
+            tracing::warn!(
+                session = %session_id,
+                ref_string = %req.ref_string,
+                timeout_secs = timeout.as_secs(),
+                "temporal scope build timed out"
+            );
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "temporal scope build timed out after {}s for {}",
+                    timeout.as_secs(),
+                    req.ref_string
+                ),
+            ));
+        }
+    };
 
     state
         .set_session_scope(&session_id, req.ref_string.clone(), head, cached_graph)
@@ -2587,10 +2640,11 @@ async fn locate(
             None
         };
         let extra_priority_files = scope_ref_string
+            .as_deref()
             .map(|ref_str| {
                 kin_cli::commands::locate::discover_historical_test_artifact_priority_files(
                     &state.layout,
-                    &ref_str,
+                    ref_str,
                     &req.text,
                 )
             })
@@ -2604,9 +2658,14 @@ async fn locate(
         // only uses vector_source when the primary graph has no embeddings,
         // so there's no double-query.
         let vector_source = Some(state.graph.as_ref());
+        let workspace_root = if scope_ref_string.is_some() {
+            None
+        } else {
+            Some(kin_core::source_dir(&state.layout))
+        };
         kin_cli::commands::locate::run_with_graph_capture_with_priority_files_and_vector_source(
             graph.as_ref(),
-            Some(state.layout.working_dir()),
+            workspace_root.as_deref(),
             &req.text,
             req.explain,
             req.max_files,
@@ -5548,6 +5607,23 @@ mod tests {
             .save(&layout.manifest_path())
             .unwrap();
         Arc::new(DaemonState::open(layout).unwrap())
+    }
+
+    #[test]
+    fn scope_build_timeout_defaults_and_rejects_invalid_values() {
+        assert_eq!(resolve_scope_build_timeout(None), Duration::from_secs(870));
+        assert_eq!(
+            resolve_scope_build_timeout(Some("")),
+            Duration::from_secs(870)
+        );
+        assert_eq!(
+            resolve_scope_build_timeout(Some("0")),
+            Duration::from_secs(870)
+        );
+        assert_eq!(
+            resolve_scope_build_timeout(Some("12")),
+            Duration::from_secs(12)
+        );
     }
 
     fn test_entity(name: &str, path: &str) -> Entity {
