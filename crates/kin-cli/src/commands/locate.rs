@@ -1655,6 +1655,8 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         .chain(boosted_test_artifact_paths.iter().cloned())
         .collect();
     let direct_priority_paths = direct_query_priority_paths(&priority_traces);
+    let graph_projection_backed_paths =
+        graph_projection_backed_generated_paths(graph, &resolve_signal_scores);
     for (path, score) in fused.iter_mut() {
         let is_priority_backed = priority_backed_paths.contains(path);
         let priority_applies_for_penalty = priority_backing_applies_for_path(
@@ -1662,13 +1664,21 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             is_priority_backed,
             direct_priority_paths.contains(path),
         );
-        *score *= post_rrf_path_penalty(
+        let mut penalty = post_rrf_path_penalty(
             path,
             source_files.contains(path.as_str()),
             tracked_artifact_paths.contains(path) || priority_applies_for_penalty,
             test_query,
             priority_applies_for_penalty,
         );
+        if graph_projection_backed_paths.contains(path) && is_amalgamated_or_generated_path(path) {
+            let global_amalgam_penalty = locate_env_f32("KIN_LOCATE_AMALGAM_PENALTY", 0.05);
+            if global_amalgam_penalty > f32::EPSILON {
+                penalty /= global_amalgam_penalty;
+            }
+            penalty *= locate_env_f32("KIN_LOCATE_DERIVED_PROJECTION_PENALTY", 0.15);
+        }
+        *score *= penalty;
     }
 
     // Module-prefix affinity: if the top seed files share a common directory
@@ -2767,12 +2777,11 @@ fn priority_relation_retention_paths(
         let seed_node = GraphNodeId::Artifact(seed_artifact_id);
         let mut candidates: Vec<(String, f32)> = Vec::new();
         for rel in graph.get_all_relations_for_node(&seed_node)? {
-            if rel.src != seed_node
-                || !matches!(rel.kind, RelationKind::Includes | RelationKind::Imports)
-            {
+            if !relation_allows_artifact_traversal(&rel, &seed_node) {
                 continue;
             }
-            let Some(path) = relation_projected_artifact_path(&rel, &seed_node) else {
+            let Some((path, _next)) = relation_adjacent_artifact_path(graph, &rel, &seed_node)
+            else {
                 continue;
             };
             if path == *seed_path || !strong_embedding_release_allowed(&path) {
@@ -6223,13 +6232,12 @@ fn extract_multihop_signals(
 
                 for rel in rels
                     .iter()
-                    .filter(|rel| {
-                        matches!(rel.kind, RelationKind::Includes | RelationKind::Imports)
-                    })
-                    .filter(|rel| rel.src == artifact_node)
+                    .filter(|rel| relation_allows_artifact_traversal(rel, &artifact_node))
                     .take(artifact_frontier_limit)
                 {
-                    let Some(path) = relation_projected_artifact_path(rel, &artifact_node) else {
+                    let Some((path, next)) =
+                        relation_adjacent_artifact_path(graph, rel, &artifact_node)
+                    else {
                         continue;
                     };
                     if path == *seed_path || is_test_path(&path) || is_vendored_path(&path) {
@@ -6244,6 +6252,7 @@ fn extract_multihop_signals(
                     };
                     let kind_mult = match rel.kind {
                         RelationKind::Includes | RelationKind::Imports => 1.8,
+                        RelationKind::DerivedFrom => 1.6,
                         _ => 1.0,
                     };
                     let path_specificity =
@@ -6259,19 +6268,6 @@ fn extract_multihop_signals(
                         spans: vec![],
                     });
 
-                    let next = match &rel.dst {
-                        GraphNodeId::Artifact(artifact_id) => {
-                            GraphNodeId::Artifact(artifact_id.clone())
-                        }
-                        _ => {
-                            let Some(artifact_id) = graph
-                                .artifact_id_for_path(&kin_model::FilePathId::new(path.as_str()))
-                            else {
-                                continue;
-                            };
-                            GraphNodeId::Artifact(artifact_id)
-                        }
-                    };
                     if visited.insert(next.clone()) {
                         queue.push_back((next, path, depth + 1));
                     }
@@ -6288,6 +6284,7 @@ fn extract_multihop_signals(
         RelationKind::Imports,
         RelationKind::Includes,
         RelationKind::UsesMacro,
+        RelationKind::DerivedFrom,
         RelationKind::Tests,
         RelationKind::DependsOn,
         RelationKind::Implements,
@@ -6380,6 +6377,7 @@ fn extract_multihop_signals(
                                 RelationKind::Imports
                                 | RelationKind::Includes
                                 | RelationKind::UsesMacro
+                                | RelationKind::DerivedFrom
                                 | RelationKind::DependsOn => 1.8,
                                 RelationKind::Implements | RelationKind::Extends => 1.5,
                                 RelationKind::References => 1.2,
@@ -8108,6 +8106,7 @@ fn resolve_entities_to_files(
         RelationKind::UsesMacro,
         RelationKind::Imports,
         RelationKind::Includes,
+        RelationKind::DerivedFrom,
         RelationKind::References,
         RelationKind::Implements,
         RelationKind::Extends,
@@ -8256,13 +8255,12 @@ fn resolve_entities_to_files(
                 });
                 for rel in artifact_rels
                     .iter()
-                    .filter(|rel| {
-                        matches!(rel.kind, RelationKind::Includes | RelationKind::Imports)
-                    })
-                    .filter(|rel| rel.src == artifact_node)
+                    .filter(|rel| relation_allows_artifact_traversal(rel, &artifact_node))
                     .take(artifact_frontier)
                 {
-                    let Some(path) = relation_projected_artifact_path(rel, &artifact_node) else {
+                    let Some((path, next_artifact)) =
+                        relation_adjacent_artifact_path(graph, rel, &artifact_node)
+                    else {
                         continue;
                     };
                     if is_test_path(&path) || is_vendored_path(&path) {
@@ -8313,19 +8311,6 @@ fn resolve_entities_to_files(
                         );
                     }
 
-                    let next_artifact = match &rel.dst {
-                        GraphNodeId::Artifact(artifact_id) => {
-                            GraphNodeId::Artifact(artifact_id.clone())
-                        }
-                        _ => {
-                            let Some(artifact_id) = graph
-                                .artifact_id_for_path(&kin_model::FilePathId::new(path.as_str()))
-                            else {
-                                continue;
-                            };
-                            GraphNodeId::Artifact(artifact_id)
-                        }
-                    };
                     if visited_artifacts.insert(next_artifact.clone()) {
                         artifact_frontier_queue.push_back((next_artifact, path, depth + 1));
                     }
@@ -8647,6 +8632,7 @@ fn resolve_relation_kind_priority(kind: RelationKind) -> u8 {
         RelationKind::Calls | RelationKind::UsesMacro | RelationKind::Tests => 5,
         RelationKind::Implements | RelationKind::Extends => 4,
         RelationKind::References => 3,
+        RelationKind::DerivedFrom => 3,
         RelationKind::Imports | RelationKind::Includes | RelationKind::DependsOn => 2,
         RelationKind::Contains => 1,
         _ => 0,
@@ -8675,10 +8661,49 @@ fn resolve_relation_kind_multiplier(kind: RelationKind) -> f32 {
         RelationKind::Implements | RelationKind::Extends => 1.8,
         RelationKind::Imports | RelationKind::DependsOn => 1.2,
         RelationKind::Includes => 1.2,
+        RelationKind::DerivedFrom => 1.6,
         RelationKind::Contains => 1.0,
         RelationKind::Tests => 2.0,
         _ => 0.8,
     }
+}
+
+fn relation_allows_artifact_traversal(rel: &kin_model::Relation, from_node: &GraphNodeId) -> bool {
+    match rel.kind {
+        RelationKind::Includes | RelationKind::Imports => rel.src == *from_node,
+        RelationKind::DerivedFrom => rel.src == *from_node || rel.dst == *from_node,
+        _ => false,
+    }
+}
+
+fn relation_adjacent_artifact_path(
+    graph: &kin_db::InMemoryGraph,
+    rel: &kin_model::Relation,
+    from_node: &GraphNodeId,
+) -> Option<(String, GraphNodeId)> {
+    if !relation_allows_artifact_traversal(rel, from_node) {
+        return None;
+    }
+
+    let other = if rel.src == *from_node {
+        rel.dst
+    } else if rel.kind == RelationKind::DerivedFrom && rel.dst == *from_node {
+        rel.src
+    } else {
+        return None;
+    };
+
+    if let GraphNodeId::Artifact(artifact_id) = other {
+        if let Some(path) = graph.path_for_artifact_id(&artifact_id) {
+            return Some((path.0, GraphNodeId::Artifact(artifact_id)));
+        }
+    }
+
+    relation_projected_artifact_path(rel, from_node).and_then(|path| {
+        graph
+            .artifact_id_for_path(&kin_model::FilePathId::new(path.as_str()))
+            .map(|artifact_id| (path, GraphNodeId::Artifact(artifact_id)))
+    })
 }
 
 fn relation_projected_artifact_path(
@@ -10942,6 +10967,40 @@ fn post_rrf_path_penalty(
     }
 
     penalty
+}
+
+fn graph_projection_backed_generated_paths(
+    graph: &kin_db::InMemoryGraph,
+    resolve_signal_scores: &HashMap<String, HashMap<String, f32>>,
+) -> HashSet<String> {
+    resolve_signal_scores
+        .iter()
+        .filter_map(|(path, signals)| {
+            if !is_amalgamated_or_generated_path(path)
+                || !signals.contains_key("graph_resolve")
+                || !path_has_derived_from_artifact_relation(graph, path)
+            {
+                return None;
+            }
+            Some(path.clone())
+        })
+        .collect()
+}
+
+fn path_has_derived_from_artifact_relation(graph: &kin_db::InMemoryGraph, path: &str) -> bool {
+    let Some(artifact_id) = graph.artifact_id_for_path(&kin_model::FilePathId::new(path)) else {
+        return false;
+    };
+    let node = GraphNodeId::Artifact(artifact_id);
+    graph
+        .get_all_relations_for_node(&node)
+        .map(|relations| {
+            relations.iter().any(|relation| {
+                relation.kind == RelationKind::DerivedFrom
+                    && (relation.src == node || relation.dst == node)
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn priority_backing_applies_for_path(
@@ -13569,6 +13628,61 @@ mod tests {
     }
 
     #[test]
+    fn generated_projection_penalty_requires_graph_derived_from_evidence() {
+        let graph = kin_db::InMemoryGraph::new();
+        let generated = FilePathId::new("single_include/nlohmann/json.hpp");
+        let source = FilePathId::new("include/nlohmann/detail/exceptions.hpp");
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: generated.clone(),
+                content_hash: Hash256::from_bytes([91; 32]),
+                mime_type: Some("text/x-c++hdr".into()),
+                text_preview: Some("amalgamated header".into()),
+            })
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: source.clone(),
+                content_hash: Hash256::from_bytes([92; 32]),
+                mime_type: Some("text/x-c++hdr".into()),
+                text_preview: Some("exception type".into()),
+            })
+            .unwrap();
+
+        let generated_id = graph.artifact_id_for_path(&generated).unwrap();
+        let source_id = graph.artifact_id_for_path(&source).unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::DerivedFrom,
+                src: GraphNodeId::Artifact(generated_id),
+                dst: GraphNodeId::Artifact(source_id),
+                confidence: 0.9,
+                origin: RelationOrigin::Inferred,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        let no_graph_signal = HashMap::from([(
+            generated.0.clone(),
+            HashMap::from([("embedding".to_string(), 1.0)]),
+        )]);
+        assert!(
+            graph_projection_backed_generated_paths(&graph, &no_graph_signal).is_empty(),
+            "embedding/text evidence alone must not bypass generated path hygiene"
+        );
+
+        let graph_signal = HashMap::from([(
+            generated.0.clone(),
+            HashMap::from([("graph_resolve".to_string(), 1.0)]),
+        )]);
+        let backed = graph_projection_backed_generated_paths(&graph, &graph_signal);
+        assert!(backed.contains(&generated.0));
+    }
+
+    #[test]
     fn tracked_artifact_penalty_is_much_softer_than_generic_non_source_penalty() {
         let tracked = post_rrf_path_penalty("package.json", false, true, false, false);
         let generic = post_rrf_path_penalty("package.json", false, false, false, false);
@@ -15075,6 +15189,59 @@ mod tests {
         assert!(
             hits.contains_key("include/nlohmann/detail/iterators/internal_iterator.hpp"),
             "artifact-level Includes edge should project included headers from file-backed seeds"
+        );
+    }
+
+    #[test]
+    fn extract_multihop_signals_follows_derived_projection_edges_from_source_hits() {
+        let graph = kin_db::InMemoryGraph::new();
+        let generated = FilePathId::new("single_include/nlohmann/json.hpp");
+        let source = FilePathId::new("include/nlohmann/detail/exceptions.hpp");
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: generated.clone(),
+                content_hash: Hash256::from_bytes([81; 32]),
+                mime_type: Some("text/x-c++hdr".into()),
+                text_preview: Some("amalgamated exception source".into()),
+            })
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: source.clone(),
+                content_hash: Hash256::from_bytes([82; 32]),
+                mime_type: Some("text/x-c++hdr".into()),
+                text_preview: Some("exception source".into()),
+            })
+            .unwrap();
+
+        let generated_id = graph.artifact_id_for_path(&generated).unwrap();
+        let source_id = graph.artifact_id_for_path(&source).unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::DerivedFrom,
+                src: GraphNodeId::Artifact(generated_id),
+                dst: GraphNodeId::Artifact(source_id),
+                confidence: 0.9,
+                origin: RelationOrigin::Inferred,
+                created_in: None,
+                import_source: None,
+                evidence: vec![kin_model::RelationEvidence {
+                    resolved_path: Some(source.0.clone()),
+                    source_path: Some("nlohmann/detail/exceptions.hpp".to_string()),
+                    parser_rule: Some("projection_include_marker".to_string()),
+                    occurrence_count: 1,
+                    ..kin_model::RelationEvidence::default()
+                }],
+            })
+            .unwrap();
+
+        let seeds = HashMap::from([(source.0.clone(), hit(72.0))]);
+        let hits =
+            extract_multihop_signals(&[&seeds], &graph, LocateProfile::Standard, false).unwrap();
+        assert!(
+            hits.contains_key(&generated.0),
+            "source artifact hits should project to generated artifacts through DerivedFrom"
         );
     }
 
