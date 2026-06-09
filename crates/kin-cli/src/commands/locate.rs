@@ -818,8 +818,12 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         max_files = max_files
     )
     .entered();
-    // Strip HTML comments from issue text
-    let text = &clean_issue_text(text);
+    // Strip HTML comments and common PR-template boilerplate before retrieval.
+    // Long checklists and contribution guidelines repeatedly mention generic
+    // paths, build tools, and policy words that are not the change request.
+    let cleaned_text = clean_issue_text(text);
+    let semantic_text = strip_pr_template_boilerplate(&cleaned_text);
+    let text = semantic_text.as_str();
     require_complete_embedding_coverage(graph, vector_source)?;
 
     let mut budget = LocateBudget::new();
@@ -2445,6 +2449,36 @@ fn clean_issue_text(text: &str) -> String {
     let text = re_checkbox.replace_all(&text, "");
 
     text.to_string()
+}
+
+fn strip_pr_template_boilerplate(text: &str) -> String {
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        let marker = line.trim_matches(['\r', '\n']).trim();
+        if is_pr_template_boilerplate_start(marker) && text[..offset].trim().len() >= 12 {
+            return text[..offset].trim_end().to_string();
+        }
+        offset += line.len();
+    }
+
+    text.to_string()
+}
+
+fn is_pr_template_boilerplate_start(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let lower = lower.trim();
+    if lower.is_empty() {
+        return false;
+    }
+
+    let heading = lower.trim_start_matches('#').trim();
+    heading.contains("pull request checklist")
+        || heading == "checklist"
+        || heading.contains("contribution guidelines")
+        || heading.starts_with("please don't")
+        || heading.starts_with("please dont")
+        || heading.starts_with("please do not")
+        || heading.contains("before submitting")
 }
 
 fn merge_priority_files_from_hits(
@@ -13570,6 +13604,26 @@ mod tests {
 
         assert!(priority > regular);
         assert!(priority > 0.7);
+    }
+
+    #[test]
+    fn strips_pr_template_boilerplate_before_retrieval() {
+        let query = "Better error 305\n\nImprove error 305 to address #1220\n\n## Pull request checklist\n\nRead the Contribution Guidelines.\n\n- [x] The source code is amalgamated; run make amalgamate to create `single_include/nlohmann/json.hpp`.\n\n## Please don't\n\nDo not work around old compilers.";
+
+        let stripped = strip_pr_template_boilerplate(&clean_issue_text(query));
+
+        assert!(stripped.contains("Better error 305"));
+        assert!(stripped.contains("Improve error 305"));
+        assert!(!stripped.contains("single_include/nlohmann/json.hpp"));
+        assert!(!stripped.to_ascii_lowercase().contains("amalgamated"));
+        assert!(!stripped.to_ascii_lowercase().contains("old compilers"));
+    }
+
+    #[test]
+    fn does_not_strip_short_issue_that_starts_with_checklist_word() {
+        let query = "Checklist parser should preserve task-specific text";
+
+        assert_eq!(strip_pr_template_boilerplate(query), query);
     }
 
     #[test]
