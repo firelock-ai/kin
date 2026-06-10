@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+[package]
+name = "kin-model"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Canonical types for Kin semantic VCS"
+
+[dependencies]
+kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
+kin-vector = { version = "0.1.0", registry = "kin" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+schemars = { version = "0.8", features = ["chrono", "uuid1"] }
+
+[dev-dependencies]
+pretty_assertions = "1"
