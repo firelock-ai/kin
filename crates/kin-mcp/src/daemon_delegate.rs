@@ -329,8 +329,30 @@ pub async fn forward_tool_call(
         // graph (`graph.embedding_status()`), so forward there and project the
         // fields MCP agents need. Self-contained — no daemon-api coordination.
         "kin_graph_status" => forward_graph_status(arguments).await,
+        // Stage-time validation in product mode: reject intrinsically-malformed
+        // staged operations locally before the daemon round-trip, so the agent
+        // gets the same fast, actionable failure it gets in-process. The daemon
+        // still owns graph-dependent validation and the actual staging.
+        "kin_transaction_stage" => match validate_stage_arguments(arguments) {
+            Ok(()) => forward_mcp_tool_call(name, arguments).await,
+            Err(message) => Ok(Some(ToolCallResult::error(message))),
+        },
         _ => forward_mcp_tool_call(name, arguments).await,
     }
+}
+
+/// Run the intrinsic stage-time validation over a `kin_transaction_stage`
+/// argument map. A missing `operations` field is left for the daemon to report
+/// (so the missing-parameter message stays authoritative); a malformed array or
+/// a payload that would be silently dropped at commit fails loud here.
+fn validate_stage_arguments(arguments: &HashMap<String, serde_json::Value>) -> Result<(), String> {
+    let Some(operations_val) = arguments.get("operations") else {
+        return Ok(());
+    };
+    let operations: Vec<crate::session::McpMutationOperation> =
+        serde_json::from_value(operations_val.clone())
+            .map_err(|e| format!("invalid operations array: {e}"))?;
+    crate::session::validate_staged_operations(&operations)
 }
 
 /// Forward `kin_graph_status` to the daemon's status command and project the
@@ -357,7 +379,10 @@ async fn forward_graph_status(
         .await
         .map_err(|e| format!("daemon graph status failed: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("daemon graph status failed: HTTP {}", resp.status()));
+        return Err(format!(
+            "daemon graph status failed: HTTP {}",
+            resp.status()
+        ));
     }
     let value: serde_json::Value = resp
         .json()
@@ -378,6 +403,26 @@ async fn forward_graph_status(
 
 pub fn daemon_unavailable_tool_result(name: &str) -> ToolCallResult {
     daemon_required_unavailable(name)
+}
+
+/// Best-effort fetch of the daemon `/health` body for response-envelope
+/// enrichment.
+///
+/// Returns the parsed JSON on success and `None` whenever the daemon is
+/// unreachable, the request fails, or the body does not parse. The envelope
+/// folds the honest degraded/freshness fields from this body
+/// (`embed_worker_failed`, `mass_deletion_blocked`, reconciliation state); a
+/// `None` here simply leaves those envelope fields unknown rather than blocking
+/// or failing the tool call. `/health` is liveness-only and never lazy-loads a
+/// repo graph, so this is a cheap localhost probe.
+pub async fn fetch_health_snapshot() -> Option<serde_json::Value> {
+    let client = daemon_client().await?;
+    let base = daemon_base_url()?;
+    let resp = client.get(format!("{}/health", base)).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<serde_json::Value>().await.ok()
 }
 
 /// Get or initialize the daemon client. Returns `None` if the daemon is not
@@ -646,8 +691,7 @@ mod tests {
     #[test]
     fn auth_token_env_override_wins_over_file() {
         let (_guard, kin_dir) = kin_dir_with_token("file-token");
-        let resolved =
-            resolve_daemon_auth_token(Some("  env-token  ".to_string()), Some(&kin_dir));
+        let resolved = resolve_daemon_auth_token(Some("  env-token  ".to_string()), Some(&kin_dir));
         assert_eq!(resolved.as_deref(), Some("env-token"));
     }
 

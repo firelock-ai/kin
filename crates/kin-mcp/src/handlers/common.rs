@@ -1055,7 +1055,7 @@ pub fn read_entity_source_excerpt_detailed<G: GraphStore>(
     LAST_READ_SOURCE.with(|f| f.set("unknown"));
 
     let span = entity.span.as_ref()?;
-    
+
     // Retrieve graph hash
     let graph_hash = if let Some(ref file_origin) = entity.file_origin {
         store.get_file_hash(file_origin).ok().flatten()
@@ -1095,7 +1095,8 @@ pub fn read_entity_source_excerpt_detailed<G: GraphStore>(
             }
         }
         let text = String::from_utf8_lossy(&bytes);
-        return expand_entity_source_excerpt(entity, &text, span.start_byte, max_lines, max_chars).or(excerpt);
+        return expand_entity_source_excerpt(entity, &text, span.start_byte, max_lines, max_chars)
+            .or(excerpt);
     }
 
     // Fall back to disk
@@ -1420,7 +1421,10 @@ pub fn clip_rendered_text_with_cap(text: &str, max_lines: usize, max_chars: usiz
 
 // ── Entity JSON formatting ──
 
-pub fn entity_response_json<G: GraphStore>(store: &G, entity: &Entity) -> Result<serde_json::Value> {
+pub fn entity_response_json<G: GraphStore>(
+    store: &G,
+    entity: &Entity,
+) -> Result<serde_json::Value> {
     let mut value = serde_json::to_value(entity).map_err(McpError::Json)?;
     let Some(obj) = value.as_object_mut() else {
         return Ok(value);
@@ -1433,9 +1437,12 @@ pub fn entity_response_json<G: GraphStore>(store: &G, entity: &Entity) -> Result
         obj.insert("start_line".into(), serde_json::json!(span.start_line));
         obj.insert("end_line".into(), serde_json::json!(span.end_line));
     }
-    if let Some(source_excerpt) =
-        read_entity_source_excerpt_detailed(store, entity, MCP_SOURCE_MAX_LINES, MCP_SOURCE_MAX_CHARS)
-    {
+    if let Some(source_excerpt) = read_entity_source_excerpt_detailed(
+        store,
+        entity,
+        MCP_SOURCE_MAX_LINES,
+        MCP_SOURCE_MAX_CHARS,
+    ) {
         obj.insert("source_excerpt".into(), serde_json::json!(source_excerpt));
     }
 
@@ -1455,8 +1462,12 @@ pub fn focal_context_json<G: GraphStore>(
 ) -> serde_json::Value {
     let start_line = entity.span.as_ref().map(|span| span.start_line);
     let end_line = entity.span.as_ref().map(|span| span.end_line);
-    let source_excerpt =
-        read_entity_source_excerpt_detailed(store, entity, MCP_SOURCE_MAX_LINES, MCP_SOURCE_MAX_CHARS);
+    let source_excerpt = read_entity_source_excerpt_detailed(
+        store,
+        entity,
+        MCP_SOURCE_MAX_LINES,
+        MCP_SOURCE_MAX_CHARS,
+    );
     let is_stale = LAST_READ_STALE.with(|f| f.get());
     let source = LAST_READ_SOURCE.with(|f| f.get());
 

@@ -226,7 +226,18 @@ enum SearchRecord {
 }
 
 impl SearchRecord {
+    /// Identity used to collapse search hits to one row per result.
+    ///
+    /// Whenever a record resolves to an entity we key on the entity id, so the
+    /// multiple embedding records a single entity can own (e.g. chunked
+    /// embeddings, or a vector hit plus a text hit) collapse to a single row
+    /// instead of one row per retrieval key. Only genuinely entity-less
+    /// artifacts fall back to the retrieval-key string, where one key really is
+    /// one result.
     fn dedupe_key(&self) -> String {
+        if let Some(entity) = record_entity(self) {
+            return entity.id.to_string();
+        }
         match self {
             SearchRecord::Entity(entity) => entity.id.to_string(),
             SearchRecord::Resolved { key, .. } => retrieval_key_string(key),
@@ -480,59 +491,69 @@ fn collect_daemon_semantic_search_response(
     let languages = request.language.as_deref().and_then(parse_language);
     let role_filter = parse_role_filter(kind_ref);
 
-    let mut raw_hits = Vec::new();
+    let mut raw_hits: Vec<kin_ranking::RawHit> = Vec::new();
     let mut item_map: HashMap<String, SearchRecord> = HashMap::new();
     let mut seen_ids: HashSet<String> = HashSet::new();
 
     for (retrieval_key, distance) in &vector_results {
-        if let Some(record) = resolve_retrieval_record(graph, *retrieval_key) {
-            if !record_matches_semantic_filters(
-                &record,
-                kinds.as_ref(),
-                languages.as_ref(),
-                role_filter,
-            ) {
-                continue;
-            }
-            let id_str = record.dedupe_key();
-            raw_hits.push(build_semantic_raw_hit(
-                graph,
-                &record,
-                None,
-                Some(*distance),
-            )?);
-            seen_ids.insert(id_str.clone());
-            item_map.insert(id_str, record);
+        let Some(record) = resolve_retrieval_record(graph, *retrieval_key) else {
+            continue;
+        };
+        if !record_matches_semantic_filters(
+            &record,
+            kinds.as_ref(),
+            languages.as_ref(),
+            role_filter,
+        ) {
+            continue;
         }
+        // Key by entity identity (via `dedupe_key`) so several embedding
+        // records for one entity collapse to a single row. When a duplicate
+        // arrives, keep the best (smallest) cosine distance so ranking sees the
+        // strongest semantic signal for that entity rather than an arbitrary one.
+        let id_str = record.dedupe_key();
+        if seen_ids.contains(&id_str) {
+            if let Some(hit) = raw_hits.iter_mut().find(|h| h.entity_id == id_str) {
+                if hit.cosine_distance.is_none_or(|existing| *distance < existing) {
+                    hit.cosine_distance = Some(*distance);
+                }
+            }
+            continue;
+        }
+        raw_hits.push(build_semantic_raw_hit(graph, &record, None, Some(*distance))?);
+        seen_ids.insert(id_str.clone());
+        item_map.insert(id_str, record);
     }
 
     let text_hits = graph.text_search(&request.query, limit * 2)?;
     for (retrieval_key, bm25_score) in &text_hits {
-        let id_str = retrieval_key_string(retrieval_key);
+        let Some(record) = resolve_retrieval_record(graph, *retrieval_key) else {
+            continue;
+        };
+        if !record_matches_semantic_filters(
+            &record,
+            kinds.as_ref(),
+            languages.as_ref(),
+            role_filter,
+        ) {
+            continue;
+        }
+        // Same entity identity as the vector loop, so a text hit for an entity
+        // already found semantically merges its lexical signal onto the existing
+        // row instead of producing a second one. Keep the strongest bm25 when an
+        // entity owns multiple text records.
+        let id_str = record.dedupe_key();
         if seen_ids.contains(&id_str) {
             if let Some(hit) = raw_hits.iter_mut().find(|h| h.entity_id == id_str) {
-                hit.bm25_score = Some(*bm25_score);
+                if hit.bm25_score.is_none_or(|existing| *bm25_score > existing) {
+                    hit.bm25_score = Some(*bm25_score);
+                }
             }
             continue;
         }
-        if let Some(record) = resolve_retrieval_record(graph, *retrieval_key) {
-            if !record_matches_semantic_filters(
-                &record,
-                kinds.as_ref(),
-                languages.as_ref(),
-                role_filter,
-            ) {
-                continue;
-            }
-            raw_hits.push(build_semantic_raw_hit(
-                graph,
-                &record,
-                Some(*bm25_score),
-                None,
-            )?);
-            seen_ids.insert(id_str.clone());
-            item_map.insert(id_str, record);
-        }
+        raw_hits.push(build_semantic_raw_hit(graph, &record, Some(*bm25_score), None)?);
+        seen_ids.insert(id_str.clone());
+        item_map.insert(id_str, record);
     }
 
     let search_query = kin_ranking::SearchQuery {
@@ -611,17 +632,19 @@ fn collect_search_results(
     if results.len() < 5 {
         let text_hits = graph.text_search(pattern, 20)?;
         for (retrieval_key, _score) in text_hits {
-            let dedupe_key = retrieval_key_string(&retrieval_key);
-            if !seen.insert(dedupe_key) {
+            let Some(record) = resolve_retrieval_record(graph, retrieval_key) else {
                 continue;
-            }
-            if let Some(record) = resolve_retrieval_record(graph, retrieval_key) {
-                if record_matches_semantic_filters(
-                    &record,
-                    kinds.as_ref(),
-                    languages.as_ref(),
-                    role_filter,
-                ) {
+            };
+            if record_matches_semantic_filters(
+                &record,
+                kinds.as_ref(),
+                languages.as_ref(),
+                role_filter,
+            ) {
+                // Dedupe by entity identity (`dedupe_key`) so a text hit for an
+                // entity already matched by name above does not add a second
+                // row, and multiple embedding records for one entity collapse.
+                if seen.insert(record.dedupe_key()) {
                     results.push(record);
                 }
             }
@@ -1280,10 +1303,85 @@ mod tests {
     };
     use kin_db::ResolvedRetrievalItem;
     use kin_model::{
-        ArtifactId, ArtifactKind, EntityKind, FilePathId, Hash256, OpaqueArtifact, RetrievalKey,
-        ShallowTrackedFile, StructuredArtifact,
+        ArtifactId, ArtifactKind, Entity, EntityId, EntityKind, EntityMetadata, EntityRevisionId,
+        EntityRole, FilePathId, FingerprintAlgorithm, Hash256, LanguageId, OpaqueArtifact,
+        RetrievalKey, SemanticFingerprint, ShallowTrackedFile, SourceSpan, StructuredArtifact,
+        Visibility,
     };
     use serial_test::serial;
+
+    /// Minimal source-function entity for dedupe-identity tests.
+    fn dedupe_test_entity(name: &str, path: &str) -> Entity {
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Python,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([1; 32]),
+                behavior_hash: Hash256::from_bytes([2; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new(path)),
+            span: Some(SourceSpan {
+                file: FilePathId::new(path),
+                start_byte: 0,
+                end_byte: 0,
+                start_line: 1,
+                start_col: 1,
+                end_line: 2,
+                end_col: 1,
+            }),
+            signature: format!("def {}()", name),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    #[test]
+    fn dedupe_key_collapses_multiple_embedding_records_for_one_entity() {
+        // Regression: the vector and text indexes can hold several retrieval
+        // keys for one entity (the entity itself plus one or more of its
+        // revisions), so `semantic_search` can return more than one record per
+        // entity. Before the fix each distinct retrieval key produced its own
+        // row; now every record that resolves to a given entity must collapse to
+        // a single dedupe identity — one entity, one search row.
+        let entity = dedupe_test_entity("handler", "src/handler.rs");
+
+        let by_entity = SearchRecord::Resolved {
+            key: RetrievalKey::Entity(entity.id),
+            item: ResolvedRetrievalItem::Entity(entity.clone()),
+        };
+        let by_revision = SearchRecord::Resolved {
+            key: RetrievalKey::EntityRevision(EntityRevisionId::from_hash(Hash256::from_bytes(
+                [9; 32],
+            ))),
+            item: ResolvedRetrievalItem::Entity(entity.clone()),
+        };
+
+        assert_eq!(
+            by_entity.dedupe_key(),
+            by_revision.dedupe_key(),
+            "two embedding records for one entity must share a dedupe identity"
+        );
+        assert_eq!(by_entity.dedupe_key(), entity.id.to_string());
+
+        // A genuinely different entity keeps a distinct identity (no
+        // over-collapse that would hide real results).
+        let other = dedupe_test_entity("other", "src/other.rs");
+        let other_record = SearchRecord::Resolved {
+            key: RetrievalKey::Entity(other.id),
+            item: ResolvedRetrievalItem::Entity(other),
+        };
+        assert_ne!(by_entity.dedupe_key(), other_record.dedupe_key());
+    }
 
     #[test]
     fn function_kind_includes_methods() {

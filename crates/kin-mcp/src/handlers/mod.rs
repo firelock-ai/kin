@@ -2076,6 +2076,57 @@ mod tests {
     }
 
     #[test]
+    fn get_context_pack_recalls_annotation_deposited_on_focal_entity() {
+        // D.7 Track B (annotation deposit + recall): an annotation deposited on
+        // an entity via kin_annotation_add must be recalled inside that entity's
+        // get_context_pack response, through the real graph surfaces — no fake
+        // or demo data, the same create/query path the product uses.
+        use kin_model::graph::EntityStore;
+        let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  return value <= maxVal;\n}\n";
+        let (_dir, entity) = make_source_backed_entity(content);
+        let store = InMemoryGraph::default();
+        store.upsert_entity(&entity).unwrap();
+
+        // Deposit via the real add handler against the entity scope.
+        let mut add_args = HashMap::new();
+        add_args.insert("kind".into(), serde_json::json!("warning"));
+        add_args.insert(
+            "body".into(),
+            serde_json::json!("Bounds validated upstream; do not re-check here."),
+        );
+        add_args.insert(
+            "targets".into(),
+            serde_json::json!([format!("entity:{}", entity.id)]),
+        );
+        work::handle_annotation_add(&add_args, &store).unwrap();
+
+        // Recall through get_context_pack (traffic off to keep the pack focused).
+        let sessions = SessionRegistry::new();
+        let mut args = HashMap::new();
+        args.insert("entity_id".into(), serde_json::json!(entity.id.to_string()));
+        args.insert("include_traffic".into(), serde_json::json!(false));
+        let result = entities::handle_get_context_pack(&args, &store, &sessions).unwrap();
+        let text = match &result.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let response: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        let annotations = response
+            .get("annotations")
+            .and_then(|v| v.as_array())
+            .expect("context pack must recall annotations on the focal entity");
+        assert!(
+            !annotations.is_empty(),
+            "expected the deposited annotation to be recalled, got none"
+        );
+        let rendered = serde_json::to_string(annotations).unwrap();
+        assert!(
+            rendered.contains("do not re-check here"),
+            "recalled annotation body should be present; got: {rendered}"
+        );
+    }
+
+    #[test]
     fn handle_trace_computation_returns_focal_body_for_entity_id() {
         use kin_model::graph::EntityStore;
         let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  if (value < minVal) {\n    return false;\n  }\n  return value <= maxVal;\n}\n";
@@ -2244,6 +2295,36 @@ mod tests {
         assert_eq!(retrieved.name, "test_fn");
     }
 
+    #[tokio::test]
+    async fn handle_transaction_stage_rejects_malformed_op_at_stage_time() {
+        // D.7 Track A: a payload-less operation must fail loud at stage time —
+        // before the transaction is even consulted — instead of being silently
+        // dropped at commit. The transaction id here does not exist; validation
+        // is expected to reject the operation first.
+        use crate::session::{McpMutationOperation, McpMutationPayload};
+        let sessions = SessionRegistry::new();
+        let session_authority = SessionAuthorityMode::OfflineFallback;
+
+        let op: McpMutationOperation = McpMutationOperation {
+            verb: "create".into(),
+            target: "function".into(),
+            payload: None::<McpMutationPayload>,
+            description: "add dummy".into(),
+        };
+        let mut stage_args = HashMap::new();
+        stage_args.insert("transaction_id".into(), serde_json::json!("no-such-tx"));
+        stage_args.insert("operations".into(), serde_json::json!(vec![op]));
+
+        let err = sessions::handle_transaction_stage(&stage_args, &sessions, session_authority)
+            .await
+            .expect_err("payload-less op must be rejected at stage time");
+        assert!(matches!(err, McpError::InvalidParams(_)));
+        assert!(
+            err.to_string().contains("missing payload"),
+            "actionable stage-time message expected, got: {err}"
+        );
+    }
+
     struct EnvVarGuard {
         key: &'static str,
         old_val: Option<std::ffi::OsString>,
@@ -2272,7 +2353,10 @@ mod tests {
 
     #[test]
     fn test_entity_served_from_blob_store_file_deleted() {
-        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempdir().unwrap();
         let kin_dir = dir.path().join(".kin");
         fs::create_dir_all(&kin_dir).unwrap();
@@ -2336,7 +2420,10 @@ mod tests {
 
     #[test]
     fn test_disk_fallback_stale_flag() {
-        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempdir().unwrap();
         let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
 
@@ -2405,7 +2492,10 @@ mod tests {
 
     #[test]
     fn test_hash_mismatch_falls_back_to_disk() {
-        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempdir().unwrap();
         let kin_dir = dir.path().join(".kin");
         fs::create_dir_all(&kin_dir).unwrap();
