@@ -165,9 +165,8 @@ pub fn handle_release_check<G: GraphStore>(
             std::collections::HashSet::new();
         let mut unapproved: Vec<kin_review::UnapprovedAgentChange> = Vec::new();
         for branch in &branches {
-            for change in
-                kin_review::unapproved_agent_changes(store, &branch.head, 50)
-                    .map_err(|e| McpError::Review(e.to_string()))?
+            for change in kin_review::unapproved_agent_changes(store, &branch.head, 50)
+                .map_err(|e| McpError::Review(e.to_string()))?
             {
                 if seen.insert(change.change_id) {
                     unapproved.push(change);

@@ -760,4 +760,81 @@ mod tests {
         assert!(scope_to_string(&serde_json::json!(42)).is_err());
         assert!(scope_to_string(&serde_json::json!({ "Bogus": "x" })).is_err());
     }
+
+    // ── Stage-time rejection parity on the daemon-forward path ───────────────
+    //
+    // `kin_transaction_stage` runs the same intrinsic validation before the
+    // daemon round-trip as the in-process handler does, so an operation the
+    // commit path would silently drop fails loud at stage time in product
+    // (daemon) mode too — not only in offline/in-process mode.
+
+    fn stage_args(
+        operations: Vec<crate::session::McpMutationOperation>,
+    ) -> HashMap<String, serde_json::Value> {
+        let mut args = HashMap::new();
+        args.insert("transaction_id".into(), serde_json::json!("tx-1"));
+        args.insert(
+            "operations".into(),
+            serde_json::to_value(operations).expect("serialize operations"),
+        );
+        args
+    }
+
+    fn stage_op(
+        verb: &str,
+        payload: Option<crate::session::McpMutationPayload>,
+    ) -> crate::session::McpMutationOperation {
+        crate::session::McpMutationOperation {
+            verb: verb.into(),
+            target: String::new(),
+            payload,
+            description: String::new(),
+        }
+    }
+
+    fn stage_relation() -> crate::session::McpMutationPayload {
+        crate::session::McpMutationPayload::Relation {
+            from: kin_model::ids::EntityId::new(),
+            to: kin_model::ids::EntityId::new(),
+            kind: kin_model::relation::RelationKind::Calls,
+        }
+    }
+
+    #[test]
+    fn delegate_stage_rejects_relation_modify() {
+        let args = stage_args(vec![stage_op("modify", Some(stage_relation()))]);
+        let err = validate_stage_arguments(&args).unwrap_err();
+        assert!(
+            err.contains("not committable for relation payloads"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn delegate_stage_rejects_blob_payload() {
+        let args = stage_args(vec![stage_op(
+            "create",
+            Some(crate::session::McpMutationPayload::Blob(vec![1, 2, 3])),
+        )]);
+        let err = validate_stage_arguments(&args).unwrap_err();
+        assert!(
+            err.contains("blob payloads are not yet committable"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn delegate_stage_accepts_committable_relation() {
+        let args = stage_args(vec![stage_op("add", Some(stage_relation()))]);
+        assert!(validate_stage_arguments(&args).is_ok());
+    }
+
+    #[test]
+    fn delegate_stage_missing_operations_defers_to_daemon() {
+        // No `operations` key => stage validation is a no-op so the daemon's
+        // authoritative missing-parameter message stays the one the agent sees.
+        let mut args = HashMap::new();
+        args.insert("transaction_id".into(), serde_json::json!("tx-1"));
+        assert!(validate_stage_arguments(&args).is_ok());
+    }
 }

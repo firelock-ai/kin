@@ -466,9 +466,11 @@ pub async fn handle_transaction_begin(
 
 pub const TRANSACTION_STAGE_DESC: &str = "\
 Stage one or more mutation operations onto an active transaction. Each operation is \
-validated at stage time — a missing payload, an unknown verb, or a nameless entity is \
-rejected immediately with an actionable error rather than being silently dropped at \
-commit. Accepted operations are queued and can be validated or committed together.";
+validated at stage time — anything the commit path would silently drop (a missing or \
+unknown verb, a missing payload, a nameless entity, a relation update/modify, or a blob \
+payload) is rejected immediately with an actionable error instead of vanishing at \
+commit. This rejection is identical in daemon and in-process modes. Accepted operations \
+are queued and can be validated or committed together.";
 
 pub async fn handle_transaction_stage(
     args: &HashMap<String, serde_json::Value>,

@@ -65,9 +65,12 @@ fn is_known_mutation_verb(verb: &str) -> bool {
 ///
 /// These checks are intrinsic to the payload (no graph access required) and are
 /// safe in every runtime, so they run identically for the in-process handler and
-/// the product daemon-forward path. They catch the silent-drop cases in the
-/// commit path: an operation with no payload, or an unrecognized verb, is simply
-/// skipped at commit — the agent's mutation vanishes with no error. Deeper,
+/// the product daemon-forward path. Stage-time rejection is a superset of what
+/// the commit path (`uncommittable_operations`) rejects: every operation the
+/// commit `match` would fall through and silently drop — an absent or unknown
+/// verb, a missing payload, a relation `update`/`modify`, or a `Blob` payload —
+/// fails loud here, plus the intrinsic empty-entity-name case. This guarantees
+/// anything that stages clean will not surprise-drop at commit. Deeper,
 /// graph-dependent validation (does the target entity exist, contract/schema
 /// conformance) stays with the daemon, which owns graph truth.
 pub fn validate_staged_operations(
@@ -99,6 +102,13 @@ pub fn validate_staged_operations(
                     "operation #{idx}: entity payload has an empty name; an entity must be named"
                 ));
             }
+        }
+        // Reject the remaining commit-silent-drop cases (relation update/modify,
+        // blob payloads) so stage-time rejection is a strict superset of what the
+        // commit path drops. Verb and payload are already validated above, so
+        // this only fires for these payload/verb combinations.
+        if let Some(reason) = uncommittable_reason(op) {
+            return Err(format!("operation #{idx} ('{}'): {reason}", op.verb));
         }
     }
     Ok(())
@@ -1005,6 +1015,70 @@ mod tests {
         ];
         let err = validate_staged_operations(&ops).unwrap_err();
         assert!(err.contains("operation #1"), "{err}");
+    }
+
+    #[test]
+    fn validate_staged_operations_rejects_relation_modify() {
+        // Relation update/modify is committable-looking but the commit path drops
+        // it; stage time must reject it now, not just at commit.
+        for verb in ["modify", "update"] {
+            let err =
+                validate_staged_operations(&[op(verb, Some(relation_payload()))]).unwrap_err();
+            assert!(
+                err.contains("not committable for relation payloads"),
+                "verb {verb}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_staged_operations_rejects_blob_payload() {
+        let err =
+            validate_staged_operations(&[op("create", Some(McpMutationPayload::Blob(vec![1, 2])))])
+                .unwrap_err();
+        assert!(
+            err.contains("blob payloads are not yet committable"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_staged_operations_accepts_relation_add_remove() {
+        // create/add and delete/remove ARE committable for relations and must
+        // still pass stage time.
+        for verb in ["add", "create", "remove", "delete"] {
+            assert!(
+                validate_staged_operations(&[op(verb, Some(relation_payload()))]).is_ok(),
+                "relation verb {verb} should stage cleanly"
+            );
+        }
+    }
+
+    #[test]
+    fn stage_time_rejection_is_superset_of_commit_drop() {
+        // Parity invariant: any batch the commit path would reject as
+        // uncommittable must also be rejected at stage time. Guards against the
+        // stage/commit asymmetry where an op stages green then drops at commit.
+        let drop_batches = vec![
+            vec![op("modify", Some(relation_payload()))],
+            vec![op("update", Some(relation_payload()))],
+            vec![op("create", Some(McpMutationPayload::Blob(vec![9])))],
+            vec![op("create", None)],
+            vec![op(
+                "frobnicate",
+                Some(McpMutationPayload::Entity(entity_named("x"))),
+            )],
+        ];
+        for ops in &drop_batches {
+            assert!(
+                !uncommittable_operations(ops).is_empty(),
+                "fixture should be uncommittable: {ops:?}"
+            );
+            assert!(
+                validate_staged_operations(ops).is_err(),
+                "commit would drop this but stage accepted it: {ops:?}"
+            );
+        }
     }
 
     fn relation_payload() -> McpMutationPayload {
