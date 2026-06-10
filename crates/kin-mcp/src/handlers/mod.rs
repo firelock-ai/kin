@@ -156,6 +156,9 @@ mod tests {
         dead_entities: Vec<Entity>,
         live_entity_ids: HashSet<EntityId>,
         file_hashes: HashMap<FilePathId, Hash256>,
+        branches: Vec<Branch>,
+        changes_by_id: HashMap<SemanticChangeId, SemanticChange>,
+        approvals_by_change: HashMap<SemanticChangeId, Vec<kin_model::provenance::Approval>>,
     }
 
     impl kin_model::graph::EntityStore for EmptyStore {
@@ -372,9 +375,9 @@ mod tests {
         }
         fn get_change(
             &self,
-            _: &SemanticChangeId,
+            id: &SemanticChangeId,
         ) -> std::result::Result<Option<SemanticChange>, Self::Error> {
-            Ok(None)
+            Ok(self.changes_by_id.get(id).cloned())
         }
         fn get_changes_since(
             &self,
@@ -383,8 +386,8 @@ mod tests {
         ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
             Ok(vec![])
         }
-        fn get_branch(&self, _: &BranchName) -> std::result::Result<Option<Branch>, Self::Error> {
-            Ok(None)
+        fn get_branch(&self, name: &BranchName) -> std::result::Result<Option<Branch>, Self::Error> {
+            Ok(self.branches.iter().find(|b| &b.name == name).cloned())
         }
         fn create_branch(&self, _: &Branch) -> std::result::Result<(), Self::Error> {
             Ok(())
@@ -400,7 +403,7 @@ mod tests {
             Ok(())
         }
         fn list_branches(&self) -> std::result::Result<Vec<Branch>, Self::Error> {
-            Ok(vec![])
+            Ok(self.branches.clone())
         }
     }
 
@@ -852,9 +855,9 @@ mod tests {
         }
         fn get_approvals_for_change(
             &self,
-            _: &SemanticChangeId,
+            id: &SemanticChangeId,
         ) -> std::result::Result<Vec<kin_model::provenance::Approval>, Self::Error> {
-            Ok(vec![])
+            Ok(self.approvals_by_change.get(id).cloned().unwrap_or_default())
         }
         fn record_audit_event(
             &self,
@@ -2581,5 +2584,255 @@ mod tests {
 
         let after_misses = GRAPH_MISS_COUNT.load(std::sync::atomic::Ordering::SeqCst);
         assert!(after_misses >= before_misses + 1);
+    }
+
+    // ── Governance handlers: release_check + security_scan ──────────────────
+
+    fn gov_change_id(byte: u8) -> SemanticChangeId {
+        SemanticChangeId::from_hash(Hash256::from_bytes([byte; 32]))
+    }
+
+    fn gov_change(id: u8, parent: Option<u8>, author: &str) -> SemanticChange {
+        SemanticChange {
+            id: gov_change_id(id),
+            parents: parent.map(|p| vec![gov_change_id(p)]).unwrap_or_default(),
+            timestamp: kin_model::timestamp::Timestamp::now(),
+            author: AuthorId::new(author),
+            message: format!("change {}", id),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        }
+    }
+
+    fn gov_approval(
+        change: &SemanticChange,
+        decision: kin_model::provenance::ApprovalDecision,
+    ) -> kin_model::provenance::Approval {
+        kin_model::provenance::Approval {
+            approval_id: kin_model::provenance::ApprovalId::new(),
+            change_id: change.id,
+            approver: kin_model::provenance::ActorId::new(),
+            decision,
+            reason: "test".into(),
+            timestamp: kin_model::timestamp::Timestamp::now(),
+        }
+    }
+
+    fn gov_entity(name: &str, kind: EntityKind, visibility: Visibility) -> Entity {
+        use kin_model::entity::{
+            EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint,
+        };
+        Entity {
+            id: EntityId::new(),
+            kind,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([0; 32]),
+                behavior_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: None,
+            span: None,
+            signature: format!("fn {}()", name),
+            visibility,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    async fn call_release_check(store: &EmptyStore, require_approval: bool) -> serde_json::Value {
+        let sessions = SessionRegistry::new();
+        let mut args = HashMap::new();
+        args.insert("require_approval".into(), serde_json::json!(require_approval));
+        let result = handle_tool_call(
+            "kin_release_check",
+            &args,
+            store,
+            &sessions,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        .unwrap();
+        let text = match &result.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn release_check_require_approval_passes_with_no_branches() {
+        // No branches => nothing to walk => approval gate cannot find blockers.
+        let store = EmptyStore::default();
+        let response = call_release_check(&store, true).await;
+        assert_eq!(response["pass"], true);
+    }
+
+    #[tokio::test]
+    async fn release_check_blocks_on_unapproved_agent_change() {
+        // The false-green this fix targets: an agent change with NO approval must
+        // fail the gate. (Previously it passed because any audit event sufficed.)
+        let mut store = EmptyStore::default();
+        let head = gov_change(1, None, "claude-agent");
+        store
+            .changes_by_id
+            .insert(head.id, head.clone());
+        store.branches.push(Branch {
+            name: BranchName::new("main"),
+            head: head.id,
+        });
+
+        let response = call_release_check(&store, true).await;
+        assert_eq!(response["pass"], false);
+        let blockers = response["blockers"].as_array().unwrap();
+        assert!(
+            blockers
+                .iter()
+                .any(|b| b.as_str().unwrap().contains("unapproved agent change")),
+            "blocker list must name the unapproved agent change: {blockers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_check_passes_when_agent_change_approved() {
+        let mut store = EmptyStore::default();
+        let head = gov_change(1, None, "claude-agent");
+        store.changes_by_id.insert(head.id, head.clone());
+        store.approvals_by_change.insert(
+            head.id,
+            vec![gov_approval(&head, kin_model::provenance::ApprovalDecision::Approved)],
+        );
+        store.branches.push(Branch {
+            name: BranchName::new("main"),
+            head: head.id,
+        });
+
+        let response = call_release_check(&store, true).await;
+        assert_eq!(response["pass"], true, "approved agent change must pass");
+    }
+
+    #[tokio::test]
+    async fn release_check_blocks_on_approved_then_mutated() {
+        // c1 (agent, approved) <- c2 (agent, unapproved, HEAD): the later
+        // unapproved mutation must block even though an earlier change is approved.
+        let mut store = EmptyStore::default();
+        let c1 = gov_change(1, None, "agent-a");
+        let c2 = gov_change(2, Some(1), "agent-a");
+        store.changes_by_id.insert(c1.id, c1.clone());
+        store.changes_by_id.insert(c2.id, c2.clone());
+        store.approvals_by_change.insert(
+            c1.id,
+            vec![gov_approval(&c1, kin_model::provenance::ApprovalDecision::Approved)],
+        );
+        store.branches.push(Branch {
+            name: BranchName::new("main"),
+            head: c2.id,
+        });
+
+        let response = call_release_check(&store, true).await;
+        assert_eq!(response["pass"], false);
+
+        // Approving the head clears the gate.
+        store.approvals_by_change.insert(
+            c2.id,
+            vec![gov_approval(&c2, kin_model::provenance::ApprovalDecision::Approved)],
+        );
+        let response = call_release_check(&store, true).await;
+        assert_eq!(response["pass"], true);
+    }
+
+    #[tokio::test]
+    async fn release_check_human_change_does_not_block() {
+        let mut store = EmptyStore::default();
+        let head = gov_change(1, None, "alice");
+        store.changes_by_id.insert(head.id, head.clone());
+        store.branches.push(Branch {
+            name: BranchName::new("main"),
+            head: head.id,
+        });
+
+        let response = call_release_check(&store, true).await;
+        assert_eq!(response["pass"], true, "human-authored change is not gated");
+    }
+
+    #[tokio::test]
+    async fn release_check_approval_disabled_skips_gate() {
+        // With require_approval=false, an unapproved agent change must NOT block.
+        let mut store = EmptyStore::default();
+        let head = gov_change(1, None, "claude-agent");
+        store.changes_by_id.insert(head.id, head.clone());
+        store.branches.push(Branch {
+            name: BranchName::new("main"),
+            head: head.id,
+        });
+
+        let response = call_release_check(&store, false).await;
+        assert_eq!(response["pass"], true);
+    }
+
+    #[tokio::test]
+    async fn security_scan_surfaces_untested_api_endpoint() {
+        let mut store = EmptyStore::default();
+        let api = gov_entity("login", EntityKind::ApiEndpoint, Visibility::Public);
+        store.entities_by_id.insert(api.id, api);
+
+        let sessions = SessionRegistry::new();
+        let args = HashMap::new();
+        let result = handle_tool_call(
+            "kin_security_scan",
+            &args,
+            &store,
+            &sessions,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        .unwrap();
+        let text = match &result.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let response: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert!(response["finding_count"].as_u64().unwrap() >= 1);
+        assert_eq!(response["severity_counts"]["high"], 1);
+        let findings = response["findings"].as_array().unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f["finding_type"] == "untested-api" && f["severity"] == "high"),
+            "untested API endpoint must appear as a high finding: {findings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn security_scan_empty_graph_has_no_findings() {
+        let store = EmptyStore::default();
+        let sessions = SessionRegistry::new();
+        let args = HashMap::new();
+        let result = handle_tool_call(
+            "kin_security_scan",
+            &args,
+            &store,
+            &sessions,
+            SessionAuthorityMode::OfflineFallback,
+        )
+        .await
+        .unwrap();
+        let text = match &result.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let response: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(response["finding_count"], 0);
     }
 }

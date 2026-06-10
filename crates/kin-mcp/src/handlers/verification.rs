@@ -79,12 +79,13 @@ pub fn handle_coverage_summary<G: GraphStore>(store: &G) -> Result<ToolCallResul
 }
 
 pub const SECURITY_SCAN_DESC: &str = "\
-Run a graph-based security/quality scan and return findings with severity. Today it \
-surfaces dead/unreachable code (a common source of latent risk and confusion) as \
-findings; set propagate=true to also compute, for each finding, the downstream entities \
-it would affect. Reach for it as a quick hygiene pass over the semantic graph. For \
-plain dead-code enumeration without the findings framing, dead_code is more direct; \
-this tool packages results as severity-tagged findings suitable for a security review.";
+Run a graph-based security/quality scan and return severity-tagged findings. It surfaces \
+untested API endpoints, orphaned public surface area, high-fan-out blast radius, dead \
+event contracts, and encapsulation leaks (public entities calling private internals); \
+set propagate=true to also emit transitive-dependency findings for everything downstream \
+of a flagged entity. This mirrors the `kin security` CLI scan. Reach for it as a hygiene \
+pass over the semantic graph before relying on or releasing code. For plain dead-code \
+enumeration, dead_code is more direct.";
 
 pub fn handle_security_scan<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -92,38 +93,32 @@ pub fn handle_security_scan<G: GraphStore>(
 ) -> Result<ToolCallResult> {
     let propagate = get_optional_bool(args, "propagate", false);
 
-    let dead = store.find_dead_code().map_err(McpError::graph)?;
+    let findings = kin_review::security_findings(store, propagate)
+        .map_err(|e| McpError::Review(e.to_string()))?;
+    let counts = kin_review::SecurityFindingCounts::of(&findings);
 
-    let findings: Vec<serde_json::Value> = dead
-        .into_iter()
-        .map(|entity| {
-            let mut finding = serde_json::json!({
-                "entity_id": entity.id,
-                "name": entity.name,
-                "kind": entity.kind,
-                "file_path": entity.file_origin.as_ref().map(|p| p.to_string()),
-                "finding_type": "dead_code",
-                "severity": "low",
-            });
-            if propagate {
-                if let Ok(impacted) = store.get_downstream_impact(&entity.id, 3) {
-                    finding["downstream_impact_count"] = serde_json::json!(impacted.len());
-                    finding["downstream_entities"] = serde_json::json!(impacted
-                        .iter()
-                        .map(|e| serde_json::json!({
-                            "id": e.id,
-                            "name": e.name,
-                        }))
-                        .collect::<Vec<_>>());
-                }
-            }
-            finding
+    let findings_json: Vec<serde_json::Value> = findings
+        .iter()
+        .map(|finding| {
+            serde_json::json!({
+                "entity_id": finding.entity_id,
+                "name": finding.entity_name,
+                "finding_type": finding.category,
+                "severity": finding.severity.to_string().to_lowercase(),
+                "message": finding.message,
+            })
         })
         .collect();
 
     let result = serde_json::json!({
-        "finding_count": findings.len(),
-        "findings": findings,
+        "finding_count": findings_json.len(),
+        "severity_counts": {
+            "high": counts.high,
+            "medium": counts.medium,
+            "low": counts.low,
+            "info": counts.info,
+        },
+        "findings": findings_json,
     });
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
@@ -133,10 +128,11 @@ pub fn handle_security_scan<G: GraphStore>(
 pub const RELEASE_CHECK_DESC: &str = "\
 Run a pre-release gate and get a pass/fail verdict with the specific blockers. Toggle \
 the policy you want enforced: require_proof fails when entities are missing test proof; \
-require_approval fails when the latest change has no recorded approval. Returns whether \
-the release would pass plus a list of what's blocking it and the current coverage \
-figures. Reach for it as the final go/no-go check before cutting a release, \
-consolidating coverage and approval gates into one answer.";
+require_approval fails when any agent-authored change in recent history lacks a recorded \
+approval (the same gate as `kin release --require-approval`). Returns whether the release \
+would pass plus a list of what's blocking it and the current coverage figures. Reach for \
+it as the final go/no-go check before cutting a release, consolidating coverage and \
+approval gates into one answer.";
 
 pub fn handle_release_check<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -159,11 +155,37 @@ pub fn handle_release_check<G: GraphStore>(
     }
 
     if require_approval {
-        // Check if there are any approvals at all by querying recent audit events
-        let events = store.query_audit_events(None, 1).map_err(McpError::graph)?;
-        if events.is_empty() {
+        // Match `kin release --require-approval`: walk change history from each
+        // branch head and block on any agent-authored change that lacks a
+        // recorded `Approved` approval. The store has no working-tree HEAD file,
+        // so heads are resolved from the branch graph (graph truth). A branch is
+        // walked over its first-parent linear history.
+        let branches = store.list_branches().map_err(McpError::graph)?;
+        let mut seen: std::collections::HashSet<kin_model::SemanticChangeId> =
+            std::collections::HashSet::new();
+        let mut unapproved: Vec<kin_review::UnapprovedAgentChange> = Vec::new();
+        for branch in &branches {
+            for change in
+                kin_review::unapproved_agent_changes(store, &branch.head, 50)
+                    .map_err(|e| McpError::Review(e.to_string()))?
+            {
+                if seen.insert(change.change_id) {
+                    unapproved.push(change);
+                }
+            }
+        }
+        if !unapproved.is_empty() {
             pass = false;
-            blockers.push("no audit events found — approval status unknown".into());
+            let detail = unapproved
+                .iter()
+                .map(|c| format!("{} ({})", c.change_id, c.author))
+                .collect::<Vec<_>>()
+                .join(", ");
+            blockers.push(format!(
+                "{} unapproved agent change(s): {}",
+                unapproved.len(),
+                detail
+            ));
         }
     }
 

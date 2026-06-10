@@ -7,6 +7,7 @@ pub mod format;
 pub mod gate;
 pub mod impact;
 pub mod inline;
+pub mod release_gate;
 pub mod review;
 pub mod risk;
 
@@ -21,5 +22,9 @@ pub use format::{
 pub use gate::{derive_decision, GateStatus, ReviewDecision, ReviewFinding, ReviewSignalKind};
 pub use impact::{analyze_impact, ImpactReport};
 pub use inline::{collect_inline_comments, group_by_file, InlineComment, InlineCommentKind};
+pub use release_gate::{
+    entities_touched_by_change, security_findings, unapproved_agent_changes, SecurityFinding,
+    SecurityFindingCounts, SecuritySeverity, UnapprovedAgentChange,
+};
 pub use review::{Review, SemanticReview};
 pub use risk::assess_risk;
