@@ -1,0 +1,586 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
+//! Shared release-gate and security-scan logic.
+//!
+//! These checks back both `kin release --require-approval` / `kin security`
+//! (the CLI surface) and the `kin_release_check` / `kin_security_scan` MCP
+//! tools. Keeping the gate semantics in one place prevents the two surfaces
+//! from drifting — a divergence that previously let the MCP approval gate pass
+//! on any audit event while the CLI required an actual approval.
+
+use kin_model::change::EntityDelta;
+use kin_model::entity::{EntityKind, Visibility};
+use kin_model::graph::GraphStore;
+use kin_model::ids::{EntityId, SemanticChangeId};
+use kin_model::provenance::ApprovalDecision;
+use kin_model::relation::{GraphNodeId, RelationKind};
+
+use crate::error::ReviewError;
+
+/// An unapproved change authored by an agent, found while walking history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnapprovedAgentChange {
+    pub change_id: SemanticChangeId,
+    pub author: String,
+}
+
+/// Walk change history from `head` and collect changes authored by an agent
+/// that lack a recorded `Approved` approval.
+///
+/// Matches the `kin release --require-approval` gate: a change blocks the
+/// release when its author identifier contains "agent" and no approval with
+/// decision `Approved` is recorded for it. The walk follows first parents
+/// (linear history) for up to `limit` changes.
+pub fn unapproved_agent_changes<G: GraphStore>(
+    store: &G,
+    head: &SemanticChangeId,
+    limit: usize,
+) -> Result<Vec<UnapprovedAgentChange>, ReviewError> {
+    let mut unapproved = Vec::new();
+    let mut current = *head;
+
+    for _ in 0..limit {
+        let change = match store
+            .get_change(&current)
+            .map_err(ReviewError::graph)?
+        {
+            Some(change) => change,
+            None => break,
+        };
+
+        let approvals = store
+            .get_approvals_for_change(&change.id)
+            .map_err(ReviewError::graph)?;
+        let is_approved = approvals
+            .iter()
+            .any(|a| a.decision == ApprovalDecision::Approved);
+        if !is_approved && change.author.0.contains("agent") {
+            unapproved.push(UnapprovedAgentChange {
+                change_id: change.id,
+                author: change.author.0.clone(),
+            });
+        }
+
+        match change.parents.first() {
+            Some(parent) => current = *parent,
+            None => break,
+        }
+    }
+
+    Ok(unapproved)
+}
+
+/// Severity of a security finding, ordered low → high.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SecuritySeverity {
+    Info,
+    Low,
+    Medium,
+    High,
+}
+
+impl std::fmt::Display for SecuritySeverity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SecuritySeverity::Info => write!(f, "INFO"),
+            SecuritySeverity::Low => write!(f, "LOW"),
+            SecuritySeverity::Medium => write!(f, "MEDIUM"),
+            SecuritySeverity::High => write!(f, "HIGH"),
+        }
+    }
+}
+
+/// A single security/quality finding from the graph scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityFinding {
+    pub severity: SecuritySeverity,
+    pub category: &'static str,
+    pub message: String,
+    pub entity_id: EntityId,
+    pub entity_name: String,
+}
+
+/// Run the graph-based security/quality scan and return structured findings.
+///
+/// Surfaces, for the entity graph:
+///   - `untested-api`: API endpoints with no test coverage (high)
+///   - `orphaned-public`: public functions/methods with no callers or tests (low)
+///   - `high-fan-out`: public entities with a large downstream blast radius (medium)
+///   - `dead-event`: event contracts with no consumers (medium)
+///   - `encapsulation-leak`: public entities calling private internals (low)
+///
+/// When `propagate` is set, additionally emits `transitive-dependency` (info)
+/// findings for every entity downstream of a flagged entity. Findings are
+/// returned sorted by severity, highest first.
+pub fn security_findings<G: GraphStore>(
+    store: &G,
+    propagate: bool,
+) -> Result<Vec<SecurityFinding>, ReviewError> {
+    let entities = store
+        .list_all_entities()
+        .map_err(ReviewError::graph)?;
+
+    let mut findings: Vec<SecurityFinding> = Vec::new();
+
+    for entity in &entities {
+        let relations = store
+            .get_all_relations_for_entity(&entity.id)
+            .map_err(ReviewError::graph)?;
+
+        // 1. Exposed API endpoints without test coverage.
+        if entity.kind == EntityKind::ApiEndpoint {
+            let has_test = relations.iter().any(|r| r.kind == RelationKind::Tests);
+            if !has_test {
+                findings.push(SecurityFinding {
+                    severity: SecuritySeverity::High,
+                    category: "untested-api",
+                    message: "API endpoint has no test coverage".into(),
+                    entity_id: entity.id,
+                    entity_name: entity.name.clone(),
+                });
+            }
+        }
+
+        // 2. Public functions/methods with no callers (orphaned surface area).
+        if entity.visibility == Visibility::Public
+            && matches!(entity.kind, EntityKind::Function | EntityKind::Method)
+        {
+            let has_callers = relations
+                .iter()
+                .any(|r| r.kind == RelationKind::Calls && r.dst == GraphNodeId::Entity(entity.id));
+            let has_tests = relations.iter().any(|r| r.kind == RelationKind::Tests);
+            if !has_callers && !has_tests {
+                findings.push(SecurityFinding {
+                    severity: SecuritySeverity::Low,
+                    category: "orphaned-public",
+                    message: "Public entity has no callers or tests — unnecessary attack surface"
+                        .into(),
+                    entity_id: entity.id,
+                    entity_name: entity.name.clone(),
+                });
+            }
+        }
+
+        // 3. Deep dependency chains (transitive risk).
+        if entity.visibility == Visibility::Public {
+            let downstream = store
+                .get_downstream_impact(&entity.id, 5)
+                .map_err(ReviewError::graph)?;
+            if downstream.len() > 20 {
+                findings.push(SecurityFinding {
+                    severity: SecuritySeverity::Medium,
+                    category: "high-fan-out",
+                    message: format!(
+                        "Public entity has {} downstream dependents (high blast radius)",
+                        downstream.len()
+                    ),
+                    entity_id: entity.id,
+                    entity_name: entity.name.clone(),
+                });
+            }
+        }
+
+        // 4. Event contracts without consumers.
+        if entity.kind == EntityKind::EventContract {
+            let has_consumer = relations.iter().any(|r| {
+                r.kind == RelationKind::ConsumesContract && r.src != GraphNodeId::Entity(entity.id)
+            });
+            if !has_consumer {
+                findings.push(SecurityFinding {
+                    severity: SecuritySeverity::Medium,
+                    category: "dead-event",
+                    message:
+                        "Event contract has no consumers — potential dead code or missing handler"
+                            .into(),
+                    entity_id: entity.id,
+                    entity_name: entity.name.clone(),
+                });
+            }
+        }
+
+        // 5. Public entity calling private internals (encapsulation leak).
+        if entity.visibility == Visibility::Public {
+            let outgoing_calls = relations.iter().filter(|r| {
+                r.kind == RelationKind::Calls && r.src == GraphNodeId::Entity(entity.id)
+            });
+            for call in outgoing_calls {
+                let Some(target_id) = call.dst.as_entity() else {
+                    continue;
+                };
+                if let Some(target) = store
+                    .get_entity(&target_id)
+                    .map_err(ReviewError::graph)?
+                {
+                    if target.visibility == Visibility::Private {
+                        findings.push(SecurityFinding {
+                            severity: SecuritySeverity::Low,
+                            category: "encapsulation-leak",
+                            message: format!(
+                                "Public entity calls private '{}' — encapsulation boundary violation",
+                                target.name
+                            ),
+                            entity_id: entity.id,
+                            entity_name: entity.name.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // 6. Transitive vulnerability propagation.
+    if propagate {
+        let flagged_ids: std::collections::HashSet<EntityId> =
+            findings.iter().map(|f| f.entity_id).collect();
+        let mut transitive = Vec::new();
+
+        for entity in &entities {
+            if !flagged_ids.contains(&entity.id) {
+                continue;
+            }
+            let downstream = store
+                .get_downstream_impact(&entity.id, 10)
+                .map_err(ReviewError::graph)?;
+            for dep in &downstream {
+                transitive.push(SecurityFinding {
+                    severity: SecuritySeverity::Info,
+                    category: "transitive-dependency",
+                    message: format!(
+                        "Transitively affected by vulnerable '{}' (depth <= 10)",
+                        entity.name
+                    ),
+                    entity_id: dep.id,
+                    entity_name: dep.name.clone(),
+                });
+            }
+        }
+
+        findings.extend(transitive);
+    }
+
+    findings.sort_by(|a, b| b.severity.cmp(&a.severity));
+    Ok(findings)
+}
+
+/// Tally of findings by severity, for summary rendering.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SecurityFindingCounts {
+    pub high: usize,
+    pub medium: usize,
+    pub low: usize,
+    pub info: usize,
+}
+
+impl SecurityFindingCounts {
+    pub fn of(findings: &[SecurityFinding]) -> Self {
+        let mut counts = Self::default();
+        for finding in findings {
+            match finding.severity {
+                SecuritySeverity::High => counts.high += 1,
+                SecuritySeverity::Medium => counts.medium += 1,
+                SecuritySeverity::Low => counts.low += 1,
+                SecuritySeverity::Info => counts.info += 1,
+            }
+        }
+        counts
+    }
+}
+
+/// Entity IDs touched by a change's entity deltas (added/modified/removed).
+///
+/// Useful for release gates that need to relate a change to the entities it
+/// affects.
+pub fn entities_touched_by_change(deltas: &[EntityDelta]) -> Vec<EntityId> {
+    deltas
+        .iter()
+        .map(|delta| match delta {
+            EntityDelta::Added(entity) => entity.id,
+            EntityDelta::Modified { new, .. } => new.id,
+            EntityDelta::Removed(id) => *id,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kin_db::InMemoryGraph;
+    use kin_model::change::SemanticChange;
+    use kin_model::entity::{
+        Entity, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint,
+    };
+    use kin_model::graph::{ChangeStore, EntityStore, ProvenanceStore};
+    use kin_model::ids::{AuthorId, Hash256, LanguageId, RelationId};
+    use kin_model::provenance::{ActorId, Approval, ApprovalId};
+    use kin_model::relation::{Relation, RelationOrigin};
+    use kin_model::timestamp::Timestamp;
+
+    fn entity(name: &str, kind: EntityKind, visibility: Visibility) -> Entity {
+        Entity {
+            id: EntityId::new(),
+            kind,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([0; 32]),
+                behavior_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: None,
+            span: None,
+            signature: format!("fn {}()", name),
+            visibility,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn change_id(byte: u8) -> SemanticChangeId {
+        SemanticChangeId::from_hash(Hash256::from_bytes([byte; 32]))
+    }
+
+    fn change(id: u8, parent: Option<u8>, author: &str) -> SemanticChange {
+        SemanticChange {
+            id: change_id(id),
+            parents: parent.map(|p| vec![change_id(p)]).unwrap_or_default(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new(author),
+            message: format!("change {}", id),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        }
+    }
+
+    fn approval(change: &SemanticChange, decision: ApprovalDecision) -> Approval {
+        Approval {
+            approval_id: ApprovalId::new(),
+            change_id: change.id,
+            approver: ActorId::new(),
+            decision,
+            reason: "test".into(),
+            timestamp: Timestamp::now(),
+        }
+    }
+
+    fn calls(src: &Entity, dst: &Entity) -> Relation {
+        Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(src.id),
+            dst: GraphNodeId::Entity(dst.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: vec![],
+        }
+    }
+
+    // ── require_approval gate (unapproved_agent_changes) ────────────────────
+
+    #[test]
+    fn agent_change_without_approval_is_flagged() {
+        let store = InMemoryGraph::new();
+        let c = change(1, None, "claude-agent");
+        store.create_change(&c).unwrap();
+
+        let found = unapproved_agent_changes(&store, &c.id, 50).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].change_id, c.id);
+        assert_eq!(found[0].author, "claude-agent");
+    }
+
+    #[test]
+    fn agent_change_with_approval_is_not_flagged() {
+        let store = InMemoryGraph::new();
+        let c = change(1, None, "claude-agent");
+        store.create_change(&c).unwrap();
+        store
+            .create_approval(&approval(&c, ApprovalDecision::Approved))
+            .unwrap();
+
+        let found = unapproved_agent_changes(&store, &c.id, 50).unwrap();
+        assert!(found.is_empty(), "approved agent change must not block");
+    }
+
+    #[test]
+    fn human_change_without_approval_is_not_flagged() {
+        let store = InMemoryGraph::new();
+        let c = change(1, None, "alice");
+        store.create_change(&c).unwrap();
+
+        let found = unapproved_agent_changes(&store, &c.id, 50).unwrap();
+        assert!(found.is_empty(), "non-agent author is never gated");
+    }
+
+    #[test]
+    fn rejected_and_conditional_do_not_satisfy_approval() {
+        for decision in [ApprovalDecision::Rejected, ApprovalDecision::Conditional] {
+            let store = InMemoryGraph::new();
+            let c = change(1, None, "agent-x");
+            store.create_change(&c).unwrap();
+            store.create_approval(&approval(&c, decision)).unwrap();
+
+            let found = unapproved_agent_changes(&store, &c.id, 50).unwrap();
+            assert_eq!(
+                found.len(),
+                1,
+                "{decision:?} is not an approval and must still block"
+            );
+        }
+    }
+
+    #[test]
+    fn previously_approved_then_mutated_blocks_until_reapproved() {
+        // History: c1 (agent, approved) <- c2 (agent, NOT approved, HEAD).
+        // The new unapproved mutation must block even though an earlier change
+        // was approved — this is the audit-events-exist-but-latest-unapproved case.
+        let store = InMemoryGraph::new();
+        let c1 = change(1, None, "agent-a");
+        let c2 = change(2, Some(1), "agent-a");
+        store.create_change(&c1).unwrap();
+        store.create_change(&c2).unwrap();
+        store
+            .create_approval(&approval(&c1, ApprovalDecision::Approved))
+            .unwrap();
+
+        let found = unapproved_agent_changes(&store, &c2.id, 50).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].change_id, c2.id);
+
+        // Approving the head clears the gate.
+        store
+            .create_approval(&approval(&c2, ApprovalDecision::Approved))
+            .unwrap();
+        let found = unapproved_agent_changes(&store, &c2.id, 50).unwrap();
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn walk_respects_limit() {
+        // c1 (agent, unapproved) <- c2 (agent, unapproved, HEAD). Limit 1 only
+        // visits the head, so the older unapproved change is not reported.
+        let store = InMemoryGraph::new();
+        let c1 = change(1, None, "agent-a");
+        let c2 = change(2, Some(1), "agent-a");
+        store.create_change(&c1).unwrap();
+        store.create_change(&c2).unwrap();
+
+        let found = unapproved_agent_changes(&store, &c2.id, 1).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].change_id, c2.id);
+    }
+
+    #[test]
+    fn missing_head_change_yields_no_blockers() {
+        let store = InMemoryGraph::new();
+        let found = unapproved_agent_changes(&store, &change_id(9), 50).unwrap();
+        assert!(found.is_empty());
+    }
+
+    // ── security_findings ───────────────────────────────────────────────────
+
+    #[test]
+    fn untested_api_endpoint_is_high_severity() {
+        let store = InMemoryGraph::new();
+        let api = entity("login", EntityKind::ApiEndpoint, Visibility::Public);
+        store.upsert_entity(&api).unwrap();
+
+        let findings = security_findings(&store, false).unwrap();
+        let api_finding = findings
+            .iter()
+            .find(|f| f.category == "untested-api")
+            .expect("untested API endpoint must be flagged");
+        assert_eq!(api_finding.severity, SecuritySeverity::High);
+        assert_eq!(api_finding.entity_id, api.id);
+    }
+
+    #[test]
+    fn orphaned_public_function_is_low_severity() {
+        let store = InMemoryGraph::new();
+        let func = entity("helper", EntityKind::Function, Visibility::Public);
+        store.upsert_entity(&func).unwrap();
+
+        let findings = security_findings(&store, false).unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.category == "orphaned-public" && f.severity == SecuritySeverity::Low),
+            "public function with no callers/tests must be flagged"
+        );
+    }
+
+    #[test]
+    fn encapsulation_leak_is_detected() {
+        let store = InMemoryGraph::new();
+        let public_fn = entity("api", EntityKind::Function, Visibility::Public);
+        let private_fn = entity("internal", EntityKind::Function, Visibility::Private);
+        store.upsert_entity(&public_fn).unwrap();
+        store.upsert_entity(&private_fn).unwrap();
+        store.upsert_relation(&calls(&public_fn, &private_fn)).unwrap();
+
+        let findings = security_findings(&store, false).unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.category == "encapsulation-leak"),
+            "public->private call must be flagged"
+        );
+    }
+
+    #[test]
+    fn empty_graph_has_no_findings() {
+        let store = InMemoryGraph::new();
+        let findings = security_findings(&store, false).unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn finding_counts_tally_by_severity() {
+        let store = InMemoryGraph::new();
+        store
+            .upsert_entity(&entity("ep", EntityKind::ApiEndpoint, Visibility::Public))
+            .unwrap();
+        store
+            .upsert_entity(&entity("orphan", EntityKind::Function, Visibility::Public))
+            .unwrap();
+
+        let findings = security_findings(&store, false).unwrap();
+        let counts = SecurityFindingCounts::of(&findings);
+        assert_eq!(counts.high, 1, "one untested API endpoint");
+        assert!(counts.low >= 1, "at least one orphaned public function");
+    }
+
+    #[test]
+    fn findings_sorted_by_severity_descending() {
+        let store = InMemoryGraph::new();
+        store
+            .upsert_entity(&entity("ep", EntityKind::ApiEndpoint, Visibility::Public))
+            .unwrap();
+        store
+            .upsert_entity(&entity("orphan", EntityKind::Function, Visibility::Public))
+            .unwrap();
+
+        let findings = security_findings(&store, false).unwrap();
+        assert!(findings.len() >= 2);
+        for pair in findings.windows(2) {
+            assert!(
+                pair[0].severity >= pair[1].severity,
+                "findings must be sorted highest severity first"
+            );
+        }
+    }
+}

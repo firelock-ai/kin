@@ -2,11 +2,10 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::Result;
-use kin_model::provenance::ApprovalDecision;
 use kin_model::{
     ArtifactDeltaKind, AuthorId, ChangeStore, EntityDelta, EntityStore, GraphStore, Hash256,
-    ProvenanceStore, RelationDelta, SemanticChange, SemanticChangeId, Timestamp, VerificationStore,
-    Visibility, WorkId, WorkStore,
+    RelationDelta, SemanticChange, SemanticChangeId, Timestamp, VerificationStore, Visibility,
+    WorkId, WorkStore,
 };
 
 /// Semver bump level.
@@ -185,22 +184,17 @@ pub async fn release_with_options(tag: String, opts: ReleaseOptions) -> Result<(
 
     // Gating: --require-approval (check recent changes for unapproved agent changes)
     if opts.require_approval {
-        let changes = collect_changes_from_head(&graph, &branch.head, 50)?;
-        let mut unapproved = Vec::new();
-        for change in &changes {
-            let approvals = graph.get_approvals_for_change(&change.id)?;
-            let is_approved = approvals
-                .iter()
-                .any(|a| a.decision == ApprovalDecision::Approved);
-            if !is_approved && change.author.0.contains("agent") {
-                unapproved.push(format!("{} ({})", change.id, change.author));
-            }
-        }
+        let unapproved = kin_review::unapproved_agent_changes(graph, &branch.head, 50)?;
         if !unapproved.is_empty() {
+            let detail = unapproved
+                .iter()
+                .map(|c| format!("{} ({})", c.change_id, c.author))
+                .collect::<Vec<_>>()
+                .join(", ");
             anyhow::bail!(
                 "Release blocked: {} unapproved agent change(s): {}",
                 unapproved.len(),
-                unapproved.join(", ")
+                detail
             );
         }
     }
