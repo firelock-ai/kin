@@ -38,6 +38,7 @@ kin-semantic-contracts = { workspace = true }
 kin-review = { workspace = true }
 kin-migrate = { workspace = true }
 kin-runtime = { workspace = true }
+kin-buildinfo = { workspace = true }
 kin-mcp = { workspace = true }
 kin-db = { workspace = true }
 kin-ranking = { workspace = true }

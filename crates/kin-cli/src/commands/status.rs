@@ -39,6 +39,8 @@ struct StatusJson {
     /// above) is deliberate: it mirrors locate so one parser serves both.
     #[serde(rename = "semantic_coverage")]
     semantic_coverage: crate::commands::locate::SemanticCoverage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build: Option<BuildStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,15 +66,40 @@ pub struct StatusSummary {
 pub struct CommandStatusRequest {
     #[serde(default)]
     pub json: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_sha: Option<String>,
+    #[serde(default)]
+    pub cli_dirty: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandStatusResponse {
     pub summary: StatusSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<BuildStatus>,
     #[serde(default)]
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub json: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BuildStatus {
+    pub cli_sha: String,
+    pub cli_dirty: bool,
+    pub daemon_sha: String,
+    pub daemon_dirty: bool,
+}
+
+impl CommandStatusRequest {
+    pub fn new(json: bool) -> Self {
+        let build = kin_buildinfo::get();
+        Self {
+            json,
+            cli_sha: Some(build.sha.to_string()),
+            cli_dirty: build.dirty,
+        }
+    }
 }
 
 pub async fn run() -> Result<()> {
@@ -111,7 +138,7 @@ async fn run_daemon_status(json: bool) -> Result<CommandStatusResponse> {
     })?;
     let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
     client
-        .command_status(&CommandStatusRequest { json })
+        .command_status(&CommandStatusRequest::new(json))
         .await
         .context("daemon status failed")
 }
@@ -282,9 +309,17 @@ impl StatusSummary {
 pub fn build_command_status_response(
     summary: StatusSummary,
     json: bool,
+    build: Option<BuildStatus>,
 ) -> Result<CommandStatusResponse> {
-    let text = summary
-        .render_lines()
+    let mut lines = summary.render_lines();
+    if let Some(build) = &build {
+        lines.push(format!(
+            "Build: CLI {} / daemon {}",
+            build_id(&build.cli_sha, build.cli_dirty),
+            build_id(&build.daemon_sha, build.daemon_dirty)
+        ));
+    }
+    let text = lines
         .into_iter()
         .map(|line| format!("{line}\n"))
         .collect::<String>();
@@ -303,6 +338,7 @@ pub fn build_command_status_response(
                 embeddings_total: summary.embeddings_total,
             },
             semantic_coverage: summary.semantic_coverage(),
+            build: build.clone(),
         };
         Some(serde_json::to_string(&payload)?)
     } else {
@@ -310,9 +346,18 @@ pub fn build_command_status_response(
     };
     Ok(CommandStatusResponse {
         summary,
+        build,
         text,
         json,
     })
+}
+
+fn build_id(sha: &str, dirty: bool) -> String {
+    if dirty && sha != "unknown" {
+        format!("{sha}-dirty")
+    } else {
+        sha.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -430,7 +475,10 @@ mod tests {
         assert_eq!(coverage.pending, 7);
         assert!(!coverage.complete);
         let note = coverage.note.expect("partial coverage must carry a note");
-        assert!(note.contains("kin embed"), "note should point at remedy: {note}");
+        assert!(
+            note.contains("kin embed"),
+            "note should point at remedy: {note}"
+        );
     }
 
     #[test]
@@ -439,6 +487,30 @@ mod tests {
         let coverage = summary_with_embeddings(10, 10, 4).semantic_coverage();
         assert!(!coverage.complete);
         assert!(coverage.note.is_some());
+    }
+
+    #[test]
+    fn command_status_response_includes_cli_and_daemon_builds() {
+        let build = super::BuildStatus {
+            cli_sha: "bd7cd12".to_string(),
+            cli_dirty: false,
+            daemon_sha: "a09f882".to_string(),
+            daemon_dirty: true,
+        };
+        let response = super::build_command_status_response(
+            summary_with_embeddings(1, 1, 0),
+            true,
+            Some(build),
+        )
+        .unwrap();
+
+        assert!(response
+            .text
+            .contains("Build: CLI bd7cd12 / daemon a09f882-dirty"));
+        let json: serde_json::Value = serde_json::from_str(&response.json.unwrap()).unwrap();
+        assert_eq!(json["build"]["cli_sha"], "bd7cd12");
+        assert_eq!(json["build"]["daemon_sha"], "a09f882");
+        assert_eq!(json["build"]["daemon_dirty"], true);
     }
 
     #[tokio::test]

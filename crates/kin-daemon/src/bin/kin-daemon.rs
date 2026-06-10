@@ -91,6 +91,10 @@ fn parse_args() -> Result<Args, String> {
                         .ok_or_else(|| "--repo-id requires a value".to_string())?,
                 );
             }
+            "--version" | "-V" => {
+                println!("{}", kin_buildinfo::version_line("kin-daemon"));
+                process::exit(0);
+            }
             "--help" | "-h" => {
                 usage(
                     &env::args()

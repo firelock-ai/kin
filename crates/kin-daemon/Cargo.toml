@@ -35,6 +35,7 @@ kin-spine = { workspace = true }
 kin-registry = { workspace = true }
 kin-lsp = { workspace = true }
 kin-cli = { workspace = true }
+kin-buildinfo = { workspace = true }
 kin-mcp = { workspace = true }
 gix = { workspace = true }
 axum = { workspace = true }

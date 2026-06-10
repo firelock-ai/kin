@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::state::DaemonEvent;
 
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -68,6 +68,14 @@ pub struct HealthResponse {
     /// until restart. A true value drives `status: "attention"`.
     #[serde(default)]
     pub embed_worker_failed: bool,
+    pub build: BuildResponse,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct BuildResponse {
+    pub sha: String,
+    pub dirty: bool,
+    pub built_at: String,
 }
 
 /// Readiness response.
@@ -449,7 +457,34 @@ async fn api_version_header(
         "X-Kin-API-Version",
         axum::http::HeaderValue::from_static(API_VERSION),
     );
+    let info = kin_buildinfo::get();
+    insert_header(response.headers_mut(), "X-Kin-Daemon-Sha", info.sha);
+    insert_header(
+        response.headers_mut(),
+        "X-Kin-Daemon-Dirty",
+        if info.dirty { "true" } else { "false" },
+    );
+    insert_header(
+        response.headers_mut(),
+        "X-Kin-Daemon-Built-At",
+        info.built_at,
+    );
     response
+}
+
+fn insert_header(headers: &mut axum::http::HeaderMap, name: &'static str, value: &str) {
+    if let Ok(value) = HeaderValue::from_str(value) {
+        headers.insert(name, value);
+    }
+}
+
+fn current_build_response() -> BuildResponse {
+    let info = kin_buildinfo::get();
+    BuildResponse {
+        sha: info.sha.to_string(),
+        dirty: info.dirty,
+        built_at: info.built_at.to_string(),
+    }
 }
 
 #[derive(Clone)]
@@ -1160,6 +1195,7 @@ async fn health(
         initialized,
         mass_deletion_blocked,
         embed_worker_failed,
+        build: current_build_response(),
     }))
 }
 
@@ -1680,8 +1716,22 @@ async fn command_status(
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
     let summary = kin_cli::commands::status::build_status_summary(&state.layout, graph.as_ref())
         .map_err(internal_error)?;
-    let response = kin_cli::commands::status::build_command_status_response(summary, request.json)
-        .map_err(internal_error)?;
+    let daemon_build = kin_buildinfo::get();
+    let build = kin_cli::commands::status::BuildStatus {
+        cli_sha: request
+            .cli_sha
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        cli_dirty: request.cli_dirty,
+        daemon_sha: daemon_build.sha.to_string(),
+        daemon_dirty: daemon_build.dirty,
+    };
+    let response = kin_cli::commands::status::build_command_status_response(
+        summary,
+        request.json,
+        Some(build),
+    )
+    .map_err(internal_error)?;
     Ok(Json(response))
 }
 
@@ -3657,9 +3707,7 @@ fn build_semantic_locate_result(
     let query = match arguments.get("query").and_then(serde_json::Value::as_str) {
         Some(value) if !value.trim().is_empty() => value.to_string(),
         _ => {
-            return kin_mcp::ToolCallResult::error(
-                "missing required parameter: query".to_string(),
-            );
+            return kin_mcp::ToolCallResult::error("missing required parameter: query".to_string());
         }
     };
     let limit = arguments
@@ -6234,6 +6282,9 @@ mod tests {
         assert_eq!(json.status, "ok");
         assert!(json.uptime_seconds < 5);
         assert!(json.graph_entity_count.is_some());
+        assert_eq!(json.build.sha, kin_buildinfo::get().sha);
+        assert_eq!(json.build.dirty, kin_buildinfo::get().dirty);
+        assert!(!json.build.built_at.is_empty());
     }
 
     #[tokio::test]
@@ -7744,6 +7795,11 @@ mod tests {
             .oneshot(Request::get("/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
+        assert_eq!(
+            response.headers().get("X-Kin-Daemon-Sha").unwrap(),
+            kin_buildinfo::get().sha
+        );
+        assert!(response.headers().get("X-Kin-Daemon-Built-At").is_some());
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();
@@ -8614,7 +8670,8 @@ mod tests {
         let app = router_with_auth(state, None);
 
         // 1. Host is loopback/localhost -> should succeed
-        let res = app.clone()
+        let res = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/health")
@@ -8626,7 +8683,8 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
 
-        let res = app.clone()
+        let res = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/health")
@@ -8639,7 +8697,8 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
 
         // 2. Host is forbidden (e.g. attacker.com) -> should fail with FORBIDDEN
-        let res = app.clone()
+        let res = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/health")
@@ -8652,7 +8711,8 @@ mod tests {
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
 
         // 3. Origin is loopback/localhost -> should succeed
-        let res = app.clone()
+        let res = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/health")
@@ -8666,7 +8726,8 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
 
         // 4. Origin is forbidden (e.g. attacker.com) -> should fail with FORBIDDEN
-        let res = app.clone()
+        let res = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/health")
@@ -8680,7 +8741,8 @@ mod tests {
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
 
         // 5. Origin is null -> should fail with FORBIDDEN
-        let res = app.clone()
+        let res = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/health")

@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+[package]
+name = "kin-buildinfo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Embedded build provenance for Kin binaries"
+build = "build.rs"
+
+[dependencies]

@@ -3104,6 +3104,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "kin-buildinfo"
+version = "0.1.0"
+
+[[package]]
 name = "kin-cli"
 version = "0.1.0"
 dependencies = [
@@ -3122,6 +3126,7 @@ dependencies = [
  "hex",
  "keyring",
  "kin-blobs",
+ "kin-buildinfo",
  "kin-context",
  "kin-core",
  "kin-db",
@@ -3216,6 +3221,7 @@ dependencies = [
  "gix",
  "hex",
  "kin-blobs",
+ "kin-buildinfo",
  "kin-cli",
  "kin-core",
  "kin-db",

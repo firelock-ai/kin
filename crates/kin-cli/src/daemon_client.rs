@@ -16,8 +16,11 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
+
+static BUILD_MISMATCH_REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// Response from `GET /health`.
 #[derive(Debug, Deserialize)]
@@ -34,6 +37,15 @@ pub struct HealthResponse {
     pub repo_root: Option<String>,
     #[serde(default)]
     pub pid: Option<u32>,
+    #[serde(default)]
+    pub build: Option<BuildResponse>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct BuildResponse {
+    pub sha: String,
+    pub dirty: bool,
+    pub built_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,6 +162,14 @@ impl DaemonClient {
                 }
             }
         }
+        let build = kin_buildinfo::get();
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(build.sha) {
+            headers.insert("X-Kin-CLI-Sha", value);
+        }
+        headers.insert(
+            "X-Kin-CLI-Dirty",
+            reqwest::header::HeaderValue::from_static(if build.dirty { "true" } else { "false" }),
+        );
         if let Some(token) = resolve_daemon_auth_token() {
             if let Ok(mut value) =
                 reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
@@ -165,6 +185,16 @@ impl DaemonClient {
             .build()
             .context("build daemon client")?;
         Ok(Self { base_url, client })
+    }
+
+    async fn send(
+        &self,
+        request: reqwest::RequestBuilder,
+        context: &'static str,
+    ) -> Result<reqwest::Response> {
+        let resp = request.send().await.context(context)?;
+        check_response_build_match(resp.headers())?;
+        Ok(resp)
     }
 
     /// Try to connect to the daemon. Returns `None` if the daemon is
@@ -192,9 +222,10 @@ impl DaemonClient {
     /// Get the daemon's health response (includes entity count, uptime, etc.).
     pub async fn health(&self) -> anyhow::Result<HealthResponse> {
         let resp = self
-            .client
-            .get(format!("{}/health", self.base_url))
-            .send()
+            .send(
+                self.client.get(format!("{}/health", self.base_url)),
+                "send daemon health request",
+            )
             .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -207,9 +238,10 @@ impl DaemonClient {
     /// Get the working copy status from the daemon.
     pub async fn status(&self) -> anyhow::Result<DaemonStatusResponse> {
         let resp = self
-            .client
-            .get(format!("{}/status", self.base_url))
-            .send()
+            .send(
+                self.client.get(format!("{}/status", self.base_url)),
+                "send daemon status request",
+            )
             .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -232,7 +264,9 @@ impl DaemonClient {
         if let Some(q) = query {
             url = format!("{}?query={}", url, urlencoding::encode(q));
         }
-        let resp = self.client.get(&url).send().await?;
+        let resp = self
+            .send(self.client.get(&url), "send daemon entity search request")
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -258,12 +292,13 @@ impl DaemonClient {
         request: &LocateRequest,
     ) -> Result<crate::commands::locate::LocateResult> {
         let resp = self
-            .client
-            .post(format!("{}/locate", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon locate request")?;
+            .send(
+                self.client
+                    .post(format!("{}/locate", self.base_url))
+                    .json(request),
+                "send daemon locate request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -277,12 +312,13 @@ impl DaemonClient {
         request: &crate::commands::search::DaemonSearchRequest,
     ) -> Result<crate::commands::search::DaemonSearchResponse> {
         let resp = self
-            .client
-            .post(format!("{}/search", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon search request")?;
+            .send(
+                self.client
+                    .post(format!("{}/search", self.base_url))
+                    .json(request),
+                "send daemon search request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -293,11 +329,11 @@ impl DaemonClient {
 
     pub async fn support(&self) -> Result<crate::commands::support::SupportJson> {
         let resp = self
-            .client
-            .get(format!("{}/support", self.base_url))
-            .send()
-            .await
-            .context("send daemon support request")?;
+            .send(
+                self.client.get(format!("{}/support", self.base_url)),
+                "send daemon support request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -311,12 +347,13 @@ impl DaemonClient {
         request: &crate::commands::context::ContextRequest,
     ) -> Result<crate::commands::context::ContextResponse> {
         let resp = self
-            .client
-            .post(format!("{}/context", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon context request")?;
+            .send(
+                self.client
+                    .post(format!("{}/context", self.base_url))
+                    .json(request),
+                "send daemon context request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -330,12 +367,13 @@ impl DaemonClient {
         request: &crate::commands::trace::TraceRequest,
     ) -> Result<crate::commands::trace::TraceResponse> {
         let resp = self
-            .client
-            .post(format!("{}/trace", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon trace request")?;
+            .send(
+                self.client
+                    .post(format!("{}/trace", self.base_url))
+                    .json(request),
+                "send daemon trace request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -349,12 +387,13 @@ impl DaemonClient {
         request: &crate::commands::impact::ImpactRequest,
     ) -> Result<crate::commands::impact::ImpactResponse> {
         let resp = self
-            .client
-            .post(format!("{}/impact", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon impact request")?;
+            .send(
+                self.client
+                    .post(format!("{}/impact", self.base_url))
+                    .json(request),
+                "send daemon impact request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -368,12 +407,13 @@ impl DaemonClient {
         request: &crate::commands::review::ReviewRequest,
     ) -> Result<crate::commands::review::ReviewResponse> {
         let resp = self
-            .client
-            .post(format!("{}/review", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon review request")?;
+            .send(
+                self.client
+                    .post(format!("{}/review", self.base_url))
+                    .json(request),
+                "send daemon review request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -397,13 +437,14 @@ impl DaemonClient {
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(300));
         let resp = self
-            .client
-            .post(format!("{}/embed", self.base_url))
-            .timeout(embed_timeout)
-            .json(request)
-            .send()
-            .await
-            .context("send daemon embed request")?;
+            .send(
+                self.client
+                    .post(format!("{}/embed", self.base_url))
+                    .timeout(embed_timeout)
+                    .json(request),
+                "send daemon embed request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -417,12 +458,13 @@ impl DaemonClient {
         request: &crate::commands::blame::BlameRequest,
     ) -> Result<crate::commands::blame::BlameResponse> {
         let resp = self
-            .client
-            .post(format!("{}/blame", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon blame request")?;
+            .send(
+                self.client
+                    .post(format!("{}/blame", self.base_url))
+                    .json(request),
+                "send daemon blame request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -436,12 +478,13 @@ impl DaemonClient {
         request: &crate::commands::history::HistoryRequest,
     ) -> Result<crate::commands::history::HistoryResponse> {
         let resp = self
-            .client
-            .post(format!("{}/history", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon history request")?;
+            .send(
+                self.client
+                    .post(format!("{}/history", self.base_url))
+                    .json(request),
+                "send daemon history request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -455,12 +498,13 @@ impl DaemonClient {
         request: &crate::commands::verify::VerifyRunRequest,
     ) -> Result<crate::commands::verify::VerifyRunResponse> {
         let resp = self
-            .client
-            .post(format!("{}/verify/run", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon verify run request")?;
+            .send(
+                self.client
+                    .post(format!("{}/verify/run", self.base_url))
+                    .json(request),
+                "send daemon verify run request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -477,12 +521,13 @@ impl DaemonClient {
         request: &crate::commands::verify::VerifyCommandRequest,
     ) -> Result<crate::commands::verify::VerifyCommandResponse> {
         let resp = self
-            .client
-            .post(format!("{}/commands/verify", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon verify request")?;
+            .send(
+                self.client
+                    .post(format!("{}/commands/verify", self.base_url))
+                    .json(request),
+                "send daemon verify request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -496,12 +541,13 @@ impl DaemonClient {
         request: &crate::commands::reconcile::ReconcileRequest,
     ) -> Result<crate::commands::reconcile::ReconcileSummary> {
         let resp = self
-            .client
-            .post(format!("{}/reconcile", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon reconcile request")?;
+            .send(
+                self.client
+                    .post(format!("{}/reconcile", self.base_url))
+                    .json(request),
+                "send daemon reconcile request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -518,12 +564,13 @@ impl DaemonClient {
         request: &crate::commands::status::CommandStatusRequest,
     ) -> Result<crate::commands::status::CommandStatusResponse> {
         let resp = self
-            .client
-            .post(format!("{}/commands/status", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon command status request")?;
+            .send(
+                self.client
+                    .post(format!("{}/commands/status", self.base_url))
+                    .json(request),
+                "send daemon command status request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -540,12 +587,13 @@ impl DaemonClient {
         request: &crate::commands::graph::GraphCommandRequest,
     ) -> Result<crate::commands::graph::GraphCommandResponse> {
         let resp = self
-            .client
-            .post(format!("{}/commands/graph", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon graph command request")?;
+            .send(
+                self.client
+                    .post(format!("{}/commands/graph", self.base_url))
+                    .json(request),
+                "send daemon graph command request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -562,12 +610,13 @@ impl DaemonClient {
         request: &crate::commands::overview::OverviewRequest,
     ) -> Result<crate::commands::overview::OverviewResponse> {
         let resp = self
-            .client
-            .post(format!("{}/commands/overview", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon overview request")?;
+            .send(
+                self.client
+                    .post(format!("{}/commands/overview", self.base_url))
+                    .json(request),
+                "send daemon overview request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -584,12 +633,13 @@ impl DaemonClient {
         request: &crate::commands::dead_code::DeadCodeRequest,
     ) -> Result<crate::commands::dead_code::DeadCodeResponse> {
         let resp = self
-            .client
-            .post(format!("{}/commands/dead-code", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon dead-code request")?;
+            .send(
+                self.client
+                    .post(format!("{}/commands/dead-code", self.base_url))
+                    .json(request),
+                "send daemon dead-code request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -606,12 +656,13 @@ impl DaemonClient {
         request: &crate::commands::dead_code::DeadCodeSeededRequest,
     ) -> Result<crate::commands::dead_code::DeadCodeSeededResponse> {
         let resp = self
-            .client
-            .post(format!("{}/commands/dead-code-seeded", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon seeded dead-code request")?;
+            .send(
+                self.client
+                    .post(format!("{}/commands/dead-code-seeded", self.base_url))
+                    .json(request),
+                "send daemon seeded dead-code request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -628,12 +679,13 @@ impl DaemonClient {
         request: &crate::commands::trace_data_flow::TraceDataFlowRequest,
     ) -> Result<crate::commands::trace_data_flow::TraceDataFlowResponse> {
         let resp = self
-            .client
-            .post(format!("{}/commands/trace-data-flow", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon trace-data-flow request")?;
+            .send(
+                self.client
+                    .post(format!("{}/commands/trace-data-flow", self.base_url))
+                    .json(request),
+                "send daemon trace-data-flow request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -650,12 +702,13 @@ impl DaemonClient {
         request: &crate::commands::refs::RefsRequest,
     ) -> Result<crate::commands::refs::RefsResponse> {
         let resp = self
-            .client
-            .post(format!("{}/commands/refs", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon refs request")?;
+            .send(
+                self.client
+                    .post(format!("{}/commands/refs", self.base_url))
+                    .json(request),
+                "send daemon refs request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -669,12 +722,13 @@ impl DaemonClient {
         request: &crate::commands::refs::BulkRefsRequest,
     ) -> Result<crate::commands::refs::BulkRefsResponse> {
         let resp = self
-            .client
-            .post(format!("{}/commands/bulk-refs", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon bulk-refs request")?;
+            .send(
+                self.client
+                    .post(format!("{}/commands/bulk-refs", self.base_url))
+                    .json(request),
+                "send daemon bulk-refs request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -691,12 +745,13 @@ impl DaemonClient {
         request: &crate::commands::xref::XrefRequest,
     ) -> Result<crate::commands::xref::XrefResponse> {
         let resp = self
-            .client
-            .post(format!("{}/commands/xref", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon xref request")?;
+            .send(
+                self.client
+                    .post(format!("{}/commands/xref", self.base_url))
+                    .json(request),
+                "send daemon xref request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -710,12 +765,13 @@ impl DaemonClient {
         request: &crate::commands::diff::DiffRequest,
     ) -> Result<crate::commands::diff::DiffResponse> {
         let resp = self
-            .client
-            .post(format!("{}/commands/diff", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon diff request")?;
+            .send(
+                self.client
+                    .post(format!("{}/commands/diff", self.base_url))
+                    .json(request),
+                "send daemon diff request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -729,12 +785,13 @@ impl DaemonClient {
         request: &crate::commands::log::LogRequest,
     ) -> Result<crate::commands::log::LogResponse> {
         let resp = self
-            .client
-            .post(format!("{}/commands/log", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon log request")?;
+            .send(
+                self.client
+                    .post(format!("{}/commands/log", self.base_url))
+                    .json(request),
+                "send daemon log request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -748,12 +805,13 @@ impl DaemonClient {
         request: &crate::commands::audit::AuditRequest,
     ) -> Result<crate::commands::audit::AuditResponse> {
         let resp = self
-            .client
-            .post(format!("{}/commands/audit", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon audit request")?;
+            .send(
+                self.client
+                    .post(format!("{}/commands/audit", self.base_url))
+                    .json(request),
+                "send daemon audit request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -767,12 +825,13 @@ impl DaemonClient {
         request: &crate::commands::approvals::ApprovalsRequest,
     ) -> Result<crate::commands::approvals::ApprovalsResponse> {
         let resp = self
-            .client
-            .post(format!("{}/commands/approvals", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon approvals request")?;
+            .send(
+                self.client
+                    .post(format!("{}/commands/approvals", self.base_url))
+                    .json(request),
+                "send daemon approvals request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -789,12 +848,13 @@ impl DaemonClient {
         request: &crate::commands::security::SecurityRequest,
     ) -> Result<crate::commands::security::SecurityResponse> {
         let resp = self
-            .client
-            .post(format!("{}/commands/security", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon security request")?;
+            .send(
+                self.client
+                    .post(format!("{}/commands/security", self.base_url))
+                    .json(request),
+                "send daemon security request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -811,12 +871,13 @@ impl DaemonClient {
         request: &crate::commands::branch::BranchRequest,
     ) -> Result<crate::commands::branch::BranchResponse> {
         let resp = self
-            .client
-            .post(format!("{}/commands/branch", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon branch request")?;
+            .send(
+                self.client
+                    .post(format!("{}/commands/branch", self.base_url))
+                    .json(request),
+                "send daemon branch request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -830,12 +891,13 @@ impl DaemonClient {
         request: &crate::commands::checkout::CheckoutRequest,
     ) -> Result<crate::commands::checkout::CheckoutResponse> {
         let resp = self
-            .client
-            .post(format!("{}/commands/checkout", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon checkout request")?;
+            .send(
+                self.client
+                    .post(format!("{}/commands/checkout", self.base_url))
+                    .json(request),
+                "send daemon checkout request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -852,12 +914,13 @@ impl DaemonClient {
         request: &crate::commands::rename::RenameRequest,
     ) -> Result<crate::commands::rename::RenameResponse> {
         let resp = self
-            .client
-            .post(format!("{}/commands/rename", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon rename request")?;
+            .send(
+                self.client
+                    .post(format!("{}/commands/rename", self.base_url))
+                    .json(request),
+                "send daemon rename request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -871,12 +934,13 @@ impl DaemonClient {
         request: &crate::commands::session_workspace::SessionWorkspaceRequest,
     ) -> Result<crate::commands::session_workspace::SessionWorkspaceResponse> {
         let resp = self
-            .client
-            .post(format!("{}/commands/session-workspace", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon session workspace request")?;
+            .send(
+                self.client
+                    .post(format!("{}/commands/session-workspace", self.base_url))
+                    .json(request),
+                "send daemon session workspace request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -893,12 +957,13 @@ impl DaemonClient {
         request: &crate::commands::exec::ExecRequest,
     ) -> Result<crate::commands::exec::ExecResponse> {
         let resp = self
-            .client
-            .post(format!("{}/commands/exec", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon exec request")?;
+            .send(
+                self.client
+                    .post(format!("{}/commands/exec", self.base_url))
+                    .json(request),
+                "send daemon exec request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -912,12 +977,13 @@ impl DaemonClient {
         request: &crate::commands::work::WorkRequest,
     ) -> Result<crate::commands::work::WorkResponse> {
         let resp = self
-            .client
-            .post(format!("{}/work", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon work request")?;
+            .send(
+                self.client
+                    .post(format!("{}/work", self.base_url))
+                    .json(request),
+                "send daemon work request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -931,12 +997,13 @@ impl DaemonClient {
         request: &crate::commands::note::NoteRequest,
     ) -> Result<crate::commands::note::NoteResponse> {
         let resp = self
-            .client
-            .post(format!("{}/note", self.base_url))
-            .json(request)
-            .send()
-            .await
-            .context("send daemon note request")?;
+            .send(
+                self.client
+                    .post(format!("{}/note", self.base_url))
+                    .json(request),
+                "send daemon note request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -947,12 +1014,13 @@ impl DaemonClient {
 
     pub async fn set_scope(&self, session_id: &str, ref_string: &str) -> Result<ScopeResponse> {
         let resp = self
-            .client
-            .post(format!("{}/session/{}/scope", self.base_url, session_id))
-            .json(&serde_json::json!({ "ref_string": ref_string }))
-            .send()
-            .await
-            .context("send set_scope request")?;
+            .send(
+                self.client
+                    .post(format!("{}/session/{}/scope", self.base_url, session_id))
+                    .json(&serde_json::json!({ "ref_string": ref_string })),
+                "send set_scope request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -963,11 +1031,12 @@ impl DaemonClient {
 
     pub async fn clear_scope(&self, session_id: &str) -> Result<()> {
         let resp = self
-            .client
-            .delete(format!("{}/session/{}/scope", self.base_url, session_id))
-            .send()
-            .await
-            .context("send clear_scope request")?;
+            .send(
+                self.client
+                    .delete(format!("{}/session/{}/scope", self.base_url, session_id)),
+                "send clear_scope request",
+            )
+            .await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -978,11 +1047,12 @@ impl DaemonClient {
 
     pub async fn get_scope(&self, session_id: &str) -> Result<Option<ScopeResponse>> {
         let resp = self
-            .client
-            .get(format!("{}/session/{}/scope", self.base_url, session_id))
-            .send()
-            .await
-            .context("send get_scope request")?;
+            .send(
+                self.client
+                    .get(format!("{}/session/{}/scope", self.base_url, session_id)),
+                "send get_scope request",
+            )
+            .await?;
         if resp.status().as_u16() == 404 {
             return Ok(None);
         }
@@ -1000,6 +1070,68 @@ fn is_transient_bool_env(name: &str) -> bool {
         .ok()
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
+}
+
+fn header_str<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name)?.to_str().ok()
+}
+
+fn build_id(sha: &str, dirty: bool) -> Option<String> {
+    let sha = sha.trim();
+    if sha.is_empty() || sha == "unknown" {
+        return None;
+    }
+    if dirty {
+        Some(format!("{sha}-dirty"))
+    } else {
+        Some(sha.to_string())
+    }
+}
+
+fn build_mismatch_message(cli: &str, daemon: &str) -> String {
+    format!("Kin build mismatch: CLI {cli} / daemon {daemon} - restart the daemon to match")
+}
+
+fn parse_boolish(value: &str) -> bool {
+    matches!(value, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+}
+
+fn build_match_error(cli: &str, daemon: &str, strict: bool) -> Result<Option<String>> {
+    if cli == daemon {
+        return Ok(None);
+    }
+    let message = build_mismatch_message(cli, daemon);
+    if strict {
+        bail!("{message}");
+    }
+    Ok(Some(message))
+}
+
+fn check_response_build_match(headers: &reqwest::header::HeaderMap) -> Result<()> {
+    let daemon_sha = match header_str(headers, "X-Kin-Daemon-Sha") {
+        Some(value) => value,
+        None => return Ok(()),
+    };
+    let daemon_dirty = header_str(headers, "X-Kin-Daemon-Dirty")
+        .map(parse_boolish)
+        .unwrap_or(false);
+    let Some(daemon_id) = build_id(daemon_sha, daemon_dirty) else {
+        return Ok(());
+    };
+    let cli = kin_buildinfo::get();
+    let Some(cli_id) = build_id(cli.sha, cli.dirty) else {
+        return Ok(());
+    };
+    if let Some(message) = build_match_error(
+        &cli_id,
+        &daemon_id,
+        is_transient_bool_env("KIN_STRICT_BUILD_MATCH"),
+    )? {
+        if !BUILD_MISMATCH_REPORTED.swap(true, Ordering::SeqCst) {
+            warn!("{message}");
+        }
+    }
+    Ok(())
 }
 
 pub fn daemon_required() -> bool {
@@ -2141,10 +2273,36 @@ mod tests {
             repo_id: Some("wrong".to_string()),
             repo_root: Some(canonical_path_string(other.path())),
             pid: Some(std::process::id()),
+            build: None,
         };
 
         let error = validate_health_repo(&health, dir.path()).unwrap_err();
         assert!(error.to_string().contains("daemon repo mismatch"));
+    }
+
+    #[test]
+    fn build_mismatch_warns_without_strict_mode() {
+        let warning = build_match_error("bd7cd12", "a09f882", false)
+            .unwrap()
+            .expect("mismatch should warn");
+
+        assert_eq!(
+            warning,
+            "Kin build mismatch: CLI bd7cd12 / daemon a09f882 - restart the daemon to match"
+        );
+    }
+
+    #[test]
+    fn build_mismatch_errors_in_strict_mode() {
+        let err = build_match_error("bd7cd12", "a09f882", true).unwrap_err();
+
+        assert!(err.to_string().contains("restart the daemon to match"));
+    }
+
+    #[test]
+    fn build_id_preserves_dirty_suffix() {
+        assert_eq!(build_id("bd7cd12", true).as_deref(), Some("bd7cd12-dirty"));
+        assert_eq!(build_id("unknown", true), None);
     }
 
     #[test]
