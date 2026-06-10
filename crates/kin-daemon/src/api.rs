@@ -32,6 +32,31 @@ use crate::state::DaemonState;
 
 static BOOTSTRAP_EXPORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
+/// Acquire a `std::sync::Mutex`, recovering the guard if the lock was poisoned
+/// by a panic in a prior holder.
+///
+/// The daemon's request-path locks guard simple in-memory map operations
+/// (`insert`/`get`/`remove`/`clone`) that leave the data structurally
+/// consistent even if a holder unwound mid-way. Propagating the poison would
+/// turn one transient panic into a permanent `500` on every later request that
+/// touches the lock (poison is sticky until restart). Recovering keeps the
+/// path serving instead, which is the correct treatment here and never panics.
+fn lock_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Read-acquire a `std::sync::RwLock`, recovering on poison. See
+/// [`lock_recover`] for why recovery (not propagation) is correct here.
+fn read_recover<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Write-acquire a `std::sync::RwLock`, recovering on poison. See
+/// [`lock_recover`] for why recovery (not propagation) is correct here.
+fn write_recover<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Health check response.
 #[derive(Debug, Serialize, serde::Deserialize)]
 pub struct HealthResponse {
@@ -1398,13 +1423,13 @@ async fn set_scope(
             // Build the historical graph at that ref, using cached OID mapping
             // for fast scope switching without re-walking the commit DAG.
             let oid_cache: Option<kin_core::ChangeOidCache> = {
-                let needs_build = state_clone.change_oid_cache.read().unwrap().is_none();
+                let needs_build = read_recover(&state_clone.change_oid_cache).is_none();
                 if needs_build {
                     if let Ok(repo) = open_repo(state_clone.layout.working_dir()) {
                         match kin_core::build_change_oid_cache(&repo) {
                             Ok(cache) => {
                                 info!("built change OID cache for fast scope switching");
-                                *state_clone.change_oid_cache.write().unwrap() = Some(cache);
+                                *write_recover(&state_clone.change_oid_cache) = Some(cache);
                             }
                             Err(err) => {
                                 tracing::warn!(error = %err, "failed to build change OID cache, falling back to per-call lookup");
@@ -1412,7 +1437,7 @@ async fn set_scope(
                         }
                     }
                 }
-                state_clone.change_oid_cache.read().unwrap().clone()
+                read_recover(&state_clone.change_oid_cache).clone()
             };
             let historical = if let Some(git_oid) = ref_string.strip_prefix("git:") {
                 kin_core::build_graph_at_git_ref_with_repo(
@@ -3634,10 +3659,7 @@ fn mcp_session_registry_snapshot(
     // Restore in-flight transactions so a registry built fresh for this request
     // sees what earlier requests staged; sessions/intents persist via the graph,
     // but transactions live only in DaemonState.
-    let transactions = state
-        .mcp_transactions
-        .lock()
-        .expect("mcp_transactions lock poisoned")
+    let transactions = lock_recover(&state.mcp_transactions)
         .values()
         .cloned()
         .collect();
@@ -3649,10 +3671,7 @@ fn mcp_session_registry_snapshot(
 /// so begin/stage/validate/commit issued across separate HTTP requests share
 /// state. Counterpart to the restore in `mcp_session_registry_snapshot`.
 fn persist_mcp_transactions(state: &DaemonState, registry: &kin_mcp::SessionRegistry) {
-    let mut store = state
-        .mcp_transactions
-        .lock()
-        .expect("mcp_transactions lock poisoned");
+    let mut store = lock_recover(&state.mcp_transactions);
     // Merge, don't clear: only upsert the transactions this request's registry
     // holds. Clearing would drop a transaction another request begun
     // concurrently (it restored the store before this one, but this registry
@@ -3667,11 +3686,7 @@ fn persist_mcp_transactions(state: &DaemonState, registry: &kin_mcp::SessionRegi
 /// (committed/aborted), so finished transactions do not accumulate. Called only
 /// after the terminal tool call succeeds.
 fn forget_mcp_transaction(state: &DaemonState, transaction_id: &str) {
-    state
-        .mcp_transactions
-        .lock()
-        .expect("mcp_transactions lock poisoned")
-        .remove(transaction_id);
+    lock_recover(&state.mcp_transactions).remove(transaction_id);
 }
 
 /// The transaction id a terminal transaction tool (commit/abort) acted on, used
