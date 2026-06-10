@@ -137,5 +137,10 @@ kin-spine = { path = "crates/kin-spine" }
 kin-registry = { path = "crates/kin-registry" }
 kin-lsp = { path = "../kin-lsp" }
 kin-pipelines = { path = "crates/kin-pipelines" }
-kin-db = { version = "0.1.0", registry = "kin", default-features = false, features = ["vector", "embeddings", "metal"] }
+# Cross-platform base: NO "metal" here. `[workspace.dependencies]` entries cannot be
+# `[target.'cfg(...)']`-gated, so listing "metal" here forces the macOS-only kin-infer/metal
+# backend on every target (incl. Linux, where it cannot compile). Metal is re-enabled
+# additively on macOS via a `[target.'cfg(target_os = "macos")'.dependencies]` block in the
+# binary/runtime crates (kin-cli, kin-daemon). Feature unification makes that additive.
+kin-db = { version = "0.1.0", registry = "kin", default-features = false, features = ["vector", "embeddings"] }
 kin-vfs-core = { version = "0.1.0", registry = "kin" }
