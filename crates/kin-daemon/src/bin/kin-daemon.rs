@@ -247,8 +247,38 @@ fn embed_batch_size_from_env() -> Result<Option<usize>, String> {
     Ok(Some(size))
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Build the async runtime explicitly (rather than via `#[tokio::main]`) so
+    // we own its teardown. The embedding worker dispatches batches onto the
+    // blocking pool doing synchronous GPU compute that cannot observe the
+    // shutdown signal; a plain runtime drop would wait for an in-flight batch
+    // *indefinitely*, leaving a headless, SIGTERM-immune CPU zombie still
+    // racing kvec writes. Bounding teardown here is what lets the process exit.
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("kin-daemon: failed to build async runtime: {error}");
+            process::exit(1);
+        }
+    };
+
+    let exit_code = runtime.block_on(async_main());
+
+    // `block_on` has returned (graceful shutdown released the lock + endpoint
+    // files), but a blocking embed batch may still be running. `shutdown_timeout`
+    // waits a bounded grace period for the blocking pool to drain, then abandons
+    // anything still running so we don't hang here…
+    runtime.shutdown_timeout(kin_daemon::daemon::runtime_shutdown_grace());
+    // …and we exit explicitly to terminate the whole process — including any
+    // blocking thread that was abandoned above. SIGTERM always ends in real
+    // termination; no zombie survives.
+    process::exit(exit_code);
+}
+
+async fn async_main() -> i32 {
     tracing_subscriber::fmt::init();
 
     let program = env::args()
@@ -272,7 +302,7 @@ async fn main() {
                 "graph_snapshot_version": kin_db::GraphSnapshot::CURRENT_VERSION,
             })
         );
-        return;
+        return 0;
     }
 
     if args.supervisor {
@@ -285,9 +315,9 @@ async fn main() {
         };
         if let Err(error) = kin_daemon::supervisor::run_supervisor(args.port, idle_timeout).await {
             eprintln!("kin-daemon supervisor: {error}");
-            process::exit(1);
+            return 1;
         }
-        return;
+        return 0;
     }
 
     let layout = match resolve_layout(&args.repo) {
@@ -342,6 +372,7 @@ async fn main() {
 
     if let Err(error) = run(state, config).await {
         eprintln!("kin-daemon: {error}");
-        process::exit(1);
+        return 1;
     }
+    0
 }
