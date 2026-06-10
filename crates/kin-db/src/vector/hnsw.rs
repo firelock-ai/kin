@@ -56,6 +56,11 @@ impl VectorIndex {
         self.inner.contains(key)
     }
 
+    /// All retrieval keys currently held in the index.
+    pub fn retrievable_keys(&self) -> Vec<RetrievalKey> {
+        self.inner.keys()
+    }
+
     /// Get the embedding vector for this entity if present.
     pub fn get(&self, entity_id: &EntityId) -> Option<Vec<f32>> {
         let key = RetrievalKey::from(*entity_id);

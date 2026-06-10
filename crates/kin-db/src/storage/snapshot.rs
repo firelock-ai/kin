@@ -517,6 +517,21 @@ impl SnapshotManager {
         }
 
         let count = graph.load_vector_index(&vector_path)?;
+
+        // Generation eviction: the root-hash gate accepts a sidecar whose entity
+        // content matches even when its revision keys were minted under a prior
+        // (re-init) change id. Those keys are now orphans — drop them so the
+        // installed index reflects only current graph truth and stale
+        // generations stop competing in ANN retrieval.
+        let evicted = graph.prune_orphaned_vectors();
+        if evicted > 0 {
+            tracing::info!(
+                path = %vector_path.display(),
+                evicted,
+                "evicted orphaned-generation vectors after loading sidecar"
+            );
+        }
+
         if metadata.is_none() && write_missing_metadata {
             if let Some((dimensions, indexed)) = graph.vector_index_stats() {
                 let (provider, model_id, revision, pipeline_epoch, runtime_dimensions) =

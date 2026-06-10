@@ -2741,6 +2741,9 @@ impl InMemoryGraph {
         if initial_pending > 0 {
             eprintln!();
         }
+        // Drain complete — reconcile the index to graph truth so superseded
+        // revision generations do not survive the pass.
+        self.prune_orphaned_vectors();
         Ok(total)
     }
 
@@ -3080,6 +3083,77 @@ impl InMemoryGraph {
         Ok(0)
     }
 
+    /// Every retrieval key that participates in semantic embedding under the
+    /// CURRENT graph truth: all entity revisions, all HEAD entities, and all
+    /// graph-owned artifacts. This is the authoritative target set the vector
+    /// index should converge to — a key in the index but absent here is a stale
+    /// generation that must be evicted.
+    #[cfg(feature = "vector")]
+    fn graph_truth_retrievable_keys(&self) -> hashbrown::HashSet<RetrievalKey> {
+        let ent = self.entities.read();
+        let mut keys = hashbrown::HashSet::new();
+        for revisions in ent.entity_revisions.values() {
+            for rev in revisions {
+                keys.insert(RetrievalKey::EntityRevision(rev.revision_id));
+            }
+        }
+        keys.extend(ent.entities.keys().map(|id| RetrievalKey::Entity(*id)));
+        keys.extend(
+            collect_artifact_ids(&ent)
+                .into_iter()
+                .map(RetrievalKey::Artifact),
+        );
+        keys
+    }
+
+    /// Evict vectors whose keys no longer exist in graph truth (generation
+    /// eviction).
+    ///
+    /// Re-init mints fresh `SemanticChangeId`s, so every entity gets a brand-new
+    /// `EntityRevision` key each cycle. The vector index upserts these as new
+    /// keys, but the prior generation's revision keys — orphaned the moment the
+    /// graph dropped them — keep their vectors and the persisted sidecar carries
+    /// them forward. Across re-init/re-embed cycles the index accumulates
+    /// generations (~78% stale) that all compete in ANN retrieval.
+    ///
+    /// This reconciles the index back to graph truth: any indexed key not in the
+    /// current retrievable set is removed. Returns the number of vectors evicted.
+    /// Idempotent and cheap when the index is already clean.
+    #[cfg(feature = "vector")]
+    pub fn prune_orphaned_vectors(&self) -> usize {
+        let _span = tracing::info_span!("kindb.prune_orphaned_vectors").entered();
+
+        let vi = match self.vector_index.lock().clone() {
+            Some(vi) => vi,
+            None => return 0,
+        };
+
+        let truth = self.graph_truth_retrievable_keys();
+        let orphans: Vec<RetrievalKey> = vi
+            .retrievable_keys()
+            .into_iter()
+            .filter(|key| !truth.contains(key))
+            .collect();
+
+        let mut evicted = 0usize;
+        for key in &orphans {
+            if vi.remove_retrievable(key).is_ok() {
+                evicted += 1;
+            }
+        }
+
+        if evicted > 0 {
+            tracing::info!(evicted, "pruned orphaned vectors from index");
+        }
+        evicted
+    }
+
+    /// Prune orphaned vectors (stub when vector feature is disabled).
+    #[cfg(not(feature = "vector"))]
+    pub fn prune_orphaned_vectors(&self) -> usize {
+        0
+    }
+
     /// Get the current embedding status.
     ///
     /// The returned `pending` field is `max(queue_length, total - indexed)` so
@@ -3091,22 +3165,7 @@ impl InMemoryGraph {
         let (queue_len, indexed, total) = {
             let queue_len =
                 self.embedding_queue.lock().len() + self.artifact_embedding_queue.lock().len();
-            let retrievable_keys = {
-                let ent = self.entities.read();
-                let mut keys = Vec::new();
-                for revisions in ent.entity_revisions.values() {
-                    for rev in revisions {
-                        keys.push(RetrievalKey::EntityRevision(rev.revision_id));
-                    }
-                }
-                keys.extend(ent.entities.keys().map(|id| RetrievalKey::Entity(*id)));
-                keys.extend(
-                    collect_artifact_ids(&ent)
-                        .into_iter()
-                        .map(RetrievalKey::Artifact),
-                );
-                keys
-            };
+            let retrievable_keys = self.graph_truth_retrievable_keys();
             let total = retrievable_keys.len();
             let indexed = self
                 .vector_index
@@ -8699,6 +8758,113 @@ mod tests {
             2,
             "reset must re-queue every entity for a clean dimension rebuild"
         );
+    }
+
+    /// Add `entities` to the graph under a fresh change id, recording one
+    /// `EntityRevision` per entity (mirrors `kin init`, whose change id is seeded
+    /// with a timestamp so every re-init mints new revision keys).
+    #[cfg(feature = "vector")]
+    fn apply_init_change(graph: &InMemoryGraph, change_byte: u8, entities: &[Entity]) {
+        let change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([change_byte; 32])),
+            parents: vec![],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "init".to_string(),
+            entity_deltas: entities
+                .iter()
+                .map(|e| EntityDelta::Added(e.clone()))
+                .collect(),
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+        graph.create_change(&change).unwrap();
+        graph.batch_upsert_entities(entities).unwrap();
+    }
+
+    /// Synthetically "embed" every current graph-truth retrievable key by
+    /// upserting a unit vector — exercises the index lifecycle without a GPU or
+    /// the `embeddings` feature (so it cannot reach `get_vector_index`).
+    #[cfg(feature = "vector")]
+    fn embed_all_retrievable(graph: &InMemoryGraph) {
+        {
+            let mut guard = graph.vector_index.lock();
+            if guard.is_none() {
+                *guard = Some(Arc::new(VectorIndex::new(2).unwrap()));
+            }
+        }
+        let vi = graph.vector_index.lock().clone().unwrap();
+        for key in graph.graph_truth_retrievable_keys() {
+            vi.upsert_retrievable(key, &[1.0, 0.0]).unwrap();
+        }
+    }
+
+    /// Gate for #21: across init → embed → re-init → re-embed the vector index
+    /// must converge to the true target count, not accumulate stale revision
+    /// generations.
+    ///
+    /// Production re-init builds a FRESH graph under a new change id, so every
+    /// entity gets a brand-new `EntityRevision` key. The prior generation's
+    /// revision vectors survive only in the persisted sidecar; once that sidecar
+    /// is loaded into the new graph they are orphans relative to current truth.
+    /// `prune_orphaned_vectors` reconciles the index back to graph truth.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn reembed_after_reinit_converges_to_true_target_count() {
+        let e1 = test_entity("foo", "src/a.rs");
+        let e2 = test_entity("bar", "src/b.rs");
+        let entities = [e1, e2];
+        let dir = tempfile::TempDir::new().unwrap();
+        let sidecar = dir.path().join("vectors.kvec");
+
+        // init (generation 1) → embed → persist sidecar
+        let gen1 = InMemoryGraph::new();
+        apply_init_change(&gen1, 0x01, &entities);
+        let target = gen1.graph_truth_retrievable_keys().len();
+        // 2 HEAD entities + 2 revisions (generation 1).
+        assert_eq!(target, 4);
+        embed_all_retrievable(&gen1);
+        assert_eq!(gen1.vector_index_stats().unwrap().1, target);
+        gen1.save_vector_index(&sidecar).unwrap();
+
+        // re-init: a fresh graph under a NEW change id. Generation-1 revision
+        // keys exist only in the sidecar now, not in this graph's truth.
+        let gen2 = InMemoryGraph::new();
+        apply_init_change(&gen2, 0x02, &entities);
+        let target_after = gen2.graph_truth_retrievable_keys().len();
+        assert_eq!(target_after, 4);
+
+        // Reopen reuses the persisted sidecar (entity content unchanged → root
+        // hash matches), dragging the generation-1 revision vectors back in.
+        let loaded = gen2.load_vector_index(&sidecar).unwrap();
+        assert_eq!(loaded, target, "sidecar carries the full generation-1 index");
+
+        // Re-embed the current generation. Its HEAD-entity keys replace, but the
+        // generation-2 revision keys are new — so without eviction the index now
+        // holds BOTH generations' revision vectors (stale-generation bloat).
+        embed_all_retrievable(&gen2);
+        let before_prune = gen2.vector_index_stats().unwrap().1;
+        assert!(
+            before_prune > target_after,
+            "expected stale-generation accumulation before pruning ({before_prune} vs {target_after})"
+        );
+
+        // GATE: eviction reconciles the index to graph truth.
+        let evicted = gen2.prune_orphaned_vectors();
+        assert_eq!(evicted, before_prune - target_after);
+        assert_eq!(
+            gen2.vector_index_stats().unwrap().1,
+            target_after,
+            "index must equal the true target count after re-embed + prune"
+        );
+
+        // Idempotent: a clean index prunes nothing.
+        assert_eq!(gen2.prune_orphaned_vectors(), 0);
     }
 
     #[cfg(feature = "vector")]
