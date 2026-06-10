@@ -4030,18 +4030,40 @@ impl EntityStore for InMemoryGraph {
         .entered();
         let ent = self.entities.read();
 
+        // Only the name-pattern lookup produces a meaningful, deterministic
+        // candidate order (exact matches ahead of token matches, id-sorted
+        // within each group). The file/kind/all branches iterate hash sets in
+        // arbitrary order, so their candidate order must NOT leak into the
+        // result order — those fall back to a pure id-sort below.
+        let candidate_order_is_ranked;
         let candidate_ids: Vec<EntityId> = if let Some(ref fp) = filter.file_path {
+            candidate_order_is_ranked = false;
             ent.indexes.by_file(&fp.0).to_vec()
         } else if let Some(ref pattern) = filter.name_pattern {
+            candidate_order_is_ranked = true;
             ent.indexes.by_name_pattern(pattern)
         } else if let Some(ref kinds) = filter.kinds {
+            candidate_order_is_ranked = false;
             if kinds.len() == 1 {
                 ent.indexes.by_kind(kinds[0]).to_vec()
             } else {
                 ent.entities.keys().copied().collect()
             }
         } else {
+            candidate_order_is_ranked = false;
             ent.entities.keys().copied().collect()
+        };
+
+        // Capture each id's rank position so the relevance order from the index
+        // lookup survives the parallel filter below instead of being discarded.
+        let rank: HashMap<EntityId, usize> = if candidate_order_is_ranked {
+            candidate_ids
+                .iter()
+                .enumerate()
+                .map(|(pos, eid)| (*eid, pos))
+                .collect()
+        } else {
+            HashMap::new()
         };
 
         let mut results: Vec<Entity> = candidate_ids
@@ -4057,7 +4079,16 @@ impl EntityStore for InMemoryGraph {
             })
             .collect();
 
-        results.sort_by(|a, b| a.id.cmp(&b.id));
+        // Sort by rank ascending (position 0 = best match), then by entity id
+        // as a total tie-break. When candidate order is not ranked the rank map
+        // is empty, so every entity shares the same rank and the result is a
+        // pure id-sort. Either way the id tie-break makes the order fully
+        // deterministic regardless of hash iteration or rayon scheduling.
+        results.sort_by(|a, b| {
+            let ra = rank.get(&a.id).copied().unwrap_or(usize::MAX);
+            let rb = rank.get(&b.id).copied().unwrap_or(usize::MAX);
+            ra.cmp(&rb).then_with(|| a.id.cmp(&b.id))
+        });
         Ok(results)
     }
 
@@ -9111,5 +9142,131 @@ mod tests {
         assert!(state.entities.is_empty());
         assert!(state.relations.is_empty());
         assert!(state.file_tree.is_empty());
+    }
+
+    fn test_entity_with_id(id_seed: u128, name: &str) -> Entity {
+        Entity {
+            id: EntityId(uuid::Uuid::from_u128(id_seed)),
+            ..test_entity(name, "src/main.rs")
+        }
+    }
+
+    #[test]
+    fn query_entities_preserves_name_rank() {
+        // An exact name match must rank ahead of a token/substring match, even
+        // when the exact match has the larger entity id (so a bare id-sort
+        // would put it last).
+        let graph = InMemoryGraph::new();
+        let exact = test_entity_with_id(0xff, "parse");
+        let token = test_entity_with_id(0x01, "parseTableFromHtml");
+        graph.upsert_entity(&exact).unwrap();
+        graph.upsert_entity(&token).unwrap();
+
+        let filter = EntityFilter {
+            name_pattern: Some("parse".to_string()),
+            ..Default::default()
+        };
+        let results = graph.query_entities(&filter).unwrap();
+        let names: Vec<&str> = results.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["parse", "parseTableFromHtml"],
+            "exact name match should outrank token match regardless of id"
+        );
+    }
+
+    #[test]
+    fn query_entities_tie_break_is_id_ascending() {
+        // Entities at the same rank (all exact name matches) are ordered by id
+        // ascending as the total tie-break.
+        let graph = InMemoryGraph::new();
+        let hi = test_entity_with_id(0x30, "dup");
+        let lo = test_entity_with_id(0x10, "dup");
+        let mid = test_entity_with_id(0x20, "dup");
+        // Insert out of id order.
+        graph.upsert_entity(&hi).unwrap();
+        graph.upsert_entity(&lo).unwrap();
+        graph.upsert_entity(&mid).unwrap();
+
+        let filter = EntityFilter {
+            name_pattern: Some("dup".to_string()),
+            ..Default::default()
+        };
+        let results = graph.query_entities(&filter).unwrap();
+        let ids: Vec<EntityId> = results.iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![lo.id, mid.id, hi.id]);
+    }
+
+    #[test]
+    fn query_entities_deterministic_across_calls() {
+        // Same query against the same graph must produce a byte-identical
+        // ordering on every call — no HashMap-iteration-order leakage.
+        let graph = InMemoryGraph::new();
+        for i in 0..32u128 {
+            graph
+                .upsert_entity(&test_entity_with_id(0x1000 + i, "handler"))
+                .unwrap();
+        }
+
+        let filter = EntityFilter {
+            name_pattern: Some("handler".to_string()),
+            ..Default::default()
+        };
+        let first: Vec<EntityId> = graph
+            .query_entities(&filter)
+            .unwrap()
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        for _ in 0..8 {
+            let again: Vec<EntityId> = graph
+                .query_entities(&filter)
+                .unwrap()
+                .iter()
+                .map(|e| e.id)
+                .collect();
+            assert_eq!(again, first, "query_entities order must be deterministic");
+        }
+    }
+
+    #[test]
+    fn query_entities_non_name_queries_stay_id_sorted() {
+        // File and kind queries draw candidates from hash sets in arbitrary
+        // order. Their result order must remain a deterministic id-sort and
+        // must not be perturbed by the name-rank path.
+        let graph = InMemoryGraph::new();
+        let ids: Vec<EntityId> = (0..24u128)
+            .map(|i| {
+                let e = test_entity_with_id(0x900 + i, &format!("fn_{i}"));
+                graph.upsert_entity(&e).unwrap();
+                e.id
+            })
+            .collect();
+        let mut expected = ids.clone();
+        expected.sort();
+
+        let by_file = EntityFilter {
+            file_path: Some(FilePathId::new("src/main.rs")),
+            ..Default::default()
+        };
+        let file_ids: Vec<EntityId> = graph
+            .query_entities(&by_file)
+            .unwrap()
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(file_ids, expected, "file query must be id-sorted");
+
+        let by_kind = EntityFilter {
+            kinds: Some(vec![EntityKind::Function]),
+            ..Default::default()
+        };
+        let kind_ids: Vec<EntityId> = graph
+            .query_entities(&by_kind)
+            .unwrap()
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(kind_ids, expected, "kind query must be id-sorted");
     }
 }

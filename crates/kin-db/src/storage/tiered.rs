@@ -332,6 +332,12 @@ impl TieredGraph {
     }
 
     /// Search entities by name pattern across both tiers.
+    ///
+    /// Hot and cold matches are merged under a single ranking rather than
+    /// concatenated: every match is keyed by its name-match relevance (exact
+    /// name match ahead of partial match) with the entity id as a total
+    /// tie-break. The id tie-break keeps the order deterministic even though
+    /// the cold tier is iterated in HashMap order.
     pub fn query_entities_by_name(&self, pattern: &str) -> Result<Vec<Entity>, KinDbError> {
         let filter = EntityFilter {
             name_pattern: Some(pattern.to_string()),
@@ -351,6 +357,15 @@ impl TieredGraph {
                 }
             }
         }
+
+        // Merge hot + cold under one ranking. `sort_by` is stable, and the
+        // explicit id tie-break makes the result independent of both the input
+        // order and HashMap iteration order.
+        results.sort_by(|a, b| {
+            name_match_rank(&a.name, pattern)
+                .cmp(&name_match_rank(&b.name, pattern))
+                .then_with(|| a.id.cmp(&b.id))
+        });
 
         Ok(results)
     }
@@ -406,6 +421,21 @@ impl TieredGraph {
         *self._cold_mmap.write() = Some(mmap);
         *self.cold_snapshot.write() = Some(snapshot);
         Ok(())
+    }
+}
+
+/// Relevance rank of an entity name against a query pattern. Lower is better:
+/// an exact (case-insensitive) full-name match ranks ahead of a partial match.
+/// Mirrors the pattern interpretation used by `matches_filter` so hot-tier and
+/// cold-tier matches are ranked on the same scale.
+fn name_match_rank(name: &str, pattern: &str) -> u8 {
+    let pat = pattern.to_lowercase();
+    let name = name.to_lowercase();
+    let bare = pat.trim_start_matches('*').trim_end_matches('*');
+    if name == bare {
+        0
+    } else {
+        1
     }
 }
 
@@ -1432,5 +1462,145 @@ mod tests {
         // Should find searchable_fn_1, searchable_fn_10-19
         assert!(!results.is_empty());
         assert!(results.iter().any(|e| e.name == "searchable_fn_1"));
+    }
+
+    fn test_entity_with_id(id_seed: u128, name: &str) -> Entity {
+        Entity {
+            id: EntityId(uuid::Uuid::from_u128(id_seed)),
+            ..test_entity(name)
+        }
+    }
+
+    /// Open a tiered graph whose snapshot file holds `cold` entities, forced
+    /// fully cold (hot tier empty) so the cold path is exercised in isolation.
+    /// A hot budget below `bytes_per_entity` yields a hot capacity of zero, so
+    /// no cold entity is duplicated into the hot tier.
+    fn open_cold_only(dir: &TempDir, cold: &[Entity]) -> TieredGraph {
+        let path = dir.path().join("graph.kndb");
+        let mut snap = GraphSnapshot::empty();
+        snap.entities = cold.iter().map(|e| (e.id, e.clone())).collect();
+        mmap::atomic_write(&path, &snap).unwrap();
+        let config = TieredConfig {
+            max_hot_bytes: Some(1),
+            bytes_per_entity: 2,
+        };
+        let tiered = TieredGraph::open(&path, config).unwrap();
+        assert_eq!(tiered.strategy(), LoadStrategy::MmapBacked);
+        assert_eq!(tiered.hot_entity_count(), 0, "cold set must stay cold-only");
+        tiered
+    }
+
+    /// Open a tiered graph in FullLoad mode (everything hot, no cold tier) from
+    /// a snapshot holding `hot` entities.
+    fn open_hot_only(dir: &TempDir, hot: &[Entity]) -> TieredGraph {
+        let path = dir.path().join("graph.kndb");
+        let mut snap = GraphSnapshot::empty();
+        snap.entities = hot.iter().map(|e| (e.id, e.clone())).collect();
+        mmap::atomic_write(&path, &snap).unwrap();
+        let config = TieredConfig {
+            max_hot_bytes: Some(1_000_000_000),
+            bytes_per_entity: 1,
+        };
+        let tiered = TieredGraph::open(&path, config).unwrap();
+        assert_eq!(tiered.strategy(), LoadStrategy::FullLoad);
+        tiered
+    }
+
+    #[test]
+    fn query_by_name_hot_only_keeps_rank() {
+        let dir = TempDir::new().unwrap();
+        let token = test_entity_with_id(0x01, "parseTableFromHtml");
+        let exact = test_entity_with_id(0xff, "parse");
+        let tiered = open_hot_only(&dir, &[token.clone(), exact.clone()]);
+
+        let names: Vec<String> = tiered
+            .query_entities_by_name("parse")
+            .unwrap()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        assert_eq!(names, vec!["parse", "parseTableFromHtml"]);
+    }
+
+    #[test]
+    fn query_by_name_cold_only_ranks_exact_first() {
+        let dir = TempDir::new().unwrap();
+        // Exact match has the larger id so a bare id-sort would bury it.
+        let exact = test_entity_with_id(0xff, "parse");
+        let substring = test_entity_with_id(0x01, "reparser");
+        let tiered = open_cold_only(&dir, &[exact.clone(), substring.clone()]);
+
+        let names: Vec<String> = tiered
+            .query_entities_by_name("parse")
+            .unwrap()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["parse", "reparser"],
+            "exact cold match should outrank substring cold match"
+        );
+    }
+
+    #[test]
+    fn query_by_name_merges_hot_and_cold_under_one_ranking() {
+        // Cold tier holds the exact name match; hot tier holds a substring
+        // match. The exact match must come first even though it lives in the
+        // cold tier and is appended after the hot results before sorting.
+        let dir = TempDir::new().unwrap();
+        let cold_exact = test_entity_with_id(0xaa, "parse");
+        let tiered = open_cold_only(&dir, &[cold_exact.clone()]);
+
+        let hot_substring = test_entity_with_id(0x02, "reparser");
+        tiered.hot.upsert_entity(&hot_substring).unwrap();
+
+        let results = tiered.query_entities_by_name("parse").unwrap();
+        let names: Vec<String> = results.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["parse", "reparser"],
+            "exact cold match must outrank substring hot match"
+        );
+    }
+
+    #[test]
+    fn query_by_name_mixed_tiers_deterministic_across_calls() {
+        // Several same-rank matches split across hot and cold tiers must come
+        // back in a byte-identical order on every call — the cold tier is
+        // iterated in HashMap order, so determinism comes from the id
+        // tie-break, not iteration order.
+        let dir = TempDir::new().unwrap();
+        let cold: Vec<Entity> = (0..16u128)
+            .map(|i| test_entity_with_id(0x100 + i, "handler"))
+            .collect();
+        let tiered = open_cold_only(&dir, &cold);
+        for i in 0..16u128 {
+            tiered
+                .hot
+                .upsert_entity(&test_entity_with_id(0x200 + i, "handler"))
+                .unwrap();
+        }
+
+        let first: Vec<EntityId> = tiered
+            .query_entities_by_name("handler")
+            .unwrap()
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(first.len(), 32);
+        // Order is strictly id-ascending (all entities share one rank).
+        let mut sorted = first.clone();
+        sorted.sort();
+        assert_eq!(first, sorted, "mixed-tier order must be id-ascending");
+        for _ in 0..8 {
+            let again: Vec<EntityId> = tiered
+                .query_entities_by_name("handler")
+                .unwrap()
+                .iter()
+                .map(|e| e.id)
+                .collect();
+            assert_eq!(again, first, "mixed-tier order must be deterministic");
+        }
     }
 }
