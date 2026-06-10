@@ -9461,6 +9461,34 @@ fn adaptive_cap(
             result.push(fused[i].clone());
         }
     }
+    // No-silent-elimination: re-admit beyond-cap candidates whose pre-compression evidence
+    // (floor_reference) stays strong, strongest-first, so a relative compression cannot
+    // silently drop a candidate whose own evidence never weakened. Bounded by support_max_total.
+    let precomp_readmit_pct = locate_env_f32("KIN_LOCATE_PRECOMP_READMIT_PCT", 0.3);
+    if precomp_readmit_pct > 0.0 && result.len() < support_max_total {
+        let readmit_floor = floor_top * precomp_readmit_pct;
+        let mut readmit: Vec<(usize, f32)> = Vec::new();
+        for (i, (path, score)) in fused.iter().enumerate().take(support_scan_limit) {
+            if i < cap || result_set.contains(path.as_str()) {
+                continue;
+            }
+            // Only undo compression-caused drops: the candidate's pre-compression evidence
+            // must both clear the floor AND exceed its current (compressed) score. An
+            // uncompressed tail file (floor == live) was already judged on its true score.
+            let strength = floor_score_for(path, *score);
+            if strength >= readmit_floor && strength > *score {
+                readmit.push((i, strength));
+            }
+        }
+        readmit.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (i, _) in readmit {
+            if result.len() >= support_max_total {
+                break;
+            }
+            result_set.insert(fused[i].0.clone());
+            result.push(fused[i].clone());
+        }
+    }
     if want_pruned {
         for (path, score) in fused.iter() {
             if !result_set.contains(path.as_str()) {
@@ -13722,6 +13750,65 @@ mod tests {
             None,
         );
         assert!(with_reference.iter().any(|(path, _)| path == "src/gold.rs"));
+    }
+
+    #[test]
+    fn adaptive_cap_readmits_strong_precompression_candidate_past_cap() {
+        // 72aa7114 shape: a text-reached gold compressed below the cluster cap (live 2.0,
+        // beyond cap, no corroboration signal) but whose pre-compression evidence stayed
+        // strong (floor_reference 9.0) must be re-admitted past the cap, not silently
+        // eliminated. Genuine tail noise (low pre-compression score) stays pruned.
+        let fused = vec![
+            ("top.rs".to_string(), 10.0),
+            ("s1.rs".to_string(), 9.0),
+            ("s2.rs".to_string(), 8.5),
+            ("s3.rs".to_string(), 8.0),
+            ("gold.rs".to_string(), 2.0),
+            ("noise1.rs".to_string(), 1.5),
+            ("noise2.rs".to_string(), 1.0),
+        ];
+        let mut all_hits: Vec<HashMap<String, Vec<FileHit>>> =
+            (0..10).map(|_| HashMap::new()).collect();
+        // Give the top cluster three independent signals each so they fill the cap;
+        // the gold and noise carry none.
+        for idx in [1usize, 4, 8] {
+            all_hits[idx] = HashMap::from([
+                (String::from("top.rs"), hit(1.0)),
+                (String::from("s1.rs"), hit(1.0)),
+                (String::from("s2.rs"), hit(1.0)),
+                (String::from("s3.rs"), hit(1.0)),
+            ]);
+        }
+        let floor_reference = HashMap::from([(String::from("gold.rs"), 9.0)]);
+
+        let with_reference = adaptive_cap(
+            &fused,
+            &all_hits,
+            10,
+            false,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &floor_reference,
+            false,
+            None,
+        );
+        assert!(with_reference.iter().any(|(path, _)| path == "gold.rs"));
+        assert!(!with_reference.iter().any(|(path, _)| path == "noise1.rs"));
+
+        let without_reference = adaptive_cap(
+            &fused,
+            &all_hits,
+            10,
+            false,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            false,
+            None,
+        );
+        assert!(!without_reference.iter().any(|(path, _)| path == "gold.rs"));
     }
 
     #[test]
