@@ -20,7 +20,10 @@ struct EnrichmentJson {
     embeddings_total: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// Not `Eq`: the embedded `semantic_coverage` block reuses
+// `locate::SemanticCoverage`, which is only `PartialEq`. This struct is a
+// private serialization shape with no `Eq`-dependent uses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct StatusJson {
     initialized: bool,
     #[serde(rename = "entityCount")]
@@ -29,6 +32,13 @@ struct StatusJson {
     graph_state: String,
     #[serde(rename = "enrichment")]
     enrichment: EnrichmentJson,
+    /// Embedding (semantic signal) coverage, in the SAME shape `kin locate
+    /// --json` emits as `semantic_coverage` — same fields, same daemon source
+    /// (`graph.embedding_status()`). An agent gauging readiness can parse it
+    /// identically from either command. Snake_case key (vs the camelCase keys
+    /// above) is deliberate: it mirrors locate so one parser serves both.
+    #[serde(rename = "semantic_coverage")]
+    semantic_coverage: crate::commands::locate::SemanticCoverage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -192,6 +202,39 @@ pub fn build_status_summary(
 }
 
 impl StatusSummary {
+    /// Embedding (semantic signal) coverage in the SAME shape `kin locate
+    /// --json` reports as `semantic_coverage`. Sourced from the identical
+    /// daemon-owned `graph.embedding_status()` numbers locate consumes (carried
+    /// here on the summary), so an agent reads readiness the same way from
+    /// either command.
+    ///
+    /// Honest by construction (R5): `complete` mirrors
+    /// `locate::embedding_status_complete` exactly — `total == 0` (nothing to
+    /// embed) or every entity indexed with nothing pending. A partial/zero
+    /// index yields `complete: false` plus a `note`; we never fabricate
+    /// `complete: true`.
+    pub fn semantic_coverage(&self) -> crate::commands::locate::SemanticCoverage {
+        let indexed = self.embeddings_indexed;
+        let total = self.embeddings_total;
+        let pending = self.embeddings_pending;
+        let complete = total == 0 || (indexed == total && pending == 0);
+        let note = if complete {
+            None
+        } else {
+            Some(format!(
+                "semantic signal partial: {indexed}/{total} indexed, {} unindexed, {pending} pending. Run `kin embed` for full semantic ranking.",
+                total.saturating_sub(indexed)
+            ))
+        };
+        crate::commands::locate::SemanticCoverage {
+            indexed,
+            total,
+            pending,
+            complete,
+            note,
+        }
+    }
+
     pub fn render_lines(&self) -> Vec<String> {
         let mut lines = vec![
             format!("Repo root: {}", self.repo_root.display()),
@@ -259,6 +302,7 @@ pub fn build_command_status_response(
                 embeddings_pending: summary.embeddings_pending,
                 embeddings_total: summary.embeddings_total,
             },
+            semantic_coverage: summary.semantic_coverage(),
         };
         Some(serde_json::to_string(&payload)?)
     } else {
@@ -332,6 +376,69 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    fn summary_with_embeddings(
+        indexed: usize,
+        total: usize,
+        pending: usize,
+    ) -> super::StatusSummary {
+        super::StatusSummary {
+            repo_root: std::path::PathBuf::from("/tmp/repo"),
+            source_root: std::path::PathBuf::from("/tmp/repo"),
+            world_preset: "default".to_string(),
+            default_remote: "(not configured)".to_string(),
+            branch: "main".to_string(),
+            head: "deadbeef".to_string(),
+            entities: total,
+            role_counts: std::collections::HashMap::new(),
+            embeddings_indexed: indexed,
+            embeddings_pending: pending,
+            embeddings_total: total,
+            import_state: "materialized semantic graph".to_string(),
+            readiness: "ready".to_string(),
+            blocked: false,
+            merge_state: None,
+        }
+    }
+
+    #[test]
+    fn semantic_coverage_reports_complete_when_fully_indexed() {
+        let coverage = summary_with_embeddings(10, 10, 0).semantic_coverage();
+        assert_eq!(coverage.indexed, 10);
+        assert_eq!(coverage.total, 10);
+        assert_eq!(coverage.pending, 0);
+        assert!(coverage.complete);
+        // Honest: no fabricated degradation note when truly complete.
+        assert!(coverage.note.is_none());
+    }
+
+    #[test]
+    fn semantic_coverage_reports_complete_when_nothing_to_embed() {
+        // total == 0 mirrors locate::embedding_status_complete: nothing eligible.
+        let coverage = summary_with_embeddings(0, 0, 0).semantic_coverage();
+        assert!(coverage.complete);
+        assert!(coverage.note.is_none());
+    }
+
+    #[test]
+    fn semantic_coverage_is_honest_about_partial_index() {
+        // R5: a half-embedded graph must NOT fabricate complete:true.
+        let coverage = summary_with_embeddings(3, 10, 7).semantic_coverage();
+        assert_eq!(coverage.indexed, 3);
+        assert_eq!(coverage.total, 10);
+        assert_eq!(coverage.pending, 7);
+        assert!(!coverage.complete);
+        let note = coverage.note.expect("partial coverage must carry a note");
+        assert!(note.contains("kin embed"), "note should point at remedy: {note}");
+    }
+
+    #[test]
+    fn semantic_coverage_is_honest_when_indexed_but_still_pending() {
+        // indexed == total but pending > 0 is still incomplete.
+        let coverage = summary_with_embeddings(10, 10, 4).semantic_coverage();
+        assert!(!coverage.complete);
+        assert!(coverage.note.is_some());
     }
 
     #[tokio::test]
