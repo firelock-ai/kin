@@ -595,6 +595,22 @@ pub async fn handle_transaction_commit<G: GraphStore>(
         )));
     }
 
+    // Fail loud on operations the commit path cannot turn into a delta (relation
+    // update/modify, blob payloads) instead of silently dropping them while
+    // still reporting "committed". Reject the whole commit atomically — nothing
+    // is applied and the transaction stays active so the agent can fix it.
+    let uncommittable = crate::session::uncommittable_operations(&tx.staged_operations);
+    if !uncommittable.is_empty() {
+        return Ok(ToolCallResult::error(format!(
+            "Cannot commit transaction {}: {} staged operation(s) are not committable and would \
+             be silently dropped:\n  - {}\nFix or remove them and retry; the transaction is left \
+             active.",
+            transaction_id,
+            uncommittable.len(),
+            uncommittable.join("\n  - ")
+        )));
+    }
+
     let mut entity_deltas = Vec::new();
     let mut relation_deltas = Vec::new();
 

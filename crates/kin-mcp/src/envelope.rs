@@ -89,10 +89,7 @@ impl SemanticCoverage {
             total: obj.get("total").and_then(Value::as_u64)?,
             pending: obj.get("pending").and_then(Value::as_u64)?,
             complete: obj.get("complete").and_then(Value::as_bool)?,
-            note: obj
-                .get("note")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            note: obj.get("note").and_then(Value::as_str).map(str::to_string),
         })
     }
 }
@@ -243,10 +240,7 @@ impl Envelope {
         if let Some(value) = health.get("mass_deletion_blocked").and_then(Value::as_bool) {
             self.degraded.mass_deletion_blocked = Some(value);
         }
-        if let Some(value) = health
-            .get("reconciliation_status")
-            .and_then(Value::as_str)
-        {
+        if let Some(value) = health.get("reconciliation_status").and_then(Value::as_str) {
             self.graph_state.reconciliation_status = Some(value.to_string());
         }
         if let Some(value) = health.get("graph_entity_count").and_then(Value::as_u64) {
@@ -356,8 +350,8 @@ fn annotate_block(block: ContentBlock, envelope_value: &Value) -> ContentBlock {
             Value::Object(map)
         }
     };
-    let rendered = serde_json::to_string_pretty(&annotated)
-        .unwrap_or_else(|_| annotated.to_string());
+    let rendered =
+        serde_json::to_string_pretty(&annotated).unwrap_or_else(|_| annotated.to_string());
     ContentBlock::Text { text: rendered }
 }
 
@@ -407,7 +401,10 @@ mod tests {
         let env = Envelope::daemon().with_health(&health);
         assert_eq!(env.degraded.embed_worker_failed, Some(true));
         assert_eq!(env.degraded.mass_deletion_blocked, Some(false));
-        assert_eq!(env.graph_state.reconciliation_status.as_deref(), Some("clean"));
+        assert_eq!(
+            env.graph_state.reconciliation_status.as_deref(),
+            Some("clean")
+        );
         assert_eq!(env.graph_state.entity_count, Some(1234));
         assert_eq!(env.graph_state.loaded, Some(true));
         assert_eq!(env.graph_state.initialized, Some(true));
@@ -481,7 +478,8 @@ mod tests {
 
     #[test]
     fn annotate_array_payload_wraps_under_result() {
-        let result = ToolCallResult::text(serde_json::to_string(&serde_json::json!([1, 2])).unwrap());
+        let result =
+            ToolCallResult::text(serde_json::to_string(&serde_json::json!([1, 2])).unwrap());
         let annotated = annotate(result, &Envelope::offline());
         let value = envelope_of(&annotated);
         assert_eq!(value["envelope_version"], ENVELOPE_VERSION);
