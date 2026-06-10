@@ -55,18 +55,62 @@ fn embedding_status_complete(status: &kin_db::EmbeddingStatus) -> bool {
     status.total == 0 || (status.indexed == status.total && status.pending == 0)
 }
 
-fn require_complete_semantic_embeddings(graph: &kin_db::InMemoryGraph) -> Result<()> {
+fn env_flag_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.as_str(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Strict-coverage mode is OFF by default for `kin search --semantic` too:
+/// users get graceful degradation. Benchmarks opt into the hard gate via
+/// `KIN_REQUIRE_COMPLETE_EMBEDDINGS=1`; an explicit
+/// `KIN_BYPASS_EMBEDDING_COVERAGE_CHECK=1` forces degradation even under strict.
+fn embedding_strict_mode() -> bool {
+    env_flag_truthy("KIN_REQUIRE_COMPLETE_EMBEDDINGS")
+        && !env_flag_truthy("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK")
+}
+
+/// Evaluate embedding coverage for a semantic search. Default behavior never
+/// errors and returns a coverage report; strict (benchmark) behavior bails on
+/// incomplete coverage exactly as before.
+fn evaluate_semantic_coverage(
+    graph: &kin_db::InMemoryGraph,
+) -> Result<crate::commands::locate::SemanticCoverage> {
     let status = graph.embedding_status();
-    if embedding_status_complete(&status) {
-        return Ok(());
+    let complete = embedding_status_complete(&status);
+
+    if !complete && embedding_strict_mode() {
+        anyhow::bail!(
+            "semantic search requires complete embeddings; graph has {}/{} indexed, {} unindexed, {} pending. Run `kin embed` until `kin status --json` reports embeddingsIndexed == embeddingsTotal and embeddingsPending == 0. (Set KIN_REQUIRE_COMPLETE_EMBEDDINGS=0 to allow graceful degradation.)",
+            status.indexed,
+            status.total,
+            status.total.saturating_sub(status.indexed),
+            status.pending
+        );
     }
-    anyhow::bail!(
-        "semantic search requires complete embeddings; graph has {}/{} indexed, {} unindexed, {} pending. Run `kin embed` until `kin status --json` reports embeddingsIndexed == embeddingsTotal and embeddingsPending == 0.",
-        status.indexed,
-        status.total,
-        status.total.saturating_sub(status.indexed),
-        status.pending
-    );
+
+    let note = if complete {
+        None
+    } else {
+        Some(format!(
+            "semantic signal partial: {}/{} embedded, {} pending. Vector hits over what is embedded, plus text fallback; run `kin embed` for full semantic search.",
+            status.indexed, status.total, status.pending
+        ))
+    };
+
+    Ok(crate::commands::locate::SemanticCoverage {
+        indexed: status.indexed,
+        total: status.total,
+        pending: status.pending,
+        complete,
+        note,
+    })
 }
 
 #[derive(Serialize)]
@@ -122,6 +166,13 @@ pub struct DaemonSearchResponse {
     pub text_fallback: bool,
     pub total_matches: usize,
     pub records: Vec<DaemonSearchRecord>,
+    /// Embedding (semantic signal) coverage at query time. On partial/zero
+    /// coverage `kin search --semantic` degrades gracefully (vector hits over
+    /// whatever is embedded, plus text fallback) instead of erroring; this
+    /// field reports the incompleteness honestly. `None` for non-semantic
+    /// searches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_coverage: Option<crate::commands::locate::SemanticCoverage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -385,6 +436,7 @@ pub fn collect_daemon_search_response(
         text_fallback: false,
         total_matches: records.len(),
         records,
+        semantic_coverage: None,
     })
 }
 
@@ -403,7 +455,7 @@ fn collect_daemon_semantic_search_response(
     graph: &kin_db::InMemoryGraph,
     request: &DaemonSearchRequest,
 ) -> Result<DaemonSearchResponse> {
-    require_complete_semantic_embeddings(graph)?;
+    let coverage = evaluate_semantic_coverage(graph)?;
     let limit = request.limit.unwrap_or(10);
     let vector_results = graph.semantic_search(&request.query, limit)?;
 
@@ -419,6 +471,7 @@ fn collect_daemon_semantic_search_response(
         )?;
         response.semantic = true;
         response.text_fallback = true;
+        response.semantic_coverage = Some(coverage);
         return Ok(response);
     }
 
@@ -501,6 +554,7 @@ fn collect_daemon_semantic_search_response(
         text_fallback: false,
         total_matches: records.len(),
         records,
+        semantic_coverage: Some(coverage),
     })
 }
 
