@@ -13,6 +13,10 @@ use kin_infer::{BertConfig, BertModel};
 
 const MODEL_DIR: &str = "/tmp/swerank";
 
+fn probe_model_dir() -> String {
+    std::env::var("KIN_INFER_PROBE_MODEL_DIR").unwrap_or_else(|_| MODEL_DIR.to_string())
+}
+
 fn synth(len: usize, salt: u32) -> (Vec<u32>, Vec<u32>) {
     let ids: Vec<u32> = (0..len)
         .map(|i| 1 + ((i as u32).wrapping_mul(2654435761).wrapping_add(salt.wrapping_mul(40503)) % 20000))
@@ -27,8 +31,9 @@ fn cos(a: &[f32], b: &[f32]) -> f64 {
 
 #[test]
 fn forward_determinism() {
-    let dir = Path::new(MODEL_DIR);
-    if !dir.join("model.safetensors").exists() { eprintln!("SKIP: no model at {MODEL_DIR}"); return; }
+    let model_dir = probe_model_dir();
+    let dir = Path::new(&model_dir);
+    if !dir.join("model.safetensors").exists() { eprintln!("SKIP: no model at {model_dir}"); return; }
     if cfg!(debug_assertions) { eprintln!("!!! REFUSING parity from a debug build — use --release !!!"); return; }
     let cfg_json = fs::read_to_string(dir.join("config.json")).expect("config");
     let config: BertConfig = serde_json::from_str(&cfg_json).expect("parse");

@@ -23,6 +23,10 @@ use kin_infer::{BertConfig, BertModel};
 
 const MODEL_DIR: &str = "/tmp/swerank";
 
+fn probe_model_dir() -> String {
+    std::env::var("KIN_INFER_PROBE_MODEL_DIR").unwrap_or_else(|_| MODEL_DIR.to_string())
+}
+
 fn synth(len: usize, salt: u32) -> (Vec<u32>, Vec<u32>) {
     let ids: Vec<u32> = (0..len)
         .map(|i| 1 + ((i as u32).wrapping_mul(2654435761).wrapping_add(salt.wrapping_mul(40503)) % 20000))
@@ -47,9 +51,10 @@ fn bin_of(l: usize) -> usize {
 
 #[test]
 fn bucketing_vs_ground_truth() {
-    let dir = Path::new(MODEL_DIR);
+    let model_dir = probe_model_dir();
+    let dir = Path::new(&model_dir);
     if !dir.join("model.safetensors").exists() {
-        eprintln!("SKIP: model not found at {MODEL_DIR}");
+        eprintln!("SKIP: model not found at {model_dir}");
         return;
     }
     if cfg!(debug_assertions) {

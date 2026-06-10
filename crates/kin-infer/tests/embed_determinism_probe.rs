@@ -45,10 +45,15 @@ use kin_infer::{BertConfig, BertModel};
 
 const MODEL_DIR: &str = "/tmp/swerank";
 
+fn probe_model_dir() -> String {
+    std::env::var("KIN_INFER_PROBE_MODEL_DIR").unwrap_or_else(|_| MODEL_DIR.to_string())
+}
+
 fn load() -> Option<BertModel> {
-    let dir = Path::new(MODEL_DIR);
+    let model_dir = probe_model_dir();
+    let dir = Path::new(&model_dir);
     if !dir.join("model.safetensors").exists() {
-        eprintln!("SKIP: model absent at {MODEL_DIR}");
+        eprintln!("SKIP: model absent at {model_dir}");
         return None;
     }
     let cfg_json = fs::read_to_string(dir.join("config.json")).ok()?;
