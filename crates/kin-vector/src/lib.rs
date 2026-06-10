@@ -908,6 +908,14 @@ impl<Id: VectorId> VectorIndex<Id> {
         self.graph.read().id_to_idx.contains_key(entity_id)
     }
 
+    /// All keys currently held in the index.
+    ///
+    /// Lets callers reconcile the index against an external source of truth —
+    /// e.g. dropping vectors whose keys no longer exist in the graph.
+    pub fn keys(&self) -> Vec<Id> {
+        self.graph.read().id_to_idx.keys().copied().collect()
+    }
+
     /// Get the embedding vector for the given entity, if present.
     pub fn get(&self, entity_id: &Id) -> Option<Vec<f32>> {
         let graph = self.graph.read();
@@ -1187,6 +1195,24 @@ mod tests {
         assert!(!idx.contains(&e2));
         idx.remove(&e1).unwrap();
         assert!(!idx.contains(&e1));
+    }
+
+    #[test]
+    fn keys_reflect_current_membership() {
+        let idx = VectorIndex::new(2).unwrap();
+        let e1 = DefaultId::new();
+        let e2 = DefaultId::new();
+
+        assert!(idx.keys().is_empty());
+        idx.upsert(e1, &[1.0, 0.0]).unwrap();
+        idx.upsert(e2, &[0.0, 1.0]).unwrap();
+        let keys = idx.keys();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&e1) && keys.contains(&e2));
+
+        idx.remove(&e1).unwrap();
+        let keys = idx.keys();
+        assert_eq!(keys, vec![e2]);
     }
 
     #[test]
