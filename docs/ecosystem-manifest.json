@@ -196,6 +196,16 @@
           ]
         }
       ]
+    },
+    {
+      "name": "kin-mcp",
+      "layer": "open-core",
+      "role": "mcp-agent-surface",
+      "dependsOn": [
+        "kin"
+      ],
+      "status": "active",
+      "note": "MCP server surface exposing Kin semantic tools to AI agents (Claude, Cursor, Codex, Gemini). Bundled inside the kin repo as the kin-mcp crate (crates/kin-mcp) plus a published npm wrapper (packages/kin-mcp); not a standalone repo."
     }
   ],
   "links": [
@@ -252,6 +262,12 @@
       "to": "kin-vfs",
       "via": "native-adoption-wedge",
       "purpose": "uses filesystem projection as part of the first-class adoption path"
+    },
+    {
+      "from": "kin-mcp",
+      "to": "kin",
+      "via": "bundled-mcp-surface",
+      "purpose": "ships inside the kin repo and serves Kin graph/semantic tools to AI agents over MCP"
     }
   ]
 }
