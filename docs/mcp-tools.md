@@ -20,15 +20,16 @@ daemon; `semantic_locate` returns an explicit error in offline/no-daemon mode.
 - **`get_entity`**: Fetch metadata about a specific entity (kind, language, path, line range, signature) without its source body.
 - **`get_entity_source` / `get_entity_body`**: Retrieve the implementation source of an entity, served from the graph.
 - **`get_context_pack`**: Package a target entity alongside its caller/import neighborhood into a single prompt-friendly bundle.
-- **`explore_codebase`**: Walk the graph namespace to understand structure.
-- **`graph_neighborhood`**: Return the local relation neighborhood around an entity.
+- **`explore_codebase`**: Get a one-shot map of the codebase via a selectable strategy (e.g. `overview`: entity counts by kind and language, plus the top public declarations).
+- **`graph_neighborhood`**: Return the dependency neighborhood of an entity — what it depends on and what depends on it — traversed to a given depth.
 
 ---
 
 ## 2. Tracing & References
 *Tools:* `trace_computation`, `trace_data_flow`, `find_references`, `bulk_check_references`, `entity_history`
 
-- **`trace_computation` / `trace_data_flow`**: Follow control-flow or dataflow paths through functions and variables in a single call, avoiding tool-looping.
+- **`trace_computation`**: Get a focal entity together with its control-/data-flow neighborhood — its body plus callers, callees, and imports — in one structured response (a flat snapshot, not an ordered walk).
+- **`trace_data_flow`**: Walk the directional call/data-flow chain rooted at a focal entity and return it as an ordered list of steps (the path-walk counterpart to `trace_computation`'s flat neighborhood).
 - **`find_references`**: Find all entities that import, call, or reference a target symbol.
 - **`bulk_check_references`**: Classify many entities by reachability in one call.
 - **`entity_history`**: Retrieve version changes scoped to a specific entity.
@@ -79,18 +80,19 @@ daemon; `semantic_locate` returns an explicit error in offline/no-daemon mode.
 - **`kin_annotation_add`**: Attach notes or documentation to specific graph nodes.
 - **`kin_annotation_list`**: Query unresolved annotations and TODOs.
 - **`kin_annotation_mark_resolved`**: Mark annotations as completed.
-- **`kin_todo_import`**: Import inline source TODOs as annotations.
+- **`kin_todo_import`**: Scan source files for inline `TODO`/`FIXME`/`HACK` markers and import each as a work item in the graph.
 
 ---
 
 ## 8. Verification & Compliance
 *Tools:* `kin_verify_entity`, `kin_coverage_summary`, `kin_security_scan`, `kin_release_check`, `kin_contract_check`, `kin_provenance_query`
 
-- **`kin_verify_entity`**: Check whether an entity satisfies its linked tests.
-- **`kin_coverage_summary`**: Generate entity-to-test coverage ratios.
-- **`kin_security_scan`**: Analyze security patterns across the entity graph.
-- **`kin_release_check` / `kin_contract_check`**: Verify release readiness and interface-schema compliance.
-- **`kin_provenance_query`**: Trace historical ownership and modification trails.
+- **`kin_verify_entity`**: Inspect the test coverage recorded for an entity — which tests are linked to it and whether it is covered (optionally filtered by runner).
+- **`kin_coverage_summary`**: Report repo-wide test coverage — total entities, how many are covered, the ratio, and what's still untested.
+- **`kin_security_scan`**: Run a graph-based security/quality scan that returns findings with severity (today it surfaces dead/unreachable code; `propagate=true` also computes each finding's downstream impact).
+- **`kin_release_check`**: Run a pre-release gate returning a pass/fail verdict with blockers (toggle `require_proof` / `require_approval`).
+- **`kin_contract_check`**: Check whether a specific behavioral contract has backing tests (which tests cover it, and whether it is covered).
+- **`kin_provenance_query`**: Answer who-changed-and-whether-approved for an entity — its change count, latest change, recorded approvals, and recent audit events.
 
 ---
 
@@ -109,4 +111,4 @@ daemon; `semantic_locate` returns an explicit error in offline/no-daemon mode.
 
 - **`dead_code` / `find_dead_code_seeded`**: Identify unreachable or orphaned entities (whole-repo or seeded by a semantic query).
 - **`benchmark`**: Run Kin's retrieval/locate benchmarks.
-- **`kin_graph_status`**: Retrieve graph telemetry, cache details, and daemon status.
+- **`kin_graph_status`**: Report the status of the graph MCP is serving — live entity count, embedding-index coverage (indexed / total / pending), and the backing authority.
