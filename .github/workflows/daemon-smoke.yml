@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Daemon Smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  daemon-smoke:
+    name: Linux Daemon Smoke + MCP Headless
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-smoke-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-smoke-
+            ${{ runner.os }}-cargo-
+
+      - name: Build kin + kin-daemon
+        run: cargo build --locked --bin kin --bin kin-daemon
+
+      - name: Daemon smoke + MCP headless tools/list
+        run: |
+          set -euo pipefail
+
+          REPO_ROOT="$(pwd)"
+          KIN="$REPO_ROOT/target/debug/kin"
+          KIN_DAEMON="$REPO_ROOT/target/debug/kin-daemon"
+          PORT=4219
+          WS="$(mktemp -d)"
+
+          echo "::group::Initialize a Kin workspace"
+          "$KIN" init "$WS"
+          echo "::endgroup::"
+
+          echo "::group::Start kin-daemon (headless) and wait for readiness"
+          "$KIN_DAEMON" --repo "$WS" --port "$PORT" >"$REPO_ROOT/daemon.log" 2>&1 &
+          DAEMON_PID=$!
+          cleanup() { kill "$DAEMON_PID" 2>/dev/null || true; }
+          trap cleanup EXIT
+
+          # The per-repo daemon exposes an unauthenticated /readiness probe on
+          # its port (same endpoint the docker-compose healthcheck uses). Poll
+          # it until it reports ready, or fail loudly with the daemon log.
+          ready=0
+          for _ in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:${PORT}/readiness" >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::kin-daemon did not become ready on :${PORT}"
+            echo "---- daemon.log ----"
+            cat "$REPO_ROOT/daemon.log" || true
+            exit 1
+          fi
+          echo "kin-daemon ready on :${PORT}"
+          echo "::endgroup::"
+
+          echo "::group::MCP headless — drive the real stdio server, assert tool catalog"
+          # `kin mcp start` is the agent-facing MCP stdio server. With
+          # KIN_DAEMON_URL set it binds directly to the running daemon instead
+          # of rediscovering it. The server accepts newline-delimited JSON-RPC;
+          # tools/list returns Kin's static tool catalog. Assert a known
+          # graph-backed tool is present. EOF on stdin shuts the server down
+          # cleanly; `timeout` is a backstop only.
+          export KIN_DAEMON_URL="http://127.0.0.1:${PORT}"
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+            | timeout 60 "$KIN" mcp start >"$REPO_ROOT/mcp_out.txt" 2>"$REPO_ROOT/mcp_err.txt" || true
+
+          if ! grep -q "semantic_locate" "$REPO_ROOT/mcp_out.txt"; then
+            echo "::error::MCP tools/list did not return the expected Kin tool catalog"
+            echo "---- mcp_out.txt ----"
+            cat "$REPO_ROOT/mcp_out.txt" || true
+            echo "---- mcp_err.txt ----"
+            cat "$REPO_ROOT/mcp_err.txt" || true
+            echo "---- daemon.log ----"
+            cat "$REPO_ROOT/daemon.log" || true
+            exit 1
+          fi
+          echo "MCP server returned the Kin tool catalog (semantic_locate present)"
+          echo "::endgroup::"
