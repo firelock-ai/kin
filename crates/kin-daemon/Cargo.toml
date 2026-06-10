@@ -15,7 +15,10 @@ doctest = false
 default = ["vector", "embeddings", "metal"]
 vector = ["kin-db/vector"]
 embeddings = ["kin-db/embeddings"]
-metal = ["embeddings", "kin-db/metal"]
+# `metal` is a macOS GPU-acceleration *marker* feature (see kin-cli for the full rationale).
+# It intentionally does NOT pull `kin-db/metal`; the real macOS-only activation lives in the
+# `[target.'cfg(target_os = "macos")'.dependencies]` block below so Linux never compiles it.
+metal = ["embeddings"]
 gcs = ["kin-db/gcs"]
 firestore = ["kin-spine/firestore"]
 
@@ -57,6 +60,11 @@ sysinfo = "0.38"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# macOS-only: re-enable the Metal embedding backend (kin-db/metal -> kin-infer/metal).
+# Additive via feature unification; absent on Linux so the Linux build stays green.
+[target.'cfg(target_os = "macos")'.dependencies]
+kin-db = { workspace = true, features = ["metal"] }
 
 [dev-dependencies]
 kin-git = { workspace = true }

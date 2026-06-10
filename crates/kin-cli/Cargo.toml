@@ -12,7 +12,13 @@ description = "CLI for Kin semantic VCS"
 default = ["vector", "embeddings", "metal"]
 vector = ["kin-db/vector"]
 embeddings = ["kin-db/embeddings"]
-metal = ["embeddings", "kin-db/metal"]
+# `metal` is a macOS GPU-acceleration *marker* feature, kept in `default` so that
+# cfg!(feature = "metal") (read by src/commands/bench_meta.rs to report `metal_enabled`)
+# stays true on the bench platform. It intentionally does NOT pull `kin-db/metal` —
+# Cargo features cannot be target-gated, so doing so would force the macOS-only
+# kin-infer/metal backend on Linux too. The real `kin-db/metal` activation is in the
+# `[target.'cfg(target_os = "macos")'.dependencies]` block below (additive via unification).
+metal = ["embeddings"]
 
 [[bin]]
 name = "kin"
@@ -79,3 +85,9 @@ serial_test = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# macOS-only: re-enable the Metal embedding backend (kin-db/metal -> kin-infer/metal).
+# Feature unification is additive, so on macOS kin-db is built with metal; on Linux this
+# block is absent and metal is never requested, keeping the Linux build green.
+[target.'cfg(target_os = "macos")'.dependencies]
+kin-db = { workspace = true, features = ["metal"] }
