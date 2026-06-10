@@ -6,10 +6,11 @@ mod error;
 pub use error::BlobError;
 
 use sha2::{Digest, Sha256};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Content-addressed 256-bit hash.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
@@ -91,8 +92,13 @@ impl BlobStore {
     /// Write data to the blob store, returning its content hash.
     ///
     /// If a blob with the same hash already exists, this is a no-op (content
-    /// deduplication). Writes are atomic: data is written to a temporary file
-    /// in the shard directory, then renamed into place.
+    /// deduplication). Writes are atomic AND durable: data is written to a
+    /// unique temporary file in the shard directory, the file's bytes are
+    /// `fsync`ed, it is renamed into place, and the directory entry is `fsync`ed
+    /// so the rename itself survives a crash. Without the fsyncs a power loss
+    /// after `rename` could leave a zero-length or torn object that the content
+    /// address now vouches for — and because [`write`](Self::write) dedup-skips
+    /// on existence, that corrupt object would be trusted forever.
     pub fn write(&self, data: &[u8]) -> Result<Hash256> {
         let _span = tracing::info_span!("kin_blobs.write", bytes = data.len()).entered();
         let hash = digest(data);
@@ -108,21 +114,66 @@ impl BlobStore {
         let shard_dir = blob_path.parent().expect("blob path always has a parent");
         fs::create_dir_all(shard_dir).map_err(|e| BlobError::io(shard_dir, e))?;
 
-        // Atomic write: write to a temp file in the shard dir, then rename.
+        // Atomic-durable write: write to a unique temp file in the shard dir,
+        // fsync its contents, rename into place, then fsync the directory.
         let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let temp_path = shard_dir.join(format!(".tmp-{}-{}-{}", hash, std::process::id(), seq));
-        fs::write(&temp_path, data).map_err(|e| BlobError::io(&temp_path, e))?;
-        fs::rename(&temp_path, &blob_path).map_err(|e| BlobError::io(&blob_path, e))?;
+        write_file_durably(&temp_path, data).map_err(|e| BlobError::io(&temp_path, e))?;
+        fs::rename(&temp_path, &blob_path).map_err(|e| {
+            // Don't leave the fsynced temp file behind on a failed rename.
+            let _ = fs::remove_file(&temp_path);
+            BlobError::io(&blob_path, e)
+        })?;
+        sync_dir(shard_dir);
 
         debug!(hash = %hash, bytes = data.len(), "wrote blob");
         Ok(hash)
     }
 
-    /// Read a blob by its hash.
+    /// Read a blob by its hash, verifying that the stored bytes still hash to
+    /// the requested address.
     ///
-    /// Returns an error if the blob does not exist.
+    /// This is the honest default for a content-addressed store: a torn write or
+    /// on-disk bit-rot is caught here instead of silently serving corrupt content
+    /// into the graph. On a mismatch the bad object is quarantined (see
+    /// [`quarantine`](Self::quarantine)) — moved aside so dedup stops trusting it
+    /// and a later `write` of the correct bytes can heal the store — and a
+    /// [`BlobError::HashMismatch`] is returned.
+    ///
+    /// Returns [`BlobError::NotFound`] if the blob does not exist. Callers on a
+    /// hot path who have already established integrity may opt out of the re-hash
+    /// with [`read_unverified`](Self::read_unverified).
     pub fn read(&self, hash: &Hash256) -> Result<Vec<u8>> {
         let _span = tracing::info_span!("kin_blobs.read", hash = %hash).entered();
+        let data = self.read_unverified(hash)?;
+        let actual = digest(&data);
+        if actual != *hash {
+            // Content no longer matches its address: the object is corrupt.
+            // Quarantine it (preserving evidence) so dedup stops trusting it and
+            // a rewrite can heal the store, then surface the mismatch.
+            let quarantined = self.quarantine(hash).unwrap_or(None);
+            warn!(
+                expected = %hash,
+                actual = %actual,
+                quarantined = ?quarantined,
+                "blob failed hash verification on read; quarantined corrupt object"
+            );
+            return Err(BlobError::HashMismatch {
+                expected: hash.to_string(),
+                actual: actual.to_string(),
+            });
+        }
+        Ok(data)
+    }
+
+    /// Read a blob by its hash WITHOUT verifying its content hash.
+    ///
+    /// Faster than [`read`](Self::read) because it skips the re-hash, but it
+    /// trusts the on-disk bytes blindly. Use only on hot paths where integrity
+    /// has already been established — never as the general-purpose read.
+    ///
+    /// Returns [`BlobError::NotFound`] if the blob does not exist.
+    pub fn read_unverified(&self, hash: &Hash256) -> Result<Vec<u8>> {
         let blob_path = self.blob_path(hash);
         fs::read(&blob_path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -162,6 +213,44 @@ impl BlobStore {
         Ok(())
     }
 
+    /// Move a corrupt object aside into a `.corrupt/` area under the store root.
+    ///
+    /// Preserves the bad bytes as evidence (quarantine never deletes data) and,
+    /// crucially, frees the object's content-addressed path so a subsequent
+    /// [`write`](Self::write) of the correct content is no longer dedup-skipped —
+    /// the store self-heals on the next write. This is invoked automatically by
+    /// [`read`](Self::read) on a [`BlobError::HashMismatch`].
+    ///
+    /// Returns the path the object was moved to, or `Ok(None)` when there was
+    /// nothing at the object's path to quarantine (e.g. a concurrent reader
+    /// already moved it). The quarantine file is named after the object's
+    /// *expected* address so an operator can trace which blob it was meant to be.
+    pub fn quarantine(&self, hash: &Hash256) -> Result<Option<PathBuf>> {
+        let blob_path = self.blob_path(hash);
+        if !blob_path.exists() {
+            return Ok(None);
+        }
+        let corrupt_dir = self.root.join(".corrupt");
+        fs::create_dir_all(&corrupt_dir).map_err(|e| BlobError::io(&corrupt_dir, e))?;
+        let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dest = corrupt_dir.join(format!("{}-{}-{}", hash, std::process::id(), seq));
+        match fs::rename(&blob_path, &dest) {
+            Ok(()) => {
+                // Make the quarantine move durable so a crash can't resurrect the
+                // corrupt object back into the dedup path.
+                sync_dir(&corrupt_dir);
+                if let Some(parent) = blob_path.parent() {
+                    sync_dir(parent);
+                }
+                debug!(hash = %hash, dest = %dest.display(), "quarantined corrupt blob");
+                Ok(Some(dest))
+            }
+            // Lost a race with another reader that already quarantined it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(BlobError::io(&dest, e)),
+        }
+    }
+
     /// Return the root directory of the blob store.
     pub fn root(&self) -> &Path {
         &self.root
@@ -173,6 +262,26 @@ impl BlobStore {
     fn blob_path(&self, hash: &Hash256) -> PathBuf {
         let hex = hash.to_string();
         self.root.join(&hex[..2]).join(&hex[2..])
+    }
+}
+
+/// Write `data` to `path` and `fsync` the file so its bytes are durable on disk
+/// before the caller renames it into its final content-addressed location.
+fn write_file_durably(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let mut file = File::create(path)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Best-effort `fsync` of a directory so a `rename`/`create` within it is
+/// durable. Directory fsync is not guaranteed on every platform (and is a no-op
+/// on some); failures are intentionally swallowed because the object file itself
+/// was already fsynced — the worst case is a crash window where the rename is
+/// not yet durable, recoverable by re-writing the (idempotent) blob.
+fn sync_dir(dir: &Path) {
+    if let Ok(handle) = File::open(dir) {
+        let _ = handle.sync_all();
     }
 }
 
@@ -588,5 +697,167 @@ mod tests {
         let hash = store.write(&data).unwrap();
         let retrieved = store.read(&hash).unwrap();
         assert_eq!(retrieved, data);
+    }
+
+    // -----------------------------------------------------------------------
+    // Crash / corruption durability tests
+    // -----------------------------------------------------------------------
+
+    /// Reconstruct a blob's on-disk path the same way `blob_path` does, so tests
+    /// can corrupt the backing file directly to simulate a torn write / bit-rot.
+    fn on_disk_path(store: &BlobStore, hash: &Hash256) -> PathBuf {
+        let hex = hash.to_string();
+        store.root().join(&hex[..2]).join(&hex[2..])
+    }
+
+    fn corrupt_dir_entries(store: &BlobStore) -> Vec<PathBuf> {
+        let corrupt = store.root().join(".corrupt");
+        if !corrupt.exists() {
+            return Vec::new();
+        }
+        std::fs::read_dir(&corrupt)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect()
+    }
+
+    /// A write must leave no temporary file behind: the temp is fsynced then
+    /// renamed atomically into place, so the shard dir holds only the final blob.
+    #[test]
+    fn write_leaves_no_temp_file() {
+        let (_dir, store) = make_store();
+        let hash = store.write(b"atomic durable write").unwrap();
+        let shard_dir = on_disk_path(&store, &hash).parent().unwrap().to_path_buf();
+        let leftovers: Vec<_> = std::fs::read_dir(&shard_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "stray temp files remain: {leftovers:?}");
+    }
+
+    /// A torn write (file truncated mid-content) must be caught on read as a
+    /// hash mismatch rather than silently returning short content.
+    #[test]
+    fn torn_write_detected_on_read() {
+        let (_dir, store) = make_store();
+        let data: Vec<u8> = (0..2048).map(|i| (i % 256) as u8).collect();
+        let hash = store.write(&data).unwrap();
+
+        // Simulate a torn write: truncate the backing file to half its length.
+        let path = on_disk_path(&store, &hash);
+        let partial = &data[..data.len() / 2];
+        std::fs::write(&path, partial).unwrap();
+
+        let err = store.read(&hash).unwrap_err();
+        assert!(
+            matches!(err, BlobError::HashMismatch { .. }),
+            "expected HashMismatch, got {err:?}"
+        );
+    }
+
+    /// A single flipped byte (silent bit-rot) must be detected on read.
+    #[test]
+    fn bit_flip_detected_on_read() {
+        let (_dir, store) = make_store();
+        let data = b"the quick brown fox jumps over the lazy dog".to_vec();
+        let hash = store.write(&data).unwrap();
+
+        let path = on_disk_path(&store, &hash);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[0] ^= 0xFF; // flip the first byte
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = store.read(&hash).unwrap_err();
+        assert!(
+            matches!(err, BlobError::HashMismatch { .. }),
+            "expected HashMismatch, got {err:?}"
+        );
+    }
+
+    /// Detecting corruption on read must quarantine the bad object (preserving
+    /// its exact bytes as evidence) and free its content-addressed path.
+    #[test]
+    fn read_quarantines_corrupt_object() {
+        let (_dir, store) = make_store();
+        let data = b"quarantine me when corrupt".to_vec();
+        let hash = store.write(&data).unwrap();
+
+        let path = on_disk_path(&store, &hash);
+        let corrupt_bytes = b"this is not the original content at all".to_vec();
+        std::fs::write(&path, &corrupt_bytes).unwrap();
+
+        let _ = store.read(&hash).unwrap_err();
+
+        // The content-addressed path is now free (no longer dedup-trusted)...
+        assert!(!path.exists(), "corrupt object should be moved out of its path");
+        // ...and the bad bytes are preserved as evidence under `.corrupt/`.
+        let entries = corrupt_dir_entries(&store);
+        assert_eq!(entries.len(), 1, "exactly one quarantined object expected");
+        let preserved = std::fs::read(&entries[0]).unwrap();
+        assert_eq!(preserved, corrupt_bytes, "quarantine must preserve evidence");
+    }
+
+    /// After a corrupt object is quarantined on read, re-writing the correct
+    /// content must land (not be dedup-skipped) and heal the store.
+    #[test]
+    fn rewrite_after_quarantine_heals() {
+        let (_dir, store) = make_store();
+        let data = b"heal me after corruption".to_vec();
+        let hash = store.write(&data).unwrap();
+
+        // Corrupt the backing file, then read to trigger quarantine.
+        let path = on_disk_path(&store, &hash);
+        std::fs::write(&path, b"corrupted").unwrap();
+        let _ = store.read(&hash).unwrap_err();
+        assert!(!path.exists());
+
+        // Re-writing the original content must NOT be dedup-skipped, and the
+        // store is healed: the read now succeeds and verifies.
+        let healed_hash = store.write(&data).unwrap();
+        assert_eq!(healed_hash, hash);
+        let retrieved = store.read(&hash).unwrap();
+        assert_eq!(retrieved, data);
+    }
+
+    /// `read_unverified` must return the raw on-disk bytes even when corrupt,
+    /// while `read` rejects them — the documented opt-out contract.
+    #[test]
+    fn read_unverified_bypasses_verification() {
+        let (_dir, store) = make_store();
+        let data = b"trust me blindly".to_vec();
+        let hash = store.write(&data).unwrap();
+
+        let path = on_disk_path(&store, &hash);
+        let corrupt = b"corrupt but returned by read_unverified".to_vec();
+        std::fs::write(&path, &corrupt).unwrap();
+
+        // Unverified read returns the corrupt bytes as-is, no error.
+        let raw = store.read_unverified(&hash).unwrap();
+        assert_eq!(raw, corrupt);
+
+        // Verified read rejects them (and quarantines).
+        let err = store.read(&hash).unwrap_err();
+        assert!(matches!(err, BlobError::HashMismatch { .. }));
+    }
+
+    /// Quarantining a hash with nothing on disk is a no-op, not an error.
+    #[test]
+    fn quarantine_missing_is_noop() {
+        let (_dir, store) = make_store();
+        let fake = Hash256([0x11; 32]);
+        assert_eq!(store.quarantine(&fake).unwrap(), None);
+    }
+
+    /// A valid (uncorrupted) blob round-trips through the verifying read.
+    #[test]
+    fn verified_read_accepts_valid_blob() {
+        let (_dir, store) = make_store();
+        let data: Vec<u8> = (0..50_000).map(|i| (i % 256) as u8).collect();
+        let hash = store.write(&data).unwrap();
+        let retrieved = store.read(&hash).unwrap();
+        assert_eq!(retrieved, data);
+        // No spurious quarantine of healthy data.
+        assert!(corrupt_dir_entries(&store).is_empty());
     }
 }
