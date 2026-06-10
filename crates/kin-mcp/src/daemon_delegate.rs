@@ -9,6 +9,7 @@
 //! unit tests.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -37,20 +38,34 @@ fn daemon_base_url() -> Option<String> {
 /// present we send no header — harmless while enforcement is flag-gated, and
 /// correct once it is enabled.
 fn daemon_auth_token() -> Option<String> {
-    if let Ok(env_token) = std::env::var("KIN_DAEMON_AUTH_TOKEN") {
+    resolve_daemon_auth_token(
+        std::env::var("KIN_DAEMON_AUTH_TOKEN").ok(),
+        discover_kin_dir().as_deref(),
+    )
+}
+
+/// Pure resolution of the daemon bearer token, factored out of
+/// [`daemon_auth_token`] so the precedence is unit-testable without mutating
+/// process env or cwd.
+///
+/// Precedence mirrors the daemon's `resolve_serve_auth_token` and the CLI's
+/// `resolve_daemon_auth_token` exactly so all three agree in every case: an
+/// explicit `KIN_DAEMON_AUTH_TOKEN` override wins, otherwise the
+/// auto-provisioned per-install loopback token at `<kin_dir>/daemon.token`
+/// (which the daemon writes via `ensure_loopback_token`). Empty/whitespace
+/// values — env or file — are treated as absent so a blank file never shadows
+/// the env override and never produces a `Bearer ` header with no secret.
+fn resolve_daemon_auth_token(env_token: Option<String>, kin_dir: Option<&Path>) -> Option<String> {
+    if let Some(env_token) = env_token {
         let env_token = env_token.trim().to_string();
         if !env_token.is_empty() {
             return Some(env_token);
         }
     }
-    let token_path = discover_kin_dir()?.join("daemon.token");
+    let token_path = kin_dir?.join("daemon.token");
     let contents = std::fs::read_to_string(token_path).ok()?;
     let token = contents.trim().to_string();
-    if token.is_empty() {
-        None
-    } else {
-        Some(token)
-    }
+    (!token.is_empty()).then_some(token)
 }
 
 /// Walk up from the working directory to the repo's `.kin` directory.
@@ -604,4 +619,101 @@ pub async fn forward_check_traffic(
         "reports": reports,
         "scope_count": scope_strings.len(),
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Write a `daemon.token` containing `contents` into a fresh temp `.kin`
+    /// dir and return (tempdir, kin_dir). The tempdir must outlive the call.
+    fn kin_dir_with_token(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
+        std::fs::write(kin_dir.join("daemon.token"), contents).expect("write token");
+        (dir, kin_dir)
+    }
+
+    // ── Auth token resolution (the R0 loopback-token contract seam) ──────────
+    //
+    // These lock the MCP client's precedence to the daemon's
+    // `resolve_serve_auth_token` / `ensure_loopback_token` and the CLI's
+    // `resolve_daemon_auth_token`: env override wins, else `<.kin>/daemon.token`,
+    // with empty/whitespace treated as absent. A regression here silently breaks
+    // every authenticated MCP→daemon forward once enforcement is enabled.
+
+    #[test]
+    fn auth_token_env_override_wins_over_file() {
+        let (_guard, kin_dir) = kin_dir_with_token("file-token");
+        let resolved =
+            resolve_daemon_auth_token(Some("  env-token  ".to_string()), Some(&kin_dir));
+        assert_eq!(resolved.as_deref(), Some("env-token"));
+    }
+
+    #[test]
+    fn auth_token_falls_back_to_loopback_file() {
+        let (_guard, kin_dir) = kin_dir_with_token("loopback-secret\n");
+        let resolved = resolve_daemon_auth_token(None, Some(&kin_dir));
+        // Trailing newline (as written by the daemon) is trimmed.
+        assert_eq!(resolved.as_deref(), Some("loopback-secret"));
+    }
+
+    #[test]
+    fn auth_token_empty_env_does_not_shadow_file() {
+        let (_guard, kin_dir) = kin_dir_with_token("loopback-secret");
+        let resolved = resolve_daemon_auth_token(Some("   ".to_string()), Some(&kin_dir));
+        assert_eq!(resolved.as_deref(), Some("loopback-secret"));
+    }
+
+    #[test]
+    fn auth_token_blank_file_is_absent() {
+        // A blank token file must never produce a bare `Bearer ` header.
+        let (_guard, kin_dir) = kin_dir_with_token("   \n");
+        assert!(resolve_daemon_auth_token(None, Some(&kin_dir)).is_none());
+    }
+
+    #[test]
+    fn auth_token_absent_when_no_env_and_no_kin_dir() {
+        assert!(resolve_daemon_auth_token(None, None).is_none());
+    }
+
+    #[test]
+    fn auth_token_absent_when_file_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // .kin exists but has no daemon.token.
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).expect("mkdir .kin");
+        assert!(resolve_daemon_auth_token(None, Some(&kin_dir)).is_none());
+    }
+
+    // ── Scope request-building (forwarded session/intent tools) ──────────────
+
+    #[test]
+    fn scope_to_string_accepts_bare_string() {
+        let value = serde_json::json!("file:src/main.rs");
+        assert_eq!(scope_to_string(&value).unwrap(), "file:src/main.rs");
+    }
+
+    #[test]
+    fn scope_to_string_maps_tagged_variants() {
+        assert_eq!(
+            scope_to_string(&serde_json::json!({ "Entity": "abc" })).unwrap(),
+            "entity:abc"
+        );
+        assert_eq!(
+            scope_to_string(&serde_json::json!({ "Contract": "c1" })).unwrap(),
+            "contract:c1"
+        );
+        assert_eq!(
+            scope_to_string(&serde_json::json!({ "Artifact": "src/lib.rs" })).unwrap(),
+            "file:src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn scope_to_string_rejects_unknown_shape() {
+        assert!(scope_to_string(&serde_json::json!(42)).is_err());
+        assert!(scope_to_string(&serde_json::json!({ "Bogus": "x" })).is_err());
+    }
 }
