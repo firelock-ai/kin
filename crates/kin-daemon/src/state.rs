@@ -213,6 +213,13 @@ pub struct DaemonState {
     /// daemon-health signal so this degraded state is LOUD, never silent (the
     /// worker dying must NOT take the whole daemon down).
     pub embed_worker_failed: AtomicBool,
+    /// Durable store for in-flight MCP transactions, keyed by transaction id.
+    ///
+    /// Each `/mcp/tools/call` rebuilds a fresh `SessionRegistry` for the request,
+    /// so transaction state (begin → stage → validate → commit issued across
+    /// separate HTTP calls) must live here to survive between calls; sessions and
+    /// intents persist through the graph, but transactions have no graph backing.
+    pub mcp_transactions: Mutex<HashMap<String, kin_mcp::McpTransaction>>,
 }
 
 /// Minimum baseline count before an anti-wipe guard can fire. Below this, the
@@ -424,6 +431,7 @@ impl DaemonState {
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
             mass_deletion_blocked: AtomicBool::new(false),
             embed_worker_failed: AtomicBool::new(false),
+            mcp_transactions: Mutex::new(HashMap::new()),
         };
         Ok(state)
     }
@@ -543,6 +551,7 @@ impl DaemonState {
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
             mass_deletion_blocked: AtomicBool::new(false),
             embed_worker_failed: AtomicBool::new(false),
+            mcp_transactions: Mutex::new(HashMap::new()),
         };
 
         // Pre-load repos into the map BEFORE any async context.
@@ -1345,6 +1354,7 @@ mod tests {
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
             mass_deletion_blocked: AtomicBool::new(false),
             embed_worker_failed: AtomicBool::new(false),
+            mcp_transactions: Mutex::new(HashMap::new()),
         }
     }
 

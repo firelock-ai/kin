@@ -605,6 +605,36 @@ impl SessionRegistry {
             .get(transaction_id)
             .cloned()
     }
+
+    /// Snapshot every transaction currently held by this registry.
+    ///
+    /// Used by the daemon to persist transaction state into its long-lived store
+    /// after a tool call, since the daemon rebuilds a fresh registry per request.
+    pub fn list_transactions(&self) -> Vec<McpTransaction> {
+        self.transactions
+            .lock()
+            .expect("transactions lock poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Replace all transactions in this registry with `transactions`.
+    ///
+    /// The daemon calls this before dispatching a tool so a registry built fresh
+    /// for the request sees transactions staged by earlier requests; without it,
+    /// `begin`/`stage`/`commit` issued across separate HTTP calls never share
+    /// state and the transaction is reported "not found".
+    pub fn replace_transactions(&self, transactions: Vec<McpTransaction>) {
+        let mut map = self
+            .transactions
+            .lock()
+            .expect("transactions lock poisoned");
+        map.clear();
+        for transaction in transactions {
+            map.insert(transaction.transaction_id.clone(), transaction);
+        }
+    }
 }
 
 impl Default for SessionRegistry {

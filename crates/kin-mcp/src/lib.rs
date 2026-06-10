@@ -19,7 +19,9 @@ pub use server::{
     process_daemon_message, process_message, run_stdio, run_stdio_daemon, McpServerConfig,
     SessionAuthorityMode,
 };
-pub use session::{AssistantSession, SessionRegistry};
+pub use session::{
+    AssistantSession, McpMutationOperation, McpMutationPayload, McpTransaction, SessionRegistry,
+};
 pub use tools::{benchmark_tool_names, tool_definitions};
 pub use types::{
     ContentBlock, JsonRpcRequest, JsonRpcResponse, ToolCallParams, ToolCallResult, ToolDefinition,
