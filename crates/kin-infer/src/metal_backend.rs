@@ -3019,27 +3019,14 @@ impl GpuCompute for MetalCompute {
         let buf_wdown = self.buf_cached(weights.ffn_down_weight)?;
 
         if let Some(gate_weight) = weights.ffn_gate_weight {
-            // SwiGLU FFN
+            // SwiGLU FFN. The fat GEMM needs `[w_gate | w_up]` stacked rows-first
+            // (gate's full [inter, h] block, then up's), so the `swiglu_activation_fat`
+            // kernel reads columns [0, inter) as gate and [inter, 2*inter) as up. This
+            // is the SAME layout `buf_cached_concat` builds and the SAME cache key the
+            // per-op `fused_ffn_swiglu` paths use, so all three share one cached buffer
+            // instead of racing to populate the key with conflicting layouts.
             let up_weight = weights.ffn_up_weight.unwrap();
-            let buf_wgateup = {
-                let key = vec![
-                    (gate_weight.as_ptr() as usize, gate_weight.len()),
-                    (up_weight.as_ptr() as usize, up_weight.len()),
-                ];
-                let mut guard = self.concat_cache.lock();
-                if let Some(buf) = guard.get(&key) {
-                    buf.clone()
-                } else {
-                    let mut cat = Vec::with_capacity(gate_weight.len() + up_weight.len());
-                    for row in 0..h {
-                        cat.extend_from_slice(&gate_weight[row * inter..(row + 1) * inter]);
-                        cat.extend_from_slice(&up_weight[row * inter..(row + 1) * inter]);
-                    }
-                    let buf = self.buf_from_slice(&cat)?;
-                    guard.insert(key, buf.clone());
-                    buf
-                }
-            };
+            let buf_wgateup = self.buf_cached_concat(&[gate_weight, up_weight])?;
             
             let buf_gateup = self.pool.acquire_uninit(total_rows * 2 * inter * 4)?;
             let buf_act = self.pool.acquire_uninit(total_rows * inter * 4)?;

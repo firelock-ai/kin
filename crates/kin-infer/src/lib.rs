@@ -3977,18 +3977,25 @@ mod tests {
     /// Validate that the single-dispatch batched RoPE (`rope_qk_batched` →
     /// `rope_pair_batched`, used by `forward_batched`) is numerically identical to
     /// the proven per-element RoPE path (`rope_qk`, used by `forward`). Embeds the
-    /// SAME inputs through both paths and asserts the embeddings match. Uses the
-    /// real SweRank model (nomic_bert, the only RoPE arm); auto-skips if absent.
+    /// SAME inputs through both paths and asserts the embeddings match. Uses a real
+    /// nomic_bert model (the RoPE arm) at /tmp/nomic; auto-skips if absent or if its
+    /// config.json is not a parseable `BertConfig` (e.g. a modeling-code-only config).
     #[test]
     fn batched_rope_matches_per_element_forward() {
-        let dir = std::path::Path::new("/tmp/swerank");
+        let dir = std::path::Path::new("/tmp/nomic");
         if !dir.join("model.safetensors").exists() {
-            eprintln!("SKIP: SweRank model absent at /tmp/swerank; batched-RoPE parity test skipped.");
+            eprintln!("SKIP: nomic model absent at /tmp/nomic; batched-RoPE parity test skipped.");
             return;
         }
         let cfg_json =
             std::fs::read_to_string(dir.join("config.json")).expect("read config.json");
-        let config: BertConfig = serde_json::from_str(&cfg_json).expect("parse config.json");
+        let config: BertConfig = match serde_json::from_str(&cfg_json) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: /tmp/nomic config.json is not a parseable BertConfig ({e}).");
+                return;
+            }
+        };
         let vocab = config.vocab_size.max(2);
         let model =
             BertModel::load(&dir.join("model.safetensors"), config).expect("load model");
@@ -4037,6 +4044,97 @@ mod tests {
             min_cos >= 1.0 - 1e-5,
             "batched RoPE diverges from per-element: min_cosine={min_cos} (max_abs={max_abs})"
         );
+    }
+
+    /// Regression for the cold-start batched-embedding corruption.
+    ///
+    /// `forward_layer_batched` built the fused `[gate|up]` FFN weight under the
+    /// SAME `concat_cache` key as the per-op `fused_ffn_swiglu`, but with a
+    /// DIFFERENT (block-interleaved) byte layout. Whichever path populated the key
+    /// first won; the other read a wrong-layout weight and produced an embedding
+    /// orthogonal to ground truth (cosine ~0). It stayed hidden because the daemon
+    /// usually ran a single `forward` first, seeding the correct layout — but a
+    /// cold batched embed (no prior single forward) was garbage, and which path
+    /// ran first varied per process, so the same text drifted across restarts.
+    ///
+    /// Two SEPARATE model instances give independent concat caches: `model_cold`
+    /// runs the batched path with a genuinely cold cache (no prior single forward),
+    /// while `model_ref` provides the always-correct single-`forward` reference.
+    /// The target also rides a much longer filler so the batch pads it wide,
+    /// folding the batch-invariance check into the same assertion. The two must be
+    /// BYTE-IDENTICAL.
+    #[test]
+    fn batched_cold_matches_single_forward() {
+        let dir = std::path::Path::new("/tmp/nomic");
+        if !dir.join("model.safetensors").exists() {
+            eprintln!("SKIP: nomic model absent at /tmp/nomic; cold-batched regression skipped.");
+            return;
+        }
+        let cfg_json =
+            std::fs::read_to_string(dir.join("config.json")).expect("read config.json");
+        let load = || {
+            let config: BertConfig = serde_json::from_str(&cfg_json).expect("parse config.json");
+            BertModel::load(&dir.join("model.safetensors"), config).expect("load model")
+        };
+        let model_cold = load();
+        let model_ref = load();
+        let vocab = serde_json::from_str::<BertConfig>(&cfg_json).unwrap().vocab_size.max(2);
+
+        let target: Vec<u32> = (0..50).map(|j| ((37 + j * 7) % vocab) as u32).collect();
+        let tmask = vec![1u32; target.len()];
+        // Long filler (len 96) forces the target to pad wide in the batched call.
+        let filler: Vec<u32> = (0..96).map(|j| ((11 + j * 13) % vocab) as u32).collect();
+        let fmask = vec![1u32; filler.len()];
+
+        // Cold batched FIRST on a fresh instance: no prior single forward seeded the
+        // shared concat cache, so the batched path must build the correct layout
+        // itself. result[0] is the target's embedding (input order is preserved).
+        let batched = model_cold
+            .forward_batched(&[target.clone(), filler], &[tmask.clone(), fmask])
+            .expect("cold forward_batched")
+            .remove(0);
+        // Always-correct single-sequence reference on a separate instance.
+        let reference = model_ref
+            .forward(&[target.clone()], &[tmask.clone()])
+            .expect("forward reference")
+            .remove(0);
+
+        let (mut dot, mut na, mut nb, mut max_abs) = (0.0f64, 0.0f64, 0.0f64, 0.0f32);
+        for (&x, &y) in reference.iter().zip(batched.iter()) {
+            dot += x as f64 * y as f64;
+            na += (x as f64).powi(2);
+            nb += (y as f64).powi(2);
+            max_abs = max_abs.max((x - y).abs());
+        }
+        let cos = dot / (na.sqrt() * nb.sqrt()).max(1e-12);
+        let identical: bool = reference
+            .iter()
+            .zip(batched.iter())
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+        let is_metal = format!("{:?}", model_cold.backend()) == "Metal";
+        eprintln!(
+            "[cold-batched regression] backend_metal={is_metal} byte_identical={identical} \
+             cosine={cos:.12} max_abs={max_abs:.3e}"
+        );
+        // Correctness floor (any backend): the layout-collision bug makes the cold
+        // batched embedding orthogonal to ground truth (cosine ~0). A tolerance well
+        // above the CPU's legitimate ~1e-7 single-vs-batched reduction-order drift
+        // still fails hard on the ~0 bug.
+        assert!(
+            cos >= 1.0 - 1e-5,
+            "cold batched embedding diverged from single forward: cosine={cos:.12} \
+             max_abs={max_abs:.3e} (a ~0 cosine is the concat-cache layout-collision bug)"
+        );
+        // Determinism guarantee (Metal): a cold batched embed must be BYTE-IDENTICAL
+        // to the single forward — that bit-equality across the batched/single split is
+        // what keeps a text's embedding stable across daemon restarts.
+        if is_metal {
+            assert!(
+                identical,
+                "Metal cold batched embedding is not byte-identical to single forward: \
+                 cosine={cos:.12} max_abs={max_abs:.3e}"
+            );
+        }
     }
 
     #[test]
