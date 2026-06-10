@@ -2254,6 +2254,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         &retained_priority_paths,
         &semantic_retention_paths,
         &floor_reference,
+        locate_env_bool("KIN_LOCATE_GRAPH_SEMANTIC_CORROBORATION", false),
         if explain {
             Some(&mut pruned_files)
         } else {
@@ -9153,6 +9154,7 @@ fn adaptive_cap(
     priority_retention_paths: &HashSet<String>,
     semantic_retention_paths: &HashSet<String>,
     floor_reference: &HashMap<String, f32>,
+    graph_semantic_corroboration: bool,
     mut pruned: Option<&mut Vec<PrunedFile>>,
 ) -> Vec<(String, f32)> {
     let _span = tracing::info_span!(
@@ -9284,8 +9286,6 @@ fn adaptive_cap(
         .iter()
         .map(|(path, score)| floor_score_for(path, *score))
         .fold(top_score, f32::max);
-    let graph_semantic_corroboration_enabled =
-        locate_env_bool("KIN_LOCATE_GRAPH_SEMANTIC_CORROBORATION", true);
     let mut supported_indices: Vec<usize> = Vec::new();
     let mut corroborated_indices: Vec<usize> = Vec::new();
     for (i, (path, score)) in fused.iter().take(support_scan_limit).enumerate() {
@@ -9301,7 +9301,7 @@ fn adaptive_cap(
         // Graph-semantic corroboration: an embedding match backed by structural
         // follow-up (multihop or imports) is semantic+graph agreement, the same
         // evidence grade as entity_resolve corroborated by another signal.
-        let has_graph_semantic_corroboration = graph_semantic_corroboration_enabled
+        let has_graph_semantic_corroboration = graph_semantic_corroboration
             && has_signal(path, all_hits, 9)
             && (has_signal(path, all_hits, 1) || has_signal(path, all_hits, 4))
             && strong_embedding_release_allowed(path);
@@ -13108,6 +13108,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            false,
             None,
         );
         assert_eq!(capped.len(), 1);
@@ -13155,6 +13156,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            false,
             None,
         );
         assert!(capped.len() >= 3, "cap was {}", capped.len());
@@ -13377,6 +13379,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            false,
             None,
         );
         assert!(capped.len() >= 4, "cap was {}", capped.len());
@@ -13417,6 +13420,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            false,
             None,
         );
 
@@ -13456,6 +13460,7 @@ mod tests {
             &priority_retention,
             &HashSet::new(),
             &HashMap::new(),
+            false,
             None,
         );
 
@@ -13513,6 +13518,7 @@ mod tests {
             &priority_retention,
             &HashSet::new(),
             &HashMap::new(),
+            false,
             None,
         );
 
@@ -13549,6 +13555,7 @@ mod tests {
             &HashSet::new(),
             &semantic_retention,
             &HashMap::new(),
+            false,
             None,
         );
 
@@ -13583,6 +13590,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            false,
             None,
         );
         assert!(!without_reference
@@ -13602,6 +13610,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &floor_reference,
+            false,
             None,
         );
         assert!(with_reference.iter().any(|(path, _)| path == "src/gold.rs"));
@@ -13635,10 +13644,27 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            true,
             None,
         );
         assert!(capped.iter().any(|(path, _)| path == "src/semantic.rs"));
         assert!(!capped.iter().any(|(path, _)| path == "src/noise.rs"));
+
+        let default_off = adaptive_cap(
+            &fused,
+            &all_hits,
+            10,
+            false,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            false,
+            None,
+        );
+        assert!(!default_off
+            .iter()
+            .any(|(path, _)| path == "src/semantic.rs"));
     }
 
     #[test]
@@ -13780,6 +13806,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            false,
             None,
         );
 
@@ -13826,6 +13853,7 @@ mod tests {
             &priority_retention,
             &HashSet::new(),
             &HashMap::new(),
+            false,
             None,
         );
 
@@ -13858,6 +13886,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            false,
             None,
         );
         assert_eq!(capped.len(), 3);
@@ -13901,6 +13930,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            false,
             None,
         );
 
@@ -13929,6 +13959,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            false,
             None,
         );
         assert!(
@@ -13945,6 +13976,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            false,
             None,
         );
         assert_eq!(
@@ -13986,6 +14018,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            false,
             None,
         );
 
