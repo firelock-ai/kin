@@ -17,6 +17,8 @@ This downloads the latest release from GitHub, installs the `kin` and `kin-vfs` 
 into `~/.kin/bin`, and updates your shell profile (`.zshrc` / `.bashrc`). To skip the
 setup wizard during install, set `KIN_NO_SETUP=1`.
 
+> **Windows:** run Kin inside WSL2. See [windows-wsl2.md](./windows-wsl2.md).
+
 ---
 
 ## 2. First-time setup
