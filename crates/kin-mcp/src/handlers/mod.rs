@@ -2076,6 +2076,57 @@ mod tests {
     }
 
     #[test]
+    fn get_context_pack_recalls_annotation_deposited_on_focal_entity() {
+        // D.7 Track B (annotation deposit + recall): an annotation deposited on
+        // an entity via kin_annotation_add must be recalled inside that entity's
+        // get_context_pack response, through the real graph surfaces — no fake
+        // or demo data, the same create/query path the product uses.
+        use kin_model::graph::EntityStore;
+        let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  return value <= maxVal;\n}\n";
+        let (_dir, entity) = make_source_backed_entity(content);
+        let store = InMemoryGraph::default();
+        store.upsert_entity(&entity).unwrap();
+
+        // Deposit via the real add handler against the entity scope.
+        let mut add_args = HashMap::new();
+        add_args.insert("kind".into(), serde_json::json!("warning"));
+        add_args.insert(
+            "body".into(),
+            serde_json::json!("Bounds validated upstream; do not re-check here."),
+        );
+        add_args.insert(
+            "targets".into(),
+            serde_json::json!([format!("entity:{}", entity.id)]),
+        );
+        work::handle_annotation_add(&add_args, &store).unwrap();
+
+        // Recall through get_context_pack (traffic off to keep the pack focused).
+        let sessions = SessionRegistry::new();
+        let mut args = HashMap::new();
+        args.insert("entity_id".into(), serde_json::json!(entity.id.to_string()));
+        args.insert("include_traffic".into(), serde_json::json!(false));
+        let result = entities::handle_get_context_pack(&args, &store, &sessions).unwrap();
+        let text = match &result.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let response: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        let annotations = response
+            .get("annotations")
+            .and_then(|v| v.as_array())
+            .expect("context pack must recall annotations on the focal entity");
+        assert!(
+            !annotations.is_empty(),
+            "expected the deposited annotation to be recalled, got none"
+        );
+        let rendered = serde_json::to_string(annotations).unwrap();
+        assert!(
+            rendered.contains("do not re-check here"),
+            "recalled annotation body should be present; got: {rendered}"
+        );
+    }
+
+    #[test]
     fn handle_trace_computation_returns_focal_body_for_entity_id() {
         use kin_model::graph::EntityStore;
         let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  if (value < minVal) {\n    return false;\n  }\n  return value <= maxVal;\n}\n";
