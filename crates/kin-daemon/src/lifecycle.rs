@@ -11,7 +11,56 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use fs2::FileExt;
 use tracing::info;
+
+// ── Daemon Singleton Lock ───────────────────────────────────────────────
+
+/// An exclusive, per-repo daemon lock.
+///
+/// Held for the daemon's entire lifetime to guarantee at most one daemon
+/// process per repo. The lock is an OS-level advisory `flock(2)` on
+/// `.kin/daemon.lock`. Because the kernel ties the lock to the open file
+/// description, it is released automatically when this handle is dropped *or*
+/// when the process dies — including a hard `SIGKILL` — so it can never go
+/// stale and strand the repo.
+///
+/// The on-disk lock file is intentionally never unlinked: removing it would
+/// open a TOCTOU window where a second daemon creates and locks a fresh file
+/// while the first still believes it holds the lock.
+#[derive(Debug)]
+pub struct DaemonLock {
+    _file: std::fs::File,
+}
+
+/// Try to acquire the exclusive daemon lock for a repo.
+///
+/// `kin_root` is the `.kin` directory (the same root that holds `daemon.pid`
+/// and `daemon.port`).
+///
+/// Returns:
+/// - `Ok(Some(lock))` — this process is now the sole daemon. Keep `lock` alive
+///   for the daemon's whole lifetime; dropping it releases the lock.
+/// - `Ok(None)` — another live daemon already holds the lock. The caller must
+///   not start a second daemon and should exit cleanly.
+/// - `Err(_)` — an unexpected IO error opening the lock file.
+pub fn acquire_singleton_lock(kin_root: &Path) -> std::io::Result<Option<DaemonLock>> {
+    let path = kin_root.join("daemon.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(DaemonLock { _file: file })),
+        // fs2 reports contention with the platform's "would block" error
+        // (EWOULDBLOCK on Unix). Treat that — and only that — as "already
+        // held"; surface every other IO error to the caller.
+        Err(err) if err.kind() == fs2::lock_contended_error().kind() => Ok(None),
+        Err(err) => Err(err),
+    }
+}
 
 // ── Daemon State Files ──────────────────────────────────────────────────
 
@@ -390,6 +439,46 @@ mod tests {
         assert!(dir.path().join("daemon.pid").exists());
         remove_pid_file(dir.path());
         assert!(!dir.path().join("daemon.pid").exists());
+    }
+
+    #[test]
+    fn second_daemon_refuses_when_lock_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // First daemon acquires the per-repo singleton lock.
+        let first = acquire_singleton_lock(root).expect("lock IO should succeed");
+        assert!(first.is_some(), "first daemon should acquire the lock");
+
+        // A second daemon on the SAME repo must be refused while the first
+        // holds the lock — this is the multiplicity bug fix. flock(2) treats
+        // each open() independently, so a fresh acquire in-process conflicts
+        // exactly as a separate daemon process would.
+        let second = acquire_singleton_lock(root).expect("lock IO should succeed");
+        assert!(
+            second.is_none(),
+            "second daemon must refuse to start while the first holds the lock"
+        );
+
+        // Releasing the first lock (process exit / drop) lets a successor take
+        // over — the lock never goes stale.
+        drop(first);
+        let third = acquire_singleton_lock(root).expect("lock IO should succeed");
+        assert!(
+            third.is_some(),
+            "a new daemon should acquire the lock once the previous one exits"
+        );
+    }
+
+    #[test]
+    fn singleton_lock_file_lives_in_kin_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = acquire_singleton_lock(dir.path()).expect("lock IO should succeed");
+        assert!(lock.is_some());
+        assert!(
+            dir.path().join("daemon.lock").exists(),
+            "lock file should be created under the .kin root"
+        );
     }
 
     #[test]

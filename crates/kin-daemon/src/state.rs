@@ -192,30 +192,65 @@ pub struct DaemonState {
     pub cached_repo_id: String,
     /// True when the daemon is shutting down.
     pub is_shutdown: AtomicBool,
+    /// Entity count of the last graph snapshot successfully written to disk,
+    /// seeded from the snapshot loaded at startup. The shutdown flush compares
+    /// the live in-memory entity count against this baseline and refuses to
+    /// overwrite a large on-disk snapshot with a drastically-collapsed in-memory
+    /// graph (the graph-wipe-on-kill class — e.g. a transient empty/bare checkout
+    /// reconciled as all-deleted). Keyed on the GRAPH, independent of the vector
+    /// index, which self-heals on load. Updated after every successful save.
+    pub persisted_entity_count: AtomicU64,
+    /// True when the last filesystem-sync tick refused to apply its deletions
+    /// because they would have wiped most of the graph-known files (a transient
+    /// empty/incomplete checkout misread as "delete everything"). Surfaced as a
+    /// daemon-health signal; cleared on the next tick whose deletions are within
+    /// the anti-wipe threshold.
+    pub mass_deletion_blocked: AtomicBool,
+}
+
+/// Minimum baseline count before an anti-wipe guard can fire. Below this, the
+/// set is small enough that a collapse is not catastrophic (and fresh-init /
+/// tiny-repo states would false-positive).
+pub(crate) const WIPE_GUARD_MIN_BASELINE: u64 = 16;
+
+/// Shared anti-wipe predicate: does dropping from a `baseline` count to a
+/// `current` count constitute a drastic collapse (more than ~75% vanished) that
+/// a guard should refuse? Returns false for trivially small baselines. Kept pure
+/// so the threshold is unit-testable, and shared by both the shutdown graph
+/// flush (entity counts) and the fs-sync mass-deletion guard (file counts) so
+/// the two stay consistent.
+pub(crate) fn graph_collapse_is_wipe(current: u64, baseline: u64) -> bool {
+    if baseline < WIPE_GUARD_MIN_BASELINE {
+        return false;
+    }
+    current.saturating_mul(4) < baseline
 }
 
 impl DaemonState {
-    fn force_load_vector_index_if_present(layout: &KinLayout, graph: &kin_db::InMemoryGraph) {
-        let path = layout.kindb_vector_index_path();
-        if !path.exists() {
-            return;
-        }
-
-        match graph.load_vector_index(&path) {
-            Ok(count) => {
-                if count > 0 {
-                    debug!(
-                        count,
-                        path = %path.display(),
-                        "force-loaded persisted vector index for daemon parity"
-                    );
-                }
+    /// Load a persisted vector-index sidecar into a graph that was NOT built
+    /// through `SnapshotManager` (the storage-backend path uses
+    /// `InMemoryGraph::from_snapshot_with_text_index`, which does not load the
+    /// sidecar). Uses kin-db's sanctioned validated entry point, which checks the
+    /// sidecar against the graph root hash + live embedder before installing —
+    /// never a raw `load_vector_index`, which would install a stale-dimension
+    /// index and trigger the embed-worker reset loop. Safely no-ops when there is
+    /// no sidecar, a stale one, or no recorded root hash to validate against.
+    ///
+    /// The `SnapshotManager::open` / `open_read_only_for_locate` path already
+    /// performs this validated load during construction, so it does not call this.
+    fn load_validated_vector_index(layout: &KinLayout, graph: &kin_db::InMemoryGraph) {
+        let snapshot_path = layout.kindb_snapshot_path();
+        match kin_db::SnapshotManager::load_vector_index_into_graph_if_valid(graph, &snapshot_path)
+        {
+            Ok(true) => {
+                debug!(path = %snapshot_path.display(), "loaded validated persisted vector index");
             }
+            Ok(false) => {}
             Err(error) => {
                 debug!(
                     error = %error,
-                    path = %path.display(),
-                    "failed to force-load persisted vector index"
+                    path = %snapshot_path.display(),
+                    "failed to load persisted vector index"
                 );
             }
         }
@@ -293,7 +328,10 @@ impl DaemonState {
         };
 
         let blobs = BlobStore::new(layout.objects_dir()).map_err(DaemonError::from)?;
-        Self::force_load_vector_index_if_present(&layout, graph.as_ref());
+        // No post-open vector-index load here: `SnapshotManager::open` /
+        // `open_read_only_for_locate` already performed the validated load during
+        // graph construction. A raw force-load on top would re-install a stale
+        // sidecar and trigger the embed-worker reset loop.
 
         // Compute the deterministic genesis change ID.
         let genesis = kin_core::build_genesis_change();
@@ -342,6 +380,10 @@ impl DaemonState {
             kin_core::manifest::resolve_repo_id(&layout, explicit_repo_id.as_deref())
                 .map_err(DaemonError::from)?;
 
+        // Baseline for the shutdown anti-wipe guard: the entity count loaded
+        // from the on-disk snapshot. Read before `graph` is moved into the state.
+        let loaded_entity_count = graph.entity_count();
+
         let state = Self {
             layout,
             graph,
@@ -372,6 +414,8 @@ impl DaemonState {
             change_oid_cache: std::sync::RwLock::new(None),
             cached_repo_id,
             is_shutdown: AtomicBool::new(false),
+            persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
+            mass_deletion_blocked: AtomicBool::new(false),
         };
         Ok(state)
     }
@@ -419,7 +463,10 @@ impl DaemonState {
             };
 
         let blobs = BlobStore::new(layout.objects_dir()).map_err(DaemonError::from)?;
-        Self::force_load_vector_index_if_present(&layout, graph.as_ref());
+        // The backend path builds the graph via `from_snapshot_with_text_index`,
+        // which does NOT load the vector-index sidecar — do the validated load
+        // here (no-ops if no/stale sidecar).
+        Self::load_validated_vector_index(&layout, graph.as_ref());
         let genesis = kin_core::build_genesis_change();
         let working_copy = WorkingCopy {
             base_change: genesis.id,
@@ -451,6 +498,10 @@ impl DaemonState {
 
         let persisted_vfs_version = Self::load_persisted_vfs_version(&layout);
 
+        // Baseline for the shutdown anti-wipe guard (entity count loaded from
+        // the backend snapshot).
+        let loaded_entity_count = graph.entity_count();
+
         let mut state = Self {
             layout,
             graph: Arc::clone(&graph),
@@ -481,6 +532,8 @@ impl DaemonState {
             change_oid_cache: std::sync::RwLock::new(None),
             cached_repo_id: repo_id.to_string(),
             is_shutdown: AtomicBool::new(false),
+            persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
+            mass_deletion_blocked: AtomicBool::new(false),
         };
 
         // Pre-load repos into the map BEFORE any async context.
@@ -994,6 +1047,11 @@ impl DaemonState {
         self.write_generation_marker(new_gen);
         self.save_read_index()?;
 
+        // The on-disk snapshot now reflects the current graph; advance the
+        // anti-wipe baseline so a later shutdown is measured against what was
+        // actually persisted.
+        self.record_persisted_entity_count();
+
         info!(
             repo_id,
             generation = new_gen,
@@ -1073,6 +1131,43 @@ impl DaemonState {
     /// Check if the graph has unsaved mutations.
     pub fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::SeqCst)
+    }
+
+    /// Whether persisting the current in-memory graph on shutdown would overwrite
+    /// a substantially larger on-disk snapshot with a drastically-collapsed one.
+    ///
+    /// This is the GRAPH-level anti-wipe guard (mirrors loop_runner's
+    /// mass-deletion principle): if the live entity count has collapsed to less
+    /// than a quarter of the last persisted count, the in-memory graph is most
+    /// likely the victim of a transient wipe (e.g. an empty/bare checkout
+    /// reconciled as all-deleted) rather than a real edit, so the shutdown flush
+    /// must be skipped. It is deliberately independent of the vector index: a
+    /// stale kvec self-heals on load and is not a reason to block the graph flush.
+    ///
+    /// The asymmetry favors skipping: a false positive is cheap (the larger
+    /// snapshot reloads and re-reconciles against the filesystem next startup),
+    /// while a false negative is expensive (a full re-index/re-embed from an
+    /// emptied graph).
+    pub fn shutdown_flush_would_wipe_graph(&self) -> bool {
+        graph_collapse_is_wipe(
+            self.graph.entity_count() as u64,
+            self.persisted_entity_count.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Record that the on-disk snapshot now holds the current graph's entity
+    /// count. Called after every successful save so the anti-wipe baseline
+    /// tracks what is actually persisted.
+    pub fn record_persisted_entity_count(&self) {
+        self.persisted_entity_count
+            .store(self.graph.entity_count() as u64, Ordering::SeqCst);
+    }
+
+    /// True when the most recent filesystem-sync tick refused a mass deletion
+    /// (its removals would have wiped most of the graph-known files). Surfaced
+    /// as a daemon-health signal.
+    pub fn is_mass_deletion_blocked(&self) -> bool {
+        self.mass_deletion_blocked.load(Ordering::Relaxed)
     }
 
     /// Duration since the last successful save.
@@ -1206,6 +1301,7 @@ mod tests {
             uncommitted_mutations: GraphOverlay::default(),
         };
         let coordinator = SessionCoordinator::new(Arc::clone(&graph));
+        let loaded_entity_count = graph.entity_count();
 
         DaemonState {
             layout,
@@ -1237,6 +1333,8 @@ mod tests {
             change_oid_cache: std::sync::RwLock::new(None),
             cached_repo_id: "test-repo".to_string(),
             is_shutdown: AtomicBool::new(false),
+            persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
+            mass_deletion_blocked: AtomicBool::new(false),
         }
     }
 
@@ -1317,7 +1415,13 @@ mod tests {
     }
 
     #[test]
-    fn open_force_loads_vector_index_even_when_metadata_is_stale() {
+    fn open_rejects_stale_vector_index_sidecar() {
+        // A persisted vector sidecar whose metadata root hash does NOT match the
+        // graph must be REJECTED on open, not installed. Installing a stale-
+        // dimension index is exactly what triggered the embed-worker reset loop;
+        // `DaemonState::open` now relies solely on the validated load that
+        // `SnapshotManager::open` performs during construction (no raw force-load
+        // override). The embed worker rebuilds the index from the live embedder.
         let repo_dir = tempfile::tempdir().unwrap();
         let init = kin_core::init(repo_dir.path()).unwrap();
         let layout = init.layout;
@@ -1331,6 +1435,7 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
         mgr.save().unwrap();
 
+        // Write a sidecar with a deliberately mismatched (stale) root hash.
         let vectors = VectorIndex::new(4).unwrap();
         vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         vectors.save(&vector_path).unwrap();
@@ -1348,7 +1453,11 @@ mod tests {
         drop(mgr);
 
         let state = DaemonState::open(layout).unwrap();
-        assert_eq!(state.graph.embedding_status().indexed, 1);
+        assert_eq!(
+            state.graph.embedding_status().indexed,
+            0,
+            "stale-root-hash vector sidecar must be rejected, not installed"
+        );
     }
 
     fn make_scoped_graph_with_entity(name: &str, file_path: &str) -> Arc<kin_db::InMemoryGraph> {
@@ -1647,5 +1756,54 @@ mod tests {
             entities.iter().any(|e| e.name == "paired_fn"),
             "reloaded snapshot must contain the saved entity"
         );
+    }
+
+    #[test]
+    fn graph_collapse_is_wipe_threshold() {
+        // Below the min baseline: never a wipe, even at total collapse.
+        assert!(!graph_collapse_is_wipe(0, WIPE_GUARD_MIN_BASELINE - 1));
+        // At/above baseline with a >75% collapse → wipe.
+        assert!(graph_collapse_is_wipe(0, 1000)); // total wipe
+        assert!(graph_collapse_is_wipe(100, 1000)); // 90% gone
+        assert!(graph_collapse_is_wipe(249, 1000)); // just over 75% gone (249*4=996<1000)
+                                                    // Exactly a quarter remaining is NOT a wipe (250*4=1000, not < 1000).
+        assert!(!graph_collapse_is_wipe(250, 1000));
+        // Growth or steady state is never a wipe.
+        assert!(!graph_collapse_is_wipe(1000, 1000));
+        assert!(!graph_collapse_is_wipe(2000, 1000));
+    }
+
+    #[tokio::test]
+    async fn shutdown_wipe_guard_blocks_drastic_graph_collapse() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+
+        // Populate a non-trivial graph and record it as the persisted baseline.
+        for i in 0..20 {
+            state
+                .graph
+                .upsert_entity(&test_entity(&format!("fn_{i}"), &format!("src/f{i}.rs")))
+                .unwrap();
+        }
+        let n = state.graph.entity_count() as u64;
+        assert!(
+            n >= WIPE_GUARD_MIN_BASELINE,
+            "test needs a non-trivial graph (got {n})"
+        );
+        state.record_persisted_entity_count();
+        assert_eq!(state.persisted_entity_count.load(Ordering::SeqCst), n);
+
+        // current == baseline → no collapse, flush allowed.
+        assert!(!state.shutdown_flush_would_wipe_graph());
+
+        // A much larger prior on-disk snapshot vs the live graph (>75% collapse)
+        // → guard fires and the flush is skipped.
+        state.persisted_entity_count.store(n * 5, Ordering::SeqCst);
+        assert!(state.shutdown_flush_would_wipe_graph());
+
+        // A moderate drop (50%) is a legitimate edit, NOT a wipe.
+        state.persisted_entity_count.store(n * 2, Ordering::SeqCst);
+        assert!(!state.shutdown_flush_would_wipe_graph());
     }
 }
