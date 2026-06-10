@@ -40,9 +40,9 @@ use kin_model::{
 
 /// Default HuggingFace model ID.
 ///
-/// SweRank small keeps semantic search local while bringing embedding build time
-/// down enough for repo-scale indexing to stay practical on developer
-/// machines.
+/// The default nomic-embed-text-v1.5 keeps semantic search local while bringing
+/// embedding build time down enough for repo-scale indexing to stay practical on
+/// developer machines.
 const DEFAULT_MODEL_ID: &str = "nomic-ai/nomic-embed-text-v1.5";
 /// Asymmetric query instruction for SweRankEmbed / nomic_bert code retrievers.
 ///
@@ -103,7 +103,7 @@ pub struct EmbeddingRuntimeConfig {
 /// Generates code embeddings using a local BERT model via a custom inference
 /// runtime. Pure Rust, zero framework dependencies (ndarray + safetensors).
 ///
-/// Uses SweRankEmbed-Small by default (768 dimensions).
+/// Uses nomic-embed-text-v1.5 by default (768 dimensions; override via KIN_EMBED_MODEL_ID).
 /// The model is downloaded from HuggingFace Hub on first use and cached locally.
 pub struct CodeEmbedder {
     #[cfg(feature = "embeddings")]
@@ -2179,7 +2179,7 @@ mod tests {
         LanguageId, SemanticFingerprint, Visibility,
     };
 
-    /// Default embedding dimensions for SweRankEmbed-Small.
+    /// Default embedding dimensions (768, nomic-embed-text-v1.5).
     const DEFAULT_EMBED_DIMS: usize = 768;
 
     #[test]
