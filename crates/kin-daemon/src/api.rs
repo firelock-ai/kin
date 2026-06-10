@@ -52,6 +52,16 @@ pub struct HealthResponse {
     pub external_session_count: u64,
     #[serde(default)]
     pub idle_seconds: u64,
+    /// Whether the daemon has loaded a snapshot or completed its first
+    /// reconciliation cycle (graph-trust signal for clients/operators).
+    #[serde(default)]
+    pub initialized: bool,
+    /// Whether the most recent filesystem-sync tick refused a suspected
+    /// mass-deletion wipe. When true, the graph is intact but in-flight bulk
+    /// removals are being withheld pending operator confirmation
+    /// (`KIN_ALLOW_MASS_DELETION=1`).
+    #[serde(default)]
+    pub mass_deletion_blocked: bool,
 }
 
 /// Readiness response.
@@ -228,6 +238,10 @@ pub struct RepoHealthResponse {
     pub repo_id: String,
     pub entity_count: usize,
     pub graph_loaded: bool,
+    #[serde(default)]
+    pub initialized: bool,
+    #[serde(default)]
+    pub mass_deletion_blocked: bool,
 }
 
 /// Repo entities search response.
@@ -519,23 +533,45 @@ async fn validate_host_and_origin(
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    // 1. Validate Host header if present
-    if let Some(host_val) = request.headers().get(header::HOST) {
-        if let Ok(host_str) = host_val.to_str() {
-            let host_part = host_without_port(host_str);
-            if !is_host_allowed(host_part) {
+    let path = request.uri().path().to_string();
+
+    // 1. Validate the Host header.
+    //
+    // HTTP/1.1 makes Host mandatory and every browser (the DNS-rebinding
+    // drive-by threat) always sends it, so a rebound request carries the
+    // attacker's Host and is rejected by the allowlist below. A *missing* Host
+    // can only come from a hand-rolled raw-socket client deliberately skipping
+    // the browser contract; on a sensitive (non-public) route we reject it so
+    // the allowlist cannot be bypassed by simply omitting the header. Public
+    // liveness routes (/health, /ready, …) stay reachable without a Host so
+    // health-probe tooling is unaffected.
+    match request.headers().get(header::HOST) {
+        Some(host_val) => {
+            if let Ok(host_str) = host_val.to_str() {
+                let host_part = host_without_port(host_str);
+                if !is_host_allowed(host_part) {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({ "error": format!("Host forbidden: {}", host_str) })),
+                    )
+                        .into_response();
+                }
+            } else {
                 return (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({ "error": format!("Host forbidden: {}", host_str) })),
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "Invalid Host header encoding" })),
                 )
                     .into_response();
             }
-        } else {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "Invalid Host header encoding" })),
-            )
-                .into_response();
+        }
+        None => {
+            if !is_public_route(&path) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "Host header required" })),
+                )
+                    .into_response();
+            }
         }
     }
 
@@ -960,7 +996,7 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
         .nest("/v1", routes)
         .with_state(state);
 
-    Router::new()
+    let app = Router::new()
         .merge(daemon_routes)
         .merge(cargo_routes)
         .merge(npm_routes)
@@ -975,7 +1011,38 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
             daemon_activity,
         ))
         .layer(middleware::from_fn(api_version_header))
-        .layer(middleware::from_fn(validate_host_and_origin))
+        .layer(middleware::from_fn(validate_host_and_origin));
+
+    // Synthetic in-process tower test requests (`Request::get("/…")`) omit the
+    // Host header that every real HTTP/1.1 client — and the production
+    // `axum::serve` path — always sends. Without it the
+    // `validate_host_and_origin` missing-Host guard would 403 the entire unit
+    // suite. This cfg(test)-only shim restores that realism by defaulting an
+    // absent Host to loopback; it layers OUTSIDE (runs before) the guard and is
+    // compiled out of production and integration builds. The guard's
+    // missing-Host behaviour is covered directly by
+    // `host_header_required_on_non_public_routes`.
+    #[cfg(test)]
+    let app = app.layer(middleware::from_fn(inject_loopback_host_in_tests));
+
+    app
+}
+
+/// Test-only: default an absent `Host` header to loopback so synthetic tower
+/// requests survive the `validate_host_and_origin` missing-Host guard. Never
+/// compiled into production builds (`#[cfg(test)]`).
+#[cfg(test)]
+async fn inject_loopback_host_in_tests(
+    mut request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if !request.headers().contains_key(header::HOST) {
+        request.headers_mut().insert(
+            header::HOST,
+            axum::http::HeaderValue::from_static("127.0.0.1"),
+        );
+    }
+    next.run(request).await
 }
 
 /// Extract an optional session ID from the `X-Kin-Session` header or
@@ -1036,8 +1103,23 @@ async fn health(
         })
         .unwrap_or(0);
 
+    let initialized = state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let mass_deletion_blocked = state
+        .mass_deletion_blocked
+        .load(std::sync::atomic::Ordering::Relaxed);
+    // Surface the graph-safety guard in the top-level status so an operator or
+    // client polling /health sees a non-"ok" signal when the daemon is actively
+    // withholding a suspected mass-deletion wipe. The graph itself is intact.
+    let status = if mass_deletion_blocked {
+        "attention"
+    } else {
+        "ok"
+    };
+
     Ok(Json(HealthResponse {
-        status: "ok".to_string(),
+        status: status.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_seconds,
         graph_entity_count: Some(entity_count),
@@ -1056,6 +1138,8 @@ async fn health(
         event_subscriber_count: state.event_tx.receiver_count() as u64,
         external_session_count,
         idle_seconds: state.idle_duration().as_secs(),
+        initialized,
+        mass_deletion_blocked,
     }))
 }
 
@@ -3827,6 +3911,12 @@ async fn repo_health(
         repo_id,
         entity_count,
         graph_loaded: entity_count > 0,
+        initialized: state
+            .is_initialized
+            .load(std::sync::atomic::Ordering::Relaxed),
+        mass_deletion_blocked: state
+            .mass_deletion_blocked
+            .load(std::sync::atomic::Ordering::Relaxed),
     }))
 }
 
@@ -8313,6 +8403,70 @@ mod tests {
             .unwrap();
         assert_ne!(allowed.status(), StatusCode::FORBIDDEN);
         assert_ne!(allowed.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn host_header_required_on_non_public_routes() {
+        // Exercise the production missing-Host guard directly: a minimal router
+        // with ONLY `validate_host_and_origin` (no cfg(test) loopback-Host
+        // injector). A raw-socket client that omits Host to dodge the allowlist
+        // must be rejected on sensitive routes, while public liveness routes
+        // stay reachable for health probes.
+        let app = Router::new()
+            .route("/search", post(|| async { StatusCode::OK }))
+            .route("/health", get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn(validate_host_and_origin));
+
+        // Missing Host on a sensitive (non-public) route -> rejected.
+        let rejected = app
+            .clone()
+            .oneshot(Request::post("/search").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+        // Missing Host on a public liveness route -> still allowed.
+        let allowed = app
+            .clone()
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+
+        // A present loopback Host on the sensitive route -> allowed through.
+        let ok = app
+            .oneshot(
+                Request::post("/search")
+                    .header(header::HOST, "127.0.0.1:4219")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_surfaces_mass_deletion_blocked_attention() {
+        // When the fs-sync guard has withheld a suspected mass-deletion wipe,
+        // /health must surface a non-"ok" "attention" status and the boolean so
+        // operators/clients can detect the held state (the graph is intact).
+        let state = test_state();
+        state
+            .mass_deletion_blocked
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: HealthResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.status, "attention");
+        assert!(json.mass_deletion_blocked);
     }
 
     #[tokio::test]
