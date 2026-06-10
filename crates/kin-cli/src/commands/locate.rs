@@ -35,6 +35,41 @@ pub struct LocateResult {
     pub files: Vec<LocateFileEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug: Option<LocateDebugInfo>,
+    /// Embedding (semantic signal) coverage at query time. When coverage is
+    /// partial or zero, locate degrades gracefully — it still returns lexical
+    /// and graph results, and this field tells the caller the semantic signal
+    /// was incomplete (so an agent can weight the result honestly) rather than
+    /// erroring out. Always populated by the daemon/in-process locate path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_coverage: Option<SemanticCoverage>,
+}
+
+/// Honest, in-band report of how complete the embedding (semantic) signal was
+/// for a locate query. This is the trust-contract "per-signal degradation"
+/// property: a partial semantic index is surfaced, not hidden behind an opaque
+/// error.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SemanticCoverage {
+    /// Entities with an embedding indexed in the vector store.
+    pub indexed: usize,
+    /// Total entities eligible for embedding.
+    pub total: usize,
+    /// Entities still queued for embedding.
+    pub pending: usize,
+    /// True when the semantic signal was complete (`total == 0`, or every
+    /// entity indexed with nothing pending).
+    pub complete: bool,
+    /// Human-readable note describing the degraded state, present only when the
+    /// semantic signal was partial. Lexical + graph signals still ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl LocateResult {
+    fn with_semantic_coverage(mut self, coverage: SemanticCoverage) -> Self {
+        self.semantic_coverage = Some(coverage);
+        self
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -597,42 +632,73 @@ fn embedding_status_summary(status: &kin_db::EmbeddingStatus) -> String {
     )
 }
 
-fn require_complete_embedding_coverage(
+/// Strict-coverage mode is OFF by default: users get graceful degradation on
+/// partial/zero embedding coverage. Benchmarks opt into the hard gate by
+/// setting `KIN_REQUIRE_COMPLETE_EMBEDDINGS=1`, which preserves
+/// benchmark-integrity (incomplete coverage refuses to score). An explicit
+/// `KIN_BYPASS_EMBEDDING_COVERAGE_CHECK=1` forces degradation even if strict
+/// was requested (kept for backward compatibility / tests).
+fn embedding_strict_mode() -> bool {
+    locate_env_bool("KIN_REQUIRE_COMPLETE_EMBEDDINGS", false)
+        && !locate_env_bool("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", false)
+}
+
+/// Pick the embedding status that actually backs the semantic signal for this
+/// query — the primary graph when it carries embeddings (or has no entities at
+/// all), otherwise the HEAD vector source used for scoped-session search.
+/// Mirrors the graph-selection logic in `extract_embedding_signals`.
+fn effective_embedding_status(
     graph: &kin_db::InMemoryGraph,
     vector_source: Option<&kin_db::InMemoryGraph>,
-) -> Result<()> {
-    if std::env::var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK")
-        .map(|v| v == "1" || v == "true" || v == "TRUE")
-        .unwrap_or(false)
-    {
-        return Ok(());
-    }
+) -> kin_db::EmbeddingStatus {
     let primary_status = graph.embedding_status();
     if primary_status.total == 0 || primary_status.indexed > 0 {
-        if embedding_status_complete(&primary_status) {
-            return Ok(());
-        }
-        anyhow::bail!(
-            "semantic locate requires complete embeddings; primary graph has {}. Run `kin embed` until `kin status --json` reports embeddingsIndexed == embeddingsTotal and embeddingsPending == 0.",
-            embedding_status_summary(&primary_status)
-        );
+        return primary_status;
     }
-
     if let Some(source) = vector_source.filter(|source| !std::ptr::eq(*source, graph)) {
-        let source_status = source.embedding_status();
-        if embedding_status_complete(&source_status) {
-            return Ok(());
-        }
+        return source.embedding_status();
+    }
+    primary_status
+}
+
+/// Evaluate embedding coverage for a locate query.
+///
+/// Default (user) behavior: never errors. Returns a `SemanticCoverage` report
+/// describing whether the semantic signal was complete; on partial/zero
+/// coverage it carries a note explaining that lexical + graph signals still
+/// ran. Strict (benchmark) behavior, gated behind
+/// `KIN_REQUIRE_COMPLETE_EMBEDDINGS=1`: bails on incomplete coverage exactly as
+/// before, so benchmarks refuse to score a half-embedded repo.
+fn evaluate_embedding_coverage(
+    graph: &kin_db::InMemoryGraph,
+    vector_source: Option<&kin_db::InMemoryGraph>,
+) -> Result<SemanticCoverage> {
+    let status = effective_embedding_status(graph, vector_source);
+    let complete = embedding_status_complete(&status);
+
+    if !complete && embedding_strict_mode() {
         anyhow::bail!(
-            "semantic locate requires complete embeddings; vector source graph has {}. Run `kin embed` on the central graph until `kin status --json` reports embeddingsIndexed == embeddingsTotal and embeddingsPending == 0.",
-            embedding_status_summary(&source_status)
+            "semantic locate requires complete embeddings; graph has {}. Run `kin embed` until `kin status --json` reports embeddingsIndexed == embeddingsTotal and embeddingsPending == 0. (Set KIN_REQUIRE_COMPLETE_EMBEDDINGS=0 to allow graceful degradation.)",
+            embedding_status_summary(&status)
         );
     }
 
-    anyhow::bail!(
-        "semantic locate requires complete embeddings; primary graph has {} and no complete vector source was provided. Run `kin embed` until `kin status --json` reports embeddingsIndexed == embeddingsTotal and embeddingsPending == 0.",
-        embedding_status_summary(&primary_status)
-    );
+    let note = if complete {
+        None
+    } else {
+        Some(format!(
+            "semantic signal partial: {} embedded. Lexical + graph results returned; run `kin embed` for full semantic ranking.",
+            embedding_status_summary(&status)
+        ))
+    };
+
+    Ok(SemanticCoverage {
+        indexed: status.indexed,
+        total: status.total,
+        pending: status.pending,
+        complete,
+        note,
+    })
 }
 
 fn file_path_from_retrieval_key(
@@ -843,7 +909,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     let cleaned_text = clean_issue_text(text);
     let semantic_text = strip_pr_template_boilerplate(&cleaned_text);
     let text = semantic_text.as_str();
-    require_complete_embedding_coverage(graph, vector_source)?;
+    let semantic_coverage = evaluate_embedding_coverage(graph, vector_source)?;
 
     let mut budget = LocateBudget::new();
     let pipeline_report = std::env::var("KIN_LOCATE_PIPELINE_REPORT").is_ok();
@@ -1166,7 +1232,8 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             &HashMap::new(),
             debug_info,
             explain,
-        ));
+        )
+        .with_semantic_coverage(semantic_coverage));
     }
 
     let signal_confidence_weights = [
@@ -2374,7 +2441,8 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         &score_breakdown,
         debug_info,
         explain,
-    ))
+    )
+    .with_semantic_coverage(semantic_coverage))
 }
 
 pub fn run_with_graph_capture_at_ref(
@@ -12644,7 +12712,11 @@ fn build_result(
         }
     }
 
-    LocateResult { files, debug }
+    LocateResult {
+        files,
+        debug,
+        semantic_coverage: None,
+    }
 }
 
 fn output_result(result: &LocateResult, json: bool) {
@@ -12744,18 +12816,54 @@ mod tests {
     }
 
     #[test]
-    fn locate_rejects_incomplete_embeddings() {
+    #[serial_test::serial]
+    fn locate_strict_mode_rejects_incomplete_embeddings() {
+        // Benchmark-integrity path: with KIN_REQUIRE_COMPLETE_EMBEDDINGS=1 set,
+        // incomplete coverage still hard-errors so benchmarks never score a
+        // half-embedded repo.
         let graph = kin_db::InMemoryGraph::new();
         let entity = test_entity("handler", "src/lib.py", 1, 5);
         graph.upsert_entity(&entity).unwrap();
 
-        let err = match run_with_graph_capture(&graph, "handler failure", true, 10, true) {
-            Ok(_) => panic!("locate should reject incomplete embeddings"),
+        std::env::set_var("KIN_REQUIRE_COMPLETE_EMBEDDINGS", "1");
+        std::env::remove_var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
+        let result = run_with_graph_capture(&graph, "handler failure", true, 10, true);
+        std::env::remove_var("KIN_REQUIRE_COMPLETE_EMBEDDINGS");
+
+        let err = match result {
+            Ok(_) => panic!("strict mode should reject incomplete embeddings"),
             Err(err) => err,
         };
         assert!(
             format!("{err}").contains("semantic locate requires complete embeddings"),
             "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn locate_degrades_gracefully_on_incomplete_embeddings() {
+        // Default (user) path: incomplete coverage must NOT error. Lexical +
+        // graph signals still run, and the result reports partial semantic
+        // coverage so the caller can weight it honestly.
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = test_entity("handler", "src/lib.py", 1, 5);
+        graph.upsert_entity(&entity).unwrap();
+
+        std::env::remove_var("KIN_REQUIRE_COMPLETE_EMBEDDINGS");
+        std::env::remove_var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
+        let result = run_with_graph_capture(&graph, "handler failure", true, 10, true)
+            .expect("default locate must degrade gracefully, not error");
+
+        let coverage = result
+            .semantic_coverage
+            .expect("semantic_coverage must be reported");
+        assert_eq!(coverage.indexed, 0, "no embeddings indexed in this graph");
+        assert_eq!(coverage.total, 1, "one embeddable entity");
+        assert!(!coverage.complete, "coverage must be marked incomplete");
+        assert!(
+            coverage.note.is_some(),
+            "partial coverage must carry a degradation note"
         );
     }
 
