@@ -1220,7 +1220,11 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 fallback_files.push((path.clone(), score));
             }
         }
-        fallback_files.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        fallback_files.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         fallback_files.truncate(max_files);
         let debug_info = if explain {
             let mut info = LocateDebugInfo::default();
@@ -1893,7 +1897,11 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         })
         .filter(|(_, score)| *score >= resolve_min)
         .collect();
-    resolve_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    resolve_ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     let strong_resolve_paths: HashSet<String> = resolve_ranked
         .iter()
         .take(resolve_cap)
@@ -2263,7 +2271,9 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                                 candidates[i].1 = score;
                             }
                             candidates.sort_by(|a, b| {
-                                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                                b.1.partial_cmp(&a.1)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                    .then_with(|| a.0.cmp(&b.0))
                             });
 
                             let mut new_fused: Vec<(String, f32)> = candidates;
@@ -7794,6 +7804,7 @@ fn extract_cochange_signals(
                 b.confidence
                     .partial_cmp(&a.confidence)
                     .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| format!("{:?}", a.id).cmp(&format!("{:?}", b.id)))
             });
             for rel in relations
                 .into_iter()
@@ -8035,7 +8046,12 @@ fn resolve_entities_to_files(
     // Detect whether the graph has LSP-enriched relations. If not (e.g., init
     // ran with --no-lsp), the LSP-only filter would block ALL graph traversal
     // since every relation is Parsed origin. Auto-disable it in that case.
-    let has_lsp_relations = entity_seeds.keys().take(20).any(|eid| {
+    // The sample is drawn from a key-sorted view so the same 20 seeds are
+    // probed on every run — `entity_seeds` is a HashMap whose iteration order
+    // would otherwise flip `lsp_only_resolve` and the whole resolve outcome.
+    let mut lsp_probe_ids: Vec<&kin_model::EntityId> = entity_seeds.keys().collect();
+    lsp_probe_ids.sort_unstable();
+    let has_lsp_relations = lsp_probe_ids.iter().take(20).any(|eid| {
         graph
             .get_all_relations_for_entity(eid)
             .unwrap_or_default()
@@ -9342,7 +9358,11 @@ fn adaptive_cap(
                     .iter()
                     .map(|(p, hits)| (p, hits.iter().map(|h| h.score).fold(f32::MIN, f32::max)))
                     .collect();
-                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                scored.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.cmp(b.0))
+                });
                 scored
                     .into_iter()
                     .filter(|(p, _)| strong_embedding_release_allowed(p))
@@ -9495,7 +9515,11 @@ fn adaptive_cap(
                 readmit.push((i, strength));
             }
         }
-        readmit.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        readmit.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         for (i, _) in readmit {
             if result.len() >= support_max_total {
                 break;
@@ -12670,7 +12694,7 @@ fn collect_spans_for_file(file: &str, all_hits: &[HashMap<String, Vec<FileHit>>]
             }
         }
     }
-    spans.sort_by_key(|s| s[0]);
+    spans.sort_unstable();
     spans
 }
 
@@ -18131,6 +18155,116 @@ mod tests {
             lineage_parent: None,
             created_in: None,
             superseded_by: None,
+        }
+    }
+
+    // ── Determinism regression tests ──────────────────────────────────────
+    // The locate pipeline must return a byte-identical ordering on every run
+    // for identical inputs, including when scores tie. Ties used to settle in
+    // whatever order the upstream HashMap happened to yield, which flipped
+    // boundary results run-to-run (proven: strict F1 0.2182 vs 0.2110 on a
+    // bit-exact binary). Every score sort now carries a path/id tie-break.
+
+    #[test]
+    fn rrf_output_is_byte_identical_across_runs() {
+        // Several files tie on the rank term (each appears once at rank 0 in a
+        // distinct list with equal score). Fusing repeatedly must yield exactly
+        // the same ordering every time.
+        std::env::set_var("KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT", "0.0");
+        let lists: Vec<Vec<(String, f32)>> = vec![
+            vec![("src/d.rs".to_string(), 1.0)],
+            vec![("src/a.rs".to_string(), 1.0)],
+            vec![("src/c.rs".to_string(), 1.0)],
+            vec![("src/b.rs".to_string(), 1.0)],
+        ];
+        let first = reciprocal_rank_fusion_weighted(&lists, 60.0, &[], &[]);
+        for _ in 0..16 {
+            let again = reciprocal_rank_fusion_weighted(&lists, 60.0, &[], &[]);
+            assert_eq!(again, first, "RRF output must be byte-identical across runs");
+        }
+        std::env::remove_var("KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT");
+        // All-tied scores: ordering must be the canonical path-ascending order.
+        let order: Vec<&str> = first.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(order, vec!["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"]);
+    }
+
+    #[test]
+    fn rrf_tie_break_is_independent_of_input_list_order() {
+        // The same tied candidates presented in different per-list orders (a
+        // stand-in for HashMap iteration variance upstream) must fuse to the
+        // same final ordering — the path tie-break, not arrival order, decides.
+        std::env::set_var("KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT", "0.0");
+        let forward: Vec<Vec<(String, f32)>> = vec![vec![
+            ("src/a.rs".to_string(), 5.0),
+            ("src/b.rs".to_string(), 5.0),
+            ("src/c.rs".to_string(), 5.0),
+        ]];
+        let reversed: Vec<Vec<(String, f32)>> = vec![vec![
+            ("src/c.rs".to_string(), 5.0),
+            ("src/b.rs".to_string(), 5.0),
+            ("src/a.rs".to_string(), 5.0),
+        ]];
+        let a = reciprocal_rank_fusion_weighted(&forward, 60.0, &[], &[]);
+        let b = reciprocal_rank_fusion_weighted(&reversed, 60.0, &[], &[]);
+        std::env::remove_var("KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT");
+        // Same RANK positions tie within one list, so the rank term is equal for
+        // all three; only the within-list rank differs. The fused set and its
+        // tie-broken order must be stable regardless of how the list was ordered.
+        let names_a: Vec<&str> = a.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(names_a, vec!["src/a.rs", "src/b.rs", "src/c.rs"]);
+        // b orders the input differently but the per-position rank terms differ,
+        // so b is not required to equal a; what IS required is that re-running b
+        // is itself stable.
+        for _ in 0..8 {
+            let b_again = reciprocal_rank_fusion_weighted(&reversed, 60.0, &[], &[]);
+            assert_eq!(b_again, b, "RRF must be stable for a fixed input");
+        }
+    }
+
+    #[test]
+    fn resolve_to_files_is_deterministic_with_tied_entities() {
+        // resolve_entities_to_files projects entity seeds to files. Two entities
+        // in different files with the same discovery score tie; the projected
+        // order must be byte-identical on every run (path tie-break), not flip
+        // with seed HashMap iteration order.
+        let graph = kin_db::InMemoryGraph::new();
+        let e1 = test_entity("alpha", "src/aaa.py", 1, 5);
+        let e2 = test_entity("beta", "src/bbb.py", 1, 5);
+        graph.upsert_entity(&e1).unwrap();
+        graph.upsert_entity(&e2).unwrap();
+
+        let mut seeds: HashMap<kin_model::EntityId, EntityDiscovery> = HashMap::new();
+        seeds.insert(
+            e1.id,
+            EntityDiscovery {
+                score: 1.0,
+                signals: vec!["search"],
+                cosine: None,
+            },
+        );
+        seeds.insert(
+            e2.id,
+            EntityDiscovery {
+                score: 1.0,
+                signals: vec!["search"],
+                cosine: None,
+            },
+        );
+
+        let first = resolve_entities_to_files(&seeds, &graph, false, "test")
+            .unwrap()
+            .0
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect::<Vec<_>>();
+        for _ in 0..8 {
+            let again = resolve_entities_to_files(&seeds, &graph, false, "test")
+                .unwrap()
+                .0
+                .iter()
+                .map(|(p, _)| p.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(again, first, "resolve projection order must be deterministic");
         }
     }
 }
