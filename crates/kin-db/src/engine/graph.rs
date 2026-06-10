@@ -157,16 +157,33 @@ fn lookup_entity_revision_id(
         .map(|revision| revision.revision_id)
 }
 
+/// Whether `entity`'s content matches the most recent recorded revision for its
+/// id. Re-importing unchanged content (re-init mints a fresh change id, so the
+/// deltas arrive again) must not append a redundant revision generation — that
+/// is what bloated the graph and the vector index across re-init cycles.
+fn entity_unchanged_since_last_revision(ent: &EntityData, entity: &Entity) -> bool {
+    ent.entity_revisions
+        .get(&entity.id)
+        .and_then(|revs| revs.last())
+        .is_some_and(|last| entity_matches_revision(&last.entity, entity))
+}
+
 fn append_entity_revisions(ent: &mut EntityData, change: &SemanticChange) {
     for delta in &change.entity_deltas {
         match delta {
             EntityDelta::Added(entity) => {
+                if entity_unchanged_since_last_revision(ent, entity) {
+                    continue;
+                }
                 ent.entity_revisions
                     .entry(entity.id)
                     .or_default()
                     .push(EntityRevision::new(entity.clone(), change.id, None));
             }
             EntityDelta::Modified { old, new } => {
+                if entity_unchanged_since_last_revision(ent, new) {
+                    continue;
+                }
                 let previous_revision = lookup_entity_revision_id(&ent.entity_revisions, old);
                 ent.entity_revisions
                     .entry(new.id)
@@ -8865,6 +8882,44 @@ mod tests {
 
         // Idempotent: a clean index prunes nothing.
         assert_eq!(gen2.prune_orphaned_vectors(), 0);
+    }
+
+    /// Source-level convergence: re-importing unchanged content must not append a
+    /// redundant revision generation, regardless of whether the re-init reused
+    /// the same change id (same-second) or minted a fresh one. A genuine content
+    /// change still records a new revision.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn reinit_over_unchanged_content_records_no_new_revision() {
+        let e1 = test_entity("foo", "src/a.rs");
+        let entities = [e1.clone()];
+        let graph = InMemoryGraph::new();
+
+        let rev_count = |g: &InMemoryGraph| -> usize {
+            let ent = g.entities.read();
+            ent.entity_revisions.values().map(|v| v.len()).sum()
+        };
+
+        apply_init_change(&graph, 0x01, &entities);
+        assert_eq!(rev_count(&graph), 1);
+        assert_eq!(graph.graph_truth_retrievable_keys().len(), 2);
+
+        // Same change id (same-second re-init) — no new revision.
+        apply_init_change(&graph, 0x01, &entities);
+        assert_eq!(rev_count(&graph), 1, "same-id re-init must not duplicate");
+
+        // Fresh change id (re-init seconds later) — still unchanged content, so
+        // still no new generation.
+        apply_init_change(&graph, 0x02, &entities);
+        assert_eq!(rev_count(&graph), 1, "fresh-id re-init must converge");
+        assert_eq!(graph.graph_truth_retrievable_keys().len(), 2);
+
+        // A genuine content change DOES record a new revision.
+        let mut changed = e1;
+        changed.signature = "fn foo(x: i32)".to_string();
+        changed.fingerprint.signature_hash = Hash256::from_bytes([7; 32]);
+        apply_init_change(&graph, 0x03, &[changed]);
+        assert_eq!(rev_count(&graph), 2, "real change must record a revision");
     }
 
     #[cfg(feature = "vector")]
