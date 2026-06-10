@@ -118,7 +118,7 @@ pub fn rank_candidates_with_config(
         })
         .collect();
 
-    ranked.sort_by(|a, b| b.score.total_cmp(&a.score));
+    ranked.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
     ranked.truncate(query.limit);
     ranked
 }
@@ -829,5 +829,34 @@ mod tests {
         );
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].score, 0.0);
+    }
+
+    #[test]
+    fn equal_score_candidates_break_ties_by_id_deterministically() {
+        // Three candidates with identical signals score equally. The ranking
+        // must settle into a canonical id order that does NOT depend on the
+        // input order — otherwise a tie at the truncation boundary flips
+        // run-to-run (the locate nondeterminism bug class).
+        let query = SearchQuery::new("x");
+        let sig = || CandidateSignals::new(0.5, 0.5, 0.5, 0.5, 0.5);
+        let forward = vec![
+            SearchCandidate { id: "a".into(), title: "A".into(), signals: sig() },
+            SearchCandidate { id: "b".into(), title: "B".into(), signals: sig() },
+            SearchCandidate { id: "c".into(), title: "C".into(), signals: sig() },
+        ];
+        let reversed = vec![
+            SearchCandidate { id: "c".into(), title: "C".into(), signals: sig() },
+            SearchCandidate { id: "b".into(), title: "B".into(), signals: sig() },
+            SearchCandidate { id: "a".into(), title: "A".into(), signals: sig() },
+        ];
+        let ids_forward: Vec<String> =
+            rank_candidates(&query, &forward).into_iter().map(|r| r.id).collect();
+        let ids_reversed: Vec<String> =
+            rank_candidates(&query, &reversed).into_iter().map(|r| r.id).collect();
+        assert_eq!(ids_forward, vec!["a", "b", "c"]);
+        assert_eq!(
+            ids_forward, ids_reversed,
+            "tied ranking must be input-order-independent"
+        );
     }
 }
