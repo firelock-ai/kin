@@ -1329,8 +1329,11 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // idx 0=traceback, 1=multihop, 2=tests, 3=snippets,
     // 4=imports, 5=errors, 6=cochange, 7=entity_resolve, 8=source_text
     let traceback_top = ranked_lists[0].first().map(|(_, s)| *s).unwrap_or(0.0);
+    // resolve_top is read from the raw resolved-files scale (0-100) so the
+    // EntityDominant gate against ed_resolve_min matches the fast-path decision.
+    // ranked_lists[7] carries the ×PROJECTION weight + source bonus (scale ~0-600).
     let (resolve_top, resolve_gap, resolve_top_is_disqualified) =
-        entity_dominant_decision_metrics(&ranked_lists[7]);
+        entity_dominant_decision_metrics(&resolved_files);
     let multihop_top = ranked_lists[1].first().map(|(_, s)| *s).unwrap_or(0.0);
 
     #[derive(Debug, Clone, Copy)]
