@@ -3530,6 +3530,17 @@ fn mcp_tool_is_session_endpoint(name: &str) -> bool {
     )
 }
 
+fn mcp_tool_is_transaction(name: &str) -> bool {
+    matches!(
+        name,
+        "kin_transaction_begin"
+            | "kin_transaction_stage"
+            | "kin_transaction_validate"
+            | "kin_transaction_commit"
+            | "kin_transaction_abort"
+    )
+}
+
 fn mcp_tool_mutates_graph(name: &str) -> bool {
     matches!(
         name,
@@ -3560,7 +3571,32 @@ fn mcp_session_registry_snapshot(
     let intents = state.graph.list_all_intents().map_err(internal_error)?;
     let registry = kin_mcp::SessionRegistry::new();
     registry.replace_agent_sessions_and_intents(sessions, intents);
+    // Restore in-flight transactions so a registry built fresh for this request
+    // sees what earlier requests staged; sessions/intents persist via the graph,
+    // but transactions live only in DaemonState.
+    let transactions = state
+        .mcp_transactions
+        .lock()
+        .expect("mcp_transactions lock poisoned")
+        .values()
+        .cloned()
+        .collect();
+    registry.replace_transactions(transactions);
     Ok(registry)
+}
+
+/// Persist the registry's transactions back into `DaemonState` after a tool call
+/// so begin/stage/validate/commit issued across separate HTTP requests share
+/// state. Counterpart to the restore in `mcp_session_registry_snapshot`.
+fn persist_mcp_transactions(state: &DaemonState, registry: &kin_mcp::SessionRegistry) {
+    let mut store = state
+        .mcp_transactions
+        .lock()
+        .expect("mcp_transactions lock poisoned");
+    store.clear();
+    for transaction in registry.list_transactions() {
+        store.insert(transaction.transaction_id.clone(), transaction);
+    }
 }
 
 /// POST /mcp/tools/call — execute an MCP tool against daemon-owned graph state.
@@ -3878,6 +3914,12 @@ async fn mcp_tools_call(
         Ok(result) => result,
         Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
     };
+
+    // Persist transaction state mutated by this call so the next HTTP request
+    // (potentially a later stage/commit on the same transaction) sees it.
+    if mcp_tool_is_transaction(&request.name) {
+        persist_mcp_transactions(&state, &sessions);
+    }
 
     if mutates && result.is_error != Some(true) {
         state.bump_version();
@@ -6370,6 +6412,116 @@ mod tests {
         };
         assert!(text.contains("handler"));
         assert!(text.contains("src/lib.py"));
+    }
+
+    async fn mcp_call(
+        router: axum::Router,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> kin_mcp::ToolCallResult {
+        let response = router
+            .oneshot(
+                Request::post("/mcp/tools/call")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "name": name, "arguments": arguments }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn mcp_result_text(result: &kin_mcp::ToolCallResult) -> String {
+        match result.content.first().unwrap() {
+            kin_mcp::ContentBlock::Text { text } => text.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_transaction_persists_across_calls() {
+        // Regression: each /mcp/tools/call rebuilds a fresh SessionRegistry, so
+        // without DaemonState-backed transaction persistence a transaction begun
+        // in one call is gone by the next ("Transaction not found"). begin → stage
+        // → validate are three separate HTTP calls and must share state.
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // 1. begin
+        let begin = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_begin",
+            serde_json::json!({ "session_id": "sess-1", "scope": "file:src/lib.rs" }),
+        )
+        .await;
+        assert_ne!(begin.is_error, Some(true), "begin failed: {begin:?}");
+        let begin_json: serde_json::Value = serde_json::from_str(&mcp_result_text(&begin)).unwrap();
+        let tx_id = begin_json["transaction_id"].as_str().unwrap().to_string();
+
+        // 2. stage onto the transaction from a SEPARATE call
+        let stage = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_stage",
+            serde_json::json!({
+                "transaction_id": tx_id,
+                "operations": [{
+                    "verb": "create",
+                    "target": "",
+                    "payload": { "Entity": test_entity("new_fn", "src/lib.rs") },
+                    "description": ""
+                }]
+            }),
+        )
+        .await;
+        assert_ne!(
+            stage.is_error,
+            Some(true),
+            "stage must find the persisted transaction, got: {}",
+            mcp_result_text(&stage)
+        );
+        let stage_json: serde_json::Value = serde_json::from_str(&mcp_result_text(&stage)).unwrap();
+        assert_eq!(stage_json["staged_count"], 1);
+
+        // 3. validate from yet another call — proves state carried again
+        let validate = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_validate",
+            serde_json::json!({ "transaction_id": tx_id }),
+        )
+        .await;
+        assert_ne!(
+            validate.is_error,
+            Some(true),
+            "validate must find the persisted transaction, got: {}",
+            mcp_result_text(&validate)
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_transaction_stage_unknown_id_still_fails() {
+        // Persistence must not paper over a genuinely missing transaction.
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let stage = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_stage",
+            serde_json::json!({
+                "transaction_id": "00000000-0000-0000-0000-000000000000",
+                "operations": []
+            }),
+        )
+        .await;
+        assert_eq!(stage.is_error, Some(true));
+        assert!(mcp_result_text(&stage).contains("not found"));
     }
 
     #[tokio::test]
