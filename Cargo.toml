@@ -135,7 +135,7 @@ kin-daemon = { path = "crates/kin-daemon" }
 kin-mcp = { path = "crates/kin-mcp" }
 kin-spine = { path = "crates/kin-spine" }
 kin-registry = { path = "crates/kin-registry" }
-kin-lsp = { path = "../kin-lsp" }
+kin-lsp = { version = "0.1.0", registry = "kin" }
 kin-pipelines = { path = "crates/kin-pipelines" }
 # Cross-platform base: NO "metal" here. `[workspace.dependencies]` entries cannot be
 # `[target.'cfg(...)']`-gated, so listing "metal" here forces the macOS-only kin-infer/metal
