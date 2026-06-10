@@ -10,22 +10,14 @@ COPY . /build/kin
 
 # Build from kin directory
 WORKDIR /build/kin
-# .cargo/config.toml is gitignored. For Docker builds, we configure the Kin
-# registry AND patch deps to use git repos as a fallback (the live registry may
-# not have all features indexed yet). Once the registry is fully GCS-backed
-# with complete metadata, the [patch] section can be removed.
+# .cargo/config.toml is gitignored. Docker builds resolve every kin-* crate
+# (incl. kin-lsp) from the live Kin sparse registry, which serves complete
+# dep/feature metadata. Verified 2026-06-10: a registry-only checkout of this
+# repo resolves, fetches, and compiles the full `kin` binary with no [patch]
+# fallback. The former git-repo [patch.kin] block is no longer needed.
 RUN mkdir -p .cargo && printf '\
 [registries.kin]\n\
 index = "sparse+https://kinlab.ai/registry/cargo/"\n\
-\n\
-[patch.kin]\n\
-kin-model = { git = "https://github.com/firelock-ai/kin-db.git", package = "kin-model", branch = "'"${KIN_DB_REF}"'" }\n\
-kin-db = { git = "https://github.com/firelock-ai/kin-db.git", package = "kin-db", branch = "'"${KIN_DB_REF}"'" }\n\
-kin-vfs-core = { git = "https://github.com/firelock-ai/kin-vfs.git", package = "kin-vfs-core" }\n\
-kin-blobs = { git = "https://github.com/firelock-ai/kin-blobs.git" }\n\
-kin-search = { git = "https://github.com/firelock-ai/kin-search.git" }\n\
-kin-vector = { git = "https://github.com/firelock-ai/kin-vector.git" }\n\
-kin-infer = { git = "https://github.com/firelock-ai/kin-infer.git" }\n\
 ' > .cargo/config.toml
 # kin-daemon needs --features gcs for GCS StorageBackend in cloud deployment.
 RUN cargo build --release --features gcs --bin kin-daemon --bin kin
