@@ -2353,7 +2353,10 @@ mod tests {
 
     #[test]
     fn test_entity_served_from_blob_store_file_deleted() {
-        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempdir().unwrap();
         let kin_dir = dir.path().join(".kin");
         fs::create_dir_all(&kin_dir).unwrap();
@@ -2417,7 +2420,10 @@ mod tests {
 
     #[test]
     fn test_disk_fallback_stale_flag() {
-        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempdir().unwrap();
         let _guard = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
 
@@ -2486,7 +2492,10 @@ mod tests {
 
     #[test]
     fn test_hash_mismatch_falls_back_to_disk() {
-        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempdir().unwrap();
         let kin_dir = dir.path().join(".kin");
         fs::create_dir_all(&kin_dir).unwrap();

@@ -584,8 +584,8 @@ mod tests {
     async fn envelope_present_on_entities_family() {
         // semantic_search returns an object payload; the envelope must ride
         // alongside the original `results` key without displacing it.
-        let payload = call_tool_payload("semantic_search", serde_json::json!({ "query": "foo" }))
-            .await;
+        let payload =
+            call_tool_payload("semantic_search", serde_json::json!({ "query": "foo" })).await;
         assert_offline_envelope(&payload, "semantic_search");
         assert!(
             payload.get("results").is_some(),

@@ -51,8 +51,7 @@ pub struct McpTransaction {
 
 /// The mutation verbs the transaction commit path understands, listed for
 /// actionable error messages.
-const KNOWN_MUTATION_VERBS: &str =
-    "create/add/upsert/insert, update/modify, or delete/remove";
+const KNOWN_MUTATION_VERBS: &str = "create/add/upsert/insert, update/modify, or delete/remove";
 
 fn is_known_mutation_verb(verb: &str) -> bool {
     matches!(
@@ -103,6 +102,68 @@ pub fn validate_staged_operations(
         }
     }
     Ok(())
+}
+
+/// Why a single staged operation cannot be turned into a committed delta, or
+/// `None` when it is committable.
+///
+/// This mirrors exactly what the commit path (`handle_transaction_commit`) can
+/// turn into an `EntityDelta`/`RelationDelta`. The cases it flags are the ones
+/// the commit `match` would otherwise fall through and silently drop:
+/// relation `update`/`modify` (relations are identity-less edges — only
+/// add/remove are committable) and `Blob` payloads (no transactional blob path
+/// yet), plus the intrinsic problems stage-time validation already guards.
+/// No graph access is required, so it is safe to run in any runtime; existence
+/// checks (does the relation/entity actually exist) stay graph-side.
+pub fn uncommittable_reason(op: &McpMutationOperation) -> Option<String> {
+    let verb = op.verb.trim().to_lowercase();
+    if verb.is_empty() {
+        return Some(format!(
+            "missing verb; expected one of {KNOWN_MUTATION_VERBS}"
+        ));
+    }
+    if !is_known_mutation_verb(&verb) {
+        return Some(format!(
+            "unknown verb '{}'; expected one of {KNOWN_MUTATION_VERBS}",
+            op.verb
+        ));
+    }
+    let Some(payload) = op.payload.as_ref() else {
+        return Some("missing payload".to_string());
+    };
+    match payload {
+        // Every known verb maps to an entity delta (add/modify/remove).
+        McpMutationPayload::Entity(_) => None,
+        McpMutationPayload::Relation { .. } => {
+            if matches!(verb.as_str(), "update" | "modify") {
+                Some(format!(
+                    "verb '{}' is not committable for relation payloads; relations support only \
+                     create/add/upsert/insert or delete/remove",
+                    op.verb
+                ))
+            } else {
+                None
+            }
+        }
+        McpMutationPayload::Blob(_) => {
+            Some("blob payloads are not yet committable through transactions".to_string())
+        }
+    }
+}
+
+/// Indexed, human-readable reasons for every staged operation that cannot be
+/// committed. Empty when the whole batch is committable. The commit and
+/// validate handlers use this to fail loud instead of silently dropping
+/// un-committable operations at commit.
+pub fn uncommittable_operations(operations: &[McpMutationOperation]) -> Vec<String> {
+    operations
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, op)| {
+            uncommittable_reason(op)
+                .map(|reason| format!("operation #{idx} ('{}'): {reason}", op.verb))
+        })
+        .collect()
 }
 
 /// Thread-safe registry for agent sessions and intents.
@@ -936,10 +997,51 @@ mod tests {
     #[test]
     fn validate_staged_operations_reports_offending_index() {
         let ops = vec![
-            op("create", Some(McpMutationPayload::Entity(entity_named("ok")))),
+            op(
+                "create",
+                Some(McpMutationPayload::Entity(entity_named("ok"))),
+            ),
             op("create", None),
         ];
         let err = validate_staged_operations(&ops).unwrap_err();
         assert!(err.contains("operation #1"), "{err}");
+    }
+
+    fn relation_payload() -> McpMutationPayload {
+        McpMutationPayload::Relation {
+            from: EntityId::new(),
+            to: EntityId::new(),
+            kind: kin_model::relation::RelationKind::Calls,
+        }
+    }
+
+    #[test]
+    fn uncommittable_operations_accepts_commit_supported_payloads() {
+        let ops = vec![
+            op(
+                "create",
+                Some(McpMutationPayload::Entity(entity_named("foo"))),
+            ),
+            op("add", Some(relation_payload())),
+            op("remove", Some(relation_payload())),
+        ];
+        assert!(uncommittable_operations(&ops).is_empty());
+    }
+
+    #[test]
+    fn uncommittable_operations_reports_commit_silent_drop_cases() {
+        let ops = vec![
+            op("modify", Some(relation_payload())),
+            op("create", Some(McpMutationPayload::Blob(vec![1, 2, 3]))),
+        ];
+        let reasons = uncommittable_operations(&ops);
+        assert_eq!(reasons.len(), 2);
+        assert!(reasons[0].contains("operation #0"), "{reasons:?}");
+        assert!(
+            reasons[0].contains("not committable for relation payloads"),
+            "{reasons:?}"
+        );
+        assert!(reasons[1].contains("operation #1"), "{reasons:?}");
+        assert!(reasons[1].contains("blob payloads"), "{reasons:?}");
     }
 }

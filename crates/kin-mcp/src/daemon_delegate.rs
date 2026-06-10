@@ -345,9 +345,7 @@ pub async fn forward_tool_call(
 /// argument map. A missing `operations` field is left for the daemon to report
 /// (so the missing-parameter message stays authoritative); a malformed array or
 /// a payload that would be silently dropped at commit fails loud here.
-fn validate_stage_arguments(
-    arguments: &HashMap<String, serde_json::Value>,
-) -> Result<(), String> {
+fn validate_stage_arguments(arguments: &HashMap<String, serde_json::Value>) -> Result<(), String> {
     let Some(operations_val) = arguments.get("operations") else {
         return Ok(());
     };
@@ -381,7 +379,10 @@ async fn forward_graph_status(
         .await
         .map_err(|e| format!("daemon graph status failed: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("daemon graph status failed: HTTP {}", resp.status()));
+        return Err(format!(
+            "daemon graph status failed: HTTP {}",
+            resp.status()
+        ));
     }
     let value: serde_json::Value = resp
         .json()
@@ -690,8 +691,7 @@ mod tests {
     #[test]
     fn auth_token_env_override_wins_over_file() {
         let (_guard, kin_dir) = kin_dir_with_token("file-token");
-        let resolved =
-            resolve_daemon_auth_token(Some("  env-token  ".to_string()), Some(&kin_dir));
+        let resolved = resolve_daemon_auth_token(Some("  env-token  ".to_string()), Some(&kin_dir));
         assert_eq!(resolved.as_deref(), Some("env-token"));
     }
 
