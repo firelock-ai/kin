@@ -64,7 +64,7 @@ kin embed
 
 Embeddings are generated locally with `nomic-embed-text-v1.5` (768 dimensions; override
 via `KIN_EMBED_MODEL_ID`). `kin status --json` reports embedding coverage under its
-`semantic_coverage` block.
+`enrichment` block (`embeddingsIndexed` / `embeddingsPending` / `embeddingsTotal`).
 
 ### 3. Configure your system and shell
 

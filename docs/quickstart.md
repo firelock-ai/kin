@@ -74,7 +74,7 @@ Embeddings are generated locally with `nomic-embed-text-v1.5` (768 dimensions; o
 via `KIN_EMBED_MODEL_ID`). You can check coverage at any time:
 
 ```sh
-kin status --json   # see the "semantic_coverage" block
+kin status --json   # see the "enrichment" block: embeddingsIndexed / embeddingsPending / embeddingsTotal
 ```
 
 > Until embedding is complete, `kin search --semantic` and `kin locate` degrade
