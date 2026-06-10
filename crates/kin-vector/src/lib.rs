@@ -556,13 +556,30 @@ impl<Id: VectorId> HnswGraph<Id> {
         self.free_list.push(idx);
 
         // If we removed the entry point, pick a new one.
+        //
+        // Selection MUST be a pure function of graph content, never of
+        // `id_to_idx`'s iteration order: that map is re-seeded per process on
+        // every deserialize (hashbrown's randomized hasher), so a tie broken "by
+        // whoever was visited first" makes the entry point — the start of every
+        // search's greedy descent — vary across daemon boots even from a
+        // byte-identical persisted index. That jitters approximate-kNN results at
+        // the candidate-set boundary (a re-routed descent can surface a whole
+        // different neighbor). Choose the active node with the highest level,
+        // breaking ties by the smallest internal index, so the result is identical
+        // regardless of visitation order.
         if self.entry_point == Some(idx) {
             self.entry_point = None;
             self.max_level = 0;
-            // Find the active node with the highest level.
             for (&_eid, &other_idx) in &self.id_to_idx {
                 let other_level = self.nodes[other_idx].level;
-                if self.entry_point.is_none() || other_level > self.max_level {
+                let replace = match self.entry_point {
+                    None => true,
+                    Some(cur) => {
+                        other_level > self.max_level
+                            || (other_level == self.max_level && other_idx < cur)
+                    }
+                };
+                if replace {
                     self.entry_point = Some(other_idx);
                     self.max_level = other_level;
                 }
@@ -1371,6 +1388,133 @@ mod tests {
 
         assert!(graph.remove(&stale));
         assert!(graph.nodes[1].connections[1].is_empty());
+    }
+
+    /// Helper: a four-node graph whose entry point (idx 1, level 3) sits above a
+    /// DELIBERATE tie at the next level — idx 0 and idx 2 are both level 2. With a
+    /// fresh `HnswGraph` each call, `id_to_idx` carries an independent per-process
+    /// hasher seed, so its iteration order over the post-removal candidates varies
+    /// run to run. This is exactly the shape that made entry-point reselection
+    /// nondeterministic across daemon boots.
+    fn graph_with_entrypoint_tie() -> (HnswGraph<DefaultId>, [DefaultId; 4]) {
+        let ids = [
+            DefaultId::new(),
+            DefaultId::new(),
+            DefaultId::new(),
+            DefaultId::new(),
+        ];
+        let mut graph = HnswGraph::new(1);
+        graph.nodes = vec![
+            // idx 0: level 2 (tie candidate, LOWEST index → must win)
+            HnswNode {
+                vector: vec![0.0],
+                connections: vec![vec![], vec![], vec![]],
+                level: 2,
+            },
+            // idx 1: level 3 (the entry point we remove)
+            HnswNode {
+                vector: vec![1.0],
+                connections: vec![vec![], vec![], vec![], vec![]],
+                level: 3,
+            },
+            // idx 2: level 2 (tie candidate, higher index → must lose the tie)
+            HnswNode {
+                vector: vec![2.0],
+                connections: vec![vec![], vec![], vec![]],
+                level: 2,
+            },
+            // idx 3: level 1
+            HnswNode {
+                vector: vec![3.0],
+                connections: vec![vec![], vec![]],
+                level: 1,
+            },
+        ];
+        graph.entry_point = Some(1);
+        graph.max_level = 3;
+        for (i, id) in ids.iter().enumerate() {
+            graph.id_to_idx.insert(*id, i);
+        }
+        graph.idx_to_id = ids.to_vec();
+        (graph, ids)
+    }
+
+    #[test]
+    fn remove_reselects_entry_point_by_level_then_lowest_index() {
+        // Removing the entry point must promote the highest-level survivor, and
+        // break a level tie by the SMALLEST internal index — a content-defined
+        // rule, not "whoever id_to_idx happened to visit first".
+        let (mut graph, ids) = graph_with_entrypoint_tie();
+        assert!(graph.remove(&ids[1]));
+        // idx 0 and idx 2 both have level 2; idx 0 is lower → it wins.
+        assert_eq!(graph.entry_point, Some(0));
+        assert_eq!(graph.max_level, 2);
+    }
+
+    #[test]
+    fn remove_entry_point_reselection_is_independent_of_map_seed() {
+        // Build many independent graphs with identical content. Each `HnswGraph`
+        // gets its own hashbrown seed, so `id_to_idx` iterates these four ids in
+        // varying orders across instances. After removing the entry point, EVERY
+        // instance must land on the same new entry point — proving reselection no
+        // longer leaks per-process map order into the search start node.
+        let mut chosen = Vec::new();
+        for _ in 0..64 {
+            let (mut graph, ids) = graph_with_entrypoint_tie();
+            assert!(graph.remove(&ids[1]));
+            chosen.push(graph.entry_point);
+        }
+        assert!(
+            chosen.iter().all(|c| *c == Some(0)),
+            "entry-point reselection varied across map seeds: {chosen:?}"
+        );
+    }
+
+    #[test]
+    fn reconcile_removal_order_does_not_change_search_results() {
+        // Mirrors the boot reconcile (`prune_orphaned_vectors`): two indices built
+        // identically, then the SAME orphan set removed in opposite orders. With
+        // deterministic entry-point reselection the two must return byte-identical
+        // neighbors — the per-boot score jitter this fix targets.
+        let pairs: Vec<(u64, Vec<f32>)> = (0..64)
+            .map(|i| {
+                let f = i as f32;
+                let v = vec![
+                    (f * 0.131).sin(),
+                    (f * 0.071).cos(),
+                    (f * 0.029).sin(),
+                    (f * 0.017).cos(),
+                ];
+                (i as u64, v)
+            })
+            .collect();
+        let build = || {
+            let idx = VectorIndex::<u64>::new(4).unwrap();
+            for (id, v) in &pairs {
+                idx.upsert(*id, v).unwrap();
+            }
+            idx
+        };
+        let idx_fwd = build();
+        let idx_rev = build();
+
+        let orphans: Vec<u64> = (0..64u64).filter(|i| i % 5 == 0).collect();
+        for id in orphans.iter() {
+            idx_fwd.remove(id).unwrap();
+        }
+        for id in orphans.iter().rev() {
+            idx_rev.remove(id).unwrap();
+        }
+
+        for q in [
+            vec![0.2f32, -0.3, 0.5, 0.8],
+            vec![-0.9, 0.1, 0.4, -0.2],
+            vec![0.5, 0.5, -0.5, 0.5],
+        ] {
+            let a = idx_fwd.search_similar(&q, 12).unwrap();
+            let b = idx_rev.search_similar(&q, 12).unwrap();
+            assert_eq!(a, b, "removal order changed search results for query {q:?}");
+        }
     }
 
     #[test]
