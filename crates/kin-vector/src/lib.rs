@@ -32,6 +32,19 @@ pub enum VectorError {
     IndexError(String),
     #[error("io error: {0}")]
     IoError(#[from] std::io::Error),
+    /// A persisted index was built with a different model/graph than the caller
+    /// expects. Loading it would return silently-wrong neighbors, so the load is
+    /// refused. Distinct from a dimension mismatch: two models can share a
+    /// dimension yet be incompatible.
+    #[error(
+        "vector index model mismatch on {field}: snapshot was built with \"{stored}\", \
+         but \"{expected}\" was requested (loading would return silently-wrong neighbors)"
+    )]
+    ModelMismatch {
+        field: &'static str,
+        expected: String,
+        stored: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +134,77 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// Index self-description (model identity + graph provenance)
+// ---------------------------------------------------------------------------
+
+/// Provenance stamped into a persisted index so that a load can prove the
+/// snapshot is compatible with the caller's current model and graph — not merely
+/// the same vector dimensionality.
+///
+/// Dimensionality alone is NOT sufficient: two different embedding models can
+/// share a dimension (e.g. both 768-d). Loading vectors embedded by model A and
+/// querying with model B passes a dimension-only check yet returns
+/// silently-wrong neighbors. Stamp `model_id` (and optionally `graph_root`) so a
+/// same-dimension model swap is caught at load time via
+/// [`IndexDescriptor::verify_compatible`].
+///
+/// Both fields are optional so legacy/unstamped snapshots still deserialize
+/// (they decode to `None`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexDescriptor {
+    /// Identity of the embedding model that produced the stored vectors, e.g.
+    /// `"bge-small-en-v1.5@1"`. `None` for legacy/unstamped snapshots.
+    #[serde(default)]
+    pub model_id: Option<String>,
+    /// Root hash / id of the graph snapshot this index was built against.
+    /// `None` when unstamped.
+    #[serde(default)]
+    pub graph_root: Option<String>,
+}
+
+impl IndexDescriptor {
+    /// Verify a loaded snapshot's descriptor (`self`) is compatible with what the
+    /// caller `expected`.
+    ///
+    /// Only fields the caller pins (`Some`) are enforced; a `None` expected field
+    /// means "don't care". If the caller pins a field but the snapshot did not
+    /// stamp it (`None`), or stamped a different value, the load is rejected — we
+    /// cannot prove the vectors were produced by the expected model, and the
+    /// whole point is to refuse silently-wrong neighbors.
+    pub fn verify_compatible(&self, expected: &IndexDescriptor) -> Result<(), VectorError> {
+        check_descriptor_field(
+            "model_id",
+            self.model_id.as_deref(),
+            expected.model_id.as_deref(),
+        )?;
+        check_descriptor_field(
+            "graph_root",
+            self.graph_root.as_deref(),
+            expected.graph_root.as_deref(),
+        )?;
+        Ok(())
+    }
+}
+
+fn check_descriptor_field(
+    field: &'static str,
+    stored: Option<&str>,
+    expected: Option<&str>,
+) -> Result<(), VectorError> {
+    let Some(exp) = expected else {
+        return Ok(()); // caller does not pin this field
+    };
+    if stored == Some(exp) {
+        return Ok(());
+    }
+    Err(VectorError::ModelMismatch {
+        field,
+        expected: exp.to_string(),
+        stored: stored.unwrap_or("<unstamped>").to_string(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Core HNSW graph
 // ---------------------------------------------------------------------------
 
@@ -151,6 +235,11 @@ pub struct HnswGraph<Id: VectorId = DefaultId> {
     pub free_list: Vec<usize>,
     /// Simple u64 state for reproducible-ish level generation.
     pub rng_state: u64,
+    /// Self-description (model identity + graph provenance) of the vectors in
+    /// this graph. Last field + `#[serde(default)]` so legacy snapshots that
+    /// predate stamping still deserialize (descriptor decodes to default/`None`).
+    #[serde(default)]
+    pub descriptor: IndexDescriptor,
 }
 
 impl<Id: VectorId> HnswGraph<Id> {
@@ -164,6 +253,7 @@ impl<Id: VectorId> HnswGraph<Id> {
             idx_to_id: Vec::new(),
             free_list: Vec::new(),
             rng_state: 0x12345678_9abcdef0,
+            descriptor: IndexDescriptor::default(),
         }
     }
 
@@ -888,6 +978,27 @@ impl<Id: VectorId> VectorIndex<Id> {
         })
     }
 
+    /// Create a new index, stamping its self-description (model identity + graph
+    /// provenance) so future loads can verify compatibility, not just dimension.
+    pub fn new_with_descriptor(
+        dimensions: usize,
+        descriptor: IndexDescriptor,
+    ) -> Result<Self, VectorError> {
+        let index = Self::new(dimensions)?;
+        index.set_descriptor(descriptor);
+        Ok(index)
+    }
+
+    /// The persisted self-description (model identity + graph provenance).
+    pub fn descriptor(&self) -> IndexDescriptor {
+        self.graph.read().descriptor.clone()
+    }
+
+    /// Stamp / replace the self-description; persisted on the next `save`.
+    pub fn set_descriptor(&self, descriptor: IndexDescriptor) {
+        self.graph.write().descriptor = descriptor;
+    }
+
     /// The dimensionality of vectors in this index.
     pub fn dimensions(&self) -> usize {
         self.graph.read().dimensions
@@ -1048,6 +1159,7 @@ impl<Id: VectorId> VectorIndex<Id> {
                 idx_to_id: graph.idx_to_id.clone(),
                 free_list: graph.free_list.clone(),
                 rng_state: graph.rng_state,
+                descriptor: graph.descriptor.clone(),
             },
         };
         let bytes = rmp_serde::to_vec(&snapshot)
@@ -1073,6 +1185,25 @@ impl<Id: VectorId> VectorIndex<Id> {
                 "loaded vector index has dimensions {loaded_dims}, expected {dimensions}",
             )));
         }
+        Ok(vi)
+    }
+
+    /// Load a previously saved index and verify it is compatible with the
+    /// caller's `expected` self-description (model identity + graph provenance),
+    /// in addition to vector dimensionality.
+    ///
+    /// Use this instead of [`VectorIndex::load`] whenever the index was built by
+    /// a specific embedding model: it returns [`VectorError::ModelMismatch`] when
+    /// a same-dimension model swap (or graph-root change) would otherwise load
+    /// silently-wrong vectors. Only the fields the caller pins on `expected` are
+    /// enforced (see [`IndexDescriptor::verify_compatible`]).
+    pub fn load_checked(
+        path: &Path,
+        dimensions: usize,
+        expected: &IndexDescriptor,
+    ) -> Result<Self, VectorError> {
+        let vi = Self::load(path, dimensions)?;
+        vi.descriptor().verify_compatible(expected)?;
         Ok(vi)
     }
 
@@ -1572,5 +1703,181 @@ mod tests {
 
         let results = idx.search_similar(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
         assert_eq!(results[0].0, id1);
+    }
+
+    // -- index self-description (model identity + graph provenance) -----------
+
+    fn descriptor(model: &str, root: &str) -> IndexDescriptor {
+        IndexDescriptor {
+            model_id: Some(model.to_string()),
+            graph_root: Some(root.to_string()),
+        }
+    }
+
+    #[test]
+    fn descriptor_round_trips_through_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idx.hnsw");
+
+        let idx =
+            VectorIndex::<DefaultId>::new_with_descriptor(4, descriptor("bge-small@1", "root-abc"))
+                .unwrap();
+        idx.upsert(DefaultId::new(), &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.save(&path).unwrap();
+
+        let loaded = VectorIndex::<DefaultId>::load_from_disk(&path).unwrap();
+        assert_eq!(loaded.descriptor(), descriptor("bge-small@1", "root-abc"));
+    }
+
+    #[test]
+    fn load_checked_accepts_matching_model_and_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idx.hnsw");
+
+        let idx =
+            VectorIndex::<DefaultId>::new_with_descriptor(4, descriptor("bge-small@1", "root-abc"))
+                .unwrap();
+        idx.upsert(DefaultId::new(), &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.save(&path).unwrap();
+
+        let loaded = VectorIndex::<DefaultId>::load_checked(
+            &path,
+            4,
+            &descriptor("bge-small@1", "root-abc"),
+        )
+        .unwrap();
+        assert_eq!(loaded.len(), 1);
+    }
+
+    #[test]
+    fn load_checked_rejects_same_dimension_model_swap() {
+        // The core bug: identical dimension (4) but a different embedding model.
+        // A dimension-only check would pass and return silently-wrong neighbors.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idx.hnsw");
+
+        let idx =
+            VectorIndex::<DefaultId>::new_with_descriptor(4, descriptor("model-A@1", "root-1"))
+                .unwrap();
+        idx.upsert(DefaultId::new(), &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.save(&path).unwrap();
+
+        // Dimension-only load still succeeds (demonstrates the gap)...
+        assert!(VectorIndex::<DefaultId>::load(&path, 4).is_ok());
+
+        // ...but the checked load catches the swap.
+        let err =
+            VectorIndex::<DefaultId>::load_checked(&path, 4, &descriptor("model-B@1", "root-1"))
+                .unwrap_err();
+        match err {
+            VectorError::ModelMismatch {
+                field,
+                expected,
+                stored,
+            } => {
+                assert_eq!(field, "model_id");
+                assert_eq!(expected, "model-B@1");
+                assert_eq!(stored, "model-A@1");
+            }
+            other => panic!("expected ModelMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_checked_rejects_graph_root_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idx.hnsw");
+
+        let idx =
+            VectorIndex::<DefaultId>::new_with_descriptor(4, descriptor("model-A@1", "root-1"))
+                .unwrap();
+        idx.upsert(DefaultId::new(), &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.save(&path).unwrap();
+
+        let err =
+            VectorIndex::<DefaultId>::load_checked(&path, 4, &descriptor("model-A@1", "root-2"))
+                .unwrap_err();
+        assert!(matches!(err, VectorError::ModelMismatch { field, .. } if field == "graph_root"));
+    }
+
+    #[test]
+    fn load_checked_rejects_unstamped_snapshot_when_model_pinned() {
+        // A legacy index saved without a descriptor cannot be proven compatible.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idx.hnsw");
+
+        let idx = VectorIndex::<DefaultId>::new(4).unwrap(); // no descriptor stamped
+        idx.upsert(DefaultId::new(), &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.save(&path).unwrap();
+
+        let err =
+            VectorIndex::<DefaultId>::load_checked(&path, 4, &descriptor("model-B@1", "root-1"))
+                .unwrap_err();
+        match err {
+            VectorError::ModelMismatch { field, stored, .. } => {
+                assert_eq!(field, "model_id");
+                assert_eq!(stored, "<unstamped>");
+            }
+            other => panic!("expected ModelMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_compatible_ignores_unpinned_fields() {
+        let stored = descriptor("model-A@1", "root-1");
+        // Caller pins nothing -> compatible.
+        stored
+            .verify_compatible(&IndexDescriptor::default())
+            .unwrap();
+        // Caller pins only the model -> compatible.
+        stored
+            .verify_compatible(&IndexDescriptor {
+                model_id: Some("model-A@1".into()),
+                graph_root: None,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn legacy_snapshot_without_descriptor_field_still_loads() {
+        // Backward-compat: a graph serialized in the PRE-descriptor layout (one
+        // fewer field) must still deserialize, with the descriptor defaulting to
+        // None. This pins the `#[serde(default)]` trailing-field behavior under
+        // rmp-serde's array struct encoding.
+        #[derive(Serialize)]
+        struct OldGraph {
+            nodes: Vec<HnswNode>,
+            entry_point: Option<usize>,
+            max_level: usize,
+            dimensions: usize,
+            id_to_idx: HashMap<DefaultId, usize>,
+            idx_to_id: Vec<DefaultId>,
+            free_list: Vec<usize>,
+            rng_state: u64,
+        }
+        #[derive(Serialize)]
+        struct OldSnapshot {
+            format_version: u8,
+            graph: OldGraph,
+        }
+
+        let old = OldSnapshot {
+            format_version: HNSW_FORMAT_VERSION,
+            graph: OldGraph {
+                nodes: Vec::new(),
+                entry_point: None,
+                max_level: 0,
+                dimensions: 8,
+                id_to_idx: HashMap::new(),
+                idx_to_id: Vec::new(),
+                free_list: Vec::new(),
+                rng_state: 7,
+            },
+        };
+        let bytes = rmp_serde::to_vec(&old).unwrap();
+
+        let graph = try_load_snapshot::<DefaultId>(&bytes).unwrap();
+        assert_eq!(graph.dimensions, 8);
+        assert_eq!(graph.descriptor, IndexDescriptor::default());
     }
 }
