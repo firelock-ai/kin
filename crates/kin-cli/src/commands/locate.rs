@@ -2259,8 +2259,8 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                         let mut candidates = Vec::new();
 
                         for (path, score) in fused.iter().take(ltr_window) {
-                            let file_path = workspace_root.join(path);
-                            let content = std::fs::read_to_string(&file_path).unwrap_or_default();
+                            let content =
+                                graph_derived_candidate_text(graph, path, workspace_root);
                             docs.push(content);
                             candidates.push((path.clone(), *score));
                         }
@@ -7362,12 +7362,46 @@ fn lowercase_source_text(
     })
 }
 
+/// Running count of locate source-text reads served from a raw workspace disk
+/// read instead of graph-owned body. A nonzero value is graph-coverage drift;
+/// the per-read trace at `kin.locate.disk_fallback` names the offending path.
+static LOCATE_DISK_SOURCE_READS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 fn read_workspace_source_text(
     path: &str,
     workspace_root: Option<&std::path::Path>,
 ) -> Option<String> {
     let root = workspace_root?;
-    std::fs::read_to_string(root.join(path)).ok()
+    let text = std::fs::read_to_string(root.join(path)).ok()?;
+    let count = LOCATE_DISK_SOURCE_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    tracing::debug!(
+        target: "kin.locate.disk_fallback",
+        path,
+        disk_source_reads = count,
+        "served locate source text from workspace disk instead of graph body"
+    );
+    Some(text)
+}
+
+/// Candidate text for `path`, served from graph-owned body (the opaque
+/// artifact's stored source) and dropping to a raw workspace disk read only
+/// when the graph holds no body for the file. The disk leg routes through
+/// `read_workspace_source_text`, so the fallback is the explicit, telemetered
+/// path — not the silent default.
+fn graph_derived_candidate_text(
+    graph: &kin_db::InMemoryGraph,
+    path: &str,
+    workspace_root: &std::path::Path,
+) -> String {
+    if let Ok(Some(artifact)) = graph.get_opaque_artifact(&kin_model::FilePathId::new(path)) {
+        if let Some(body) = artifact.text_preview {
+            if !body.is_empty() {
+                return body;
+            }
+        }
+    }
+    read_workspace_source_text(path, Some(workspace_root)).unwrap_or_default()
 }
 
 fn workspace_source_path_exists(path: &str, workspace_root: Option<&std::path::Path>) -> bool {
