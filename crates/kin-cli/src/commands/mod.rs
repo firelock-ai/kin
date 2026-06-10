@@ -58,7 +58,6 @@ pub mod remote;
 pub mod rename;
 pub mod resolve;
 pub mod review;
-pub mod run;
 pub mod scope;
 pub mod search;
 pub mod secret;

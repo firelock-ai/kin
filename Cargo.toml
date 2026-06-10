@@ -23,7 +23,6 @@ members = [
     "crates/kin-mcp",
     "crates/kin-spine",
     "crates/kin-registry",
-    "crates/kin-pipelines",
     "tests/integration",
 ]
 
@@ -35,6 +34,7 @@ authors = ["Troy Fortin <troy@firelock.ai>"]
 repository = "https://github.com/firelock-ai/kin"
 
 [workspace.dependencies]
+parking_lot = "0.12"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -71,12 +71,12 @@ notify = "7"
 # Tree-sitter
 tree-sitter = "0.25"
 tree-sitter-typescript = "0.23"
-tree-sitter-python = "0.23"
+tree-sitter-python = "0.25"
 tree-sitter-go = "0.23"
 tree-sitter-java = "0.23"
 tree-sitter-rust = "0.23"
-tree-sitter-javascript = "0.23"
-tree-sitter-c = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 tree-sitter-c-sharp = "0.23"
 tree-sitter-ruby = "0.23"
@@ -138,7 +138,6 @@ kin-mcp = { path = "crates/kin-mcp" }
 kin-spine = { path = "crates/kin-spine" }
 kin-registry = { path = "crates/kin-registry" }
 kin-lsp = { version = "0.1.0", registry = "kin" }
-kin-pipelines = { path = "crates/kin-pipelines" }
 # Cross-platform base: NO "metal" here. `[workspace.dependencies]` entries cannot be
 # `[target.'cfg(...)']`-gated, so listing "metal" here forces the macOS-only kin-infer/metal
 # backend on every target (incl. Linux, where it cannot compile). Metal is re-enabled
