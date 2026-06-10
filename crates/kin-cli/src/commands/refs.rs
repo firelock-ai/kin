@@ -173,7 +173,7 @@ pub fn build_refs_response(
     };
     let Some(target) = target else {
         return Ok(RefsResponse {
-            lines: vec![format!("Entity '{}' not found", request.entity)],
+            lines: refs_not_found_guidance(&request.entity),
         });
     };
     let target = &target;
@@ -217,6 +217,41 @@ pub fn build_refs_response(
     }
 
     Ok(RefsResponse { lines })
+}
+
+/// Actionable guidance when `kin refs <symbol>` misses in the current repo's
+/// graph.
+///
+/// `refs` resolves references within the CURRENT repo only. A symbol defined in
+/// a sibling/dependency repo (e.g. a `kin-db` symbol queried from the `kin/`
+/// graph) legitimately misses here. Rather than dead-ending on a bare
+/// "Entity not found", keep the not-found signal but point the agent at the
+/// cross-repo surface (`kin xref`) as the concrete next step.
+///
+/// We do not fabricate a cross-repo *existence* claim: confirming a symbol lives
+/// in another repo requires the spine xref query, which is keyed by an entity id
+/// we don't have on a local miss. So we hand off to `kin xref` (which performs
+/// that lookup) instead of guessing.
+fn refs_not_found_guidance(entity: &str) -> Vec<String> {
+    let mut lines = vec![format!("Entity '{}' not found in this repo's graph.", entity)];
+    if uuid::Uuid::parse_str(entity.trim()).is_ok() {
+        // A UUID miss can't be re-queried by name; xref resolves by symbol name.
+        lines.push(
+            "hint: `kin refs` resolves references within the current repo only. For a symbol \
+             defined in a sibling/dependency repo, look it up cross-repo with `kin xref \
+             <symbol-name>` (xref resolves by name)."
+                .to_string(),
+        );
+    } else {
+        lines.push(
+            "hint: `kin refs` resolves references within the current repo only.".to_string(),
+        );
+        lines.push(format!(
+            "      If '{entity}' is defined in a sibling/dependency repo, look it up cross-repo:"
+        ));
+        lines.push(format!("        kin xref {entity}"));
+    }
+    lines
 }
 
 pub fn build_bulk_refs_response(
@@ -534,8 +569,41 @@ fn display_read_path(_layout: &kin_core::KinLayout, rel_path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_relation_kinds;
+    use super::{parse_relation_kinds, refs_not_found_guidance};
     use kin_model::RelationKind;
+
+    #[test]
+    fn refs_not_found_guidance_keeps_signal_and_points_at_xref() {
+        let lines = refs_not_found_guidance("load_vector_index_into_graph_if_valid");
+        // Not-found signal preserved (don't silently swallow the miss).
+        assert!(
+            lines[0].contains("not found"),
+            "first line keeps the not-found signal: {:?}",
+            lines
+        );
+        let joined = lines.join("\n");
+        // Actionable next step: the cross-repo surface, with a runnable command.
+        assert!(joined.contains("kin xref"), "should point at xref: {joined}");
+        assert!(
+            joined.contains("kin xref load_vector_index_into_graph_if_valid"),
+            "should include a runnable cross-repo command: {joined}"
+        );
+    }
+
+    #[test]
+    fn refs_not_found_guidance_handles_uuid_query() {
+        let uuid = "00000000-0000-0000-0000-000000000000";
+        let lines = refs_not_found_guidance(uuid);
+        let joined = lines.join("\n");
+        assert!(lines[0].contains("not found"));
+        // A UUID can't be re-queried by name, so guide toward xref by symbol name
+        // rather than emitting `kin xref <uuid>`.
+        assert!(joined.contains("kin xref"), "should mention xref: {joined}");
+        assert!(
+            !joined.contains(&format!("kin xref {uuid}")),
+            "should not suggest `kin xref <uuid>`: {joined}"
+        );
+    }
 
     #[test]
     fn parse_relation_kinds_defaults_to_all_reference_types() {
