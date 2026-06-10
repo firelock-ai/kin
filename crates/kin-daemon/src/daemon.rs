@@ -350,6 +350,21 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
         Err(error) => return Err(DaemonError::Io(error)),
     };
 
+    // Refuse to serve an incompatible `.kin/` layout. We now hold the singleton
+    // lock (sole writer for this repo) but have not bound a port, written
+    // endpoint files, or touched graph/kindb state — the safe point to validate
+    // and forward-migrate the on-disk layout version. A newer-than-supported or
+    // un-upgradable layout fails loudly here instead of being silently
+    // mis-served; a current layout is a cheap read with no disk write.
+    if let Err(error) = state.layout.migrate() {
+        tracing::error!(
+            repo = %state.layout.root().display(),
+            %error,
+            "refusing to start: .kin/ layout is incompatible with this kin build"
+        );
+        return Err(error.into());
+    }
+
     // Set up LSP enrichment channel before wrapping state in Arc.
     let lsp_rx = if config.lsp_enabled {
         let discovered = kin_lsp::discovery::discover_servers();
