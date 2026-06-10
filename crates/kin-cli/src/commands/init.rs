@@ -7,10 +7,10 @@ use kin_model::ChangeStore;
 use kin_model::EntityStore;
 use kin_model::VerificationStore;
 use kin_model::{
-    AuthorId, Entity, EntityDelta, EntityFilter, EntityId, FileLayout, FilePathId, GraphNodeId,
-    Hash256, OpaqueArtifact, ParseCompleteness, Relation, RelationDelta, RelationId, RelationKind,
-    RelationOrigin, SemanticChange, SemanticChangeId, ShallowTrackedFile, StructuredArtifact,
-    TestCase, TestId, TestKind, TestRunner, Timestamp, WorkScope,
+    ArtifactId, AuthorId, Entity, EntityDelta, EntityFilter, EntityId, FileLayout, FilePathId,
+    GraphNodeId, Hash256, OpaqueArtifact, ParseCompleteness, Relation, RelationDelta, RelationId,
+    RelationKind, RelationOrigin, SemanticChange, SemanticChangeId, ShallowTrackedFile,
+    StructuredArtifact, TestCase, TestId, TestKind, TestRunner, Timestamp, WorkScope,
 };
 use kin_projection::build_layout;
 use rayon::prelude::*;
@@ -883,6 +883,7 @@ pub(crate) fn enrich_imported_changes_with_semantics(
     let mut current_files = HashMap::<String, ImportedSemanticFileState>::new();
     let mut current_relations = HashMap::<RelationId, Relation>::new();
     let mut relations_by_src = HashMap::<EntityId, HashSet<RelationId>>::new();
+    let mut relations_by_src_artifact = HashMap::<ArtifactId, HashSet<RelationId>>::new();
     let mut incremental_linker = kin_index::IncrementalLinker::new();
 
     // Profiling timers
@@ -1041,6 +1042,7 @@ pub(crate) fn enrich_imported_changes_with_semantics(
             &impacted_files,
             &semantic_entities_by_file,
             &relations_by_src,
+            &relations_by_src_artifact,
         );
 
         let changed_parse_data = impacted_files
@@ -1052,7 +1054,11 @@ pub(crate) fn enrich_imported_changes_with_semantics(
         let mut old_relations = HashMap::<RelationId, Relation>::new();
         for relation_id in &old_relation_ids {
             if let Some(old_relation) = current_relations.remove(relation_id) {
-                remove_relation_src_index(&mut relations_by_src, &old_relation);
+                remove_relation_src_index(
+                    &mut relations_by_src,
+                    &mut relations_by_src_artifact,
+                    &old_relation,
+                );
                 old_relations.insert(*relation_id, old_relation);
             }
         }
@@ -1080,18 +1086,30 @@ pub(crate) fn enrich_imported_changes_with_semantics(
                     Some(old_relation)
                         if imported_relations_equivalent(&old_relation, &relation) =>
                     {
-                        insert_relation_src_index(&mut relations_by_src, &old_relation);
+                        insert_relation_src_index(
+                            &mut relations_by_src,
+                            &mut relations_by_src_artifact,
+                            &old_relation,
+                        );
                         current_relations.insert(relation_id, old_relation);
                     }
                     Some(_) => {
                         relation_deltas.push(RelationDelta::Removed(relation_id));
                         relation_deltas.push(RelationDelta::Added(relation.clone()));
-                        insert_relation_src_index(&mut relations_by_src, &relation);
+                        insert_relation_src_index(
+                            &mut relations_by_src,
+                            &mut relations_by_src_artifact,
+                            &relation,
+                        );
                         current_relations.insert(relation_id, relation);
                     }
                     None => {
                         relation_deltas.push(RelationDelta::Added(relation.clone()));
-                        insert_relation_src_index(&mut relations_by_src, &relation);
+                        insert_relation_src_index(
+                            &mut relations_by_src,
+                            &mut relations_by_src_artifact,
+                            &relation,
+                        );
                         current_relations.insert(relation_id, relation);
                     }
                 }
@@ -1222,20 +1240,29 @@ fn imported_reverse_dependency_closure(
     visited
 }
 
+#[allow(deprecated)]
 fn collect_relation_ids_for_imported_files(
     files: &BTreeSet<String>,
     semantic_entities_by_file: &HashMap<String, Vec<Entity>>,
     relations_by_src: &HashMap<EntityId, HashSet<RelationId>>,
+    relations_by_src_artifact: &HashMap<ArtifactId, HashSet<RelationId>>,
 ) -> HashSet<RelationId> {
     let mut relation_ids = HashSet::new();
     for file_path in files {
-        let Some(entities) = semantic_entities_by_file.get(file_path) else {
-            continue;
-        };
-        for entity in entities {
-            if let Some(existing_ids) = relations_by_src.get(&entity.id) {
-                relation_ids.extend(existing_ids.iter().copied());
+        if let Some(entities) = semantic_entities_by_file.get(file_path) {
+            for entity in entities {
+                if let Some(existing_ids) = relations_by_src.get(&entity.id) {
+                    relation_ids.extend(existing_ids.iter().copied());
+                }
             }
+        }
+        // Import/include edges are anchored to the file artifact (not an
+        // entity), so collect them by the file's artifact id too — otherwise a
+        // stable cross-file import edge is invisible to the incremental diff
+        // and gets re-added on every relink of an impacted file.
+        let artifact_id = ArtifactId::from_path(file_path);
+        if let Some(existing_ids) = relations_by_src_artifact.get(&artifact_id) {
+            relation_ids.extend(existing_ids.iter().copied());
         }
     }
 
@@ -1244,27 +1271,49 @@ fn collect_relation_ids_for_imported_files(
 
 fn insert_relation_src_index(
     relations_by_src: &mut HashMap<EntityId, HashSet<RelationId>>,
+    relations_by_src_artifact: &mut HashMap<ArtifactId, HashSet<RelationId>>,
     relation: &Relation,
 ) {
-    if let Some(src_entity) = relation.src.as_entity() {
-        relations_by_src
-            .entry(src_entity)
-            .or_default()
-            .insert(relation.id);
+    match relation.src {
+        GraphNodeId::Entity(src_entity) => {
+            relations_by_src
+                .entry(src_entity)
+                .or_default()
+                .insert(relation.id);
+        }
+        GraphNodeId::Artifact(src_artifact) => {
+            relations_by_src_artifact
+                .entry(src_artifact)
+                .or_default()
+                .insert(relation.id);
+        }
+        _ => {}
     }
 }
 
 fn remove_relation_src_index(
     relations_by_src: &mut HashMap<EntityId, HashSet<RelationId>>,
+    relations_by_src_artifact: &mut HashMap<ArtifactId, HashSet<RelationId>>,
     relation: &Relation,
 ) {
-    if let Some(src_entity) = relation.src.as_entity() {
-        if let Some(ids) = relations_by_src.get_mut(&src_entity) {
-            ids.remove(&relation.id);
-            if ids.is_empty() {
-                relations_by_src.remove(&src_entity);
+    match relation.src {
+        GraphNodeId::Entity(src_entity) => {
+            if let Some(ids) = relations_by_src.get_mut(&src_entity) {
+                ids.remove(&relation.id);
+                if ids.is_empty() {
+                    relations_by_src.remove(&src_entity);
+                }
             }
         }
+        GraphNodeId::Artifact(src_artifact) => {
+            if let Some(ids) = relations_by_src_artifact.get_mut(&src_artifact) {
+                ids.remove(&relation.id);
+                if ids.is_empty() {
+                    relations_by_src_artifact.remove(&src_artifact);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2990,14 +3039,24 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(removed_relations.len(), 2);
+        // Imports are now artifact-level (file→file) edges, so removing the
+        // callee drops only the entity-level Calls edge (handler→executeTool);
+        // the file-level import edge stays because api.ts still imports the
+        // tools module, which still exists. Exactly one reverse-dependent edge
+        // is removed.
+        assert_eq!(
+            removed_relations.len(),
+            1,
+            "the entity-level caller edge (handler→executeTool) should be removed"
+        );
         assert!(
             imported[1]
                 .change
                 .relation_deltas
                 .iter()
                 .all(|delta| matches!(delta, RelationDelta::Removed(_))),
-            "reverse-dependent caller edges should be removed instead of left stale"
+            "reverse-dependent caller edges should be removed instead of left stale, \
+             with no spurious re-add of the stable artifact import edge"
         );
     }
 
