@@ -964,14 +964,20 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
     let base_url = std::env::var("KIN_REGISTRY_BASE_URL")
         .unwrap_or_else(|_| "http://localhost:4219".to_string());
 
-    // Cargo registry
+    // Cargo registry. The publish (write) path is gated on a shared secret from
+    // KIN_REGISTRY_CARGO_TOKEN; reads stay open. A None token fails closed
+    // (publishing disabled), so an unset/empty env var never falls open.
     let crates_dir = packages_dir.join("crates");
     std::fs::create_dir_all(&crates_dir).ok();
+    let cargo_publish_token = std::env::var("KIN_REGISTRY_CARGO_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty());
     let cargo_routes =
         kin_registry::cargo::cargo_routes(Arc::new(kin_registry::cargo::CargoRegistryState {
             manifest_store: kin_registry::ManifestStore::new(state.layout.root()),
             blobs_dir: crates_dir,
             base_url: base_url.clone(),
+            publish_token: cargo_publish_token,
         }));
 
     let npm_routes = npm_registry_routes(

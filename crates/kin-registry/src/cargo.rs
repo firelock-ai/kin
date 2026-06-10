@@ -29,9 +29,21 @@ pub struct CargoRegistryState {
     pub manifest_store: ManifestStore,
     pub blobs_dir: std::path::PathBuf,
     pub base_url: String,
+    /// Shared secret required to authorize `publish` requests (the write path).
+    ///
+    /// Sourced from the `KIN_REGISTRY_CARGO_TOKEN` env var when the daemon
+    /// constructs this state. Read endpoints (config, sparse index, downloads)
+    /// ignore this field and stay open so `cargo` can fetch without auth.
+    ///
+    /// Fail-closed: when this is `None` (env unset/empty) every publish request
+    /// is rejected, so a misconfigured deployment cannot silently fall open.
+    pub publish_token: Option<String>,
 }
 
 const CRATES_IO_INDEX_URL: &str = "https://github.com/rust-lang/crates.io-index";
+
+/// Maximum accepted `.crate` upload size (50 MiB), matching crates.io's cap.
+const MAX_CRATE_SIZE: usize = 50 * 1024 * 1024;
 
 /// Create axum router for Cargo registry endpoints
 pub fn cargo_routes(state: Arc<CargoRegistryState>) -> Router {
@@ -132,20 +144,129 @@ struct PublishParams {
     version: String,
 }
 
+/// Constant-time comparison of two byte slices.
+///
+/// Returns `true` only when the slices are equal. The comparison time depends
+/// on the input *lengths* but never short-circuits on the first differing byte,
+/// so it does not leak how many leading bytes of a candidate token matched.
+/// Implemented manually to avoid pulling in a new crate dependency.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Authorize a publish request against the configured shared secret.
+///
+/// Fail-closed contract:
+/// - `publish_token == None` (env unset/empty) -> `503`, publishing disabled.
+/// - token configured but `Authorization` header missing/malformed/mismatched
+///   -> `401`.
+///
+/// On success returns `None`; otherwise returns the rejection response.
+fn authorize_publish(state: &CargoRegistryState, headers: &axum::http::HeaderMap) -> Option<Response> {
+    let Some(expected) = state.publish_token.as_deref() else {
+        return Some(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "registry publishing is disabled: no token configured"
+                })),
+            )
+                .into_response(),
+        );
+    };
+
+    let provided = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim);
+
+    match provided {
+        Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => None,
+        _ => Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "invalid or missing publish token"
+                })),
+            )
+                .into_response(),
+        ),
+    }
+}
+
 /// POST /registry/cargo/api/v1/crates/publish
 ///
 /// Accepts a `.crate` file as the request body (application/octet-stream).
 /// Query params: `name` and `version`.
-/// Computes SHA-256 checksum, stores the .crate file, and registers the version.
+///
+/// Authorization (write path only): requires `Authorization: Bearer <token>`
+/// matching `state.publish_token`. Reads stay open. Fails closed when no token
+/// is configured.
+///
+/// Validates the body (non-empty, size cap, valid gzip-tar whose embedded
+/// `Cargo.toml` `[package]` name/version match the query params), computes the
+/// SHA-256 checksum, stores the .crate file, and registers the version.
+/// Existing versions are immutable: re-publishing returns `409` rather than
+/// silently overwriting.
 async fn publish_crate(
     State(state): State<Arc<CargoRegistryState>>,
     Query(params): Query<PublishParams>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    // Auth gate runs first so unauthorized callers learn nothing about the
+    // request body or registry contents.
+    if let Some(rejection) = authorize_publish(&state, &headers) {
+        return rejection;
+    }
+
     if params.name.is_empty() || params.version.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "name and version are required" })),
+        )
+            .into_response();
+    }
+
+    // Reject an empty upload before touching the filesystem.
+    if body.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "crate body is empty" })),
+        )
+            .into_response();
+    }
+
+    // Enforce the size cap.
+    if body.len() > MAX_CRATE_SIZE {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": format!(
+                    "crate body of {} bytes exceeds the {MAX_CRATE_SIZE} byte limit",
+                    body.len()
+                )
+            })),
+        )
+            .into_response();
+    }
+
+    // Verify the uploaded bytes are a valid gzip-tar whose embedded Cargo.toml
+    // declares a `[package]` name/version matching the query params. This
+    // prevents publishing arbitrary/garbage bytes or claiming a coordinate that
+    // disagrees with the crate's own manifest.
+    if let Err(message) = verify_crate_coordinates(&body, &params.name, &params.version) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": message })),
         )
             .into_response();
     }
@@ -205,27 +326,18 @@ async fn publish_crate(
         )
             .into_response(),
         Err(crate::RegistryError::VersionExists(_, _)) => {
-            // Replace existing version — allows re-publishing with corrected metadata
-            match state
-                .manifest_store
-                .replace_versions(&pkg_version.id, &[pkg_version.clone()])
-            {
-                Ok(()) => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "name": params.name,
-                        "version": params.version,
-                        "checksum": checksum,
-                        "replaced": true,
-                    })),
-                )
-                    .into_response(),
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": format!("{e}") })),
-                )
-                    .into_response(),
-            }
+            // Published versions are immutable. Refuse to overwrite an existing
+            // version so a republish cannot swap crate contents under consumers.
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "version {} of crate {} already exists and cannot be overwritten",
+                        params.version, params.name
+                    )
+                })),
+            )
+                .into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -233,6 +345,82 @@ async fn publish_crate(
         )
             .into_response(),
     }
+}
+
+/// Verify an uploaded `.crate` blob is a well-formed gzip-tar whose embedded
+/// manifest matches the published coordinates.
+///
+/// `.crate` files are gzipped tarballs that must contain
+/// `{name}-{version}/Cargo.toml`; the manifest's `[package] name` and `version`
+/// must equal `name`/`version`. Returns `Err(message)` describing the first
+/// problem found (bad gzip/tar, missing manifest, unparseable TOML, or a
+/// name/version mismatch) so the caller can surface a `400`.
+fn verify_crate_coordinates(crate_bytes: &[u8], name: &str, version: &str) -> Result<(), String> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    let expected_manifest = format!("{}-{}/Cargo.toml", name, version);
+    let gz = GzDecoder::new(crate_bytes);
+    let mut archive = tar::Archive::new(gz);
+
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("crate is not a valid gzip-tar archive: {e}"))?;
+
+    let mut cargo_toml_content = String::new();
+    let mut found_manifest = false;
+    for entry in entries {
+        // A malformed tar stream surfaces here (e.g. truncated/non-gzip body).
+        let mut entry =
+            entry.map_err(|e| format!("crate is not a valid gzip-tar archive: {e}"))?;
+        let is_manifest = entry
+            .path()
+            .ok()
+            .map(|path| path.to_str() == Some(&expected_manifest))
+            .unwrap_or(false);
+        if is_manifest {
+            entry
+                .read_to_string(&mut cargo_toml_content)
+                .map_err(|e| format!("failed to read {expected_manifest} from crate: {e}"))?;
+            found_manifest = true;
+            break;
+        }
+    }
+
+    if !found_manifest {
+        return Err(format!("crate does not contain {expected_manifest}"));
+    }
+
+    let toml_value: toml::Value = cargo_toml_content
+        .parse()
+        .map_err(|e| format!("crate {expected_manifest} is not valid TOML: {e}"))?;
+
+    let package = toml_value
+        .get("package")
+        .and_then(|p| p.as_table())
+        .ok_or_else(|| "crate Cargo.toml is missing a [package] section".to_string())?;
+
+    let manifest_name = package
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "crate Cargo.toml [package] is missing a name".to_string())?;
+    if manifest_name != name {
+        return Err(format!(
+            "crate name mismatch: query says {name:?} but Cargo.toml says {manifest_name:?}"
+        ));
+    }
+
+    let manifest_version = package
+        .get("version")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "crate Cargo.toml [package] is missing a version".to_string())?;
+    if manifest_version != version {
+        return Err(format!(
+            "crate version mismatch: query says {version:?} but Cargo.toml says {manifest_version:?}"
+        ));
+    }
+
+    Ok(())
 }
 
 /// Extract features and dependencies from a .crate tarball.
@@ -550,12 +738,19 @@ mod tests {
     use tower::ServiceExt;
 
     fn registry_state() -> (tempfile::TempDir, Arc<CargoRegistryState>) {
+        registry_state_with_token(None)
+    }
+
+    fn registry_state_with_token(
+        publish_token: Option<&str>,
+    ) -> (tempfile::TempDir, Arc<CargoRegistryState>) {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".kin")).unwrap();
         let state = Arc::new(CargoRegistryState {
             manifest_store: ManifestStore::new(&root.path().join(".kin")),
             blobs_dir: root.path().join("cargo"),
             base_url: "https://kinlab.ai".to_string(),
+            publish_token: publish_token.map(String::from),
         });
         (root, state)
     }
@@ -653,5 +848,206 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
             .unwrap();
         let deps = versions[0].metadata["deps"].as_array().unwrap();
         assert_eq!(deps.len(), 3);
+    }
+
+    /// Build a valid `.crate` blob for a simple `[package]` manifest.
+    fn valid_crate(name: &str, version: &str) -> Vec<u8> {
+        let cargo_toml = format!(
+            "[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n"
+        );
+        build_test_crate(name, version, &cargo_toml)
+    }
+
+    /// Build a `POST .../publish` request with the given query, optional Bearer
+    /// token, and raw body bytes.
+    fn publish_request(
+        name: &str,
+        version: &str,
+        token: Option<&str>,
+        body: Vec<u8>,
+    ) -> Request<Body> {
+        let uri = format!(
+            "/registry/cargo/api/v1/crates/publish?name={name}&version={version}"
+        );
+        let mut builder = Request::builder().method("POST").uri(uri);
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder.body(Body::from(body)).unwrap()
+    }
+
+    async fn publish(
+        state: Arc<CargoRegistryState>,
+        name: &str,
+        version: &str,
+        token: Option<&str>,
+        body: Vec<u8>,
+    ) -> StatusCode {
+        cargo_routes(state)
+            .oneshot(publish_request(name, version, token, body))
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn publish_without_configured_token_is_disabled() {
+        // (a) No token on state -> fail closed with 503 even with a Bearer header.
+        let (_root, state) = registry_state_with_token(None);
+        let status = publish(
+            state,
+            "demo",
+            "0.1.0",
+            Some("anything"),
+            valid_crate("demo", "0.1.0"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn publish_with_wrong_or_missing_token_is_unauthorized() {
+        // (b) Token configured but Authorization wrong/missing -> 401.
+        let (_root, state) = registry_state_with_token(Some("s3cret"));
+
+        let missing = publish(
+            state.clone(),
+            "demo",
+            "0.1.0",
+            None,
+            valid_crate("demo", "0.1.0"),
+        )
+        .await;
+        assert_eq!(missing, StatusCode::UNAUTHORIZED);
+
+        let wrong = publish(
+            state,
+            "demo",
+            "0.1.0",
+            Some("nope"),
+            valid_crate("demo", "0.1.0"),
+        )
+        .await;
+        assert_eq!(wrong, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn publish_with_correct_token_and_valid_crate_succeeds() {
+        // (c) Correct Bearer + valid .crate -> 200, and the version is registered.
+        let (_root, state) = registry_state_with_token(Some("s3cret"));
+        let status = publish(
+            state.clone(),
+            "demo",
+            "0.1.0",
+            Some("s3cret"),
+            valid_crate("demo", "0.1.0"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let versions = state
+            .manifest_store
+            .get_versions(Ecosystem::Cargo, "demo")
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version, "0.1.0");
+    }
+
+    #[tokio::test]
+    async fn republishing_existing_version_conflicts() {
+        // (d) Re-publishing the same version -> 409 (immutable, no overwrite).
+        let (_root, state) = registry_state_with_token(Some("s3cret"));
+
+        let first = publish(
+            state.clone(),
+            "demo",
+            "0.1.0",
+            Some("s3cret"),
+            valid_crate("demo", "0.1.0"),
+        )
+        .await;
+        assert_eq!(first, StatusCode::OK);
+
+        let second = publish(
+            state.clone(),
+            "demo",
+            "0.1.0",
+            Some("s3cret"),
+            valid_crate("demo", "0.1.0"),
+        )
+        .await;
+        assert_eq!(second, StatusCode::CONFLICT);
+
+        // The original version must still be intact (a single entry).
+        let versions = state
+            .manifest_store
+            .get_versions(Ecosystem::Cargo, "demo")
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn publish_empty_body_is_rejected() {
+        // (e) Empty body -> 400 (with a valid token so we exercise the body check).
+        let (_root, state) = registry_state_with_token(Some("s3cret"));
+        let status = publish(state, "demo", "0.1.0", Some("s3cret"), Vec::new()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn publish_with_mismatched_manifest_is_rejected() {
+        // A valid gzip-tar whose embedded Cargo.toml disagrees with the query
+        // coordinates must be refused (400), not stored under the claimed name.
+        let (_root, state) = registry_state_with_token(Some("s3cret"));
+        // Crate body is internally named other-crate@0.1.0 but published as demo.
+        let body = valid_crate("other-crate", "0.1.0");
+        let status = publish(state.clone(), "demo", "0.1.0", Some("s3cret"), body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        assert!(state
+            .manifest_store
+            .get_versions(Ecosystem::Cargo, "demo")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn publish_with_non_crate_body_is_rejected() {
+        // Arbitrary non-gzip bytes are not a valid .crate -> 400.
+        let (_root, state) = registry_state_with_token(Some("s3cret"));
+        let status = publish(
+            state,
+            "demo",
+            "0.1.0",
+            Some("s3cret"),
+            b"this is not a gzip tarball".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn reads_remain_open_without_token() {
+        // Read endpoints must stay reachable without any Authorization header,
+        // even when a publish token is configured.
+        let (_root, state) = registry_state_with_token(Some("s3cret"));
+        let response = cargo_routes(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/registry/cargo/config.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_equal_slices() {
+        assert!(constant_time_eq(b"token", b"token"));
+        assert!(!constant_time_eq(b"token", b"toke"));
+        assert!(!constant_time_eq(b"token", b"tokeN"));
+        assert!(constant_time_eq(b"", b""));
     }
 }
