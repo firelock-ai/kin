@@ -68,7 +68,11 @@ impl GradientBoostedRanker {
         for (_, score, features) in candidates.iter_mut() {
             *score = self.predict(features);
         }
-        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
     }
 
     /// Train a new model from labelled examples using gradient boosting.
