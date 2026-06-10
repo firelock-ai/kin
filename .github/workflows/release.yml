@@ -18,6 +18,18 @@ jobs:
   build:
     name: Build (${{ matrix.artifact }})
     runs-on: ${{ matrix.os }}
+    # macOS signing/notarization secrets are surfaced as env so they can be used
+    # in step `if:` guards. The `secrets` context is NOT available in `if:`
+    # conditions, so guarding on `env.MACOS_CERTIFICATE != ''` is the supported
+    # pattern. When the secrets are unset every signing step is skipped and the
+    # pipeline still builds, packages, and publishes the (unsigned) binaries.
+    env:
+      MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+      MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+      MACOS_DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
     strategy:
       fail-fast: false
       matrix:
@@ -123,6 +135,69 @@ jobs:
           cross build --release --target "$TARGET" -p kin-vfs-shim
         env:
           TARGET: ${{ matrix.target }}
+
+      # --- macOS code signing + notarization -------------------------------
+      # Runs only on the macOS legs, and only when signing secrets are present
+      # (see the job-level env block). Signing happens BEFORE packaging so the
+      # tarball + its published sha256 cover the signed binaries.
+      - name: Import code signing certificate (macOS)
+        if: ${{ runner.os == 'macOS' && env.MACOS_CERTIFICATE != '' }}
+        run: |
+          CERT_PATH="$RUNNER_TEMP/build_certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PWD="$(openssl rand -base64 24)"
+          echo -n "$MACOS_CERTIFICATE" | base64 --decode -o "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$MACOS_CERTIFICATE_PWD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          rm -f "$CERT_PATH"
+
+      - name: Sign macOS binaries
+        if: ${{ runner.os == 'macOS' && env.MACOS_CERTIFICATE != '' }}
+        run: |
+          for f in \
+            "target/${TARGET}/release/kin" \
+            "kin-vfs/target/${TARGET}/release/kin-vfs" \
+            "kin-vfs/target/${TARGET}/release/${SHIM_NAME}"; do
+            if [ -f "$f" ]; then
+              codesign --force --options runtime --timestamp \
+                --sign "$MACOS_DEVELOPER_ID" "$f"
+              codesign --verify --strict --verbose=2 "$f"
+            fi
+          done
+        env:
+          TARGET: ${{ matrix.target }}
+          SHIM_NAME: ${{ matrix.shim_name }}
+
+      - name: Notarize macOS binaries
+        if: ${{ runner.os == 'macOS' && env.MACOS_CERTIFICATE != '' && env.APPLE_ID != '' }}
+        run: |
+          NOTARIZE_ZIP="$RUNNER_TEMP/${ARTIFACT}-notarize.zip"
+          FILES=()
+          for f in \
+            "target/${TARGET}/release/kin" \
+            "kin-vfs/target/${TARGET}/release/kin-vfs" \
+            "kin-vfs/target/${TARGET}/release/${SHIM_NAME}"; do
+            [ -f "$f" ] && FILES+=("$f")
+          done
+          zip -j "$NOTARIZE_ZIP" "${FILES[@]}"
+          xcrun notarytool submit "$NOTARIZE_ZIP" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          # NOTE: a bare CLI binary (and a .tar.gz) cannot be stapled — `xcrun
+          # stapler` only supports .app bundles, .dmg, .pkg, and .xip. The
+          # notarization ticket is stored on Apple's servers and validated
+          # online by Gatekeeper on first run. If a .dmg/.pkg installer is added
+          # later, run `xcrun stapler staple <installer>` here.
+        env:
+          TARGET: ${{ matrix.target }}
+          SHIM_NAME: ${{ matrix.shim_name }}
+          ARTIFACT: ${{ matrix.artifact }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
