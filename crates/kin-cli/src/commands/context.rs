@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use kin_model::EntityStore;
-use kin_model::{Entity, EntityFilter, EntityId, TokenBudget};
+use kin_model::{Entity, EntityFilter, EntityId, EntityKind, TokenBudget};
 use serde::{Deserialize, Serialize};
 
 /// Resolve session id from KIN_SESSION_ID env var.
@@ -175,7 +175,58 @@ fn resolve_context_target(
         name_pattern: Some(trimmed.to_string()),
         ..Default::default()
     };
-    Ok(graph.query_entities(&filter)?.into_iter().next())
+    // `query_entities` matches names by exact/token/substring and then returns
+    // candidates sorted by entity id, so a bare `.next()` would pick an
+    // arbitrary match — e.g. `kin context Foo` landing on `Foo.__init__` instead
+    // of the class `Foo`. Rank the matches by intent here so the symbol the user
+    // typed wins: an exact name beats a partial one, and a type/container
+    // declaration beats one of its members.
+    Ok(pick_context_target(trimmed, graph.query_entities(&filter)?))
+}
+
+/// Choose the entity a `kin context <symbol>` query most likely meant from the
+/// name-pattern matches the graph returned.
+fn pick_context_target(query: &str, mut candidates: Vec<Entity>) -> Option<Entity> {
+    candidates.sort_by(|a, b| {
+        name_match_rank(query, a)
+            .cmp(&name_match_rank(query, b))
+            .then_with(|| kind_rank(a.kind).cmp(&kind_rank(b.kind)))
+            // Shorter names are more canonical (`Foo` over `Foo.__init__`).
+            .then_with(|| a.name.len().cmp(&b.name.len()))
+            // Stable, deterministic final tiebreak.
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    candidates.into_iter().next()
+}
+
+/// Lower is a better name match: an exact hit beats a case-insensitive hit,
+/// which beats a mere substring/token match.
+fn name_match_rank(query: &str, entity: &Entity) -> u8 {
+    if entity.name == query {
+        0
+    } else if entity.name.eq_ignore_ascii_case(query) {
+        1
+    } else {
+        2
+    }
+}
+
+/// Lower is preferred: a type/container declaration outranks one of its members
+/// when both match equally well, so `kin context Foo` resolves to the class
+/// rather than `Foo.__init__` or another method.
+fn kind_rank(kind: EntityKind) -> u8 {
+    match kind {
+        EntityKind::Class
+        | EntityKind::Interface
+        | EntityKind::TraitDef
+        | EntityKind::TypeAlias
+        | EntityKind::EnumDef
+        | EntityKind::Module
+        | EntityKind::Package
+        | EntityKind::Schema
+        | EntityKind::EventContract => 0,
+        _ => 1,
+    }
 }
 
 fn parse_budget(s: &str) -> Result<TokenBudget> {
@@ -223,9 +274,13 @@ mod tests {
     }
 
     fn test_entity(name: &str) -> Entity {
+        test_entity_kind(name, EntityKind::Function)
+    }
+
+    fn test_entity_kind(name: &str, kind: EntityKind) -> Entity {
         Entity {
             id: EntityId::new(),
-            kind: EntityKind::Function,
+            kind,
             name: name.to_string(),
             language: LanguageId::Rust,
             fingerprint: SemanticFingerprint {
@@ -258,5 +313,40 @@ mod tests {
         let resolved = resolve_context_target(&graph, &id.to_string()).unwrap();
 
         assert_eq!(resolved.unwrap().id, id);
+    }
+
+    #[test]
+    fn context_target_prefers_class_over_constructor_member() {
+        // Dogfood wart #10: `kin context Foo` must land on the class, not the
+        // `Foo.__init__` constructor that also matches the name pattern. The
+        // graph returns both (sorted by id), so resolution has to rank by intent.
+        let graph = kin_db::InMemoryGraph::new();
+        let class = test_entity_kind("Foo", EntityKind::Class);
+        let ctor = test_entity_kind("Foo.__init__", EntityKind::Method);
+        let class_id = class.id;
+        // Insert the member first so a naive "first match" would pick it.
+        graph.upsert_entity(&ctor).unwrap();
+        graph.upsert_entity(&class).unwrap();
+
+        let resolved = resolve_context_target(&graph, "Foo").unwrap().unwrap();
+
+        assert_eq!(resolved.id, class_id, "expected the class, got {}", resolved.name);
+        assert_eq!(resolved.kind, EntityKind::Class);
+    }
+
+    #[test]
+    fn context_target_exact_name_beats_substring_match() {
+        // An exact name must win over a longer name that merely contains the
+        // query as a token/substring, regardless of kind.
+        let graph = kin_db::InMemoryGraph::new();
+        let exact = test_entity_kind("parse", EntityKind::Function);
+        let longer = test_entity_kind("parse_config", EntityKind::Function);
+        let exact_id = exact.id;
+        graph.upsert_entity(&longer).unwrap();
+        graph.upsert_entity(&exact).unwrap();
+
+        let resolved = resolve_context_target(&graph, "parse").unwrap().unwrap();
+
+        assert_eq!(resolved.id, exact_id, "expected exact match, got {}", resolved.name);
     }
 }
