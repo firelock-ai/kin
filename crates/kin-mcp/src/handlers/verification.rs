@@ -173,6 +173,10 @@ pub fn handle_release_check<G: GraphStore>(
                 }
             }
         }
+        // Total-order the blockers by change id so the emitted list is byte-stable
+        // across identical-state runs regardless of branch iteration order — agents
+        // diffing gate output must not see phantom reorderings.
+        unapproved.sort_by(|a, b| a.change_id.to_string().cmp(&b.change_id.to_string()));
         if !unapproved.is_empty() {
             pass = false;
             let detail = unapproved

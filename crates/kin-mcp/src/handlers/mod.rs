@@ -2852,4 +2852,33 @@ mod tests {
         let response: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(response["finding_count"], 0);
     }
+
+    #[tokio::test]
+    async fn release_check_blockers_are_byte_stable() {
+        // Two branches, each headed by a distinct unapproved agent change. The
+        // blockers string concatenates change ids in the order branches are walked,
+        // so the sort is what makes the output stable. Two identical-state calls
+        // must produce byte-identical blockers.
+        let mut store = EmptyStore::default();
+        let c_a = gov_change(0xAA, None, "agent-a");
+        let c_b = gov_change(0xBB, None, "agent-b");
+        store.changes_by_id.insert(c_a.id, c_a.clone());
+        store.changes_by_id.insert(c_b.id, c_b.clone());
+        store.branches.push(Branch {
+            name: BranchName::new("feature"),
+            head: c_a.id,
+        });
+        store.branches.push(Branch {
+            name: BranchName::new("main"),
+            head: c_b.id,
+        });
+
+        let first = call_release_check(&store, true).await;
+        let second = call_release_check(&store, true).await;
+        assert_eq!(first["pass"], false);
+        assert_eq!(
+            first["blockers"], second["blockers"],
+            "blockers must be deterministic across identical-state runs"
+        );
+    }
 }

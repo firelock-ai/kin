@@ -41,10 +41,7 @@ pub fn unapproved_agent_changes<G: GraphStore>(
     let mut current = *head;
 
     for _ in 0..limit {
-        let change = match store
-            .get_change(&current)
-            .map_err(ReviewError::graph)?
-        {
+        let change = match store.get_change(&current).map_err(ReviewError::graph)? {
             Some(change) => change,
             None => break,
         };
@@ -117,9 +114,7 @@ pub fn security_findings<G: GraphStore>(
     store: &G,
     propagate: bool,
 ) -> Result<Vec<SecurityFinding>, ReviewError> {
-    let entities = store
-        .list_all_entities()
-        .map_err(ReviewError::graph)?;
+    let entities = store.list_all_entities().map_err(ReviewError::graph)?;
 
     let mut findings: Vec<SecurityFinding> = Vec::new();
 
@@ -208,10 +203,7 @@ pub fn security_findings<G: GraphStore>(
                 let Some(target_id) = call.dst.as_entity() else {
                     continue;
                 };
-                if let Some(target) = store
-                    .get_entity(&target_id)
-                    .map_err(ReviewError::graph)?
-                {
+                if let Some(target) = store.get_entity(&target_id).map_err(ReviewError::graph)? {
                     if target.visibility == Visibility::Private {
                         findings.push(SecurityFinding {
                             severity: SecuritySeverity::Low,
@@ -259,7 +251,17 @@ pub fn security_findings<G: GraphStore>(
         findings.extend(transitive);
     }
 
-    findings.sort_by(|a, b| b.severity.cmp(&a.severity));
+    // Sort highest severity first, then by a total key (category, name, entity id)
+    // so the findings list is byte-stable run-to-run. Without the tie-break, order
+    // within a severity tier would follow `list_all_entities` iteration order and
+    // reorder across identical-state scans — phantom diffs for agents.
+    findings.sort_by(|a, b| {
+        b.severity
+            .cmp(&a.severity)
+            .then_with(|| a.category.cmp(b.category))
+            .then_with(|| a.entity_name.cmp(&b.entity_name))
+            .then_with(|| a.entity_id.cmp(&b.entity_id))
+    });
     Ok(findings)
 }
 
@@ -530,13 +532,13 @@ mod tests {
         let private_fn = entity("internal", EntityKind::Function, Visibility::Private);
         store.upsert_entity(&public_fn).unwrap();
         store.upsert_entity(&private_fn).unwrap();
-        store.upsert_relation(&calls(&public_fn, &private_fn)).unwrap();
+        store
+            .upsert_relation(&calls(&public_fn, &private_fn))
+            .unwrap();
 
         let findings = security_findings(&store, false).unwrap();
         assert!(
-            findings
-                .iter()
-                .any(|f| f.category == "encapsulation-leak"),
+            findings.iter().any(|f| f.category == "encapsulation-leak"),
             "public->private call must be flagged"
         );
     }
@@ -582,5 +584,43 @@ mod tests {
                 "findings must be sorted highest severity first"
             );
         }
+    }
+
+    #[test]
+    fn findings_order_is_byte_stable_within_severity_tier() {
+        // Several entities land in the same (Low) severity tier, so ordering is
+        // decided by the total tie-break, not entity iteration order. Two scans of
+        // the same store must produce byte-identical ordering.
+        let store = InMemoryGraph::new();
+        for name in ["zeta", "alpha", "mike", "bravo", "yankee"] {
+            store
+                .upsert_entity(&entity(name, EntityKind::Function, Visibility::Public))
+                .unwrap();
+        }
+
+        let first = security_findings(&store, false).unwrap();
+        let second = security_findings(&store, false).unwrap();
+        assert!(first.len() >= 5, "all orphaned publics should be flagged");
+
+        let key = |fs: &[SecurityFinding]| {
+            fs.iter()
+                .map(|f| (f.severity, f.category, f.entity_name.clone(), f.entity_id))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            key(&first),
+            key(&second),
+            "scan order must be deterministic"
+        );
+
+        // And the names within the tier are actually in ascending order.
+        let low_names: Vec<&str> = first
+            .iter()
+            .filter(|f| f.category == "orphaned-public")
+            .map(|f| f.entity_name.as_str())
+            .collect();
+        let mut sorted = low_names.clone();
+        sorted.sort_unstable();
+        assert_eq!(low_names, sorted, "tie-break should order names ascending");
     }
 }
