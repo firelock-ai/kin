@@ -58,6 +58,53 @@ fn next_embed_error_backoff(current: Option<Duration>, base: Duration, max: Dura
     current.unwrap_or(base).saturating_mul(2).min(max)
 }
 
+/// Default grace the shutdown-escalation watchdog grants — once graceful
+/// shutdown is signalled — before force-exiting the process. Generous enough
+/// for a legitimate final snapshot flush + task drain to win the race on their
+/// own, short enough that a wedged embed batch (blocking GPU compute that cannot
+/// observe the cancel signal) can never leave a SIGTERM-immune CPU zombie.
+const DEFAULT_SHUTDOWN_ESCALATION_GRACE: Duration = Duration::from_secs(25);
+
+/// Default bound on how long tokio runtime teardown waits for in-flight blocking
+/// tasks (e.g. an embedding batch mid GPU-compute) before abandoning them so the
+/// process can actually exit.
+const DEFAULT_RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(8);
+
+/// How often the escalation watchdog polls for the shutdown signal.
+const SHUTDOWN_WATCH_POLL: Duration = Duration::from_millis(250);
+
+/// Parse a whole-seconds duration, falling back to `default` for absent, empty,
+/// or unparseable input. Kept pure so the grace-period config is unit-testable.
+fn parse_duration_secs(raw: Option<&str>, default: Duration) -> Duration {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(default)
+}
+
+fn duration_from_env_secs(name: &str, default: Duration) -> Duration {
+    parse_duration_secs(std::env::var(name).ok().as_deref(), default)
+}
+
+/// Grace period the escalation watchdog waits after shutdown is signalled before
+/// force-exiting. Configurable via `KIN_DAEMON_SHUTDOWN_GRACE_SECS` (0 escalates
+/// immediately once the signal fires — used by tests).
+pub fn shutdown_escalation_grace() -> Duration {
+    duration_from_env_secs(
+        "KIN_DAEMON_SHUTDOWN_GRACE_SECS",
+        DEFAULT_SHUTDOWN_ESCALATION_GRACE,
+    )
+}
+
+/// Bound on how long tokio runtime teardown waits for in-flight blocking tasks
+/// before abandoning them. Configurable via
+/// `KIN_DAEMON_RUNTIME_SHUTDOWN_GRACE_SECS`.
+pub fn runtime_shutdown_grace() -> Duration {
+    duration_from_env_secs(
+        "KIN_DAEMON_RUNTIME_SHUTDOWN_GRACE_SECS",
+        DEFAULT_RUNTIME_SHUTDOWN_GRACE,
+    )
+}
+
 fn endpoint_files_missing(state: &DaemonState) -> bool {
     let root = state.layout.root();
     !root.join("daemon.pid").exists() || !root.join("daemon.port").exists()
@@ -466,6 +513,43 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
         }
     });
 
+    // Shutdown-escalation watchdog. A plain OS thread — deliberately
+    // NOT a tokio task — so it stays runnable even while the async runtime is
+    // tearing down. Once graceful shutdown is signalled it grants a bounded
+    // grace period for the drain + final flush to finish, then force-exits.
+    // This is the hard backstop against the embed-worker zombie: a blocking
+    // embedding batch mid GPU-compute cannot observe the cancel signal, so
+    // runtime teardown can otherwise block forever and leave a headless,
+    // SIGTERM-immune CPU zombie that still races kvec writes. Keyed on
+    // `is_shutdown` (set by the propagation task above for EVERY shutdown path:
+    // SIGTERM/SIGINT, idle timeout, watched-PID death, or any task exiting), so
+    // it never fires during normal operation.
+    let escalation_state = Arc::clone(&state);
+    let escalation_grace = shutdown_escalation_grace();
+    if let Err(error) = std::thread::Builder::new()
+        .name("kin-shutdown-watchdog".to_string())
+        .spawn(move || {
+            while !escalation_state
+                .is_shutdown
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                std::thread::sleep(SHUTDOWN_WATCH_POLL);
+            }
+            std::thread::sleep(escalation_grace);
+            // Still alive after the grace period → the graceful path is wedged
+            // (almost certainly a blocking embed batch the runtime drop is
+            // waiting on). Force the whole process down so SIGTERM always
+            // results in actual termination — no zombie.
+            eprintln!(
+                "kin-daemon: graceful shutdown exceeded {}s grace — forcing process exit to prevent a CPU zombie",
+                escalation_grace.as_secs()
+            );
+            std::process::exit(0);
+        })
+    {
+        warn!(error = %error, "failed to spawn shutdown-escalation watchdog");
+    }
+
     // Spawn projection rebuild in background — VFS needs it but locate doesn't.
     // The reconcile loop and API server can start immediately.
     let projection_state = Arc::clone(&state);
@@ -812,6 +896,16 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         break;
                     }
+                }
+
+                // Cooperative cancellation: a shutdown signalled mid-drain must
+                // not linger in the pacing sleep or loop back for another batch.
+                // Break promptly the moment cancel is observed so only the single
+                // in-flight blocking batch (which cannot itself observe the
+                // signal) is left for the bounded teardown to handle.
+                if *embed_cancel.borrow() {
+                    info!("embedding worker stopping mid-drain on shutdown");
+                    break 'wake;
                 }
 
                 // Cooperative pause: let locate, persistence, and explicit
@@ -1636,12 +1730,52 @@ async fn select_with_signals(
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{next_embed_error_backoff, watched_process_is_alive, DaemonConfig};
+    use super::{
+        next_embed_error_backoff, parse_duration_secs, watched_process_is_alive, DaemonConfig,
+        DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE,
+    };
     use std::time::Duration;
 
     #[test]
     fn default_embed_batch_is_backlog_friendly() {
         assert_eq!(DaemonConfig::default().embed_batch_size, 512);
+    }
+
+    #[test]
+    fn shutdown_grace_parsing_is_robust() {
+        let default = Duration::from_secs(25);
+        // Absent / empty / unparseable input all fall back to the default.
+        assert_eq!(parse_duration_secs(None, default), default);
+        assert_eq!(parse_duration_secs(Some(""), default), default);
+        assert_eq!(parse_duration_secs(Some("  "), default), default);
+        assert_eq!(parse_duration_secs(Some("garbage"), default), default);
+        assert_eq!(parse_duration_secs(Some("-5"), default), default);
+        // Valid whole-seconds values (with surrounding whitespace) are honoured.
+        assert_eq!(
+            parse_duration_secs(Some("10"), default),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            parse_duration_secs(Some("  3 "), default),
+            Duration::from_secs(3)
+        );
+        // 0 is honoured so tests can force the watchdog to escalate immediately
+        // once the shutdown signal fires.
+        assert_eq!(
+            parse_duration_secs(Some("0"), default),
+            Duration::from_secs(0)
+        );
+    }
+
+    #[test]
+    fn shutdown_grace_defaults_are_sane() {
+        // The escalation backstop must outlast the runtime-teardown bound so the
+        // normal (block_on returns → shutdown_timeout → process::exit) path wins
+        // the race in the common case; the watchdog only fires when that stalls.
+        assert!(
+            DEFAULT_SHUTDOWN_ESCALATION_GRACE > DEFAULT_RUNTIME_SHUTDOWN_GRACE,
+            "escalation grace must exceed the runtime teardown bound"
+        );
     }
 
     #[test]
