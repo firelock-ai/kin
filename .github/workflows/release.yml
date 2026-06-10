@@ -184,6 +184,17 @@ jobs:
             --input ./CHANGELOG.md \
             --output ./release-notes.md
 
+      - name: Aggregate per-artifact checksums
+        run: |
+          # Forward-compat: combine the per-artifact "*.sha256" files into a
+          # single checksums-sha256.txt. Installers verify against the
+          # per-artifact files, so this is published as a convenience only.
+          : > checksums-sha256.txt
+          for f in *.tar.gz.sha256 *.zip.sha256; do
+            [ -e "$f" ] || continue
+            cat "$f" >> checksums-sha256.txt
+          done
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -201,6 +212,7 @@ jobs:
             kin-macos-aarch64.tar.gz.sha256
             kin-windows-x86_64.zip
             kin-windows-x86_64.zip.sha256
+            checksums-sha256.txt
 
   publish_npm:
     name: Publish npm Wrapper

@@ -89,53 +89,59 @@ fi
 
 ARCHIVE="kin-${TARGET}.tar.gz"
 URL="$BASE_URL/download/v${VERSION}/${ARCHIVE}"
-CHECKSUMS_URL="$BASE_URL/download/v${VERSION}/checksums-sha256.txt"
+CHECKSUM_URL="${URL}.sha256"
 
 info "Downloading $ARCHIVE..."
 
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
+# Download the archive and its per-artifact checksum. The release workflow
+# publishes "<archive>.sha256" next to every archive (shasum -a 256 format:
+# "<hash>  <filename>"). Both downloads must succeed.
 if has_cmd curl; then
     curl -fsSL "$URL" -o "$TMPDIR/$ARCHIVE"
-    curl -fsSL "$CHECKSUMS_URL" -o "$TMPDIR/checksums-sha256.txt" 2>/dev/null || true
+    # Tolerate a failed checksum fetch here so the explicit, friendly error
+    # below fires (instead of a bare curl error under `set -e`).
+    curl -fsSL "$CHECKSUM_URL" -o "$TMPDIR/$ARCHIVE.sha256" 2>/dev/null || true
 elif has_cmd wget; then
     wget -q "$URL" -O "$TMPDIR/$ARCHIVE"
-    wget -q "$CHECKSUMS_URL" -O "$TMPDIR/checksums-sha256.txt" 2>/dev/null || true
+    wget -q "$CHECKSUM_URL" -O "$TMPDIR/$ARCHIVE.sha256" 2>/dev/null || true
 fi
 
 # ── Verify checksum ───────────────────────────────────────────────────
 
-if [ -f "$TMPDIR/checksums-sha256.txt" ] && [ -s "$TMPDIR/checksums-sha256.txt" ]; then
-    EXPECTED=$(grep "  ${ARCHIVE}$" "$TMPDIR/checksums-sha256.txt" | cut -d' ' -f1)
-    if [ -n "$EXPECTED" ]; then
-        if has_cmd shasum; then
-            ACTUAL=$(shasum -a 256 "$TMPDIR/$ARCHIVE" | cut -d' ' -f1)
-        elif has_cmd sha256sum; then
-            ACTUAL=$(sha256sum "$TMPDIR/$ARCHIVE" | cut -d' ' -f1)
-        else
-            ACTUAL=""
-        fi
-
-        if [ -n "$ACTUAL" ]; then
-            if [ "$ACTUAL" != "$EXPECTED" ]; then
-                err "SHA-256 checksum mismatch!"
-                err "Expected: $EXPECTED"
-                err "Got:      $ACTUAL"
-                err "The download may be corrupted or tampered with. Aborting."
-                exit 1
-            fi
-            ok "SHA-256 checksum verified"
-        else
-            info "No SHA-256 tool available — skipping checksum verification"
-        fi
-    else
-        info "Archive not found in checksums file — skipping verification"
-    fi
-else
-    info "No checksums file available — skipping checksum verification"
-    info "Run 'kin update' after install for full signature verification"
+if [ ! -s "$TMPDIR/$ARCHIVE.sha256" ]; then
+    err "Could not download checksum file: $CHECKSUM_URL"
+    err "Refusing to install an unverified download. Aborting."
+    exit 1
 fi
+
+EXPECTED=$(cut -d' ' -f1 "$TMPDIR/$ARCHIVE.sha256")
+if [ -z "$EXPECTED" ]; then
+    err "Checksum file was empty or malformed: $CHECKSUM_URL"
+    err "Refusing to install an unverified download. Aborting."
+    exit 1
+fi
+
+if has_cmd shasum; then
+    ACTUAL=$(shasum -a 256 "$TMPDIR/$ARCHIVE" | cut -d' ' -f1)
+elif has_cmd sha256sum; then
+    ACTUAL=$(sha256sum "$TMPDIR/$ARCHIVE" | cut -d' ' -f1)
+else
+    err "No SHA-256 tool (shasum or sha256sum) found."
+    err "Cannot verify the download integrity. Install one and retry. Aborting."
+    exit 1
+fi
+
+if [ "$ACTUAL" != "$EXPECTED" ]; then
+    err "SHA-256 checksum mismatch!"
+    err "Expected: $EXPECTED"
+    err "Got:      $ACTUAL"
+    err "The download may be corrupted or tampered with. Aborting."
+    exit 1
+fi
+ok "SHA-256 checksum verified"
 
 # ── Extract ─────────────────────────────────────────────────────────────
 

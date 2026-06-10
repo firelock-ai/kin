@@ -28,7 +28,7 @@ function extractSection(changelog, version) {
   const start = normalized.indexOf(heading);
 
   if (start === -1) {
-    throw new Error(`release notes not found for version ${version}`);
+    return null;
   }
 
   const rest = normalized.slice(start);
@@ -38,6 +38,17 @@ function extractSection(changelog, version) {
   return `${section.trim()}\n`;
 }
 
+async function readChangelog(input) {
+  try {
+    return await fs.readFile(input, 'utf8');
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
+}
+
 async function main() {
   const { input, output, version } = parseArgs(process.argv.slice(2));
 
@@ -45,8 +56,20 @@ async function main() {
     throw new Error('usage: node scripts/extract-release-notes.mjs --version <version> --input <path> --output <path>');
   }
 
-  const changelog = await fs.readFile(input, 'utf8');
-  const notes = extractSection(changelog, version);
+  const changelog = await readChangelog(input);
+
+  let notes;
+  if (changelog === null) {
+    console.warn(`changelog not found at ${input}; falling back to auto-generated release notes`);
+    notes = '';
+  } else {
+    notes = extractSection(changelog, version);
+    if (notes === null) {
+      console.warn(`no changelog section for version ${version}; falling back to auto-generated release notes`);
+      notes = '';
+    }
+  }
+
   await fs.writeFile(output, notes);
 }
 
