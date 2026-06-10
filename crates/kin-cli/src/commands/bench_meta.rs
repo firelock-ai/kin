@@ -165,6 +165,21 @@ fn current_binary_sha256() -> Result<String> {
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
+/// Whether the Metal embedding backend is *actually* compiled into this binary.
+///
+/// The real `kin-db/metal` -> `kin-infer/metal` backend is pulled in by the
+/// `[target.'cfg(target_os = "macos")'.dependencies] kin-db = { features = ["metal"] }`
+/// block in kin-cli/Cargo.toml. Cargo target-dependency sections are gated by the build
+/// *target* only — never by the crate's own cargo features (`feature = ...` isn't even
+/// allowed in a `[target.'cfg(...)']` key) — so that block is UNCONDITIONAL on macOS:
+/// Metal is built for every macOS build, even under `--no-default-features`. The `metal`
+/// cargo feature is therefore vestigial for "is Metal built"; the honest predicate is the
+/// target OS alone. (`cfg!(feature = "metal")` would be wrong both ways: true on Linux where
+/// Metal isn't compiled, and false for a macOS `--no-default-features` build where it is.)
+const fn metal_active() -> bool {
+    cfg!(target_os = "macos")
+}
+
 fn feature_flags() -> Vec<&'static str> {
     let mut flags = Vec::new();
     if cfg!(feature = "vector") {
@@ -173,7 +188,7 @@ fn feature_flags() -> Vec<&'static str> {
     if cfg!(feature = "embeddings") {
         flags.push("embeddings");
     }
-    if cfg!(feature = "metal") {
+    if metal_active() {
         flags.push("metal");
     }
     flags.sort_unstable();
@@ -187,7 +202,7 @@ fn embedding_meta() -> EmbeddingMeta {
         return EmbeddingMeta {
             vector_enabled: cfg!(feature = "vector"),
             embeddings_enabled: true,
-            metal_enabled: cfg!(feature = "metal"),
+            metal_enabled: metal_active(),
             model_id: Some(runtime.model_id),
             model_revision: Some(runtime.revision),
             pipeline_epoch: Some(runtime.pipeline_epoch),
@@ -199,7 +214,7 @@ fn embedding_meta() -> EmbeddingMeta {
         EmbeddingMeta {
             vector_enabled: cfg!(feature = "vector"),
             embeddings_enabled: false,
-            metal_enabled: cfg!(feature = "metal"),
+            metal_enabled: metal_active(),
             model_id: None,
             model_revision: None,
             pipeline_epoch: None,
@@ -367,7 +382,7 @@ fn hash_json(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_meta, build_prepared_manifests, embedding_meta, feature_flags,
+        build_meta, build_prepared_manifests, embedding_meta, feature_flags, metal_active,
         vector_index_metadata_version,
     };
     use std::fs;
@@ -394,7 +409,9 @@ mod tests {
         let meta = embedding_meta();
         assert_eq!(meta.vector_enabled, cfg!(feature = "vector"));
         assert_eq!(meta.embeddings_enabled, cfg!(feature = "embeddings"));
-        assert_eq!(meta.metal_enabled, cfg!(feature = "metal"));
+        // metal_enabled must track the ACTUAL compiled backend (macOS-only), not the
+        // no-op `metal` marker feature which stays on for every target.
+        assert_eq!(meta.metal_enabled, metal_active());
         if cfg!(feature = "embeddings") {
             assert!(meta.model_id.is_some());
             assert!(meta.model_revision.is_some());
