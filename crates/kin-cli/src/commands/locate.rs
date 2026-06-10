@@ -12870,6 +12870,79 @@ mod tests {
         }]
     }
 
+    #[test]
+    fn graph_derived_candidate_text_prefers_graph_body_over_disk() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("src/foo.rs"),
+                content_hash: Hash256::from_bytes([7; 32]),
+                mime_type: Some("text/x-rust".into()),
+                text_preview: Some("GRAPH_BODY_MARKER".into()),
+            })
+            .unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/foo.rs"), "DISK_BODY_MARKER").unwrap();
+
+        assert_eq!(
+            graph_derived_candidate_text(&graph, "src/foo.rs", dir.path()),
+            "GRAPH_BODY_MARKER",
+            "graph-owned body must win over the on-disk file"
+        );
+    }
+
+    #[test]
+    fn graph_derived_candidate_text_falls_back_to_disk_only_on_graph_miss() {
+        let graph = kin_db::InMemoryGraph::new();
+        // Artifact present but with no stored body, and with an empty body —
+        // both must fall through to the explicit disk leg, not return blank.
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("src/none.rs"),
+                content_hash: Hash256::from_bytes([9; 32]),
+                mime_type: Some("text/x-rust".into()),
+                text_preview: None,
+            })
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("src/empty.rs"),
+                content_hash: Hash256::from_bytes([11; 32]),
+                mime_type: Some("text/x-rust".into()),
+                text_preview: Some(String::new()),
+            })
+            .unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/none.rs"), "DISK_NONE").unwrap();
+        std::fs::write(dir.path().join("src/empty.rs"), "DISK_EMPTY").unwrap();
+        std::fs::write(dir.path().join("src/untracked.rs"), "DISK_ONLY").unwrap();
+
+        assert_eq!(
+            graph_derived_candidate_text(&graph, "src/none.rs", dir.path()),
+            "DISK_NONE",
+            "text_preview=None must reach disk"
+        );
+        assert_eq!(
+            graph_derived_candidate_text(&graph, "src/empty.rs", dir.path()),
+            "DISK_EMPTY",
+            "empty graph body must reach disk, not short-circuit blank"
+        );
+        assert_eq!(
+            graph_derived_candidate_text(&graph, "src/untracked.rs", dir.path()),
+            "DISK_ONLY",
+            "no graph artifact must reach disk"
+        );
+        assert_eq!(
+            graph_derived_candidate_text(&graph, "src/missing.rs", dir.path()),
+            "",
+            "absent in both graph and disk must yield empty, never panic"
+        );
+    }
+
     #[cfg(feature = "vector")]
     fn load_complete_test_vectors(graph: &kin_db::InMemoryGraph, entities: &[Entity]) {
         let dir = tempfile::TempDir::new().unwrap();
