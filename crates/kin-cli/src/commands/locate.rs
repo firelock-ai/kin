@@ -7362,12 +7362,26 @@ fn lowercase_source_text(
     })
 }
 
+/// Running count of locate source-text reads served from a raw workspace disk
+/// read instead of graph-owned body. A nonzero value is graph-coverage drift;
+/// the per-read trace at `kin.locate.disk_fallback` names the offending path.
+static LOCATE_DISK_SOURCE_READS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 fn read_workspace_source_text(
     path: &str,
     workspace_root: Option<&std::path::Path>,
 ) -> Option<String> {
     let root = workspace_root?;
-    std::fs::read_to_string(root.join(path)).ok()
+    let text = std::fs::read_to_string(root.join(path)).ok()?;
+    let count = LOCATE_DISK_SOURCE_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    tracing::debug!(
+        target: "kin.locate.disk_fallback",
+        path,
+        disk_source_reads = count,
+        "served locate source text from workspace disk instead of graph body"
+    );
+    Some(text)
 }
 
 fn workspace_source_path_exists(path: &str, workspace_root: Option<&std::path::Path>) -> bool {
