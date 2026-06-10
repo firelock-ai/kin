@@ -249,7 +249,8 @@ enum Command {
     /// Build embeddings for the current repository's entity graph.
     ///
     /// Generates vector embeddings for all entities using a local code retriever
-    /// (SweRankEmbed-Small, 768 dimensions). Embeddings enable semantic similarity
+    /// (nomic-embed-text-v1.5, 768 dimensions; override via KIN_EMBED_MODEL_ID).
+    /// Embeddings enable semantic similarity
     /// search in `kin locate` and `kin search --semantic`.
     ///
     /// Fast init + progressive embedding: `kin init` builds the graph instantly,
