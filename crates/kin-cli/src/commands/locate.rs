@@ -13687,18 +13687,18 @@ mod tests {
         ]);
         let imports = HashMap::new();
 
-        assert!(
-            graph_corroborated_semantic_retention_paths(
-                &fused,
-                &resolved_hits,
-                &source_text,
-                &embedding_hits,
-                &multihop,
-                &imports,
-            )
-            .is_empty(),
-            "strong semantic retention should be opt-in by default"
+        let default_retained = graph_corroborated_semantic_retention_paths(
+            &fused,
+            &resolved_hits,
+            &source_text,
+            &embedding_hits,
+            &multihop,
+            &imports,
         );
+        assert!(default_retained.contains("include/nlohmann/detail/macro_scope.hpp"));
+        assert!(!default_retained.contains("include/nlohmann/detail/vector_only.hpp"));
+        assert!(!default_retained.contains("include/nlohmann/detail/graph_only.hpp"));
+        assert!(!default_retained.contains("single_include/nlohmann/json.hpp"));
 
         let retained = graph_corroborated_semantic_retention_paths_with_limit(
             &fused,
