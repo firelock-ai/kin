@@ -508,6 +508,18 @@ fn locate_env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+/// Single source for the entity-resolve strength floor (read by both the
+/// strong-resolve support cap and resolve-boundary compression).
+fn resolve_strength_floor() -> f32 {
+    locate_env_f32("KIN_LOCATE_RESOLVE_STRENGTH_FLOOR", 0.25)
+}
+
+/// Single source for the amalgamated/generated-header penalty (read by both the
+/// projection-backed penalty and the post-RRF path penalty).
+fn amalgam_penalty() -> f32 {
+    locate_env_f32("KIN_LOCATE_AMALGAM_PENALTY", 0.05)
+}
+
 fn fast_entity_dominant_enabled(
     explain: bool,
     test_query: bool,
@@ -1731,7 +1743,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             priority_applies_for_penalty,
         );
         if graph_projection_backed_paths.contains(path) && is_amalgamated_or_generated_path(path) {
-            let global_amalgam_penalty = locate_env_f32("KIN_LOCATE_AMALGAM_PENALTY", 0.05);
+            let global_amalgam_penalty = amalgam_penalty();
             if global_amalgam_penalty > f32::EPSILON {
                 penalty /= global_amalgam_penalty;
             }
@@ -1864,7 +1876,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // the support filter (has_entity_resolve) treats them all equally.
     // Capping to the strongest files keeps precision tight.
     let resolve_cap = locate_env_usize("KIN_LOCATE_RESOLVE_SUPPORT_CAP", 8);
-    let resolve_strength_floor = locate_env_f32("KIN_LOCATE_RESOLVE_STRENGTH_FLOOR", 0.25);
+    let resolve_strength_floor = resolve_strength_floor();
     let top_resolve_score = resolved_hits
         .values()
         .flat_map(|hits| hits.iter().map(|h| h.score))
@@ -9656,7 +9668,7 @@ fn apply_resolve_boundary_compression(
         .map(|(path, _)| path.as_str())
         .collect();
     let compress_factor = locate_env_f32("KIN_LOCATE_NOISE_TAIL_COMPRESS", 0.4);
-    let resolve_strength_floor = locate_env_f32("KIN_LOCATE_RESOLVE_STRENGTH_FLOOR", 0.25);
+    let resolve_strength_floor = resolve_strength_floor();
     let top_resolve = fused
         .first()
         .and_then(|(p, _)| resolve_scores.get(p.as_str()).copied())
@@ -11238,7 +11250,7 @@ fn post_rrf_path_penalty(
     // These high-centrality files match nearly every query but rarely represent
     // the actual change locus. Demoting them sharply improves precision.
     if is_amalgamated_or_generated_path(path) {
-        penalty *= locate_env_f32("KIN_LOCATE_AMALGAM_PENALTY", 0.05);
+        penalty *= amalgam_penalty();
     }
 
     penalty
@@ -13809,6 +13821,124 @@ mod tests {
             None,
         );
         assert!(!without_reference.iter().any(|(path, _)| path == "gold.rs"));
+    }
+
+    // Committed-map invariant #1 (no silent elimination): a candidate that enters
+    // adaptive_cap and does not survive must carry a named pruned_files reason.
+    #[test]
+    fn invariant_no_silent_elimination_in_adaptive_cap() {
+        let scenarios: Vec<(Vec<(String, f32)>, usize, bool)> = vec![
+            // dominant winner + long decaying tail → cluster_gap + below_floor + over_cap
+            (
+                (0..12)
+                    .map(|i| {
+                        (
+                            format!("f{i}.rs"),
+                            if i == 0 { 100.0 } else { 1.0 / i as f32 },
+                        )
+                    })
+                    .collect(),
+                10,
+                false,
+            ),
+            // flat plateau with an explicit small ceiling → over_max_files
+            (
+                (0..8)
+                    .map(|i| (format!("p{i}.rs"), 5.0 - i as f32 * 0.1))
+                    .collect(),
+                3,
+                true,
+            ),
+            // single candidate (early return path) — nothing should drop
+            (vec![("solo.rs".to_string(), 7.0)], 10, false),
+        ];
+        for (fused, max_files, explicit) in scenarios {
+            let all_hits: Vec<HashMap<String, Vec<FileHit>>> =
+                (0..10).map(|_| HashMap::new()).collect();
+            let mut pruned = Vec::new();
+            let result = adaptive_cap(
+                &fused,
+                &all_hits,
+                max_files,
+                explicit,
+                &HashSet::new(),
+                &HashSet::new(),
+                &HashSet::new(),
+                &HashMap::new(),
+                false,
+                Some(&mut pruned),
+            );
+            let kept: HashSet<&str> = result.iter().map(|(p, _)| p.as_str()).collect();
+            let pruned_paths: HashSet<&str> = pruned.iter().map(|p| p.path.as_str()).collect();
+            for (path, _) in &fused {
+                assert!(
+                    kept.contains(path.as_str()) || pruned_paths.contains(path.as_str()),
+                    "candidate {path} eliminated with no named pruned_files reason"
+                );
+            }
+            for entry in &pruned {
+                assert!(
+                    !entry.reason.is_empty(),
+                    "pruned {} carries an empty reason",
+                    entry.path
+                );
+            }
+        }
+    }
+
+    // Committed-map invariant F (monotonicity), tested at the elimination stage: raising a
+    // candidate's fused score never drops it from adaptive_cap's result. The cap and the
+    // multiplicative compression stages are per-candidate monotonic. FULL-PIPELINE
+    // monotonicity is still violated UPSTREAM by the track-selection cliff (resolve crossing
+    // ed_resolve_min flips BroadBlend<->EntityDominant) and EntityDominant resolve-list
+    // normalization — a discontinuity, not a multiplier. That violation needs full-pipeline
+    // scaffolding and the Rec-D de-cliff; tracked as a follow-up task.
+    #[test]
+    fn invariant_monotonicity_adaptive_cap_in_fused_score() {
+        let base = vec![
+            ("a.rs".to_string(), 10.0),
+            ("b.rs".to_string(), 6.0),
+            ("target.rs".to_string(), 2.0),
+            ("c.rs".to_string(), 1.5),
+        ];
+        let all_hits: Vec<HashMap<String, Vec<FileHit>>> =
+            (0..10).map(|_| HashMap::new()).collect();
+        let mut was_present = false;
+        for boost in [0.0_f32, 1.0, 2.0, 4.0, 8.0, 20.0] {
+            let mut fused = base.clone();
+            fused
+                .iter_mut()
+                .find(|(p, _)| p == "target.rs")
+                .unwrap()
+                .1 = 2.0 + boost;
+            fused.sort_by(|x, y| {
+                y.1.partial_cmp(&x.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| x.0.cmp(&y.0))
+            });
+            let present = adaptive_cap(
+                &fused,
+                &all_hits,
+                10,
+                false,
+                &HashSet::new(),
+                &HashSet::new(),
+                &HashSet::new(),
+                &HashMap::new(),
+                false,
+                None,
+            )
+            .iter()
+            .any(|(p, _)| p == "target.rs");
+            if was_present {
+                assert!(
+                    present,
+                    "raising target's fused score dropped it from the result (cap non-monotonic)"
+                );
+            }
+            was_present = present;
+        }
+        assert!(was_present, "target never entered the result; test is vacuous");
     }
 
     #[test]
