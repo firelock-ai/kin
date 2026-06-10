@@ -4,7 +4,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -15,6 +17,26 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 pub enum SearchError {
     #[error("search error: {0}")]
     IndexError(String),
+
+    /// The persisted index on disk could not be loaded because it is corrupt:
+    /// truncated, undecodable, or an unsupported format version.
+    ///
+    /// The text index is a *derived* view over graph-owned truth, so the correct
+    /// recovery is to rebuild it from the graph — never to fail hard and brick
+    /// the daemon. The corrupt file has been archived best-effort (`archived` is
+    /// `Some` when the rename succeeded), preserving it as evidence and clearing
+    /// the way for a clean reopen. Callers should treat this as "rebuild needed"
+    /// and repopulate via `rebuild_all`/`upsert` + `commit`. This is exactly how
+    /// the existing kin-db consumer already reacts to an `open` error (warn, fall
+    /// back to an empty index, rebuild on the next root-hash mismatch), so the
+    /// load contract is unchanged — only now the bad file is moved aside and the
+    /// reason is typed rather than a bare string.
+    #[error("corrupt text index at {}: {reason} (rebuild needed)", path.display())]
+    CorruptIndex {
+        path: PathBuf,
+        archived: Option<PathBuf>,
+        reason: String,
+    },
 }
 
 // ── DocId trait ─────────────────────────────────────────────────────────────
@@ -208,6 +230,85 @@ impl<Id: DocId> PersistedIndex<Id> {
 
 const BM25_K1: f32 = 1.2;
 const BM25_B: f32 = 0.75;
+
+// ── Durable-persistence helpers ──────────────────────────────────────────────
+
+/// Monotonic counter so concurrently-persisting handles get distinct temp and
+/// archive file names within a process (a fixed `.tmp` name would let two
+/// commits clobber each other's in-flight write).
+static PERSIST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Build a unique sibling temp path for `path`, e.g. `index.bin.tmp-<pid>-<seq>`.
+fn unique_tmp_path(path: &Path, seq: u64) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".tmp-{}-{}", std::process::id(), seq));
+    path.with_file_name(name)
+}
+
+/// Write `bytes` to `path` and `fsync` the file so its contents are durable on
+/// disk before the caller renames it into place — without this, a crash after
+/// `rename` can publish a zero-length or torn index.
+fn write_file_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Best-effort `fsync` of a path's parent directory so a `rename`/`create`
+/// within it is durable. Directory fsync is unsupported on some platforms;
+/// failures are non-fatal because the file itself was already fsynced.
+fn sync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+}
+
+/// Move a corrupt index file aside, preserving it as evidence and clearing the
+/// canonical path so the next reopen starts clean. Best-effort: returns `None`
+/// (and logs) when the rename fails — e.g. a read-only filesystem — in which
+/// case the caller still surfaces a typed [`SearchError::CorruptIndex`].
+fn archive_corrupt_index(storage_path: &Path) -> Option<PathBuf> {
+    let seq = PERSIST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut name = storage_path.file_name().map(|n| n.to_os_string())?;
+    name.push(format!(".corrupt-{}-{}", std::process::id(), seq));
+    let dest = storage_path.with_file_name(name);
+    match std::fs::rename(storage_path, &dest) {
+        Ok(()) => {
+            sync_parent_dir(storage_path);
+            tracing::warn!(
+                from = %storage_path.display(),
+                to = %dest.display(),
+                "archived corrupt text index; rebuild needed"
+            );
+            Some(dest)
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %storage_path.display(),
+                error = %err,
+                "failed to archive corrupt text index; leaving in place"
+            );
+            None
+        }
+    }
+}
+
+/// Build a typed [`SearchError::CorruptIndex`], archiving the bad file first so
+/// the corrupt bytes are preserved as evidence and a clean reopen is possible.
+fn corrupt_index_error(storage_path: &Path, reason: String) -> SearchError {
+    let archived = archive_corrupt_index(storage_path);
+    SearchError::CorruptIndex {
+        path: storage_path.to_path_buf(),
+        archived,
+        reason,
+    }
+}
 
 // ── Tokenization ────────────────────────────────────────────────────────────
 
@@ -878,11 +979,10 @@ where
         // is what lets older (v1) indexes be migrated forward instead of being
         // rejected as "unsupported".
         if bytes.len() < 4 {
-            return Err(SearchError::IndexError(format!(
-                "text index {} is truncated ({} bytes)",
-                storage_path.display(),
-                bytes.len()
-            )));
+            return Err(corrupt_index_error(
+                storage_path,
+                format!("truncated ({} bytes)", bytes.len()),
+            ));
         }
         let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
 
@@ -894,36 +994,42 @@ where
         .entered();
 
         if version == PersistedIndex::<Id>::VERSION {
-            let persisted: PersistedIndex<Id> = bincode::deserialize(&bytes).map_err(|err| {
-                SearchError::IndexError(format!(
-                    "failed to decode text index {}: {err}",
-                    storage_path.display()
-                ))
-            })?;
+            let persisted: PersistedIndex<Id> = match bincode::deserialize(&bytes) {
+                Ok(persisted) => persisted,
+                Err(err) => {
+                    return Err(corrupt_index_error(
+                        storage_path,
+                        format!("undecodable (declared v{version}): {err}"),
+                    ));
+                }
+            };
             if persisted.version != PersistedIndex::<Id>::VERSION {
-                return Err(SearchError::IndexError(format!(
-                    "text index {} declared version {} but decoded version {}",
-                    storage_path.display(),
-                    version,
-                    persisted.version
-                )));
+                return Err(corrupt_index_error(
+                    storage_path,
+                    format!(
+                        "declared version {version} but decoded version {}",
+                        persisted.version
+                    ),
+                ));
             }
             Ok(Some(persisted))
         } else if version == 1 {
             // Migrate the legacy flat-`Vec` posting layout forward in memory.
             // The next `commit()` re-persists in the current (v2) format.
-            let v1: PersistedIndexV1<Id> = bincode::deserialize(&bytes).map_err(|err| {
-                SearchError::IndexError(format!(
-                    "failed to decode v1 text index {}: {err}",
-                    storage_path.display()
-                ))
-            })?;
+            let v1: PersistedIndexV1<Id> = match bincode::deserialize(&bytes) {
+                Ok(v1) => v1,
+                Err(err) => {
+                    return Err(corrupt_index_error(
+                        storage_path,
+                        format!("undecodable (declared v1): {err}"),
+                    ));
+                }
+            };
             if v1.version != 1 {
-                return Err(SearchError::IndexError(format!(
-                    "text index {} declared version 1 but decoded version {}",
-                    storage_path.display(),
-                    v1.version
-                )));
+                return Err(corrupt_index_error(
+                    storage_path,
+                    format!("declared version 1 but decoded version {}", v1.version),
+                ));
             }
             tracing::info!(
                 path = %storage_path.display(),
@@ -939,11 +1045,14 @@ where
                 graph_root_hash: v1.graph_root_hash,
             }))
         } else {
-            Err(SearchError::IndexError(format!(
-                "unsupported text index version {} in {}",
-                version,
-                storage_path.display()
-            )))
+            // An unknown version is unloadable by this build. Because the index
+            // is fully derived from graph-owned truth, archiving the foreign file
+            // and signalling rebuild-needed is safe and avoids bricking the
+            // daemon on a format it cannot parse.
+            Err(corrupt_index_error(
+                storage_path,
+                format!("unsupported version {version}"),
+            ))
         }
     }
 
@@ -978,20 +1087,28 @@ where
         let encoded = bincode::serialize(&persisted).map_err(|err| {
             SearchError::IndexError(format!("failed to encode text index: {err}"))
         })?;
-        let tmp_path = path.with_extension("tmp");
-        std::fs::write(&tmp_path, &encoded).map_err(|err| {
+        // Atomic-durable write: encode to a unique temp file, fsync its bytes,
+        // rename it into place, then fsync the directory so the rename itself
+        // survives a crash. A fixed `.tmp` name plus a non-fsynced write is the
+        // torn-write class this guards against.
+        let seq = PERSIST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = unique_tmp_path(path, seq);
+        write_file_durably(&tmp_path, &encoded).map_err(|err| {
+            let _ = std::fs::remove_file(&tmp_path);
             SearchError::IndexError(format!(
                 "failed to write text index {}: {err}",
                 tmp_path.display()
             ))
         })?;
         std::fs::rename(&tmp_path, path).map_err(|err| {
+            let _ = std::fs::remove_file(&tmp_path);
             SearchError::IndexError(format!(
                 "failed to promote text index {} -> {}: {err}",
                 tmp_path.display(),
                 path.display()
             ))
         })?;
+        sync_parent_dir(path);
         Ok(())
     }
 }
@@ -1376,6 +1493,149 @@ mod tests {
 
         let reopened = TextIndex::<TestId>::open(Some(&dir)).unwrap();
         let results = reopened.fuzzy_search("persistMe", 10).unwrap();
+        assert_eq!(results[0].0, id);
+    }
+
+    // -----------------------------------------------------------------------
+    // Crash / corruption durability tests
+    // -----------------------------------------------------------------------
+
+    /// Build a persisted index directory holding one searchable doc and return
+    /// (tempdir guard, index dir, storage-file-path).
+    fn make_persisted_index() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ti");
+        std::fs::create_dir_all(&dir).unwrap();
+        let idx = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+        let (id, doc) = make_doc("persistMe", "src/persist.rs", "Function");
+        idx.upsert_searchable(id, &doc).unwrap();
+        idx.commit().unwrap();
+        let storage = TextIndex::<TestId>::storage_file_path(&dir);
+        assert!(storage.exists());
+        (tmp, dir, storage)
+    }
+
+    fn corrupt_sibling_count(storage: &Path) -> usize {
+        let parent = storage.parent().unwrap();
+        std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .count()
+    }
+
+    /// A commit must leave no temporary file behind: the temp is fsynced then
+    /// renamed atomically into place.
+    #[test]
+    fn persist_leaves_no_temp_file() {
+        let (_tmp, _dir, storage) = make_persisted_index();
+        let parent = storage.parent().unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "stray temp files remain: {leftovers:?}");
+    }
+
+    /// An undecodable index (valid version prefix, garbage body) is reported as
+    /// a typed `CorruptIndex`, the bad file is archived as evidence, and the
+    /// canonical path is cleared for a clean reopen.
+    #[test]
+    fn corrupt_index_is_archived_and_typed() {
+        let (_tmp, dir, storage) = make_persisted_index();
+
+        let mut bytes = TEXT_INDEX_FORMAT_VERSION.to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"this is not a valid bincode index payload");
+        std::fs::write(&storage, &bytes).unwrap();
+
+        let err = TextIndex::<TestId>::open(Some(&dir)).err().unwrap();
+        match err {
+            SearchError::CorruptIndex {
+                archived, reason, ..
+            } => {
+                assert!(reason.contains("undecodable"), "reason was: {reason}");
+                assert!(archived.is_some(), "corrupt file should be archived");
+            }
+            other => panic!("expected CorruptIndex, got {other:?}"),
+        }
+        // Canonical path cleared, evidence preserved alongside it.
+        assert!(!storage.exists(), "corrupt file must be moved off the canonical path");
+        assert_eq!(corrupt_sibling_count(&storage), 1);
+    }
+
+    /// A truncated index (fewer than the 4-byte version prefix) is corrupt.
+    #[test]
+    fn truncated_index_is_corrupt() {
+        let (_tmp, dir, storage) = make_persisted_index();
+        std::fs::write(&storage, b"ab").unwrap(); // 2 bytes < 4
+
+        let err = TextIndex::<TestId>::open(Some(&dir)).err().unwrap();
+        assert!(
+            matches!(err, SearchError::CorruptIndex { ref reason, .. } if reason.contains("truncated")),
+            "expected truncated CorruptIndex, got {err:?}"
+        );
+    }
+
+    /// A partially-written index (valid version, body cut short) is corrupt:
+    /// this is the torn-write class the fsync-before-rename guards against, and
+    /// even if a torn file does land it must be caught on load, not served.
+    #[test]
+    fn torn_body_is_corrupt() {
+        let (_tmp, dir, storage) = make_persisted_index();
+        let mut bytes = std::fs::read(&storage).unwrap();
+        assert!(bytes.len() > 8);
+        bytes.truncate(8); // keep version, drop the rest of the payload
+        std::fs::write(&storage, &bytes).unwrap();
+
+        let err = TextIndex::<TestId>::open(Some(&dir)).err().unwrap();
+        assert!(
+            matches!(err, SearchError::CorruptIndex { .. }),
+            "expected CorruptIndex, got {err:?}"
+        );
+    }
+
+    /// An index written by an unknown (future) format version is unloadable by
+    /// this build; it is archived and reported rebuild-needed rather than
+    /// bricking the open.
+    #[test]
+    fn unsupported_version_is_corrupt() {
+        let (_tmp, dir, storage) = make_persisted_index();
+        let mut bytes = 999u32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"future format payload");
+        std::fs::write(&storage, &bytes).unwrap();
+
+        let err = TextIndex::<TestId>::open(Some(&dir)).err().unwrap();
+        assert!(
+            matches!(err, SearchError::CorruptIndex { ref reason, .. } if reason.contains("unsupported version")),
+            "expected unsupported-version CorruptIndex, got {err:?}"
+        );
+    }
+
+    /// After corruption is detected and archived, the store self-heals: because
+    /// the bad file was moved aside, a reopen finds a clean (empty) index, and a
+    /// rebuild + commit re-persists a valid index that reopens successfully —
+    /// mirroring how the kin-db consumer recovers (fall back to empty, rebuild).
+    #[test]
+    fn reopen_after_corruption_is_clean_and_rebuildable() {
+        let (_tmp, dir, storage) = make_persisted_index();
+
+        // Corrupt, then the first open surfaces the typed error + archives it.
+        std::fs::write(&storage, b"xy").unwrap();
+        let err = TextIndex::<TestId>::open(Some(&dir)).err().unwrap();
+        assert!(matches!(err, SearchError::CorruptIndex { .. }));
+        assert!(!storage.exists());
+
+        // The next open is clean (no recurrence): the archived file no longer
+        // blocks load, so we get a fresh empty index that rebuilds + persists.
+        let healed = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+        let (id, doc) = make_doc("rebuiltDoc", "src/rebuilt.rs", "Function");
+        healed.upsert_searchable(id, &doc).unwrap();
+        healed.commit().unwrap();
+
+        let reopened = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+        let results = reopened.fuzzy_search("rebuiltDoc", 10).unwrap();
+        assert!(!results.is_empty());
         assert_eq!(results[0].0, id);
     }
 }
