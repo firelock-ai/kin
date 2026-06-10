@@ -65,7 +65,7 @@ if ($env:KIN_VERSION) {
 
 # ── Download ────────────────────────────────────────────────────────────
 
-$Archive = "kin-v$Version-$Target.zip"
+$Archive = "kin-$Target.zip"
 $Url = "$BaseUrl/download/v$Version/$Archive"
 
 Write-Info "Downloading $Archive..."
@@ -81,34 +81,47 @@ try {
 }
 
 # ── Verify checksum ───────────────────────────────────────────────────
+# The release workflow publishes "<archive>.sha256" next to every archive
+# (Get-FileHash format). Download it and fail loudly if it is missing,
+# malformed, or does not match — never install an unverified download.
 
-$ChecksumsUrl = "$BaseUrl/download/v$Version/checksums-sha256.txt"
-$ChecksumsFile = Join-Path $TmpDir "checksums-sha256.txt"
-$ChecksumsOk = $false
+$ChecksumUrl = "$Url.sha256"
+$ChecksumFile = Join-Path $TmpDir "$Archive.sha256"
 
 try {
-    Invoke-WebRequest -Uri $ChecksumsUrl -OutFile $ChecksumsFile -UseBasicParsing -ErrorAction Stop
-    $ChecksumsContent = Get-Content $ChecksumsFile -Raw
-    $ExpectedLine = ($ChecksumsContent -split "`n") | Where-Object { $_ -match "\s+$([regex]::Escape($Archive))$" } | Select-Object -First 1
-    if ($ExpectedLine) {
-        $ExpectedHash = ($ExpectedLine -split '\s+')[0].ToLower()
-        $ActualHash = (Get-FileHash -Path (Join-Path $TmpDir $Archive) -Algorithm SHA256).Hash.ToLower()
-        if ($ActualHash -ne $ExpectedHash) {
-            Write-Err "SHA-256 checksum mismatch!"
-            Write-Err "Expected: $ExpectedHash"
-            Write-Err "Got:      $ActualHash"
-            Write-Err "The download may be corrupted or tampered with. Aborting."
-            exit 1
-        }
-        Write-Ok "SHA-256 checksum verified"
-        $ChecksumsOk = $true
-    } else {
-        Write-Info "Archive not found in checksums file - skipping verification"
-    }
+    Invoke-WebRequest -Uri $ChecksumUrl -OutFile $ChecksumFile -UseBasicParsing -ErrorAction Stop
 } catch {
-    Write-Info "No checksums file available - skipping checksum verification"
-    Write-Info "Run 'kin update' after install for full signature verification"
+    Write-Err "Could not download checksum file: $ChecksumUrl"
+    Write-Err "Refusing to install an unverified download. Aborting."
+    exit 1
 }
+
+$ChecksumContent = Get-Content $ChecksumFile -Raw
+# Match the hash on the line referencing this archive; tolerate either a bare
+# hash line or "<hash>  <filename>". Hashes are 64 hex chars.
+$ExpectedHash = $null
+foreach ($line in ($ChecksumContent -split "`n")) {
+    if ($line -match '([0-9a-fA-F]{64})') {
+        $ExpectedHash = $Matches[1].ToLower()
+        break
+    }
+}
+
+if (-not $ExpectedHash) {
+    Write-Err "Checksum file was empty or malformed: $ChecksumUrl"
+    Write-Err "Refusing to install an unverified download. Aborting."
+    exit 1
+}
+
+$ActualHash = (Get-FileHash -Path (Join-Path $TmpDir $Archive) -Algorithm SHA256).Hash.ToLower()
+if ($ActualHash -ne $ExpectedHash) {
+    Write-Err "SHA-256 checksum mismatch!"
+    Write-Err "Expected: $ExpectedHash"
+    Write-Err "Got:      $ActualHash"
+    Write-Err "The download may be corrupted or tampered with. Aborting."
+    exit 1
+}
+Write-Ok "SHA-256 checksum verified"
 
 # ── Extract ─────────────────────────────────────────────────────────────
 
