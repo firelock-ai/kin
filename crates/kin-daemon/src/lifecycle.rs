@@ -461,13 +461,31 @@ mod tests {
         );
 
         // Releasing the first lock (process exit / drop) lets a successor take
-        // over — the lock never goes stale.
+        // over — the lock never goes stale. A *concurrent* test that fork+execs
+        // while this lock fd is open transiently inherits it (flock is keyed to
+        // the open file description and survives until every inheriting fd
+        // closes; the child's fd closes on exec via CLOEXEC). That window can
+        // briefly keep the lock held after `drop(first)`, so retry the reacquire
+        // rather than asserting success on the first attempt.
         drop(first);
-        let third = acquire_singleton_lock(root).expect("lock IO should succeed");
+        let third = retry_acquire_lock(root);
         assert!(
             third.is_some(),
             "a new daemon should acquire the lock once the previous one exits"
         );
+    }
+
+    /// Acquire the singleton lock, briefly retrying while a concurrent test's
+    /// inherited fd still holds it. Bounded so a genuinely-stuck lock still fails
+    /// the test instead of hanging.
+    fn retry_acquire_lock(root: &Path) -> Option<DaemonLock> {
+        for _ in 0..100 {
+            match acquire_singleton_lock(root).expect("lock IO should succeed") {
+                Some(lock) => return Some(lock),
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        None
     }
 
     #[test]
