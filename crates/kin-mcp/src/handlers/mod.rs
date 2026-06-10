@@ -2295,6 +2295,36 @@ mod tests {
         assert_eq!(retrieved.name, "test_fn");
     }
 
+    #[tokio::test]
+    async fn handle_transaction_stage_rejects_malformed_op_at_stage_time() {
+        // D.7 Track A: a payload-less operation must fail loud at stage time —
+        // before the transaction is even consulted — instead of being silently
+        // dropped at commit. The transaction id here does not exist; validation
+        // is expected to reject the operation first.
+        use crate::session::{McpMutationOperation, McpMutationPayload};
+        let sessions = SessionRegistry::new();
+        let session_authority = SessionAuthorityMode::OfflineFallback;
+
+        let op: McpMutationOperation = McpMutationOperation {
+            verb: "create".into(),
+            target: "function".into(),
+            payload: None::<McpMutationPayload>,
+            description: "add dummy".into(),
+        };
+        let mut stage_args = HashMap::new();
+        stage_args.insert("transaction_id".into(), serde_json::json!("no-such-tx"));
+        stage_args.insert("operations".into(), serde_json::json!(vec![op]));
+
+        let err = sessions::handle_transaction_stage(&stage_args, &sessions, session_authority)
+            .await
+            .expect_err("payload-less op must be rejected at stage time");
+        assert!(matches!(err, McpError::InvalidParams(_)));
+        assert!(
+            err.to_string().contains("missing payload"),
+            "actionable stage-time message expected, got: {err}"
+        );
+    }
+
     struct EnvVarGuard {
         key: &'static str,
         old_val: Option<std::ffi::OsString>,

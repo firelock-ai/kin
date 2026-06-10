@@ -49,6 +49,62 @@ pub struct McpTransaction {
     pub staged_operations: Vec<McpMutationOperation>,
 }
 
+/// The mutation verbs the transaction commit path understands, listed for
+/// actionable error messages.
+const KNOWN_MUTATION_VERBS: &str =
+    "create/add/upsert/insert, update/modify, or delete/remove";
+
+fn is_known_mutation_verb(verb: &str) -> bool {
+    matches!(
+        verb,
+        "create" | "add" | "upsert" | "insert" | "update" | "modify" | "delete" | "remove"
+    )
+}
+
+/// Validate staged mutation operations at stage time so malformed payloads fail
+/// loud with an actionable message instead of being silently dropped at commit.
+///
+/// These checks are intrinsic to the payload (no graph access required) and are
+/// safe in every runtime, so they run identically for the in-process handler and
+/// the product daemon-forward path. They catch the silent-drop cases in the
+/// commit path: an operation with no payload, or an unrecognized verb, is simply
+/// skipped at commit — the agent's mutation vanishes with no error. Deeper,
+/// graph-dependent validation (does the target entity exist, contract/schema
+/// conformance) stays with the daemon, which owns graph truth.
+pub fn validate_staged_operations(
+    operations: &[McpMutationOperation],
+) -> std::result::Result<(), String> {
+    for (idx, op) in operations.iter().enumerate() {
+        let verb = op.verb.trim().to_lowercase();
+        if verb.is_empty() {
+            return Err(format!(
+                "operation #{idx}: missing verb; expected one of {KNOWN_MUTATION_VERBS}"
+            ));
+        }
+        if !is_known_mutation_verb(&verb) {
+            return Err(format!(
+                "operation #{idx}: unknown verb '{}'; expected one of {KNOWN_MUTATION_VERBS}",
+                op.verb
+            ));
+        }
+        let Some(payload) = op.payload.as_ref() else {
+            return Err(format!(
+                "operation #{idx} ('{}'): missing payload; an entity, relation, or blob payload \
+                 is required — a payload-less operation is silently dropped at commit",
+                op.verb
+            ));
+        };
+        if let McpMutationPayload::Entity(entity) = payload {
+            if entity.name.trim().is_empty() {
+                return Err(format!(
+                    "operation #{idx}: entity payload has an empty name; an entity must be named"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Thread-safe registry for agent sessions and intents.
 ///
 /// This is the in-process coordination hub. The daemon would host this
@@ -788,5 +844,102 @@ mod tests {
         assert!(registry
             .stage_transaction(&tx.transaction_id, vec![])
             .is_err());
+    }
+
+    // ── Stage-time validation (D.7 Track A) ──────────────────────────────────
+
+    fn entity_named(name: &str) -> kin_model::Entity {
+        use kin_model::entity::{
+            EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint,
+            Visibility,
+        };
+        use kin_model::ids::{Hash256, LanguageId};
+        kin_model::Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([0; 32]),
+                behavior_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: None,
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn op(verb: &str, payload: Option<McpMutationPayload>) -> McpMutationOperation {
+        McpMutationOperation {
+            verb: verb.to_string(),
+            target: "function".to_string(),
+            payload,
+            description: "d".to_string(),
+        }
+    }
+
+    #[test]
+    fn validate_staged_operations_accepts_well_formed_and_empty() {
+        assert!(validate_staged_operations(&[]).is_ok());
+        let ops = vec![op(
+            "create",
+            Some(McpMutationPayload::Entity(entity_named("foo"))),
+        )];
+        assert!(validate_staged_operations(&ops).is_ok());
+    }
+
+    #[test]
+    fn validate_staged_operations_rejects_missing_payload() {
+        // The commit path silently skips payload-less ops; stage time must not.
+        let err = validate_staged_operations(&[op("create", None)]).unwrap_err();
+        assert!(err.contains("missing payload"), "{err}");
+        assert!(err.contains("silently dropped at commit"), "{err}");
+    }
+
+    #[test]
+    fn validate_staged_operations_rejects_unknown_and_empty_verb() {
+        let unknown = validate_staged_operations(&[op(
+            "frobnicate",
+            Some(McpMutationPayload::Entity(entity_named("foo"))),
+        )])
+        .unwrap_err();
+        assert!(unknown.contains("unknown verb 'frobnicate'"), "{unknown}");
+
+        let empty = validate_staged_operations(&[op(
+            "  ",
+            Some(McpMutationPayload::Entity(entity_named("foo"))),
+        )])
+        .unwrap_err();
+        assert!(empty.contains("missing verb"), "{empty}");
+    }
+
+    #[test]
+    fn validate_staged_operations_rejects_empty_entity_name() {
+        let err = validate_staged_operations(&[op(
+            "create",
+            Some(McpMutationPayload::Entity(entity_named("   "))),
+        )])
+        .unwrap_err();
+        assert!(err.contains("empty name"), "{err}");
+    }
+
+    #[test]
+    fn validate_staged_operations_reports_offending_index() {
+        let ops = vec![
+            op("create", Some(McpMutationPayload::Entity(entity_named("ok")))),
+            op("create", None),
+        ];
+        let err = validate_staged_operations(&ops).unwrap_err();
+        assert!(err.contains("operation #1"), "{err}");
     }
 }

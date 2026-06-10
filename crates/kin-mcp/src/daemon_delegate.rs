@@ -329,8 +329,32 @@ pub async fn forward_tool_call(
         // graph (`graph.embedding_status()`), so forward there and project the
         // fields MCP agents need. Self-contained — no daemon-api coordination.
         "kin_graph_status" => forward_graph_status(arguments).await,
+        // Stage-time validation in product mode: reject intrinsically-malformed
+        // staged operations locally before the daemon round-trip, so the agent
+        // gets the same fast, actionable failure it gets in-process. The daemon
+        // still owns graph-dependent validation and the actual staging.
+        "kin_transaction_stage" => match validate_stage_arguments(arguments) {
+            Ok(()) => forward_mcp_tool_call(name, arguments).await,
+            Err(message) => Ok(Some(ToolCallResult::error(message))),
+        },
         _ => forward_mcp_tool_call(name, arguments).await,
     }
+}
+
+/// Run the intrinsic stage-time validation over a `kin_transaction_stage`
+/// argument map. A missing `operations` field is left for the daemon to report
+/// (so the missing-parameter message stays authoritative); a malformed array or
+/// a payload that would be silently dropped at commit fails loud here.
+fn validate_stage_arguments(
+    arguments: &HashMap<String, serde_json::Value>,
+) -> Result<(), String> {
+    let Some(operations_val) = arguments.get("operations") else {
+        return Ok(());
+    };
+    let operations: Vec<crate::session::McpMutationOperation> =
+        serde_json::from_value(operations_val.clone())
+            .map_err(|e| format!("invalid operations array: {e}"))?;
+    crate::session::validate_staged_operations(&operations)
 }
 
 /// Forward `kin_graph_status` to the daemon's status command and project the
