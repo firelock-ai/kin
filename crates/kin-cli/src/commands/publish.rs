@@ -80,9 +80,28 @@ async fn publish_crate(
     );
 
     let client = reqwest::Client::new();
-    let response = client
+    let mut request = client
         .post(&url)
-        .header("content-type", "application/octet-stream")
+        .header("content-type", "application/octet-stream");
+
+    // The registry now requires authentication to publish (reads remain open).
+    // The publisher's token must match the daemon's KIN_REGISTRY_CARGO_TOKEN.
+    // Prefer KINLAB_CARGO_TOKEN (the CI/publish convention), then fall back to
+    // KIN_REGISTRY_CARGO_TOKEN (the daemon's variable name).
+    match std::env::var("KINLAB_CARGO_TOKEN")
+        .or_else(|_| std::env::var("KIN_REGISTRY_CARGO_TOKEN"))
+    {
+        Ok(token) if !token.is_empty() => {
+            request = request.header("authorization", format!("Bearer {}", token));
+        }
+        _ => {
+            eprintln!(
+                "warning: no KINLAB_CARGO_TOKEN set; publish will be rejected by an authenticated registry"
+            );
+        }
+    }
+
+    let response = request
         .body(crate_bytes.to_vec())
         .send()
         .await
