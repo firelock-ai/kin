@@ -8,11 +8,20 @@
       "name": "kin-db",
       "layer": "open-core",
       "role": "semantic-graph-substrate",
-      "dependsOn": ["kin-search", "kin-vector", "kin-infer"],
+      "dependsOn": [
+        "kin-search",
+        "kin-vector",
+        "kin-infer"
+      ],
       "quickChecks": [
         {
           "name": "cargo-tests",
-          "run": ["cargo", "test", "-p", "kin-db"]
+          "run": [
+            "cargo",
+            "test",
+            "-p",
+            "kin-db"
+          ]
         }
       ]
     },
@@ -20,11 +29,25 @@
       "name": "kin",
       "layer": "open-core",
       "role": "semantic-system-of-record",
-      "dependsOn": ["kin-db", "kin-blobs"],
+      "dependsOn": [
+        "kin-db",
+        "kin-blobs"
+      ],
       "quickChecks": [
         {
           "name": "targeted-cargo-tests",
-          "run": ["cargo", "test", "-p", "kin-core", "-p", "kin-index", "-p", "kin-cli", "-p", "kin-integration-tests"]
+          "run": [
+            "cargo",
+            "test",
+            "-p",
+            "kin-core",
+            "-p",
+            "kin-index",
+            "-p",
+            "kin-cli",
+            "-p",
+            "kin-integration-tests"
+          ]
         }
       ]
     },
@@ -32,11 +55,17 @@
       "name": "kin-vfs",
       "layer": "flagship",
       "role": "filesystem-projection",
-      "dependsOn": ["kin", "kin-db"],
+      "dependsOn": [
+        "kin",
+        "kin-db"
+      ],
       "quickChecks": [
         {
           "name": "cargo-tests",
-          "run": ["cargo", "test"]
+          "run": [
+            "cargo",
+            "test"
+          ]
         }
       ]
     },
@@ -44,11 +73,17 @@
       "name": "kin-editor",
       "layer": "flagship",
       "role": "editor-access-surface",
-      "dependsOn": ["kin", "kin-vfs"],
+      "dependsOn": [
+        "kin",
+        "kin-vfs"
+      ],
       "quickChecks": [
         {
           "name": "npm-tests",
-          "run": ["npm", "test"]
+          "run": [
+            "npm",
+            "test"
+          ]
         }
       ]
     },
@@ -56,7 +91,10 @@
       "name": "kinlab",
       "layer": "product",
       "role": "hosted-collaboration-and-control-plane",
-      "dependsOn": ["kin", "kin-vfs"]
+      "dependsOn": [
+        "kin",
+        "kin-vfs"
+      ]
     },
     {
       "name": "kin-blobs",
@@ -86,13 +124,18 @@
       "name": "kin-bench",
       "layer": "support",
       "role": "proof-and-evidence",
-      "dependsOn": ["kin", "kin-db"]
+      "dependsOn": [
+        "kin",
+        "kin-db"
+      ]
     },
     {
       "name": "kin-lsp",
       "layer": "support",
       "role": "language-server-integration",
-      "dependsOn": ["kin-db"],
+      "dependsOn": [
+        "kin-db"
+      ],
       "status": "active",
       "note": "kin depends directly on the standalone kin-lsp repo."
     },
@@ -100,7 +143,9 @@
       "name": "infra",
       "layer": "proprietary",
       "role": "deployment-and-ops",
-      "dependsOn": ["kinlab"]
+      "dependsOn": [
+        "kinlab"
+      ]
     },
     {
       "name": "planning",
@@ -112,19 +157,45 @@
       "name": "experimental/kin-kernel",
       "layer": "systems-track",
       "role": "trusted-semantic-control-plane-research",
-      "dependsOn": ["kin"]
+      "dependsOn": [
+        "kin"
+      ]
     },
     {
       "name": "experimental/kin-os",
       "layer": "systems-track",
       "role": "semantic-first-runtime-research",
-      "dependsOn": ["kin", "experimental/kin-kernel"]
+      "dependsOn": [
+        "kin",
+        "experimental/kin-kernel"
+      ]
     },
     {
       "name": "experimental/kin-hardware",
       "layer": "systems-track",
       "role": "hardware-topology-research",
-      "dependsOn": ["experimental/kin-os", "experimental/kin-kernel"]
+      "dependsOn": [
+        "experimental/kin-os",
+        "experimental/kin-kernel"
+      ]
+    },
+    {
+      "name": "kin-model",
+      "layer": "open-core",
+      "role": "canonical-types",
+      "dependsOn": [
+        "kin-blobs",
+        "kin-vector"
+      ],
+      "quickChecks": [
+        {
+          "name": "cargo-tests",
+          "run": [
+            "cargo",
+            "test"
+          ]
+        }
+      ]
     }
   ],
   "links": [

@@ -451,11 +451,6 @@ enum Command {
         #[command(subcommand)]
         action: WorkspaceAction,
     },
-    /// Run a validation command and capture evidence
-    Run {
-        /// Command to execute
-        command: String,
-    },
     /// MCP server commands
     Mcp {
         #[command(subcommand)]
@@ -1994,7 +1989,6 @@ fn main() -> Result<()> {
                         commands::workspace::rename(old_name, new_name).await
                     }
                 },
-                Command::Run { command } => commands::run::run(command).await,
                 Command::Mcp { action } => match action {
                     McpAction::Start { global: _ } => commands::mcp::start().await,
                 },
