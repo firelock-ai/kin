@@ -1694,6 +1694,16 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         );
     }
 
+    // Floor reference: support floors in adaptive_cap measure evidence strength,
+    // so they must be evaluated against scores from before the relative tail
+    // compressions (dominance/boundary), which express another file's dominance
+    // rather than weakened evidence for this file.
+    let floor_reference: HashMap<String, f32> = if locate_env_bool("KIN_LOCATE_FLOOR_PRECOMP", true)
+    {
+        fused.iter().cloned().collect()
+    } else {
+        HashMap::new()
+    };
     let graph_semantic_retention_paths = graph_corroborated_semantic_retention_paths(
         &fused,
         &resolved_hits,
@@ -2243,6 +2253,8 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         &cochange_seed_paths,
         &retained_priority_paths,
         &semantic_retention_paths,
+        &floor_reference,
+        locate_env_bool("KIN_LOCATE_GRAPH_SEMANTIC_CORROBORATION", false),
         if explain {
             Some(&mut pruned_files)
         } else {
@@ -8197,94 +8209,96 @@ fn resolve_entities_to_files(
             let artifact_hops = locate_env_usize("KIN_LOCATE_RESOLVE_ARTIFACT_HOPS", 2);
             let artifact_frontier = locate_env_usize("KIN_LOCATE_RESOLVE_ARTIFACT_FRONTIER", 32);
             let artifact_hop_decay = locate_env_f32("KIN_LOCATE_RESOLVE_ARTIFACT_HOP_DECAY", 0.55);
-            let Some(start_artifact_id) =
-                graph.artifact_id_for_path(&kin_model::FilePathId::new(fo.0.as_str()))
-            else {
-                continue;
-            };
-            let start_artifact = GraphNodeId::Artifact(start_artifact_id);
-            let mut visited_artifacts = HashSet::from([start_artifact.clone()]);
-            let mut artifact_frontier_queue =
-                VecDeque::from([(start_artifact, fo.0.clone(), 0usize)]);
+            let start_artifact_id =
+                graph.artifact_id_for_path(&kin_model::FilePathId::new(fo.0.as_str()));
+            if let Some(start_artifact_id) = start_artifact_id {
+                let start_artifact = GraphNodeId::Artifact(start_artifact_id);
+                let mut visited_artifacts = HashSet::from([start_artifact.clone()]);
+                let mut artifact_frontier_queue =
+                    VecDeque::from([(start_artifact, fo.0.clone(), 0usize)]);
 
-            while let Some((artifact_node, source_path, depth)) =
-                artifact_frontier_queue.pop_front()
-            {
-                if depth >= artifact_hops {
-                    continue;
-                }
-
-                let mut artifact_rels = graph.get_all_relations_for_node(&artifact_node)?;
-                artifact_rels.sort_by(|left, right| {
-                    let left_kind = resolve_relation_kind_priority(left.kind);
-                    let right_kind = resolve_relation_kind_priority(right.kind);
-                    let left_origin = resolve_relation_origin_priority(left.origin);
-                    let right_origin = resolve_relation_origin_priority(right.origin);
-                    right_kind
-                        .cmp(&left_kind)
-                        .then_with(|| right_origin.cmp(&left_origin))
-                        .then_with(|| format!("{:?}", left.id).cmp(&format!("{:?}", right.id)))
-                });
-                for rel in artifact_rels
-                    .iter()
-                    .filter(|rel| relation_allows_artifact_traversal(rel, &artifact_node))
-                    .take(artifact_frontier)
+                while let Some((artifact_node, source_path, depth)) =
+                    artifact_frontier_queue.pop_front()
                 {
-                    let Some((path, next_artifact)) =
-                        relation_adjacent_artifact_path(graph, rel, &artifact_node)
-                    else {
-                        continue;
-                    };
-                    if is_test_path(&path) || is_vendored_path(&path) {
+                    if depth >= artifact_hops {
                         continue;
                     }
 
-                    let origin_mult = resolve_relation_origin_multiplier(
-                        rel.origin,
-                        lsp_boost,
-                        parsed_weight,
-                        inferred_weight,
-                    );
-                    let kind_mult = resolve_relation_kind_multiplier(rel.kind);
-                    let hop = depth + 1;
-                    let hop_decay = artifact_hop_decay.powi(depth as i32);
-                    let path_specificity =
-                        artifact_relation_path_specificity_multiplier(&fo.0, &path, hop);
-                    let score =
-                        discovery.score * origin_mult * kind_mult * path_specificity * hop_decay
+                    let mut artifact_rels = graph.get_all_relations_for_node(&artifact_node)?;
+                    artifact_rels.sort_by(|left, right| {
+                        let left_kind = resolve_relation_kind_priority(left.kind);
+                        let right_kind = resolve_relation_kind_priority(right.kind);
+                        let left_origin = resolve_relation_origin_priority(left.origin);
+                        let right_origin = resolve_relation_origin_priority(right.origin);
+                        right_kind
+                            .cmp(&left_kind)
+                            .then_with(|| right_origin.cmp(&left_origin))
+                            .then_with(|| format!("{:?}", left.id).cmp(&format!("{:?}", right.id)))
+                    });
+                    for rel in artifact_rels
+                        .iter()
+                        .filter(|rel| relation_allows_artifact_traversal(rel, &artifact_node))
+                        .take(artifact_frontier)
+                    {
+                        let Some((path, next_artifact)) =
+                            relation_adjacent_artifact_path(graph, rel, &artifact_node)
+                        else {
+                            continue;
+                        };
+                        if is_test_path(&path) || is_vendored_path(&path) {
+                            continue;
+                        }
+
+                        let origin_mult = resolve_relation_origin_multiplier(
+                            rel.origin,
+                            lsp_boost,
+                            parsed_weight,
+                            inferred_weight,
+                        );
+                        let kind_mult = resolve_relation_kind_multiplier(rel.kind);
+                        let hop = depth + 1;
+                        let hop_decay = artifact_hop_decay.powi(depth as i32);
+                        let path_specificity =
+                            artifact_relation_path_specificity_multiplier(&fo.0, &path, hop);
+                        let score = discovery.score
+                            * origin_mult
+                            * kind_mult
+                            * path_specificity
+                            * hop_decay
                             / ((hop + 1) as f32);
 
-                    candidates.push(ResolveCandidate {
-                        id: format!("relation:{}:artifact:{}:hop{}", rel.id, rel.dst, hop),
-                        kind: "relation_artifact",
-                        path: path.clone(),
-                        name: None,
-                        score,
-                        source: ResolveCandidateSource::Graph,
-                        reason: format!(
-                            "{:?} hop {} from file artifact {} via {}",
-                            rel.kind, hop, fo.0, source_path
-                        ),
-                    });
-                    file_signal_scores
-                        .entry(path.clone())
-                        .or_default()
-                        .entry("graph_resolve".to_string())
-                        .and_modify(|s| *s += score)
-                        .or_insert(score);
-                    if explain {
-                        push_projection_reason(
-                            &mut file_explain,
-                            &path,
-                            format!(
-                                "artifact {:?} hop {} from `{}` via `{}` includes/imports `{}`",
-                                rel.kind, hop, fo.0, source_path, path
+                        candidates.push(ResolveCandidate {
+                            id: format!("relation:{}:artifact:{}:hop{}", rel.id, rel.dst, hop),
+                            kind: "relation_artifact",
+                            path: path.clone(),
+                            name: None,
+                            score,
+                            source: ResolveCandidateSource::Graph,
+                            reason: format!(
+                                "{:?} hop {} from file artifact {} via {}",
+                                rel.kind, hop, fo.0, source_path
                             ),
-                        );
-                    }
+                        });
+                        file_signal_scores
+                            .entry(path.clone())
+                            .or_default()
+                            .entry("graph_resolve".to_string())
+                            .and_modify(|s| *s += score)
+                            .or_insert(score);
+                        if explain {
+                            push_projection_reason(
+                                &mut file_explain,
+                                &path,
+                                format!(
+                                    "artifact {:?} hop {} from `{}` via `{}` includes/imports `{}`",
+                                    rel.kind, hop, fo.0, source_path, path
+                                ),
+                            );
+                        }
 
-                    if visited_artifacts.insert(next_artifact.clone()) {
-                        artifact_frontier_queue.push_back((next_artifact, path, depth + 1));
+                        if visited_artifacts.insert(next_artifact.clone()) {
+                            artifact_frontier_queue.push_back((next_artifact, path, depth + 1));
+                        }
                     }
                 }
             }
@@ -9139,6 +9153,8 @@ fn adaptive_cap(
     cochange_seed_paths: &HashSet<String>,
     priority_retention_paths: &HashSet<String>,
     semantic_retention_paths: &HashSet<String>,
+    floor_reference: &HashMap<String, f32>,
+    graph_semantic_corroboration: bool,
     mut pruned: Option<&mut Vec<PrunedFile>>,
 ) -> Vec<(String, f32)> {
     let _span = tracing::info_span!(
@@ -9254,6 +9270,22 @@ fn adaptive_cap(
             .unwrap_or_default()
     };
     let strong_semantic_paths: HashSet<String> = HashSet::new();
+    // Support floors measure evidence strength, so they are evaluated against
+    // the pre-compression score regime when a floor reference is provided:
+    // relative tail compressions (dominance/boundary) reorder the list but must
+    // not push corroborated evidence below floors calibrated on uncompressed
+    // score distributions.
+    let floor_score_for = |path: &str, score: f32| -> f32 {
+        floor_reference
+            .get(path)
+            .copied()
+            .unwrap_or(score)
+            .max(score)
+    };
+    let floor_top = fused
+        .iter()
+        .map(|(path, score)| floor_score_for(path, *score))
+        .fold(top_score, f32::max);
     let mut supported_indices: Vec<usize> = Vec::new();
     let mut corroborated_indices: Vec<usize> = Vec::new();
     for (i, (path, score)) in fused.iter().take(support_scan_limit).enumerate() {
@@ -9266,6 +9298,13 @@ fn adaptive_cap(
                 || all_hits.iter().enumerate().any(|(idx, signal)| {
                     idx != 6 && idx != 7 && signal.contains_key(path.as_str())
                 }));
+        // Graph-semantic corroboration: an embedding match backed by structural
+        // follow-up (multihop or imports) is semantic+graph agreement, the same
+        // evidence grade as entity_resolve corroborated by another signal.
+        let has_graph_semantic_corroboration = graph_semantic_corroboration
+            && has_signal(path, all_hits, 9)
+            && (has_signal(path, all_hits, 1) || has_signal(path, all_hits, 4))
+            && strong_embedding_release_allowed(path);
         let is_priority_retained = priority_retention_paths.contains(path.as_str());
         let is_semantic_retained = semantic_retention_paths.contains(path.as_str());
         let is_cochange_seed = cochange_seed_paths.contains(path.as_str());
@@ -9273,7 +9312,7 @@ fn adaptive_cap(
         let is_strong_embedding = strong_embedding_paths.contains(path.as_str());
         let floor_pct = if is_cochange_seed {
             retention_floor_pct
-        } else if has_corroborated_resolve {
+        } else if has_corroborated_resolve || has_graph_semantic_corroboration {
             corroborated_resolve_floor_pct
         } else if is_semantic_retained {
             priority_retention_floor_pct
@@ -9286,12 +9325,14 @@ fn adaptive_cap(
             && !is_semantic_retained
             && !is_strong_embedding
             && !is_strong_semantic
-            && *score < top_score * floor_pct
+            && !multi_signal
+            && floor_score_for(path, *score) < floor_top * floor_pct
         {
             record_pruned(path, *score, "below_support_floor");
             continue;
         }
         if has_corroborated_resolve
+            || has_graph_semantic_corroboration
             || multi_signal
             || is_priority_retained
             || is_semantic_retained
@@ -9305,6 +9346,7 @@ fn adaptive_cap(
             // seed, or a top-K embedding match (strong standalone semantic evidence).
             // A lone or doubly-signalled file on a flat query must not flood results.
             if has_corroborated_resolve
+                || has_graph_semantic_corroboration
                 || multi_signal
                 || is_priority_retained
                 || is_semantic_retained
@@ -13065,6 +13107,8 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
+            false,
             None,
         );
         assert_eq!(capped.len(), 1);
@@ -13111,6 +13155,8 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
+            false,
             None,
         );
         assert!(capped.len() >= 3, "cap was {}", capped.len());
@@ -13332,6 +13378,8 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
+            false,
             None,
         );
         assert!(capped.len() >= 4, "cap was {}", capped.len());
@@ -13371,6 +13419,8 @@ mod tests {
             &retention,
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
+            false,
             None,
         );
 
@@ -13409,6 +13459,8 @@ mod tests {
             &HashSet::new(),
             &priority_retention,
             &HashSet::new(),
+            &HashMap::new(),
+            false,
             None,
         );
 
@@ -13465,6 +13517,8 @@ mod tests {
             &HashSet::new(),
             &priority_retention,
             &HashSet::new(),
+            &HashMap::new(),
+            false,
             None,
         );
 
@@ -13500,6 +13554,8 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &semantic_retention,
+            &HashMap::new(),
+            false,
             None,
         );
 
@@ -13509,6 +13565,106 @@ mod tests {
         assert!(!capped
             .iter()
             .any(|(path, _)| path == "develop/detail/input/lexer.hpp"));
+    }
+
+    #[test]
+    fn adaptive_cap_floor_uses_precompression_scores_for_corroborated_files() {
+        let fused = vec![
+            ("src/core.rs".to_string(), 100.0),
+            ("src/gold.rs".to_string(), 0.9),
+        ];
+        let mut all_hits: Vec<HashMap<String, Vec<FileHit>>> =
+            (0..10).map(|_| HashMap::new()).collect();
+        all_hits[7] = HashMap::from([
+            (String::from("src/core.rs"), hit(50.0)),
+            (String::from("src/gold.rs"), hit(10.0)),
+        ]);
+        all_hits[8] = HashMap::from([(String::from("src/gold.rs"), hit(4.0))]);
+
+        let without_reference = adaptive_cap(
+            &fused,
+            &all_hits,
+            10,
+            false,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            false,
+            None,
+        );
+        assert!(!without_reference
+            .iter()
+            .any(|(path, _)| path == "src/gold.rs"));
+
+        let floor_reference = HashMap::from([
+            (String::from("src/core.rs"), 100.0),
+            (String::from("src/gold.rs"), 6.75),
+        ]);
+        let with_reference = adaptive_cap(
+            &fused,
+            &all_hits,
+            10,
+            false,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &floor_reference,
+            false,
+            None,
+        );
+        assert!(with_reference.iter().any(|(path, _)| path == "src/gold.rs"));
+    }
+
+    #[test]
+    fn adaptive_cap_graph_semantic_corroboration_gets_corroborated_floor() {
+        let fused = vec![
+            ("src/core.rs".to_string(), 100.0),
+            ("src/semantic.rs".to_string(), 8.0),
+            ("src/noise.rs".to_string(), 7.5),
+        ];
+        let mut all_hits: Vec<HashMap<String, Vec<FileHit>>> =
+            (0..10).map(|_| HashMap::new()).collect();
+        all_hits[1] = HashMap::from([(String::from("src/semantic.rs"), hit(2.0))]);
+        all_hits[9] = HashMap::from([
+            (String::from("src/d1.rs"), hit(20.0)),
+            (String::from("src/d2.rs"), hit(19.0)),
+            (String::from("src/d3.rs"), hit(18.0)),
+            (String::from("src/d4.rs"), hit(17.0)),
+            (String::from("src/d5.rs"), hit(16.0)),
+            (String::from("src/semantic.rs"), hit(8.0)),
+        ]);
+
+        let capped = adaptive_cap(
+            &fused,
+            &all_hits,
+            10,
+            false,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            true,
+            None,
+        );
+        assert!(capped.iter().any(|(path, _)| path == "src/semantic.rs"));
+        assert!(!capped.iter().any(|(path, _)| path == "src/noise.rs"));
+
+        let default_off = adaptive_cap(
+            &fused,
+            &all_hits,
+            10,
+            false,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            false,
+            None,
+        );
+        assert!(!default_off
+            .iter()
+            .any(|(path, _)| path == "src/semantic.rs"));
     }
 
     #[test]
@@ -13557,18 +13713,18 @@ mod tests {
         ]);
         let imports = HashMap::new();
 
-        assert!(
-            graph_corroborated_semantic_retention_paths(
-                &fused,
-                &resolved_hits,
-                &source_text,
-                &embedding_hits,
-                &multihop,
-                &imports,
-            )
-            .is_empty(),
-            "strong semantic retention should be opt-in by default"
+        let default_retained = graph_corroborated_semantic_retention_paths(
+            &fused,
+            &resolved_hits,
+            &source_text,
+            &embedding_hits,
+            &multihop,
+            &imports,
         );
+        assert!(default_retained.contains("include/nlohmann/detail/macro_scope.hpp"));
+        assert!(!default_retained.contains("include/nlohmann/detail/vector_only.hpp"));
+        assert!(!default_retained.contains("include/nlohmann/detail/graph_only.hpp"));
+        assert!(!default_retained.contains("single_include/nlohmann/json.hpp"));
 
         let retained = graph_corroborated_semantic_retention_paths_with_limit(
             &fused,
@@ -13649,6 +13805,8 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
+            false,
             None,
         );
 
@@ -13694,6 +13852,8 @@ mod tests {
             &HashSet::new(),
             &priority_retention,
             &HashSet::new(),
+            &HashMap::new(),
+            false,
             None,
         );
 
@@ -13725,6 +13885,8 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
+            false,
             None,
         );
         assert_eq!(capped.len(), 3);
@@ -13767,6 +13929,8 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
+            false,
             None,
         );
 
@@ -13794,6 +13958,8 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
+            false,
             None,
         );
         assert!(
@@ -13809,6 +13975,8 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
+            false,
             None,
         );
         assert_eq!(
@@ -13849,6 +14017,8 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
+            false,
             None,
         );
 
