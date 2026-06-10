@@ -3597,10 +3597,40 @@ fn persist_mcp_transactions(state: &DaemonState, registry: &kin_mcp::SessionRegi
         .mcp_transactions
         .lock()
         .expect("mcp_transactions lock poisoned");
-    store.clear();
+    // Merge, don't clear: only upsert the transactions this request's registry
+    // holds. Clearing would drop a transaction another request begun
+    // concurrently (it restored the store before this one, but this registry
+    // never saw it) — a lost-update window. Upsert-only keeps concurrently-begun
+    // transactions intact.
     for transaction in registry.list_transactions() {
         store.insert(transaction.transaction_id.clone(), transaction);
     }
+}
+
+/// Drop a transaction from the durable store once it reaches a terminal state
+/// (committed/aborted), so finished transactions do not accumulate. Called only
+/// after the terminal tool call succeeds.
+fn forget_mcp_transaction(state: &DaemonState, transaction_id: &str) {
+    state
+        .mcp_transactions
+        .lock()
+        .expect("mcp_transactions lock poisoned")
+        .remove(transaction_id);
+}
+
+/// The transaction id a terminal transaction tool (commit/abort) acted on, used
+/// to evict it from the durable store after success.
+fn terminal_transaction_id(
+    name: &str,
+    arguments: &HashMap<String, serde_json::Value>,
+) -> Option<String> {
+    if !matches!(name, "kin_transaction_commit" | "kin_transaction_abort") {
+        return None;
+    }
+    arguments
+        .get("transaction_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 /// POST /mcp/tools/call — execute an MCP tool against daemon-owned graph state.
@@ -3923,6 +3953,13 @@ async fn mcp_tools_call(
     // (potentially a later stage/commit on the same transaction) sees it.
     if mcp_tool_is_transaction(&request.name) {
         persist_mcp_transactions(&state, &sessions);
+        // Once a transaction commits or aborts successfully, evict it so the
+        // durable store does not grow without bound.
+        if result.is_error != Some(true) {
+            if let Some(tx_id) = terminal_transaction_id(&request.name, &request.arguments) {
+                forget_mcp_transaction(&state, &tx_id);
+            }
+        }
     }
 
     if mutates && result.is_error != Some(true) {
@@ -6580,6 +6617,68 @@ mod tests {
             state.graph.entity_count(),
             before + 1,
             "committed entity must land in the canonical graph"
+        );
+    }
+
+    #[test]
+    fn persist_does_not_clobber_concurrently_begun_transaction() {
+        // Models the interleave: request A restores the store ({tx1}), then while
+        // A is mid-dispatch request B begins tx2 and persists ({tx1, tx2}). When A
+        // finally persists, its registry only ever saw {tx1}. A clear-then-reinsert
+        // persist would drop tx2; merge-upsert must keep it.
+        let state = test_state();
+
+        // tx1 already durable.
+        let registry_b = kin_mcp::SessionRegistry::new();
+        let tx1 = registry_b.begin_transaction("sess", "file:a.rs").unwrap();
+        persist_mcp_transactions(&state, &registry_b);
+
+        // Request B begins tx2 on top of the current store and persists.
+        let registry_b2 = mcp_session_registry_snapshot(&state).unwrap();
+        let tx2 = registry_b2.begin_transaction("sess", "file:b.rs").unwrap();
+        persist_mcp_transactions(&state, &registry_b2);
+
+        // Request A — its registry was snapshotted back when only tx1 existed.
+        let registry_a = kin_mcp::SessionRegistry::new();
+        registry_a.replace_transactions(vec![tx1.clone()]);
+        persist_mcp_transactions(&state, &registry_a);
+
+        let store = state.mcp_transactions.lock().unwrap();
+        assert!(
+            store.contains_key(&tx2.transaction_id),
+            "concurrently-begun tx2 must survive A's persist"
+        );
+        assert!(store.contains_key(&tx1.transaction_id));
+    }
+
+    #[tokio::test]
+    async fn mcp_transaction_commit_evicts_from_durable_store() {
+        // A committed transaction is terminal and must not linger in the store.
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let begin = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_begin",
+            serde_json::json!({ "session_id": "sess-1", "scope": "file:src/lib.rs" }),
+        )
+        .await;
+        let begin_json: serde_json::Value = serde_json::from_str(&mcp_result_text(&begin)).unwrap();
+        let tx_id = begin_json["transaction_id"].as_str().unwrap().to_string();
+        assert!(state.mcp_transactions.lock().unwrap().contains_key(&tx_id));
+
+        let commit = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_commit",
+            serde_json::json!({ "transaction_id": tx_id }),
+        )
+        .await;
+        assert_ne!(commit.is_error, Some(true), "{}", mcp_result_text(&commit));
+        assert!(
+            !state.mcp_transactions.lock().unwrap().contains_key(&tx_id),
+            "committed transaction must be evicted from the durable store"
         );
     }
 
