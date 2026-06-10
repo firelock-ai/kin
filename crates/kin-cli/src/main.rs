@@ -11,7 +11,7 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "kin", version, about = "Kin semantic VCS")]
+#[command(name = "kin", version = kin_buildinfo::version(), about = "Kin semantic VCS")]
 struct Cli {
     /// Write a machine-readable execution profile to this JSON file
     #[arg(long, global = true, value_name = "FILE")]

@@ -218,7 +218,7 @@ async fn build_repo_summary_opt(layout: &kin_core::KinLayout) -> Option<kin_core
         )?;
     let client = crate::daemon_client::DaemonClient::from_base_url(base_url).ok()?;
     let status = client
-        .command_status(&crate::commands::status::CommandStatusRequest { json: false })
+        .command_status(&crate::commands::status::CommandStatusRequest::new(false))
         .await
         .ok()?;
 

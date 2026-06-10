@@ -17,6 +17,7 @@ members = [
     "crates/kin-review",
     "crates/kin-migrate",
     "crates/kin-runtime",
+    "crates/kin-buildinfo",
     "crates/kin-cli",
     "crates/kin-daemon",
     "crates/kin-mcp",
@@ -130,6 +131,7 @@ kin-remote = { path = "crates/kin-remote" }
 kin-review = { path = "crates/kin-review" }
 kin-migrate = { path = "crates/kin-migrate" }
 kin-runtime = { path = "crates/kin-runtime" }
+kin-buildinfo = { path = "crates/kin-buildinfo" }
 kin-cli = { path = "crates/kin-cli" }
 kin-daemon = { path = "crates/kin-daemon" }
 kin-mcp = { path = "crates/kin-mcp" }
