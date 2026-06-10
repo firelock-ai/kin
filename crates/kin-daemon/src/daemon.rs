@@ -881,10 +881,18 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                     Err(e) => {
                         consecutive_panics += 1;
                         if consecutive_panics >= MAX_CONSECUTIVE_PANICS {
+                            // Mark the derived-index worker as permanently failed
+                            // so /health surfaces the degraded state LOUDLY. The
+                            // daemon keeps serving graph/locate/reconcile — the
+                            // worker exiting must NOT take the whole process down
+                            // (that was the exit(0) "silent death", #11).
+                            embed_state
+                                .embed_worker_failed
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
                             error!(
                                 error = %e,
                                 consecutive_panics,
-                                "embedding worker permanently failed — vector index will not update until daemon restart"
+                                "embedding worker permanently failed — vector index will not update until daemon restart; daemon continues in embed-degraded mode (see /health embed_worker_failed)"
                             );
                             break 'wake;
                         }
@@ -1519,7 +1527,7 @@ async fn select_with_signals(
     mut loop_handle: tokio::task::JoinHandle<std::result::Result<(), crate::error::DaemonError>>,
     mut api_handle: tokio::task::JoinHandle<std::result::Result<(), std::io::Error>>,
     mut sweep_handle: tokio::task::JoinHandle<()>,
-    mut embed_handle: tokio::task::JoinHandle<()>,
+    embed_handle: tokio::task::JoinHandle<()>,
     mut idle_handle: tokio::task::JoinHandle<()>,
     persist_handle: tokio::task::JoinHandle<()>,
     supervisor_handle: tokio::task::JoinHandle<()>,
@@ -1533,7 +1541,6 @@ async fn select_with_signals(
         Reconciliation,
         Api,
         Sweeper,
-        Embedding,
         Idle,
         Signal,
     }
@@ -1566,11 +1573,15 @@ async fn select_with_signals(
             let _ = cancel_tx.send(true);
             (CompletedTask::Sweeper, Ok(()))
         }
-        _ = &mut embed_handle => {
-            info!("embedding worker exited");
-            let _ = cancel_tx.send(true);
-            (CompletedTask::Embedding, Ok(()))
-        }
+        // NOTE: the embedding worker is deliberately NOT a select! arm. Embeddings
+        // are a DERIVED index, so the worker exiting (e.g. exhausting its
+        // consecutive-panic budget under heavy umbrella-scale load) must NOT shut
+        // the daemon down — doing so produced a clean exit(0) that read as an
+        // intentional shutdown and left the daemon silently dead (#11). The worker
+        // now sets `embed_worker_failed`; the daemon keeps serving
+        // graph/locate/reconcile in an embed-degraded state, surfaced LOUDLY via
+        // /health. `embed_handle` is handed to `drain_handles` only on a REAL
+        // shutdown below.
         _ = &mut idle_handle => {
             info!("idle monitor exited");
             let _ = cancel_tx.send(true);
@@ -1592,7 +1603,7 @@ async fn select_with_signals(
         (completed != CompletedTask::Reconciliation).then_some(loop_handle),
         (completed != CompletedTask::Api).then_some(api_handle),
         (completed != CompletedTask::Sweeper).then_some(sweep_handle),
-        (completed != CompletedTask::Embedding).then_some(embed_handle),
+        Some(embed_handle),
         (completed != CompletedTask::Idle).then_some(idle_handle),
         Some(persist_handle),
         Some(supervisor_handle),
@@ -1654,7 +1665,7 @@ async fn select_with_signals(
     mut loop_handle: tokio::task::JoinHandle<std::result::Result<(), crate::error::DaemonError>>,
     mut api_handle: tokio::task::JoinHandle<std::result::Result<(), std::io::Error>>,
     mut sweep_handle: tokio::task::JoinHandle<()>,
-    mut embed_handle: tokio::task::JoinHandle<()>,
+    embed_handle: tokio::task::JoinHandle<()>,
     mut idle_handle: tokio::task::JoinHandle<()>,
     persist_handle: tokio::task::JoinHandle<()>,
     supervisor_handle: tokio::task::JoinHandle<()>,
@@ -1665,7 +1676,6 @@ async fn select_with_signals(
         Reconciliation,
         Api,
         Sweeper,
-        Embedding,
         Idle,
         Signal,
     }
@@ -1698,11 +1708,15 @@ async fn select_with_signals(
             let _ = cancel_tx.send(true);
             (CompletedTask::Sweeper, Ok(()))
         }
-        _ = &mut embed_handle => {
-            info!("embedding worker exited");
-            let _ = cancel_tx.send(true);
-            (CompletedTask::Embedding, Ok(()))
-        }
+        // NOTE: the embedding worker is deliberately NOT a select! arm. Embeddings
+        // are a DERIVED index, so the worker exiting (e.g. exhausting its
+        // consecutive-panic budget under heavy umbrella-scale load) must NOT shut
+        // the daemon down — doing so produced a clean exit(0) that read as an
+        // intentional shutdown and left the daemon silently dead (#11). The worker
+        // now sets `embed_worker_failed`; the daemon keeps serving
+        // graph/locate/reconcile in an embed-degraded state, surfaced LOUDLY via
+        // /health. `embed_handle` is handed to `drain_handles` only on a REAL
+        // shutdown below.
         _ = &mut idle_handle => {
             info!("idle monitor exited");
             let _ = cancel_tx.send(true);
@@ -1719,7 +1733,7 @@ async fn select_with_signals(
         (completed != CompletedTask::Reconciliation).then_some(loop_handle),
         (completed != CompletedTask::Api).then_some(api_handle),
         (completed != CompletedTask::Sweeper).then_some(sweep_handle),
-        (completed != CompletedTask::Embedding).then_some(embed_handle),
+        Some(embed_handle),
         (completed != CompletedTask::Idle).then_some(idle_handle),
         Some(persist_handle),
         Some(supervisor_handle),
