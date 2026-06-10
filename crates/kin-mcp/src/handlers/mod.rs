@@ -1462,6 +1462,12 @@ mod tests {
 
     #[test]
     fn entity_response_json_includes_real_source_excerpt() {
+        // read_path is only the raw file_origin while KIN_SOURCE_ROOT is unset;
+        // hold ENV_MUTEX so the EnvVarGuard tests can't set it mid-assertion.
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  if (value < minVal) {\n    return false;\n  }\n  return value <= maxVal;\n}\n";
         let (_dir, entity) = make_source_backed_entity(content);
 
