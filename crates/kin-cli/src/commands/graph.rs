@@ -461,7 +461,7 @@ fn build_graph_inspect_response(
 
     if matches.is_empty() {
         return Ok(GraphCommandResponse {
-            lines: vec![format!("Entity '{}' not found", name)],
+            lines: graph_entity_not_found_lines(name),
             error: Some(format!("no entity found matching '{}'", name)),
             source: None,
         });
@@ -550,6 +550,19 @@ fn build_graph_inspect_response(
     })
 }
 
+/// Actionable lines when a `kin graph inspect|source <name>` lookup misses in
+/// this repo's graph. Keeps the not-found signal (callers also set the
+/// structured `error` field), then points at discovery commands instead of
+/// dead-ending. Honest by construction — no claim the symbol exists elsewhere.
+fn graph_entity_not_found_lines(name: &str) -> Vec<String> {
+    vec![
+        format!("Entity '{name}' not found in this repo's graph."),
+        format!(
+            "hint: try `kin search {name}` to find the symbol by name, or `kin graph status` to confirm the graph is populated."
+        ),
+    ]
+}
+
 pub fn build_graph_source_response(
     layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,
@@ -559,7 +572,7 @@ pub fn build_graph_source_response(
         Some(e) => e,
         None => {
             return Ok(GraphCommandResponse {
-                lines: vec![format!("Entity '{}' not found", entity_query)],
+                lines: graph_entity_not_found_lines(entity_query),
                 error: Some(format!("no entity found matching '{}'", entity_query)),
                 source: None,
             });
@@ -739,6 +752,15 @@ mod tests {
         SemanticChangeId, SemanticFingerprint, SourceSpan, Timestamp, Visibility,
     };
     use std::fs;
+
+    #[test]
+    fn graph_entity_not_found_lines_keep_signal_and_offer_next_steps() {
+        let lines = graph_entity_not_found_lines("frobnicate");
+        assert!(lines[0].contains("not found"), "keeps not-found signal: {lines:?}");
+        let joined = lines.join("\n");
+        assert!(joined.contains("kin search frobnicate"), "offers search: {joined}");
+        assert!(joined.contains("kin graph status"), "offers graph status: {joined}");
+    }
 
     fn test_entity(name: &str) -> Entity {
         Entity {

@@ -311,7 +311,7 @@ fn build_trace_lines_with_graph(
                 followup_limit,
             ));
         }
-        return Ok(vec![format!("Entity '{}' not found", entity)]);
+        return Ok(trace_not_found_guidance(entity));
     }
 
     let target = match select_best_match_with_layout(layout, entity, &matches) {
@@ -327,7 +327,7 @@ fn build_trace_lines_with_graph(
                     followup_limit,
                 ));
             }
-            return Ok(vec![format!("Entity '{}' not found", entity)]);
+            return Ok(trace_not_found_guidance(entity));
         }
     };
 
@@ -1042,11 +1042,24 @@ fn extract_textual_followups(text: &str) -> Vec<String> {
     out
 }
 
+/// Actionable guidance when `kin trace <symbol>` resolves nothing — not as a
+/// graph entity and not via the source-symbol fallback. Keep the not-found
+/// signal, then point at discovery commands rather than dead-ending. Honest by
+/// construction — no claim the symbol exists anywhere.
+fn trace_not_found_guidance(entity: &str) -> Vec<String> {
+    vec![
+        format!("Entity '{entity}' not found in this repo's graph (no source-symbol fallback matched either)."),
+        format!(
+            "hint: try `kin search {entity}` to find the symbol by name, or `kin locate \"<what it does>\"` to find relevant files."
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         best_source_snippet_for_patterns, fallback_leaf_trace_matches, query_trace_matches,
-        select_best_match,
+        select_best_match, trace_not_found_guidance,
     };
     use kin_core::normalize_trace_name;
     use kin_db::InMemoryGraph;
@@ -1055,6 +1068,15 @@ mod tests {
         Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, Hash256,
         LanguageId, SemanticFingerprint, Visibility,
     };
+
+    #[test]
+    fn trace_not_found_guidance_keeps_signal_and_offers_discovery() {
+        let lines = trace_not_found_guidance("frobnicate");
+        assert!(lines[0].contains("not found"), "keeps not-found signal: {lines:?}");
+        let joined = lines.join("\n");
+        assert!(joined.contains("kin search frobnicate"), "offers search: {joined}");
+        assert!(joined.contains("kin locate"), "offers locate: {joined}");
+    }
 
     fn make_entity(name: &str) -> Entity {
         Entity {

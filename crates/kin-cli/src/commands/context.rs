@@ -116,7 +116,7 @@ pub fn build_context_response(
 
     let Some(target) = resolve_context_target(graph, &request.entity)? else {
         return Ok(ContextResponse {
-            lines: vec![format!("Entity '{}' not found", request.entity)],
+            lines: context_not_found_guidance(&request.entity),
         });
     };
     let opts = kin_context::ContextOptions {
@@ -192,6 +192,19 @@ fn parse_budget(s: &str) -> Result<TokenBudget> {
     }
 }
 
+/// Actionable guidance when `kin context <symbol>` can't resolve the symbol in
+/// this repo's graph. A context pack is built around a local entity, so a name
+/// miss dead-ends; keep the not-found signal and point at discovery commands
+/// (`kin search` by name, `kin locate` by description) instead of a bare error.
+fn context_not_found_guidance(entity: &str) -> Vec<String> {
+    vec![
+        format!("Entity '{entity}' not found in this repo's graph."),
+        format!(
+            "hint: try `kin search {entity}` to find the symbol by name, or `kin locate \"<what it does>\"` to find relevant files."
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,6 +212,15 @@ mod tests {
         EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, Hash256, LanguageId,
         SemanticFingerprint, Visibility,
     };
+
+    #[test]
+    fn context_not_found_guidance_keeps_signal_and_offers_discovery() {
+        let lines = context_not_found_guidance("frobnicate");
+        assert!(lines[0].contains("not found"), "keeps not-found signal: {lines:?}");
+        let joined = lines.join("\n");
+        assert!(joined.contains("kin search frobnicate"), "offers search: {joined}");
+        assert!(joined.contains("kin locate"), "offers locate: {joined}");
+    }
 
     fn test_entity(name: &str) -> Entity {
         Entity {
