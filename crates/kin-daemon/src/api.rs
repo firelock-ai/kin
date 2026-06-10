@@ -62,6 +62,12 @@ pub struct HealthResponse {
     /// (`KIN_ALLOW_MASS_DELETION=1`).
     #[serde(default)]
     pub mass_deletion_blocked: bool,
+    /// Whether the background embedding worker has permanently stopped after
+    /// exhausting its panic budget. The daemon keeps serving graph/locate/
+    /// reconcile (embeddings are a derived index); the vector index is frozen
+    /// until restart. A true value drives `status: "attention"`.
+    #[serde(default)]
+    pub embed_worker_failed: bool,
 }
 
 /// Readiness response.
@@ -242,6 +248,8 @@ pub struct RepoHealthResponse {
     pub initialized: bool,
     #[serde(default)]
     pub mass_deletion_blocked: bool,
+    #[serde(default)]
+    pub embed_worker_failed: bool,
 }
 
 /// Repo entities search response.
@@ -1109,10 +1117,15 @@ async fn health(
     let mass_deletion_blocked = state
         .mass_deletion_blocked
         .load(std::sync::atomic::Ordering::Relaxed);
-    // Surface the graph-safety guard in the top-level status so an operator or
-    // client polling /health sees a non-"ok" signal when the daemon is actively
-    // withholding a suspected mass-deletion wipe. The graph itself is intact.
-    let status = if mass_deletion_blocked {
+    let embed_worker_failed = state
+        .embed_worker_failed
+        .load(std::sync::atomic::Ordering::Relaxed);
+    // Surface graph-safety + derived-index health in the top-level status so an
+    // operator or client polling /health sees a non-"ok" signal when the daemon
+    // is withholding a suspected mass-deletion wipe OR the embedding worker has
+    // permanently stopped (embed-degraded). The graph itself stays intact and
+    // served in both cases.
+    let status = if mass_deletion_blocked || embed_worker_failed {
         "attention"
     } else {
         "ok"
@@ -1140,6 +1153,7 @@ async fn health(
         idle_seconds: state.idle_duration().as_secs(),
         initialized,
         mass_deletion_blocked,
+        embed_worker_failed,
     }))
 }
 
@@ -3916,6 +3930,9 @@ async fn repo_health(
             .load(std::sync::atomic::Ordering::Relaxed),
         mass_deletion_blocked: state
             .mass_deletion_blocked
+            .load(std::sync::atomic::Ordering::Relaxed),
+        embed_worker_failed: state
+            .embed_worker_failed
             .load(std::sync::atomic::Ordering::Relaxed),
     }))
 }
@@ -8467,6 +8484,29 @@ mod tests {
         let json: HealthResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(json.status, "attention");
         assert!(json.mass_deletion_blocked);
+    }
+
+    #[tokio::test]
+    async fn health_surfaces_embed_worker_failed_attention() {
+        // When the embedding worker has permanently stopped (#11), the daemon
+        // stays UP and serving, but /health must surface a non-"ok" "attention"
+        // status + the boolean so the embed-degraded state is never silent.
+        let state = test_state();
+        state
+            .embed_worker_failed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: HealthResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.status, "attention");
+        assert!(json.embed_worker_failed);
     }
 
     #[tokio::test]

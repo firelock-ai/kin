@@ -206,6 +206,13 @@ pub struct DaemonState {
     /// daemon-health signal; cleared on the next tick whose deletions are within
     /// the anti-wipe threshold.
     pub mass_deletion_blocked: AtomicBool,
+    /// True when the background embedding worker has permanently stopped (it
+    /// exhausted its consecutive-panic budget). The graph/locate/reconcile
+    /// surfaces keep serving — embeddings are a DERIVED index — but the vector
+    /// index will not advance until the daemon restarts. Surfaced as a
+    /// daemon-health signal so this degraded state is LOUD, never silent (the
+    /// worker dying must NOT take the whole daemon down).
+    pub embed_worker_failed: AtomicBool,
 }
 
 /// Minimum baseline count before an anti-wipe guard can fire. Below this, the
@@ -416,6 +423,7 @@ impl DaemonState {
             is_shutdown: AtomicBool::new(false),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
             mass_deletion_blocked: AtomicBool::new(false),
+            embed_worker_failed: AtomicBool::new(false),
         };
         Ok(state)
     }
@@ -534,6 +542,7 @@ impl DaemonState {
             is_shutdown: AtomicBool::new(false),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
             mass_deletion_blocked: AtomicBool::new(false),
+            embed_worker_failed: AtomicBool::new(false),
         };
 
         // Pre-load repos into the map BEFORE any async context.
@@ -1335,6 +1344,7 @@ mod tests {
             is_shutdown: AtomicBool::new(false),
             persisted_entity_count: AtomicU64::new(loaded_entity_count as u64),
             mass_deletion_blocked: AtomicBool::new(false),
+            embed_worker_failed: AtomicBool::new(false),
         }
     }
 
