@@ -6313,7 +6313,7 @@ fn extract_multihop_signals(
 
                     let hop = depth + 1;
                     let origin_mult = if rel.origin == kin_model::RelationOrigin::Lsp {
-                        locate_env_f32("KIN_LOCATE_LSP_ORIGIN_BOOST", 1.5)
+                        locate_env_f32("KIN_LOCATE_LSP_ORIGIN_BOOST", 2.0)
                     } else {
                         1.0
                     };
@@ -6453,7 +6453,7 @@ fn extract_multihop_signals(
                             // Boost LSP-origin relations — they're type-resolved and more
                             // precise than tree-sitter's name-based matching.
                             let origin_mult = if rel.origin == kin_model::RelationOrigin::Lsp {
-                                locate_env_f32("KIN_LOCATE_LSP_ORIGIN_BOOST", 1.5)
+                                locate_env_f32("KIN_LOCATE_LSP_ORIGIN_BOOST", 2.0)
                             } else {
                                 1.0
                             };
