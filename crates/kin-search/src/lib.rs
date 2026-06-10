@@ -347,14 +347,16 @@ pub fn tokenize(text: &str) -> Vec<String> {
         let mut current = String::new();
         let chars: Vec<char> = segment.chars().collect();
         for i in 0..chars.len() {
-            if i > 0 && chars[i].is_uppercase() && chars[i - 1].is_lowercase() {
-                if !current.is_empty() {
-                    let lower = current.to_lowercase();
-                    if !lower.is_empty() {
-                        tokens.push(lower);
-                    }
-                    current.clear();
+            if i > 0
+                && chars[i].is_uppercase()
+                && chars[i - 1].is_lowercase()
+                && !current.is_empty()
+            {
+                let lower = current.to_lowercase();
+                if !lower.is_empty() {
+                    tokens.push(lower);
                 }
+                current.clear();
             }
             current.push(chars[i]);
         }
@@ -433,6 +435,12 @@ pub struct TextIndex<Id: DocId = u64> {
     /// Optional graph-root hash stamp used to validate this index against
     /// the persisted graph snapshot.
     graph_root_hash: RwLock<Option<[u8; 32]>>,
+}
+
+impl<Id: DocId> Default for TextIndex<Id> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<Id: DocId> TextIndex<Id> {
