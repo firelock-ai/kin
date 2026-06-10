@@ -167,13 +167,17 @@ fn current_binary_sha256() -> Result<String> {
 
 /// Whether the Metal embedding backend is *actually* compiled into this binary.
 ///
-/// The `metal` cargo feature is a no-op marker kept in `default` (so cfg-gated code keeps
-/// compiling), but the real `kin-db/metal` -> `kin-infer/metal` backend is only pulled in
-/// via the `[target.'cfg(target_os = "macos")'.dependencies]` block in kin-cli/Cargo.toml.
-/// So `cfg!(feature = "metal")` is true even on Linux, where Metal does NOT compile. Report
-/// capability honestly (R5 thesis): Metal is active iff macOS AND the marker feature is on.
+/// The real `kin-db/metal` -> `kin-infer/metal` backend is pulled in by the
+/// `[target.'cfg(target_os = "macos")'.dependencies] kin-db = { features = ["metal"] }`
+/// block in kin-cli/Cargo.toml. Cargo target-dependency sections are gated by the build
+/// *target* only — never by the crate's own cargo features (`feature = ...` isn't even
+/// allowed in a `[target.'cfg(...)']` key) — so that block is UNCONDITIONAL on macOS:
+/// Metal is built for every macOS build, even under `--no-default-features`. The `metal`
+/// cargo feature is therefore vestigial for "is Metal built"; the honest predicate is the
+/// target OS alone. (`cfg!(feature = "metal")` would be wrong both ways: true on Linux where
+/// Metal isn't compiled, and false for a macOS `--no-default-features` build where it is.)
 const fn metal_active() -> bool {
-    cfg!(target_os = "macos") && cfg!(feature = "metal")
+    cfg!(target_os = "macos")
 }
 
 fn feature_flags() -> Vec<&'static str> {
