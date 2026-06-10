@@ -1448,8 +1448,20 @@ fn canonical_path_string(path: &Path) -> String {
         .to_string()
 }
 
+/// Whether a daemon `/health` status string means the daemon is alive and
+/// serving the graph. The daemon reports `"attention"` (not `"ok"`) when it is
+/// up and serving but degraded — a withheld mass-deletion wipe or a permanently
+/// stopped embedding worker (see kin-daemon `api.rs` `health`). The graph stays
+/// intact and queryable in both cases, so an attention daemon is a valid
+/// endpoint, not a dead one. Treating it as invalid wipes the endpoint files and
+/// respawns a fresh daemon that reports the same status, producing a
+/// spawn→reject→clear hang.
+fn health_status_is_serving(status: &str) -> bool {
+    matches!(status, "ok" | "attention")
+}
+
 fn validate_health_repo(health: &HealthResponse, working_dir: &Path) -> Result<()> {
-    if health.status != "ok" {
+    if !health_status_is_serving(&health.status) {
         bail!("daemon health status is {}", health.status);
     }
     if let Some(repo_root) = health.repo_root.as_deref() {
@@ -1461,6 +1473,13 @@ fn validate_health_repo(health: &HealthResponse, working_dir: &Path) -> Result<(
                 expected
             );
         }
+    }
+    if health.status == "attention" {
+        warn!(
+            repo_root = health.repo_root.as_deref().unwrap_or("<unknown>"),
+            "daemon is up and serving but reports health=attention (degraded); \
+             continuing to use it. Run `kin status` for details."
+        );
     }
     Ok(())
 }
@@ -1726,7 +1745,12 @@ async fn validate_supervisor_endpoint(endpoint: LiveDaemonEndpoint) -> Result<St
         .json()
         .await
         .context("parse supervisor health response")?;
-    if health.status != "ok" {
+    // The supervisor reports "ok" while serving (it has no degraded "attention"
+    // state of its own today). Route through the same serving-status predicate so
+    // that if the supervisor ever surfaces an alive-but-degraded status it is not
+    // mistaken for a dead endpoint and wiped/respawned — only a genuinely unknown
+    // status is rejected here.
+    if !health_status_is_serving(&health.status) {
         bail!("supervisor health status is {}", health.status);
     }
     Ok(base_url)
@@ -2278,6 +2302,63 @@ mod tests {
 
         let error = validate_health_repo(&health, dir.path()).unwrap_err();
         assert!(error.to_string().contains("daemon repo mismatch"));
+    }
+
+    fn health_for(status: &str, repo_root: &Path) -> HealthResponse {
+        HealthResponse {
+            status: status.to_string(),
+            version: "test".to_string(),
+            uptime_seconds: 0,
+            graph_entity_count: Some(0),
+            graph_loaded: false,
+            reconciliation_status: "idle".to_string(),
+            repo_id: Some("repo".to_string()),
+            repo_root: Some(canonical_path_string(repo_root)),
+            pid: Some(std::process::id()),
+            build: None,
+        }
+    }
+
+    #[test]
+    fn serving_status_predicate_accepts_ok_and_attention_only() {
+        assert!(health_status_is_serving("ok"));
+        assert!(health_status_is_serving("attention"));
+        assert!(!health_status_is_serving("starting"));
+        assert!(!health_status_is_serving("error"));
+        assert!(!health_status_is_serving(""));
+    }
+
+    #[test]
+    fn health_validation_accepts_attention_for_matching_repo() {
+        // A degraded-but-serving daemon (embed_worker_failed / mass_deletion_blocked
+        // -> status "attention") is a valid endpoint, not a dead one. Accepting it
+        // is what breaks the spawn->reject->clear hang: the caller keeps the daemon
+        // instead of wiping its endpoint files and respawning.
+        let dir = tempfile::tempdir().unwrap();
+        let health = health_for("attention", dir.path());
+        validate_health_repo(&health, dir.path())
+            .expect("attention daemon for the right repo must validate as serving");
+    }
+
+    #[test]
+    fn health_validation_rejects_attention_for_wrong_repo() {
+        // Attention means alive+serving, but a repo mismatch is still invalid — an
+        // attention status must not bypass the repo-root guard.
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let health = health_for("attention", other.path());
+        let error = validate_health_repo(&health, dir.path()).unwrap_err();
+        assert!(error.to_string().contains("daemon repo mismatch"));
+    }
+
+    #[test]
+    fn health_validation_rejects_unknown_status() {
+        // Any status that is neither "ok" nor "attention" is treated as a genuinely
+        // invalid endpoint and rejected (so truly broken daemons are still cleared).
+        let dir = tempfile::tempdir().unwrap();
+        let health = health_for("error", dir.path());
+        let error = validate_health_repo(&health, dir.path()).unwrap_err();
+        assert!(error.to_string().contains("daemon health status is error"));
     }
 
     #[test]
