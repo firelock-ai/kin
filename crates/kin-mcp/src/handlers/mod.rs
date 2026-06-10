@@ -386,7 +386,10 @@ mod tests {
         ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
             Ok(vec![])
         }
-        fn get_branch(&self, name: &BranchName) -> std::result::Result<Option<Branch>, Self::Error> {
+        fn get_branch(
+            &self,
+            name: &BranchName,
+        ) -> std::result::Result<Option<Branch>, Self::Error> {
             Ok(self.branches.iter().find(|b| &b.name == name).cloned())
         }
         fn create_branch(&self, _: &Branch) -> std::result::Result<(), Self::Error> {
@@ -857,7 +860,11 @@ mod tests {
             &self,
             id: &SemanticChangeId,
         ) -> std::result::Result<Vec<kin_model::provenance::Approval>, Self::Error> {
-            Ok(self.approvals_by_change.get(id).cloned().unwrap_or_default())
+            Ok(self
+                .approvals_by_change
+                .get(id)
+                .cloned()
+                .unwrap_or_default())
         }
         fn record_audit_event(
             &self,
@@ -2656,7 +2663,10 @@ mod tests {
     async fn call_release_check(store: &EmptyStore, require_approval: bool) -> serde_json::Value {
         let sessions = SessionRegistry::new();
         let mut args = HashMap::new();
-        args.insert("require_approval".into(), serde_json::json!(require_approval));
+        args.insert(
+            "require_approval".into(),
+            serde_json::json!(require_approval),
+        );
         let result = handle_tool_call(
             "kin_release_check",
             &args,
@@ -2686,9 +2696,7 @@ mod tests {
         // fail the gate. (Previously it passed because any audit event sufficed.)
         let mut store = EmptyStore::default();
         let head = gov_change(1, None, "claude-agent");
-        store
-            .changes_by_id
-            .insert(head.id, head.clone());
+        store.changes_by_id.insert(head.id, head.clone());
         store.branches.push(Branch {
             name: BranchName::new("main"),
             head: head.id,
@@ -2712,7 +2720,10 @@ mod tests {
         store.changes_by_id.insert(head.id, head.clone());
         store.approvals_by_change.insert(
             head.id,
-            vec![gov_approval(&head, kin_model::provenance::ApprovalDecision::Approved)],
+            vec![gov_approval(
+                &head,
+                kin_model::provenance::ApprovalDecision::Approved,
+            )],
         );
         store.branches.push(Branch {
             name: BranchName::new("main"),
@@ -2734,7 +2745,10 @@ mod tests {
         store.changes_by_id.insert(c2.id, c2.clone());
         store.approvals_by_change.insert(
             c1.id,
-            vec![gov_approval(&c1, kin_model::provenance::ApprovalDecision::Approved)],
+            vec![gov_approval(
+                &c1,
+                kin_model::provenance::ApprovalDecision::Approved,
+            )],
         );
         store.branches.push(Branch {
             name: BranchName::new("main"),
@@ -2747,7 +2761,10 @@ mod tests {
         // Approving the head clears the gate.
         store.approvals_by_change.insert(
             c2.id,
-            vec![gov_approval(&c2, kin_model::provenance::ApprovalDecision::Approved)],
+            vec![gov_approval(
+                &c2,
+                kin_model::provenance::ApprovalDecision::Approved,
+            )],
         );
         let response = call_release_check(&store, true).await;
         assert_eq!(response["pass"], true);
