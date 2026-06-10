@@ -2259,8 +2259,8 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                         let mut candidates = Vec::new();
 
                         for (path, score) in fused.iter().take(ltr_window) {
-                            let file_path = workspace_root.join(path);
-                            let content = std::fs::read_to_string(&file_path).unwrap_or_default();
+                            let content =
+                                graph_derived_candidate_text(graph, path, workspace_root);
                             docs.push(content);
                             candidates.push((path.clone(), *score));
                         }
@@ -7382,6 +7382,26 @@ fn read_workspace_source_text(
         "served locate source text from workspace disk instead of graph body"
     );
     Some(text)
+}
+
+/// Candidate text for `path`, served from graph-owned body (the opaque
+/// artifact's stored source) and dropping to a raw workspace disk read only
+/// when the graph holds no body for the file. The disk leg routes through
+/// `read_workspace_source_text`, so the fallback is the explicit, telemetered
+/// path — not the silent default.
+fn graph_derived_candidate_text(
+    graph: &kin_db::InMemoryGraph,
+    path: &str,
+    workspace_root: &std::path::Path,
+) -> String {
+    if let Ok(Some(artifact)) = graph.get_opaque_artifact(&kin_model::FilePathId::new(path)) {
+        if let Some(body) = artifact.text_preview {
+            if !body.is_empty() {
+                return body;
+            }
+        }
+    }
+    read_workspace_source_text(path, Some(workspace_root)).unwrap_or_default()
 }
 
 fn workspace_source_path_exists(path: &str, workspace_root: Option<&std::path::Path>) -> bool {
