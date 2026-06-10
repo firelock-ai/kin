@@ -465,8 +465,10 @@ pub async fn handle_transaction_begin(
 }
 
 pub const TRANSACTION_STAGE_DESC: &str = "\
-Stage one or more mutation operations onto an active transaction. Operations are \
-queued in memory and can be validated or committed together.";
+Stage one or more mutation operations onto an active transaction. Each operation is \
+validated at stage time — a missing payload, an unknown verb, or a nameless entity is \
+rejected immediately with an actionable error rather than being silently dropped at \
+commit. Accepted operations are queued and can be validated or committed together.";
 
 pub async fn handle_transaction_stage(
     args: &HashMap<String, serde_json::Value>,
@@ -482,6 +484,13 @@ pub async fn handle_transaction_stage(
         .map_err(|e| {
             crate::error::McpError::InvalidParams(format!("invalid operations array: {e}"))
         })?;
+
+    // Stage-time validation: reject intrinsically-malformed operations now, with
+    // an actionable message, rather than letting the commit path silently drop
+    // them. Runs before forwarding so the agent gets the same fast failure in
+    // both daemon and in-process modes.
+    crate::session::validate_staged_operations(&operations)
+        .map_err(crate::error::McpError::InvalidParams)?;
 
     if session_authority_mode.uses_daemon() {
         match crate::daemon_delegate::forward_tool_call("kin_transaction_stage", args).await {
@@ -583,6 +592,22 @@ pub async fn handle_transaction_commit<G: GraphStore>(
         return Ok(ToolCallResult::error(format!(
             "Cannot commit transaction {} in state: {}",
             transaction_id, tx.state
+        )));
+    }
+
+    // Fail loud on operations the commit path cannot turn into a delta (relation
+    // update/modify, blob payloads) instead of silently dropping them while
+    // still reporting "committed". Reject the whole commit atomically — nothing
+    // is applied and the transaction stays active so the agent can fix it.
+    let uncommittable = crate::session::uncommittable_operations(&tx.staged_operations);
+    if !uncommittable.is_empty() {
+        return Ok(ToolCallResult::error(format!(
+            "Cannot commit transaction {}: {} staged operation(s) are not committable and would \
+             be silently dropped:\n  - {}\nFix or remove them and retry; the transaction is left \
+             active.",
+            transaction_id,
+            uncommittable.len(),
+            uncommittable.join("\n  - ")
         )));
     }
 
