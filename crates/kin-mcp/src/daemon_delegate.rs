@@ -380,6 +380,26 @@ pub fn daemon_unavailable_tool_result(name: &str) -> ToolCallResult {
     daemon_required_unavailable(name)
 }
 
+/// Best-effort fetch of the daemon `/health` body for response-envelope
+/// enrichment.
+///
+/// Returns the parsed JSON on success and `None` whenever the daemon is
+/// unreachable, the request fails, or the body does not parse. The envelope
+/// folds the honest degraded/freshness fields from this body
+/// (`embed_worker_failed`, `mass_deletion_blocked`, reconciliation state); a
+/// `None` here simply leaves those envelope fields unknown rather than blocking
+/// or failing the tool call. `/health` is liveness-only and never lazy-loads a
+/// repo graph, so this is a cheap localhost probe.
+pub async fn fetch_health_snapshot() -> Option<serde_json::Value> {
+    let client = daemon_client().await?;
+    let base = daemon_base_url()?;
+    let resp = client.get(format!("{}/health", base)).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<serde_json::Value>().await.ok()
+}
+
 /// Get or initialize the daemon client. Returns `None` if the daemon is not
 /// reachable right now; daemon-required callers turn that into a hard error.
 pub async fn daemon_client() -> Option<reqwest::Client> {

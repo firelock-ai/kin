@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::daemon_delegate;
+use crate::envelope::{self, Envelope};
 use crate::error::{McpError, Result};
 use crate::handlers::handle_tool_call;
 use crate::session::SessionRegistry;
@@ -398,10 +399,7 @@ async fn handle_tools_call<G: PersistableMcpStore>(
                 "tool '{}' is not enabled in this MCP profile",
                 call_params.name
             ));
-            return JsonRpcResponse::success(
-                id,
-                serde_json::to_value(&error_result).unwrap_or_default(),
-            );
+            return offline_envelope_success(id, error_result);
         }
     }
 
@@ -449,19 +447,24 @@ async fn handle_tools_call<G: PersistableMcpStore>(
                     let error_result = ToolCallResult::error(format!(
                         "tool succeeded but snapshot persistence failed: {error}"
                     ));
-                    return JsonRpcResponse::success(
-                        id,
-                        serde_json::to_value(&error_result).unwrap_or_default(),
-                    );
+                    return offline_envelope_success(id, error_result);
                 }
             }
-            JsonRpcResponse::success(id, serde_json::to_value(&result).unwrap_or_default())
+            offline_envelope_success(id, result)
         }
-        Err(e) => {
-            let error_result = ToolCallResult::error(e.to_string());
-            JsonRpcResponse::success(id, serde_json::to_value(&error_result).unwrap_or_default())
-        }
+        Err(e) => offline_envelope_success(id, ToolCallResult::error(e.to_string())),
     }
+}
+
+/// Attach the offline/in-process response envelope and wrap the result as a
+/// JSON-RPC success. The in-process path is the explicit offline runtime, so the
+/// envelope honestly flags `offline_fallback` (not daemon-owned truth).
+fn offline_envelope_success(
+    id: Option<serde_json::Value>,
+    result: ToolCallResult,
+) -> JsonRpcResponse {
+    let enveloped = envelope::finalize(result, Envelope::offline());
+    JsonRpcResponse::success(id, serde_json::to_value(&enveloped).unwrap_or_default())
 }
 
 async fn handle_tools_call_daemon(
@@ -482,21 +485,35 @@ async fn handle_tools_call_daemon(
                 "tool '{}' is not enabled in this MCP profile",
                 call_params.name
             ));
+            let enveloped = envelope::finalize(error_result, Envelope::daemon());
             return JsonRpcResponse::success(
                 id,
-                serde_json::to_value(&error_result).unwrap_or_default(),
+                serde_json::to_value(&enveloped).unwrap_or_default(),
             );
         }
     }
 
-    let result =
+    let (result, mut base_env) =
         match daemon_delegate::forward_tool_call(&call_params.name, &call_params.arguments).await {
-            Ok(Some(result)) => result,
-            Ok(None) => daemon_delegate::daemon_unavailable_tool_result(&call_params.name),
-            Err(error) => ToolCallResult::error(error),
+            Ok(Some(result)) => (result, Envelope::daemon()),
+            Ok(None) => (
+                daemon_delegate::daemon_unavailable_tool_result(&call_params.name),
+                Envelope::daemon_unreachable(),
+            ),
+            Err(error) => (ToolCallResult::error(error), Envelope::daemon()),
         };
 
-    JsonRpcResponse::success(id, serde_json::to_value(&result).unwrap_or_default())
+    // Enrich the envelope with honest degraded/freshness signals from the daemon
+    // `/health` body when the daemon is actually reachable. When it was already
+    // determined unreachable, skip the probe — there is nothing to ask.
+    if base_env.degraded.daemon_unreachable != Some(true) {
+        if let Some(health) = daemon_delegate::fetch_health_snapshot().await {
+            base_env = base_env.with_health(&health);
+        }
+    }
+
+    let enveloped = envelope::finalize(result, base_env);
+    JsonRpcResponse::success(id, serde_json::to_value(&enveloped).unwrap_or_default())
 }
 
 fn tool_requires_persist(name: &str) -> bool {
@@ -516,7 +533,97 @@ fn tool_requires_persist(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envelope::{ENVELOPE_KEY, ENVELOPE_VERSION};
     use kin_db::InMemoryGraph;
+
+    /// Run a `tools/call` through the real in-process chokepoint and return the
+    /// parsed tool payload (the JSON inside the single text content block).
+    async fn call_tool_payload(tool: &str, arguments: serde_json::Value) -> serde_json::Value {
+        let mut config = McpServerConfig::default();
+        config.session_authority_mode = SessionAuthorityMode::OfflineFallback;
+        let sessions = SessionRegistry::new();
+        let store = InMemoryGraph::default();
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": tool, "arguments": arguments },
+        })
+        .to_string();
+        let resp = process_message(&msg, &store, &config, &sessions)
+            .await
+            .expect("response");
+        assert!(resp.error.is_none(), "transport error for {tool}");
+        let result: ToolCallResult =
+            serde_json::from_value(resp.result.expect("result")).expect("tool call result");
+        let ContentBlock::Text { text } = result.content.first().expect("one content block");
+        serde_json::from_str(text)
+            .unwrap_or_else(|e| panic!("envelope-annotated payload for {tool} is not JSON: {e}"))
+    }
+
+    /// Assert the offline envelope is present and well-formed on a payload.
+    fn assert_offline_envelope(payload: &serde_json::Value, tool: &str) {
+        let env = payload
+            .get(ENVELOPE_KEY)
+            .unwrap_or_else(|| panic!("tool {tool} response is missing the _kin envelope"));
+        assert_eq!(
+            env["envelope_version"], ENVELOPE_VERSION,
+            "tool {tool} envelope version"
+        );
+        assert_eq!(
+            env["runtime"], "offline-in-process",
+            "tool {tool} runtime should report the in-process fallback"
+        );
+        // Honesty: the offline path flags itself as a non-daemon fallback.
+        assert_eq!(env["degraded"]["offline_fallback"], true, "tool {tool}");
+    }
+
+    // ── D.8: every tool family carries the unified response envelope ──────────
+
+    #[tokio::test]
+    async fn envelope_present_on_entities_family() {
+        // semantic_search returns an object payload; the envelope must ride
+        // alongside the original `results` key without displacing it.
+        let payload = call_tool_payload("semantic_search", serde_json::json!({ "query": "foo" }))
+            .await;
+        assert_offline_envelope(&payload, "semantic_search");
+        assert!(
+            payload.get("results").is_some(),
+            "semantic_search payload must keep its `results` key where agents expect it"
+        );
+    }
+
+    #[tokio::test]
+    async fn envelope_present_on_work_family() {
+        let payload = call_tool_payload("kin_work_list", serde_json::json!({})).await;
+        assert_offline_envelope(&payload, "kin_work_list");
+    }
+
+    #[tokio::test]
+    async fn envelope_present_on_verification_family() {
+        let payload = call_tool_payload("kin_coverage_summary", serde_json::json!({})).await;
+        assert_offline_envelope(&payload, "kin_coverage_summary");
+    }
+
+    #[tokio::test]
+    async fn envelope_present_on_error_results() {
+        // semantic_locate errors offline (vector search needs the daemon). The
+        // envelope must still be attached so degraded states are surfaced, and
+        // the human message preserved alongside it.
+        let payload = call_tool_payload(
+            "semantic_locate",
+            serde_json::json!({ "query": "where is auth handled" }),
+        )
+        .await;
+        assert_offline_envelope(&payload, "semantic_locate");
+        let message = payload["message"]
+            .as_str()
+            .expect("wrapped error message present");
+        assert!(
+            message.contains("requires the Kin daemon"),
+            "original error message preserved, got: {message}"
+        );
+    }
 
     #[test]
     fn default_config_requires_daemon_session_authority() {
