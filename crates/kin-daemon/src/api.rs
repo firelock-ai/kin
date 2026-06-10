@@ -3561,6 +3561,10 @@ fn mcp_tool_mutates_graph(name: &str) -> bool {
             | "kin_review_discuss_resolve"
             | "kin_review_assign"
             | "kin_review_unassign"
+            // Commit applies staged entity/relation deltas via
+            // apply_transaction_delta, so it must run against the canonical
+            // mutable graph — never a session's read-only temporal-scope view.
+            | "kin_transaction_commit"
     )
 }
 
@@ -6522,6 +6526,61 @@ mod tests {
         .await;
         assert_eq!(stage.is_error, Some(true));
         assert!(mcp_result_text(&stage).contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn mcp_transaction_commit_lands_in_canonical_graph() {
+        // End-to-end: begin → stage → commit across separate calls must apply the
+        // staged entity to the canonical state.graph (commit is a mutating tool, so
+        // it routes there rather than a session's read-only scoped view).
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let before = state.graph.entity_count();
+
+        let begin = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_begin",
+            serde_json::json!({ "session_id": "sess-1", "scope": "file:src/lib.rs" }),
+        )
+        .await;
+        let begin_json: serde_json::Value = serde_json::from_str(&mcp_result_text(&begin)).unwrap();
+        let tx_id = begin_json["transaction_id"].as_str().unwrap().to_string();
+
+        let _stage = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_stage",
+            serde_json::json!({
+                "transaction_id": tx_id,
+                "operations": [{
+                    "verb": "create",
+                    "target": "",
+                    "payload": { "Entity": test_entity("committed_fn", "src/lib.rs") },
+                    "description": ""
+                }]
+            }),
+        )
+        .await;
+
+        let commit = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_commit",
+            serde_json::json!({ "transaction_id": tx_id }),
+        )
+        .await;
+        assert_ne!(
+            commit.is_error,
+            Some(true),
+            "commit failed: {}",
+            mcp_result_text(&commit)
+        );
+
+        assert_eq!(
+            state.graph.entity_count(),
+            before + 1,
+            "committed entity must land in the canonical graph"
+        );
     }
 
     #[tokio::test]
