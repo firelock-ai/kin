@@ -11921,10 +11921,15 @@ fn resolve_path_in_graph(graph: &kin_db::InMemoryGraph, partial_path: &str) -> O
             return Some(candidate.to_string());
         }
 
+        // Several tracked files can match one suffix (e.g. a vendored copy of
+        // test/CMakeLists.txt), and the tracked list iterates in map order —
+        // pick by a total preference (exact > shortest > lexicographic) so the
+        // winner never depends on per-process iteration order.
         if let Some(path) = tracked_non_entity_files(graph)
             .into_iter()
             .map(|tracked| tracked.path)
-            .find(|path| path == candidate || path.ends_with(&format!("/{}", candidate)))
+            .filter(|path| path == candidate || path.ends_with(&format!("/{}", candidate)))
+            .min_by_key(|path| (path != candidate, path.len(), path.clone()))
         {
             return Some(path);
         }
