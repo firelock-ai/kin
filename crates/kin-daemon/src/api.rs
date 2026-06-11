@@ -5420,6 +5420,9 @@ async fn vfs_file_changed(
                             entity_id: *id,
                             change_type: ChangeType::Created,
                             file_path: Some(request.path.clone()),
+                            // Truthful attribution: the originating session the
+                            // VFS write-back request carried (None if anonymous).
+                            session_id: request.session_id.clone(),
                         });
                     }
                     for id in modified {
@@ -5427,6 +5430,9 @@ async fn vfs_file_changed(
                             entity_id: *id,
                             change_type: ChangeType::Modified,
                             file_path: Some(request.path.clone()),
+                            // Truthful attribution: the originating session the
+                            // VFS write-back request carried (None if anonymous).
+                            session_id: request.session_id.clone(),
                         });
                     }
                     for id in removed {
@@ -5434,6 +5440,9 @@ async fn vfs_file_changed(
                             entity_id: *id,
                             change_type: ChangeType::Deleted,
                             file_path: Some(request.path.clone()),
+                            // Truthful attribution: the originating session the
+                            // VFS write-back request carried (None if anonymous).
+                            session_id: request.session_id.clone(),
                         });
                     }
                     (added.len(), modified.len(), removed.len())
@@ -5565,6 +5574,9 @@ async fn vfs_write_notify(
                             entity_id: *id,
                             change_type: crate::state::ChangeType::Created,
                             file_path: Some(request.file_path.clone()),
+                            // Truthful attribution: the originating session the
+                            // write-notify request carried (None if anonymous).
+                            session_id: request.session_id.clone(),
                         });
                     }
                     for id in modified {
@@ -5572,6 +5584,9 @@ async fn vfs_write_notify(
                             entity_id: *id,
                             change_type: crate::state::ChangeType::Modified,
                             file_path: Some(request.file_path.clone()),
+                            // Truthful attribution: the originating session the
+                            // write-notify request carried (None if anonymous).
+                            session_id: request.session_id.clone(),
                         });
                     }
                     for id in removed {
@@ -5579,6 +5594,9 @@ async fn vfs_write_notify(
                             entity_id: *id,
                             change_type: crate::state::ChangeType::Deleted,
                             file_path: Some(request.file_path.clone()),
+                            // Truthful attribution: the originating session the
+                            // write-notify request carried (None if anonymous).
+                            session_id: request.session_id.clone(),
                         });
                     }
                     count
