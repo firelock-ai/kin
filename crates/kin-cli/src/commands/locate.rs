@@ -193,6 +193,13 @@ pub struct LocateDebugResolvedFile {
     pub score: f32,
     pub direct: f32,
     pub graph: f32,
+    /// Representative entity recovered for this file from Phase-1 discovery
+    /// seeds. The fusion pipeline collapses entity identity to file paths (the
+    /// `FileHit{score,spans}` seam), so this re-attaches the highest-scoring
+    /// non-test seed entity defined in the file. Observability only — ranking
+    /// is untouched. Omitted when no seed entity is attributable to the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1517,6 +1524,9 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             fallback
         });
         let debug_limit = locate_env_usize("KIN_LOCATE_DEBUG_LIST_LIMIT", 12);
+        // Re-attach entity identity (dropped at the FileHit/entity→file seam) to
+        // resolved files for observability. Read-only; never feeds ranking.
+        let resolve_identity = entity_resolve_identity(&all_entity_seeds, graph)?;
         Some(LocateDebugInfo {
             scoring_track: Some(format!("{track:?}")),
             traceback_top: Some(traceback_top),
@@ -1552,6 +1562,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                         .and_then(|scores| scores.get("graph_resolve"))
                         .copied()
                         .unwrap_or(0.0),
+                    entity_id: resolve_identity.get(path).map(|id| id.to_string()),
                 })
                 .collect(),
             stages: Vec::new(),
@@ -8666,6 +8677,52 @@ fn resolve_entities_to_files(
         file_symbols,
         candidate_stages,
     ))
+}
+
+/// Recover file → representative-entity identity from Phase-1 discovery seeds.
+///
+/// The fusion pipeline collapses entity identity to file paths: signal hits are
+/// `FileHit{score, spans}` (the documented seam — no entity id), and both
+/// [`to_ranked`] and [`resolve_entities_to_files`] key purely on path. This
+/// helper re-derives, for each file, the highest-scoring non-test seed entity
+/// whose definition lives in that file, so entity identity survives the
+/// entity→file boundary. It is a *parallel* association keyed by the same path
+/// keys the ranked lists already use — it does not change any score or ordering.
+/// `--explain` surfaces it; entity-granular fusion (behind
+/// `KIN_LOCATE_ENTITY_FUSION`) consumes it to key fusion at entity granularity.
+///
+/// Determinism: seeds are visited in ascending entity-id order and a file keeps
+/// the strictly-higher discovery score (ties resolve to the lower entity id),
+/// so the result is independent of `HashMap` iteration order.
+fn entity_resolve_identity(
+    seeds: &HashMap<kin_model::EntityId, EntityDiscovery>,
+    graph: &kin_db::InMemoryGraph,
+) -> Result<HashMap<String, kin_model::EntityId>> {
+    let mut ordered: Vec<(&kin_model::EntityId, &EntityDiscovery)> = seeds.iter().collect();
+    ordered.sort_by(|a, b| a.0.cmp(b.0));
+    let mut best: HashMap<String, (kin_model::EntityId, f32)> = HashMap::new();
+    for (entity_id, discovery) in ordered {
+        let Some(entity) = graph.get_entity(entity_id)? else {
+            continue;
+        };
+        let Some(file_origin) = entity.file_origin.as_ref() else {
+            continue;
+        };
+        if is_test_by_role(&file_origin.0, Some(&entity)) {
+            continue;
+        }
+        let keep = match best.get(file_origin.0.as_str()) {
+            Some((_, prev_score)) => discovery.score > *prev_score,
+            None => true,
+        };
+        if keep {
+            best.insert(file_origin.0.clone(), (*entity_id, discovery.score));
+        }
+    }
+    Ok(best
+        .into_iter()
+        .map(|(path, (entity_id, _))| (path, entity_id))
+        .collect())
 }
 
 fn resolve_candidate_debug_stages(
