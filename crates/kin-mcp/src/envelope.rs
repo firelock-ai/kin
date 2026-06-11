@@ -32,7 +32,7 @@
 //! still rides along without losing the original content.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use crate::types::{ContentBlock, ToolCallResult};
 
@@ -179,6 +179,24 @@ impl GraphState {
     }
 }
 
+/// Which completeness gate governs whether an *absent* result can be trusted as
+/// a definitive negative. Different retrieval families depend on different
+/// substrates, so "is the index complete enough to trust an empty answer?" has
+/// two different answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NegativeClass {
+    /// Embedding-backed retrieval (`semantic_locate`, `semantic_search`). An
+    /// empty result is only authoritative when *embedding* coverage is complete —
+    /// a half-embedded graph can hide a match that exists.
+    Semantic,
+    /// Graph-structure-backed retrieval (`find_references`, `graph_neighborhood`,
+    /// `trace_data_flow`, `dead_code`, `find_dead_code_seeded`, `entity_history`,
+    /// `bulk_check_references`). These read typed graph relations, not embeddings,
+    /// so their absence-trust depends on the *graph* being initialized and loaded,
+    /// not on embedding coverage.
+    Structural,
+}
+
 /// The versioned MCP response envelope shared by every tool family.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Envelope {
@@ -189,9 +207,10 @@ pub struct Envelope {
     /// Embedding coverage when known; `null`/absent when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_coverage: Option<SemanticCoverage>,
-    /// Precise graph version marker when known; `null`/absent otherwise. The
-    /// daemon `/health` surface does not yet expose a generation/content marker,
-    /// so this is only populated when a tool payload carries one.
+    /// Precise graph version marker when known; `null`/absent otherwise. Populated
+    /// from the daemon `/health` `graph_generation` marker (the monotonic snapshot
+    /// generation, bumped per committed snapshot) via [`Envelope::with_health`], or
+    /// from a tool payload's own `graph_as_of`/`as_of` marker when one is carried.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_as_of: Option<Value>,
     /// Honest graph freshness context; omitted entirely when nothing is known.
@@ -272,6 +291,16 @@ impl Envelope {
         if let Some(value) = health.get("initialized").and_then(Value::as_bool) {
             self.graph_state.initialized = Some(value);
         }
+        // The daemon `/health` `graph_generation` marker (monotonic snapshot
+        // generation, bumped per committed snapshot) is a precise freshness
+        // marker: lift it into `graph_as_of` so a negative can say *which* graph
+        // answered. A tool payload's own marker, if one is later carried, still
+        // wins (the `is_none` guard leaves a payload-lifted value untouched).
+        if self.graph_as_of.is_none() {
+            if let Some(generation) = health.get("graph_generation").and_then(Value::as_u64) {
+                self.graph_as_of = Some(json!({ "generation": generation }));
+            }
+        }
         self
     }
 
@@ -300,18 +329,25 @@ impl Envelope {
         self
     }
 
-    /// Whether an "absent" answer produced from this graph state can be trusted
-    /// as a definitive negative, with the machine-stable reason.
+    /// Whether an "absent" answer from a tool of the given [`NegativeClass`] can
+    /// be trusted as a definitive negative, with the machine-stable reason naming
+    /// *which gate ruled*.
     ///
     /// This is the epistemic core of the confidence-qualified-negative contract:
     /// a "not found" is only distinguishable from "not indexed" when the answer
-    /// came from daemon-owned truth (`RepoDaemon`) **with** complete embedding
-    /// coverage **and** no degraded signals. Anything else — the offline fallback
-    /// surface, unknown coverage (the daemon did not report it), partial
-    /// coverage, or any degraded flag — leaves absence inconclusive. The reason
-    /// is honest about *which* of those held, and never claims authority the
+    /// came from daemon-owned truth (`RepoDaemon`) with no degraded signals **and**
+    /// the substrate the tool actually reads is complete. The two runtime/degraded
+    /// gates are shared; the completeness gate is class-specific:
+    ///
+    /// - [`NegativeClass::Semantic`] tools read embeddings, so absence is
+    ///   authoritative only with **complete embedding coverage**.
+    /// - [`NegativeClass::Structural`] tools read typed graph relations, so absence
+    ///   is authoritative when the daemon **graph is initialized and loaded** —
+    ///   embedding coverage is irrelevant to them.
+    ///
+    /// The reason is honest about which gate held and never claims authority the
     /// envelope did not actually observe.
-    pub fn negative_trust(&self) -> (bool, &'static str) {
+    pub fn negative_trust(&self, class: NegativeClass) -> (bool, &'static str) {
         if self.runtime != Runtime::RepoDaemon {
             return (
                 false,
@@ -324,19 +360,39 @@ impl Envelope {
                 "degraded: the daemon reported a degraded signal, so the index may not reflect current truth",
             );
         }
-        match &self.semantic_coverage {
-            None => (
-                false,
-                "coverage_unknown: embedding coverage was not reported, so an empty result may mean 'not indexed' rather than 'not present'",
-            ),
-            Some(coverage) if !coverage.complete => (
-                false,
-                "coverage_partial: the semantic index is incomplete, so an empty result may mean 'not indexed' rather than 'not present'",
-            ),
-            Some(_) => (
-                true,
-                "authoritative: daemon-owned truth with complete embedding coverage and no degraded signals",
-            ),
+        match class {
+            NegativeClass::Semantic => match &self.semantic_coverage {
+                None => (
+                    false,
+                    "coverage_unknown: embedding coverage was not reported, so an empty result may mean 'not indexed' rather than 'not present'",
+                ),
+                Some(coverage) if !coverage.complete => (
+                    false,
+                    "coverage_partial: the semantic index is incomplete, so an empty result may mean 'not indexed' rather than 'not present'",
+                ),
+                Some(_) => (
+                    true,
+                    "semantic_authoritative: daemon-owned truth with complete embedding coverage and no degraded signals",
+                ),
+            },
+            NegativeClass::Structural => {
+                if self.graph_state.initialized != Some(true) {
+                    (
+                        false,
+                        "graph_uninitialized: the daemon has not confirmed first reconciliation/snapshot load, so an empty structural result may mean the graph is not yet complete",
+                    )
+                } else if self.graph_state.loaded != Some(true) {
+                    (
+                        false,
+                        "graph_not_loaded: the daemon reports no graph loaded, so an empty structural result is not authoritative",
+                    )
+                } else {
+                    (
+                        true,
+                        "structural_authoritative: daemon graph initialized and loaded with no degraded signals",
+                    )
+                }
+            }
         }
     }
 
@@ -509,6 +565,30 @@ mod tests {
         assert!(env.degraded.mass_deletion_blocked.is_none());
         assert!(env.graph_state.is_empty());
         assert!(!env.degraded.any());
+    }
+
+    #[test]
+    fn with_health_lifts_graph_generation_into_graph_as_of() {
+        // 621af29 added `graph_generation` to /health; the envelope lifts that
+        // monotonic snapshot marker into `graph_as_of` so a negative can name
+        // which graph snapshot answered.
+        let env = Envelope::daemon().with_health(&serde_json::json!({
+            "graph_loaded": true,
+            "initialized": true,
+            "graph_generation": 7,
+        }));
+        assert_eq!(
+            env.graph_as_of,
+            Some(serde_json::json!({ "generation": 7 }))
+        );
+    }
+
+    #[test]
+    fn with_health_without_generation_leaves_graph_as_of_unknown() {
+        // Honesty: no marker reported => graph_as_of stays absent, never fabricated.
+        let env =
+            Envelope::daemon().with_health(&serde_json::json!({ "graph_loaded": true }));
+        assert!(env.graph_as_of.is_none());
     }
 
     #[test]
