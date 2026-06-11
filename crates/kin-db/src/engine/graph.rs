@@ -1690,8 +1690,12 @@ impl InMemoryGraph {
         // order — so an unsorted remove sequence makes the HNSW slot history
         // (and thus live-search results) vary run to run. Sorting fixes the
         // remove/enqueue order deterministically.
-        let mut unique_ids: Vec<EntityId> =
-            entity_ids.iter().copied().collect::<HashSet<EntityId>>().into_iter().collect();
+        let mut unique_ids: Vec<EntityId> = entity_ids
+            .iter()
+            .copied()
+            .collect::<HashSet<EntityId>>()
+            .into_iter()
+            .collect();
         unique_ids.sort();
         for entity_id in &unique_ids {
             self.remove_retrievable_vector(&RetrievalKey::Entity(*entity_id))?;
@@ -3077,10 +3081,7 @@ impl InMemoryGraph {
     /// replaces the previous raw `HashSet::iter()` drain, whose per-process
     /// iteration order made artifact batch composition nondeterministic.
     #[cfg(feature = "vector")]
-    fn drain_artifact_embedding_batch(
-        &self,
-        batch_size: usize,
-    ) -> Vec<(ArtifactId, EmbedRecency)> {
+    fn drain_artifact_embedding_batch(&self, batch_size: usize) -> Vec<(ArtifactId, EmbedRecency)> {
         let batch_size = batch_size.max(1);
         let mut all = {
             let mut queue = self.artifact_embedding_queue.lock();
@@ -5694,9 +5695,10 @@ impl InMemoryGraph {
                 None => continue,
             };
             // Skip annotations already anchored to a live entity (not orphaned).
-            let has_live_scope = ann.scopes.iter().any(
-                |s| matches!(s, WorkScope::Entity(id) if ent.entities.contains_key(id)),
-            );
+            let has_live_scope = ann
+                .scopes
+                .iter()
+                .any(|s| matches!(s, WorkScope::Entity(id) if ent.entities.contains_key(id)));
             if has_live_scope {
                 continue;
             }
@@ -9527,7 +9529,10 @@ mod tests {
         // Reopen reuses the persisted sidecar (entity content unchanged → root
         // hash matches), dragging the generation-1 revision vectors back in.
         let loaded = gen2.load_vector_index(&sidecar).unwrap();
-        assert_eq!(loaded, target, "sidecar carries the full generation-1 index");
+        assert_eq!(
+            loaded, target,
+            "sidecar carries the full generation-1 index"
+        );
 
         // Re-embed the current generation. Its HEAD-entity keys replace, but the
         // generation-2 revision keys are new — so without eviction the index now
@@ -10218,11 +10223,19 @@ mod tests {
 
         // Source code by visibility (non-API kinds).
         assert_eq!(
-            entity_embed_tier(&with(Visibility::Public, EntityRole::Source, EntityKind::Function)),
+            entity_embed_tier(&with(
+                Visibility::Public,
+                EntityRole::Source,
+                EntityKind::Function
+            )),
             embed_tier::PUBLIC_SOURCE
         );
         assert_eq!(
-            entity_embed_tier(&with(Visibility::Crate, EntityRole::Source, EntityKind::Function)),
+            entity_embed_tier(&with(
+                Visibility::Crate,
+                EntityRole::Source,
+                EntityKind::Function
+            )),
             embed_tier::CRATE_SOURCE
         );
         assert_eq!(
@@ -10244,19 +10257,35 @@ mod tests {
 
         // Non-source roles trail all live source, regardless of visibility.
         assert_eq!(
-            entity_embed_tier(&with(Visibility::Public, EntityRole::Test, EntityKind::Function)),
+            entity_embed_tier(&with(
+                Visibility::Public,
+                EntityRole::Test,
+                EntityKind::Function
+            )),
             embed_tier::TEST
         );
         // A source-roled but structurally-test entity is still a test.
         assert_eq!(
-            entity_embed_tier(&with(Visibility::Public, EntityRole::Source, EntityKind::Test)),
+            entity_embed_tier(&with(
+                Visibility::Public,
+                EntityRole::Source,
+                EntityKind::Test
+            )),
             embed_tier::TEST
         );
         assert_eq!(
-            entity_embed_tier(&with(Visibility::Public, EntityRole::Docs, EntityKind::DocumentNode)),
+            entity_embed_tier(&with(
+                Visibility::Public,
+                EntityRole::Docs,
+                EntityKind::DocumentNode
+            )),
             embed_tier::DOCS
         );
-        for role in [EntityRole::Generated, EntityRole::Vendored, EntityRole::External] {
+        for role in [
+            EntityRole::Generated,
+            EntityRole::Vendored,
+            EntityRole::External,
+        ] {
             assert_eq!(
                 entity_embed_tier(&with(Visibility::Public, role, EntityKind::Function)),
                 embed_tier::OTHER,
@@ -10367,10 +10396,9 @@ mod tests {
             g2.upsert_entity(e).unwrap();
         }
 
-        let keys =
-            |drained: Vec<(RetrievalKey, EmbedRecency)>| -> Vec<RetrievalKey> {
-                drained.into_iter().map(|(k, _)| k).collect()
-            };
+        let keys = |drained: Vec<(RetrievalKey, EmbedRecency)>| -> Vec<RetrievalKey> {
+            drained.into_iter().map(|(k, _)| k).collect()
+        };
         let order1 = keys(g1.drain_embedding_batch(100));
         let order2 = keys(g2.drain_embedding_batch(100));
         assert_eq!(
@@ -10690,7 +10718,10 @@ mod tests {
             recalled[0].annotation.annotation_id,
             AnnotationId(uuid::Uuid::from_u128(0xb1))
         );
-        assert_eq!(recalled[0].match_basis, RecallMatchBasis::FingerprintReanchor);
+        assert_eq!(
+            recalled[0].match_basis,
+            RecallMatchBasis::FingerprintReanchor
+        );
         assert_eq!(recalled[0].staleness, StalenessState::Fresh);
 
         // The old (now-removed) id resolves to nothing.

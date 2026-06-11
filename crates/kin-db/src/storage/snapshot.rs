@@ -2261,7 +2261,10 @@ mod tests {
 
         let reloaded = SnapshotManager::open(&snapshot_path).unwrap();
         // Loaded, not archived: the original index file remains in place.
-        assert!(vector_path.exists(), "legacy unstamped index must be preserved");
+        assert!(
+            vector_path.exists(),
+            "legacy unstamped index must be preserved"
+        );
         assert!(!archived_sidecar_path(&vector_path).exists());
         assert_eq!(reloaded.graph().embedding_status().indexed, 1);
     }

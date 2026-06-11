@@ -276,7 +276,9 @@ impl VectorIndex {
     pub fn load_compatible(path: &Path, expected: &IndexDescriptor) -> IndexLoadOutcome {
         let inner = match kin_vector::VectorIndex::<RetrievalKey>::load_from_disk(path) {
             Ok(inner) => inner,
-            Err(e) => return IndexLoadOutcome::Incompatible(format!("unreadable vector index: {e}")),
+            Err(e) => {
+                return IndexLoadOutcome::Incompatible(format!("unreadable vector index: {e}"))
+            }
         };
         match inner.descriptor().verify_compatible(expected) {
             Ok(()) => IndexLoadOutcome::Loaded(Self { inner }),
@@ -297,7 +299,9 @@ impl VectorIndex {
     ) -> IndexLoadOutcome {
         let inner = match kin_vector::VectorIndex::<RetrievalKey>::load_from_disk(path) {
             Ok(inner) => inner,
-            Err(e) => return IndexLoadOutcome::Incompatible(format!("unreadable vector index: {e}")),
+            Err(e) => {
+                return IndexLoadOutcome::Incompatible(format!("unreadable vector index: {e}"))
+            }
         };
         let stored = inner.descriptor();
         // Enforce only the fields the stored index actually stamped (grandfather
