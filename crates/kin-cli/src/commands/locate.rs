@@ -13105,6 +13105,27 @@ fn build_result(
     }
 }
 
+/// Human-readable coverage banner for the locate main path (0.1-R5).
+///
+/// Returns `Some(message)` when the semantic (embedding) signal was incomplete
+/// for this query, so the human/CLI surface can warn that results lean on the
+/// lexical + graph signals; `None` when coverage was complete (no banner, no
+/// noise). Prefers the coverage's own degradation note, falling back to a
+/// synthesized indexed/total/pending summary. JSON output already carries the
+/// full `semantic_coverage` object, so the banner is human-output only.
+fn coverage_banner(coverage: &SemanticCoverage) -> Option<String> {
+    if coverage.complete {
+        return None;
+    }
+    Some(coverage.note.clone().unwrap_or_else(|| {
+        format!(
+            "semantic (embedding) signal incomplete: {}/{} entities indexed, \
+             {} pending — lexical + graph signals still ran",
+            coverage.indexed, coverage.total, coverage.pending
+        )
+    }))
+}
+
 fn output_result(result: &LocateResult, json: bool) {
     if json {
         println!(
@@ -13117,6 +13138,11 @@ fn output_result(result: &LocateResult, json: bool) {
 }
 
 fn output_text(result: &LocateResult) {
+    // 0.1-R5: surface degraded semantic coverage on the main path. Written to
+    // stderr so the stdout file list stays clean for piping.
+    if let Some(banner) = result.semantic_coverage.as_ref().and_then(coverage_banner) {
+        eprintln!("⚠ {banner}");
+    }
     if result.files.is_empty() {
         println!("No relevant files found.");
         return;
@@ -18812,5 +18838,44 @@ mod tests {
         assert!(rerank_within_budget(50, 100));
         assert!(rerank_within_budget(100, 100));
         assert!(!rerank_within_budget(101, 100));
+    }
+
+    #[test]
+    fn coverage_banner_only_warns_on_degraded_signal() {
+        let complete = SemanticCoverage {
+            indexed: 10,
+            total: 10,
+            pending: 0,
+            complete: true,
+            note: None,
+        };
+        assert!(
+            coverage_banner(&complete).is_none(),
+            "complete coverage emits no banner"
+        );
+
+        let partial_with_note = SemanticCoverage {
+            indexed: 4,
+            total: 10,
+            pending: 6,
+            complete: false,
+            note: Some("custom degradation note".to_string()),
+        };
+        assert_eq!(
+            coverage_banner(&partial_with_note).as_deref(),
+            Some("custom degradation note"),
+            "the coverage's own note is preferred"
+        );
+
+        let partial_no_note = SemanticCoverage {
+            indexed: 4,
+            total: 10,
+            pending: 6,
+            complete: false,
+            note: None,
+        };
+        let synth = coverage_banner(&partial_no_note).expect("degraded coverage emits a banner");
+        assert!(synth.contains("4/10"), "synthesized banner cites indexed/total");
+        assert!(synth.contains("6 pending"), "synthesized banner cites pending");
     }
 }
