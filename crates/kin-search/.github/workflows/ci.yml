@@ -56,6 +56,8 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     needs: [check]
     runs-on: ubuntu-latest
+    env:
+      DISPATCH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
     steps:
       - name: Trigger kin CI
         # No-op until DISPATCH_TOKEN is provisioned (it never has been): without
