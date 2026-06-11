@@ -86,7 +86,7 @@ tree-sitter-kotlin-ng = "1.1"
 tree-sitter-hcl = "1.1"
 
 # Git interop
-gix = { version = "0.80", default-features = false, features = ["max-performance-safe"] }
+gix = { version = "0.84", default-features = false, features = ["max-performance-safe", "sha1"] }
 
 # HTTP / MCP
 axum = "0.8"
