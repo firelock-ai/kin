@@ -437,6 +437,11 @@ struct FileChangedRequest {
     edit_old_end_byte: Option<usize>,
     #[serde(default)]
     edit_new_end_byte: Option<usize>,
+    /// Optional VFS shim caller session. Additive field used for write-veto
+    /// self-exclusion so a session's own hard intents don't block its writes
+    /// (parity with `/vfs/write-notify`). Absent → no own-write exclusion.
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 /// Request body for VFS write-notify (shim → daemon immediate re-index).
@@ -5216,6 +5221,96 @@ async fn vfs_readdir(
     Ok(Json(json!({ "entries": file_entries })))
 }
 
+/// Rung-3 write-veto precheck shared by the VFS apply paths (`vfs_file_changed`
+/// and `vfs_write_notify`) so the two siblings can never drift — leaving one
+/// ungated would make enforce-mode trivially bypassable via the other endpoint.
+///
+/// Under `KIN_WRITE_VETO=enforce`, returns `Err((409, body))` when the file's
+/// existing entity scopes or its artifact scope are held under another session's
+/// hard intent, rejecting the write *before* it is folded into the graph.
+/// Returns `Ok(())` when the veto is off (default) or the write is allowed,
+/// leaving the apply path byte-identical to prior behavior. `caller` is the
+/// writing session when attributed; a session is never blocked by its own
+/// intent. See [`crate::write_veto`].
+async fn write_veto_precheck(
+    state: &Arc<DaemonState>,
+    file_path: &FsPath,
+    display_path: &str,
+    caller: Option<SessionId>,
+) -> std::result::Result<(), (StatusCode, String)> {
+    if !crate::write_veto::WriteVetoMode::from_env().is_enforcing() {
+        return Ok(());
+    }
+    let file_id = kin_index::normalize_file_path_id(file_path, state.layout.working_dir());
+    let filter = kin_model::EntityFilter {
+        file_path: Some(file_id.clone()),
+        ..Default::default()
+    };
+    // Perf: this `query_entities` runs once per write under enforce; it is
+    // O(entities-in-file) and is the only added cost on the hot path. Cap the
+    // per-file entity-scope comparison set so the veto can never cost more than
+    // the reconcile it guards — a file-level hard intent is still caught via the
+    // always-present Artifact scope, and the reconciler's own (uncapped) check
+    // remains the backstop.
+    const VETO_SCOPE_CAP: usize = 1024;
+    let file_entities = state.graph.query_entities(&filter).map_err(internal_error)?;
+    if file_entities.len() > VETO_SCOPE_CAP {
+        tracing::warn!(
+            path = %display_path,
+            entities = file_entities.len(),
+            cap = VETO_SCOPE_CAP,
+            "write-veto: capping per-file entity-scope comparison set"
+        );
+    }
+    let mut touched: Vec<IntentScope> = file_entities
+        .iter()
+        .take(VETO_SCOPE_CAP)
+        .map(|e| IntentScope::Entity(e.id))
+        .collect();
+    touched.push(IntentScope::Artifact(file_id));
+
+    let intents = state.graph.list_all_intents().map_err(internal_error)?;
+    if let crate::write_veto::WriteVetoDecision::Deny { blocking } =
+        crate::write_veto::evaluate_write_veto(&intents, &touched, caller)
+    {
+        tracing::info!(
+            path = %display_path,
+            blocking = blocking.len(),
+            "write-veto: scope held by foreign hard intent"
+        );
+        let body = crate::write_veto::veto_conflict_body(display_path, &blocking);
+        return Err((StatusCode::CONFLICT, body.to_string()));
+    }
+    Ok(())
+}
+
+/// Under `KIN_WRITE_VETO=enforce`, map a reconcile `CollisionBlocked` (e.g. a
+/// brand-new entity colliding with a foreign hard intent — a scope the precheck
+/// cannot see because the entity does not yet exist in the graph) to the same
+/// structured pre-write 409. Returns `None` otherwise, leaving the caller's
+/// soft-notification path intact.
+fn write_veto_collision_response(
+    err: &kin_reconcile::ReconcileError,
+    display_path: &str,
+) -> Option<(StatusCode, String)> {
+    if !crate::write_veto::WriteVetoMode::from_env().is_enforcing() {
+        return None;
+    }
+    if let kin_reconcile::ReconcileError::CollisionBlocked {
+        blocking_intents, ..
+    } = err
+    {
+        tracing::info!(
+            path = %display_path,
+            blocking = blocking_intents.len(),
+            "write-veto: hard collision during reconcile"
+        );
+        let body = crate::write_veto::veto_conflict_body(display_path, blocking_intents);
+        return Some((StatusCode::CONFLICT, body.to_string()));
+    }
+    None
+}
+
 /// POST /vfs/file-changed — notify the daemon that a file was modified on disk.
 ///
 /// Triggers reconciliation for the specified path. Used by the VFS write-back
@@ -5226,6 +5321,16 @@ async fn vfs_file_changed(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let file_path = std::path::PathBuf::from(&request.path);
     tracing::info!(path = %request.path, "VFS file-changed notification received");
+
+    // Rung-3 write veto (KIN_WRITE_VETO=enforce): the general-purpose sibling of
+    // /vfs/write-notify must gate too, else enforce is trivially bypassable by
+    // choosing this endpoint. Off by default (byte-identical).
+    let caller = request
+        .session_id
+        .as_ref()
+        .and_then(|s| s.parse::<Uuid>().ok())
+        .map(SessionId);
+    write_veto_precheck(&state, &file_path, &request.path, caller).await?;
 
     let event = kin_index::FileEvent::Changed(file_path);
 
@@ -5243,13 +5348,35 @@ async fn vfs_file_changed(
     let mut reconciler = state.reconciler.write().await;
     let mut wc = state.working_copy.write().await;
 
-    match reconciler.reconcile_file_change_with_hint(
+    // Temporarily adopt the caller's session so the reconciler's own collision
+    // check excludes the caller's intents (parity with /vfs/write-notify); the
+    // write-veto precheck above applies the same own-write exclusion.
+    let prev_session_id = if let Some(ref sid) = request.session_id {
+        let prev = reconciler.session_id().copied();
+        if let Ok(parsed) = sid.parse::<Uuid>() {
+            reconciler.set_session_id(SessionId(parsed));
+        }
+        prev
+    } else {
+        None
+    };
+
+    let result = reconciler.reconcile_file_change_with_hint(
         &event,
         &state.blobs,
         state.graph.as_ref(),
         &mut wc.uncommitted_mutations,
         edit_hint.as_ref(),
-    ) {
+    );
+
+    if request.session_id.is_some() {
+        match prev_session_id {
+            Some(prev) => reconciler.set_session_id(prev),
+            None => reconciler.clear_session_id(),
+        }
+    }
+
+    match result {
         Ok(outcome) => {
             let should_apply = matches!(
                 &outcome,
@@ -5327,6 +5454,11 @@ async fn vfs_file_changed(
         Err(e) => {
             drop(wc);
             drop(reconciler);
+            // Under enforce, surface a hard collision detected during reconcile
+            // as a pre-write 409 rather than the soft notification below.
+            if let Some(resp) = write_veto_collision_response(&e, &request.path) {
+                return Err(resp);
+            }
             tracing::warn!(path = %request.path, error = %e, "reconciliation failed");
             Ok(Json(json!({
                 "status": "error",
@@ -5350,62 +5482,15 @@ async fn vfs_write_notify(
     let file_path = std::path::PathBuf::from(&request.file_path);
     tracing::info!(path = %request.file_path, "VFS write-notify received");
 
-    // Rung-3 write veto (KIN_WRITE_VETO=enforce). Before touching the
-    // reconciler, reject a write whose existing entity scopes or file artifact
-    // are held under another session's hard intent, returning a structured
-    // pre-write 409. Default (Off) skips this block entirely, leaving the path
-    // byte-identical to prior behavior.
-    let veto_mode = crate::write_veto::WriteVetoMode::from_env();
-    if veto_mode.is_enforcing() {
-        let caller = request
-            .session_id
-            .as_ref()
-            .and_then(|s| s.parse::<Uuid>().ok())
-            .map(SessionId);
-        let file_id = kin_index::normalize_file_path_id(&file_path, state.layout.working_dir());
-        let filter = kin_model::EntityFilter {
-            file_path: Some(file_id.clone()),
-            ..Default::default()
-        };
-        // Perf: this `query_entities` runs once per write under enforce; it is
-        // O(entities-in-file) and is the only added cost on the hot path. The
-        // comparison set handed to the veto is the file's entity scopes plus its
-        // artifact scope. To guarantee the veto never costs more than the
-        // reconcile it guards, cap the per-file entity-scope set: a pathological
-        // file (> VETO_SCOPE_CAP entities) compares only the first
-        // VETO_SCOPE_CAP, and logs. Correctness is preserved — a file-level hard
-        // intent is still caught via the always-present Artifact scope, and the
-        // reconciler's own (uncapped) collision check remains the backstop.
-        const VETO_SCOPE_CAP: usize = 1024;
-        let file_entities = state.graph.query_entities(&filter).map_err(internal_error)?;
-        if file_entities.len() > VETO_SCOPE_CAP {
-            tracing::warn!(
-                path = %request.file_path,
-                entities = file_entities.len(),
-                cap = VETO_SCOPE_CAP,
-                "write-veto: capping per-file entity-scope comparison set"
-            );
-        }
-        let mut touched: Vec<IntentScope> = file_entities
-            .iter()
-            .take(VETO_SCOPE_CAP)
-            .map(|e| IntentScope::Entity(e.id))
-            .collect();
-        touched.push(IntentScope::Artifact(file_id));
-
-        let intents = state.graph.list_all_intents().map_err(internal_error)?;
-        if let crate::write_veto::WriteVetoDecision::Deny { blocking } =
-            crate::write_veto::evaluate_write_veto(&intents, &touched, caller)
-        {
-            tracing::info!(
-                path = %request.file_path,
-                blocking = blocking.len(),
-                "write-notify vetoed: scope held by foreign hard intent"
-            );
-            let body = crate::write_veto::veto_conflict_body(&request.file_path, &blocking);
-            return Err((StatusCode::CONFLICT, body.to_string()));
-        }
-    }
+    // Rung-3 write veto (KIN_WRITE_VETO=enforce): reject a write whose existing
+    // entity/artifact scopes are held under another session's hard intent
+    // before the reconciler touches the overlay. Off by default (byte-identical).
+    let caller = request
+        .session_id
+        .as_ref()
+        .and_then(|s| s.parse::<Uuid>().ok())
+        .map(SessionId);
+    write_veto_precheck(&state, &file_path, &request.file_path, caller).await?;
 
     let event = kin_index::FileEvent::Changed(file_path);
 
@@ -5512,25 +5597,11 @@ async fn vfs_write_notify(
         Err(e) => {
             drop(wc);
             drop(reconciler);
-            // Under enforce, a hard collision detected during reconcile (e.g. a
-            // brand-new entity colliding with a foreign hard intent — a scope
-            // the pre-reconcile check cannot see because the entity does not yet
-            // exist in the graph) is surfaced as a structured pre-write 409
-            // rather than the soft notification below.
-            if veto_mode.is_enforcing() {
-                if let kin_reconcile::ReconcileError::CollisionBlocked {
-                    blocking_intents, ..
-                } = &e
-                {
-                    tracing::info!(
-                        path = %request.file_path,
-                        blocking = blocking_intents.len(),
-                        "write-notify vetoed: hard collision during reconcile"
-                    );
-                    let body =
-                        crate::write_veto::veto_conflict_body(&request.file_path, blocking_intents);
-                    return Err((StatusCode::CONFLICT, body.to_string()));
-                }
+            // Under enforce, surface a hard collision detected during reconcile
+            // (e.g. a brand-new entity the precheck cannot see) as a pre-write
+            // 409 rather than the soft notification below.
+            if let Some(resp) = write_veto_collision_response(&e, &request.file_path) {
+                return Err(resp);
             }
             tracing::warn!(path = %request.file_path, error = %e, "write-notify reconciliation failed");
             Ok(Json(json!({
@@ -9335,5 +9406,112 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["reindexed"], true);
+    }
+
+    async fn file_changed(app: Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let resp = app
+            .oneshot(
+                Request::post("/vfs/file-changed")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn file_changed_enforce_foreign_hard_intent_returns_409() {
+        // The veto must cover /vfs/file-changed too — otherwise enforce-mode is
+        // trivially bypassable by choosing this endpoint over /vfs/write-notify.
+        let _lock = VETO_ENV_LOCK.lock().await;
+        let state = test_state();
+        let (file_id, abs) = veto_file_target(&state, "src/lib.py");
+        let foreign = register_foreign_session(&state, "other-agent");
+        state
+            .coordinator
+            .register_intent(
+                &foreign,
+                vec![IntentScope::Artifact(file_id)],
+                LockType::Hard,
+                "rewriting lib",
+                None,
+            )
+            .unwrap();
+
+        let _env = EnvVarGuard("KIN_WRITE_VETO");
+        std::env::set_var("KIN_WRITE_VETO", "enforce");
+        let (status, json) = file_changed(router(state), serde_json::json!({ "path": abs })).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(json["error"], "write_veto");
+        assert!(!json["blocking_intents"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn file_changed_flag_off_keeps_soft_notification() {
+        // Flag-off identity for the file-changed path: foreign hard intent
+        // present, default behavior unchanged — soft 200 {status:"error"}, no 409.
+        let _lock = VETO_ENV_LOCK.lock().await;
+        let _env = EnvVarGuard("KIN_WRITE_VETO");
+        std::env::remove_var("KIN_WRITE_VETO");
+
+        let state = test_state();
+        let (file_id, abs) = veto_file_target(&state, "src/lib.py");
+        write_disk_file(&state, "src/lib.py", "def foo():\n    return 1\n");
+        let foreign = register_foreign_session(&state, "other-agent");
+        state
+            .coordinator
+            .register_intent(
+                &foreign,
+                vec![IntentScope::Artifact(file_id)],
+                LockType::Hard,
+                "rewriting lib",
+                None,
+            )
+            .unwrap();
+
+        let (status, json) = file_changed(router(state), serde_json::json!({ "path": abs })).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["status"], "error");
+    }
+
+    #[tokio::test]
+    async fn file_changed_enforce_own_intent_allows_write() {
+        // The additive session_id field lets file-changed honor the own-write
+        // guard: a session editing a file it has itself hard-locked is allowed.
+        let _lock = VETO_ENV_LOCK.lock().await;
+        let state = test_state();
+        let (file_id, abs) = veto_file_target(&state, "src/lib.py");
+        write_disk_file(&state, "src/lib.py", "def foo():\n    return 1\n");
+        let caller = register_foreign_session(&state, "me");
+        state
+            .coordinator
+            .register_intent(
+                &caller,
+                vec![IntentScope::Artifact(file_id)],
+                LockType::Hard,
+                "editing my own file",
+                None,
+            )
+            .unwrap();
+
+        let _env = EnvVarGuard("KIN_WRITE_VETO");
+        std::env::set_var("KIN_WRITE_VETO", "enforce");
+        let (status, json) = file_changed(
+            router(state),
+            serde_json::json!({ "path": abs, "session_id": caller.to_string() }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["status"], "reconciled");
     }
 }
