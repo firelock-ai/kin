@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -226,6 +226,171 @@ impl<Id: DocId> PersistedIndex<Id> {
     const VERSION: u32 = TEXT_INDEX_FORMAT_VERSION;
 }
 
+// ── Segmented (incremental) on-disk format ───────────────────────────────────
+
+/// Format version for the segmented on-disk layout (a small `manifest` file plus
+/// one immutable `seg-<k>-<gen>` file per non-empty segment). Distinct from the
+/// monolithic [`TEXT_INDEX_FORMAT_VERSION`] because it is a different file set;
+/// the manifest is the single versioned, atomically-swapped commit point.
+pub const SEGMENTED_FORMAT_VERSION: u32 = 3;
+
+/// Default number of segments a doc set is partitioned into when the segmented
+/// persistence path is active. Each segment is an independent, immutable file;
+/// a commit re-serializes only the segments whose docs changed, so the cost of a
+/// persist scales with the churn, not the whole index. Overridable (only when a
+/// fresh segmented index is first established) via `KIN_SEARCH_SEGMENT_COUNT`.
+const DEFAULT_SEGMENT_COUNT: usize = 64;
+
+/// Env flag that opts a handle into segmented/incremental persistence. Default
+/// OFF: an unset / non-truthy value keeps the monolithic full-rewrite path. The
+/// flag governs only the *write* strategy and dirty-tracking — load always
+/// auto-detects the on-disk format, so toggling it is safe in both directions.
+const INCREMENTAL_PERSIST_ENV: &str = "KIN_SEARCH_INCREMENTAL_PERSIST";
+
+/// Env override for the segment count of a *newly established* segmented index.
+const SEGMENT_COUNT_ENV: &str = "KIN_SEARCH_SEGMENT_COUNT";
+
+fn incremental_persist_enabled() -> bool {
+    matches!(
+        std::env::var(INCREMENTAL_PERSIST_ENV).ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("on")
+    )
+}
+
+fn resolve_default_segment_count() -> usize {
+    std::env::var(SEGMENT_COUNT_ENV)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(DEFAULT_SEGMENT_COUNT)
+}
+
+/// A fully-specified FNV-1a 64-bit hasher. Used to assign a document to a
+/// segment deterministically and *stably across binary versions* — unlike
+/// `std::collections::hash_map::DefaultHasher`, whose algorithm the standard
+/// library explicitly reserves the right to change between releases. A stable
+/// assignment is what makes incremental dirty-tracking sound: the same id must
+/// always map to the same segment, or a doc could be written into one segment
+/// while a stale copy lingers in another. (A drift is still caught safely on
+/// load by the duplicate-id check, which downgrades it to a clean rebuild.)
+struct FnvHasher(u64);
+
+impl FnvHasher {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn new() -> Self {
+        Self(Self::OFFSET_BASIS)
+    }
+}
+
+impl std::hash::Hasher for FnvHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = self.0;
+        for &byte in bytes {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(Self::PRIME);
+        }
+        self.0 = hash;
+    }
+}
+
+/// Compute the segment index for a document id under a given segment count.
+fn segment_of<Id: DocId>(id: &Id, segment_count: usize) -> usize {
+    let mut hasher = FnvHasher::new();
+    id.hash(&mut hasher);
+    (hasher.finish() % segment_count as u64) as usize
+}
+
+/// One segment's self-contained slice of the index: the postings and forward
+/// docs for the subset of documents assigned to this segment. Merging every
+/// segment's slice reconstructs exactly the monolithic in-memory state (doc sets
+/// are disjoint across segments, so the union is exact and the merge order does
+/// not affect any per-document score).
+#[derive(Serialize, Deserialize)]
+struct SegmentData<Id: DocId> {
+    index: HashMap<String, Postings<Id>>,
+    docs: HashMap<Id, IndexedDoc>,
+    doc_count: usize,
+    total_doc_length: usize,
+}
+
+/// The fully-merged in-memory state reconstructed from a segmented on-disk
+/// index, plus the baseline bookkeeping the handle needs to do future
+/// incremental persists. Carries exactly the same fields a monolithic load
+/// produces, so the two load paths converge on identical live state.
+struct LoadedSegmented<Id: DocId> {
+    index: HashMap<String, Postings<Id>>,
+    docs: HashMap<Id, IndexedDoc>,
+    doc_count: usize,
+    total_doc_length: usize,
+    graph_root_hash: Option<[u8; 32]>,
+    segment_count: usize,
+    baseline_gens: Vec<Option<u64>>,
+}
+
+/// The segmented-format commit point. Small (one entry per segment), so it is
+/// cheap to rewrite on every commit. Written durably and atomically renamed into
+/// place *after* all referenced segment files are fsynced — so a crash either
+/// leaves the previous manifest (old segments) or the new one (all new/kept
+/// segments present), never a torn half-applied set.
+#[derive(Serialize, Deserialize)]
+struct SegmentManifest {
+    version: u32,
+    segment_count: usize,
+    /// Per-segment generation: `Some(gen)` names the live `seg-<k>-<gen>` file;
+    /// `None` means the segment is empty and has no file.
+    segment_gens: Vec<Option<u64>>,
+    doc_count: usize,
+    total_doc_length: usize,
+    graph_root_hash: Option<[u8; 32]>,
+}
+
+/// Tracks which segments have changed since the last segmented persist.
+enum SegmentDirty {
+    /// Every segment must be (re)written — used before a baseline exists (fresh
+    /// index, or one loaded from the monolithic format) and after `rebuild_all`.
+    All,
+    /// Only these segment indices changed and need re-serialization; the rest
+    /// keep their existing on-disk generation.
+    Tracked(HashSet<usize>),
+}
+
+/// In-memory bookkeeping for the segmented persistence path.
+struct SegmentPersistState {
+    /// Segment count this index is partitioned into. Fixed once a baseline
+    /// exists so a doc never migrates between segments mid-life.
+    segment_count: usize,
+    /// On-disk generation per segment, or `None` if the canonical on-disk format
+    /// is currently monolithic / absent (no segmented baseline to do delta from).
+    baseline_gens: Option<Vec<Option<u64>>>,
+    dirty: SegmentDirty,
+}
+
+impl SegmentPersistState {
+    fn new(segment_count: usize) -> Self {
+        Self {
+            segment_count,
+            baseline_gens: None,
+            dirty: SegmentDirty::All,
+        }
+    }
+
+    fn mark_dirty(&mut self, segment: usize) {
+        if let SegmentDirty::Tracked(set) = &mut self.dirty {
+            set.insert(segment);
+        }
+    }
+
+    fn mark_all_dirty(&mut self) {
+        self.dirty = SegmentDirty::All;
+    }
+}
+
 // ── BM25 parameters ────────────────────────────────────────────────────────
 
 const BM25_K1: f32 = 1.2;
@@ -308,6 +473,50 @@ fn corrupt_index_error(storage_path: &Path, reason: String) -> SearchError {
         archived,
         reason,
     }
+}
+
+/// Suffix appended to the storage file name to derive segmented-format siblings,
+/// e.g. `index.bin` -> `index.bin.kinseg-manifest`, `index.bin.kinseg-3-7`.
+const KINSEG_PREFIX: &str = ".kinseg-";
+
+/// Path of the segmented manifest, a sibling of the monolithic storage file.
+fn manifest_path(storage_path: &Path) -> PathBuf {
+    let mut name = storage_path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!("{KINSEG_PREFIX}manifest"));
+    storage_path.with_file_name(name)
+}
+
+/// Path of the file holding segment `k` at generation `gen`.
+fn segment_path(storage_path: &Path, segment: usize, gen: u64) -> PathBuf {
+    let mut name = storage_path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!("{KINSEG_PREFIX}{segment}-{gen}"));
+    storage_path.with_file_name(name)
+}
+
+/// Best-effort enumeration of every segmented sibling file (manifest + segment
+/// files) so they can be cleaned up when reverting to the monolithic format.
+fn kinseg_sibling_files(storage_path: &Path) -> Vec<PathBuf> {
+    let Some(file_name) = storage_path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return Vec::new();
+    };
+    let needle = format!("{file_name}{KINSEG_PREFIX}");
+    let Some(parent) = storage_path.parent() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with(&needle))
+        .map(|e| e.path())
+        .collect()
 }
 
 // ── Tokenization ────────────────────────────────────────────────────────────
@@ -435,6 +644,13 @@ pub struct TextIndex<Id: DocId = u64> {
     /// Optional graph-root hash stamp used to validate this index against
     /// the persisted graph snapshot.
     graph_root_hash: RwLock<Option<[u8; 32]>>,
+    /// Whether this handle writes via the segmented/incremental path. Cached at
+    /// construction from [`INCREMENTAL_PERSIST_ENV`]; default OFF. Governs only
+    /// the write strategy and dirty-tracking — load auto-detects the format.
+    incremental_enabled: bool,
+    /// Segmented-persistence bookkeeping (segment count, on-disk generations,
+    /// dirty set). Only consulted on the segmented write/load paths.
+    seg: RwLock<SegmentPersistState>,
 }
 
 impl<Id: DocId> Default for TextIndex<Id> {
@@ -454,6 +670,8 @@ impl<Id: DocId> TextIndex<Id> {
             staged: RwLock::new(None),
             path: None,
             graph_root_hash: RwLock::new(None),
+            incremental_enabled: incremental_persist_enabled(),
+            seg: RwLock::new(SegmentPersistState::new(resolve_default_segment_count())),
         }
     }
 
@@ -520,6 +738,8 @@ impl<Id: DocId> TextIndex<Id> {
             staged: RwLock::new(None),
             path,
             graph_root_hash: RwLock::new(None),
+            incremental_enabled: incremental_persist_enabled(),
+            seg: RwLock::new(SegmentPersistState::new(resolve_default_segment_count())),
         }
     }
 
@@ -529,6 +749,27 @@ impl<Id: DocId> TextIndex<Id> {
         } else {
             path.join("index.bin")
         }
+    }
+
+    /// Record that the segment owning `id` changed, so the next segmented
+    /// persist re-serializes it. A no-op when incremental persistence is off, so
+    /// the default write path carries zero extra bookkeeping.
+    fn mark_doc_dirty(&self, id: &Id) {
+        if !self.incremental_enabled {
+            return;
+        }
+        let mut seg = self.seg.write();
+        let segment = segment_of(id, seg.segment_count);
+        seg.mark_dirty(segment);
+    }
+
+    /// Mark every segment dirty (a full rewrite is required). Used by the
+    /// `rebuild_all*` paths, which replace the entire corpus.
+    fn mark_all_segments_dirty(&self) {
+        if !self.incremental_enabled {
+            return;
+        }
+        self.seg.write().mark_all_dirty();
     }
 
     /// Index or re-index a document with pre-tokenized weighted fields.
@@ -593,7 +834,9 @@ impl<Id: DocId> TextIndex<Id> {
                 doc_length,
             },
         );
+        drop(staged_guard);
 
+        self.mark_doc_dirty(&id);
         Ok(())
     }
 
@@ -631,7 +874,9 @@ impl<Id: DocId> TextIndex<Id> {
             state.doc_count = state.doc_count.saturating_sub(1);
             state.total_doc_length = state.total_doc_length.saturating_sub(old_doc.doc_length);
         }
+        drop(staged_guard);
 
+        self.mark_doc_dirty(id);
         Ok(())
     }
 
@@ -665,7 +910,11 @@ impl<Id: DocId> TextIndex<Id> {
                 state.total_doc_length = state.total_doc_length.saturating_sub(old_doc.doc_length);
             }
         }
+        drop(staged_guard);
 
+        for id in ids {
+            self.mark_doc_dirty(id);
+        }
         Ok(())
     }
 
@@ -717,6 +966,7 @@ impl<Id: DocId> TextIndex<Id> {
         *self.total_doc_length.write() = total_doc_length;
         // Clear any pending staged state.
         *self.staged.write() = None;
+        self.mark_all_segments_dirty();
 
         Ok(())
     }
@@ -771,6 +1021,7 @@ impl<Id: DocId> TextIndex<Id> {
         *self.doc_count.write() = doc_count;
         *self.total_doc_length.write() = total_doc_length;
         *self.staged.write() = None;
+        self.mark_all_segments_dirty();
 
         Ok(())
     }
@@ -944,19 +1195,35 @@ where
         };
 
         let storage_path = Self::storage_file_path(path);
-        let persisted = Self::load_persisted(&storage_path)?;
         let index = Self::with_path(if persist_changes {
             Some(storage_path.clone())
         } else {
             None
         });
 
-        if let Some(persisted) = persisted {
+        // Auto-detect the on-disk format independently of the write-side flag, so
+        // toggling `KIN_SEARCH_INCREMENTAL_PERSIST` is safe in both directions: a
+        // segmented index opened with the flag off still loads (and the next
+        // monolithic commit retires it), and vice-versa.
+        if manifest_path(&storage_path).exists() {
+            let loaded = Self::load_segmented(&storage_path)?;
+            *index.index.write() = loaded.index;
+            *index.docs.write() = loaded.docs;
+            *index.doc_count.write() = loaded.doc_count;
+            *index.total_doc_length.write() = loaded.total_doc_length;
+            *index.graph_root_hash.write() = loaded.graph_root_hash;
+            let mut seg = index.seg.write();
+            seg.segment_count = loaded.segment_count;
+            seg.baseline_gens = Some(loaded.baseline_gens);
+            seg.dirty = SegmentDirty::Tracked(HashSet::new());
+        } else if let Some(persisted) = Self::load_persisted(&storage_path)? {
             *index.index.write() = persisted.index;
             *index.docs.write() = persisted.docs;
             *index.doc_count.write() = persisted.doc_count;
             *index.total_doc_length.write() = persisted.total_doc_length;
             *index.graph_root_hash.write() = persisted.graph_root_hash;
+            // Monolithic on disk: no segmented baseline, so a first segmented
+            // persist (if the flag is on) performs a full establishing rewrite.
         }
 
         Ok(index)
@@ -1064,11 +1331,33 @@ where
         }
     }
 
+    /// Persist the live index to disk.
+    ///
+    /// Dispatches on the cached write-strategy flag: the default monolithic path
+    /// (full bincode + atomic rename) or, when `KIN_SEARCH_INCREMENTAL_PERSIST`
+    /// was set at open, the segmented path that rewrites only changed segments.
     fn persist_to_disk(&self) -> Result<(), SearchError> {
         let Some(path) = self.path.as_ref() else {
             return Ok(());
         };
 
+        if self.incremental_enabled {
+            self.persist_segmented(path)
+        } else {
+            self.persist_monolithic(path)?;
+            // Transition safety: if this index was previously segmented, the
+            // monolithic file we just wrote is now the truth — retire the stale
+            // manifest so load stops preferring the (now-orphaned) segments.
+            self.retire_segmented_artifacts(path);
+            Ok(())
+        }
+    }
+
+    /// The original full-index persist: serialize the entire index with
+    /// `bincode` and publish it via a fsynced temp + atomic rename. O(full index)
+    /// per call — the scaling cost the segmented path exists to avoid — but the
+    /// simplest crash-safe baseline and the default.
+    fn persist_monolithic(&self, path: &Path) -> Result<(), SearchError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|err| {
                 SearchError::IndexError(format!(
@@ -1118,6 +1407,313 @@ where
         })?;
         sync_parent_dir(path);
         Ok(())
+    }
+
+    /// Segmented/incremental persist: partition documents into segments, then
+    /// re-serialize and durably write only the segments whose documents changed
+    /// since the last persist, and finally swap in a small manifest. The manifest
+    /// is the single atomic commit point: every referenced segment file is
+    /// fsynced before it is named, so a crash leaves either the old manifest (old
+    /// segments) or the new one (all new/kept segments present) — never a torn,
+    /// half-applied set.
+    fn persist_segmented(&self, path: &Path) -> Result<(), SearchError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                SearchError::IndexError(format!(
+                    "failed to create text index directory {}: {err}",
+                    parent.display()
+                ))
+            })?;
+        }
+
+        let docs = self.docs.read();
+        let doc_count = *self.doc_count.read();
+        let total_doc_length = *self.total_doc_length.read();
+        let graph_root_hash = *self.graph_root_hash.read();
+
+        let mut seg = self.seg.write();
+        let segment_count = match &seg.baseline_gens {
+            Some(gens) => gens.len().max(1),
+            None => seg.segment_count.max(1),
+        };
+        // A full rewrite is required when there is no segmented baseline to delta
+        // from (fresh index, or one just loaded from the monolithic format) or
+        // after a `rebuild_all` marked every segment dirty.
+        let rewrite_all =
+            seg.baseline_gens.is_none() || matches!(seg.dirty, SegmentDirty::All);
+        let dirty: Vec<usize> = if rewrite_all {
+            (0..segment_count).collect()
+        } else {
+            match &seg.dirty {
+                SegmentDirty::Tracked(set) => set.iter().copied().collect(),
+                SegmentDirty::All => (0..segment_count).collect(),
+            }
+        };
+
+        // Bucket the live docs by segment — O(docs) hashing, far cheaper than the
+        // O(postings) full serialization the monolithic path pays every commit.
+        let mut buckets: Vec<Vec<&Id>> = vec![Vec::new(); segment_count];
+        for id in docs.keys() {
+            buckets[segment_of(id, segment_count)].push(id);
+        }
+
+        let old_gens: Vec<Option<u64>> = match &seg.baseline_gens {
+            Some(gens) => gens.clone(),
+            None => vec![None; segment_count],
+        };
+        let mut new_gens = old_gens.clone();
+
+        // Re-serialize and durably write each dirty segment under a fresh
+        // generation (an immutable new file — never an in-place overwrite).
+        for &s in &dirty {
+            let ids = &buckets[s];
+            if ids.is_empty() {
+                // The segment is now empty: it gets no file and a `None` gen.
+                new_gens[s] = None;
+                continue;
+            }
+            let mut seg_index: HashMap<String, Postings<Id>> = HashMap::new();
+            let mut seg_docs: HashMap<Id, IndexedDoc> = HashMap::with_capacity(ids.len());
+            let mut seg_doc_count = 0usize;
+            let mut seg_total_len = 0usize;
+            for &id in ids {
+                let doc = &docs[id];
+                // Reconstruct this doc's postings from its stored tokens in the
+                // exact same order `upsert`/`rebuild_all` built the global index,
+                // so the merged-on-load result is byte-for-byte the same index.
+                for (token, weight) in &doc.tokens_by_field {
+                    seg_index.entry(token.clone()).or_default().add(*id, *weight);
+                }
+                seg_doc_count += 1;
+                seg_total_len += doc.doc_length;
+                seg_docs.insert(*id, doc.clone());
+            }
+            let seg_data = SegmentData {
+                index: seg_index,
+                docs: seg_docs,
+                doc_count: seg_doc_count,
+                total_doc_length: seg_total_len,
+            };
+            let encoded = bincode::serialize(&seg_data).map_err(|err| {
+                SearchError::IndexError(format!("failed to encode text index segment {s}: {err}"))
+            })?;
+            let new_gen = old_gens[s].map(|g| g.wrapping_add(1)).unwrap_or(0);
+            let seg_file = segment_path(path, s, new_gen);
+            let seq = PERSIST_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let tmp = unique_tmp_path(&seg_file, seq);
+            write_file_durably(&tmp, &encoded).map_err(|err| {
+                let _ = std::fs::remove_file(&tmp);
+                SearchError::IndexError(format!(
+                    "failed to write text index segment {}: {err}",
+                    tmp.display()
+                ))
+            })?;
+            std::fs::rename(&tmp, &seg_file).map_err(|err| {
+                let _ = std::fs::remove_file(&tmp);
+                SearchError::IndexError(format!(
+                    "failed to promote text index segment {} -> {}: {err}",
+                    tmp.display(),
+                    seg_file.display()
+                ))
+            })?;
+            sync_parent_dir(&seg_file);
+            new_gens[s] = Some(new_gen);
+        }
+
+        // Publish the manifest — the atomic commit point.
+        let manifest = SegmentManifest {
+            version: SEGMENTED_FORMAT_VERSION,
+            segment_count,
+            segment_gens: new_gens.clone(),
+            doc_count,
+            total_doc_length,
+            graph_root_hash,
+        };
+        let m_encoded = bincode::serialize(&manifest).map_err(|err| {
+            SearchError::IndexError(format!("failed to encode text index manifest: {err}"))
+        })?;
+        let m_path = manifest_path(path);
+        let seq = PERSIST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let m_tmp = unique_tmp_path(&m_path, seq);
+        write_file_durably(&m_tmp, &m_encoded).map_err(|err| {
+            let _ = std::fs::remove_file(&m_tmp);
+            SearchError::IndexError(format!(
+                "failed to write text index manifest {}: {err}",
+                m_tmp.display()
+            ))
+        })?;
+        std::fs::rename(&m_tmp, &m_path).map_err(|err| {
+            let _ = std::fs::remove_file(&m_tmp);
+            SearchError::IndexError(format!(
+                "failed to promote text index manifest {} -> {}: {err}",
+                m_tmp.display(),
+                m_path.display()
+            ))
+        })?;
+        sync_parent_dir(&m_path);
+
+        // Committed. Adopt the new generations as the baseline and clear dirt.
+        seg.baseline_gens = Some(new_gens.clone());
+        seg.segment_count = segment_count;
+        seg.dirty = SegmentDirty::Tracked(HashSet::new());
+        drop(seg);
+        drop(docs);
+
+        // Best-effort GC of files the new manifest no longer references: prior
+        // generations of rewritten segments, and any stale monolithic file this
+        // segmented index supersedes. Orphans are harmless (load only follows the
+        // manifest); this just reclaims space.
+        for s in 0..segment_count {
+            if let Some(old) = old_gens[s] {
+                if new_gens[s] != Some(old) {
+                    let _ = std::fs::remove_file(segment_path(path, s, old));
+                }
+            }
+        }
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    /// Load a segmented index: read the manifest (the version gate), then read
+    /// and merge every referenced segment into a single in-memory index that is
+    /// identical to what a monolithic load of the same data would produce. A
+    /// missing/undecodable manifest or segment, or any cross-segment duplicate
+    /// doc id, is reported as a typed [`SearchError::CorruptIndex`] (the manifest
+    /// is archived) so the consumer rebuilds rather than serving a partial index.
+    fn load_segmented(storage_path: &Path) -> Result<LoadedSegmented<Id>, SearchError> {
+        let m_path = manifest_path(storage_path);
+        let bytes = std::fs::read(&m_path).map_err(|err| {
+            SearchError::IndexError(format!(
+                "failed to read text index manifest {}: {err}",
+                m_path.display()
+            ))
+        })?;
+        if bytes.len() < 4 {
+            return Err(corrupt_index_error(
+                &m_path,
+                format!("truncated manifest ({} bytes)", bytes.len()),
+            ));
+        }
+        let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if version != SEGMENTED_FORMAT_VERSION {
+            return Err(corrupt_index_error(
+                &m_path,
+                format!("unsupported segmented manifest version {version}"),
+            ));
+        }
+        let manifest: SegmentManifest = bincode::deserialize(&bytes).map_err(|err| {
+            corrupt_index_error(&m_path, format!("undecodable manifest: {err}"))
+        })?;
+        if manifest.version != SEGMENTED_FORMAT_VERSION {
+            return Err(corrupt_index_error(
+                &m_path,
+                format!(
+                    "declared version {version} but decoded version {}",
+                    manifest.version
+                ),
+            ));
+        }
+        if manifest.segment_gens.len() != manifest.segment_count {
+            return Err(corrupt_index_error(
+                &m_path,
+                format!(
+                    "manifest segment_count {} disagrees with {} gen entries",
+                    manifest.segment_count,
+                    manifest.segment_gens.len()
+                ),
+            ));
+        }
+
+        let mut index: HashMap<String, Postings<Id>> = HashMap::new();
+        let mut docs: HashMap<Id, IndexedDoc> = HashMap::new();
+        let mut doc_count = 0usize;
+        let mut total_doc_length = 0usize;
+
+        for (s, gen_opt) in manifest.segment_gens.iter().enumerate() {
+            let Some(gen) = gen_opt else {
+                continue;
+            };
+            let seg_file = segment_path(storage_path, s, *gen);
+            let seg_bytes = std::fs::read(&seg_file).map_err(|err| {
+                corrupt_index_error(
+                    &m_path,
+                    format!("missing/unreadable segment {s} gen {gen}: {err}"),
+                )
+            })?;
+            let seg_data: SegmentData<Id> = bincode::deserialize(&seg_bytes).map_err(|err| {
+                corrupt_index_error(
+                    &m_path,
+                    format!("undecodable segment {s} gen {gen}: {err}"),
+                )
+            })?;
+
+            // Merge this segment's postings. Doc sets are disjoint across
+            // segments, so this is a pure union; a collision means the on-disk
+            // segmentation drifted (e.g. a hash-impl change) — surface it as
+            // corruption rather than silently double-counting.
+            for (token, postings) in seg_data.index {
+                let entry = index.entry(token).or_default();
+                for (id, weights) in postings.by_doc {
+                    let occ = weights.len();
+                    if entry.by_doc.insert(id, weights).is_some() {
+                        return Err(corrupt_index_error(
+                            &m_path,
+                            format!("duplicate doc id in postings (segment {s})"),
+                        ));
+                    }
+                    entry.occurrences += occ;
+                }
+            }
+            for (id, doc) in seg_data.docs {
+                if docs.insert(id, doc).is_some() {
+                    return Err(corrupt_index_error(
+                        &m_path,
+                        format!("duplicate doc id across segments (segment {s})"),
+                    ));
+                }
+            }
+            doc_count += seg_data.doc_count;
+            total_doc_length += seg_data.total_doc_length;
+        }
+
+        if doc_count != manifest.doc_count || total_doc_length != manifest.total_doc_length {
+            return Err(corrupt_index_error(
+                &m_path,
+                format!(
+                    "segment sums ({doc_count} docs / {total_doc_length} len) disagree with manifest ({} / {})",
+                    manifest.doc_count, manifest.total_doc_length
+                ),
+            ));
+        }
+
+        Ok(LoadedSegmented {
+            index,
+            docs,
+            doc_count,
+            total_doc_length,
+            graph_root_hash: manifest.graph_root_hash,
+            segment_count: manifest.segment_count,
+            baseline_gens: manifest.segment_gens,
+        })
+    }
+
+    /// Remove a stale segmented manifest (and orphaned segment files) when the
+    /// canonical on-disk format reverts to monolithic. The manifest unlink is the
+    /// transition commit point: before it, load follows the old segments; after
+    /// it, load follows the freshly-written `index.bin`. Best-effort.
+    fn retire_segmented_artifacts(&self, path: &Path) {
+        let m_path = manifest_path(path);
+        if !m_path.exists() {
+            return;
+        }
+        let _ = std::fs::remove_file(&m_path);
+        sync_parent_dir(&m_path);
+        for file in kinseg_sibling_files(path) {
+            let _ = std::fs::remove_file(file);
+        }
+        let mut seg = self.seg.write();
+        seg.baseline_gens = None;
+        seg.dirty = SegmentDirty::All;
     }
 }
 
@@ -1645,5 +2241,336 @@ mod tests {
         let results = reopened.fuzzy_search("rebuiltDoc", 10).unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].0, id);
+    }
+
+    // -----------------------------------------------------------------------
+    // Segmented / incremental persistence (KIN_SEARCH_INCREMENTAL_PERSIST)
+    //
+    // The env flag is read once at construction; tests flip the cached field
+    // directly (same-module access) instead of mutating process env, which would
+    // race across the parallel test runner.
+    // -----------------------------------------------------------------------
+
+    /// A fixed fixture corpus with stable ids, so a monolithic build and a
+    /// segmented build over the same data are directly comparable.
+    fn fixture_docs() -> Vec<(TestId, TestDoc)> {
+        let specs = [
+            ("getUserById", "src/users/lookup.rs", "Function"),
+            ("deletePost", "src/posts/admin.rs", "Function"),
+            ("parseTableFromHtml", "src/io/ascii/html.py", "Function"),
+            ("QdpReader", "src/io/qdp.py", "Struct"),
+            ("alphaHandler", "src/handlers/alpha.rs", "Function"),
+            ("betaProcessor", "src/handlers/beta.rs", "Function"),
+            ("computeChecksum", "src/util/hash.rs", "Function"),
+            ("renderTemplate", "src/render/template.rs", "Function"),
+            ("loadConfig", "src/config/loader.rs", "Function"),
+            ("authenticateUser", "src/auth/login.rs", "Function"),
+            ("serializeGraph", "src/graph/serialize.rs", "Function"),
+            ("tokenizeInput", "src/search/tokenize.rs", "Function"),
+            ("mergeSegments", "src/storage/segment.rs", "Function"),
+            ("validateSchema", "src/schema/validate.rs", "Function"),
+            ("buildIndex", "src/index/builder.rs", "Function"),
+            ("queryPlanner", "src/query/planner.rs", "Struct"),
+            ("cacheEviction", "src/cache/lru.rs", "Function"),
+            ("retryPolicy", "src/net/retry.rs", "Struct"),
+            ("decodePayload", "src/net/codec.rs", "Function"),
+            ("flushBuffer", "src/io/buffer.rs", "Function"),
+        ];
+        specs
+            .iter()
+            .enumerate()
+            .map(|(i, (name, file, kind))| {
+                let id = TestId(10_000 + i as u64);
+                let doc = TestDoc {
+                    name: name.to_string(),
+                    signature: format!("fn {name}()"),
+                    file_path: file.to_string(),
+                    kind: kind.to_string(),
+                };
+                (id, doc)
+            })
+            .collect()
+    }
+
+    const FIXTURE_QUERIES: &[&str] = &[
+        "user", "parse", "table", "html", "reader", "handler", "processor",
+        "checksum", "render", "config", "auth", "graph", "tokenize", "segment",
+        "schema", "index", "query", "cache", "retry", "decode", "buffer", "src",
+        "rs", "py", "function", "struct", "qdp", "getUserById", "zzz_no_match",
+    ];
+
+    /// Build the fixture corpus into `dir` via either the monolithic (default) or
+    /// the segmented write path. A small segment count makes the fixtures span
+    /// several segments so merge-on-load is genuinely exercised.
+    fn build_into(dir: &PathBuf, segmented: bool) -> TextIndex<TestId> {
+        let mut idx = TextIndex::<TestId>::open(Some(dir)).unwrap();
+        idx.incremental_enabled = segmented;
+        if segmented {
+            idx.seg.write().segment_count = 8;
+        }
+        for (id, doc) in fixture_docs() {
+            idx.upsert_searchable(id, &doc).unwrap();
+        }
+        idx.set_graph_root_hash([42; 32]);
+        idx.commit().unwrap();
+        idx
+    }
+
+    fn all_query_results(idx: &TextIndex<TestId>) -> Vec<Vec<(TestId, f32)>> {
+        FIXTURE_QUERIES
+            .iter()
+            .map(|q| idx.fuzzy_search(q, 20).unwrap())
+            .collect()
+    }
+
+    fn read_manifest_gens(storage: &Path) -> Vec<Option<u64>> {
+        let bytes = std::fs::read(manifest_path(storage)).unwrap();
+        let manifest: SegmentManifest = bincode::deserialize(&bytes).unwrap();
+        manifest.segment_gens
+    }
+
+    fn first_present_segment(storage: &Path) -> usize {
+        read_manifest_gens(storage)
+            .iter()
+            .position(|g| g.is_some())
+            .expect("at least one present segment")
+    }
+
+    /// GOLDEN TEST: a segmented persist + reload yields byte-for-byte identical
+    /// retrieval to a monolithic persist + reload over the same corpus. This is
+    /// the storage-layer-only guarantee — only *how* the bytes hit disk changes,
+    /// never what a query returns.
+    #[test]
+    fn segmented_persist_is_retrieval_identical_to_monolithic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mono_dir = tmp.path().join("mono");
+        let seg_dir = tmp.path().join("seg");
+
+        let mono = build_into(&mono_dir, false);
+        let seg = build_into(&seg_dir, true);
+
+        // Same data, different write path → identical in-memory results.
+        assert_eq!(all_query_results(&mono), all_query_results(&seg));
+
+        // The segmented dir is actually segmented: manifest present, and no
+        // monolithic index.bin lingering.
+        let seg_storage = TextIndex::<TestId>::storage_file_path(&seg_dir);
+        assert!(manifest_path(&seg_storage).exists(), "segmented manifest must exist");
+        assert!(
+            !seg_storage.exists(),
+            "segmented index must not leave a monolithic index.bin"
+        );
+
+        // Reload from each on-disk format (both reopens auto-detect) and compare.
+        let mono_reopened = TextIndex::<TestId>::open(Some(&mono_dir)).unwrap();
+        let seg_reopened = TextIndex::<TestId>::open(Some(&seg_dir)).unwrap();
+        assert_eq!(
+            all_query_results(&mono_reopened),
+            all_query_results(&seg_reopened)
+        );
+        assert_eq!(seg_reopened.graph_root_hash(), Some([42; 32]));
+        assert_eq!(seg_reopened.live_document_count(), fixture_docs().len());
+    }
+
+    /// Incremental persist re-serializes ONLY the segments whose documents
+    /// changed: adding one doc bumps exactly its segment's generation and leaves
+    /// every other segment file untouched. This is the scaling-cliff fix.
+    #[test]
+    fn incremental_persist_rewrites_only_the_dirty_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("seg");
+        let idx = build_into(&dir, true);
+        let storage = TextIndex::<TestId>::storage_file_path(&dir);
+
+        let gens_before = read_manifest_gens(&storage);
+        let segment_count = gens_before.len();
+
+        let new_id = TestId(99_999);
+        let new_doc = TestDoc {
+            name: "freshlyAddedSymbol".to_string(),
+            signature: "fn freshlyAddedSymbol()".to_string(),
+            file_path: "src/new/added.rs".to_string(),
+            kind: "Function".to_string(),
+        };
+        idx.upsert_searchable(new_id, &new_doc).unwrap();
+        idx.commit().unwrap();
+
+        let gens_after = read_manifest_gens(&storage);
+        assert_eq!(gens_after.len(), segment_count);
+
+        let touched = segment_of(&new_id, segment_count);
+        let changed: Vec<usize> = (0..segment_count)
+            .filter(|&s| gens_before[s] != gens_after[s])
+            .collect();
+        assert_eq!(
+            changed,
+            vec![touched],
+            "exactly the touched segment must be rewritten (the cliff fix)"
+        );
+
+        let reopened = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+        let hits = reopened.fuzzy_search("freshlyAddedSymbol", 10).unwrap();
+        assert_eq!(hits[0].0, new_id);
+        assert_eq!(reopened.live_document_count(), fixture_docs().len() + 1);
+    }
+
+    /// Truncating a referenced segment file is caught on load as a typed
+    /// `CorruptIndex` (manifest archived for a clean reopen), NEVER served as a
+    /// partial/garbled index. The torn-segment crash-consistency contract.
+    #[test]
+    fn truncated_segment_is_corrupt_not_served() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("seg");
+        let _idx = build_into(&dir, true);
+        let storage = TextIndex::<TestId>::storage_file_path(&dir);
+
+        let target = first_present_segment(&storage);
+        let gen = read_manifest_gens(&storage)[target].unwrap();
+        let seg_file = segment_path(&storage, target, gen);
+        let mut bytes = std::fs::read(&seg_file).unwrap();
+        assert!(bytes.len() > 4);
+        bytes.truncate(3);
+        std::fs::write(&seg_file, &bytes).unwrap();
+
+        let err = TextIndex::<TestId>::open(Some(&dir)).err().unwrap();
+        assert!(
+            matches!(err, SearchError::CorruptIndex { .. }),
+            "expected CorruptIndex, got {err:?}"
+        );
+        assert!(
+            !manifest_path(&storage).exists(),
+            "corrupt manifest must be archived off the canonical path"
+        );
+
+        // Self-heals: the next reopen is clean (empty, ready to rebuild).
+        let healed = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+        assert_eq!(healed.live_document_count(), 0);
+    }
+
+    /// A manifest referencing a segment file that no longer exists is corrupt.
+    #[test]
+    fn missing_segment_is_corrupt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("seg");
+        let _idx = build_into(&dir, true);
+        let storage = TextIndex::<TestId>::storage_file_path(&dir);
+
+        let target = first_present_segment(&storage);
+        let gen = read_manifest_gens(&storage)[target].unwrap();
+        std::fs::remove_file(segment_path(&storage, target, gen)).unwrap();
+
+        let err = TextIndex::<TestId>::open(Some(&dir)).err().unwrap();
+        assert!(
+            matches!(err, SearchError::CorruptIndex { ref reason, .. } if reason.contains("missing/unreadable segment")),
+            "expected missing-segment CorruptIndex, got {err:?}"
+        );
+    }
+
+    /// A manifest with a valid version prefix but an undecodable body is corrupt
+    /// and archived, just like the monolithic equivalent.
+    #[test]
+    fn corrupt_manifest_is_archived() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("seg");
+        let _idx = build_into(&dir, true);
+        let storage = TextIndex::<TestId>::storage_file_path(&dir);
+        let manifest = manifest_path(&storage);
+
+        let mut bytes = SEGMENTED_FORMAT_VERSION.to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"this is not a valid manifest payload");
+        std::fs::write(&manifest, &bytes).unwrap();
+
+        let err = TextIndex::<TestId>::open(Some(&dir)).err().unwrap();
+        assert!(
+            matches!(err, SearchError::CorruptIndex { ref reason, .. } if reason.contains("undecodable manifest")),
+            "expected undecodable-manifest CorruptIndex, got {err:?}"
+        );
+        assert!(!manifest.exists(), "corrupt manifest must be archived");
+    }
+
+    /// Toggling the flag OFF on a segmented index: it still loads, and the next
+    /// (monolithic) commit retires the manifest. Results are stable throughout.
+    #[test]
+    fn segmented_to_monolithic_toggle_preserves_results() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("idx");
+        let seg = build_into(&dir, true);
+        let before = all_query_results(&seg);
+        let storage = TextIndex::<TestId>::storage_file_path(&dir);
+        assert!(manifest_path(&storage).exists());
+
+        // Reopen with the flag off (auto-detects + loads the segmented index).
+        let mut idx = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+        idx.incremental_enabled = false;
+        assert_eq!(all_query_results(&idx), before);
+
+        // A commit now writes monolithic and retires the stale manifest.
+        idx.commit().unwrap();
+        assert!(!manifest_path(&storage).exists(), "manifest must be retired");
+        assert!(storage.exists(), "monolithic index.bin must be written");
+
+        let reopened = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+        assert_eq!(all_query_results(&reopened), before);
+    }
+
+    /// Toggling the flag ON over a monolithic index converts it to segmented on
+    /// the next commit. Results are stable throughout.
+    #[test]
+    fn monolithic_to_segmented_toggle_preserves_results() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("idx");
+        let mono = build_into(&dir, false);
+        let before = all_query_results(&mono);
+        let storage = TextIndex::<TestId>::storage_file_path(&dir);
+        assert!(storage.exists());
+        assert!(!manifest_path(&storage).exists());
+
+        let mut idx = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+        idx.incremental_enabled = true;
+        idx.commit().unwrap();
+        assert!(manifest_path(&storage).exists(), "manifest must be created");
+
+        let reopened = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+        assert_eq!(all_query_results(&reopened), before);
+    }
+
+    /// Emptying every document in a segment drops its file and records a `None`
+    /// generation; the index still reloads cleanly with the remaining docs.
+    #[test]
+    fn emptying_a_segment_removes_its_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("seg");
+        let idx = build_into(&dir, true);
+        let storage = TextIndex::<TestId>::storage_file_path(&dir);
+
+        let gens_before = read_manifest_gens(&storage);
+        let segment_count = gens_before.len();
+        let target = first_present_segment(&storage);
+
+        let to_remove: Vec<TestId> = fixture_docs()
+            .into_iter()
+            .map(|(id, _)| id)
+            .filter(|id| segment_of(id, segment_count) == target)
+            .collect();
+        assert!(!to_remove.is_empty());
+        for id in &to_remove {
+            idx.remove(id).unwrap();
+        }
+        idx.commit().unwrap();
+
+        let gens_after = read_manifest_gens(&storage);
+        assert_eq!(gens_after[target], None, "emptied segment must have no file");
+        if let Some(old) = gens_before[target] {
+            assert!(
+                !segment_path(&storage, target, old).exists(),
+                "old segment file must be GC'd"
+            );
+        }
+
+        let reopened = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+        assert_eq!(
+            reopened.live_document_count(),
+            fixture_docs().len() - to_remove.len()
+        );
     }
 }
