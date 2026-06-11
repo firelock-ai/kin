@@ -226,6 +226,9 @@ pub async fn run_loop(
                                 entity_id: *id,
                                 change_type: ChangeType::Created,
                                 file_path: Some(file_path.clone()),
+                                // FS-reconcile loop: a raw filesystem change has
+                                // no owning agent, so attribution is honestly None.
+                                session_id: None,
                             });
                         }
                         for id in modified {
@@ -233,6 +236,9 @@ pub async fn run_loop(
                                 entity_id: *id,
                                 change_type: ChangeType::Modified,
                                 file_path: Some(file_path.clone()),
+                                // FS-reconcile loop: a raw filesystem change has
+                                // no owning agent, so attribution is honestly None.
+                                session_id: None,
                             });
                         }
                         for id in removed {
@@ -240,6 +246,9 @@ pub async fn run_loop(
                                 entity_id: *id,
                                 change_type: ChangeType::Deleted,
                                 file_path: Some(file_path.clone()),
+                                // FS-reconcile loop: a raw filesystem change has
+                                // no owning agent, so attribution is honestly None.
+                                session_id: None,
                             });
                         }
                         state.bump_version();
@@ -275,6 +284,9 @@ pub async fn run_loop(
                                 entity_id: *id,
                                 change_type: ChangeType::Deleted,
                                 file_path: Some(file_path.clone()),
+                                // FS-reconcile loop: a raw filesystem change has
+                                // no owning agent, so attribution is honestly None.
+                                session_id: None,
                             });
                         }
 
@@ -625,6 +637,8 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
                                 entity_id: *id,
                                 change_type: ChangeType::Deleted,
                                 file_path: Some(file_id.0.clone()),
+                                // FS-reconcile loop: anonymous, no owning session.
+                                session_id: None,
                             });
                         }
                     }

@@ -31,6 +31,13 @@ pub enum DaemonEvent {
         entity_id: EntityId,
         change_type: ChangeType,
         file_path: Option<String>,
+        /// Originating session, when the change came from a request that carried
+        /// one (the VFS `/vfs/file-changed` and `/vfs/write-notify` handlers).
+        /// `None` for anonymous FS-reconcile-loop changes — never inferred by
+        /// time-correlating `OverlayUpdated` with later events. Additive: `serde`
+        /// default keeps existing payloads and consumers working unchanged.
+        #[serde(default)]
+        session_id: Option<String>,
     },
     /// Files were added or removed from the tracked tree.
     TreeChanged {
@@ -1381,6 +1388,77 @@ mod tests {
             lineage_parent: None,
             created_in: None,
             superseded_by: None,
+        }
+    }
+
+    #[test]
+    fn entity_changed_serializes_session_attribution() {
+        // An attributed change carries the originating session on the SSE wire,
+        // so Mission Control can render "<session> -> entity <id>".
+        let event = DaemonEvent::EntityChanged {
+            entity_id: kin_model::EntityId::new(),
+            change_type: ChangeType::Modified,
+            file_path: Some("crates/kin-daemon/src/api.rs".to_string()),
+            session_id: Some("mission-ctl-7".to_string()),
+        };
+        let v = serde_json::to_value(&event).unwrap();
+        assert_eq!(v["type"], json!("EntityChanged"));
+        assert_eq!(v["session_id"], json!("mission-ctl-7"));
+    }
+
+    #[test]
+    fn entity_changed_anonymous_session_is_null() {
+        // FS-reconcile changes have no owning agent: session_id renders null, which
+        // Mission Control reads as "unattributed" (never a fabricated guess).
+        let event = DaemonEvent::EntityChanged {
+            entity_id: kin_model::EntityId::new(),
+            change_type: ChangeType::Created,
+            file_path: Some("src/lib.rs".to_string()),
+            session_id: None,
+        };
+        let v = serde_json::to_value(&event).unwrap();
+        assert_eq!(v["session_id"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn entity_changed_legacy_payload_without_session_defaults_to_none() {
+        // Backward compatibility: a pre-attribution payload (no session_id field)
+        // must still deserialize, defaulting session_id to None. This is the
+        // `#[serde(default)]` additive contract the change relies on.
+        let mut payload = serde_json::to_value(DaemonEvent::EntityChanged {
+            entity_id: kin_model::EntityId::new(),
+            change_type: ChangeType::Modified,
+            file_path: Some("api.rs".to_string()),
+            session_id: Some("dropme".to_string()),
+        })
+        .unwrap();
+        payload.as_object_mut().unwrap().remove("session_id");
+        let event: DaemonEvent = serde_json::from_value(payload).unwrap();
+        match event {
+            DaemonEvent::EntityChanged { session_id, .. } => assert!(session_id.is_none()),
+            other => panic!("expected EntityChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emit_event_delivers_session_attribution_to_subscriber() {
+        // The real /events emit path: emit_event -> broadcast -> SSE subscriber.
+        // An attributed event reaches a subscriber with its session intact.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+        let mut rx = state.event_tx.subscribe();
+        state.emit_event(DaemonEvent::EntityChanged {
+            entity_id: kin_model::EntityId::new(),
+            change_type: ChangeType::Modified,
+            file_path: Some("crates/kin-daemon/src/api.rs".to_string()),
+            session_id: Some("mission-ctl-7".to_string()),
+        });
+        match rx.try_recv().expect("event delivered to SSE subscriber") {
+            DaemonEvent::EntityChanged { session_id, .. } => {
+                assert_eq!(session_id.as_deref(), Some("mission-ctl-7"));
+            }
+            other => panic!("expected EntityChanged, got {other:?}"),
         }
     }
 
