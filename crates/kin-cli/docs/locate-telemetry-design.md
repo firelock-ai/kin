@@ -25,8 +25,12 @@ Resolution order (first decisive wins), default OFF:
 
 1. `KIN_LOCATE_TELEMETRY` env: `1`/`true` → on, `0`/`false` → force off (CI/ephemeral,
    matches the codebase's env opt-in convention, e.g. `KIN_CONTEXTBENCH_TEST_HINTS`).
-2. `.kin/config.toml` `[telemetry] locate_enabled = true/false` (durable, intentional
-   per-repo opt-in — the primary consent record).
+2. **Consent marker file** `.kin/telemetry/consent`: its presence is the durable,
+   intentional per-repo opt-in record (create it to opt in, delete it to revoke). A
+   plain marker keeps phase 1 dependency-free (no `toml` parsing, no Cargo.lock churn
+   under freeze) and trivially inspectable. Folding this into `kin_core`'s `WorldConfig`
+   (`.kin/config.toml [telemetry] locate_enabled`) is a clean follow-up once a shared
+   config reader is wired through kin-cli — out of this lane's boundary today.
 3. Otherwise: **OFF**.
 
 On the first write of a session (consent on, spool file freshly opened), emit a one-time
@@ -34,8 +38,8 @@ disclosure to **stderr** (never stdout — keeps result piping clean):
 
 ```
 ℹ kin locate telemetry is ON (you opted in). Recording queries + results + funnel
-  traces to .kin/telemetry/ — local only, never uploaded. Disable: set
-  [telemetry] locate_enabled = false (or KIN_LOCATE_TELEMETRY=0). Purge: delete .kin/telemetry/.
+  traces to .kin/telemetry/ — local only, never uploaded. Disable: delete
+  .kin/telemetry/consent (or set KIN_LOCATE_TELEMETRY=0). Purge: delete .kin/telemetry/.
 ```
 
 ## Schema (documented, versioned)
