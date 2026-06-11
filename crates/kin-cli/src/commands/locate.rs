@@ -2280,6 +2280,10 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 let revision = std::env::var("KIN_LOCATE_CROSS_ENCODER_REVISION")
                     .unwrap_or_else(|_| "main".to_string());
 
+                // 1.7 latency gate: time model load + rerank so an over-budget
+                // rerank can fall back to the pre-rerank order (see
+                // rerank_within_budget). Budget unset (0) == prior behavior.
+                let rerank_started = std::time::Instant::now();
                 match kin_db::embed::rerank::CrossEncoder::new(&model_id, &revision) {
                     Ok(encoder) => {
                         let mut docs = Vec::new();
@@ -2294,28 +2298,51 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
 
                         let doc_refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
                         if let Ok(scores) = encoder.rerank(text, &doc_refs) {
-                            for (i, score) in scores.into_iter().enumerate() {
-                                candidates[i].1 = score;
-                            }
-                            candidates.sort_by(|a, b| {
-                                b.1.partial_cmp(&a.1)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                                    .then_with(|| a.0.cmp(&b.0))
-                            });
+                            let elapsed_ms = rerank_started.elapsed().as_millis();
+                            let budget_ms =
+                                locate_env_usize("KIN_LOCATE_RERANK_LATENCY_BUDGET_MS", 0) as u128;
+                            if rerank_within_budget(elapsed_ms, budget_ms) {
+                                for (i, score) in scores.into_iter().enumerate() {
+                                    candidates[i].1 = score;
+                                }
+                                candidates.sort_by(|a, b| {
+                                    b.1.partial_cmp(&a.1)
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                        .then_with(|| a.0.cmp(&b.0))
+                                });
 
-                            let mut new_fused: Vec<(String, f32)> = candidates;
-                            for (path, score) in fused.iter().skip(ltr_window) {
-                                new_fused.push((path.clone(), *score));
-                            }
-                            fused = new_fused;
+                                let mut new_fused: Vec<(String, f32)> = candidates;
+                                for (path, score) in fused.iter().skip(ltr_window) {
+                                    new_fused.push((path.clone(), *score));
+                                }
+                                fused = new_fused;
 
-                            if explain {
-                                record_debug_stage(
-                                    &mut score_breakdown,
-                                    &mut debug_info,
-                                    &fused,
-                                    "after_cross_encoder",
+                                if explain {
+                                    record_debug_stage(
+                                        &mut score_breakdown,
+                                        &mut debug_info,
+                                        &fused,
+                                        "after_cross_encoder",
+                                    );
+                                }
+                            } else {
+                                // Latency gate tripped: the rerank stage exceeded its
+                                // budget, so keep the pre-rerank fusion order. The result
+                                // then respects the latency SLO deterministically instead
+                                // of surfacing an over-budget reranking.
+                                tracing::warn!(
+                                    "cross-encoder rerank gated: {elapsed_ms}ms exceeds \
+                                     KIN_LOCATE_RERANK_LATENCY_BUDGET_MS={budget_ms}ms; \
+                                     keeping pre-rerank order"
                                 );
+                                if explain {
+                                    record_debug_stage(
+                                        &mut score_breakdown,
+                                        &mut debug_info,
+                                        &fused,
+                                        "cross_encoder_gated",
+                                    );
+                                }
                             }
                         }
                     }
@@ -9189,6 +9216,19 @@ fn rrf_rank_lift_weights(num_lists: usize) -> Vec<f32> {
         weights[9] = locate_env_f32("KIN_LOCATE_RRF_WEIGHT_EMBEDDING", 1.0);
     }
     weights
+}
+
+/// Latency gate for the optional cross-encoder rerank stage (1.7).
+///
+/// Returns whether a rerank that took `elapsed_ms` may be applied under a
+/// `budget_ms` SLO. A budget of `0` disables the gate (always apply), so an
+/// operator who enables the cross-encoder without setting
+/// `KIN_LOCATE_RERANK_LATENCY_BUDGET_MS` keeps the prior behavior byte-for-byte.
+/// Otherwise the rerank result is applied only when its measured latency is
+/// within budget; an over-budget rerank falls back to the pre-rerank order so
+/// the returned ranking is deterministic with respect to the latency cap.
+fn rerank_within_budget(elapsed_ms: u128, budget_ms: u128) -> bool {
+    budget_ms == 0 || elapsed_ms <= budget_ms
 }
 
 fn reciprocal_rank_fusion(ranked_lists: &[Vec<(String, f32)>], k: f32) -> Vec<(String, f32)> {
@@ -18762,5 +18802,15 @@ mod tests {
             signals: vec!["search"],
             cosine: None,
         }
+    }
+
+    #[test]
+    fn rerank_latency_gate_respects_budget() {
+        // Budget 0 disables the gate → always apply (prior behavior preserved).
+        assert!(rerank_within_budget(10_000, 0));
+        // Within, at, and over the budget boundary.
+        assert!(rerank_within_budget(50, 100));
+        assert!(rerank_within_budget(100, 100));
+        assert!(!rerank_within_budget(101, 100));
     }
 }
