@@ -58,6 +58,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Trigger kin CI
+        # No-op until DISPATCH_TOKEN is provisioned (it never has been): without
+        # the secret, env.DISPATCH_TOKEN is empty so this step skips and the job
+        # stays green, instead of failing on a missing token. Mirrors kin-vector
+        # / kin-infer c119b84. Remove the guard once the cross-repo PAT is added.
+        if: ${{ env.DISPATCH_TOKEN != '' }}
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.DISPATCH_TOKEN }}
