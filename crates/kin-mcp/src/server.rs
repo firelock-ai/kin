@@ -399,7 +399,7 @@ async fn handle_tools_call<G: PersistableMcpStore>(
                 "tool '{}' is not enabled in this MCP profile",
                 call_params.name
             ));
-            return offline_envelope_success(id, error_result);
+            return offline_envelope_success(id, error_result, &call_params.name);
         }
     }
 
@@ -447,23 +447,28 @@ async fn handle_tools_call<G: PersistableMcpStore>(
                     let error_result = ToolCallResult::error(format!(
                         "tool succeeded but snapshot persistence failed: {error}"
                     ));
-                    return offline_envelope_success(id, error_result);
+                    return offline_envelope_success(id, error_result, &call_params.name);
                 }
             }
-            offline_envelope_success(id, result)
+            offline_envelope_success(id, result, &call_params.name)
         }
-        Err(e) => offline_envelope_success(id, ToolCallResult::error(e.to_string())),
+        Err(e) => {
+            offline_envelope_success(id, ToolCallResult::error(e.to_string()), &call_params.name)
+        }
     }
 }
 
 /// Attach the offline/in-process response envelope and wrap the result as a
 /// JSON-RPC success. The in-process path is the explicit offline runtime, so the
-/// envelope honestly flags `offline_fallback` (not daemon-owned truth).
+/// envelope honestly flags `offline_fallback` (not daemon-owned truth). The tool
+/// name lets `finalize` synthesize the confidence-qualified negative for empty
+/// retrieval results on this path too.
 fn offline_envelope_success(
     id: Option<serde_json::Value>,
     result: ToolCallResult,
+    tool_name: &str,
 ) -> JsonRpcResponse {
-    let enveloped = envelope::finalize(result, Envelope::offline());
+    let enveloped = envelope::finalize(result, Envelope::offline(), tool_name);
     JsonRpcResponse::success(id, serde_json::to_value(&enveloped).unwrap_or_default())
 }
 
@@ -485,7 +490,7 @@ async fn handle_tools_call_daemon(
                 "tool '{}' is not enabled in this MCP profile",
                 call_params.name
             ));
-            let enveloped = envelope::finalize(error_result, Envelope::daemon());
+            let enveloped = envelope::finalize(error_result, Envelope::daemon(), &call_params.name);
             return JsonRpcResponse::success(
                 id,
                 serde_json::to_value(&enveloped).unwrap_or_default(),
@@ -512,7 +517,7 @@ async fn handle_tools_call_daemon(
         }
     }
 
-    let enveloped = envelope::finalize(result, base_env);
+    let enveloped = envelope::finalize(result, base_env, &call_params.name);
     JsonRpcResponse::success(id, serde_json::to_value(&enveloped).unwrap_or_default())
 }
 
@@ -622,6 +627,74 @@ mod tests {
         assert!(
             message.contains("requires the Kin daemon"),
             "original error message preserved, got: {message}"
+        );
+    }
+
+    // ── Track C: confidence-qualified negatives ride the envelope through the
+    //    real dispatch chokepoint, on the offline path, across tool groups. ──────
+
+    /// Assert the additive `negative` contract is present and shaped, without
+    /// disturbing the envelope or the original payload keys.
+    fn assert_negative(payload: &serde_json::Value, tool: &str, kind: &str) -> serde_json::Value {
+        assert_offline_envelope(payload, tool);
+        let negative = payload
+            .get("negative")
+            .unwrap_or_else(|| panic!("tool {tool} empty result must carry a `negative` contract"));
+        assert_eq!(negative["kind"], kind, "tool {tool} negative kind");
+        // Offline is a fallback surface: absence is never authoritative here.
+        assert_eq!(
+            negative["safe_to_conclude_absent"], false,
+            "tool {tool} offline absence must be inconclusive"
+        );
+        assert_eq!(negative["trust"], "inconclusive", "tool {tool}");
+        assert!(
+            negative["advice"].as_str().is_some_and(|a| !a.is_empty()),
+            "tool {tool} negative must carry human advice"
+        );
+        negative.clone()
+    }
+
+    #[tokio::test]
+    async fn negative_contract_on_empty_object_payload_search() {
+        // Object payload: `negative` is added beside `_kin` and the untouched
+        // `results` key.
+        let payload =
+            call_tool_payload("semantic_search", serde_json::json!({ "query": "nonexistent" }))
+                .await;
+        let negative = assert_negative(&payload, "semantic_search", "no_entity_match");
+        assert_eq!(negative["result_count"], 0);
+        assert_eq!(negative["interpretation"], "absent_as_indexed");
+        // Back-compat: the original result collection still lives where agents
+        // expect it, empty.
+        assert_eq!(
+            payload["results"].as_array().map(|a| a.len()),
+            Some(0),
+            "negative must not displace the original `results` key"
+        );
+    }
+
+    #[tokio::test]
+    async fn negative_contract_on_empty_bare_array_dead_code() {
+        // Bare-array payload: the annotator wraps it under `result`; `negative`
+        // rides alongside.
+        let payload = call_tool_payload("dead_code", serde_json::json!({})).await;
+        let negative = assert_negative(&payload, "dead_code", "no_dead_code");
+        assert_eq!(negative["result_count"], 0);
+        assert!(
+            payload["result"].is_array(),
+            "bare-array dead_code payload is wrapped under `result`"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_negative_on_non_retrieval_tool() {
+        // Work-graph listing is not a code-retrieval negative surface: an empty
+        // work list must NOT be dressed up as a confidence-qualified absence.
+        let payload = call_tool_payload("kin_work_list", serde_json::json!({})).await;
+        assert_offline_envelope(&payload, "kin_work_list");
+        assert!(
+            payload.get("negative").is_none(),
+            "non-retrieval tools must not carry a `negative` contract"
         );
     }
 
