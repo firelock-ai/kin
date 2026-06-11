@@ -71,8 +71,10 @@ jobs:
 
       # TEMPORARY debt allow-list — burn down per crates/kin-cli/docs/kin-cli-clippy-triage.md
       # + release-ops task; no additions without lead sign-off.
-      # Enumerated 2026-06-10 from `cargo clippy --all-targets --all-features` on main:
-      # 271 warnings, 42 distinct clippy lints. The trailing `-A deprecated` is a rustc
+      # Enumerated from `cargo clippy --all-targets --all-features` on main against
+      # the CI toolchain (rustc/clippy 1.96.0, dtolnay rust-toolchain@stable):
+      # 45 distinct clippy lints (the 1.96 bump from 1.94 added collapsible_match,
+      # manual_checked_ops, useless_conversion). The trailing `-A deprecated` is a rustc
       # (non-clippy) lint covering the ArtifactId::from_path deprecation warnings; it is
       # required for the -Dwarnings gate to pass until that migration lands. The `--` keeps
       # these allows AFTER the RUSTFLAGS=-Dwarnings group so each specific lint overrides it.
@@ -83,6 +85,7 @@ jobs:
           -A clippy::bool_assert_comparison
           -A clippy::clone_on_copy
           -A clippy::collapsible_if
+          -A clippy::collapsible_match
           -A clippy::derivable_impls
           -A clippy::doc_lazy_continuation
           -A clippy::doc_overindented_list_items
@@ -96,6 +99,7 @@ jobs:
           -A clippy::items_after_test_module
           -A clippy::large_enum_variant
           -A clippy::len_zero
+          -A clippy::manual_checked_ops
           -A clippy::manual_contains
           -A clippy::manual_is_multiple_of
           -A clippy::manual_map
@@ -121,6 +125,7 @@ jobs:
           -A clippy::unnecessary_map_or
           -A clippy::unnecessary_sort_by
           -A clippy::unnecessary_unwrap
+          -A clippy::useless_conversion
           -A deprecated
 
       - name: Check Runtime Boundaries
