@@ -459,6 +459,7 @@ fn extract_calls_from_body(
 }
 
 /// Extract `use` imports at any nesting level.
+#[allow(clippy::only_used_in_recursion)]
 fn extract_php_imports(
     node: &tree_sitter::Node,
     source: &[u8],
