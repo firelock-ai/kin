@@ -37,6 +37,12 @@ struct RoutingInner {
     endpoints: HashMap<String, RepoEndpoint>,
 }
 
+impl Default for RoutingTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RoutingTable {
     pub fn new() -> Self {
         Self {

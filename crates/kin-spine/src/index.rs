@@ -68,6 +68,12 @@ struct SpineInner {
     root_hashes: HashMap<RepoId, String>,
 }
 
+impl Default for SpineIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SpineIndex {
     pub fn new() -> Self {
         Self {

@@ -99,6 +99,7 @@ fn extract_csharp_output(tree: &Tree, source: &[u8], file_id: &FilePathId) -> Pa
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extract_csharp_node(
     node: &Node,
     source: &[u8],
@@ -325,8 +326,8 @@ fn extract_csharp_node(
             }
         }
         _ => {
-            if callable_ctx.is_some() {
-                extract_csharp_calls(node, source, callable_ctx.unwrap(), relations);
+            if let Some(ctx) = callable_ctx {
+                extract_csharp_calls(node, source, ctx, relations);
             }
         }
     }
@@ -494,6 +495,7 @@ fn extract_ruby_output(tree: &Tree, source: &[u8], file_id: &FilePathId) -> Pars
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extract_ruby_node(
     node: &Node,
     source: &[u8],

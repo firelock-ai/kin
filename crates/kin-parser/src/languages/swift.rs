@@ -331,8 +331,6 @@ fn extract_swift_node(
 
                 let kind = if class_ctx.is_none() && is_constant {
                     EntityKind::Constant
-                } else if class_ctx.is_none() {
-                    EntityKind::StaticVar
                 } else {
                     EntityKind::StaticVar
                 };

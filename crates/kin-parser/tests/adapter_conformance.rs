@@ -177,6 +177,7 @@ fn conformance_parse_valid_source() {
 
 #[test]
 fn conformance_imports_are_file_imports_not_file_id_relations() {
+    #[allow(clippy::type_complexity)]
     let cases: Vec<(&str, Box<dyn LanguageAdapter>, &str, &[u8])> = vec![
         (
             "python",

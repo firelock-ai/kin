@@ -153,6 +153,7 @@ impl LanguageAdapter for GoAdapter {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extract_go_node(
     node: &tree_sitter::Node,
     source: &[u8],

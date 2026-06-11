@@ -233,6 +233,10 @@ fn find_best_split(
 
     let total_sum: f32 = indices.iter().map(|&i| residuals[i]).sum();
 
+    // `feat` is a column index into the per-row feature vectors (features[i][feat]
+    // across rows i), not a walk over a single slice — so the range loop is the
+    // clearest form and can't be replaced by a borrowing iterator.
+    #[allow(clippy::needless_range_loop)]
     for feat in 0..LocateFeatureVector::FEATURE_COUNT {
         // Collect and sort feature values.
         let mut vals: Vec<(f32, usize)> = indices.iter().map(|&i| (features[i][feat], i)).collect();
