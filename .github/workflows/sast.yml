@@ -19,6 +19,20 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Configure kin cargo registry
+        # cargo-deny resolves the full dependency graph via `cargo metadata`,
+        # which needs the `kin` registry alias to find the published kin-* crates
+        # (the committed Cargo.toml declares them with registry = "kin"). The
+        # local-dev .cargo/config.toml is gitignored, so write the alias here.
+        # The cargo-deny-action mounts the workspace at /github/workspace, so the
+        # config at the repo root is on cargo's config search path inside it.
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'TOML'
+          [registries.kin]
+          index = "sparse+https://kinlab.ai/registry/cargo/"
+          TOML
+
       - name: Run cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
         with:

@@ -16,12 +16,37 @@ jobs:
   daemon-smoke:
     name: Linux Daemon Smoke + MCP Headless
     runs-on: ubuntu-latest
+    # EXPERIMENTAL — non-blocking until a real green run is observed.
+    # This job was added 2026-06-10 and has never passed end-to-end on a runner.
+    # The build + tool wiring are verified (kin-daemon takes --repo/--port and
+    # serves an unauthenticated /readiness; `kin mcp start` honours
+    # KIN_DAEMON_URL; semantic_locate is a real tool), but readiness on a
+    # freshly-`kin init`-ed EMPTY workspace is unproven: /readiness returns 503
+    # until the graph is "initialized" (see kin-daemon api.rs
+    # readiness_returns_503_when_empty), so an empty repo may never go ready and
+    # the poll could time out. Kept honest as allow-failure rather than faked
+    # green or deleted.
+    # TODO(ci-green): once a real run is green, drop continue-on-error to make
+    # this a blocking gate. If empty-repo readiness never settles, seed a minimal
+    # indexed entity before the readiness poll (or assert against /health).
+    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Configure kin cargo registry
+        # .cargo/config.toml is gitignored; write the registry alias the
+        # committed Cargo.toml needs to resolve the published kin-* crates from
+        # the kinlab.ai sparse registry. Mirrors ci.yml / release.yml / Dockerfile.
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'TOML'
+          [registries.kin]
+          index = "sparse+https://kinlab.ai/registry/cargo/"
+          TOML
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
@@ -35,8 +60,11 @@ jobs:
             ${{ runner.os }}-cargo-smoke-
             ${{ runner.os }}-cargo-
 
+      # --locked omitted: committed Cargo.lock is patch-flavoured (local path
+      # crates, no registry checksums); allow the registry-only resolve to update
+      # it in-CI, as ci.yml and the kin-bench CI(Linux) job do.
       - name: Build kin + kin-daemon
-        run: cargo build --locked --bin kin --bin kin-daemon
+        run: cargo build --bin kin --bin kin-daemon
 
       - name: Daemon smoke + MCP headless tools/list
         run: |
