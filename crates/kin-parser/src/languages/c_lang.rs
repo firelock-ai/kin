@@ -525,6 +525,7 @@ fn is_valid_callee(name: &str) -> bool {
         && !name.chars().all(|c| c.is_numeric())
 }
 
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -920,7 +921,7 @@ fn extract_includes_and_macros_recursive(
         node.kind(),
         "identifier" | "type_identifier" | "statement_identifier" | "field_identifier"
     ) {
-        if let Some(name) = node.utf8_text(source).ok() {
+        if let Ok(name) = node.utf8_text(source) {
             if is_all_caps_macro(name) {
                 if let Some(src_name) = find_enclosing_entity(node, source) {
                     if src_name != name && !src_name.ends_with(&format!("::{}", name)) {

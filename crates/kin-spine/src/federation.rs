@@ -218,7 +218,7 @@ mod tests {
             result.repos_involved.len() >= 2,
             "should span multiple repos"
         );
-        assert!(result.edges.len() >= 1, "should have cross-repo edges");
+        assert!(!result.edges.is_empty(), "should have cross-repo edges");
 
         // The BFS should find the path: kin-db ← kin ← kin-editor
         let repo_set: HashSet<&str> = result.repos_involved.iter().map(|s| s.as_str()).collect();
