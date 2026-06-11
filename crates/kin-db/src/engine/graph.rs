@@ -5371,6 +5371,78 @@ impl ChangeStore for InMemoryGraph {
 // Memory re-anchor — rename-durable annotation recall (Track B)
 // ---------------------------------------------------------------------------
 
+/// How a recalled annotation matched the queried entity. Carried in the recall
+/// payload so an agent knows the epistemic basis of the memory it is given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecallMatchBasis {
+    /// The annotation is scoped directly to this entity's current id.
+    Id,
+    /// Re-anchored by fingerprint: the annotation's original scoped entity no
+    /// longer resolves (renamed/removed) and its anchor matches this entity.
+    FingerprintReanchor,
+    /// Fingerprint collision: the anchor matches, but the annotation's scoped
+    /// entity is a DIFFERENT entity that is still live (shared/duplicated
+    /// fingerprint, e.g. templated code). Excluded from recall by default.
+    FingerprintCollision,
+}
+
+/// An annotation recalled for an entity, tagged with the epistemic signal an
+/// agent needs: how it matched and how stale its anchor is relative to the
+/// entity's current fingerprint.
+#[derive(Debug, Clone)]
+pub struct RecalledAnnotation {
+    pub annotation: Annotation,
+    pub match_basis: RecallMatchBasis,
+    pub staleness: StalenessState,
+    /// Whether the matched/owning entity shares the queried entity's file.
+    /// Always true for an `Id` match; false (unknown) for a re-anchor whose
+    /// original entity is gone.
+    pub same_file: bool,
+    /// Whether the matched/owning entity shares the queried entity's kind.
+    pub same_kind: bool,
+}
+
+/// Options controlling [`InMemoryGraph::recall_for_entity_with`].
+#[derive(Debug, Clone, Default)]
+pub struct RecallOptions {
+    /// Include `Stale` matches (anchor structurally diverged). Off by default.
+    pub include_stale: bool,
+    /// Include `FingerprintCollision` matches — memory owned by a *different*
+    /// live entity that shares the fingerprint. Off by default so recall never
+    /// silently hands an agent another entity's memory.
+    pub include_fingerprint_collisions: bool,
+}
+
+/// Staleness of an anchor relative to an entity's current fingerprint.
+fn anchor_staleness(anchor: &SemanticAnchor, fp: &SemanticFingerprint) -> StalenessState {
+    let ast_match = anchor.ast_hash == fp.ast_hash;
+    let sig_match = anchor.signature_hash == fp.signature_hash;
+    if ast_match && sig_match {
+        StalenessState::Fresh
+    } else if ast_match {
+        // Structure unchanged, signature changed — the memory may still apply.
+        StalenessState::Suspect
+    } else {
+        StalenessState::Stale
+    }
+}
+
+fn recall_basis_rank(b: RecallMatchBasis) -> u8 {
+    match b {
+        RecallMatchBasis::Id => 0,
+        RecallMatchBasis::FingerprintReanchor => 1,
+        RecallMatchBasis::FingerprintCollision => 2,
+    }
+}
+
+fn recall_staleness_rank(s: StalenessState) -> u8 {
+    match s {
+        StalenessState::Fresh => 0,
+        StalenessState::Suspect => 1,
+        StalenessState::Stale => 2,
+    }
+}
+
 impl InMemoryGraph {
     /// Capture a rename-durable [`SemanticAnchor`] for an annotation from the
     /// first live entity scope it carries.
@@ -5391,6 +5463,132 @@ impl InMemoryGraph {
             }),
             _ => None,
         })
+    }
+
+    /// Recall annotations ("memory deposits") for an entity, re-anchoring across
+    /// renames. Uses default [`RecallOptions`] (exclude `Stale` and fingerprint
+    /// collisions).
+    pub fn recall_for_entity(&self, entity_id: &EntityId) -> Vec<RecalledAnnotation> {
+        self.recall_for_entity_with(entity_id, &RecallOptions::default())
+    }
+
+    /// Recall annotations for an entity by id OR by rename-durable fingerprint
+    /// anchor, each tagged with its [`RecallMatchBasis`] and [`StalenessState`].
+    ///
+    /// An annotation matches when it is scoped to `entity_id` (basis `Id`), or
+    /// when its `anchored_fingerprint` structurally matches the entity's current
+    /// fingerprint (`ast_hash` equal). A fingerprint match is a
+    /// `FingerprintReanchor` when the annotation's original scoped entity no
+    /// longer resolves (a rename), or a `FingerprintCollision` when that scope
+    /// still points at a different live entity (duplicated/templated code that
+    /// happens to share a fingerprint). Collisions and `Stale` matches are
+    /// excluded unless requested in `opts`.
+    ///
+    /// Results are returned in a deterministic total order: match basis
+    /// (`Id` < re-anchor < collision), then staleness (fresh first), then
+    /// same-file and same-kind preference, then annotation id.
+    pub fn recall_for_entity_with(
+        &self,
+        entity_id: &EntityId,
+        opts: &RecallOptions,
+    ) -> Vec<RecalledAnnotation> {
+        let ent = self.entities.read();
+        let target = match ent.entities.get(entity_id) {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
+        let target_fp = target.fingerprint.clone();
+        let target_file = target.file_origin.clone();
+        let target_kind = target.kind;
+
+        let wrk = self.work.read();
+        let mut out: Vec<RecalledAnnotation> = Vec::new();
+        for ann in wrk.annotations.values() {
+            let id_match = ann
+                .scopes
+                .iter()
+                .any(|s| matches!(s, WorkScope::Entity(e) if e == entity_id));
+
+            if id_match {
+                // Staleness from the deposit-time anchor vs the current
+                // fingerprint; without an anchor we cannot tell, so treat Fresh.
+                let staleness = ann
+                    .anchored_fingerprint
+                    .as_ref()
+                    .map(|a| anchor_staleness(a, &target_fp))
+                    .unwrap_or(StalenessState::Fresh);
+                if staleness == StalenessState::Stale && !opts.include_stale {
+                    continue;
+                }
+                out.push(RecalledAnnotation {
+                    annotation: ann.clone(),
+                    match_basis: RecallMatchBasis::Id,
+                    staleness,
+                    same_file: true,
+                    same_kind: true,
+                });
+                continue;
+            }
+
+            // Fingerprint re-anchor / collision: require a structural ast match.
+            let anchor = match &ann.anchored_fingerprint {
+                Some(a) if a.ast_hash == target_fp.ast_hash => a,
+                _ => continue,
+            };
+            let staleness = anchor_staleness(anchor, &target_fp); // Fresh or Suspect
+
+            // Does any entity scope still resolve to a LIVE entity != target?
+            // If so this fingerprint match belongs to that living entity
+            // (collision); otherwise the original is gone → a rename re-anchor.
+            let owner = ann.scopes.iter().find_map(|s| match s {
+                WorkScope::Entity(sid) if sid != entity_id => ent.entities.get(sid),
+                _ => None,
+            });
+
+            let (match_basis, same_file, same_kind) = match owner {
+                Some(o) => (
+                    RecallMatchBasis::FingerprintCollision,
+                    o.file_origin == target_file,
+                    o.kind == target_kind,
+                ),
+                // Original entity gone — its file/kind are unknown, so we cannot
+                // claim same-file/same-kind.
+                None => (RecallMatchBasis::FingerprintReanchor, false, false),
+            };
+
+            if match_basis == RecallMatchBasis::FingerprintCollision
+                && !opts.include_fingerprint_collisions
+            {
+                continue;
+            }
+            if staleness == StalenessState::Stale && !opts.include_stale {
+                continue;
+            }
+            out.push(RecalledAnnotation {
+                annotation: ann.clone(),
+                match_basis,
+                staleness,
+                same_file,
+                same_kind,
+            });
+        }
+
+        // Deterministic total order: basis → staleness → same-file → same-kind →
+        // annotation id. Prefers exact-id, fresh, same-file/same-kind memory.
+        out.sort_by(|a, b| {
+            recall_basis_rank(a.match_basis)
+                .cmp(&recall_basis_rank(b.match_basis))
+                .then(recall_staleness_rank(a.staleness).cmp(&recall_staleness_rank(b.staleness)))
+                .then((!a.same_file).cmp(&(!b.same_file)))
+                .then((!a.same_kind).cmp(&(!b.same_kind)))
+                .then(
+                    a.annotation
+                        .annotation_id
+                        .0
+                        .cmp(&b.annotation.annotation_id.0),
+                )
+        });
+        out
     }
 }
 
@@ -10305,5 +10503,138 @@ mod tests {
             .unwrap()
             .anchored_fingerprint
             .is_none());
+    }
+
+    /// Deposit an annotation on a scope (anchor captured by `create_annotation`).
+    fn deposit_on(graph: &InMemoryGraph, ann_seed: u128, scope: WorkScope) -> AnnotationId {
+        let id = AnnotationId(uuid::Uuid::from_u128(ann_seed));
+        let ann = Annotation {
+            annotation_id: id,
+            kind: AnnotationKind::Instruction,
+            body: "remembered detail".into(),
+            scopes: vec![scope],
+            anchored_fingerprint: None,
+            authored_by: IdentityRef::human("t"),
+            created_at: Timestamp::now(),
+            staleness: StalenessState::Fresh,
+        };
+        graph.create_annotation(&ann).unwrap();
+        id
+    }
+
+    fn entity_with_fp(seed: u128, name: &str, file: &str, ast: u8, sig: u8) -> Entity {
+        let mut e = test_entity_with_id(seed, name);
+        e.file_origin = Some(FilePathId::new(file));
+        e.fingerprint.ast_hash = Hash256::from_bytes([ast; 32]);
+        e.fingerprint.signature_hash = Hash256::from_bytes([sig; 32]);
+        e
+    }
+
+    #[test]
+    fn recall_by_exact_id_is_fresh() {
+        let graph = InMemoryGraph::new();
+        let e = entity_with_fp(0x100, "foo", "src/a.rs", 1, 2);
+        graph.upsert_entity(&e).unwrap();
+        deposit_on(&graph, 0xa1, WorkScope::Entity(e.id));
+
+        let recalled = graph.recall_for_entity(&e.id);
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled[0].match_basis, RecallMatchBasis::Id);
+        assert_eq!(recalled[0].staleness, StalenessState::Fresh);
+    }
+
+    #[test]
+    fn recall_reanchors_across_rename() {
+        let graph = InMemoryGraph::new();
+        let old = entity_with_fp(0x200, "oldName", "src/a.rs", 5, 6);
+        graph.upsert_entity(&old).unwrap();
+        deposit_on(&graph, 0xb1, WorkScope::Entity(old.id)); // anchor = (5, 6)
+
+        // Rename: the old entity is removed and a new entity (different id, same
+        // file/kind/fingerprint, different name) takes its place.
+        graph.remove_entity(&old.id).unwrap();
+        let new = entity_with_fp(0x201, "newName", "src/a.rs", 5, 6);
+        graph.upsert_entity(&new).unwrap();
+
+        // Recall by the NEW id re-anchors the orphaned memory by fingerprint.
+        let recalled = graph.recall_for_entity(&new.id);
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(
+            recalled[0].annotation.annotation_id,
+            AnnotationId(uuid::Uuid::from_u128(0xb1))
+        );
+        assert_eq!(recalled[0].match_basis, RecallMatchBasis::FingerprintReanchor);
+        assert_eq!(recalled[0].staleness, StalenessState::Fresh);
+
+        // The old (now-removed) id resolves to nothing.
+        assert!(graph.recall_for_entity(&old.id).is_empty());
+    }
+
+    #[test]
+    fn recall_staleness_tiers_by_signature_then_ast_change() {
+        let graph = InMemoryGraph::new();
+        let e = entity_with_fp(0x300, "f", "src/a.rs", 3, 4);
+        graph.upsert_entity(&e).unwrap();
+        deposit_on(&graph, 0xc1, WorkScope::Entity(e.id)); // anchor = (3, 4)
+
+        // Signature changes (ast unchanged) → Suspect, still recalled by default.
+        graph
+            .upsert_entity(&entity_with_fp(0x300, "f", "src/a.rs", 3, 44))
+            .unwrap();
+        let r = graph.recall_for_entity(&e.id);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].staleness, StalenessState::Suspect);
+
+        // AST changes too → Stale: excluded by default, included on request.
+        graph
+            .upsert_entity(&entity_with_fp(0x300, "f", "src/a.rs", 33, 44))
+            .unwrap();
+        assert!(
+            graph.recall_for_entity(&e.id).is_empty(),
+            "Stale matches are excluded by default"
+        );
+        let r_all = graph.recall_for_entity_with(
+            &e.id,
+            &RecallOptions {
+                include_stale: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(r_all.len(), 1);
+        assert_eq!(r_all[0].staleness, StalenessState::Stale);
+    }
+
+    #[test]
+    fn recall_excludes_fingerprint_collisions_by_default() {
+        let graph = InMemoryGraph::new();
+        // Two DIFFERENT live entities sharing a fingerprint (duplicated code).
+        let x = entity_with_fp(0x400, "x", "src/x.rs", 8, 8);
+        let y = entity_with_fp(0x401, "y", "src/y.rs", 8, 8);
+        graph.upsert_entity(&x).unwrap();
+        graph.upsert_entity(&y).unwrap();
+        deposit_on(&graph, 0xd1, WorkScope::Entity(y.id)); // memory on Y
+
+        // Recall for X: Y is still live, so its memory is a collision — excluded.
+        assert!(
+            graph.recall_for_entity(&x.id).is_empty(),
+            "another live entity's memory must not surface by default"
+        );
+
+        // Opt-in surfaces it, tagged as a cross-file collision.
+        let r = graph.recall_for_entity_with(
+            &x.id,
+            &RecallOptions {
+                include_fingerprint_collisions: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].match_basis, RecallMatchBasis::FingerprintCollision);
+        assert!(!r[0].same_file, "Y is in a different file than X");
+
+        // Y itself recalls its own memory as an exact-id match.
+        let ry = graph.recall_for_entity(&y.id);
+        assert_eq!(ry.len(), 1);
+        assert_eq!(ry[0].match_basis, RecallMatchBasis::Id);
     }
 }
