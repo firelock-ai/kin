@@ -4300,6 +4300,128 @@ mod tests {
         }
     }
 
+    /// Guard for batch-SIZE / batch-COMPOSITION invariance of a single entity's
+    /// embedding — the sibling of `batched_cold_matches_single_forward` (which
+    /// guards padding-LAYOUT invariance via the concat-cache fix).
+    ///
+    /// Motivation: the GEMM kernel is *selected* by a batch-derived dimension. In
+    /// the batched path the projection/FFN GEMMs gate on `use_mma(m = total_rows)`
+    /// where `total_rows = batch_size * max_len`, and attention gates on
+    /// `use_mma(m = max_len)`; `use_mma` flips the scalar tile → simdgroup MMA at
+    /// `m >= 32`. So a short text crosses the scalar↔MMA boundary as its batch
+    /// grows or as a longer neighbor widens `max_len`. The two kernels reduce over
+    /// K differently, so if they ever disagree, the SAME text would get a
+    /// last-bit-different vector depending only on the batch it rode in — exactly
+    /// the kind of run-to-run drift the freeze must not have.
+    ///
+    /// A 12-token target is embedded alone (per-op single `forward`) and then under
+    /// a battery of batched compositions that straddle the threshold on the
+    /// projection axis (n copies → total_rows 12→96) and the attention axis (long
+    /// fillers → max_len 12→60). Every config's target vector must be BYTE-IDENTICAL
+    /// to the lone-forward baseline on Metal (a strict determinism guarantee), and
+    /// cosine-identical on any backend. This locks today's good behavior so a future
+    /// flip of `KIN_INFER_MMA_WIDE` / `KIN_INFER_GEMM_FP16` / steel, or any edit to
+    /// the `use_mma` shape floor, cannot silently reintroduce batch-dependence.
+    #[test]
+    fn embedding_is_invariant_to_batch_size_and_composition() {
+        let dir = std::path::Path::new("/tmp/nomic");
+        if !dir.join("model.safetensors").exists() {
+            eprintln!("SKIP: nomic model absent at /tmp/nomic; batch-size invariance guard skipped.");
+            return;
+        }
+        let cfg_json = std::fs::read_to_string(dir.join("config.json")).expect("read config.json");
+        let config: BertConfig = serde_json::from_str(&cfg_json).expect("parse config.json");
+        let model = BertModel::load(&dir.join("model.safetensors"), config).expect("load model");
+        let vocab = model.config.vocab_size.max(2);
+
+        // 12-token target: BELOW the m>=32 MMA floor when alone, crosses it as the
+        // batch grows. A filler of length `len` (deterministic, content-distinct).
+        let synth = |len: usize, salt: u32| -> (Vec<u32>, Vec<u32>) {
+            let ids: Vec<u32> = (0..len)
+                .map(|i| {
+                    1 + ((i as u32)
+                        .wrapping_mul(2654435761)
+                        .wrapping_add(salt.wrapping_mul(40503))
+                        % (vocab as u32 - 1))
+                })
+                .collect();
+            (ids, vec![1u32; len])
+        };
+        let (target, tmask) = synth(12, 7);
+
+        // Baseline: lone single `forward` (per-op path, m = seq_len = 12 → scalar).
+        let baseline = model
+            .forward(&[target.clone()], &[tmask.clone()])
+            .expect("forward baseline")
+            .remove(0);
+
+        let is_metal = format!("{:?}", model.backend()) == "Metal";
+
+        // (label, batch). Target is always index 0; the rest only shape total_rows /
+        // max_len so the target straddles the scalar↔MMA threshold on each axis.
+        let configs: Vec<(&str, Vec<(Vec<u32>, Vec<u32>)>)> = vec![
+            ("n2_same", vec![(target.clone(), tmask.clone()); 2]), // total_rows 24, scalar
+            ("n3_same", vec![(target.clone(), tmask.clone()); 3]), // total_rows 36, proj→MMA
+            ("n8_same", vec![(target.clone(), tmask.clone()); 8]), // total_rows 96, proj MMA
+            (
+                "filler20",
+                vec![(target.clone(), tmask.clone()), synth(20, 101)],
+            ), // max_len 20 (attn scalar), proj MMA
+            (
+                "filler40",
+                vec![(target.clone(), tmask.clone()), synth(40, 102)],
+            ), // max_len 40 → attn MMA too
+            (
+                "filler60",
+                vec![(target.clone(), tmask.clone()), synth(60, 103)],
+            ), // max_len 60, both MMA
+        ];
+
+        for (label, batch) in &configs {
+            let ids: Vec<Vec<u32>> = batch.iter().map(|(i, _)| i.clone()).collect();
+            let masks: Vec<Vec<u32>> = batch.iter().map(|(_, m)| m.clone()).collect();
+            let out = model
+                .forward_batched(&ids, &masks)
+                .unwrap_or_else(|e| panic!("forward_batched {label}: {e:?}"));
+            let got = &out[0]; // target is index 0
+            assert_eq!(got.len(), baseline.len(), "{label}: embedding dim mismatch");
+
+            let (mut dot, mut na, mut nb, mut max_abs) = (0.0f64, 0.0f64, 0.0f64, 0.0f32);
+            let mut byte_identical = true;
+            for (&a, &b) in baseline.iter().zip(got.iter()) {
+                if a.to_bits() != b.to_bits() {
+                    byte_identical = false;
+                }
+                dot += a as f64 * b as f64;
+                na += (a as f64).powi(2);
+                nb += (b as f64).powi(2);
+                max_abs = max_abs.max((a - b).abs());
+            }
+            let cos = dot / (na.sqrt() * nb.sqrt()).max(1e-12);
+            eprintln!(
+                "[batch-size invariance] {label:<9} byte_identical={byte_identical} \
+                 cosine={cos:.12} max_abs={max_abs:.3e}"
+            );
+
+            // Any backend: the target must not change with the batch it rides in.
+            assert!(
+                cos >= 1.0 - 1e-5,
+                "{label}: embedding drifted with batch composition (cosine={cos:.12}, \
+                 max_abs={max_abs:.3e}) — a batch-dependent kernel divergence"
+            );
+            // Metal: the freeze's determinism guarantee is BYTE equality across the
+            // scalar↔MMA threshold and the single↔batched code-path split.
+            if is_metal {
+                assert!(
+                    byte_identical,
+                    "{label}: Metal embedding is not byte-identical to the lone forward \
+                     (cosine={cos:.12}, max_abs={max_abs:.3e}) — batch-size-dependent kernel \
+                     selection reintroduced last-bit drift"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_gelu_zero() {
         assert!((gelu(0.0) - 0.0).abs() < 1e-6);
