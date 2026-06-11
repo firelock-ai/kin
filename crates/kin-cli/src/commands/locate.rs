@@ -6532,7 +6532,21 @@ fn extract_multihop_signals(
                     continue;
                 }
 
-                let rels = graph.get_all_relations_for_entity(&current)?;
+                let mut rels = graph.get_all_relations_for_entity(&current)?;
+                // The frontier cut below keeps a PREFIX, so the order must be
+                // deterministic (adjacency iteration order is per-process):
+                // highest-priority relations first, id as the total tie-break —
+                // mirrors the artifact-branch sort above.
+                rels.sort_by(|left, right| {
+                    let left_kind = resolve_relation_kind_priority(left.kind);
+                    let right_kind = resolve_relation_kind_priority(right.kind);
+                    let left_origin = resolve_relation_origin_priority(left.origin);
+                    let right_origin = resolve_relation_origin_priority(right.origin);
+                    right_kind
+                        .cmp(&left_kind)
+                        .then_with(|| right_origin.cmp(&left_origin))
+                        .then_with(|| format!("{:?}", left.id).cmp(&format!("{:?}", right.id)))
+                });
                 // Frontier size limit: only process up to frontier_limit relations per BFS level
                 let rels_to_process = if rels.len() > frontier_limit {
                     &rels[..frontier_limit]
