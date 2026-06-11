@@ -27,7 +27,11 @@ without re-locating the symbol. Returns a ranked list (compact by default: \
 id/name/kind/language/file_path/line range/signature; set compact=false to also get \
 the doc summary) plus the total match count so you know whether results were \
 truncated. Prefer it over text search when you care about declarations and want \
-precise, navigable anchors rather than a pile of line hits.";
+precise, navigable anchors rather than a pile of line hits. \
+On an empty result the response carries an additive `negative` object: its \
+`safe_to_conclude_absent` flag says whether the absence is authoritative \
+(daemon-owned graph, complete embedding coverage, no degraded signals) or merely \
+\"not indexed yet\" — check it before treating \"none found\" as ground truth.";
 
 pub fn handle_semantic_search<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -85,7 +89,9 @@ roll results up to the most relevant files. The response also reports semantic_c
 — the fraction of the graph that has embeddings indexed — so you can tell whether a thin \
 result set means \"not relevant\" or \"not yet embedded\". Requires the Kin daemon: vector \
 search runs against the daemon's live graph and HNSW index, so this tool returns an error \
-in offline/no-daemon mode.";
+in offline/no-daemon mode. On an empty result the additive `negative` object's \
+`safe_to_conclude_absent` flag distinguishes an authoritative \"no match\" from \
+\"not yet embedded\".";
 
 /// Offline/generic dispatch arm for `semantic_locate`.
 ///
@@ -412,7 +418,11 @@ change or remove something, to gauge blast radius, or to navigate from a definit
 to its usages. Filter with relation_kinds (calls, imports, references) when you only \
 care about one kind of edge; it defaults to all three. When you need this answer for \
 many entities at once (e.g. classifying a whole set as used vs. unused), don't loop \
-this call per entity — bulk_check_references does the batch in one shot.";
+this call per entity — bulk_check_references does the batch in one shot. \
+When no references come back, the additive `negative` object's `safe_to_conclude_absent` \
+flag says whether \"nothing depends on this\" is authoritative (daemon-owned graph, \
+complete coverage, no degraded signals) or merely \"not indexed yet\" — consult it \
+before treating the entity as safe to delete.";
 
 pub async fn handle_find_references<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -543,7 +553,9 @@ batched classification. Choose relation_kind to scope the check to Calls, Import
 References, or Any (the union, default). For a single entity where you want the actual \
 list of callers, find_references is the right tool; for finding dead code from a search \
 concept rather than a known ID set, find_dead_code_seeded combines the search and the \
-classification.";
+classification. Each `has_references:false` row is qualified by the response's additive \
+`negative` object — consult `safe_to_conclude_absent` before treating a false verdict as \
+\"safe to delete\", since an incomplete or stale index can report a false negative.";
 
 pub fn handle_bulk_check_references<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -1164,7 +1176,10 @@ definitions, or check whether a particular file still has live entry points. Bec
 reachability is read directly off the graph's relation edges, you get the answer in one \
 call without manually cross-referencing every symbol. When you'd rather start from a \
 search concept than scan files — \"which of the entities matching X are dead?\" — \
-find_dead_code_seeded combines the search and the dead-classification in one step.";
+find_dead_code_seeded combines the search and the dead-classification in one step. \
+The response carries an additive `negative` object whose `safe_to_conclude_absent` flag \
+says whether \"nothing dead found\" is authoritative or limited by index freshness — \
+check it before concluding everything is reachable.";
 
 pub fn handle_dead_code<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -1365,7 +1380,9 @@ this call, and what do those call?\" or \"trace this value back to its source\" 
 the chain in traversal order, not a bag of neighbors. Its value is that the whole walk \
 happens substrate-side and comes back as one structured response, so you don't loop \
 get_entity_source per hop and exhaust your tool-call budget. Tune depth and \
-limit_per_step to control breadth; results flag when they were truncated.";
+limit_per_step to control breadth; results flag when they were truncated. \
+When the chain comes back empty, the additive `negative` object's `safe_to_conclude_absent` \
+flag says whether \"no flow from here\" is authoritative or merely \"not indexed yet\".";
 
 /// Trace the actual call/data-flow chain rooted at a focal entity.
 ///
@@ -1564,7 +1581,9 @@ rather than full source bodies: impact-scoping a change, understanding coupling,
 mapping how a module hangs together. It returns summaries rather than code precisely so \
 the neighborhood stays within token budgets even at depth; when you then want to read a \
 specific neighbor's implementation, follow up with get_entity_source, and when you want \
-a directional ordered chain with bodies inlined, use trace_data_flow.";
+a directional ordered chain with bodies inlined, use trace_data_flow. \
+When no neighbors come back, the additive `negative` object's `safe_to_conclude_absent` \
+flag says whether \"isolated, no dependencies\" is authoritative or merely \"not indexed yet\".";
 
 pub fn handle_graph_neighborhood<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
