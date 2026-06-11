@@ -53,11 +53,11 @@ jobs:
             ${{ runner.os }}-cargo-smoke-
             ${{ runner.os }}-cargo-
 
-      # --locked omitted: committed Cargo.lock is patch-flavoured (local path
-      # crates, no registry checksums); allow the registry-only resolve to update
-      # it in-CI, as ci.yml and the kin-bench CI(Linux) job do.
+      # Committed Cargo.lock is registry-flavoured (kin-* resolve from the
+      # kinlab.ai sparse registry with checksums), so --locked enforces a frozen,
+      # reproducible resolve here, matching ci.yml.
       - name: Build kin + kin-daemon
-        run: cargo build --bin kin --bin kin-daemon
+        run: cargo build --bin kin --bin kin-daemon --locked
 
       - name: Daemon smoke + MCP headless tools/list
         run: |

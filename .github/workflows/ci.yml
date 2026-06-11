@@ -140,16 +140,17 @@ jobs:
       - name: Check Private Repo Coupling
         run: bash scripts/check_private_repo_coupling.sh
 
-      # NOTE: --locked is intentionally omitted. The committed Cargo.lock is
-      # generated against the local-dev [patch] redirects (path crates, no
-      # registry checksums); a fresh registry-only resolve must be allowed to
-      # update the lock in-CI, exactly as the kin-bench CI(Linux) job does. If
-      # a committed registry-flavoured Cargo.lock lands later, restore --locked.
+      # The committed Cargo.lock is registry-flavoured: kin-* deps resolve from
+      # the kinlab.ai sparse registry with recorded checksums (regenerated via
+      # `cargo generate-lockfile` with only the [registries.kin] alias in
+      # .cargo/config.toml — no [patch]). --locked therefore enforces a frozen,
+      # reproducible resolve here, matching what an external registry-only build
+      # sees. Re-run that regen (no [patch]) when bumping published kin-* deps.
       - name: Build
-        run: cargo build --all-targets
+        run: cargo build --all-targets --locked
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked
 
   # Security audit moved to sast.yml (cargo-deny: advisories + licenses + bans + sources)
 
