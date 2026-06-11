@@ -502,7 +502,10 @@ fn segment_path(storage_path: &Path, segment: usize, gen: u64) -> PathBuf {
 /// Best-effort enumeration of every segmented sibling file (manifest + segment
 /// files) so they can be cleaned up when reverting to the monolithic format.
 fn kinseg_sibling_files(storage_path: &Path) -> Vec<PathBuf> {
-    let Some(file_name) = storage_path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+    let Some(file_name) = storage_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+    else {
         return Vec::new();
     };
     let needle = format!("{file_name}{KINSEG_PREFIX}");
@@ -1438,8 +1441,7 @@ where
         // A full rewrite is required when there is no segmented baseline to delta
         // from (fresh index, or one just loaded from the monolithic format) or
         // after a `rebuild_all` marked every segment dirty.
-        let rewrite_all =
-            seg.baseline_gens.is_none() || matches!(seg.dirty, SegmentDirty::All);
+        let rewrite_all = seg.baseline_gens.is_none() || matches!(seg.dirty, SegmentDirty::All);
         let dirty: Vec<usize> = if rewrite_all {
             (0..segment_count).collect()
         } else {
@@ -1481,7 +1483,10 @@ where
                 // exact same order `upsert`/`rebuild_all` built the global index,
                 // so the merged-on-load result is byte-for-byte the same index.
                 for (token, weight) in &doc.tokens_by_field {
-                    seg_index.entry(token.clone()).or_default().add(*id, *weight);
+                    seg_index
+                        .entry(token.clone())
+                        .or_default()
+                        .add(*id, *weight);
                 }
                 seg_doc_count += 1;
                 seg_total_len += doc.doc_length;
@@ -1600,9 +1605,8 @@ where
                 format!("unsupported segmented manifest version {version}"),
             ));
         }
-        let manifest: SegmentManifest = bincode::deserialize(&bytes).map_err(|err| {
-            corrupt_index_error(&m_path, format!("undecodable manifest: {err}"))
-        })?;
+        let manifest: SegmentManifest = bincode::deserialize(&bytes)
+            .map_err(|err| corrupt_index_error(&m_path, format!("undecodable manifest: {err}")))?;
         if manifest.version != SEGMENTED_FORMAT_VERSION {
             return Err(corrupt_index_error(
                 &m_path,
@@ -1640,10 +1644,7 @@ where
                 )
             })?;
             let seg_data: SegmentData<Id> = bincode::deserialize(&seg_bytes).map_err(|err| {
-                corrupt_index_error(
-                    &m_path,
-                    format!("undecodable segment {s} gen {gen}: {err}"),
-                )
+                corrupt_index_error(&m_path, format!("undecodable segment {s} gen {gen}: {err}"))
             })?;
 
             // Merge this segment's postings. Doc sets are disjoint across
@@ -2304,10 +2305,35 @@ mod tests {
     }
 
     const FIXTURE_QUERIES: &[&str] = &[
-        "user", "parse", "table", "html", "reader", "handler", "processor",
-        "checksum", "render", "config", "auth", "graph", "tokenize", "segment",
-        "schema", "index", "query", "cache", "retry", "decode", "buffer", "src",
-        "rs", "py", "function", "struct", "qdp", "getUserById", "zzz_no_match",
+        "user",
+        "parse",
+        "table",
+        "html",
+        "reader",
+        "handler",
+        "processor",
+        "checksum",
+        "render",
+        "config",
+        "auth",
+        "graph",
+        "tokenize",
+        "segment",
+        "schema",
+        "index",
+        "query",
+        "cache",
+        "retry",
+        "decode",
+        "buffer",
+        "src",
+        "rs",
+        "py",
+        "function",
+        "struct",
+        "qdp",
+        "getUserById",
+        "zzz_no_match",
     ];
 
     /// Build the fixture corpus into `dir` via either the monolithic (default) or
@@ -2366,7 +2392,10 @@ mod tests {
         // The segmented dir is actually segmented: manifest present, and no
         // monolithic index.bin lingering.
         let seg_storage = TextIndex::<TestId>::storage_file_path(&seg_dir);
-        assert!(manifest_path(&seg_storage).exists(), "segmented manifest must exist");
+        assert!(
+            manifest_path(&seg_storage).exists(),
+            "segmented manifest must exist"
+        );
         assert!(
             !seg_storage.exists(),
             "segmented index must not leave a monolithic index.bin"
@@ -2517,7 +2546,10 @@ mod tests {
 
         // A commit now writes monolithic and retires the stale manifest.
         idx.commit().unwrap();
-        assert!(!manifest_path(&storage).exists(), "manifest must be retired");
+        assert!(
+            !manifest_path(&storage).exists(),
+            "manifest must be retired"
+        );
         assert!(storage.exists(), "monolithic index.bin must be written");
 
         let reopened = TextIndex::<TestId>::open(Some(&dir)).unwrap();
@@ -2570,7 +2602,10 @@ mod tests {
         idx.commit().unwrap();
 
         let gens_after = read_manifest_gens(&storage);
-        assert_eq!(gens_after[target], None, "emptied segment must have no file");
+        assert_eq!(
+            gens_after[target], None,
+            "emptied segment must have no file"
+        );
         if let Some(old) = gens_before[target] {
             assert!(
                 !segment_path(&storage, target, old).exists(),
