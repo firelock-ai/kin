@@ -18,6 +18,7 @@ pub mod session_registry;
 pub mod state;
 pub mod supervisor;
 pub mod traffic_adapter;
+pub mod write_veto;
 
 pub use daemon::{run, DaemonConfig};
 pub use error::{DaemonError, Result};
