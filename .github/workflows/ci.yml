@@ -13,7 +13,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -Dwarnings
+  # `-D warnings` is the enforcing gate for ALL steps (clippy, build, test).
+  # `-A deprecated` rides here (not only on the clippy step) because RUSTFLAGS
+  # applies to build + test too, and the ArtifactId::from_path deprecation debt
+  # would otherwise fail `cargo build`/`cargo test` even though clippy allow-lists
+  # it. TEMPORARY — drops when the ArtifactId migration lands. (clippy::* lints
+  # stay on the clippy command: plain rustc rejects the `clippy` tool namespace.)
+  RUSTFLAGS: "-D warnings -A deprecated"
 
 jobs:
   dco:
