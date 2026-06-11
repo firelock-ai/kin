@@ -45,7 +45,9 @@ fn make_qkv(total_heads: usize, seq_len: usize, head_dim: usize) -> (Vec<f32>, V
 
 /// Realistic BERT/BGE-small mask: first `valid` columns are 1, rest are 0.
 fn padding_mask(seq_len: usize, valid: usize) -> Vec<u32> {
-    (0..seq_len).map(|i| if i < valid { 1 } else { 0 }).collect()
+    (0..seq_len)
+        .map(|i| if i < valid { 1 } else { 0 })
+        .collect()
 }
 
 fn max_abs_err(a: &[f32], b: &[f32]) -> f32 {
@@ -78,7 +80,6 @@ fn count_nonfinite(v: &[f32]) -> usize {
     v.iter().filter(|x| !x.is_finite()).count()
 }
 
-
 /// Sweep over seq_len for the grouped (batched) attention path used by
 /// BertModel::forward_batched. Mirrors the existing seq_len=7 test setup,
 /// extended across the 7..=1024 range.
@@ -108,30 +109,34 @@ fn metal_fused_attention_batched_seq_len_sweep() {
         let masks = padding_mask(seq_len, valid);
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        let out_metal = metal.fused_attention_batched(
-            &q,
-            &k,
-            &v,
-            num_groups,
-            heads_per_group,
-            seq_len,
-            head_dim,
-            scale,
-            &alibi,
-            &masks,
-        ).unwrap();
-        let out_cpu = cpu.fused_attention_batched(
-            &q,
-            &k,
-            &v,
-            num_groups,
-            heads_per_group,
-            seq_len,
-            head_dim,
-            scale,
-            &alibi,
-            &masks,
-        ).unwrap();
+        let out_metal = metal
+            .fused_attention_batched(
+                &q,
+                &k,
+                &v,
+                num_groups,
+                heads_per_group,
+                seq_len,
+                head_dim,
+                scale,
+                &alibi,
+                &masks,
+            )
+            .unwrap();
+        let out_cpu = cpu
+            .fused_attention_batched(
+                &q,
+                &k,
+                &v,
+                num_groups,
+                heads_per_group,
+                seq_len,
+                head_dim,
+                scale,
+                &alibi,
+                &masks,
+            )
+            .unwrap();
 
         let nan_metal = count_nonfinite(&out_metal);
         let nan_cpu = count_nonfinite(&out_cpu);
@@ -185,7 +190,9 @@ fn metal_gelu_does_not_nan_on_large_inputs() {
     // production NaN appeared at GELU on real BGE-small inputs; values up to
     // ~50 are realistic after several layers without any normalization
     // applied to FFN intermediates.
-    let mags = [0.0f32, 1.0, 5.0, 10.0, 12.0, 13.0, 14.0, 15.0, 20.0, 30.0, 50.0, 100.0];
+    let mags = [
+        0.0f32, 1.0, 5.0, 10.0, 12.0, 13.0, 14.0, 15.0, 20.0, 30.0, 50.0, 100.0,
+    ];
     let mut data: Vec<f32> = Vec::new();
     for &m in &mags {
         data.push(m);
@@ -198,7 +205,12 @@ fn metal_gelu_does_not_nan_on_large_inputs() {
 
     eprintln!("input  -> metal | cpu");
     let mut bad = Vec::new();
-    for (idx, ((x, m), c)) in data.iter().zip(metal_out.iter()).zip(cpu_out.iter()).enumerate() {
+    for (idx, ((x, m), c)) in data
+        .iter()
+        .zip(metal_out.iter())
+        .zip(cpu_out.iter())
+        .enumerate()
+    {
         eprintln!("{x:>8} -> {m:>14e} | {c:>14e}");
         if !m.is_finite() && c.is_finite() {
             bad.push((idx, *x, *m, *c));
@@ -223,13 +235,13 @@ fn metal_matmul_shapes_match_cpu_at_bert_dims() {
 
     // (m, n, k) — what BGE-small-en-v1.5 uses per layer.
     let cases = [
-        (64usize, 384usize, 384usize),    // QKV proj at seq=64
-        (64, 1536, 384),                   // FFN intermediate at seq=64
-        (64, 384, 1536),                   // FFN out at seq=64
-        (512, 384, 384),                   // QKV proj at seq=512
-        (512, 1536, 384),                  // FFN intermediate at seq=512
-        (512, 384, 1536),                  // FFN out at seq=512
-        (48, 768, 768),                    // Divergent shape
+        (64usize, 384usize, 384usize), // QKV proj at seq=64
+        (64, 1536, 384),               // FFN intermediate at seq=64
+        (64, 384, 1536),               // FFN out at seq=64
+        (512, 384, 384),               // QKV proj at seq=512
+        (512, 1536, 384),              // FFN intermediate at seq=512
+        (512, 384, 1536),              // FFN out at seq=512
+        (48, 768, 768),                // Divergent shape
     ];
 
     for &(m, n, k) in &cases {
@@ -243,9 +255,7 @@ fn metal_matmul_shapes_match_cpu_at_bert_dims() {
         let c_cpu = cpu.matmul(&a, &b, m, n, k).unwrap();
         let err = max_abs_err(&c_metal, &c_cpu);
         let nan = count_nonfinite(&c_metal);
-        eprintln!(
-            "matmul m={m:>4} n={n:>4} k={k:>4} max_abs_err={err:.6e} nan={nan}"
-        );
+        eprintln!("matmul m={m:>4} n={n:>4} k={k:>4} max_abs_err={err:.6e} nan={nan}");
         assert_eq!(nan, 0, "matmul m={m} n={n} k={k} produced {nan} non-finite");
         // Tolerance: matmul accumulates k terms of magnitude ~ (max_a * max_b),
         // so absolute error scales with sqrt(k).
@@ -283,9 +293,9 @@ fn metal_fused_linear_add_norm_matches_per_op() {
     // block, to exercise the epilogue bounds-guard through the fold.
     let cases = [
         (64usize, 768usize, 768usize),
-        (100, 768, 768),   // ragged: 100 rows is not a multiple of 32
-        (512, 384, 384),   // BGE-small dims
-        (37, 384, 384),    // ragged + small
+        (100, 768, 768), // ragged: 100 rows is not a multiple of 32
+        (512, 384, 384), // BGE-small dims
+        (37, 384, 384),  // ragged + small
     ];
 
     for &(rows, cols, hidden) in &cases {
@@ -303,23 +313,26 @@ fn metal_fused_linear_add_norm_matches_per_op() {
         let eps = 1e-12f32;
 
         // Candidate: the fused residency path.
-        let fused = metal.fused_linear_add_norm(
-            &x, &w, &residual, &gamma, &beta, rows, cols, hidden, eps,
-        ).unwrap();
+        let fused = metal
+            .fused_linear_add_norm(&x, &w, &residual, &gamma, &beta, rows, cols, hidden, eps)
+            .unwrap();
 
         // Oracle A: same Metal primitives, per-op (matmul -> host add -> layer_norm).
         let mut ref_metal = metal.matmul(&x, &w, rows, hidden, cols).unwrap();
         for (s, r) in ref_metal.iter_mut().zip(residual.iter()) {
             *s += *r;
         }
-        metal.layer_norm(&mut ref_metal, &gamma, &beta, rows, hidden, eps).unwrap();
+        metal
+            .layer_norm(&mut ref_metal, &gamma, &beta, rows, hidden, eps)
+            .unwrap();
 
         // Oracle B: CPU primitives end-to-end.
         let mut ref_cpu = cpu.matmul(&x, &w, rows, hidden, cols).unwrap();
         for (s, r) in ref_cpu.iter_mut().zip(residual.iter()) {
             *s += *r;
         }
-        cpu.layer_norm(&mut ref_cpu, &gamma, &beta, rows, hidden, eps).unwrap();
+        cpu.layer_norm(&mut ref_cpu, &gamma, &beta, rows, hidden, eps)
+            .unwrap();
 
         let err_metal = max_abs_err(&fused, &ref_metal);
         let err_cpu = max_abs_err(&fused, &ref_cpu);
@@ -337,7 +350,13 @@ fn metal_fused_linear_add_norm_matches_per_op() {
         );
         // vs CPU: LayerNorm output is well-conditioned; 1e-4 is a tight anchor.
         if err_cpu >= 1e-4 {
-            print_diff_details(&fused, &ref_cpu, rows, hidden, "fused_linear_add_norm vs CPU");
+            print_diff_details(
+                &fused,
+                &ref_cpu,
+                rows,
+                hidden,
+                "fused_linear_add_norm vs CPU",
+            );
         }
         assert!(
             err_cpu < 1e-4,
@@ -345,7 +364,6 @@ fn metal_fused_linear_add_norm_matches_per_op() {
         );
     }
 }
-
 
 /// Parity for the post-LN FFN residency fold `fused_ffn_swiglu_add_norm`.
 ///
@@ -389,23 +407,32 @@ fn metal_fused_ffn_swiglu_add_norm_matches_per_op() {
         let beta: Vec<f32> = (0..hidden).map(|i| (i as f32) * 1e-4 - 0.05).collect();
         let eps = 1e-12f32;
 
-        let fused = metal.fused_ffn_swiglu_add_norm(
-            &x, &w_gate, &w_up, &w_down, &residual, &gamma, &beta, rows, hidden, inter, eps,
-        ).unwrap();
+        let fused = metal
+            .fused_ffn_swiglu_add_norm(
+                &x, &w_gate, &w_up, &w_down, &residual, &gamma, &beta, rows, hidden, inter, eps,
+            )
+            .unwrap();
 
         // Oracle A: same Metal primitives, per-op.
-        let mut ref_metal = metal.fused_ffn_swiglu(&x, &w_gate, &w_up, &w_down, rows, hidden, inter).unwrap();
+        let mut ref_metal = metal
+            .fused_ffn_swiglu(&x, &w_gate, &w_up, &w_down, rows, hidden, inter)
+            .unwrap();
         for (s, r) in ref_metal.iter_mut().zip(residual.iter()) {
             *s += *r;
         }
-        metal.layer_norm(&mut ref_metal, &gamma, &beta, rows, hidden, eps).unwrap();
+        metal
+            .layer_norm(&mut ref_metal, &gamma, &beta, rows, hidden, eps)
+            .unwrap();
 
         // Oracle B: CPU primitives end-to-end.
-        let mut ref_cpu = cpu.fused_ffn_swiglu(&x, &w_gate, &w_up, &w_down, rows, hidden, inter).unwrap();
+        let mut ref_cpu = cpu
+            .fused_ffn_swiglu(&x, &w_gate, &w_up, &w_down, rows, hidden, inter)
+            .unwrap();
         for (s, r) in ref_cpu.iter_mut().zip(residual.iter()) {
             *s += *r;
         }
-        cpu.layer_norm(&mut ref_cpu, &gamma, &beta, rows, hidden, eps).unwrap();
+        cpu.layer_norm(&mut ref_cpu, &gamma, &beta, rows, hidden, eps)
+            .unwrap();
 
         let err_metal = max_abs_err(&fused, &ref_metal);
         let err_cpu = max_abs_err(&fused, &ref_cpu);
@@ -414,13 +441,22 @@ fn metal_fused_ffn_swiglu_add_norm_matches_per_op() {
             "fused_ffn_swiglu_add_norm rows={rows:>4} hidden={hidden:>4} inter={inter:>4} \
              err_vs_metal_perop={err_metal:.3e} err_vs_cpu={err_cpu:.3e} nan={nan}"
         );
-        assert_eq!(nan, 0, "fused_ffn_swiglu_add_norm produced {nan} non-finite");
+        assert_eq!(
+            nan, 0,
+            "fused_ffn_swiglu_add_norm produced {nan} non-finite"
+        );
         assert!(
             err_metal < 1e-4,
             "fused vs Metal per-op rows={rows} hidden={hidden} inter={inter}: {err_metal} >= 1e-4"
         );
         if err_cpu >= 1e-4 {
-            print_diff_details(&fused, &ref_cpu, rows, hidden, "fused_ffn_swiglu_add_norm vs CPU");
+            print_diff_details(
+                &fused,
+                &ref_cpu,
+                rows,
+                hidden,
+                "fused_ffn_swiglu_add_norm vs CPU",
+            );
         }
         assert!(
             err_cpu < 1e-4,
@@ -428,7 +464,6 @@ fn metal_fused_ffn_swiglu_add_norm_matches_per_op() {
         );
     }
 }
-
 
 /// Locate the HuggingFace-cached BGE-small-en-v1.5 snapshot directory. Returns
 /// `None` if the weights have not been downloaded on this machine — the test
@@ -657,12 +692,16 @@ fn metal_fused_attention_seq_len_sweep() {
         let mask = padding_mask(seq_len, valid);
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        let out_metal = metal.fused_attention(
-            &q, &k, &v, num_heads, seq_len, head_dim, scale, &alibi, &mask,
-        ).unwrap();
-        let out_cpu = cpu.fused_attention(
-            &q, &k, &v, num_heads, seq_len, head_dim, scale, &alibi, &mask,
-        ).unwrap();
+        let out_metal = metal
+            .fused_attention(
+                &q, &k, &v, num_heads, seq_len, head_dim, scale, &alibi, &mask,
+            )
+            .unwrap();
+        let out_cpu = cpu
+            .fused_attention(
+                &q, &k, &v, num_heads, seq_len, head_dim, scale, &alibi, &mask,
+            )
+            .unwrap();
 
         let nan_metal = count_nonfinite(&out_metal);
         let nan_cpu = count_nonfinite(&out_cpu);

@@ -23,7 +23,12 @@ const MODEL_DIR: &str = "/tmp/swerank";
 
 fn synth(len: usize, salt: u32) -> (Vec<u32>, Vec<u32>) {
     let ids: Vec<u32> = (0..len)
-        .map(|i| 1 + ((i as u32).wrapping_mul(2654435761).wrapping_add(salt.wrapping_mul(40503)) % 20000))
+        .map(|i| {
+            1 + ((i as u32)
+                .wrapping_mul(2654435761)
+                .wrapping_add(salt.wrapping_mul(40503))
+                % 20000)
+        })
         .collect();
     (ids, vec![1u32; len])
 }
@@ -53,7 +58,9 @@ fn short_min_cos(model: &BertModel, short_len: usize, other_len: usize, n: usize
     let emb = model.forward_batched(&ids, &masks).unwrap();
     let mut min_c = 1.0f64;
     for j in 0..n {
-        let single = model.forward(&[batch[j].0.clone()], &[batch[j].1.clone()]).unwrap();
+        let single = model
+            .forward(&[batch[j].0.clone()], &[batch[j].1.clone()])
+            .unwrap();
         min_c = min_c.min(cos(&emb[j], &single[0]));
     }
     min_c

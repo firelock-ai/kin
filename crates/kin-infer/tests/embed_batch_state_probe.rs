@@ -31,7 +31,12 @@ fn probe_model_dir() -> String {
 
 fn synth(len: usize, salt: u32) -> (Vec<u32>, Vec<u32>) {
     let ids: Vec<u32> = (0..len)
-        .map(|i| 1 + ((i as u32).wrapping_mul(2654435761).wrapping_add(salt.wrapping_mul(40503)) % 20000))
+        .map(|i| {
+            1 + ((i as u32)
+                .wrapping_mul(2654435761)
+                .wrapping_add(salt.wrapping_mul(40503))
+                % 20000)
+        })
         .collect();
     (ids, vec![1u32; len])
 }

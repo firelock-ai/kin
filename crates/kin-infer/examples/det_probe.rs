@@ -42,7 +42,10 @@ fn child(model_dir: &str, mode: &str) {
     let tmask = vec![1u32; target.len()];
 
     let emb = match mode {
-        "solo" => model.forward(&[target], &[tmask]).expect("forward").remove(0),
+        "solo" => model
+            .forward(&[target], &[tmask])
+            .expect("forward")
+            .remove(0),
         "batched" => {
             // Cold batched: this fresh process has no prior single forward, so the
             // batched path must build its own (correct) fused FFN weight layout. The
@@ -87,7 +90,10 @@ fn main() {
         return;
     }
 
-    let exe = std::env::current_exe().expect("current_exe").to_string_lossy().into_owned();
+    let exe = std::env::current_exe()
+        .expect("current_exe")
+        .to_string_lossy()
+        .into_owned();
     // Two separate processes per arrangement, plus the single/batched split.
     let solo_a = run_child(&exe, &model_dir, "solo");
     let solo_b = run_child(&exe, &model_dir, "solo");
@@ -101,7 +107,9 @@ fn main() {
 
     let all = [&solo_a, &solo_b, &batched_a, &batched_b];
     let hash0 = solo_a.split_whitespace().next().unwrap();
-    let ok = all.iter().all(|s| s.split_whitespace().next().unwrap() == hash0);
+    let ok = all
+        .iter()
+        .all(|s| s.split_whitespace().next().unwrap() == hash0);
     if ok {
         println!("\nPASS: same text is BIT-IDENTICAL across processes and across the single/batched split.");
     } else {

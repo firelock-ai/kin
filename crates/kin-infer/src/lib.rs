@@ -313,7 +313,11 @@ fn dump_entity_index() -> usize {
 /// layer; `sub` is "embed", "attn" (post-attention output), or "ffn" (layer output).
 fn dump_hidden(path: &str, layer: i32, sub: &str, rows: &[f32]) {
     let sum: f64 = rows.iter().map(|&x| x as f64).sum();
-    let l2: f64 = rows.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+    let l2: f64 = rows
+        .iter()
+        .map(|&x| (x as f64) * (x as f64))
+        .sum::<f64>()
+        .sqrt();
     let g = |i: usize| rows.get(i).copied().unwrap_or(0.0);
     eprintln!(
         "DUMP path={path} layer={layer} sub={sub} rows={n} l2={l2:.6} sum={sum:.6} first4=[{:.5},{:.5},{:.5},{:.5}]",
@@ -762,7 +766,10 @@ impl BertModel {
         Self::load_from_tensors(&tensors, config)
     }
 
-    fn load_from_tensors(tensors: &SafeTensors, mut config: BertConfig) -> Result<Self, InferError> {
+    fn load_from_tensors(
+        tensors: &SafeTensors,
+        mut config: BertConfig,
+    ) -> Result<Self, InferError> {
         let _names: Vec<_> = tensors.names().into_iter().collect();
 
         // GPT-style configs (nomic_bert) name the FFN activation via
@@ -815,8 +822,11 @@ impl BertModel {
             embed_dim,
         )?;
 
-        let embed_ln_weight =
-            try_load_1d_flexible(tensors, &["embeddings.LayerNorm.weight", "emb_ln.weight"], h)?;
+        let embed_ln_weight = try_load_1d_flexible(
+            tensors,
+            &["embeddings.LayerNorm.weight", "emb_ln.weight"],
+            h,
+        )?;
         let embed_ln_bias =
             try_load_1d_flexible(tensors, &["embeddings.LayerNorm.bias", "emb_ln.bias"], h)?;
 
@@ -1160,11 +1170,8 @@ impl BertModel {
             1,
             h,
         )?;
-        let classifier_bias = try_load_1d_flexible(
-            tensors,
-            &["classifier.dense.bias", "classifier.bias"],
-            1,
-        )?;
+        let classifier_bias =
+            try_load_1d_flexible(tensors, &["classifier.dense.bias", "classifier.bias"], 1)?;
 
         let head_dim = h / config.num_attention_heads;
         let kv_head_dim = h / config.num_attention_heads;
@@ -1310,7 +1317,12 @@ impl BertModel {
                 let layer = &self.weights.layers[i % num_groups];
                 hidden = self.encoder_layer(&hidden, mask, layer, i)?;
                 if dump_layer_enabled() && b == dump_entity_index() {
-                    dump_hidden("single", (i + 1) as i32, "ffn", hidden.as_slice().unwrap_or(&[]));
+                    dump_hidden(
+                        "single",
+                        (i + 1) as i32,
+                        "ffn",
+                        hidden.as_slice().unwrap_or(&[]),
+                    );
                 }
             }
 
@@ -1338,9 +1350,12 @@ impl BertModel {
     ) -> Result<(Array2<f32>, Vec<Vec<u8>>, usize), InferError> {
         let batch_size = token_ids.len();
         if batch_size == 0 {
-            return Ok((ndarray::Array2::zeros((0, self.config.hidden_size)), vec![], 0));
+            return Ok((
+                ndarray::Array2::zeros((0, self.config.hidden_size)),
+                vec![],
+                0,
+            ));
         }
-        
 
         let h = self.config.hidden_size;
         let embed_dim = self.config.embedding_size.unwrap_or(h);
@@ -1454,7 +1469,7 @@ impl BertModel {
                 let layer_tensors = crate::gpu::LayerTensors {
                     norm1_weight: layer.norm1_weight.as_slice().unwrap(),
                     norm1_bias: layer.norm1_bias.as_ref().and_then(|x| x.as_slice()),
-                    
+
                     qkv_weight: layer.qkv_weight.as_ref().and_then(|x| x.as_slice()),
                     qkv_bias: layer.qkv_bias.as_ref().and_then(|x| x.as_slice()),
                     q_weight: layer.q_weight.as_slice(),
@@ -1470,19 +1485,28 @@ impl BertModel {
 
                     attn_out_weight: layer.attn_out_weight.as_slice().unwrap(),
                     attn_out_bias: layer.attn_out_bias.as_ref().and_then(|x| x.as_slice()),
-                    
+
                     norm2_weight: layer.norm2_weight.as_slice().unwrap(),
                     norm2_bias: layer.norm2_bias.as_ref().and_then(|x| x.as_slice()),
-                    
+
                     ffn_gate_weight: layer.ffn_gate_weight.as_ref().and_then(|x| x.as_slice()),
                     ffn_up_weight: layer.ffn_up_weight.as_ref().and_then(|x| x.as_slice()),
                     ffn_up_bias: layer.ffn_up_bias.as_ref().and_then(|x| x.as_slice()),
                     ffn_down_weight: layer.ffn_down_weight.as_slice().unwrap(),
                     ffn_down_bias: layer.ffn_down_bias.as_ref().and_then(|x| x.as_slice()),
-                    ffn_up_gated_weight: layer.ffn_up_gated_weight.as_ref().and_then(|x| x.as_slice()),
+                    ffn_up_gated_weight: layer
+                        .ffn_up_gated_weight
+                        .as_ref()
+                        .and_then(|x| x.as_slice()),
 
-                    relative_attention_bias: layer.relative_attention_bias.as_ref().and_then(|x| x.as_slice()),
-                    rel_pos_embeddings: layer.rel_pos_embeddings.as_ref().and_then(|x| x.as_slice()),
+                    relative_attention_bias: layer
+                        .relative_attention_bias
+                        .as_ref()
+                        .and_then(|x| x.as_slice()),
+                    rel_pos_embeddings: layer
+                        .rel_pos_embeddings
+                        .as_ref()
+                        .and_then(|x| x.as_slice()),
                 };
 
                 let layer_config = crate::gpu::LayerConfig {
@@ -1501,12 +1525,18 @@ impl BertModel {
                 };
 
                 let rope_cos_slice = if self.weights.position_embeddings.is_none() {
-                    self.rope_cos.as_ref().and_then(|x| x.as_slice()).unwrap_or(&[])
+                    self.rope_cos
+                        .as_ref()
+                        .and_then(|x| x.as_slice())
+                        .unwrap_or(&[])
                 } else {
                     &[]
                 };
                 let rope_sin_slice = if self.weights.position_embeddings.is_none() {
-                    self.rope_sin.as_ref().and_then(|x| x.as_slice()).unwrap_or(&[])
+                    self.rope_sin
+                        .as_ref()
+                        .and_then(|x| x.as_slice())
+                        .unwrap_or(&[])
                 } else {
                     &[]
                 };
@@ -1521,7 +1551,7 @@ impl BertModel {
                 )? {
                     hidden = Array2::from_shape_vec((total_rows, h), fused_out)
                         .expect("fused layer output dimension mismatch");
-                    
+
                     if dump_layer_enabled() {
                         let e = dump_entity_index();
                         if e < batch_size {
@@ -1755,7 +1785,10 @@ impl BertModel {
             if post_ln_swiglu_fold {
                 hidden = self.ffn_swiglu_add_norm(
                     &post_attn,
-                    layer.ffn_gate_weight.as_ref().expect("ffn_gate_weight missing"),
+                    layer
+                        .ffn_gate_weight
+                        .as_ref()
+                        .expect("ffn_gate_weight missing"),
                     layer.ffn_up_weight.as_ref().expect("ffn_up_weight missing"),
                     &layer.ffn_down_weight,
                     layer.ffn_down_bias.as_ref(),
@@ -1835,7 +1868,7 @@ impl BertModel {
             }
         }
 
-            Ok((hidden, masks, max_len))
+        Ok((hidden, masks, max_len))
     }
 
     /// Batched forward pass: all inputs processed together for projections/FFN,
@@ -1886,7 +1919,9 @@ impl BertModel {
         let cls_pooling = self.config.uses_cls_pooling();
         for b in 0..batch_size {
             let base = b * max_len;
-            let h_b = hidden.slice(ndarray::s![base..base + max_len, ..]).to_owned();
+            let h_b = hidden
+                .slice(ndarray::s![base..base + max_len, ..])
+                .to_owned();
             let pooled = if cls_pooling {
                 cls_pool(&h_b)
             } else {
@@ -1940,10 +1975,11 @@ impl BertModel {
         // every group writes its results back, so all slots are filled.
         let mut results: Vec<Vec<f32>> = vec![Vec::new(); batch_size];
         for indices in groups.values() {
-            let group_ids: Vec<Vec<u32>> =
-                indices.iter().map(|&i| token_ids[i].clone()).collect();
-            let group_masks: Vec<Vec<u32>> =
-                indices.iter().map(|&i| attention_masks[i].clone()).collect();
+            let group_ids: Vec<Vec<u32>> = indices.iter().map(|&i| token_ids[i].clone()).collect();
+            let group_masks: Vec<Vec<u32>> = indices
+                .iter()
+                .map(|&i| attention_masks[i].clone())
+                .collect();
             let (hidden, masks, max_len) = self.encode_batched(&group_ids, &group_masks)?;
             let pooled = self.pool_and_normalize(&hidden, &masks, max_len);
             for (slot, &orig) in indices.iter().enumerate() {
@@ -1977,7 +2013,7 @@ impl BertModel {
             InferError::ModelError("cross-encoder requires classifier_weight".into())
         })?;
         let bias = self.weights.classifier_bias.as_ref();
-        
+
         let logits = self.linear(&cls_tokens, weight, bias)?;
         let mut results = Vec::with_capacity(batch_size);
         for b in 0..batch_size {
@@ -1985,7 +2021,6 @@ impl BertModel {
         }
         Ok(results)
     }
-
 
     /// GPU-accelerated linear projection helper.
     fn linear(
@@ -2282,9 +2317,8 @@ impl BertModel {
                     let rows = x.nrows();
                     let cols = x.ncols();
                     let hidden = weight.nrows();
-                    let out = gpu.fused_linear_add_norm(
-                        xs, ws, rs, gs, bs, rows, cols, hidden, eps,
-                    )?;
+                    let out =
+                        gpu.fused_linear_add_norm(xs, ws, rs, gs, bs, rows, cols, hidden, eps)?;
                     return Ok(Array2::from_shape_vec((rows, hidden), out)
                         .expect("fused_linear_add_norm shape"));
                 }
@@ -2353,7 +2387,13 @@ impl BertModel {
     }
 
     /// GPU-accelerated RoPE helper.
-    fn rope(&self, x: &mut Array2<f32>, seq_offset: usize, seq_len: usize, head_dim: usize) -> Result<(), InferError> {
+    fn rope(
+        &self,
+        x: &mut Array2<f32>,
+        seq_offset: usize,
+        seq_len: usize,
+        head_dim: usize,
+    ) -> Result<(), InferError> {
         let _span = tracing::info_span!(
             "kin_infer.model.rope",
             rows = x.nrows(),
@@ -2378,7 +2418,13 @@ impl BertModel {
     /// are submitted in one command buffer (they share the cos/sin tables and
     /// are mutually independent), halving the RoPE round-trips per layer. Falls
     /// back to two independent `rope` calls otherwise. No-op without RoPE tables.
-    fn rope_qk(&self, q: &mut Array2<f32>, k: &mut Array2<f32>, seq_len: usize, head_dim: usize) -> Result<(), InferError> {
+    fn rope_qk(
+        &self,
+        q: &mut Array2<f32>,
+        k: &mut Array2<f32>,
+        seq_len: usize,
+        head_dim: usize,
+    ) -> Result<(), InferError> {
         let (Some(cos), Some(sin)) = (&self.rope_cos, &self.rope_sin) else {
             return Ok(());
         };
@@ -2512,7 +2558,14 @@ impl BertModel {
             for b in 0..batch_size {
                 let base = b * max_len;
                 self.rope_batched_one(
-                    q, k, base, actual, head_dim, &cos_compact, &sin_compact, total_dim,
+                    q,
+                    k,
+                    base,
+                    actual,
+                    head_dim,
+                    &cos_compact,
+                    &sin_compact,
+                    total_dim,
                 )?;
             }
             return Ok(());
@@ -2526,7 +2579,14 @@ impl BertModel {
             for b in 0..batch_size {
                 let base = b * max_len;
                 self.rope_batched_one(
-                    q, k, base, actual, head_dim, &cos_compact, &sin_compact, total_dim,
+                    q,
+                    k,
+                    base,
+                    actual,
+                    head_dim,
+                    &cos_compact,
+                    &sin_compact,
+                    total_dim,
                 )?;
             }
             return Ok(());
@@ -2564,8 +2624,16 @@ impl BertModel {
         let Some(gpu) = self.gpu.as_ref() else {
             return Ok(());
         };
-        let mut q_block: Vec<f32> = q.slice(s![base..base + actual, ..]).iter().copied().collect();
-        let mut k_block: Vec<f32> = k.slice(s![base..base + actual, ..]).iter().copied().collect();
+        let mut q_block: Vec<f32> = q
+            .slice(s![base..base + actual, ..])
+            .iter()
+            .copied()
+            .collect();
+        let mut k_block: Vec<f32> = k
+            .slice(s![base..base + actual, ..])
+            .iter()
+            .copied()
+            .collect();
         gpu.rope_pair(
             &mut q_block,
             &mut k_block,
@@ -3501,7 +3569,11 @@ fn build_fused_projection<const N: usize>(
 }
 
 /// GPU-accelerated linear: C = X × W^T using GpuCompute::matmul.
-fn gpu_linear(x: &Array2<f32>, weight: &Array2<f32>, gpu: &dyn gpu::GpuCompute) -> Result<Array2<f32>, InferError> {
+fn gpu_linear(
+    x: &Array2<f32>,
+    weight: &Array2<f32>,
+    gpu: &dyn gpu::GpuCompute,
+) -> Result<Array2<f32>, InferError> {
     let m = x.nrows();
     let k = x.ncols();
     let n = weight.nrows(); // weight is [N, K], we want X[M,K] × W^T[K,N] = [M,N]
@@ -3668,7 +3740,12 @@ fn rms_norm_2d(x: &mut Array2<f32>, weight: &Array1<f32>, eps: f32) {
 }
 
 /// GPU-accelerated RMSNorm.
-fn gpu_rms_norm_2d(x: &mut Array2<f32>, weight: &Array1<f32>, eps: f32, gpu: &dyn gpu::GpuCompute) -> Result<(), InferError> {
+fn gpu_rms_norm_2d(
+    x: &mut Array2<f32>,
+    weight: &Array1<f32>,
+    eps: f32,
+    gpu: &dyn gpu::GpuCompute,
+) -> Result<(), InferError> {
     let _span = tracing::info_span!(
         "kin_infer.gpu.rms_norm_2d",
         rows = x.nrows(),
@@ -3737,7 +3814,11 @@ fn swiglu_2d(gate: &Array2<f32>, up: &Array2<f32>) -> Array2<f32> {
     out
 }
 
-fn gpu_swiglu_2d(gate: &Array2<f32>, up: &Array2<f32>, gpu: &dyn gpu::GpuCompute) -> Result<Array2<f32>, InferError> {
+fn gpu_swiglu_2d(
+    gate: &Array2<f32>,
+    up: &Array2<f32>,
+    gpu: &dyn gpu::GpuCompute,
+) -> Result<Array2<f32>, InferError> {
     let _span = tracing::info_span!(
         "kin_infer.gpu.swiglu_2d",
         rows = gate.nrows(),
@@ -3987,8 +4068,7 @@ mod tests {
             eprintln!("SKIP: nomic model absent at /tmp/nomic; batched-RoPE parity test skipped.");
             return;
         }
-        let cfg_json =
-            std::fs::read_to_string(dir.join("config.json")).expect("read config.json");
+        let cfg_json = std::fs::read_to_string(dir.join("config.json")).expect("read config.json");
         let config: BertConfig = match serde_json::from_str(&cfg_json) {
             Ok(c) => c,
             Err(e) => {
@@ -3997,15 +4077,16 @@ mod tests {
             }
         };
         let vocab = config.vocab_size.max(2);
-        let model =
-            BertModel::load(&dir.join("model.safetensors"), config).expect("load model");
+        let model = BertModel::load(&dir.join("model.safetensors"), config).expect("load model");
 
         // Synthetic mixed-length batch (RoPE positions differ per length).
         let lens = [5usize, 17, 32, 48];
         let mut token_ids: Vec<Vec<u32>> = Vec::new();
         let mut masks: Vec<Vec<u32>> = Vec::new();
         for (i, &len) in lens.iter().enumerate() {
-            let ids: Vec<u32> = (0..len).map(|j| ((i * 131 + j * 7 + 3) % vocab) as u32).collect();
+            let ids: Vec<u32> = (0..len)
+                .map(|j| ((i * 131 + j * 7 + 3) % vocab) as u32)
+                .collect();
             masks.push(vec![1u32; len]);
             token_ids.push(ids);
         }
@@ -4016,9 +4097,13 @@ mod tests {
         // differences and from the pre-existing shared-GPU nondeterminism — only
         // the RoPE dispatch strategy differs between the two runs here.
         std::env::set_var("KIN_ROPE_PERELEM", "1");
-        let per_elem = model.forward_batched(&token_ids, &masks).expect("forward_batched perelem");
+        let per_elem = model
+            .forward_batched(&token_ids, &masks)
+            .expect("forward_batched perelem");
         std::env::remove_var("KIN_ROPE_PERELEM");
-        let batched = model.forward_batched(&token_ids, &masks).expect("forward_batched single");
+        let batched = model
+            .forward_batched(&token_ids, &masks)
+            .expect("forward_batched single");
 
         assert_eq!(per_elem.len(), batched.len(), "embedding count mismatch");
         let mut max_abs = 0.0f32;
@@ -4070,15 +4155,17 @@ mod tests {
             eprintln!("SKIP: nomic model absent at /tmp/nomic; cold-batched regression skipped.");
             return;
         }
-        let cfg_json =
-            std::fs::read_to_string(dir.join("config.json")).expect("read config.json");
+        let cfg_json = std::fs::read_to_string(dir.join("config.json")).expect("read config.json");
         let load = || {
             let config: BertConfig = serde_json::from_str(&cfg_json).expect("parse config.json");
             BertModel::load(&dir.join("model.safetensors"), config).expect("load model")
         };
         let model_cold = load();
         let model_ref = load();
-        let vocab = serde_json::from_str::<BertConfig>(&cfg_json).unwrap().vocab_size.max(2);
+        let vocab = serde_json::from_str::<BertConfig>(&cfg_json)
+            .unwrap()
+            .vocab_size
+            .max(2);
 
         let target: Vec<u32> = (0..50).map(|j| ((37 + j * 7) % vocab) as u32).collect();
         let tmask = vec![1u32; target.len()];

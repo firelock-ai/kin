@@ -61,7 +61,7 @@ fn max_buffer_length() -> u64 {
 /// cap is RAM-bounded (tens of GiB at most), so `count * 4` is a modest u64.
 fn impossible_f32_count() -> usize {
     let bytes = max_buffer_length().saturating_add(1 << 30); // + 1 GiB slack
-    // ceil(bytes / 4) + 1, so `count * 4 > max_buffer_length` with margin.
+                                                             // ceil(bytes / 4) + 1, so `count * 4 > max_buffer_length` with margin.
     ((bytes / 4) + 1) as usize
 }
 

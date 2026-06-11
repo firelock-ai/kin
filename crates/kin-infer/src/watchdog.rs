@@ -391,7 +391,7 @@ mod tests {
     #[test]
     fn throughput_floor_trips_only_when_sustained_low() {
         let cfg = EmbedConfig {
-            throughput_floor: Some(100.0), // need >=100 persisted/sec
+            throughput_floor: Some(100.0),          // need >=100 persisted/sec
             floor_window: Duration::from_millis(0), // trip as soon as below
             floor_grace: Duration::from_secs(0),
             ..base_cfg()
