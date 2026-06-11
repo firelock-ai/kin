@@ -1358,6 +1358,8 @@ impl BertModel {
 
     /// Batched forward pass: all inputs processed together for projections/FFN,
     /// split only for per-input attention. Reduces GPU dispatches by batch_size×.
+    // Multi-output tensor op (inline tuple clearer than an alias) with flat-offset index loops over ndarray rows.
+    #[allow(clippy::type_complexity, clippy::needless_range_loop)]
     pub fn encode_batched(
         &self,
         token_ids: &[Vec<u32>],
@@ -1952,6 +1954,8 @@ impl BertModel {
     /// `masks[b]` is input `b`'s padded attention mask, and `max_len` is the row
     /// stride. Returns one L2-normalized embedding per input, in input order.
     /// Pooling is mask-aware, so padding rows contribute nothing.
+    // Index drives flat-offset slicing (base = b * max_len) into the hidden ndarray; range loop is the clearer form.
+    #[allow(clippy::needless_range_loop)]
     fn pool_and_normalize(
         &self,
         hidden: &Array2<f32>,
@@ -2124,6 +2128,8 @@ impl BertModel {
         Ok(())
     }
 
+    // Multi-output tensor op: a 3-tuple of Q/K/V arrays is clearer inline than behind a type alias.
+    #[allow(clippy::type_complexity)]
     fn project_qkv(
         &self,
         x: &Array2<f32>,
@@ -2820,7 +2826,7 @@ impl BertModel {
             }
 
             // Build mask as u32 array
-            let mask_u32: Vec<u32> = mask.iter().map(|&m| m as u32).collect();
+            let mask_u32: Vec<u32> = mask.to_vec();
             let alibi = alibi_slopes.as_deref().unwrap_or(&[]);
 
             // Single fused call: 4 GPU ops in 1 command buffer
@@ -3860,6 +3866,8 @@ fn gpu_softmax_rows(x: &mut Array2<f32>, gpu: &dyn gpu::GpuCompute) -> Result<()
     Ok(())
 }
 
+// GELU constant kept at full precision (0.7978845608 = sqrt(2/π)) to document intent; f32 truncation is expected.
+#[allow(clippy::excessive_precision)]
 fn gelu(x: f32) -> f32 {
     x * 0.5 * (1.0 + (x * 0.7978845608 * (1.0 + 0.044715 * x * x)).tanh())
 }
@@ -4258,7 +4266,7 @@ mod tests {
             .remove(0);
         // Always-correct single-sequence reference on a separate instance.
         let reference = model_ref
-            .forward(&[target.clone()], &[tmask.clone()])
+            .forward(std::slice::from_ref(&target), std::slice::from_ref(&tmask))
             .expect("forward reference")
             .remove(0);
 
@@ -4322,6 +4330,8 @@ mod tests {
     /// cosine-identical on any backend. This locks today's good behavior so a future
     /// flip of `KIN_INFER_MMA_WIDE` / `KIN_INFER_GEMM_FP16` / steel, or any edit to
     /// the `use_mma` shape floor, cannot silently reintroduce batch-dependence.
+    // Test-local config table: inline tuple type is clearer than an alias for a one-off fixture.
+    #[allow(clippy::type_complexity)]
     #[test]
     fn embedding_is_invariant_to_batch_size_and_composition() {
         let dir = std::path::Path::new("/tmp/nomic");
@@ -4353,7 +4363,7 @@ mod tests {
 
         // Baseline: lone single `forward` (per-op path, m = seq_len = 12 → scalar).
         let baseline = model
-            .forward(&[target.clone()], &[tmask.clone()])
+            .forward(std::slice::from_ref(&target), std::slice::from_ref(&tmask))
             .expect("forward baseline")
             .remove(0);
 

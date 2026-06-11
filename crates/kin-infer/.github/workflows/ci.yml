@@ -42,22 +42,16 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
-      # TEMPORARY debt allow-list — burn down in a follow-up kin-infer clippy
-      # cleanup; no additions without lead sign-off. Enumerated 2026-06-11 from
-      # `cargo clippy --all-targets` (default features): 7 distinct clippy lints,
-      # mostly clippy-1.94 new/strictness lints (e.g. cloned_ref_to_slice_refs).
-      # Gate stays ENFORCING (-D warnings retained); only these named lints are
-      # allowed, each overriding the broad deny because it appears after it.
+      # Clippy debt allow-list burned down 2026-06-11. The 7 enumerated lints were
+      # FIXED (unnecessary_cast, cloned_ref_to_slice_refs) or RECLASSIFIED as
+      # intentional via scoped, justified in-source `#[allow]`s: too_many_arguments
+      # and needless_range_loop (GPU op signatures + flat-buffer tensor kernels),
+      # type_complexity (multi-output tensor tuples), excessive_precision (GELU
+      # sqrt(2/π) constant), vec_init_then_push (cfg-gated device discovery).
+      # Gate is fully ENFORCING with NO command-line allows — keep it that way;
+      # no broad `-A` re-additions without lead sign-off.
       - name: Clippy
-        run: >
-          cargo clippy --all-targets -- -D warnings
-          -A clippy::cloned_ref_to_slice_refs
-          -A clippy::excessive_precision
-          -A clippy::needless_range_loop
-          -A clippy::too_many_arguments
-          -A clippy::type_complexity
-          -A clippy::unnecessary_cast
-          -A clippy::vec_init_then_push
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Build
         run: cargo build --all-targets

@@ -63,6 +63,8 @@ impl fmt::Display for GpuDeviceInfo {
 ///
 /// Returns devices sorted by preference: Metal > CUDA > CPU.
 /// Always includes at least one CPU device as fallback.
+// cfg-gated backend extends precede the unconditional CPU-fallback push; no vec! literal can express the conditional accumulation.
+#[allow(clippy::vec_init_then_push)]
 pub fn discover_devices() -> Vec<GpuDeviceInfo> {
     let mut devices = Vec::new();
 
@@ -298,6 +300,8 @@ pub trait GpuCompute: Send + Sync {
     /// The default implementation chains the existing primitives and is the
     /// numerical reference; accelerator backends override this to keep the whole
     /// chain resident on-device with a single host synchronization.
+    // GPU op signature: each tensor/dim arg is semantically required; a params struct adds indirection without value.
+    #[allow(clippy::too_many_arguments)]
     fn fused_ffn_swiglu(
         &self,
         x: &[f32],
@@ -316,6 +320,8 @@ pub trait GpuCompute: Send + Sync {
     }
 
     /// RoPE: apply rotary position encoding in-place.
+    // GPU op signature: rotary tables + dims are each required; a params struct adds indirection without value.
+    #[allow(clippy::too_many_arguments)]
     fn rope(
         &self,
         data: &mut [f32],
@@ -386,6 +392,8 @@ pub trait GpuCompute: Send + Sync {
     /// in a single GPU submission. Returns [num_heads, seq_len, head_dim].
     /// `alibi_slopes`: per-head slopes, or empty slice for no ALiBi.
     /// `mask`: per-position mask (1=keep, 0=mask), length seq_len.
+    // GPU op signature + flat-buffer index kernels: args are each required and the loops drive offset arithmetic into `scores`.
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     fn fused_attention(
         &self,
         q: &[f32],
@@ -426,6 +434,8 @@ pub trait GpuCompute: Send + Sync {
     /// `q`, `k`, and `v` are laid out as `[num_groups * heads_per_group, seq_len, head_dim]`
     /// in head-major order. `masks` is `[num_groups, seq_len]`, flattened row-major.
     /// `alibi_slopes` is per-head within a group, or empty for no ALiBi.
+    // GPU op signature + flat-buffer index kernels: args are each required and the loops drive offset arithmetic into `scores`.
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     fn fused_attention_batched(
         &self,
         q: &[f32],
@@ -926,6 +936,8 @@ impl GpuCompute for CpuCompute {
         Ok(())
     }
 
+    // GELU constant kept at full precision (0.7978845608 = sqrt(2/π)) to document intent; f32 truncation is expected.
+    #[allow(clippy::excessive_precision)]
     fn gelu(&self, data: &mut [f32]) -> Result<(), InferError> {
         if should_parallelize(data.len()) {
             data.par_iter_mut().for_each(|v| {
