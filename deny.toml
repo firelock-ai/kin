@@ -17,12 +17,19 @@ feature-depth = 1
 # Ignore specific advisories that cannot be resolved yet.
 # Each entry must have a reason explaining why it is safe to ignore.
 ignore = [
-    # Transitive, build-time-only, no fixed upgrade available. Both arrive via
-    # tokenizers (kin-infer → tokenizers → indicatif/macro_rules_attribute) and
-    # are "unmaintained" notices, not vulnerabilities. No runtime exposure; no
-    # safe upgrade exists today. Revisit when tokenizers drops these deps.
-    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained — transitive via tokenizers; no fix available, no vuln" },
-    { id = "RUSTSEC-2025-0119", reason = "number_prefix 0.4.0 unmaintained — transitive via indicatif/tokenizers; no fix available, no vuln" },
+    # Unmaintained-only advisories (NOT vulnerabilities) with no safe upgrade
+    # available, all transitive. Verified locally with cargo-deny 0.19.8 against
+    # the registry-resolved graph. Each is a maintenance notice, not a runtime
+    # exposure; revisit when an upstream drops the dep.
+    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained — transitive via kin-infer/tokenizers; no fix, no vuln" },
+    { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained — transitive; no safe upgrade; no vuln" },
+    { id = "RUSTSEC-2024-0384", reason = "instant unmaintained — transitive; no safe upgrade; no vuln" },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 unmaintained — transitive build-time macro dep; no safe upgrade; no vuln" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained — transitive via the TLS stack; no safe upgrade; no vuln" },
+    # NOTE: RUSTSEC-2026-0098 / -0099 / -0104 (rustls-webpki 0.103.10 name-constraint
+    # + CRL-panic VULNERABILITIES) are intentionally NOT ignored. They have a fix:
+    # `cargo update -p rustls-webpki` (>=0.103.13). That is a Cargo.lock change and
+    # belongs to the lockfile-regen owner — do not paper over real vulns here.
 ]
 
 # --- License policy ---
@@ -44,6 +51,10 @@ allow = [
     "Unicode-DFS-2016",
     "Unlicense",
     "Zlib",
+    # ureq 3.x bundles a webpki-roots-style trust store under this permissive
+    # data license (pulled via kin-remote → kin-cli). Permissive; OK for an
+    # Apache-2.0 distribution. Verified as the only license outside the base set.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 
