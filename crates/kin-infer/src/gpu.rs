@@ -66,7 +66,7 @@ impl fmt::Display for GpuDeviceInfo {
 pub fn discover_devices() -> Vec<GpuDeviceInfo> {
     let mut devices = Vec::new();
 
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     {
         devices.extend(discover_metal_devices());
     }
@@ -114,7 +114,7 @@ fn cpu_name() -> String {
 // Metal device discovery (macOS)
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 fn discover_metal_devices() -> Vec<GpuDeviceInfo> {
     use crate::metal_backend;
     metal_backend::discover_devices()
@@ -666,7 +666,7 @@ pub fn create_compute() -> Box<dyn GpuCompute> {
         return Box::new(CpuCompute);
     }
 
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     {
         if let Some(compute) = crate::metal_backend::MetalCompute::try_new() {
             return Box::new(compute);

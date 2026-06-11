@@ -2754,7 +2754,10 @@ impl GpuCompute for MetalCompute {
                     );
                 }
                 buf_normed1 = Some(buf);
-                qkv_in = buf_normed1.as_ref().unwrap().buffer();
+                qkv_in = buf_normed1
+                    .as_ref()
+                    .expect("buf_normed1 was just assigned in this pre_ln branch")
+                    .buffer();
             }
 
             let buf_q_dim = self.buf_u32(q_dim as u32)?;
@@ -2865,9 +2868,15 @@ impl GpuCompute for MetalCompute {
                 }
                 retains1.push(buf_qkv);
             } else {
-                let buf_qw = self.buf_cached(weights.q_weight.unwrap())?;
-                let buf_kw = self.buf_cached(weights.k_weight.unwrap())?;
-                let buf_vw = self.buf_cached(weights.v_weight.unwrap())?;
+                let buf_qw = self.buf_cached(weights.q_weight.ok_or_else(|| {
+                    InferError::ModelIncompatible("attention requires q_weight".into())
+                })?)?;
+                let buf_kw = self.buf_cached(weights.k_weight.ok_or_else(|| {
+                    InferError::ModelIncompatible("attention requires k_weight".into())
+                })?)?;
+                let buf_vw = self.buf_cached(weights.v_weight.ok_or_else(|| {
+                    InferError::ModelIncompatible("attention requires v_weight".into())
+                })?)?;
                 if use_mma(total_rows, q_dim, h) {
                     self.encode_mma(
                         cmd1,
@@ -3354,7 +3363,9 @@ impl GpuCompute for MetalCompute {
                 // is the SAME layout `buf_cached_concat` builds and the SAME cache key the
                 // per-op `fused_ffn_swiglu` paths use, so all three share one cached buffer
                 // instead of racing to populate the key with conflicting layouts.
-                let up_weight = weights.ffn_up_weight.unwrap();
+                let up_weight = weights.ffn_up_weight.ok_or_else(|| {
+                    InferError::ModelIncompatible("SwiGLU FFN requires ffn_up_weight".into())
+                })?;
                 let buf_wgateup = self.buf_cached_concat(&[gate_weight, up_weight])?;
 
                 let buf_gateup = self.pool.acquire_uninit(total_rows * 2 * inter * 4)?;
@@ -3436,7 +3447,9 @@ impl GpuCompute for MetalCompute {
                 retains3.push(buf_act);
             } else {
                 // Standard GELU FFN
-                let up_weight = weights.ffn_up_weight.unwrap();
+                let up_weight = weights.ffn_up_weight.ok_or_else(|| {
+                    InferError::ModelIncompatible("FFN requires ffn_up_weight".into())
+                })?;
                 let buf_wup = self.buf_cached(up_weight)?;
                 let buf_up = self.pool.acquire_uninit(total_rows * inter * 4)?;
 

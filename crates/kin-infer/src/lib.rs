@@ -16,7 +16,7 @@
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
 pub mod gpu;
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal_backend;
 pub mod watchdog;
 
@@ -39,6 +39,12 @@ pub enum InferError {
     IoError(#[from] std::io::Error),
     #[error("gpu out of memory: {0}")]
     OutOfMemory(String),
+    #[error("model incompatible: {0}")]
+    ModelIncompatible(String),
+    #[error("backend error: {0}")]
+    BackendError(String),
+    #[error("internal invariant violated: {0}")]
+    Internal(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -478,21 +484,26 @@ impl KvCache {
         layer: usize,
         new_k: &Array2<f32>,
         new_v: &Array2<f32>,
-    ) -> (Array2<f32>, Array2<f32>) {
+    ) -> Result<(Array2<f32>, Array2<f32>), InferError> {
         let k = if self.key[layer].nrows() == 0 {
             new_k.clone()
         } else {
-            ndarray::concatenate(ndarray::Axis(0), &[self.key[layer].view(), new_k.view()]).unwrap()
+            ndarray::concatenate(ndarray::Axis(0), &[self.key[layer].view(), new_k.view()])
+                .map_err(|e| {
+                    InferError::Internal(format!("kv-cache key concat (kv_dim mismatch): {e}"))
+                })?
         };
         let v = if self.value[layer].nrows() == 0 {
             new_v.clone()
         } else {
             ndarray::concatenate(ndarray::Axis(0), &[self.value[layer].view(), new_v.view()])
-                .unwrap()
+                .map_err(|e| {
+                    InferError::Internal(format!("kv-cache value concat (kv_dim mismatch): {e}"))
+                })?
         };
         self.key[layer] = k.clone();
         self.value[layer] = v.clone();
-        (k, v)
+        Ok((k, v))
     }
 }
 
@@ -553,7 +564,11 @@ fn load_2d(
         .tensor(name)
         .map_err(|e| InferError::ModelError(format!("missing tensor '{name}': {e}")))?;
     let floats = decode_tensor_to_f32(name, &view, rows * cols)?;
-    Ok(Array2::from_shape_vec((rows, cols), floats).unwrap())
+    Array2::from_shape_vec((rows, cols), floats).map_err(|e| {
+        InferError::ModelIncompatible(format!(
+            "tensor '{name}': cannot reshape to {rows}x{cols}: {e}"
+        ))
+    })
 }
 
 fn decode_tensor_to_f32(
@@ -1467,7 +1482,10 @@ impl BertModel {
 
             if let Some(gpu) = self.gpu.as_ref() {
                 let layer_tensors = crate::gpu::LayerTensors {
-                    norm1_weight: layer.norm1_weight.as_slice().unwrap(),
+                    norm1_weight: layer
+                        .norm1_weight
+                        .as_slice()
+                        .expect("loaded weight is std-layout contiguous"),
                     norm1_bias: layer.norm1_bias.as_ref().and_then(|x| x.as_slice()),
 
                     qkv_weight: layer.qkv_weight.as_ref().and_then(|x| x.as_slice()),
@@ -1483,16 +1501,25 @@ impl BertModel {
                     k_ln_weight: layer.k_ln_weight.as_ref().and_then(|x| x.as_slice()),
                     k_ln_bias: layer.k_ln_bias.as_ref().and_then(|x| x.as_slice()),
 
-                    attn_out_weight: layer.attn_out_weight.as_slice().unwrap(),
+                    attn_out_weight: layer
+                        .attn_out_weight
+                        .as_slice()
+                        .expect("loaded weight is std-layout contiguous"),
                     attn_out_bias: layer.attn_out_bias.as_ref().and_then(|x| x.as_slice()),
 
-                    norm2_weight: layer.norm2_weight.as_slice().unwrap(),
+                    norm2_weight: layer
+                        .norm2_weight
+                        .as_slice()
+                        .expect("loaded weight is std-layout contiguous"),
                     norm2_bias: layer.norm2_bias.as_ref().and_then(|x| x.as_slice()),
 
                     ffn_gate_weight: layer.ffn_gate_weight.as_ref().and_then(|x| x.as_slice()),
                     ffn_up_weight: layer.ffn_up_weight.as_ref().and_then(|x| x.as_slice()),
                     ffn_up_bias: layer.ffn_up_bias.as_ref().and_then(|x| x.as_slice()),
-                    ffn_down_weight: layer.ffn_down_weight.as_slice().unwrap(),
+                    ffn_down_weight: layer
+                        .ffn_down_weight
+                        .as_slice()
+                        .expect("loaded weight is std-layout contiguous"),
                     ffn_down_bias: layer.ffn_down_bias.as_ref().and_then(|x| x.as_slice()),
                     ffn_up_gated_weight: layer
                         .ffn_up_gated_weight
@@ -1542,15 +1569,20 @@ impl BertModel {
                 };
 
                 if let Some(fused_out) = gpu.forward_layer_batched(
-                    hidden.as_slice().unwrap(),
+                    hidden
+                        .as_slice()
+                        .expect("activation buffer is row-major contiguous"),
                     &flat_masks,
                     &layer_tensors,
                     &layer_config,
                     rope_cos_slice,
                     rope_sin_slice,
                 )? {
-                    hidden = Array2::from_shape_vec((total_rows, h), fused_out)
-                        .expect("fused layer output dimension mismatch");
+                    hidden = Array2::from_shape_vec((total_rows, h), fused_out).map_err(|e| {
+                        InferError::Internal(format!(
+                            "fused layer output not {total_rows}x{h}: {e}"
+                        ))
+                    })?;
 
                     if dump_layer_enabled() {
                         let e = dump_entity_index();
@@ -1596,7 +1628,9 @@ impl BertModel {
                 layer.rel_pos_embeddings.is_some() || layer.relative_attention_bias.is_some();
 
             let attn_output = if !needs_per_head && self.has_accelerator_backend() {
-                let gpu = self.gpu.as_ref().unwrap();
+                let gpu = self.gpu.as_ref().ok_or_else(|| {
+                    InferError::BackendError("accelerator backend expected but absent".into())
+                })?;
                 let base_alibi = alibi_slopes.as_deref().unwrap_or(&[]);
 
                 let q_data: Cow<'_, [f32]> = q
@@ -1630,8 +1664,11 @@ impl BertModel {
                         base_alibi,
                         &flat_masks,
                     )?;
-                    Array2::from_shape_vec((total_rows, h), out_flat)
-                        .expect("posmajor attention output is [total_rows, h]")
+                    Array2::from_shape_vec((total_rows, h), out_flat).map_err(|e| {
+                        InferError::Internal(format!(
+                            "posmajor attention output not {total_rows}x{h}: {e}"
+                        ))
+                    })?
                 } else {
                     // Reshape Q,K,V from [batch_size * max_len, num_heads * head_dim]
                     // to [(batch_size * num_heads), max_len, head_dim] head-major flat
@@ -1681,7 +1718,9 @@ impl BertModel {
 
                     // Reshape back to [batch_size * max_len, num_heads * head_dim]
                     let mut out = Array2::<f32>::zeros((total_rows, h));
-                    let out_s = out.as_slice_mut().unwrap();
+                    let out_s = out
+                        .as_slice_mut()
+                        .expect("freshly allocated Array2 is contiguous");
                     for b in 0..batch_size {
                         for s in 0..max_len {
                             for hd in 0..num_heads {
@@ -1785,11 +1824,12 @@ impl BertModel {
             if post_ln_swiglu_fold {
                 hidden = self.ffn_swiglu_add_norm(
                     &post_attn,
-                    layer
-                        .ffn_gate_weight
-                        .as_ref()
-                        .expect("ffn_gate_weight missing"),
-                    layer.ffn_up_weight.as_ref().expect("ffn_up_weight missing"),
+                    layer.ffn_gate_weight.as_ref().ok_or_else(|| {
+                        InferError::ModelIncompatible("SwiGLU FFN requires ffn_gate_weight".into())
+                    })?,
+                    layer.ffn_up_weight.as_ref().ok_or_else(|| {
+                        InferError::ModelIncompatible("FFN requires ffn_up_weight".into())
+                    })?,
                     &layer.ffn_down_weight,
                     layer.ffn_down_bias.as_ref(),
                     &post_attn,
@@ -1816,7 +1856,9 @@ impl BertModel {
                     self.ffn_swiglu(
                         &ffn_input,
                         gate_weight,
-                        layer.ffn_up_weight.as_ref().expect("ffn_up_weight missing"),
+                        layer.ffn_up_weight.as_ref().ok_or_else(|| {
+                            InferError::ModelIncompatible("FFN requires ffn_up_weight".into())
+                        })?,
                         &layer.ffn_down_weight,
                         layer.ffn_down_bias.as_ref(),
                     )?
@@ -1831,7 +1873,9 @@ impl BertModel {
                 } else {
                     let ffn_up = self.linear(
                         &ffn_input,
-                        layer.ffn_up_weight.as_ref().expect("ffn_up_weight missing"),
+                        layer.ffn_up_weight.as_ref().ok_or_else(|| {
+                            InferError::ModelIncompatible("FFN requires ffn_up_weight".into())
+                        })?,
                         layer.ffn_up_bias.as_ref(),
                     )?;
                     let ffn_activated = self.gelu(&ffn_up)?;
@@ -2128,9 +2172,15 @@ impl BertModel {
                 ],
                 gpu.as_ref(),
             )?;
-            let v = projected.pop().expect("missing V projection");
-            let mut k = projected.pop().expect("missing K projection");
-            let mut q = projected.pop().expect("missing Q projection");
+            let v = projected
+                .pop()
+                .ok_or_else(|| InferError::Internal("qkv projection missing V output".into()))?;
+            let mut k = projected
+                .pop()
+                .ok_or_else(|| InferError::Internal("qkv projection missing K output".into()))?;
+            let mut q = projected
+                .pop()
+                .ok_or_else(|| InferError::Internal("qkv projection missing Q output".into()))?;
             self.optional_layer_norm(
                 &mut q,
                 layer.q_ln_weight.as_ref(),
@@ -2268,8 +2318,11 @@ impl BertModel {
                     let hidden = x.ncols();
                     let inter = gate_w.nrows();
                     let out = gpu.fused_ffn_swiglu(xs, gw, uw, dw, rows, hidden, inter)?;
-                    return Ok(Array2::from_shape_vec((rows, hidden), out)
-                        .expect("fused_ffn_swiglu shape"));
+                    return Array2::from_shape_vec((rows, hidden), out).map_err(|e| {
+                        InferError::Internal(format!(
+                            "fused_ffn_swiglu output not {rows}x{hidden}: {e}"
+                        ))
+                    });
                 }
             }
         }
@@ -2319,8 +2372,11 @@ impl BertModel {
                     let hidden = weight.nrows();
                     let out =
                         gpu.fused_linear_add_norm(xs, ws, rs, gs, bs, rows, cols, hidden, eps)?;
-                    return Ok(Array2::from_shape_vec((rows, hidden), out)
-                        .expect("fused_linear_add_norm shape"));
+                    return Array2::from_shape_vec((rows, hidden), out).map_err(|e| {
+                        InferError::Internal(format!(
+                            "fused_linear_add_norm output not {rows}x{hidden}: {e}"
+                        ))
+                    });
                 }
             }
         }
@@ -2375,8 +2431,11 @@ impl BertModel {
                     let out = gpu.fused_ffn_swiglu_add_norm(
                         xs, gw, uw, dw, rs, gs, bs, rows, hidden, inter, eps,
                     )?;
-                    return Ok(Array2::from_shape_vec((rows, hidden), out)
-                        .expect("fused_ffn_swiglu_add_norm shape"));
+                    return Array2::from_shape_vec((rows, hidden), out).map_err(|e| {
+                        InferError::Internal(format!(
+                            "fused_ffn_swiglu_add_norm output not {rows}x{hidden}: {e}"
+                        ))
+                    });
                 }
             }
         }
@@ -2728,7 +2787,9 @@ impl BertModel {
         let attn_output = if !needs_per_head && self.has_accelerator_backend() {
             // === Fused GPU attention: 4 ops in 1 command buffer ===
             // Q×K^T → scale+ALiBi+mask → softmax → scores×V
-            let gpu = self.gpu.as_ref().unwrap();
+            let gpu = self.gpu.as_ref().ok_or_else(|| {
+                InferError::BackendError("accelerator backend expected but absent".into())
+            })?;
             let total_dim = num_heads * head_dim;
 
             // Reshape Q, K, V to head-major [num_heads, seq_len, head_dim]
@@ -2770,7 +2831,9 @@ impl BertModel {
             // Reshape back to [seq_len, num_heads * head_dim]
             let mut output = Array2::<f32>::zeros((seq_len, h));
             {
-                let out_slice = output.as_slice_mut().unwrap();
+                let out_slice = output
+                    .as_slice_mut()
+                    .expect("freshly allocated Array2 is contiguous");
                 for hd in 0..num_heads {
                     for s in 0..seq_len {
                         let src = hd * seq_len * head_dim + s * head_dim;
@@ -2910,10 +2973,9 @@ impl BertModel {
             self.ffn_swiglu(
                 &ffn_input,
                 gate_weight,
-                layer
-                    .ffn_up_weight
-                    .as_ref()
-                    .expect("ffn_up_weight missing for SwiGLU"),
+                layer.ffn_up_weight.as_ref().ok_or_else(|| {
+                    InferError::ModelIncompatible("SwiGLU FFN requires ffn_up_weight".into())
+                })?,
                 &layer.ffn_down_weight,
                 layer.ffn_down_bias.as_ref(),
             )?
@@ -2928,7 +2990,9 @@ impl BertModel {
         } else {
             let ffn_up = self.linear(
                 &ffn_input,
-                layer.ffn_up_weight.as_ref().expect("ffn_up_weight missing"),
+                layer.ffn_up_weight.as_ref().ok_or_else(|| {
+                    InferError::ModelIncompatible("FFN requires ffn_up_weight".into())
+                })?,
                 layer.ffn_up_bias.as_ref(),
             )?;
             let ffn_activated = self.gelu(&ffn_up)?;
@@ -3026,7 +3090,7 @@ impl BertModel {
             self.rope(&mut k, start_pos, seq_len, head_dim)?;
 
             // KV cache
-            let (k_full, v_full) = cache.append_kv(li, &k, &v);
+            let (k_full, v_full) = cache.append_kv(li, &k, &v)?;
             let kv_seq_len = k_full.nrows();
 
             // GQA: repeat K/V
@@ -3118,14 +3182,18 @@ impl BertModel {
                 self.ffn_swiglu(
                     &normed2,
                     gate_w,
-                    layer.ffn_up_weight.as_ref().expect("ffn_up_weight missing"),
+                    layer.ffn_up_weight.as_ref().ok_or_else(|| {
+                        InferError::ModelIncompatible("FFN requires ffn_up_weight".into())
+                    })?,
                     &layer.ffn_down_weight,
                     layer.ffn_down_bias.as_ref(),
                 )?
             } else {
                 let up = self.linear(
                     &normed2,
-                    layer.ffn_up_weight.as_ref().expect("ffn_up_weight"),
+                    layer.ffn_up_weight.as_ref().ok_or_else(|| {
+                        InferError::ModelIncompatible("FFN requires ffn_up_weight".into())
+                    })?,
                     layer.ffn_up_bias.as_ref(),
                 )?;
                 let act = self.gelu(&up)?;
@@ -3203,7 +3271,10 @@ impl BertModel {
         // Decode: one token at a time
         for _ in 1..max_tokens {
             let pos = prompt_ids.len() + generated.len() - 1;
-            let hidden = self.decoder_forward(&[*generated.last().unwrap()], &mut cache, pos)?;
+            let last = *generated
+                .last()
+                .ok_or_else(|| InferError::Internal("generation buffer empty".into()))?;
+            let hidden = self.decoder_forward(&[last], &mut cache, pos)?;
             let logits = self.lm_logits(&hidden);
             let last_logits = logits.row(0).to_owned();
             let token = sample_token(&last_logits, prompt_ids, &generated, params);
@@ -3669,21 +3740,22 @@ fn gpu_linear_many_bias(
         .collect();
     let outputs = gpu.matmul_many(x_data.as_ref(), &weight_refs, m, &ns, k)?;
 
-    Ok(outputs
+    outputs
         .into_iter()
         .zip(projections.iter().zip(ns.iter().copied()))
         .map(|(out, (projection, n))| {
             let (_, bias) = *projection;
-            let mut matrix =
-                Array2::from_shape_vec((m, n), out).expect("gpu matmul_many shape mismatch");
+            let mut matrix = Array2::from_shape_vec((m, n), out).map_err(|e| {
+                InferError::Internal(format!("gpu matmul_many output not {m}x{n}: {e}"))
+            })?;
             if let Some(bias) = bias {
                 for mut row in matrix.rows_mut() {
                     row += bias;
                 }
             }
-            matrix
+            Ok(matrix)
         })
-        .collect())
+        .collect()
 }
 
 /// LayerNorm: (x - mean) / sqrt(var + eps) * gamma + beta.
@@ -3718,8 +3790,10 @@ fn gpu_layer_norm_2d(
     let rows = x.nrows();
     let cols = x.ncols();
     if let Some(data) = x.as_slice_mut() {
-        let g = gamma.as_slice().unwrap();
-        let b = beta.as_slice().unwrap();
+        let g = gamma
+            .as_slice()
+            .expect("norm weight is std-layout contiguous");
+        let b = beta.as_slice().expect("norm bias is std-layout contiguous");
         gpu.layer_norm(data, g, b, rows, cols, eps)?;
     } else {
         layer_norm_2d(x, gamma, beta, eps);
@@ -3757,7 +3831,9 @@ fn gpu_rms_norm_2d(
     let rows = x.nrows();
     let cols = x.ncols();
     if let Some(data) = x.as_slice_mut() {
-        let w = weight.as_slice().unwrap();
+        let w = weight
+            .as_slice()
+            .expect("norm weight is std-layout contiguous");
         gpu.rms_norm(data, w, rows, cols, eps)?;
     } else {
         rms_norm_2d(x, weight, eps);
@@ -4442,16 +4518,136 @@ mod tests {
         let mut cache = KvCache::new(1, 4);
         let k1 = Array2::from_shape_vec((2, 4), vec![1.0; 8]).unwrap();
         let v1 = Array2::from_shape_vec((2, 4), vec![2.0; 8]).unwrap();
-        let (k, v) = cache.append_kv(0, &k1, &v1);
+        let (k, v) = cache.append_kv(0, &k1, &v1).unwrap();
         assert_eq!(k.nrows(), 2);
         assert_eq!(v.nrows(), 2);
 
         let k2 = Array2::from_shape_vec((1, 4), vec![3.0; 4]).unwrap();
         let v2 = Array2::from_shape_vec((1, 4), vec![4.0; 4]).unwrap();
-        let (k, v) = cache.append_kv(0, &k2, &v2);
+        let (k, v) = cache.append_kv(0, &k2, &v2).unwrap();
         assert_eq!(k.nrows(), 3);
         assert_eq!(v.nrows(), 3);
         assert!((k[[2, 0]] - 3.0).abs() < 1e-6);
+    }
+
+    // -- Typed-error shape mocks -------------------------------------------
+    // Hand-built CPU models (gpu = None, std-layout weights) exercise the
+    // forward-pass ModelIncompatible paths without loading a real model.
+
+    /// One transformer layer with all attention/norm weights present at the
+    /// given dims; the three FFN weights are caller-controlled so a test can
+    /// omit one and hit a typed-error path.
+    fn mock_layer(
+        h: usize,
+        inter: usize,
+        ffn_gate_weight: Option<Array2<f32>>,
+        ffn_up_weight: Option<Array2<f32>>,
+    ) -> TransformerLayerWeights {
+        TransformerLayerWeights {
+            q_weight: Array2::zeros((h, h)),
+            q_bias: None,
+            q_ln_weight: None,
+            q_ln_bias: None,
+            k_weight: Array2::zeros((h, h)),
+            k_bias: None,
+            k_ln_weight: None,
+            k_ln_bias: None,
+            v_weight: Array2::zeros((h, h)),
+            v_bias: None,
+            qkv_weight: None,
+            qkv_bias: None,
+            attn_out_weight: Array2::zeros((h, h)),
+            attn_out_bias: None,
+            norm1_weight: Array1::ones(h),
+            norm1_bias: None,
+            ffn_up_weight,
+            ffn_up_bias: None,
+            ffn_gate_weight,
+            ffn_up_gated_weight: None,
+            ffn_down_weight: Array2::zeros((h, inter)),
+            ffn_down_bias: None,
+            norm2_weight: Array1::ones(h),
+            norm2_bias: None,
+            relative_attention_bias: None,
+            rel_pos_embeddings: None,
+        }
+    }
+
+    /// Minimal single-layer CPU encoder (gpu = None) around `layer`.
+    fn mock_encoder(layer: TransformerLayerWeights) -> BertModel {
+        let json = r#"{
+            "n_embd": 4, "n_layer": 1, "n_head": 1, "n_inner": 4,
+            "n_positions": 16, "vocab_size": 4
+        }"#;
+        let config: BertConfig = serde_json::from_str(json).expect("parse config");
+        let h = config.hidden_size;
+        let weights = ModelWeights {
+            word_embeddings: Array2::zeros((config.vocab_size, h)),
+            position_embeddings: None,
+            token_type_embeddings: None,
+            embed_ln_weight: None,
+            embed_ln_bias: None,
+            embed_projection: None,
+            layers: vec![layer],
+            final_norm_weight: None,
+            final_norm_bias: None,
+            lm_head_weight: None,
+            lm_head_bias: None,
+            classifier_weight: None,
+            classifier_bias: None,
+        };
+        BertModel {
+            config,
+            weights,
+            head_dim: h,
+            kv_head_dim: h,
+            rope_cos: None,
+            rope_sin: None,
+            gpu: None,
+        }
+    }
+
+    #[test]
+    fn absent_ffn_up_weight_is_model_incompatible_not_panic() {
+        // GELU FFN path: no gate, no up -> the required up projection is absent.
+        let model = mock_encoder(mock_layer(4, 4, None, None));
+        let err = model
+            .forward(&[vec![0u32, 1]], &[vec![1u32, 1]])
+            .expect_err("missing ffn_up_weight must surface a typed error, not panic");
+        assert!(
+            matches!(err, InferError::ModelIncompatible(_)),
+            "expected ModelIncompatible, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn swiglu_missing_up_weight_is_model_incompatible() {
+        // SwiGLU path: gate present but up absent -> still a model-shape problem.
+        let gate = Array2::zeros((4, 4));
+        let model = mock_encoder(mock_layer(4, 4, Some(gate), None));
+        let err = model
+            .forward(&[vec![0u32, 1]], &[vec![1u32, 1]])
+            .expect_err("SwiGLU FFN without ffn_up_weight must error");
+        assert!(
+            matches!(err, InferError::ModelIncompatible(_)),
+            "expected ModelIncompatible, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn typed_error_variants_render_distinctly() {
+        assert_eq!(
+            InferError::ModelIncompatible("x".into()).to_string(),
+            "model incompatible: x"
+        );
+        assert_eq!(
+            InferError::BackendError("x".into()).to_string(),
+            "backend error: x"
+        );
+        assert_eq!(
+            InferError::Internal("x".into()).to_string(),
+            "internal invariant violated: x"
+        );
     }
 
     #[test]
