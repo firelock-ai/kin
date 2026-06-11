@@ -39,6 +39,12 @@ pub enum InferError {
     IoError(#[from] std::io::Error),
     #[error("gpu out of memory: {0}")]
     OutOfMemory(String),
+    #[error("model incompatible: {0}")]
+    ModelIncompatible(String),
+    #[error("backend error: {0}")]
+    BackendError(String),
+    #[error("internal invariant violated: {0}")]
+    Internal(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -553,7 +559,11 @@ fn load_2d(
         .tensor(name)
         .map_err(|e| InferError::ModelError(format!("missing tensor '{name}': {e}")))?;
     let floats = decode_tensor_to_f32(name, &view, rows * cols)?;
-    Ok(Array2::from_shape_vec((rows, cols), floats).unwrap())
+    Array2::from_shape_vec((rows, cols), floats).map_err(|e| {
+        InferError::ModelIncompatible(format!(
+            "tensor '{name}': cannot reshape to {rows}x{cols}: {e}"
+        ))
+    })
 }
 
 fn decode_tensor_to_f32(
@@ -3669,21 +3679,22 @@ fn gpu_linear_many_bias(
         .collect();
     let outputs = gpu.matmul_many(x_data.as_ref(), &weight_refs, m, &ns, k)?;
 
-    Ok(outputs
+    outputs
         .into_iter()
         .zip(projections.iter().zip(ns.iter().copied()))
         .map(|(out, (projection, n))| {
             let (_, bias) = *projection;
-            let mut matrix =
-                Array2::from_shape_vec((m, n), out).expect("gpu matmul_many shape mismatch");
+            let mut matrix = Array2::from_shape_vec((m, n), out).map_err(|e| {
+                InferError::Internal(format!("gpu matmul_many output not {m}x{n}: {e}"))
+            })?;
             if let Some(bias) = bias {
                 for mut row in matrix.rows_mut() {
                     row += bias;
                 }
             }
-            matrix
+            Ok(matrix)
         })
-        .collect())
+        .collect()
 }
 
 /// LayerNorm: (x - mean) / sqrt(var + eps) * gamma + beta.
