@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::error::{Result, RuntimeError};
-use crate::evidence::CapturedEvidence;
+use crate::evidence::{parse_test_output, CapturedEvidence};
 
 /// Status of a validation run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +122,15 @@ pub fn execute_run(mut run: ValidationRun) -> Result<ValidationRun> {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
+    // Parse structured per-test results out of the captured output. Different
+    // runners emit their result lines on different streams (cargo/pytest on
+    // stdout, some harnesses on stderr), so parse both and merge.
+    // `parse_test_output` is best-effort and self-limiting — it returns empty
+    // for output it does not recognize — so calling it on arbitrary command
+    // output is safe and simply yields no results for non-test commands.
+    let mut test_results = parse_test_output(&stdout);
+    test_results.extend(parse_test_output(&stderr));
+
     run.evidence = Some(CapturedEvidence {
         stdout: if stdout.is_empty() {
             None
@@ -133,7 +142,7 @@ pub fn execute_run(mut run: ValidationRun) -> Result<ValidationRun> {
         } else {
             Some(stderr)
         },
-        test_results: Vec::new(),
+        test_results,
     });
 
     if output.status.success() {
@@ -214,6 +223,62 @@ mod tests {
         let result = execute_run(run).unwrap();
         let ev = result.evidence.unwrap();
         assert!(ev.stderr.unwrap().contains("error_output"));
+    }
+
+    #[test]
+    fn execute_wires_parsed_test_results_from_stdout() {
+        // The cargo-style result lines on stdout must be parsed into structured
+        // test_results — the regression guard for the previously-hardcoded empty
+        // vec at the capture site.
+        let run = create_run(RunOptions {
+            label: "cargo-style test".into(),
+            command: "printf 'running 2 tests\\ntest mod::alpha ... ok\\ntest mod::beta ... FAILED\\n'"
+                .into(),
+            working_dir: "/tmp".into(),
+            snapshot_id: None,
+        });
+        let result = execute_run(run).unwrap();
+        let ev = result.evidence.expect("evidence captured");
+        assert_eq!(ev.test_results.len(), 2, "both test lines parsed");
+        assert_eq!(ev.test_results[0].name, "mod::alpha");
+        assert!(ev.test_results[0].passed);
+        assert_eq!(ev.test_results[1].name, "mod::beta");
+        assert!(!ev.test_results[1].passed);
+    }
+
+    #[test]
+    fn execute_parses_test_results_emitted_on_stderr() {
+        // Some runners emit their result lines on stderr; those must be picked up
+        // too. Redirect a result line to stderr and assert it is parsed.
+        let run = create_run(RunOptions {
+            label: "stderr-results test".into(),
+            command: "printf 'test it::works ... ok\\n' >&2".into(),
+            working_dir: "/tmp".into(),
+            snapshot_id: None,
+        });
+        let result = execute_run(run).unwrap();
+        let ev = result.evidence.expect("evidence captured");
+        assert_eq!(ev.test_results.len(), 1);
+        assert_eq!(ev.test_results[0].name, "it::works");
+        assert!(ev.test_results[0].passed);
+    }
+
+    #[test]
+    fn execute_non_test_command_yields_no_test_results() {
+        // Arbitrary command output must not be mistaken for test results — the
+        // wire is safe for non-test commands.
+        let run = create_run(RunOptions {
+            label: "plain echo".into(),
+            command: "echo hello world".into(),
+            working_dir: "/tmp".into(),
+            snapshot_id: None,
+        });
+        let result = execute_run(run).unwrap();
+        let ev = result.evidence.expect("evidence captured");
+        assert!(
+            ev.test_results.is_empty(),
+            "non-test output must yield no structured results"
+        );
     }
 
     #[test]
