@@ -188,7 +188,9 @@ Return the change history of a single entity — the ordered list of semantic ch
 that created, modified, or superseded it over time. Reach for it to answer \"how did \
 this declaration get to its current form?\", to find the change IDs you can feed into \
 semantic_diff/impact_analysis, or as a starting point for provenance questions. For \
-who-made-the-change and approval status, kin_provenance_query builds on this.";
+who-made-the-change and approval status, kin_provenance_query builds on this. \
+When no history comes back, the additive `negative` object's `safe_to_conclude_absent` \
+flag says whether \"no recorded history\" is authoritative or merely \"not indexed yet\".";
 
 pub fn handle_entity_history<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
