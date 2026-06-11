@@ -1482,7 +1482,10 @@ impl BertModel {
 
             if let Some(gpu) = self.gpu.as_ref() {
                 let layer_tensors = crate::gpu::LayerTensors {
-                    norm1_weight: layer.norm1_weight.as_slice().unwrap(),
+                    norm1_weight: layer
+                        .norm1_weight
+                        .as_slice()
+                        .expect("loaded weight is std-layout contiguous"),
                     norm1_bias: layer.norm1_bias.as_ref().and_then(|x| x.as_slice()),
 
                     qkv_weight: layer.qkv_weight.as_ref().and_then(|x| x.as_slice()),
@@ -1498,16 +1501,25 @@ impl BertModel {
                     k_ln_weight: layer.k_ln_weight.as_ref().and_then(|x| x.as_slice()),
                     k_ln_bias: layer.k_ln_bias.as_ref().and_then(|x| x.as_slice()),
 
-                    attn_out_weight: layer.attn_out_weight.as_slice().unwrap(),
+                    attn_out_weight: layer
+                        .attn_out_weight
+                        .as_slice()
+                        .expect("loaded weight is std-layout contiguous"),
                     attn_out_bias: layer.attn_out_bias.as_ref().and_then(|x| x.as_slice()),
 
-                    norm2_weight: layer.norm2_weight.as_slice().unwrap(),
+                    norm2_weight: layer
+                        .norm2_weight
+                        .as_slice()
+                        .expect("loaded weight is std-layout contiguous"),
                     norm2_bias: layer.norm2_bias.as_ref().and_then(|x| x.as_slice()),
 
                     ffn_gate_weight: layer.ffn_gate_weight.as_ref().and_then(|x| x.as_slice()),
                     ffn_up_weight: layer.ffn_up_weight.as_ref().and_then(|x| x.as_slice()),
                     ffn_up_bias: layer.ffn_up_bias.as_ref().and_then(|x| x.as_slice()),
-                    ffn_down_weight: layer.ffn_down_weight.as_slice().unwrap(),
+                    ffn_down_weight: layer
+                        .ffn_down_weight
+                        .as_slice()
+                        .expect("loaded weight is std-layout contiguous"),
                     ffn_down_bias: layer.ffn_down_bias.as_ref().and_then(|x| x.as_slice()),
                     ffn_up_gated_weight: layer
                         .ffn_up_gated_weight
@@ -1557,7 +1569,9 @@ impl BertModel {
                 };
 
                 if let Some(fused_out) = gpu.forward_layer_batched(
-                    hidden.as_slice().unwrap(),
+                    hidden
+                        .as_slice()
+                        .expect("activation buffer is row-major contiguous"),
                     &flat_masks,
                     &layer_tensors,
                     &layer_config,
@@ -1704,7 +1718,9 @@ impl BertModel {
 
                     // Reshape back to [batch_size * max_len, num_heads * head_dim]
                     let mut out = Array2::<f32>::zeros((total_rows, h));
-                    let out_s = out.as_slice_mut().unwrap();
+                    let out_s = out
+                        .as_slice_mut()
+                        .expect("freshly allocated Array2 is contiguous");
                     for b in 0..batch_size {
                         for s in 0..max_len {
                             for hd in 0..num_heads {
@@ -2815,7 +2831,9 @@ impl BertModel {
             // Reshape back to [seq_len, num_heads * head_dim]
             let mut output = Array2::<f32>::zeros((seq_len, h));
             {
-                let out_slice = output.as_slice_mut().unwrap();
+                let out_slice = output
+                    .as_slice_mut()
+                    .expect("freshly allocated Array2 is contiguous");
                 for hd in 0..num_heads {
                     for s in 0..seq_len {
                         let src = hd * seq_len * head_dim + s * head_dim;
@@ -3772,8 +3790,10 @@ fn gpu_layer_norm_2d(
     let rows = x.nrows();
     let cols = x.ncols();
     if let Some(data) = x.as_slice_mut() {
-        let g = gamma.as_slice().unwrap();
-        let b = beta.as_slice().unwrap();
+        let g = gamma
+            .as_slice()
+            .expect("norm weight is std-layout contiguous");
+        let b = beta.as_slice().expect("norm bias is std-layout contiguous");
         gpu.layer_norm(data, g, b, rows, cols, eps)?;
     } else {
         layer_norm_2d(x, gamma, beta, eps);
@@ -3811,7 +3831,9 @@ fn gpu_rms_norm_2d(
     let rows = x.nrows();
     let cols = x.ncols();
     if let Some(data) = x.as_slice_mut() {
-        let w = weight.as_slice().unwrap();
+        let w = weight
+            .as_slice()
+            .expect("norm weight is std-layout contiguous");
         gpu.rms_norm(data, w, rows, cols, eps)?;
     } else {
         rms_norm_2d(x, weight, eps);
