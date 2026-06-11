@@ -3,4 +3,5 @@
 
 mod hnsw;
 
-pub use hnsw::VectorIndex;
+pub use hnsw::{IndexLoadOutcome, VectorIndex};
+pub use kin_vector::IndexDescriptor;

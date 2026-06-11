@@ -10,6 +10,7 @@ use crate::error::KinDbError;
 use crate::search::{resolve_roles, ScoredHit};
 use crate::types::EntityId;
 use kin_model::{EntityRole, RetrievalKey};
+use kin_vector::IndexDescriptor;
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
@@ -28,6 +29,19 @@ impl VectorIndex {
         let inner = kin_vector::VectorIndex::new(dimensions)
             .map_err(|e| KinDbError::IndexError(e.to_string()))?;
         Ok(Self { inner })
+    }
+
+    /// The index's self-description (embedding model identity + graph provenance)
+    /// stamped into the persisted file.
+    pub fn descriptor(&self) -> IndexDescriptor {
+        self.inner.descriptor()
+    }
+
+    /// Stamp the index's self-description before saving, so a later load can
+    /// prove the persisted vectors were produced by the expected model/graph and
+    /// refuse silently-wrong neighbors.
+    pub fn set_descriptor(&self, descriptor: IndexDescriptor) {
+        self.inner.set_descriptor(descriptor);
     }
 
     /// The dimensionality of vectors in this index.
@@ -248,6 +262,38 @@ impl VectorIndex {
             .map_err(|e| KinDbError::IndexError(e.to_string()))?;
         Ok(Self { inner })
     }
+
+    /// Load the index at `path` and verify its self-description against
+    /// `expected`, returning [`IndexLoadOutcome`].
+    ///
+    /// This NEVER returns an error for an incompatible or unreadable index:
+    /// a model/graph mismatch (kin-vector's typed `ModelMismatch`) or a corrupt
+    /// file both resolve to [`IndexLoadOutcome::Incompatible`] so the caller can
+    /// archive-and-rebuild rather than crash-loop or serve silently-wrong
+    /// neighbors. `expected` pins only the fields it sets to `Some`; an index
+    /// whose descriptor cannot satisfy a pinned field is treated as incompatible
+    /// (this includes a legacy/unstamped index when the caller pins identity).
+    pub fn load_compatible(path: &Path, expected: &IndexDescriptor) -> IndexLoadOutcome {
+        let inner = match kin_vector::VectorIndex::<RetrievalKey>::load_from_disk(path) {
+            Ok(inner) => inner,
+            Err(e) => return IndexLoadOutcome::Incompatible(format!("unreadable vector index: {e}")),
+        };
+        match inner.descriptor().verify_compatible(expected) {
+            Ok(()) => IndexLoadOutcome::Loaded(Self { inner }),
+            Err(e) => IndexLoadOutcome::Incompatible(e.to_string()),
+        }
+    }
+}
+
+/// Outcome of [`VectorIndex::load_compatible`].
+pub enum IndexLoadOutcome {
+    /// The on-disk index loaded and proved compatible with the expected
+    /// model/graph self-description.
+    Loaded(VectorIndex),
+    /// The index exists but is incompatible (model/graph mismatch) or unreadable
+    /// and must be archived + rebuilt rather than served. Carries a
+    /// human-readable reason for the LOUD recovery notice.
+    Incompatible(String),
 }
 
 impl std::fmt::Debug for VectorIndex {
@@ -493,5 +539,74 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].role, None);
+    }
+
+    fn descriptor(model: &str, root: &str) -> IndexDescriptor {
+        IndexDescriptor {
+            model_id: Some(model.to_string()),
+            graph_root: Some(root.to_string()),
+        }
+    }
+
+    #[test]
+    fn load_compatible_accepts_match_and_rejects_model_or_graph_swap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.hnsw");
+
+        let idx = VectorIndex::new(4).unwrap();
+        idx.upsert(EntityId::new(), &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        idx.set_descriptor(descriptor("model-A@1", "root-1"));
+        idx.save(&path).unwrap();
+
+        // Exact match loads.
+        assert!(matches!(
+            VectorIndex::load_compatible(&path, &descriptor("model-A@1", "root-1")),
+            IndexLoadOutcome::Loaded(_)
+        ));
+        // Same dimension, DIFFERENT model → incompatible (would be silently-wrong).
+        assert!(matches!(
+            VectorIndex::load_compatible(&path, &descriptor("model-B@1", "root-1")),
+            IndexLoadOutcome::Incompatible(_)
+        ));
+        // Graph root changed → incompatible.
+        assert!(matches!(
+            VectorIndex::load_compatible(&path, &descriptor("model-A@1", "root-2")),
+            IndexLoadOutcome::Incompatible(_)
+        ));
+        // Pinning nothing (sidecar-vouched path) loads regardless.
+        assert!(matches!(
+            VectorIndex::load_compatible(&path, &IndexDescriptor::default()),
+            IndexLoadOutcome::Loaded(_)
+        ));
+    }
+
+    #[test]
+    fn load_compatible_rejects_unstamped_or_corrupt_index() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("vectors.hnsw");
+
+        let idx = VectorIndex::new(4).unwrap();
+        idx.upsert(EntityId::new(), &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        // No set_descriptor → legacy/unstamped index.
+        idx.save(&path).unwrap();
+
+        // A pinned identity cannot be proven by an unstamped index → incompatible.
+        assert!(matches!(
+            VectorIndex::load_compatible(
+                &path,
+                &IndexDescriptor {
+                    model_id: Some("model-A@1".into()),
+                    graph_root: None,
+                },
+            ),
+            IndexLoadOutcome::Incompatible(_)
+        ));
+
+        // An unreadable/corrupt index is Incompatible (archive + rebuild), never a crash.
+        std::fs::write(&path, b"corrupt").unwrap();
+        assert!(matches!(
+            VectorIndex::load_compatible(&path, &IndexDescriptor::default()),
+            IndexLoadOutcome::Incompatible(_)
+        ));
     }
 }
