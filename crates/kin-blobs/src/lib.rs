@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
 
 /// Content-addressed 256-bit hash.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Hash256(pub [u8; 32]);
 
@@ -733,7 +735,10 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| name.starts_with(".tmp-"))
             .collect();
-        assert!(leftovers.is_empty(), "stray temp files remain: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "stray temp files remain: {leftovers:?}"
+        );
     }
 
     /// A torn write (file truncated mid-content) must be caught on read as a
@@ -790,12 +795,18 @@ mod tests {
         let _ = store.read(&hash).unwrap_err();
 
         // The content-addressed path is now free (no longer dedup-trusted)...
-        assert!(!path.exists(), "corrupt object should be moved out of its path");
+        assert!(
+            !path.exists(),
+            "corrupt object should be moved out of its path"
+        );
         // ...and the bad bytes are preserved as evidence under `.corrupt/`.
         let entries = corrupt_dir_entries(&store);
         assert_eq!(entries.len(), 1, "exactly one quarantined object expected");
         let preserved = std::fs::read(&entries[0]).unwrap();
-        assert_eq!(preserved, corrupt_bytes, "quarantine must preserve evidence");
+        assert_eq!(
+            preserved, corrupt_bytes,
+            "quarantine must preserve evidence"
+        );
     }
 
     /// After a corrupt object is quarantined on read, re-writing the correct
