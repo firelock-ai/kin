@@ -5,8 +5,6 @@
 //! This tests whether the background reader + oneshot + timeout work correctly
 //! when called in the same sequence as the daemon worker.
 
-use std::path::Path;
-
 use kin_lsp::adapters::rust_analyzer::RustAnalyzerAdapter;
 use kin_lsp::adapters::LspAdapter;
 use kin_lsp::lifecycle::LspServer;

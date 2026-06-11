@@ -180,8 +180,6 @@ async fn read_one_message(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn json_rpc_request_format() {
         let request = serde_json::json!({

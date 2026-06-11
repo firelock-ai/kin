@@ -203,4 +203,82 @@ mod tests {
         assert!(positions.contains(&18));
         assert!(!positions.contains(&0));
     }
+
+    /// Build a large, adversarial source string: several thousand lines,
+    /// periodic very-long lines, unicode identifiers/strings/comments, and
+    /// comment/string lines to exercise every branch of the scanner.
+    fn synth_large_file(lines: usize) -> String {
+        let mut out = String::with_capacity(lines * 80);
+        for i in 0..lines {
+            match i % 10 {
+                0 => {
+                    // Long line (~500 cols) packed with identifiers + a string.
+                    out.push_str("    let ");
+                    for j in 0..40 {
+                        out.push_str(&format!("ident_{i}_{j} = compute_naïve_café(α_{j}, β_{j}); "));
+                    }
+                    out.push_str("\"a string with spaces and symbols !@#\"\n");
+                }
+                3 => out.push_str("    // a comment line with λμβδα and words galore\n"),
+                6 => out.push_str(
+                    "    let msg = \"unicode 日本語 строка with many words inside\";\n",
+                ),
+                _ => out.push_str(&format!(
+                    "    let value_{i} = SomeType::method_call(arg_one, arg_two);\n"
+                )),
+            }
+        }
+        out
+    }
+
+    /// Honest local-CPU measurement of the per-identifier scanner that the
+    /// enrichment loops (`enrich_file_definitions`, `enrich_entity_uses_type`)
+    /// run before each LSP request. The LSP round-trip itself is not measured
+    /// here — that is the dominant cost and cannot be batched output-identically
+    /// (definition resolution is position-dependent). This isolates the only
+    /// work a "single-pass / batch" refactor could remove.
+    #[test]
+    fn measure_identifier_scan_throughput_on_large_unicode_file() {
+        let lines = 5_000usize;
+        let content = synth_large_file(lines);
+        let bytes = content.len();
+
+        // Warm up so we measure steady-state, not first-touch allocation.
+        let mut warm = 0usize;
+        for line in content.lines() {
+            warm += identifier_positions_in_line(line).len();
+        }
+        assert!(warm > 0, "scanner must find identifiers");
+
+        let reps = 50u32;
+        let start = std::time::Instant::now();
+        let mut total_idents = 0usize;
+        for _ in 0..reps {
+            for line in content.lines() {
+                total_idents += identifier_positions_in_line(line).len();
+            }
+        }
+        let elapsed = start.elapsed();
+
+        let idents_per_rep = total_idents / reps as usize;
+        let per_rep = elapsed / reps;
+        let ns_per_ident = elapsed.as_nanos() as f64 / total_idents as f64;
+        let mb_per_s = (bytes as f64 * reps as f64) / elapsed.as_secs_f64() / 1.0e6;
+
+        println!(
+            "[scan-bench] {lines} lines, {bytes} bytes, {idents_per_rep} idents/file | \
+             per-file {:?} | {ns_per_ident:.1} ns/ident | {mb_per_s:.0} MB/s",
+            per_rep
+        );
+
+        // Sanity ceiling: scanning one whole large file must stay far under a
+        // single LSP round-trip (which carries a 2s per-request timeout and
+        // tens-of-ms typical latency). If a refactor ever made this O(n^2),
+        // this guard would catch it. Generous bound to avoid CI flakiness.
+        assert!(
+            per_rep < std::time::Duration::from_millis(50),
+            "per-file identifier scan should be sub-50ms (was {per_rep:?}); \
+             the loop is LSP-RPC-bound, not scan-bound"
+        );
+    }
 }
