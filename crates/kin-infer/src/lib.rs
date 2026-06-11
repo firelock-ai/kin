@@ -16,7 +16,7 @@
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
 pub mod gpu;
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal_backend;
 pub mod watchdog;
 
