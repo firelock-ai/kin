@@ -283,6 +283,34 @@ impl VectorIndex {
             Err(e) => IndexLoadOutcome::Incompatible(e.to_string()),
         }
     }
+
+    /// Like [`VectorIndex::load_compatible`], but GRANDFATHERS a legacy index
+    /// that does not self-describe: only a field the stored index actually
+    /// stamped is enforced. An unstamped index (the pre-stamping format) loads
+    /// regardless — it cannot prove a mismatch and must remain usable — while a
+    /// stamped index that positively declares a different model/graph is
+    /// rejected as [`IndexLoadOutcome::Incompatible`] (kin-vector's typed
+    /// `ModelMismatch`). A corrupt/unreadable index is also `Incompatible`.
+    pub fn load_compatible_grandfathered(
+        path: &Path,
+        expected: &IndexDescriptor,
+    ) -> IndexLoadOutcome {
+        let inner = match kin_vector::VectorIndex::<RetrievalKey>::load_from_disk(path) {
+            Ok(inner) => inner,
+            Err(e) => return IndexLoadOutcome::Incompatible(format!("unreadable vector index: {e}")),
+        };
+        let stored = inner.descriptor();
+        // Enforce only the fields the stored index actually stamped (grandfather
+        // unstamped fields to None = "don't care").
+        let effective = IndexDescriptor {
+            model_id: stored.model_id.as_ref().and(expected.model_id.clone()),
+            graph_root: stored.graph_root.as_ref().and(expected.graph_root.clone()),
+        };
+        match stored.verify_compatible(&effective) {
+            Ok(()) => IndexLoadOutcome::Loaded(Self { inner }),
+            Err(e) => IndexLoadOutcome::Incompatible(e.to_string()),
+        }
+    }
 }
 
 /// Outcome of [`VectorIndex::load_compatible`].

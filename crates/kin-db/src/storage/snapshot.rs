@@ -286,6 +286,50 @@ fn vector_metadata_matches_graph(
     true
 }
 
+/// Append a deterministic `.archived` suffix to a path. A single archive slot
+/// per file (re-archiving overwrites it) keeps recovery deterministic and caps
+/// on-disk clutter.
+#[cfg(feature = "vector")]
+fn archived_sidecar_path(p: &Path) -> PathBuf {
+    let mut name = p.as_os_str().to_os_string();
+    name.push(".archived");
+    PathBuf::from(name)
+}
+
+/// Move an incompatible vector index (and its metadata sidecar, if present)
+/// aside to a deterministic `.archived` path so it is neither served nor
+/// re-detected into a crash loop. Best-effort: a rename failure is logged, not
+/// propagated — recovery (rebuild from the embedding queue) proceeds regardless,
+/// so an un-archivable file never crashes the load.
+#[cfg(feature = "vector")]
+fn archive_incompatible_index(vector_path: &Path, metadata_path: &Path) {
+    if vector_path.exists() {
+        let archived = archived_sidecar_path(vector_path);
+        match std::fs::rename(vector_path, &archived) {
+            Ok(()) => tracing::warn!(
+                from = %vector_path.display(),
+                to = %archived.display(),
+                "archived incompatible vector index"
+            ),
+            Err(e) => tracing::error!(
+                path = %vector_path.display(),
+                error = %e,
+                "failed to archive incompatible vector index (rebuilding anyway)"
+            ),
+        }
+    }
+    if metadata_path.exists() {
+        let archived = archived_sidecar_path(metadata_path);
+        if let Err(e) = std::fs::rename(metadata_path, &archived) {
+            tracing::error!(
+                path = %metadata_path.display(),
+                error = %e,
+                "failed to archive vector index metadata (rebuilding anyway)"
+            );
+        }
+    }
+}
+
 impl SnapshotManager {
     /// Acquire an OS-level file lock adjacent to the snapshot path.
     /// Returns the lock file handle on success.
@@ -513,6 +557,10 @@ impl SnapshotManager {
             .unwrap_or(true);
 
         if !should_load {
+            // Sidecar/graph-root staleness is transient (the graph may reconcile
+            // back, or a matching reopen may reuse these vectors). PRESERVE the
+            // sidecar on disk — never move/delete graph-owned truth here (the
+            // prepared-state kvec-drop regression) — just skip it and rebuild.
             tracing::warn!(
                 path = %vector_path.display(),
                 metadata = %metadata_path.display(),
@@ -525,7 +573,36 @@ impl SnapshotManager {
             return Ok(false);
         }
 
-        let count = graph.load_vector_index(&vector_path)?;
+        // Defense-in-depth against silently-wrong neighbors: verify the index's
+        // OWN model self-description. This catches a same-dimension MODEL swap the
+        // sidecar can miss (e.g. an absent sidecar). It enforces model identity
+        // ONLY and GRANDFATHERS an unstamped legacy index (it cannot prove a
+        // mismatch, and pre-stamp repos must still load). Graph-root staleness is
+        // intentionally left to the sidecar above (preserve semantics), so this
+        // never archives merely-stale vectors — only a positively-declared model
+        // mismatch, which is permanent.
+        let (_, runtime_model_id, _, _, _) = current_embedding_runtime_fields();
+        let expected = crate::vector::IndexDescriptor {
+            model_id: runtime_model_id,
+            graph_root: None,
+        };
+
+        let count = match graph.load_vector_index_compatible(&vector_path, &expected) {
+            crate::vector::VectorIndexLoad::Loaded(count) => count,
+            crate::vector::VectorIndexLoad::Incompatible(reason) => {
+                tracing::warn!(
+                    path = %vector_path.display(),
+                    reason = %reason,
+                    "LOUD WARNING: archiving incompatible vector index (index declares a different embedding model) and rebuilding"
+                );
+                archive_incompatible_index(&vector_path, &metadata_path);
+                if write_missing_metadata {
+                    graph.queue_missing_for_embedding();
+                    graph.queue_missing_artifacts_for_embedding();
+                }
+                return Ok(false);
+            }
+        };
 
         // Generation eviction: the root-hash gate accepts a sidecar whose entity
         // content matches even when its revision keys were minted under a prior
@@ -2118,6 +2195,75 @@ mod tests {
         assert_eq!(reloaded.graph().embedding_status().indexed, 0);
         assert_eq!(reloaded.graph().pending_embeddings(), 1);
         assert_eq!(reloaded.graph().pending_artifact_embeddings(), 1);
+    }
+
+    /// "Model swap on a live repo": an index that positively declares a DIFFERENT
+    /// embedding model (a same-dimension swap the sidecar can miss) is ARCHIVED
+    /// aside on reopen — not served as silently-wrong neighbors, not deleted —
+    /// and the entities are requeued for a clean rebuild. No crash-loop.
+    #[test]
+    fn model_swapped_vector_index_is_archived_on_reopen() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let entity = test_entity("archived_vector");
+        graph.upsert_entity(&entity).unwrap();
+        mgr.save().unwrap();
+
+        // Persist an index whose OWN descriptor declares a different model than
+        // the runtime, with NO sidecar — the index self-description is the only
+        // provenance signal, and it proves the vectors are from another model.
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        vectors.set_descriptor(crate::vector::IndexDescriptor {
+            model_id: Some("definitely-not-the-runtime-model@9".into()),
+            graph_root: None,
+        });
+        vectors.save(&vector_path).unwrap();
+
+        let reloaded = SnapshotManager::open(&snapshot_path).unwrap();
+        // Recovery requeues the entity for a clean re-embed (no crash, no serve).
+        assert_eq!(reloaded.graph().pending_embeddings(), 1);
+        // The incompatible index was archived aside, not served and not deleted.
+        assert!(
+            !vector_path.exists(),
+            "model-swapped index must be moved aside on reopen"
+        );
+        assert!(
+            archived_sidecar_path(&vector_path).exists(),
+            "an archived copy of the incompatible index must exist"
+        );
+    }
+
+    /// Conversely, an UNSTAMPED legacy index (pre-self-description format) with no
+    /// sidecar is GRANDFATHERED — it cannot prove a mismatch, so it loads rather
+    /// than being archived. (Guards against over-aggressive recovery wiping
+    /// pre-stamp repos' vectors on first upgrade.)
+    #[test]
+    fn unstamped_legacy_index_is_grandfathered_on_reopen() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let entity = test_entity("legacy_vector");
+        graph.upsert_entity(&entity).unwrap();
+        mgr.save().unwrap();
+
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        // No set_descriptor → unstamped legacy index. No sidecar written.
+        vectors.save(&vector_path).unwrap();
+
+        let reloaded = SnapshotManager::open(&snapshot_path).unwrap();
+        // Loaded, not archived: the original index file remains in place.
+        assert!(vector_path.exists(), "legacy unstamped index must be preserved");
+        assert!(!archived_sidecar_path(&vector_path).exists());
+        assert_eq!(reloaded.graph().embedding_status().indexed, 1);
     }
 
     /// A save from a graph that never loaded the vector index (e.g. it was

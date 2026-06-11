@@ -2470,6 +2470,32 @@ impl InMemoryGraph {
         Ok(count)
     }
 
+    /// Load a persisted index, rejecting it ONLY if it positively declares a
+    /// model/graph identity incompatible with `expected` (a legacy unstamped
+    /// index is grandfathered and still loads).
+    ///
+    /// Unlike [`InMemoryGraph::load_vector_index`], an incompatible or unreadable
+    /// index is NOT installed and does NOT error — it returns
+    /// [`VectorIndexLoad::Incompatible`] so the caller can archive + rebuild
+    /// instead of crash-looping or serving silently-wrong neighbors. The in-memory
+    /// index is left untouched on incompatibility.
+    #[cfg(feature = "vector")]
+    pub fn load_vector_index_compatible(
+        &self,
+        path: &std::path::Path,
+        expected: &crate::vector::IndexDescriptor,
+    ) -> crate::vector::VectorIndexLoad {
+        use crate::vector::{IndexLoadOutcome, VectorIndexLoad};
+        match VectorIndex::load_compatible_grandfathered(path, expected) {
+            IndexLoadOutcome::Loaded(index) => {
+                let count = index.len();
+                *self.vector_index.lock() = Some(Arc::new(index));
+                VectorIndexLoad::Loaded(count)
+            }
+            IndexLoadOutcome::Incompatible(reason) => VectorIndexLoad::Incompatible(reason),
+        }
+    }
+
     #[cfg(feature = "vector")]
     pub fn save_vector_index(&self, path: &std::path::Path) -> Result<(), KinDbError> {
         let _span = tracing::info_span!(
@@ -10814,5 +10840,50 @@ mod tests {
             ),
             IndexLoadOutcome::Incompatible(_)
         ));
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn load_vector_index_compatible_rejects_swap_without_installing() {
+        use crate::vector::{IndexDescriptor, VectorIndexLoad};
+
+        // Persist a stamped index (model-A).
+        let writer = InMemoryGraph::new();
+        let vi = crate::VectorIndex::new(2).unwrap();
+        vi.upsert(EntityId::new(), &[1.0, 0.0]).unwrap();
+        *writer.vector_index.lock() = Some(std::sync::Arc::new(vi));
+        writer.stamp_vector_index_descriptor(IndexDescriptor {
+            model_id: Some("model-A@1".into()),
+            graph_root: Some("root-1".into()),
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("g.kvec");
+        writer.save_vector_index(&path).unwrap();
+
+        // A model-B expectation is rejected and NOT installed (no silent garbage).
+        let graph = InMemoryGraph::new();
+        let out = graph.load_vector_index_compatible(
+            &path,
+            &IndexDescriptor {
+                model_id: Some("model-B@1".into()),
+                graph_root: Some("root-1".into()),
+            },
+        );
+        assert!(matches!(out, VectorIndexLoad::Incompatible(_)));
+        assert!(
+            graph.vector_index.lock().is_none(),
+            "an incompatible index must never be installed"
+        );
+
+        // The matching expectation installs it.
+        let out2 = graph.load_vector_index_compatible(
+            &path,
+            &IndexDescriptor {
+                model_id: Some("model-A@1".into()),
+                graph_root: Some("root-1".into()),
+            },
+        );
+        assert!(matches!(out2, VectorIndexLoad::Loaded(1)));
+        assert!(graph.vector_index.lock().is_some());
     }
 }
