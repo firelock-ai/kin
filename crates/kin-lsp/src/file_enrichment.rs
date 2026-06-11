@@ -275,14 +275,15 @@ mod tests {
                     // Long line (~500 cols) packed with identifiers + a string.
                     out.push_str("    let ");
                     for j in 0..40 {
-                        out.push_str(&format!("ident_{i}_{j} = compute_naïve_café(α_{j}, β_{j}); "));
+                        out.push_str(&format!(
+                            "ident_{i}_{j} = compute_naïve_café(α_{j}, β_{j}); "
+                        ));
                     }
                     out.push_str("\"a string with spaces and symbols !@#\"\n");
                 }
                 3 => out.push_str("    // a comment line with λμβδα and words galore\n"),
-                6 => out.push_str(
-                    "    let msg = \"unicode 日本語 строка with many words inside\";\n",
-                ),
+                6 => out
+                    .push_str("    let msg = \"unicode 日本語 строка with many words inside\";\n"),
                 _ => out.push_str(&format!(
                     "    let value_{i} = SomeType::method_call(arg_one, arg_two);\n"
                 )),
