@@ -30,6 +30,38 @@
 //! work: no contract-content data exists at the apply boundary, and file writes
 //! do not yet emit `Contract` touched-scopes. See [`write_veto`] for the
 //! evaluator.
+//!
+//! ## Write-path inventory
+//!
+//! Every state-mutating route and its current *pre-write* gate, as of this
+//! change. The two VFS apply paths (`vfs_write_notify`, `vfs_file_changed`) are
+//! flag-gated by the write-veto and `graph_commit` is always-on; the rest
+//! either rely on the reconciler's own soft-block, gate upstream, or are out of
+//! this crate's veto scope.
+//!
+//! - `POST /vfs/write-notify` (`vfs_write_notify`): **write-veto** under
+//!   `KIN_WRITE_VETO=enforce` (pre-write 409); default = reconciler soft-block
+//!   (`200 {reindexed:false}`).
+//! - `POST /vfs/file-changed` (`vfs_file_changed`): **write-veto** under
+//!   `KIN_WRITE_VETO=enforce` (pre-write 409); default = reconciler soft-block
+//!   (`200 {status:"error"}`). The general-purpose sibling of write-notify;
+//!   gated through the same shared `write_veto_precheck` /
+//!   `write_veto_collision_response` helpers so the two paths cannot drift and
+//!   enforce cannot be bypassed by choosing one endpoint over the other.
+//! - `POST /graph/commit` (`graph_commit`): always-on lease **409** on a
+//!   foreign hard intent (the CLI semantic-commit path).
+//! - `POST /commands/commit` (`command_commit`): commits the already-reconciled
+//!   overlay; relies on the reconcile loop's upstream collision gating; no
+//!   separate pre-write veto.
+//! - `POST /reconcile` (`reconcile`): delegates to the kin-cli reconcile path; a
+//!   scoped reconcile mutates a session-private graph isolated from HEAD.
+//! - `POST /graph/mutations` (`graph_mutations`): work-item / annotation / audit
+//!   metadata, not entity truth; ungated.
+//! - `PUT /graph/branches/{name}/head`, `DELETE /graph/branches/{name}`: branch
+//!   ref operations; ungated.
+//! - `POST /mcp/tools/call` (`mcp_tools_call`): MCP write transactions — out of
+//!   this crate's veto scope (kin-mcp lane), with its own stage/commit
+//!   validation.
 
 pub mod api;
 pub mod daemon;
