@@ -5367,6 +5367,33 @@ impl ChangeStore for InMemoryGraph {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Memory re-anchor — rename-durable annotation recall (Track B)
+// ---------------------------------------------------------------------------
+
+impl InMemoryGraph {
+    /// Capture a rename-durable [`SemanticAnchor`] for an annotation from the
+    /// first live entity scope it carries.
+    ///
+    /// An annotation deposited on `WorkScope::Entity(id)` is anchored to that id,
+    /// but the id derives from (file, name, kind, line) — so a rename mints a new
+    /// id and orphans the deposit. The entity's `SemanticFingerprint`
+    /// (`ast_hash` + `signature_hash`) is rename-invariant (a pure rename changes
+    /// only `name`), so recording it at deposit time lets recall re-anchor the
+    /// memory by fingerprint after a rename. Returns `None` when no entity scope
+    /// resolves to a live entity.
+    fn capture_entity_anchor(&self, scopes: &[WorkScope]) -> Option<SemanticAnchor> {
+        let ent = self.entities.read();
+        scopes.iter().find_map(|scope| match scope {
+            WorkScope::Entity(id) => ent.entities.get(id).map(|e| SemanticAnchor {
+                ast_hash: e.fingerprint.ast_hash,
+                signature_hash: e.fingerprint.signature_hash,
+            }),
+            _ => None,
+        })
+    }
+}
+
 impl WorkStore for InMemoryGraph {
     type Error = KinDbError;
 
@@ -5444,10 +5471,15 @@ impl WorkStore for InMemoryGraph {
     // -----------------------------------------------------------------------
 
     fn create_annotation(&self, ann: &Annotation) -> Result<(), KinDbError> {
-        self.work
-            .write()
-            .annotations
-            .insert(ann.annotation_id, ann.clone());
+        let mut ann = ann.clone();
+        // Capture the rename-durable fingerprint anchor at deposit time when the
+        // caller did not supply one (Track B memory re-anchor). Acquires the
+        // entities read lock first, then the work write lock — never both at
+        // once — respecting the entities → work lock order.
+        if ann.anchored_fingerprint.is_none() {
+            ann.anchored_fingerprint = self.capture_entity_anchor(&ann.scopes);
+        }
+        self.work.write().annotations.insert(ann.annotation_id, ann);
         Ok(())
     }
 
@@ -10203,5 +10235,75 @@ mod tests {
             "invalidate path must UPGRADE backfill→changed-this-sync (max policy), \
              flipping the id-tiebreak order"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Memory re-anchor — rename-durable annotation recall (Track B)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn deposit_captures_entity_fingerprint_anchor() {
+        let graph = InMemoryGraph::new();
+        let mut e = test_entity("foo", "src/lib.rs");
+        e.fingerprint.ast_hash = Hash256::from_bytes([7; 32]);
+        e.fingerprint.signature_hash = Hash256::from_bytes([9; 32]);
+        graph.upsert_entity(&e).unwrap();
+
+        // Deposit with no anchor — the store must capture the entity fingerprint.
+        let ann = Annotation {
+            annotation_id: AnnotationId::new(),
+            kind: AnnotationKind::Instruction,
+            body: "remember the invariant".into(),
+            scopes: vec![WorkScope::Entity(e.id)],
+            anchored_fingerprint: None,
+            authored_by: IdentityRef::human("alice"),
+            created_at: Timestamp::now(),
+            staleness: StalenessState::Fresh,
+        };
+        graph.create_annotation(&ann).unwrap();
+        let anchor = graph
+            .get_annotation(&ann.annotation_id)
+            .unwrap()
+            .unwrap()
+            .anchored_fingerprint
+            .expect("deposit must capture the entity fingerprint anchor");
+        assert_eq!(anchor.ast_hash, Hash256::from_bytes([7; 32]));
+        assert_eq!(anchor.signature_hash, Hash256::from_bytes([9; 32]));
+
+        // A caller-supplied anchor must be preserved, not overwritten.
+        let custom = SemanticAnchor {
+            ast_hash: Hash256::from_bytes([1; 32]),
+            signature_hash: Hash256::from_bytes([2; 32]),
+        };
+        let ann2 = Annotation {
+            annotation_id: AnnotationId::new(),
+            anchored_fingerprint: Some(custom.clone()),
+            ..ann.clone()
+        };
+        graph.create_annotation(&ann2).unwrap();
+        assert_eq!(
+            graph
+                .get_annotation(&ann2.annotation_id)
+                .unwrap()
+                .unwrap()
+                .anchored_fingerprint,
+            Some(custom),
+            "caller-supplied anchor must be preserved"
+        );
+
+        // No entity scope → no anchor captured.
+        let ann3 = Annotation {
+            annotation_id: AnnotationId::new(),
+            scopes: vec![WorkScope::Artifact(FilePathId::new("src/lib.rs"))],
+            anchored_fingerprint: None,
+            ..ann.clone()
+        };
+        graph.create_annotation(&ann3).unwrap();
+        assert!(graph
+            .get_annotation(&ann3.annotation_id)
+            .unwrap()
+            .unwrap()
+            .anchored_fingerprint
+            .is_none());
     }
 }
