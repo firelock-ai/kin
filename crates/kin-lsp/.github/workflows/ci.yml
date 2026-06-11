@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  check:
+    name: Check & Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Toolchain channel is pinned by rust-toolchain.toml (1.96.0); the action
+      # honours that file. Bump both together, never via @stable drift.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      # Enforcing gate: warnings fail the build. Keep it that way — silence a
+      # lint with a scoped, justified in-source #[allow], not a blanket -A here.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --all-targets
+
+      - name: Test
+        run: cargo test
+
+  notify-downstream:
+    name: Notify Downstream Repos
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [check]
+    runs-on: ubuntu-latest
+    env:
+      DISPATCH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+    steps:
+      - name: Trigger kin CI
+        # Skip cleanly when DISPATCH_TOKEN is not provisioned so the job stays
+        # green instead of failing on a missing secret (secrets can't be read
+        # in a job-level `if:`, so the guard lives on the step). kin consumes
+        # kin-lsp directly, so it is the downstream to rebuild on a change here.
+        if: env.DISPATCH_TOKEN != ''
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          # Requires a PAT with repo scope stored as the DISPATCH_TOKEN secret.
+          # Create at: GitHub > Settings > Developer settings > Personal access tokens
+          # Then add to: kin-lsp repo > Settings > Secrets > Actions > DISPATCH_TOKEN
+          token: ${{ secrets.DISPATCH_TOKEN }}
+          repository: firelock-ai/kin
+          event-type: dependency-updated
+          client-payload: '{"source": "kin-lsp", "sha": "${{ github.sha }}"}'
