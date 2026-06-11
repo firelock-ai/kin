@@ -11,7 +11,7 @@
 //! `uuid::Uuid`.
 
 use std::collections::BinaryHeap;
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::{cmp::Reverse, fs, fs::File, fs::OpenOptions};
 
@@ -105,6 +105,72 @@ const EF_SEARCH: usize = 50;
 /// Normalization factor for level generation: 1 / ln(M).
 fn ml() -> f64 {
     1.0 / (M as f64).ln()
+}
+
+// ---------------------------------------------------------------------------
+// Stable, process-independent key hashing
+// ---------------------------------------------------------------------------
+
+/// FNV-1a 64-bit hasher with a fixed offset basis.
+///
+/// Unlike the default `RandomState`, this is seeded identically in every
+/// process, so feeding a key's `Hash` encoding through it yields the same u64
+/// on every daemon boot. That stability is what lets HNSW level assignment and
+/// tie-breaks be derived from the key itself rather than from insert-order
+/// history (which varies run to run under the reconcile/embed race).
+struct Fnv64(u64);
+
+impl Default for Fnv64 {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Hasher for Fnv64 {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self.0 = h;
+    }
+}
+
+/// Stable 64-bit hash of a key, derived only from the key's contents.
+///
+/// The FNV-1a digest is run through a splitmix64 finalizer so even short or
+/// sequential keys (e.g. small `u64` ids) avalanche to a ~uniform u64. The
+/// result is process-independent and is used both to (a) assign a node's HNSW
+/// level and (b) break distance ties — making slot/insert history unobservable
+/// in search results.
+fn key_hash<Id: Hash>(id: &Id) -> u64 {
+    let mut h = Fnv64::default();
+    id.hash(&mut h);
+    let mut z = h.finish().wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// Assign a node's HNSW level from a STABLE hash of its key rather than a
+/// running RNG counter.
+///
+/// The key hash is mapped to a uniform `u` in `(0, 1]` and run through the SAME
+/// geometric transform the previous RNG path used — `floor(-ln(u) * mL)` with
+/// `mL = 1 / ln(M)`. Because a well-distributed hash makes `u` uniform on
+/// `(0, 1]` (exactly the distribution the old xorshift output had), the per-level
+/// probabilities are unchanged: `P(level >= k) = exp(-k / mL) = M^-k`, i.e.
+/// `1/16` at level >= 1, `1/256` at level >= 2, and so on. Only the *source* of
+/// `u` changes — from insert-order-dependent to key-stable — so the level skew
+/// that HNSW relies on for its log-search performance is preserved.
+fn hnsw_level_for_key<Id: Hash>(id: &Id) -> usize {
+    let u = ((key_hash(id) as f64) / (u64::MAX as f64)).max(1e-15);
+    (-u.ln() * ml()).floor() as usize
 }
 
 // ---------------------------------------------------------------------------
@@ -257,24 +323,6 @@ impl<Id: VectorId> HnswGraph<Id> {
         }
     }
 
-    /// Cheap xorshift64 for level generation.
-    fn next_rand(&mut self) -> f64 {
-        let mut s = self.rng_state;
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        self.rng_state = s;
-        // Map to (0, 1)
-        (s as f64) / (u64::MAX as f64)
-    }
-
-    /// Assign a random level for a new node following the HNSW paper's
-    /// geometric distribution: floor(-ln(uniform) * mL).
-    fn random_level(&mut self) -> usize {
-        let r = self.next_rand().max(1e-15);
-        (-r.ln() * ml()).floor() as usize
-    }
-
     fn active_count(&self) -> usize {
         self.id_to_idx.len()
     }
@@ -311,19 +359,25 @@ impl<Id: VectorId> HnswGraph<Id> {
 
         let entry_dist = cosine_distance(query, &self.nodes[entry].vector);
 
-        // (distance, idx) — BinaryHeap is max-heap by default
-        let mut candidates: BinaryHeap<Reverse<(OrderedF32, usize)>> = BinaryHeap::new();
-        let mut result: BinaryHeap<(OrderedF32, usize)> = BinaryHeap::new();
+        // Heap entries are ordered by (distance, key_hash, idx). The key_hash —
+        // a process-independent hash of the node's key — breaks distance ties so
+        // that which of two equidistant nodes survives the `ef` cap (and the
+        // final ordering) is a pure function of the node keys, never of the
+        // insert/slot history that produced their internal indices. `idx` is a
+        // final fallback only on an (astronomically unlikely) key_hash collision.
+        let entry_kh = key_hash(&self.idx_to_id[entry]);
+        let mut candidates: BinaryHeap<Reverse<(OrderedF32, u64, usize)>> = BinaryHeap::new();
+        let mut result: BinaryHeap<(OrderedF32, u64, usize)> = BinaryHeap::new();
 
-        candidates.push(Reverse((OrderedF32(entry_dist), entry)));
+        candidates.push(Reverse((OrderedF32(entry_dist), entry_kh, entry)));
         if predicate.map_or(true, |p| p(&self.idx_to_id[entry])) {
-            result.push((OrderedF32(entry_dist), entry));
+            result.push((OrderedF32(entry_dist), entry_kh, entry));
         }
 
-        while let Some(Reverse((OrderedF32(c_dist), c_idx))) = candidates.pop() {
+        while let Some(Reverse((OrderedF32(c_dist), _, c_idx))) = candidates.pop() {
             let worst_dist = result
                 .peek()
-                .map(|(OrderedF32(d), _)| *d)
+                .map(|(OrderedF32(d), _, _)| *d)
                 .unwrap_or(f32::MAX);
             if c_dist > worst_dist {
                 break;
@@ -350,13 +404,14 @@ impl<Id: VectorId> HnswGraph<Id> {
                 let nb_dist = cosine_distance(query, &self.nodes[nb].vector);
                 let worst_dist = result
                     .peek()
-                    .map(|(OrderedF32(d), _)| *d)
+                    .map(|(OrderedF32(d), _, _)| *d)
                     .unwrap_or(f32::MAX);
 
                 if nb_dist < worst_dist || result.len() < ef {
-                    candidates.push(Reverse((OrderedF32(nb_dist), nb)));
+                    let nb_kh = key_hash(&self.idx_to_id[nb]);
+                    candidates.push(Reverse((OrderedF32(nb_dist), nb_kh, nb)));
                     if predicate.map_or(true, |p| p(&self.idx_to_id[nb])) {
-                        result.push((OrderedF32(nb_dist), nb));
+                        result.push((OrderedF32(nb_dist), nb_kh, nb));
                         if result.len() > ef {
                             result.pop();
                         }
@@ -368,7 +423,7 @@ impl<Id: VectorId> HnswGraph<Id> {
         result
             .into_sorted_vec()
             .into_iter()
-            .map(|(OrderedF32(d), idx)| (d, idx))
+            .map(|(OrderedF32(d), _, idx)| (d, idx))
             .collect()
     }
 
@@ -422,8 +477,16 @@ impl<Id: VectorId> HnswGraph<Id> {
         candidates.iter().take(m).map(|&(_, idx)| idx).collect()
     }
 
-    fn sort_scored_neighbors(scored: &mut [(f32, usize)]) {
-        scored.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    /// Sort `(distance, idx)` pairs ascending by distance, breaking ties by the
+    /// node's stable key hash rather than by internal index. NaN distances sort
+    /// last (via `total_cmp`). Key-based tie-breaks keep neighbor pruning
+    /// independent of slot-allocation history.
+    fn sort_scored_neighbors(&self, scored: &mut [(f32, usize)]) {
+        scored.sort_by(|a, b| {
+            a.0.total_cmp(&b.0).then_with(|| {
+                key_hash(&self.idx_to_id[a.1]).cmp(&key_hash(&self.idx_to_id[b.1]))
+            })
+        });
     }
 
     /// Insert a node into the graph.
@@ -437,7 +500,7 @@ impl<Id: VectorId> HnswGraph<Id> {
             )));
         }
 
-        let level = self.random_level();
+        let level = hnsw_level_for_key(&entity_id);
         let node = HnswNode {
             vector: vector.to_vec(),
             connections: vec![Vec::new(); level + 1],
@@ -503,7 +566,7 @@ impl<Id: VectorId> HnswGraph<Id> {
                         .iter()
                         .map(|&n| (cosine_distance(&nb_vec, &self.nodes[n].vector), n))
                         .collect();
-                    Self::sort_scored_neighbors(&mut scored);
+                    self.sort_scored_neighbors(&mut scored);
                     self.nodes[nb].connections[lc] =
                         scored.into_iter().take(nb_m_max).map(|(_, n)| n).collect();
                 }
@@ -558,30 +621,40 @@ impl<Id: VectorId> HnswGraph<Id> {
         // If we removed the entry point, pick a new one.
         //
         // Selection MUST be a pure function of graph content, never of
-        // `id_to_idx`'s iteration order: that map is re-seeded per process on
-        // every deserialize (hashbrown's randomized hasher), so a tie broken "by
-        // whoever was visited first" makes the entry point — the start of every
-        // search's greedy descent — vary across daemon boots even from a
-        // byte-identical persisted index. That jitters approximate-kNN results at
-        // the candidate-set boundary (a re-routed descent can surface a whole
-        // different neighbor). Choose the active node with the highest level,
-        // breaking ties by the smallest internal index, so the result is identical
-        // regardless of visitation order.
+        // `id_to_idx`'s iteration order OR of internal-index allocation history:
+        //
+        //  * That map is re-seeded per process on every deserialize (hashbrown's
+        //    randomized hasher), so a tie broken "by whoever was visited first"
+        //    makes the entry point vary across daemon boots even from a
+        //    byte-identical persisted index.
+        //  * Internal indices are assigned from the free-list, so under the
+        //    reconcile/embed re-embed race the SAME surviving node can hold a
+        //    different `idx` between runs; an `idx`-based tie-break therefore
+        //    leaks slot history into the entry point too.
+        //
+        // The entry point is the start of every search's greedy descent, so any
+        // jitter there re-routes descents and surfaces different neighbors at the
+        // candidate-set boundary. Choose the active node with the highest level,
+        // breaking ties by the smallest stable KEY HASH, so the result is
+        // identical regardless of visitation order AND of slot history.
         if self.entry_point == Some(idx) {
             self.entry_point = None;
             self.max_level = 0;
-            for (&_eid, &other_idx) in &self.id_to_idx {
+            let mut best_key_hash: Option<u64> = None;
+            for (eid, &other_idx) in &self.id_to_idx {
                 let other_level = self.nodes[other_idx].level;
-                let replace = match self.entry_point {
+                let other_kh = key_hash(eid);
+                let replace = match best_key_hash {
                     None => true,
-                    Some(cur) => {
+                    Some(cur_kh) => {
                         other_level > self.max_level
-                            || (other_level == self.max_level && other_idx < cur)
+                            || (other_level == self.max_level && other_kh < cur_kh)
                     }
                 };
                 if replace {
                     self.entry_point = Some(other_idx);
                     self.max_level = other_level;
+                    best_key_hash = Some(other_kh);
                 }
             }
         }
@@ -1271,15 +1344,17 @@ impl<Id: VectorId> std::fmt::Debug for VectorIndex<Id> {
 mod tests {
     use super::*;
 
-    fn seed_for_level_at_least(min_level: usize) -> u64 {
-        for seed in 0..10_000u64 {
-            let mut probe = HnswGraph::<DefaultId>::new(1);
-            probe.rng_state = seed;
-            if probe.random_level() >= min_level {
-                return seed;
+    /// Find a `DefaultId` whose key-hash-derived HNSW level is at least
+    /// `min_level`. Levels are now a pure function of the key, so tests that need
+    /// a node above layer 0 pick a qualifying key instead of seeding an RNG.
+    fn default_id_with_level_at_least(min_level: usize) -> DefaultId {
+        for n in 0..1_000_000u128 {
+            let id = DefaultId(uuid::Uuid::from_u128(n));
+            if hnsw_level_for_key(&id) >= min_level {
+                return id;
             }
         }
-        panic!("no seed found for level >= {min_level}");
+        panic!("no key found for level >= {min_level}");
     }
 
     #[test]
@@ -1396,12 +1471,17 @@ mod tests {
     /// hasher seed, so its iteration order over the post-removal candidates varies
     /// run to run. This is exactly the shape that made entry-point reselection
     /// nondeterministic across daemon boots.
+    ///
+    /// The keys are FIXED (not random) so the key-hash tie-break has a single
+    /// deterministic winner across instances; only the per-process map seed
+    /// varies between calls. The winner is whichever of idx 0 / idx 2 has the
+    /// smaller `key_hash`.
     fn graph_with_entrypoint_tie() -> (HnswGraph<DefaultId>, [DefaultId; 4]) {
         let ids = [
-            DefaultId::new(),
-            DefaultId::new(),
-            DefaultId::new(),
-            DefaultId::new(),
+            DefaultId(uuid::Uuid::from_u128(0xA1)),
+            DefaultId(uuid::Uuid::from_u128(0xB2)),
+            DefaultId(uuid::Uuid::from_u128(0xC3)),
+            DefaultId(uuid::Uuid::from_u128(0xD4)),
         ];
         let mut graph = HnswGraph::new(1);
         graph.nodes = vec![
@@ -1440,14 +1520,21 @@ mod tests {
     }
 
     #[test]
-    fn remove_reselects_entry_point_by_level_then_lowest_index() {
+    fn remove_reselects_entry_point_by_level_then_smallest_key_hash() {
         // Removing the entry point must promote the highest-level survivor, and
-        // break a level tie by the SMALLEST internal index — a content-defined
-        // rule, not "whoever id_to_idx happened to visit first".
+        // break a level tie by the SMALLEST stable key hash — a content-defined
+        // rule, not "whoever id_to_idx happened to visit first" and not the
+        // internal index (which carries slot/insert history under the re-embed
+        // race).
         let (mut graph, ids) = graph_with_entrypoint_tie();
         assert!(graph.remove(&ids[1]));
-        // idx 0 and idx 2 both have level 2; idx 0 is lower → it wins.
-        assert_eq!(graph.entry_point, Some(0));
+        // idx 0 and idx 2 both have level 2; the smaller key hash wins.
+        let expected = if key_hash(&ids[0]) <= key_hash(&ids[2]) {
+            Some(0)
+        } else {
+            Some(2)
+        };
+        assert_eq!(graph.entry_point, expected);
         assert_eq!(graph.max_level, 2);
     }
 
@@ -1458,6 +1545,14 @@ mod tests {
         // varying orders across instances. After removing the entry point, EVERY
         // instance must land on the same new entry point — proving reselection no
         // longer leaks per-process map order into the search start node.
+        let expected = {
+            let (_, ids) = graph_with_entrypoint_tie();
+            if key_hash(&ids[0]) <= key_hash(&ids[2]) {
+                Some(0)
+            } else {
+                Some(2)
+            }
+        };
         let mut chosen = Vec::new();
         for _ in 0..64 {
             let (mut graph, ids) = graph_with_entrypoint_tie();
@@ -1465,7 +1560,7 @@ mod tests {
             chosen.push(graph.entry_point);
         }
         assert!(
-            chosen.iter().all(|c| *c == Some(0)),
+            chosen.iter().all(|c| *c == expected),
             "entry-point reselection varied across map seeds: {chosen:?}"
         );
     }
@@ -1517,11 +1612,223 @@ mod tests {
         }
     }
 
+    /// The key conviction test for the HNSW-determinism fix.
+    ///
+    /// Two indices reach the SAME final content, but index B gets there via a
+    /// DIFFERENT remove/insert *interleaving*: every few keys it re-embeds
+    /// (remove + re-`upsert`, identical key and vector) a VARYING number of extra
+    /// times, immediately after that key's first insert — exactly the mid-run
+    /// upsert churn the reconcile/embed race produces (a re-embed's count and
+    /// interleaving vary run to run).
+    ///
+    /// Each churn is performed before the next key is inserted, so a re-embedded
+    /// key's FINAL insert still happens against the same set of predecessors as
+    /// in the clean sequence; the graph stays small enough (< M_MAX_0 nodes) that
+    /// no neighbor pruning ever fires, so remove+re-insert against the same node
+    /// set is a true graph identity. The ONLY things the churn perturbs are (a)
+    /// how many inserts precede later keys and (b) the free-list / internal-index
+    /// history — precisely the two sources this fix neutralizes by deriving levels
+    /// and tie-breaks from stable key hashes.
+    ///
+    /// Before the fix, the extra inserts advanced the shared level RNG, shifting
+    /// every later node's level and diverging the topology; after the fix, kNN
+    /// results AND the entry point are byte-identical between the two sequences.
+    #[test]
+    fn interleaved_reembed_history_does_not_change_results() {
+        let pairs: Vec<(u64, Vec<f32>)> = (0..28)
+            .map(|i| {
+                let f = i as f32;
+                (
+                    i as u64,
+                    vec![
+                        (f * 0.137).sin(),
+                        (f * 0.091).cos(),
+                        (f * 0.041).sin(),
+                        (f * 0.023).cos(),
+                    ],
+                )
+            })
+            .collect();
+
+        // Sequence A: each key inserted exactly once, in order.
+        let idx_a = VectorIndex::<u64>::new(4).unwrap();
+        for (id, v) in &pairs {
+            idx_a.upsert(*id, v).unwrap();
+        }
+
+        // Sequence B: same order, but every 5th key is re-embedded a varying
+        // number of extra times right after its first insert.
+        let idx_b = VectorIndex::<u64>::new(4).unwrap();
+        for (n, (id, v)) in pairs.iter().enumerate() {
+            idx_b.upsert(*id, v).unwrap();
+            if n % 5 == 0 {
+                for _ in 0..(1 + n % 3) {
+                    idx_b.remove(id).unwrap();
+                    idx_b.upsert(*id, v).unwrap();
+                }
+            }
+        }
+
+        assert_eq!(idx_a.len(), idx_b.len());
+
+        // Identical kNN results for every probe.
+        for q in [
+            vec![0.2f32, -0.3, 0.5, 0.8],
+            vec![-0.9, 0.1, 0.4, -0.2],
+            vec![0.5, 0.5, -0.5, 0.5],
+            vec![0.1, 0.9, 0.2, -0.7],
+        ] {
+            let a = idx_a.search_similar(&q, 15).unwrap();
+            let b = idx_b.search_similar(&q, 15).unwrap();
+            assert_eq!(a, b, "re-embed interleaving changed results for {q:?}");
+        }
+
+        // Identical entry point (the start of every greedy descent). Compare by
+        // KEY, since the internal index legitimately differs between histories.
+        let entry_key = |idx: &VectorIndex<u64>| -> Option<u64> {
+            let g = idx.graph.read();
+            g.entry_point.map(|ep| g.idx_to_id[ep])
+        };
+        assert_eq!(
+            entry_key(&idx_a),
+            entry_key(&idx_b),
+            "re-embed interleaving changed the entry point"
+        );
+    }
+
+    /// The key-hash level source must reproduce the HNSW geometric level
+    /// distribution the old RNG produced: `P(level >= k) = M^-k`. A wrong skew is
+    /// an HNSW performance cliff, so this pins it empirically over a large key
+    /// sample.
+    #[test]
+    fn level_distribution_matches_geometric() {
+        let n = 200_000u64;
+        let mut ge1 = 0u64;
+        let mut ge2 = 0u64;
+        let mut ge3 = 0u64;
+        for k in 0..n {
+            let level = hnsw_level_for_key(&k);
+            if level >= 1 {
+                ge1 += 1;
+            }
+            if level >= 2 {
+                ge2 += 1;
+            }
+            if level >= 3 {
+                ge3 += 1;
+            }
+        }
+        let f1 = ge1 as f64 / n as f64;
+        let f2 = ge2 as f64 / n as f64;
+        let f3 = ge3 as f64 / n as f64;
+        // M = 16 → expected 1/16, 1/256, 1/4096.
+        assert!(
+            (f1 - 1.0 / 16.0).abs() < 0.006,
+            "P(level>=1)={f1}, expected ~{}",
+            1.0 / 16.0
+        );
+        assert!(
+            (f2 - 1.0 / 256.0).abs() < 0.0025,
+            "P(level>=2)={f2}, expected ~{}",
+            1.0 / 256.0
+        );
+        assert!(
+            (f3 - 1.0 / 4096.0).abs() < 0.0015,
+            "P(level>=3)={f3}, expected ~{}",
+            1.0 / 4096.0
+        );
+    }
+
+    /// A node's HNSW level is whatever was persisted — `load` never recomputes it
+    /// from the current key-hash formula. This proves indices built under the old
+    /// RNG level scheme keep working without any migration step, and that the
+    /// off-formula level survives a save/reload round-trip untouched.
+    #[test]
+    fn persisted_node_levels_survive_load_without_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.hnsw");
+
+        let k_hi = 7u64;
+        let k_lo = 8u64;
+        // A stored level the current key-hash formula would NOT assign to k_hi.
+        let forced_hi_level = hnsw_level_for_key(&k_hi) + 3;
+        assert_ne!(forced_hi_level, hnsw_level_for_key(&k_hi));
+
+        let mut graph = HnswGraph::<u64>::new(2);
+        graph.nodes = vec![
+            HnswNode {
+                vector: vec![0.0, 1.0],
+                connections: vec![Vec::new(); forced_hi_level + 1],
+                level: forced_hi_level,
+            },
+            HnswNode {
+                vector: vec![1.0, 0.0],
+                connections: vec![Vec::new()],
+                level: 0,
+            },
+        ];
+        graph.entry_point = Some(0);
+        graph.max_level = forced_hi_level;
+        graph.id_to_idx.insert(k_hi, 0);
+        graph.id_to_idx.insert(k_lo, 1);
+        graph.idx_to_id = vec![k_hi, k_lo];
+
+        let vi = VectorIndex::<u64> {
+            graph: RwLock::new(graph),
+            persistence_path: RwLock::new(None),
+        };
+        vi.save(&path).unwrap();
+
+        let loaded = VectorIndex::<u64>::load(&path, 2).unwrap();
+        assert_eq!(loaded.graph.read().nodes[0].level, forced_hi_level);
+        assert_ne!(forced_hi_level, hnsw_level_for_key(&k_hi));
+        assert_eq!(loaded.len(), 2);
+    }
+
+    /// After a normal save/reload, fresh key-based-level inserts coexist with the
+    /// loaded nodes and both remain searchable — the "mixed old/new indices load
+    /// and work" guarantee, end to end.
+    #[test]
+    fn reload_then_insert_keeps_old_and_new_searchable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.hnsw");
+
+        let mk = |i: u64| -> Vec<f32> {
+            let f = i as f32;
+            vec![
+                (f * 0.13).sin(),
+                (f * 0.07).cos(),
+                (f * 0.29).sin(),
+                (f * 0.17).cos(),
+            ]
+        };
+
+        let idx = VectorIndex::<u64>::new(4).unwrap();
+        for i in 0..40u64 {
+            idx.upsert(i, &mk(i)).unwrap();
+        }
+        idx.save(&path).unwrap();
+
+        let loaded = VectorIndex::<u64>::load(&path, 4).unwrap();
+        for i in 40..50u64 {
+            loaded.upsert(i, &mk(i)).unwrap();
+        }
+        assert_eq!(loaded.len(), 50);
+
+        for probe in [5u64, 45u64] {
+            let v = loaded.get(&probe).unwrap();
+            let r = loaded.search_similar(&v, 1).unwrap();
+            assert_eq!(r[0].0, probe, "probe {probe} not its own nearest neighbor");
+        }
+    }
+
     #[test]
     fn insert_ignores_neighbors_without_active_layer() {
         let low = DefaultId::new();
         let high = DefaultId::new();
-        let newcomer = DefaultId::new();
+        // Levels are key-derived now: pick a newcomer key that lands at level >= 1
+        // so it has a layer-1 to (try to) connect at.
+        let newcomer = default_id_with_level_at_least(1);
         let mut graph = HnswGraph::new(1);
         graph.nodes = vec![
             HnswNode {
@@ -1540,7 +1847,6 @@ mod tests {
         graph.id_to_idx.insert(low, 0);
         graph.id_to_idx.insert(high, 1);
         graph.idx_to_id = vec![low, high];
-        graph.rng_state = seed_for_level_at_least(1);
 
         graph.insert(newcomer, &[0.5]).unwrap();
 
@@ -1552,11 +1858,38 @@ mod tests {
 
     #[test]
     fn sort_scored_neighbors_handles_nan_distances() {
+        // Finite distances sort before NaN (via total_cmp); ties among equal
+        // (here NaN) distances break by the node's stable key hash, NOT by
+        // internal index — so pruning order is independent of slot history.
+        let mut graph = HnswGraph::<u64>::new(1);
+        graph.idx_to_id = vec![10u64, 11u64, 12u64];
+
         let mut scored = vec![(f32::NAN, 2usize), (0.0, 1usize), (f32::NAN, 0usize)];
-        HnswGraph::<DefaultId>::sort_scored_neighbors(&mut scored);
-        assert_eq!(scored[0].1, 1);
-        assert_eq!(scored[1].1, 0);
-        assert_eq!(scored[2].1, 2);
+        graph.sort_scored_neighbors(&mut scored);
+
+        // The single finite distance comes first.
+        assert_eq!(scored[0], (0.0, 1));
+        // The two NaN entries (idx 0 and 2) are ordered by key hash.
+        let expected_second = if key_hash(&graph.idx_to_id[0]) <= key_hash(&graph.idx_to_id[2]) {
+            0
+        } else {
+            2
+        };
+        assert_eq!(scored[1].1, expected_second);
+        assert_eq!(
+            scored[2].1,
+            if expected_second == 0 { 2 } else { 0 },
+            "both NaN entries must be present, ordered deterministically"
+        );
+
+        // Sorting a differently-ordered input yields the identical index order
+        // (determinism). Compare by index, since NaN != NaN makes a direct
+        // tuple-vec equality always false.
+        let mut again = vec![(f32::NAN, 0usize), (0.0, 1usize), (f32::NAN, 2usize)];
+        graph.sort_scored_neighbors(&mut again);
+        let order_again: Vec<usize> = again.iter().map(|&(_, i)| i).collect();
+        let order_scored: Vec<usize> = scored.iter().map(|&(_, i)| i).collect();
+        assert_eq!(order_again, order_scored);
     }
 
     #[test]
@@ -1788,9 +2121,20 @@ mod tests {
 
         assert_eq!(idx.len(), 100);
 
+        // The vectors repeat every 8 entities (i and i+8 share a vector), so
+        // querying entities[0].1 has many exact (distance-0) matches. Search
+        // quality means the nearest result is one of those exact matches — which
+        // duplicate surfaces is now decided by a stable key hash, not by internal
+        // index, so assert on the vector (distance ~0) rather than a specific id.
         let results = idx.search_similar(&entities[0].1, 5).unwrap();
         assert!(!results.is_empty());
-        assert_eq!(results[0].0, entities[0].0);
+        assert!(
+            results[0].1 < 1e-6,
+            "nearest result was not an exact-vector match: dist={}",
+            results[0].1
+        );
+        let top_vec = idx.get(&results[0].0).unwrap();
+        assert_eq!(top_vec, entities[0].1.to_vec());
     }
 
     #[test]
