@@ -1,0 +1,12 @@
+# Kin Cargo registry for public and local builds.
+#
+# Keep this file free of local path patches and credentials so a fresh public
+# clone can resolve Kin crates from public source. Put machine-local overrides
+# in Cargo's user-level config instead of this tracked file.
+
+[registries.kin]
+index = "sparse+https://kinlab.ai/registry/cargo/"
+
+[patch.kin]
+kin-blobs = { git = "https://github.com/firelock-ai/kin-blobs.git", rev = "5e8b3c3a596163fe6c4b276bcd27c02ffacd694f" }
+kin-vector = { git = "https://github.com/firelock-ai/kin-vector.git", rev = "dd743d741c6832e15179ac60720b5218558e10fb" }
