@@ -19,7 +19,8 @@ fn vec_for(i: u64, dim: usize) -> Vec<f32> {
     (0..dim)
         .map(|d| {
             let x = (i.wrapping_mul(2654435761).wrapping_add(d as u64 * 40503) % 1000) as f32;
-            ((x / 1000.0) * std::f32::consts::TAU).sin() + ((i as f32) * 0.013 * (d as f32 + 1.0)).cos()
+            ((x / 1000.0) * std::f32::consts::TAU).sin()
+                + ((i as f32) * 0.013 * (d as f32 + 1.0)).cos()
         })
         .collect()
 }

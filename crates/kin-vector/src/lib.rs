@@ -2361,7 +2361,10 @@ mod tests {
 
         let mut cases: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
         for &dim in &[1usize, 2, 3, 4, 7, 8, 31, 48, 127, 768] {
-            cases.push((vec_for(dim as u64 * 2, dim), vec_for(dim as u64 * 2 + 1, dim)));
+            cases.push((
+                vec_for(dim as u64 * 2, dim),
+                vec_for(dim as u64 * 2 + 1, dim),
+            ));
             let v = vec_for(99 + dim as u64, dim);
             cases.push((v.clone(), v.clone())); // identical → ~0
             let v = vec_for(7 + dim as u64, dim);
@@ -2385,7 +2388,10 @@ mod tests {
                 a.len()
             );
             assert!(s.is_finite() && n1.is_finite(), "non-finite distance");
-            assert!((0.0..=2.0).contains(&n1), "NEON distance out of range: {n1}");
+            assert!(
+                (0.0..=2.0).contains(&n1),
+                "NEON distance out of range: {n1}"
+            );
             max_abs = max_abs.max((s - n1).abs());
             max_ulp = max_ulp.max(ulp_diff(s, n1));
         }
