@@ -72,6 +72,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Trigger kin CI
+        if: ${{ env.DISPATCH_TOKEN != '' }}
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.DISPATCH_TOKEN }}
