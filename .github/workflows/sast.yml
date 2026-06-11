@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.96.0
 
       - name: Configure kin cargo registry
         # cargo-deny resolves the full dependency graph via `cargo metadata`,
