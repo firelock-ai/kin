@@ -1685,7 +1685,14 @@ impl InMemoryGraph {
             return Ok(());
         }
 
-        let unique_ids: HashSet<EntityId> = entity_ids.iter().copied().collect();
+        // Dedup, then SORT before removal. The removal order feeds the vector
+        // index's free-list, and a `HashSet` iterates in per-process-random
+        // order — so an unsorted remove sequence makes the HNSW slot history
+        // (and thus live-search results) vary run to run. Sorting fixes the
+        // remove/enqueue order deterministically.
+        let mut unique_ids: Vec<EntityId> =
+            entity_ids.iter().copied().collect::<HashSet<EntityId>>().into_iter().collect();
+        unique_ids.sort();
         for entity_id in &unique_ids {
             self.remove_retrievable_vector(&RetrievalKey::Entity(*entity_id))?;
         }
