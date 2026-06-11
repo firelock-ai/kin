@@ -1696,6 +1696,91 @@ mod tests {
         );
     }
 
+    /// CHARACTERIZATION TEST — currently FAILS BY DESIGN (hence `#[ignore]`).
+    ///
+    /// KNOWN GAP: HNSW topology is insert-order-dependent (3/8 kNN differ
+    /// sorted-vs-reversed, 600-vector corpus); the benchmark protocol bypasses
+    /// this via frozen all-refs golden state (eval never embeds); the durable fix
+    /// is insert-order-independent topology or canonical insert ordering —
+    /// un-ignore this test when that lands. See
+    /// `planning/kin-determinism-saga-jun11.md`.
+    ///
+    /// Why this exists: `interleaved_reembed_history_does_not_change_results`
+    /// (above) only re-embeds keys IN PLACE in the SAME order, so it never
+    /// exercises a *different* insert order. But each node's neighbor selection
+    /// reads the graph built SO FAR, so two indices built from the SAME vector set
+    /// in different orders can wire up different connections — even with the
+    /// key-hash levels/tie-breaks (efe77db) that make every per-step decision
+    /// order-independent. The key-hash fixes removed the *tie-order* leak; the
+    /// remaining drift is the *candidate set* each insert sees. This test inserts
+    /// the same 600 vectors sorted vs reversed and asserts identical kNN + entry
+    /// point; it currently fails on a subset of probes, which is the documented
+    /// residual that surfaced as the freeze's `embedding`-signal jitter whenever
+    /// the eval re-embedded mid-run.
+    #[test]
+    #[ignore = "KNOWN GAP: HNSW topology is insert-order-dependent; un-ignore when canonical/order-independent insert lands (see kin-determinism-saga-jun11.md)"]
+    fn hnsw_search_is_invariant_to_insert_order() {
+        // Deterministic pseudo-vector for key `i` (no RNG → reproducible across
+        // processes and runs; this characterization must not itself be flaky).
+        fn vec_for(i: u64, dim: usize) -> Vec<f32> {
+            (0..dim)
+                .map(|d| {
+                    let x =
+                        (i.wrapping_mul(2654435761).wrapping_add(d as u64 * 40503) % 1000) as f32;
+                    ((x / 1000.0) * std::f32::consts::TAU).sin()
+                        + ((i as f32) * 0.013 * (d as f32 + 1.0)).cos()
+                })
+                .collect()
+        }
+        fn build(order: &[u64], dim: usize) -> VectorIndex<u64> {
+            let idx = VectorIndex::<u64>::new(dim).unwrap();
+            for &k in order {
+                idx.upsert(k, &vec_for(k, dim)).unwrap();
+            }
+            idx
+        }
+
+        let n: u64 = 600;
+        let dim = 48;
+        let sorted: Vec<u64> = (0..n).collect();
+        let reversed: Vec<u64> = (0..n).rev().collect();
+
+        let a = build(&sorted, dim);
+        let b = build(&reversed, dim);
+        assert_eq!(a.len(), b.len(), "same vector SET must give same size");
+
+        // Same entry point (the start of every greedy descent). Compare by KEY —
+        // the internal index legitimately differs between insert histories.
+        let entry_key = |idx: &VectorIndex<u64>| -> Option<u64> {
+            let g = idx.graph.read();
+            g.entry_point.map(|ep| g.idx_to_id[ep])
+        };
+        assert_eq!(
+            entry_key(&a),
+            entry_key(&b),
+            "insert order changed the HNSW entry point"
+        );
+
+        // Identical kNN for every probe — the property the frozen-golden protocol
+        // depends on and that a durable topology fix must restore.
+        let limit = 20;
+        for q in 0..8u64 {
+            let query = vec_for(10_000 + q, dim);
+            let ids = |idx: &VectorIndex<u64>| -> Vec<u64> {
+                idx.search_similar(&query, limit)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect()
+            };
+            assert_eq!(
+                ids(&a),
+                ids(&b),
+                "insert order changed kNN for probe {q} (sorted vs reversed)"
+            );
+        }
+    }
+
     /// The key-hash level source must reproduce the HNSW geometric level
     /// distribution the old RNG produced: `P(level >= k) = M^-k`. A wrong skew is
     /// an HNSW performance cliff, so this pins it empirically over a large key
