@@ -3,6 +3,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+// `Command` is only used by the macOS profilers (`ps`, `system_profiler`); on
+// Linux/other the import is unused, which `-D warnings` rejects. Gate it to match.
+#[cfg(target_os = "macos")]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
