@@ -2502,6 +2502,18 @@ impl InMemoryGraph {
         Ok(())
     }
 
+    /// Stamp the in-memory vector index's self-description (embedding model
+    /// identity + graph provenance) so the next `save_vector_index` persists it
+    /// into the `.kvec`. A later load can then prove the stored vectors were
+    /// produced by the expected model/graph and refuse silently-wrong neighbors,
+    /// independently of the sidecar metadata. No-op when no index is loaded.
+    #[cfg(feature = "vector")]
+    pub fn stamp_vector_index_descriptor(&self, descriptor: crate::vector::IndexDescriptor) {
+        if let Some(ref index) = *self.vector_index.lock() {
+            index.set_descriptor(descriptor);
+        }
+    }
+
     #[cfg(feature = "embeddings")]
     pub fn share_embedder_from(&self, source: &InMemoryGraph) {
         let source_embedder = source.embedder.lock().clone();
@@ -10755,5 +10767,52 @@ mod tests {
             vec![WorkScope::Entity(old.id)],
             "ambiguous anchors are left for lazy fingerprint recall, not committed"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Vector index self-description / dimension recovery (R2/R9, #10c)
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn save_vector_index_persists_stamped_descriptor() {
+        use crate::vector::{IndexDescriptor, IndexLoadOutcome};
+
+        let graph = InMemoryGraph::new();
+        let vi = crate::VectorIndex::new(2).unwrap();
+        vi.upsert(EntityId::new(), &[1.0, 0.0]).unwrap();
+        *graph.vector_index.lock() = Some(std::sync::Arc::new(vi));
+
+        graph.stamp_vector_index_descriptor(IndexDescriptor {
+            model_id: Some("model-A@1".into()),
+            graph_root: Some("root-1".into()),
+        });
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("g.kvec");
+        graph.save_vector_index(&path).unwrap();
+
+        // The persisted .kvec proves its own model/graph identity on load.
+        assert!(matches!(
+            crate::VectorIndex::load_compatible(
+                &path,
+                &IndexDescriptor {
+                    model_id: Some("model-A@1".into()),
+                    graph_root: Some("root-1".into()),
+                },
+            ),
+            IndexLoadOutcome::Loaded(_)
+        ));
+        // A same-dimension model swap is caught from the stamp alone.
+        assert!(matches!(
+            crate::VectorIndex::load_compatible(
+                &path,
+                &IndexDescriptor {
+                    model_id: Some("model-B@1".into()),
+                    graph_root: Some("root-1".into()),
+                },
+            ),
+            IndexLoadOutcome::Incompatible(_)
+        ));
     }
 }

@@ -448,12 +448,21 @@ impl SnapshotManager {
         graph_root_hash: [u8; 32],
     ) -> Result<(), KinDbError> {
         let vector_path = vector_index_path_for(path);
+
+        let (provider, model_id, revision, pipeline_epoch, runtime_dimensions) =
+            current_embedding_runtime_fields();
+
+        // Stamp the index's self-description (model identity + graph provenance)
+        // BEFORE saving, so the persisted `.kvec` proves its own compatibility on
+        // load — defense-in-depth alongside the sidecar metadata below.
+        graph.stamp_vector_index_descriptor(crate::vector::IndexDescriptor {
+            model_id: model_id.clone(),
+            graph_root: Some(hex::encode(graph_root_hash)),
+        });
         graph.save_vector_index(&vector_path)?;
 
         let metadata_path = vector_index_metadata_path_for(path);
         if let Some((dimensions, indexed)) = graph.vector_index_stats() {
-            let (provider, model_id, revision, pipeline_epoch, runtime_dimensions) =
-                current_embedding_runtime_fields();
             let metadata = VectorIndexMetadata {
                 version: VectorIndexMetadata::VERSION,
                 graph_root_hash: hex::encode(graph_root_hash),
