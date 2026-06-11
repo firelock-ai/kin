@@ -34,7 +34,9 @@ __pycache__/
 *.pem
 *.key
 *.p12
-.cargo/config.toml
+.cargo/credentials
+.cargo/credentials.toml
+.cargo/config.local.toml
 
 # Snapshot working copies
 /.kin-snapshot-tmp/

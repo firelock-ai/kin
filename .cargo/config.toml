@@ -1,0 +1,18 @@
+# Kin Cargo registry for public and local builds.
+#
+# Keep this file free of local path patches and credentials so a fresh public
+# clone can resolve Kin crates from public source. Put machine-local overrides
+# in Cargo's user-level config instead of this tracked file.
+
+[registries.kin]
+index = "sparse+https://kinlab.ai/registry/cargo/"
+
+[patch.kin]
+kin-blobs = { git = "https://github.com/firelock-ai/kin-blobs.git", rev = "5e8b3c3a596163fe6c4b276bcd27c02ffacd694f" }
+kin-db = { git = "https://github.com/firelock-ai/kin-db.git", rev = "990c29be0cdc86d6f5c29d3e179c228dedc49a53" }
+kin-infer = { git = "https://github.com/firelock-ai/kin-infer.git", rev = "ff1a60c46aa51487b8a492c499b0841592102447" }
+kin-lsp = { git = "https://github.com/firelock-ai/kin-lsp.git", rev = "f4f2b5fee92af5caee737c673f8202ce070b46b6" }
+kin-model = { git = "https://github.com/firelock-ai/kin-model.git", rev = "99344c94e961efbfff40d5e5350d8e4943bc7913" }
+kin-search = { git = "https://github.com/firelock-ai/kin-search.git", rev = "cb0680b82f38c8477a0facd33b4cdefde3fa6dfc" }
+kin-vector = { git = "https://github.com/firelock-ai/kin-vector.git", rev = "dd743d741c6832e15179ac60720b5218558e10fb" }
+kin-vfs-core = { git = "https://github.com/firelock-ai/kin-vfs.git", rev = "79e1be5bc94a32baf7418c8c2424c6cc5c83e4fc" }
