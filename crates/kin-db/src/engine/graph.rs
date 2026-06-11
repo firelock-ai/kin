@@ -562,6 +562,102 @@ struct SessionData {
 }
 
 // ---------------------------------------------------------------------------
+// Embedding queue — deterministic priority ordering
+// ---------------------------------------------------------------------------
+
+/// Recency class of a queued embedding item. Lower variants embed earlier.
+///
+/// `ChangedThisSync` covers entities/artifacts invalidated by a live graph
+/// mutation (the incremental sync path: upsert/commit/relation edits).
+/// `Backfill` covers bulk and "missing" re-queues (load-time backfill,
+/// `queue_all_*`, `queue_missing_*`, manual bulk import). Declaration order is
+/// the sort order, so a live change always outranks a backfill item.
+///
+/// The recency class is a deterministic property of *which producer enqueued
+/// the item*, not of enqueue timing or map iteration order, so it never
+/// reintroduces per-process nondeterminism into batch composition.
+#[cfg(feature = "vector")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum EmbedRecency {
+    /// Invalidated by a live graph mutation this sync — embed first.
+    ChangedThisSync,
+    /// Bulk / missing backfill — embed after changed-this-sync work.
+    Backfill,
+}
+
+/// Deduplicating embedding work queue keyed by `K`.
+///
+/// Replaces the previous bare `HashSet<K>`: it still deduplicates (one embed
+/// per key regardless of how many times it is enqueued) but additionally
+/// records each key's [`EmbedRecency`] so the drain path can order work
+/// deterministically by priority. The map's own iteration order is never
+/// observed for batch composition — the drain always sorts by a total order —
+/// so batch contents are identical across processes regardless of the
+/// per-process HashMap seed.
+#[cfg(feature = "vector")]
+struct RecencyQueue<K: Eq + std::hash::Hash + Copy> {
+    items: hashbrown::HashMap<K, EmbedRecency>,
+}
+
+#[cfg(feature = "vector")]
+impl<K: Eq + std::hash::Hash + Copy> Default for RecencyQueue<K> {
+    fn default() -> Self {
+        Self {
+            items: hashbrown::HashMap::new(),
+        }
+    }
+}
+
+#[cfg(feature = "vector")]
+impl<K: Eq + std::hash::Hash + Copy> RecencyQueue<K> {
+    /// Enqueue `key`, deduplicating. If the key is already queued, keep the
+    /// higher-priority (lower) recency so a live change is never demoted to
+    /// backfill by a subsequent bulk re-queue.
+    fn insert(&mut self, key: K, recency: EmbedRecency) {
+        self.items
+            .entry(key)
+            .and_modify(|cur| {
+                if recency < *cur {
+                    *cur = recency;
+                }
+            })
+            .or_insert(recency);
+    }
+
+    /// Remove a key from the queue (e.g., when its entity is deleted).
+    fn remove(&mut self, key: &K) -> bool {
+        self.items.remove(key).is_some()
+    }
+
+    /// HashSet-style membership facade (used by tests; kept for parity with the
+    /// previous queue type so call sites read identically).
+    #[allow(dead_code)]
+    fn contains(&self, key: &K) -> bool {
+        self.items.contains_key(key)
+    }
+
+    #[allow(dead_code)]
+    fn clear(&mut self) {
+        self.items.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    #[allow(dead_code)]
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Remove and return every `(key, recency)` pair. Iteration order is
+    /// unspecified; callers MUST sort deterministically before using the result.
+    fn drain_all(&mut self) -> Vec<(K, EmbedRecency)> {
+        self.items.drain().collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // InMemoryGraph — sharded by domain
 // ---------------------------------------------------------------------------
 
@@ -604,15 +700,18 @@ pub struct InMemoryGraph {
     /// HNSW vector index for semantic similarity search, lazily initialized.
     #[cfg(feature = "vector")]
     vector_index: parking_lot::Mutex<Option<Arc<VectorIndex>>>,
-    /// Queue of entity IDs that need embedding. Populated on upsert, drained
+    /// Queue of entity keys that need embedding. Populated on upsert, drained
     /// by background workers or explicit `process_embedding_queue` calls.
-    /// Using HashSet to deduplicate (an entity modified twice only needs one embed).
+    /// A [`RecencyQueue`] deduplicates (an entity modified twice only needs one
+    /// embed) and records recency so the drain path can order work
+    /// deterministically by priority (public-API/high-centrality and
+    /// changed-this-sync entities first).
     #[cfg(feature = "vector")]
-    embedding_queue: parking_lot::Mutex<hashbrown::HashSet<RetrievalKey>>,
+    embedding_queue: parking_lot::Mutex<RecencyQueue<RetrievalKey>>,
     /// Queue of artifact IDs that need embedding. This keeps artifact re-embed
     /// work targeted instead of forcing a full artifact pass on every embed run.
     #[cfg(feature = "vector")]
-    artifact_embedding_queue: parking_lot::Mutex<hashbrown::HashSet<ArtifactId>>,
+    artifact_embedding_queue: parking_lot::Mutex<RecencyQueue<ArtifactId>>,
 }
 
 impl InMemoryGraph {
@@ -703,9 +802,9 @@ impl InMemoryGraph {
             #[cfg(feature = "vector")]
             vector_index: parking_lot::Mutex::new(None),
             #[cfg(feature = "vector")]
-            embedding_queue: parking_lot::Mutex::new(hashbrown::HashSet::new()),
+            embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
             #[cfg(feature = "vector")]
-            artifact_embedding_queue: parking_lot::Mutex::new(hashbrown::HashSet::new()),
+            artifact_embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
         };
 
         graph
@@ -1081,9 +1180,9 @@ impl InMemoryGraph {
             #[cfg(feature = "vector")]
             vector_index: parking_lot::Mutex::new(None),
             #[cfg(feature = "vector")]
-            embedding_queue: parking_lot::Mutex::new(hashbrown::HashSet::new()),
+            embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
             #[cfg(feature = "vector")]
-            artifact_embedding_queue: parking_lot::Mutex::new(hashbrown::HashSet::new()),
+            artifact_embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
         };
 
         if !skip_text_index && (!text_index_current || !text_index_entity_coverage_current) {
@@ -1295,9 +1394,9 @@ impl InMemoryGraph {
             #[cfg(feature = "vector")]
             vector_index: parking_lot::Mutex::new(None),
             #[cfg(feature = "vector")]
-            embedding_queue: parking_lot::Mutex::new(hashbrown::HashSet::new()),
+            embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
             #[cfg(feature = "vector")]
-            artifact_embedding_queue: parking_lot::Mutex::new(hashbrown::HashSet::new()),
+            artifact_embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
         };
 
         if !text_index_current {
@@ -1465,8 +1564,15 @@ impl InMemoryGraph {
         for entity_id in &unique_ids {
             self.remove_retrievable_vector(&RetrievalKey::Entity(*entity_id))?;
         }
-        let ids: Vec<EntityId> = unique_ids.into_iter().collect();
-        self.queue_for_embedding(&ids);
+        // Live mutation path: these entities changed this sync, so enqueue them
+        // as `ChangedThisSync` (the highest recency tier) rather than backfill.
+        let mut queue = self.embedding_queue.lock();
+        for entity_id in &unique_ids {
+            queue.insert(
+                RetrievalKey::Entity(*entity_id),
+                EmbedRecency::ChangedThisSync,
+            );
+        }
         Ok(())
     }
 
@@ -1481,7 +1587,10 @@ impl InMemoryGraph {
     #[cfg(feature = "vector")]
     fn invalidate_artifact_for_embedding(&self, artifact_id: ArtifactId) -> Result<(), KinDbError> {
         self.remove_retrievable_vector(&RetrievalKey::Artifact(artifact_id))?;
-        self.artifact_embedding_queue.lock().insert(artifact_id);
+        // Live mutation path: changed-this-sync recency.
+        self.artifact_embedding_queue
+            .lock()
+            .insert(artifact_id, EmbedRecency::ChangedThisSync);
         Ok(())
     }
 
@@ -2459,7 +2568,7 @@ impl InMemoryGraph {
     pub fn queue_for_embedding(&self, ids: &[EntityId]) {
         let mut queue = self.embedding_queue.lock();
         for id in ids {
-            queue.insert(RetrievalKey::Entity(*id));
+            queue.insert(RetrievalKey::Entity(*id), EmbedRecency::Backfill);
         }
     }
 
@@ -2468,7 +2577,7 @@ impl InMemoryGraph {
     pub fn queue_keys_for_embedding(&self, keys: &[RetrievalKey]) {
         let mut queue = self.embedding_queue.lock();
         for key in keys {
-            queue.insert(*key);
+            queue.insert(*key, EmbedRecency::Backfill);
         }
     }
 
@@ -2477,7 +2586,7 @@ impl InMemoryGraph {
     pub fn queue_artifacts_for_embedding(&self, ids: &[ArtifactId]) {
         let mut queue = self.artifact_embedding_queue.lock();
         for id in ids {
-            queue.insert(*id);
+            queue.insert(*id, EmbedRecency::Backfill);
         }
     }
 
@@ -2490,13 +2599,16 @@ impl InMemoryGraph {
         // Queue all historical revisions
         for revisions in ent.entity_revisions.values() {
             for rev in revisions {
-                queue.insert(RetrievalKey::EntityRevision(rev.revision_id));
+                queue.insert(
+                    RetrievalKey::EntityRevision(rev.revision_id),
+                    EmbedRecency::Backfill,
+                );
             }
         }
 
         // Queue all current HEAD entities
         for id in ent.entities.keys() {
-            queue.insert(RetrievalKey::Entity(*id));
+            queue.insert(RetrievalKey::Entity(*id), EmbedRecency::Backfill);
         }
     }
 
@@ -2529,7 +2641,7 @@ impl InMemoryGraph {
                     .map(|vi| !vi.contains_retrievable(&key))
                     .unwrap_or(true);
                 if missing {
-                    queue.insert(key);
+                    queue.insert(key, EmbedRecency::Backfill);
                 }
             }
         }
@@ -2542,7 +2654,7 @@ impl InMemoryGraph {
                 .map(|vi| !vi.contains_retrievable(&key))
                 .unwrap_or(true);
             if missing {
-                queue.insert(key);
+                queue.insert(key, EmbedRecency::Backfill);
             }
         }
     }
@@ -2720,6 +2832,77 @@ impl InMemoryGraph {
     #[cfg(not(feature = "vector"))]
     pub fn share_vector_index_from(&self, _source: &InMemoryGraph) {}
 
+    /// Drain up to `batch_size` keys from the entity embedding queue in a
+    /// deterministic order, leaving the remainder queued.
+    ///
+    /// This is the single ordering authority for entity embedding batches. The
+    /// returned order is a pure function of the queued work (and, once the
+    /// priority-signals layer lands, graph state); it never observes the
+    /// queue's HashMap iteration order, so two processes that queued the same
+    /// work drain identical batches in the identical order. That determinism is
+    /// what removes the per-process batch-composition variance behind the embed
+    /// determinism bug.
+    #[cfg(feature = "vector")]
+    fn drain_embedding_batch(&self, batch_size: usize) -> Vec<(RetrievalKey, EmbedRecency)> {
+        let batch_size = batch_size.max(1);
+        let mut all = {
+            let mut queue = self.embedding_queue.lock();
+            queue.drain_all()
+        };
+        if all.is_empty() {
+            return Vec::new();
+        }
+
+        // Stable total order via the key's native `Ord`. (Priority tier,
+        // centrality, and recency ordering are layered on in a later commit.)
+        all.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        let take = batch_size.min(all.len());
+        let leftover = all.split_off(take);
+        if !leftover.is_empty() {
+            let mut queue = self.embedding_queue.lock();
+            for (key, recency) in leftover {
+                queue.insert(key, recency);
+            }
+        }
+        all
+    }
+
+    /// Drain up to `batch_size` artifact IDs from the artifact embedding queue
+    /// in a deterministic order, leaving the remainder queued.
+    ///
+    /// Mirrors [`InMemoryGraph::drain_embedding_batch`] for artifacts. This
+    /// replaces the previous raw `HashSet::iter()` drain, whose per-process
+    /// iteration order made artifact batch composition nondeterministic.
+    #[cfg(feature = "vector")]
+    fn drain_artifact_embedding_batch(
+        &self,
+        batch_size: usize,
+    ) -> Vec<(ArtifactId, EmbedRecency)> {
+        let batch_size = batch_size.max(1);
+        let mut all = {
+            let mut queue = self.artifact_embedding_queue.lock();
+            queue.drain_all()
+        };
+        if all.is_empty() {
+            return Vec::new();
+        }
+
+        // Stable total order via the artifact id. (Recency ordering is layered
+        // on in a later commit.)
+        all.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        let take = batch_size.min(all.len());
+        let leftover = all.split_off(take);
+        if !leftover.is_empty() {
+            let mut queue = self.artifact_embedding_queue.lock();
+            for (id, recency) in leftover {
+                queue.insert(id, recency);
+            }
+        }
+        all
+    }
+
     /// Drain the current pending embedding queue in batches.
     ///
     /// This is the graph-first incremental path: graph mutations enqueue
@@ -2832,44 +3015,35 @@ impl InMemoryGraph {
 
         let batch_size = batch_size.max(1);
 
+        // Drain a deterministic, priority-ordered batch. `drain_embedding_batch`
+        // is the single ordering authority: it sorts queued work by a stable
+        // total order, so batch composition depends only on queue contents and
+        // graph state — never on map iteration order — and is identical across
+        // processes.
+        let batch = self.drain_embedding_batch(batch_size);
+        if batch.is_empty() {
+            return Ok(0);
+        }
+
+        // Preserve each key's recency so an error-requeue cannot silently demote
+        // changed-this-sync work to backfill.
+        let batch_recency: hashbrown::HashMap<RetrievalKey, EmbedRecency> =
+            batch.iter().copied().collect();
+        let batch_keys: Vec<RetrievalKey> = batch.iter().map(|(key, _)| *key).collect();
+
         let requeue = |keys: &[RetrievalKey]| {
             if keys.is_empty() {
                 return;
             }
             let mut queue = self.embedding_queue.lock();
             for key in keys {
-                queue.insert(*key);
+                let recency = batch_recency
+                    .get(key)
+                    .copied()
+                    .unwrap_or(EmbedRecency::Backfill);
+                queue.insert(*key, recency);
             }
         };
-
-        // Drain ALL keys from the queue to sort them deterministically
-        let mut all_keys: Vec<RetrievalKey> = {
-            let mut queue = self.embedding_queue.lock();
-            queue.drain().collect()
-        };
-
-        if all_keys.is_empty() {
-            return Ok(0);
-        }
-
-        // Sort keys deterministically to ensure stable HNSW insertion order across re-embeds.
-        // RetrievalKey derives Ord natively — no allocation needed.
-        all_keys.sort_unstable();
-
-        let take_count = batch_size.min(all_keys.len());
-        let batch_keys: Vec<RetrievalKey> = all_keys.drain(0..take_count).collect();
-
-        // Put the rest back
-        if !all_keys.is_empty() {
-            let mut queue = self.embedding_queue.lock();
-            for key in all_keys {
-                queue.insert(key);
-            }
-        }
-
-        if batch_keys.is_empty() {
-            return Ok(0);
-        }
 
         // Collect text representations under read lock, then drop before inference.
         let mut entity_data: Vec<(RetrievalKey, String)> = Vec::with_capacity(batch_keys.len());
@@ -2995,36 +3169,31 @@ impl InMemoryGraph {
 
         let batch_size = batch_size.max(1);
 
+        // Deterministic, dedup-preserving drain (single ordering authority).
+        let batch = self.drain_artifact_embedding_batch(batch_size);
+        if batch.is_empty() {
+            return Ok(0);
+        }
+
+        // Preserve each id's recency so an error-requeue cannot demote
+        // changed-this-sync work to backfill.
+        let batch_recency: hashbrown::HashMap<ArtifactId, EmbedRecency> =
+            batch.iter().copied().collect();
+        let ids: Vec<ArtifactId> = batch.iter().map(|(id, _)| *id).collect();
+
         let requeue = |ids: &[ArtifactId]| {
             if ids.is_empty() {
                 return;
             }
             let mut queue = self.artifact_embedding_queue.lock();
             for id in ids {
-                queue.insert(*id);
+                let recency = batch_recency
+                    .get(id)
+                    .copied()
+                    .unwrap_or(EmbedRecency::Backfill);
+                queue.insert(*id, recency);
             }
         };
-
-        let ids: Vec<ArtifactId> = {
-            let mut queue = self.artifact_embedding_queue.lock();
-            let mut drained = Vec::with_capacity(batch_size.min(queue.len()));
-            let mut iter = queue.iter().copied();
-            for _ in 0..batch_size {
-                if let Some(id) = iter.next() {
-                    drained.push(id);
-                } else {
-                    break;
-                }
-            }
-            for id in &drained {
-                queue.remove(id);
-            }
-            drained
-        };
-
-        if ids.is_empty() {
-            return Ok(0);
-        }
 
         let docs: Vec<(ArtifactId, RetrievalKey, String)> = {
             let ent = self.entities.read();
