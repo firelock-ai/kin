@@ -2875,8 +2875,7 @@ dependencies = [
 [[package]]
 name = "kin-blobs"
 version = "0.1.0"
-source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "536e18c2348cf91e797a7dff9a0c1e362e0fe3c34f8d0b07506b4ea848e01f89"
+source = "git+https://github.com/firelock-ai/kin-blobs.git?rev=5e8b3c3a596163fe6c4b276bcd27c02ffacd694f#5e8b3c3a596163fe6c4b276bcd27c02ffacd694f"
 dependencies = [
  "hex",
  "schemars",
@@ -3041,8 +3040,7 @@ dependencies = [
 [[package]]
 name = "kin-db"
 version = "0.1.0"
-source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "f6e848d391c6c7fc1c10b42a9b5eac2929da9c1b784cf1b1966e3ca51825e91d"
+source = "git+https://github.com/firelock-ai/kin-db.git?rev=990c29be0cdc86d6f5c29d3e179c228dedc49a53#990c29be0cdc86d6f5c29d3e179c228dedc49a53"
 dependencies = [
  "bincode",
  "bytes",
@@ -3119,8 +3117,7 @@ dependencies = [
 [[package]]
 name = "kin-infer"
 version = "0.2.0"
-source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "7eaa995cb967fbc0dc8058d1264cc2edfeacb332cfec99278bac455e9c59464e"
+source = "git+https://github.com/firelock-ai/kin-infer.git?rev=ff1a60c46aa51487b8a492c499b0841592102447#ff1a60c46aa51487b8a492c499b0841592102447"
 dependencies = [
  "block",
  "half",
@@ -3169,8 +3166,7 @@ dependencies = [
 [[package]]
 name = "kin-lsp"
 version = "0.1.0"
-source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "fe6b911d6c05d7eb60c74c5cc75648d08a250cdebb4769674bea1ba512625696"
+source = "git+https://github.com/firelock-ai/kin-lsp.git?rev=f4f2b5fee92af5caee737c673f8202ce070b46b6#f4f2b5fee92af5caee737c673f8202ce070b46b6"
 dependencies = [
  "kin-model",
  "serde",
@@ -3231,8 +3227,7 @@ dependencies = [
 [[package]]
 name = "kin-model"
 version = "0.1.0"
-source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "f82c12146cb1b3d9c9ec803eae3895109b724328503a2119b856a8a34f1477ee"
+source = "git+https://github.com/firelock-ai/kin-model.git?rev=99344c94e961efbfff40d5e5350d8e4943bc7913#99344c94e961efbfff40d5e5350d8e4943bc7913"
 dependencies = [
  "chrono",
  "hex",
@@ -3396,8 +3391,7 @@ dependencies = [
 [[package]]
 name = "kin-search"
 version = "0.1.0"
-source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "6af4fdba7fcda07546dd381c4dfbc6199335517a9a491d2a09b4d62a06a32b96"
+source = "git+https://github.com/firelock-ai/kin-search.git?rev=cb0680b82f38c8477a0facd33b4cdefde3fa6dfc#cb0680b82f38c8477a0facd33b4cdefde3fa6dfc"
 dependencies = [
  "bincode",
  "parking_lot",
@@ -3443,8 +3437,7 @@ dependencies = [
 [[package]]
 name = "kin-vector"
 version = "0.1.0"
-source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "d133d8899853db181099a8e02d5fe49b07cb6d5cb07639b279cebdb42333637c"
+source = "git+https://github.com/firelock-ai/kin-vector.git?rev=dd743d741c6832e15179ac60720b5218558e10fb#dd743d741c6832e15179ac60720b5218558e10fb"
 dependencies = [
  "fs2",
  "hashbrown 0.15.5",
@@ -3461,8 +3454,7 @@ dependencies = [
 [[package]]
 name = "kin-vfs-core"
 version = "0.1.0"
-source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "a2df0d57f926a4a47588edae8d36974f91f3bc2174b8b4eff3f95bf81646f2a8"
+source = "git+https://github.com/firelock-ai/kin-vfs.git?rev=79e1be5bc94a32baf7418c8c2424c6cc5c83e4fc#79e1be5bc94a32baf7418c8c2424c6cc5c83e4fc"
 dependencies = [
  "lru",
  "parking_lot",
