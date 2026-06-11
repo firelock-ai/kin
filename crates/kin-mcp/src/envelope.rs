@@ -129,6 +129,26 @@ impl Degraded {
         .into_iter()
         .any(|flag| flag == Some(true))
     }
+
+    /// The names of the degraded signals that are affirmatively set, in a stable
+    /// order. Used to spell out "degraded signals Z" in a confidence-qualified
+    /// negative without fabricating flags that were never observed.
+    pub fn active_labels(&self) -> Vec<&'static str> {
+        let mut labels = Vec::new();
+        if self.daemon_unreachable == Some(true) {
+            labels.push("daemon_unreachable");
+        }
+        if self.embed_worker_failed == Some(true) {
+            labels.push("embed_worker_failed");
+        }
+        if self.mass_deletion_blocked == Some(true) {
+            labels.push("mass_deletion_blocked");
+        }
+        if self.offline_fallback == Some(true) {
+            labels.push("offline_fallback");
+        }
+        labels
+    }
 }
 
 /// Graph freshness context — what graph state answered the query. `as_of` is a
@@ -280,6 +300,46 @@ impl Envelope {
         self
     }
 
+    /// Whether an "absent" answer produced from this graph state can be trusted
+    /// as a definitive negative, with the machine-stable reason.
+    ///
+    /// This is the epistemic core of the confidence-qualified-negative contract:
+    /// a "not found" is only distinguishable from "not indexed" when the answer
+    /// came from daemon-owned truth (`RepoDaemon`) **with** complete embedding
+    /// coverage **and** no degraded signals. Anything else — the offline fallback
+    /// surface, unknown coverage (the daemon did not report it), partial
+    /// coverage, or any degraded flag — leaves absence inconclusive. The reason
+    /// is honest about *which* of those held, and never claims authority the
+    /// envelope did not actually observe.
+    pub fn negative_trust(&self) -> (bool, &'static str) {
+        if self.runtime != Runtime::RepoDaemon {
+            return (
+                false,
+                "offline_fallback: answered by the in-process graph, a fallback surface — not authoritative graph truth",
+            );
+        }
+        if self.degraded.any() {
+            return (
+                false,
+                "degraded: the daemon reported a degraded signal, so the index may not reflect current truth",
+            );
+        }
+        match &self.semantic_coverage {
+            None => (
+                false,
+                "coverage_unknown: embedding coverage was not reported, so an empty result may mean 'not indexed' rather than 'not present'",
+            ),
+            Some(coverage) if !coverage.complete => (
+                false,
+                "coverage_partial: the semantic index is incomplete, so an empty result may mean 'not indexed' rather than 'not present'",
+            ),
+            Some(_) => (
+                true,
+                "authoritative: daemon-owned truth with complete embedding coverage and no degraded signals",
+            ),
+        }
+    }
+
     /// Serialize the envelope to a JSON value for embedding under [`ENVELOPE_KEY`].
     fn to_value(&self) -> Value {
         serde_json::to_value(self).unwrap_or(Value::Null)
@@ -297,11 +357,23 @@ impl Envelope {
 ///
 /// `is_error` and any non-text content blocks are preserved unchanged.
 pub fn annotate(result: ToolCallResult, envelope: &Envelope) -> ToolCallResult {
+    annotate_inner(result, envelope, None)
+}
+
+/// Like [`annotate`], but also attaches a confidence-qualified `negative` object
+/// alongside `_kin` when one was synthesized for the tool. The negative rides
+/// the same content block as the envelope so an agent reads both from one place.
+/// A pre-existing `negative` key is never clobbered.
+fn annotate_inner(
+    result: ToolCallResult,
+    envelope: &Envelope,
+    negative: Option<&Value>,
+) -> ToolCallResult {
     let envelope_value = envelope.to_value();
     let content = result
         .content
         .into_iter()
-        .map(|block| annotate_block(block, &envelope_value))
+        .map(|block| annotate_block(block, &envelope_value, negative))
         .collect();
     ToolCallResult {
         content,
@@ -319,27 +391,45 @@ fn first_payload_value(result: &ToolCallResult) -> Option<Value> {
 
 /// The single call sites use to attach the envelope: lift any metadata the tool
 /// payload already carries (`semantic_coverage`, `graph_as_of`) into `base`,
-/// then annotate the result under [`ENVELOPE_KEY`]. Keeping lift + annotate
-/// together means every dispatch path produces a consistently-enriched envelope.
-pub fn finalize(result: ToolCallResult, base: Envelope) -> ToolCallResult {
-    let envelope = match first_payload_value(&result) {
-        Some(payload) => base.with_payload_metadata(&payload),
+/// synthesize a confidence-qualified `negative` for retrieval tools that came
+/// back empty, then annotate the result under [`ENVELOPE_KEY`]. Keeping
+/// lift + qualify + annotate together in one chokepoint means every dispatch
+/// path (offline and daemon) produces a consistently-enriched envelope and an
+/// identical negative contract regardless of which runtime answered.
+pub fn finalize(result: ToolCallResult, base: Envelope, tool_name: &str) -> ToolCallResult {
+    let payload = first_payload_value(&result);
+    let envelope = match &payload {
+        Some(payload) => base.with_payload_metadata(payload),
         None => base,
     };
-    annotate(result, &envelope)
+    let negative = payload
+        .as_ref()
+        .and_then(|payload| crate::negative::negative_for(tool_name, payload, &envelope));
+    annotate_inner(result, &envelope, negative.as_ref())
 }
 
-fn annotate_block(block: ContentBlock, envelope_value: &Value) -> ContentBlock {
+fn annotate_block(
+    block: ContentBlock,
+    envelope_value: &Value,
+    negative: Option<&Value>,
+) -> ContentBlock {
     let ContentBlock::Text { text } = block;
     let annotated = match serde_json::from_str::<Value>(&text) {
         Ok(Value::Object(mut map)) => {
             map.entry(ENVELOPE_KEY.to_string())
                 .or_insert_with(|| envelope_value.clone());
+            if let Some(negative) = negative {
+                map.entry(crate::negative::NEGATIVE_KEY.to_string())
+                    .or_insert_with(|| negative.clone());
+            }
             Value::Object(map)
         }
         Ok(other) => {
             let mut map = Map::new();
             map.insert(ENVELOPE_KEY.to_string(), envelope_value.clone());
+            if let Some(negative) = negative {
+                map.insert(crate::negative::NEGATIVE_KEY.to_string(), negative.clone());
+            }
             map.insert("result".to_string(), other);
             Value::Object(map)
         }
