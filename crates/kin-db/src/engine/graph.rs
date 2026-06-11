@@ -9790,4 +9790,295 @@ mod tests {
             .collect();
         assert_eq!(kind_ids, expected, "kind query must be id-sorted");
     }
+
+    // -----------------------------------------------------------------------
+    // Deterministic priority embedding queue (5.8/R5)
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn recency_queue_dedups_and_keeps_highest_priority_recency() {
+        let key = RetrievalKey::Entity(EntityId(uuid::Uuid::from_u128(1)));
+
+        let mut q: RecencyQueue<RetrievalKey> = RecencyQueue::default();
+        q.insert(key, EmbedRecency::Backfill);
+        q.insert(key, EmbedRecency::Backfill);
+        assert_eq!(q.len(), 1, "duplicate inserts must dedup to one entry");
+
+        // Re-queuing as a live change upgrades recency (lower value wins).
+        q.insert(key, EmbedRecency::ChangedThisSync);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.drain_all(), vec![(key, EmbedRecency::ChangedThisSync)]);
+
+        // A later backfill must NOT downgrade an existing live-change entry.
+        let mut q2: RecencyQueue<RetrievalKey> = RecencyQueue::default();
+        q2.insert(key, EmbedRecency::ChangedThisSync);
+        q2.insert(key, EmbedRecency::Backfill);
+        assert_eq!(q2.drain_all(), vec![(key, EmbedRecency::ChangedThisSync)]);
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn entity_embed_tier_orders_public_api_first_and_tests_last() {
+        let mut api = test_entity("api", "src/lib.rs");
+        api.kind = EntityKind::Interface;
+        api.visibility = Visibility::Public;
+        assert_eq!(entity_embed_tier(&api), embed_tier::PUBLIC_API);
+
+        let pubfn = test_entity("pubfn", "src/lib.rs"); // Public Source Function
+        assert_eq!(entity_embed_tier(&pubfn), embed_tier::PUBLIC_SOURCE);
+
+        let mut privfn = test_entity("privfn", "src/lib.rs");
+        privfn.visibility = Visibility::Private;
+        assert_eq!(entity_embed_tier(&privfn), embed_tier::PRIVATE_SOURCE);
+
+        let mut testfn = test_entity("testfn", "src/lib.rs");
+        testfn.role = EntityRole::Test;
+        assert_eq!(entity_embed_tier(&testfn), embed_tier::TEST);
+
+        let mut generated = test_entity("gen", "src/lib.rs");
+        generated.role = EntityRole::Generated;
+        assert_eq!(entity_embed_tier(&generated), embed_tier::OTHER);
+
+        assert!(embed_tier::PUBLIC_API < embed_tier::PUBLIC_SOURCE);
+        assert!(embed_tier::PUBLIC_SOURCE < embed_tier::PRIVATE_SOURCE);
+        assert!(embed_tier::PRIVATE_SOURCE < embed_tier::TEST);
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn embed_sort_key_precedence_is_tier_recency_centrality_id() {
+        let k_lo = RetrievalKey::Entity(EntityId(uuid::Uuid::from_u128(1)));
+        let k_hi = RetrievalKey::Entity(EntityId(uuid::Uuid::from_u128(2)));
+
+        // Tier dominates recency and centrality.
+        let better_tier = EmbedSortKey {
+            tier: 0,
+            recency: EmbedRecency::Backfill,
+            centrality_rank: u32::MAX,
+            key: k_hi,
+        };
+        let worse_tier = EmbedSortKey {
+            tier: 1,
+            recency: EmbedRecency::ChangedThisSync,
+            centrality_rank: 0,
+            key: k_lo,
+        };
+        assert!(better_tier < worse_tier);
+
+        // Within a tier, recency dominates centrality.
+        let changed = EmbedSortKey {
+            tier: 1,
+            recency: EmbedRecency::ChangedThisSync,
+            centrality_rank: u32::MAX,
+            key: k_hi,
+        };
+        let backfill = EmbedSortKey {
+            tier: 1,
+            recency: EmbedRecency::Backfill,
+            centrality_rank: 0,
+            key: k_lo,
+        };
+        assert!(changed < backfill);
+
+        // Within tier+recency, higher in-degree (lower rank) embeds first.
+        let high_centrality = EmbedSortKey {
+            tier: 1,
+            recency: EmbedRecency::Backfill,
+            centrality_rank: embed_centrality_rank(10),
+            key: k_hi,
+        };
+        let low_centrality = EmbedSortKey {
+            tier: 1,
+            recency: EmbedRecency::Backfill,
+            centrality_rank: embed_centrality_rank(0),
+            key: k_lo,
+        };
+        assert!(high_centrality < low_centrality);
+
+        // All else equal, the key id is the stable tiebreak.
+        let id_lo = EmbedSortKey {
+            tier: 1,
+            recency: EmbedRecency::Backfill,
+            centrality_rank: embed_centrality_rank(0),
+            key: k_lo,
+        };
+        let id_hi = EmbedSortKey {
+            tier: 1,
+            recency: EmbedRecency::Backfill,
+            centrality_rank: embed_centrality_rank(0),
+            key: k_hi,
+        };
+        assert!(id_lo < id_hi);
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn drain_embedding_batch_is_stable_across_insertion_orders() {
+        // Same three entities, two different insertion orders -> identical drain.
+        let mut alpha = test_entity_with_id(0x10, "alpha");
+        alpha.visibility = Visibility::Private; // tier PRIVATE_SOURCE
+        let mut beta = test_entity_with_id(0x20, "beta");
+        beta.kind = EntityKind::Interface; // tier PUBLIC_API
+        let gamma = test_entity_with_id(0x30, "gamma"); // tier PUBLIC_SOURCE
+
+        let g1 = InMemoryGraph::new();
+        for e in [&alpha, &beta, &gamma] {
+            g1.upsert_entity(e).unwrap();
+        }
+        let g2 = InMemoryGraph::new();
+        for e in [&gamma, &alpha, &beta] {
+            g2.upsert_entity(e).unwrap();
+        }
+
+        let keys =
+            |drained: Vec<(RetrievalKey, EmbedRecency)>| -> Vec<RetrievalKey> {
+                drained.into_iter().map(|(k, _)| k).collect()
+            };
+        let order1 = keys(g1.drain_embedding_batch(100));
+        let order2 = keys(g2.drain_embedding_batch(100));
+        assert_eq!(
+            order1, order2,
+            "drain order must be independent of insertion / map-seed order"
+        );
+
+        // And it is the priority order: public API, then public source, then private.
+        assert_eq!(
+            order1,
+            vec![
+                RetrievalKey::Entity(beta.id),
+                RetrievalKey::Entity(gamma.id),
+                RetrievalKey::Entity(alpha.id),
+            ]
+        );
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn drain_embedding_batch_prioritizes_high_centrality_within_tier() {
+        let g = InMemoryGraph::new();
+        let hub = test_entity_with_id(0x60, "hub");
+        let leaf = test_entity_with_id(0x61, "leaf");
+        g.upsert_entity(&hub).unwrap();
+        g.upsert_entity(&leaf).unwrap();
+
+        // Give hub three incoming relations (in-degree 3); leaf stays at 0.
+        for i in 0..3u128 {
+            let dep = test_entity_with_id(0x70 + i, "dep");
+            g.upsert_entity(&dep).unwrap();
+            g.upsert_relation(&test_relation(dep.id, hub.id, RelationKind::Calls))
+                .unwrap();
+        }
+
+        let order: Vec<RetrievalKey> = g
+            .drain_embedding_batch(100)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        let pos = |id| {
+            order
+                .iter()
+                .position(|k| *k == RetrievalKey::Entity(id))
+                .unwrap()
+        };
+        // Same tier + recency; hub's higher in-degree must place it before leaf.
+        assert!(
+            pos(hub.id) < pos(leaf.id),
+            "higher-centrality entity must embed earlier within a tier"
+        );
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn drain_embedding_batch_orders_changed_this_sync_before_backfill() {
+        let g = InMemoryGraph::new();
+        // a.id < b.id, so an id-only sort would put `a` first; recency must flip it.
+        let a = test_entity_with_id(0x40, "aaa");
+        let b = test_entity_with_id(0x41, "bbb");
+        g.upsert_entity(&a).unwrap();
+        g.upsert_entity(&b).unwrap();
+
+        g.embedding_queue.lock().clear();
+        g.queue_for_embedding(&[a.id]); // a -> Backfill
+        g.upsert_entity(&b).unwrap(); // b -> ChangedThisSync (live invalidate path)
+
+        let order: Vec<RetrievalKey> = g
+            .drain_embedding_batch(100)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            order,
+            vec![RetrievalKey::Entity(b.id), RetrievalKey::Entity(a.id)],
+            "changed-this-sync must embed before backfill despite a lower id"
+        );
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn drain_embedding_batch_respects_batch_size_and_requeues_leftover() {
+        let g = InMemoryGraph::new();
+        let mut api = test_entity_with_id(0x80, "api");
+        api.kind = EntityKind::Interface; // tier PUBLIC_API
+        let pubfn = test_entity_with_id(0x81, "pubfn"); // tier PUBLIC_SOURCE
+        let mut privfn = test_entity_with_id(0x82, "privfn");
+        privfn.visibility = Visibility::Private; // tier PRIVATE_SOURCE
+        g.upsert_entity(&privfn).unwrap();
+        g.upsert_entity(&pubfn).unwrap();
+        g.upsert_entity(&api).unwrap();
+
+        // Batch of 1 -> only the highest-priority item (the API surface).
+        let first = g.drain_embedding_batch(1);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, RetrievalKey::Entity(api.id));
+        assert_eq!(g.pending_embeddings(), 2, "leftover must be requeued");
+
+        // Next drain continues in priority order.
+        let rest: Vec<RetrievalKey> = g
+            .drain_embedding_batch(100)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            rest,
+            vec![
+                RetrievalKey::Entity(pubfn.id),
+                RetrievalKey::Entity(privfn.id)
+            ]
+        );
+        assert_eq!(g.pending_embeddings(), 0);
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn drain_artifact_embedding_batch_is_deterministic_and_recency_first() {
+        let g = InMemoryGraph::new();
+        let id1 = ArtifactId::from_file_id(&FilePathId::new("a.rs"));
+        let id2 = ArtifactId::from_file_id(&FilePathId::new("b.rs"));
+        let id3 = ArtifactId::from_file_id(&FilePathId::new("c.rs"));
+
+        {
+            let mut q = g.artifact_embedding_queue.lock();
+            // Scrambled insertion order, mixed recency.
+            q.insert(id3, EmbedRecency::Backfill);
+            q.insert(id1, EmbedRecency::ChangedThisSync);
+            q.insert(id2, EmbedRecency::Backfill);
+            // Duplicate insert must dedup.
+            q.insert(id2, EmbedRecency::Backfill);
+        }
+        assert_eq!(g.pending_artifact_embeddings(), 3);
+
+        let order: Vec<ArtifactId> = g
+            .drain_artifact_embedding_batch(100)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        // Changed-this-sync first, then backfill ids in ascending id order.
+        let mut backfill = vec![id2, id3];
+        backfill.sort();
+        let mut expected = vec![id1];
+        expected.extend(backfill);
+        assert_eq!(order, expected);
+    }
 }
