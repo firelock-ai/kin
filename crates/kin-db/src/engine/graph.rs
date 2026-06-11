@@ -5590,6 +5590,64 @@ impl InMemoryGraph {
         });
         out
     }
+
+    /// Actively re-scope orphaned annotations onto their renamed entity.
+    ///
+    /// For each annotation that has a fingerprint anchor but whose entity scopes
+    /// no longer resolve to any live entity (the original was renamed/removed),
+    /// find live entities whose fingerprint matches the anchor. When there is
+    /// EXACTLY ONE such entity (an unambiguous rename target) append
+    /// `WorkScope::Entity(new_id)` so future recall is an O(1) exact-id match.
+    /// Ambiguous anchors (a fingerprint shared by several live entities —
+    /// duplicated/templated code) are left untouched and continue to resolve via
+    /// lazy fingerprint recall, so this never mis-anchors memory to the wrong
+    /// duplicate. Returns the number of annotations re-scoped. Idempotent.
+    ///
+    /// This is the OPTIONAL active-detection path. kin-db never invokes it on its
+    /// own (it is inert by default); the reconcile/sync path (kin-side) calls it
+    /// behind a default-off flag after applying a graph diff.
+    pub fn reanchor_orphaned_annotations(&self) -> usize {
+        // Lock order: entities (read) BEFORE work (write).
+        let ent = self.entities.read();
+        let mut by_fp: HashMap<(Hash256, Hash256), Vec<EntityId>> = HashMap::new();
+        for (id, e) in &ent.entities {
+            by_fp
+                .entry((e.fingerprint.ast_hash, e.fingerprint.signature_hash))
+                .or_default()
+                .push(*id);
+        }
+
+        let mut wrk = self.work.write();
+        let mut count = 0usize;
+        for ann in wrk.annotations.values_mut() {
+            let anchor = match &ann.anchored_fingerprint {
+                Some(a) => a,
+                None => continue,
+            };
+            // Skip annotations already anchored to a live entity (not orphaned).
+            let has_live_scope = ann.scopes.iter().any(
+                |s| matches!(s, WorkScope::Entity(id) if ent.entities.contains_key(id)),
+            );
+            if has_live_scope {
+                continue;
+            }
+            // Re-scope only on an UNAMBIGUOUS single fingerprint match.
+            if let Some(ids) = by_fp.get(&(anchor.ast_hash, anchor.signature_hash)) {
+                if ids.len() == 1 {
+                    let new_id = ids[0];
+                    let already = ann
+                        .scopes
+                        .iter()
+                        .any(|s| matches!(s, WorkScope::Entity(id) if *id == new_id));
+                    if !already {
+                        ann.scopes.push(WorkScope::Entity(new_id));
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
+    }
 }
 
 impl WorkStore for InMemoryGraph {
@@ -10636,5 +10694,66 @@ mod tests {
         let ry = graph.recall_for_entity(&y.id);
         assert_eq!(ry.len(), 1);
         assert_eq!(ry[0].match_basis, RecallMatchBasis::Id);
+    }
+
+    #[test]
+    fn reanchor_orphaned_annotations_rescopes_unique_rename() {
+        let graph = InMemoryGraph::new();
+        let old = entity_with_fp(0x500, "oldName", "src/a.rs", 5, 6);
+        graph.upsert_entity(&old).unwrap();
+        deposit_on(&graph, 0xe1, WorkScope::Entity(old.id));
+
+        // Rename to a single new entity sharing the fingerprint.
+        graph.remove_entity(&old.id).unwrap();
+        let new = entity_with_fp(0x501, "newName", "src/a.rs", 5, 6);
+        graph.upsert_entity(&new).unwrap();
+
+        // Before active re-scope, recall resolves only via fingerprint re-anchor.
+        assert_eq!(
+            graph.recall_for_entity(&new.id)[0].match_basis,
+            RecallMatchBasis::FingerprintReanchor
+        );
+
+        // Active re-scope appends the new entity scope (unambiguous match).
+        assert_eq!(graph.reanchor_orphaned_annotations(), 1);
+        let recalled = graph.recall_for_entity(&new.id);
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(
+            recalled[0].match_basis,
+            RecallMatchBasis::Id,
+            "after re-scope the memory is an exact-id match"
+        );
+
+        // Idempotent: a second pass changes nothing.
+        assert_eq!(graph.reanchor_orphaned_annotations(), 0);
+    }
+
+    #[test]
+    fn reanchor_skips_ambiguous_fingerprint() {
+        let graph = InMemoryGraph::new();
+        let old = entity_with_fp(0x600, "oldName", "src/a.rs", 7, 7);
+        graph.upsert_entity(&old).unwrap();
+        deposit_on(&graph, 0xf1, WorkScope::Entity(old.id));
+        graph.remove_entity(&old.id).unwrap();
+
+        // Two live entities now share the orphaned anchor's fingerprint.
+        graph
+            .upsert_entity(&entity_with_fp(0x601, "candA", "src/a.rs", 7, 7))
+            .unwrap();
+        graph
+            .upsert_entity(&entity_with_fp(0x602, "candB", "src/b.rs", 7, 7))
+            .unwrap();
+
+        // Ambiguous → must NOT commit a re-scope (could mis-anchor to a duplicate).
+        assert_eq!(graph.reanchor_orphaned_annotations(), 0);
+        let ann = graph
+            .get_annotation(&AnnotationId(uuid::Uuid::from_u128(0xf1)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ann.scopes,
+            vec![WorkScope::Entity(old.id)],
+            "ambiguous anchors are left for lazy fingerprint recall, not committed"
+        );
     }
 }
