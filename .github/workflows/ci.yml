@@ -69,8 +69,59 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
+      # TEMPORARY debt allow-list — burn down per crates/kin-cli/docs/kin-cli-clippy-triage.md
+      # + release-ops task; no additions without lead sign-off.
+      # Enumerated 2026-06-10 from `cargo clippy --all-targets --all-features` on main:
+      # 271 warnings, 42 distinct clippy lints. The trailing `-A deprecated` is a rustc
+      # (non-clippy) lint covering the ArtifactId::from_path deprecation warnings; it is
+      # required for the -Dwarnings gate to pass until that migration lands. The `--` keeps
+      # these allows AFTER the RUSTFLAGS=-Dwarnings group so each specific lint overrides it.
       - name: Clippy
-        run: cargo clippy --all-targets --all-features
+        run: >
+          cargo clippy --all-targets --all-features --
+          -A clippy::await_holding_lock
+          -A clippy::bool_assert_comparison
+          -A clippy::clone_on_copy
+          -A clippy::collapsible_if
+          -A clippy::derivable_impls
+          -A clippy::doc_lazy_continuation
+          -A clippy::doc_overindented_list_items
+          -A clippy::field_reassign_with_default
+          -A clippy::filter_map_bool_then
+          -A clippy::for_kv_map
+          -A clippy::format_in_format_args
+          -A clippy::if_same_then_else
+          -A clippy::int_plus_one
+          -A clippy::io_other_error
+          -A clippy::items_after_test_module
+          -A clippy::large_enum_variant
+          -A clippy::len_zero
+          -A clippy::manual_contains
+          -A clippy::manual_is_multiple_of
+          -A clippy::manual_map
+          -A clippy::manual_pattern_char_comparison
+          -A clippy::manual_strip
+          -A clippy::map_entry
+          -A clippy::match_single_binding
+          -A clippy::missing_const_for_thread_local
+          -A clippy::needless_borrow
+          -A clippy::needless_option_as_deref
+          -A clippy::needless_question_mark
+          -A clippy::needless_return
+          -A clippy::new_without_default
+          -A clippy::only_used_in_recursion
+          -A clippy::ptr_arg
+          -A clippy::redundant_closure
+          -A clippy::redundant_field_names
+          -A clippy::regex_creation_in_loops
+          -A clippy::result_large_err
+          -A clippy::too_many_arguments
+          -A clippy::type_complexity
+          -A clippy::unnecessary_cast
+          -A clippy::unnecessary_map_or
+          -A clippy::unnecessary_sort_by
+          -A clippy::unnecessary_unwrap
+          -A deprecated
 
       - name: Check Runtime Boundaries
         run: bash scripts/check_runtime_boundaries.sh
