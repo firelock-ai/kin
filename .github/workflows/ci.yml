@@ -42,6 +42,19 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Configure kin cargo registry
+        # .cargo/config.toml is gitignored (it carries local-dev [patch] paths),
+        # so CI writes only the registry alias the committed Cargo.toml needs to
+        # resolve the published kin-* crates (kin-model, kin-db, kin-lsp, …) from
+        # the kinlab.ai sparse registry. Mirrors release.yml / Dockerfile and the
+        # kin-bench CI(Linux) workflow.
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'TOML'
+          [registries.kin]
+          index = "sparse+https://kinlab.ai/registry/cargo/"
+          TOML
+
       - name: Cache cargo registry and build
         uses: actions/cache@v4
         with:
@@ -65,11 +78,16 @@ jobs:
       - name: Check Private Repo Coupling
         run: bash scripts/check_private_repo_coupling.sh
 
+      # NOTE: --locked is intentionally omitted. The committed Cargo.lock is
+      # generated against the local-dev [patch] redirects (path crates, no
+      # registry checksums); a fresh registry-only resolve must be allowed to
+      # update the lock in-CI, exactly as the kin-bench CI(Linux) job does. If
+      # a committed registry-flavoured Cargo.lock lands later, restore --locked.
       - name: Build
-        run: cargo build --locked --all-targets
+        run: cargo build --all-targets
 
       - name: Test
-        run: cargo test --locked
+        run: cargo test
 
   # Security audit moved to sast.yml (cargo-deny: advisories + licenses + bans + sources)
 
@@ -81,6 +99,16 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Configure kin cargo registry
+        # Same registry alias the check job writes; tarpaulin resolves the
+        # published kin-* crates from the kinlab.ai sparse registry too.
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'TOML'
+          [registries.kin]
+          index = "sparse+https://kinlab.ai/registry/cargo/"
+          TOML
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
@@ -98,7 +126,7 @@ jobs:
 
       - name: Run coverage
         run: |
-          if ! cargo tarpaulin --locked --out xml --out stdout; then
+          if ! cargo tarpaulin --out xml --out stdout; then
             echo "::warning::Tarpaulin is currently non-blocking in CI for the public alpha."
           fi
 
