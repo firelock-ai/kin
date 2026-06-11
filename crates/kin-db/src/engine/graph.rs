@@ -750,6 +750,11 @@ struct EmbedSortKey {
 /// state. HEAD entities draw tier and centrality from their own graph facts;
 /// historical revisions trail live HEAD source at a fixed revision tier;
 /// artifact keys (not normally present in the entity queue) sort last.
+///
+/// PERF: this is O(1) per key — two `HashMap` point lookups (`entities` and
+/// `incoming`) plus `Vec::len`, and a constant-time `entity_embed_tier` match.
+/// No graph traversal happens here, so building keys for an init backfill of
+/// 20K–50K entities is O(n) and the surrounding drain sort is O(n log n).
 #[cfg(feature = "vector")]
 fn embed_sort_key_for(ent: &EntityData, key: RetrievalKey, recency: EmbedRecency) -> EmbedSortKey {
     let (tier, centrality_rank) = match key {
@@ -759,6 +764,8 @@ fn embed_sort_key_for(ent: &EntityData, key: RetrievalKey, recency: EmbedRecency
                 .get(&id)
                 .map(entity_embed_tier)
                 .unwrap_or(embed_tier::OTHER);
+            // In-degree (dependents) is a direct adjacency-list length lookup —
+            // O(1), no edge walk.
             let in_degree = ent.incoming.get(&id).map(|rels| rels.len()).unwrap_or(0);
             (tier, embed_centrality_rank(in_degree))
         }
@@ -2973,7 +2980,11 @@ impl InMemoryGraph {
 
         // Compute a deterministic priority sort key for each item from current
         // graph state (tier → recency → centrality → id), then order ascending
-        // so the smallest — highest-priority — item embeds first.
+        // so the smallest — highest-priority — item embeds first. The sort is
+        // GLOBAL over the entire drained queue and happens BEFORE the caller
+        // chunks the returned batch for inference, so priority is never merely
+        // per-chunk. (O(n) key build + O(n log n) sort; see `embed_sort_key_for`
+        // for the per-key O(1) bound.)
         let mut keyed: Vec<(EmbedSortKey, RetrievalKey, EmbedRecency)> = {
             let ent = self.entities.read();
             drained
@@ -9817,32 +9828,100 @@ mod tests {
         assert_eq!(q2.drain_all(), vec![(key, EmbedRecency::ChangedThisSync)]);
     }
 
+    /// Pin the INTENDED tier lattice (semantics, not implementation): a refactor
+    /// that silently inverts any rung must fail here. Canonical order, earliest
+    /// embed first:
+    ///   PUBLIC_API < PUBLIC_SOURCE < CRATE_SOURCE < INTERNAL_SOURCE
+    ///   < PRIVATE_SOURCE < REVISION < TEST < DOCS < OTHER
     #[cfg(feature = "vector")]
     #[test]
-    fn entity_embed_tier_orders_public_api_first_and_tests_last() {
-        let mut api = test_entity("api", "src/lib.rs");
-        api.kind = EntityKind::Interface;
-        api.visibility = Visibility::Public;
-        assert_eq!(entity_embed_tier(&api), embed_tier::PUBLIC_API);
+    fn entity_embed_tier_lattice_is_pinned_public_api_first_generated_last() {
+        let with = |vis: Visibility, role: EntityRole, kind: EntityKind| -> Entity {
+            let mut e = test_entity("e", "src/lib.rs");
+            e.visibility = vis;
+            e.role = role;
+            e.kind = kind;
+            e
+        };
 
-        let pubfn = test_entity("pubfn", "src/lib.rs"); // Public Source Function
-        assert_eq!(entity_embed_tier(&pubfn), embed_tier::PUBLIC_SOURCE);
+        // Public API contract surface (each API kind, when Public).
+        for kind in [
+            EntityKind::ApiEndpoint,
+            EntityKind::EventContract,
+            EntityKind::Schema,
+            EntityKind::Interface,
+            EntityKind::TraitDef,
+        ] {
+            assert_eq!(
+                entity_embed_tier(&with(Visibility::Public, EntityRole::Source, kind)),
+                embed_tier::PUBLIC_API,
+                "{kind:?} @ Public must be the public-API tier"
+            );
+        }
 
-        let mut privfn = test_entity("privfn", "src/lib.rs");
-        privfn.visibility = Visibility::Private;
-        assert_eq!(entity_embed_tier(&privfn), embed_tier::PRIVATE_SOURCE);
+        // Source code by visibility (non-API kinds).
+        assert_eq!(
+            entity_embed_tier(&with(Visibility::Public, EntityRole::Source, EntityKind::Function)),
+            embed_tier::PUBLIC_SOURCE
+        );
+        assert_eq!(
+            entity_embed_tier(&with(Visibility::Crate, EntityRole::Source, EntityKind::Function)),
+            embed_tier::CRATE_SOURCE
+        );
+        assert_eq!(
+            entity_embed_tier(&with(
+                Visibility::Internal,
+                EntityRole::Source,
+                EntityKind::Function
+            )),
+            embed_tier::INTERNAL_SOURCE
+        );
+        assert_eq!(
+            entity_embed_tier(&with(
+                Visibility::Private,
+                EntityRole::Source,
+                EntityKind::Function
+            )),
+            embed_tier::PRIVATE_SOURCE
+        );
 
-        let mut testfn = test_entity("testfn", "src/lib.rs");
-        testfn.role = EntityRole::Test;
-        assert_eq!(entity_embed_tier(&testfn), embed_tier::TEST);
+        // Non-source roles trail all live source, regardless of visibility.
+        assert_eq!(
+            entity_embed_tier(&with(Visibility::Public, EntityRole::Test, EntityKind::Function)),
+            embed_tier::TEST
+        );
+        // A source-roled but structurally-test entity is still a test.
+        assert_eq!(
+            entity_embed_tier(&with(Visibility::Public, EntityRole::Source, EntityKind::Test)),
+            embed_tier::TEST
+        );
+        assert_eq!(
+            entity_embed_tier(&with(Visibility::Public, EntityRole::Docs, EntityKind::DocumentNode)),
+            embed_tier::DOCS
+        );
+        for role in [EntityRole::Generated, EntityRole::Vendored, EntityRole::External] {
+            assert_eq!(
+                entity_embed_tier(&with(Visibility::Public, role, EntityKind::Function)),
+                embed_tier::OTHER,
+                "{role:?} must be the trailing tier even when Public"
+            );
+        }
 
-        let mut generated = test_entity("gen", "src/lib.rs");
-        generated.role = EntityRole::Generated;
-        assert_eq!(entity_embed_tier(&generated), embed_tier::OTHER);
-
-        assert!(embed_tier::PUBLIC_API < embed_tier::PUBLIC_SOURCE);
-        assert!(embed_tier::PUBLIC_SOURCE < embed_tier::PRIVATE_SOURCE);
-        assert!(embed_tier::PRIVATE_SOURCE < embed_tier::TEST);
+        // The full lattice is strictly ordered, earliest-embed first. REVISION
+        // is not produced by entity_embed_tier (it is assigned to historical
+        // revision keys in embed_sort_key_for) but is pinned in the chain so the
+        // overall ordering contract is encoded in one place.
+        assert!(
+            embed_tier::PUBLIC_API < embed_tier::PUBLIC_SOURCE
+                && embed_tier::PUBLIC_SOURCE < embed_tier::CRATE_SOURCE
+                && embed_tier::CRATE_SOURCE < embed_tier::INTERNAL_SOURCE
+                && embed_tier::INTERNAL_SOURCE < embed_tier::PRIVATE_SOURCE
+                && embed_tier::PRIVATE_SOURCE < embed_tier::REVISION
+                && embed_tier::REVISION < embed_tier::TEST
+                && embed_tier::TEST < embed_tier::DOCS
+                && embed_tier::DOCS < embed_tier::OTHER,
+            "tier lattice must stay strictly ordered public-API → generated"
+        );
     }
 
     #[cfg(feature = "vector")]
@@ -10080,5 +10159,49 @@ mod tests {
         let mut expected = vec![id1];
         expected.extend(backfill);
         assert_eq!(order, expected);
+    }
+
+    /// Rider 1: the live invalidate (re-enqueue) path must UPGRADE an item
+    /// already queued as Backfill to ChangedThisSync — a max-priority insert,
+    /// never first-writer-wins — and must not duplicate it.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn invalidate_path_upgrades_queued_backfill_to_changed_this_sync() {
+        let g = InMemoryGraph::new();
+        // peer has the LOWER id, target the HIGHER id. Same tier + centrality.
+        // If recency were ignored, the id tiebreak alone would order [peer, target];
+        // an upgrade of `target` to ChangedThisSync must flip that to [target, peer].
+        let peer = test_entity_with_id(0x90, "peer");
+        let target = test_entity_with_id(0x91, "target");
+        g.upsert_entity(&peer).unwrap();
+        g.upsert_entity(&target).unwrap();
+
+        // Establish a known baseline: both queued as Backfill.
+        g.embedding_queue.lock().clear();
+        g.queue_for_embedding(&[peer.id, target.id]);
+        assert_eq!(g.pending_embeddings(), 2);
+
+        // Live mutation re-enqueues `target` via the invalidate path.
+        g.upsert_entity(&target).unwrap();
+        assert_eq!(
+            g.pending_embeddings(),
+            2,
+            "re-enqueue must upgrade in place, not add a duplicate"
+        );
+
+        let order: Vec<RetrievalKey> = g
+            .drain_embedding_batch(100)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                RetrievalKey::Entity(target.id),
+                RetrievalKey::Entity(peer.id)
+            ],
+            "invalidate path must UPGRADE backfill→changed-this-sync (max policy), \
+             flipping the id-tiebreak order"
+        );
     }
 }
