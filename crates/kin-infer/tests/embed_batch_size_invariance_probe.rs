@@ -106,7 +106,11 @@ fn run_for_model(model_dir: &str) {
     // crosses it as the batch grows. Always at input index 0.
     const TLEN: usize = 12;
     let (t, tm) = synth(TLEN, 7);
-    let baseline = model.forward(&[t.clone()], &[tm.clone()]).unwrap().pop().unwrap();
+    let baseline = model
+        .forward(&[t.clone()], &[tm.clone()])
+        .unwrap()
+        .pop()
+        .unwrap();
 
     // Each config: (label, predicted regime, batch token_ids, batch masks).
     // The target is always index 0; fillers ride alongside to drive max_len/total_rows.
@@ -119,10 +123,26 @@ fn run_for_model(model_dir: &str) {
     };
 
     let configs: Vec<Batch> = vec![
-        mk("fb_n1     ", "A proj=scalar attn=scalar", vec![(t.clone(), tm.clone())]),
-        mk("fb_n2     ", "A proj=scalar attn=scalar", vec![(t.clone(), tm.clone()); 2]),
-        mk("fb_n3     ", "B proj=MMA    attn=scalar", vec![(t.clone(), tm.clone()); 3]),
-        mk("fb_n8     ", "B proj=MMA    attn=scalar", vec![(t.clone(), tm.clone()); 8]),
+        mk(
+            "fb_n1     ",
+            "A proj=scalar attn=scalar",
+            vec![(t.clone(), tm.clone())],
+        ),
+        mk(
+            "fb_n2     ",
+            "A proj=scalar attn=scalar",
+            vec![(t.clone(), tm.clone()); 2],
+        ),
+        mk(
+            "fb_n3     ",
+            "B proj=MMA    attn=scalar",
+            vec![(t.clone(), tm.clone()); 3],
+        ),
+        mk(
+            "fb_n8     ",
+            "B proj=MMA    attn=scalar",
+            vec![(t.clone(), tm.clone()); 8],
+        ),
         mk(
             "fb_filler20",
             "B proj=MMA    attn=scalar",
@@ -167,9 +187,18 @@ fn run_for_model(model_dir: &str) {
         ("A: fb_n1  == fb_n2  ", "fb_n1", "fb_n2"),
         ("B: fb_n3  == fb_n8  ", "fb_n3", "fb_n8"),
         ("B: fb_n3  == fb_filler20", "fb_n3", "fb_filler20"),
-        ("C: fb_filler40 == fb_filler60", "fb_filler40", "fb_filler60"),
+        (
+            "C: fb_filler40 == fb_filler60",
+            "fb_filler40",
+            "fb_filler60",
+        ),
     ];
-    let find = |name: &str| vectors.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone());
+    let find = |name: &str| {
+        vectors
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+    };
     for (desc, a, b) in pairs {
         if let (Some(va), Some(vb)) = (find(a), find(b)) {
             let (ndiff, max_abs, _) = compare(&va, &vb);
@@ -196,7 +225,8 @@ fn batch_size_invariance_probe() {
 ///   run twice:  for i in 1 2; do <bin> corpus_fingerprint --nocapture; done
 #[test]
 fn corpus_fingerprint() {
-    let model_dir = std::env::var("KIN_INFER_PROBE_MODEL_DIR").unwrap_or_else(|_| "/tmp/nomic".into());
+    let model_dir =
+        std::env::var("KIN_INFER_PROBE_MODEL_DIR").unwrap_or_else(|_| "/tmp/nomic".into());
     let dir = Path::new(&model_dir);
     if !dir.join("model.safetensors").exists() {
         eprintln!("SKIP: no model at {model_dir}");

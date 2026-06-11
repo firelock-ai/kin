@@ -4326,7 +4326,9 @@ mod tests {
     fn embedding_is_invariant_to_batch_size_and_composition() {
         let dir = std::path::Path::new("/tmp/nomic");
         if !dir.join("model.safetensors").exists() {
-            eprintln!("SKIP: nomic model absent at /tmp/nomic; batch-size invariance guard skipped.");
+            eprintln!(
+                "SKIP: nomic model absent at /tmp/nomic; batch-size invariance guard skipped."
+            );
             return;
         }
         let cfg_json = std::fs::read_to_string(dir.join("config.json")).expect("read config.json");
