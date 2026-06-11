@@ -2,6 +2,6 @@
 index = "sparse+https://kinlab.ai/registry/cargo/"
 
 [patch.kin]
-kin-model = { path = "../kin-db/crates/kin-model" }
+kin-model = { path = "../kin-model" }
 kin-blobs = { path = "../kin-blobs" }
 kin-vector = { path = "../kin-vector" }
