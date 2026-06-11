@@ -16,7 +16,14 @@ feature-depth = 1
 [advisories]
 # Ignore specific advisories that cannot be resolved yet.
 # Each entry must have a reason explaining why it is safe to ignore.
-ignore = []
+ignore = [
+    # Transitive, build-time-only, no fixed upgrade available. Both arrive via
+    # tokenizers (kin-infer → tokenizers → indicatif/macro_rules_attribute) and
+    # are "unmaintained" notices, not vulnerabilities. No runtime exposure; no
+    # safe upgrade exists today. Revisit when tokenizers drops these deps.
+    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained — transitive via tokenizers; no fix available, no vuln" },
+    { id = "RUSTSEC-2025-0119", reason = "number_prefix 0.4.0 unmaintained — transitive via indicatif/tokenizers; no fix available, no vuln" },
+]
 
 # --- License policy ---
 [licenses]
