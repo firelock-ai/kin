@@ -418,7 +418,15 @@ fn locate_ref_hydrates_missing_imported_git_history_on_demand() {
         .expect("git add initial");
     assert!(add_initial.status.success());
     let commit_initial = Command::new("git")
-        .args(["-c", "user.name=kin-ci", "-c", "user.email=ci@kin.dev", "commit", "-m", "initial"])
+        .args([
+            "-c",
+            "user.name=kin-ci",
+            "-c",
+            "user.email=ci@kin.dev",
+            "commit",
+            "-m",
+            "initial",
+        ])
         .current_dir(repo.path())
         .output()
         .expect("git commit initial");
@@ -447,7 +455,15 @@ fn locate_ref_hydrates_missing_imported_git_history_on_demand() {
         .expect("git add current");
     assert!(add_current.status.success());
     let commit_current = Command::new("git")
-        .args(["-c", "user.name=kin-ci", "-c", "user.email=ci@kin.dev", "commit", "-m", "rename handler"])
+        .args([
+            "-c",
+            "user.name=kin-ci",
+            "-c",
+            "user.email=ci@kin.dev",
+            "commit",
+            "-m",
+            "rename handler",
+        ])
         .current_dir(repo.path())
         .output()
         .expect("git commit current");
