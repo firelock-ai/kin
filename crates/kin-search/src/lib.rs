@@ -918,7 +918,6 @@ impl<Id: DocId> TextIndex<Id> {
         Ok(())
     }
 
-
     /// Rebuild the entire index from scratch with a batch of documents.
     ///
     /// Unlike repeated `upsert` calls, this avoids the clone-on-write overhead
@@ -2028,7 +2027,10 @@ mod tests {
         };
         // "stable" occurs once per upsert of the single doc — re-upsert replaces
         // rather than appends, so the posting count stays at 1 (not 50).
-        assert_eq!(token_count, 1, "re-upsert must not accumulate stale postings");
+        assert_eq!(
+            token_count, 1,
+            "re-upsert must not accumulate stale postings"
+        );
     }
 
     /// A format-v1 index on disk (flat `Vec` posting lists) must load, migrate
@@ -2085,7 +2087,10 @@ mod tests {
 
         let idx = TextIndex::<TestId>::open(Some(&dir)).unwrap();
         let results = idx.fuzzy_search("persistMe", 10).unwrap();
-        assert!(!results.is_empty(), "migrated v1 index must still be searchable");
+        assert!(
+            !results.is_empty(),
+            "migrated v1 index must still be searchable"
+        );
         assert_eq!(results[0].0, id);
         assert_eq!(idx.graph_root_hash(), Some([9; 32]));
 
@@ -2139,7 +2144,10 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| name.contains(".tmp-"))
             .collect();
-        assert!(leftovers.is_empty(), "stray temp files remain: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "stray temp files remain: {leftovers:?}"
+        );
     }
 
     /// An undecodable index (valid version prefix, garbage body) is reported as
@@ -2164,7 +2172,10 @@ mod tests {
             other => panic!("expected CorruptIndex, got {other:?}"),
         }
         // Canonical path cleared, evidence preserved alongside it.
-        assert!(!storage.exists(), "corrupt file must be moved off the canonical path");
+        assert!(
+            !storage.exists(),
+            "corrupt file must be moved off the canonical path"
+        );
         assert_eq!(corrupt_sibling_count(&storage), 1);
     }
 
