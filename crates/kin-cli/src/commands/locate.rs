@@ -3387,7 +3387,10 @@ fn extract_priority_file_traces(
             );
         } else {
             // Suffix match: scan entities for file paths containing the fragment
-            if let Ok(all) = graph.query_entities(&EntityFilter::default()) {
+            if let Ok(mut all) = graph.query_entities(&EntityFilter::default()) {
+                // Determinism: sort before the take() clip so the scanned subset
+                // is stable across processes (query order is not guaranteed).
+                all.sort_by(|a, b| a.id.cmp(&b.id));
                 let mut seen_paths = HashSet::new();
                 let mut matched_paths = Vec::new();
                 for entity in all.iter().take(2000) {
@@ -3466,7 +3469,9 @@ fn extract_priority_file_traces(
         if !dir_search_terms.is_empty() {
             // Collect all unique (directory_component → [file_paths]) from entity file origins
             let mut dir_to_files: HashMap<String, Vec<String>> = HashMap::new();
-            if let Ok(all_entities) = graph.query_entities(&EntityFilter::default()) {
+            if let Ok(mut all_entities) = graph.query_entities(&EntityFilter::default()) {
+                // Determinism: stable subset under the take() clip.
+                all_entities.sort_by(|a, b| a.id.cmp(&b.id));
                 let mut seen_files = HashSet::new();
                 for entity in all_entities.iter().take(5000) {
                     if let Some(ref fo) = entity.file_origin {
@@ -6799,7 +6804,10 @@ fn extract_test_signals(
                 name_pattern: Some(term),
                 ..Default::default()
             };
-            for entity in graph.query_entities(&filter)?.into_iter().take(12) {
+            let mut name_matched = graph.query_entities(&filter)?;
+            // Determinism: stable subset under the take() clip.
+            name_matched.sort_by(|a, b| a.id.cmp(&b.id));
+            for entity in name_matched.into_iter().take(12) {
                 if !seen_entities.insert(entity.id) {
                     continue;
                 }
@@ -8054,10 +8062,18 @@ fn compute_import_centrality(
             file_path: Some(kin_model::FilePathId::new(path.as_str())),
             ..Default::default()
         };
-        let entities = match graph.query_entities(&filter) {
+        let mut entities = match graph.query_entities(&filter) {
             Ok(e) => e,
             Err(_) => continue,
         };
+        // Determinism: query_entities order is not guaranteed stable across
+        // processes, and the take() below clips it. Without a stable sort, which
+        // entities feed the centrality count varies per run, perturbing the
+        // import-centrality bonus on the fused.take(15) boundary and flipping
+        // exact/near-tie candidates in/out of the cap (the #20 bug class). Sort
+        // by entity id so the considered subset — and thus import_count — is
+        // deterministic.
+        entities.sort_by(|a, b| a.id.cmp(&b.id));
 
         let mut importer_files: HashSet<String> = HashSet::new();
         for entity in entities
@@ -18898,6 +18914,60 @@ mod tests {
             score,
             signals: vec!["search"],
             cosine: None,
+        }
+    }
+
+    #[test]
+    fn import_centrality_is_stable_and_counts_inbound_importers() {
+        // Determinism regression guard for the tie-break fix: compute_import_centrality
+        // sorts query_entities by id before the take() clip, so the considered
+        // entity subset — and thus the import count that perturbs the fused
+        // boundary — is process-independent. A single test process can't vary the
+        // RandomState seed (the cross-process guarantee is by-construction via the
+        // id sort), but this pins functional correctness + intra-run stability so a
+        // future map-order-dependent regression is caught.
+        let graph = kin_db::InMemoryGraph::new();
+        let hub = test_entity("hub_fn", "src/hub.rs", 1, 10);
+        let user = test_entity("user_fn", "src/user.rs", 1, 10);
+        graph.upsert_entity(&hub).unwrap();
+        graph.upsert_entity(&user).unwrap();
+        // user_fn imports hub_fn → inbound to hub_fn → src/user.rs is an importer of src/hub.rs.
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Imports,
+                src: GraphNodeId::Entity(user.id),
+                dst: GraphNodeId::Entity(hub.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        let hits: HashMap<String, Vec<FileHit>> = HashMap::from([
+            ("src/hub.rs".to_string(), hit(5.0)),
+            ("src/user.rs".to_string(), hit(3.0)),
+        ]);
+        let signal_sets: Vec<&HashMap<String, Vec<FileHit>>> = vec![&hits];
+
+        let first = compute_import_centrality(&graph, &signal_sets).unwrap();
+        assert!(
+            first.contains_key("src/hub.rs"),
+            "hub.rs has an inbound importer → must get a centrality entry"
+        );
+        for _ in 0..5 {
+            let again = compute_import_centrality(&graph, &signal_sets).unwrap();
+            let a: std::collections::BTreeMap<_, _> = first
+                .iter()
+                .map(|(k, v)| (k.clone(), v.iter().map(|h| h.score).sum::<f32>()))
+                .collect();
+            let b: std::collections::BTreeMap<_, _> = again
+                .iter()
+                .map(|(k, v)| (k.clone(), v.iter().map(|h| h.score).sum::<f32>()))
+                .collect();
+            assert_eq!(a, b, "import centrality must be stable across calls");
         }
     }
 
