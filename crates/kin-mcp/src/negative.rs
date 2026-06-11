@@ -32,7 +32,7 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::envelope::Envelope;
+use crate::envelope::{Envelope, NegativeClass};
 
 /// Reserved, additive top-level key under which a retrieval tool's
 /// confidence-qualified negative is attached, beside the `_kin` envelope.
@@ -53,6 +53,9 @@ struct RetrievalSpec {
     /// — e.g. batch reachability, whose `has_references: false` rows are
     /// themselves the negatives an agent must calibrate before deleting.
     always: bool,
+    /// Which substrate's completeness gates this tool's absence-trust: embeddings
+    /// (`Semantic`) or graph structure (`Structural`). See [`NegativeClass`].
+    class: NegativeClass,
 }
 
 /// The registry of negative-capable retrieval tools. Returns `None` for any tool
@@ -65,6 +68,7 @@ fn spec_for(tool: &str) -> Option<RetrievalSpec> {
             kind: "no_entity_match",
             subject: "no entity declaration matched the search",
             always: false,
+            class: NegativeClass::Semantic,
         },
         // Daemon-only: offline returns an error (no payload), so this fires only
         // on the daemon path, where the payload carries `results`.
@@ -73,30 +77,35 @@ fn spec_for(tool: &str) -> Option<RetrievalSpec> {
             kind: "no_ranked_match",
             subject: "no entity ranked above threshold for the query",
             always: false,
+            class: NegativeClass::Semantic,
         },
         "find_references" => RetrievalSpec {
             field: "references",
             kind: "no_references",
             subject: "no references to the focal entity were found",
             always: false,
+            class: NegativeClass::Structural,
         },
         "graph_neighborhood" => RetrievalSpec {
             field: "entities",
             kind: "no_neighbors",
             subject: "the entity has no graph neighbors at the requested depth",
             always: false,
+            class: NegativeClass::Structural,
         },
         "find_dead_code_seeded" => RetrievalSpec {
             field: "candidates",
             kind: "no_seed_match",
             subject: "no entities matched the seed query",
             always: false,
+            class: NegativeClass::Structural,
         },
         "trace_data_flow" => RetrievalSpec {
             field: "chain",
             kind: "no_flow",
             subject: "no data-flow chain was found from the focal entity",
             always: false,
+            class: NegativeClass::Structural,
         },
         // Bare-array payloads (wrapped under `result` by the annotator).
         "dead_code" => RetrievalSpec {
@@ -104,12 +113,14 @@ fn spec_for(tool: &str) -> Option<RetrievalSpec> {
             kind: "no_dead_code",
             subject: "no unreachable entities were found in the scanned set",
             always: false,
+            class: NegativeClass::Structural,
         },
         "entity_history" => RetrievalSpec {
             field: "",
             kind: "no_history",
             subject: "no change history was found for the entity",
             always: false,
+            class: NegativeClass::Structural,
         },
         // Batch reachability never returns an empty `results` on success (it
         // errors on empty input), but its `has_references: false` rows ARE the
@@ -119,6 +130,7 @@ fn spec_for(tool: &str) -> Option<RetrievalSpec> {
             kind: "reachability_verdicts",
             subject: "per-entity reachability verdicts",
             always: true,
+            class: NegativeClass::Structural,
         },
         _ => return None,
     };
@@ -209,7 +221,7 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
         return None;
     }
 
-    let (trustworthy, trust_reason) = envelope.negative_trust();
+    let (trustworthy, trust_reason) = envelope.negative_trust(spec.class);
     let interpretation = if spec.always {
         "qualified_verdicts"
     } else {
@@ -250,11 +262,12 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::envelope::{Degraded, Envelope, GraphState, Runtime, SemanticCoverage};
+    use crate::envelope::{Degraded, Envelope, SemanticCoverage};
 
-    /// A daemon envelope with complete coverage and no degraded signals — the
-    /// only state in which an absent result is authoritative.
-    fn authoritative_envelope() -> Envelope {
+    /// A daemon envelope whose SEMANTIC substrate is complete — full embedding
+    /// coverage, no degraded signals: the only state in which a *semantic* tool's
+    /// absent result is authoritative.
+    fn semantic_authoritative_envelope() -> Envelope {
         let mut env = Envelope::daemon();
         env.semantic_coverage = Some(SemanticCoverage {
             indexed: 100,
@@ -265,6 +278,18 @@ mod tests {
         });
         env.graph_as_of = Some(json!("change:deadbeef"));
         env
+    }
+
+    /// A daemon envelope whose GRAPH substrate is complete — initialized + loaded
+    /// (folded honestly from `/health`), no degraded signals, and crucially NO
+    /// embedding coverage reported. *Structural* tools are authoritative here;
+    /// semantic tools are not (they still need coverage).
+    fn structural_ready_envelope() -> Envelope {
+        Envelope::daemon().with_health(&json!({
+            "graph_loaded": true,
+            "initialized": true,
+            "graph_generation": 12,
+        }))
     }
 
     #[test]
@@ -304,21 +329,25 @@ mod tests {
         assert_eq!(negative["semantic_coverage"], Value::Null);
     }
 
+    // ---- semantic class: absence gated on EMBEDDING coverage ----
+
     #[test]
-    fn empty_references_with_complete_coverage_is_authoritative() {
-        let payload = json!({ "total_upstream": 0, "references": [] });
-        let negative = negative_for("find_references", &payload, &authoritative_envelope())
-            .expect("empty references yields a negative");
-        assert_eq!(negative["kind"], json!("no_references"));
+    fn semantic_search_complete_coverage_is_authoritative() {
+        let payload = json!({ "results": [] });
+        let negative =
+            negative_for("semantic_search", &payload, &semantic_authoritative_envelope())
+                .expect("empty results yields a negative");
         assert_eq!(negative["safe_to_conclude_absent"], json!(true));
         assert_eq!(negative["trust"], json!("authoritative"));
-        assert_eq!(negative["graph_as_of"], json!("change:deadbeef"));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("semantic_authoritative"));
         assert_eq!(negative["semantic_coverage"]["percent"], json!(100.0));
-        assert!(negative["advice"].as_str().unwrap().contains("authoritative"));
     }
 
     #[test]
-    fn partial_coverage_blocks_authoritative_absence() {
+    fn semantic_search_partial_coverage_is_inconclusive() {
         let mut env = Envelope::daemon();
         env.semantic_coverage = Some(SemanticCoverage {
             indexed: 40,
@@ -327,8 +356,8 @@ mod tests {
             complete: false,
             note: Some("indexing".to_string()),
         });
-        let payload = json!({ "references": [] });
-        let negative = negative_for("find_references", &payload, &env).unwrap();
+        let payload = json!({ "results": [] });
+        let negative = negative_for("semantic_search", &payload, &env).unwrap();
         assert_eq!(negative["safe_to_conclude_absent"], json!(false));
         assert!(negative["trust_reason"]
             .as_str()
@@ -338,8 +367,68 @@ mod tests {
     }
 
     #[test]
-    fn degraded_signal_blocks_authoritative_absence() {
-        let mut env = authoritative_envelope();
+    fn semantic_search_coverage_unknown_even_on_ready_graph_is_inconclusive() {
+        // The class boundary: a fully initialized + loaded graph does NOT make a
+        // semantic absence authoritative — embeddings can still be incomplete, so
+        // an empty semantic result may mean "not indexed".
+        let payload = json!({ "results": [] });
+        let negative =
+            negative_for("semantic_search", &payload, &structural_ready_envelope()).unwrap();
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("coverage_unknown"));
+    }
+
+    // ---- structural class: absence gated on GRAPH initialized + loaded ----
+
+    #[test]
+    fn find_references_on_loaded_graph_is_authoritative_without_coverage() {
+        // The headline structural lift: an empty find_references is authoritative
+        // on an initialized + loaded graph even with NO embedding coverage —
+        // structural tools read typed relations, not embeddings.
+        let payload = json!({ "total_upstream": 0, "references": [] });
+        let negative =
+            negative_for("find_references", &payload, &structural_ready_envelope())
+                .expect("empty references yields a negative");
+        assert_eq!(negative["kind"], json!("no_references"));
+        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+        assert_eq!(negative["trust"], json!("authoritative"));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("structural_authoritative"));
+        // graph_as_of was lifted from the /health generation marker.
+        assert_eq!(negative["graph_as_of"], json!({ "generation": 12 }));
+        // No embedding coverage observed — honest null, not fabricated.
+        assert_eq!(negative["semantic_coverage"], Value::Null);
+        assert!(negative["advice"].as_str().unwrap().contains("authoritative"));
+    }
+
+    #[test]
+    fn find_references_graph_uninitialized_is_inconclusive() {
+        // graph_loaded but first reconciliation not confirmed: a structural
+        // absence is not authoritative, and the reason names the GRAPH gate — not
+        // coverage (find_references does not depend on embeddings).
+        let env = Envelope::daemon().with_health(&json!({
+            "reconciliation_status": "reconciling",
+            "graph_loaded": true,
+        }));
+        let payload = json!({ "references": [] });
+        let negative = negative_for("find_references", &payload, &env).unwrap();
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("graph_uninitialized"));
+    }
+
+    #[test]
+    fn find_references_degraded_is_inconclusive() {
+        // The degraded gate is class-independent: it short-circuits before the
+        // structural graph check.
+        let mut env = structural_ready_envelope();
         env.degraded = Degraded {
             embed_worker_failed: Some(true),
             ..Degraded::default()
@@ -391,22 +480,18 @@ mod tests {
     }
 
     #[test]
-    fn coverage_unknown_on_daemon_is_inconclusive() {
-        // The common daemon case today: reachable, healthy, but coverage not
-        // reported. Absence must stay inconclusive — this is the honest signal
-        // that the daemon-side coverage gap blocks certified negatives.
-        let env = Envelope::daemon().with_health(&json!({
-            "reconciliation_status": "clean",
-            "graph_loaded": true,
-        }));
-        let payload = json!({ "references": [] });
-        let negative = negative_for("find_references", &payload, &env).unwrap();
-        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+    fn dead_code_on_loaded_graph_is_authoritative() {
+        // dead_code is structural and returns a bare array: an empty result is
+        // authoritative on an initialized + loaded graph, regardless of embedding
+        // coverage. Mirrors find_references through a different payload shape.
+        let payload = json!([]);
+        let negative =
+            negative_for("dead_code", &payload, &structural_ready_envelope()).unwrap();
+        assert_eq!(negative["kind"], json!("no_dead_code"));
+        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
         assert!(negative["trust_reason"]
             .as_str()
             .unwrap()
-            .contains("coverage_unknown"));
-        let _ = GraphState::default();
-        let _ = Runtime::RepoDaemon;
+            .contains("structural_authoritative"));
     }
 }
