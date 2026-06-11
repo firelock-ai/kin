@@ -5367,11 +5367,28 @@ async fn vfs_write_notify(
             file_path: Some(file_id.clone()),
             ..Default::default()
         };
-        let mut touched: Vec<IntentScope> = state
-            .graph
-            .query_entities(&filter)
-            .map_err(internal_error)?
+        // Perf: this `query_entities` runs once per write under enforce; it is
+        // O(entities-in-file) and is the only added cost on the hot path. The
+        // comparison set handed to the veto is the file's entity scopes plus its
+        // artifact scope. To guarantee the veto never costs more than the
+        // reconcile it guards, cap the per-file entity-scope set: a pathological
+        // file (> VETO_SCOPE_CAP entities) compares only the first
+        // VETO_SCOPE_CAP, and logs. Correctness is preserved — a file-level hard
+        // intent is still caught via the always-present Artifact scope, and the
+        // reconciler's own (uncapped) collision check remains the backstop.
+        const VETO_SCOPE_CAP: usize = 1024;
+        let file_entities = state.graph.query_entities(&filter).map_err(internal_error)?;
+        if file_entities.len() > VETO_SCOPE_CAP {
+            tracing::warn!(
+                path = %request.file_path,
+                entities = file_entities.len(),
+                cap = VETO_SCOPE_CAP,
+                "write-veto: capping per-file entity-scope comparison set"
+            );
+        }
+        let mut touched: Vec<IntentScope> = file_entities
             .iter()
+            .take(VETO_SCOPE_CAP)
             .map(|e| IntentScope::Entity(e.id))
             .collect();
         touched.push(IntentScope::Artifact(file_id));

@@ -30,6 +30,36 @@
 //! work: no contract-content data exists at the apply boundary, and file writes
 //! do not yet emit `Contract` touched-scopes. See [`write_veto`] for the
 //! evaluator.
+//!
+//! ## Write-path inventory
+//!
+//! Every state-mutating route and its current *pre-write* gate, as of this
+//! change. Only `vfs_write_notify` (flag-gated) and `graph_commit` (always-on)
+//! reject before mutating; the rest either rely on the reconciler's own
+//! soft-block, gate upstream, or are out of this crate's veto scope.
+//!
+//! - `POST /vfs/write-notify` (`vfs_write_notify`): **write-veto** under
+//!   `KIN_WRITE_VETO=enforce` (pre-write 409); default = reconciler soft-block
+//!   (`200 {reindexed:false}`).
+//! - `POST /vfs/file-changed` (`vfs_file_changed`): reconciler soft-block only
+//!   (`200` on `CollisionBlocked`); **NOT veto-wired**. This is the *third*
+//!   graph-truth write path and shares the same post-write-notification gap;
+//!   it was left outside the confirmed `/vfs/write-notify` scope and reported
+//!   as a finding rather than fixed here.
+//! - `POST /graph/commit` (`graph_commit`): always-on lease **409** on a
+//!   foreign hard intent (the CLI semantic-commit path).
+//! - `POST /commands/commit` (`command_commit`): commits the already-reconciled
+//!   overlay; relies on the reconcile loop's upstream collision gating; no
+//!   separate pre-write veto.
+//! - `POST /reconcile` (`reconcile`): delegates to the kin-cli reconcile path; a
+//!   scoped reconcile mutates a session-private graph isolated from HEAD.
+//! - `POST /graph/mutations` (`graph_mutations`): work-item / annotation / audit
+//!   metadata, not entity truth; ungated.
+//! - `PUT /graph/branches/{name}/head`, `DELETE /graph/branches/{name}`: branch
+//!   ref operations; ungated.
+//! - `POST /mcp/tools/call` (`mcp_tools_call`): MCP write transactions — out of
+//!   this crate's veto scope (kin-mcp lane), with its own stage/commit
+//!   validation.
 
 pub mod api;
 pub mod daemon;
