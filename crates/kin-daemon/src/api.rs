@@ -42,19 +42,23 @@ static BOOTSTRAP_EXPORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new(
 /// touches the lock (poison is sticky until restart). Recovering keeps the
 /// path serving instead, which is the correct treatment here and never panics.
 fn lock_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Read-acquire a `std::sync::RwLock`, recovering on poison. See
 /// [`lock_recover`] for why recovery (not propagation) is correct here.
 fn read_recover<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
-    lock.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+    lock.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Write-acquire a `std::sync::RwLock`, recovering on poison. See
 /// [`lock_recover`] for why recovery (not propagation) is correct here.
 fn write_recover<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
-    lock.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+    lock.write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Health check response.
@@ -5260,7 +5264,10 @@ async fn write_veto_precheck(
     // always-present Artifact scope, and the reconciler's own (uncapped) check
     // remains the backstop.
     const VETO_SCOPE_CAP: usize = 1024;
-    let file_entities = state.graph.query_entities(&filter).map_err(internal_error)?;
+    let file_entities = state
+        .graph
+        .query_entities(&filter)
+        .map_err(internal_error)?;
     if file_entities.len() > VETO_SCOPE_CAP {
         tracing::warn!(
             path = %display_path,
@@ -9361,13 +9368,17 @@ mod tests {
 
         let _env = EnvVarGuard("KIN_WRITE_VETO");
         std::env::set_var("KIN_WRITE_VETO", "enforce");
-        let (status, json) = write_notify(router(state), serde_json::json!({ "file_path": abs })).await;
+        let (status, json) =
+            write_notify(router(state), serde_json::json!({ "file_path": abs })).await;
 
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(json["error"], "write_veto");
         assert_eq!(json["conflict_type"], "HardCollision");
         assert!(!json["blocking_intents"].as_array().unwrap().is_empty());
-        assert_eq!(json["blocking_intents"][0]["session_id"], foreign.to_string());
+        assert_eq!(
+            json["blocking_intents"][0]["session_id"],
+            foreign.to_string()
+        );
     }
 
     #[tokio::test]
@@ -9394,7 +9405,8 @@ mod tests {
             )
             .unwrap();
 
-        let (status, json) = write_notify(router(state), serde_json::json!({ "file_path": abs })).await;
+        let (status, json) =
+            write_notify(router(state), serde_json::json!({ "file_path": abs })).await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["reindexed"], false);
@@ -9454,7 +9466,8 @@ mod tests {
 
         let _env = EnvVarGuard("KIN_WRITE_VETO");
         std::env::set_var("KIN_WRITE_VETO", "enforce");
-        let (status, json) = write_notify(router(state), serde_json::json!({ "file_path": abs })).await;
+        let (status, json) =
+            write_notify(router(state), serde_json::json!({ "file_path": abs })).await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["reindexed"], true);

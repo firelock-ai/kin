@@ -232,8 +232,9 @@ mod tests {
         // vec at the capture site.
         let run = create_run(RunOptions {
             label: "cargo-style test".into(),
-            command: "printf 'running 2 tests\\ntest mod::alpha ... ok\\ntest mod::beta ... FAILED\\n'"
-                .into(),
+            command:
+                "printf 'running 2 tests\\ntest mod::alpha ... ok\\ntest mod::beta ... FAILED\\n'"
+                    .into(),
             working_dir: "/tmp".into(),
             snapshot_id: None,
         });

@@ -154,7 +154,10 @@ mod tests {
     fn spool_file_name_is_utc_day_bucketed() {
         assert_eq!(spool_file_name(0), "locate-1970-01-01.jsonl");
         // 2021-01-01T00:00:00Z = 1609459200 s.
-        assert_eq!(spool_file_name(1_609_459_200_000), "locate-2021-01-01.jsonl");
+        assert_eq!(
+            spool_file_name(1_609_459_200_000),
+            "locate-2021-01-01.jsonl"
+        );
     }
 
     #[test]

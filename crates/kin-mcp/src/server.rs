@@ -658,9 +658,11 @@ mod tests {
     async fn negative_contract_on_empty_object_payload_search() {
         // Object payload: `negative` is added beside `_kin` and the untouched
         // `results` key.
-        let payload =
-            call_tool_payload("semantic_search", serde_json::json!({ "query": "nonexistent" }))
-                .await;
+        let payload = call_tool_payload(
+            "semantic_search",
+            serde_json::json!({ "query": "nonexistent" }),
+        )
+        .await;
         let negative = assert_negative(&payload, "semantic_search", "no_entity_match");
         assert_eq!(negative["result_count"], 0);
         assert_eq!(negative["interpretation"], "absent_as_indexed");

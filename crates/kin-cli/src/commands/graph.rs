@@ -756,10 +756,19 @@ mod tests {
     #[test]
     fn graph_entity_not_found_lines_keep_signal_and_offer_next_steps() {
         let lines = graph_entity_not_found_lines("frobnicate");
-        assert!(lines[0].contains("not found"), "keeps not-found signal: {lines:?}");
+        assert!(
+            lines[0].contains("not found"),
+            "keeps not-found signal: {lines:?}"
+        );
         let joined = lines.join("\n");
-        assert!(joined.contains("kin search frobnicate"), "offers search: {joined}");
-        assert!(joined.contains("kin graph status"), "offers graph status: {joined}");
+        assert!(
+            joined.contains("kin search frobnicate"),
+            "offers search: {joined}"
+        );
+        assert!(
+            joined.contains("kin graph status"),
+            "offers graph status: {joined}"
+        );
     }
 
     fn test_entity(name: &str) -> Entity {

@@ -514,13 +514,21 @@ fn collect_daemon_semantic_search_response(
         let id_str = record.dedupe_key();
         if seen_ids.contains(&id_str) {
             if let Some(hit) = raw_hits.iter_mut().find(|h| h.entity_id == id_str) {
-                if hit.cosine_distance.is_none_or(|existing| *distance < existing) {
+                if hit
+                    .cosine_distance
+                    .is_none_or(|existing| *distance < existing)
+                {
                     hit.cosine_distance = Some(*distance);
                 }
             }
             continue;
         }
-        raw_hits.push(build_semantic_raw_hit(graph, &record, None, Some(*distance))?);
+        raw_hits.push(build_semantic_raw_hit(
+            graph,
+            &record,
+            None,
+            Some(*distance),
+        )?);
         seen_ids.insert(id_str.clone());
         item_map.insert(id_str, record);
     }
@@ -551,7 +559,12 @@ fn collect_daemon_semantic_search_response(
             }
             continue;
         }
-        raw_hits.push(build_semantic_raw_hit(graph, &record, Some(*bm25_score), None)?);
+        raw_hits.push(build_semantic_raw_hit(
+            graph,
+            &record,
+            Some(*bm25_score),
+            None,
+        )?);
         seen_ids.insert(id_str.clone());
         item_map.insert(id_str, record);
     }

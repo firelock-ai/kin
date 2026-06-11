@@ -129,7 +129,10 @@ mod tests {
         );
         let joined = lines.join("\n");
         // Explains why (anchor model) and the concrete next steps.
-        assert!(joined.contains("anchor"), "should explain the anchor model: {joined}");
+        assert!(
+            joined.contains("anchor"),
+            "should explain the anchor model: {joined}"
+        );
         assert!(
             joined.contains("kin import") || joined.contains("kin deps"),
             "should give an actionable next step: {joined}"

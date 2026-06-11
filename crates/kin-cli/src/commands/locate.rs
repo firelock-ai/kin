@@ -1457,142 +1457,143 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         )?
     } else {
         match track {
-        ScoringTrack::TracebackDominant => {
-            // Traceback explicitly names files — trust it as ground truth.
-            // Entity resolve and multihop supplement but don't override.
-            let mut weights = signal_confidence_weights;
-            weights[0] = 10.0; // traceback dominates
-            weights[7] = 2.0; // entity_resolve second
-            for w in weights[1..7].iter_mut() {
-                *w *= 0.3;
-            } // suppress others
-            for (list, weight) in ranked_lists.iter_mut().zip(weights.iter()) {
-                for (_, score) in list.iter_mut() {
-                    *score *= weight;
-                }
-            }
-            reciprocal_rank_fusion_weighted(
-                &ranked_lists,
-                60.0,
-                &rrf_rank_lift_weights(ranked_lists.len()),
-                &[],
-            )
-        }
-        ScoringTrack::EntityDominant => {
-            // Conditional scoring: when entity_resolve produces few unique
-            // files (<=3), diverse signal blending via weighted RRF is needed
-            // to surface files that entity resolution alone misses. When
-            // entity_resolve produces many unique files (>3), it already has
-            // good coverage — use direct entity ordering which preserves the
-            // entity-resolve ranking and avoids RRF diluting strong results.
-            let entity_resolve_unique_files: HashSet<&str> =
-                resolved_files.iter().map(|(p, _)| p.as_str()).collect();
-            let rrf_threshold = locate_env_usize("KIN_LOCATE_ENTITY_DOMINANT_RRF_THRESHOLD", 3);
-
-            if entity_resolve_unique_files.len() <= rrf_threshold {
-                // Sparse entity results — blend via weighted RRF so that
-                // source_text and other signals can contribute files.
-                let mut entity_dom_weights = vec![1.0f32; ranked_lists.len()];
-                entity_dom_weights[7] =
-                    locate_env_f32("KIN_LOCATE_ENTITY_DOMINANT_RESOLVE_WEIGHT", 8.0); // entity_resolve dominates
-                entity_dom_weights[8] = 1.5; // source_text second
-                entity_dom_weights[0] = 2.0; // traceback if present
-                if entity_dom_weights.len() > 9 {
-                    entity_dom_weights[9] =
-                        locate_env_f32("KIN_LOCATE_ENTITY_DOMINANT_EMBEDDING_WEIGHT", 2.0);
-                    // embedding as independent corroboration
-                }
-                // Suppress test/snippet/import/error noise
-                for idx in [2, 3, 4, 5] {
-                    entity_dom_weights[idx] *= 0.3;
+            ScoringTrack::TracebackDominant => {
+                // Traceback explicitly names files — trust it as ground truth.
+                // Entity resolve and multihop supplement but don't override.
+                let mut weights = signal_confidence_weights;
+                weights[0] = 10.0; // traceback dominates
+                weights[7] = 2.0; // entity_resolve second
+                for w in weights[1..7].iter_mut() {
+                    *w *= 0.3;
+                } // suppress others
+                for (list, weight) in ranked_lists.iter_mut().zip(weights.iter()) {
+                    for (_, score) in list.iter_mut() {
+                        *score *= weight;
+                    }
                 }
                 reciprocal_rank_fusion_weighted(
                     &ranked_lists,
                     60.0,
                     &rrf_rank_lift_weights(ranked_lists.len()),
-                    &entity_dom_weights,
+                    &[],
                 )
-            } else {
-                // Rich entity results — trust entity_resolve ordering directly.
-                // Normalize scores to a bounded range and supplement with other
-                // signals for files entity_resolve didn't find.
-                let resolve_list = &ranked_lists[7];
-                let mut result: Vec<(String, f32)> = Vec::new();
-                let resolve_set: HashSet<String> =
-                    resolve_list.iter().map(|(p, _)| p.clone()).collect();
-                let include_tests = test_query;
-
-                let resolve_cap = locate_env_f32("KIN_LOCATE_ENTITY_DOMINANT_RESOLVE_CAP", 100.0);
-                let resolve_max = resolve_list
-                    .first()
-                    .map(|(_, s)| *s)
-                    .unwrap_or(1.0)
-                    .max(1.0);
-
-                for (path, score) in resolve_list {
-                    if include_tests || !is_test_path(path) {
-                        let normalized = (*score / resolve_max) * resolve_cap;
-                        result.push((path.clone(), normalized));
-                    }
-                }
-
-                // Supplement with other signaled files at competitive scores.
-                let other_ceiling_ratio =
-                    locate_env_f32("KIN_LOCATE_ENTITY_DOMINANT_OTHER_CEILING", 0.4);
-                let other_ceiling = resolve_cap * other_ceiling_ratio;
-
-                let other_ranked_lists = ranked_lists
-                    .iter()
-                    .enumerate()
-                    .filter(|(idx, _)| *idx != 7)
-                    .map(|(_, list)| list.clone())
-                    .collect::<Vec<_>>();
-                let other_fused = reciprocal_rank_fusion(&other_ranked_lists, 60.0);
-                let other_max = other_fused
-                    .first()
-                    .map(|(_, s)| *s)
-                    .unwrap_or(1.0)
-                    .max(0.001);
-                for (path, score) in other_fused {
-                    if !resolve_set.contains(&path) && (include_tests || !is_test_path(&path)) {
-                        let scaled = (score / other_max) * other_ceiling;
-                        result.push((path, scaled));
-                    }
-                }
-                result
             }
-        }
-        ScoringTrack::GraphStructural => {
-            // No entity resolve — rely on graph expansion signals.
-            // Boost multihop and imports, suppress test/snippet noise.
-            reciprocal_rank_fusion_weighted(
-                &ranked_lists,
-                60.0,
-                &rrf_rank_lift_weights(ranked_lists.len()),
-                &[],
-            )
-        }
-        ScoringTrack::BroadBlend => {
-            // Mixed signals — standard RRF blend, but penalize test files
-            // in non-resolve signals to prevent test files from winning
-            // via cross-signal count alone.
-            for (idx, list) in ranked_lists.iter_mut().enumerate() {
-                if idx == 7 {
-                    continue;
-                }
-                for (path, score) in list.iter_mut() {
-                    if is_test_path(path) {
-                        *score *= locate_env_f32("KIN_LOCATE_BROAD_TEST_PENALTY", 0.1);
+            ScoringTrack::EntityDominant => {
+                // Conditional scoring: when entity_resolve produces few unique
+                // files (<=3), diverse signal blending via weighted RRF is needed
+                // to surface files that entity resolution alone misses. When
+                // entity_resolve produces many unique files (>3), it already has
+                // good coverage — use direct entity ordering which preserves the
+                // entity-resolve ranking and avoids RRF diluting strong results.
+                let entity_resolve_unique_files: HashSet<&str> =
+                    resolved_files.iter().map(|(p, _)| p.as_str()).collect();
+                let rrf_threshold = locate_env_usize("KIN_LOCATE_ENTITY_DOMINANT_RRF_THRESHOLD", 3);
+
+                if entity_resolve_unique_files.len() <= rrf_threshold {
+                    // Sparse entity results — blend via weighted RRF so that
+                    // source_text and other signals can contribute files.
+                    let mut entity_dom_weights = vec![1.0f32; ranked_lists.len()];
+                    entity_dom_weights[7] =
+                        locate_env_f32("KIN_LOCATE_ENTITY_DOMINANT_RESOLVE_WEIGHT", 8.0); // entity_resolve dominates
+                    entity_dom_weights[8] = 1.5; // source_text second
+                    entity_dom_weights[0] = 2.0; // traceback if present
+                    if entity_dom_weights.len() > 9 {
+                        entity_dom_weights[9] =
+                            locate_env_f32("KIN_LOCATE_ENTITY_DOMINANT_EMBEDDING_WEIGHT", 2.0);
+                        // embedding as independent corroboration
                     }
+                    // Suppress test/snippet/import/error noise
+                    for idx in [2, 3, 4, 5] {
+                        entity_dom_weights[idx] *= 0.3;
+                    }
+                    reciprocal_rank_fusion_weighted(
+                        &ranked_lists,
+                        60.0,
+                        &rrf_rank_lift_weights(ranked_lists.len()),
+                        &entity_dom_weights,
+                    )
+                } else {
+                    // Rich entity results — trust entity_resolve ordering directly.
+                    // Normalize scores to a bounded range and supplement with other
+                    // signals for files entity_resolve didn't find.
+                    let resolve_list = &ranked_lists[7];
+                    let mut result: Vec<(String, f32)> = Vec::new();
+                    let resolve_set: HashSet<String> =
+                        resolve_list.iter().map(|(p, _)| p.clone()).collect();
+                    let include_tests = test_query;
+
+                    let resolve_cap =
+                        locate_env_f32("KIN_LOCATE_ENTITY_DOMINANT_RESOLVE_CAP", 100.0);
+                    let resolve_max = resolve_list
+                        .first()
+                        .map(|(_, s)| *s)
+                        .unwrap_or(1.0)
+                        .max(1.0);
+
+                    for (path, score) in resolve_list {
+                        if include_tests || !is_test_path(path) {
+                            let normalized = (*score / resolve_max) * resolve_cap;
+                            result.push((path.clone(), normalized));
+                        }
+                    }
+
+                    // Supplement with other signaled files at competitive scores.
+                    let other_ceiling_ratio =
+                        locate_env_f32("KIN_LOCATE_ENTITY_DOMINANT_OTHER_CEILING", 0.4);
+                    let other_ceiling = resolve_cap * other_ceiling_ratio;
+
+                    let other_ranked_lists = ranked_lists
+                        .iter()
+                        .enumerate()
+                        .filter(|(idx, _)| *idx != 7)
+                        .map(|(_, list)| list.clone())
+                        .collect::<Vec<_>>();
+                    let other_fused = reciprocal_rank_fusion(&other_ranked_lists, 60.0);
+                    let other_max = other_fused
+                        .first()
+                        .map(|(_, s)| *s)
+                        .unwrap_or(1.0)
+                        .max(0.001);
+                    for (path, score) in other_fused {
+                        if !resolve_set.contains(&path) && (include_tests || !is_test_path(&path)) {
+                            let scaled = (score / other_max) * other_ceiling;
+                            result.push((path, scaled));
+                        }
+                    }
+                    result
                 }
             }
-            reciprocal_rank_fusion_weighted(
-                &ranked_lists,
-                60.0,
-                &rrf_rank_lift_weights(ranked_lists.len()),
-                &[],
-            )
-        }
+            ScoringTrack::GraphStructural => {
+                // No entity resolve — rely on graph expansion signals.
+                // Boost multihop and imports, suppress test/snippet noise.
+                reciprocal_rank_fusion_weighted(
+                    &ranked_lists,
+                    60.0,
+                    &rrf_rank_lift_weights(ranked_lists.len()),
+                    &[],
+                )
+            }
+            ScoringTrack::BroadBlend => {
+                // Mixed signals — standard RRF blend, but penalize test files
+                // in non-resolve signals to prevent test files from winning
+                // via cross-signal count alone.
+                for (idx, list) in ranked_lists.iter_mut().enumerate() {
+                    if idx == 7 {
+                        continue;
+                    }
+                    for (path, score) in list.iter_mut() {
+                        if is_test_path(path) {
+                            *score *= locate_env_f32("KIN_LOCATE_BROAD_TEST_PENALTY", 0.1);
+                        }
+                    }
+                }
+                reciprocal_rank_fusion_weighted(
+                    &ranked_lists,
+                    60.0,
+                    &rrf_rank_lift_weights(ranked_lists.len()),
+                    &[],
+                )
+            }
         }
     };
 
@@ -2361,8 +2362,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                         let mut candidates = Vec::new();
 
                         for (path, score) in fused.iter().take(ltr_window) {
-                            let content =
-                                graph_derived_candidate_text(graph, path, workspace_root);
+                            let content = graph_derived_candidate_text(graph, path, workspace_root);
                             docs.push(content);
                             candidates.push((path.clone(), *score));
                         }
@@ -14438,11 +14438,7 @@ mod tests {
         let mut was_present = false;
         for boost in [0.0_f32, 1.0, 2.0, 4.0, 8.0, 20.0] {
             let mut fused = base.clone();
-            fused
-                .iter_mut()
-                .find(|(p, _)| p == "target.rs")
-                .unwrap()
-                .1 = 2.0 + boost;
+            fused.iter_mut().find(|(p, _)| p == "target.rs").unwrap().1 = 2.0 + boost;
             fused.sort_by(|x, y| {
                 y.1.partial_cmp(&x.1)
                     .unwrap_or(std::cmp::Ordering::Equal)
@@ -14470,7 +14466,10 @@ mod tests {
             }
             was_present = present;
         }
-        assert!(was_present, "target never entered the result; test is vacuous");
+        assert!(
+            was_present,
+            "target never entered the result; test is vacuous"
+        );
     }
 
     #[test]
@@ -18685,7 +18684,10 @@ mod tests {
         let first = reciprocal_rank_fusion_weighted(&lists, 60.0, &[], &[]);
         for _ in 0..16 {
             let again = reciprocal_rank_fusion_weighted(&lists, 60.0, &[], &[]);
-            assert_eq!(again, first, "RRF output must be byte-identical across runs");
+            assert_eq!(
+                again, first,
+                "RRF output must be byte-identical across runs"
+            );
         }
         std::env::remove_var("KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT");
         // All-tied scores: ordering must be the canonical path-ascending order.
@@ -18769,7 +18771,10 @@ mod tests {
                 .iter()
                 .map(|(p, _)| p.clone())
                 .collect::<Vec<_>>();
-            assert_eq!(again, first, "resolve projection order must be deterministic");
+            assert_eq!(
+                again, first,
+                "resolve projection order must be deterministic"
+            );
         }
     }
 
@@ -18845,8 +18850,10 @@ mod tests {
         let keyed = entity_seed_keyed(&seeds, &graph).unwrap();
         // Test entity excluded; the other three survive as distinct items.
         assert_eq!(keyed.len(), 3, "test entity must be excluded");
-        let shared_items: Vec<&(String, String, f32)> =
-            keyed.iter().filter(|(_, p, _)| p == "src/shared.rs").collect();
+        let shared_items: Vec<&(String, String, f32)> = keyed
+            .iter()
+            .filter(|(_, p, _)| p == "src/shared.rs")
+            .collect();
         assert_eq!(
             shared_items.len(),
             2,
@@ -18869,18 +18876,19 @@ mod tests {
             graph.upsert_entity(e).unwrap();
         }
         // Two entities in src/a.rs (scores 10, 4), one in src/b.rs (score 8).
-        let text_seeds = HashMap::from([
-            (a1.id, disc(10.0)),
-            (a2.id, disc(4.0)),
-            (b.id, disc(8.0)),
-        ]);
+        let text_seeds =
+            HashMap::from([(a1.id, disc(10.0)), (a2.id, disc(4.0)), (b.id, disc(8.0))]);
         let embedding_seeds: HashMap<kin_model::EntityId, EntityDiscovery> = HashMap::new();
         let ranked_lists: Vec<Vec<(String, f32)>> = vec![Vec::new(); 10];
         let fused =
             entity_granular_fused_files(&ranked_lists, &text_seeds, &embedding_seeds, &graph)
                 .unwrap();
         // Both files present; the two src/a.rs entities collapse to ONE file.
-        assert_eq!(fused.len(), 2, "two entities in one file project to one file");
+        assert_eq!(
+            fused.len(),
+            2,
+            "two entities in one file project to one file"
+        );
         assert_eq!(fused[0].0, "src/a.rs", "best-ranked entity's file wins");
         assert_eq!(fused[1].0, "src/b.rs");
         assert!(fused[0].1 > fused[1].1);
@@ -19016,8 +19024,14 @@ mod tests {
             note: None,
         };
         let synth = coverage_banner(&partial_no_note).expect("degraded coverage emits a banner");
-        assert!(synth.contains("4/10"), "synthesized banner cites indexed/total");
-        assert!(synth.contains("6 pending"), "synthesized banner cites pending");
+        assert!(
+            synth.contains("4/10"),
+            "synthesized banner cites indexed/total"
+        );
+        assert!(
+            synth.contains("6 pending"),
+            "synthesized banner cites pending"
+        );
     }
 
     fn telemetry_test_result() -> LocateResult {
@@ -19057,7 +19071,11 @@ mod tests {
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
             .collect();
-        assert_eq!(entries.len(), 1, "consent on → exactly one spool file written");
+        assert_eq!(
+            entries.len(),
+            1,
+            "consent on → exactly one spool file written"
+        );
         let line = std::fs::read_to_string(&entries[0]).unwrap();
         let event: tel::LocateQueryEvent = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(event.query, "where is the parser");
@@ -19065,7 +19083,10 @@ mod tests {
         assert_eq!(event.results.len(), 1);
         assert_eq!(event.results[0].path, "src/x.rs");
         assert_eq!(event.results[0].rank, 0);
-        assert_eq!(event.results[0].signals, vec!["entity_resolve", "source_text"]);
+        assert_eq!(
+            event.results[0].signals,
+            vec!["entity_resolve", "source_text"]
+        );
     }
 
     #[test]

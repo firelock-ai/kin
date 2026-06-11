@@ -99,4 +99,3 @@ pub fn read_blob_from_layout(layout: &KinLayout, hash: &kin_model::Hash256) -> O
     let store = kin_blobs::BlobStore::new(layout.objects_dir()).ok()?;
     store.read(hash).ok()
 }
-

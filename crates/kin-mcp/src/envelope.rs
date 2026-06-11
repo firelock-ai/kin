@@ -586,8 +586,7 @@ mod tests {
     #[test]
     fn with_health_without_generation_leaves_graph_as_of_unknown() {
         // Honesty: no marker reported => graph_as_of stays absent, never fabricated.
-        let env =
-            Envelope::daemon().with_health(&serde_json::json!({ "graph_loaded": true }));
+        let env = Envelope::daemon().with_health(&serde_json::json!({ "graph_loaded": true }));
         assert!(env.graph_as_of.is_none());
     }
 

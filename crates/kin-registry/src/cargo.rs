@@ -169,7 +169,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 ///   -> `401`.
 ///
 /// On success returns `None`; otherwise returns the rejection response.
-fn authorize_publish(state: &CargoRegistryState, headers: &axum::http::HeaderMap) -> Option<Response> {
+fn authorize_publish(
+    state: &CargoRegistryState,
+    headers: &axum::http::HeaderMap,
+) -> Option<Response> {
     let Some(expected) = state.publish_token.as_deref() else {
         return Some(
             (
@@ -371,8 +374,7 @@ fn verify_crate_coordinates(crate_bytes: &[u8], name: &str, version: &str) -> Re
     let mut found_manifest = false;
     for entry in entries {
         // A malformed tar stream surfaces here (e.g. truncated/non-gzip body).
-        let mut entry =
-            entry.map_err(|e| format!("crate is not a valid gzip-tar archive: {e}"))?;
+        let mut entry = entry.map_err(|e| format!("crate is not a valid gzip-tar archive: {e}"))?;
         let is_manifest = entry
             .path()
             .ok()
@@ -852,9 +854,8 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
 
     /// Build a valid `.crate` blob for a simple `[package]` manifest.
     fn valid_crate(name: &str, version: &str) -> Vec<u8> {
-        let cargo_toml = format!(
-            "[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n"
-        );
+        let cargo_toml =
+            format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n");
         build_test_crate(name, version, &cargo_toml)
     }
 
@@ -866,9 +867,7 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
         token: Option<&str>,
         body: Vec<u8>,
     ) -> Request<Body> {
-        let uri = format!(
-            "/registry/cargo/api/v1/crates/publish?name={name}&version={version}"
-        );
+        let uri = format!("/registry/cargo/api/v1/crates/publish?name={name}&version={version}");
         let mut builder = Request::builder().method("POST").uri(uri);
         if let Some(token) = token {
             builder = builder.header("authorization", format!("Bearer {token}"));
