@@ -207,7 +207,9 @@ fn metal_fused_pipeline_survives_many_forwards() {
     };
 
     let (checksum, total_entities) = if spawn_thread {
-        std::thread::spawn(workload).join().expect("workload thread")
+        std::thread::spawn(workload)
+            .join()
+            .expect("workload thread")
     } else {
         workload()
     };

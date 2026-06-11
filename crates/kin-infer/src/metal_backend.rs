@@ -8,7 +8,7 @@
 
 #![cfg(feature = "metal")]
 
-use crate::gpu::{GpuBackend, GpuCompute, GpuDeviceInfo, LayerTensors, LayerConfig};
+use crate::gpu::{GpuBackend, GpuCompute, GpuDeviceInfo, LayerConfig, LayerTensors};
 use crate::InferError;
 use metal::{
     Buffer, CommandBufferRef, CommandQueue, CompileOptions, ComputePipelineState, Device,
@@ -187,11 +187,7 @@ static MMA_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// attention) waste the MMA on zero-pad and stay on the scalar kernel.
 #[inline]
 fn use_mma(m: usize, n: usize, k: usize) -> bool {
-    mma_enabled()
-        && MMA_AVAILABLE.load(Ordering::Relaxed)
-        && m >= 32
-        && n >= 32
-        && k >= 16
+    mma_enabled() && MMA_AVAILABLE.load(Ordering::Relaxed) && m >= 32 && n >= 32 && k >= 16
 }
 
 /// Whether the wider 64x64 MMA tile (Lever #5 phase 1) is selected. OPT-IN for
@@ -1774,8 +1770,9 @@ impl BufferPool {
         let buf = self.free.lock().get_mut(&class).and_then(|v| v.pop());
         let buf = match buf {
             Some(buf) => buf,
-            None => try_new_buffer(&self.device, class as u64)
-                .ok_or_else(|| InferError::OutOfMemory(format!("metal buffer alloc failed: {class} bytes")))?,
+            None => try_new_buffer(&self.device, class as u64).ok_or_else(|| {
+                InferError::OutOfMemory(format!("metal buffer alloc failed: {class} bytes"))
+            })?,
         };
         unsafe {
             std::ptr::write_bytes(buf.contents() as *mut u8, 0, class);
@@ -1795,8 +1792,9 @@ impl BufferPool {
         let buf = self.free.lock().get_mut(&class).and_then(|v| v.pop());
         let buf = match buf {
             Some(buf) => buf,
-            None => try_new_buffer(&self.device, class as u64)
-                .ok_or_else(|| InferError::OutOfMemory(format!("metal buffer alloc failed: {class} bytes")))?,
+            None => try_new_buffer(&self.device, class as u64).ok_or_else(|| {
+                InferError::OutOfMemory(format!("metal buffer alloc failed: {class} bytes"))
+            })?,
         };
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -1825,11 +1823,14 @@ impl BufferPool {
         let buf = self.free.lock().get_mut(&class).and_then(|v| v.pop());
         let buf = match buf {
             Some(buf) => buf,
-            None => try_new_buffer(&self.device, class as u64)
-                .ok_or_else(|| InferError::OutOfMemory(format!("metal buffer alloc failed: {class} bytes")))?,
+            None => try_new_buffer(&self.device, class as u64).ok_or_else(|| {
+                InferError::OutOfMemory(format!("metal buffer alloc failed: {class} bytes"))
+            })?,
         };
         if zero_all_buffers() {
-            unsafe { std::ptr::write_bytes(buf.contents() as *mut u8, 0, class); }
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, class);
+            }
         }
         Ok(PooledBuffer {
             buf,
@@ -2095,11 +2096,9 @@ impl MetalCompute {
                     ];
                     let mut ok = true;
                     for &name in fp16_kernel_names {
-                        let pipeline = fp16_library
-                            .get_function(name, None)
-                            .and_then(|func| {
-                                device.new_compute_pipeline_state_with_function(&func)
-                            });
+                        let pipeline = fp16_library.get_function(name, None).and_then(|func| {
+                            device.new_compute_pipeline_state_with_function(&func)
+                        });
                         match pipeline {
                             Ok(pipeline) => {
                                 pipelines.insert(name, pipeline);
@@ -2142,8 +2141,9 @@ impl MetalCompute {
     /// Create a Metal buffer from a slice and copy data in.
     fn buf_from_slice(&self, data: &[f32]) -> Result<Buffer, InferError> {
         let bytes = data.len() * std::mem::size_of::<f32>();
-        try_new_buffer_with_bytes(&self.device, data.as_ptr() as *const u8, bytes)
-            .ok_or_else(|| InferError::OutOfMemory(format!("metal buffer alloc failed: {bytes} bytes")))
+        try_new_buffer_with_bytes(&self.device, data.as_ptr() as *const u8, bytes).ok_or_else(
+            || InferError::OutOfMemory(format!("metal buffer alloc failed: {bytes} bytes")),
+        )
     }
 
     /// Acquire a zero-filled transient buffer of `count` floats from the pool.
@@ -2244,8 +2244,9 @@ impl MetalCompute {
     /// fresh upload per attention call is negligible and strictly correct.
     fn buf_u32_slice(&self, data: &[u32]) -> Result<Buffer, InferError> {
         let bytes = data.len() * std::mem::size_of::<u32>();
-        try_new_buffer_with_bytes(&self.device, data.as_ptr() as *const u8, bytes)
-            .ok_or_else(|| InferError::OutOfMemory(format!("metal u32 buffer alloc failed: {bytes} bytes")))
+        try_new_buffer_with_bytes(&self.device, data.as_ptr() as *const u8, bytes).ok_or_else(
+            || InferError::OutOfMemory(format!("metal u32 buffer alloc failed: {bytes} bytes")),
+        )
     }
 
     /// Read floats back from a Metal buffer. Timed into the copy/readback phase.
@@ -2335,7 +2336,9 @@ impl MetalCompute {
         let retain = Mutex::new(Some(retain));
         let handler = block::ConcreteBlock::new(move |cb: &CommandBufferRef| {
             if cb.status() == metal::MTLCommandBufferStatus::Error {
-                tracing::warn!("kin_infer.metal.commit_bounded: command buffer completed in Error state");
+                tracing::warn!(
+                    "kin_infer.metal.commit_bounded: command buffer completed in Error state"
+                );
             }
             // Recycle retained buffers (drop returns them to the pool) before
             // releasing the in-flight slot.
@@ -2669,7 +2672,6 @@ fn steel_mma_name(base: &str) -> &str {
 }
 
 impl GpuCompute for MetalCompute {
-
     fn forward_layer_batched(
         &self,
         hidden: &[f32],
@@ -2681,429 +2683,908 @@ impl GpuCompute for MetalCompute {
     ) -> Result<Option<Vec<f32>>, InferError> {
         autoreleasepool(|_| {
             let kv_heads = if let Some(k) = weights.k_weight {
-            k.len() / (config.hidden_size * config.head_dim)
-        } else if let Some(qkv) = weights.qkv_weight {
-            let total_qkv_dim = qkv.len() / config.hidden_size;
-            let q_dim = config.num_heads * config.head_dim;
-            (total_qkv_dim - q_dim) / (2 * config.head_dim)
-        } else {
-            config.num_heads
-        };
-
-        let _span = tracing::info_span!("kin_infer.metal.forward_layer_batched").entered();
-
-        let batch_size = config.batch_size;
-        let max_len = config.max_len;
-        let total_rows = batch_size * max_len;
-        let h = config.hidden_size;
-        let heads = config.num_heads;
-        let head_dim = config.head_dim;
-        let inter = config.inter_size;
-        let q_dim = heads * head_dim;
-        let kv_dim = kv_heads * head_dim;
-
-        let current_hidden = self.buf_slice_pooled(hidden)?;
-        
-        // ---------------------------------------------------------
-        // Command Buffer 1: Norm 1 + QKV Projections
-        // ---------------------------------------------------------
-        let cmd1 = self.queue.new_command_buffer();
-        let mut retains1 = Vec::new();
-        
-        let buf_rows = self.buf_u32(total_rows as u32)?;
-        let buf_h = self.buf_u32(h as u32)?;
-        let buf_eps = self.buf_f32(if config.use_rms { config.rms_eps } else { config.eps })?;
-        
-        // Layer norm 1
-        let mut buf_normed1 = None;
-        let mut qkv_in = current_hidden.buffer();
-        if config.pre_ln {
-            let buf = self.pool.acquire_uninit(total_rows * h * 4)?;
-            {
-                let blit = cmd1.new_blit_command_encoder();
-                blit.copy_from_buffer(current_hidden.buffer(), 0, buf.buffer(), 0, (total_rows * h * 4) as u64);
-                blit.end_encoding();
-            }
-            let buf_norm1_w = self.buf_cached(weights.norm1_weight)?;
-            if config.use_rms {
-                self.encode_1d(cmd1, "rms_norm", &[buf.buffer(), &buf_norm1_w, &buf_h, &buf_eps], total_rows);
+                k.len() / (config.hidden_size * config.head_dim)
+            } else if let Some(qkv) = weights.qkv_weight {
+                let total_qkv_dim = qkv.len() / config.hidden_size;
+                let q_dim = config.num_heads * config.head_dim;
+                (total_qkv_dim - q_dim) / (2 * config.head_dim)
             } else {
-                let buf_norm1_b = self.buf_cached(weights.norm1_bias.unwrap_or(&[]))?;
-                self.encode_1d(cmd1, "layer_norm", &[buf.buffer(), &buf_norm1_w, &buf_norm1_b, &buf_h, &buf_eps], total_rows);
-            }
-            buf_normed1 = Some(buf);
-            qkv_in = buf_normed1.as_ref().unwrap().buffer();
-        }
-        
-        let buf_q_dim = self.buf_u32(q_dim as u32)?;
-        let buf_kv_dim = self.buf_u32(kv_dim as u32)?;
-        let buf_q = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
-        let buf_k = self.pool.acquire_uninit(total_rows * kv_dim * 4)?;
-        let buf_v = self.pool.acquire_uninit(total_rows * kv_dim * 4)?;
-        
-        if let Some(qkv_weight) = weights.qkv_weight {
-            let total_qkv = q_dim + 2 * kv_dim;
-            let buf_qkv_dim = self.buf_u32(total_qkv as u32)?;
-            let buf_qkv = self.pool.acquire_uninit(total_rows * total_qkv * 4)?;
-            let buf_qkv_w = self.buf_cached(qkv_weight)?;
-            
-            if use_mma(total_rows, total_qkv, h) {
-                self.encode_mma(cmd1, "matmul_transb_simdgroup", &[qkv_in, &buf_qkv_w, buf_qkv.buffer(), &buf_rows, &buf_qkv_dim, &buf_h], total_rows, total_qkv, h, 1);
+                config.num_heads
+            };
+
+            let _span = tracing::info_span!("kin_infer.metal.forward_layer_batched").entered();
+
+            let batch_size = config.batch_size;
+            let max_len = config.max_len;
+            let total_rows = batch_size * max_len;
+            let h = config.hidden_size;
+            let heads = config.num_heads;
+            let head_dim = config.head_dim;
+            let inter = config.inter_size;
+            let q_dim = heads * head_dim;
+            let kv_dim = kv_heads * head_dim;
+
+            let current_hidden = self.buf_slice_pooled(hidden)?;
+
+            // ---------------------------------------------------------
+            // Command Buffer 1: Norm 1 + QKV Projections
+            // ---------------------------------------------------------
+            let cmd1 = self.queue.new_command_buffer();
+            let mut retains1 = Vec::new();
+
+            let buf_rows = self.buf_u32(total_rows as u32)?;
+            let buf_h = self.buf_u32(h as u32)?;
+            let buf_eps = self.buf_f32(if config.use_rms {
+                config.rms_eps
             } else {
-                Self::encode_matmul(cmd1, &self.pipelines["matmul_transb"], qkv_in, &buf_qkv_w, buf_qkv.buffer(), &buf_rows, &buf_qkv_dim, &buf_h, total_qkv, total_rows);
+                config.eps
+            })?;
+
+            // Layer norm 1
+            let mut buf_normed1 = None;
+            let mut qkv_in = current_hidden.buffer();
+            if config.pre_ln {
+                let buf = self.pool.acquire_uninit(total_rows * h * 4)?;
+                {
+                    let blit = cmd1.new_blit_command_encoder();
+                    blit.copy_from_buffer(
+                        current_hidden.buffer(),
+                        0,
+                        buf.buffer(),
+                        0,
+                        (total_rows * h * 4) as u64,
+                    );
+                    blit.end_encoding();
+                }
+                let buf_norm1_w = self.buf_cached(weights.norm1_weight)?;
+                if config.use_rms {
+                    self.encode_1d(
+                        cmd1,
+                        "rms_norm",
+                        &[buf.buffer(), &buf_norm1_w, &buf_h, &buf_eps],
+                        total_rows,
+                    );
+                } else {
+                    let buf_norm1_b = self.buf_cached(weights.norm1_bias.unwrap_or(&[]))?;
+                    self.encode_1d(
+                        cmd1,
+                        "layer_norm",
+                        &[buf.buffer(), &buf_norm1_w, &buf_norm1_b, &buf_h, &buf_eps],
+                        total_rows,
+                    );
+                }
+                buf_normed1 = Some(buf);
+                qkv_in = buf_normed1.as_ref().unwrap().buffer();
             }
 
-            if let Some(qkv_bias) = weights.qkv_bias {
-                let b_bias = self.buf_cached(qkv_bias)?;
-                self.encode_1d(cmd1, "elementwise_add_broadcast", &[buf_qkv.buffer(), &b_bias, &buf_qkv_dim], total_rows * total_qkv);
-            }
-            
-            let split_p = &self.pipelines["split_qkv_packed"];
-            let enc = cmd1.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(split_p);
-            enc.set_buffer(0, Some(buf_qkv.buffer()), 0);
-            enc.set_buffer(1, Some(buf_q.buffer()), 0);
-            enc.set_buffer(2, Some(buf_k.buffer()), 0);
-            enc.set_buffer(3, Some(buf_v.buffer()), 0);
-            enc.set_buffer(4, Some(&buf_q_dim), 0);
-            enc.set_buffer(5, Some(&buf_kv_dim), 0);
-            enc.set_buffer(6, Some(&buf_kv_dim), 0);
-            let threads = metal::MTLSize::new(total_qkv as u64, total_rows as u64, 1);
-            let tw = split_p.thread_execution_width() as u64;
-            let tg = metal::MTLSize::new(tw.min(total_qkv as u64).max(1), 16.min(total_rows as u64).max(1), 1);
-            enc.dispatch_threads(threads, tg);
-            enc.end_encoding();
+            let buf_q_dim = self.buf_u32(q_dim as u32)?;
+            let buf_kv_dim = self.buf_u32(kv_dim as u32)?;
+            let buf_q = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
+            let buf_k = self.pool.acquire_uninit(total_rows * kv_dim * 4)?;
+            let buf_v = self.pool.acquire_uninit(total_rows * kv_dim * 4)?;
 
-            if let Some(q_ln_w) = weights.q_ln_weight {
-                let q_ln_w_buf = self.buf_cached(q_ln_w)?;
-                let q_ln_b_buf = self.buf_cached(weights.q_ln_bias.unwrap_or(&[]))?;
-                self.encode_1d(cmd1, "layer_norm", &[buf_q.buffer(), &q_ln_w_buf, &q_ln_b_buf, &buf_q_dim, &buf_eps], total_rows);
-            }
-            if let Some(k_ln_w) = weights.k_ln_weight {
-                let k_ln_w_buf = self.buf_cached(k_ln_w)?;
-                let k_ln_b_buf = self.buf_cached(weights.k_ln_bias.unwrap_or(&[]))?;
-                self.encode_1d(cmd1, "layer_norm", &[buf_k.buffer(), &k_ln_w_buf, &k_ln_b_buf, &buf_kv_dim, &buf_eps], total_rows);
-            }
-            retains1.push(buf_qkv);
-        } else {
-            let buf_qw = self.buf_cached(weights.q_weight.unwrap())?;
-            let buf_kw = self.buf_cached(weights.k_weight.unwrap())?;
-            let buf_vw = self.buf_cached(weights.v_weight.unwrap())?;
-            if use_mma(total_rows, q_dim, h) {
-                self.encode_mma(cmd1, "matmul_transb_simdgroup", &[qkv_in, &buf_qw, buf_q.buffer(), &buf_rows, &buf_q_dim, &buf_h], total_rows, q_dim, h, 1);
-            } else {
-                Self::encode_matmul(cmd1, &self.pipelines["matmul_transb"], qkv_in, &buf_qw, buf_q.buffer(), &buf_rows, &buf_q_dim, &buf_h, q_dim, total_rows);
-            }
-            if use_mma(total_rows, kv_dim, h) {
-                self.encode_mma(cmd1, "matmul_transb_simdgroup", &[qkv_in, &buf_kw, buf_k.buffer(), &buf_rows, &buf_kv_dim, &buf_h], total_rows, kv_dim, h, 1);
-                self.encode_mma(cmd1, "matmul_transb_simdgroup", &[qkv_in, &buf_vw, buf_v.buffer(), &buf_rows, &buf_kv_dim, &buf_h], total_rows, kv_dim, h, 1);
-            } else {
-                Self::encode_matmul(cmd1, &self.pipelines["matmul_transb"], qkv_in, &buf_kw, buf_k.buffer(), &buf_rows, &buf_kv_dim, &buf_h, kv_dim, total_rows);
-                Self::encode_matmul(cmd1, &self.pipelines["matmul_transb"], qkv_in, &buf_vw, buf_v.buffer(), &buf_rows, &buf_kv_dim, &buf_h, kv_dim, total_rows);
-            }
-            if let Some(q_bias) = weights.q_bias {
-                let b = self.buf_cached(q_bias)?;
-                self.encode_1d(cmd1, "elementwise_add_broadcast", &[buf_q.buffer(), &b, &buf_q_dim], total_rows * q_dim);
-            }
-            if let Some(k_bias) = weights.k_bias {
-                let b = self.buf_cached(k_bias)?;
-                self.encode_1d(cmd1, "elementwise_add_broadcast", &[buf_k.buffer(), &b, &buf_kv_dim], total_rows * kv_dim);
-            }
-            if let Some(v_bias) = weights.v_bias {
-                let b = self.buf_cached(v_bias)?;
-                self.encode_1d(cmd1, "elementwise_add_broadcast", &[buf_v.buffer(), &b, &buf_kv_dim], total_rows * kv_dim);
-            }
-        }
-        
-        if let Some(b) = buf_normed1 {
-            retains1.push(b);
-        }
-        self.commit_bounded(cmd1, retains1);
-        
-        // ---------------------------------------------------------
-        // Command Buffer 2: RoPE + Fused Attention Posmajor + Attn Out Projection + Add Residual
-        // ---------------------------------------------------------
-        let cmd2 = self.queue.new_command_buffer();
-        let mut retains2 = Vec::new();
-        
-        // Only apply RoPE if cos/sin are provided
-        if !rope_cos.is_empty() {
-            let buf_cos = self.buf_cached(rope_cos)?;
-            let buf_sin = self.buf_cached(rope_sin)?;
-            let buf_max_len = self.buf_u32(max_len as u32)?;
-            let buf_head_dim = self.buf_u32(head_dim as u32)?;
-            let buf_actual = self.buf_u32(max_len as u32)?;
-            
-            let rope_p = &self.pipelines["rope_apply_batched"];
-            
-            // Q RoPE
-            {
-                let enc = cmd2.new_compute_command_encoder();
-                let num_pairs = q_dim / head_dim * (head_dim / 2);
-                enc.set_compute_pipeline_state(rope_p);
-                enc.set_buffer(0, Some(buf_q.buffer()), 0);
-                enc.set_buffer(1, Some(&buf_cos), 0);
-                enc.set_buffer(2, Some(&buf_sin), 0);
-                enc.set_buffer(3, Some(&buf_max_len), 0);
-                enc.set_buffer(4, Some(&buf_head_dim), 0);
-                enc.set_buffer(5, Some(&buf_q_dim), 0);
-                enc.set_buffer(6, Some(&buf_head_dim), 0);
-                enc.set_buffer(7, Some(&buf_actual), 0);
-                let threads = metal::MTLSize::new(num_pairs as u64, total_rows as u64, 1);
-                let tg = metal::MTLSize::new(16.min(num_pairs) as u64, 16.min(total_rows) as u64, 1);
-                enc.dispatch_threads(threads, tg);
-                enc.end_encoding();
-            }
-            
-            // K RoPE
-            {
-                let enc = cmd2.new_compute_command_encoder();
-                let num_pairs = kv_dim / head_dim * (head_dim / 2);
-                enc.set_compute_pipeline_state(rope_p);
-                enc.set_buffer(0, Some(buf_k.buffer()), 0);
-                enc.set_buffer(1, Some(&buf_cos), 0);
-                enc.set_buffer(2, Some(&buf_sin), 0);
-                enc.set_buffer(3, Some(&buf_max_len), 0);
-                enc.set_buffer(4, Some(&buf_head_dim), 0);
+            if let Some(qkv_weight) = weights.qkv_weight {
+                let total_qkv = q_dim + 2 * kv_dim;
+                let buf_qkv_dim = self.buf_u32(total_qkv as u32)?;
+                let buf_qkv = self.pool.acquire_uninit(total_rows * total_qkv * 4)?;
+                let buf_qkv_w = self.buf_cached(qkv_weight)?;
+
+                if use_mma(total_rows, total_qkv, h) {
+                    self.encode_mma(
+                        cmd1,
+                        "matmul_transb_simdgroup",
+                        &[
+                            qkv_in,
+                            &buf_qkv_w,
+                            buf_qkv.buffer(),
+                            &buf_rows,
+                            &buf_qkv_dim,
+                            &buf_h,
+                        ],
+                        total_rows,
+                        total_qkv,
+                        h,
+                        1,
+                    );
+                } else {
+                    Self::encode_matmul(
+                        cmd1,
+                        &self.pipelines["matmul_transb"],
+                        qkv_in,
+                        &buf_qkv_w,
+                        buf_qkv.buffer(),
+                        &buf_rows,
+                        &buf_qkv_dim,
+                        &buf_h,
+                        total_qkv,
+                        total_rows,
+                    );
+                }
+
+                if let Some(qkv_bias) = weights.qkv_bias {
+                    let b_bias = self.buf_cached(qkv_bias)?;
+                    self.encode_1d(
+                        cmd1,
+                        "elementwise_add_broadcast",
+                        &[buf_qkv.buffer(), &b_bias, &buf_qkv_dim],
+                        total_rows * total_qkv,
+                    );
+                }
+
+                let split_p = &self.pipelines["split_qkv_packed"];
+                let enc = cmd1.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(split_p);
+                enc.set_buffer(0, Some(buf_qkv.buffer()), 0);
+                enc.set_buffer(1, Some(buf_q.buffer()), 0);
+                enc.set_buffer(2, Some(buf_k.buffer()), 0);
+                enc.set_buffer(3, Some(buf_v.buffer()), 0);
+                enc.set_buffer(4, Some(&buf_q_dim), 0);
                 enc.set_buffer(5, Some(&buf_kv_dim), 0);
-                enc.set_buffer(6, Some(&buf_head_dim), 0);
-                enc.set_buffer(7, Some(&buf_actual), 0);
-                let threads = metal::MTLSize::new(num_pairs as u64, total_rows as u64, 1);
-                let tg = metal::MTLSize::new(16.min(num_pairs) as u64, 16.min(total_rows) as u64, 1);
+                enc.set_buffer(6, Some(&buf_kv_dim), 0);
+                let threads = metal::MTLSize::new(total_qkv as u64, total_rows as u64, 1);
+                let tw = split_p.thread_execution_width() as u64;
+                let tg = metal::MTLSize::new(
+                    tw.min(total_qkv as u64).max(1),
+                    16.min(total_rows as u64).max(1),
+                    1,
+                );
+                enc.dispatch_threads(threads, tg);
+                enc.end_encoding();
+
+                if let Some(q_ln_w) = weights.q_ln_weight {
+                    let q_ln_w_buf = self.buf_cached(q_ln_w)?;
+                    let q_ln_b_buf = self.buf_cached(weights.q_ln_bias.unwrap_or(&[]))?;
+                    self.encode_1d(
+                        cmd1,
+                        "layer_norm",
+                        &[
+                            buf_q.buffer(),
+                            &q_ln_w_buf,
+                            &q_ln_b_buf,
+                            &buf_q_dim,
+                            &buf_eps,
+                        ],
+                        total_rows,
+                    );
+                }
+                if let Some(k_ln_w) = weights.k_ln_weight {
+                    let k_ln_w_buf = self.buf_cached(k_ln_w)?;
+                    let k_ln_b_buf = self.buf_cached(weights.k_ln_bias.unwrap_or(&[]))?;
+                    self.encode_1d(
+                        cmd1,
+                        "layer_norm",
+                        &[
+                            buf_k.buffer(),
+                            &k_ln_w_buf,
+                            &k_ln_b_buf,
+                            &buf_kv_dim,
+                            &buf_eps,
+                        ],
+                        total_rows,
+                    );
+                }
+                retains1.push(buf_qkv);
+            } else {
+                let buf_qw = self.buf_cached(weights.q_weight.unwrap())?;
+                let buf_kw = self.buf_cached(weights.k_weight.unwrap())?;
+                let buf_vw = self.buf_cached(weights.v_weight.unwrap())?;
+                if use_mma(total_rows, q_dim, h) {
+                    self.encode_mma(
+                        cmd1,
+                        "matmul_transb_simdgroup",
+                        &[
+                            qkv_in,
+                            &buf_qw,
+                            buf_q.buffer(),
+                            &buf_rows,
+                            &buf_q_dim,
+                            &buf_h,
+                        ],
+                        total_rows,
+                        q_dim,
+                        h,
+                        1,
+                    );
+                } else {
+                    Self::encode_matmul(
+                        cmd1,
+                        &self.pipelines["matmul_transb"],
+                        qkv_in,
+                        &buf_qw,
+                        buf_q.buffer(),
+                        &buf_rows,
+                        &buf_q_dim,
+                        &buf_h,
+                        q_dim,
+                        total_rows,
+                    );
+                }
+                if use_mma(total_rows, kv_dim, h) {
+                    self.encode_mma(
+                        cmd1,
+                        "matmul_transb_simdgroup",
+                        &[
+                            qkv_in,
+                            &buf_kw,
+                            buf_k.buffer(),
+                            &buf_rows,
+                            &buf_kv_dim,
+                            &buf_h,
+                        ],
+                        total_rows,
+                        kv_dim,
+                        h,
+                        1,
+                    );
+                    self.encode_mma(
+                        cmd1,
+                        "matmul_transb_simdgroup",
+                        &[
+                            qkv_in,
+                            &buf_vw,
+                            buf_v.buffer(),
+                            &buf_rows,
+                            &buf_kv_dim,
+                            &buf_h,
+                        ],
+                        total_rows,
+                        kv_dim,
+                        h,
+                        1,
+                    );
+                } else {
+                    Self::encode_matmul(
+                        cmd1,
+                        &self.pipelines["matmul_transb"],
+                        qkv_in,
+                        &buf_kw,
+                        buf_k.buffer(),
+                        &buf_rows,
+                        &buf_kv_dim,
+                        &buf_h,
+                        kv_dim,
+                        total_rows,
+                    );
+                    Self::encode_matmul(
+                        cmd1,
+                        &self.pipelines["matmul_transb"],
+                        qkv_in,
+                        &buf_vw,
+                        buf_v.buffer(),
+                        &buf_rows,
+                        &buf_kv_dim,
+                        &buf_h,
+                        kv_dim,
+                        total_rows,
+                    );
+                }
+                if let Some(q_bias) = weights.q_bias {
+                    let b = self.buf_cached(q_bias)?;
+                    self.encode_1d(
+                        cmd1,
+                        "elementwise_add_broadcast",
+                        &[buf_q.buffer(), &b, &buf_q_dim],
+                        total_rows * q_dim,
+                    );
+                }
+                if let Some(k_bias) = weights.k_bias {
+                    let b = self.buf_cached(k_bias)?;
+                    self.encode_1d(
+                        cmd1,
+                        "elementwise_add_broadcast",
+                        &[buf_k.buffer(), &b, &buf_kv_dim],
+                        total_rows * kv_dim,
+                    );
+                }
+                if let Some(v_bias) = weights.v_bias {
+                    let b = self.buf_cached(v_bias)?;
+                    self.encode_1d(
+                        cmd1,
+                        "elementwise_add_broadcast",
+                        &[buf_v.buffer(), &b, &buf_kv_dim],
+                        total_rows * kv_dim,
+                    );
+                }
+            }
+
+            if let Some(b) = buf_normed1 {
+                retains1.push(b);
+            }
+            self.commit_bounded(cmd1, retains1);
+
+            // ---------------------------------------------------------
+            // Command Buffer 2: RoPE + Fused Attention Posmajor + Attn Out Projection + Add Residual
+            // ---------------------------------------------------------
+            let cmd2 = self.queue.new_command_buffer();
+            let mut retains2 = Vec::new();
+
+            // Only apply RoPE if cos/sin are provided
+            if !rope_cos.is_empty() {
+                let buf_cos = self.buf_cached(rope_cos)?;
+                let buf_sin = self.buf_cached(rope_sin)?;
+                let buf_max_len = self.buf_u32(max_len as u32)?;
+                let buf_head_dim = self.buf_u32(head_dim as u32)?;
+                let buf_actual = self.buf_u32(max_len as u32)?;
+
+                let rope_p = &self.pipelines["rope_apply_batched"];
+
+                // Q RoPE
+                {
+                    let enc = cmd2.new_compute_command_encoder();
+                    let num_pairs = q_dim / head_dim * (head_dim / 2);
+                    enc.set_compute_pipeline_state(rope_p);
+                    enc.set_buffer(0, Some(buf_q.buffer()), 0);
+                    enc.set_buffer(1, Some(&buf_cos), 0);
+                    enc.set_buffer(2, Some(&buf_sin), 0);
+                    enc.set_buffer(3, Some(&buf_max_len), 0);
+                    enc.set_buffer(4, Some(&buf_head_dim), 0);
+                    enc.set_buffer(5, Some(&buf_q_dim), 0);
+                    enc.set_buffer(6, Some(&buf_head_dim), 0);
+                    enc.set_buffer(7, Some(&buf_actual), 0);
+                    let threads = metal::MTLSize::new(num_pairs as u64, total_rows as u64, 1);
+                    let tg =
+                        metal::MTLSize::new(16.min(num_pairs) as u64, 16.min(total_rows) as u64, 1);
+                    enc.dispatch_threads(threads, tg);
+                    enc.end_encoding();
+                }
+
+                // K RoPE
+                {
+                    let enc = cmd2.new_compute_command_encoder();
+                    let num_pairs = kv_dim / head_dim * (head_dim / 2);
+                    enc.set_compute_pipeline_state(rope_p);
+                    enc.set_buffer(0, Some(buf_k.buffer()), 0);
+                    enc.set_buffer(1, Some(&buf_cos), 0);
+                    enc.set_buffer(2, Some(&buf_sin), 0);
+                    enc.set_buffer(3, Some(&buf_max_len), 0);
+                    enc.set_buffer(4, Some(&buf_head_dim), 0);
+                    enc.set_buffer(5, Some(&buf_kv_dim), 0);
+                    enc.set_buffer(6, Some(&buf_head_dim), 0);
+                    enc.set_buffer(7, Some(&buf_actual), 0);
+                    let threads = metal::MTLSize::new(num_pairs as u64, total_rows as u64, 1);
+                    let tg =
+                        metal::MTLSize::new(16.min(num_pairs) as u64, 16.min(total_rows) as u64, 1);
+                    enc.dispatch_threads(threads, tg);
+                    enc.end_encoding();
+                }
+            }
+
+            let buf_q_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
+            let buf_k_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
+            let buf_v_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
+            let buf_heads = self.buf_u32(heads as u32)?;
+            let buf_seq = self.buf_u32(max_len as u32)?;
+            let buf_head_dim = self.buf_u32(head_dim as u32)?;
+            let total_q_heads = batch_size * heads;
+
+            if kv_heads == heads {
+                self.encode_3d(
+                    cmd2,
+                    "reshape_qkv_pos_to_head",
+                    &[
+                        buf_q.buffer(),
+                        buf_k.buffer(),
+                        buf_v.buffer(),
+                        buf_q_reshaped.buffer(),
+                        buf_k_reshaped.buffer(),
+                        buf_v_reshaped.buffer(),
+                        &buf_heads,
+                        &buf_seq,
+                        &buf_head_dim,
+                    ],
+                    head_dim,
+                    max_len,
+                    total_q_heads,
+                );
+            } else {
+                let buf_kv_heads = self.buf_u32(kv_heads as u32)?;
+                let p = &self.pipelines["reshape_qkv_pos_to_head_gqa"];
+                let enc = cmd2.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(p);
+                enc.set_buffer(0, Some(buf_q.buffer()), 0);
+                enc.set_buffer(1, Some(buf_k.buffer()), 0);
+                enc.set_buffer(2, Some(buf_v.buffer()), 0);
+                enc.set_buffer(3, Some(buf_q_reshaped.buffer()), 0);
+                enc.set_buffer(4, Some(buf_k_reshaped.buffer()), 0);
+                enc.set_buffer(5, Some(buf_v_reshaped.buffer()), 0);
+                enc.set_buffer(6, Some(&buf_heads), 0);
+                enc.set_buffer(7, Some(&buf_seq), 0);
+                enc.set_buffer(8, Some(&buf_head_dim), 0);
+                enc.set_buffer(9, Some(&buf_kv_heads), 0);
+
+                let threads =
+                    metal::MTLSize::new(head_dim as u64, max_len as u64, total_q_heads as u64);
+                let tg = metal::MTLSize::new(16.min(head_dim) as u64, 16.min(max_len) as u64, 1);
                 enc.dispatch_threads(threads, tg);
                 enc.end_encoding();
             }
-        }
-        
-        let buf_q_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
-        let buf_k_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
-        let buf_v_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
-        let buf_heads = self.buf_u32(heads as u32)?;
-        let buf_seq = self.buf_u32(max_len as u32)?;
-        let buf_head_dim = self.buf_u32(head_dim as u32)?;
-        let total_q_heads = batch_size * heads;
-        
-        if kv_heads == heads {
-            self.encode_3d(cmd2, "reshape_qkv_pos_to_head", &[
-                buf_q.buffer(), buf_k.buffer(), buf_v.buffer(),
-                buf_q_reshaped.buffer(), buf_k_reshaped.buffer(), buf_v_reshaped.buffer(),
-                &buf_heads, &buf_seq, &buf_head_dim
-            ], head_dim, max_len, total_q_heads);
-        } else {
-            let buf_kv_heads = self.buf_u32(kv_heads as u32)?;
-            let p = &self.pipelines["reshape_qkv_pos_to_head_gqa"];
-            let enc = cmd2.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(p);
-            enc.set_buffer(0, Some(buf_q.buffer()), 0);
-            enc.set_buffer(1, Some(buf_k.buffer()), 0);
-            enc.set_buffer(2, Some(buf_v.buffer()), 0);
-            enc.set_buffer(3, Some(buf_q_reshaped.buffer()), 0);
-            enc.set_buffer(4, Some(buf_k_reshaped.buffer()), 0);
-            enc.set_buffer(5, Some(buf_v_reshaped.buffer()), 0);
-            enc.set_buffer(6, Some(&buf_heads), 0);
-            enc.set_buffer(7, Some(&buf_seq), 0);
-            enc.set_buffer(8, Some(&buf_head_dim), 0);
-            enc.set_buffer(9, Some(&buf_kv_heads), 0);
-            
-            let threads = metal::MTLSize::new(head_dim as u64, max_len as u64, total_q_heads as u64);
-            let tg = metal::MTLSize::new(16.min(head_dim) as u64, 16.min(max_len) as u64, 1);
-            enc.dispatch_threads(threads, tg);
-            enc.end_encoding();
-        }
-        
-        let buf_scores = self.pool.acquire_uninit(total_q_heads * max_len * max_len * 4)?;
-        let buf_scale = self.buf_f32(config.scale)?;
-        let buf_masks = self.buf_u32_slice(masks)?;
-        let buf_has_alibi = self.buf_u32(0)?;
-        let buf_alibi = self.buf_slice_pooled(&[0.0f32])?;
-        let buf_out_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
-        
-        let qk_bufs = [
-            buf_q_reshaped.buffer(), buf_k_reshaped.buffer(), buf_scores.buffer(), &buf_seq, &buf_head_dim, &self.buf_u32(1)?
-        ];
-        if use_mma(max_len, max_len, head_dim) {
-            self.encode_mma(cmd2, "batched_matmul_transb_simdgroup", &qk_bufs, max_len, max_len, head_dim, total_q_heads);
-        } else {
-            self.encode_3d(cmd2, "batched_matmul_transb", &qk_bufs, max_len, max_len, total_q_heads);
-        }
-        
-        self.encode_3d(cmd2, "scale_mask_alibi_grouped", &[
-            buf_scores.buffer(), buf_alibi.buffer(), &buf_masks, &buf_scale, &buf_seq, &buf_has_alibi, &buf_heads
-        ], max_len, max_len, total_q_heads);
-        
-        self.encode_1d(cmd2, "softmax_rows", &[
-            buf_scores.buffer(), &buf_seq
-        ], total_q_heads * max_len);
-        
-        let sv_bufs = [
-            buf_scores.buffer(), buf_v_reshaped.buffer(), buf_out_reshaped.buffer(), &buf_seq, &buf_head_dim, &self.buf_u32(1)?
-        ];
-        if use_mma(max_len, head_dim, max_len) {
-            self.encode_mma(cmd2, "batched_matmul_ab_simdgroup", &sv_bufs, max_len, head_dim, max_len, total_q_heads);
-        } else {
-            self.encode_3d(cmd2, "batched_matmul_ab", &sv_bufs, head_dim, max_len, total_q_heads);
-        }
-        
-        let buf_attn_out = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
-        self.encode_3d(cmd2, "reshape_head_to_pos", &[
-            buf_out_reshaped.buffer(), buf_attn_out.buffer(), &buf_heads, &buf_seq, &buf_head_dim
-        ], head_dim, max_len, total_q_heads);
-        
-        let buf_proj_out = self.pool.acquire_uninit(total_rows * h * 4)?;
-        let buf_out_w = self.buf_cached(weights.attn_out_weight)?;
-        
-        if use_mma(total_rows, h, q_dim) {
-            self.encode_mma(cmd2, "matmul_transb_simdgroup", &[buf_attn_out.buffer(), &buf_out_w, buf_proj_out.buffer(), &buf_rows, &buf_h, &buf_q_dim], total_rows, h, q_dim, 1);
-        } else {
-            Self::encode_matmul(cmd2, &self.pipelines["matmul_transb"], buf_attn_out.buffer(), &buf_out_w, buf_proj_out.buffer(), &buf_rows, &buf_h, &buf_q_dim, h, total_rows);
-        }
 
-        if let Some(attn_out_bias) = weights.attn_out_bias {
-            let b = self.buf_cached(attn_out_bias)?;
-            self.encode_1d(cmd2, "elementwise_add_broadcast", &[buf_proj_out.buffer(), &b, &buf_h], total_rows * h);
-        }
-        
-        self.encode_1d(cmd2, "elementwise_add", &[current_hidden.buffer(), buf_proj_out.buffer()], total_rows * h);
-        
-        if !config.pre_ln {
-            let buf_norm1_w = self.buf_cached(weights.norm1_weight)?;
-            if config.use_rms {
-                self.encode_1d(cmd2, "rms_norm", &[current_hidden.buffer(), &buf_norm1_w, &buf_h, &buf_eps], total_rows);
-            } else {
-                let buf_norm1_b = self.buf_cached(weights.norm1_bias.unwrap_or(&[]))?;
-                self.encode_1d(cmd2, "layer_norm", &[current_hidden.buffer(), &buf_norm1_w, &buf_norm1_b, &buf_h, &buf_eps], total_rows);
-            }
-        }
-        
-        retains2.push(buf_q);
-        retains2.push(buf_k);
-        retains2.push(buf_v);
-        retains2.push(buf_alibi);
-        retains2.push(buf_q_reshaped);
-        retains2.push(buf_k_reshaped);
-        retains2.push(buf_v_reshaped);
-        retains2.push(buf_scores);
-        retains2.push(buf_out_reshaped);
-        retains2.push(buf_attn_out);
-        retains2.push(buf_proj_out);
-        self.commit_bounded(cmd2, retains2);
-        
-        // ---------------------------------------------------------
-        // Command Buffer 3: Norm 2 + FFN + Residual
-        // ---------------------------------------------------------
-        let cmd3 = self.queue.new_command_buffer();
-        let mut retains3 = Vec::new();
-        
-        // Layer norm 2
-        let mut buf_normed2 = None;
-        if config.pre_ln {
-            let buf = self.pool.acquire_uninit(total_rows * h * 4)?;
-            {
-                let blit = cmd3.new_blit_command_encoder();
-                blit.copy_from_buffer(current_hidden.buffer(), 0, buf.buffer(), 0, (total_rows * h * 4) as u64);
-                blit.end_encoding();
-            }
-            let buf_norm2_w = self.buf_cached(weights.norm2_weight)?;
-            if config.use_rms {
-                self.encode_1d(cmd3, "rms_norm", &[buf.buffer(), &buf_norm2_w, &buf_h, &buf_eps], total_rows);
-            } else {
-                let buf_norm2_b = self.buf_cached(weights.norm2_bias.unwrap_or(&[]))?;
-                self.encode_1d(cmd3, "layer_norm", &[buf.buffer(), &buf_norm2_w, &buf_norm2_b, &buf_h, &buf_eps], total_rows);
-            }
-            buf_normed2 = Some(buf);
-        }
-        
-        let ffn_in = if let Some(ref b) = buf_normed2 { b.buffer() } else { current_hidden.buffer() };
-        let buf_inter = self.buf_u32(inter as u32)?;
-        let buf_ffn_out = self.pool.acquire_uninit(total_rows * h * 4)?;
-        let buf_wdown = self.buf_cached(weights.ffn_down_weight)?;
+            let buf_scores = self
+                .pool
+                .acquire_uninit(total_q_heads * max_len * max_len * 4)?;
+            let buf_scale = self.buf_f32(config.scale)?;
+            let buf_masks = self.buf_u32_slice(masks)?;
+            let buf_has_alibi = self.buf_u32(0)?;
+            let buf_alibi = self.buf_slice_pooled(&[0.0f32])?;
+            let buf_out_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
 
-        if let Some(gate_weight) = weights.ffn_gate_weight {
-            // SwiGLU FFN. The fat GEMM needs `[w_gate | w_up]` stacked rows-first
-            // (gate's full [inter, h] block, then up's), so the `swiglu_activation_fat`
-            // kernel reads columns [0, inter) as gate and [inter, 2*inter) as up. This
-            // is the SAME layout `buf_cached_concat` builds and the SAME cache key the
-            // per-op `fused_ffn_swiglu` paths use, so all three share one cached buffer
-            // instead of racing to populate the key with conflicting layouts.
-            let up_weight = weights.ffn_up_weight.unwrap();
-            let buf_wgateup = self.buf_cached_concat(&[gate_weight, up_weight])?;
-            
-            let buf_gateup = self.pool.acquire_uninit(total_rows * 2 * inter * 4)?;
-            let buf_act = self.pool.acquire_uninit(total_rows * inter * 4)?;
-            let buf_two_inter = self.buf_u32((2 * inter) as u32)?;
-            
-            if use_mma(total_rows, inter, h) {
-                self.encode_mma(cmd3, "matmul_transb_simdgroup", &[ffn_in, &buf_wgateup, buf_gateup.buffer(), &buf_rows, &buf_two_inter, &buf_h], total_rows, 2 * inter, h, 1);
+            let qk_bufs = [
+                buf_q_reshaped.buffer(),
+                buf_k_reshaped.buffer(),
+                buf_scores.buffer(),
+                &buf_seq,
+                &buf_head_dim,
+                &self.buf_u32(1)?,
+            ];
+            if use_mma(max_len, max_len, head_dim) {
+                self.encode_mma(
+                    cmd2,
+                    "batched_matmul_transb_simdgroup",
+                    &qk_bufs,
+                    max_len,
+                    max_len,
+                    head_dim,
+                    total_q_heads,
+                );
             } else {
-                Self::encode_matmul(cmd3, &self.pipelines["matmul_transb"], ffn_in, &buf_wgateup, buf_gateup.buffer(), &buf_rows, &buf_two_inter, &buf_h, 2 * inter, total_rows);
+                self.encode_3d(
+                    cmd2,
+                    "batched_matmul_transb",
+                    &qk_bufs,
+                    max_len,
+                    max_len,
+                    total_q_heads,
+                );
             }
-            
-            self.encode_1d(cmd3, "swiglu_activation_fat", &[buf_gateup.buffer(), buf_act.buffer(), &buf_inter], total_rows * inter);
-            
-            if use_mma(total_rows, h, inter) {
-                self.encode_mma(cmd3, "matmul_transb_simdgroup", &[buf_act.buffer(), &buf_wdown, buf_ffn_out.buffer(), &buf_rows, &buf_h, &buf_inter], total_rows, h, inter, 1);
+
+            self.encode_3d(
+                cmd2,
+                "scale_mask_alibi_grouped",
+                &[
+                    buf_scores.buffer(),
+                    buf_alibi.buffer(),
+                    &buf_masks,
+                    &buf_scale,
+                    &buf_seq,
+                    &buf_has_alibi,
+                    &buf_heads,
+                ],
+                max_len,
+                max_len,
+                total_q_heads,
+            );
+
+            self.encode_1d(
+                cmd2,
+                "softmax_rows",
+                &[buf_scores.buffer(), &buf_seq],
+                total_q_heads * max_len,
+            );
+
+            let sv_bufs = [
+                buf_scores.buffer(),
+                buf_v_reshaped.buffer(),
+                buf_out_reshaped.buffer(),
+                &buf_seq,
+                &buf_head_dim,
+                &self.buf_u32(1)?,
+            ];
+            if use_mma(max_len, head_dim, max_len) {
+                self.encode_mma(
+                    cmd2,
+                    "batched_matmul_ab_simdgroup",
+                    &sv_bufs,
+                    max_len,
+                    head_dim,
+                    max_len,
+                    total_q_heads,
+                );
             } else {
-                Self::encode_matmul(cmd3, &self.pipelines["matmul_transb"], buf_act.buffer(), &buf_wdown, buf_ffn_out.buffer(), &buf_rows, &buf_h, &buf_inter, h, total_rows);
+                self.encode_3d(
+                    cmd2,
+                    "batched_matmul_ab",
+                    &sv_bufs,
+                    head_dim,
+                    max_len,
+                    total_q_heads,
+                );
             }
-            
-            retains3.push(buf_gateup);
-            retains3.push(buf_act);
-        } else {
-            // Standard GELU FFN
-            let up_weight = weights.ffn_up_weight.unwrap();
-            let buf_wup = self.buf_cached(up_weight)?;
-            let buf_up = self.pool.acquire_uninit(total_rows * inter * 4)?;
-            
-            if use_mma(total_rows, inter, h) {
-                self.encode_mma(cmd3, "matmul_transb_simdgroup", &[ffn_in, &buf_wup, buf_up.buffer(), &buf_rows, &buf_inter, &buf_h], total_rows, inter, h, 1);
+
+            let buf_attn_out = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
+            self.encode_3d(
+                cmd2,
+                "reshape_head_to_pos",
+                &[
+                    buf_out_reshaped.buffer(),
+                    buf_attn_out.buffer(),
+                    &buf_heads,
+                    &buf_seq,
+                    &buf_head_dim,
+                ],
+                head_dim,
+                max_len,
+                total_q_heads,
+            );
+
+            let buf_proj_out = self.pool.acquire_uninit(total_rows * h * 4)?;
+            let buf_out_w = self.buf_cached(weights.attn_out_weight)?;
+
+            if use_mma(total_rows, h, q_dim) {
+                self.encode_mma(
+                    cmd2,
+                    "matmul_transb_simdgroup",
+                    &[
+                        buf_attn_out.buffer(),
+                        &buf_out_w,
+                        buf_proj_out.buffer(),
+                        &buf_rows,
+                        &buf_h,
+                        &buf_q_dim,
+                    ],
+                    total_rows,
+                    h,
+                    q_dim,
+                    1,
+                );
             } else {
-                Self::encode_matmul(cmd3, &self.pipelines["matmul_transb"], ffn_in, &buf_wup, buf_up.buffer(), &buf_rows, &buf_inter, &buf_h, inter, total_rows);
+                Self::encode_matmul(
+                    cmd2,
+                    &self.pipelines["matmul_transb"],
+                    buf_attn_out.buffer(),
+                    &buf_out_w,
+                    buf_proj_out.buffer(),
+                    &buf_rows,
+                    &buf_h,
+                    &buf_q_dim,
+                    h,
+                    total_rows,
+                );
             }
-            
-            if let Some(up_bias) = weights.ffn_up_bias {
-                let b = self.buf_cached(up_bias)?;
-                self.encode_1d(cmd3, "elementwise_add_broadcast", &[buf_up.buffer(), &b, &buf_inter], total_rows * inter);
+
+            if let Some(attn_out_bias) = weights.attn_out_bias {
+                let b = self.buf_cached(attn_out_bias)?;
+                self.encode_1d(
+                    cmd2,
+                    "elementwise_add_broadcast",
+                    &[buf_proj_out.buffer(), &b, &buf_h],
+                    total_rows * h,
+                );
             }
-            
-            self.encode_1d(cmd3, "gelu_activation", &[buf_up.buffer()], total_rows * inter);
-            
-            if use_mma(total_rows, h, inter) {
-                self.encode_mma(cmd3, "matmul_transb_simdgroup", &[buf_up.buffer(), &buf_wdown, buf_ffn_out.buffer(), &buf_rows, &buf_h, &buf_inter], total_rows, h, inter, 1);
+
+            self.encode_1d(
+                cmd2,
+                "elementwise_add",
+                &[current_hidden.buffer(), buf_proj_out.buffer()],
+                total_rows * h,
+            );
+
+            if !config.pre_ln {
+                let buf_norm1_w = self.buf_cached(weights.norm1_weight)?;
+                if config.use_rms {
+                    self.encode_1d(
+                        cmd2,
+                        "rms_norm",
+                        &[current_hidden.buffer(), &buf_norm1_w, &buf_h, &buf_eps],
+                        total_rows,
+                    );
+                } else {
+                    let buf_norm1_b = self.buf_cached(weights.norm1_bias.unwrap_or(&[]))?;
+                    self.encode_1d(
+                        cmd2,
+                        "layer_norm",
+                        &[
+                            current_hidden.buffer(),
+                            &buf_norm1_w,
+                            &buf_norm1_b,
+                            &buf_h,
+                            &buf_eps,
+                        ],
+                        total_rows,
+                    );
+                }
+            }
+
+            retains2.push(buf_q);
+            retains2.push(buf_k);
+            retains2.push(buf_v);
+            retains2.push(buf_alibi);
+            retains2.push(buf_q_reshaped);
+            retains2.push(buf_k_reshaped);
+            retains2.push(buf_v_reshaped);
+            retains2.push(buf_scores);
+            retains2.push(buf_out_reshaped);
+            retains2.push(buf_attn_out);
+            retains2.push(buf_proj_out);
+            self.commit_bounded(cmd2, retains2);
+
+            // ---------------------------------------------------------
+            // Command Buffer 3: Norm 2 + FFN + Residual
+            // ---------------------------------------------------------
+            let cmd3 = self.queue.new_command_buffer();
+            let mut retains3 = Vec::new();
+
+            // Layer norm 2
+            let mut buf_normed2 = None;
+            if config.pre_ln {
+                let buf = self.pool.acquire_uninit(total_rows * h * 4)?;
+                {
+                    let blit = cmd3.new_blit_command_encoder();
+                    blit.copy_from_buffer(
+                        current_hidden.buffer(),
+                        0,
+                        buf.buffer(),
+                        0,
+                        (total_rows * h * 4) as u64,
+                    );
+                    blit.end_encoding();
+                }
+                let buf_norm2_w = self.buf_cached(weights.norm2_weight)?;
+                if config.use_rms {
+                    self.encode_1d(
+                        cmd3,
+                        "rms_norm",
+                        &[buf.buffer(), &buf_norm2_w, &buf_h, &buf_eps],
+                        total_rows,
+                    );
+                } else {
+                    let buf_norm2_b = self.buf_cached(weights.norm2_bias.unwrap_or(&[]))?;
+                    self.encode_1d(
+                        cmd3,
+                        "layer_norm",
+                        &[buf.buffer(), &buf_norm2_w, &buf_norm2_b, &buf_h, &buf_eps],
+                        total_rows,
+                    );
+                }
+                buf_normed2 = Some(buf);
+            }
+
+            let ffn_in = if let Some(ref b) = buf_normed2 {
+                b.buffer()
             } else {
-                Self::encode_matmul(cmd3, &self.pipelines["matmul_transb"], buf_up.buffer(), &buf_wdown, buf_ffn_out.buffer(), &buf_rows, &buf_h, &buf_inter, h, total_rows);
-            }
-            retains3.push(buf_up);
-        }
-        
-        if let Some(down_bias) = weights.ffn_down_bias {
-            let b = self.buf_cached(down_bias)?;
-            self.encode_1d(cmd3, "elementwise_add_broadcast", &[buf_ffn_out.buffer(), &b, &buf_h], total_rows * h);
-        }
-        
-        self.encode_1d(cmd3, "elementwise_add", &[current_hidden.buffer(), buf_ffn_out.buffer()], total_rows * h);
-        
-        if !config.pre_ln {
-            let buf_norm2_w = self.buf_cached(weights.norm2_weight)?;
-            if config.use_rms {
-                self.encode_1d(cmd3, "rms_norm", &[current_hidden.buffer(), &buf_norm2_w, &buf_h, &buf_eps], total_rows);
+                current_hidden.buffer()
+            };
+            let buf_inter = self.buf_u32(inter as u32)?;
+            let buf_ffn_out = self.pool.acquire_uninit(total_rows * h * 4)?;
+            let buf_wdown = self.buf_cached(weights.ffn_down_weight)?;
+
+            if let Some(gate_weight) = weights.ffn_gate_weight {
+                // SwiGLU FFN. The fat GEMM needs `[w_gate | w_up]` stacked rows-first
+                // (gate's full [inter, h] block, then up's), so the `swiglu_activation_fat`
+                // kernel reads columns [0, inter) as gate and [inter, 2*inter) as up. This
+                // is the SAME layout `buf_cached_concat` builds and the SAME cache key the
+                // per-op `fused_ffn_swiglu` paths use, so all three share one cached buffer
+                // instead of racing to populate the key with conflicting layouts.
+                let up_weight = weights.ffn_up_weight.unwrap();
+                let buf_wgateup = self.buf_cached_concat(&[gate_weight, up_weight])?;
+
+                let buf_gateup = self.pool.acquire_uninit(total_rows * 2 * inter * 4)?;
+                let buf_act = self.pool.acquire_uninit(total_rows * inter * 4)?;
+                let buf_two_inter = self.buf_u32((2 * inter) as u32)?;
+
+                if use_mma(total_rows, inter, h) {
+                    self.encode_mma(
+                        cmd3,
+                        "matmul_transb_simdgroup",
+                        &[
+                            ffn_in,
+                            &buf_wgateup,
+                            buf_gateup.buffer(),
+                            &buf_rows,
+                            &buf_two_inter,
+                            &buf_h,
+                        ],
+                        total_rows,
+                        2 * inter,
+                        h,
+                        1,
+                    );
+                } else {
+                    Self::encode_matmul(
+                        cmd3,
+                        &self.pipelines["matmul_transb"],
+                        ffn_in,
+                        &buf_wgateup,
+                        buf_gateup.buffer(),
+                        &buf_rows,
+                        &buf_two_inter,
+                        &buf_h,
+                        2 * inter,
+                        total_rows,
+                    );
+                }
+
+                self.encode_1d(
+                    cmd3,
+                    "swiglu_activation_fat",
+                    &[buf_gateup.buffer(), buf_act.buffer(), &buf_inter],
+                    total_rows * inter,
+                );
+
+                if use_mma(total_rows, h, inter) {
+                    self.encode_mma(
+                        cmd3,
+                        "matmul_transb_simdgroup",
+                        &[
+                            buf_act.buffer(),
+                            &buf_wdown,
+                            buf_ffn_out.buffer(),
+                            &buf_rows,
+                            &buf_h,
+                            &buf_inter,
+                        ],
+                        total_rows,
+                        h,
+                        inter,
+                        1,
+                    );
+                } else {
+                    Self::encode_matmul(
+                        cmd3,
+                        &self.pipelines["matmul_transb"],
+                        buf_act.buffer(),
+                        &buf_wdown,
+                        buf_ffn_out.buffer(),
+                        &buf_rows,
+                        &buf_h,
+                        &buf_inter,
+                        h,
+                        total_rows,
+                    );
+                }
+
+                retains3.push(buf_gateup);
+                retains3.push(buf_act);
             } else {
-                let buf_norm2_b = self.buf_cached(weights.norm2_bias.unwrap_or(&[]))?;
-                self.encode_1d(cmd3, "layer_norm", &[current_hidden.buffer(), &buf_norm2_w, &buf_norm2_b, &buf_h, &buf_eps], total_rows);
+                // Standard GELU FFN
+                let up_weight = weights.ffn_up_weight.unwrap();
+                let buf_wup = self.buf_cached(up_weight)?;
+                let buf_up = self.pool.acquire_uninit(total_rows * inter * 4)?;
+
+                if use_mma(total_rows, inter, h) {
+                    self.encode_mma(
+                        cmd3,
+                        "matmul_transb_simdgroup",
+                        &[
+                            ffn_in,
+                            &buf_wup,
+                            buf_up.buffer(),
+                            &buf_rows,
+                            &buf_inter,
+                            &buf_h,
+                        ],
+                        total_rows,
+                        inter,
+                        h,
+                        1,
+                    );
+                } else {
+                    Self::encode_matmul(
+                        cmd3,
+                        &self.pipelines["matmul_transb"],
+                        ffn_in,
+                        &buf_wup,
+                        buf_up.buffer(),
+                        &buf_rows,
+                        &buf_inter,
+                        &buf_h,
+                        inter,
+                        total_rows,
+                    );
+                }
+
+                if let Some(up_bias) = weights.ffn_up_bias {
+                    let b = self.buf_cached(up_bias)?;
+                    self.encode_1d(
+                        cmd3,
+                        "elementwise_add_broadcast",
+                        &[buf_up.buffer(), &b, &buf_inter],
+                        total_rows * inter,
+                    );
+                }
+
+                self.encode_1d(
+                    cmd3,
+                    "gelu_activation",
+                    &[buf_up.buffer()],
+                    total_rows * inter,
+                );
+
+                if use_mma(total_rows, h, inter) {
+                    self.encode_mma(
+                        cmd3,
+                        "matmul_transb_simdgroup",
+                        &[
+                            buf_up.buffer(),
+                            &buf_wdown,
+                            buf_ffn_out.buffer(),
+                            &buf_rows,
+                            &buf_h,
+                            &buf_inter,
+                        ],
+                        total_rows,
+                        h,
+                        inter,
+                        1,
+                    );
+                } else {
+                    Self::encode_matmul(
+                        cmd3,
+                        &self.pipelines["matmul_transb"],
+                        buf_up.buffer(),
+                        &buf_wdown,
+                        buf_ffn_out.buffer(),
+                        &buf_rows,
+                        &buf_h,
+                        &buf_inter,
+                        h,
+                        total_rows,
+                    );
+                }
+                retains3.push(buf_up);
             }
-        }
-        
-        if let Some(b) = buf_normed2 {
-            retains3.push(b);
-        }
-        retains3.push(buf_ffn_out);
-        
-        self.commit_wait(&cmd3);
-        
+
+            if let Some(down_bias) = weights.ffn_down_bias {
+                let b = self.buf_cached(down_bias)?;
+                self.encode_1d(
+                    cmd3,
+                    "elementwise_add_broadcast",
+                    &[buf_ffn_out.buffer(), &b, &buf_h],
+                    total_rows * h,
+                );
+            }
+
+            self.encode_1d(
+                cmd3,
+                "elementwise_add",
+                &[current_hidden.buffer(), buf_ffn_out.buffer()],
+                total_rows * h,
+            );
+
+            if !config.pre_ln {
+                let buf_norm2_w = self.buf_cached(weights.norm2_weight)?;
+                if config.use_rms {
+                    self.encode_1d(
+                        cmd3,
+                        "rms_norm",
+                        &[current_hidden.buffer(), &buf_norm2_w, &buf_h, &buf_eps],
+                        total_rows,
+                    );
+                } else {
+                    let buf_norm2_b = self.buf_cached(weights.norm2_bias.unwrap_or(&[]))?;
+                    self.encode_1d(
+                        cmd3,
+                        "layer_norm",
+                        &[
+                            current_hidden.buffer(),
+                            &buf_norm2_w,
+                            &buf_norm2_b,
+                            &buf_h,
+                            &buf_eps,
+                        ],
+                        total_rows,
+                    );
+                }
+            }
+
+            if let Some(b) = buf_normed2 {
+                retains3.push(b);
+            }
+            retains3.push(buf_ffn_out);
+
+            self.commit_wait(&cmd3);
+
             let out = Self::read_buf(current_hidden.buffer(), total_rows * h);
             Ok(Some(out))
         })
     }
-    fn matmul(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Result<Vec<f32>, InferError> {
+    fn matmul(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Vec<f32>, InferError> {
         let _span = tracing::info_span!("kin_infer.metal.matmul", m = m, n = n, k = k).entered();
         let buf_a = self.buf_slice_pooled(a)?;
         // Cache B (weight matrix): stable pointers across forward passes
@@ -3247,7 +3728,10 @@ impl GpuCompute for MetalCompute {
             }
         });
 
-        Ok(Self::read_buf(buf_c.buffer(), num_heads * seq_len * seq_len))
+        Ok(Self::read_buf(
+            buf_c.buffer(),
+            num_heads * seq_len * seq_len,
+        ))
     }
 
     fn batched_attn_values(
@@ -3297,7 +3781,10 @@ impl GpuCompute for MetalCompute {
             }
         });
 
-        Ok(Self::read_buf(buf_c.buffer(), num_heads * seq_len * head_dim))
+        Ok(Self::read_buf(
+            buf_c.buffer(),
+            num_heads * seq_len * head_dim,
+        ))
     }
 
     fn softmax(&self, data: &mut [f32], rows: usize, cols: usize) -> Result<(), InferError> {
@@ -3347,7 +3834,14 @@ impl GpuCompute for MetalCompute {
         Ok(())
     }
 
-    fn rms_norm(&self, data: &mut [f32], weight: &[f32], rows: usize, cols: usize, eps: f32) -> Result<(), InferError> {
+    fn rms_norm(
+        &self,
+        data: &mut [f32],
+        weight: &[f32],
+        rows: usize,
+        cols: usize,
+        eps: f32,
+    ) -> Result<(), InferError> {
         let _span = tracing::info_span!(
             "kin_infer.metal.rms_norm",
             rows = rows,
@@ -3360,7 +3854,11 @@ impl GpuCompute for MetalCompute {
         let buf_cols = self.buf_u32(cols as u32)?;
         let buf_eps = self.buf_f32(eps)?;
         time_phase(Phase::Norm, || {
-            self.dispatch_1d("rms_norm", &[buf.buffer(), &buf_weight, &buf_cols, &buf_eps], rows)
+            self.dispatch_1d(
+                "rms_norm",
+                &[buf.buffer(), &buf_weight, &buf_cols, &buf_eps],
+                rows,
+            )
         });
         Self::read_buf_into(buf.buffer(), data);
         Ok(())
@@ -3393,7 +3891,11 @@ impl GpuCompute for MetalCompute {
         let buf_a = self.buf_slice_pooled(a)?;
         let buf_b = self.buf_slice_pooled(b)?;
         time_phase(Phase::Activation, || {
-            self.dispatch_1d("elementwise_mul", &[buf_a.buffer(), buf_b.buffer()], a.len())
+            self.dispatch_1d(
+                "elementwise_mul",
+                &[buf_a.buffer(), buf_b.buffer()],
+                a.len(),
+            )
         });
         Self::read_buf_into(buf_a.buffer(), a);
         Ok(())
@@ -3450,9 +3952,35 @@ impl GpuCompute for MetalCompute {
 
             // gateup = x @ [w_gate|w_up]^T -> [rows, 2*inter]  (M=rows, N=2*inter, K=hidden)
             if gateup_mma {
-                self.encode_mma(cmd, mm_mma, &[buf_x.buffer(), &buf_wgateup, buf_gateup.buffer(), &buf_rows, &buf_two_inter, &buf_hidden], rows, 2 * inter, hidden, 1);
+                self.encode_mma(
+                    cmd,
+                    mm_mma,
+                    &[
+                        buf_x.buffer(),
+                        &buf_wgateup,
+                        buf_gateup.buffer(),
+                        &buf_rows,
+                        &buf_two_inter,
+                        &buf_hidden,
+                    ],
+                    rows,
+                    2 * inter,
+                    hidden,
+                    1,
+                );
             } else {
-                Self::encode_matmul(cmd, mm, buf_x.buffer(), &buf_wgateup, buf_gateup.buffer(), &buf_rows, &buf_two_inter, &buf_hidden, 2 * inter, rows);
+                Self::encode_matmul(
+                    cmd,
+                    mm,
+                    buf_x.buffer(),
+                    &buf_wgateup,
+                    buf_gateup.buffer(),
+                    &buf_rows,
+                    &buf_two_inter,
+                    &buf_hidden,
+                    2 * inter,
+                    rows,
+                );
             }
 
             // act = silu(gate) * up -> [rows, inter], reading the interleaved fat buffer
@@ -3464,15 +3992,44 @@ impl GpuCompute for MetalCompute {
                 enc.set_buffer(2, Some(&buf_inter), 0);
                 let total = (rows * inter) as u64;
                 let tw = swi.thread_execution_width() as u64;
-                enc.dispatch_threads(MTLSize::new(total, 1, 1), MTLSize::new(tw.min(total).max(1), 1, 1));
+                enc.dispatch_threads(
+                    MTLSize::new(total, 1, 1),
+                    MTLSize::new(tw.min(total).max(1), 1, 1),
+                );
                 enc.end_encoding();
             }
 
             // out = act @ w_down^T -> [rows, hidden]  (M=rows, N=hidden, K=inter)
             if down_mma {
-                self.encode_mma(cmd, mm_mma, &[buf_act.buffer(), &buf_wdown, buf_out.buffer(), &buf_rows, &buf_hidden, &buf_inter], rows, hidden, inter, 1);
+                self.encode_mma(
+                    cmd,
+                    mm_mma,
+                    &[
+                        buf_act.buffer(),
+                        &buf_wdown,
+                        buf_out.buffer(),
+                        &buf_rows,
+                        &buf_hidden,
+                        &buf_inter,
+                    ],
+                    rows,
+                    hidden,
+                    inter,
+                    1,
+                );
             } else {
-                Self::encode_matmul(cmd, mm, buf_act.buffer(), &buf_wdown, buf_out.buffer(), &buf_rows, &buf_hidden, &buf_inter, hidden, rows);
+                Self::encode_matmul(
+                    cmd,
+                    mm,
+                    buf_act.buffer(),
+                    &buf_wdown,
+                    buf_out.buffer(),
+                    &buf_rows,
+                    &buf_hidden,
+                    &buf_inter,
+                    hidden,
+                    rows,
+                );
             }
 
             time_phase(Phase::Matmul, || {
@@ -3480,7 +4037,10 @@ impl GpuCompute for MetalCompute {
             });
             Self::read_buf(buf_out.buffer(), rows * hidden)
         });
-        Self::count_nonfinite(&format!("fused_ffn_swiglu rows={rows} hidden={hidden} inter={inter}"), &out);
+        Self::count_nonfinite(
+            &format!("fused_ffn_swiglu rows={rows} hidden={hidden} inter={inter}"),
+            &out,
+        );
         Ok(out)
     }
 
@@ -3538,9 +4098,35 @@ impl GpuCompute for MetalCompute {
 
             // gateup = x @ [w_gate|w_up]^T -> [rows, 2*inter]
             if gateup_mma {
-                self.encode_mma(cmd, mm_mma, &[buf_x.buffer(), &buf_wgateup, buf_gateup.buffer(), &buf_rows, &buf_two_inter, &buf_hidden], rows, 2 * inter, hidden, 1);
+                self.encode_mma(
+                    cmd,
+                    mm_mma,
+                    &[
+                        buf_x.buffer(),
+                        &buf_wgateup,
+                        buf_gateup.buffer(),
+                        &buf_rows,
+                        &buf_two_inter,
+                        &buf_hidden,
+                    ],
+                    rows,
+                    2 * inter,
+                    hidden,
+                    1,
+                );
             } else {
-                Self::encode_matmul(cmd, mm, buf_x.buffer(), &buf_wgateup, buf_gateup.buffer(), &buf_rows, &buf_two_inter, &buf_hidden, 2 * inter, rows);
+                Self::encode_matmul(
+                    cmd,
+                    mm,
+                    buf_x.buffer(),
+                    &buf_wgateup,
+                    buf_gateup.buffer(),
+                    &buf_rows,
+                    &buf_two_inter,
+                    &buf_hidden,
+                    2 * inter,
+                    rows,
+                );
             }
 
             // act = silu(gate) * up -> [rows, inter]
@@ -3552,15 +4138,44 @@ impl GpuCompute for MetalCompute {
                 enc.set_buffer(2, Some(&buf_inter), 0);
                 let total = (rows * inter) as u64;
                 let tw = swi.thread_execution_width() as u64;
-                enc.dispatch_threads(MTLSize::new(total, 1, 1), MTLSize::new(tw.min(total).max(1), 1, 1));
+                enc.dispatch_threads(
+                    MTLSize::new(total, 1, 1),
+                    MTLSize::new(tw.min(total).max(1), 1, 1),
+                );
                 enc.end_encoding();
             }
 
             // out = act @ w_down^T -> [rows, hidden]
             if down_mma {
-                self.encode_mma(cmd, mm_mma, &[buf_act.buffer(), &buf_wdown, buf_out.buffer(), &buf_rows, &buf_hidden, &buf_inter], rows, hidden, inter, 1);
+                self.encode_mma(
+                    cmd,
+                    mm_mma,
+                    &[
+                        buf_act.buffer(),
+                        &buf_wdown,
+                        buf_out.buffer(),
+                        &buf_rows,
+                        &buf_hidden,
+                        &buf_inter,
+                    ],
+                    rows,
+                    hidden,
+                    inter,
+                    1,
+                );
             } else {
-                Self::encode_matmul(cmd, mm, buf_act.buffer(), &buf_wdown, buf_out.buffer(), &buf_rows, &buf_hidden, &buf_inter, hidden, rows);
+                Self::encode_matmul(
+                    cmd,
+                    mm,
+                    buf_act.buffer(),
+                    &buf_wdown,
+                    buf_out.buffer(),
+                    &buf_rows,
+                    &buf_hidden,
+                    &buf_inter,
+                    hidden,
+                    rows,
+                );
             }
 
             // out += residual (resident)
@@ -3571,7 +4186,10 @@ impl GpuCompute for MetalCompute {
                 enc.set_buffer(1, Some(buf_residual.buffer()), 0);
                 let total = (rows * hidden) as u64;
                 let tw = add.thread_execution_width() as u64;
-                enc.dispatch_threads(MTLSize::new(total, 1, 1), MTLSize::new(tw.min(total).max(1), 1, 1));
+                enc.dispatch_threads(
+                    MTLSize::new(total, 1, 1),
+                    MTLSize::new(tw.min(total).max(1), 1, 1),
+                );
                 enc.end_encoding();
             }
 
@@ -3586,7 +4204,10 @@ impl GpuCompute for MetalCompute {
                 enc.set_buffer(4, Some(&buf_eps), 0);
                 let tw = ln.thread_execution_width() as u64;
                 let rows_u = rows as u64;
-                enc.dispatch_threads(MTLSize::new(rows_u, 1, 1), MTLSize::new(tw.min(rows_u).max(1), 1, 1));
+                enc.dispatch_threads(
+                    MTLSize::new(rows_u, 1, 1),
+                    MTLSize::new(tw.min(rows_u).max(1), 1, 1),
+                );
                 enc.end_encoding();
             }
 
@@ -3595,7 +4216,10 @@ impl GpuCompute for MetalCompute {
             });
             Self::read_buf(buf_out.buffer(), rows * hidden)
         });
-        Self::count_nonfinite(&format!("fused_ffn_swiglu_add_norm rows={rows} hidden={hidden} inter={inter}"), &out);
+        Self::count_nonfinite(
+            &format!("fused_ffn_swiglu_add_norm rows={rows} hidden={hidden} inter={inter}"),
+            &out,
+        );
         Ok(out)
     }
 
@@ -3646,9 +4270,35 @@ impl GpuCompute for MetalCompute {
 
             // proj = x @ weight^T -> [rows, hidden]  (M=rows, N=hidden, K=cols)
             if proj_mma {
-                self.encode_mma(cmd, mm_mma, &[buf_x.buffer(), &buf_w, buf_proj.buffer(), &buf_rows, &buf_hidden, &buf_cols], rows, hidden, cols, 1);
+                self.encode_mma(
+                    cmd,
+                    mm_mma,
+                    &[
+                        buf_x.buffer(),
+                        &buf_w,
+                        buf_proj.buffer(),
+                        &buf_rows,
+                        &buf_hidden,
+                        &buf_cols,
+                    ],
+                    rows,
+                    hidden,
+                    cols,
+                    1,
+                );
             } else {
-                Self::encode_matmul(cmd, mm, buf_x.buffer(), &buf_w, buf_proj.buffer(), &buf_rows, &buf_hidden, &buf_cols, hidden, rows);
+                Self::encode_matmul(
+                    cmd,
+                    mm,
+                    buf_x.buffer(),
+                    &buf_w,
+                    buf_proj.buffer(),
+                    &buf_rows,
+                    &buf_hidden,
+                    &buf_cols,
+                    hidden,
+                    rows,
+                );
             }
 
             // proj += residual (in-place on the resident projection buffer)
@@ -3659,7 +4309,10 @@ impl GpuCompute for MetalCompute {
                 enc.set_buffer(1, Some(buf_residual.buffer()), 0);
                 let total = (rows * hidden) as u64;
                 let tw = add.thread_execution_width() as u64;
-                enc.dispatch_threads(MTLSize::new(total, 1, 1), MTLSize::new(tw.min(total).max(1), 1, 1));
+                enc.dispatch_threads(
+                    MTLSize::new(total, 1, 1),
+                    MTLSize::new(tw.min(total).max(1), 1, 1),
+                );
                 enc.end_encoding();
             }
 
@@ -3674,7 +4327,10 @@ impl GpuCompute for MetalCompute {
                 enc.set_buffer(4, Some(&buf_eps), 0);
                 let tw = ln.thread_execution_width() as u64;
                 let rows_u = rows as u64;
-                enc.dispatch_threads(MTLSize::new(rows_u, 1, 1), MTLSize::new(tw.min(rows_u).max(1), 1, 1));
+                enc.dispatch_threads(
+                    MTLSize::new(rows_u, 1, 1),
+                    MTLSize::new(tw.min(rows_u).max(1), 1, 1),
+                );
                 enc.end_encoding();
             }
 
@@ -3683,7 +4339,10 @@ impl GpuCompute for MetalCompute {
             });
             Self::read_buf(buf_proj.buffer(), rows * hidden)
         });
-        Self::count_nonfinite(&format!("fused_linear_add_norm rows={rows} hidden={hidden}"), &out);
+        Self::count_nonfinite(
+            &format!("fused_linear_add_norm rows={rows} hidden={hidden}"),
+            &out,
+        );
         Ok(out)
     }
 
@@ -4022,7 +4681,10 @@ impl GpuCompute for MetalCompute {
                 });
             }
 
-            Ok(Self::read_buf(buf_out.buffer(), num_heads * seq_len * head_dim))
+            Ok(Self::read_buf(
+                buf_out.buffer(),
+                num_heads * seq_len * head_dim,
+            ))
         })?;
         Self::count_nonfinite(
             &format!("fused_attention seq_len={seq_len} num_heads={num_heads}"),
@@ -4195,12 +4857,13 @@ impl GpuCompute for MetalCompute {
                 });
             }
 
-            Ok(Self::read_buf(buf_out.buffer(), total_heads * seq_len * head_dim))
+            Ok(Self::read_buf(
+                buf_out.buffer(),
+                total_heads * seq_len * head_dim,
+            ))
         })?;
         Self::count_nonfinite(
-            &format!(
-                "fused_attention_batched seq_len={seq_len} total_heads={total_heads}"
-            ),
+            &format!("fused_attention_batched seq_len={seq_len} total_heads={total_heads}"),
             &out,
         );
         Ok(out)
@@ -4286,8 +4949,7 @@ impl GpuCompute for MetalCompute {
                 enc.set_buffer(6, Some(&buf_hpg), 0);
                 enc.set_buffer(7, Some(&buf_seq), 0);
                 enc.set_buffer(8, Some(&buf_dim), 0);
-                let threads =
-                    MTLSize::new(head_dim as u64, seq_len as u64, total_heads as u64);
+                let threads = MTLSize::new(head_dim as u64, seq_len as u64, total_heads as u64);
                 let tg = MTLSize::new(
                     8.min(head_dim) as u64,
                     8.min(seq_len) as u64,
@@ -4425,8 +5087,7 @@ impl GpuCompute for MetalCompute {
                 enc.set_buffer(2, Some(&buf_hpg), 0);
                 enc.set_buffer(3, Some(&buf_seq), 0);
                 enc.set_buffer(4, Some(&buf_dim), 0);
-                let threads =
-                    MTLSize::new(head_dim as u64, seq_len as u64, total_heads as u64);
+                let threads = MTLSize::new(head_dim as u64, seq_len as u64, total_heads as u64);
                 let tg = MTLSize::new(
                     8.min(head_dim) as u64,
                     8.min(seq_len) as u64,
@@ -4516,7 +5177,10 @@ mod tests {
         // process and on prior GPU work in the suite.
         let phases = profile_gpu_phase_nanos();
         let tags: Vec<&str> = phases.iter().map(|(t, _)| *t).collect();
-        assert_eq!(tags, vec!["matmul", "attention", "norm", "activation", "copy"]);
+        assert_eq!(
+            tags,
+            vec!["matmul", "attention", "norm", "activation", "copy"]
+        );
     }
 
     #[test]
@@ -4551,7 +5215,9 @@ mod tests {
             let rows = actual * total_dim;
             let mut qb = q_ref[base..base + rows].to_vec();
             let mut kb = k_ref[base..base + rows].to_vec();
-            metal.rope_pair(&mut qb, &mut kb, &cos, &sin, 0, actual, head_dim, total_dim).unwrap();
+            metal
+                .rope_pair(&mut qb, &mut kb, &cos, &sin, 0, actual, head_dim, total_dim)
+                .unwrap();
             q_ref[base..base + rows].copy_from_slice(&qb);
             k_ref[base..base + rows].copy_from_slice(&kb);
         }
@@ -4559,9 +5225,12 @@ mod tests {
         // Candidate: single-dispatch rope_pair_batched.
         let mut q_bat = q0.clone();
         let mut k_bat = k0.clone();
-        metal.rope_pair_batched(
-            &mut q_bat, &mut k_bat, &cos, &sin, batch_size, max_len, actual, head_dim, total_dim,
-        ).unwrap();
+        metal
+            .rope_pair_batched(
+                &mut q_bat, &mut k_bat, &cos, &sin, batch_size, max_len, actual, head_dim,
+                total_dim,
+            )
+            .unwrap();
 
         let max_q = q_ref
             .iter()
@@ -4580,7 +5249,10 @@ mod tests {
         eprintln!(
             "[rope_pair_batched] max_q_err={max_q:.3e} max_k_err={max_k:.3e} first_diff_idx={first_diff:?}"
         );
-        assert!(max_q < 1e-4 && max_k < 1e-4, "rope_pair_batched diverges from per-block: q={max_q} k={max_k}");
+        assert!(
+            max_q < 1e-4 && max_k < 1e-4,
+            "rope_pair_batched diverges from per-block: q={max_q} k={max_k}"
+        );
     }
 
     #[test]
@@ -4619,7 +5291,9 @@ mod tests {
         let mut data = vec![1.0, 2.0, 3.0, 4.0];
         let gamma = vec![1.0; 4];
         let beta = vec![0.0; 4];
-        metal.layer_norm(&mut data, &gamma, &beta, 1, 4, 1e-5).unwrap();
+        metal
+            .layer_norm(&mut data, &gamma, &beta, 1, 4, 1e-5)
+            .unwrap();
         let mean: f32 = data.iter().sum::<f32>() / 4.0;
         assert!(mean.abs() < 1e-3, "mean={}", mean);
     }
@@ -4682,8 +5356,12 @@ mod tests {
             .map(|i| ((i % 83) as f32 - 41.0) * 0.01)
             .collect();
 
-        let scores_metal = metal.batched_matmul(&q, &k, num_heads, seq_len, head_dim).unwrap();
-        let scores_cpu = cpu.batched_matmul(&q, &k, num_heads, seq_len, head_dim).unwrap();
+        let scores_metal = metal
+            .batched_matmul(&q, &k, num_heads, seq_len, head_dim)
+            .unwrap();
+        let scores_cpu = cpu
+            .batched_matmul(&q, &k, num_heads, seq_len, head_dim)
+            .unwrap();
 
         assert_eq!(scores_metal.len(), num_heads * seq_len * seq_len);
         let max_err: f32 = scores_metal
@@ -4724,8 +5402,12 @@ mod tests {
             .map(|i| ((i % 71) as f32 - 35.0) * 0.01)
             .collect();
 
-        let out_metal = metal.batched_attn_values(&scores, &v, num_heads, seq_len, head_dim).unwrap();
-        let out_cpu = cpu.batched_attn_values(&scores, &v, num_heads, seq_len, head_dim).unwrap();
+        let out_metal = metal
+            .batched_attn_values(&scores, &v, num_heads, seq_len, head_dim)
+            .unwrap();
+        let out_cpu = cpu
+            .batched_attn_values(&scores, &v, num_heads, seq_len, head_dim)
+            .unwrap();
 
         assert_eq!(out_metal.len(), num_heads * seq_len * head_dim);
         let max_err: f32 = out_metal
@@ -4765,30 +5447,34 @@ mod tests {
         let alibi = vec![0.0, 0.0625];
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        let out_metal = metal.fused_attention_batched(
-            &q,
-            &k,
-            &v,
-            num_groups,
-            heads_per_group,
-            seq_len,
-            head_dim,
-            scale,
-            &alibi,
-            &masks,
-        ).unwrap();
-        let out_cpu = cpu.fused_attention_batched(
-            &q,
-            &k,
-            &v,
-            num_groups,
-            heads_per_group,
-            seq_len,
-            head_dim,
-            scale,
-            &alibi,
-            &masks,
-        ).unwrap();
+        let out_metal = metal
+            .fused_attention_batched(
+                &q,
+                &k,
+                &v,
+                num_groups,
+                heads_per_group,
+                seq_len,
+                head_dim,
+                scale,
+                &alibi,
+                &masks,
+            )
+            .unwrap();
+        let out_cpu = cpu
+            .fused_attention_batched(
+                &q,
+                &k,
+                &v,
+                num_groups,
+                heads_per_group,
+                seq_len,
+                head_dim,
+                scale,
+                &alibi,
+                &masks,
+            )
+            .unwrap();
 
         assert_eq!(out_metal.len(), total_heads * seq_len * head_dim);
         let max_err: f32 = out_metal
@@ -4824,9 +5510,15 @@ mod tests {
         let total_heads = num_groups * heads_per_group;
         let elems = total_heads * seq_len * head_dim;
 
-        let q: Vec<f32> = (0..elems).map(|i| ((i % 257) as f32 - 128.0) * 0.003).collect();
-        let k: Vec<f32> = (0..elems).map(|i| ((i % 251) as f32 - 125.0) * 0.003).collect();
-        let v: Vec<f32> = (0..elems).map(|i| ((i % 241) as f32 - 120.0) * 0.003).collect();
+        let q: Vec<f32> = (0..elems)
+            .map(|i| ((i % 257) as f32 - 128.0) * 0.003)
+            .collect();
+        let k: Vec<f32> = (0..elems)
+            .map(|i| ((i % 251) as f32 - 125.0) * 0.003)
+            .collect();
+        let v: Vec<f32> = (0..elems)
+            .map(|i| ((i % 241) as f32 - 120.0) * 0.003)
+            .collect();
 
         // Mixed mask: even groups are len-32 padded to 64, odd groups are full 64
         // (the len-32-padded-into-a-small-max_len case that corrupts).
@@ -4840,16 +5532,38 @@ mod tests {
         let alibi: Vec<f32> = vec![]; // RoPE model → no ALiBi
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        let first = metal.fused_attention_batched(
-            &q, &k, &v, num_groups, heads_per_group, seq_len, head_dim, scale, &alibi, &masks,
-        ).unwrap();
+        let first = metal
+            .fused_attention_batched(
+                &q,
+                &k,
+                &v,
+                num_groups,
+                heads_per_group,
+                seq_len,
+                head_dim,
+                scale,
+                &alibi,
+                &masks,
+            )
+            .unwrap();
         assert_eq!(first.len(), elems);
 
         // Determinism: 20 repeats must be bit-identical to the first run.
         for run in 0..20 {
-            let out = metal.fused_attention_batched(
-                &q, &k, &v, num_groups, heads_per_group, seq_len, head_dim, scale, &alibi, &masks,
-            ).unwrap();
+            let out = metal
+                .fused_attention_batched(
+                    &q,
+                    &k,
+                    &v,
+                    num_groups,
+                    heads_per_group,
+                    seq_len,
+                    head_dim,
+                    scale,
+                    &alibi,
+                    &masks,
+                )
+                .unwrap();
             let max_abs: f32 = first
                 .iter()
                 .zip(out.iter())
@@ -4862,9 +5576,20 @@ mod tests {
         }
 
         // Correctness vs CPU reference.
-        let out_cpu = cpu.fused_attention_batched(
-            &q, &k, &v, num_groups, heads_per_group, seq_len, head_dim, scale, &alibi, &masks,
-        ).unwrap();
+        let out_cpu = cpu
+            .fused_attention_batched(
+                &q,
+                &k,
+                &v,
+                num_groups,
+                heads_per_group,
+                seq_len,
+                head_dim,
+                scale,
+                &alibi,
+                &masks,
+            )
+            .unwrap();
         let max_err: f32 = first
             .iter()
             .zip(out_cpu.iter())
@@ -4902,8 +5627,12 @@ mod tests {
     fn test_metal_matmul_determinism_prod_scale() {
         let Some(metal) = get_metal() else { return };
         let (m, n, k) = (2560usize, 768usize, 768usize);
-        let a: Vec<f32> = (0..m * k).map(|i| ((i % 257) as f32 - 128.0) * 0.003).collect();
-        let b: Vec<f32> = (0..n * k).map(|i| ((i % 251) as f32 - 125.0) * 0.003).collect();
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 257) as f32 - 128.0) * 0.003)
+            .collect();
+        let b: Vec<f32> = (0..n * k)
+            .map(|i| ((i % 251) as f32 - 125.0) * 0.003)
+            .collect();
         let first = metal.matmul(&a, &b, m, n, k).unwrap();
         assert_eq!(first.len(), m * n);
         for run in 0..20 {
@@ -4921,8 +5650,12 @@ mod tests {
     fn test_metal_matmul_many_determinism_prod_scale() {
         let Some(metal) = get_metal() else { return };
         let (m, k) = (2560usize, 768usize);
-        let a: Vec<f32> = (0..m * k).map(|i| ((i % 257) as f32 - 128.0) * 0.003).collect();
-        let w: Vec<f32> = (0..768 * k).map(|i| ((i % 251) as f32 - 125.0) * 0.003).collect();
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 257) as f32 - 128.0) * 0.003)
+            .collect();
+        let w: Vec<f32> = (0..768 * k)
+            .map(|i| ((i % 251) as f32 - 125.0) * 0.003)
+            .collect();
         let weights: Vec<&[f32]> = vec![&w, &w, &w];
         let ns = vec![768usize, 768, 768];
         let first = metal.matmul_many(&a, &weights, m, &ns, k).unwrap();
@@ -4944,14 +5677,26 @@ mod tests {
     fn test_metal_fused_ffn_swiglu_determinism_prod_scale() {
         let Some(metal) = get_metal() else { return };
         let (rows, hidden, inter) = (2560usize, 768usize, 3072usize);
-        let x: Vec<f32> = (0..rows * hidden).map(|i| ((i % 257) as f32 - 128.0) * 0.003).collect();
-        let wg: Vec<f32> = (0..inter * hidden).map(|i| ((i % 251) as f32 - 125.0) * 0.002).collect();
-        let wu: Vec<f32> = (0..inter * hidden).map(|i| ((i % 241) as f32 - 120.0) * 0.002).collect();
-        let wd: Vec<f32> = (0..hidden * inter).map(|i| ((i % 239) as f32 - 119.0) * 0.002).collect();
-        let first = metal.fused_ffn_swiglu(&x, &wg, &wu, &wd, rows, hidden, inter).unwrap();
+        let x: Vec<f32> = (0..rows * hidden)
+            .map(|i| ((i % 257) as f32 - 128.0) * 0.003)
+            .collect();
+        let wg: Vec<f32> = (0..inter * hidden)
+            .map(|i| ((i % 251) as f32 - 125.0) * 0.002)
+            .collect();
+        let wu: Vec<f32> = (0..inter * hidden)
+            .map(|i| ((i % 241) as f32 - 120.0) * 0.002)
+            .collect();
+        let wd: Vec<f32> = (0..hidden * inter)
+            .map(|i| ((i % 239) as f32 - 119.0) * 0.002)
+            .collect();
+        let first = metal
+            .fused_ffn_swiglu(&x, &wg, &wu, &wd, rows, hidden, inter)
+            .unwrap();
         assert_eq!(first.len(), rows * hidden);
         for run in 0..20 {
-            let out = metal.fused_ffn_swiglu(&x, &wg, &wu, &wd, rows, hidden, inter).unwrap();
+            let out = metal
+                .fused_ffn_swiglu(&x, &wg, &wu, &wd, rows, hidden, inter)
+                .unwrap();
             let d = max_abs_diff(&first, &out);
             assert!(
                 d == 0.0,
@@ -4967,15 +5712,21 @@ mod tests {
     fn test_metal_layer_norm_determinism_prod_scale() {
         let Some(metal) = get_metal() else { return };
         let (rows, cols) = (2560usize, 768usize);
-        let base: Vec<f32> = (0..rows * cols).map(|i| ((i % 257) as f32 - 128.0) * 0.01).collect();
+        let base: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i % 257) as f32 - 128.0) * 0.01)
+            .collect();
         let gamma: Vec<f32> = (0..cols).map(|i| 1.0 + (i % 13) as f32 * 0.01).collect();
         let beta: Vec<f32> = (0..cols).map(|i| (i % 7) as f32 * 0.01).collect();
         let eps = 1e-12f32;
         let mut first = base.clone();
-        metal.layer_norm(&mut first, &gamma, &beta, rows, cols, eps).unwrap();
+        metal
+            .layer_norm(&mut first, &gamma, &beta, rows, cols, eps)
+            .unwrap();
         for run in 0..20 {
             let mut out = base.clone();
-            metal.layer_norm(&mut out, &gamma, &beta, rows, cols, eps).unwrap();
+            metal
+                .layer_norm(&mut out, &gamma, &beta, rows, cols, eps)
+                .unwrap();
             let d = max_abs_diff(&first, &out);
             assert!(
                 d == 0.0,
@@ -4999,9 +5750,15 @@ mod tests {
         let total_heads = num_groups * heads_per_group;
         let elems = total_heads * seq_len * head_dim;
 
-        let qh: Vec<f32> = (0..elems).map(|i| ((i % 89) as f32 - 44.0) * 0.01).collect();
-        let kh: Vec<f32> = (0..elems).map(|i| ((i % 73) as f32 - 36.0) * 0.01).collect();
-        let vh: Vec<f32> = (0..elems).map(|i| ((i % 61) as f32 - 30.0) * 0.01).collect();
+        let qh: Vec<f32> = (0..elems)
+            .map(|i| ((i % 89) as f32 - 44.0) * 0.01)
+            .collect();
+        let kh: Vec<f32> = (0..elems)
+            .map(|i| ((i % 73) as f32 - 36.0) * 0.01)
+            .collect();
+        let vh: Vec<f32> = (0..elems)
+            .map(|i| ((i % 61) as f32 - 30.0) * 0.01)
+            .collect();
         let masks = vec![
             1, 1, 1, 1, 1, 0, 0, // group 0
             1, 1, 1, 1, 1, 1, 1, // group 1
@@ -5026,12 +5783,34 @@ mod tests {
             }
         }
 
-        let out_pos = metal.fused_attention_batched_posmajor(
-            &qp, &kp, &vp, num_groups, heads_per_group, seq_len, head_dim, scale, &alibi, &masks,
-        ).unwrap();
-        let out_head = metal.fused_attention_batched(
-            &qh, &kh, &vh, num_groups, heads_per_group, seq_len, head_dim, scale, &alibi, &masks,
-        ).unwrap();
+        let out_pos = metal
+            .fused_attention_batched_posmajor(
+                &qp,
+                &kp,
+                &vp,
+                num_groups,
+                heads_per_group,
+                seq_len,
+                head_dim,
+                scale,
+                &alibi,
+                &masks,
+            )
+            .unwrap();
+        let out_head = metal
+            .fused_attention_batched(
+                &qh,
+                &kh,
+                &vh,
+                num_groups,
+                heads_per_group,
+                seq_len,
+                head_dim,
+                scale,
+                &alibi,
+                &masks,
+            )
+            .unwrap();
 
         assert_eq!(out_pos.len(), elems);
         let mut max_err = 0.0f32;
@@ -5071,8 +5850,12 @@ mod tests {
         // matmul_transb: C[M,N] = A[M,K] * B[N,K]^T; M,N > 64 to exercise both a
         // full 64x64 block and a ragged remainder.
         let (m, n, k) = (80usize, 96usize, 64usize);
-        let a: Vec<f32> = (0..m * k).map(|i| ((i % 89) as f32 - 44.0) * 0.01).collect();
-        let b: Vec<f32> = (0..n * k).map(|i| ((i % 73) as f32 - 36.0) * 0.01).collect();
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 89) as f32 - 44.0) * 0.01)
+            .collect();
+        let b: Vec<f32> = (0..n * k)
+            .map(|i| ((i % 73) as f32 - 36.0) * 0.01)
+            .collect();
 
         let buf_a = metal.buf_slice_pooled(&a).unwrap();
         let buf_b = metal.buf_cached(&b).unwrap();
@@ -5080,7 +5863,14 @@ mod tests {
         let buf_m = metal.buf_u32(m as u32).unwrap();
         let buf_n = metal.buf_u32(n as u32).unwrap();
         let buf_k = metal.buf_u32(k as u32).unwrap();
-        let bufs = [buf_a.buffer(), &buf_b, buf_c.buffer(), &buf_m, &buf_n, &buf_k];
+        let bufs = [
+            buf_a.buffer(),
+            &buf_b,
+            buf_c.buffer(),
+            &buf_m,
+            &buf_n,
+            &buf_k,
+        ];
         autoreleasepool(|_| {
             let cmd = metal.queue.new_command_buffer();
             let pipeline = &metal.pipelines["matmul_transb_simdgroup_wide"];
@@ -5103,7 +5893,11 @@ mod tests {
             .zip(cpu_out.iter())
             .map(|(x, y)| (x - y).abs() / x.abs().max(y.abs()).max(1e-6))
             .fold(0.0f32, f32::max);
-        assert!(max_err < 5e-3, "wide MMA vs CPU matmul max err: {}", max_err);
+        assert!(
+            max_err < 5e-3,
+            "wide MMA vs CPU matmul max err: {}",
+            max_err
+        );
     }
 
     #[test]
@@ -5127,8 +5921,12 @@ mod tests {
 
         // matmul_transb: C[M,N] = A[M,K] * B[N,K]^T.
         let (m, n, k) = (80usize, 96usize, 80usize);
-        let a: Vec<f32> = (0..m * k).map(|i| ((i % 89) as f32 - 44.0) * 0.01).collect();
-        let b: Vec<f32> = (0..n * k).map(|i| ((i % 73) as f32 - 36.0) * 0.01).collect();
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 89) as f32 - 44.0) * 0.01)
+            .collect();
+        let b: Vec<f32> = (0..n * k)
+            .map(|i| ((i % 73) as f32 - 36.0) * 0.01)
+            .collect();
 
         let buf_a = metal.buf_slice_pooled(&a).unwrap();
         let buf_b = metal.buf_cached(&b).unwrap();
@@ -5136,7 +5934,14 @@ mod tests {
         let buf_m = metal.buf_u32(m as u32).unwrap();
         let buf_n = metal.buf_u32(n as u32).unwrap();
         let buf_k = metal.buf_u32(k as u32).unwrap();
-        let bufs = [buf_a.buffer(), &buf_b, buf_c.buffer(), &buf_m, &buf_n, &buf_k];
+        let bufs = [
+            buf_a.buffer(),
+            &buf_b,
+            buf_c.buffer(),
+            &buf_m,
+            &buf_n,
+            &buf_k,
+        ];
         autoreleasepool(|_| {
             let cmd = metal.queue.new_command_buffer();
             let pipeline = &metal.pipelines["matmul_transb_simdgroup_steel"];
@@ -5165,7 +5970,11 @@ mod tests {
             .zip(cpu_out.iter())
             .map(|(x, y)| (x - y).abs() / x.abs().max(y.abs()).max(1e-6))
             .fold(0.0f32, f32::max);
-        assert!(max_err < 5e-3, "steel MMA vs CPU matmul max err: {}", max_err);
+        assert!(
+            max_err < 5e-3,
+            "steel MMA vs CPU matmul max err: {}",
+            max_err
+        );
     }
 
     #[test]
@@ -5184,8 +5993,12 @@ mod tests {
         let cpu = crate::gpu::CpuCompute;
 
         let (m, n, k) = (40usize, 48usize, 64usize);
-        let a: Vec<f32> = (0..m * k).map(|i| ((i % 89) as f32 - 44.0) * 0.01).collect();
-        let b: Vec<f32> = (0..n * k).map(|i| ((i % 73) as f32 - 36.0) * 0.01).collect();
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 89) as f32 - 44.0) * 0.01)
+            .collect();
+        let b: Vec<f32> = (0..n * k)
+            .map(|i| ((i % 73) as f32 - 36.0) * 0.01)
+            .collect();
 
         let buf_a = metal.buf_slice_pooled(&a).unwrap();
         let buf_b = metal.buf_cached(&b).unwrap();
@@ -5193,7 +6006,14 @@ mod tests {
         let buf_m = metal.buf_u32(m as u32).unwrap();
         let buf_n = metal.buf_u32(n as u32).unwrap();
         let buf_k = metal.buf_u32(k as u32).unwrap();
-        let bufs = [buf_a.buffer(), &buf_b, buf_c.buffer(), &buf_m, &buf_n, &buf_k];
+        let bufs = [
+            buf_a.buffer(),
+            &buf_b,
+            buf_c.buffer(),
+            &buf_m,
+            &buf_n,
+            &buf_k,
+        ];
         autoreleasepool(|_| {
             let cmd = metal.queue.new_command_buffer();
             let pipeline = &metal.pipelines["matmul_transb_simdgroup_fp16"];
@@ -5221,7 +6041,11 @@ mod tests {
             .zip(cpu_out.iter())
             .map(|(x, y)| (x - y).abs() / x.abs().max(y.abs()).max(1e-6))
             .fold(0.0f32, f32::max);
-        assert!(max_err < 5e-2, "fp16 MMA vs CPU matmul max err: {}", max_err);
+        assert!(
+            max_err < 5e-2,
+            "fp16 MMA vs CPU matmul max err: {}",
+            max_err
+        );
     }
 
     #[test]
@@ -5242,7 +6066,9 @@ mod tests {
             .map(|i| ((i % 37) as f32 - 18.0) * 0.01)
             .collect();
 
-        let many = metal.matmul_many(&a, &[&b0, &b1, &b2], m, &[n, n, n], k).unwrap();
+        let many = metal
+            .matmul_many(&a, &[&b0, &b1, &b2], m, &[n, n, n], k)
+            .unwrap();
         let single = vec![
             metal.matmul(&a, &b0, m, n, k).unwrap(),
             metal.matmul(&a, &b1, m, n, k).unwrap(),

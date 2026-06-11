@@ -26,7 +26,12 @@ const MODEL_DIR: &str = "/tmp/swerank";
 
 fn synth(len: usize, salt: u32) -> (Vec<u32>, Vec<u32>) {
     let ids: Vec<u32> = (0..len)
-        .map(|i| 1 + ((i as u32).wrapping_mul(2654435761).wrapping_add(salt.wrapping_mul(40503)) % 20000))
+        .map(|i| {
+            1 + ((i as u32)
+                .wrapping_mul(2654435761)
+                .wrapping_add(salt.wrapping_mul(40503))
+                % 20000)
+        })
         .collect();
     (ids, vec![1u32; len])
 }
@@ -56,14 +61,22 @@ fn layer_divergence_trace() {
     let ent0 = bin64[0].clone();
 
     eprintln!("===== SINGLE forward(entity0 len32 salt0) =====");
-    let single = model.forward(&[ent0.0.clone()], &[ent0.1.clone()]).expect("single");
-    eprintln!("single_emb_first3=[{:.6},{:.6},{:.6}]", single[0][0], single[0][1], single[0][2]);
+    let single = model
+        .forward(&[ent0.0.clone()], &[ent0.1.clone()])
+        .expect("single");
+    eprintln!(
+        "single_emb_first3=[{:.6},{:.6},{:.6}]",
+        single[0][0], single[0][1], single[0][2]
+    );
 
     eprintln!("===== BATCHED forward_batched(bin64 group, 40 ent, dump entity 0) =====");
     let ids: Vec<Vec<u32>> = bin64.iter().map(|e| e.0.clone()).collect();
     let masks: Vec<Vec<u32>> = bin64.iter().map(|e| e.1.clone()).collect();
     let batched = model.forward_batched(&ids, &masks).expect("batched");
-    eprintln!("batched_emb[0]_first3=[{:.6},{:.6},{:.6}]", batched[0][0], batched[0][1], batched[0][2]);
+    eprintln!(
+        "batched_emb[0]_first3=[{:.6},{:.6},{:.6}]",
+        batched[0][0], batched[0][1], batched[0][2]
+    );
 
     // final cosine for context
     let mut dot = 0.0f64;

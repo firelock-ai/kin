@@ -826,7 +826,14 @@ impl Drop for CudaCompute {
 }
 
 impl GpuCompute for CudaCompute {
-    fn matmul(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Result<Vec<f32>, InferError> {
+    fn matmul(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Vec<f32>, InferError> {
         let func = self.get_function("matmul_transb").unwrap();
         let mut buf_a = CudaBuffer::from_slice(a).unwrap();
         let mut buf_b = CudaBuffer::from_slice(b).unwrap();
@@ -945,7 +952,14 @@ impl GpuCompute for CudaCompute {
         Ok(())
     }
 
-    fn rms_norm(&self, data: &mut [f32], weight: &[f32], rows: usize, cols: usize, eps: f32) -> Result<(), InferError> {
+    fn rms_norm(
+        &self,
+        data: &mut [f32],
+        weight: &[f32],
+        rows: usize,
+        cols: usize,
+        eps: f32,
+    ) -> Result<(), InferError> {
         let func = self.get_function("rms_norm").unwrap();
         let mut buf = CudaBuffer::from_slice(data).unwrap();
         let mut buf_weight = CudaBuffer::from_slice(weight).unwrap();

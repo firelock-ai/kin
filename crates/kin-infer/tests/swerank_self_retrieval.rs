@@ -37,9 +37,7 @@ fn embed(model: &BertModel, tokenizer: &Tokenizer, text: &str) -> Vec<f32> {
     let enc = tokenizer.encode(text, true).expect("tokenize");
     let ids: Vec<u32> = enc.get_ids().to_vec();
     let mask: Vec<u32> = enc.get_attention_mask().to_vec();
-    let out = model
-        .forward(&[ids], &[mask])
-        .expect("forward");
+    let out = model.forward(&[ids], &[mask]).expect("forward");
     out.into_iter().next().expect("one embedding")
 }
 
@@ -69,7 +67,8 @@ fn swerank_self_retrieval_probe() {
     // pre-load the raw field is what carries "swiglu"; the fold + gated-FFN path is then
     // proven by the top-1 retrieval assertion below.
     assert_eq!(
-        config.activation_function.as_deref(), Some("swiglu"),
+        config.activation_function.as_deref(),
+        Some("swiglu"),
         "config.json activation_function must parse as swiglu"
     );
 
@@ -99,16 +98,13 @@ fn swerank_self_retrieval_probe() {
         "fn quicksort(arr: &mut [i32]) {\n    if arr.len() <= 1 { return; }\n    let pivot = arr[arr.len() / 2];\n    let (mut i, mut j) = (0, arr.len() - 1);\n    // partition around pivot, then recurse on each half\n}",
     ];
     // Query that should match doc 0 (binary search) and nothing else closely.
-    let query_text = "function that searches a sorted array for a value by repeatedly halving the search range";
+    let query_text =
+        "function that searches a sorted array for a value by repeatedly halving the search range";
     let correct = 0usize;
 
     // 3. Embed.
     let doc_vecs: Vec<Vec<f32>> = docs.iter().map(|d| embed(&model, &tokenizer, d)).collect();
-    let query_vec = embed(
-        &model,
-        &tokenizer,
-        &format!("{QUERY_PREFIX}{query_text}"),
-    );
+    let query_vec = embed(&model, &tokenizer, &format!("{QUERY_PREFIX}{query_text}"));
 
     // --- Diagnostics (printed before any assertion fires) ---
     // Determinism / self-similarity: embedding the same text twice must be ~identical.
@@ -123,8 +119,10 @@ fn swerank_self_retrieval_probe() {
     );
 
     // Mean-pooling comparison.
-    let doc_vecs_mean: Vec<Vec<f32>> =
-        docs.iter().map(|d| embed(&model_mean, &tokenizer, d)).collect();
+    let doc_vecs_mean: Vec<Vec<f32>> = docs
+        .iter()
+        .map(|d| embed(&model_mean, &tokenizer, d))
+        .collect();
     let query_vec_mean = embed(
         &model_mean,
         &tokenizer,
@@ -144,14 +142,26 @@ fn swerank_self_retrieval_probe() {
     // 4a. Finiteness + L2≈1 for every vector.
     for (i, v) in doc_vecs.iter().enumerate() {
         assert_eq!(v.len(), 768, "doc {i} dim");
-        assert!(v.iter().all(|x| x.is_finite()), "doc {i} has non-finite values");
+        assert!(
+            v.iter().all(|x| x.is_finite()),
+            "doc {i} has non-finite values"
+        );
         let n = l2(v);
-        assert!((n - 1.0).abs() < 1e-3, "doc {i} not L2-normalized (||v||={n})");
+        assert!(
+            (n - 1.0).abs() < 1e-3,
+            "doc {i} not L2-normalized (||v||={n})"
+        );
     }
     assert_eq!(query_vec.len(), 768, "query dim");
-    assert!(query_vec.iter().all(|x| x.is_finite()), "query has non-finite values");
+    assert!(
+        query_vec.iter().all(|x| x.is_finite()),
+        "query has non-finite values"
+    );
     let qn = l2(&query_vec);
-    assert!((qn - 1.0).abs() < 1e-3, "query not L2-normalized (||v||={qn})");
+    assert!(
+        (qn - 1.0).abs() < 1e-3,
+        "query not L2-normalized (||v||={qn})"
+    );
 
     // 4b. Rank documents by cosine to the query.
     let mut sims: Vec<(usize, f32)> = doc_vecs
@@ -171,9 +181,7 @@ fn swerank_self_retrieval_probe() {
     let top_sim = sims[0].1;
     let runner_up_sim = sims[1].1;
     let margin = top_sim - runner_up_sim;
-    eprintln!(
-        "top-1 doc[{top}] (expected doc[{correct}]); margin over runner-up = {margin:.4}\n"
-    );
+    eprintln!("top-1 doc[{top}] (expected doc[{correct}]); margin over runner-up = {margin:.4}\n");
 
     assert_eq!(
         top, correct,

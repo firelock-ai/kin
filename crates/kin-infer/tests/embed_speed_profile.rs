@@ -87,9 +87,12 @@ fn head_short_sha() -> String {
 /// release=3). The fallback is documented so a future profile override that drifts
 /// from these defaults is an obvious place to look.
 fn build_stamp() -> String {
-    let build = if cfg!(debug_assertions) { "debug" } else { "release" };
-    let opt = option_env!("OPT_LEVEL")
-        .unwrap_or(if cfg!(debug_assertions) { "0" } else { "3" });
+    let build = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let opt = option_env!("OPT_LEVEL").unwrap_or(if cfg!(debug_assertions) { "0" } else { "3" });
     format!(
         "BUILD={build}  opt-level={opt}  kin-infer-HEAD={}",
         head_short_sha()
@@ -157,7 +160,10 @@ fn metal_embed_forward_profile() {
     let (wids, wmask) = &corpus[0];
     let warm = embed_one(&model, wids, wmask);
     assert_eq!(warm.len(), hidden, "warm-up embedding dim");
-    assert!(warm.iter().all(|x| x.is_finite()), "warm-up produced non-finite");
+    assert!(
+        warm.iter().all(|x| x.is_finite()),
+        "warm-up produced non-finite"
+    );
 
     // Within-process determinism guard. The very first GPU forward after load is
     // a cold pass (pipeline/shader warm-up, first weight-cache population) and may
@@ -191,15 +197,17 @@ fn metal_embed_forward_profile() {
     let stall_s = stall_ns as f64 / 1e9;
     let rest_s = (wall_s - stall_s).max(0.0);
     let ent_per_s = total as f64 / wall_s;
-    let stall_pct = if wall_s > 0.0 { stall_s / wall_s * 100.0 } else { 0.0 };
+    let stall_pct = if wall_s > 0.0 {
+        stall_s / wall_s * 100.0
+    } else {
+        0.0
+    };
     let subs_per_fwd = submissions as f64 / total as f64;
 
     eprintln!(
         "\nentities={total}  wall={wall_s:.3}s  ent/s={ent_per_s:.2}  (checksum={checksum:.3})"
     );
-    eprintln!(
-        "host-stall (commit+wait)  = {stall_s:.3}s  ({stall_pct:.1}% of wall)"
-    );
+    eprintln!("host-stall (commit+wait)  = {stall_s:.3}s  ({stall_pct:.1}% of wall)");
     eprintln!(
         "rest (CPU glue + copies)  = {rest_s:.3}s  ({:.1}% of wall)",
         100.0 - stall_pct
@@ -235,8 +243,9 @@ fn metal_embed_forward_profile() {
     eprintln!("rayon threads = {}", rayon::current_num_threads());
     let probe_len = 128usize;
     let probe_n = 16usize;
-    let batch: Vec<(Vec<u32>, Vec<u32>)> =
-        (0..probe_n).map(|j| synth_sequence(probe_len, 7000 + j as u32)).collect();
+    let batch: Vec<(Vec<u32>, Vec<u32>)> = (0..probe_n)
+        .map(|j| synth_sequence(probe_len, 7000 + j as u32))
+        .collect();
     let ids_b: Vec<Vec<u32>> = batch.iter().map(|(i, _)| i.clone()).collect();
     let masks_b: Vec<Vec<u32>> = batch.iter().map(|(_, m)| m.clone()).collect();
 

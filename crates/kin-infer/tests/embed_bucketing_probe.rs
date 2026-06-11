@@ -82,7 +82,15 @@ fn time_bucketed(
     (total, n_groups)
 }
 
-fn report(label: &str, n: usize, mixed_s: f64, bucket_s: f64, n_groups: usize, useful: usize, padded: usize) {
+fn report(
+    label: &str,
+    n: usize,
+    mixed_s: f64,
+    bucket_s: f64,
+    n_groups: usize,
+    useful: usize,
+    padded: usize,
+) {
     let mixed_eps = n as f64 / mixed_s.max(1e-9);
     let bucket_eps = n as f64 / bucket_s.max(1e-9);
     eprintln!(
@@ -107,7 +115,11 @@ fn embed_length_bucketing_ab() {
     }
     eprintln!(
         "\n[bucketing] BUILD={}  (perf numbers require --release)",
-        if cfg!(debug_assertions) { "debug" } else { "release" }
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
     );
     if cfg!(debug_assertions) {
         eprintln!("!!! REFUSING perf numbers from a debug build — rerun with --release !!!");
@@ -133,7 +145,15 @@ fn embed_length_bucketing_ab() {
     let maxlen_a = corpus_a.iter().map(|(i, _)| i.len()).max().unwrap();
     let mixed_a = time_mixed(&model, &corpus_a);
     let (bucket_a, g_a) = time_bucketed(&model, &corpus_a, |l| l); // exact-length groups
-    report("uniform-spread x100", n_a, mixed_a, bucket_a, g_a, useful_a, n_a * maxlen_a);
+    report(
+        "uniform-spread x100",
+        n_a,
+        mixed_a,
+        bucket_a,
+        g_a,
+        useful_a,
+        n_a * maxlen_a,
+    );
 
     // --- Bit-identity verification (Track B parity gate) ---
     // Grouping must not change ANY entity's embedding. Compare one mixed batch
@@ -156,7 +176,9 @@ fn embed_length_bucketing_ab() {
         };
         let all_ids: Vec<Vec<u32>> = corpus_a.iter().map(|e| e.0.clone()).collect();
         let all_masks: Vec<Vec<u32>> = corpus_a.iter().map(|e| e.1.clone()).collect();
-        let mixed_emb = model.forward_batched(&all_ids, &all_masks).expect("mixed emb");
+        let mixed_emb = model
+            .forward_batched(&all_ids, &all_masks)
+            .expect("mixed emb");
         let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for (i, e) in corpus_a.iter().enumerate() {
             groups.entry(bin_of(e.0.len())).or_default().push(i);
@@ -198,12 +220,13 @@ fn embed_length_bucketing_ab() {
     // group count stays small (bounded per-forward overhead) — the production scheme.
     let mut corpus_b: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
     let mut salt = 5000u32;
-    let push_n = |corpus: &mut Vec<(Vec<u32>, Vec<u32>)>, count: usize, len: usize, salt: &mut u32| {
-        for _ in 0..count {
-            corpus.push(synth_sequence(len, *salt));
-            *salt += 1;
-        }
-    };
+    let push_n =
+        |corpus: &mut Vec<(Vec<u32>, Vec<u32>)>, count: usize, len: usize, salt: &mut u32| {
+            for _ in 0..count {
+                corpus.push(synth_sequence(len, *salt));
+                *salt += 1;
+            }
+        };
     // long tail: lots of short, few long (typical of code entities)
     push_n(&mut corpus_b, 40, 16, &mut salt);
     push_n(&mut corpus_b, 35, 32, &mut salt);
@@ -225,7 +248,15 @@ fn embed_length_bucketing_ab() {
     };
     let mixed_b = time_mixed(&model, &corpus_b);
     let (bucket_b, g_b) = time_bucketed(&model, &corpus_b, bin); // coarse bins
-    report("realistic-longtail x160", n_b, mixed_b, bucket_b, g_b, useful_b, n_b * maxlen_b);
+    report(
+        "realistic-longtail x160",
+        n_b,
+        mixed_b,
+        bucket_b,
+        g_b,
+        useful_b,
+        n_b * maxlen_b,
+    );
 
     eprintln!(
         "\nNOTE: bucketed groups each warmed + timed separately, so the bucketed total \

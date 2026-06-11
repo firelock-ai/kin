@@ -29,7 +29,12 @@ fn probe_model_dir() -> String {
 
 fn synth(len: usize, salt: u32) -> (Vec<u32>, Vec<u32>) {
     let ids: Vec<u32> = (0..len)
-        .map(|i| 1 + ((i as u32).wrapping_mul(2654435761).wrapping_add(salt.wrapping_mul(40503)) % 20000))
+        .map(|i| {
+            1 + ((i as u32)
+                .wrapping_mul(2654435761)
+                .wrapping_add(salt.wrapping_mul(40503))
+                % 20000)
+        })
         .collect();
     (ids, vec![1u32; len])
 }
@@ -80,7 +85,13 @@ fn bucketing_vs_ground_truth() {
     // Ground truth: single forward per entity (batch=1, never pads).
     let single: Vec<Vec<f32>> = corpus
         .iter()
-        .map(|e| model.forward(&[e.0.clone()], &[e.1.clone()]).unwrap().pop().unwrap())
+        .map(|e| {
+            model
+                .forward(&[e.0.clone()], &[e.1.clone()])
+                .unwrap()
+                .pop()
+                .unwrap()
+        })
         .collect();
 
     let _ = model.forward_batched(&all_ids, &all_masks).unwrap(); // warm
@@ -120,7 +131,9 @@ fn bucketing_vs_ground_truth() {
     eprintln!("  mixed      vs binned : {mb_min:?}");
     let worst_mixed = mixed_min.values().cloned().fold(1.0f64, f64::min);
     let worst_binned = binned_min.values().cloned().fold(1.0f64, f64::min);
-    eprintln!("[truth] worst: mixed-vs-single={worst_mixed:.6}  binned-vs-single={worst_binned:.6}");
+    eprintln!(
+        "[truth] worst: mixed-vs-single={worst_mixed:.6}  binned-vs-single={worst_binned:.6}"
+    );
 
     // Characterize HOW corrupt binned entities are wrong (end-only read → no
     // inter-op host work, so it does NOT suppress the race). For each corrupt
