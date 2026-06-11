@@ -3,21 +3,23 @@ SPDX-License-Identifier: Apache-2.0
 Copyright 2026 Firelock, LLC
 -->
 
-# Enrichment per-identifier loop — evidence & closure
+# Why `enrich_file_definitions` is RPC-bound: measured costs and optimization levers
 
-External adversarial diligence flagged the per-identifier-per-line loops at
+This note analyzes the cost structure of the per-identifier loops in
 `src/file_enrichment.rs` (`enrich_file_definitions`) and `src/enrichment.rs`
-(`enrich_entity_uses_type`) as a scaling concern. This note records the
-code-verified consumption path, the measured local cost, the recommendation,
-and the real levers that the diligence pass *should* have flagged.
+(`enrich_entity_uses_type`): where they run, why their latency is owned by
+external LSP round-trips rather than Kin's own CPU, the measured cost of the
+local identifier scan, and which optimizations are actually safe.
 
-**Bottom line:** the loops are dominated by sequential external LSP round-trips,
-not by Kin's CPU, and the whole path is disabled during benchmarks. The flagged
-"per-identifier scan" is noise. The one safe, output-identical win — gating LSP
-round-trips on lines that lie inside a known entity — is implemented here; the
-remaining levers are LSP-RPC-layer work that is out of scope for the freeze.
+**Bottom line:** each loop iteration is an awaited LSP request to an external
+language server; the local identifier scan is several orders of magnitude
+cheaper than one round-trip, and the whole path runs only in a background daemon
+worker that is disabled during benchmarks. The one safe, output-identical
+reduction — gating round-trips on lines that lie inside a known entity — is
+implemented in `enrich_file_definitions`; the remaining levers are LSP-RPC-layer
+work.
 
-## 1. Consumption-path verdict (where the loops actually run)
+## 1. Where the loops run
 
 | Question | Finding | Evidence (file:line) |
 | --- | --- | --- |
@@ -31,13 +33,13 @@ remaining levers are LSP-RPC-layer work that is out of scope for the freeze.
 | Reachable during benchmarks? | **No — doubly disabled.** Bench init runs `kin init --no-lsp`, and the bench daemon runs with `KIN_DAEMON_DISABLE_LSP=1`, so the enrichment worker is never even created. | `kin-bench/crates/kin-bench-engine/src/live/workspace.rs:2385`; `kin-bench/crates/kin-bench-prep/src/bin/kin-bench-eval.rs:2367`; `kin/crates/kin-daemon/src/bin/kin-daemon.rs:365` |
 | Requires anything else? | Yes — rust-analyzer/pyright must be present (discovered via `which::which`). | `src/discovery.rs:49` |
 
-Net: zero impact on freeze/locate numbers; latency is owned by the external LSP
+Net: zero impact on benchmark numbers; latency is owned by the external LSP
 server, not by the per-identifier scan.
 
 ## 2. Measured local cost (the only thing a "batch" could remove)
 
 Honest timing of `identifier_positions_in_line` — the local CPU run before each
-LSP request — on an adversarial fixture (5,000 lines, periodic ~500-col lines,
+LSP request — on a worst-case fixture (5,000 lines, periodic ~500-col lines,
 unicode identifiers/strings/comments). Release build, Apple Silicon. Test:
 `file_enrichment::tests::measure_identifier_scan_throughput_on_large_unicode_file`.
 
@@ -50,21 +52,21 @@ unicode identifiers/strings/comments). Release build, Apple Silicon. Test:
 | Throughput | **~450 MB/s** |
 
 A single LSP round-trip is milliseconds (typical) to 2 s (timeout). The local
-scan is therefore 5–8 orders of magnitude below one RPC. The loop is
+scan is therefore several orders of magnitude below one RPC. The loop is
 **LSP-RPC-bound, not scan-bound.** The scanner is already a single O(line) pass;
 there is no local batching win to capture.
 
-## 3. Recommendation: wontfix the flagged item; ship the one safe gate
+## 3. Skip the naive dedupe; ship the one safe gate
 
-The diligence framing ("nested per-identifier loop = scaling hot spot") misreads
-an RPC-bound background path as a CPU hot loop. The naive fix it implies —
-deduping by identifier *text* so each unique token issues one RPC — is **not
-output-identical**: `textDocument/definition` is position-dependent, so the same
-token text on different lines can resolve to different definitions and so to
-different relations. Text dedupe would silently drop legitimate edges.
+The per-identifier loop looks like a CPU hot spot, but §1–2 show it is RPC-bound.
+The naive optimization that shape suggests — deduping by identifier *text* so
+each unique token issues one RPC — is **not output-identical**:
+`textDocument/definition` is position-dependent, so the same token text on
+different lines can resolve to different definitions and so to different
+relations. Text dedupe would silently drop legitimate edges.
 
-The genuinely safe, output-identical win is different and is implemented in this
-branch (`enrich_file_definitions`):
+The genuinely safe, output-identical win is different and is implemented here
+(`enrich_file_definitions`):
 
 - **Source-line gating.** A relation is emitted only when `(source, target)` are
   both `Some`. `source = entity_index.find_at(uri, line)` depends solely on the
@@ -83,18 +85,17 @@ branch (`enrich_file_definitions`):
   this crate does not yet have; equivalence here rests on that predicate test
   plus the structural invariant above.
 
-## 4. Real levers, if production enrichment latency ever matters
+## 4. Optimization levers, if production enrichment latency ever matters
 
 None of these are benchmark-relevant; they belong to the background daemon path
-and are listed so the genuine costs are on record (this is what the diligence
-pass should have surfaced instead of the CPU scan):
+and are listed so the genuine costs are on record:
 
 1. **Sequential per-identifier RPC awaits (largest lever).** Every identifier is
    queried one-at-a-time with `.await`. For a several-thousand-line file this is
    tens of thousands of serial round-trips. Bounded-concurrency in-flight
    requests (e.g. a `FuturesUnordered` window of N) or LSP request batching would
    cut wall-clock by ~N×. Output-identical if results are reassembled per
-   position. **Non-trivial; follow-up, not freeze scope.**
+   position. **Non-trivial; follow-up.**
 2. **Warmup sleeps.** Fixed `25s`/language + `5s` first-`didOpen` sleeps
    (`daemon.rs:1333`, `:1372`) dominate small-repo enrichment latency. Replacing
    them with a readiness signal (poll until the server answers, capped) would
