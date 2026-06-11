@@ -1370,7 +1370,22 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         ScoringTrack::BroadBlend
     };
 
-    let mut fused = match track {
+    // Entity-granular fusion experiment (default OFF; byte-identical when unset).
+    // When KIN_LOCATE_ENTITY_FUSION=1, fuse at ENTITY granularity (entity-derived
+    // signals keyed by entity id, the rest by path) and PROJECT to files at the
+    // fusion boundary, so the file-keyed post-fusion pipeline (boosts/demotes/
+    // floors/adaptive_cap) below runs unchanged. When unset, the original
+    // track-regime path fusion runs verbatim — see the flip-plan in
+    // crates/kin-cli/docs/locate-entity-fusion-flip-plan.md for scope and A/B.
+    let mut fused = if locate_env_bool("KIN_LOCATE_ENTITY_FUSION", false) {
+        entity_granular_fused_files(
+            &ranked_lists,
+            &all_entity_seeds,
+            &embedding_entity_seeds,
+            graph,
+        )?
+    } else {
+        match track {
         ScoringTrack::TracebackDominant => {
             // Traceback explicitly names files — trust it as ground truth.
             // Entity resolve and multihop supplement but don't override.
@@ -1506,6 +1521,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 &rrf_rank_lift_weights(ranked_lists.len()),
                 &[],
             )
+        }
         }
     };
 
@@ -8723,6 +8739,178 @@ fn entity_resolve_identity(
         .into_iter()
         .map(|(path, (entity_id, _))| (path, entity_id))
         .collect())
+}
+
+/// Per-entity fusion items recovered from discovery seeds: `(entity_key, file, score)`.
+/// One item per non-test, non-vendored seed entity that has a file origin, keyed by
+/// entity id and scored by its Phase-1 discovery score. Multiple entities defined in
+/// one file produce multiple items — this is the entity granularity the path-keyed
+/// pipeline collapses away in `to_ranked`/`resolve_entities_to_files`.
+///
+/// The emitted list is sorted by discovery score descending (ties broken by
+/// entity key ascending), mirroring [`to_ranked`] so the RRF rank term is
+/// meaningful and the order is independent of `HashMap` iteration order.
+fn entity_seed_keyed(
+    seeds: &HashMap<kin_model::EntityId, EntityDiscovery>,
+    graph: &kin_db::InMemoryGraph,
+) -> Result<Vec<(String, String, f32)>> {
+    let mut out: Vec<(String, String, f32)> = Vec::new();
+    for (entity_id, discovery) in seeds {
+        let Some(entity) = graph.get_entity(entity_id)? else {
+            continue;
+        };
+        let Some(file_origin) = entity.file_origin.as_ref() else {
+            continue;
+        };
+        if is_test_by_role(&file_origin.0, Some(&entity)) || is_vendored_path(&file_origin.0) {
+            continue;
+        }
+        out.push((
+            format!("entity:{entity_id}"),
+            file_origin.0.clone(),
+            discovery.score,
+        ));
+    }
+    out.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    Ok(out)
+}
+
+/// Entity-granular reciprocal rank fusion. Mirrors the core of
+/// [`reciprocal_rank_fusion`] (rank term + per-list max-normalized raw term +
+/// cross-signal bonus) but keys on the entity identity carried in each
+/// `(key, path, score)` item and skips vendored files by *path*. Returns
+/// `(key, path, fused_score)` sorted descending (ties broken by key for
+/// determinism).
+///
+/// It intentionally omits the path fuser's graph-neighborhood tiebreaker and
+/// semantic-primacy term: both are keyed by fixed signal-list *index positions*
+/// over file keys, which do not carry over to entity keys. Per the scoring-map
+/// recommendation, the entity path is a clean rank-space fuser rather than a
+/// re-derivation of the index-positional path tunings.
+fn reciprocal_rank_fusion_entities(
+    keyed_lists: &[Vec<(String, String, f32)>],
+    k: f32,
+) -> Vec<(String, String, f32)> {
+    let mut rrf: FxHashMap<String, f32> = FxHashMap::default();
+    let mut raw: FxHashMap<String, f32> = FxHashMap::default();
+    let mut signal_counts: FxHashMap<String, usize> = FxHashMap::default();
+    let mut key_path: FxHashMap<String, String> = FxHashMap::default();
+    for list in keyed_lists {
+        let max_score = list
+            .iter()
+            .map(|(_, _, s)| *s)
+            .fold(0.0f32, f32::max)
+            .max(1.0);
+        let mut keys_in_list: HashSet<String> = HashSet::new();
+        for (rank, (key, path, score)) in list.iter().enumerate() {
+            if is_vendored_path(path) {
+                continue;
+            }
+            *rrf.entry(key.clone()).or_default() += 1.0 / (k + rank as f32 + 1.0);
+            *raw.entry(key.clone()).or_default() += score / max_score;
+            key_path.entry(key.clone()).or_insert_with(|| path.clone());
+            keys_in_list.insert(key.clone());
+        }
+        for key in &keys_in_list {
+            *signal_counts.entry(key.clone()).or_default() += 1;
+        }
+    }
+    let raw_weight = locate_env_f32("KIN_LOCATE_RRF_RAW_WEIGHT", 0.05);
+    let mut combined: Vec<(String, String, f32)> = rrf
+        .iter()
+        .map(|(key, rrf_score)| {
+            let raw_score = raw.get(key).copied().unwrap_or(0.0);
+            let signals = signal_counts.get(key).copied().unwrap_or(0) as f32;
+            let cross_bonus = if signals > 1.0 {
+                (signals - 1.0) * 0.02
+            } else {
+                0.0
+            };
+            let path = key_path.get(key).cloned().unwrap_or_default();
+            (
+                key.clone(),
+                path,
+                rrf_score + raw_score * raw_weight + cross_bonus,
+            )
+        })
+        .collect();
+    combined.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    combined
+}
+
+/// Entity-granular fusion (behind `KIN_LOCATE_ENTITY_FUSION`, default OFF).
+///
+/// Builds entity-keyed ranked lists — the two entity-derived signals
+/// (`entity_resolve` idx 7 and `embedding` idx 9) keyed by entity id from the
+/// discovery seeds, every other signal keyed by its file path — fuses them with
+/// [`reciprocal_rank_fusion_entities`], then PROJECTS the fused entity ranking
+/// down to files (each file takes its best entity's fused score). The projected
+/// file list then feeds the existing file-keyed post-fusion pipeline unchanged.
+///
+/// This is the architecture-bet ON path: entity ranking survives INTO fusion
+/// rather than terminating at discovery. Deliberate first-cut limits, to be
+/// validated by the post-freeze A/B (see the flip-plan):
+/// 1. Projection happens at the fusion boundary, so dominance/floors/adaptive_cap
+///    stay file-granular (re-keying the ~40-function post-fusion pipeline to
+///    entities is out of scope under freeze and risks the proven determinism).
+/// 2. Only the two entity-derived signals carry entity keys; text/traceback/
+///    import signals stay file-granular because their `FileHit`s hold no entity id.
+/// 3. The fuser is uniform rank-space RRF (no track regimes), per the scoring-map
+///    recommendation to shrink mechanisms rather than tune knobs.
+///
+/// If neither entity-derived signal yields seed entities, every list falls back
+/// to its path key, so the projection reduces to a plain file RRF rather than
+/// dropping signal.
+fn entity_granular_fused_files(
+    ranked_lists: &[Vec<(String, f32)>],
+    text_seeds: &HashMap<kin_model::EntityId, EntityDiscovery>,
+    embedding_seeds: &HashMap<kin_model::EntityId, EntityDiscovery>,
+    graph: &kin_db::InMemoryGraph,
+) -> Result<Vec<(String, f32)>> {
+    let resolve_keyed = entity_seed_keyed(text_seeds, graph)?;
+    let embedding_keyed = entity_seed_keyed(embedding_seeds, graph)?;
+    let path_keyed = |list: &[(String, f32)]| -> Vec<(String, String, f32)> {
+        list.iter()
+            .map(|(path, score)| (path.clone(), path.clone(), *score))
+            .collect()
+    };
+    let mut keyed_lists: Vec<Vec<(String, String, f32)>> = Vec::with_capacity(ranked_lists.len());
+    for (idx, list) in ranked_lists.iter().enumerate() {
+        let keyed = match idx {
+            7 if !resolve_keyed.is_empty() => resolve_keyed.clone(),
+            9 if !embedding_keyed.is_empty() => embedding_keyed.clone(),
+            _ => path_keyed(list),
+        };
+        keyed_lists.push(keyed);
+    }
+    let fused_entities = reciprocal_rank_fusion_entities(&keyed_lists, 60.0);
+    // Project entity ranking → files: each file takes its best entity's score.
+    let mut best_per_file: HashMap<String, f32> = HashMap::new();
+    for (_, path, score) in &fused_entities {
+        best_per_file
+            .entry(path.clone())
+            .and_modify(|existing| {
+                if *score > *existing {
+                    *existing = *score;
+                }
+            })
+            .or_insert(*score);
+    }
+    let mut result: Vec<(String, f32)> = best_per_file.into_iter().collect();
+    result.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    Ok(result)
 }
 
 fn resolve_candidate_debug_stages(
@@ -18429,6 +18617,150 @@ mod tests {
                 .map(|(p, _)| p.clone())
                 .collect::<Vec<_>>();
             assert_eq!(again, first, "resolve projection order must be deterministic");
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Entity-granular fusion (KIN_LOCATE_ENTITY_FUSION) — 3.1 step 3.
+    // The OFF path is exercised (and proven byte-stable) by every other test in
+    // this module plus the determinism tests above: the flag gates an `if` whose
+    // body is never entered when unset, so the original track-regime fusion runs
+    // verbatim. These tests pin the ON-path projection logic.
+    // ───────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn entity_fusion_is_disabled_by_default() {
+        // The architecture bet must stay OFF until the post-freeze A/B flips it.
+        // No test in this module sets the var, so the default governs.
+        assert!(
+            !locate_env_bool("KIN_LOCATE_ENTITY_FUSION", false),
+            "KIN_LOCATE_ENTITY_FUSION must default OFF"
+        );
+    }
+
+    #[test]
+    fn reciprocal_rank_fusion_entities_ranks_skips_vendored_and_is_deterministic() {
+        // Two distinct entity keys projecting to real files, plus a vendored one
+        // that must be dropped by PATH even though its key is non-vendored.
+        let lists = vec![
+            vec![
+                ("entity:1".to_string(), "src/a.rs".to_string(), 10.0),
+                ("entity:2".to_string(), "src/b.rs".to_string(), 4.0),
+                (
+                    "entity:9".to_string(),
+                    "third_party/dep/x.rs".to_string(),
+                    99.0,
+                ),
+            ],
+            vec![("entity:1".to_string(), "src/a.rs".to_string(), 7.0)],
+        ];
+        let fused = reciprocal_rank_fusion_entities(&lists, 60.0);
+        let keys: Vec<&str> = fused.iter().map(|(k, _, _)| k.as_str()).collect();
+        assert!(
+            !keys.contains(&"entity:9"),
+            "vendored file must be skipped by path"
+        );
+        // entity:1 appears in both lists at rank 0 → highest rank term + a
+        // cross-signal bonus → must outrank entity:2 (single list).
+        assert_eq!(fused[0].0, "entity:1");
+        assert_eq!(fused[0].1, "src/a.rs");
+        assert_eq!(fused[1].0, "entity:2");
+        // Deterministic across repeated calls.
+        let again = reciprocal_rank_fusion_entities(&lists, 60.0);
+        assert_eq!(fused, again, "entity fusion must be deterministic");
+    }
+
+    #[test]
+    fn entity_seed_keyed_preserves_per_entity_granularity() {
+        let graph = kin_db::InMemoryGraph::new();
+        // Two source entities in ONE file (the granularity the path pipeline
+        // collapses), one in another file, plus a test-file entity to exclude.
+        let a1 = test_entity("alpha", "src/shared.rs", 1, 10);
+        let a2 = test_entity("beta", "src/shared.rs", 20, 30);
+        let b = test_entity("gamma", "src/other.rs", 1, 10);
+        let mut t = test_entity("test_helper", "tests/it_test.rs", 1, 10);
+        t.role = EntityRole::Test; // is_test_by_role keys on role when present
+        for e in [&a1, &a2, &b, &t] {
+            graph.upsert_entity(e).unwrap();
+        }
+        let seeds = HashMap::from([
+            (a1.id, disc(9.0)),
+            (a2.id, disc(3.0)),
+            (b.id, disc(6.0)),
+            (t.id, disc(100.0)),
+        ]);
+        let keyed = entity_seed_keyed(&seeds, &graph).unwrap();
+        // Test entity excluded; the other three survive as distinct items.
+        assert_eq!(keyed.len(), 3, "test entity must be excluded");
+        let shared_items: Vec<&(String, String, f32)> =
+            keyed.iter().filter(|(_, p, _)| p == "src/shared.rs").collect();
+        assert_eq!(
+            shared_items.len(),
+            2,
+            "two entities in one file stay distinct (entity granularity)"
+        );
+        // Sorted by score desc → src/shared.rs alpha(9) first, src/other.rs(6),
+        // then src/shared.rs beta(3).
+        assert_eq!(keyed[0].2, 9.0);
+        assert_eq!(keyed[1].2, 6.0);
+        assert_eq!(keyed[2].2, 3.0);
+    }
+
+    #[test]
+    fn entity_granular_fused_files_projects_best_entity_per_file() {
+        let graph = kin_db::InMemoryGraph::new();
+        let a1 = test_entity("alpha", "src/a.rs", 1, 10);
+        let a2 = test_entity("beta", "src/a.rs", 20, 30);
+        let b = test_entity("gamma", "src/b.rs", 1, 10);
+        for e in [&a1, &a2, &b] {
+            graph.upsert_entity(e).unwrap();
+        }
+        // Two entities in src/a.rs (scores 10, 4), one in src/b.rs (score 8).
+        let text_seeds = HashMap::from([
+            (a1.id, disc(10.0)),
+            (a2.id, disc(4.0)),
+            (b.id, disc(8.0)),
+        ]);
+        let embedding_seeds: HashMap<kin_model::EntityId, EntityDiscovery> = HashMap::new();
+        let ranked_lists: Vec<Vec<(String, f32)>> = vec![Vec::new(); 10];
+        let fused =
+            entity_granular_fused_files(&ranked_lists, &text_seeds, &embedding_seeds, &graph)
+                .unwrap();
+        // Both files present; the two src/a.rs entities collapse to ONE file.
+        assert_eq!(fused.len(), 2, "two entities in one file project to one file");
+        assert_eq!(fused[0].0, "src/a.rs", "best-ranked entity's file wins");
+        assert_eq!(fused[1].0, "src/b.rs");
+        assert!(fused[0].1 > fused[1].1);
+    }
+
+    #[test]
+    fn entity_granular_fused_files_falls_back_to_path_rrf_without_seeds() {
+        // No entity-derived seeds → every signal keys by path → the result is a
+        // plain file projection (no signal dropped, vendored excluded).
+        let graph = kin_db::InMemoryGraph::new();
+        let empty: HashMap<kin_model::EntityId, EntityDiscovery> = HashMap::new();
+        let mut ranked_lists: Vec<Vec<(String, f32)>> = vec![Vec::new(); 10];
+        ranked_lists[0] = vec![
+            ("src/x.rs".to_string(), 1.0),
+            ("src/y.rs".to_string(), 0.5),
+            ("vendor/dep/z.rs".to_string(), 9.0),
+        ];
+        let fused = entity_granular_fused_files(&ranked_lists, &empty, &empty, &graph).unwrap();
+        let paths: Vec<&str> = fused.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(paths.contains(&"src/x.rs"));
+        assert!(paths.contains(&"src/y.rs"));
+        assert!(
+            !paths.contains(&"vendor/dep/z.rs"),
+            "vendored file excluded in path-fallback projection"
+        );
+        assert_eq!(fused[0].0, "src/x.rs", "higher-ranked path wins");
+    }
+
+    fn disc(score: f32) -> EntityDiscovery {
+        EntityDiscovery {
+            score,
+            signals: vec!["search"],
+            cosine: None,
         }
     }
 }
