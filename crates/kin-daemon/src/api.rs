@@ -9140,14 +9140,12 @@ mod tests {
     // These exercise the real `vfs_write_notify` handler in-process (no daemon
     // is spawned). `KIN_WRITE_VETO` is process-global, so the env-touching
     // tests serialize on `VETO_ENV_LOCK` and restore the variable via an RAII
-    // guard so a leak never bleeds into another test.
+    // guard so a leak never bleeds into another test. The lock is a
+    // `tokio::sync::Mutex` so the guard can be safely held across the handler's
+    // `.await` (a std `MutexGuard` would trip `clippy::await_holding_lock`).
     // ---------------------------------------------------------------
 
-    static VETO_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn lock_veto_env() -> std::sync::MutexGuard<'static, ()> {
-        VETO_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    static VETO_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     struct EnvVarGuard(&'static str);
     impl Drop for EnvVarGuard {
@@ -9204,7 +9202,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_notify_enforce_foreign_hard_intent_returns_409() {
-        let _lock = lock_veto_env();
+        let _lock = VETO_ENV_LOCK.lock().await;
         let state = test_state();
         let (file_id, abs) = veto_file_target(&state, "src/lib.py");
         // The veto short-circuits before reconcile reads the file, so the file
@@ -9237,7 +9235,7 @@ mod tests {
         // Flag-off identity: with a foreign hard intent present, default
         // behavior is unchanged — the reconciler's own check still declines to
         // fold the write (reindexed:false) and NO 409 is produced.
-        let _lock = lock_veto_env();
+        let _lock = VETO_ENV_LOCK.lock().await;
         let _env = EnvVarGuard("KIN_WRITE_VETO");
         std::env::remove_var("KIN_WRITE_VETO");
 
@@ -9266,7 +9264,7 @@ mod tests {
     async fn write_notify_enforce_own_intent_allows_write() {
         // Own-write guard at the handler: a session editing a file it has
         // itself hard-locked is allowed, and the write is folded into the graph.
-        let _lock = lock_veto_env();
+        let _lock = VETO_ENV_LOCK.lock().await;
         let state = test_state();
         let (file_id, abs) = veto_file_target(&state, "src/lib.py");
         write_disk_file(&state, "src/lib.py", "def foo():\n    return 1\n");
@@ -9298,7 +9296,7 @@ mod tests {
     async fn write_notify_enforce_foreign_soft_intent_allows_write() {
         // Soft intents are advisory: even under enforce, a foreign soft intent
         // never vetoes the write.
-        let _lock = lock_veto_env();
+        let _lock = VETO_ENV_LOCK.lock().await;
         let state = test_state();
         let (file_id, abs) = veto_file_target(&state, "src/lib.py");
         write_disk_file(&state, "src/lib.py", "def foo():\n    return 1\n");
