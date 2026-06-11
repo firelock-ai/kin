@@ -483,9 +483,8 @@ impl<Id: VectorId> HnswGraph<Id> {
     /// independent of slot-allocation history.
     fn sort_scored_neighbors(&self, scored: &mut [(f32, usize)]) {
         scored.sort_by(|a, b| {
-            a.0.total_cmp(&b.0).then_with(|| {
-                key_hash(&self.idx_to_id[a.1]).cmp(&key_hash(&self.idx_to_id[b.1]))
-            })
+            a.0.total_cmp(&b.0)
+                .then_with(|| key_hash(&self.idx_to_id[a.1]).cmp(&key_hash(&self.idx_to_id[b.1])))
         });
     }
 
