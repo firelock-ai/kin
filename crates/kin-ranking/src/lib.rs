@@ -840,19 +840,47 @@ mod tests {
         let query = SearchQuery::new("x");
         let sig = || CandidateSignals::new(0.5, 0.5, 0.5, 0.5, 0.5);
         let forward = vec![
-            SearchCandidate { id: "a".into(), title: "A".into(), signals: sig() },
-            SearchCandidate { id: "b".into(), title: "B".into(), signals: sig() },
-            SearchCandidate { id: "c".into(), title: "C".into(), signals: sig() },
+            SearchCandidate {
+                id: "a".into(),
+                title: "A".into(),
+                signals: sig(),
+            },
+            SearchCandidate {
+                id: "b".into(),
+                title: "B".into(),
+                signals: sig(),
+            },
+            SearchCandidate {
+                id: "c".into(),
+                title: "C".into(),
+                signals: sig(),
+            },
         ];
         let reversed = vec![
-            SearchCandidate { id: "c".into(), title: "C".into(), signals: sig() },
-            SearchCandidate { id: "b".into(), title: "B".into(), signals: sig() },
-            SearchCandidate { id: "a".into(), title: "A".into(), signals: sig() },
+            SearchCandidate {
+                id: "c".into(),
+                title: "C".into(),
+                signals: sig(),
+            },
+            SearchCandidate {
+                id: "b".into(),
+                title: "B".into(),
+                signals: sig(),
+            },
+            SearchCandidate {
+                id: "a".into(),
+                title: "A".into(),
+                signals: sig(),
+            },
         ];
-        let ids_forward: Vec<String> =
-            rank_candidates(&query, &forward).into_iter().map(|r| r.id).collect();
-        let ids_reversed: Vec<String> =
-            rank_candidates(&query, &reversed).into_iter().map(|r| r.id).collect();
+        let ids_forward: Vec<String> = rank_candidates(&query, &forward)
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        let ids_reversed: Vec<String> = rank_candidates(&query, &reversed)
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
         assert_eq!(ids_forward, vec!["a", "b", "c"]);
         assert_eq!(
             ids_forward, ids_reversed,

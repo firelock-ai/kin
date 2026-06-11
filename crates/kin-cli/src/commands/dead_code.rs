@@ -185,7 +185,8 @@ pub fn build_dead_code_seeded_response(
     };
 
     let embedding_status = graph.embedding_status();
-    let semantic_complete = embedding_status.total == 0 || (embedding_status.indexed == embedding_status.total && embedding_status.pending == 0);
+    let semantic_complete = embedding_status.total == 0
+        || (embedding_status.indexed == embedding_status.total && embedding_status.pending == 0);
 
     let search_request = DaemonSearchRequest {
         query: query.to_string(),

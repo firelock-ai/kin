@@ -192,8 +192,14 @@ mod tests {
         assert_eq!(WriteVetoMode::parse(Some("off")), WriteVetoMode::Off);
         assert_eq!(WriteVetoMode::parse(Some("0")), WriteVetoMode::Off);
         assert_eq!(WriteVetoMode::parse(Some("warn")), WriteVetoMode::Off);
-        assert_eq!(WriteVetoMode::parse(Some("enforce")), WriteVetoMode::Enforce);
-        assert_eq!(WriteVetoMode::parse(Some("  ENFORCE  ")), WriteVetoMode::Enforce);
+        assert_eq!(
+            WriteVetoMode::parse(Some("enforce")),
+            WriteVetoMode::Enforce
+        );
+        assert_eq!(
+            WriteVetoMode::parse(Some("  ENFORCE  ")),
+            WriteVetoMode::Enforce
+        );
         assert!(!WriteVetoMode::Off.is_enforcing());
         assert!(WriteVetoMode::Enforce.is_enforcing());
     }
@@ -222,7 +228,11 @@ mod tests {
         let file = FilePathId::new("src/lib.rs");
         let caller = SessionId::new();
         let other = SessionId::new();
-        let intents = vec![intent(other, IntentScope::Artifact(file.clone()), LockType::Hard)];
+        let intents = vec![intent(
+            other,
+            IntentScope::Artifact(file.clone()),
+            LockType::Hard,
+        )];
         let touched = vec![IntentScope::Artifact(file)];
 
         assert!(evaluate_write_veto(&intents, &touched, Some(caller)).is_denied());
@@ -299,10 +309,7 @@ mod tests {
         assert_eq!(body["error"], "write_veto");
         assert_eq!(body["file_path"], "src/lib.rs");
         assert_eq!(body["blocking_intents"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            body["blocking_intents"][0]["session_id"],
-            other.to_string()
-        );
+        assert_eq!(body["blocking_intents"][0]["session_id"], other.to_string());
         assert_eq!(body["blocking_intents"][0]["lock_type"], "Hard");
     }
 }

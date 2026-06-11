@@ -1072,9 +1072,15 @@ mod tests {
     #[test]
     fn trace_not_found_guidance_keeps_signal_and_offers_discovery() {
         let lines = trace_not_found_guidance("frobnicate");
-        assert!(lines[0].contains("not found"), "keeps not-found signal: {lines:?}");
+        assert!(
+            lines[0].contains("not found"),
+            "keeps not-found signal: {lines:?}"
+        );
         let joined = lines.join("\n");
-        assert!(joined.contains("kin search frobnicate"), "offers search: {joined}");
+        assert!(
+            joined.contains("kin search frobnicate"),
+            "offers search: {joined}"
+        );
         assert!(joined.contains("kin locate"), "offers locate: {joined}");
     }
 

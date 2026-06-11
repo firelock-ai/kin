@@ -107,9 +107,18 @@ mod tests {
     #[test]
     fn impact_not_found_guidance_keeps_signal_and_offers_next_steps() {
         let lines = impact_not_found_guidance("frobnicate");
-        assert!(lines[0].contains("not found"), "keeps not-found signal: {lines:?}");
+        assert!(
+            lines[0].contains("not found"),
+            "keeps not-found signal: {lines:?}"
+        );
         let joined = lines.join("\n");
-        assert!(joined.contains("kin search frobnicate"), "offers a search next step: {joined}");
-        assert!(joined.contains("kin xref"), "notes cross-repo path: {joined}");
+        assert!(
+            joined.contains("kin search frobnicate"),
+            "offers a search next step: {joined}"
+        );
+        assert!(
+            joined.contains("kin xref"),
+            "notes cross-repo path: {joined}"
+        );
     }
 }

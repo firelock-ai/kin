@@ -205,7 +205,10 @@ fn build_advice(spec: &RetrievalSpec, envelope: &Envelope, trustworthy: bool) ->
         "Absence is NOT authoritative: do not conclude the target is unused or deletable — an empty result may mean 'not indexed'. Re-check after embedding is complete and the daemon is healthy."
     };
 
-    format!("{}, against {as_of} with {coverage} and {degraded}. {consequence}", spec.subject)
+    format!(
+        "{}, against {as_of} with {coverage} and {degraded}. {consequence}",
+        spec.subject
+    )
 }
 
 /// Build a confidence-qualified negative for `tool`'s `payload`, enriched from
@@ -334,9 +337,12 @@ mod tests {
     #[test]
     fn semantic_search_complete_coverage_is_authoritative() {
         let payload = json!({ "results": [] });
-        let negative =
-            negative_for("semantic_search", &payload, &semantic_authoritative_envelope())
-                .expect("empty results yields a negative");
+        let negative = negative_for(
+            "semantic_search",
+            &payload,
+            &semantic_authoritative_envelope(),
+        )
+        .expect("empty results yields a negative");
         assert_eq!(negative["safe_to_conclude_absent"], json!(true));
         assert_eq!(negative["trust"], json!("authoritative"));
         assert!(negative["trust_reason"]
@@ -389,9 +395,8 @@ mod tests {
         // on an initialized + loaded graph even with NO embedding coverage —
         // structural tools read typed relations, not embeddings.
         let payload = json!({ "total_upstream": 0, "references": [] });
-        let negative =
-            negative_for("find_references", &payload, &structural_ready_envelope())
-                .expect("empty references yields a negative");
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("empty references yields a negative");
         assert_eq!(negative["kind"], json!("no_references"));
         assert_eq!(negative["safe_to_conclude_absent"], json!(true));
         assert_eq!(negative["trust"], json!("authoritative"));
@@ -403,7 +408,10 @@ mod tests {
         assert_eq!(negative["graph_as_of"], json!({ "generation": 12 }));
         // No embedding coverage observed — honest null, not fabricated.
         assert_eq!(negative["semantic_coverage"], Value::Null);
-        assert!(negative["advice"].as_str().unwrap().contains("authoritative"));
+        assert!(negative["advice"]
+            .as_str()
+            .unwrap()
+            .contains("authoritative"));
     }
 
     #[test]
@@ -436,11 +444,11 @@ mod tests {
         let payload = json!({ "references": [] });
         let negative = negative_for("find_references", &payload, &env).unwrap();
         assert_eq!(negative["safe_to_conclude_absent"], json!(false));
-        assert!(negative["trust_reason"].as_str().unwrap().contains("degraded"));
-        assert_eq!(
-            negative["degraded_signals"],
-            json!(["embed_worker_failed"])
-        );
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("degraded"));
+        assert_eq!(negative["degraded_signals"], json!(["embed_worker_failed"]));
     }
 
     #[test]
@@ -485,8 +493,7 @@ mod tests {
         // authoritative on an initialized + loaded graph, regardless of embedding
         // coverage. Mirrors find_references through a different payload shape.
         let payload = json!([]);
-        let negative =
-            negative_for("dead_code", &payload, &structural_ready_envelope()).unwrap();
+        let negative = negative_for("dead_code", &payload, &structural_ready_envelope()).unwrap();
         assert_eq!(negative["kind"], json!("no_dead_code"));
         assert_eq!(negative["safe_to_conclude_absent"], json!(true));
         assert!(negative["trust_reason"]

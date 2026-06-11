@@ -233,7 +233,10 @@ pub fn build_refs_response(
 /// we don't have on a local miss. So we hand off to `kin xref` (which performs
 /// that lookup) instead of guessing.
 fn refs_not_found_guidance(entity: &str) -> Vec<String> {
-    let mut lines = vec![format!("Entity '{}' not found in this repo's graph.", entity)];
+    let mut lines = vec![format!(
+        "Entity '{}' not found in this repo's graph.",
+        entity
+    )];
     if uuid::Uuid::parse_str(entity.trim()).is_ok() {
         // A UUID miss can't be re-queried by name; xref resolves by symbol name.
         lines.push(
@@ -243,9 +246,8 @@ fn refs_not_found_guidance(entity: &str) -> Vec<String> {
                 .to_string(),
         );
     } else {
-        lines.push(
-            "hint: `kin refs` resolves references within the current repo only.".to_string(),
-        );
+        lines
+            .push("hint: `kin refs` resolves references within the current repo only.".to_string());
         lines.push(format!(
             "      If '{entity}' is defined in a sibling/dependency repo, look it up cross-repo:"
         ));
@@ -583,7 +585,10 @@ mod tests {
         );
         let joined = lines.join("\n");
         // Actionable next step: the cross-repo surface, with a runnable command.
-        assert!(joined.contains("kin xref"), "should point at xref: {joined}");
+        assert!(
+            joined.contains("kin xref"),
+            "should point at xref: {joined}"
+        );
         assert!(
             joined.contains("kin xref load_vector_index_into_graph_if_valid"),
             "should include a runnable cross-repo command: {joined}"

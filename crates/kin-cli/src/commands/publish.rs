@@ -88,8 +88,7 @@ async fn publish_crate(
     // The publisher's token must match the daemon's KIN_REGISTRY_CARGO_TOKEN.
     // Prefer KINLAB_CARGO_TOKEN (the CI/publish convention), then fall back to
     // KIN_REGISTRY_CARGO_TOKEN (the daemon's variable name).
-    match std::env::var("KINLAB_CARGO_TOKEN")
-        .or_else(|_| std::env::var("KIN_REGISTRY_CARGO_TOKEN"))
+    match std::env::var("KINLAB_CARGO_TOKEN").or_else(|_| std::env::var("KIN_REGISTRY_CARGO_TOKEN"))
     {
         Ok(token) if !token.is_empty() => {
             request = request.header("authorization", format!("Bearer {}", token));

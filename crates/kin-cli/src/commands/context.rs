@@ -267,9 +267,15 @@ mod tests {
     #[test]
     fn context_not_found_guidance_keeps_signal_and_offers_discovery() {
         let lines = context_not_found_guidance("frobnicate");
-        assert!(lines[0].contains("not found"), "keeps not-found signal: {lines:?}");
+        assert!(
+            lines[0].contains("not found"),
+            "keeps not-found signal: {lines:?}"
+        );
         let joined = lines.join("\n");
-        assert!(joined.contains("kin search frobnicate"), "offers search: {joined}");
+        assert!(
+            joined.contains("kin search frobnicate"),
+            "offers search: {joined}"
+        );
         assert!(joined.contains("kin locate"), "offers locate: {joined}");
     }
 
@@ -330,7 +336,11 @@ mod tests {
 
         let resolved = resolve_context_target(&graph, "Foo").unwrap().unwrap();
 
-        assert_eq!(resolved.id, class_id, "expected the class, got {}", resolved.name);
+        assert_eq!(
+            resolved.id, class_id,
+            "expected the class, got {}",
+            resolved.name
+        );
         assert_eq!(resolved.kind, EntityKind::Class);
     }
 
@@ -347,6 +357,10 @@ mod tests {
 
         let resolved = resolve_context_target(&graph, "parse").unwrap().unwrap();
 
-        assert_eq!(resolved.id, exact_id, "expected exact match, got {}", resolved.name);
+        assert_eq!(
+            resolved.id, exact_id,
+            "expected exact match, got {}",
+            resolved.name
+        );
     }
 }
