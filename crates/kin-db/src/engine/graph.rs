@@ -657,6 +657,124 @@ impl<K: Eq + std::hash::Hash + Copy> RecencyQueue<K> {
     }
 }
 
+// Embedding priority tiers. Lower tiers embed first, giving agents useful
+// semantic coverage on the entities that matter (public API surface, then the
+// rest of the live source) before historical revisions, tests, and generated
+// code. The buckets are derived only from facts the graph already records
+// (visibility / role / kind) — no new analysis pass.
+#[cfg(feature = "vector")]
+mod embed_tier {
+    /// Public API contract surface (endpoints, interfaces, traits, schemas).
+    pub const PUBLIC_API: u8 = 0;
+    /// Other public source symbols.
+    pub const PUBLIC_SOURCE: u8 = 1;
+    /// Crate-visible source symbols.
+    pub const CRATE_SOURCE: u8 = 2;
+    /// Internal source symbols.
+    pub const INTERNAL_SOURCE: u8 = 3;
+    /// Private source symbols.
+    pub const PRIVATE_SOURCE: u8 = 4;
+    /// Historical (non-HEAD) entity revisions — embed after all live HEAD source.
+    pub const REVISION: u8 = 5;
+    /// Test code.
+    pub const TEST: u8 = 6;
+    /// Documentation entities.
+    pub const DOCS: u8 = 7;
+    /// Generated / vendored / external code and non-entity keys.
+    pub const OTHER: u8 = 8;
+}
+
+/// Classify a HEAD entity into an [`embed_tier`] bucket from its visibility,
+/// role, and kind. Public API surface ranks first; non-source roles last.
+#[cfg(feature = "vector")]
+fn entity_embed_tier(entity: &Entity) -> u8 {
+    // Role dominates: non-source code always ranks after live source code.
+    match entity.role {
+        EntityRole::Test => return embed_tier::TEST,
+        EntityRole::Docs => return embed_tier::DOCS,
+        EntityRole::Generated | EntityRole::Vendored | EntityRole::External => {
+            return embed_tier::OTHER
+        }
+        EntityRole::Source => {}
+    }
+    // A source-roled entity that is structurally a test still ranks as test.
+    if matches!(entity.kind, EntityKind::Test) {
+        return embed_tier::TEST;
+    }
+    let is_api_surface = matches!(
+        entity.kind,
+        EntityKind::ApiEndpoint
+            | EntityKind::EventContract
+            | EntityKind::Schema
+            | EntityKind::Interface
+            | EntityKind::TraitDef
+    );
+    match entity.visibility {
+        Visibility::Public if is_api_surface => embed_tier::PUBLIC_API,
+        Visibility::Public => embed_tier::PUBLIC_SOURCE,
+        Visibility::Crate => embed_tier::CRATE_SOURCE,
+        Visibility::Internal => embed_tier::INTERNAL_SOURCE,
+        Visibility::Private => embed_tier::PRIVATE_SOURCE,
+    }
+}
+
+/// Map an entity's incoming-relation degree (dependent/caller count, the cheap
+/// centrality proxy the graph already maintains) to an ascending sort rank, so
+/// that *higher* in-degree sorts *earlier*.
+#[cfg(feature = "vector")]
+fn embed_centrality_rank(in_degree: usize) -> u32 {
+    u32::MAX - (in_degree.min(u32::MAX as usize) as u32)
+}
+
+/// Deterministic priority sort key for a queued embedding item. Sorts ascending
+/// — the smallest key embeds first. Fields in precedence order:
+/// 1. `tier` — semantic-importance bucket (public API ... generated; see [`embed_tier`])
+/// 2. `recency` — changed-this-sync before bulk backfill
+/// 3. `centrality_rank` — higher in-degree (more dependents) first
+/// 4. `key` — `RetrievalKey` total order, the stable tiebreak on id
+///
+/// Because every field is a pure function of queue contents + current graph
+/// state (and `key` is unique per queued item), the resulting order is a
+/// deterministic total order — identical across processes regardless of how the
+/// items were inserted.
+#[cfg(feature = "vector")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct EmbedSortKey {
+    tier: u8,
+    recency: EmbedRecency,
+    centrality_rank: u32,
+    key: RetrievalKey,
+}
+
+/// Compute the [`EmbedSortKey`] for a queued entity key against current graph
+/// state. HEAD entities draw tier and centrality from their own graph facts;
+/// historical revisions trail live HEAD source at a fixed revision tier;
+/// artifact keys (not normally present in the entity queue) sort last.
+#[cfg(feature = "vector")]
+fn embed_sort_key_for(ent: &EntityData, key: RetrievalKey, recency: EmbedRecency) -> EmbedSortKey {
+    let (tier, centrality_rank) = match key {
+        RetrievalKey::Entity(id) => {
+            let tier = ent
+                .entities
+                .get(&id)
+                .map(entity_embed_tier)
+                .unwrap_or(embed_tier::OTHER);
+            let in_degree = ent.incoming.get(&id).map(|rels| rels.len()).unwrap_or(0);
+            (tier, embed_centrality_rank(in_degree))
+        }
+        RetrievalKey::EntityRevision(_) => (embed_tier::REVISION, embed_centrality_rank(0)),
+        RetrievalKey::Artifact(_) | RetrievalKey::ArtifactRevision(_) => {
+            (embed_tier::OTHER, embed_centrality_rank(0))
+        }
+    };
+    EmbedSortKey {
+        tier,
+        recency,
+        centrality_rank,
+        key,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // InMemoryGraph — sharded by domain
 // ---------------------------------------------------------------------------
@@ -2845,27 +2963,38 @@ impl InMemoryGraph {
     #[cfg(feature = "vector")]
     fn drain_embedding_batch(&self, batch_size: usize) -> Vec<(RetrievalKey, EmbedRecency)> {
         let batch_size = batch_size.max(1);
-        let mut all = {
+        let drained = {
             let mut queue = self.embedding_queue.lock();
             queue.drain_all()
         };
-        if all.is_empty() {
+        if drained.is_empty() {
             return Vec::new();
         }
 
-        // Stable total order via the key's native `Ord`. (Priority tier,
-        // centrality, and recency ordering are layered on in a later commit.)
-        all.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        // Compute a deterministic priority sort key for each item from current
+        // graph state (tier → recency → centrality → id), then order ascending
+        // so the smallest — highest-priority — item embeds first.
+        let mut keyed: Vec<(EmbedSortKey, RetrievalKey, EmbedRecency)> = {
+            let ent = self.entities.read();
+            drained
+                .into_iter()
+                .map(|(key, recency)| (embed_sort_key_for(&ent, key, recency), key, recency))
+                .collect()
+        };
+        keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-        let take = batch_size.min(all.len());
-        let leftover = all.split_off(take);
+        let take = batch_size.min(keyed.len());
+        let leftover = keyed.split_off(take);
         if !leftover.is_empty() {
             let mut queue = self.embedding_queue.lock();
-            for (key, recency) in leftover {
+            for (_, key, recency) in leftover {
                 queue.insert(key, recency);
             }
         }
-        all
+        keyed
+            .into_iter()
+            .map(|(_, key, recency)| (key, recency))
+            .collect()
     }
 
     /// Drain up to `batch_size` artifact IDs from the artifact embedding queue
@@ -2888,9 +3017,11 @@ impl InMemoryGraph {
             return Vec::new();
         }
 
-        // Stable total order via the artifact id. (Recency ordering is layered
-        // on in a later commit.)
-        all.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        // Deterministic total order: recency first (changed-this-sync before
+        // backfill), then the artifact id as the stable tiebreak. (Artifacts
+        // carry less semantic structure than entities, so recency + id is the
+        // honest priority signal available without extra lookups.)
+        all.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
         let take = batch_size.min(all.len());
         let leftover = all.split_off(take);
