@@ -93,6 +93,12 @@ pub struct HealthResponse {
     /// until restart. A true value drives `status: "attention"`.
     #[serde(default)]
     pub embed_worker_failed: bool,
+    /// Monotonic snapshot generation marker (`.kin/kindb/generation`), bumped
+    /// when the daemon commits a newer graph snapshot. A freshness token that
+    /// lets clients and the MCP envelope express `graph_as_of` and detect stale
+    /// reads. Additive; `0` before the first snapshot is committed.
+    #[serde(default)]
+    pub graph_generation: u64,
     pub build: BuildResponse,
 }
 
@@ -1225,6 +1231,7 @@ async fn health(
         initialized,
         mass_deletion_blocked,
         embed_worker_failed,
+        graph_generation: DaemonState::read_generation_marker(&state.layout),
         build: current_build_response(),
     }))
 }
@@ -6448,6 +6455,33 @@ mod tests {
         assert_eq!(json.build.sha, kin_buildinfo::get().sha);
         assert_eq!(json.build.dirty, kin_buildinfo::get().dirty);
         assert!(!json.build.built_at.is_empty());
+        // Additive freshness marker present; 0 before any snapshot is committed.
+        assert_eq!(json.graph_generation, 0);
+    }
+
+    #[tokio::test]
+    async fn health_surfaces_graph_generation_marker() {
+        // /health must read and surface the persisted snapshot generation marker
+        // (.kin/kindb/generation) so the MCP envelope can express graph_as_of.
+        let state = test_state();
+        let kindb = state.layout.root().join("kindb");
+        std::fs::create_dir_all(&kindb).unwrap();
+        std::fs::write(kindb.join("generation"), "7").unwrap();
+
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: HealthResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json.graph_generation, 7,
+            "/health must surface the persisted graph generation marker"
+        );
     }
 
     #[tokio::test]

@@ -9,6 +9,29 @@
 //! Phase 7 adds session coordination and intent arbitration via
 //! the `SessionCoordinator`.
 //!
+//! # Freshness & coverage signals
+//!
+//! Two honest signals let clients (and the MCP envelope) judge how fresh and
+//! how complete a retrieval answer is:
+//!
+//! - **`graph_generation`** on `GET /health`: the monotonic snapshot generation
+//!   marker (`.kin/kindb/generation`), bumped on each committed snapshot. This
+//!   is the *universal* freshness token — it applies to every retrieval payload
+//!   because the MCP envelope wraps each tool result and can lift it into
+//!   `graph_as_of`. (The kin-mcp `Envelope::with_health` lift that reads this
+//!   field lives in the kin-mcp lane.)
+//! - **`semantic_coverage`** on retrieval payloads: the fraction of the graph
+//!   that has embeddings indexed (`indexed / total`). It is only meaningful for
+//!   *embedding-backed* retrieval. In the daemon the sole embedding-backed
+//!   retrieval payload is `semantic_locate` (`build_semantic_locate_result`),
+//!   which already emits it. `semantic_search` is a name/metadata filter and
+//!   the structural tools (references, neighborhood, trace, impact, dead-code)
+//!   do not consult the vector index, so attaching `semantic_coverage` to them
+//!   would misrepresent — those payloads rely on `graph_generation`/`graph_as_of`
+//!   for freshness instead. Retrieval payloads whose constructors live in
+//!   kin-cli / kin-mcp are out of this crate; their coverage is owned by those
+//!   lanes.
+//!
 //! # Write veto (`KIN_WRITE_VETO`)
 //!
 //! Rung-3 of the write path. The agent-write apply path (`POST /vfs/write-notify`)
