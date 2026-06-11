@@ -834,10 +834,15 @@ impl GpuCompute for CudaCompute {
         n: usize,
         k: usize,
     ) -> Result<Vec<f32>, InferError> {
-        let func = self.get_function("matmul_transb").unwrap();
-        let mut buf_a = CudaBuffer::from_slice(a).unwrap();
-        let mut buf_b = CudaBuffer::from_slice(b).unwrap();
-        let mut buf_c = CudaBuffer::alloc(m * n * 4).unwrap();
+        let func = self.get_function("matmul_transb").ok_or_else(|| {
+            InferError::BackendError("CUDA kernel 'matmul_transb' unavailable".into())
+        })?;
+        let mut buf_a = CudaBuffer::from_slice(a)
+            .ok_or_else(|| InferError::BackendError("CUDA host->device copy failed".into()))?;
+        let mut buf_b = CudaBuffer::from_slice(b)
+            .ok_or_else(|| InferError::BackendError("CUDA host->device copy failed".into()))?;
+        let mut buf_c = CudaBuffer::alloc(m * n * 4)
+            .ok_or_else(|| InferError::OutOfMemory(format!("CUDA alloc of {} bytes", m * n * 4)))?;
         let mut m_val = m as u32;
         let mut n_val = n as u32;
         let mut k_val = k as u32;
@@ -909,8 +914,11 @@ impl GpuCompute for CudaCompute {
     }
 
     fn softmax(&self, data: &mut [f32], rows: usize, cols: usize) -> Result<(), InferError> {
-        let func = self.get_function("softmax_rows").unwrap();
-        let mut buf = CudaBuffer::from_slice(data).unwrap();
+        let func = self.get_function("softmax_rows").ok_or_else(|| {
+            InferError::BackendError("CUDA kernel 'softmax_rows' unavailable".into())
+        })?;
+        let mut buf = CudaBuffer::from_slice(data)
+            .ok_or_else(|| InferError::BackendError("CUDA host->device copy failed".into()))?;
         let mut cols_val = cols as u32;
 
         let mut params: Vec<*mut c_void> = vec![
@@ -932,10 +940,15 @@ impl GpuCompute for CudaCompute {
         cols: usize,
         eps: f32,
     ) -> Result<(), InferError> {
-        let func = self.get_function("layer_norm").unwrap();
-        let mut buf = CudaBuffer::from_slice(data).unwrap();
-        let mut buf_gamma = CudaBuffer::from_slice(gamma).unwrap();
-        let mut buf_beta = CudaBuffer::from_slice(beta).unwrap();
+        let func = self.get_function("layer_norm").ok_or_else(|| {
+            InferError::BackendError("CUDA kernel 'layer_norm' unavailable".into())
+        })?;
+        let mut buf = CudaBuffer::from_slice(data)
+            .ok_or_else(|| InferError::BackendError("CUDA host->device copy failed".into()))?;
+        let mut buf_gamma = CudaBuffer::from_slice(gamma)
+            .ok_or_else(|| InferError::BackendError("CUDA host->device copy failed".into()))?;
+        let mut buf_beta = CudaBuffer::from_slice(beta)
+            .ok_or_else(|| InferError::BackendError("CUDA host->device copy failed".into()))?;
         let mut cols_val = cols as u32;
         let mut eps_val = eps;
 
@@ -960,9 +973,13 @@ impl GpuCompute for CudaCompute {
         cols: usize,
         eps: f32,
     ) -> Result<(), InferError> {
-        let func = self.get_function("rms_norm").unwrap();
-        let mut buf = CudaBuffer::from_slice(data).unwrap();
-        let mut buf_weight = CudaBuffer::from_slice(weight).unwrap();
+        let func = self
+            .get_function("rms_norm")
+            .ok_or_else(|| InferError::BackendError("CUDA kernel 'rms_norm' unavailable".into()))?;
+        let mut buf = CudaBuffer::from_slice(data)
+            .ok_or_else(|| InferError::BackendError("CUDA host->device copy failed".into()))?;
+        let mut buf_weight = CudaBuffer::from_slice(weight)
+            .ok_or_else(|| InferError::BackendError("CUDA host->device copy failed".into()))?;
         let mut cols_val = cols as u32;
         let mut eps_val = eps;
 
@@ -979,8 +996,11 @@ impl GpuCompute for CudaCompute {
     }
 
     fn gelu(&self, data: &mut [f32]) -> Result<(), InferError> {
-        let func = self.get_function("gelu_activation").unwrap();
-        let mut buf = CudaBuffer::from_slice(data).unwrap();
+        let func = self.get_function("gelu_activation").ok_or_else(|| {
+            InferError::BackendError("CUDA kernel 'gelu_activation' unavailable".into())
+        })?;
+        let mut buf = CudaBuffer::from_slice(data)
+            .ok_or_else(|| InferError::BackendError("CUDA host->device copy failed".into()))?;
         let mut count = data.len() as u32;
 
         let mut params: Vec<*mut c_void> = vec![
@@ -994,8 +1014,11 @@ impl GpuCompute for CudaCompute {
     }
 
     fn silu(&self, data: &mut [f32]) -> Result<(), InferError> {
-        let func = self.get_function("silu_activation").unwrap();
-        let mut buf = CudaBuffer::from_slice(data).unwrap();
+        let func = self.get_function("silu_activation").ok_or_else(|| {
+            InferError::BackendError("CUDA kernel 'silu_activation' unavailable".into())
+        })?;
+        let mut buf = CudaBuffer::from_slice(data)
+            .ok_or_else(|| InferError::BackendError("CUDA host->device copy failed".into()))?;
         let mut count = data.len() as u32;
 
         let mut params: Vec<*mut c_void> = vec![
@@ -1009,9 +1032,13 @@ impl GpuCompute for CudaCompute {
     }
 
     fn elementwise_mul(&self, a: &mut [f32], b: &[f32]) -> Result<(), InferError> {
-        let func = self.get_function("elementwise_mul").unwrap();
-        let mut buf_a = CudaBuffer::from_slice(a).unwrap();
-        let mut buf_b = CudaBuffer::from_slice(b).unwrap();
+        let func = self.get_function("elementwise_mul").ok_or_else(|| {
+            InferError::BackendError("CUDA kernel 'elementwise_mul' unavailable".into())
+        })?;
+        let mut buf_a = CudaBuffer::from_slice(a)
+            .ok_or_else(|| InferError::BackendError("CUDA host->device copy failed".into()))?;
+        let mut buf_b = CudaBuffer::from_slice(b)
+            .ok_or_else(|| InferError::BackendError("CUDA host->device copy failed".into()))?;
         let mut count = a.len() as u32;
 
         let mut params: Vec<*mut c_void> = vec![
@@ -1035,10 +1062,15 @@ impl GpuCompute for CudaCompute {
         head_dim: usize,
         total_dim: usize,
     ) -> Result<(), InferError> {
-        let func = self.get_function("rope_apply").unwrap();
-        let mut buf = CudaBuffer::from_slice(data).unwrap();
-        let mut buf_cos = CudaBuffer::from_slice(cos_table).unwrap();
-        let mut buf_sin = CudaBuffer::from_slice(sin_table).unwrap();
+        let func = self.get_function("rope_apply").ok_or_else(|| {
+            InferError::BackendError("CUDA kernel 'rope_apply' unavailable".into())
+        })?;
+        let mut buf = CudaBuffer::from_slice(data)
+            .ok_or_else(|| InferError::BackendError("CUDA host->device copy failed".into()))?;
+        let mut buf_cos = CudaBuffer::from_slice(cos_table)
+            .ok_or_else(|| InferError::BackendError("CUDA host->device copy failed".into()))?;
+        let mut buf_sin = CudaBuffer::from_slice(sin_table)
+            .ok_or_else(|| InferError::BackendError("CUDA host->device copy failed".into()))?;
         let mut seq_offset_val = seq_offset as u32;
         let mut seq_len_val = seq_len as u32;
         let mut head_dim_val = head_dim as u32;
