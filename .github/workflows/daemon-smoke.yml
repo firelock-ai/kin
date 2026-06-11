@@ -16,20 +16,13 @@ jobs:
   daemon-smoke:
     name: Linux Daemon Smoke + MCP Headless
     runs-on: ubuntu-latest
-    # EXPERIMENTAL — non-blocking until a real green run is observed.
-    # This job was added 2026-06-10 and has never passed end-to-end on a runner.
-    # The build + tool wiring are verified (kin-daemon takes --repo/--port and
-    # serves an unauthenticated /readiness; `kin mcp start` honours
-    # KIN_DAEMON_URL; semantic_locate is a real tool), but readiness on a
-    # freshly-`kin init`-ed EMPTY workspace is unproven: /readiness returns 503
-    # until the graph is "initialized" (see kin-daemon api.rs
-    # readiness_returns_503_when_empty), so an empty repo may never go ready and
-    # the poll could time out. Kept honest as allow-failure rather than faked
-    # green or deleted.
-    # TODO(ci-green): once a real run is green, drop continue-on-error to make
-    # this a blocking gate. If empty-repo readiness never settles, seed a minimal
-    # indexed entity before the readiness poll (or assert against /health).
-    continue-on-error: true
+    # BLOCKING gate. The experimental allow-failure was dropped after a real
+    # end-to-end green run was observed on main (run 27318898667 / af14579:
+    # "kin-daemon ready on :4219" + "semantic_locate present"). To keep the gate
+    # deterministic rather than relying on empty-repo readiness behaviour, the
+    # smoke step now seeds a tiny source fixture before `kin init` so the first
+    # sync tick has content and /readiness legitimately flips out of 503
+    # (readiness gates on initialization, not embedding coverage).
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -75,6 +68,38 @@ jobs:
           KIN_DAEMON="$REPO_ROOT/target/debug/kin-daemon"
           PORT=4219
           WS="$(mktemp -d)"
+
+          echo "::group::Seed a tiny source fixture (deterministic readiness)"
+          # A few real source files so the daemon's first sync tick has content
+          # to index and /readiness flips out of 503 deterministically — instead
+          # of relying on empty-repo readiness behaviour. Graph + lexical
+          # indexing need no embeddings, so this is offline/CPU-safe.
+          mkdir -p "$WS/src"
+          cat > "$WS/src/lib.rs" <<'RS'
+          pub fn add(a: i64, b: i64) -> i64 {
+              a + b
+          }
+
+          pub struct Counter {
+              value: i64,
+          }
+
+          impl Counter {
+              pub fn new() -> Self {
+                  Counter { value: 0 }
+              }
+
+              pub fn increment(&mut self) {
+                  self.value += 1;
+              }
+          }
+          RS
+          cat > "$WS/src/util.rs" <<'RS'
+          pub fn greet(name: &str) -> String {
+              format!("hello, {name}")
+          }
+          RS
+          echo "::endgroup::"
 
           echo "::group::Initialize a Kin workspace"
           "$KIN" init "$WS"
