@@ -468,7 +468,7 @@ impl<Id: VectorId> HnswGraph<Id> {
         let mut result: BinaryHeap<(OrderedF32, u64, usize)> = BinaryHeap::new();
 
         candidates.push(Reverse((OrderedF32(entry_dist), entry_kh, entry)));
-        if predicate.map_or(true, |p| p(&self.idx_to_id[entry])) {
+        if predicate.is_none_or(|p| p(&self.idx_to_id[entry])) {
             result.push((OrderedF32(entry_dist), entry_kh, entry));
         }
 
@@ -508,7 +508,7 @@ impl<Id: VectorId> HnswGraph<Id> {
                 if nb_dist < worst_dist || result.len() < ef {
                     let nb_kh = key_hash(&self.idx_to_id[nb]);
                     candidates.push(Reverse((OrderedF32(nb_dist), nb_kh, nb)));
-                    if predicate.map_or(true, |p| p(&self.idx_to_id[nb])) {
+                    if predicate.is_none_or(|p| p(&self.idx_to_id[nb])) {
                         result.push((OrderedF32(nb_dist), nb_kh, nb));
                         if result.len() > ef {
                             result.pop();
@@ -863,6 +863,10 @@ fn acquire_write_lock(path: &Path, label: &str) -> Result<File, VectorError> {
     let lock_path = write_lock_path(path);
     let lock = OpenOptions::new()
         .create(true)
+        // Advisory lock file: never truncate (content is irrelevant to flock, and
+        // truncating would be a behavior change). Explicit to satisfy clippy's
+        // suspicious_open_options without altering the open semantics.
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)
