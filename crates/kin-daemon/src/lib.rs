@@ -34,18 +34,20 @@
 //! ## Write-path inventory
 //!
 //! Every state-mutating route and its current *pre-write* gate, as of this
-//! change. Only `vfs_write_notify` (flag-gated) and `graph_commit` (always-on)
-//! reject before mutating; the rest either rely on the reconciler's own
-//! soft-block, gate upstream, or are out of this crate's veto scope.
+//! change. The two VFS apply paths (`vfs_write_notify`, `vfs_file_changed`) are
+//! flag-gated by the write-veto and `graph_commit` is always-on; the rest
+//! either rely on the reconciler's own soft-block, gate upstream, or are out of
+//! this crate's veto scope.
 //!
 //! - `POST /vfs/write-notify` (`vfs_write_notify`): **write-veto** under
 //!   `KIN_WRITE_VETO=enforce` (pre-write 409); default = reconciler soft-block
 //!   (`200 {reindexed:false}`).
-//! - `POST /vfs/file-changed` (`vfs_file_changed`): reconciler soft-block only
-//!   (`200` on `CollisionBlocked`); **NOT veto-wired**. This is the *third*
-//!   graph-truth write path and shares the same post-write-notification gap;
-//!   it was left outside the confirmed `/vfs/write-notify` scope and reported
-//!   as a finding rather than fixed here.
+//! - `POST /vfs/file-changed` (`vfs_file_changed`): **write-veto** under
+//!   `KIN_WRITE_VETO=enforce` (pre-write 409); default = reconciler soft-block
+//!   (`200 {status:"error"}`). The general-purpose sibling of write-notify;
+//!   gated through the same shared `write_veto_precheck` /
+//!   `write_veto_collision_response` helpers so the two paths cannot drift and
+//!   enforce cannot be bypassed by choosing one endpoint over the other.
 //! - `POST /graph/commit` (`graph_commit`): always-on lease **409** on a
 //!   foreign hard intent (the CLI semantic-commit path).
 //! - `POST /commands/commit` (`command_commit`): commits the already-reconciled
