@@ -106,9 +106,19 @@ pub async fn enrich_file_definitions(
     // Scan each line for identifier positions.
     for (line_num, line_text) in file_content.lines().enumerate() {
         let line = line_num as u32;
-        for col in identifier_positions_in_line(line_text) {
-            positions_queried += 1;
+        let positions = identifier_positions_in_line(line_text);
+        positions_queried += positions.len();
 
+        // The relation source depends only on the line (never the column), and
+        // every relation emitted below requires it to be Some. Lines outside any
+        // known entity span can therefore never contribute a relation, so skip
+        // their per-identifier LSP round-trips. Output-identical: this removes
+        // only queries whose results were structurally guaranteed to be dropped.
+        let Some(source) = entity_index.find_at(&uri, line) else {
+            continue;
+        };
+
+        for col in positions {
             let def_result = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 server.client.request(
@@ -136,38 +146,37 @@ pub async fn enrich_file_definitions(
                 for location in &locations {
                     let target_line = location.range.start.line;
                     let target_uri = &location.uri;
-                    let source = entity_index.find_at(&uri, line);
-                    let target = entity_index.find_at(target_uri, target_line);
+                    let Some(dst) = entity_index.find_at(target_uri, target_line) else {
+                        continue;
+                    };
 
-                    if let (Some(src), Some(dst)) = (source, target) {
-                        if src.id == dst.id {
-                            continue;
-                        }
-
-                        definitions_resolved += 1;
-
-                        let kind_str = if target_uri.contains(&rel_path) {
-                            "same_file"
-                        } else {
-                            "cross_file"
-                        };
-
-                        if !seen.insert((src.id, dst.id, kind_str)) {
-                            continue;
-                        }
-
-                        relations.push(Relation {
-                            id: deterministic_relation_id(RelationKind::References, src.id, dst.id),
-                            kind: RelationKind::References,
-                            src: GraphNodeId::Entity(src.id),
-                            dst: GraphNodeId::Entity(dst.id),
-                            confidence: 0.95,
-                            origin: RelationOrigin::Lsp,
-                            created_in: None,
-                            import_source: None,
-                            evidence: Vec::new(),
-                        });
+                    if source.id == dst.id {
+                        continue;
                     }
+
+                    definitions_resolved += 1;
+
+                    let kind_str = if target_uri.contains(&rel_path) {
+                        "same_file"
+                    } else {
+                        "cross_file"
+                    };
+
+                    if !seen.insert((source.id, dst.id, kind_str)) {
+                        continue;
+                    }
+
+                    relations.push(Relation {
+                        id: deterministic_relation_id(RelationKind::References, source.id, dst.id),
+                        kind: RelationKind::References,
+                        src: GraphNodeId::Entity(source.id),
+                        dst: GraphNodeId::Entity(dst.id),
+                        confidence: 0.95,
+                        origin: RelationOrigin::Lsp,
+                        created_in: None,
+                        import_source: None,
+                        evidence: Vec::new(),
+                    });
                 }
             }
         }
@@ -194,6 +203,57 @@ pub async fn enrich_file_definitions(
 #[cfg(test)]
 mod tests {
     use super::identifier_positions_in_line;
+    use crate::enrichment::{EntityIndex, EntityRef};
+    use kin_model::EntityId;
+
+    /// The source-line gate in `enrich_file_definitions` skips a line's LSP
+    /// round-trips iff `entity_index.find_at(uri, line)` is None. This proves
+    /// the gate fires only on lines outside every entity span — exactly the
+    /// lines on which the source half of `(source, target)` is None and so no
+    /// relation could ever be emitted. That makes the skip output-identical.
+    #[test]
+    fn source_line_gate_skips_only_lines_outside_entity_spans() {
+        let uri = "file:///project/src/lib.rs";
+        let entities = vec![
+            EntityRef {
+                id: EntityId::new(),
+                name: "alpha".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: 0,
+                start_col: 0,
+                end_line: 5,
+                name_line: 0,
+                name_col: 3,
+            },
+            EntityRef {
+                id: EntityId::new(),
+                name: "beta".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                start_line: 20,
+                start_col: 0,
+                end_line: 25,
+                name_line: 20,
+                name_col: 3,
+            },
+        ];
+        let index = EntityIndex::new(entities);
+
+        // Inside an entity span → queried (find_at is Some).
+        for line in [0u32, 3, 5, 20, 25] {
+            assert!(
+                index.find_at(uri, line).is_some(),
+                "line {line} is inside an entity span and must be queried"
+            );
+        }
+        // Outside any span (imports, blank lines, inter-entity gap, tail) →
+        // gated out (find_at is None). These can never produce a relation.
+        for line in [6u32, 12, 19, 26, 9_999] {
+            assert!(
+                index.find_at(uri, line).is_none(),
+                "line {line} is outside every entity span and is safe to skip"
+            );
+        }
+    }
 
     #[test]
     fn identifier_positions_include_real_tokens_not_line_zero() {
