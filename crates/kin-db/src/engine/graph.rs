@@ -2393,10 +2393,16 @@ impl InMemoryGraph {
     #[cfg(all(feature = "embeddings", feature = "vector"))]
     pub fn build_embeddings(&self) -> Result<usize, KinDbError> {
         let _span = tracing::info_span!("kindb.build_embeddings").entered();
-        let all_ids: Vec<EntityId> = {
+        let mut all_ids: Vec<EntityId> = {
             let ent = self.entities.read();
             ent.entities.keys().copied().collect()
         };
+        // `entities.keys()` iterates in per-process HashMap order; embedding (and
+        // therefore inserting into the order-sensitive HNSW) in that order builds a
+        // different graph each run. Sort so a from-scratch build is byte-identical
+        // across processes. (The incremental daemon path drains via the globally
+        // sorted `EmbedSortKey`; this is the from-scratch/backfill convenience.)
+        all_ids.sort_unstable();
         self.embed_entities(&all_ids)
     }
 
@@ -2858,7 +2864,18 @@ impl InMemoryGraph {
 
         let mut propagated: usize = 0;
 
-        for revisions in ent.entity_revisions.values() {
+        // Iterate revision chains in a deterministic order. `entity_revisions` is
+        // a HashMap, so `.values()` visits chains in per-process order; because
+        // each propagated vector is upserted into the order-sensitive HNSW, that
+        // would make the built index (and the persisted `.kvec`) differ run to
+        // run. Sort by the owning entity id so insertion order is reproducible.
+        // Eligibility itself is order-independent — it depends only on fingerprints
+        // and the fully-built `rev_by_id` lookup, plus the per-chain `last_vectored`
+        // cursor — never on which chain ran first.
+        let mut chain_owner_ids: Vec<EntityId> = ent.entity_revisions.keys().copied().collect();
+        chain_owner_ids.sort_unstable();
+        for owner_id in &chain_owner_ids {
+            let revisions = &ent.entity_revisions[owner_id];
             // Walk the chronological revision list. Track the most recent
             // revision id that is known to have a vector (either because it was
             // already in the index, or because we just propagated one to it).
@@ -3495,11 +3512,18 @@ impl InMemoryGraph {
         };
 
         let truth = self.graph_truth_retrievable_keys();
-        let orphans: Vec<RetrievalKey> = vi
+        let mut orphans: Vec<RetrievalKey> = vi
             .retrievable_keys()
             .into_iter()
             .filter(|key| !truth.contains(key))
             .collect();
+        // `retrievable_keys()` returns keys in the index's per-process HashMap
+        // order. Evicting in that order makes the resulting `free_list` push order
+        // (and thus the slot a later re-embed reuses) vary across daemon boots,
+        // which perturbs approximate-kNN neighbors at the candidate-set boundary.
+        // Sort by the key's total order so eviction — and the index state it
+        // leaves behind — is identical regardless of the map seed.
+        orphans.sort_unstable();
 
         let mut evicted = 0usize;
         for key in &orphans {
