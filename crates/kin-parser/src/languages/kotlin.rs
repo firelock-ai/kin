@@ -331,8 +331,6 @@ fn extract_kotlin_node(
 
                 let kind = if class_ctx.is_none() && (is_const || is_val) {
                     EntityKind::Constant
-                } else if class_ctx.is_none() {
-                    EntityKind::StaticVar
                 } else {
                     EntityKind::StaticVar
                 };
@@ -761,16 +759,14 @@ fn extract_kotlin_import(node: &tree_sitter::Node, source: &[u8]) -> Option<File
 fn extract_kotlin_tests(node: &tree_sitter::Node, source: &[u8], tests: &mut Vec<ExtractedTest>) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() == "function_declaration" {
-            if has_test_annotation(&child, source) {
-                if let Some(name) = find_named_child_text(&child, "identifier", source) {
-                    if !name.is_empty() {
-                        tests.push(ExtractedTest {
-                            name,
-                            kind: ExtractedTestKind::Unit,
-                            runner: "junit".to_string(),
-                        });
-                    }
+        if child.kind() == "function_declaration" && has_test_annotation(&child, source) {
+            if let Some(name) = find_named_child_text(&child, "identifier", source) {
+                if !name.is_empty() {
+                    tests.push(ExtractedTest {
+                        name,
+                        kind: ExtractedTestKind::Unit,
+                        runner: "junit".to_string(),
+                    });
                 }
             }
         }
