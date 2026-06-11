@@ -15,4 +15,4 @@ kin-lsp = { git = "https://github.com/firelock-ai/kin-lsp.git", rev = "f4f2b5fee
 kin-model = { git = "https://github.com/firelock-ai/kin-model.git", rev = "99344c94e961efbfff40d5e5350d8e4943bc7913" }
 kin-search = { git = "https://github.com/firelock-ai/kin-search.git", rev = "cb0680b82f38c8477a0facd33b4cdefde3fa6dfc" }
 kin-vector = { git = "https://github.com/firelock-ai/kin-vector.git", rev = "dd743d741c6832e15179ac60720b5218558e10fb" }
-kin-vfs-core = { git = "https://github.com/firelock-ai/kin-vfs.git", rev = "79e1be5bc94a32baf7418c8c2424c6cc5c83e4fc" }
+kin-vfs-core = { git = "https://github.com/firelock-ai/kin-vfs.git", rev = "4e59b7d17d8df53be54c3845968518cc135f20e6" }
