@@ -786,7 +786,7 @@ pub async fn capture(
         );
     }
 
-    try_locate_via_daemon(
+    let result = try_locate_via_daemon(
         &layout,
         text,
         explain,
@@ -794,7 +794,78 @@ pub async fn capture(
         max_files_explicit,
         reference,
     )
-    .await
+    .await?;
+    record_locate_telemetry(&layout, text, max_files, &result);
+    Ok(result)
+}
+
+/// Spool an opt-in, local-first telemetry event for a completed locate query
+/// (5.11/R12). No-op unless the operator opted in (env `KIN_LOCATE_TELEMETRY` or
+/// a `.kin/telemetry/consent` marker), so default behavior is byte-identical.
+/// Best-effort: a spool error is logged at debug and never affects the result.
+/// Funnel/pruning + scoring-track are recorded when present (i.e. `--explain`).
+fn record_locate_telemetry(
+    layout: &kin_core::KinLayout,
+    query: &str,
+    max_files: usize,
+    result: &LocateResult,
+) {
+    use crate::commands::locate_telemetry as tel;
+
+    let env_value = std::env::var("KIN_LOCATE_TELEMETRY").ok();
+    let marker_present = tel::consent_marker_path(layout.root()).exists();
+    if !tel::telemetry_enabled(env_value.as_deref(), marker_present) {
+        return;
+    }
+
+    let ts_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut event = tel::LocateQueryEvent::new(ts_unix_ms, query, max_files);
+    event.scoring_track = result.debug.as_ref().and_then(|d| d.scoring_track.clone());
+    event.results = result
+        .files
+        .iter()
+        .enumerate()
+        .map(|(rank, f)| tel::TelemetryResult {
+            path: f.path.clone(),
+            rank,
+            score: f.score,
+            signals: f.signals.clone(),
+            top_entity: f.symbols.first().map(|s| s.name.clone()),
+        })
+        .collect();
+    if let Some(debug) = result.debug.as_ref() {
+        event.funnel = debug
+            .pruned_files
+            .iter()
+            .map(|p| tel::TelemetryFunnelEntry {
+                path: p.path.clone(),
+                score: p.score,
+                reason: p.reason.clone(),
+            })
+            .collect();
+    }
+
+    emit_telemetry_disclosure_once();
+    let dir = tel::telemetry_dir(layout.root());
+    if let Err(e) = tel::append_event(&dir, &event) {
+        tracing::debug!("locate telemetry spool failed (non-fatal): {e}");
+    }
+}
+
+/// One-time stderr disclosure the first time locate telemetry engages in this
+/// process. Stderr keeps the stdout result list clean for piping.
+fn emit_telemetry_disclosure_once() {
+    static DISCLOSED: std::sync::Once = std::sync::Once::new();
+    DISCLOSED.call_once(|| {
+        eprintln!(
+            "ℹ kin locate telemetry is ON (you opted in). Recording queries + results \
++ funnel traces to .kin/telemetry/ — local only, never uploaded. Disable: delete \
+.kin/telemetry/consent (or KIN_LOCATE_TELEMETRY=0). Purge: delete .kin/telemetry/."
+        );
+    });
 }
 
 async fn try_locate_via_daemon(
@@ -18877,5 +18948,70 @@ mod tests {
         let synth = coverage_banner(&partial_no_note).expect("degraded coverage emits a banner");
         assert!(synth.contains("4/10"), "synthesized banner cites indexed/total");
         assert!(synth.contains("6 pending"), "synthesized banner cites pending");
+    }
+
+    fn telemetry_test_result() -> LocateResult {
+        LocateResult {
+            files: vec![LocateFileEntry {
+                path: "src/x.rs".to_string(),
+                score: 1.5,
+                signals: vec!["entity_resolve".to_string(), "source_text".to_string()],
+                spans: vec![],
+                symbols: vec![],
+                explain: vec![],
+                provenance: None,
+                signal_scores: None,
+                score_breakdown: None,
+            }],
+            debug: None,
+            semantic_coverage: None,
+        }
+    }
+
+    #[test]
+    fn locate_telemetry_hook_spools_when_consent_marker_present() {
+        use crate::commands::locate_telemetry as tel;
+        let dir = tempfile::TempDir::new().unwrap();
+        let kin_root = dir.path().join(".kin");
+        let layout = kin_core::KinLayout::new(kin_root.clone());
+        // Opt in via the durable consent marker (no env mutation → parallel-safe).
+        std::fs::create_dir_all(tel::telemetry_dir(&kin_root)).unwrap();
+        std::fs::write(tel::consent_marker_path(&kin_root), b"").unwrap();
+
+        record_locate_telemetry(&layout, "where is the parser", 6, &telemetry_test_result());
+
+        let spool = tel::telemetry_dir(&kin_root);
+        let entries: Vec<_> = std::fs::read_dir(&spool)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+            .collect();
+        assert_eq!(entries.len(), 1, "consent on → exactly one spool file written");
+        let line = std::fs::read_to_string(&entries[0]).unwrap();
+        let event: tel::LocateQueryEvent = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(event.query, "where is the parser");
+        assert_eq!(event.max_files, 6);
+        assert_eq!(event.results.len(), 1);
+        assert_eq!(event.results[0].path, "src/x.rs");
+        assert_eq!(event.results[0].rank, 0);
+        assert_eq!(event.results[0].signals, vec!["entity_resolve", "source_text"]);
+    }
+
+    #[test]
+    fn locate_telemetry_hook_is_noop_without_consent() {
+        use crate::commands::locate_telemetry as tel;
+        // No marker + (no test sets KIN_LOCATE_TELEMETRY) → telemetry stays OFF.
+        let dir = tempfile::TempDir::new().unwrap();
+        let kin_root = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_root).unwrap();
+        let layout = kin_core::KinLayout::new(kin_root.clone());
+
+        record_locate_telemetry(&layout, "no consent given", 6, &telemetry_test_result());
+
+        assert!(
+            !tel::telemetry_dir(&kin_root).exists(),
+            "default-OFF: no consent → no telemetry dir, no spool"
+        );
     }
 }
