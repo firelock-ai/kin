@@ -1932,7 +1932,7 @@ impl BertModel {
             return self.forward(token_ids, attention_masks);
         }
 
-        // Length-bucketing (opt-in via KIN_INFER_BUCKET): split mixed-length
+        // Length-bucketing (opt-out via KIN_INFER_BUCKET=0): split mixed-length
         // inputs into coarse length bins so the projection/FFN GEMMs stop running
         // short sequences padded to the batch's global max_len. Bit-identical per
         // entity to the default path below; see `forward_batched_bucketed`.
@@ -1998,6 +1998,10 @@ impl BertModel {
     /// batch each entity rides in — and thus the amount of wasted padding —
     /// changes; the math for a real token row does not. Results are reassembled
     /// into the original input order before returning.
+    ///
+    /// Side-effect note: bucketing changes the order in which entities ride each
+    /// sub-batch call, which changes HNSW insert order downstream. This is
+    /// irrelevant to embedding values but tracked in FIR-823/FIR-825.
     fn forward_batched_bucketed(
         &self,
         token_ids: &[Vec<u32>],
@@ -4430,6 +4434,150 @@ mod tests {
                      (cosine={cos:.12}, max_abs={max_abs:.3e}) — batch-size-dependent kernel \
                      selection reintroduced last-bit drift"
                 );
+            }
+        }
+    }
+
+    /// Batch-composition parity gate for length-bucketed batching (FIR-902).
+    ///
+    /// Asserts that per-entity embeddings are bit-identical (Metal) or
+    /// cosine ≥ 1 − 1e-5 (all backends) regardless of how inputs are batched:
+    ///
+    ///   (a) `encode_batched` on the full mixed set + `pool_and_normalize`
+    ///       (the pre-fix defect path: every item pads to the global max_len)
+    ///   (b) `encode_batched` per coarse length bin + `pool_and_normalize`
+    ///       (the bucketed sub-batch path; mirrors `forward_batched_bucketed`)
+    ///   (c) `forward` one entity at a time (canonical per-op reference)
+    ///
+    /// Corpus mixes short entities (len 20, bin 64) with a long one (len 200,
+    /// bin 256): in path (a) all four pad to max_len = 200; in path (b) the
+    /// shorts pad only to 20. This is the docstring-heavy pattern that collapsed
+    /// sympy throughput to 8 ents/s and motivated the fix.
+    ///
+    /// Requires `/tmp/nomic` (model.safetensors + config.json); skips if absent.
+    #[test]
+    fn bucket_composition_parity() {
+        let dir = std::path::Path::new("/tmp/nomic");
+        if !dir.join("model.safetensors").exists() {
+            eprintln!(
+                "SKIP: nomic model absent at /tmp/nomic; bucket-composition parity test skipped."
+            );
+            return;
+        }
+        let cfg_json = std::fs::read_to_string(dir.join("config.json")).expect("read config.json");
+        let config: BertConfig = match serde_json::from_str(&cfg_json) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: /tmp/nomic config.json is not a parseable BertConfig ({e}).");
+                return;
+            }
+        };
+        let model = BertModel::load(&dir.join("model.safetensors"), config).expect("load model");
+        let vocab = model.config.vocab_size.max(2);
+        let is_metal = format!("{:?}", model.backend()) == "Metal";
+
+        let synth = |len: usize, salt: u32| -> (Vec<u32>, Vec<u32>) {
+            let ids: Vec<u32> = (0..len)
+                .map(|i| {
+                    1 + ((i as u32)
+                        .wrapping_mul(2654435761)
+                        .wrapping_add(salt.wrapping_mul(40503))
+                        % (vocab as u32 - 1))
+                })
+                .collect();
+            (ids, vec![1u32; len])
+        };
+
+        // 3 short (len 20, bin 64) + 1 long (len 200, bin 256).
+        let corpus: Vec<(Vec<u32>, Vec<u32>)> =
+            vec![synth(20, 1), synth(20, 2), synth(20, 3), synth(200, 4)];
+        let n = corpus.len();
+        let all_ids: Vec<Vec<u32>> = corpus.iter().map(|(ids, _)| ids.clone()).collect();
+        let all_masks: Vec<Vec<u32>> = corpus.iter().map(|(_, m)| m.clone()).collect();
+
+        // (c) Canonical reference: one entity at a time.
+        let single: Vec<Vec<f32>> = corpus
+            .iter()
+            .map(|(ids, mask)| {
+                model
+                    .forward(std::slice::from_ref(ids), std::slice::from_ref(mask))
+                    .expect("single forward")
+                    .remove(0)
+            })
+            .collect();
+
+        // (a) Full mixed batch via encode_batched (global max_len = 200; pre-fix path).
+        let (hidden_mixed, masks_mixed, max_len_mixed) = model
+            .encode_batched(&all_ids, &all_masks)
+            .expect("encode_batched mixed");
+        let mixed = model.pool_and_normalize(&hidden_mixed, &masks_mixed, max_len_mixed);
+
+        // (b) Per-bucket: group by length_bin, encode each bucket, reassemble.
+        let bin_of = |l: usize| -> usize {
+            const BINS: [usize; 5] = [64, 128, 256, 512, 1024];
+            for &b in &BINS {
+                if l <= b {
+                    return b;
+                }
+            }
+            2048
+        };
+        let mut groups: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (i, (ids, _)) in corpus.iter().enumerate() {
+            groups.entry(bin_of(ids.len())).or_default().push(i);
+        }
+        let mut per_bucket: Vec<Vec<f32>> = vec![Vec::new(); n];
+        for indices in groups.values() {
+            let g_ids: Vec<Vec<u32>> = indices.iter().map(|&i| corpus[i].0.clone()).collect();
+            let g_masks: Vec<Vec<u32>> = indices.iter().map(|&i| corpus[i].1.clone()).collect();
+            let (h, m, ml) = model
+                .encode_batched(&g_ids, &g_masks)
+                .expect("encode_batched per-bucket");
+            let pooled = model.pool_and_normalize(&h, &m, ml);
+            for (slot, &orig) in indices.iter().enumerate() {
+                per_bucket[orig] = pooled[slot].clone();
+            }
+        }
+
+        // Assert bit-identical (Metal) / cosine-identical (all) vs single-forward.
+        for i in 0..n {
+            let baseline = &single[i];
+            for (label, got) in [("mixed-padded", &mixed[i]), ("per-bucket", &per_bucket[i])] {
+                assert_eq!(
+                    baseline.len(),
+                    got.len(),
+                    "entity {i} ({label}): embedding dim mismatch"
+                );
+                let mut byte_identical = true;
+                let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+                let mut max_abs = 0.0f32;
+                for (&x, &y) in baseline.iter().zip(got.iter()) {
+                    if x.to_bits() != y.to_bits() {
+                        byte_identical = false;
+                    }
+                    dot += x as f64 * y as f64;
+                    na += (x as f64).powi(2);
+                    nb += (y as f64).powi(2);
+                    max_abs = max_abs.max((x - y).abs());
+                }
+                let cos = dot / (na.sqrt() * nb.sqrt()).max(1e-12);
+                eprintln!(
+                    "[bucket-parity] entity {i} ({label}): byte_identical={byte_identical} \
+                     cosine={cos:.12} max_abs={max_abs:.3e}"
+                );
+                assert!(
+                    cos >= 1.0 - 1e-5,
+                    "entity {i} ({label}): drifted from single-forward reference \
+                     (cosine={cos:.12}, max_abs={max_abs:.3e})"
+                );
+                if is_metal {
+                    assert!(
+                        byte_identical,
+                        "entity {i} ({label}): Metal result not byte-identical to single-forward \
+                         (cosine={cos:.12}, max_abs={max_abs:.3e})"
+                    );
+                }
             }
         }
     }
