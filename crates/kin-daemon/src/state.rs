@@ -1141,18 +1141,94 @@ impl DaemonState {
 
     /// Rebuild projection state from the current graph.
     ///
-    /// Hydrates persisted file layouts from graph truth, falling back to
-    /// span-based reconstruction only for older snapshots that do not yet
-    /// persist layouts. Called after graph init or commit.
+    /// Primary path: loads each persisted [`FileLayout`] and its blob-backed
+    /// base content from graph truth via [`ProjectionState::from_graph`].
+    ///
+    /// Fallback path: if a file layout exists in the graph but its file hash
+    /// has not yet been persisted (older snapshots from before FIR-929 started
+    /// writing hashes), `from_graph` returns
+    /// [`ProjectionError::BaseContentUnavailable`].  Rather than hard-failing
+    /// and leaving the daemon unable to serve VFS reads or accept projected
+    /// writes, the fallback iterates layouts individually: files whose hash IS
+    /// present are loaded from blobs (graph-backed); files whose hash is absent
+    /// are loaded from the working-directory copy on disk (migration-debt path).
+    /// Files that are neither in blobs nor on disk are skipped with a warning.
+    ///
+    /// Called after graph init, snapshot load, or a write-notify reconcile.
     pub async fn rebuild_projection(&self) -> Result<()> {
         let mut projection = self.projection.write().await;
-        *projection = ProjectionState::from_graph(self.graph.as_ref(), self.blobs.as_ref())
-            .map_err(DaemonError::from)?;
-        let registered = projection.file_ids().len();
 
+        // Fast path: all file hashes persisted — build directly from graph truth.
+        match ProjectionState::from_graph(self.graph.as_ref(), self.blobs.as_ref()) {
+            Ok(state) => {
+                let registered = state.file_ids().len();
+                *projection = state;
+                info!(
+                    files = registered,
+                    "rebuilt projection state from persisted graph truth"
+                );
+                return Ok(());
+            }
+            Err(kin_projection::ProjectionError::BaseContentUnavailable { .. }) => {
+                // Fall through to the per-file fallback below.
+            }
+            Err(e) => return Err(DaemonError::from(e)),
+        }
+
+        // Fallback path: some file hashes are absent (older snapshot).
+        // Build the projection file-by-file, reading from disk when blobs lack
+        // the content.  This is migration debt — once all snapshots are on the
+        // FIR-929 schema (hashes always persisted) this path becomes unreachable.
+        let layouts = self.graph.list_file_layouts().map_err(DaemonError::from)?;
+        let mut new_projection = ProjectionState::new();
+        let mut loaded = 0usize;
+        let mut disk_fallback = 0usize;
+        let mut skipped = 0usize;
+
+        for layout in layouts {
+            let file_id = layout.file_id.clone();
+
+            // Try to load content from blobs (graph-backed, preferred).
+            // InMemoryGraph::get_file_hash takes &str and returns Option<[u8; 32]>.
+            let blob_content = self
+                .graph
+                .get_file_hash(&file_id.0)
+                .and_then(|raw| self.blobs.read(&kin_blobs::Hash256::from_bytes(raw)).ok());
+
+            if let Some(content) = blob_content {
+                new_projection.register_file(layout, content);
+                loaded += 1;
+                continue;
+            }
+
+            // Blob not available: fall back to the on-disk working copy.
+            let file_path = self.layout.working_dir().join(file_id.0.as_str());
+            match std::fs::read(&file_path) {
+                Ok(content) => {
+                    new_projection.register_file(layout, content);
+                    disk_fallback += 1;
+                }
+                Err(e) => {
+                    // File is neither in blobs nor on disk (deleted, not yet
+                    // checked out, etc.) — skip it rather than hard-failing.
+                    warn!(
+                        file = %file_id,
+                        error = %e,
+                        "FIR-904·4: skipping projection rebuild for file not in blobs or disk \
+                         (migration-debt fallback)"
+                    );
+                    skipped += 1;
+                }
+            }
+        }
+
+        *projection = new_projection;
         info!(
-            files = registered,
-            "rebuilt projection state from persisted graph truth"
+            files = loaded + disk_fallback,
+            graph_backed = loaded,
+            disk_fallback = disk_fallback,
+            skipped = skipped,
+            "rebuilt projection state via per-file fallback (older snapshot without file hashes)"
         );
         Ok(())
     }
