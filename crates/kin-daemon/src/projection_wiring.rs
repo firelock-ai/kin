@@ -18,18 +18,28 @@
 //! is **not rolled back**. This keeps the graph-side commit atomic and lets the
 //! agent retry the projection or inspect the failure. See FIR-929 for rationale.
 //!
-//! # detect_conflict slot (FIR-904·3, NOT implemented here)
+//! # Conflict detection (FIR-904·3)
 //!
-//! Concurrent file edits are not detected in this changeset. The correct slot
-//! for that check is inside [`project_after_mcp_commit`], between building
-//! `temp_overlay` and calling `reconciler.project_overlay_to_files`. A
-//! `detect_conflict` call would compare each overlay entity against the current
-//! on-disk entity (via a fresh parse or projection snapshot) and return a
-//! structured conflict before the splice is attempted.
+//! Before each splice is attempted, the current on-disk file content is compared
+//! against the projection cache's last-reconciled snapshot at the entity's span.
+//! A byte-range mismatch indicates a concurrent human file edit.  Conflicted
+//! entities are **skipped** (not spliced); a structured [`kin_model::ConflictObject`]
+//! is returned for each one so the caller can surface an actionable message.
+//! Non-conflicted entities in the same overlay still project normally
+//! (skip-conflicted, not abort-all).
+//!
+//! # Reparse-equivalence invariant (FIR-904·5)
+//!
+//! After every successful splice, the projected bytes at the entity's span are
+//! compared with the pre-projection cached bytes.  A mismatch means the CST
+//! splice silently garbled the entity body — this is surfaced as a loud error,
+//! never silent.  NOTE: this check verifies that the splice preserved the byte
+//! representation, not that the file compiles; full compilation-at-runtime is
+//! out of scope and is not attempted here.
 
 use std::sync::Arc;
 
-use kin_model::{Entity, EntityId, FilePathId, GraphOverlay};
+use kin_model::{ConflictObject, Entity, EntityId, FilePathId, GraphOverlay};
 use kin_reconcile::ReconcileError;
 
 use crate::state::DaemonState;
@@ -85,12 +95,23 @@ impl std::fmt::Display for McpProjectionError {
 ///
 /// # Returns
 ///
-/// `Ok((modified_files, collision_warnings))` on success, or a
-/// [`McpProjectionError`] naming the first failing entity + file on error.
+/// `Ok((modified_files, collision_warnings, conflicts))` on success, where
+/// `conflicts` lists any entities that were skipped due to concurrent file edits
+/// (FIR-904·3 skip-conflicted semantics).  A non-empty `conflicts` vec means
+/// some entities were NOT projected; the caller should surface each conflict to
+/// the agent.  Returns [`McpProjectionError`] naming the first failing entity +
+/// file on a hard projection error.
 pub async fn project_after_mcp_commit(
     state: &Arc<DaemonState>,
     pre_commit_entities: &[Entity],
-) -> Result<(Vec<FilePathId>, Vec<kin_model::IntentSummary>), McpProjectionError> {
+) -> Result<
+    (
+        Vec<FilePathId>,
+        Vec<kin_model::IntentSummary>,
+        Vec<ConflictObject>,
+    ),
+    McpProjectionError,
+> {
     // Build a GraphOverlay with entity_mods for every entity that has a source
     // span (placement in a working-directory file). Span-less entities are new
     // graph-only nodes with no file home yet — skip them gracefully.
@@ -104,17 +125,8 @@ pub async fn project_after_mcp_commit(
     if temp_overlay.entity_mods.is_empty() {
         // Nothing to project — all mutations were span-less (new entities or
         // relation-only operations). Not an error.
-        return Ok((vec![], vec![]));
+        return Ok((vec![], vec![], vec![]));
     }
-
-    // FIR-904·3 (detect_conflict) slot: before acquiring the reconciler lock,
-    // this is the correct place to compare each entity in `temp_overlay.entity_mods`
-    // against the current on-disk content to detect concurrent file edits.
-    // Leave a precise breadcrumb: iterate `temp_overlay.entity_mods`, for each
-    // entity read the current file bytes (from `state.projection` cache or disk),
-    // parse the entity at its span, and compare fingerprints. A mismatch signals a
-    // concurrent human edit — surface as a conflict rather than proceeding with
-    // the stale splice. This check is intentionally absent here (FIR-929 scope).
 
     // Acquire the reconciler write lock — same locking discipline as loop_runner
     // and vfs_write_notify: hold the lock for the full duration of the projection
@@ -122,9 +134,193 @@ pub async fn project_after_mcp_commit(
     // the projection cache entries we are about to use.
     let mut reconciler = state.reconciler.write().await;
 
-    reconciler
-        .project_overlay_to_files(&temp_overlay)
-        .map_err(|e| reconcile_err_to_projection_err(e, pre_commit_entities))
+    // -----------------------------------------------------------------------
+    // FIR-904·3: Conflict detection — skip-conflicted semantics.
+    //
+    // For each entity in the overlay, compare the current on-disk file bytes at
+    // the entity's span against the projection cache's last-reconciled content.
+    // A byte-range mismatch means a concurrent human file edit occurred between
+    // the last reconcile and now.  Conflicted entities are removed from the
+    // overlay and returned as structured ConflictObjects; non-conflicted entities
+    // still project normally (abort-all would block all projections when only
+    // one entity is touched by a human editor, which is the common partial-edit
+    // case the concurrent-dogfood workflow exercises).
+    // -----------------------------------------------------------------------
+    let mut conflicts: Vec<ConflictObject> = Vec::new();
+    let mut clean_overlay = GraphOverlay::default();
+
+    for (entity_id, entity) in &temp_overlay.entity_mods {
+        let Some(span) = &entity.span else {
+            // Span-less entity: cannot have a concurrent file conflict, project it.
+            clean_overlay.entity_mods.insert(*entity_id, entity.clone());
+            continue;
+        };
+
+        // Get the last-reconciled content for this file from the projection cache.
+        let cached_opt = reconciler
+            .projection()
+            .get_content(&span.file)
+            .map(|b| b.to_vec());
+
+        let Some(cached) = cached_opt else {
+            // No cached content for this file: cannot compare, project it and let
+            // the engine's own pre-write check (engine.rs line ~209) handle any
+            // concurrent edit at the commit layer.
+            clean_overlay.entity_mods.insert(*entity_id, entity.clone());
+            continue;
+        };
+
+        // Read the current on-disk file to detect a concurrent human edit.
+        let disk_bytes = {
+            let file_path = state.layout.working_dir().join(span.file.0.as_str());
+            std::fs::read(&file_path).unwrap_or_default()
+        };
+
+        // Extract bytes at the entity's span from both the cache and disk.
+        let span_start = span.start_byte;
+        let cache_span_end = span.end_byte.min(cached.len());
+        let disk_span_end = span.end_byte.min(disk_bytes.len());
+
+        let cached_at_span: &[u8] = if span_start < cache_span_end {
+            &cached[span_start..cache_span_end]
+        } else {
+            &[]
+        };
+        let disk_at_span: &[u8] = if span_start < disk_span_end {
+            &disk_bytes[span_start..disk_span_end]
+        } else {
+            &[]
+        };
+
+        if cached_at_span != disk_at_span {
+            // Concurrent human edit detected: disk has different bytes at this
+            // entity's span than the projection cache's last-reconciled snapshot.
+            // Build a stub entity representing the disk state for detect_conflict.
+            let disk_ast_hash =
+                kin_blobs::Hash256::from_bytes(kin_blobs::digest_bytes(disk_at_span));
+            let mut disk_entity_stub = entity.clone();
+            disk_entity_stub.fingerprint.ast_hash = disk_ast_hash;
+
+            if let Some(conflict) = reconciler.detect_conflict(entity_id, entity, &disk_entity_stub)
+            {
+                tracing::warn!(
+                    entity_id = %entity_id,
+                    file = %span.file,
+                    "FIR-904·3: concurrent file edit at entity span — skipping projection, \
+                     conflict surfaced to caller"
+                );
+                conflicts.push(conflict);
+                continue; // skip this entity: do NOT splice over the human's edit
+            }
+        }
+
+        clean_overlay.entity_mods.insert(*entity_id, entity.clone());
+    }
+
+    // If every entity had a conflict, nothing to project.
+    if clean_overlay.entity_mods.is_empty() {
+        return Ok((vec![], vec![], conflicts));
+    }
+
+    // -----------------------------------------------------------------------
+    // Project the non-conflicted entities.
+    // -----------------------------------------------------------------------
+    // Snapshot the pre-projection cached content for the reparse-equivalence
+    // check below.  We only need it for files that will actually be modified,
+    // but collecting it here (before the mutable borrow of reconciler for the
+    // projection call) is the cleanest approach under Rust's borrow rules.
+    let pre_projection_content: std::collections::HashMap<FilePathId, Vec<u8>> = clean_overlay
+        .entity_mods
+        .values()
+        .filter_map(|e| e.span.as_ref())
+        .map(|span| {
+            let content = reconciler
+                .projection()
+                .get_content(&span.file)
+                .map(|b| b.to_vec())
+                .unwrap_or_default();
+            (span.file.clone(), content)
+        })
+        .collect();
+
+    let (modified_files, collision_warnings) = reconciler
+        .project_overlay_to_files(&clean_overlay)
+        .map_err(|e| reconcile_err_to_projection_err(e, pre_commit_entities))?;
+
+    // -----------------------------------------------------------------------
+    // FIR-904·5: Reparse-equivalence invariant.
+    //
+    // For each entity that was projected, verify that the projected file content
+    // at the entity's span is byte-identical to the pre-projection cached content.
+    // A mismatch indicates the CST splice silently garbled the entity body — this
+    // is surfaced as a loud structured error, never silent.
+    //
+    // NOTE: this verifies byte-level splice preservation, NOT that the file
+    // compiles.  Full compilation-at-runtime is out of scope; the check is named
+    // "reparse-equivalence" because it guards the engine contract that a subsequent
+    // reconcile must NOT see the projected entity as changed (no-clobber invariant).
+    // -----------------------------------------------------------------------
+    for entity in clean_overlay.entity_mods.values() {
+        let Some(span) = &entity.span else {
+            continue;
+        };
+
+        // Only check files that were actually modified.
+        if !modified_files.contains(&span.file) {
+            continue;
+        }
+
+        let post_content = reconciler.projection().get_content(&span.file);
+        let Some(post) = post_content else {
+            // Projection cache was not updated for this file (e.g. the engine
+            // skipped it due to its own concurrent-edit check).  Not a
+            // reparse-equivalence violation on our part.
+            continue;
+        };
+
+        let pre = pre_projection_content.get(&span.file).map(|v| v.as_slice());
+        let Some(pre) = pre else {
+            continue;
+        };
+
+        // Extract the entity bytes at the span from both snapshots.
+        let span_start = span.start_byte;
+        let pre_end = span.end_byte.min(pre.len());
+        let post_end = span.end_byte.min(post.len());
+
+        let pre_at_span: &[u8] = if span_start < pre_end {
+            &pre[span_start..pre_end]
+        } else {
+            &[]
+        };
+        let post_at_span: &[u8] = if span_start < post_end {
+            &post[span_start..post_end]
+        } else {
+            &[]
+        };
+
+        if pre_at_span != post_at_span {
+            // The splice altered the entity's bytes — this violates the
+            // no-clobber contract and means the next reconcile will see the
+            // entity as changed and may clobber the graph mutation.
+            return Err(McpProjectionError {
+                file: entity.file_origin.clone(),
+                entity_id: entity.id,
+                reason: format!(
+                    "reparse-equivalence violation: splice altered entity bytes at {}..{} \
+                     in {} (FIR-904·5); {pre_len} pre-projection bytes → {post_len} \
+                     post-projection bytes",
+                    span.start_byte,
+                    span.end_byte,
+                    span.file,
+                    pre_len = pre_at_span.len(),
+                    post_len = post_at_span.len(),
+                ),
+            });
+        }
+    }
+
+    Ok((modified_files, collision_warnings, conflicts))
 }
 
 /// Convert a [`ReconcileError`] from `project_overlay_to_files` into a
@@ -298,7 +494,7 @@ mod tests {
 
         // Step 3: Call project_after_mcp_commit (the production hook).
         drop(reconciler); // release lock before calling the async helper
-        let (modified_files, warnings) =
+        let (modified_files, warnings, conflicts) =
             project_after_mcp_commit(&state, &[pre_commit_entity.clone()])
                 .await
                 .expect("projection must succeed");
@@ -313,6 +509,11 @@ mod tests {
             warnings.is_empty(),
             "no collision warnings expected; got {}",
             warnings.len()
+        );
+        assert!(
+            conflicts.is_empty(),
+            "no conflicts expected (no concurrent edit); got {}",
+            conflicts.len()
         );
 
         // Step 4 (assertion a): file exists with content — surrounding formatting
@@ -368,7 +569,7 @@ mod tests {
             superseded_by: None,
         };
 
-        let (modified_files, warnings) = project_after_mcp_commit(&state, &[span_less])
+        let (modified_files, warnings, conflicts) = project_after_mcp_commit(&state, &[span_less])
             .await
             .expect("span-less entity must not cause an error");
 
@@ -377,6 +578,7 @@ mod tests {
             "no files should be modified for a span-less entity"
         );
         assert!(warnings.is_empty(), "no warnings expected");
+        assert!(conflicts.is_empty(), "no conflicts expected");
     }
 
     // ------------------------------------------------------------------
@@ -449,5 +651,177 @@ mod tests {
             }
             Ok(_) => panic!("expected a structured error for an entity with a stale/missing span"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Test 4 (FIR-904·3): concurrent file edit → conflict surfaced, not spliced.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn concurrent_file_edit_surfaces_conflict_and_skips_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = make_test_state(dir.path());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let rel = "src/lib.rs";
+        let file_path = dir.path().join(rel);
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        let original = b"pub fn foo() -> i32 { 1 }\npub fn bar() -> i32 { 2 }\n";
+        std::fs::write(&file_path, original).unwrap();
+
+        let blob_store = BlobStore::new(state.layout.objects_dir()).expect("blob store must open");
+
+        // Step 1: Reconcile to prime the projection cache.
+        let mut reconciler = state.reconciler.write().await;
+        let mut overlay = GraphOverlay::default();
+        reconciler
+            .reconcile_file_change(
+                &FileEvent::Changed(file_path.clone()),
+                &blob_store,
+                state.graph.as_ref(),
+                &mut overlay,
+            )
+            .expect("reconcile must succeed");
+
+        let pre_commit_entity = overlay
+            .entity_adds
+            .values()
+            .find(|e| e.name == "foo")
+            .cloned()
+            .expect("foo must be present");
+
+        apply_overlay_to_graph(state.graph.as_ref(), &mut overlay).expect("apply must succeed");
+        drop(reconciler);
+
+        // Step 2: Simulate a concurrent human edit that modifies the file AFTER
+        // reconcile but BEFORE the MCP commit's projection.
+        let edited = b"pub fn foo() -> i32 { 999 }\npub fn bar() -> i32 { 2 }\n";
+        std::fs::write(&file_path, edited).unwrap();
+
+        // Step 3: Call project_after_mcp_commit — should detect the concurrent
+        // edit and surface a conflict instead of splicing over it.
+        let (modified_files, _warnings, conflicts) =
+            project_after_mcp_commit(&state, &[pre_commit_entity])
+                .await
+                .expect("conflict detection must not hard-fail");
+
+        // The conflicted entity must NOT have been projected.
+        assert!(
+            modified_files.is_empty(),
+            "conflicted entity must not be projected; got {} modified files",
+            modified_files.len()
+        );
+
+        // A conflict must be surfaced to the caller.
+        assert!(
+            !conflicts.is_empty(),
+            "concurrent edit must surface a ConflictObject to the caller"
+        );
+        assert_eq!(
+            conflicts[0].kind,
+            kin_model::ConflictKind::StructuralCollision,
+            "conflict kind must be StructuralCollision"
+        );
+
+        // The human's edits must be preserved on disk (not overwritten).
+        let on_disk = std::fs::read(&file_path).expect("file must still exist");
+        assert_eq!(
+            on_disk, edited,
+            "human's concurrent edits must be preserved (not spliced over)"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test 5 (FIR-904·4): persist + reopen projection state cleanly.
+    // ------------------------------------------------------------------
+    // Verifies that rebuild_projection succeeds on a fresh DaemonState
+    // without any persisted file layouts (the empty-graph case).
+    #[tokio::test]
+    async fn rebuild_projection_succeeds_on_empty_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = make_test_state(dir.path());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Should complete without error even when no file layouts are persisted.
+        state
+            .rebuild_projection()
+            .await
+            .expect("rebuild_projection must succeed on empty graph");
+
+        let proj = state.projection.read().await;
+        assert!(
+            proj.file_ids().is_empty(),
+            "empty graph → empty projection state"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Test 6 (FIR-904·4): restart rebuild from persisted graph + blobs.
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn rebuild_projection_restores_from_persisted_graph_truth() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = make_test_state(dir.path());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let rel = "src/lib.rs";
+        let file_path = dir.path().join(rel);
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        let content = b"pub fn foo() -> i32 { 1 }\n";
+        std::fs::write(&file_path, content).unwrap();
+
+        let blob_store = BlobStore::new(state.layout.objects_dir()).expect("blob store must open");
+
+        // Reconcile to populate the reconciler's projection and the graph.
+        let mut reconciler = state.reconciler.write().await;
+        let mut overlay = GraphOverlay::default();
+        reconciler
+            .reconcile_file_change(
+                &FileEvent::Changed(file_path.clone()),
+                &blob_store,
+                state.graph.as_ref(),
+                &mut overlay,
+            )
+            .expect("reconcile must succeed");
+        apply_overlay_to_graph(state.graph.as_ref(), &mut overlay).unwrap();
+
+        // Persist projection truth (layout + hash) to the graph so
+        // rebuild_projection can restore it.
+        let file_id = kin_model::FilePathId::new(rel);
+        state
+            .persist_projection_truth_from_reconcile(
+                &reconciler,
+                &kin_reconcile::ReconcileOutcome::Updated {
+                    file_id: file_id.clone(),
+                    added: vec![],
+                    modified: vec![],
+                    removed: vec![],
+                    collision_warnings: vec![],
+                },
+            )
+            .expect("persist_projection_truth must succeed");
+        drop(reconciler);
+
+        // Rebuild projection from persisted graph truth.
+        state
+            .rebuild_projection()
+            .await
+            .expect("rebuild_projection must succeed from persisted truth");
+
+        let proj = state.projection.read().await;
+        assert!(
+            proj.file_ids().iter().any(|id| **id == file_id),
+            "rebuilt projection must contain the persisted file"
+        );
+        assert!(
+            proj.get_content(&file_id).is_some(),
+            "rebuilt projection must have content for the persisted file"
+        );
     }
 }

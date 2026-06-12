@@ -4063,25 +4063,57 @@ async fn mcp_tools_call(
         });
     }
 
-    // FIR-929: project entity mutations into working-directory files so the
-    // next reconcile does not silently clobber the graph (file-wins LWW).
+    // FIR-929/FIR-904·3: project entity mutations into working-directory files
+    // so the next reconcile does not silently clobber the graph (file-wins LWW).
     //
     // The graph commit has already landed and the version counter already
     // reflects it above.  A projection failure does NOT roll back the graph —
     // the agent's intent is preserved and the caller is told loudly so it can
     // retry or inspect the source file.
+    //
+    // Conflicts (FIR-904·3 skip-conflicted semantics): entities where a
+    // concurrent human file edit was detected are NOT projected; a structured
+    // conflict description is appended to the result so the agent can resolve.
     if request.name == "kin_transaction_commit"
         && result.is_error != Some(true)
         && !pre_commit_entities.is_empty()
     {
-        if let Err(proj_err) =
-            crate::projection_wiring::project_after_mcp_commit(&state, &pre_commit_entities).await
+        match crate::projection_wiring::project_after_mcp_commit(&state, &pre_commit_entities).await
         {
-            return Ok(Json(kin_mcp::ToolCallResult::error(format!(
-                "graph commit succeeded but file projection failed — agent intent is preserved \
-                 in the graph; retry projection or inspect the source file. \
-                 Detail: {proj_err}"
-            ))));
+            Err(proj_err) => {
+                return Ok(Json(kin_mcp::ToolCallResult::error(format!(
+                    "graph commit succeeded but file projection failed — agent intent is \
+                     preserved in the graph; retry projection or inspect the source file. \
+                     Detail: {proj_err}"
+                ))));
+            }
+            Ok((_modified, _warnings, conflicts)) if !conflicts.is_empty() => {
+                // Some entities were skipped due to concurrent file edits.
+                // Surface each conflict loudly so the agent can resolve.
+                let conflict_msgs: Vec<String> = conflicts
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "conflict on {}: {}",
+                            c.affected_files
+                                .first()
+                                .map(|f| f.to_string())
+                                .unwrap_or_else(|| "<unknown file>".into()),
+                            c.divergence_reason
+                        )
+                    })
+                    .collect();
+                return Ok(Json(kin_mcp::ToolCallResult::error(format!(
+                    "graph commit succeeded but {n} entity/entities had concurrent file \
+                     edits — those entities were NOT projected (human edits preserved). \
+                     Resolve conflicts and retry. Details: {details}",
+                    n = conflicts.len(),
+                    details = conflict_msgs.join("; "),
+                ))));
+            }
+            Ok(_) => {
+                // All entities projected successfully (or none had spans).
+            }
         }
     }
 
