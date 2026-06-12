@@ -22,12 +22,39 @@ use crate::types::ToolCallResult;
 /// daemon that comes online after MCP startup can still take authority.
 static DAEMON_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
+/// Runtime override for the daemon base URL.
+///
+/// Set by the revival path when it restarts the daemon on a (potentially
+/// different) port.  Takes precedence over `KIN_DAEMON_URL` so subsequent
+/// tool calls are routed at the revived daemon immediately, without requiring
+/// a process restart.
+static DAEMON_URL_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 /// Base URL for the daemon HTTP API.
+///
+/// Checks the revival-path override first; falls back to the `KIN_DAEMON_URL`
+/// environment variable that `kin mcp start` sets at process startup.
 fn daemon_base_url() -> Option<String> {
+    if let Ok(guard) = DAEMON_URL_OVERRIDE.lock() {
+        if let Some(url) = guard.as_ref() {
+            return Some(url.clone());
+        }
+    }
     std::env::var("KIN_DAEMON_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
 }
+
+// ── MCP-path idle timeout ───────────────────────────────────────────────
+
+/// Idle timeout injected into daemons started by the MCP revival path.
+///
+/// Interactive MCP agent loops routinely pause longer than a minute between
+/// tool calls.  The CLI default of 60 s is far too short for these sessions;
+/// 30 minutes gives ample headroom while still ensuring eventual cleanup when
+/// an agent session is truly abandoned.  An explicit
+/// `KIN_DAEMON_IDLE_TIMEOUT_SECS` env var always overrides this at runtime.
+const MCP_IDLE_TIMEOUT_SECS: &str = "1800";
 
 /// Bearer token the daemon expects on non-public routes.
 ///
@@ -207,38 +234,278 @@ fn scope_strings(args: &HashMap<String, serde_json::Value>) -> Result<Vec<String
     scopes.iter().map(scope_to_string).collect()
 }
 
+// ── Daemon revival seam ─────────────────────────────────────────────────
+
+/// Error returned by [`DaemonCallSeam::call_tool`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DaemonCallError {
+    /// Transport-level failure (connection refused, timeout, TCP reset) —
+    /// the daemon may have exited.  The revival path will attempt exactly one
+    /// restart before surfacing an error.
+    ConnectionLost(String),
+    /// HTTP-level or protocol failure — the daemon responded but signalled an
+    /// error.  Revival is not attempted; the error is surfaced immediately.
+    DaemonError(String),
+}
+
+/// Abstraction over daemon communication and revival used by
+/// [`forward_mcp_with_seam`].
+///
+/// The production implementation ([`RealDaemonSeam`]) makes real HTTP requests
+/// and can spawn a new daemon process via `std::process::Command`.  Tests
+/// inject a controlled stub to exercise the revival state machine without
+/// touching the network or spawning any processes.
+pub(crate) trait DaemonCallSeam: Sync {
+    /// Attempt a single MCP tool call against the daemon at `base`.
+    ///
+    /// Returns:
+    /// - `Ok(Some(result))` on success.
+    /// - `Ok(None)` when the daemon URL is not configured (graceful no-op).
+    /// - `Err(ConnectionLost(_))` for transport failures — warrants revival.
+    /// - `Err(DaemonError(_))` for HTTP/protocol failures — no revival.
+    async fn call_tool(
+        &self,
+        base: &str,
+        name: &str,
+        args: &HashMap<String, serde_json::Value>,
+    ) -> Result<Option<ToolCallResult>, DaemonCallError>;
+
+    /// Attempt to revive a dead daemon and return its new base URL.
+    async fn revive(&self) -> Result<String, String>;
+}
+
+/// Production implementation of [`DaemonCallSeam`].
+pub(crate) struct RealDaemonSeam;
+
+impl DaemonCallSeam for RealDaemonSeam {
+    async fn call_tool(
+        &self,
+        base: &str,
+        name: &str,
+        args: &HashMap<String, serde_json::Value>,
+    ) -> Result<Option<ToolCallResult>, DaemonCallError> {
+        let Some(client) = daemon_client().await else {
+            return Ok(None);
+        };
+        let request = client
+            .post(format!("{}/mcp/tools/call", base))
+            .json(&serde_json::json!({ "name": name, "arguments": args }));
+        let request = with_session_header(with_auth(request), args);
+        let resp = request.send().await.map_err(|e| {
+            if e.is_connect() || e.is_timeout() {
+                DaemonCallError::ConnectionLost(e.to_string())
+            } else {
+                DaemonCallError::DaemonError(format!("daemon MCP tool call failed: {e}"))
+            }
+        })?;
+        if !resp.status().is_success() {
+            return Err(DaemonCallError::DaemonError(format!(
+                "daemon MCP tool call failed: HTTP {}",
+                resp.status()
+            )));
+        }
+        let result = resp.json::<ToolCallResult>().await.map_err(|e| {
+            DaemonCallError::DaemonError(format!("daemon MCP tool call response parse failed: {e}"))
+        })?;
+        Ok(Some(result))
+    }
+
+    async fn revive(&self) -> Result<String, String> {
+        revive_mcp_daemon().await
+    }
+}
+
+// ── Revival helpers ─────────────────────────────────────────────────────
+
+/// Locate the `kin-daemon` binary for the revival path.
+///
+/// Resolution order mirrors `lifecycle.rs::find_daemon_binary` so the MCP
+/// revival path finds the same binary without a `kin-daemon` crate dep
+/// (which would be circular: `kin-daemon` already depends on `kin-mcp`).
+fn find_mcp_daemon_binary() -> Option<std::path::PathBuf> {
+    if let Ok(explicit) = std::env::var("KIN_DAEMON_BIN") {
+        let path = std::path::PathBuf::from(explicit);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let sibling = exe.with_file_name("kin-daemon");
+        if sibling.exists() {
+            return Some(sibling);
+        }
+        // Dev/test layout: .../target/<profile>/deps/ → .../target/<profile>/
+        if exe
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|name| name == "deps")
+        {
+            if let Some(target_dir) = exe.parent().and_then(|p| p.parent()) {
+                let sibling = target_dir.join("kin-daemon");
+                if sibling.exists() {
+                    return Some(sibling);
+                }
+            }
+        }
+    }
+    // Walk PATH manually (avoids `which` crate dep).
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join("kin-daemon");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn find_mcp_free_port() -> Option<u16> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port())
+}
+
+/// Spawn a fresh daemon and wait for it to pass `/health`.
+///
+/// Uses the MCP-path idle timeout (30 min) unless the user has set
+/// `KIN_DAEMON_IDLE_TIMEOUT_SECS` explicitly.  On success, writes the new
+/// base URL into [`DAEMON_URL_OVERRIDE`] so all subsequent delegate calls
+/// are routed to the revived daemon automatically.
+async fn revive_mcp_daemon() -> Result<String, String> {
+    let kin_dir =
+        discover_kin_dir().ok_or_else(|| "MCP revival: cannot find .kin directory".to_string())?;
+    let working_dir = kin_dir
+        .parent()
+        .ok_or_else(|| "MCP revival: invalid .kin layout (no parent directory)".to_string())?
+        .to_path_buf();
+    let daemon_bin = find_mcp_daemon_binary().ok_or_else(|| {
+        "MCP revival: kin-daemon binary not found (not in PATH or next to kin binary)".to_string()
+    })?;
+    let port = find_mcp_free_port().unwrap_or(4219);
+
+    tracing::info!(
+        binary = %daemon_bin.display(),
+        repo = %working_dir.display(),
+        port,
+        "MCP revival: starting fresh daemon"
+    );
+
+    let mut cmd = std::process::Command::new(&daemon_bin);
+    cmd.args([
+        "--repo",
+        &working_dir.display().to_string(),
+        "--port",
+        &port.to_string(),
+    ]);
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    // Inject the MCP-path idle timeout unless the user has an explicit
+    // override in the environment — user's value always wins.
+    if std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_none() {
+        cmd.env("KIN_DAEMON_IDLE_TIMEOUT_SECS", MCP_IDLE_TIMEOUT_SECS);
+    }
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+
+    cmd.spawn()
+        .map_err(|e| format!("MCP revival: spawn kin-daemon failed: {e}"))?;
+
+    // Poll /health until the daemon is ready (bounded at 15 s).
+    let new_base = format!("http://127.0.0.1:{port}");
+    let probe = reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(300))
+        .timeout(Duration::from_secs(3))
+        .build()
+        .map_err(|e| format!("MCP revival: build probe client: {e}"))?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "MCP revival: daemon did not become healthy within 15s (port {port})"
+            ));
+        }
+        if let Ok(resp) = probe.get(format!("{new_base}/health")).send().await {
+            if resp.status().is_success() {
+                // Route all subsequent delegate calls at the revived daemon.
+                if let Ok(mut guard) = DAEMON_URL_OVERRIDE.lock() {
+                    *guard = Some(new_base.clone());
+                }
+                tracing::info!(url = %new_base, "MCP revival: daemon is healthy");
+                return Ok(new_base);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+// ── Seam-based MCP tool dispatch ────────────────────────────────────────
+
+/// Core MCP-tool-call dispatch with one-shot daemon revival.
+///
+/// On a connection-class failure ([`DaemonCallError::ConnectionLost`]) the
+/// seam's `revive` method is called **exactly once**.  If revival succeeds the
+/// original request is retried against the new URL.  Non-connection failures
+/// bypass revival entirely.
+///
+/// Invariants:
+/// - `revive` is called at most once per invocation.
+/// - `call_tool` is called at most twice (first attempt + one retry).
+/// - Non-connection errors are never silently discarded.
+async fn forward_mcp_with_seam(
+    name: &str,
+    args: &HashMap<String, serde_json::Value>,
+    seam: &impl DaemonCallSeam,
+    daemon_url: &str,
+) -> Result<Option<ToolCallResult>, String> {
+    match seam.call_tool(daemon_url, name, args).await {
+        Ok(result) => Ok(result),
+        Err(DaemonCallError::DaemonError(e)) => Err(e),
+        Err(DaemonCallError::ConnectionLost(first_err)) => {
+            // Daemon may have exited (idle timeout or crash).  Single revival
+            // attempt before giving up.
+            match seam.revive().await {
+                Err(revive_err) => Err(format!(
+                    "tool {name}: daemon at {daemon_url} is not responding \
+                     ({first_err}); revival failed: {revive_err}. \
+                     Restart `kin mcp start` to recover."
+                )),
+                Ok(new_url) => {
+                    // Retry exactly once on the post-revival URL.
+                    match seam.call_tool(&new_url, name, args).await {
+                        Ok(result) => Ok(result),
+                        Err(e) => {
+                            let detail = match e {
+                                DaemonCallError::ConnectionLost(s)
+                                | DaemonCallError::DaemonError(s) => s,
+                            };
+                            Err(format!(
+                                "tool {name}: daemon was revived at {new_url} but \
+                                 the retry still failed: {detail}. \
+                                 Check `kin daemon status`."
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn forward_mcp_tool_call(
     name: &str,
     arguments: &HashMap<String, serde_json::Value>,
 ) -> Result<Option<ToolCallResult>, String> {
-    let Some(client) = daemon_client().await else {
-        return Ok(None);
-    };
     let Some(base) = daemon_base_url() else {
         return Ok(None);
     };
-    let request = client
-        .post(format!("{}/mcp/tools/call", base))
-        .json(&serde_json::json!({
-            "name": name,
-            "arguments": arguments,
-        }));
-    let request = with_session_header(with_auth(request), arguments);
-    let resp = request
-        .send()
-        .await
-        .map_err(|e| format!("daemon MCP tool call failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "daemon MCP tool call failed: HTTP {}",
-            resp.status()
-        ));
-    }
-    let result = resp
-        .json::<ToolCallResult>()
-        .await
-        .map_err(|e| format!("daemon MCP tool call response parse failed: {e}"))?;
-    Ok(Some(result))
+    forward_mcp_with_seam(name, arguments, &RealDaemonSeam, &base).await
 }
 
 /// Forward any product-mode MCP tool call to the daemon-owned implementation.
@@ -669,6 +936,193 @@ pub async fn forward_check_traffic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Revival state machine ──────────────────────────────────────────────
+    //
+    // Tests exercise `forward_mcp_with_seam` via a controlled stub seam.
+    // No real daemon is started; no network calls beyond loopback are made.
+
+    struct FakeSeam {
+        /// Results to return on successive `call_tool` invocations (FIFO).
+        calls: std::sync::Mutex<
+            std::collections::VecDeque<Result<Option<ToolCallResult>, DaemonCallError>>,
+        >,
+        /// Value that `revive` returns.
+        revive_result: Result<String, String>,
+        /// Number of `call_tool` invocations.
+        call_count: std::sync::atomic::AtomicUsize,
+        /// Number of `revive` invocations.
+        revive_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeSeam {
+        fn new(
+            call_sequence: Vec<Result<Option<ToolCallResult>, DaemonCallError>>,
+            revive_result: Result<String, String>,
+        ) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(call_sequence.into()),
+                revive_result,
+                call_count: std::sync::atomic::AtomicUsize::new(0),
+                revive_count: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn calls_made(&self) -> usize {
+            self.call_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn revives_attempted(&self) -> usize {
+            self.revive_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl DaemonCallSeam for FakeSeam {
+        async fn call_tool(
+            &self,
+            _base: &str,
+            _name: &str,
+            _args: &HashMap<String, serde_json::Value>,
+        ) -> Result<Option<ToolCallResult>, DaemonCallError> {
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("FakeSeam: unexpected extra call_tool invocation")
+        }
+
+        async fn revive(&self) -> Result<String, String> {
+            self.revive_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.revive_result.clone()
+        }
+    }
+
+    fn conn_lost() -> DaemonCallError {
+        DaemonCallError::ConnectionLost("connection refused".into())
+    }
+
+    fn daemon_err() -> DaemonCallError {
+        DaemonCallError::DaemonError("HTTP 500 Internal Server Error".into())
+    }
+
+    fn ok_tool_result() -> Result<Option<ToolCallResult>, DaemonCallError> {
+        Ok(Some(ToolCallResult::text("ok".to_string())))
+    }
+
+    #[tokio::test]
+    async fn revival_triggered_exactly_once_on_connection_error() {
+        let seam = FakeSeam::new(
+            vec![Err(conn_lost()), ok_tool_result()],
+            Ok("http://127.0.0.1:9999".to_string()),
+        );
+        let result =
+            forward_mcp_with_seam("tool", &HashMap::new(), &seam, "http://127.0.0.1:4219").await;
+        assert!(result.is_ok(), "should succeed after revival: {result:?}");
+        assert_eq!(seam.calls_made(), 2, "call_tool must run exactly twice");
+        assert_eq!(seam.revives_attempted(), 1, "revive must run exactly once");
+    }
+
+    #[tokio::test]
+    async fn non_connection_error_bypasses_revival() {
+        let seam = FakeSeam::new(
+            vec![Err(daemon_err())],
+            Ok("http://127.0.0.1:9999".to_string()),
+        );
+        let result =
+            forward_mcp_with_seam("tool", &HashMap::new(), &seam, "http://127.0.0.1:4219").await;
+        let err = result.unwrap_err();
+        assert!(err.contains("HTTP 500"), "original error preserved: {err}");
+        assert_eq!(
+            seam.revives_attempted(),
+            0,
+            "revive must NOT run for HTTP errors"
+        );
+        assert_eq!(
+            seam.calls_made(),
+            1,
+            "only one call_tool attempt for HTTP errors"
+        );
+    }
+
+    #[tokio::test]
+    async fn revival_failure_yields_actionable_error() {
+        let seam = FakeSeam::new(vec![Err(conn_lost())], Err("binary not found".to_string()));
+        let err = forward_mcp_with_seam("tool", &HashMap::new(), &seam, "http://127.0.0.1:4219")
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("revival failed"),
+            "must mention revival failure: {err}"
+        );
+        assert!(
+            err.contains("kin mcp start"),
+            "must suggest recovery action: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_failure_after_revival_surfaces_clear_error() {
+        let seam = FakeSeam::new(
+            vec![Err(conn_lost()), Err(conn_lost())],
+            Ok("http://127.0.0.1:9999".to_string()),
+        );
+        let err = forward_mcp_with_seam("tool", &HashMap::new(), &seam, "http://127.0.0.1:4219")
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("retry still failed"),
+            "must indicate retry failure: {err}"
+        );
+        assert!(
+            err.contains("kin daemon status"),
+            "must suggest diagnostic: {err}"
+        );
+        assert_eq!(
+            seam.revives_attempted(),
+            1,
+            "revival attempted at most once even when retry fails"
+        );
+    }
+
+    #[test]
+    fn mcp_idle_timeout_constant_is_1800() {
+        assert_eq!(
+            MCP_IDLE_TIMEOUT_SECS, "1800",
+            "MCP path must use 30-min timeout"
+        );
+    }
+
+    /// Verify that `reqwest::Error` from a connection-refused qualifies as a
+    /// transport error.  Uses a loopback port that is guaranteed to be closed.
+    /// No real daemon is spawned.
+    #[tokio::test]
+    async fn connection_refused_is_a_transport_error() {
+        // Bind then immediately drop to guarantee the port is closed.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(300))
+            .build()
+            .unwrap();
+        let err = client
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .send()
+            .await
+            .unwrap_err();
+        // The real seam classifies is_connect() as ConnectionLost.
+        assert!(
+            err.is_connect() || err.is_timeout(),
+            "connection refused must be a connect error: {err:?}"
+        );
+    }
+
+    // ── Existing tests below ───────────────────────────────────────────────
 
     /// Write a `daemon.token` containing `contents` into a fresh temp `.kin`
     /// dir and return (tempdir, kin_dir). The tempdir must outlive the call.
