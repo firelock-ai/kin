@@ -1603,9 +1603,7 @@ async fn graph_commit(
                     .flat_map(|r| r.active_intents.iter())
                     .filter(|s| {
                         s.lock_type == kin_model::session::LockType::Hard
-                            && caller_session
-                                .as_ref()
-                                .map_or(true, |cs| &s.session_id != cs)
+                            && caller_session.as_ref().is_none_or(|cs| &s.session_id != cs)
                     })
                     .collect();
                 if !foreign_blocks.is_empty() {
@@ -2315,83 +2313,33 @@ async fn command_commit(
             )
         })?;
 
-    // Build entity deltas from the working copy overlay.
-    // The reconcile loop has already applied file changes into the overlay
-    // AND into the primary graph (via apply_overlay_to_graph), so entity_adds/mods/removes
-    // reflect the full diff since the last commit.
-    let working_copy = state.working_copy.read().await;
-    let overlay = &working_copy.uncommitted_mutations;
+    // Compute deltas reconstructively by diffing current graph state against
+    // the last-committed change-DAG node.  The reconcile loop's
+    // `apply_overlay_to_graph` folds mutations into the primary graph and
+    // then clears the working-copy overlay, so reading the overlay here
+    // would always produce empty deltas.  Instead we walk the change DAG
+    // from genesis to branch.head to reconstruct the committed baseline,
+    // then diff it against the live graph — robust regardless of overlay drain timing.
+    let commit_deltas = crate::commit_deltas::compute_deltas_vs_last_commit(
+        graph,
+        state.blobs.as_ref(),
+        &state.layout,
+        &branch.head,
+    )
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to compute commit deltas: {e}"),
+        )
+    })?;
 
-    let mut entity_deltas = Vec::new();
-    for entity in overlay.entity_adds.values() {
-        entity_deltas.push(kin_model::EntityDelta::Added(entity.clone()));
-    }
-    for entity in overlay.entity_mods.values() {
-        entity_deltas.push(kin_model::EntityDelta::Modified {
-            old: entity.clone(), // Simplified — old is the current state
-            new: entity.clone(),
-        });
-    }
-    for id in &overlay.entity_removes {
-        entity_deltas.push(kin_model::EntityDelta::Removed(*id));
-    }
-
-    let mut relation_deltas = Vec::new();
-    for relation in overlay.relation_adds.values() {
-        relation_deltas.push(kin_model::RelationDelta::Added(relation.clone()));
-    }
-    for id in &overlay.relation_removes {
-        relation_deltas.push(kin_model::RelationDelta::Removed(*id));
-    }
+    let entity_deltas = commit_deltas.entity_deltas;
+    let relation_deltas = commit_deltas.relation_deltas;
+    let artifact_deltas = commit_deltas.artifact_deltas;
 
     let entity_count = entity_deltas.len();
     let relation_count = relation_deltas.len();
-
-    // Collect unique files from entity origins and build artifact deltas.
-    // These deltas are required for build_file_tree() to reconstruct the VFS
-    // file tree from the change DAG — without them, /vfs/tree returns empty.
-    let mut files = HashSet::new();
-    for entity in overlay.entity_adds.values() {
-        if let Some(ref fp) = entity.file_origin {
-            files.insert(fp.0.clone());
-        }
-    }
-    for entity in overlay.entity_mods.values() {
-        if let Some(ref fp) = entity.file_origin {
-            files.insert(fp.0.clone());
-        }
-    }
-    let file_count = files.len();
-
-    // Build artifact deltas: read each file, store in blob store, record hash.
-    // These are required for build_file_tree() to reconstruct the VFS file tree.
-    let mut artifact_deltas = Vec::new();
-    for file_path in &files {
-        let abs_path = state.layout.working_dir().join(file_path);
-        if let Ok(content) = std::fs::read(&abs_path) {
-            // Check if blob already exists (indicates file was previously committed).
-            let content_digest = kin_blobs::digest(&content);
-            let previously_existed = state.blobs.exists(&content_digest).unwrap_or(false);
-
-            let blob_hash = state.blobs.write(&content).unwrap_or(content_digest);
-            let content_hash = kin_model::Hash256::from_bytes(blob_hash.0);
-
-            let kind = if previously_existed {
-                kin_model::ArtifactDeltaKind::Modified
-            } else {
-                kin_model::ArtifactDeltaKind::Added
-            };
-
-            artifact_deltas.push(kin_model::ArtifactDelta {
-                file_id: FilePathId::new(file_path),
-                kind,
-                old_hash: None,
-                new_hash: Some(content_hash),
-            });
-        }
-    }
-
-    drop(working_copy);
+    let file_count = artifact_deltas.len();
 
     // --- Lease enforcement gate (same as /graph/commit) ---
     {
@@ -2402,7 +2350,7 @@ async fn command_commit(
             .map(|d| match d {
                 kin_model::EntityDelta::Added(e) => IntentScope::Entity(e.id),
                 kin_model::EntityDelta::Modified { new, .. } => IntentScope::Entity(new.id),
-                kin_model::EntityDelta::Removed(id) => IntentScope::Entity(*id),
+                kin_model::EntityDelta::Removed(ref id) => IntentScope::Entity(*id),
             })
             .collect();
 
@@ -2422,9 +2370,7 @@ async fn command_commit(
                     .flat_map(|r| r.active_intents.iter())
                     .filter(|s| {
                         s.lock_type == kin_model::session::LockType::Hard
-                            && caller_session
-                                .as_ref()
-                                .map_or(true, |cs| &s.session_id != cs)
+                            && caller_session.as_ref().is_none_or(|cs| &s.session_id != cs)
                     })
                     .collect();
                 if !foreign_blocks.is_empty() {
