@@ -1395,6 +1395,33 @@ fn default_idle_timeout_secs() -> &'static str {
     }
 }
 
+/// Idle timeout (seconds) for MCP-initiated daemon autostarts: 30 minutes.
+///
+/// Mirrors `kin_daemon::lifecycle::MCP_IDLE_TIMEOUT_SECS`; keep both in sync
+/// at "1800". kin-cli does not take a direct dep on kin-daemon, so the value
+/// is repeated here with an explicit cross-reference as the guard.
+const MCP_IDLE_TIMEOUT_SECS: &str = "1800";
+
+/// Pure env-assembly for the daemon's idle timeout, mirroring
+/// `kin_daemon::lifecycle::resolve_idle_timeout_env`.
+///
+/// Returns `None` when the user has already set `KIN_DAEMON_IDLE_TIMEOUT_SECS`
+/// (their value propagates naturally to the child process). Returns
+/// `Some(value)` when we should inject it: the caller's override if given,
+/// otherwise the compiled default (60 s / 1 s in tests).
+///
+/// Factored out of the spawn path so the env-assembly logic is unit-testable
+/// without actually starting a daemon process.
+fn resolve_idle_timeout_env(
+    user_env_is_set: bool,
+    caller_override: Option<&'static str>,
+) -> Option<&'static str> {
+    if user_env_is_set {
+        return None;
+    }
+    Some(caller_override.unwrap_or_else(default_idle_timeout_secs))
+}
+
 fn existing_daemon_ready_timeout_secs() -> u64 {
     std::env::var("KIN_DAEMON_EXISTING_READY_TIMEOUT_SECS")
         .ok()
@@ -2102,6 +2129,20 @@ fn is_connection_error(err: &reqwest::Error) -> bool {
 }
 
 pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String> {
+    ensure_daemon_running_with_idle_timeout(kin_root, None).await
+}
+
+/// Like [`ensure_daemon_running`] but lets the caller inject a specific idle
+/// timeout into the spawned daemon process.
+///
+/// Pass `Some(MCP_IDLE_TIMEOUT_SECS)` on the MCP-initiated path (30 min) so
+/// interactive agent sessions don't expire the daemon mid-session. Pass `None`
+/// to use the compiled default (60 s). An explicit
+/// `KIN_DAEMON_IDLE_TIMEOUT_SECS` env var always takes precedence over both.
+pub async fn ensure_daemon_running_with_idle_timeout(
+    kin_root: &Path,
+    idle_timeout_override: Option<&'static str>,
+) -> Result<String> {
     let supervisor_url = ensure_supervisor_running()
         .await
         .context("kin supervisor is required")?;
@@ -2144,8 +2185,9 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String> {
         .context("clone daemon log handle for stderr")?;
     cmd.stdout(Stdio::from(log));
     cmd.stderr(Stdio::from(stderr));
-    if std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_none() {
-        cmd.env("KIN_DAEMON_IDLE_TIMEOUT_SECS", default_idle_timeout_secs());
+    let user_timeout_set = std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_some();
+    if let Some(timeout) = resolve_idle_timeout_env(user_timeout_set, idle_timeout_override) {
+        cmd.env("KIN_DAEMON_IDLE_TIMEOUT_SECS", timeout);
     }
     cmd.env("KIN_SUPERVISOR_URL", &supervisor_url);
 
@@ -2198,6 +2240,23 @@ pub async fn resolve_daemon_url_if_running_async(layout: &KinLayout) -> Option<S
 }
 
 pub async fn resolve_daemon_url(layout: &KinLayout) -> Result<Option<String>> {
+    resolve_daemon_url_inner(layout, None).await
+}
+
+/// Like [`resolve_daemon_url`] but uses the 30-minute MCP idle timeout instead
+/// of the 60-second CLI default when autostarting a daemon.
+///
+/// Call from `kin mcp start` so the first daemon spawned on the MCP path gets
+/// the same long idle window as the FIR-910 auto-revival path.  An explicit
+/// `KIN_DAEMON_IDLE_TIMEOUT_SECS` env var always overrides this.
+pub async fn resolve_daemon_url_for_mcp(layout: &KinLayout) -> Result<Option<String>> {
+    resolve_daemon_url_inner(layout, Some(MCP_IDLE_TIMEOUT_SECS)).await
+}
+
+async fn resolve_daemon_url_inner(
+    layout: &KinLayout,
+    idle_timeout_override: Option<&'static str>,
+) -> Result<Option<String>> {
     let no_daemon_autostart = is_transient_bool_env("KIN_NO_DAEMON");
     let explicit_daemon_url = std::env::var("KIN_DAEMON_URL")
         .ok()
@@ -2209,7 +2268,7 @@ pub async fn resolve_daemon_url(layout: &KinLayout) -> Result<Option<String>> {
         return Ok(supervisor_route_for_repo_if_running_async(layout.root()).await);
     }
 
-    match ensure_daemon_running(layout.root()).await {
+    match ensure_daemon_running_with_idle_timeout(layout.root(), idle_timeout_override).await {
         Ok(url) => Ok(Some(url)),
         Err(err) => Err(err.context("kin daemon is required")),
     }
@@ -2394,5 +2453,45 @@ mod tests {
 
         assert!(startup_lock_is_stale(&lock, Duration::ZERO));
         assert!(!startup_lock_is_stale(&lock, Duration::from_secs(60)));
+    }
+
+    // ── idle-timeout env-assembly (FIR-927) ────────────────────────────────
+
+    #[test]
+    fn resolve_idle_timeout_uses_default_when_nothing_set() {
+        // No user env, no caller override → compiled default.
+        // In test builds default_idle_timeout_secs() returns "1"; we key on
+        // whatever that function returns so the assertion survives cfg changes.
+        assert_eq!(
+            resolve_idle_timeout_env(false, None),
+            Some(default_idle_timeout_secs())
+        );
+    }
+
+    #[test]
+    fn resolve_idle_timeout_mcp_override_propagates() {
+        // MCP-path caller passes Some(MCP_IDLE_TIMEOUT_SECS) → "1800" reaches daemon.
+        assert_eq!(
+            resolve_idle_timeout_env(false, Some(MCP_IDLE_TIMEOUT_SECS)),
+            Some("1800")
+        );
+    }
+
+    #[test]
+    fn resolve_idle_timeout_user_env_always_wins() {
+        // When user has set KIN_DAEMON_IDLE_TIMEOUT_SECS we must not inject anything,
+        // regardless of the caller override.
+        assert_eq!(resolve_idle_timeout_env(true, None), None);
+        assert_eq!(
+            resolve_idle_timeout_env(true, Some(MCP_IDLE_TIMEOUT_SECS)),
+            None
+        );
+    }
+
+    #[test]
+    fn mcp_idle_timeout_constant_is_1800() {
+        // Regression guard: the MCP path must inject 1800s (30 min), not the
+        // 60-second CLI default.
+        assert_eq!(MCP_IDLE_TIMEOUT_SECS, "1800");
     }
 }

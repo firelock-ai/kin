@@ -17,7 +17,7 @@ pub async fn start() -> Result<()> {
         let layout = kin_core::KinLayout::discover(&cwd).ok_or_else(|| {
             anyhow::anyhow!("not a Kin repository (no .kin/ found); run `kin init .` first")
         })?;
-        let url = crate::daemon_client::resolve_daemon_url(&layout)
+        let url = crate::daemon_client::resolve_daemon_url_for_mcp(&layout)
             .await?
             .ok_or_else(|| {
                 anyhow::anyhow!(
