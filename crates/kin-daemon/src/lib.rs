@@ -92,6 +92,7 @@ pub mod daemon;
 pub mod error;
 pub mod lifecycle;
 pub mod loop_runner;
+pub mod projection_wiring;
 pub mod session_registry;
 pub mod state;
 pub mod supervisor;
