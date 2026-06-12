@@ -1847,6 +1847,23 @@ pub fn format_graph_entity_text_with_context(entity: &Entity, context_lines: &[S
     parts.push(entity_kind_label(entity.kind).to_string());
 
     if let Some(file_origin) = &entity.file_origin {
+        // FIR-826: machine-absolute paths must never enter embed text — they
+        // bake machine-specific prefixes into vectors, breaking cross-host
+        // reproducibility. The parser layer is responsible for storing
+        // repo-relative paths; this guard catches regressions at the embed
+        // boundary where the damage would be silent.
+        debug_assert!(
+            !file_origin.0.starts_with('/'),
+            "absolute path in embed text: '{}' — store repo-relative paths only",
+            file_origin.0
+        );
+        if file_origin.0.starts_with('/') {
+            tracing::warn!(
+                path = %file_origin.0,
+                "machine-absolute path detected in embedding input (entity file_origin); \
+                 vectors may not be reproducible across machines — store repo-relative paths"
+            );
+        }
         parts.push(file_origin.0.clone());
     }
     if !entity.name.is_empty() {
@@ -2554,5 +2571,43 @@ mod tests {
         );
 
         assert_ne!(base.runtime_revision(), tuned.runtime_revision());
+    }
+
+    // ── FIR-826: no-absolute-path guard ─────────────────────────────────────
+
+    /// Guard test (durable artifact): a machine-absolute path in file_origin
+    /// triggers the debug_assert! guard, documenting that this is a bug.
+    /// In debug builds (all `cargo test` runs) this panics; a regression that
+    /// introduces absolute paths will be caught immediately.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "absolute path in embed text")]
+    fn absolute_file_origin_guard_fires() {
+        let entity = Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: "absolute_path_fn".into(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256([0; 32]),
+                signature_hash: Hash256([0; 32]),
+                behavior_hash: Hash256([0; 32]),
+                stability_score: 1.0,
+            },
+            // Machine-absolute path — must never enter the embedder.
+            file_origin: Some(FilePathId::new("/Users/ci/myrepo/src/config.rs")),
+            span: None,
+            signature: "fn absolute_path_fn()".into(),
+            visibility: kin_model::Visibility::Public,
+            role: kin_model::EntityRole::Source,
+            doc_summary: None,
+            metadata: kin_model::EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        };
+        // The debug_assert! inside format_graph_entity_text_with_context fires here.
+        let _ = format_graph_entity_text(&entity);
     }
 }
