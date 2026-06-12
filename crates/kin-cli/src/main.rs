@@ -83,10 +83,25 @@ enum Command {
         /// Head change ID
         head: Option<String>,
     },
-    /// Remove Kin and restore files to pre-init state
+    /// ⚠ WARNING: Remove Kin metadata from this repository.
+    ///
+    /// By default (safe): stops the daemon and removes .kin/ graph + metadata.
+    /// Working files are left exactly as they are.
+    ///
+    /// With --revert-files (DESTRUCTIVE): additionally overwrites every working
+    /// file with the pre-init snapshot copy, destroying any uncommitted changes.
+    /// Requires typing "revert" to confirm unless --yes is also given.
+    /// A backup of current files is created before any mutation.
     Eject {
-        /// Skip confirmation prompt
+        /// DESTRUCTIVE: overwrite working files with the pre-init snapshot and
+        /// delete the Kin graph. Requires typing "revert" to confirm (or --yes).
         #[arg(long)]
+        revert_files: bool,
+        /// Skip typed confirmation for --revert-files (for non-interactive use).
+        #[arg(long)]
+        yes: bool,
+        /// Deprecated: use --yes. Kept for compatibility; has no effect without --revert-files.
+        #[arg(long, hide = true)]
         force: bool,
     },
     /// Show downstream impact of an entity
@@ -1174,8 +1189,19 @@ enum AssistantAction {
 
 #[derive(Subcommand)]
 enum StashAction {
-    /// Save current working state
-    Push,
+    /// Snapshot current working state (non-destructive by default).
+    ///
+    /// Files are snapshotted into .kin/stashes/ but are NOT removed from the
+    /// working tree unless --remove-from-tree is given.
+    Push {
+        /// DESTRUCTIVE: delete source files from the working tree after
+        /// snapshotting. Requires typing "remove" to confirm (or --yes).
+        #[arg(long)]
+        remove_from_tree: bool,
+        /// Skip typed confirmation for --remove-from-tree (for non-interactive use).
+        #[arg(long)]
+        yes: bool,
+    },
     /// Restore the most recent stash entry
     Pop,
     /// List stash entries
@@ -1570,7 +1596,11 @@ fn main() -> Result<()> {
                     BranchAction::Switch { name } => commands::branch::switch(name).await,
                 },
                 Command::Diff { base, head } => commands::diff::run(base, head).await,
-                Command::Eject { force } => commands::eject::run(force).await,
+                Command::Eject {
+                    revert_files,
+                    yes,
+                    force,
+                } => commands::eject::run(revert_files, yes || force).await,
                 Command::Impact { entity, depth } => commands::impact::run(entity, depth).await,
                 Command::Context {
                     entity,
@@ -1973,7 +2003,10 @@ fn main() -> Result<()> {
                         .await
                 }
                 Command::Stash { action } => match action {
-                    StashAction::Push => commands::stash::push().await,
+                    StashAction::Push {
+                        remove_from_tree,
+                        yes,
+                    } => commands::stash::push(remove_from_tree, yes).await,
                     StashAction::Pop => commands::stash::pop().await,
                     StashAction::List => commands::stash::list().await,
                 },
