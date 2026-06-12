@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -181,6 +181,17 @@ pub struct DaemonState {
     pub persist_lock: Mutex<()>,
     /// When the last successful background save completed.
     pub last_save: std::sync::Mutex<Instant>,
+    /// When the graph was last mutated (`mark_dirty`). The background
+    /// persistence task debounces its idle flush on this clock — quiet since
+    /// the last MUTATION — which is distinct from `last_save` (how long dirty
+    /// state has sat unpersisted, the periodic durability bound).
+    pub last_mutation: std::sync::Mutex<Instant>,
+    /// Number of daemon-side embed passes (`POST /embed`) currently in
+    /// flight. While nonzero the background idle flush stays suppressed: the
+    /// embed handler persists its own progress (pre-pass snapshot, per-batch
+    /// kvec, post-pass snapshot), and a full-graph flush on every starved
+    /// feed gap multiplies FS events that starve the feed further.
+    pub active_embed_passes: AtomicU32,
     /// Last externally visible daemon activity, measured as milliseconds since
     /// `started_at`. Used by opt-in idle shutdown for CLI-autostarted daemons.
     pub last_activity_ms: AtomicU64,
@@ -429,6 +440,8 @@ impl DaemonState {
             embedding_work: Mutex::new(()),
             persist_lock: Mutex::new(()),
             last_save: std::sync::Mutex::new(Instant::now()),
+            last_mutation: std::sync::Mutex::new(Instant::now()),
+            active_embed_passes: AtomicU32::new(0),
             last_activity_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
@@ -549,6 +562,8 @@ impl DaemonState {
             embedding_work: Mutex::new(()),
             persist_lock: Mutex::new(()),
             last_save: std::sync::Mutex::new(Instant::now()),
+            last_mutation: std::sync::Mutex::new(Instant::now()),
+            active_embed_passes: AtomicU32::new(0),
             last_activity_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
@@ -1143,6 +1158,9 @@ impl DaemonState {
     /// will flush to disk when it sees this flag.
     pub fn mark_dirty(&self) {
         self.dirty.store(true, Ordering::SeqCst);
+        if let Ok(mut last) = self.last_mutation.lock() {
+            *last = Instant::now();
+        }
     }
 
     /// Mark the graph as clean (just saved). Records the save timestamp.
@@ -1201,6 +1219,28 @@ impl DaemonState {
             .lock()
             .map(|last| last.elapsed())
             .unwrap_or(Duration::ZERO)
+    }
+
+    /// Duration since the last graph mutation (`mark_dirty`).
+    pub fn time_since_mutation(&self) -> Duration {
+        self.last_mutation
+            .lock()
+            .map(|last| last.elapsed())
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// True while at least one daemon-side embed pass is in flight.
+    pub fn embed_pass_active(&self) -> bool {
+        self.active_embed_passes.load(Ordering::SeqCst) > 0
+    }
+
+    /// Mark a daemon-side embed pass as in flight for the lifetime of the
+    /// returned guard. Counter-based so overlapping callers compose; the
+    /// guard decrements on drop, including error returns and panic unwinds
+    /// out of the embed handler.
+    pub fn begin_embed_pass(&self) -> EmbedPassGuard<'_> {
+        self.active_embed_passes.fetch_add(1, Ordering::SeqCst);
+        EmbedPassGuard(self)
     }
 
     /// Record externally visible daemon activity.
@@ -1291,6 +1331,17 @@ impl DaemonState {
     }
 }
 
+/// RAII marker for an in-flight daemon-side embed pass. Decrements the pass
+/// counter on drop so the background idle flush resumes even when the embed
+/// handler exits early.
+pub struct EmbedPassGuard<'a>(&'a DaemonState);
+
+impl Drop for EmbedPassGuard<'_> {
+    fn drop(&mut self) {
+        self.0.active_embed_passes.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1352,6 +1403,8 @@ mod tests {
             embedding_work: Mutex::new(()),
             persist_lock: Mutex::new(()),
             last_save: std::sync::Mutex::new(Instant::now()),
+            last_mutation: std::sync::Mutex::new(Instant::now()),
+            active_embed_passes: AtomicU32::new(0),
             last_activity_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
@@ -1460,6 +1513,38 @@ mod tests {
             }
             other => panic!("expected EntityChanged, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn embed_pass_guard_tracks_in_flight_passes() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+        assert!(!state.embed_pass_active());
+
+        let outer = state.begin_embed_pass();
+        let inner = state.begin_embed_pass();
+        assert!(state.embed_pass_active());
+
+        drop(inner);
+        assert!(
+            state.embed_pass_active(),
+            "outer pass still in flight after inner guard drops"
+        );
+
+        drop(outer);
+        assert!(!state.embed_pass_active());
+    }
+
+    #[test]
+    fn mark_dirty_advances_the_mutation_clock() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(state.time_since_mutation() >= Duration::from_millis(20));
+        state.mark_dirty();
+        assert!(state.time_since_mutation() < Duration::from_millis(20));
     }
 
     #[test]

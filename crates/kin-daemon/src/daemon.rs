@@ -85,6 +85,28 @@ fn duration_from_env_secs(name: &str, default: Duration) -> Duration {
     parse_duration_secs(std::env::var(name).ok().as_deref(), default)
 }
 
+/// Decide whether the background persistence task should flush dirty state.
+///
+/// Two independent clocks gate the flush:
+/// - Periodic (`since_save`): bounds how long dirty state may sit
+///   unpersisted, regardless of activity.
+/// - Idle (`since_mutation`): debounces the full-graph serialize to mutation
+///   quiet periods, and is suppressed entirely while a daemon-side embed
+///   pass is in flight. The embed handler persists its own progress
+///   (pre-pass snapshot, per-batch kvec, post-pass snapshot), so flushing
+///   the full graph on every starved feed gap only multiplies FS events
+///   that starve the feed further — O(gaps × graph size) writes on large
+///   repos.
+fn should_flush_now(
+    since_save: Duration,
+    since_mutation: Duration,
+    embed_pass_active: bool,
+    idle_flush: Duration,
+    periodic_flush: Duration,
+) -> bool {
+    since_save >= periodic_flush || (!embed_pass_active && since_mutation >= idle_flush)
+}
+
 /// Grace period the escalation watchdog waits after shutdown is signalled before
 /// force-exiting. Configurable via `KIN_DAEMON_SHUTDOWN_GRACE_SECS` (0 escalates
 /// immediately once the signal fires — used by tests).
@@ -604,14 +626,24 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
     // Spawn the background persistence task.
     // Instead of blocking the reconcile loop with synchronous save_graph(),
     // this task periodically flushes dirty state to disk:
-    //   - Idle flush: 2s after the last mutation with no new mutations
-    //   - Periodic flush: every 30s regardless of activity
+    //   - Idle flush: KIN_DAEMON_IDLE_FLUSH_SECS (default 2s) after the last
+    //     mutation with no new mutations; suppressed while a daemon-side
+    //     embed pass is in flight (see should_flush_now)
+    //   - Periodic flush: every KIN_DAEMON_PERIODIC_FLUSH_SECS (default 30s)
+    //     of unpersisted dirty state, regardless of activity
     //   - Shutdown flush: handled separately in the graceful shutdown path
     let persist_state = Arc::clone(&state);
     let mut persist_cancel = cancel_rx.clone();
     let persist_handle = tokio::spawn(async move {
-        let idle_flush = Duration::from_secs(2);
-        let periodic_flush = Duration::from_secs(30);
+        let idle_flush =
+            duration_from_env_secs("KIN_DAEMON_IDLE_FLUSH_SECS", Duration::from_secs(2));
+        let periodic_flush =
+            duration_from_env_secs("KIN_DAEMON_PERIODIC_FLUSH_SECS", Duration::from_secs(30));
+        info!(
+            idle_flush_s = idle_flush.as_secs(),
+            periodic_flush_s = periodic_flush.as_secs(),
+            "background persistence intervals"
+        );
         let base_interval = Duration::from_millis(500);
         let max_backoff = Duration::from_secs(30);
         const UNHEALTHY_THRESHOLD: u32 = 5;
@@ -659,9 +691,13 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                 continue;
             }
 
-            let since_save = persist_state.time_since_save();
-
-            let should_flush = since_save >= periodic_flush || since_save >= idle_flush;
+            let should_flush = should_flush_now(
+                persist_state.time_since_save(),
+                persist_state.time_since_mutation(),
+                persist_state.embed_pass_active(),
+                idle_flush,
+                periodic_flush,
+            );
 
             if should_flush {
                 let start = std::time::Instant::now();
@@ -1760,14 +1796,62 @@ async fn select_with_signals(
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        next_embed_error_backoff, parse_duration_secs, watched_process_is_alive, DaemonConfig,
-        DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE,
+        next_embed_error_backoff, parse_duration_secs, should_flush_now,
+        watched_process_is_alive, DaemonConfig, DEFAULT_RUNTIME_SHUTDOWN_GRACE,
+        DEFAULT_SHUTDOWN_ESCALATION_GRACE,
     };
     use std::time::Duration;
 
     #[test]
     fn default_embed_batch_is_backlog_friendly() {
         assert_eq!(DaemonConfig::default().embed_batch_size, 512);
+    }
+
+    #[test]
+    fn idle_flush_waits_for_mutation_quiet() {
+        let idle = Duration::from_secs(2);
+        let periodic = Duration::from_secs(30);
+        // Mutations still arriving: dirty state is old but the graph is hot —
+        // no flush. (The pre-fix predicate compared only `since_save`, so it
+        // fired a full-graph save on every >=2s save gap mid-activity.)
+        assert!(!should_flush_now(
+            Duration::from_secs(10),
+            Duration::from_secs(1),
+            false,
+            idle,
+            periodic,
+        ));
+        // Mutation-quiet past the idle threshold: flush.
+        assert!(should_flush_now(
+            Duration::from_secs(10),
+            Duration::from_secs(3),
+            false,
+            idle,
+            periodic,
+        ));
+    }
+
+    #[test]
+    fn active_embed_pass_suppresses_idle_flush_but_not_periodic() {
+        let idle = Duration::from_secs(2);
+        let periodic = Duration::from_secs(30);
+        // A starved feed gap mid-pass looks idle; the pass marker suppresses
+        // the idle flush so the gap cannot trigger a full-graph save.
+        assert!(!should_flush_now(
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+            true,
+            idle,
+            periodic,
+        ));
+        // The periodic durability bound still fires through an active pass.
+        assert!(should_flush_now(
+            Duration::from_secs(31),
+            Duration::from_secs(5),
+            true,
+            idle,
+            periodic,
+        ));
     }
 
     #[test]
