@@ -55,8 +55,12 @@ fn vector_index_metadata_path_for(snapshot_path: &Path) -> PathBuf {
     vector_index_path_for(snapshot_path).with_extension("kvec.meta.json")
 }
 
+/// Bump this constant whenever a new required field is added to
+/// `VectorIndexMetadata`. Version 1 (legacy) is still accepted on read —
+/// only fields present in both sides are enforced. Unknown future versions
+/// (> VERSION) are rejected.
 #[cfg(feature = "vector")]
-pub const VECTOR_INDEX_METADATA_VERSION: u32 = 1;
+pub const VECTOR_INDEX_METADATA_VERSION: u32 = 2;
 
 const LOCATE_CACHE_VERSION: u32 = 1;
 
@@ -75,6 +79,13 @@ struct VectorIndexMetadata {
     embedding_model_revision: Option<String>,
     #[serde(default)]
     embedding_pipeline_epoch: Option<String>,
+    /// Caller-supplied artifact/binary identity of the embedder that produced
+    /// these vectors (e.g. a build SHA or version string). `None` for legacy
+    /// stores (version ≤ 1). Enforced in `vector_metadata_matches_graph` only
+    /// when both stored and expected are `Some` — `None` on either side is
+    /// treated as legacy and logs a warning but does not reject the load.
+    #[serde(default)]
+    embedder_identity: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -145,7 +156,10 @@ fn read_vector_index_metadata(path: &Path) -> Result<Option<VectorIndexMetadata>
             path.display()
         ))
     })?;
-    if metadata.version != VectorIndexMetadata::VERSION {
+    // Accept version 1 (legacy, no embedder_identity) and version 2 (current).
+    // A future version written by a newer binary is rejected so we never
+    // silently interpret fields we don't understand.
+    if metadata.version == 0 || metadata.version > VectorIndexMetadata::VERSION {
         return Err(KinDbError::StorageError(format!(
             "unsupported vector index metadata version {} in {}",
             metadata.version,
@@ -246,6 +260,7 @@ fn current_embedding_runtime_fields() -> (
 fn vector_metadata_matches_graph(
     metadata: &VectorIndexMetadata,
     graph_root_hash: [u8; 32],
+    expected_embedder_identity: Option<&str>,
 ) -> bool {
     if metadata.graph_root_hash != hex::encode(graph_root_hash) {
         return false;
@@ -281,6 +296,31 @@ fn vector_metadata_matches_graph(
                 return false;
             }
         }
+    }
+
+    // Embedder identity: enforced only when both stored and expected are Some.
+    // None on either side is a legacy/unknown value — warn but allow the load
+    // so existing stores remain non-breaking.
+    match (
+        metadata.embedder_identity.as_deref(),
+        expected_embedder_identity,
+    ) {
+        (Some(stored), Some(expected)) if stored != expected => {
+            tracing::warn!(
+                stored = %stored,
+                expected = %expected,
+                "vector sidecar embedder_identity mismatch: rejecting load"
+            );
+            return false;
+        }
+        (None, Some(_)) | (Some(_), None) => {
+            tracing::warn!(
+                stored = ?metadata.embedder_identity,
+                expected = ?expected_embedder_identity,
+                "vector sidecar has missing embedder_identity (legacy store); loading anyway"
+            );
+        }
+        _ => {}
     }
 
     true
@@ -490,6 +530,7 @@ impl SnapshotManager {
         path: &Path,
         graph: &InMemoryGraph,
         graph_root_hash: [u8; 32],
+        embedder_identity: Option<&str>,
     ) -> Result<(), KinDbError> {
         let vector_path = vector_index_path_for(path);
 
@@ -516,6 +557,7 @@ impl SnapshotManager {
                 embedding_model_id: model_id,
                 embedding_model_revision: revision,
                 embedding_pipeline_epoch: pipeline_epoch,
+                embedder_identity: embedder_identity.map(str::to_owned),
             };
             write_vector_index_metadata(&metadata_path, &metadata)?;
         }
@@ -543,6 +585,7 @@ impl SnapshotManager {
         graph: &InMemoryGraph,
         graph_root_hash: [u8; 32],
         write_missing_metadata: bool,
+        expected_embedder_identity: Option<&str>,
     ) -> Result<bool, KinDbError> {
         let vector_path = vector_index_path_for(path);
         if !vector_path.exists() {
@@ -551,10 +594,13 @@ impl SnapshotManager {
 
         let metadata_path = vector_index_metadata_path_for(path);
         let metadata = read_vector_index_metadata(&metadata_path)?;
+        // FIR-901: A .kvec present with no .kvec.meta.json must NOT default to
+        // load — that bypassed the root-hash gate entirely. Absent sidecar ⇒
+        // stale: clear out-of-date vectors and queue a clean rebuild.
         let should_load = metadata
             .as_ref()
-            .map(|metadata| vector_metadata_matches_graph(metadata, graph_root_hash))
-            .unwrap_or(true);
+            .map(|m| vector_metadata_matches_graph(m, graph_root_hash, expected_embedder_identity))
+            .unwrap_or(false);
 
         if !should_load {
             // Sidecar/graph-root staleness is transient (the graph may reconcile
@@ -574,17 +620,16 @@ impl SnapshotManager {
         }
 
         // Defense-in-depth against silently-wrong neighbors: verify the index's
-        // OWN model self-description. This catches a same-dimension MODEL swap the
-        // sidecar can miss (e.g. an absent sidecar). It enforces model identity
-        // ONLY and GRANDFATHERS an unstamped legacy index (it cannot prove a
-        // mismatch, and pre-stamp repos must still load). Graph-root staleness is
-        // intentionally left to the sidecar above (preserve semantics), so this
-        // never archives merely-stale vectors — only a positively-declared model
-        // mismatch, which is permanent.
+        // OWN model self-description. Catches a same-dimension MODEL swap the
+        // sidecar can miss. Also passes graph_root so a positively-declared root
+        // mismatch is caught here too. Grandfathering via
+        // `load_vector_index_compatible` (which uses `load_compatible_grandfathered`
+        // internally) means an UNSTAMPED legacy index (graph_root=None) is still
+        // allowed — it cannot prove a mismatch and pre-stamp repos must load.
         let (_, runtime_model_id, _, _, _) = current_embedding_runtime_fields();
         let expected = crate::vector::IndexDescriptor {
             model_id: runtime_model_id,
-            graph_root: None,
+            graph_root: Some(hex::encode(graph_root_hash)),
         };
 
         let count = match graph.load_vector_index_compatible(&vector_path, &expected) {
@@ -631,6 +676,10 @@ impl SnapshotManager {
                     embedding_model_id: model_id,
                     embedding_model_revision: revision,
                     embedding_pipeline_epoch: pipeline_epoch,
+                    // No embedder_identity in this repair path — the daemon
+                    // caller writes the authoritative sidecar via
+                    // save_vector_index_for_graph.
+                    embedder_identity: None,
                 };
                 write_vector_index_metadata(&metadata_path, &metadata)?;
             }
@@ -668,10 +717,15 @@ impl SnapshotManager {
     /// graph construction, so a separate post-open call is only needed for code
     /// paths that build a graph without going through `SnapshotManager` — and it
     /// must replace, not supplement, any unchecked `load_vector_index` call.
+    /// **FOLLOW-UP WIRING (FIR-901):** the kin daemon's post-open vector load
+    /// path must pass `Some(kin_binary_sha256)` as `expected_embedder_identity`
+    /// once `save_vector_index_for_graph` is updated to supply the identity on
+    /// write. Until then `None` is non-breaking (legacy warn+load).
     #[cfg(feature = "vector")]
     pub fn load_vector_index_into_graph_if_valid(
         graph: &InMemoryGraph,
         snapshot_path: &Path,
+        expected_embedder_identity: Option<&str>,
     ) -> Result<bool, KinDbError> {
         let Some(graph_root_hash) = graph.snapshot_root_hash() else {
             tracing::warn!(
@@ -680,7 +734,13 @@ impl SnapshotManager {
             );
             return Ok(false);
         };
-        Self::load_vector_index_if_valid(snapshot_path, graph, graph_root_hash, false)
+        Self::load_vector_index_if_valid(
+            snapshot_path,
+            graph,
+            graph_root_hash,
+            false,
+            expected_embedder_identity,
+        )
     }
 
     /// Feature-disabled stub: with no vector backend there is nothing to load.
@@ -688,6 +748,7 @@ impl SnapshotManager {
     pub fn load_vector_index_into_graph_if_valid(
         _graph: &InMemoryGraph,
         _snapshot_path: &Path,
+        _expected_embedder_identity: Option<&str>,
     ) -> Result<bool, KinDbError> {
         Ok(false)
     }
@@ -863,7 +924,7 @@ impl SnapshotManager {
 
         #[cfg(feature = "vector")]
         {
-            Self::load_vector_index_if_valid(path, &graph, graph_root_hash, !read_only)?;
+            Self::load_vector_index_if_valid(path, &graph, graph_root_hash, !read_only, None)?;
         }
 
         Ok(graph)
@@ -891,7 +952,13 @@ impl SnapshotManager {
                     );
                     #[cfg(feature = "vector")]
                     {
-                        Self::load_vector_index_if_valid(path, &graph, graph_root_hash, false)?;
+                        Self::load_vector_index_if_valid(
+                            path,
+                            &graph,
+                            graph_root_hash,
+                            false,
+                            None,
+                        )?;
                     }
                     return Ok(graph);
                 }
@@ -930,7 +997,7 @@ impl SnapshotManager {
 
         #[cfg(feature = "vector")]
         {
-            Self::load_vector_index_if_valid(path, &graph, graph_root_hash, false)?;
+            Self::load_vector_index_if_valid(path, &graph, graph_root_hash, false, None)?;
         }
 
         Ok(graph)
@@ -1129,7 +1196,7 @@ impl SnapshotManager {
 
         #[cfg(feature = "vector")]
         {
-            Self::save_vector_index_bundle(&path, graph, graph_root_hash)?;
+            Self::save_vector_index_bundle(&path, graph, graph_root_hash, None)?;
         }
 
         Ok(graph_root_hash)
@@ -1139,16 +1206,29 @@ impl SnapshotManager {
     ///
     /// This is intended for daemon background embedding work that updates the
     /// vector index without performing a full snapshot write on every batch.
+    ///
+    /// `embedder_identity` is an optional caller-supplied string that uniquely
+    /// identifies the embedder binary/artifact (e.g. a build SHA). When
+    /// `Some`, it is stored in the sidecar and enforced on the next load —
+    /// a mismatch rejects the cached vectors so that an embedder change that
+    /// leaves `model+epoch` unchanged cannot silently serve stale vectors.
+    /// Pass `None` for legacy callers that do not yet supply an identity.
+    ///
+    /// **FOLLOW-UP WIRING (FIR-901):** the kin daemon's embed-worker must be
+    /// updated to pass `Some(kin_binary_sha256)` (or equivalent build id) as
+    /// `embedder_identity`. Until that wiring lands, `None` is accepted and
+    /// triggers a legacy-store warning on load (non-breaking).
     #[cfg(feature = "vector")]
     pub fn save_vector_index_for_graph(
         path: impl Into<PathBuf>,
         graph: &InMemoryGraph,
+        embedder_identity: Option<&str>,
     ) -> Result<(), KinDbError> {
         let path = normalize_snapshot_path(path.into());
         let graph_root_hash = graph
             .snapshot_root_hash_hint()
             .unwrap_or_else(|| compute_graph_root_hash(&graph.to_snapshot()));
-        Self::save_vector_index_bundle(&path, graph, graph_root_hash)
+        Self::save_vector_index_bundle(&path, graph, graph_root_hash, embedder_identity)
     }
 
     /// Compute a delta between the on-disk snapshot and the current in-memory
@@ -2037,7 +2117,7 @@ mod tests {
         updated_vectors.save(&vector_path).unwrap();
         graph.load_vector_index(&vector_path).unwrap();
 
-        SnapshotManager::save_vector_index_for_graph(&snapshot_path, graph.as_ref()).unwrap();
+        SnapshotManager::save_vector_index_for_graph(&snapshot_path, graph.as_ref(), None).unwrap();
 
         let metadata = read_vector_index_metadata(&metadata_path)
             .unwrap()
@@ -2095,7 +2175,8 @@ mod tests {
             updated.upsert(second.id, &[0.0, 1.0, 0.0, 0.0]).unwrap();
             updated.save(&vector_path).unwrap();
             graph.load_vector_index(&vector_path).unwrap();
-            SnapshotManager::save_vector_index_for_graph(&snapshot_path, graph.as_ref()).unwrap();
+            SnapshotManager::save_vector_index_for_graph(&snapshot_path, graph.as_ref(), None)
+                .unwrap();
             // `mgr` dropped here — models a process exit right after a flush.
         }
 
@@ -2187,6 +2268,7 @@ mod tests {
                 embedding_model_id: None,
                 embedding_model_revision: None,
                 embedding_pipeline_epoch: None,
+                embedder_identity: None,
             },
         )
         .unwrap();
@@ -2203,9 +2285,14 @@ mod tests {
     /// and the entities are requeued for a clean rebuild. No crash-loop.
     #[test]
     fn model_swapped_vector_index_is_archived_on_reopen() {
+        // FIR-901: a model-swapped index is archived when a SIDECAR is present
+        // (the sidecar is the authoritative validation gate). Without a sidecar
+        // the index is treated as stale rather than archived — see the
+        // torn_sidecar test above. This test validates the sidecar-present path.
         let dir = TempDir::new().unwrap();
         let snapshot_path = dir.path().join("graph.kndb");
         let vector_path = vector_index_path_for(&snapshot_path);
+        let metadata_path = vector_index_metadata_path_for(&snapshot_path);
 
         let mgr = SnapshotManager::new(&snapshot_path);
         let graph = mgr.graph();
@@ -2213,16 +2300,33 @@ mod tests {
         graph.upsert_entity(&entity).unwrap();
         mgr.save().unwrap();
 
-        // Persist an index whose OWN descriptor declares a different model than
-        // the runtime, with NO sidecar — the index self-description is the only
-        // provenance signal, and it proves the vectors are from another model.
+        // Persist an index + a MATCHING sidecar, but the index's own descriptor
+        // declares a different model — the in-index descriptor check catches it.
+        let root_hash = compute_graph_root_hash(&graph.to_snapshot());
         let vectors = VectorIndex::new(4).unwrap();
         vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         vectors.set_descriptor(crate::vector::IndexDescriptor {
             model_id: Some("definitely-not-the-runtime-model@9".into()),
-            graph_root: None,
+            graph_root: Some(hex::encode(root_hash)),
         });
         vectors.save(&vector_path).unwrap();
+        // Write a sidecar that passes the root-hash gate, so we reach the
+        // in-index descriptor self-check which detects the model mismatch.
+        write_vector_index_metadata(
+            &metadata_path,
+            &VectorIndexMetadata {
+                version: VectorIndexMetadata::VERSION,
+                graph_root_hash: hex::encode(root_hash),
+                dimensions: 4,
+                indexed: 1,
+                embedding_provider: None,
+                embedding_model_id: None,
+                embedding_model_revision: None,
+                embedding_pipeline_epoch: None,
+                embedder_identity: None,
+            },
+        )
+        .unwrap();
 
         let reloaded = SnapshotManager::open(&snapshot_path).unwrap();
         // Recovery requeues the entity for a clean re-embed (no crash, no serve).
@@ -2238,12 +2342,13 @@ mod tests {
         );
     }
 
-    /// Conversely, an UNSTAMPED legacy index (pre-self-description format) with no
-    /// sidecar is GRANDFATHERED — it cannot prove a mismatch, so it loads rather
-    /// than being archived. (Guards against over-aggressive recovery wiping
-    /// pre-stamp repos' vectors on first upgrade.)
+    /// FIR-901: a .kvec without a .kvec.meta.json sidecar is now treated as
+    /// stale regardless of whether the index is stamped or unstamped. The old
+    /// grandfather behavior (load-without-sidecar) is closed because it bypassed
+    /// the root-hash gate. An orphaned .kvec simply triggers a clean rebuild;
+    /// it is preserved on disk (not archived) per the prepare-state hygiene rule.
     #[test]
-    fn unstamped_legacy_index_is_grandfathered_on_reopen() {
+    fn unstamped_legacy_index_without_sidecar_is_now_stale() {
         let dir = TempDir::new().unwrap();
         let snapshot_path = dir.path().join("graph.kndb");
         let vector_path = vector_index_path_for(&snapshot_path);
@@ -2260,13 +2365,19 @@ mod tests {
         vectors.save(&vector_path).unwrap();
 
         let reloaded = SnapshotManager::open(&snapshot_path).unwrap();
-        // Loaded, not archived: the original index file remains in place.
+        // FIR-901: absent sidecar = stale; NOT loaded, NOT archived.
         assert!(
             vector_path.exists(),
-            "legacy unstamped index must be preserved"
+            ".kvec must be preserved (not deleted/archived) — only the sidecar is the gate"
         );
         assert!(!archived_sidecar_path(&vector_path).exists());
-        assert_eq!(reloaded.graph().embedding_status().indexed, 1);
+        assert_eq!(
+            reloaded.graph().embedding_status().indexed,
+            0,
+            "absent sidecar must not allow load even for an unstamped legacy index"
+        );
+        // The entity should be queued for rebuild.
+        assert_eq!(reloaded.graph().pending_embeddings(), 1);
     }
 
     /// A save from a graph that never loaded the vector index (e.g. it was
@@ -2304,6 +2415,7 @@ mod tests {
                 embedding_model_id: None,
                 embedding_model_revision: None,
                 embedding_pipeline_epoch: None,
+                embedder_identity: None,
             },
         )
         .unwrap();
@@ -2566,6 +2678,11 @@ mod tests {
         );
     }
 
+    /// FIR-901: with the no-sidecar grandfather bypass closed, a read-only open
+    /// where only .kvec exists (no .kvec.meta.json) must NOT load the vector
+    /// index — no sidecar means no provenance, treat as stale. The .kvec is
+    /// preserved (not modified), and the read-only flag means no metadata is
+    /// written either.
     #[test]
     #[cfg(feature = "vector")]
     fn read_only_open_does_not_write_missing_vector_metadata() {
@@ -2588,10 +2705,17 @@ mod tests {
         }
 
         let reloaded = SnapshotManager::open_read_only(&snapshot_path).unwrap();
-        assert_eq!(reloaded.graph().embedding_status().indexed, 1);
+        // FIR-901: absent sidecar = stale; the vector index is NOT loaded.
+        assert_eq!(
+            reloaded.graph().embedding_status().indexed,
+            0,
+            "absent sidecar must not allow vector load even in read-only mode"
+        );
+        // The .kvec is preserved (read-only, no writes).
+        assert!(vector_path.exists(), ".kvec must be preserved (read-only)");
         assert!(
             !metadata_path.exists(),
-            "read-only open should not create vector metadata"
+            "read-only open must not create vector metadata"
         );
     }
 
@@ -2881,5 +3005,212 @@ mod tests {
         let reopened_graph = reopened.graph();
         assert_eq!(reopened_graph.snapshot_root_hash_hint(), Some(root_hash));
         assert_eq!(reopened_graph.compute_root_hash(), root_hash);
+    }
+
+    // ── FIR-901 tests ────────────────────────────────────────────────────────
+
+    /// A .kvec present without its .kvec.meta.json sidecar must NOT be loaded:
+    /// the absent sidecar bypassed the root-hash gate in the old `unwrap_or(true)`.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn torn_sidecar_absent_rejects_load() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+        let metadata_path = vector_index_metadata_path_for(&snapshot_path);
+
+        // Set up: entity + vector index, full save (produces .kvec + .meta.json).
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let entity = test_entity("torn_sidecar_entity");
+        graph.upsert_entity(&entity).unwrap();
+
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        vectors.save(&vector_path).unwrap();
+        graph.load_vector_index(&vector_path).unwrap();
+        mgr.save().unwrap();
+
+        assert!(vector_path.exists(), ".kvec must exist after save");
+        assert!(
+            metadata_path.exists(),
+            ".kvec.meta.json must exist after save"
+        );
+
+        // Tear the sidecar: remove .kvec.meta.json, leaving orphaned .kvec.
+        std::fs::remove_file(&metadata_path).unwrap();
+
+        // Reopen: the vector index must NOT be loaded (absent sidecar = stale).
+        let reopened = SnapshotManager::open(&snapshot_path).unwrap();
+        assert_eq!(
+            reopened.graph().embedding_status().indexed,
+            0,
+            "torn sidecar (.kvec present, .meta.json absent) must not load the vector index"
+        );
+    }
+
+    /// With both .kvec and .kvec.meta.json present and matching, the vector
+    /// index must load successfully.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn stamped_match_loads_vector_index() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let entity = test_entity("stamped_match_entity");
+        graph.upsert_entity(&entity).unwrap();
+
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        vectors.save(&vector_path).unwrap();
+        graph.load_vector_index(&vector_path).unwrap();
+        mgr.save().unwrap();
+
+        let reopened = SnapshotManager::open(&snapshot_path).unwrap();
+        assert_eq!(
+            reopened.graph().embedding_status().indexed,
+            1,
+            "matching sidecar must load the vector index"
+        );
+    }
+
+    /// `vector_metadata_matches_graph`: embedder_identity mismatch must reject.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn embedder_identity_mismatch_rejects() {
+        let root = [1u8; 32];
+        let metadata = VectorIndexMetadata {
+            version: VectorIndexMetadata::VERSION,
+            graph_root_hash: hex::encode(root),
+            dimensions: 768,
+            indexed: 1,
+            embedding_provider: None,
+            embedding_model_id: None,
+            embedding_model_revision: None,
+            embedding_pipeline_epoch: None,
+            embedder_identity: Some("sha256-aabbcc".to_string()),
+        };
+        assert!(
+            !vector_metadata_matches_graph(&metadata, root, Some("sha256-ddeeff")),
+            "different embedder_identity must reject"
+        );
+    }
+
+    /// `vector_metadata_matches_graph`: None on either side is legacy —
+    /// warn but load.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn embedder_identity_legacy_none_loads() {
+        let root = [1u8; 32];
+
+        // Stored=None (legacy store), expected=Some: warn+load.
+        let metadata_none = VectorIndexMetadata {
+            version: 1,
+            graph_root_hash: hex::encode(root),
+            dimensions: 768,
+            indexed: 1,
+            embedding_provider: None,
+            embedding_model_id: None,
+            embedding_model_revision: None,
+            embedding_pipeline_epoch: None,
+            embedder_identity: None,
+        };
+        assert!(
+            vector_metadata_matches_graph(&metadata_none, root, Some("sha256-aabbcc")),
+            "stored=None (legacy) must not block load when expected is Some"
+        );
+
+        // Stored=Some, expected=None: warn+load.
+        let metadata_some = VectorIndexMetadata {
+            version: VectorIndexMetadata::VERSION,
+            graph_root_hash: hex::encode(root),
+            dimensions: 768,
+            indexed: 1,
+            embedding_provider: None,
+            embedding_model_id: None,
+            embedding_model_revision: None,
+            embedding_pipeline_epoch: None,
+            embedder_identity: Some("sha256-aabbcc".to_string()),
+        };
+        assert!(
+            vector_metadata_matches_graph(&metadata_some, root, None),
+            "stored=Some, expected=None (legacy caller) must not block load"
+        );
+    }
+
+    /// `vector_metadata_matches_graph`: matching identities on both sides loads.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn embedder_identity_match_loads() {
+        let root = [1u8; 32];
+        let metadata = VectorIndexMetadata {
+            version: VectorIndexMetadata::VERSION,
+            graph_root_hash: hex::encode(root),
+            dimensions: 768,
+            indexed: 1,
+            embedding_provider: None,
+            embedding_model_id: None,
+            embedding_model_revision: None,
+            embedding_pipeline_epoch: None,
+            embedder_identity: Some("sha256-aabbcc".to_string()),
+        };
+        assert!(
+            vector_metadata_matches_graph(&metadata, root, Some("sha256-aabbcc")),
+            "matching embedder_identity must load"
+        );
+    }
+
+    /// `save_vector_index_for_graph` stamps embedder_identity into the sidecar;
+    /// a reload with the same identity succeeds, a different identity rejects.
+    #[test]
+    #[cfg(feature = "vector")]
+    fn save_and_load_embedder_identity_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+        let metadata_path = vector_index_metadata_path_for(&snapshot_path);
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let entity = test_entity("identity_entity");
+        graph.upsert_entity(&entity).unwrap();
+
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(entity.id, &[0.5, 0.5, 0.5, 0.5]).unwrap();
+        vectors.save(&vector_path).unwrap();
+        graph.load_vector_index(&vector_path).unwrap();
+        mgr.save().unwrap();
+
+        // Overwrite sidecar with an explicit embedder_identity.
+        SnapshotManager::save_vector_index_for_graph(
+            &snapshot_path,
+            graph.as_ref(),
+            Some("build-v1"),
+        )
+        .unwrap();
+
+        let stored_metadata = read_vector_index_metadata(&metadata_path)
+            .unwrap()
+            .expect("metadata must be present");
+        assert_eq!(
+            stored_metadata.embedder_identity.as_deref(),
+            Some("build-v1"),
+            "embedder_identity must be persisted in sidecar"
+        );
+
+        // Same identity → loads.
+        let root = compute_graph_root_hash(&graph.to_snapshot());
+        assert!(
+            vector_metadata_matches_graph(&stored_metadata, root, Some("build-v1")),
+            "matching identity must load"
+        );
+        // Different identity → rejects.
+        assert!(
+            !vector_metadata_matches_graph(&stored_metadata, root, Some("build-v2")),
+            "different identity must reject"
+        );
     }
 }
