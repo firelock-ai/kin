@@ -3060,7 +3060,7 @@ dependencies = [
 [[package]]
 name = "kin-db"
 version = "0.1.0"
-source = "git+https://github.com/firelock-ai/kin-db.git?rev=990c29be0cdc86d6f5c29d3e179c228dedc49a53#990c29be0cdc86d6f5c29d3e179c228dedc49a53"
+source = "git+https://github.com/firelock-ai/kin-db.git?rev=2dacb1908dcf325cc1e96d4e1f5931b9b4ab951b#2dacb1908dcf325cc1e96d4e1f5931b9b4ab951b"
 dependencies = [
  "bincode",
  "bytes",
@@ -3137,7 +3137,7 @@ dependencies = [
 [[package]]
 name = "kin-infer"
 version = "0.2.0"
-source = "git+https://github.com/firelock-ai/kin-infer.git?rev=ff1a60c46aa51487b8a492c499b0841592102447#ff1a60c46aa51487b8a492c499b0841592102447"
+source = "git+https://github.com/firelock-ai/kin-infer.git?rev=29461aef2a405d170c55162d4d5e07150142ad4f#29461aef2a405d170c55162d4d5e07150142ad4f"
 dependencies = [
  "block",
  "half",
