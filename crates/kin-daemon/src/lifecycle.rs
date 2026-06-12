@@ -201,6 +201,36 @@ fn default_idle_timeout_secs() -> &'static str {
     }
 }
 
+/// Default idle timeout for MCP-initiated daemon autostarts (30 minutes).
+///
+/// Interactive MCP agent loops routinely pause longer than the 60-second CLI
+/// default between tool calls, so MCP-path spawns use this larger window.  An
+/// explicit `KIN_DAEMON_IDLE_TIMEOUT_SECS` env var always overrides both.
+pub const MCP_IDLE_TIMEOUT_SECS: &str = "1800";
+
+/// Pure resolution of the idle-timeout value to inject into a spawned daemon.
+///
+/// Returns `None` when the user has already set `KIN_DAEMON_IDLE_TIMEOUT_SECS`
+/// (their value wins; we let the env var propagate naturally to the child).
+/// Returns `Some(value)` when we should explicitly set the env var: either
+/// the caller-supplied override or the compiled default when no override is
+/// given.
+///
+/// All accepted values are compile-time string literals (`&'static str`), so
+/// the caller-override parameter is restricted to that lifetime.
+///
+/// Factored out of the spawn path so the env-assembly logic is unit-testable
+/// without actually starting a daemon process.
+pub(crate) fn resolve_idle_timeout_env(
+    user_env_is_set: bool,
+    caller_override: Option<&'static str>,
+) -> Option<&'static str> {
+    if user_env_is_set {
+        return None;
+    }
+    Some(caller_override.unwrap_or(default_idle_timeout_secs()))
+}
+
 // ── The One Function ────────────────────────────────────────────────────
 
 /// Ensure the daemon is running for this repo. Returns its base URL.
@@ -211,6 +241,20 @@ fn default_idle_timeout_secs() -> &'static str {
 ///
 /// No timeouts, no escape hatches, no lock file dances. Simple.
 pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String, AutoStartError> {
+    ensure_daemon_running_with_idle_timeout(kin_root, None).await
+}
+
+/// Like [`ensure_daemon_running`] but lets the caller inject a specific idle
+/// timeout into the spawned daemon process.
+///
+/// Pass `Some(MCP_IDLE_TIMEOUT_SECS)` on the MCP-initiated path (30 min) so
+/// interactive agent sessions don't expire the daemon mid-session.  Pass
+/// `None` to use the compiled default (60 s).  An explicit
+/// `KIN_DAEMON_IDLE_TIMEOUT_SECS` env var always takes precedence over both.
+pub async fn ensure_daemon_running_with_idle_timeout(
+    kin_root: &Path,
+    idle_timeout_override: Option<&'static str>,
+) -> Result<String, AutoStartError> {
     // ── If it's there, use it ───────────────────────────────────────────
     if let Some(port) = daemon_is_up(kin_root) {
         return Ok(format!("http://127.0.0.1:{}", port));
@@ -234,8 +278,11 @@ pub async fn ensure_daemon_running(kin_root: &Path) -> Result<String, AutoStartE
     ]);
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
-    if std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_none() {
-        cmd.env("KIN_DAEMON_IDLE_TIMEOUT_SECS", default_idle_timeout_secs());
+    if let Some(timeout) = resolve_idle_timeout_env(
+        std::env::var_os("KIN_DAEMON_IDLE_TIMEOUT_SECS").is_some(),
+        idle_timeout_override,
+    ) {
+        cmd.env("KIN_DAEMON_IDLE_TIMEOUT_SECS", timeout);
     }
 
     #[cfg(unix)]
@@ -415,6 +462,44 @@ pub enum AutoStartError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Idle-timeout env resolution ────────────────────────────────────────
+    //
+    // These lock the scoped-timeout contract: user env wins over everything,
+    // callers can inject an override (MCP 1800s), and None falls back to the
+    // compiled default.
+
+    #[test]
+    fn resolve_idle_timeout_uses_default_when_nothing_set() {
+        // No user env, no caller override → fall through to default_idle_timeout_secs().
+        // In test builds default_idle_timeout_secs() returns "1"; we just assert
+        // the value matches whatever that function returns, not a hard-coded number.
+        let result = resolve_idle_timeout_env(false, None);
+        assert_eq!(result, Some(default_idle_timeout_secs()));
+    }
+
+    #[test]
+    fn resolve_idle_timeout_caller_override_propagates() {
+        // MCP-path caller passes Some("1800") → that value reaches the daemon.
+        assert_eq!(resolve_idle_timeout_env(false, Some("1800")), Some("1800"));
+        assert_eq!(resolve_idle_timeout_env(false, Some("300")), Some("300"));
+    }
+
+    #[test]
+    fn resolve_idle_timeout_user_env_always_wins() {
+        // When the user has set KIN_DAEMON_IDLE_TIMEOUT_SECS we must not inject
+        // anything, regardless of the caller override.
+        assert_eq!(resolve_idle_timeout_env(true, None), None);
+        assert_eq!(resolve_idle_timeout_env(true, Some("1800")), None);
+        assert_eq!(resolve_idle_timeout_env(true, Some("9999")), None);
+    }
+
+    #[test]
+    fn mcp_idle_timeout_constant_is_1800() {
+        // Regression guard: the MCP path must inject 1800s (30 min), not the
+        // 60-second CLI default.
+        assert_eq!(MCP_IDLE_TIMEOUT_SECS, "1800");
+    }
 
     #[test]
     fn stale_pid_cleaned_up() {
