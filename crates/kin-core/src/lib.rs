@@ -50,7 +50,7 @@ pub use text_refs::{
 };
 pub use tree::{build_file_tree, checkout_branch};
 
-pub use diff::{compute_change_id, whoami};
+pub use diff::{compute_change_id, content_identity_from_deltas, whoami};
 pub use disambiguation::{fallback_leaf_trace_matches, query_trace_matches};
 pub use ranking::{
     normalize_symbol_hint, normalize_trace_name, qualifier_hint_from_query, select_best_match,
