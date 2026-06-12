@@ -272,8 +272,12 @@ impl DaemonState {
     /// performs this validated load during construction, so it does not call this.
     fn load_validated_vector_index(layout: &KinLayout, graph: &kin_db::InMemoryGraph) {
         let snapshot_path = layout.kindb_snapshot_path();
-        match kin_db::SnapshotManager::load_vector_index_into_graph_if_valid(graph, &snapshot_path)
-        {
+        let expected_embedder_identity = kin_buildinfo::sha_with_dirty(kin_buildinfo::get());
+        match kin_db::SnapshotManager::load_vector_index_into_graph_if_valid(
+            graph,
+            &snapshot_path,
+            Some(expected_embedder_identity.as_str()),
+        ) {
             Ok(true) => {
                 debug!(path = %snapshot_path.display(), "loaded validated persisted vector index");
             }

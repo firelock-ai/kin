@@ -857,9 +857,12 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                                         "persist lock poisoned".to_string(),
                                     )
                                 })?;
+                            let embedder_identity =
+                                kin_buildinfo::sha_with_dirty(kin_buildinfo::get());
                             kin_db::SnapshotManager::save_vector_index_for_graph(
                                 state_for_persist.layout.kindb_snapshot_path(),
                                 state_for_persist.graph.as_ref(),
+                                Some(embedder_identity.as_str()),
                             )
                         })
                         .await;
@@ -1796,9 +1799,8 @@ async fn select_with_signals(
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        next_embed_error_backoff, parse_duration_secs, should_flush_now,
-        watched_process_is_alive, DaemonConfig, DEFAULT_RUNTIME_SHUTDOWN_GRACE,
-        DEFAULT_SHUTDOWN_ESCALATION_GRACE,
+        next_embed_error_backoff, parse_duration_secs, should_flush_now, watched_process_is_alive,
+        DaemonConfig, DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE,
     };
     use std::time::Duration;
 
