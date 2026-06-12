@@ -21,7 +21,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Toolchain channel is pinned by rust-toolchain.toml (1.96.0); the action
       # honours that file. Bump both together, never via @stable drift.
