@@ -3662,6 +3662,47 @@ fn forget_mcp_transaction(state: &DaemonState, transaction_id: &str) {
     lock_recover(&state.mcp_transactions).remove(transaction_id);
 }
 
+/// Collect the current graph state of all entities referenced in a commit
+/// transaction's staged operations.  Called immediately before the commit is
+/// applied so the returned entities carry the source-span metadata set by the
+/// last reconcile — the information
+/// [`project_after_mcp_commit`](crate::projection_wiring::project_after_mcp_commit)
+/// needs to splice the mutation back into the working-directory files.
+///
+/// Only entity operations are projected (relations and blobs have no file span).
+/// Entities not yet in the graph (new creates staged for the first time) are
+/// silently omitted — they have no span, so
+/// `project_after_mcp_commit` would skip them anyway.
+fn collect_pre_commit_entities(
+    state: &DaemonState,
+    sessions: &kin_mcp::SessionRegistry,
+    arguments: &HashMap<String, serde_json::Value>,
+) -> Vec<kin_model::Entity> {
+    let Some(tx_id) = arguments
+        .get("transaction_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return vec![];
+    };
+    let Some(transaction) = sessions.get_transaction(tx_id) else {
+        return vec![];
+    };
+
+    let mut entities = Vec::new();
+    for op in &transaction.staged_operations {
+        let Some(kin_mcp::McpMutationPayload::Entity(payload_entity)) = op.payload.as_ref() else {
+            continue;
+        };
+        // Look up the pre-commit entity from the graph — it carries the span
+        // set by the last reconcile.  The agent's staged payload may not have
+        // span metadata (agents do not know file placement).
+        if let Ok(Some(graph_entity)) = state.graph.get_entity(&payload_entity.id) {
+            entities.push(graph_entity);
+        }
+    }
+    entities
+}
+
 /// The transaction id a terminal transaction tool (commit/abort) acted on, used
 /// to evict it from the durable store after success.
 fn terminal_transaction_id(
@@ -3978,6 +4019,16 @@ async fn mcp_tools_call(
 
     let sessions = mcp_session_registry_snapshot(&state)?;
 
+    // FIR-929: snapshot entity state before the commit so we can project the
+    // mutations into working-directory files after the graph is updated.
+    // Entities without a span (new creates, relation-only ops) are included but
+    // silently skipped by project_after_mcp_commit.
+    let pre_commit_entities = if request.name == "kin_transaction_commit" {
+        collect_pre_commit_entities(&state, &sessions, &request.arguments)
+    } else {
+        vec![]
+    };
+
     let result = match kin_mcp::handlers::handle_tool_call(
         &request.name,
         &request.arguments,
@@ -4010,6 +4061,28 @@ async fn mcp_tools_call(
             old_root_hash: None,
             new_root_hash: format!("mcp-tool:{}", request.name),
         });
+    }
+
+    // FIR-929: project entity mutations into working-directory files so the
+    // next reconcile does not silently clobber the graph (file-wins LWW).
+    //
+    // The graph commit has already landed and the version counter already
+    // reflects it above.  A projection failure does NOT roll back the graph —
+    // the agent's intent is preserved and the caller is told loudly so it can
+    // retry or inspect the source file.
+    if request.name == "kin_transaction_commit"
+        && result.is_error != Some(true)
+        && !pre_commit_entities.is_empty()
+    {
+        if let Err(proj_err) =
+            crate::projection_wiring::project_after_mcp_commit(&state, &pre_commit_entities).await
+        {
+            return Ok(Json(kin_mcp::ToolCallResult::error(format!(
+                "graph commit succeeded but file projection failed — agent intent is preserved \
+                 in the graph; retry projection or inspect the source file. \
+                 Detail: {proj_err}"
+            ))));
+        }
     }
 
     Ok(Json(result))
