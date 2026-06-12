@@ -3278,9 +3278,14 @@ async fn embed(
             let _persist = persist_state.persist_lock.lock().map_err(|_| {
                 kin_db::KinDbError::ConcurrentAccessError("persist lock poisoned".to_string())
             })?;
+            // Stamp the sidecar with this daemon build's identity so vectors
+            // written by one embedder stack are never silently trusted by
+            // another (FIR-901).
+            let embedder_identity = kin_buildinfo::sha_with_dirty(kin_buildinfo::get());
             kin_db::SnapshotManager::save_vector_index_for_graph(
                 persist_state.layout.kindb_snapshot_path(),
                 persist_state.graph.as_ref(),
+                Some(embedder_identity.as_str()),
             )
         };
 
