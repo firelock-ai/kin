@@ -616,15 +616,26 @@ impl Reconciler {
         }
 
         // Process relations: diff existing relations against newly parsed ones.
+        //
+        // Origin-filtered stale removal (FIR-905): a single-file reconcile is only
+        // authoritative for relations it could have re-derived from this file's index
+        // pass — those where the origin is parser-derived (Parsed or Inferred) AND both
+        // endpoints belong to entities of the file being reconciled.  Cross-file linker
+        // edges (e.g. init-time Calls whose dst lives in another file), LSP-enrichment
+        // edges, and agent-created Manual edges are never re-derived by a single-file
+        // reconcile and must be preserved.  We therefore track origin alongside the
+        // relation ID so the removal loop can apply the combined filter.
+        let file_entity_node_ids: std::collections::HashSet<GraphNodeId> =
+            existing.iter().map(|e| GraphNodeId::Entity(e.id)).collect();
         // Collect existing relations for all entities in this file.
         let mut existing_relations: HashMap<
             (GraphNodeId, GraphNodeId, kin_model::RelationKind),
-            kin_model::RelationId,
+            (kin_model::RelationId, kin_model::RelationOrigin),
         > = HashMap::new();
         for entity in &existing {
             if let Ok(rels) = graph.get_all_relations_for_entity(&entity.id) {
                 for rel in rels {
-                    existing_relations.insert((rel.src, rel.dst, rel.kind), rel.id);
+                    existing_relations.insert((rel.src, rel.dst, rel.kind), (rel.id, rel.origin));
                 }
             }
         }
@@ -660,15 +671,28 @@ impl Reconciler {
         }
 
         // Remove stale relations that no longer exist in the file.
-        for ((src, dst, kind), rel_id) in &existing_relations {
+        // Only remove a relation when this reconcile pass could have re-derived it:
+        //   1. origin is parser-derived (Parsed or Inferred), AND
+        //   2. both src and dst are entities of the file being reconciled.
+        // This preserves cross-file linker edges, LSP-enrichment edges, and
+        // agent-created Manual edges that a single-file re-parse cannot recreate.
+        for ((src, dst, kind), (rel_id, origin)) in &existing_relations {
             if !new_relation_keys.contains(&(*src, *dst, *kind)) {
-                overlay.relation_removes.push(*rel_id);
-                debug!(
-                    relation_id = %rel_id,
-                    src = %src,
-                    dst = %dst,
-                    "stale relation removed"
+                let both_in_file =
+                    file_entity_node_ids.contains(src) && file_entity_node_ids.contains(dst);
+                let parser_derived = matches!(
+                    origin,
+                    kin_model::RelationOrigin::Parsed | kin_model::RelationOrigin::Inferred
                 );
+                if parser_derived && both_in_file {
+                    overlay.relation_removes.push(*rel_id);
+                    debug!(
+                        relation_id = %rel_id,
+                        src = %src,
+                        dst = %dst,
+                        "stale relation removed"
+                    );
+                }
             }
         }
 
@@ -2630,5 +2654,206 @@ mod tests {
     fn validate_entity_accepts_valid() {
         let entity = make_entity("test", "src/lib.rs");
         assert!(super::validate_entity(&entity).is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // FIR-905 conviction test: origin-filtered stale-removal
+    // ---------------------------------------------------------------
+
+    /// Verify that a single-file reconcile only removes relations it could have
+    /// re-derived from that file's index pass.  The test builds a graph with five
+    /// pre-existing relations on entities of `file_a`, then reconciles `file_a`
+    /// with an IndexedFile that has no relations in the fresh parse:
+    ///
+    ///   1. cross_file_rel   – Parsed, src is in file_b             → SURVIVES
+    ///   2. manual_rel       – Manual, src in file_a, dst in file_b  → SURVIVES
+    ///   3. lsp_rel          – Lsp, src in file_a, dst in file_b     → SURVIVES
+    ///   4. stale_same_file  – Parsed, both endpoints in file_a      → REMOVED
+    ///   5. manual_same_file – Manual, both endpoints in file_a      → SURVIVES
+    ///
+    /// The test also asserts that the entity absent from the re-parse is removed.
+    #[test]
+    fn stale_removal_preserves_cross_file_lsp_manual_relations() {
+        use kin_blobs::BlobStore;
+        use kin_db::InMemoryGraph;
+        use kin_index::IndexedFile;
+        use kin_model::{
+            EntityStore, FileLayout, ImportSection, ParseCompleteness, ParseState, Relation,
+            RelationId, RelationKind, RelationOrigin,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(dir.path().join("objects")).unwrap();
+        let graph = InMemoryGraph::new();
+
+        let file_a = "src/a.rs";
+        let file_b = "src/b.rs";
+        let file_a_path = dir.path().join(file_a);
+        std::fs::create_dir_all(file_a_path.parent().unwrap()).unwrap();
+
+        // Write minimal content for file_a so blob_store.read() succeeds.
+        let content: &[u8] = b"pub fn foo() -> i32 { 1 }\n";
+        std::fs::write(&file_a_path, content).unwrap();
+        let blob_hash = blob_store.write(content).unwrap();
+
+        // Entities: entity_a and stale_entity in file_a; entity_b in file_b.
+        let entity_a = make_entity("foo", file_a);
+        let stale_entity = make_entity("old_func", file_a);
+        let entity_b = make_entity("bar", file_b);
+
+        graph.upsert_entity(&entity_a).unwrap();
+        graph.upsert_entity(&stale_entity).unwrap();
+        graph.upsert_entity(&entity_b).unwrap();
+
+        // Helper closure to build a Relation value.
+        let make_rel = |id: RelationId,
+                        kind: RelationKind,
+                        src: GraphNodeId,
+                        dst: GraphNodeId,
+                        origin: RelationOrigin| Relation {
+            id,
+            kind,
+            src,
+            dst,
+            confidence: 1.0,
+            origin,
+            created_in: None,
+            import_source: None,
+            evidence: vec![],
+        };
+
+        let cross_file_rel_id = RelationId::new();
+        let manual_rel_id = RelationId::new();
+        let lsp_rel_id = RelationId::new();
+        let stale_same_file_rel_id = RelationId::new();
+        let manual_same_file_rel_id = RelationId::new();
+
+        // 1. Cross-file Parsed: entity_b (file_b) → Calls → entity_a (file_a).
+        //    Simulates the cross-file linker run at init time.
+        graph
+            .upsert_relation(&make_rel(
+                cross_file_rel_id,
+                RelationKind::Calls,
+                GraphNodeId::Entity(entity_b.id),
+                GraphNodeId::Entity(entity_a.id),
+                RelationOrigin::Parsed,
+            ))
+            .unwrap();
+        // 2. Manual: entity_a → References → entity_b.  Agent-created via MCP.
+        graph
+            .upsert_relation(&make_rel(
+                manual_rel_id,
+                RelationKind::References,
+                GraphNodeId::Entity(entity_a.id),
+                GraphNodeId::Entity(entity_b.id),
+                RelationOrigin::Manual,
+            ))
+            .unwrap();
+        // 3. LSP: entity_a → Calls → entity_b.  LSP-enrichment edge.
+        graph
+            .upsert_relation(&make_rel(
+                lsp_rel_id,
+                RelationKind::Calls,
+                GraphNodeId::Entity(entity_a.id),
+                GraphNodeId::Entity(entity_b.id),
+                RelationOrigin::Lsp,
+            ))
+            .unwrap();
+        // 4. Stale same-file Parsed: entity_a → Calls → stale_entity (both in file_a).
+        //    This is the relation that the reconcile SHOULD remove — the re-parse no
+        //    longer produces it because stale_entity was deleted from the file.
+        graph
+            .upsert_relation(&make_rel(
+                stale_same_file_rel_id,
+                RelationKind::Calls,
+                GraphNodeId::Entity(entity_a.id),
+                GraphNodeId::Entity(stale_entity.id),
+                RelationOrigin::Parsed,
+            ))
+            .unwrap();
+        // 5. Manual same-file: entity_a → OwnedBy → stale_entity.
+        //    Even though both endpoints are in file_a, Manual origin means reconcile
+        //    must NOT remove it (it was not produced by the parser).
+        graph
+            .upsert_relation(&make_rel(
+                manual_same_file_rel_id,
+                RelationKind::OwnedBy,
+                GraphNodeId::Entity(entity_a.id),
+                GraphNodeId::Entity(stale_entity.id),
+                RelationOrigin::Manual,
+            ))
+            .unwrap();
+
+        // Seed the reconciler LKG with the file_a entities so `has_changed` returns
+        // false for entity_a (no modification → no entity_mods in the overlay).
+        let mut reconciler = Reconciler::new(dir.path().to_path_buf());
+        reconciler.lkg.record(entity_a.clone(), vec![]);
+        reconciler.lkg.record(stale_entity.clone(), vec![]);
+
+        // Construct an IndexedFile that represents a re-parse of file_a:
+        //   - entity_a is present (same name/kind → matched, no fingerprint change)
+        //   - stale_entity is absent → will go into entity_removes
+        //   - relations is empty → no same-file relations re-derived
+        let indexed = IndexedFile {
+            file_id: FilePathId::new(file_a),
+            language: kin_model::LanguageId::Rust,
+            entities: vec![entity_a.clone()],
+            relations: vec![],
+            unresolved_relations: vec![],
+            file_layout: FileLayout {
+                file_id: FilePathId::new(file_a),
+                parse_completeness: ParseCompleteness::Full,
+                imports: ImportSection {
+                    byte_range: 0..0,
+                    items: vec![],
+                },
+                regions: vec![],
+            },
+            parse_state: ParseState::Valid,
+            blob_hash,
+            extracted_relations: vec![],
+            imports: vec![],
+        };
+
+        let mut overlay = GraphOverlay::default();
+        reconciler
+            .reconcile_file_edit_inner(
+                &indexed,
+                &FilePathId::new(file_a),
+                &file_a_path,
+                &blob_store,
+                &graph,
+                &mut overlay,
+            )
+            .expect("reconcile_file_edit_inner should succeed");
+
+        // --- Relation survival assertions ---
+
+        assert!(
+            !overlay.relation_removes.contains(&cross_file_rel_id),
+            "cross-file Parsed edge must NOT be removed by single-file reconcile"
+        );
+        assert!(
+            !overlay.relation_removes.contains(&manual_rel_id),
+            "Manual relation must NOT be removed by reconcile"
+        );
+        assert!(
+            !overlay.relation_removes.contains(&lsp_rel_id),
+            "Lsp relation must NOT be removed by reconcile"
+        );
+        assert!(
+            overlay.relation_removes.contains(&stale_same_file_rel_id),
+            "stale same-file Parsed relation MUST be removed by reconcile"
+        );
+        assert!(
+            !overlay.relation_removes.contains(&manual_same_file_rel_id),
+            "Manual relation with both endpoints in file must NOT be removed"
+        );
+
+        // --- Entity removal assertion ---
+        assert!(
+            overlay.entity_removes.contains(&stale_entity.id),
+            "stale_entity must be in entity_removes (absent from re-parse)"
+        );
     }
 }
