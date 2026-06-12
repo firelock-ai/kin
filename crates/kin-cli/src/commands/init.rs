@@ -28,8 +28,7 @@ use tracing::{info, warn};
 const SNAPSHOT_SKIP_DIRS: &[&str] = &[".git/objects", ".git/pack"];
 
 const INIT_WARM_CACHE_SCHEMA_VERSION: &str = "v1";
-pub(crate) const INIT_WARM_CACHE_PIPELINE_EPOCH: &str =
-    "init-warm-2026-04-17-cross-lang-call-resolution";
+pub(crate) const INIT_WARM_CACHE_PIPELINE_EPOCH: &str = "init-warm-2026-06-11-exclude-git-plumbing";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct WarmCacheBundleManifestEntry {
@@ -201,6 +200,18 @@ fn should_skip(rel: &Path) -> bool {
         return true;
     }
     if rel_str.starts_with(".kin-") {
+        return true;
+    }
+    // VCS plumbing is never code semantics, and it must never enter graph truth.
+    // In a normal repo `.git` is a directory of internal state; in a git
+    // *worktree* the repo-root `.git` is a FILE whose contents are a `gitdir:`
+    // pointer baking in a machine-absolute path. Excluding the entire `.git`
+    // subtree (file or directory) keeps machine paths and serialization-unstable
+    // git internals out of the snapshot — and therefore out of the indexed
+    // entity set. Mirrors `kin_index::should_skip_dir(".git")`, applied here to
+    // the worktree pointer FILE as well. (Subsumes the `.git/objects` and
+    // `.git/pack` SNAPSHOT_SKIP_DIRS entries below.)
+    if rel_str == ".git" || rel_str.starts_with(".git/") {
         return true;
     }
     // Snapshot-specific skips (git internals that aren't full directories).
@@ -2786,6 +2797,14 @@ fn collect_source_files_recursive(root: &Path, dir: &Path, files: &mut Vec<PathB
             }
             collect_source_files_recursive(root, &path, files)?;
         } else if path.is_file() {
+            // A git *worktree* root carries `.git` as a FILE (a `gitdir:` pointer
+            // holding a machine-absolute path), not a directory. Apply the same
+            // VCS/internal skip to file entries so that pointer file — and any
+            // other internal-named file (`.kin`, `.git-export`) — can never
+            // become an indexed entity and leak a machine path into graph truth.
+            if kin_index::should_skip_dir(name_str.as_ref()) {
+                continue;
+            }
             files.push(path);
         }
     }
@@ -4080,6 +4099,122 @@ mod tests {
 
         // Verify manifest data is correct.
         assert_eq!(manifest["file_count"], 5);
+    }
+
+    /// Regression: a git *worktree* root carries `.git` as a FILE whose contents
+    /// are a `gitdir:` pointer holding a machine-absolute path. Indexing that file
+    /// would bake an ambient filesystem path into graph truth, so two preps of
+    /// identical content at different checkout paths would diverge by one entity
+    /// (and its embedding). Prove the full snapshot→collect→index pipeline excludes
+    /// it on every surface, while git-adjacent *repo* files (`.gitignore`,
+    /// `.github/`) are still indexed.
+    #[test]
+    fn cold_init_pipeline_excludes_git_worktree_pointer_file() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let root = repo_dir.path();
+
+        // The machine-absolute path the worktree pointer would otherwise leak.
+        let worktree_abs = "/Users/somebody/checkouts/main/.git/worktrees/feature-x";
+        fs::write(root.join(".git"), format!("gitdir: {}\n", worktree_abs)).unwrap();
+
+        // Real repo content that MUST survive indexing — including git-adjacent
+        // dotfiles/dirs that are genuine repo content, not VCS plumbing.
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/main.rs"),
+            "fn main() { println!(\"hi\"); }\n",
+        )
+        .unwrap();
+        fs::write(root.join(".gitignore"), "target\n").unwrap();
+        fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        fs::write(root.join(".github/workflows/ci.yml"), "name: ci\n").unwrap();
+
+        // Phase 1: the snapshot must not copy the worktree `.git` pointer file.
+        let (snapshot_path, _manifest) = snapshot_repo(root).unwrap();
+        assert!(
+            !snapshot_path.join(".git").exists(),
+            "worktree `.git` pointer file leaked into the snapshot"
+        );
+
+        // Phase 2: collect must yield no `.git`-pathed entry, and every collected
+        // path must be repo-owned and free of the machine-absolute path.
+        let all_files = collect_source_files(&snapshot_path).unwrap();
+        let rel_paths: BTreeSet<String> = all_files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&snapshot_path)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            !rel_paths
+                .iter()
+                .any(|p| p.as_str() == ".git" || p.starts_with(".git/")),
+            "`.git` plumbing leaked into collect_source_files: {:?}",
+            rel_paths
+        );
+        for p in &rel_paths {
+            assert!(
+                is_repo_owned_graph_path(p),
+                "non-repo path leaked into collect_source_files: {}",
+                p
+            );
+        }
+        // Git-adjacent repo content is preserved.
+        assert!(rel_paths.contains("src/main.rs"), "got: {:?}", rel_paths);
+        assert!(rel_paths.contains(".gitignore"), "got: {:?}", rel_paths);
+        assert!(
+            rel_paths.contains(".github/workflows/ci.yml"),
+            "got: {:?}",
+            rel_paths
+        );
+
+        // Phase 2b: the machine-absolute path must appear in no collected input
+        // (the pointer file was its only carrier).
+        for p in &all_files {
+            let text = String::from_utf8_lossy(&fs::read(p).unwrap()).into_owned();
+            assert!(
+                !text.contains(worktree_abs),
+                "machine-absolute worktree path leaked into snapshot content: {}",
+                p.display()
+            );
+        }
+
+        // Phase 3: index into a real graph and assert no `.git`-pathed entity or
+        // artifact — and no machine path — reaches graph truth on any surface.
+        let indexable = collect_indexable_files(&snapshot_path, &all_files).unwrap();
+        let init_result = kin_core::init(root).unwrap();
+        let blob_store = kin_blobs::BlobStore::new(init_result.layout.objects_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        parse_and_index(&graph, &blob_store, &indexable).unwrap();
+
+        let tracked = tracked_graph_paths(&graph);
+        assert!(
+            !tracked
+                .iter()
+                .any(|p| p.as_str() == ".git" || p.starts_with(".git/")),
+            "`.git` plumbing reached graph truth: {:?}",
+            tracked
+        );
+        for p in &tracked {
+            assert!(
+                is_repo_owned_graph_path(p),
+                "non-repo path in graph truth: {}",
+                p
+            );
+            assert!(
+                !p.contains(worktree_abs),
+                "machine-absolute worktree path reached graph truth: {}",
+                p
+            );
+        }
+        assert!(
+            tracked.contains("src/main.rs"),
+            "real source file missing from graph truth; got: {:?}",
+            tracked
+        );
     }
 
     #[test]
