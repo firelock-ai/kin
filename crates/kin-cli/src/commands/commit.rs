@@ -447,7 +447,9 @@ async fn run_local_commit_pipeline_for_tests(
     let write_start = Instant::now();
 
     // Build the semantic change
-    let change_id = kin_core::compute_change_id(&message, &parent_id);
+    let content_id =
+        kin_core::content_identity_from_deltas(&entity_deltas, &relation_deltas, &artifact_deltas);
+    let change_id = kin_core::compute_change_id(&message, &parent_id, &content_id);
     let change = SemanticChange {
         id: change_id,
         parents: vec![parent_id],
