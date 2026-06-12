@@ -636,7 +636,7 @@ impl DaemonState {
                         role: Some(e.role),
                     })
                     .collect();
-                let root_hash = format!("init-{}", entities.len());
+                let root_hash = hex::encode(self.graph.compute_root_hash());
                 backend.register_repo(repo_id, entries, &root_hash);
                 info!(
                     repo_id,

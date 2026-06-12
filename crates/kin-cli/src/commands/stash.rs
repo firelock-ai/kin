@@ -6,7 +6,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use kin_model::ChangeStore;
 
 /// `kin stash push` — Save the current overlay state to .kin/stashes/.
 pub async fn push() -> Result<()> {
@@ -33,13 +32,7 @@ fn push_with_layout(layout: &kin_core::KinLayout) -> Result<()> {
     let index = entries.len();
     let stash_file = stash_dir.join(format!("stash-{}.json", index));
 
-    // Serialize the current working copy overlay from the graph.
-    let graph = kin_db::InMemoryGraph::new();
     let current_branch = kin_core::read_current_branch(layout)?;
-
-    // Capture a snapshot: branch heads + current branch + timestamp + file snapshots.
-
-    let branches = graph.list_branches()?;
 
     // Snapshot working directory files.
     let work_dir = layout.working_dir();
@@ -50,12 +43,6 @@ fn push_with_layout(layout: &kin_core::KinLayout) -> Result<()> {
         "index": index,
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "current_branch": current_branch.to_string(),
-        "branches": branches.iter().map(|b| {
-            serde_json::json!({
-                "name": b.name.to_string(),
-                "head": b.head.to_string(),
-            })
-        }).collect::<Vec<_>>(),
         "file_snapshots": file_snapshots,
     });
 
@@ -85,25 +72,8 @@ fn pop_with_layout(layout: &kin_core::KinLayout) -> Result<()> {
 
     let index = snapshot["index"].as_u64().unwrap_or(0);
 
-    // Restore branch heads from the stash.
-    let graph = kin_db::InMemoryGraph::new();
-
-    if let Some(branches) = snapshot["branches"].as_array() {
-        for branch_val in branches {
-            if let (Some(name), Some(head_str)) =
-                (branch_val["name"].as_str(), branch_val["head"].as_str())
-            {
-                if let Ok(bytes) = hex::decode(head_str) {
-                    if bytes.len() == 32 {
-                        let hash = kin_model::Hash256::from_bytes(bytes.try_into().unwrap());
-                        let branch_name = kin_model::BranchName::new(name);
-                        let change_id = kin_model::SemanticChangeId(hash);
-                        let _ = graph.update_branch_head(&branch_name, &change_id);
-                    }
-                }
-            }
-        }
-    }
+    // Legacy stashes may contain a `branches` field; it is ignored — graph-native
+    // branch snapshot/restore requires real daemon/graph wiring (out of scope here).
 
     // Restore current branch if stored.
     if let Some(branch_str) = snapshot["current_branch"].as_str() {
@@ -338,5 +308,58 @@ mod tests {
         );
         assert!(!dir.path().join("src/extra.rs").exists());
         assert!(!dir.path().join(".kin/stashes/stash-0.json").exists());
+    }
+
+    #[tokio::test]
+    async fn push_stash_has_no_branches_field() {
+        // Locks removal of the dead InMemoryGraph branch ops: new stashes must not
+        // contain a `branches` field (the throwaway graph was a silent no-op).
+        let dir = tempfile::tempdir().unwrap();
+        kin_core::init(dir.path()).unwrap();
+        let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "fn foo() {}\n").unwrap();
+
+        push_with_layout(&layout).unwrap();
+
+        let stash = layout.stashes_dir().join("stash-0.json");
+        let val: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(stash).unwrap()).unwrap();
+        assert!(
+            val.get("branches").is_none(),
+            "stash must not include `branches` (dead field removed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn pop_ignores_branches_field_in_legacy_stash() {
+        // Legacy stashes may have a `branches` array; pop must silently ignore it
+        // and still restore file snapshots correctly.
+        let dir = tempfile::tempdir().unwrap();
+        kin_core::init(dir.path()).unwrap();
+        let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
+
+        let stash_dir = layout.stashes_dir();
+        std::fs::create_dir_all(&stash_dir).unwrap();
+        let legacy = serde_json::json!({
+            "index": 0,
+            "timestamp": "2026-01-01T00:00:00Z",
+            "current_branch": "main",
+            "branches": [{"name": "main", "head": "aa".repeat(32)}],
+            "file_snapshots": {"src/lib.rs": "fn original() {}\n"}
+        });
+        std::fs::write(
+            stash_dir.join("stash-0.json"),
+            serde_json::to_string_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        pop_with_layout(&layout).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap(),
+            "fn original() {}\n",
+            "legacy stash with branches field must still restore file snapshots"
+        );
     }
 }
