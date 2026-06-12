@@ -3251,6 +3251,10 @@ async fn embed(
             .embedding_work
             .lock()
             .map_err(|_| "embedding work lock poisoned".to_string())?;
+        // Suppress the background idle flush for the duration of the pass —
+        // this handler does its own pre/per-batch/post persistence, and a
+        // full-graph flush per feed gap amplifies FS churn on large repos.
+        let _embed_pass = state_for_embed.begin_embed_pass();
 
         // Pin graph.kndb on disk at the current root hash H before embedding so
         // the per-batch kvec flushes (which tag metadata with H) match on reopen.
