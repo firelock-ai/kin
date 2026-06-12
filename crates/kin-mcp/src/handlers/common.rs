@@ -1144,25 +1144,6 @@ pub fn read_entity_source_excerpt_detailed<G: GraphStore>(
     expand_entity_source_excerpt(entity, &text, span.start_byte, max_lines, max_chars).or(excerpt)
 }
 
-pub fn read_entity_source_excerpt(
-    entity: &Entity,
-    max_lines: usize,
-    max_chars: usize,
-) -> Option<String> {
-    let span = entity.span.as_ref()?;
-    let path = resolve_entity_source_path(entity)?;
-    let bytes = std::fs::read(path).ok()?;
-    let excerpt = excerpt_from_span_bytes(&bytes, span, max_lines, max_chars);
-    if let Some(ref excerpt) = excerpt {
-        if !should_expand_excerpt(entity, excerpt) {
-            return Some(excerpt.clone());
-        }
-    }
-
-    let text = String::from_utf8_lossy(&bytes);
-    expand_entity_source_excerpt(entity, &text, span.start_byte, max_lines, max_chars).or(excerpt)
-}
-
 pub fn excerpt_from_span_bytes(
     bytes: &[u8],
     span: &SourceSpan,
