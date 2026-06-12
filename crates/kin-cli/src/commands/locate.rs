@@ -11318,6 +11318,20 @@ fn block_focus_source_candidates(
         return candidates;
     }
 
+    // Graph-miss: no /blocks/{term}.{ext} found in graph. Instrument always;
+    // inject disk-discovered paths only when KIN_LOCATE_BLOCK_SOURCE_OPTIN is set
+    // (default OFF). Bench suites have no /blocks/ layout so numbers are unaffected.
+    let count = LOCATE_DISK_SOURCE_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    tracing::debug!(
+        target: "kin.locate.disk_fallback",
+        disk_source_reads = count,
+        "block-focus graph-miss: no /blocks/ candidates in graph; \
+         disk injection requires KIN_LOCATE_BLOCK_SOURCE_OPTIN"
+    );
+    if !locate_env_bool("KIN_LOCATE_BLOCK_SOURCE_OPTIN", false) {
+        return candidates;
+    }
+
     let root = workspace_root.unwrap();
     for term in block_focus_terms(text) {
         for ext in [".js", ".ts", ".jsx", ".tsx"] {
@@ -19122,6 +19136,54 @@ mod tests {
         assert!(
             !tel::telemetry_dir(&kin_root).exists(),
             "default-OFF: no consent → no telemetry dir, no spool"
+        );
+    }
+
+    // Both tests mutate process-global env; serial ensures they don't race.
+    #[serial_test::serial(block_focus_env)]
+    #[test]
+    fn block_focus_candidates_default_no_injection_on_graph_miss() {
+        std::env::remove_var("KIN_LOCATE_BLOCK_SOURCE_OPTIN");
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/blocks")).unwrap();
+        std::fs::write(dir.path().join("src/blocks/button.tsx"), "").unwrap();
+
+        let source_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let before = super::LOCATE_DISK_SOURCE_READS.load(std::sync::atomic::Ordering::Relaxed);
+
+        let result =
+            super::block_focus_source_candidates("button block", &source_files, Some(dir.path()));
+        let after = super::LOCATE_DISK_SOURCE_READS.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert!(result.is_empty(), "default: no graph-miss injection");
+        assert_eq!(
+            after,
+            before + 1,
+            "LOCATE_DISK_SOURCE_READS must be bumped on block-focus graph-miss"
+        );
+    }
+
+    #[serial_test::serial(block_focus_env)]
+    #[test]
+    fn block_focus_candidates_optin_injects_disk_paths() {
+        std::env::set_var("KIN_LOCATE_BLOCK_SOURCE_OPTIN", "1");
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/blocks")).unwrap();
+        std::fs::write(dir.path().join("src/blocks/button.tsx"), "").unwrap();
+
+        let source_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let result =
+            super::block_focus_source_candidates("button block", &source_files, Some(dir.path()));
+        std::env::remove_var("KIN_LOCATE_BLOCK_SOURCE_OPTIN");
+
+        assert_eq!(result.len(), 1, "opt-in: disk candidates must be injected");
+        assert!(
+            result[0]
+                .to_ascii_lowercase()
+                .ends_with("/blocks/button.tsx"),
+            "unexpected path: {}",
+            result[0]
         );
     }
 }
