@@ -2461,8 +2461,10 @@ async fn command_commit(
     }
 
     // Create the semantic change.
+    let content_id =
+        kin_core::content_identity_from_deltas(&entity_deltas, &relation_deltas, &artifact_deltas);
     let change = kin_model::SemanticChange {
-        id: kin_core::compute_change_id(&request.message, &branch.head),
+        id: kin_core::compute_change_id(&request.message, &branch.head, &content_id),
         parents: vec![branch.head],
         author: kin_model::AuthorId::new(kin_core::whoami()),
         message: request.message,
