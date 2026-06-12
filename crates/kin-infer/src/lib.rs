@@ -1358,6 +1358,17 @@ impl BertModel {
 
     /// Batched forward pass: all inputs processed together for projections/FFN,
     /// split only for per-input attention. Reduces GPU dispatches by batch_size×.
+    ///
+    /// Length-bucketing (gated by `bucket_enabled()` / `KIN_INFER_BUCKET`): when the
+    /// batch spans more than one coarse length bin, inputs are partitioned by bin and
+    /// encoded per group, so each group pads only to its own max length. Outputs are
+    /// reassembled in input order with a global-max-len row stride. Single-bin batches
+    /// use the legacy path unchanged.
+    ///
+    /// **Trap**: the bucketing gate must fire before the global `max_len` allocation
+    /// (`[batch_size * max_len, hidden_size]`). Allocating that buffer first — then
+    /// bucketing — produces no benefit and was the defect fixed by FIR-902. Keep the
+    /// `bucket_enabled()` check above the `max_len` computation.
     // Multi-output tensor op (inline tuple clearer than an alias) with flat-offset index loops over ndarray rows.
     #[allow(clippy::type_complexity, clippy::needless_range_loop)]
     pub fn encode_batched(
@@ -1374,22 +1385,68 @@ impl BertModel {
             ));
         }
 
+        // Length-bucketing gate — must precede the global max_len allocation below.
+        // See the doc-comment trap note above.
+        if bucket_enabled() {
+            use std::collections::BTreeMap;
+            let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+            for (idx, ids) in token_ids.iter().enumerate() {
+                groups.entry(length_bin(ids.len())).or_default().push(idx);
+            }
+            if groups.len() > 1 {
+                let h = self.config.hidden_size;
+                let global_max_len = token_ids.iter().map(|t| t.len()).max().unwrap_or(0);
+                let bucket_count = groups.len();
+                let _span = tracing::info_span!(
+                    "kin_infer.model.encode_batched",
+                    batch_size,
+                    max_seq_len = global_max_len,
+                    hidden_size = h,
+                    backend = %self.backend(),
+                    bucket_count,
+                )
+                .entered();
+                let mut out_hidden = Array2::<f32>::zeros((batch_size * global_max_len, h));
+                let mut out_masks: Vec<Vec<u8>> = vec![vec![0u8; global_max_len]; batch_size];
+                for indices in groups.values() {
+                    let sub_ids: Vec<Vec<u32>> =
+                        indices.iter().map(|&i| token_ids[i].clone()).collect();
+                    let sub_mask_in: Vec<Vec<u32>> = indices
+                        .iter()
+                        .map(|&i| attention_masks[i].clone())
+                        .collect();
+                    let (sub_hidden, sub_masks_out, sub_max_len) =
+                        self.encode_batched(&sub_ids, &sub_mask_in)?;
+                    for (slot, &orig) in indices.iter().enumerate() {
+                        let src = slot * sub_max_len;
+                        let dst = orig * global_max_len;
+                        out_hidden
+                            .slice_mut(s![dst..dst + sub_max_len, ..])
+                            .assign(&sub_hidden.slice(s![src..src + sub_max_len, ..]));
+                        out_masks[orig][..sub_max_len].copy_from_slice(&sub_masks_out[slot]);
+                    }
+                }
+                return Ok((out_hidden, out_masks, global_max_len));
+            }
+        }
+
         let h = self.config.hidden_size;
         let embed_dim = self.config.embedding_size.unwrap_or(h);
         let max_len = token_ids.iter().map(|t| t.len()).max().unwrap_or(0);
         let _span = tracing::info_span!(
-            "kin_infer.model.forward_batched",
+            "kin_infer.model.encode_batched",
             batch_size = batch_size,
             max_seq_len = max_len,
             hidden_size = h,
-            backend = %self.backend()
+            backend = %self.backend(),
+            bucket_count = 1_usize,
         )
         .entered();
 
         // 1. Batched embedding: [batch_size * max_len, embed_dim]
         let total_rows = batch_size * max_len;
         let _embed_span = tracing::info_span!(
-            "kin_infer.model.forward_batched.embedding_lookup",
+            "kin_infer.model.encode_batched.embedding_lookup",
             total_rows = total_rows,
             embed_dim = embed_dim
         )
@@ -1426,7 +1483,7 @@ impl BertModel {
         // ALBERT: project up [total_rows, embed_dim] → [total_rows, h]
         if let Some(ref proj) = self.weights.embed_projection {
             let _project_span = tracing::info_span!(
-                "kin_infer.model.forward_batched.embedding_projection",
+                "kin_infer.model.encode_batched.embedding_projection",
                 rows = total_rows,
                 cols = embed_dim
             )
@@ -1436,7 +1493,7 @@ impl BertModel {
 
         // 2. Batched embedding LayerNorm
         let _embed_norm_span =
-            tracing::info_span!("kin_infer.model.forward_batched.embedding_norm").entered();
+            tracing::info_span!("kin_infer.model.encode_batched.embedding_norm").entered();
         self.optional_layer_norm(
             &mut hidden,
             self.weights.embed_ln_weight.as_ref(),
@@ -4443,16 +4500,18 @@ mod tests {
     /// Asserts that per-entity embeddings are bit-identical (Metal) or
     /// cosine ≥ 1 − 1e-5 (all backends) regardless of how inputs are batched:
     ///
-    ///   (a) `encode_batched` on the full mixed set + `pool_and_normalize`
-    ///       (the pre-fix defect path: every item pads to the global max_len)
+    ///   (a) `encode_batched` called directly on the full mixed set (post-fix:
+    ///       auto-bucketed internally; KIN_INFER_BUCKET=0 exercises the legacy
+    ///       global-max-len path in a separate run)
     ///   (b) `encode_batched` per coarse length bin + `pool_and_normalize`
-    ///       (the bucketed sub-batch path; mirrors `forward_batched_bucketed`)
+    ///       (cross-check: mirrors the per-group sub-calls encode_batched now
+    ///       performs internally for multi-bin batches)
     ///   (c) `forward` one entity at a time (canonical per-op reference)
     ///
     /// Corpus mixes short entities (len 20, bin 64) with a long one (len 200,
-    /// bin 256): in path (a) all four pad to max_len = 200; in path (b) the
-    /// shorts pad only to 20. This is the docstring-heavy pattern that collapsed
-    /// sympy throughput to 8 ents/s and motivated the fix.
+    /// bin 256): in the legacy path all four pad to max_len = 200; after the
+    /// fix shorts pad only to 20. This is the docstring-heavy pattern that
+    /// collapsed sympy throughput to 8 ents/s and motivated FIR-902.
     ///
     /// Requires `/tmp/nomic` (model.safetensors + config.json); skips if absent.
     #[test]
@@ -4506,11 +4565,13 @@ mod tests {
             })
             .collect();
 
-        // (a) Full mixed batch via encode_batched (global max_len = 200; pre-fix path).
+        // (a) encode_batched called directly on the full mixed batch: post-fix this
+        // auto-bucketed internally (shorts pad only to 20, not 200).
         let (hidden_mixed, masks_mixed, max_len_mixed) = model
             .encode_batched(&all_ids, &all_masks)
             .expect("encode_batched mixed");
-        let mixed = model.pool_and_normalize(&hidden_mixed, &masks_mixed, max_len_mixed);
+        let encode_batched_direct =
+            model.pool_and_normalize(&hidden_mixed, &masks_mixed, max_len_mixed);
 
         // (b) Per-bucket: group by length_bin, encode each bucket, reassemble.
         let bin_of = |l: usize| -> usize {
@@ -4543,7 +4604,10 @@ mod tests {
         // Assert bit-identical (Metal) / cosine-identical (all) vs single-forward.
         for i in 0..n {
             let baseline = &single[i];
-            for (label, got) in [("mixed-padded", &mixed[i]), ("per-bucket", &per_bucket[i])] {
+            for (label, got) in [
+                ("encode-batched-direct", &encode_batched_direct[i]),
+                ("per-bucket", &per_bucket[i]),
+            ] {
                 assert_eq!(
                     baseline.len(),
                     got.len(),
