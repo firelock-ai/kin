@@ -1796,9 +1796,8 @@ async fn select_with_signals(
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        next_embed_error_backoff, parse_duration_secs, should_flush_now,
-        watched_process_is_alive, DaemonConfig, DEFAULT_RUNTIME_SHUTDOWN_GRACE,
-        DEFAULT_SHUTDOWN_ESCALATION_GRACE,
+        next_embed_error_backoff, parse_duration_secs, should_flush_now, watched_process_is_alive,
+        DaemonConfig, DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE,
     };
     use std::time::Duration;
 
