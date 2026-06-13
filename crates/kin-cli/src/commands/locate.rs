@@ -2977,7 +2977,7 @@ fn priority_relation_retention_paths(
             continue;
         };
         let seed_node = GraphNodeId::Artifact(seed_artifact_id);
-        let mut candidates: Vec<(String, f32)> = Vec::new();
+        let mut adjacent: Vec<(String, f32)> = Vec::new();
         for rel in graph.get_all_relations_for_node(&seed_node)? {
             if !relation_allows_artifact_traversal(&rel, &seed_node) {
                 continue;
@@ -2989,16 +2989,34 @@ fn priority_relation_retention_paths(
             if path == *seed_path || !strong_embedding_release_allowed(&path) {
                 continue;
             }
-            let specificity = artifact_relation_path_specificity_multiplier(seed_path, &path, 2);
-            if specificity < min_specificity {
-                continue;
-            }
             let origin_mult = if rel.origin == kin_model::RelationOrigin::Lsp {
                 1.25
             } else {
                 1.0
             };
-            candidates.push((path, specificity * origin_mult * rel.confidence.max(0.1)));
+            adjacent.push((path, origin_mult * rel.confidence.max(0.1)));
+        }
+
+        // Tokens shared by the seed and every adjacent path cannot distinguish
+        // same-family from hub fan-out within this neighborhood (e.g. a vendor
+        // or project-root directory name) — exclude them from family evidence.
+        let neighborhood: Vec<&str> = std::iter::once(seed_path.as_str())
+            .chain(adjacent.iter().map(|(path, _)| path.as_str()))
+            .collect();
+        let non_discriminative = neighborhood_ubiquitous_path_tokens(&neighborhood);
+
+        let mut candidates: Vec<(String, f32)> = Vec::new();
+        for (path, weight) in adjacent {
+            let specificity = artifact_relation_path_specificity_multiplier_excluding(
+                seed_path,
+                &path,
+                2,
+                &non_discriminative,
+            );
+            if specificity < min_specificity {
+                continue;
+            }
+            candidates.push((path, specificity * weight));
         }
         candidates.sort_by(|left, right| {
             right
@@ -9217,11 +9235,26 @@ fn artifact_relation_path_specificity_multiplier(
     target_path: &str,
     hop: usize,
 ) -> f32 {
+    artifact_relation_path_specificity_multiplier_excluding(
+        seed_path,
+        target_path,
+        hop,
+        &HashSet::new(),
+    )
+}
+
+fn artifact_relation_path_specificity_multiplier_excluding(
+    seed_path: &str,
+    target_path: &str,
+    hop: usize,
+    excluded_tokens: &HashSet<String>,
+) -> f32 {
     if hop <= 1 {
         return 1.0;
     }
 
-    let seed_tokens = semantic_path_tokens(seed_path);
+    let mut seed_tokens = semantic_path_tokens(seed_path);
+    seed_tokens.retain(|token| !excluded_tokens.contains(token));
     if seed_tokens.is_empty() {
         return 1.0;
     }
@@ -9236,6 +9269,28 @@ fn artifact_relation_path_specificity_multiplier(
     } else {
         locate_env_f32("KIN_LOCATE_ARTIFACT_HUB_FANOUT_PENALTY", 0.45)
     }
+}
+
+/// Tokens present in every path of a neighborhood carry no family signal —
+/// they cannot split the set into same-family vs hub fan-out. Requires at
+/// least three paths so "ubiquitous" is distinguishable from "shared".
+fn neighborhood_ubiquitous_path_tokens(paths: &[&str]) -> HashSet<String> {
+    if paths.len() < 3 {
+        return HashSet::new();
+    }
+    let mut iter = paths.iter();
+    let Some(first) = iter.next() else {
+        return HashSet::new();
+    };
+    let mut ubiquitous = semantic_path_tokens(first);
+    for path in iter {
+        if ubiquitous.is_empty() {
+            break;
+        }
+        let tokens = semantic_path_tokens(path);
+        ubiquitous.retain(|token| tokens.contains(token));
+    }
+    ubiquitous
 }
 
 fn semantic_path_tokens(path: &str) -> HashSet<String> {
@@ -9269,7 +9324,6 @@ fn push_semantic_path_token(tokens: &mut HashSet<String>, raw: &str) {
             | "detail"
             | "common"
             | "class"
-            | "nlohmann"
             | "json"
             | "single"
             | "thirdparty"
@@ -15126,6 +15180,31 @@ mod tests {
 
         assert!(retained.contains("include/nlohmann/detail/iterators/internal_iterator.hpp"));
         assert!(!retained.contains("include/nlohmann/detail/macro_scope.hpp"));
+    }
+
+    #[test]
+    fn neighborhood_ubiquitous_tokens_exclude_only_set_wide_tokens() {
+        let paths = [
+            "include/vendorlib/detail/iterators/iter_impl.hpp",
+            "include/vendorlib/detail/iterators/internal_iterator.hpp",
+            "include/vendorlib/detail/macro_scope.hpp",
+        ];
+        let ubiquitous = neighborhood_ubiquitous_path_tokens(&paths);
+        assert!(
+            ubiquitous.contains("vendorlib"),
+            "set-wide vendor dir token must be excluded: {ubiquitous:?}"
+        );
+        assert!(
+            !ubiquitous.contains("iterator"),
+            "token present in only part of the set must stay discriminative: {ubiquitous:?}"
+        );
+
+        // Below three paths there is no contrast set — nothing is excluded.
+        let pair = [
+            "include/vendorlib/detail/iterators/iter_impl.hpp",
+            "include/vendorlib/detail/iterators/internal_iterator.hpp",
+        ];
+        assert!(neighborhood_ubiquitous_path_tokens(&pair).is_empty());
     }
 
     #[test]

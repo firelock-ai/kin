@@ -627,12 +627,9 @@ fn textual_patterns_for_query(query: &str) -> Vec<String> {
         patterns.push(leaf.to_string());
         patterns.push(format!("{}.{}", qualifier, leaf));
         patterns.push(format!("{}::{}", qualifier, leaf));
-        patterns.push(format!("inst._zod.{}", leaf));
-        patterns.push(format!("_zod.{}", leaf));
         patterns.push(format!(".{}", leaf));
     } else if !leaf.is_empty() {
         patterns.push(leaf.to_string());
-        patterns.push(format!("_zod.{}", leaf));
         patterns.push(format!(".{}", leaf));
     }
 
@@ -658,21 +655,10 @@ fn best_source_snippet_for_patterns(
         for (idx, _) in content.match_indices(pattern) {
             let mut score = match pattern.as_str() {
                 p if p == patterns[0] => 300,
-                p if p.starts_with("inst._zod.") => 260,
-                p if p.starts_with("_zod.") => 240,
                 p if p.starts_with('.') => 120,
                 _ => 180,
             };
 
-            if path_str.contains("/core/") {
-                score += 50;
-            }
-            if path_str.contains("/classic/") {
-                score += 35;
-            }
-            if path_str.contains("/mini/") {
-                score -= 90;
-            }
             if path_str.contains("/tests/")
                 || path_str.contains("/test/")
                 || path_str.contains(".test.")
@@ -684,7 +670,7 @@ fn best_source_snippet_for_patterns(
             {
                 score -= 220;
             }
-            if path_str.contains("/bench/") || path_str.contains("/tsc/bench/") {
+            if path_str.contains("/bench/") {
                 score -= 120;
             }
             score += local_symbol_context_bonus(content, idx, pattern);
@@ -727,17 +713,10 @@ fn local_symbol_context_bonus(content: &str, idx: usize, pattern: &str) -> i32 {
         format!("{} =", leaf),
         format!("{}(", leaf),
         format!("{}:", leaf),
-        format!("inst.{} =", leaf),
-        format!("schema.{}(", leaf),
-        format!("parse.{}(", leaf),
     ] {
         if window.contains(&needle) {
             score += 35;
         }
-    }
-
-    if window.contains("_zod.run") {
-        score += 30;
     }
 
     if window.contains("describe(") || window.contains("it(") || window.contains("test(") {
@@ -1128,9 +1107,9 @@ mod tests {
 
     #[test]
     fn falls_back_to_qualified_leaf_match() {
-        let entities = vec![make_entity("Foo.safeParse"), make_entity("Foo.parse")];
-        let picked = select_best_match("safeParse", &entities).unwrap();
-        assert_eq!(picked.name, "Foo.safeParse");
+        let entities = vec![make_entity("Foo.parseStrict"), make_entity("Foo.parse")];
+        let picked = select_best_match("parseStrict", &entities).unwrap();
+        assert_eq!(picked.name, "Foo.parseStrict");
     }
 
     #[test]
@@ -1139,7 +1118,7 @@ mod tests {
         let run = make_entity("run");
         graph.upsert_entity(&run).unwrap();
 
-        let matches = fallback_leaf_trace_matches(&graph, "_zod.run").unwrap();
+        let matches = fallback_leaf_trace_matches(&graph, "cfg.run").unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].name, "run");
     }
@@ -1173,14 +1152,14 @@ mod tests {
         let store = InMemoryGraph::new();
         store.upsert_entity(&make_entity("run")).unwrap();
 
-        let matches = query_trace_matches(&store, "$ZodType::run").unwrap();
+        let matches = query_trace_matches(&store, "$Config::run").unwrap();
         assert!(matches.is_empty());
     }
 
     #[test]
     fn select_best_match_returns_none_when_qualifier_is_unmatched() {
-        let entities = vec![make_entity("run"), make_entity("Tinybench.run")];
-        let picked = select_best_match("$ZodType::run", &entities);
+        let entities = vec![make_entity("run"), make_entity("Helper.run")];
+        let picked = select_best_match("$Config::run", &entities);
         assert!(picked.is_none());
     }
 
@@ -1212,12 +1191,12 @@ mod tests {
     #[test]
     fn extract_textual_followups_captures_multi_segment_calls() {
         let text = r#"
-const result = schema._zod.run(payload, ctx);
-issues.map((iss) => util.finalizeIssue(iss, ctx, core.config()));
+const result = schema.engine.run(payload, ctx);
+issues.map((iss) => util.finalizeItem(iss, ctx, core.config()));
 "#;
         let followups = super::extract_textual_followups(text);
-        assert!(followups.iter().any(|s| s == "_zod.run"));
-        assert!(followups.iter().any(|s| s == "util.finalizeIssue"));
+        assert!(followups.iter().any(|s| s == "engine.run"));
+        assert!(followups.iter().any(|s| s == "util.finalizeItem"));
         assert!(followups.iter().any(|s| s == "core.config"));
     }
 
@@ -1225,7 +1204,7 @@ issues.map((iss) => util.finalizeIssue(iss, ctx, core.config()));
     fn looks_like_file_path_detects_paths() {
         assert!(super::looks_like_file_path("src/parser.ts"));
         assert!(super::looks_like_file_path(
-            "packages/zod/src/v4/core/parse.ts"
+            "packages/app/src/v4/core/parse.ts"
         ));
         assert!(super::looks_like_file_path("index.js"));
         assert!(super::looks_like_file_path("main.rs"));
@@ -1238,32 +1217,32 @@ issues.map((iss) => util.finalizeIssue(iss, ctx, core.config()));
 
     #[test]
     fn looks_like_file_path_rejects_entity_names() {
-        assert!(!super::looks_like_file_path("safeParse"));
-        assert!(!super::looks_like_file_path("ZodString"));
-        assert!(!super::looks_like_file_path("$ZodType"));
+        assert!(!super::looks_like_file_path("parseStrict"));
+        assert!(!super::looks_like_file_path("MyString"));
+        assert!(!super::looks_like_file_path("$MyType"));
         assert!(!super::looks_like_file_path("Router::route"));
         assert!(!super::looks_like_file_path("Foo.parse"));
-        assert!(!super::looks_like_file_path("_zod.run"));
+        assert!(!super::looks_like_file_path("_ns.run"));
     }
 
     #[test]
     fn source_fallback_prefers_implementation_over_test_file() {
         let impl_content = r#"
-export const safeParse = <T>(schema: $ZodType<T>, value: unknown) => {
-  const result = schema._zod.run({ value, issues: [] }, { async: false });
+export const parseStrict = <T>(schema: $MyType<T>, value: unknown) => {
+  const result = schema.engine.run({ value, issues: [] }, { async: false });
   return result;
 };
 "#;
         let test_content = r#"
-test("safeParse works", () => {
-  expect(schema.safeParse("x").success).toBe(true);
+test("parseStrict works", () => {
+  expect(schema.parseStrict("x").success).toBe(true);
 });
 "#;
 
         let impl_score = best_source_snippet_for_patterns(
-            std::path::Path::new("/repo/packages/zod/src/v4/core/parse.ts"),
+            std::path::Path::new("/repo/packages/app/src/core/parse.ts"),
             impl_content,
-            &["safeParse".to_string(), ".safeParse".to_string()],
+            &["parseStrict".to_string(), ".parseStrict".to_string()],
             20,
             2400,
         )
@@ -1271,9 +1250,9 @@ test("safeParse works", () => {
         .0;
 
         let test_score = best_source_snippet_for_patterns(
-            std::path::Path::new("/repo/packages/zod/src/v4/core/tests/index.test.ts"),
+            std::path::Path::new("/repo/packages/app/src/core/tests/index.test.ts"),
             test_content,
-            &["safeParse".to_string(), ".safeParse".to_string()],
+            &["parseStrict".to_string(), ".parseStrict".to_string()],
             20,
             2400,
         )
@@ -1287,58 +1266,17 @@ test("safeParse works", () => {
     }
 
     #[test]
-    fn source_fallback_prefers_classic_core_over_mini_variant() {
-        let classic_content = r#"
-export interface ZodType {
-  safeParse(data: unknown): Result;
-}
-inst.safeParse = (data, params) => parse.safeParse(inst, data, params);
-"#;
-        let mini_content = r#"
-export interface ZodMiniType {
-  safeParse(data: unknown): Result;
-}
-inst.safeParse = (data, params) => parse.safeParse(inst, data, params);
-"#;
-
-        let classic_score = best_source_snippet_for_patterns(
-            std::path::Path::new("/repo/packages/zod/src/v4/classic/schemas.ts"),
-            classic_content,
-            &["safeParse".to_string()],
-            20,
-            2400,
-        )
-        .unwrap()
-        .0;
-
-        let mini_score = best_source_snippet_for_patterns(
-            std::path::Path::new("/repo/packages/zod/src/v4/mini/schemas.ts"),
-            mini_content,
-            &["safeParse".to_string()],
-            20,
-            2400,
-        )
-        .unwrap()
-        .0;
-
-        assert!(
-            classic_score > mini_score,
-            "{classic_score} should outrank {mini_score}"
-        );
-    }
-
-    #[test]
     fn source_fallback_handles_unicode_without_panicking() {
         let content = r#"
 test("Georgian locale uses 'ველი' instead of 'სტრინგი'", () => {
-  expect(schema.safeParse("x").success).toBe(true);
+  expect(schema.parseStrict("x").success).toBe(true);
 });
 "#;
 
         let found = best_source_snippet_for_patterns(
-            std::path::Path::new("/repo/packages/zod/src/v4/core/tests/index.test.ts"),
+            std::path::Path::new("/repo/src/tests/index.test.ts"),
             content,
-            &["safeParse".to_string()],
+            &["parseStrict".to_string()],
             20,
             2400,
         );

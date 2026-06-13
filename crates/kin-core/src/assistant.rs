@@ -911,7 +911,7 @@ pub fn generate_bootstrap_docs(_layout: &KinLayout, kind: AssistantKind) -> Stri
     out.push_str("4. `kin search <ExactName> --kind function --show-body --limit 5` only if trace is too coarse\n");
     out.push_str("5. `kin context <entity>` for the full pack\n\n");
     out.push_str("## Rules\n");
-    out.push_str("- Prefer exact names like `safeParse`, `parse`, or `$ZodType`\n");
+    out.push_str("- Prefer exact names like `parseStrict`, `parse`, or `$MyType`\n");
     out.push_str("- Avoid broad shotgun searches\n");
     out.push_str("- Native sessions shim normal file reads/searches to the managed source view when needed\n");
     out.push_str("- Legacy docs live under `.kin/docs/imported/`\n\n");

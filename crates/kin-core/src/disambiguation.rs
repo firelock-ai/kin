@@ -63,7 +63,7 @@ pub fn query_trace_matches(graph: &impl GraphStore, query: &str) -> Result<Vec<E
 /// Fallback: split on `::` or `.` and search for just the leaf name.
 ///
 /// Used when `query_trace_matches` returns empty. For example,
-/// `_zod.run` falls back to searching for `run`.
+/// `cfg.run` falls back to searching for `run`.
 pub fn fallback_leaf_trace_matches(
     graph: &impl GraphStore,
     query: &str,
@@ -148,7 +148,7 @@ mod tests {
         let store = InMemoryGraph::new();
         store.upsert_entity(&make_entity("run")).unwrap();
 
-        let matches = query_trace_matches(&store, "$ZodType::run").unwrap();
+        let matches = query_trace_matches(&store, "$Config::run").unwrap();
         assert!(matches.is_empty());
     }
 
@@ -158,7 +158,7 @@ mod tests {
         let run = make_entity("run");
         graph.upsert_entity(&run).unwrap();
 
-        let matches = fallback_leaf_trace_matches(&graph, "_zod.run").unwrap();
+        let matches = fallback_leaf_trace_matches(&graph, "cfg.run").unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].name, "run");
     }

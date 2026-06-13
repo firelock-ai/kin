@@ -1024,8 +1024,8 @@ pub fn handle_explore_codebase<G: GraphStore>(
                     }
                 }
 
-                let mut decoy_candidates = matches;
-                if decoy_candidates.len() <= 1 {
+                let mut similar_candidates = matches;
+                if similar_candidates.len() <= 1 {
                     if let Some(broader_query) = broaden_trace_query(&trace_query.symbol) {
                         let broader_matches = store
                             .query_entities(&EntityFilter {
@@ -1034,30 +1034,22 @@ pub fn handle_explore_codebase<G: GraphStore>(
                             })
                             .map_err(McpError::graph)?;
                         for entity in broader_matches {
-                            if !decoy_candidates.iter().any(|known| known.id == entity.id) {
-                                decoy_candidates.push(entity);
+                            if !similar_candidates.iter().any(|known| known.id == entity.id) {
+                                similar_candidates.push(entity);
                             }
                         }
                     }
                 }
 
-                let decoys = decoy_candidates
+                let similar = similar_candidates
                     .into_iter()
                     .filter(|entity| entity.id != focal.id)
-                    .filter(|entity| {
-                        looks_like_alt_name(&entity.name)
-                            || entity
-                                .file_origin
-                                .as_ref()
-                                .map(|path| looks_like_decoy_path(path.0.as_str()))
-                                .unwrap_or(false)
-                    })
                     .collect::<Vec<_>>();
 
-                if !decoys.is_empty() {
-                    let header = "\n## Similar/Decoy Matches\n";
+                if !similar.is_empty() {
+                    let header = "\n## Similar Matches\n";
                     if push_with_budget(&mut output, &mut tokens_used, token_budget, header) {
-                        for entity in decoys {
+                        for entity in similar {
                             let line = format!(
                                 "  - {} ({:?}){}\n",
                                 entity.name,
