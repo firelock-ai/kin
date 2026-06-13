@@ -211,6 +211,17 @@ fn build_advice(spec: &RetrievalSpec, envelope: &Envelope, trustworthy: bool) ->
     )
 }
 
+/// True when `payload.focal_entity.kind` is a method — the entity kind whose
+/// incoming call edges the linker under-resolves (FIR-938), so absence of
+/// references must not be certified as authoritative.
+fn focal_entity_is_method(payload: &Value) -> bool {
+    payload
+        .get("focal_entity")
+        .and_then(|focal| focal.get("kind"))
+        .and_then(|kind| kind.as_str())
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("method"))
+}
+
 /// Build a confidence-qualified negative for `tool`'s `payload`, enriched from
 /// `envelope`, or `None` when the tool is not negative-capable or it returned a
 /// non-empty result (and is not an `always`-qualify tool).
@@ -224,7 +235,22 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
         return None;
     }
 
-    let (trustworthy, trust_reason) = envelope.negative_trust(spec.class);
+    let (mut trustworthy, mut trust_reason) = envelope.negative_trust(spec.class);
+
+    // FIR-938: receiver-method calls (`x.method()`) are resolved by bare name in
+    // the linker while method entities are keyed by their qualified name, so a
+    // method's incoming `Calls` edges are frequently dropped. An empty
+    // `find_references` for a method is therefore NOT an authoritative "unused"
+    // verdict — the calls may simply never have been linked. Never let an agent
+    // read "safe to delete" off an incomplete call graph: downgrade to
+    // inconclusive so the absence is flagged as possibly-unresolved, not certain.
+    if tool == "find_references" && focal_entity_is_method(payload) {
+        trustworthy = false;
+        trust_reason = "method_call_resolution_incomplete: receiver-method calls are \
+             linked by bare name and may be unresolved, so an empty result is not an \
+             authoritative absence for a method";
+    }
+
     let interpretation = if spec.always {
         "qualified_verdicts"
     } else {
@@ -412,6 +438,40 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("authoritative"));
+    }
+
+    #[test]
+    fn find_references_on_method_is_inconclusive_despite_loaded_graph() {
+        // FIR-938: receiver-method call edges are under-resolved by the linker
+        // (method entities are keyed by qualified name; calls arrive bare), so an
+        // empty find_references for a method must NOT be certified authoritative
+        // ("safe to delete") even on a healthy, loaded graph.
+        let payload = json!({
+            "focal_entity": { "kind": "method", "name": "Foo::bar" },
+            "references": []
+        });
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("empty references yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        assert!(negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("method_call_resolution_incomplete"));
+    }
+
+    #[test]
+    fn find_references_on_function_stays_authoritative() {
+        // The gate is method-specific: a free function's incoming call edges
+        // resolve, so its empty find_references remains an authoritative absence.
+        let payload = json!({
+            "focal_entity": { "kind": "function", "name": "free_fn" },
+            "references": []
+        });
+        let negative =
+            negative_for("find_references", &payload, &structural_ready_envelope()).unwrap();
+        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+        assert_eq!(negative["trust"], json!("authoritative"));
     }
 
     #[test]
