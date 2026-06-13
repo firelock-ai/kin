@@ -3770,12 +3770,13 @@ fn build_semantic_locate_result(
         status.indexed as f32 / status.total as f32
     };
 
-    // For file granularity, over-fetch so dedupe-by-file can still fill `limit`.
-    let fetch_limit = if file_granularity {
-        limit.saturating_mul(8).max(limit)
-    } else {
-        limit
-    };
+    // Over-fetch so post-resolution dedupe can still fill `limit`: by file for
+    // file granularity, by resolved entity for entity granularity (FIR-941).
+    // Every entity carries both an `Entity(E)` and an `EntityRevision(head)`
+    // vector in the index, both resolving to the same entity, so without the
+    // entity dedup below each entity would appear ~twice and effective recall@k
+    // would halve.
+    let fetch_limit = limit.saturating_mul(8).max(limit);
 
     let raw = match graph.semantic_search(&query, fetch_limit) {
         Ok(hits) => hits,
@@ -3786,6 +3787,7 @@ fn build_semantic_locate_result(
 
     let mut results = Vec::with_capacity(limit);
     let mut seen_files: HashSet<String> = HashSet::new();
+    let mut seen_entities: HashSet<String> = HashSet::new();
     for (key, distance) in raw {
         if results.len() >= limit {
             break;
@@ -3825,6 +3827,11 @@ fn build_semantic_locate_result(
                 // File granularity requires a file path; skip pathless hits.
                 None => continue,
             }
+        } else if !seen_entities.insert(entity_id.clone()) {
+            // FIR-941: collapse the two index keys per entity (`Entity(E)` +
+            // `EntityRevision(head)`) into a single result. `raw` is rank-ordered
+            // by distance, so the first occurrence of an entity is its best hit.
+            continue;
         }
 
         let score = 1.0_f32 - distance;
