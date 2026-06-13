@@ -37,10 +37,12 @@
 //! representation, not that the file compiles; full compilation-at-runtime is
 //! out of scope and is not attempted here.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use kin_index::FileEvent;
 use kin_model::{ConflictObject, Entity, EntityId, FilePathId, GraphOverlay};
-use kin_reconcile::ReconcileError;
+use kin_reconcile::{apply_overlay_to_graph, ReconcileError};
 
 use crate::state::DaemonState;
 
@@ -92,6 +94,15 @@ impl std::fmt::Display for McpProjectionError {
 ///   `file_origin` populated (set during the preceding reconcile). Entities
 ///   without a span are silently skipped — new graph-only entities have no
 ///   file placement yet.
+/// * `supplied_bodies` — FIR-934: new full UTF-8 source bytes for entities whose
+///   staged operation carried a `body`, keyed by `EntityId`. When an entity has
+///   a supplied body the projection writes that text into the file (rather than
+///   re-splicing the file's own bytes — an identity no-op), so the agent's graph
+///   mutation actually reaches disk. After projecting a body edit the file bytes
+///   change, so each touched file is re-reconciled here to converge the
+///   reconciler LKG baseline and the graph onto the projected source — without
+///   that resync the next reconcile would see a fresh fingerprint, diverge from
+///   the stale LKG, and clobber the agent's mutation (file-wins LWW).
 ///
 /// # Returns
 ///
@@ -104,6 +115,7 @@ impl std::fmt::Display for McpProjectionError {
 pub async fn project_after_mcp_commit(
     state: &Arc<DaemonState>,
     pre_commit_entities: &[Entity],
+    supplied_bodies: &HashMap<EntityId, Vec<u8>>,
 ) -> Result<
     (
         Vec<FilePathId>,
@@ -217,6 +229,16 @@ pub async fn project_after_mcp_commit(
         clean_overlay.entity_mods.insert(*entity_id, entity.clone());
     }
 
+    // FIR-934: carry the agent-supplied new source text for each non-conflicted
+    // entity onto the overlay. `project_overlay_to_files` prefers this over the
+    // identity span-extract, so the file is written with the agent's new body.
+    let clean_ids: Vec<EntityId> = clean_overlay.entity_mods.keys().copied().collect();
+    for id in clean_ids {
+        if let Some(body) = supplied_bodies.get(&id) {
+            clean_overlay.entity_bodies.insert(id, body.clone());
+        }
+    }
+
     // If every entity had a conflict, nothing to project.
     if clean_overlay.entity_mods.is_empty() {
         return Ok((vec![], vec![], conflicts));
@@ -261,6 +283,15 @@ pub async fn project_after_mcp_commit(
     // reconcile must NOT see the projected entity as changed (no-clobber invariant).
     // -----------------------------------------------------------------------
     for entity in clean_overlay.entity_mods.values() {
+        // FIR-934: a body edit intentionally rewrites the bytes at the entity's
+        // span, so byte preservation does NOT apply. The no-clobber guarantee for
+        // body edits is enforced instead by the LKG/graph resync below (which
+        // re-derives the entity from the projected source). The check still
+        // guards metadata-only edits, which must remain byte-identical.
+        if clean_overlay.entity_bodies.contains_key(&entity.id) {
+            continue;
+        }
+
         let Some(span) = &entity.span else {
             continue;
         };
@@ -317,6 +348,52 @@ pub async fn project_after_mcp_commit(
                     post_len = post_at_span.len(),
                 ),
             });
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // FIR-934: no-clobber resync.
+    //
+    // A body edit rewrote the file's bytes, so the reconciler's LKG fingerprint
+    // baseline (recorded by the previous reconcile) and the committed graph
+    // entity are now stale relative to the projected source. Re-reconcile each
+    // body-carried file so both converge onto what the file actually parses to.
+    // Without this, the next reconcile tick re-parses a fresh fingerprint, finds
+    // it differs from the stale LKG, and clobbers the agent's mutation
+    // (file-wins LWW) — the very bug this carrier exists to close.
+    //
+    // Metadata-only edits carry no body and are skipped here: their projection is
+    // byte-identical, so the LKG baseline already matches and no resync is needed.
+    // -----------------------------------------------------------------------
+    if !clean_overlay.entity_bodies.is_empty() {
+        let body_files: HashSet<FilePathId> = clean_overlay
+            .entity_mods
+            .values()
+            .filter(|e| clean_overlay.entity_bodies.contains_key(&e.id))
+            .filter_map(|e| e.span.as_ref().map(|s| s.file.clone()))
+            .collect();
+
+        for file_id in &modified_files {
+            if !body_files.contains(file_id) {
+                continue;
+            }
+            let path = state.layout.working_dir().join(file_id.0.as_str());
+            let mut resync_overlay = GraphOverlay::default();
+            reconciler
+                .reconcile_file_change(
+                    &FileEvent::Changed(path),
+                    state.blobs.as_ref(),
+                    state.graph.as_ref(),
+                    &mut resync_overlay,
+                )
+                .map_err(|e| reconcile_err_to_projection_err(e, pre_commit_entities))?;
+            apply_overlay_to_graph(state.graph.as_ref(), &mut resync_overlay).map_err(|e| {
+                McpProjectionError {
+                    file: Some(file_id.clone()),
+                    entity_id: EntityId::default(),
+                    reason: format!("no-clobber resync: failed to apply reconciled overlay: {e}"),
+                }
+            })?;
         }
     }
 
@@ -495,7 +572,7 @@ mod tests {
         // Step 3: Call project_after_mcp_commit (the production hook).
         drop(reconciler); // release lock before calling the async helper
         let (modified_files, warnings, conflicts) =
-            project_after_mcp_commit(&state, &[pre_commit_entity.clone()])
+            project_after_mcp_commit(&state, &[pre_commit_entity.clone()], &HashMap::new())
                 .await
                 .expect("projection must succeed");
 
@@ -527,6 +604,140 @@ mod tests {
         // Step 5 (assertion b): a subsequent reconcile must produce NO entity
         // changes — the projection updated the projection cache so the LKG
         // comparison sees no delta (no-clobber guarantee).
+        let mut reconciler2 = state.reconciler.write().await;
+        assert_no_clobber(&mut reconciler2, &state, &file_path);
+    }
+
+    // ------------------------------------------------------------------
+    // Test 1b (FIR-934): project a REAL body edit → file gets the agent's new
+    // source text (not an identity no-op), then reconcile → no clobber.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn project_body_edit_writes_new_text_and_no_clobber() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = make_test_state(dir.path());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let rel = "src/lib.rs";
+        let file_path = dir.path().join(rel);
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        let original = b"pub fn foo() -> i32 { 1 }\npub fn bar() -> i32 { 2 }\n";
+        std::fs::write(&file_path, original).unwrap();
+
+        let blob_store = BlobStore::new(state.layout.objects_dir()).expect("blob store must open");
+
+        // Step 1: reconcile — entities enter with spans; LKG primed at the
+        // ORIGINAL body fingerprint.
+        let mut reconciler = state.reconciler.write().await;
+        let mut overlay = GraphOverlay::default();
+        reconciler
+            .reconcile_file_change(
+                &FileEvent::Changed(file_path.clone()),
+                &blob_store,
+                state.graph.as_ref(),
+                &mut overlay,
+            )
+            .expect("first reconcile must succeed");
+
+        let pre_commit_entity = overlay
+            .entity_adds
+            .values()
+            .find(|e| e.name == "foo")
+            .cloned()
+            .expect("foo must be present in the reconcile overlay");
+        let span = pre_commit_entity.span.clone().expect("foo must have a span");
+
+        apply_overlay_to_graph(state.graph.as_ref(), &mut overlay)
+            .expect("apply overlay must succeed");
+        drop(reconciler);
+
+        // The agent's NEW source for foo: take the exact bytes occupying foo's
+        // span and rewrite the body literal, so the splice yields valid Rust.
+        let orig_region = &original[span.start_byte..span.end_byte];
+        let new_body = String::from_utf8_lossy(orig_region)
+            .replace("{ 1 }", "{ 42 }")
+            .into_bytes();
+        assert_ne!(
+            new_body.as_slice(),
+            orig_region,
+            "test setup: new body must differ from the original region"
+        );
+
+        // Step 2: simulate the graph-side commit of the body edit — the graph
+        // entity is updated with the agent's intent (fingerprint changed); span
+        // and file_origin are preserved, as collect_pre_commit_entities carries
+        // them from the graph.
+        let mut committed = pre_commit_entity.clone();
+        committed.fingerprint.ast_hash = Hash256::from_bytes([0xcd; 32]);
+        state.graph.upsert_entity(&committed).unwrap();
+
+        // FIR-934↔FIR-937 guard (baseline): the no-clobber resync must converge
+        // LKG + graph via REVISION-FREE upsert — it must NOT mint a SemanticChange
+        // or append an EntityRevision generation. Under FIR-937 a new head
+        // revision retires the prior vector and re-embeds, so a revision minted
+        // here would mean spurious re-embed churn on every MCP body edit. Capture
+        // the change-DAG and revision-generation counts now; assert them identical
+        // immediately after project_after_mcp_commit below.
+        let snap_before = state.graph.to_snapshot();
+        let changes_before = snap_before.changes.len();
+        let revisions_before: usize =
+            snap_before.entity_revisions.values().map(|v| v.len()).sum();
+
+        // Step 3: project with the supplied body (the FIR-934 carrier).
+        let mut bodies = HashMap::new();
+        bodies.insert(pre_commit_entity.id, new_body.clone());
+        let (modified_files, warnings, conflicts) =
+            project_after_mcp_commit(&state, &[pre_commit_entity.clone()], &bodies)
+                .await
+                .expect("projection must succeed");
+
+        assert_eq!(modified_files.len(), 1, "exactly one file projected");
+        assert!(warnings.is_empty(), "no collision warnings expected");
+        assert!(conflicts.is_empty(), "no conflicts expected");
+
+        // FIR-934↔FIR-937 guard (assertion): the resync minted NO new change and
+        // NO new revision generation — convergence was revision-free, so there is
+        // no spurious vector re-embed churn on a body edit. This pins the
+        // FIR-934↔FIR-937 seam against future refactors that might route the resync
+        // through the change-minting commit path.
+        let snap_after = state.graph.to_snapshot();
+        assert_eq!(
+            snap_after.changes.len(),
+            changes_before,
+            "no-clobber resync must mint no SemanticChange (revision-free convergence)"
+        );
+        let revisions_after: usize =
+            snap_after.entity_revisions.values().map(|v| v.len()).sum();
+        assert_eq!(
+            revisions_after, revisions_before,
+            "no-clobber resync must append no EntityRevision generation (no FIR-937 re-embed churn)"
+        );
+
+        // Step 4 (assertion a): the file now holds the agent's NEW text — a real
+        // edit, NOT the identity splice the old write-loop produced.
+        let on_disk = std::fs::read(&file_path).expect("projected file must exist");
+        assert_ne!(on_disk, original, "file must change (not an identity no-op)");
+        let on_disk_str = String::from_utf8(on_disk).expect("projected file is utf-8");
+        assert!(
+            on_disk_str.contains("{ 42 }"),
+            "file must contain the new body literal; got: {on_disk_str}"
+        );
+        assert!(
+            !on_disk_str.contains("{ 1 }"),
+            "old body literal must be gone; got: {on_disk_str}"
+        );
+        assert!(
+            on_disk_str.contains("pub fn bar() -> i32 { 2 }"),
+            "sibling entity bar must be preserved; got: {on_disk_str}"
+        );
+
+        // Step 5 (assertion b): a subsequent reconcile must produce NO entity
+        // changes. The body edit changed the bytes, but the FIR-934 resync drove
+        // the reconciler LKG + graph onto the projected source, so the next
+        // reconcile sees no delta — the agent's edit is NOT clobbered.
         let mut reconciler2 = state.reconciler.write().await;
         assert_no_clobber(&mut reconciler2, &state, &file_path);
     }
@@ -569,9 +780,10 @@ mod tests {
             superseded_by: None,
         };
 
-        let (modified_files, warnings, conflicts) = project_after_mcp_commit(&state, &[span_less])
-            .await
-            .expect("span-less entity must not cause an error");
+        let (modified_files, warnings, conflicts) =
+            project_after_mcp_commit(&state, &[span_less], &HashMap::new())
+                .await
+                .expect("span-less entity must not cause an error");
 
         assert!(
             modified_files.is_empty(),
@@ -629,7 +841,7 @@ mod tests {
             superseded_by: None,
         };
 
-        let result = project_after_mcp_commit(&state, &[bad_entity]).await;
+        let result = project_after_mcp_commit(&state, &[bad_entity], &HashMap::new()).await;
 
         match result {
             Err(e) => {
@@ -703,7 +915,7 @@ mod tests {
         // Step 3: Call project_after_mcp_commit — should detect the concurrent
         // edit and surface a conflict instead of splicing over it.
         let (modified_files, _warnings, conflicts) =
-            project_after_mcp_commit(&state, &[pre_commit_entity])
+            project_after_mcp_commit(&state, &[pre_commit_entity], &HashMap::new())
                 .await
                 .expect("conflict detection must not hard-fail");
 
