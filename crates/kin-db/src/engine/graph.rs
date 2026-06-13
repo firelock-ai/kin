@@ -199,6 +199,24 @@ fn append_entity_revisions(ent: &mut EntityData, change: &SemanticChange) {
     }
 }
 
+/// The most recent (HEAD) revision id of every entity's revision chain.
+///
+/// `append_entity_revisions` pushes each new generation to the end of the
+/// chain, so `revs.last()` is the live revision. Superseded generations are
+/// intentionally excluded: the vector index tracks at most one revision vector
+/// per live entity. A superseded generation that a live re-embed leaves behind
+/// is an orphan to reclaim — not retrieval truth that semantic search should
+/// return as a second hit for the same entity. This is the single authority for
+/// "which revision keys are current", shared by the prune target and the
+/// embedding-queue backfill so the two never disagree (a disagreement would make
+/// the backfill re-embed a key the prune immediately evicts, churning forever).
+#[cfg(feature = "vector")]
+fn latest_revision_ids(ent: &EntityData) -> impl Iterator<Item = EntityRevisionId> + '_ {
+    ent.entity_revisions
+        .values()
+        .filter_map(|revs| revs.last().map(|rev| rev.revision_id))
+}
+
 fn entity_ids_for_relation(relation: &Relation) -> Vec<EntityId> {
     [relation.src.as_entity(), relation.dst.as_entity()]
         .into_iter()
@@ -2770,20 +2788,22 @@ impl InMemoryGraph {
         }
     }
 
-    /// Queue ALL entities in the graph (HEAD and all historical revisions) for embedding.
+    /// Queue every entity in the graph for a from-scratch embedding pass: the
+    /// HEAD revision of each entity plus every current HEAD entity.
+    ///
+    /// Only the latest revision of each entity is queued — superseded
+    /// generations are not retrieval truth and would be evicted by
+    /// `prune_orphaned_vectors`, so embedding them on a rebuild is pure waste
+    /// (and reintroduces the doubled-vector state this convergence fixes,
+    /// FIR-937). This matches the target set of `graph_truth_retrievable_keys`.
     #[cfg(feature = "vector")]
     pub fn queue_all_for_embedding(&self) {
         let mut queue = self.embedding_queue.lock();
         let ent = self.entities.read();
 
-        // Queue all historical revisions
-        for revisions in ent.entity_revisions.values() {
-            for rev in revisions {
-                queue.insert(
-                    RetrievalKey::EntityRevision(rev.revision_id),
-                    EmbedRecency::Backfill,
-                );
-            }
+        // Queue the HEAD revision of each entity.
+        for key in latest_revision_ids(&ent).map(RetrievalKey::EntityRevision) {
+            queue.insert(key, EmbedRecency::Backfill);
         }
 
         // Queue all current HEAD entities
@@ -2812,17 +2832,18 @@ impl InMemoryGraph {
         let mut queue = self.embedding_queue.lock();
         let ent = self.entities.read();
 
-        // Queue missing revisions
-        for revisions in ent.entity_revisions.values() {
-            for rev in revisions {
-                let key = RetrievalKey::EntityRevision(rev.revision_id);
-                let missing = vector_index
-                    .as_ref()
-                    .map(|vi| !vi.contains_retrievable(&key))
-                    .unwrap_or(true);
-                if missing {
-                    queue.insert(key, EmbedRecency::Backfill);
-                }
+        // Queue only the missing HEAD revision of each entity. Superseded
+        // generations are deliberately NOT enqueued: they are not retrieval
+        // truth (see `graph_truth_retrievable_keys`) and `prune_orphaned_vectors`
+        // evicts them — enqueuing them would re-embed a key the prune removes on
+        // the next pass, churning forever (FIR-937).
+        for key in latest_revision_ids(&ent).map(RetrievalKey::EntityRevision) {
+            let missing = vector_index
+                .as_ref()
+                .map(|vi| !vi.contains_retrievable(&key))
+                .unwrap_or(true);
+            if missing {
+                queue.insert(key, EmbedRecency::Backfill);
             }
         }
 
@@ -3354,6 +3375,17 @@ impl InMemoryGraph {
             }
         }
 
+        // Live retire: when this batch drains the entity queue, a re-embed that
+        // appended a new revision (and embedded its key) has left the entity's
+        // prior revision vector behind. Reconcile the index to graph truth so the
+        // superseded generation is retired now, instead of accumulating until the
+        // next daemon boot's load-time reclaim. Gated on the queue being empty so
+        // a multi-batch backfill prunes once at the end (O(index) per drain, not
+        // per batch) rather than rescanning the whole index after every chunk.
+        if count > 0 && self.embedding_queue.lock().is_empty() {
+            self.prune_orphaned_vectors();
+        }
+
         Ok(count)
     }
 
@@ -3475,19 +3507,25 @@ impl InMemoryGraph {
     }
 
     /// Every retrieval key that participates in semantic embedding under the
-    /// CURRENT graph truth: all entity revisions, all HEAD entities, and all
-    /// graph-owned artifacts. This is the authoritative target set the vector
-    /// index should converge to — a key in the index but absent here is a stale
-    /// generation that must be evicted.
+    /// CURRENT graph truth: the LATEST revision of each entity, all HEAD
+    /// entities, and all graph-owned artifacts. This is the authoritative target
+    /// set the vector index should converge to — a key in the index but absent
+    /// here is a stale generation that must be evicted.
+    ///
+    /// Only the latest revision per entity is admitted (not every historical
+    /// generation). The live `reconcile → re-embed` path appends a new
+    /// `EntityRevision` each time an entity's content changes; admitting every
+    /// generation as truth made `prune_orphaned_vectors` keep the superseded
+    /// vectors forever (they are still "referenced" by the revision history), so
+    /// each entity accumulated one vector per edit and `semantic_locate`
+    /// returned it once per generation. Pinning truth to the head revision lets
+    /// the existing prune reclaim those superseded generations, leaving one
+    /// revision vector per live entity (FIR-937).
     #[cfg(feature = "vector")]
     fn graph_truth_retrievable_keys(&self) -> hashbrown::HashSet<RetrievalKey> {
         let ent = self.entities.read();
         let mut keys = hashbrown::HashSet::new();
-        for revisions in ent.entity_revisions.values() {
-            for rev in revisions {
-                keys.insert(RetrievalKey::EntityRevision(rev.revision_id));
-            }
-        }
+        keys.extend(latest_revision_ids(&ent).map(RetrievalKey::EntityRevision));
         keys.extend(ent.entities.keys().map(|id| RetrievalKey::Entity(*id)));
         keys.extend(
             collect_artifact_ids(&ent)
@@ -3500,12 +3538,21 @@ impl InMemoryGraph {
     /// Evict vectors whose keys no longer exist in graph truth (generation
     /// eviction).
     ///
-    /// Re-init mints fresh `SemanticChangeId`s, so every entity gets a brand-new
-    /// `EntityRevision` key each cycle. The vector index upserts these as new
-    /// keys, but the prior generation's revision keys — orphaned the moment the
-    /// graph dropped them — keep their vectors and the persisted sidecar carries
-    /// them forward. Across re-init/re-embed cycles the index accumulates
-    /// generations (~78% stale) that all compete in ANN retrieval.
+    /// Two sources feed generation accumulation, both reclaimed here:
+    ///
+    /// - Re-init mints fresh `SemanticChangeId`s, so every entity gets a
+    ///   brand-new `EntityRevision` key each cycle. The prior generation's
+    ///   revision keys — orphaned the moment the graph dropped them — keep their
+    ///   vectors and the persisted sidecar carries them forward.
+    /// - The live `reconcile → re-embed` path appends a new `EntityRevision`
+    ///   each time an entity's content changes while its earlier generation
+    ///   stays in the revision history. The superseded vector lingers because the
+    ///   old revision is still "referenced"; truth (`graph_truth_retrievable_keys`)
+    ///   admits only the head revision, so it falls out here (FIR-937).
+    ///
+    /// Across re-init/re-embed cycles the index otherwise accumulates
+    /// generations that all compete in ANN retrieval and return the same entity
+    /// once per generation.
     ///
     /// This reconciles the index back to graph truth: any indexed key not in the
     /// current retrievable set is removed. Returns the number of vectors evicted.
@@ -9593,6 +9640,127 @@ mod tests {
         changed.fingerprint.signature_hash = Hash256::from_bytes([7; 32]);
         apply_init_change(&graph, 0x03, &[changed]);
         assert_eq!(rev_count(&graph), 2, "real change must record a revision");
+    }
+
+    /// Build entity `e1` with a two-generation revision chain (revision 1
+    /// superseded by revision 2, both retained in history) and return its
+    /// (old, new) revision ids.
+    #[cfg(feature = "vector")]
+    fn two_revision_entity(graph: &InMemoryGraph, e1: &Entity) -> (EntityRevisionId, EntityRevisionId) {
+        apply_init_change(graph, 0x01, std::slice::from_ref(e1));
+        let mut changed = e1.clone();
+        changed.signature = "fn foo(x: i32)".to_string();
+        changed.fingerprint.signature_hash = Hash256::from_bytes([7; 32]);
+        apply_init_change(graph, 0x02, &[changed]);
+
+        let ent = graph.entities.read();
+        let chain = ent
+            .entity_revisions
+            .get(&e1.id)
+            .expect("entity must have a revision chain");
+        assert_eq!(chain.len(), 2, "entity must hold an old + new revision");
+        let pair = (chain[0].revision_id, chain[1].revision_id);
+        assert_ne!(pair.0, pair.1, "the two generations must be distinct keys");
+        pair
+    }
+
+    /// FIR-937 (live re-embed retire): a re-embed that appends a new revision
+    /// for an entity must leave exactly ONE vector for that entity — the new
+    /// revision's. The superseded generation is still referenced by the entity's
+    /// revision history, so before the fix `prune_orphaned_vectors` (whose truth
+    /// admitted every generation) kept BOTH vectors and `semantic_locate`
+    /// returned the entity twice with two distinct cosine scores. Discriminating:
+    /// FAILS on the old all-revisions truth (evicts 0), PASSES on head-only truth.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn live_reembed_retires_superseded_revision_vector() {
+        let graph = InMemoryGraph::new();
+        let e1 = test_entity("foo", "src/a.rs");
+        let (rev_old, rev_new) = two_revision_entity(&graph, &e1);
+
+        // The doubled state a live re-embed leaves behind: revision 1's vector
+        // (indexed earlier) AND revision 2's vector (the re-embed) both live,
+        // each a DISTINCT vector under the SAME entity.
+        let vi = VectorIndex::new(2).unwrap();
+        let vec_old = [1.0f32, 0.0];
+        let vec_new = [0.0f32, 1.0];
+        vi.upsert_retrievable(RetrievalKey::EntityRevision(rev_old), &vec_old)
+            .unwrap();
+        vi.upsert_retrievable(RetrievalKey::EntityRevision(rev_new), &vec_new)
+            .unwrap();
+        vi.upsert(e1.id, &vec_new).unwrap(); // HEAD entity key (kept by truth)
+        *graph.vector_index.lock() = Some(Arc::new(vi));
+
+        let evicted = graph.prune_orphaned_vectors();
+        assert_eq!(
+            evicted, 1,
+            "exactly the superseded revision-1 vector must be retired"
+        );
+
+        let vi = graph.vector_index.lock().clone().unwrap();
+        assert!(
+            vi.get_retrievable(&RetrievalKey::EntityRevision(rev_old))
+                .is_none(),
+            "superseded revision-1 vector must be gone"
+        );
+        assert_eq!(
+            vi.get_retrievable(&RetrievalKey::EntityRevision(rev_new)),
+            Some(vec_new.to_vec()),
+            "head revision-2 vector must survive unchanged"
+        );
+        assert!(
+            vi.contains(&e1.id),
+            "HEAD entity vector is current truth and must remain"
+        );
+        // Idempotent once converged.
+        assert_eq!(graph.prune_orphaned_vectors(), 0);
+    }
+
+    /// FIR-937 (load-time reclaim): an index already doubled on disk (tonight's
+    /// persisted state — both revision generations of an entity) self-heals when
+    /// reopened. Mirrors `load_vector_index_if_valid`'s load-then-prune sequence.
+    /// Discriminating: the reclaim evicts 0 on the old truth, 1 on the fix.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn load_time_reclaim_heals_doubled_persisted_revision_index() {
+        let e1 = test_entity("foo", "src/a.rs");
+        let dir = tempfile::TempDir::new().unwrap();
+        let sidecar = dir.path().join("vectors.kvec");
+
+        // Persist a sidecar holding BOTH revision generations + the HEAD entity.
+        let (rev_old, rev_new) = {
+            let graph = InMemoryGraph::new();
+            let (rev_old, rev_new) = two_revision_entity(&graph, &e1);
+            let vi = VectorIndex::new(2).unwrap();
+            vi.upsert_retrievable(RetrievalKey::EntityRevision(rev_old), &[1.0, 0.0])
+                .unwrap();
+            vi.upsert_retrievable(RetrievalKey::EntityRevision(rev_new), &[0.0, 1.0])
+                .unwrap();
+            vi.upsert(e1.id, &[0.0, 1.0]).unwrap();
+            vi.save(&sidecar).unwrap();
+            (rev_old, rev_new)
+        };
+
+        // A fresh graph at the SAME revision history reopens the doubled sidecar.
+        // Revision ids are hash(entity_id, change_id) — deterministic across
+        // graphs — so the persisted revision keys match this graph's history.
+        let graph = InMemoryGraph::new();
+        let (rev_old2, rev_new2) = two_revision_entity(&graph, &e1);
+        assert_eq!((rev_old, rev_new), (rev_old2, rev_new2));
+
+        let loaded = graph.load_vector_index(&sidecar).unwrap();
+        assert_eq!(loaded, 3, "sidecar carries both revisions + the head entity");
+
+        let evicted = graph.prune_orphaned_vectors();
+        assert_eq!(evicted, 1, "load-time reclaim retires the superseded revision");
+
+        let vi = graph.vector_index.lock().clone().unwrap();
+        assert!(vi
+            .get_retrievable(&RetrievalKey::EntityRevision(rev_old))
+            .is_none());
+        assert!(vi
+            .get_retrievable(&RetrievalKey::EntityRevision(rev_new))
+            .is_some());
     }
 
     #[cfg(feature = "vector")]
