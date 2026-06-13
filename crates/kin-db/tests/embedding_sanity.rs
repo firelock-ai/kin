@@ -18,11 +18,13 @@ use std::path::PathBuf;
 use kin_db::embed::format_entity_text;
 use kin_db::{CodeEmbedder, RetrievalKey, SnapshotManager};
 
-/// Path to Vue's pre-built graph (from the focused bench workdir).
+/// Path to a pre-built Vue graph fixture, supplied via the
+/// `KIN_EMBED_SANITY_GRAPH` env var. When unset the path is empty, so every
+/// test that needs it skips through its existing `.exists()` guard.
 fn vue_graph_path() -> PathBuf {
-    PathBuf::from(
-        "/Users/troyfortinjr/GitHub/kin-ecosystem/kin-bench/workdir-focused/arms/kin/repos/vuejs__core/.kin/kindb/graph.kndb",
-    )
+    std::env::var_os("KIN_EMBED_SANITY_GRAPH")
+        .map(PathBuf::from)
+        .unwrap_or_default()
 }
 
 fn count_nan(v: &[f32]) -> usize {
