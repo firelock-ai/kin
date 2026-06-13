@@ -437,12 +437,14 @@ mod tests {
 
     #[test]
     fn test_open_repo_resolves_git_suffix_directories() {
-        let path = Path::new("/Users/troyfortinjr/GitHub/kin-ecosystem/kin-bench/.bench/contextbench-official/repos/master_svelte.git");
-        if !path.exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("master_svelte.git");
+        std::fs::create_dir(&repo_dir).unwrap();
+        if !init_git_repo(&repo_dir) {
             return;
         }
-        let repo =
-            open_repo(path).expect("open_repo should succeed even on .git-suffixed directories");
+        let repo = open_repo(&repo_dir)
+            .expect("open_repo should succeed even on .git-suffixed directories");
         assert!(!repo.is_bare());
     }
 
