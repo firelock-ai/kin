@@ -573,6 +573,19 @@ pub async fn handle_transaction_commit<G: GraphStore>(
 ) -> Result<ToolCallResult> {
     let transaction_id = get_string_param(args, "transaction_id")?;
 
+    // FIR-942: If operations are provided, validate and stage them in one shot
+    // to bypass state-loss across HTTP calls.
+    let mut inline_ops = None;
+    if let Some(ops_val) = args.get("operations") {
+        let parsed: Vec<crate::session::McpMutationOperation> = serde_json::from_value(ops_val.clone())
+            .map_err(|e| {
+                crate::error::McpError::InvalidParams(format!("invalid operations array: {e}"))
+            })?;
+        crate::session::validate_staged_operations(&parsed)
+            .map_err(crate::error::McpError::InvalidParams)?;
+        inline_ops = Some(parsed);
+    }
+
     if session_authority_mode.uses_daemon() {
         match crate::daemon_delegate::forward_tool_call("kin_transaction_commit", args).await {
             Ok(Some(value)) => return Ok(value),
@@ -580,6 +593,13 @@ pub async fn handle_transaction_commit<G: GraphStore>(
                 return Ok(daemon_required_unavailable("transaction commit"));
             }
             Ok(None) => {}
+            Err(err) => return Ok(ToolCallResult::error(err)),
+        }
+    }
+
+    if let Some(ops) = inline_ops {
+        match sessions.stage_transaction(&transaction_id, ops) {
+            Ok(_) => {}
             Err(err) => return Ok(ToolCallResult::error(err)),
         }
     }
