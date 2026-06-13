@@ -674,6 +674,18 @@ mod tests {
         committed.fingerprint.ast_hash = Hash256::from_bytes([0xcd; 32]);
         state.graph.upsert_entity(&committed).unwrap();
 
+        // FIR-934↔FIR-937 guard (baseline): the no-clobber resync must converge
+        // LKG + graph via REVISION-FREE upsert — it must NOT mint a SemanticChange
+        // or append an EntityRevision generation. Under FIR-937 a new head
+        // revision retires the prior vector and re-embeds, so a revision minted
+        // here would mean spurious re-embed churn on every MCP body edit. Capture
+        // the change-DAG and revision-generation counts now; assert them identical
+        // immediately after project_after_mcp_commit below.
+        let snap_before = state.graph.to_snapshot();
+        let changes_before = snap_before.changes.len();
+        let revisions_before: usize =
+            snap_before.entity_revisions.values().map(|v| v.len()).sum();
+
         // Step 3: project with the supplied body (the FIR-934 carrier).
         let mut bodies = HashMap::new();
         bodies.insert(pre_commit_entity.id, new_body.clone());
@@ -685,6 +697,24 @@ mod tests {
         assert_eq!(modified_files.len(), 1, "exactly one file projected");
         assert!(warnings.is_empty(), "no collision warnings expected");
         assert!(conflicts.is_empty(), "no conflicts expected");
+
+        // FIR-934↔FIR-937 guard (assertion): the resync minted NO new change and
+        // NO new revision generation — convergence was revision-free, so there is
+        // no spurious vector re-embed churn on a body edit. This pins the
+        // FIR-934↔FIR-937 seam against future refactors that might route the resync
+        // through the change-minting commit path.
+        let snap_after = state.graph.to_snapshot();
+        assert_eq!(
+            snap_after.changes.len(),
+            changes_before,
+            "no-clobber resync must mint no SemanticChange (revision-free convergence)"
+        );
+        let revisions_after: usize =
+            snap_after.entity_revisions.values().map(|v| v.len()).sum();
+        assert_eq!(
+            revisions_after, revisions_before,
+            "no-clobber resync must append no EntityRevision generation (no FIR-937 re-embed churn)"
+        );
 
         // Step 4 (assertion a): the file now holds the agent's NEW text — a real
         // edit, NOT the identity splice the old write-loop produced.
