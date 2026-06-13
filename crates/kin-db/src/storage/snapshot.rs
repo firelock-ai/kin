@@ -1225,9 +1225,13 @@ impl SnapshotManager {
         embedder_identity: Option<&str>,
     ) -> Result<(), KinDbError> {
         let path = normalize_snapshot_path(path.into());
-        let graph_root_hash = graph
-            .snapshot_root_hash_hint()
-            .unwrap_or_else(|| compute_graph_root_hash(&graph.to_snapshot()));
+        // FIR-930: stamp the canonical root, never `snapshot_root_hash_hint()`.
+        // The hint is a mid-lifecycle cache that can carry a non-canonical value
+        // for the live graph's current content — it diverged across byte-identical
+        // preps in the FIR-814 identity experiment (ROOT_HASH_MATCH=0/26). The
+        // canonical recompute is prep-invariant and equals what the load-time gate
+        // compares against; the hint remains in use for the lock-guarded kndb trailer.
+        let graph_root_hash = compute_graph_root_hash(&graph.to_snapshot());
         Self::save_vector_index_bundle(&path, graph, graph_root_hash, embedder_identity)
     }
 
@@ -3214,3 +3218,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "snapshot_kvec_root_stamp_test.rs"]
+mod kvec_root_stamp_test;
