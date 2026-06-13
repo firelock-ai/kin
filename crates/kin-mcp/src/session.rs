@@ -39,6 +39,15 @@ pub struct McpMutationOperation {
     #[serde(default)]
     pub target: String,
     pub payload: Option<McpMutationPayload>,
+    /// New full UTF-8 source text for an entity body edit. When present on an
+    /// entity update, the post-commit graph→file projection writes this text
+    /// into the working-directory file (via `GraphOverlay.entity_bodies`)
+    /// instead of re-splicing the file's own bytes at the entity span. This is
+    /// the channel that lets an agent express "this entity's new source is X" so
+    /// the file actually reflects the graph mutation. Absent for metadata-only
+    /// edits, relation/blob ops, and creates with no file placement yet.
+    #[serde(default)]
+    pub body: Option<String>,
     pub description: String,
 }
 
@@ -944,6 +953,7 @@ mod tests {
             verb: "create".to_string(),
             target: "function".to_string(),
             payload: None,
+            body: None,
             description: "add dummy function".to_string(),
         };
         let tx_staged = registry
@@ -1001,6 +1011,7 @@ mod tests {
             verb: verb.to_string(),
             target: "function".to_string(),
             payload,
+            body: None,
             description: "d".to_string(),
         }
     }
