@@ -139,7 +139,7 @@ pub fn link_cross_file_against_entities(
     .entered();
     // Step 1: Build entity indices
     //   (file_path, entity_name) -> EntityId
-    let (entity_by_file_name, entity_by_name, entity_kind_by_id, known_files) = {
+    let (entity_by_file_name, entity_by_name, entity_by_bare_name, entity_kind_by_id, known_files) = {
         let _span = tracing::info_span!(
             "kin.index.link_cross_file.build_entity_indices",
             universe_entities = universe_entities.len()
@@ -147,6 +147,7 @@ pub fn link_cross_file_against_entities(
         .entered();
         let mut entity_by_file_name: HashMap<(&str, &str), EntityId> = HashMap::new();
         let mut entity_by_name: HashMap<&str, Vec<(&str, EntityId)>> = HashMap::new();
+        let mut entity_by_bare_name: HashMap<&str, Vec<(&str, EntityId)>> = HashMap::new();
         let mut entity_kind_by_id: HashMap<EntityId, EntityKind> = HashMap::new();
         let mut known_files: HashSet<&str> = HashSet::new();
 
@@ -161,6 +162,20 @@ pub fn link_cross_file_against_entities(
                 .entry(&*entity.name)
                 .or_default()
                 .push((file_path, entity.id));
+                
+            let bare_name = match entity.name.rfind("::") {
+                Some(idx) => &entity.name[idx + 2..],
+                None => match entity.name.rfind('.') {
+                    Some(idx) => &entity.name[idx + 1..],
+                    None => &*entity.name,
+                }
+            };
+            if bare_name != entity.name {
+                entity_by_bare_name
+                    .entry(bare_name)
+                    .or_default()
+                    .push((file_path, entity.id));
+            }
         }
 
         for file in files {
@@ -170,6 +185,7 @@ pub fn link_cross_file_against_entities(
         (
             entity_by_file_name,
             entity_by_name,
+            entity_by_bare_name,
             entity_kind_by_id,
             known_files,
         )
@@ -340,18 +356,47 @@ pub fn link_cross_file_against_entities(
                 }
 
                 // (c) Global name-match fallback
-                if let Some(candidates) = entity_by_name.get(rel.dst_name.as_str()) {
-                    // Pick the first candidate from a different file
-                    let other_file_match = candidates
-                        .iter()
-                        .find(|(fp, _)| *fp != file.file_path.as_str());
+                let exact_candidates = entity_by_name
+                    .get(rel.dst_name.as_str())
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
 
-                    if let Some(&(_, dst_id)) = other_file_match {
-                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                            resolved.push(make_relation(rel.kind, src_id, dst_id, 0.7));
-                        }
-                        continue;
+                let bare_candidates = if rel.kind == RelationKind::Calls {
+                    entity_by_bare_name
+                        .get(rel.dst_name.as_str())
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[])
+                } else {
+                    &[]
+                };
+
+                let mut linked = false;
+
+                // Pick the first exact candidate from a different file
+                if let Some(&(_, dst_id)) = exact_candidates
+                    .iter()
+                    .find(|(fp, _)| *fp != file.file_path.as_str())
+                {
+                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                        resolved.push(make_relation(rel.kind, src_id, dst_id, 0.7));
+                        linked = true;
                     }
+                }
+
+                // Link to bare-name matches for calls to resolve method receivers correctly
+                if !bare_candidates.is_empty() {
+                    for &(fp, dst_id) in bare_candidates {
+                        if fp != file.file_path.as_str() {
+                            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                                resolved.push(make_relation(rel.kind, src_id, dst_id, 0.3));
+                                linked = true;
+                            }
+                        }
+                    }
+                }
+
+                if linked {
+                    continue;
                 }
 
                 debug!(
