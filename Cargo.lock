@@ -3060,7 +3060,7 @@ dependencies = [
 [[package]]
 name = "kin-db"
 version = "0.1.0"
-source = "git+https://github.com/firelock-ai/kin-db.git?rev=36c1762b17ce0ff5a2fcb9642ef0ceef13912e15#36c1762b17ce0ff5a2fcb9642ef0ceef13912e15"
+source = "git+https://github.com/firelock-ai/kin-db.git?rev=8c0ad20656aaf50d8be98525be9cea33432603d7#8c0ad20656aaf50d8be98525be9cea33432603d7"
 dependencies = [
  "bincode",
  "bytes",
