@@ -482,7 +482,20 @@ mod tests {
 
         let results = idx.search_similar(&entities[0].1, 5).unwrap();
         assert!(!results.is_empty());
-        assert_eq!(results[0].0, RetrievalKey::from(entities[0].0));
+        // The `i % 8` / `(i + 1) % 8` pattern makes entities 0, 8, 16, … share an
+        // identical vector, so the query has many exact (distance-0) matches. The
+        // top hit is therefore ANY of those tied entities — asserting one
+        // specific (randomly-generated) `EntityId` wins the tie is not a property
+        // approximate-kNN guarantees. Assert the search returned a true nearest:
+        // the top hit's stored vector equals the query vector.
+        let top_vector = idx
+            .get_retrievable(&results[0].0)
+            .expect("top hit must be retrievable from the index");
+        assert_eq!(
+            top_vector,
+            entities[0].1.to_vec(),
+            "top hit must be an exact-match (distance-0) neighbour"
+        );
     }
 
     #[test]
