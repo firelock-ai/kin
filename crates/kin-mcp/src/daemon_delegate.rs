@@ -1242,6 +1242,7 @@ mod tests {
             verb: verb.into(),
             target: String::new(),
             payload,
+            body: None,
             description: String::new(),
         }
     }

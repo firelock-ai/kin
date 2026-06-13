@@ -2264,6 +2264,7 @@ mod tests {
             verb: "create".into(),
             target: "".into(),
             payload: Some(McpMutationPayload::Entity(entity.clone())),
+            body: None,
             description: "add test function".into(),
         };
 
@@ -2325,6 +2326,7 @@ mod tests {
             verb: "create".into(),
             target: "function".into(),
             payload: None::<McpMutationPayload>,
+            body: None,
             description: "add dummy".into(),
         };
         let mut stage_args = HashMap::new();
