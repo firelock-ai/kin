@@ -419,6 +419,10 @@ pub fn tool_definitions() -> ToolsListResult {
                                         "type": "object",
                                         "description": "Detailed mutation payload: {\"Entity\": { ... }} or {\"Relation\": {\"from\": \"...\", \"to\": \"...\", \"kind\": \"...\"}} or {\"Blob\": [...]}"
                                     },
+                                    "body": {
+                                        "type": "string",
+                                        "description": "New full UTF-8 source text for the entity. Supply this on an entity update to project an entity-body edit into the working file so the graph mutation actually reaches disk (graph and file agree). Omit for metadata-only edits, relation/blob ops, or creates with no file placement yet."
+                                    },
                                     "description": { "type": "string", "description": "Human-readable explanation of this change" }
                                 },
                                 "required": ["verb", "description"]

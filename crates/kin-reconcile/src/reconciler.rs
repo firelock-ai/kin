@@ -839,7 +839,16 @@ impl Reconciler {
         // and corrupt body extraction.
         let mut mutations: HashMap<EntityId, Vec<u8>> = HashMap::new();
         for (id, entity) in &overlay.entity_mods {
-            let body = if let Some(ref span) = entity.span {
+            // Prefer an explicitly supplied entity body (e.g. an MCP agent's new
+            // source text carried through `GraphOverlay.entity_bodies`). This is
+            // the channel that turns a graph mutation into a real file edit: when
+            // present we splice the agent's new text rather than re-extracting —
+            // and reproducing — the file's own bytes at the span (an identity
+            // no-op). Fall back to span-extraction only when no body was supplied
+            // (metadata-only edits, where the source text is unchanged).
+            let body = if let Some(supplied) = overlay.entity_bodies.get(id) {
+                supplied.clone()
+            } else if let Some(ref span) = entity.span {
                 // Try cached content first (race-safe), fall back to disk.
                 let contents = if let Some(cached) = self.projection.get_content(&span.file) {
                     cached.to_vec()

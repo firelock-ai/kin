@@ -3677,22 +3677,32 @@ fn collect_pre_commit_entities(
     state: &DaemonState,
     sessions: &kin_mcp::SessionRegistry,
     arguments: &HashMap<String, serde_json::Value>,
-) -> Vec<kin_model::Entity> {
+) -> (
+    Vec<kin_model::Entity>,
+    HashMap<kin_model::EntityId, Vec<u8>>,
+) {
     let Some(tx_id) = arguments
         .get("transaction_id")
         .and_then(serde_json::Value::as_str)
     else {
-        return vec![];
+        return (vec![], HashMap::new());
     };
     let Some(transaction) = sessions.get_transaction(tx_id) else {
-        return vec![];
+        return (vec![], HashMap::new());
     };
 
     let mut entities = Vec::new();
+    let mut supplied_bodies: HashMap<kin_model::EntityId, Vec<u8>> = HashMap::new();
     for op in &transaction.staged_operations {
         let Some(kin_mcp::McpMutationPayload::Entity(payload_entity)) = op.payload.as_ref() else {
             continue;
         };
+        // FIR-934: capture the agent-supplied new source text (if present) keyed
+        // by entity id, so the post-commit projection writes it to the working
+        // file instead of re-splicing the file's own bytes (an identity no-op).
+        if let Some(body) = op.body.as_ref() {
+            supplied_bodies.insert(payload_entity.id, body.clone().into_bytes());
+        }
         // Look up the pre-commit entity from the graph — it carries the span
         // set by the last reconcile.  The agent's staged payload may not have
         // span metadata (agents do not know file placement).
@@ -3700,7 +3710,7 @@ fn collect_pre_commit_entities(
             entities.push(graph_entity);
         }
     }
-    entities
+    (entities, supplied_bodies)
 }
 
 /// The transaction id a terminal transaction tool (commit/abort) acted on, used
@@ -4023,10 +4033,10 @@ async fn mcp_tools_call(
     // mutations into working-directory files after the graph is updated.
     // Entities without a span (new creates, relation-only ops) are included but
     // silently skipped by project_after_mcp_commit.
-    let pre_commit_entities = if request.name == "kin_transaction_commit" {
+    let (pre_commit_entities, supplied_bodies) = if request.name == "kin_transaction_commit" {
         collect_pre_commit_entities(&state, &sessions, &request.arguments)
     } else {
-        vec![]
+        (vec![], HashMap::new())
     };
 
     let result = match kin_mcp::handlers::handle_tool_call(
@@ -4063,8 +4073,10 @@ async fn mcp_tools_call(
         });
     }
 
-    // FIR-929/FIR-904·3: project entity mutations into working-directory files
-    // so the next reconcile does not silently clobber the graph (file-wins LWW).
+    // FIR-929/FIR-904·3/FIR-934: project entity mutations into working-directory
+    // files so the next reconcile does not silently clobber the graph (file-wins
+    // LWW). When an entity carried a new body, `supplied_bodies` routes that text
+    // through the projection so the file actually reflects the agent's mutation.
     //
     // The graph commit has already landed and the version counter already
     // reflects it above.  A projection failure does NOT roll back the graph —
@@ -4073,12 +4085,17 @@ async fn mcp_tools_call(
     //
     // Conflicts (FIR-904·3 skip-conflicted semantics): entities where a
     // concurrent human file edit was detected are NOT projected; a structured
-    // conflict description is appended to the result so the agent can resolve.
+    // conflict description is surfaced as an error so the agent can resolve.
     if request.name == "kin_transaction_commit"
         && result.is_error != Some(true)
         && !pre_commit_entities.is_empty()
     {
-        match crate::projection_wiring::project_after_mcp_commit(&state, &pre_commit_entities).await
+        match crate::projection_wiring::project_after_mcp_commit(
+            &state,
+            &pre_commit_entities,
+            &supplied_bodies,
+        )
+        .await
         {
             Err(proj_err) => {
                 return Ok(Json(kin_mcp::ToolCallResult::error(format!(
