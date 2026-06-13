@@ -633,8 +633,22 @@ pub async fn handle_transaction_commit<G: GraphStore>(
                             .ok()
                             .flatten()
                             .unwrap_or_else(|| entity.clone());
+                        // FIR-940: an agent knows an entity's id and the field it's
+                        // changing but not Kin's file placement, so a partial update
+                        // payload often carries file_origin/span = None. Committing
+                        // that as-is would drop the entity's placement, and the
+                        // post-commit reconcile would then reparse it as a NEW entity
+                        // (duplicate) instead of a modification. Carry placement
+                        // forward from the existing entity when the payload omits it.
+                        let mut new = entity;
+                        if new.file_origin.is_none() {
+                            new.file_origin = old.file_origin.clone();
+                        }
+                        if new.span.is_none() {
+                            new.span = old.span.clone();
+                        }
                         entity_deltas
-                            .push(kin_model::change::EntityDelta::Modified { old, new: entity });
+                            .push(kin_model::change::EntityDelta::Modified { old, new });
                     } else if verb == "delete" || verb == "remove" {
                         entity_deltas.push(kin_model::change::EntityDelta::Removed(entity.id));
                     }
