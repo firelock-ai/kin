@@ -625,30 +625,52 @@ pub async fn handle_transaction_commit<G: GraphStore>(
         if let Some(payload) = op.payload {
             match payload {
                 McpMutationPayload::Entity(entity) => {
-                    if verb == "create" || verb == "add" || verb == "upsert" || verb == "insert" {
-                        entity_deltas.push(kin_model::change::EntityDelta::Added(entity));
-                    } else if verb == "update" || verb == "modify" {
-                        let old = store
-                            .get_entity(&entity.id)
-                            .ok()
-                            .flatten()
-                            .unwrap_or_else(|| entity.clone());
-                        // FIR-940: an agent knows an entity's id and the field it's
-                        // changing but not Kin's file placement, so a partial update
-                        // payload often carries file_origin/span = None. Committing
-                        // that as-is would drop the entity's placement, and the
-                        // post-commit reconcile would then reparse it as a NEW entity
-                        // (duplicate) instead of a modification. Carry placement
-                        // forward from the existing entity when the payload omits it.
-                        let mut new = entity;
+                    let mut old_opt = store.get_entity(&entity.id).ok().flatten();
+                    
+                    // FIR-940: Fall back to lookup by name+kind if ID lookup fails (common for upserts)
+                    if old_opt.is_none() {
+                        let filter = kin_model::EntityFilter {
+                            name_pattern: Some(entity.name.clone()),
+                            kinds: Some(vec![entity.kind]),
+                            ..Default::default()
+                        };
+                        if let Ok(mut found) = store.query_entities(&filter) {
+                            if let Some(first) = found.pop() {
+                                old_opt = Some(first);
+                            }
+                        }
+                    }
+
+                    // FIR-940: an agent knows an entity's name/id and the field it's
+                    // changing but not Kin's file placement, so a partial payload
+                    // often carries file_origin/span = None. Carry placement
+                    // forward from the existing entity when the payload omits it.
+                    let mut new = entity.clone();
+                    if let Some(old) = &old_opt {
                         if new.file_origin.is_none() {
                             new.file_origin = old.file_origin.clone();
                         }
                         if new.span.is_none() {
                             new.span = old.span.clone();
                         }
-                        entity_deltas
-                            .push(kin_model::change::EntityDelta::Modified { old, new });
+                    } else if (verb == "create" || verb == "add" || verb == "upsert" || verb == "insert") && new.file_origin.is_none() {
+                        // Fail loud if it's a completely new entity with no placement info
+                        return Ok(ToolCallResult::error(format!(
+                            "Cannot commit transaction {}: Payload for new entity '{}' missing required 'file_origin'.",
+                            transaction_id, entity.name
+                        )));
+                    }
+
+                    if verb == "create" || verb == "add" || verb == "upsert" || verb == "insert" {
+                        if old_opt.is_some() && (verb == "upsert" || verb == "create" || verb == "add" || verb == "insert") {
+                            // Convert upserts of existing entities into Modified deltas to avoid duplicates
+                            entity_deltas.push(kin_model::change::EntityDelta::Modified { old: old_opt.unwrap(), new });
+                        } else {
+                            entity_deltas.push(kin_model::change::EntityDelta::Added(new));
+                        }
+                    } else if verb == "update" || verb == "modify" {
+                        let old = old_opt.unwrap_or_else(|| entity.clone());
+                        entity_deltas.push(kin_model::change::EntityDelta::Modified { old, new });
                     } else if verb == "delete" || verb == "remove" {
                         entity_deltas.push(kin_model::change::EntityDelta::Removed(entity.id));
                     }

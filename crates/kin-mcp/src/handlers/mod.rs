@@ -2249,7 +2249,7 @@ mod tests {
                 behavior_hash: Hash256::from_bytes([0; 32]),
                 stability_score: 1.0,
             },
-            file_origin: None,
+            file_origin: Some(kin_model::ids::FilePathId::new("src/test.rs")),
             span: None,
             signature: "fn test_fn()".into(),
             visibility: kin_model::entity::Visibility::Public,
