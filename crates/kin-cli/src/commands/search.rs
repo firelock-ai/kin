@@ -1216,7 +1216,7 @@ fn enforce_precise_search_mode(
         .find(|sub| !looks_precise_name(sub, has_kind))
     {
         anyhow::bail!(
-            "precise native search: `{}` is too broad for `--show-body`. Use an exact symbol like `ZodString`, `$ZodType`, `Router::route`, or add `--kind`.",
+            "precise native search: `{}` is too broad for `--show-body`. Use an exact symbol like `MyString`, `$MyType`, `Router::route`, or add `--kind`.",
             bad
         );
     }
@@ -1411,9 +1411,9 @@ mod tests {
 
     #[test]
     fn precise_mode_accepts_exact_symbol_names() {
-        assert!(looks_precise_name("ZodString", false));
-        assert!(looks_precise_name("safeParse", false));
-        assert!(looks_precise_name("$ZodType", false));
+        assert!(looks_precise_name("MyString", false));
+        assert!(looks_precise_name("parseStrict", false));
+        assert!(looks_precise_name("$MyType", false));
         assert!(looks_precise_name("Router::route", false));
         assert!(looks_precise_name("src/parser.ts", false));
     }
@@ -1436,8 +1436,8 @@ mod tests {
     fn precise_mode_rejects_broad_show_body_searches() {
         std::env::set_var("KIN_SEARCH_MODE", "precise");
         let err = enforce_precise_search_mode(
-            "parse|safeParse|_parse|run",
-            &["parse", "safeParse", "_parse", "run"],
+            "parse|parseStrict|_parse|run",
+            &["parse", "parseStrict", "_parse", "run"],
             None,
             true,
             Some(20),
@@ -1453,8 +1453,8 @@ mod tests {
     fn precise_mode_accepts_small_exact_or_searches() {
         std::env::set_var("KIN_SEARCH_MODE", "precise");
         let result = enforce_precise_search_mode(
-            "$ZodType|$ZodTypeInternals",
-            &["$ZodType", "$ZodTypeInternals"],
+            "$MyType|$MyTypeInternals",
+            &["$MyType", "$MyTypeInternals"],
             None,
             true,
             Some(5),

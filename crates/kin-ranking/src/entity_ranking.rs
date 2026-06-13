@@ -41,21 +41,6 @@ pub fn relation_kind_rank(kind: &RelationKind) -> usize {
     }
 }
 
-/// Returns true if the file path looks like a decoy/test fixture path.
-pub fn looks_like_decoy_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.contains("/decoy")
-        || lower.contains("decoy_")
-        || lower.contains("/local_")
-        || lower.contains("/fake_")
-}
-
-/// Returns true if an entity name looks like an alternative/decoy name.
-pub fn looks_like_alt_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.contains("alt") || lower.contains("decoy")
-}
-
 /// The composite ranking key used to select the best entity match.
 ///
 /// Compared via tuple ordering (higher = better):
@@ -65,15 +50,13 @@ pub fn looks_like_alt_name(name: &str) -> bool {
 /// 4. Direct call/import count (incoming)
 /// 5. Total incoming reference count
 /// 6. Has file origin
-/// 7. Not a decoy
-/// 8. Shorter name preferred (Reverse)
+/// 7. Shorter name preferred (Reverse)
 pub type EntityRankingKey = (
     bool,
     bool,
     usize,
     usize,
     usize,
-    bool,
     bool,
     std::cmp::Reverse<usize>,
 );
@@ -85,12 +68,6 @@ pub fn entity_ranking_key(
     incoming_refs: usize,
     direct_signal: usize,
 ) -> EntityRankingKey {
-    let path = entity
-        .file_origin
-        .as_ref()
-        .map(|f| f.0.as_str())
-        .unwrap_or("");
-    let is_decoy = looks_like_decoy_path(path) || looks_like_alt_name(&entity.name);
     let exported = matches!(entity.visibility, Visibility::Public | Visibility::Internal);
     (
         entity.name == query,
@@ -99,7 +76,6 @@ pub fn entity_ranking_key(
         direct_signal,
         incoming_refs,
         entity.file_origin.is_some(),
-        !is_decoy,
         std::cmp::Reverse(entity.name.len()),
     )
 }
@@ -180,13 +156,13 @@ pub fn entity_directory(entity: &Entity) -> Option<String> {
 
 /// Compute a composite score for trace callee selection.
 ///
-/// Returns a tuple ordered by: relation rank, same directory, not a
-/// decoy, declaration kind, has file origin, shorter name.
+/// Returns a tuple ordered by: relation rank, same directory,
+/// declaration kind, has file origin, shorter name.
 pub fn trace_callee_score(
     entity: &Entity,
     relation_kind: RelationKind,
     focal_dir: Option<&str>,
-) -> (usize, bool, bool, usize, bool, usize) {
+) -> (usize, bool, usize, bool, usize) {
     let same_dir = focal_dir
         .zip(entity_directory(entity).as_deref())
         .map(|(root, dir)| root == dir)
@@ -194,12 +170,6 @@ pub fn trace_callee_score(
     (
         trace_relation_rank(relation_kind),
         same_dir,
-        !looks_like_alt_name(&entity.name)
-            && entity
-                .file_origin
-                .as_ref()
-                .map(|path| !looks_like_decoy_path(path.0.as_str()))
-                .unwrap_or(true),
         declaration_kind_rank(&entity.kind),
         entity.file_origin.is_some(),
         usize::MAX.saturating_sub(entity.name.len()),
@@ -255,22 +225,6 @@ mod tests {
             relation_kind_rank(&RelationKind::Calls)
                 < relation_kind_rank(&RelationKind::References)
         );
-    }
-
-    #[test]
-    fn looks_like_decoy_path_matches() {
-        assert!(looks_like_decoy_path("src/decoy/foo.rs"));
-        assert!(looks_like_decoy_path("src/local_stub/foo.rs"));
-        assert!(looks_like_decoy_path("src/fake_data/foo.rs"));
-        assert!(!looks_like_decoy_path("src/core/foo.rs"));
-    }
-
-    #[test]
-    fn looks_like_alt_name_matches() {
-        assert!(looks_like_alt_name("AltDatabase"));
-        assert!(looks_like_alt_name("DecoyService"));
-        assert!(looks_like_alt_name("alternative_impl"));
-        assert!(!looks_like_alt_name("RealService"));
     }
 
     #[test]
