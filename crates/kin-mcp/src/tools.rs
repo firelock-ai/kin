@@ -445,7 +445,7 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_transaction_commit".into(),
-                description: "Commit all staged mutations in the transaction atomically to the graph. Returns the new Merkle root hash of the graph.".into(),
+                description: "Commit all staged mutations in the transaction atomically to the graph. On success returns an object with: `status` (\"committed\"), `ops_applied` (count of entity+relation deltas actually applied), `empty` (true when ops_applied is 0 — a no-op commit), `new_root_hash` (the graph's Merkle root after the commit), `modified_files` (working-directory files the projection wrote — entity-body edits reach disk here), `collision_warnings`, and `conflicts` (entities skipped due to a concurrent file edit). A non-empty `conflicts` set is surfaced as an error instead.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {

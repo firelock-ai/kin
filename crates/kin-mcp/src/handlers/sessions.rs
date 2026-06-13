@@ -558,8 +558,12 @@ pub async fn handle_transaction_validate(
 }
 
 pub const TRANSACTION_COMMIT_DESC: &str = "\
-Commit all staged mutations in the transaction atomically to the graph. Returns \
-the new Merkle root hash of the graph.";
+Commit all staged mutations in the transaction atomically to the graph. On success \
+returns status, ops_applied (entity+relation deltas applied), empty (true for a \
+no-op commit), new_root_hash (graph Merkle root after the commit), modified_files \
+(working-directory files the projection wrote — entity-body edits reach disk here), \
+collision_warnings, and conflicts (entities skipped due to a concurrent file edit; a \
+non-empty set is surfaced as an error instead).";
 
 pub async fn handle_transaction_commit<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -670,6 +674,11 @@ pub async fn handle_transaction_commit<G: GraphStore>(
         }
     }
 
+    // FIR-935: count the deltas the commit will actually apply so the response
+    // distinguishes a real commit from a no-op. A relation delete that matched
+    // nothing, or a transaction with no staged ops, lands here as zero.
+    let ops_applied = entity_deltas.len() + relation_deltas.len();
+
     let delta = kin_model::change::TransactionDelta {
         entity_deltas,
         relation_deltas,
@@ -685,10 +694,16 @@ pub async fn handle_transaction_commit<G: GraphStore>(
         .commit_transaction(&transaction_id)
         .map_err(|e| crate::error::McpError::InvalidParams(e))?;
 
+    // FIR-935: report what the commit did. `ops_applied`/`empty` make a zero-op
+    // commit unambiguous; the daemon path further enriches this with the real
+    // `new_root_hash`, `modified_files`, `collision_warnings`, and `conflicts`
+    // once the graph→file projection has run.
     let result = serde_json::json!({
         "transaction_id": committed_tx.transaction_id,
         "state": committed_tx.state,
         "status": "committed",
+        "ops_applied": ops_applied,
+        "empty": ops_applied == 0,
     });
     let json = serde_json::to_string_pretty(&result).map_err(crate::error::McpError::Json)?;
     Ok(ToolCallResult::text(json))
