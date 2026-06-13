@@ -445,11 +445,32 @@ pub fn tool_definitions() -> ToolsListResult {
             },
             ToolDefinition {
                 name: "kin_transaction_commit".into(),
-                description: "Commit all staged mutations in the transaction atomically to the graph. On success returns an object with: `status` (\"committed\"), `ops_applied` (count of entity+relation deltas actually applied), `empty` (true when ops_applied is 0 — a no-op commit), `new_root_hash` (the graph's Merkle root after the commit), `modified_files` (working-directory files the projection wrote — entity-body edits reach disk here), `collision_warnings`, and `conflicts` (entities skipped due to a concurrent file edit). A non-empty `conflicts` set is surfaced as an error instead.".into(),
+                description: "Commit all staged mutations in the transaction atomically to the graph. On success returns an object with: `status` (\"committed\"), `ops_applied` (count of entity+relation deltas actually applied), `empty` (true when ops_applied is 0 — a no-op commit), `new_root_hash` (the graph's Merkle root after the commit), `modified_files` (working-directory files the projection wrote — entity-body edits reach disk here), `collision_warnings`, and `conflicts` (entities skipped due to a concurrent file edit). A non-empty `conflicts` set is surfaced as an error instead. You can optionally provide an 'operations' array to stage and commit in a single call.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "transaction_id": { "type": "string", "description": "Transaction UUID" }
+                        "transaction_id": { "type": "string", "description": "Transaction UUID" },
+                        "operations": {
+                            "type": "array",
+                            "description": "Optional array of mutation operations to stage immediately before committing (solves stage+commit HTTP persistence gaps)",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "verb": { "type": "string", "description": "Operation verb: create, update, delete, upsert" },
+                                    "target": { "type": "string", "description": "Legacy compat target (optional)", "default": "" },
+                                    "payload": {
+                                        "type": "object",
+                                        "description": "Detailed mutation payload: {\"Entity\": { ... }} or {\"Relation\": {\"from\": \"...\", \"to\": \"...\", \"kind\": \"...\"}} or {\"Blob\": [...]}"
+                                    },
+                                    "body": {
+                                        "type": "string",
+                                        "description": "New full UTF-8 source text for the entity."
+                                    },
+                                    "description": { "type": "string", "description": "Human-readable explanation of this change" }
+                                },
+                                "required": ["verb", "description"]
+                            }
+                        }
                     },
                     "required": ["transaction_id"]
                 }),
