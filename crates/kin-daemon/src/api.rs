@@ -4039,7 +4039,7 @@ async fn mcp_tools_call(
         (vec![], HashMap::new())
     };
 
-    let result = match kin_mcp::handlers::handle_tool_call(
+    let mut result = match kin_mcp::handlers::handle_tool_call(
         &request.name,
         &request.arguments,
         graph.as_ref(),
@@ -4073,10 +4073,10 @@ async fn mcp_tools_call(
         });
     }
 
-    // FIR-929/FIR-904·3/FIR-934: project entity mutations into working-directory
-    // files so the next reconcile does not silently clobber the graph (file-wins
-    // LWW). When an entity carried a new body, `supplied_bodies` routes that text
-    // through the projection so the file actually reflects the agent's mutation.
+    // FIR-929/FIR-904·3/FIR-934/FIR-935: project entity mutations into
+    // working-directory files (so the next reconcile does not silently clobber
+    // the graph — file-wins LWW) and enrich the commit response with what the
+    // commit actually did.
     //
     // The graph commit has already landed and the version counter already
     // reflects it above.  A projection failure does NOT roll back the graph —
@@ -4084,57 +4084,113 @@ async fn mcp_tools_call(
     // retry or inspect the source file.
     //
     // Conflicts (FIR-904·3 skip-conflicted semantics): entities where a
-    // concurrent human file edit was detected are NOT projected; a structured
-    // conflict description is surfaced as an error so the agent can resolve.
-    if request.name == "kin_transaction_commit"
-        && result.is_error != Some(true)
-        && !pre_commit_entities.is_empty()
-    {
-        match crate::projection_wiring::project_after_mcp_commit(
-            &state,
-            &pre_commit_entities,
-            &supplied_bodies,
-        )
-        .await
-        {
-            Err(proj_err) => {
-                return Ok(Json(kin_mcp::ToolCallResult::error(format!(
-                    "graph commit succeeded but file projection failed — agent intent is \
-                     preserved in the graph; retry projection or inspect the source file. \
-                     Detail: {proj_err}"
-                ))));
+    // concurrent human file edit was detected are NOT projected; the commit is
+    // surfaced as an error so the agent can resolve.
+    if request.name == "kin_transaction_commit" && result.is_error != Some(true) {
+        // FIR-935: the real graph Merkle root, now that the delta has landed.
+        let new_root_hash = hex::encode(state.graph.compute_root_hash());
+
+        let (modified_files, collision_warnings) = if pre_commit_entities.is_empty() {
+            // Relation-only / new-entity / zero-op commit: nothing to project.
+            (Vec::new(), Vec::new())
+        } else {
+            match crate::projection_wiring::project_after_mcp_commit(
+                &state,
+                &pre_commit_entities,
+                &supplied_bodies,
+            )
+            .await
+            {
+                Err(proj_err) => {
+                    return Ok(Json(kin_mcp::ToolCallResult::error(format!(
+                        "graph commit succeeded but file projection failed — agent intent is \
+                         preserved in the graph; retry projection or inspect the source file. \
+                         Detail: {proj_err}"
+                    ))));
+                }
+                Ok((_modified, _warnings, conflicts)) if !conflicts.is_empty() => {
+                    // Some entities were skipped due to concurrent file edits.
+                    // Surface each conflict loudly so the agent can resolve.
+                    let conflict_msgs: Vec<String> = conflicts
+                        .iter()
+                        .map(|c| {
+                            format!(
+                                "conflict on {}: {}",
+                                c.affected_files
+                                    .first()
+                                    .map(|f| f.to_string())
+                                    .unwrap_or_else(|| "<unknown file>".into()),
+                                c.divergence_reason
+                            )
+                        })
+                        .collect();
+                    return Ok(Json(kin_mcp::ToolCallResult::error(format!(
+                        "graph commit succeeded but {n} entity/entities had concurrent file \
+                         edits — those entities were NOT projected (human edits preserved). \
+                         Resolve conflicts and retry. Details: {details}",
+                        n = conflicts.len(),
+                        details = conflict_msgs.join("; "),
+                    ))));
+                }
+                Ok((modified, warnings, _conflicts)) => (modified, warnings),
             }
-            Ok((_modified, _warnings, conflicts)) if !conflicts.is_empty() => {
-                // Some entities were skipped due to concurrent file edits.
-                // Surface each conflict loudly so the agent can resolve.
-                let conflict_msgs: Vec<String> = conflicts
-                    .iter()
-                    .map(|c| {
-                        format!(
-                            "conflict on {}: {}",
-                            c.affected_files
-                                .first()
-                                .map(|f| f.to_string())
-                                .unwrap_or_else(|| "<unknown file>".into()),
-                            c.divergence_reason
-                        )
-                    })
-                    .collect();
-                return Ok(Json(kin_mcp::ToolCallResult::error(format!(
-                    "graph commit succeeded but {n} entity/entities had concurrent file \
-                     edits — those entities were NOT projected (human edits preserved). \
-                     Resolve conflicts and retry. Details: {details}",
-                    n = conflicts.len(),
-                    details = conflict_msgs.join("; "),
-                ))));
-            }
-            Ok(_) => {
-                // All entities projected successfully (or none had spans).
-            }
-        }
+        };
+
+        // FIR-935: fold the projection outcome and root hash into the success
+        // response so a commit reports what it did instead of an opaque
+        // "committed". `ops_applied`/`empty` already rode in from the handler.
+        result = enrich_commit_result(result, &new_root_hash, &modified_files, &collision_warnings);
     }
 
     Ok(Json(result))
+}
+
+/// FIR-935: enrich a successful `kin_transaction_commit` text result with the
+/// post-commit graph root hash and the graph→file projection outcome.
+///
+/// The base handler returns `{transaction_id, state, status, ops_applied,
+/// empty}`; this adds `new_root_hash`, `modified_files`, `collision_warnings`,
+/// and `conflicts: []` (a non-empty conflict set is surfaced as an error by the
+/// caller, so the success path always reports an empty conflicts list). Errors
+/// and non-JSON payloads pass through untouched.
+fn enrich_commit_result(
+    result: kin_mcp::ToolCallResult,
+    new_root_hash: &str,
+    modified_files: &[FilePathId],
+    collision_warnings: &[kin_model::IntentSummary],
+) -> kin_mcp::ToolCallResult {
+    if result.is_error == Some(true) {
+        return result;
+    }
+    let Some(kin_mcp::ContentBlock::Text { text }) = result.content.first() else {
+        return result;
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return result;
+    };
+    let Some(map) = value.as_object_mut() else {
+        return result;
+    };
+    map.insert("new_root_hash".into(), serde_json::json!(new_root_hash));
+    map.insert(
+        "modified_files".into(),
+        serde_json::json!(modified_files
+            .iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()),
+    );
+    map.insert(
+        "collision_warnings".into(),
+        serde_json::to_value(collision_warnings).unwrap_or_else(|_| serde_json::json!([])),
+    );
+    map.insert("conflicts".into(), serde_json::json!([]));
+
+    match serde_json::to_string_pretty(&value) {
+        Ok(json) => kin_mcp::ToolCallResult::text(json),
+        Err(_) => kin_mcp::ToolCallResult::error(
+            "commit succeeded but response serialization failed".to_string(),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
