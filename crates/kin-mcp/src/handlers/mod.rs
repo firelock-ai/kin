@@ -1687,7 +1687,7 @@ mod tests {
         assert!(content.contains("Imported constants"));
         assert!(content.contains(&constant.name));
         assert!(content.contains("export const"));
-        assert!(content.contains("Similar/Decoy Matches"));
+        assert!(content.contains("## Similar Matches"));
         assert!(content.contains(&decoy.name));
         assert!(content.contains("return n + PROBE_BASE"));
     }

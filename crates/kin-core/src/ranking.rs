@@ -167,9 +167,9 @@ mod tests {
 
     #[test]
     fn falls_back_to_qualified_leaf_match() {
-        let entities = vec![make_entity("Foo.safeParse"), make_entity("Foo.parse")];
-        let picked = select_best_match("safeParse", &entities, name_only_checker).unwrap();
-        assert_eq!(picked.name, "Foo.safeParse");
+        let entities = vec![make_entity("Foo.parseStrict"), make_entity("Foo.parse")];
+        let picked = select_best_match("parseStrict", &entities, name_only_checker).unwrap();
+        assert_eq!(picked.name, "Foo.parseStrict");
     }
 
     #[test]
@@ -181,8 +181,8 @@ mod tests {
 
     #[test]
     fn returns_none_when_qualifier_is_unmatched() {
-        let entities = vec![make_entity("run"), make_entity("Tinybench.run")];
-        let picked = select_best_match("$ZodType::run", &entities, name_only_checker);
+        let entities = vec![make_entity("run"), make_entity("Helper.run")];
+        let picked = select_best_match("$Config::run", &entities, name_only_checker);
         assert!(picked.is_none());
     }
 

@@ -35,6 +35,8 @@ pub enum McpMutationPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpMutationOperation {
     pub verb: String,
+    /// Legacy compat target; the tool schema declares it optional with default "".
+    #[serde(default)]
     pub target: String,
     pub payload: Option<McpMutationPayload>,
     pub description: String,
@@ -646,6 +648,20 @@ impl Default for SessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutation_operation_deserializes_without_target() {
+        // The tool schema declares `target` optional with default "" (FIR-936);
+        // the deserializer must accept schema-conformant payloads that omit it.
+        let json = serde_json::json!({
+            "verb": "update",
+            "description": "schema-conformant op without target"
+        });
+        let op: McpMutationOperation =
+            serde_json::from_value(json).expect("operation without target must deserialize");
+        assert_eq!(op.target, "");
+        assert_eq!(op.verb, "update");
+    }
 
     #[test]
     fn register_and_get_session() {

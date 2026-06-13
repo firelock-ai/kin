@@ -255,8 +255,8 @@ pub async fn fetch_spine_xref(
 // Shared ranking primitives live in kin-search; re-exported here for backward
 // compatibility with existing handler code.
 pub use kin_ranking::entity_ranking::{
-    declaration_kind_rank, entity_directory, looks_like_alt_name, looks_like_decoy_path,
-    relation_kind_rank, select_best_entity as select_best_reference_target,
+    declaration_kind_rank, entity_directory, relation_kind_rank,
+    select_best_entity as select_best_reference_target,
 };
 
 // ── Trace helpers ──
