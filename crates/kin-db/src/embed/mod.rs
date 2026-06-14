@@ -72,6 +72,19 @@ const CUDA_MAX_BATCH_TOKENS: usize = 65_536;
 // the common short-entity case. Tune up via KIN_EMBED_MAX_BATCH_TOKENS.
 #[cfg(feature = "embeddings")]
 const METAL_MAX_BATCH_TOKENS: usize = 16_384;
+// The real GPU cost of a Metal attention dispatch is the score buffer, sized
+// `count × max_seq²` (= padded-tokens × max_seq). The token budget above bounds
+// padded-tokens but NOT that product: at a fixed token budget, attention memory
+// still grows linearly with max_seq, so a dispatch packed with long entities
+// allocates a far larger buffer than one packed with short ones — and trips the
+// macOS GPU watchdog (silent SIGKILL). `METAL_MAX_ATTENTION_AREA` bounds that
+// product directly, so a dispatch is safe at ANY entity length: long entities
+// pack fewer-per-dispatch, short entities still pack many. 8_388_608 = 2 × 2048²
+// (two entities at the EMBED_MAX_SEQ_LEN cap) — the largest worst-case dispatch
+// verified to survive the watchdog live on a long-body repo; 4 × that died.
+// Tune via KIN_EMBED_MAX_ATTENTION_AREA.
+#[cfg(feature = "embeddings")]
+const METAL_MAX_ATTENTION_AREA: usize = 8_388_608;
 #[cfg(feature = "embeddings")]
 const EMBEDDING_CACHE_SCHEMA_VERSION: &str = "v2";
 #[cfg(feature = "embeddings")]
@@ -590,33 +603,17 @@ impl BertEmbedder {
             .collect();
         encoded.sort_by_key(|(_, ids, _)| ids.len());
 
-        let max_batch_tokens = std::env::var("KIN_EMBED_MAX_BATCH_TOKENS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or_else(|| default_max_batch_tokens(self.model.backend()));
+        let budget = BatchBudget::from_env(self.model.backend());
 
         let mode = hybrid_mode();
         if mode != HybridMode::Off {
-            return self.embed_hybrid(encoded, dimensions, max_batch_tokens, texts.len(), mode);
+            return self.embed_hybrid(encoded, dimensions, budget, texts.len(), mode);
         }
 
         let mut results: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
         let mut start = 0usize;
         while start < encoded.len() {
-            let mut end = start;
-            let mut longest = 0usize;
-
-            while end < encoded.len() {
-                let candidate_len = encoded[end].1.len().max(1);
-                let projected_longest = longest.max(candidate_len);
-                let projected_tokens = projected_longest * (end - start + 1);
-                if end > start && projected_tokens > max_batch_tokens {
-                    break;
-                }
-                longest = projected_longest;
-                end += 1;
-            }
+            let (end, longest) = budget.next_batch(&encoded, start);
 
             let batch = &encoded[start..end];
             let token_ids: Vec<Vec<u32>> = batch.iter().map(|(_, ids, _)| ids.clone()).collect();
@@ -774,7 +771,7 @@ impl BertEmbedder {
         &self,
         encoded: Vec<Encoded>,
         dimensions: usize,
-        max_batch_tokens: usize,
+        budget: BatchBudget,
         total: usize,
         mode: HybridMode,
     ) -> Result<Vec<Vec<f32>>, KinDbError> {
@@ -784,7 +781,7 @@ impl BertEmbedder {
                 let split =
                     encoded.partition_point(|(_, ids, _)| ids.len() <= EMBED_CPU_SEQ_THRESHOLD);
                 let (short, long) = encoded.split_at(split);
-                self.dispatch_concurrent(short, long, dimensions, max_batch_tokens)?
+                self.dispatch_concurrent(short, long, dimensions, budget)?
             }
             HybridMode::Balanced { gpu_tput_ratio } => {
                 let (metal_subset, cpu_subset) = balanced_partition(&encoded, gpu_tput_ratio);
@@ -800,7 +797,7 @@ impl BertEmbedder {
                     cpu_threads = rayon::current_num_threads(),
                     "embed_hybrid_balance"
                 );
-                self.dispatch_concurrent(&metal_subset, &cpu_subset, dimensions, max_batch_tokens)?
+                self.dispatch_concurrent(&metal_subset, &cpu_subset, dimensions, budget)?
             }
         };
 
@@ -822,25 +819,13 @@ impl BertEmbedder {
         &self,
         encoded: &[(usize, Vec<u32>, Vec<u32>)],
         dimensions: usize,
-        max_batch_tokens: usize,
+        budget: BatchBudget,
         backend_override: Option<EmbedBackendChoice>,
     ) -> Result<Vec<(usize, Vec<f32>)>, KinDbError> {
         let mut placed: Vec<(usize, Vec<f32>)> = Vec::with_capacity(encoded.len());
         let mut start = 0usize;
         while start < encoded.len() {
-            let mut end = start;
-            let mut longest = 0usize;
-
-            while end < encoded.len() {
-                let candidate_len = encoded[end].1.len().max(1);
-                let projected_longest = longest.max(candidate_len);
-                let projected_tokens = projected_longest * (end - start + 1);
-                if end > start && projected_tokens > max_batch_tokens {
-                    break;
-                }
-                longest = projected_longest;
-                end += 1;
-            }
+            let (end, longest) = budget.next_batch(encoded, start);
 
             let batch = &encoded[start..end];
             let token_ids: Vec<Vec<u32>> = batch.iter().map(|(_, ids, _)| ids.clone()).collect();
@@ -976,13 +961,13 @@ impl BertEmbedder {
         metal_side: &[Encoded],
         cpu_side: &[Encoded],
         dimensions: usize,
-        max_batch_tokens: usize,
+        budget: BatchBudget,
     ) -> Result<Vec<(usize, Vec<f32>)>, KinDbError> {
         if metal_side.is_empty() {
-            return self.process_encoded_subset(cpu_side, dimensions, max_batch_tokens, None);
+            return self.process_encoded_subset(cpu_side, dimensions, budget, None);
         }
         if cpu_side.is_empty() {
-            return self.process_encoded_subset(metal_side, dimensions, max_batch_tokens, None);
+            return self.process_encoded_subset(metal_side, dimensions, budget, None);
         }
 
         // Hybrid concurrency is only safe when the CPU arm runs on its OWN model
@@ -1000,7 +985,7 @@ impl BertEmbedder {
             let mut merged = self.process_encoded_subset(
                 metal_side,
                 dimensions,
-                max_batch_tokens,
+                budget,
                 Some(EmbedBackendChoice::Metal {
                     reason: "hybrid_serial_primary",
                 }),
@@ -1008,7 +993,7 @@ impl BertEmbedder {
             merged.extend(self.process_encoded_subset(
                 cpu_side,
                 dimensions,
-                max_batch_tokens,
+                budget,
                 Some(EmbedBackendChoice::Metal {
                     reason: "hybrid_serial_primary",
                 }),
@@ -1021,7 +1006,7 @@ impl BertEmbedder {
                 self.process_encoded_subset(
                     metal_side,
                     dimensions,
-                    max_batch_tokens,
+                    budget,
                     Some(EmbedBackendChoice::Metal {
                         reason: "hybrid_metal",
                     }),
@@ -1031,7 +1016,7 @@ impl BertEmbedder {
                 self.process_encoded_subset(
                     cpu_side,
                     dimensions,
-                    max_batch_tokens,
+                    budget,
                     Some(EmbedBackendChoice::Cpu {
                         reason: "hybrid_cpu",
                     }),
@@ -1613,6 +1598,84 @@ fn default_max_batch_tokens(backend: GpuBackend) -> usize {
         GpuBackend::Metal => METAL_MAX_BATCH_TOKENS,
         GpuBackend::Cuda => CUDA_MAX_BATCH_TOKENS,
         GpuBackend::Cpu => DEFAULT_MAX_BATCH_TOKENS,
+    }
+}
+
+#[cfg(feature = "embeddings")]
+fn default_max_attention_area(backend: GpuBackend) -> usize {
+    match backend {
+        GpuBackend::Metal => METAL_MAX_ATTENTION_AREA,
+        // CUDA (flash-attention, large VRAM) and CPU (host RAM, no GPU watchdog)
+        // are not bounded by the macOS GPU attention ceiling; leave the area
+        // effectively unbounded so their dispatch sizing stays governed by the
+        // token budget exactly as before this guard was introduced.
+        GpuBackend::Cuda | GpuBackend::Cpu => usize::MAX,
+    }
+}
+
+/// The two budgets that bound a single embed GPU dispatch, and the rule that packs
+/// a length-sorted run of entities into one.
+///
+/// Entities are sorted by token length, then greedily packed into a dispatch until
+/// EITHER budget would be exceeded:
+/// - `max_tokens` bounds padded tokens (`max_seq × count`) → the linear buffers
+///   (token ids, FFN activations, output embeddings).
+/// - `max_attention_area` bounds attention area (`max_seq² × count`) → the O(seq²)
+///   Metal attention score buffer. The token budget alone does NOT bound this (see
+///   `METAL_MAX_ATTENTION_AREA`), so without it a dispatch of long entities trips
+///   the macOS GPU watchdog even while its token count is in budget.
+#[cfg(feature = "embeddings")]
+#[derive(Clone, Copy)]
+struct BatchBudget {
+    max_tokens: usize,
+    max_attention_area: usize,
+}
+
+#[cfg(feature = "embeddings")]
+impl BatchBudget {
+    /// Resolve both budgets for `backend`, honoring the `KIN_EMBED_MAX_BATCH_TOKENS`
+    /// and `KIN_EMBED_MAX_ATTENTION_AREA` overrides (each ignored unless it parses to
+    /// a value > 0).
+    fn from_env(backend: GpuBackend) -> Self {
+        let env_usize = |key: &str, fallback: usize| {
+            std::env::var(key)
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(fallback)
+        };
+        Self {
+            max_tokens: env_usize("KIN_EMBED_MAX_BATCH_TOKENS", default_max_batch_tokens(backend)),
+            max_attention_area: env_usize(
+                "KIN_EMBED_MAX_ATTENTION_AREA",
+                default_max_attention_area(backend),
+            ),
+        }
+    }
+
+    /// Greedily extend a batch from `start` over length-sorted `encoded`, stopping
+    /// before either budget would be exceeded. A single entity is always admitted
+    /// (the `end > start` guard) so an over-budget lone entity still gets embedded.
+    /// Returns `(end, longest)`; the batch is `encoded[start..end]` padded to
+    /// `longest` tokens.
+    fn next_batch(self, encoded: &[Encoded], start: usize) -> (usize, usize) {
+        let mut end = start;
+        let mut longest = 0usize;
+        while end < encoded.len() {
+            let candidate_len = encoded[end].1.len().max(1);
+            let projected_longest = longest.max(candidate_len);
+            let projected_tokens = projected_longest * (end - start + 1);
+            let projected_area = projected_longest * projected_tokens;
+            if end > start
+                && (projected_tokens > self.max_tokens
+                    || projected_area > self.max_attention_area)
+            {
+                break;
+            }
+            longest = projected_longest;
+            end += 1;
+        }
+        (end, longest)
     }
 }
 
@@ -2454,6 +2517,69 @@ mod tests {
             default_max_batch_tokens(GpuBackend::Metal),
             METAL_MAX_BATCH_TOKENS
         );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn backend_specific_default_attention_area_matches_runtime() {
+        assert_eq!(
+            default_max_attention_area(GpuBackend::Metal),
+            METAL_MAX_ATTENTION_AREA
+        );
+        // CUDA/CPU are not bound by the macOS GPU attention ceiling.
+        assert_eq!(default_max_attention_area(GpuBackend::Cuda), usize::MAX);
+        assert_eq!(default_max_attention_area(GpuBackend::Cpu), usize::MAX);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn batch_budget_area_cap_splits_long_entity_dispatch() {
+        // Token budget effectively unbounded so ONLY the attention-area cap binds.
+        let budget = BatchBudget {
+            max_tokens: usize::MAX,
+            max_attention_area: METAL_MAX_ATTENTION_AREA, // 8_388_608 = 2 × 2048²
+        };
+        // Four entities at the EMBED_MAX_SEQ_LEN cap. attention area = 2048² × count;
+        // count=2 → 8_388_608 (== cap, admitted), count=3 → 12_582_912 (> cap, split).
+        // This is the exact worst-case dispatch verified to survive the GPU watchdog.
+        let entities: Vec<Encoded> = (0..4).map(|i| (i, vec![0u32; 2048], Vec::new())).collect();
+        let (end, longest) = budget.next_batch(&entities, 0);
+        assert_eq!(end, 2, "long-entity dispatch must cap at 2 at the 2×2048² area");
+        assert_eq!(longest, 2048);
+        // The remaining two pack into the next dispatch the same way.
+        let (end2, _) = budget.next_batch(&entities, end);
+        assert_eq!(end2, 4);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn batch_budget_token_cap_bounds_short_entity_dispatch() {
+        // Area unbounded so ONLY the token cap binds: short entities still pack many,
+        // exactly as before the area guard existed (no common-case regression).
+        let budget = BatchBudget {
+            max_tokens: METAL_MAX_BATCH_TOKENS, // 16_384
+            max_attention_area: usize::MAX,
+        };
+        // 256-token entities: 16_384 / 256 = 64 per dispatch.
+        let entities: Vec<Encoded> = (0..100).map(|i| (i, vec![0u32; 256], Vec::new())).collect();
+        let (end, longest) = budget.next_batch(&entities, 0);
+        assert_eq!(end, 64);
+        assert_eq!(longest, 256);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn batch_budget_admits_single_oversized_entity_alone() {
+        // A lone entity exceeding both budgets is still admitted (so it always gets
+        // embedded), but nothing else is packed with it.
+        let budget = BatchBudget {
+            max_tokens: 100,
+            max_attention_area: 100,
+        };
+        let entities: Vec<Encoded> = vec![(0, vec![0u32; 2048], Vec::new()), (1, vec![0u32; 2048], Vec::new())];
+        let (end, longest) = budget.next_batch(&entities, 0);
+        assert_eq!(end, 1, "over-budget lone entity admitted; next not packed with it");
+        assert_eq!(longest, 2048);
     }
 
     #[cfg(feature = "embeddings")]
