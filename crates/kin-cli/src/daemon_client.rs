@@ -426,16 +426,28 @@ impl DaemonClient {
         &self,
         request: &crate::commands::embed::EmbedRequest,
     ) -> Result<crate::commands::embed::EmbedResponse> {
-        // A full-repo cold embed can run for many minutes (large graphs, GPU
-        // throughput), far longer than the shared 300s client default. Allow a
-        // per-request override via KIN_EMBED_HTTP_TIMEOUT_SECS so the CLI waits
-        // for the daemon to finish instead of timing the request out mid-embed.
-        // Default preserves the existing 300s; only the embed RPC is affected.
+        // Embed is a long, work-proportional operation, not a fast query: a
+        // bounded pass spends its whole `max_seconds` compute budget plus the
+        // per-batch index persistence whose cost grows with the graph, and an
+        // unbounded full-repo embed can run for many minutes on a large graph.
+        // The shared 300s client default is sized for queries and silently
+        // severs a legitimate embed mid-flight — the dropped connection orphans
+        // the server-side pass (it keeps running, holding the embedding lock),
+        // so retries stack on a wedged daemon. Size the wait to the actual work:
+        // honor an explicit KIN_EMBED_HTTP_TIMEOUT_SECS override, else give a
+        // bounded pass its budget plus generous persistence headroom, and an
+        // unbounded embed a high ceiling. The daemon's own `max_seconds` +
+        // shutdown cancellation bound the work; the client just has to wait.
         let embed_timeout = std::env::var("KIN_EMBED_HTTP_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .map(Duration::from_secs)
-            .unwrap_or_else(|| Duration::from_secs(300));
+            .unwrap_or_else(|| match request.max_seconds {
+                Some(seconds) if seconds > 0 => {
+                    Duration::from_secs(seconds.saturating_mul(2).saturating_add(300))
+                }
+                _ => Duration::from_secs(3600),
+            });
         let resp = self
             .send(
                 self.client
