@@ -62,8 +62,16 @@ const DEFAULT_REVISION: &str = "main";
 const DEFAULT_MAX_BATCH_TOKENS: usize = 32_768;
 #[cfg(feature = "embeddings")]
 const CUDA_MAX_BATCH_TOKENS: usize = 65_536;
+// Metal attention is O(seq²): a GPU dispatch packed to 65_536 tokens of long
+// (≈2048-token) entities allocates a multi-GB attention buffer that blows the
+// GPU and gets the daemon SIGKILLed by the watchdog (no panic/OOM trace —
+// observed live on a long-body repo: dies at batch=256, survives at batch=32).
+// The token *sum* alone doesn't bound attention memory, which scales with
+// (tokens × max_seq); with the 2048 seq cap, 16_384 tokens/dispatch keeps the
+// worst-case attention buffer ~1.6GB — safe — while staying well-batched for
+// the common short-entity case. Tune up via KIN_EMBED_MAX_BATCH_TOKENS.
 #[cfg(feature = "embeddings")]
-const METAL_MAX_BATCH_TOKENS: usize = 65_536;
+const METAL_MAX_BATCH_TOKENS: usize = 16_384;
 #[cfg(feature = "embeddings")]
 const EMBEDDING_CACHE_SCHEMA_VERSION: &str = "v2";
 #[cfg(feature = "embeddings")]
