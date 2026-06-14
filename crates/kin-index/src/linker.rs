@@ -383,14 +383,24 @@ pub fn link_cross_file_against_entities(
                     }
                 }
 
-                // Link to bare-name matches for calls to resolve method receivers correctly
-                if !bare_candidates.is_empty() {
+                // (c2) Receiver-method calls (`x.method()`) arrive as the bare method
+                // name and never match (b)'s `Type::method` key. Resolve them through
+                // the bare-name index only when unambiguous — exactly one method of
+                // that name in another file. Ambiguous names (`new`, `run`, `get`) have
+                // an unknowable receiver type, so linking every candidate would mint
+                // spurious callers; leave those to the FIR-938 inconclusive-absence gate.
+                if !linked && !bare_candidates.is_empty() {
+                    let mut distinct_targets: HashSet<EntityId> = HashSet::new();
                     for &(fp, dst_id) in bare_candidates {
                         if fp != file.file_path.as_str() {
-                            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                                resolved.push(make_relation(rel.kind, src_id, dst_id, 0.3));
-                                linked = true;
-                            }
+                            distinct_targets.insert(dst_id);
+                        }
+                    }
+                    if distinct_targets.len() == 1 {
+                        let dst_id = *distinct_targets.iter().next().expect("len checked == 1");
+                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                            resolved.push(make_relation(rel.kind, src_id, dst_id, 0.3));
+                            linked = true;
                         }
                     }
                 }
@@ -1924,6 +1934,89 @@ void f();
 
         let result = link_cross_file(&files);
         assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn receiver_method_call_resolves_when_bare_name_unambiguous() {
+        // `project_after_mcp_commit` calls `reconciler.project_overlay_to_files(...)`,
+        // captured as the bare name `project_overlay_to_files`; exactly one method of
+        // that name exists, so the receiver target is unambiguous and must link.
+        let caller = make_entity("project_after_mcp_commit", "src/wiring.rs");
+        let callee = make_entity("Reconciler::project_overlay_to_files", "src/reconciler.rs");
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/wiring.rs".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![ExtractedRelation {
+                    kind: RelationKind::Calls,
+                    src_name: "project_after_mcp_commit".to_string(),
+                    dst_name: "project_overlay_to_files".to_string(),
+                    import_source: None,
+                }],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/reconciler.rs".to_string(),
+                entities: vec![callee.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let calls = result
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls)
+            .expect("unambiguous receiver-method call should resolve to the single Type::method");
+        assert_eq!(calls.src, GraphNodeId::Entity(caller.id));
+        assert_eq!(calls.dst, GraphNodeId::Entity(callee.id));
+    }
+
+    #[test]
+    fn receiver_method_call_skipped_when_bare_name_ambiguous() {
+        // A call to bare `new` could target either `Foo::new` or `Bar::new`; the
+        // receiver type is unknowable from the name, so linking to either would mint
+        // a spurious caller. Leave it unlinked for the FIR-938 inconclusive gate.
+        let caller = make_entity("build", "src/caller.rs");
+        let foo_new = make_entity("Foo::new", "src/foo.rs");
+        let bar_new = make_entity("Bar::new", "src/bar.rs");
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/caller.rs".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![ExtractedRelation {
+                    kind: RelationKind::Calls,
+                    src_name: "build".to_string(),
+                    dst_name: "new".to_string(),
+                    import_source: None,
+                }],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/foo.rs".to_string(),
+                entities: vec![foo_new],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/bar.rs".to_string(),
+                entities: vec![bar_new],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let calls = result
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls)
+            .count();
+        assert_eq!(
+            calls, 0,
+            "ambiguous bare-name receiver call must not link to any candidate, got {calls} edges"
+        );
     }
 
     #[test]
