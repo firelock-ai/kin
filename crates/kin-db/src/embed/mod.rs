@@ -72,15 +72,19 @@ pub const EMBEDDING_BODY_PREVIEW_KEY: &str = "embedding_body_preview";
 const FILE_IMPORT_CONTEXT_KEY: &str = "file_import_context";
 const FILE_SURFACE_CONTEXT_KEY: &str = "file_surface_context";
 
-/// Practical per-entity tokenization ceiling for embeddings. Bounded *below* the
-/// model's trained range so a single entity can never dominate GPU cost: the
-/// naive scalar Metal attention is O(seq²), so a 2982-token entity (e.g. a
-/// scikit-learn class whose numpy docstring alone is ~3700 tokens) costs ~30×
-/// a typical ~500-token entity for negligible retrieval gain. The entity embed
-/// text is front-loaded with the discriminating signal (kind, path, name,
-/// signature, doc summary, body preview), so right-truncation past this length
-/// drops boilerplate (Parameters/Examples/References prose), not semantics.
-const EMBED_MAX_SEQ_LEN: usize = 8192;
+/// Practical per-entity tokenization ceiling for embeddings. Bounded *well below*
+/// the model's trained range so a single entity can never dominate GPU cost — and,
+/// critically, so no single Metal embed command runs long enough to trip the macOS
+/// GPU watchdog, which SIGKILLs the daemon with no panic/OOM trace (observed live:
+/// a long-body repo's ~8k-token entity wedged the embed pass, the watchdog reaped
+/// the process, retries then stacked on the dead daemon). The naive scalar Metal
+/// attention is O(seq²): a 2982-token entity costs ~30× a typical ~500-token one,
+/// and an 8192-token entity ~270× (~13s on one command — over the watchdog limit).
+/// The entity embed text is front-loaded with the discriminating signal (kind,
+/// path, name, signature, doc summary, body preview), so right-truncation past this
+/// length drops boilerplate (Parameters/Examples/References prose), not semantics —
+/// while keeping every embed command sub-second and the daemon alive at scale.
+const EMBED_MAX_SEQ_LEN: usize = 2048;
 
 /// Maximum characters of an entity's docstring (`doc_summary`) folded into its
 /// embedding text. NumPy/PEP-257 docstrings are front-loaded — the summary line
