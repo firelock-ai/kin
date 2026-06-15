@@ -391,7 +391,6 @@ impl GraphSnapshot {
 
         // 1. Remove orphaned relations (missing node on either endpoint)
         let before = self.relations.len();
-        #[allow(deprecated)]
         let artifact_ids: HashSet<ArtifactId> = self
             .artifact_index
             .values()
@@ -399,22 +398,22 @@ impl GraphSnapshot {
             .chain(
                 self.shallow_files
                     .iter()
-                    .map(|file| ArtifactId::from_file_id(&file.file_id)),
+                    .map(|file| ArtifactId::seed_from_file_id(&file.file_id)),
             )
             .chain(
                 self.file_layouts
                     .iter()
-                    .map(|layout| ArtifactId::from_file_id(&layout.file_id)),
+                    .map(|layout| ArtifactId::seed_from_file_id(&layout.file_id)),
             )
             .chain(
                 self.structured_artifacts
                     .iter()
-                    .map(|artifact| ArtifactId::from_file_id(&artifact.file_id)),
+                    .map(|artifact| ArtifactId::seed_from_file_id(&artifact.file_id)),
             )
             .chain(
                 self.opaque_artifacts
                     .iter()
-                    .map(|artifact| ArtifactId::from_file_id(&artifact.file_id)),
+                    .map(|artifact| ArtifactId::seed_from_file_id(&artifact.file_id)),
             )
             .collect();
         self.relations.retain(|_, rel| {

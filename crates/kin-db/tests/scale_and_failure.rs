@@ -145,10 +145,13 @@ fn scale_100k_entities() {
     let graph = InMemoryGraph::from_snapshot(snapshot);
     let hydrate_time = start.elapsed();
 
-    // Hydration should complete in reasonable time (< 30s even on slow hardware).
+    // Hydration smoke guard (not a perf benchmark): catches gross regressions
+    // while tolerating shared/throttled CI runners. macOS CI runners have been
+    // observed at ~32s for correct hydration, so the bound is 60s — a true
+    // regression (e.g. an O(n^2) reintroduction) blows well past this.
     assert!(
-        hydrate_time.as_secs() < 30,
-        "hydration of 100K entities took {:?}, expected < 30s",
+        hydrate_time.as_secs() < 60,
+        "hydration of 100K entities took {:?}, expected < 60s",
         hydrate_time
     );
 

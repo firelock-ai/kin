@@ -58,7 +58,6 @@ fn coverage_percent(indexed: usize, total: usize) -> f64 {
     (indexed as f64 / total as f64) * 100.0
 }
 
-#[allow(deprecated)]
 fn build_artifact_indexes_from_paths<I>(
     paths: I,
 ) -> (
@@ -71,7 +70,7 @@ where
     let mut artifact_index = HashMap::new();
     let mut artifact_reverse = HashMap::new();
     for path in paths {
-        let id = ArtifactId::from_file_id(&path);
+        let id = ArtifactId::seed_from_file_id(&path);
         artifact_index.entry(path.clone()).or_insert(id);
         artifact_reverse.entry(id).or_insert(path);
     }
@@ -2242,13 +2241,12 @@ impl InMemoryGraph {
     /// Idempotent: returns existing ID if tracked, else assigns new one.
     /// For migration, uses from_path() deterministic derivation so existing
     /// graph edges remain valid.
-    #[allow(deprecated)]
     pub fn ensure_artifact_id(&self, path: &FilePathId) -> ArtifactId {
         let mut ent = self.entities.write();
         if let Some(id) = ent.artifact_index.get(path) {
             *id
         } else {
-            let new_id = ArtifactId::from_path(&path.0);
+            let new_id = ArtifactId::seed_from_path(&path.0);
             ent.artifact_index.insert(path.clone(), new_id);
             ent.artifact_reverse.insert(new_id, path.clone());
             self.record_artifact_index_delta_upsert(path.clone(), new_id);
@@ -4179,8 +4177,7 @@ impl InMemoryGraph {
     /// Delete a shallow tracked file by file path.
     pub fn delete_shallow_file(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
         let artifact_id = self.artifact_id_for_path(file_id).unwrap_or_else(|| {
-            #[allow(deprecated)]
-            let id = ArtifactId::from_file_id(file_id);
+            let id = ArtifactId::seed_from_file_id(file_id);
             id
         });
 
@@ -4456,33 +4453,30 @@ fn collect_artifact_text_index_docs<'a>(
     ent.shallow_files
         .values()
         .map(|file| {
-            #[allow(deprecated)]
             let id = ent
                 .artifact_index
                 .get(&file.file_id)
                 .copied()
-                .unwrap_or_else(|| ArtifactId::from_file_id(&file.file_id));
+                .unwrap_or_else(|| ArtifactId::seed_from_file_id(&file.file_id));
             (RetrievalKey::Artifact(id), shallow_file_fields(file))
         })
         .chain(ent.structured_artifacts.values().map(|artifact| {
-            #[allow(deprecated)]
             let id = ent
                 .artifact_index
                 .get(&artifact.file_id)
                 .copied()
-                .unwrap_or_else(|| ArtifactId::from_file_id(&artifact.file_id));
+                .unwrap_or_else(|| ArtifactId::seed_from_file_id(&artifact.file_id));
             (
                 RetrievalKey::Artifact(id),
                 structured_artifact_fields(artifact),
             )
         }))
         .chain(ent.opaque_artifacts.values().map(|artifact| {
-            #[allow(deprecated)]
             let id = ent
                 .artifact_index
                 .get(&artifact.file_id)
                 .copied()
-                .unwrap_or_else(|| ArtifactId::from_file_id(&artifact.file_id));
+                .unwrap_or_else(|| ArtifactId::seed_from_file_id(&artifact.file_id));
             (RetrievalKey::Artifact(id), opaque_artifact_fields(artifact))
         }))
 }
@@ -4765,6 +4759,13 @@ fn relation_embedding_label(kind: RelationKind, outgoing: bool) -> &'static str 
 
 impl EntityStore for InMemoryGraph {
     type Error = KinDbError;
+
+    // Graph-assigned artifact identity: generic `GraphStore` consumers resolve a
+    // path to its graph-owned `ArtifactId` through this override (delegates to the
+    // inherent O(1) artifact-index lookup) rather than re-deriving from the path.
+    fn artifact_id_for_path(&self, path: &FilePathId) -> Option<ArtifactId> {
+        InMemoryGraph::artifact_id_for_path(self, path)
+    }
 
     // -----------------------------------------------------------------------
     // Read operations — entities lock only
@@ -5327,8 +5328,7 @@ impl EntityStore for InMemoryGraph {
 
     fn delete_structured_artifact(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
         let artifact_id = self.artifact_id_for_path(file_id).unwrap_or_else(|| {
-            #[allow(deprecated)]
-            let id = ArtifactId::from_file_id(file_id);
+            let id = ArtifactId::seed_from_file_id(file_id);
             id
         });
 
@@ -5387,8 +5387,7 @@ impl EntityStore for InMemoryGraph {
 
     fn delete_opaque_artifact(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
         let artifact_id = self.artifact_id_for_path(file_id).unwrap_or_else(|| {
-            #[allow(deprecated)]
-            let id = ArtifactId::from_file_id(file_id);
+            let id = ArtifactId::seed_from_file_id(file_id);
             id
         });
 
@@ -5452,8 +5451,7 @@ impl EntityStore for InMemoryGraph {
 
     fn delete_file_layout(&self, file_id: &FilePathId) -> Result<(), KinDbError> {
         let artifact_id = self.artifact_id_for_path(file_id).unwrap_or_else(|| {
-            #[allow(deprecated)]
-            let id = ArtifactId::from_file_id(file_id);
+            let id = ArtifactId::seed_from_file_id(file_id);
             id
         });
 

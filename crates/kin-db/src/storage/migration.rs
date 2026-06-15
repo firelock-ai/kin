@@ -131,19 +131,16 @@ fn migrate_v7_to_v8(body: &[u8]) -> Result<Vec<u8>, KinDbError> {
     })?;
 
     // Build deterministic index mappings from paths
-    #[allow(deprecated)]
     for file in &snapshot.shallow_files {
-        let id = kin_model::ArtifactId::from_file_id(&file.file_id);
+        let id = kin_model::ArtifactId::seed_from_file_id(&file.file_id);
         snapshot.artifact_index.insert(file.file_id.clone(), id);
     }
-    #[allow(deprecated)]
     for artifact in &snapshot.structured_artifacts {
-        let id = kin_model::ArtifactId::from_file_id(&artifact.file_id);
+        let id = kin_model::ArtifactId::seed_from_file_id(&artifact.file_id);
         snapshot.artifact_index.insert(artifact.file_id.clone(), id);
     }
-    #[allow(deprecated)]
     for artifact in &snapshot.opaque_artifacts {
-        let id = kin_model::ArtifactId::from_file_id(&artifact.file_id);
+        let id = kin_model::ArtifactId::seed_from_file_id(&artifact.file_id);
         snapshot.artifact_index.insert(artifact.file_id.clone(), id);
     }
 
@@ -353,8 +350,7 @@ mod tests {
 
         assert_eq!(loaded.version, 8);
         assert!(loaded.artifact_index.contains_key(&file_id));
-        #[allow(deprecated)]
-        let expected_id = kin_model::ArtifactId::from_file_id(&file_id);
+        let expected_id = kin_model::ArtifactId::seed_from_file_id(&file_id);
         assert_eq!(loaded.artifact_index[&file_id], expected_id);
     }
 
