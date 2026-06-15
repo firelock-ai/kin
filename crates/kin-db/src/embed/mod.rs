@@ -1645,7 +1645,10 @@ impl BatchBudget {
                 .unwrap_or(fallback)
         };
         Self {
-            max_tokens: env_usize("KIN_EMBED_MAX_BATCH_TOKENS", default_max_batch_tokens(backend)),
+            max_tokens: env_usize(
+                "KIN_EMBED_MAX_BATCH_TOKENS",
+                default_max_batch_tokens(backend),
+            ),
             max_attention_area: env_usize(
                 "KIN_EMBED_MAX_ATTENTION_AREA",
                 default_max_attention_area(backend),
@@ -1667,8 +1670,7 @@ impl BatchBudget {
             let projected_tokens = projected_longest * (end - start + 1);
             let projected_area = projected_longest * projected_tokens;
             if end > start
-                && (projected_tokens > self.max_tokens
-                    || projected_area > self.max_attention_area)
+                && (projected_tokens > self.max_tokens || projected_area > self.max_attention_area)
             {
                 break;
             }
@@ -2544,7 +2546,10 @@ mod tests {
         // This is the exact worst-case dispatch verified to survive the GPU watchdog.
         let entities: Vec<Encoded> = (0..4).map(|i| (i, vec![0u32; 2048], Vec::new())).collect();
         let (end, longest) = budget.next_batch(&entities, 0);
-        assert_eq!(end, 2, "long-entity dispatch must cap at 2 at the 2×2048² area");
+        assert_eq!(
+            end, 2,
+            "long-entity dispatch must cap at 2 at the 2×2048² area"
+        );
         assert_eq!(longest, 2048);
         // The remaining two pack into the next dispatch the same way.
         let (end2, _) = budget.next_batch(&entities, end);
@@ -2576,9 +2581,15 @@ mod tests {
             max_tokens: 100,
             max_attention_area: 100,
         };
-        let entities: Vec<Encoded> = vec![(0, vec![0u32; 2048], Vec::new()), (1, vec![0u32; 2048], Vec::new())];
+        let entities: Vec<Encoded> = vec![
+            (0, vec![0u32; 2048], Vec::new()),
+            (1, vec![0u32; 2048], Vec::new()),
+        ];
         let (end, longest) = budget.next_batch(&entities, 0);
-        assert_eq!(end, 1, "over-budget lone entity admitted; next not packed with it");
+        assert_eq!(
+            end, 1,
+            "over-budget lone entity admitted; next not packed with it"
+        );
         assert_eq!(longest, 2048);
     }
 

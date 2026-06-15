@@ -224,7 +224,7 @@ impl MerkleCache {
         compute_root_from_sorted_hashes(
             self.root_hashes
                 .iter()
-                .flat_map(|(hash, count)| std::iter::repeat(*hash).take(*count)),
+                .flat_map(|(hash, count)| std::iter::repeat_n(*hash, *count)),
         )
     }
 }

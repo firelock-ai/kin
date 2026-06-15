@@ -5886,11 +5886,9 @@ impl ChangeStore for InMemoryGraph {
         let revision_updates: Vec<(EntityId, Vec<EntityRevision>)> = change
             .entity_deltas
             .iter()
-            .filter_map(|delta| match delta {
-                EntityDelta::Added(entity) | EntityDelta::Modified { new: entity, .. } => {
-                    Some(entity.id)
-                }
-                EntityDelta::Removed(id) => Some(*id),
+            .map(|delta| match delta {
+                EntityDelta::Added(entity) | EntityDelta::Modified { new: entity, .. } => entity.id,
+                EntityDelta::Removed(id) => *id,
             })
             .filter_map(|entity_id| {
                 ent.entity_revisions
