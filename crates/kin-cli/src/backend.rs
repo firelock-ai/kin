@@ -484,7 +484,7 @@ mod tests {
     use kin_model::WorkStore;
     use kin_model::{
         Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId, FingerprintAlgorithm,
-        Hash256, LanguageId, SemanticFingerprint, Visibility,
+        Hash256, LanguageId, RetrievalKey, SemanticFingerprint, Visibility,
     };
 
     fn test_entity(name: &str) -> Entity {
@@ -520,9 +520,8 @@ mod tests {
         let layout = kin_core::init(repo_root).unwrap().layout;
 
         let source = kin_db::InMemoryGraph::with_text_index(layout.text_index_dir());
-        source
-            .upsert_entity(&test_entity("bootstrap_entity"))
-            .unwrap();
+        let entity = test_entity("bootstrap_entity");
+        source.upsert_entity(&entity).unwrap();
         let snapshot = source.to_snapshot();
         let expected_root = kin_db::compute_graph_root_hash(&snapshot);
 
@@ -535,7 +534,19 @@ mod tests {
 
         let persisted = kin_db::TextIndex::open_read_only(Some(&layout.text_index_dir())).unwrap();
         assert_eq!(persisted.graph_root_hash(), Some(expected_root));
-        assert!(layout.text_index_dir().join("index.bin").exists());
+        let reopened_hits = persisted.fuzzy_search("bootstrap_entity", 10).unwrap();
+        assert!(
+            reopened_hits
+                .iter()
+                .any(|(key, _)| *key == RetrievalKey::Entity(entity.id)),
+            "persisted text index should reopen with the bootstrap entity queryable"
+        );
+        let monolithic = layout.text_index_dir().join("index.bin");
+        let segmented_manifest = layout.text_index_dir().join("index.bin.kinseg-manifest");
+        assert!(
+            monolithic.exists() || segmented_manifest.exists(),
+            "persistent text index should leave either monolithic or segmented sidecar storage"
+        );
     }
 
     #[test]
