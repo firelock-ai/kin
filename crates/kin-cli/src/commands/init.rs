@@ -1253,7 +1253,6 @@ fn imported_reverse_dependency_closure(
     visited
 }
 
-#[allow(deprecated)]
 fn collect_relation_ids_for_imported_files(
     files: &BTreeSet<String>,
     semantic_entities_by_file: &HashMap<String, Vec<Entity>>,
@@ -1273,7 +1272,10 @@ fn collect_relation_ids_for_imported_files(
         // entity), so collect them by the file's artifact id too — otherwise a
         // stable cross-file import edge is invisible to the incremental diff
         // and gets re-added on every relink of an impacted file.
-        let artifact_id = ArtifactId::from_path(file_path);
+        // Graph-less map key: `relations_by_src_artifact` is keyed by the same
+        // path-derived id used when the map was built, so this lookup must derive
+        // the id identically (no graph/snapshot handle is in scope here).
+        let artifact_id = ArtifactId::seed_from_path(file_path);
         if let Some(existing_ids) = relations_by_src_artifact.get(&artifact_id) {
             relation_ids.extend(existing_ids.iter().copied());
         }
@@ -2349,9 +2351,8 @@ fn artifact_id_for_file(graph: &kin_db::InMemoryGraph, path: &str) -> ArtifactId
     graph
         .artifact_id_for_path(&FilePathId::new(path))
         .unwrap_or_else(|| {
-            #[allow(deprecated)]
             {
-                ArtifactId::from_path(path)
+                ArtifactId::seed_from_path(path)
             }
         })
 }
@@ -3722,7 +3723,7 @@ mod tests {
 
     fn assert_makefile_is_text_searchable(graph: &kin_db::InMemoryGraph) {
         let makefile_key =
-            kin_db::RetrievalKey::Artifact(kin_db::ArtifactId::from_path("Makefile"));
+            kin_db::RetrievalKey::Artifact(kin_db::ArtifactId::seed_from_path("Makefile"));
         let hits = graph.text_search("cargo build", 10).unwrap();
         assert!(
             hits.iter().any(|(key, _)| *key == makefile_key),

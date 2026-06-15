@@ -653,9 +653,14 @@ where
             .map_err(|e| ContextError::Graph(e.to_string()))?
         {
             entries.push(ArtifactContextEntry {
-                retrieval_key: RetrievalKey::Artifact(ArtifactId::from_path(
-                    file.file_id.0.as_str(),
-                )),
+                retrieval_key: RetrievalKey::Artifact(
+                    graph.artifact_id_for_path(&file.file_id).unwrap_or_else(|| {
+                        // Fallback only for stores without an artifact index
+                        // (e.g. mocks) or untracked paths; production graph
+                        // returns the graph-assigned id above.
+                        ArtifactId::seed_from_path(file.file_id.0.as_str())
+                    }),
+                ),
                 file_path: file.file_id.clone(),
                 kind: ArtifactContextKind::ShallowFile,
                 content: kin_db::embed::format_shallow_text(&file),
@@ -667,9 +672,11 @@ where
             .map_err(|e| ContextError::Graph(e.to_string()))?
         {
             entries.push(ArtifactContextEntry {
-                retrieval_key: RetrievalKey::Artifact(ArtifactId::from_path(
-                    artifact.file_id.0.as_str(),
-                )),
+                retrieval_key: RetrievalKey::Artifact(
+                    graph.artifact_id_for_path(&artifact.file_id).unwrap_or_else(|| {
+                        ArtifactId::seed_from_path(artifact.file_id.0.as_str())
+                    }),
+                ),
                 file_path: artifact.file_id.clone(),
                 kind: ArtifactContextKind::StructuredArtifact(artifact.kind),
                 content: kin_db::embed::format_artifact_text(&artifact),
@@ -681,9 +688,11 @@ where
             .map_err(|e| ContextError::Graph(e.to_string()))?
         {
             entries.push(ArtifactContextEntry {
-                retrieval_key: RetrievalKey::Artifact(ArtifactId::from_path(
-                    artifact.file_id.0.as_str(),
-                )),
+                retrieval_key: RetrievalKey::Artifact(
+                    graph.artifact_id_for_path(&artifact.file_id).unwrap_or_else(|| {
+                        ArtifactId::seed_from_path(artifact.file_id.0.as_str())
+                    }),
+                ),
                 file_path: artifact.file_id.clone(),
                 kind: ArtifactContextKind::OpaqueArtifact,
                 content: kin_db::embed::format_opaque_text(&artifact),
@@ -888,6 +897,8 @@ fn normalize_entity_name(name: &str) -> String {
 }
 
 #[cfg(test)]
+// Test fixtures build artifact RetrievalKeys by path; in-test graph-assigned ids
+// are path-derived, so the deprecated path constructor is the correct fixture tool.
 mod tests {
     use super::*;
     use kin_model::*;
@@ -1179,7 +1190,7 @@ mod tests {
 
         let plan = ContextPlan {
             seeds: vec![ContextPlanSeed {
-                retrieval_key: RetrievalKey::Artifact(ArtifactId::from_file_id(&makefile)),
+                retrieval_key: RetrievalKey::Artifact(ArtifactId::seed_from_file_id(&makefile)),
                 file_path: Some(makefile.clone()),
                 score: 3.0,
                 lexical: true,
@@ -1288,7 +1299,7 @@ mod tests {
             &ContextOptions::default(),
             &ContextPlan {
                 seeds: vec![ContextPlanSeed {
-                    retrieval_key: RetrievalKey::Artifact(ArtifactId::from_path("Makefile")),
+                    retrieval_key: RetrievalKey::Artifact(ArtifactId::seed_from_path("Makefile")),
                     file_path: None,
                     score: 1.0,
                     lexical: true,
@@ -1333,7 +1344,7 @@ mod tests {
 
         let plan = ContextPlan {
             seeds: vec![ContextPlanSeed {
-                retrieval_key: RetrievalKey::Artifact(ArtifactId::from_file_id(&makefile)),
+                retrieval_key: RetrievalKey::Artifact(ArtifactId::seed_from_file_id(&makefile)),
                 file_path: Some(makefile),
                 score: 1.0,
                 lexical: true,

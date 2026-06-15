@@ -3060,7 +3060,7 @@ dependencies = [
 [[package]]
 name = "kin-db"
 version = "0.1.0"
-source = "git+https://github.com/firelock-ai/kin-db.git?rev=0f7ae046fd710480f217fe054762b545d6626fbe#0f7ae046fd710480f217fe054762b545d6626fbe"
+source = "git+https://github.com/firelock-ai/kin-db.git?rev=42b0a8c8ac13eb9a0936628166f3b030ec0d4023#42b0a8c8ac13eb9a0936628166f3b030ec0d4023"
 dependencies = [
  "bincode",
  "bytes",
@@ -3248,7 +3248,7 @@ dependencies = [
 [[package]]
 name = "kin-model"
 version = "0.1.0"
-source = "git+https://github.com/firelock-ai/kin-model.git?rev=99344c94e961efbfff40d5e5350d8e4943bc7913#99344c94e961efbfff40d5e5350d8e4943bc7913"
+source = "git+https://github.com/firelock-ai/kin-model.git?rev=aad97894cdd3074894f3d16eec3cf7d43fc4444f#aad97894cdd3074894f3d16eec3cf7d43fc4444f"
 dependencies = [
  "chrono",
  "hex",
