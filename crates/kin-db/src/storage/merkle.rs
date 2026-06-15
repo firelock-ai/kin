@@ -12,7 +12,7 @@
 //! This enables O(log n) verification of any sub-graph without hashing the entire repository.
 
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::error::KinDbError;
 use crate::storage::format::GraphSnapshot;
@@ -26,6 +26,7 @@ pub trait GraphHashSource {
     fn hash_entity(&self, id: &EntityId) -> Option<&Entity>;
     fn hash_relation(&self, id: &RelationId) -> Option<&Relation>;
     fn hash_outgoing(&self, id: &EntityId) -> Option<&[RelationId]>;
+    fn hash_incoming(&self, id: &EntityId) -> Option<&[RelationId]>;
     fn hash_entity_ids(&self) -> Vec<EntityId>;
 }
 
@@ -39,21 +40,43 @@ impl GraphHashSource for GraphSnapshot {
     fn hash_outgoing(&self, id: &EntityId) -> Option<&[RelationId]> {
         self.outgoing.get(id).map(|v| v.as_slice())
     }
+    fn hash_incoming(&self, id: &EntityId) -> Option<&[RelationId]> {
+        self.incoming.get(id).map(|v| v.as_slice())
+    }
     fn hash_entity_ids(&self) -> Vec<EntityId> {
         self.entities.keys().copied().collect()
     }
 }
 
-/// Persistent cache of per-entity content hashes.
+/// Maintained Merkle state for the live entity/relation graph.
 ///
-/// Avoids recomputing SHA-256 for every entity on each
-/// `compute_graph_root_hash` call. Callers should update this cache
-/// incrementally via [`MerkleCache::entity_upserted`] and
-/// [`MerkleCache::entity_removed`] whenever the graph mutates.
-#[derive(Debug, Clone, Default)]
+/// This preserves the exact root semantics of [`compute_graph_root_hash`] while
+/// allowing live graphs to update the root from mutation seeds. The root hash
+/// itself is still the SHA-256 stream over all sorted subgraph hashes; because
+/// that legacy digest is intentionally unchanged, refreshing the root folds the
+/// cached subgraph-hash multiset rather than walking or rehashing the full
+/// graph.
+#[derive(Debug, Clone)]
 pub struct MerkleCache {
     /// Cached content hash for each entity, keyed by EntityId.
     entity_hashes: HashMap<EntityId, MerkleHash>,
+    /// Cached subgraph hash for each entity, keyed by EntityId.
+    subgraph_hashes: HashMap<EntityId, MerkleHash>,
+    /// Multiset of current subgraph hashes, sorted for root folding.
+    root_hashes: BTreeMap<MerkleHash, usize>,
+    /// Current root hash for the live graph state.
+    root_hash: MerkleHash,
+}
+
+impl Default for MerkleCache {
+    fn default() -> Self {
+        Self {
+            entity_hashes: HashMap::new(),
+            subgraph_hashes: HashMap::new(),
+            root_hashes: BTreeMap::new(),
+            root_hash: compute_root_from_sorted_hashes(std::iter::empty()),
+        }
+    }
 }
 
 impl MerkleCache {
@@ -64,12 +87,37 @@ impl MerkleCache {
 
     /// Warm the cache from an existing snapshot (bulk build).
     pub fn from_snapshot(snapshot: &GraphSnapshot) -> Self {
-        let entity_hashes = snapshot
-            .entities
-            .iter()
-            .map(|(id, entity)| (*id, compute_entity_hash(entity)))
-            .collect();
-        Self { entity_hashes }
+        Self::from_source(snapshot)
+    }
+
+    /// Warm the cache from any graph hash source (bulk build/cold open).
+    pub fn from_source(source: &impl GraphHashSource) -> Self {
+        let mut cache = Self::new();
+        let mut subgraph_cache = HashMap::new();
+        let mut entity_ids = source.hash_entity_ids();
+        entity_ids.sort_by_key(|entity_id| *entity_id.0.as_bytes());
+
+        for entity_id in entity_ids {
+            if let Some(entity) = source.hash_entity(&entity_id) {
+                cache
+                    .entity_hashes
+                    .insert(entity_id, compute_entity_hash(entity));
+            }
+            let subgraph_hash = compute_subgraph_hash_generic(
+                &entity_id,
+                source,
+                &mut subgraph_cache,
+                Some(&mut cache),
+            );
+            cache.set_subgraph_hash(entity_id, Some(subgraph_hash));
+        }
+        cache.root_hash = cache.compute_root_from_multiset();
+        cache
+    }
+
+    /// Current graph root hash.
+    pub fn root_hash(&self) -> MerkleHash {
+        self.root_hash
     }
 
     /// Update the cached hash for a single entity (upsert).
@@ -81,6 +129,7 @@ impl MerkleCache {
     /// Remove a cached entity hash.
     pub fn entity_removed(&mut self, entity_id: &EntityId) {
         self.entity_hashes.remove(entity_id);
+        self.set_subgraph_hash(*entity_id, None);
     }
 
     /// Number of cached entries.
@@ -96,7 +145,159 @@ impl MerkleCache {
     /// Clear the entire cache.
     pub fn clear(&mut self) {
         self.entity_hashes.clear();
+        self.subgraph_hashes.clear();
+        self.root_hashes.clear();
+        self.root_hash = compute_root_from_sorted_hashes(std::iter::empty());
     }
+
+    /// Rebuild the maintained state from a source and return the fresh root.
+    pub fn rebuild_from_source(&mut self, source: &impl GraphHashSource) -> MerkleHash {
+        *self = Self::from_source(source);
+        self.root_hash
+    }
+
+    /// Refresh the root after mutation seeds changed.
+    ///
+    /// The dirty set is the touched entity component. A pure DAG only needs the
+    /// reverse-dependency closure, but the frozen hash algorithm has explicit
+    /// cycle handling and a shared traversal cache; preserving bit-identical
+    /// roots therefore requires recomputing the component whose traversal
+    /// context can change.
+    pub fn refresh_affected<I>(&mut self, source: &impl GraphHashSource, seeds: I) -> MerkleHash
+    where
+        I: IntoIterator<Item = EntityId>,
+    {
+        let dirty = collect_touched_entity_component(source, seeds);
+        if dirty.is_empty() {
+            return self.root_hash;
+        }
+
+        for entity_id in &dirty {
+            self.set_subgraph_hash(*entity_id, None);
+            match source.hash_entity(entity_id) {
+                Some(entity) => self.entity_upserted(entity),
+                None => {
+                    self.entity_hashes.remove(entity_id);
+                }
+            }
+        }
+
+        let dirty_set: HashSet<EntityId> = dirty.iter().copied().collect();
+        let mut subgraph_cache: HashMap<EntityId, MerkleHash> = self
+            .subgraph_hashes
+            .iter()
+            .filter_map(|(entity_id, hash)| {
+                if dirty_set.contains(entity_id) {
+                    None
+                } else {
+                    Some((*entity_id, *hash))
+                }
+            })
+            .collect();
+        for entity_id in dirty {
+            if source.hash_entity(&entity_id).is_some() {
+                let hash = compute_subgraph_hash_generic(
+                    &entity_id,
+                    source,
+                    &mut subgraph_cache,
+                    Some(self),
+                );
+                self.set_subgraph_hash(entity_id, Some(hash));
+            }
+        }
+
+        self.root_hash = self.compute_root_from_multiset();
+        self.root_hash
+    }
+
+    fn set_subgraph_hash(&mut self, entity_id: EntityId, hash: Option<MerkleHash>) {
+        if let Some(old_hash) = self.subgraph_hashes.remove(&entity_id) {
+            decrement_hash_multiset(&mut self.root_hashes, old_hash);
+        }
+        if let Some(hash) = hash {
+            self.subgraph_hashes.insert(entity_id, hash);
+            *self.root_hashes.entry(hash).or_insert(0) += 1;
+        }
+    }
+
+    fn compute_root_from_multiset(&self) -> MerkleHash {
+        compute_root_from_sorted_hashes(
+            self.root_hashes
+                .iter()
+                .flat_map(|(hash, count)| std::iter::repeat(*hash).take(*count)),
+        )
+    }
+}
+
+fn decrement_hash_multiset(multiset: &mut BTreeMap<MerkleHash, usize>, hash: MerkleHash) {
+    match multiset.get_mut(&hash) {
+        Some(count) if *count > 1 => *count -= 1,
+        Some(_) => {
+            multiset.remove(&hash);
+        }
+        None => {}
+    }
+}
+
+fn compute_root_from_sorted_hashes<I>(hashes: I) -> MerkleHash
+where
+    I: IntoIterator<Item = MerkleHash>,
+{
+    let mut hasher = Sha256::new();
+    hasher.update(b"kin-graph-root-v1:");
+    for hash in hashes {
+        hasher.update(hash);
+    }
+    let result = hasher.finalize();
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&result);
+    hash
+}
+
+fn collect_touched_entity_component<I>(source: &impl GraphHashSource, seeds: I) -> Vec<EntityId>
+where
+    I: IntoIterator<Item = EntityId>,
+{
+    let mut dirty = HashSet::new();
+    let mut stack = Vec::new();
+    for seed in seeds {
+        if dirty.insert(seed) {
+            stack.push(seed);
+        }
+    }
+
+    while let Some(entity_id) = stack.pop() {
+        if let Some(relation_ids) = source.hash_incoming(&entity_id) {
+            for relation_id in relation_ids {
+                let Some(relation) = source.hash_relation(relation_id) else {
+                    continue;
+                };
+                let Some(src_id) = relation.src.as_entity() else {
+                    continue;
+                };
+                if dirty.insert(src_id) {
+                    stack.push(src_id);
+                }
+            }
+        }
+        if let Some(relation_ids) = source.hash_outgoing(&entity_id) {
+            for relation_id in relation_ids {
+                let Some(relation) = source.hash_relation(relation_id) else {
+                    continue;
+                };
+                let Some(dst_id) = relation.dst.as_entity() else {
+                    continue;
+                };
+                if dirty.insert(dst_id) {
+                    stack.push(dst_id);
+                }
+            }
+        }
+    }
+
+    let mut dirty: Vec<EntityId> = dirty.into_iter().collect();
+    dirty.sort_by_key(|entity_id| *entity_id.0.as_bytes());
+    dirty
 }
 
 /// A 32-byte SHA-256 hash used throughout the Merkle DAG.
@@ -415,12 +616,6 @@ pub fn compute_root_hash_generic(
     // Sort for determinism
     all_hashes.sort();
 
-    let mut hasher = Sha256::new();
-    hasher.update(b"kin-graph-root-v1:");
-    for h in &all_hashes {
-        hasher.update(h);
-    }
-
     // Back-fill the MerkleCache with any entity hashes we computed during traversal
     if let Some(ref mut mc) = merkle_cache {
         for id in &entity_ids {
@@ -432,10 +627,7 @@ pub fn compute_root_hash_generic(
         }
     }
 
-    let result = hasher.finalize();
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
-    hash
+    compute_root_from_sorted_hashes(all_hashes)
 }
 
 /// Compute a full repo-truth hash covering ALL first-class truth domains.
@@ -686,6 +878,7 @@ pub fn remove_entity_hash(entity_id: &EntityId, hash_map: &mut HashMap<EntityId,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
 
     fn test_entity(name: &str) -> Entity {
         Entity {
@@ -1124,5 +1317,110 @@ mod tests {
         let h_cached = compute_graph_root_hash_with(&snap2, Some(&mut mc));
         let h_fresh = compute_graph_root_hash(&snap2);
         assert_eq!(h_cached, h_fresh);
+    }
+
+    #[test]
+    fn merkle_cache_incremental_root_matches_full_recompute_across_random_mutations() {
+        let mut rng = StdRng::seed_from_u64(0xF1955);
+        let mut entities: Vec<Entity> = (0..12)
+            .map(|index| {
+                let mut entity = test_entity(&format!("entity_{index}"));
+                entity.id = EntityId(uuid::Uuid::from_u128(index as u128 + 1));
+                entity
+            })
+            .collect();
+        let mut relations = Vec::new();
+
+        // Include cycles up front so the incremental path must terminate and
+        // preserve the same ZERO_HASH back-edge semantics as the cold path.
+        for (src_index, dst_index) in [(0usize, 1usize), (1, 2), (2, 0), (3, 4), (4, 3)] {
+            relations.push(test_relation(
+                entities[src_index].id,
+                entities[dst_index].id,
+                RelationKind::Calls,
+            ));
+        }
+        for _ in 0..18 {
+            let src_index = rng.gen_range(0..entities.len());
+            let dst_index = rng.gen_range(0..entities.len());
+            if src_index != dst_index {
+                relations.push(test_relation(
+                    entities[src_index].id,
+                    entities[dst_index].id,
+                    RelationKind::References,
+                ));
+            }
+        }
+
+        let mut snapshot = build_snapshot(entities.clone(), relations.clone());
+        let mut cache = MerkleCache::from_snapshot(&snapshot);
+        assert_eq!(cache.root_hash(), compute_graph_root_hash(&snapshot));
+
+        for step in 0..80 {
+            let mut seeds = Vec::new();
+            let op = match rng.gen_range(0..4) {
+                0 if !entities.is_empty() => {
+                    let index = rng.gen_range(0..entities.len());
+                    entities[index].name = format!("entity_{index}_mutated_{step}");
+                    entities[index].signature = format!("fn entity_{index}_mutated_{step}()");
+                    seeds.push(entities[index].id);
+                    format!("mutate entity index {index}")
+                }
+                1 if entities.len() > 3 => {
+                    let index = rng.gen_range(0..entities.len());
+                    let removed = entities.remove(index);
+                    for relation in &relations {
+                        if relation.src.as_entity() == Some(removed.id)
+                            || relation.dst.as_entity() == Some(removed.id)
+                        {
+                            if let Some(src) = relation.src.as_entity() {
+                                seeds.push(src);
+                            }
+                        }
+                    }
+                    relations.retain(|relation| {
+                        relation.src.as_entity() != Some(removed.id)
+                            && relation.dst.as_entity() != Some(removed.id)
+                    });
+                    seeds.push(removed.id);
+                    format!("delete entity index {index}")
+                }
+                2 if entities.len() > 1 => {
+                    let src_index = rng.gen_range(0..entities.len());
+                    let mut dst_index = rng.gen_range(0..entities.len());
+                    if src_index == dst_index {
+                        dst_index = (dst_index + 1) % entities.len();
+                    }
+                    let relation = test_relation(
+                        entities[src_index].id,
+                        entities[dst_index].id,
+                        if step % 2 == 0 {
+                            RelationKind::Calls
+                        } else {
+                            RelationKind::Imports
+                        },
+                    );
+                    seeds.push(entities[src_index].id);
+                    relations.push(relation);
+                    format!("add relation {src_index}->{dst_index}")
+                }
+                _ if !relations.is_empty() => {
+                    let index = rng.gen_range(0..relations.len());
+                    let relation = relations.remove(index);
+                    seeds.extend(relation.src.as_entity());
+                    seeds.extend(relation.dst.as_entity());
+                    format!("remove relation index {index}")
+                }
+                _ => "noop".to_string(),
+            };
+
+            snapshot = build_snapshot(entities.clone(), relations.clone());
+            cache.refresh_affected(&snapshot, seeds);
+            assert_eq!(
+                cache.root_hash(),
+                compute_graph_root_hash(&snapshot),
+                "incremental root diverged from cold recompute at step {step}: {op}"
+            );
+        }
     }
 }

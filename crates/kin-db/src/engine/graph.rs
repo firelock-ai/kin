@@ -16,7 +16,9 @@ use crate::search::{
     opaque_artifact_fields, shallow_file_fields, structured_artifact_fields, TextIndex,
 };
 use crate::storage::format::LocateGraphSnapshot;
-use crate::storage::merkle::{compute_graph_root_hash, compute_root_hash_generic, GraphHashSource};
+use crate::storage::merkle::{
+    compute_graph_root_hash, compute_root_hash_generic, GraphHashSource, MerkleCache,
+};
 use crate::storage::{CollectionDelta, Generation, GraphSnapshot, GraphSnapshotDelta, VecDelta};
 use crate::store::{
     ChangeStore, EntityStore, GraphStore, ProvenanceStore, ReviewStore, SessionStore,
@@ -520,6 +522,9 @@ impl GraphHashSource for EntityData {
     fn hash_outgoing(&self, id: &EntityId) -> Option<&[RelationId]> {
         self.outgoing.get(id).map(|v| v.as_slice())
     }
+    fn hash_incoming(&self, id: &EntityId) -> Option<&[RelationId]> {
+        self.incoming.get(id).map(|v| v.as_slice())
+    }
     fn hash_entity_ids(&self) -> Vec<EntityId> {
         self.entities.keys().copied().collect()
     }
@@ -979,8 +984,8 @@ pub struct InMemoryGraph {
     sessions: RwLock<SessionData>,
     /// Optional full-text search index for ranked search queries.
     text_index: Option<TextIndex>,
-    /// Cached Merkle root hash for the current graph state.
-    snapshot_root_hash: parking_lot::RwLock<Option<[u8; 32]>>,
+    /// Continuously-current Merkle state for the entity/relation graph.
+    merkle: parking_lot::RwLock<MerkleCache>,
     /// Mutation-time delta journal for O(change) persistence flushes between commits.
     pending_delta: parking_lot::Mutex<PendingGraphDelta>,
     /// True when a mutation touched a domain not yet covered by the O(change) journal.
@@ -1091,7 +1096,7 @@ impl InMemoryGraph {
                 downstream_warnings: Vec::new(),
             }),
             text_index,
-            snapshot_root_hash: parking_lot::RwLock::new(None),
+            merkle: parking_lot::RwLock::new(MerkleCache::new()),
             pending_delta: parking_lot::Mutex::new(PendingGraphDelta::default()),
             full_snapshot_required: AtomicBool::new(false),
             text_dirty: AtomicBool::new(false),
@@ -1414,24 +1419,27 @@ impl InMemoryGraph {
             (persisted_artifact_index, artifact_reverse)
         };
 
+        let entity_data = EntityData {
+            entities: entities.into_iter().collect(),
+            entity_revisions,
+            relations,
+            outgoing,
+            incoming,
+            node_outgoing,
+            node_incoming,
+            indexes,
+            file_hashes: file_hashes.into_iter().collect(),
+            shallow_files,
+            file_layouts,
+            structured_artifacts,
+            opaque_artifacts,
+            artifact_index,
+            artifact_reverse,
+        };
+        let merkle = MerkleCache::from_source(&entity_data);
+
         let graph = Self {
-            entities: RwLock::new(EntityData {
-                entities: entities.into_iter().collect(),
-                entity_revisions,
-                relations,
-                outgoing,
-                incoming,
-                node_outgoing,
-                node_incoming,
-                indexes,
-                file_hashes: file_hashes.into_iter().collect(),
-                shallow_files,
-                file_layouts,
-                structured_artifacts,
-                opaque_artifacts,
-                artifact_index,
-                artifact_reverse,
-            }),
+            entities: RwLock::new(entity_data),
             changes: RwLock::new(ChangeData {
                 changes: changes.into_iter().collect(),
                 change_children: change_children.into_iter().collect(),
@@ -1471,7 +1479,7 @@ impl InMemoryGraph {
                 downstream_warnings,
             }),
             text_index,
-            snapshot_root_hash: parking_lot::RwLock::new(None),
+            merkle: parking_lot::RwLock::new(merkle),
             pending_delta: parking_lot::Mutex::new(PendingGraphDelta::default()),
             full_snapshot_required: AtomicBool::new(false),
             text_dirty: AtomicBool::new(false),
@@ -1490,7 +1498,6 @@ impl InMemoryGraph {
             graph.rebuild_text_index_with_root_hash(expected_root_hash);
         }
 
-        graph.record_snapshot_root_hash(expected_root_hash);
         graph
     }
 
@@ -1627,30 +1634,33 @@ impl InMemoryGraph {
             (persisted_artifact_index, artifact_reverse)
         };
 
+        let entity_data = EntityData {
+            entities,
+            entity_revisions: kin_model::graph::derive_entity_revisions_from_changes(
+                topologically_order_changes(
+                    changes.iter().map(|(id, change)| (*id, change.clone())),
+                ),
+            )
+            .into_iter()
+            .collect(),
+            relations,
+            outgoing,
+            incoming,
+            node_outgoing,
+            node_incoming,
+            indexes,
+            file_hashes: HashMap::new(),
+            shallow_files,
+            file_layouts,
+            structured_artifacts,
+            opaque_artifacts,
+            artifact_index,
+            artifact_reverse,
+        };
+        let merkle = MerkleCache::from_source(&entity_data);
+
         let graph = Self {
-            entities: RwLock::new(EntityData {
-                entities,
-                entity_revisions: kin_model::graph::derive_entity_revisions_from_changes(
-                    topologically_order_changes(
-                        changes.iter().map(|(id, change)| (*id, change.clone())),
-                    ),
-                )
-                .into_iter()
-                .collect(),
-                relations,
-                outgoing,
-                incoming,
-                node_outgoing,
-                node_incoming,
-                indexes,
-                file_hashes: HashMap::new(),
-                shallow_files,
-                file_layouts,
-                structured_artifacts,
-                opaque_artifacts,
-                artifact_index,
-                artifact_reverse,
-            }),
+            entities: RwLock::new(entity_data),
             changes: RwLock::new(ChangeData {
                 changes,
                 change_children: HashMap::new(),
@@ -1687,7 +1697,7 @@ impl InMemoryGraph {
                 downstream_warnings: Vec::new(),
             }),
             text_index,
-            snapshot_root_hash: parking_lot::RwLock::new(None),
+            merkle: parking_lot::RwLock::new(merkle),
             pending_delta: parking_lot::Mutex::new(PendingGraphDelta::default()),
             full_snapshot_required: AtomicBool::new(false),
             text_dirty: AtomicBool::new(false),
@@ -1706,7 +1716,6 @@ impl InMemoryGraph {
             graph.rebuild_text_index_with_root_hash(expected_root_hash);
         }
 
-        graph.record_snapshot_root_hash(expected_root_hash);
         graph
     }
 
@@ -1760,27 +1769,27 @@ impl InMemoryGraph {
 
     #[inline]
     pub(crate) fn snapshot_root_hash_hint(&self) -> Option<[u8; 32]> {
-        *self.snapshot_root_hash.read()
+        Some(self.compute_root_hash())
     }
 
-    /// The graph-root hash recorded when this graph was opened from (or saved
-    /// to) a snapshot, if any.
+    /// Current graph-root hash for the live entity/relation graph.
     ///
     /// This is the value a persisted vector-index sidecar must match before it
     /// can be trusted as graph-owned truth. Exposed so out-of-process callers
     /// (the daemon) can validate a sidecar against the live graph via
     /// [`SnapshotManager::load_vector_index_into_graph_if_valid`] instead of
-    /// force-loading it unchecked. Returns `None` for a graph that has never
-    /// been associated with a snapshot (e.g. a freshly constructed in-memory
-    /// graph), in which case no sidecar can be validated.
+    /// force-loading it unchecked.
     #[inline]
     pub fn snapshot_root_hash(&self) -> Option<[u8; 32]> {
-        *self.snapshot_root_hash.read()
+        Some(self.compute_root_hash())
     }
 
     #[inline]
-    pub(crate) fn record_snapshot_root_hash(&self, root_hash: [u8; 32]) {
-        *self.snapshot_root_hash.write() = Some(root_hash);
+    fn refresh_merkle_for_entities<I>(&self, ent: &EntityData, seeds: I) -> [u8; 32]
+    where
+        I: IntoIterator<Item = EntityId>,
+    {
+        self.merkle.write().refresh_affected(ent, seeds)
     }
 
     #[inline]
@@ -1826,11 +1835,6 @@ impl InMemoryGraph {
 
     fn require_full_snapshot(&self) {
         self.full_snapshot_required.store(true, Ordering::Release);
-    }
-
-    #[inline]
-    fn invalidate_snapshot_root_hash(&self) {
-        *self.snapshot_root_hash.write() = None;
     }
 
     fn record_entity_delta_upsert(&self, entity: Entity) {
@@ -2165,7 +2169,10 @@ impl InMemoryGraph {
         let graph_root_hash = {
             let _span =
                 tracing::info_span!("kindb.graph.serialize_snapshot.compute_root_hash").entered();
-            precomputed_hash.unwrap_or_else(|| compute_root_hash_generic(&*ent, None))
+            let current = self.merkle.read().root_hash();
+            precomputed_hash
+                .filter(|hash| *hash == current)
+                .unwrap_or(current)
         };
         let t_hash = t1.elapsed();
 
@@ -2210,8 +2217,6 @@ impl InMemoryGraph {
             borrowed.to_bytes_with_persisted_root_hash(graph_root_hash)?
         };
         let t_serialize = t2.elapsed();
-
-        self.record_snapshot_root_hash(graph_root_hash);
 
         eprintln!(
             "[save-timer] lock={:.1}ms  root_hash={:.1}ms  serialize={:.1}ms  bytes={}",
@@ -2263,7 +2268,6 @@ impl InMemoryGraph {
         ent.artifact_reverse.insert(id, new_path.clone());
         self.record_artifact_index_delta_remove(old_path.clone());
         self.record_artifact_index_delta_upsert(new_path.clone(), id);
-        self.invalidate_snapshot_root_hash();
         Some(id)
     }
 
@@ -2344,22 +2348,16 @@ impl InMemoryGraph {
     /// Compute the Merkle root hash directly from the live entity stores,
     /// without materialising a full `GraphSnapshot`.
     pub fn compute_root_hash(&self) -> crate::storage::merkle::MerkleHash {
-        if let Some(root_hash) = self.snapshot_root_hash_hint() {
-            return root_hash;
-        }
-        let ent = self.entities.read();
-        let root_hash = compute_root_hash_generic(&*ent, None);
-        self.record_snapshot_root_hash(root_hash);
-        root_hash
+        let _ent = self.entities.read();
+        self.merkle.read().root_hash()
     }
 
     /// Recompute the canonical Merkle root hash directly from the live entity
-    /// stores, ignoring any cached snapshot-root hint.
+    /// stores. This is the cold verification reference and does not replace the
+    /// continuously-maintained live root.
     pub fn recompute_root_hash(&self) -> crate::storage::merkle::MerkleHash {
         let ent = self.entities.read();
-        let root_hash = compute_root_hash_generic(&*ent, None);
-        self.record_snapshot_root_hash(root_hash);
-        root_hash
+        compute_root_hash_generic(&*ent, None)
     }
 
     /// Number of entities in the graph.
@@ -2550,14 +2548,12 @@ impl InMemoryGraph {
             .swap(false, Ordering::AcqRel)
         {
             self.rebuild_text_index_with_root_hash(graph_root_hash);
-            self.record_snapshot_root_hash(graph_root_hash);
             return Ok(());
         }
 
         if let Some(ref ti) = self.text_index {
             let root_hash_changed = ti.graph_root_hash() != Some(graph_root_hash);
             ti.set_graph_root_hash(graph_root_hash);
-            self.record_snapshot_root_hash(graph_root_hash);
             if root_hash_changed {
                 return ti.commit();
             }
@@ -4058,10 +4054,10 @@ impl InMemoryGraph {
             self.record_entity_delta_upsert(entity.clone());
         }
         let affected = collect_entity_refresh_targets(&ent, &entity_ids);
+        self.refresh_merkle_for_entities(&ent, entity_ids.iter().copied());
         drop(ent);
         self.refresh_text_index_for_entities(&affected);
         self.invalidate_entities_for_embedding(&affected)?;
-        self.invalidate_snapshot_root_hash();
 
         Ok(())
     }
@@ -4112,6 +4108,12 @@ impl InMemoryGraph {
                 self.record_relation_delta_remove(&ent, relation);
             }
         }
+        let merkle_seeds: Vec<EntityId> = removed_ids
+            .iter()
+            .copied()
+            .chain(affected_neighbors.iter().copied())
+            .collect();
+        self.refresh_merkle_for_entities(&ent, merkle_seeds);
         drop(ent);
 
         if let Some(ref ti) = self.text_index {
@@ -4120,7 +4122,6 @@ impl InMemoryGraph {
             }
             self.text_dirty.store(true, Ordering::Release);
         }
-        self.invalidate_snapshot_root_hash();
 
         // Remove vectors for deleted entities.
         #[cfg(feature = "vector")]
@@ -4141,7 +4142,6 @@ impl InMemoryGraph {
         let affected_neighbors: Vec<EntityId> = affected_neighbors.into_iter().collect();
         self.refresh_text_index_for_entities(&affected_neighbors);
         self.invalidate_entities_for_embedding(&affected_neighbors)?;
-        self.invalidate_snapshot_root_hash();
 
         Ok(())
     }
@@ -4165,6 +4165,10 @@ impl InMemoryGraph {
             }
         }
         let affected: Vec<EntityId> = affected.into_iter().collect();
+        self.refresh_merkle_for_entities(
+            &ent,
+            std::iter::once(*id).chain(affected.iter().copied()),
+        );
         drop(ent);
 
         self.refresh_text_index_for_entities(&affected);
@@ -4199,7 +4203,6 @@ impl InMemoryGraph {
         {
             self.artifact_embedding_queue.lock().remove(&artifact_id);
         }
-        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -4293,7 +4296,6 @@ impl InMemoryGraph {
             .file_hashes
             .insert(path.to_string(), hash);
         self.record_file_hash_delta_upsert(path.to_string(), hash);
-        self.invalidate_snapshot_root_hash();
     }
 
     /// Get the recorded hash for a file.
@@ -4316,11 +4318,11 @@ impl InMemoryGraph {
         if entity_ids.is_empty() {
             ent.file_hashes.remove(path);
             self.record_file_hash_delta_remove(path.to_string());
-            self.invalidate_snapshot_root_hash();
             return Vec::new();
         }
 
         let entity_set: hashbrown::HashSet<EntityId> = entity_ids.iter().copied().collect();
+        let mut merkle_seeds: HashSet<EntityId> = entity_ids.iter().copied().collect();
 
         for &eid in &entity_ids {
             // Remove the entity itself.
@@ -4360,14 +4362,14 @@ impl InMemoryGraph {
                     // check if the source is in the same file set — if so the relation
                     // was already removed above.
                     if let Some(rel) = ent.relations.get(rid) {
-                        if rel
-                            .src
-                            .as_entity()
-                            .is_some_and(|src| entity_set.contains(&src))
-                        {
-                            // Already removed as outgoing above — this is a leftover ref.
-                            // The relation is already gone from ent.relations via the
-                            // outgoing removal pass.
+                        if let Some(src) = rel.src.as_entity() {
+                            if entity_set.contains(&src) {
+                                // Already removed as outgoing above — this is a leftover ref.
+                                // The relation is already gone from ent.relations via the
+                                // outgoing removal pass.
+                            } else {
+                                merkle_seeds.insert(src);
+                            }
                         }
                         // If src is NOT in entity_set, this is a cross-file incoming
                         // relation. Keep the relation in ent.relations (dangling dst).
@@ -4379,7 +4381,7 @@ impl InMemoryGraph {
         // Also remove the file hash entry.
         ent.file_hashes.remove(path);
         self.record_file_hash_delta_remove(path.to_string());
-        self.invalidate_snapshot_root_hash();
+        self.refresh_merkle_for_entities(&ent, merkle_seeds);
 
         entity_ids
     }
@@ -5051,11 +5053,11 @@ impl EntityStore for InMemoryGraph {
         ent.entities.insert(entity.id, entity.clone());
         let affected = collect_entity_refresh_targets(&ent, &[entity.id]);
         self.record_entity_delta_upsert(entity.clone());
+        self.refresh_merkle_for_entities(&ent, std::iter::once(entity.id));
         drop(ent); // Release write lock before text index + embedding work.
 
         self.refresh_text_index_for_entities(&affected);
         self.invalidate_entities_for_embedding(&affected)?;
-        self.invalidate_snapshot_root_hash();
 
         Ok(())
     }
@@ -5063,10 +5065,12 @@ impl EntityStore for InMemoryGraph {
     fn upsert_relation(&self, relation: &Relation) -> Result<(), KinDbError> {
         let mut ent = self.entities.write();
         let mut affected = HashSet::new();
+        let mut merkle_seeds = Vec::new();
 
         // Remove old edge entries if updating
         if let Some(old) = ent.relations.remove(&relation.id) {
             affected.extend(entity_ids_for_relation(&old));
+            merkle_seeds.extend(entity_ids_for_relation(&old));
             remove_relation_indexes(&mut ent, &old);
             self.record_relation_delta_remove(&ent, &old);
         }
@@ -5076,11 +5080,12 @@ impl EntityStore for InMemoryGraph {
         ent.relations.insert(relation.id, relation.clone());
         self.record_relation_delta_upsert(&ent, relation.clone());
         affected.extend(entity_ids_for_relation(relation));
+        merkle_seeds.extend(entity_ids_for_relation(relation));
         let affected: Vec<EntityId> = affected.into_iter().collect();
+        self.refresh_merkle_for_entities(&ent, merkle_seeds);
         drop(ent);
         self.refresh_text_index_for_entities(&affected);
         self.invalidate_entities_for_embedding(&affected)?;
-        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -5128,6 +5133,10 @@ impl EntityStore for InMemoryGraph {
         for relation in &removed_relations {
             self.record_relation_delta_remove(&ent, relation);
         }
+        let merkle_seeds: Vec<EntityId> = std::iter::once(*id)
+            .chain(affected_neighbors.iter().copied())
+            .collect();
+        self.refresh_merkle_for_entities(&ent, merkle_seeds);
         drop(ent);
 
         // Remove vector for deleted entity.
@@ -5143,7 +5152,6 @@ impl EntityStore for InMemoryGraph {
 
         self.refresh_text_index_for_entities(&affected_neighbors);
         self.invalidate_entities_for_embedding(&affected_neighbors)?;
-        self.invalidate_snapshot_root_hash();
 
         Ok(())
     }
@@ -5195,6 +5203,12 @@ impl EntityStore for InMemoryGraph {
                 self.record_relation_delta_remove(&ent, relation);
             }
         }
+        let merkle_seeds: Vec<EntityId> = ids
+            .iter()
+            .copied()
+            .chain(affected_neighbors.iter().copied())
+            .collect();
+        self.refresh_merkle_for_entities(&ent, merkle_seeds);
         drop(ent);
 
         // Keep text index in sync (commit is deferred — call flush_text_index())
@@ -5220,7 +5234,6 @@ impl EntityStore for InMemoryGraph {
 
         self.refresh_text_index_for_entities(&affected_neighbors);
         self.invalidate_entities_for_embedding(&affected_neighbors)?;
-        self.invalidate_snapshot_root_hash();
 
         Ok(())
     }
@@ -5231,14 +5244,15 @@ impl EntityStore for InMemoryGraph {
 
         if let Some(rel) = ent.relations.remove(id) {
             affected.extend(entity_ids_for_relation(&rel));
+            let merkle_seeds = entity_ids_for_relation(&rel);
             remove_relation_indexes(&mut ent, &rel);
             self.record_relation_delta_remove(&ent, &rel);
+            self.refresh_merkle_for_entities(&ent, merkle_seeds);
         }
 
         drop(ent);
         self.refresh_text_index_for_entities(&affected);
         self.invalidate_entities_for_embedding(&affected)?;
-        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -5254,7 +5268,6 @@ impl EntityStore for InMemoryGraph {
         let fields = shallow_file_fields(shallow);
         self.upsert_retrievable_text_index(key, &fields)?;
         self.invalidate_artifact_for_embedding(artifact_id)?;
-        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -5287,7 +5300,6 @@ impl EntityStore for InMemoryGraph {
         let fields = structured_artifact_fields(artifact);
         self.upsert_retrievable_text_index(key, &fields)?;
         self.invalidate_artifact_for_embedding(artifact_id)?;
-        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -5338,7 +5350,6 @@ impl EntityStore for InMemoryGraph {
         {
             self.artifact_embedding_queue.lock().remove(&artifact_id);
         }
-        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -5354,7 +5365,6 @@ impl EntityStore for InMemoryGraph {
         let fields = opaque_artifact_fields(artifact);
         self.upsert_retrievable_text_index(key, &fields)?;
         self.invalidate_artifact_for_embedding(artifact_id)?;
-        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -5402,7 +5412,6 @@ impl EntityStore for InMemoryGraph {
         {
             self.artifact_embedding_queue.lock().remove(&artifact_id);
         }
-        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -5414,7 +5423,6 @@ impl EntityStore for InMemoryGraph {
             .file_layouts
             .insert(layout.file_id.clone(), layout.clone());
         self.record_file_layout_delta_upsert(old, layout.clone());
-        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -5460,13 +5468,13 @@ impl EntityStore for InMemoryGraph {
             ent.artifact_reverse.remove(&artifact_id);
             self.record_artifact_index_delta_remove(file_id.clone());
         }
-        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
     fn apply_transaction_delta(&self, delta: &TransactionDelta) -> Result<(), KinDbError> {
         let mut affected = HashSet::new();
         let mut deleted_entities = Vec::new();
+        let mut merkle_seeds = HashSet::new();
 
         {
             let mut ent = self.entities.write();
@@ -5506,9 +5514,11 @@ impl EntityStore for InMemoryGraph {
                         ent.entities.insert(entity.id, entity.clone());
                         self.record_entity_delta_upsert(entity.clone());
                         affected.insert(entity.id);
+                        merkle_seeds.insert(entity.id);
                     }
                     EntityDelta::Removed(id) => {
                         deleted_entities.push(*id);
+                        merkle_seeds.insert(*id);
                         if let Some(entity) = ent.entities.remove(id) {
                             ent.indexes.remove(
                                 &entity.id,
@@ -5528,6 +5538,7 @@ impl EntityStore for InMemoryGraph {
                                             entity_neighbor_for_relation(rel, id)
                                         {
                                             affected.insert(neighbor);
+                                            merkle_seeds.insert(neighbor);
                                         }
                                     }
                                 }
@@ -5539,6 +5550,7 @@ impl EntityStore for InMemoryGraph {
                                             entity_neighbor_for_relation(rel, id)
                                         {
                                             affected.insert(neighbor);
+                                            merkle_seeds.insert(neighbor);
                                         }
                                     }
                                 }
@@ -5559,6 +5571,7 @@ impl EntityStore for InMemoryGraph {
                     RelationDelta::Added(relation) => {
                         if let Some(old) = ent.relations.remove(&relation.id) {
                             affected.extend(entity_ids_for_relation(&old));
+                            merkle_seeds.extend(entity_ids_for_relation(&old));
                             remove_relation_indexes(&mut ent, &old);
                             self.record_relation_delta_remove(&ent, &old);
                         }
@@ -5566,16 +5579,19 @@ impl EntityStore for InMemoryGraph {
                         ent.relations.insert(relation.id, relation.clone());
                         self.record_relation_delta_upsert(&ent, relation.clone());
                         affected.extend(entity_ids_for_relation(relation));
+                        merkle_seeds.extend(entity_ids_for_relation(relation));
                     }
                     RelationDelta::Removed(id) => {
                         if let Some(rel) = ent.relations.remove(id) {
                             affected.extend(entity_ids_for_relation(&rel));
+                            merkle_seeds.extend(entity_ids_for_relation(&rel));
                             remove_relation_indexes(&mut ent, &rel);
                             self.record_relation_delta_remove(&ent, &rel);
                         }
                     }
                 }
             }
+            self.refresh_merkle_for_entities(&ent, merkle_seeds.iter().copied());
         }
 
         // 3. Clean up deleted entities from the embedding queue / vector index
@@ -5598,7 +5614,6 @@ impl EntityStore for InMemoryGraph {
             self.invalidate_entities_for_embedding(&affected_list)?;
         }
 
-        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -5641,12 +5656,13 @@ impl EntityStore for InMemoryGraph {
                 all_affected.push(entity.id);
             }
 
-            collect_entity_refresh_targets(&ent, &all_affected)
+            let affected = collect_entity_refresh_targets(&ent, &all_affected);
+            self.refresh_merkle_for_entities(&ent, all_affected.iter().copied());
+            affected
         };
 
         self.refresh_text_index_for_entities(&affected);
         self.invalidate_entities_for_embedding(&affected)?;
-        self.invalidate_snapshot_root_hash();
 
         Ok(())
     }
@@ -5658,10 +5674,12 @@ impl EntityStore for InMemoryGraph {
 
         {
             let mut ent = self.entities.write();
+            let mut merkle_seeds = Vec::new();
 
             ent.relations.reserve(relations.len());
             for relation in relations {
                 if let Some(old) = ent.relations.remove(&relation.id) {
+                    merkle_seeds.extend(entity_ids_for_relation(&old));
                     remove_relation_indexes(&mut ent, &old);
                     self.record_relation_delta_remove(&ent, &old);
                 }
@@ -5669,7 +5687,9 @@ impl EntityStore for InMemoryGraph {
                 insert_relation_indexes(&mut ent, relation);
                 ent.relations.insert(relation.id, relation.clone());
                 self.record_relation_delta_upsert(&ent, relation.clone());
+                merkle_seeds.extend(entity_ids_for_relation(relation));
             }
+            self.refresh_merkle_for_entities(&ent, merkle_seeds);
         }
 
         // Relation-derived text fields are now stale for affected entities,
@@ -5678,7 +5698,6 @@ impl EntityStore for InMemoryGraph {
         // be honored by persist_text_index_with_root_hash before saving.
         self.text_full_rebuild_required
             .store(true, Ordering::Release);
-        self.invalidate_snapshot_root_hash();
 
         Ok(())
     }
@@ -5708,6 +5727,7 @@ impl EntityStore for InMemoryGraph {
         // Step 2: Single write lock — retain non-kind + insert new + rebuild indexes
         {
             let mut ent = self.entities.write();
+            let mut merkle_seeds = Vec::new();
 
             // Remove all relations of this kind — O(N) scan, no per-relation index work
             let removed_relations: Vec<Relation> = ent
@@ -5722,10 +5742,14 @@ impl EntityStore for InMemoryGraph {
             if removed == 0 && new_map.is_empty() {
                 return Ok(());
             }
+            for relation in &removed_relations {
+                merkle_seeds.extend(entity_ids_for_relation(relation));
+            }
 
             // Reserve and insert new relations
             ent.relations.reserve(new_map.len());
             for (id, rel) in new_map {
+                merkle_seeds.extend(entity_ids_for_relation(&rel));
                 ent.relations.insert(id, rel);
             }
 
@@ -5743,11 +5767,11 @@ impl EntityStore for InMemoryGraph {
             for relation in ent.relations.values().filter(|rel| rel.kind == kind) {
                 self.record_relation_delta_upsert(&ent, relation.clone());
             }
+            self.refresh_merkle_for_entities(&ent, merkle_seeds);
         }
 
         self.text_full_rebuild_required
             .store(true, Ordering::Release);
-        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -5758,19 +5782,21 @@ impl EntityStore for InMemoryGraph {
 
         {
             let mut ent = self.entities.write();
+            let mut merkle_seeds = Vec::new();
 
             for id in ids {
                 if let Some(rel) = ent.relations.remove(*id) {
+                    merkle_seeds.extend(entity_ids_for_relation(&rel));
                     remove_relation_indexes(&mut ent, &rel);
                     self.record_relation_delta_remove(&ent, &rel);
                 }
             }
+            self.refresh_merkle_for_entities(&ent, merkle_seeds);
         }
 
         // Defer text index rebuild like upsert_relations_batch.
         self.text_full_rebuild_required
             .store(true, Ordering::Release);
-        self.invalidate_snapshot_root_hash();
 
         Ok(())
     }
@@ -5889,7 +5915,6 @@ impl ChangeStore for InMemoryGraph {
 
         chg.changes.insert(change.id, change.clone());
         self.record_change_delta_upsert(change.clone());
-        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -5942,7 +5967,6 @@ impl ChangeStore for InMemoryGraph {
         }
         chg.branches.insert(branch.name.clone(), branch.clone());
         self.record_branch_delta_upsert(branch.clone());
-        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -5956,7 +5980,6 @@ impl ChangeStore for InMemoryGraph {
             Some(branch) => {
                 branch.head = *new_head;
                 self.record_branch_delta_upsert(branch.clone());
-                self.invalidate_snapshot_root_hash();
                 Ok(())
             }
             None => Err(KinDbError::NotFound(format!("branch '{}'", name))),
@@ -5966,7 +5989,6 @@ impl ChangeStore for InMemoryGraph {
     fn delete_branch(&self, name: &BranchName) -> Result<(), KinDbError> {
         self.changes.write().branches.remove(name);
         self.record_branch_delta_remove(name.clone());
-        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -6888,7 +6910,6 @@ impl VerificationStore for InMemoryGraph {
             }
         }
         self.require_full_snapshot();
-        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -7689,6 +7710,47 @@ mod tests {
 
         assert!(graph.get_relations(&e1.id, &[]).unwrap().is_empty());
         assert_eq!(graph.relation_count(), 0);
+    }
+
+    #[test]
+    fn merkle_root_stays_current_across_live_entity_relation_mutations() {
+        fn assert_current(graph: &InMemoryGraph) {
+            assert_eq!(
+                graph.snapshot_root_hash(),
+                Some(compute_graph_root_hash(&graph.to_snapshot())),
+                "maintained live root must match cold recompute"
+            );
+        }
+
+        let graph = InMemoryGraph::new();
+        assert_current(&graph);
+
+        let mut root = test_entity("root", "a.rs");
+        let child = test_entity("child", "b.rs");
+        let leaf = test_entity("leaf", "c.rs");
+        graph.upsert_entity(&root).unwrap();
+        graph.upsert_entity(&child).unwrap();
+        graph.upsert_entity(&leaf).unwrap();
+        assert_current(&graph);
+
+        let root_to_child = test_relation(root.id, child.id, RelationKind::Calls);
+        let child_to_leaf = test_relation(child.id, leaf.id, RelationKind::Calls);
+        let leaf_to_root = test_relation(leaf.id, root.id, RelationKind::References);
+        graph.upsert_relation(&root_to_child).unwrap();
+        graph.upsert_relation(&child_to_leaf).unwrap();
+        graph.upsert_relation(&leaf_to_root).unwrap();
+        assert_current(&graph);
+
+        root.name = "root_changed".to_string();
+        root.signature = "fn root_changed()".to_string();
+        graph.upsert_entity(&root).unwrap();
+        assert_current(&graph);
+
+        graph.remove_relation(&child_to_leaf.id).unwrap();
+        assert_current(&graph);
+
+        graph.remove_entity(&leaf.id).unwrap();
+        assert_current(&graph);
     }
 
     #[test]

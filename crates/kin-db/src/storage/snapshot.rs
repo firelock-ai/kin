@@ -1401,15 +1401,10 @@ impl SnapshotManager {
         embedder_identity: Option<&str>,
     ) -> Result<(), KinDbError> {
         let path = normalize_snapshot_path(path.into());
-        // FIR-930: stamp the canonical root, never `snapshot_root_hash_hint()`.
-        // The hint is a mid-lifecycle cache that can carry a non-canonical value
-        // for the live graph's current content — it diverged across byte-identical
-        // preps in the FIR-814 identity experiment (ROOT_HASH_MATCH=0/26). The
-        // canonical recompute is prep-invariant and equals what the load-time gate
-        // compares against; the hint remains in use for the lock-guarded kndb
-        // trailer. Use the borrowed live graph so this does not clone the full
-        // snapshot just to stamp the sidecar.
-        let graph_root_hash = graph.recompute_root_hash();
+        // FIR-955: the live graph maintains a continuously-current root. Stamp
+        // that root instead of forcing a full Merkle recompute on every vector
+        // sidecar flush.
+        let graph_root_hash = graph.compute_root_hash();
         Self::save_vector_index_bundle(&path, graph, graph_root_hash, embedder_identity)
     }
 
