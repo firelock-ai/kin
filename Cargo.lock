@@ -3060,7 +3060,7 @@ dependencies = [
 [[package]]
 name = "kin-db"
 version = "0.1.0"
-source = "git+https://github.com/firelock-ai/kin-db.git?rev=704ebc06ee9da2ec77c37ac0af07557e9252242f#704ebc06ee9da2ec77c37ac0af07557e9252242f"
+source = "git+https://github.com/firelock-ai/kin-db.git?rev=a9e5aea16d9a592e4b8e260a05758031ab8a4143#a9e5aea16d9a592e4b8e260a05758031ab8a4143"
 dependencies = [
  "bincode",
  "bytes",
@@ -3412,7 +3412,7 @@ dependencies = [
 [[package]]
 name = "kin-search"
 version = "0.1.0"
-source = "git+https://github.com/firelock-ai/kin-search.git?rev=cb0680b82f38c8477a0facd33b4cdefde3fa6dfc#cb0680b82f38c8477a0facd33b4cdefde3fa6dfc"
+source = "git+https://github.com/firelock-ai/kin-search.git?rev=a766b0f219459e1d290da6282133279d499c5ce6#a766b0f219459e1d290da6282133279d499c5ce6"
 dependencies = [
  "bincode",
  "parking_lot",
@@ -3458,7 +3458,7 @@ dependencies = [
 [[package]]
 name = "kin-vector"
 version = "0.1.0"
-source = "git+https://github.com/firelock-ai/kin-vector.git?rev=dd743d741c6832e15179ac60720b5218558e10fb#dd743d741c6832e15179ac60720b5218558e10fb"
+source = "git+https://github.com/firelock-ai/kin-vector.git?rev=afac0e7958067d14ad7fb566e788985dd1243a7e#afac0e7958067d14ad7fb566e788985dd1243a7e"
 dependencies = [
  "fs2",
  "hashbrown 0.15.5",
