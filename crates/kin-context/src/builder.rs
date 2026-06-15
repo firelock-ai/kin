@@ -49,6 +49,15 @@ fn relation_weight(kind: &RelationKind) -> f64 {
     }
 }
 
+/// Minimum relation weight for a TRANSITIVE (2+ hop, non-direct) entity to earn a
+/// slot in the pack. Structural-containment edges (`Contains`, `OwnedBy`,
+/// `OwnedByFile`, `DocumentedBy`) carry weight 0.5 — they are graph plumbing, not
+/// dependencies, and were padding packs with same-file/same-crate noise (FIR-939).
+/// Requiring at least a `References`-grade (1.0) connection keeps every semantic
+/// edge while dropping pure structural neighbours. Direct deps (any edge to the
+/// focal), tests, and contracts are unaffected — this gates only transitive fill.
+const TRANSITIVE_RELEVANCE_FLOOR: f64 = 1.0;
+
 /// Build a map from entity ID to its maximum relation weight relative to the focal entity.
 ///
 /// For each relation in the subgraph, the weight is assigned to the non-focal endpoint.
@@ -333,6 +342,13 @@ where
                 });
             }
         } else {
+            // Transitive fill must be reached via a semantic edge, not pure
+            // structural containment — otherwise the budget pads with same-file /
+            // same-crate plumbing (FIR-939). Direct deps bypass this (handled above).
+            let weight = weight_map.get(eid).copied().unwrap_or(0.0);
+            if weight < TRANSITIVE_RELEVANCE_FLOOR {
+                continue;
+            }
             // Transitive deps: name and kind level
             let mut content = project_name_and_kind(entity);
             if opts.assistant_hint == Some(AssistantHint::GeminiCli) {
@@ -1452,6 +1468,71 @@ mod tests {
         let pack = build_context_pack(&store, &focal.id, &opts).unwrap();
         assert!(pack.actual_tokens <= opts.budget.max_tokens());
         assert!(!pack.dependency_signatures.is_empty());
+    }
+
+    // ── Transitive relevance floor (FIR-939) ────────────────────────────
+
+    #[test]
+    fn transitive_fill_drops_structural_only_neighbors() {
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+        let mk_rel = |kind, src: EntityId, dst: EntityId| Relation {
+            id: kin_model::ids::RelationId::new(),
+            kind,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("focal_fn", EntityKind::Function);
+        let direct = make_entity("caller_A", EntityKind::Function);
+        let semantic = make_entity("semantic_C", EntityKind::Function);
+        let structural = make_entity("structural_B", EntityKind::Function);
+        for e in [&focal, &direct, &semantic, &structural] {
+            store.upsert_entity(e).unwrap();
+        }
+        // focal -Calls-> direct (1-hop real dep)
+        store
+            .upsert_relation(&mk_rel(RelationKind::Calls, focal.id, direct.id))
+            .unwrap();
+        // direct -Calls-> semantic (2-hop, weight 5.0 → KEEP)
+        store
+            .upsert_relation(&mk_rel(RelationKind::Calls, direct.id, semantic.id))
+            .unwrap();
+        // direct -Contains-> structural (2-hop, weight 0.5 plumbing → DROP)
+        store
+            .upsert_relation(&mk_rel(RelationKind::Contains, direct.id, structural.id))
+            .unwrap();
+
+        let opts = ContextOptions {
+            max_depth: 2,
+            ..Default::default()
+        };
+        let pack = build_context_pack(&store, &focal.id, &opts).unwrap();
+
+        assert!(
+            pack.dependency_signatures
+                .iter()
+                .any(|e| e.content.contains("caller_A")),
+            "direct Calls dep must be included"
+        );
+        let transitive: Vec<&str> = pack
+            .transitive_deps
+            .iter()
+            .map(|e| e.content.as_str())
+            .collect();
+        assert!(
+            transitive.iter().any(|c| c.contains("semantic_C")),
+            "semantic (Calls) transitive dep must be kept"
+        );
+        assert!(
+            transitive.iter().all(|c| !c.contains("structural_B")),
+            "structural-only (Contains) transitive neighbour must be filtered (FIR-939)"
+        );
     }
 
     // ── Language-specific slicing ────────────────────────────────────────
