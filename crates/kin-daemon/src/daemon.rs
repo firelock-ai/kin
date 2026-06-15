@@ -87,16 +87,21 @@ fn duration_from_env_secs(name: &str, default: Duration) -> Duration {
 
 /// Decide whether the background persistence task should flush dirty state.
 ///
-/// Two independent clocks gate the flush:
-/// - Periodic (`since_save`): bounds how long dirty state may sit
-///   unpersisted, regardless of activity.
+/// Both clocks are suppressed while a daemon-side embed pass is in flight:
+/// - Periodic (`since_save`): bounds how long dirty state may sit unpersisted.
 /// - Idle (`since_mutation`): debounces the full-graph serialize to mutation
-///   quiet periods, and is suppressed entirely while a daemon-side embed
-///   pass is in flight. The embed handler persists its own progress
-///   (pre-pass snapshot, per-batch kvec, post-pass snapshot), so flushing
-///   the full graph on every starved feed gap only multiplies FS events
-///   that starve the feed further — O(gaps × graph size) writes on large
-///   repos.
+///   quiet periods.
+///
+/// During an embed pass the embed handler persists its own progress (pre-pass
+/// snapshot, per-batch kvec, post-pass snapshot), and the only graph mutations
+/// are re-derivable enrichment (LSP relations). A background FULL-graph flush
+/// here is therefore redundant — and on large repos ruinous: it re-serializes
+/// the entire graph on every fire. Observed killing the daemon on a ~955MB mui
+/// graph (repeated 955MB writes every few seconds starved the embed feed and
+/// pressured host memory until the process died — "Connection refused" mid-pass).
+/// The post-pass snapshot persists the final state once the pass completes, and
+/// a mid-pass crash only loses re-derivable enrichment, never primary truth.
+/// O(gaps × graph size) writes on large repos are the failure mode being closed.
 fn should_flush_now(
     since_save: Duration,
     since_mutation: Duration,
@@ -104,7 +109,10 @@ fn should_flush_now(
     idle_flush: Duration,
     periodic_flush: Duration,
 ) -> bool {
-    since_save >= periodic_flush || (!embed_pass_active && since_mutation >= idle_flush)
+    if embed_pass_active {
+        return false;
+    }
+    since_save >= periodic_flush || since_mutation >= idle_flush
 }
 
 /// Grace period the escalation watchdog waits after shutdown is signalled before
@@ -1834,7 +1842,7 @@ mod tests {
     }
 
     #[test]
-    fn active_embed_pass_suppresses_idle_flush_but_not_periodic() {
+    fn active_embed_pass_suppresses_both_flush_clocks() {
         let idle = Duration::from_secs(2);
         let periodic = Duration::from_secs(30);
         // A starved feed gap mid-pass looks idle; the pass marker suppresses
@@ -1846,11 +1854,22 @@ mod tests {
             idle,
             periodic,
         ));
-        // The periodic durability bound still fires through an active pass.
-        assert!(should_flush_now(
+        // The periodic clock is ALSO suppressed during an embed pass: re-serializing
+        // the full graph mid-pass re-derives only enrichment and, on large repos
+        // (~955MB mui), the repeated O(graph) writes starved the feed and killed the
+        // daemon. The post-pass snapshot persists the final state.
+        assert!(!should_flush_now(
             Duration::from_secs(31),
             Duration::from_secs(5),
             true,
+            idle,
+            periodic,
+        ));
+        // Once the pass ends, the periodic durability bound fires as before.
+        assert!(should_flush_now(
+            Duration::from_secs(31),
+            Duration::from_secs(5),
+            false,
             idle,
             periodic,
         ));
