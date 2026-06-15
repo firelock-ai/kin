@@ -2461,7 +2461,8 @@ mod tests {
         vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         vectors
             .upsert_retrievable(
-                RetrievalKey::Artifact(ArtifactId::from_file_id(&artifact.file_id)),
+                // Identity is graph-assigned by the upsert above: read it back.
+                RetrievalKey::Artifact(graph.artifact_id_for_path(&artifact.file_id).unwrap()),
                 &[0.0, 1.0, 0.0, 0.0],
             )
             .unwrap();

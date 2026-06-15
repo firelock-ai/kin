@@ -355,7 +355,8 @@ mod tests {
     #[test]
     fn upsert_retrievable_accepts_artifacts() {
         let idx = VectorIndex::new(4).unwrap();
-        let key = RetrievalKey::Artifact(kin_model::ArtifactId::from_path("src/lib.rs"));
+        // Round-trip test: the id value is opaque to the index, so mint one.
+        let key = RetrievalKey::Artifact(kin_model::ArtifactId::new());
 
         idx.upsert_retrievable(key, &[1.0, 0.0, 0.0, 0.0]).unwrap();
 
@@ -532,7 +533,8 @@ mod tests {
     fn search_returns_retrieval_keys_for_mixed_ids() {
         let idx = VectorIndex::new(4).unwrap();
         let entity = EntityId::new();
-        let artifact = kin_model::ArtifactId::from_path("README.md");
+        // Mixed-id search test: the artifact id value is opaque here, so mint one.
+        let artifact = kin_model::ArtifactId::new();
 
         idx.upsert(entity, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         idx.upsert_retrievable(RetrievalKey::Artifact(artifact), &[0.95, 0.05, 0.0, 0.0])
@@ -573,7 +575,8 @@ mod tests {
     #[test]
     fn search_similar_with_roles_artifacts_get_none_role() {
         let idx = VectorIndex::new(4).unwrap();
-        let artifact = kin_model::ArtifactId::from_path("README.md");
+        // Role resolution ignores artifact id values; any graph-assigned id works.
+        let artifact = kin_model::ArtifactId::new();
 
         idx.upsert_retrievable(RetrievalKey::Artifact(artifact), &[1.0, 0.0, 0.0, 0.0])
             .unwrap();

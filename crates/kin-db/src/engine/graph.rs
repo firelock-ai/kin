@@ -7968,11 +7968,18 @@ mod tests {
             content_hash: Hash256::from_bytes([9; 32]),
             text_preview: Some("build install".into()),
         };
-        let artifact_key = RetrievalKey::Artifact(ArtifactId::from_file_id(&artifact.file_id));
+        let artifact_file_id = artifact.file_id.clone();
         snapshot.structured_artifacts.push(artifact);
 
         let graph =
             InMemoryGraph::from_snapshot_with_text_index(snapshot, dir.path().join("text-index"));
+
+        // Identity is graph-assigned: read the id the graph minted on restore.
+        let artifact_key = RetrievalKey::Artifact(
+            graph
+                .artifact_id_for_path(&artifact_file_id)
+                .expect("restored artifact must have a graph-assigned id"),
+        );
 
         let hits = graph.text_search("extension registry", 10).unwrap();
         assert!(
@@ -7998,10 +8005,15 @@ mod tests {
             content_hash: Hash256::from_bytes([9; 32]),
             text_preview: Some("build install".into()),
         };
-        let artifact_key = RetrievalKey::Artifact(ArtifactId::from_file_id(&artifact.file_id));
-
         graph.upsert_structured_artifact(&artifact).unwrap();
         graph.flush_text_index().unwrap();
+
+        // Identity is graph-assigned by the upsert: read it back from the index.
+        let artifact_key = RetrievalKey::Artifact(
+            graph
+                .artifact_id_for_path(&artifact.file_id)
+                .expect("upserted artifact must have a graph-assigned id"),
+        );
 
         let hits = graph.text_search("build install", 10).unwrap();
         assert!(hits.iter().any(|(key, _)| *key == artifact_key));
@@ -8030,10 +8042,15 @@ mod tests {
             content_hash: Hash256::from_bytes([7; 32]),
             text_preview: Some("build clean".into()),
         };
-        let artifact_key = RetrievalKey::Artifact(ArtifactId::from_file_id(&artifact.file_id));
-
         graph.upsert_structured_artifact(&artifact).unwrap();
         graph.flush_text_index().unwrap();
+
+        // Identity is graph-assigned by the upsert: capture it before deletion.
+        let artifact_key = RetrievalKey::Artifact(
+            graph
+                .artifact_id_for_path(&artifact.file_id)
+                .expect("upserted artifact must have a graph-assigned id"),
+        );
         assert!(graph
             .text_search("build clean", 10)
             .unwrap()
@@ -9761,9 +9778,10 @@ mod tests {
         graph.upsert_structured_artifact(&structured).unwrap();
         graph.upsert_opaque_artifact(&opaque).unwrap();
 
-        let shallow_id = ArtifactId::from_file_id(&shallow.file_id);
-        let structured_id = ArtifactId::from_file_id(&structured.file_id);
-        let opaque_id = ArtifactId::from_file_id(&opaque.file_id);
+        // Identity is graph-assigned by the upserts above: read it back.
+        let shallow_id = graph.artifact_id_for_path(&shallow.file_id).unwrap();
+        let structured_id = graph.artifact_id_for_path(&structured.file_id).unwrap();
+        let opaque_id = graph.artifact_id_for_path(&opaque.file_id).unwrap();
 
         {
             let queue = graph.artifact_embedding_queue.lock();
@@ -10379,7 +10397,10 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("vectors.usearch");
         let index = crate::VectorIndex::new(2).unwrap();
-        let structured_key = RetrievalKey::Artifact(ArtifactId::from_file_id(&structured.file_id));
+        // Identity is graph-assigned by the upsert above: read it back so the
+        // pre-seeded vector index entry matches what the graph will look for.
+        let structured_key =
+            RetrievalKey::Artifact(graph.artifact_id_for_path(&structured.file_id).unwrap());
         index
             .upsert_retrievable(structured_key, &[1.0, 0.0])
             .unwrap();
@@ -10389,7 +10410,7 @@ mod tests {
         graph.artifact_embedding_queue.lock().clear();
         graph.queue_missing_artifacts_for_embedding();
 
-        let opaque_id = ArtifactId::from_file_id(&opaque.file_id);
+        let opaque_id = graph.artifact_id_for_path(&opaque.file_id).unwrap();
         let queue = graph.artifact_embedding_queue.lock();
         assert_eq!(queue.len(), 1);
         assert!(queue.contains(&opaque_id));
@@ -11279,9 +11300,11 @@ mod tests {
     #[test]
     fn drain_artifact_embedding_batch_is_deterministic_and_recency_first() {
         let g = InMemoryGraph::new();
-        let id1 = ArtifactId::from_file_id(&FilePathId::new("a.rs"));
-        let id2 = ArtifactId::from_file_id(&FilePathId::new("b.rs"));
-        let id3 = ArtifactId::from_file_id(&FilePathId::new("c.rs"));
+        // Pure queue-ordering test: ids are arbitrary distinct graph-assigned
+        // values, not tied to any tracked path, so mint them directly.
+        let id1 = ArtifactId::new();
+        let id2 = ArtifactId::new();
+        let id3 = ArtifactId::new();
 
         {
             let mut q = g.artifact_embedding_queue.lock();

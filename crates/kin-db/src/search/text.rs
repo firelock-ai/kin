@@ -844,7 +844,8 @@ mod tests {
 
         let e1 = EntityId::new();
         let e2 = EntityId::new();
-        let artifact_key = RetrievalKey::Artifact(ArtifactId::from_path("README.md"));
+        // Role resolution ignores artifact id values; any graph-assigned id works.
+        let artifact_key = RetrievalKey::Artifact(ArtifactId::new());
 
         let mut roles: HashMap<EntityId, EntityRole> = HashMap::new();
         roles.insert(e1, EntityRole::Source);
@@ -882,7 +883,8 @@ mod tests {
     #[test]
     fn upsert_retrievable_indexes_artifact_keys() {
         let idx = TextIndex::new().unwrap();
-        let key = RetrievalKey::Artifact(kin_model::ArtifactId::from_path("docs/guide.md"));
+        // Round-trip test: the id value is opaque to the index, so mint one.
+        let key = RetrievalKey::Artifact(kin_model::ArtifactId::new());
 
         idx.upsert_retrievable(key, &[("semantic substrate", 4.0)])
             .unwrap();
