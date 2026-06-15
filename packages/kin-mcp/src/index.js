@@ -22,17 +22,37 @@ export function resolveReleaseTag(version = PACKAGE_VERSION) {
 
 export function resolveReleaseAsset(platform = process.platform, arch = process.arch) {
   if (platform === 'darwin' && arch === 'arm64') {
-    return { assetName: 'kin-macos-aarch64', binaryName: 'kin' };
+    return {
+      assetName: 'kin-macos-aarch64',
+      archiveName: 'kin-macos-aarch64.tar.gz',
+      binaryName: 'kin'
+    };
   }
   if (platform === 'darwin' && arch === 'x64') {
-    return { assetName: 'kin-macos-x86_64', binaryName: 'kin' };
+    return {
+      assetName: 'kin-macos-x86_64',
+      archiveName: 'kin-macos-x86_64.tar.gz',
+      binaryName: 'kin'
+    };
   }
   if (platform === 'linux' && arch === 'x64') {
-    return { assetName: 'kin-linux-x86_64', binaryName: 'kin' };
+    return {
+      assetName: 'kin-linux-x86_64',
+      archiveName: 'kin-linux-x86_64.tar.gz',
+      binaryName: 'kin'
+    };
+  }
+  if (platform === 'linux' && arch === 'arm64') {
+    return {
+      assetName: 'kin-linux-aarch64',
+      archiveName: 'kin-linux-aarch64.tar.gz',
+      binaryName: 'kin'
+    };
   }
 
   throw new Error(
-    `kin-mcp does not have a published Kin binary for ${platform}/${arch} yet`
+    `kin-mcp does not have a published Kin binary for ${platform}/${arch} yet. ` +
+      'On Windows, use WSL2 for this alpha.'
   );
 }
 
@@ -180,39 +200,82 @@ Environment:
 }
 
 async function installKinBinary({ binaryPath, env, platform, arch, version }) {
-  const { assetName } = resolveReleaseAsset(platform, arch);
+  const { assetName, archiveName, binaryName } = resolveReleaseAsset(platform, arch);
   const tag = resolveReleaseTag(version);
   const baseUrl = (env.KIN_MCP_RELEASE_BASE_URL || DEFAULT_RELEASE_BASE_URL).replace(
     /\/$/,
     ''
   );
-  const assetUrl = `${baseUrl}/${tag}/${assetName}`;
-  const checksumUrl = `${assetUrl}.sha256`;
+  const archiveUrl = `${baseUrl}/${tag}/${archiveName}`;
+  const checksumUrl = `${archiveUrl}.sha256`;
 
   await fsp.mkdir(path.dirname(binaryPath), { recursive: true });
 
   const checksumText = await fetchText(checksumUrl);
   const expectedSha = parseChecksum(checksumText);
-  const binaryBytes = await fetchBytes(assetUrl);
-  const actualSha = sha256(binaryBytes);
+  const archiveBytes = await fetchBytes(archiveUrl);
+  const actualSha = sha256(archiveBytes);
 
   if (actualSha !== expectedSha) {
     throw new Error(
-      `checksum mismatch for ${assetName}: expected ${expectedSha}, got ${actualSha}`
+      `checksum mismatch for ${archiveName}: expected ${expectedSha}, got ${actualSha}`
     );
   }
 
+  await installFromArchive({
+    archiveBytes,
+    archiveName,
+    assetName,
+    binaryName,
+    binaryPath,
+    platform
+  });
+}
+
+async function installFromArchive({
+  archiveBytes,
+  archiveName,
+  assetName,
+  binaryName,
+  binaryPath,
+  platform
+}) {
+  const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-install-'));
+  const archivePath = path.join(tmpRoot, archiveName);
   const tmpPath = `${binaryPath}.download`;
+
   try {
-    await fsp.writeFile(tmpPath, binaryBytes, { mode: 0o755 });
+    await fsp.writeFile(archivePath, archiveBytes);
+    await execFile('tar', ['-xzf', archivePath, '-C', tmpRoot]);
+
+    const extractedBinary = path.join(tmpRoot, assetName, binaryName);
+    await fsp.access(extractedBinary, fs.constants.R_OK);
+    await fsp.copyFile(extractedBinary, tmpPath);
     if (platform !== 'win32') {
       await fsp.chmod(tmpPath, 0o755);
     }
     await fsp.rename(tmpPath, binaryPath);
   } catch (error) {
     await fsp.unlink(tmpPath).catch(() => {});
-    throw error;
+    throw new Error(`failed to install ${binaryName} from ${archiveName}: ${error.message}`);
+  } finally {
+    await fsp.rm(tmpRoot, { recursive: true, force: true });
   }
+}
+
+function execFile(file, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    cp.execFile(file, args, options, (error, stdout, stderr) => {
+      if (error) {
+        if (stderr) {
+          error.message = `${error.message}: ${stderr.trim()}`;
+        }
+        reject(error);
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+  });
 }
 
 async function fetchText(url) {
