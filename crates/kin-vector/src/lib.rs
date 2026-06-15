@@ -10,6 +10,7 @@
 //! [`DefaultId`] (UUID-based) and blanket impls for `u64`, `u32`, and
 //! `uuid::Uuid`.
 
+use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -404,6 +405,15 @@ pub struct HnswGraph<Id: VectorId = DefaultId> {
     /// predate stamping still deserialize (descriptor decodes to default/`None`).
     #[serde(default)]
     pub descriptor: IndexDescriptor,
+    /// Reverse edge index: backlinks[target][layer] = source indices with an
+    /// outgoing edge to target at layer. This is rebuilt on load and intentionally
+    /// not serialized; it exists to keep removal bounded by incident degree.
+    #[serde(skip)]
+    pub backlinks: Vec<Vec<Vec<usize>>>,
+    /// Mutations can happen in caller order; before search/save, rebuild once in
+    /// canonical key order so final topology is independent of ingestion order.
+    #[serde(skip)]
+    pub canonical_order_dirty: bool,
 }
 
 impl<Id: VectorId> HnswGraph<Id> {
@@ -418,6 +428,8 @@ impl<Id: VectorId> HnswGraph<Id> {
             free_list: Vec::new(),
             rng_state: 0x12345678_9abcdef0,
             descriptor: IndexDescriptor::default(),
+            backlinks: Vec::new(),
+            canonical_order_dirty: false,
         }
     }
 
@@ -575,6 +587,104 @@ impl<Id: VectorId> HnswGraph<Id> {
         candidates.iter().take(m).map(|&(_, idx)| idx).collect()
     }
 
+    fn canonical_id_bytes(id: &Id) -> Result<Vec<u8>, VectorError> {
+        rmp_serde::to_vec(id).map_err(|e| {
+            VectorError::IndexError(format!("failed to serialize vector id for ordering: {e}"))
+        })
+    }
+
+    fn canonical_id_cmp(a: &(u64, &[u8]), b: &(u64, &[u8])) -> Ordering {
+        a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1))
+    }
+
+    fn ensure_backlink_slot(&mut self, target: usize, layer: usize) {
+        if self.backlinks.len() <= target {
+            self.backlinks.resize_with(target + 1, Vec::new);
+        }
+        if self.backlinks[target].len() <= layer {
+            self.backlinks[target].resize_with(layer + 1, Vec::new);
+        }
+    }
+
+    fn add_backlink(&mut self, target: usize, layer: usize, source: usize) {
+        if target >= self.nodes.len() {
+            return;
+        }
+        self.ensure_backlink_slot(target, layer);
+        let sources = &mut self.backlinks[target][layer];
+        if !sources.contains(&source) {
+            sources.push(source);
+            sources.sort_unstable();
+        }
+    }
+
+    fn remove_backlink(&mut self, target: usize, layer: usize, source: usize) {
+        if target >= self.backlinks.len() || layer >= self.backlinks[target].len() {
+            return;
+        }
+        self.backlinks[target][layer].retain(|&candidate| candidate != source);
+    }
+
+    fn dedupe_neighbors(neighbors: Vec<usize>) -> Vec<usize> {
+        let mut deduped = Vec::with_capacity(neighbors.len());
+        for neighbor in neighbors {
+            if !deduped.contains(&neighbor) {
+                deduped.push(neighbor);
+            }
+        }
+        deduped
+    }
+
+    fn set_connections(&mut self, source: usize, layer: usize, neighbors: Vec<usize>) {
+        if source >= self.nodes.len() || layer >= self.nodes[source].connections.len() {
+            return;
+        }
+
+        let next = Self::dedupe_neighbors(neighbors);
+        let previous = std::mem::replace(&mut self.nodes[source].connections[layer], next.clone());
+
+        for target in &previous {
+            if !next.contains(target) {
+                self.remove_backlink(*target, layer, source);
+            }
+        }
+        for target in &next {
+            if !previous.contains(target) {
+                self.add_backlink(*target, layer, source);
+            }
+        }
+    }
+
+    fn add_directed_connection(&mut self, source: usize, target: usize, layer: usize) {
+        if source >= self.nodes.len() || layer >= self.nodes[source].connections.len() {
+            return;
+        }
+        if !self.nodes[source].connections[layer].contains(&target) {
+            self.nodes[source].connections[layer].push(target);
+            self.add_backlink(target, layer, source);
+        }
+    }
+
+    fn rebuild_backlinks(&mut self) {
+        self.backlinks.clear();
+        self.backlinks.resize_with(self.nodes.len(), Vec::new);
+
+        for source in 0..self.nodes.len() {
+            let connections = self.nodes[source].connections.clone();
+            for (layer, neighbors) in connections.into_iter().enumerate() {
+                for target in Self::dedupe_neighbors(neighbors) {
+                    self.add_backlink(target, layer, source);
+                }
+            }
+        }
+    }
+
+    fn ensure_backlinks_ready(&mut self) {
+        if self.backlinks.len() != self.nodes.len() {
+            self.rebuild_backlinks();
+        }
+    }
+
     /// Sort `(distance, idx)` pairs ascending by distance, breaking ties by the
     /// node's stable key hash rather than by internal index. NaN distances sort
     /// last (via `total_cmp`). Key-based tie-breaks keep neighbor pruning
@@ -588,6 +698,18 @@ impl<Id: VectorId> HnswGraph<Id> {
 
     /// Insert a node into the graph.
     fn insert(&mut self, entity_id: Id, vector: &[f32]) -> Result<(), VectorError> {
+        let level = hnsw_level_for_key(&entity_id);
+        self.insert_with_level(entity_id, vector, level)?;
+        self.canonical_order_dirty = true;
+        Ok(())
+    }
+
+    fn insert_with_level(
+        &mut self,
+        entity_id: Id,
+        vector: &[f32],
+        level: usize,
+    ) -> Result<(), VectorError> {
         let dims = self.dimensions;
         if vector.len() != dims {
             return Err(VectorError::IndexError(format!(
@@ -597,7 +719,6 @@ impl<Id: VectorId> HnswGraph<Id> {
             )));
         }
 
-        let level = hnsw_level_for_key(&entity_id);
         let node = HnswNode {
             vector: vector.to_vec(),
             connections: vec![Vec::new(); level + 1],
@@ -608,11 +729,16 @@ impl<Id: VectorId> HnswGraph<Id> {
         let idx = if let Some(free_idx) = self.free_list.pop() {
             self.nodes[free_idx] = node;
             self.idx_to_id[free_idx] = entity_id;
+            if self.backlinks.len() <= free_idx {
+                self.backlinks.resize_with(free_idx + 1, Vec::new);
+            }
+            self.backlinks[free_idx].clear();
             free_idx
         } else {
             let idx = self.nodes.len();
             self.nodes.push(node);
             self.idx_to_id.push(entity_id);
+            self.backlinks.push(Vec::new());
             idx
         };
         self.id_to_idx.insert(entity_id, idx);
@@ -644,15 +770,15 @@ impl<Id: VectorId> HnswGraph<Id> {
                 .filter(|&nb| lc < self.nodes[nb].connections.len())
                 .collect();
 
-            // Set this node's connections at this layer
-            self.nodes[idx].connections[lc] = selected.clone();
+            // Set this node's connections at this layer.
+            self.set_connections(idx, lc, selected.clone());
 
             // Add bidirectional connections
             for &nb in &selected {
                 if lc >= self.nodes[nb].connections.len() {
                     continue;
                 }
-                self.nodes[nb].connections[lc].push(idx);
+                self.add_directed_connection(nb, idx, lc);
                 let nb_m_max = if lc == 0 { M_MAX_0 } else { M };
                 if self.nodes[nb].connections[lc].len() > nb_m_max {
                     // Prune: keep only the closest nb_m_max neighbors.
@@ -664,8 +790,8 @@ impl<Id: VectorId> HnswGraph<Id> {
                         .map(|&n| (cosine_distance(&nb_vec, &self.nodes[n].vector), n))
                         .collect();
                     self.sort_scored_neighbors(&mut scored);
-                    self.nodes[nb].connections[lc] =
-                        scored.into_iter().take(nb_m_max).map(|(_, n)| n).collect();
+                    let pruned = scored.into_iter().take(nb_m_max).map(|(_, n)| n).collect();
+                    self.set_connections(nb, lc, pruned);
                 }
             }
 
@@ -684,28 +810,84 @@ impl<Id: VectorId> HnswGraph<Id> {
         Ok(())
     }
 
+    fn ensure_canonical_order(&mut self) -> Result<(), VectorError> {
+        if !self.canonical_order_dirty {
+            return Ok(());
+        }
+
+        let dimensions = self.dimensions;
+        let rng_state = self.rng_state;
+        let descriptor = self.descriptor.clone();
+        let mut items: Vec<(u64, Vec<u8>, Id, Vec<f32>, usize)> =
+            Vec::with_capacity(self.id_to_idx.len());
+
+        for (&id, &idx) in &self.id_to_idx {
+            let node = self.nodes.get(idx).ok_or_else(|| {
+                VectorError::IndexError(format!(
+                    "vector id {id:?} points at missing HNSW node {idx}"
+                ))
+            })?;
+            if node.vector.is_empty() {
+                return Err(VectorError::IndexError(format!(
+                    "vector id {id:?} points at removed HNSW node {idx}"
+                )));
+            }
+            items.push((
+                key_hash(&id),
+                Self::canonical_id_bytes(&id)?,
+                id,
+                node.vector.clone(),
+                node.level,
+            ));
+        }
+
+        items.sort_by(|a, b| Self::canonical_id_cmp(&(a.0, &a.1), &(b.0, &b.1)));
+
+        let mut rebuilt = HnswGraph::new(dimensions);
+        rebuilt.rng_state = rng_state;
+        rebuilt.descriptor = descriptor;
+        for (_, _, id, vector, level) in items {
+            rebuilt.insert_with_level(id, &vector, level)?;
+        }
+        rebuilt.canonical_order_dirty = false;
+        *self = rebuilt;
+
+        Ok(())
+    }
+
     /// Remove a node from the graph.  We disconnect it from all neighbors and
     /// add its slot to the free list.  We do NOT try to repair neighbor
     /// connectivity — this is acceptable for a soft-delete approach common in
     /// HNSW implementations.
     fn remove(&mut self, entity_id: &Id) -> bool {
-        let idx = match self.id_to_idx.remove(entity_id) {
+        let idx = match self.id_to_idx.get(entity_id).copied() {
             Some(idx) => idx,
             None => return false,
         };
+        self.ensure_backlinks_ready();
+        self.id_to_idx.remove(entity_id);
 
-        // Disconnect from all neighbors at all layers.
-        let connections = self.nodes[idx].connections.clone();
-        for (layer, neighbors) in connections.iter().enumerate() {
-            for &nb in neighbors {
-                if nb < self.nodes.len() && layer < self.nodes[nb].connections.len() {
-                    self.nodes[nb].connections[layer].retain(|&n| n != idx);
-                }
+        // Drop outbound edges from this node by removing its source backlink from
+        // each target. The node's own connection lists are cleared below.
+        let outgoing = self.nodes[idx].connections.clone();
+        for (layer, neighbors) in outgoing.into_iter().enumerate() {
+            for nb in neighbors {
+                self.remove_backlink(nb, layer, idx);
             }
         }
-        for node in &mut self.nodes {
-            for neighbors in &mut node.connections {
-                neighbors.retain(|&n| n != idx);
+
+        // Drop inbound edges using the reverse-edge index. This replaces the old
+        // full-graph scan and is bounded by the number of incident sources.
+        let incoming = if idx < self.backlinks.len() {
+            std::mem::take(&mut self.backlinks[idx])
+        } else {
+            Vec::new()
+        };
+        for (layer, sources) in incoming.into_iter().enumerate() {
+            for source in sources {
+                if source < self.nodes.len() && layer < self.nodes[source].connections.len() {
+                    self.nodes[source].connections[layer].retain(|&n| n != idx);
+                }
             }
         }
 
@@ -713,7 +895,11 @@ impl<Id: VectorId> HnswGraph<Id> {
         self.nodes[idx].connections.clear();
         self.nodes[idx].vector.clear();
         self.nodes[idx].level = 0;
+        if idx < self.backlinks.len() {
+            self.backlinks[idx].clear();
+        }
         self.free_list.push(idx);
+        self.canonical_order_dirty = true;
 
         // If we removed the entry point, pick a new one.
         //
@@ -1079,7 +1265,9 @@ fn try_load_snapshot<Id: VectorId>(bytes: &[u8]) -> Result<HnswGraph<Id>, Vector
             snapshot.format_version
         )));
     }
-    Ok(snapshot.graph)
+    let mut graph = snapshot.graph;
+    graph.rebuild_backlinks();
+    Ok(graph)
 }
 
 fn recover_from_tmp<Id: VectorId>(
@@ -1160,6 +1348,20 @@ pub struct VectorIndex<Id: VectorId = DefaultId> {
 }
 
 impl<Id: VectorId> VectorIndex<Id> {
+    fn with_canonical_graph<R>(
+        &self,
+        f: impl FnOnce(&HnswGraph<Id>) -> Result<R, VectorError>,
+    ) -> Result<R, VectorError> {
+        let graph = self.graph.upgradable_read();
+        if graph.canonical_order_dirty {
+            let mut graph = parking_lot::RwLockUpgradableReadGuard::upgrade(graph);
+            graph.ensure_canonical_order()?;
+            f(&graph)
+        } else {
+            f(&graph)
+        }
+    }
+
     /// Create a new vector index for embeddings of the given dimensionality.
     pub fn new(dimensions: usize) -> Result<Self, VectorError> {
         let _span = tracing::info_span!("kin_vector.new", dimensions = dimensions).entered();
@@ -1273,21 +1475,21 @@ impl<Id: VectorId> VectorIndex<Id> {
             limit = limit
         )
         .entered();
-        let graph = self.graph.read();
+        self.with_canonical_graph(|graph| {
+            if embedding.len() != graph.dimensions {
+                return Err(VectorError::IndexError(format!(
+                    "query dimension mismatch: expected {}, got {}",
+                    graph.dimensions,
+                    embedding.len()
+                )));
+            }
 
-        if embedding.len() != graph.dimensions {
-            return Err(VectorError::IndexError(format!(
-                "query dimension mismatch: expected {}, got {}",
-                graph.dimensions,
-                embedding.len()
-            )));
-        }
+            if graph.active_count() == 0 {
+                return Ok(Vec::new());
+            }
 
-        if graph.active_count() == 0 {
-            return Ok(Vec::new());
-        }
-
-        Ok(graph.search(embedding, limit, None))
+            Ok(graph.search(embedding, limit, None))
+        })
     }
 
     /// Search for the `limit` most similar entities to the given embedding, filtering by a predicate.
@@ -1305,22 +1507,22 @@ impl<Id: VectorId> VectorIndex<Id> {
             limit = limit
         )
         .entered();
-        let graph = self.graph.read();
-
-        if embedding.len() != graph.dimensions {
-            return Err(VectorError::IndexError(format!(
-                "query dimension mismatch: expected {}, got {}",
-                graph.dimensions,
-                embedding.len()
-            )));
-        }
-
-        if graph.active_count() == 0 {
-            return Ok(Vec::new());
-        }
-
         let pred_dyn: &dyn Fn(&Id) -> bool = &predicate;
-        Ok(graph.search(embedding, limit, Some(pred_dyn)))
+        self.with_canonical_graph(|graph| {
+            if embedding.len() != graph.dimensions {
+                return Err(VectorError::IndexError(format!(
+                    "query dimension mismatch: expected {}, got {}",
+                    graph.dimensions,
+                    embedding.len()
+                )));
+            }
+
+            if graph.active_count() == 0 {
+                return Ok(Vec::new());
+            }
+
+            Ok(graph.search(embedding, limit, Some(pred_dyn)))
+        })
     }
 
     /// Set the persistence path for this index.
@@ -1338,23 +1540,27 @@ impl<Id: VectorId> VectorIndex<Id> {
             path = %path.display()
         )
         .entered();
-        let graph = self.graph.read();
-        let snapshot = HnswSnapshot {
-            format_version: HNSW_FORMAT_VERSION,
-            graph: HnswGraph {
-                nodes: graph.nodes.clone(),
-                entry_point: graph.entry_point,
-                max_level: graph.max_level,
-                dimensions: graph.dimensions,
-                id_to_idx: graph.id_to_idx.clone(),
-                idx_to_id: graph.idx_to_id.clone(),
-                free_list: graph.free_list.clone(),
-                rng_state: graph.rng_state,
-                descriptor: graph.descriptor.clone(),
-            },
-        };
-        let bytes = rmp_serde::to_vec(&snapshot)
-            .map_err(|e| VectorError::IndexError(format!("failed to serialize HNSW index: {e}")))?;
+        let bytes = self.with_canonical_graph(|graph| {
+            let snapshot = HnswSnapshot {
+                format_version: HNSW_FORMAT_VERSION,
+                graph: HnswGraph {
+                    nodes: graph.nodes.clone(),
+                    entry_point: graph.entry_point,
+                    max_level: graph.max_level,
+                    dimensions: graph.dimensions,
+                    id_to_idx: graph.id_to_idx.clone(),
+                    idx_to_id: graph.idx_to_id.clone(),
+                    free_list: graph.free_list.clone(),
+                    rng_state: graph.rng_state,
+                    descriptor: graph.descriptor.clone(),
+                    backlinks: Vec::new(),
+                    canonical_order_dirty: false,
+                },
+            };
+            rmp_serde::to_vec(&snapshot).map_err(|e| {
+                VectorError::IndexError(format!("failed to serialize HNSW index: {e}"))
+            })
+        })?;
         atomic_save_bytes(path, &bytes, "vector index")
     }
 
@@ -1797,14 +2003,11 @@ mod tests {
         );
     }
 
-    /// CHARACTERIZATION TEST — currently FAILS BY DESIGN (hence `#[ignore]`).
-    ///
-    /// KNOWN GAP: HNSW topology is insert-order-dependent (3/8 kNN differ
-    /// sorted-vs-reversed, 600-vector corpus); the benchmark protocol bypasses
-    /// this via frozen all-refs golden state (eval never embeds); the durable fix
-    /// is insert-order-independent topology or canonical insert ordering —
-    /// un-ignore this test when that lands. See
-    /// `planning/kin-determinism-saga-jun11.md`.
+    /// HNSW topology is incrementally constructed, so raw caller insertion order
+    /// can change candidate sets. Public search/save now canonicalizes dirty
+    /// graphs exactly once in stable key order before the graph is used, making
+    /// the operational topology a function of final content rather than of
+    /// ingestion order.
     ///
     /// Why this exists: `interleaved_reembed_history_does_not_change_results`
     /// (above) only re-embeds keys IN PLACE in the SAME order, so it never
@@ -1813,13 +2016,10 @@ mod tests {
     /// in different orders can wire up different connections — even with the
     /// key-hash levels/tie-breaks (efe77db) that make every per-step decision
     /// order-independent. The key-hash fixes removed the *tie-order* leak; the
-    /// remaining drift is the *candidate set* each insert sees. This test inserts
-    /// the same 600 vectors sorted vs reversed and asserts identical kNN + entry
-    /// point; it currently fails on a subset of probes, which is the documented
-    /// residual that surfaced as the freeze's `embedding`-signal jitter whenever
-    /// the eval re-embedded mid-run.
+    /// canonical rebuild below removes the remaining *candidate set* drift. This
+    /// inserts the same 600 vectors sorted vs reversed and asserts identical kNN
+    /// + entry point after the same canonicalization boundary search/save uses.
     #[test]
-    #[ignore = "KNOWN GAP: HNSW topology is insert-order-dependent; un-ignore when canonical/order-independent insert lands (see kin-determinism-saga-jun11.md)"]
     fn hnsw_search_is_invariant_to_insert_order() {
         // Deterministic pseudo-vector for key `i` (no RNG → reproducible across
         // processes and runs; this characterization must not itself be flaky).
@@ -1850,6 +2050,21 @@ mod tests {
         let b = build(&reversed, dim);
         assert_eq!(a.len(), b.len(), "same vector SET must give same size");
 
+        let limit = 20;
+        let ids = |idx: &VectorIndex<u64>, query: &[f32]| -> Vec<u64> {
+            idx.search_similar(query, limit)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
+        let warm_query = vec_for(10_000, dim);
+        assert_eq!(
+            ids(&a, &warm_query),
+            ids(&b, &warm_query),
+            "insert order changed kNN at the first canonicalizing search"
+        );
+
         // Same entry point (the start of every greedy descent). Compare by KEY —
         // the internal index legitimately differs between insert histories.
         let entry_key = |idx: &VectorIndex<u64>| -> Option<u64> {
@@ -1864,19 +2079,11 @@ mod tests {
 
         // Identical kNN for every probe — the property the frozen-golden protocol
         // depends on and that a durable topology fix must restore.
-        let limit = 20;
         for q in 0..8u64 {
             let query = vec_for(10_000 + q, dim);
-            let ids = |idx: &VectorIndex<u64>| -> Vec<u64> {
-                idx.search_similar(&query, limit)
-                    .unwrap()
-                    .into_iter()
-                    .map(|(id, _)| id)
-                    .collect()
-            };
             assert_eq!(
-                ids(&a),
-                ids(&b),
+                ids(&a, &query),
+                ids(&b, &query),
                 "insert order changed kNN for probe {q} (sorted vs reversed)"
             );
         }
