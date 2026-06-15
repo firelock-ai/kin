@@ -177,7 +177,7 @@ jobs:
 
       - name: Run coverage
         run: |
-          if ! cargo tarpaulin --out xml --out stdout; then
+          if ! timeout 30m cargo tarpaulin --out xml --out stdout; then
             echo "::warning::Tarpaulin is currently non-blocking in CI for the public alpha."
           fi
 
