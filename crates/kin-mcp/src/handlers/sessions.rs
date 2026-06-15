@@ -577,8 +577,8 @@ pub async fn handle_transaction_commit<G: GraphStore>(
     // to bypass state-loss across HTTP calls.
     let mut inline_ops = None;
     if let Some(ops_val) = args.get("operations") {
-        let parsed: Vec<crate::session::McpMutationOperation> = serde_json::from_value(ops_val.clone())
-            .map_err(|e| {
+        let parsed: Vec<crate::session::McpMutationOperation> =
+            serde_json::from_value(ops_val.clone()).map_err(|e| {
                 crate::error::McpError::InvalidParams(format!("invalid operations array: {e}"))
             })?;
         crate::session::validate_staged_operations(&parsed)
@@ -646,7 +646,7 @@ pub async fn handle_transaction_commit<G: GraphStore>(
             match payload {
                 McpMutationPayload::Entity(entity) => {
                     let mut old_opt = store.get_entity(&entity.id).ok().flatten();
-                    
+
                     // FIR-940: Fall back to lookup by name+kind if ID lookup fails (common for upserts)
                     if old_opt.is_none() {
                         let filter = kin_model::EntityFilter {
@@ -673,7 +673,12 @@ pub async fn handle_transaction_commit<G: GraphStore>(
                         if new.span.is_none() {
                             new.span = old.span.clone();
                         }
-                    } else if (verb == "create" || verb == "add" || verb == "upsert" || verb == "insert") && new.file_origin.is_none() {
+                    } else if (verb == "create"
+                        || verb == "add"
+                        || verb == "upsert"
+                        || verb == "insert")
+                        && new.file_origin.is_none()
+                    {
                         // Fail loud if it's a completely new entity with no placement info
                         return Ok(ToolCallResult::error(format!(
                             "Cannot commit transaction {}: Payload for new entity '{}' missing required 'file_origin'.",
@@ -682,9 +687,17 @@ pub async fn handle_transaction_commit<G: GraphStore>(
                     }
 
                     if verb == "create" || verb == "add" || verb == "upsert" || verb == "insert" {
-                        if old_opt.is_some() && (verb == "upsert" || verb == "create" || verb == "add" || verb == "insert") {
+                        if old_opt.is_some()
+                            && (verb == "upsert"
+                                || verb == "create"
+                                || verb == "add"
+                                || verb == "insert")
+                        {
                             // Convert upserts of existing entities into Modified deltas to avoid duplicates
-                            entity_deltas.push(kin_model::change::EntityDelta::Modified { old: old_opt.unwrap(), new });
+                            entity_deltas.push(kin_model::change::EntityDelta::Modified {
+                                old: old_opt.unwrap(),
+                                new,
+                            });
                         } else {
                             entity_deltas.push(kin_model::change::EntityDelta::Added(new));
                         }

@@ -162,13 +162,13 @@ pub fn link_cross_file_against_entities(
                 .entry(&*entity.name)
                 .or_default()
                 .push((file_path, entity.id));
-                
+
             let bare_name = match entity.name.rfind("::") {
                 Some(idx) => &entity.name[idx + 2..],
                 None => match entity.name.rfind('.') {
                     Some(idx) => &entity.name[idx + 1..],
                     None => &*entity.name,
-                }
+                },
             };
             if bare_name != entity.name {
                 entity_by_bare_name

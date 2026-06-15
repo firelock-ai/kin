@@ -30,16 +30,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.96.0
 
-      - name: Configure kin cargo registry
-        # .cargo/config.toml is gitignored; write the registry alias the
-        # committed Cargo.toml needs to resolve the published kin-* crates from
-        # the kinlab.ai sparse registry. Mirrors ci.yml / release.yml / Dockerfile.
+      - name: Verify kin cargo registry config
+        # Preserve the tracked config because it carries public Git [patch.kin]
+        # pins for kin-* crates that are not all registry-published yet.
         run: |
-          mkdir -p .cargo
-          cat > .cargo/config.toml <<'TOML'
-          [registries.kin]
-          index = "sparse+https://kinlab.ai/registry/cargo/"
-          TOML
+          test -f .cargo/config.toml
+          grep -q '^\[registries\.kin\]' .cargo/config.toml
+          grep -q '^kin-blobs = { git = ' .cargo/config.toml
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
@@ -53,9 +50,8 @@ jobs:
             ${{ runner.os }}-cargo-smoke-
             ${{ runner.os }}-cargo-
 
-      # Committed Cargo.lock is registry-flavoured (kin-* resolve from the
-      # kinlab.ai sparse registry with checksums), so --locked enforces a frozen,
-      # reproducible resolve here, matching ci.yml.
+      # Cargo.lock and .cargo/config.toml together pin kin-* deps to public
+      # source until every crate is registry-published.
       - name: Build kin + kin-daemon
         run: cargo build --bin kin --bin kin-daemon --locked
 

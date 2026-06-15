@@ -237,6 +237,14 @@ async fn run_idle_monitor(
         if *cancel_rx.borrow() {
             return;
         }
+        if control_plane_missing(&state) {
+            warn!(
+                root = %state.layout.root().display(),
+                "Kin control directory disappeared; shutting down daemon"
+            );
+            let _ = cancel_tx.send(true);
+            return;
+        }
         if ready_for_idle_shutdown(&state, idle_timeout) {
             if state.is_dirty() {
                 if control_plane_missing(&state) {

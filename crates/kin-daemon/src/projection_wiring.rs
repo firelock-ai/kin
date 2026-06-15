@@ -571,10 +571,13 @@ mod tests {
 
         // Step 3: Call project_after_mcp_commit (the production hook).
         drop(reconciler); // release lock before calling the async helper
-        let (modified_files, warnings, conflicts) =
-            project_after_mcp_commit(&state, &[pre_commit_entity.clone()], &HashMap::new())
-                .await
-                .expect("projection must succeed");
+        let (modified_files, warnings, conflicts) = project_after_mcp_commit(
+            &state,
+            std::slice::from_ref(&pre_commit_entity),
+            &HashMap::new(),
+        )
+        .await
+        .expect("projection must succeed");
 
         assert_eq!(
             modified_files.len(),
@@ -648,7 +651,10 @@ mod tests {
             .find(|e| e.name == "foo")
             .cloned()
             .expect("foo must be present in the reconcile overlay");
-        let span = pre_commit_entity.span.clone().expect("foo must have a span");
+        let span = pre_commit_entity
+            .span
+            .clone()
+            .expect("foo must have a span");
 
         apply_overlay_to_graph(state.graph.as_ref(), &mut overlay)
             .expect("apply overlay must succeed");
@@ -683,14 +689,13 @@ mod tests {
         // immediately after project_after_mcp_commit below.
         let snap_before = state.graph.to_snapshot();
         let changes_before = snap_before.changes.len();
-        let revisions_before: usize =
-            snap_before.entity_revisions.values().map(|v| v.len()).sum();
+        let revisions_before: usize = snap_before.entity_revisions.values().map(|v| v.len()).sum();
 
         // Step 3: project with the supplied body (the FIR-934 carrier).
         let mut bodies = HashMap::new();
         bodies.insert(pre_commit_entity.id, new_body.clone());
         let (modified_files, warnings, conflicts) =
-            project_after_mcp_commit(&state, &[pre_commit_entity.clone()], &bodies)
+            project_after_mcp_commit(&state, std::slice::from_ref(&pre_commit_entity), &bodies)
                 .await
                 .expect("projection must succeed");
 
@@ -709,8 +714,7 @@ mod tests {
             changes_before,
             "no-clobber resync must mint no SemanticChange (revision-free convergence)"
         );
-        let revisions_after: usize =
-            snap_after.entity_revisions.values().map(|v| v.len()).sum();
+        let revisions_after: usize = snap_after.entity_revisions.values().map(|v| v.len()).sum();
         assert_eq!(
             revisions_after, revisions_before,
             "no-clobber resync must append no EntityRevision generation (no FIR-937 re-embed churn)"
@@ -719,7 +723,10 @@ mod tests {
         // Step 4 (assertion a): the file now holds the agent's NEW text — a real
         // edit, NOT the identity splice the old write-loop produced.
         let on_disk = std::fs::read(&file_path).expect("projected file must exist");
-        assert_ne!(on_disk, original, "file must change (not an identity no-op)");
+        assert_ne!(
+            on_disk, original,
+            "file must change (not an identity no-op)"
+        );
         let on_disk_str = String::from_utf8(on_disk).expect("projected file is utf-8");
         assert!(
             on_disk_str.contains("{ 42 }"),
