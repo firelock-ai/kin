@@ -25,7 +25,6 @@ impl ArtifactId {
         Self(Uuid::new_v4())
     }
 
-    /// Deterministically derive an artifact ID from a graph-owned file path.
     /// Deterministic minting seed (UUIDv5 of the path) for artifact identity.
     ///
     /// This is the low-level primitive the **graph assigner** and the **v7→v8
@@ -110,15 +109,14 @@ pub trait RetrievalKeyFileResolver {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::{ArtifactId, RetrievalKey};
 
     #[test]
     fn artifact_id_is_deterministic_for_same_path() {
-        let left = ArtifactId::from_path("src/lib.rs");
-        let right = ArtifactId::from_path("src/lib.rs");
-        let other = ArtifactId::from_path("src/main.rs");
+        let left = ArtifactId::seed_from_path("src/lib.rs");
+        let right = ArtifactId::seed_from_path("src/lib.rs");
+        let other = ArtifactId::seed_from_path("src/main.rs");
 
         assert_eq!(left, right);
         assert_ne!(left, other);
@@ -126,7 +124,7 @@ mod tests {
 
     #[test]
     fn retrieval_key_roundtrips_through_json() {
-        let key = RetrievalKey::Artifact(ArtifactId::from_path("Makefile"));
+        let key = RetrievalKey::Artifact(ArtifactId::seed_from_path("Makefile"));
         let json = serde_json::to_string(&key).unwrap();
         let parsed: RetrievalKey = serde_json::from_str(&json).unwrap();
 
