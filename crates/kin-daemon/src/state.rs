@@ -226,6 +226,10 @@ pub struct DaemonState {
     /// kvec, post-pass snapshot), and a full-graph flush on every starved
     /// feed gap multiplies FS events that starve the feed further.
     pub active_embed_passes: AtomicU32,
+    /// True after a bounded explicit embed pass has claimed the embed resource.
+    /// The background worker stays paused so a time-limited foreground command
+    /// cannot return while the daemon keeps draining the same large backfill.
+    pub background_embed_paused: AtomicBool,
     /// Last externally visible daemon activity, measured as milliseconds since
     /// `started_at`. Used by opt-in idle shutdown for CLI-autostarted daemons.
     pub last_activity_ms: AtomicU64,
@@ -480,6 +484,7 @@ impl DaemonState {
             last_save: std::sync::Mutex::new(Instant::now()),
             last_mutation: std::sync::Mutex::new(Instant::now()),
             active_embed_passes: AtomicU32::new(0),
+            background_embed_paused: AtomicBool::new(false),
             last_activity_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
@@ -602,6 +607,7 @@ impl DaemonState {
             last_save: std::sync::Mutex::new(Instant::now()),
             last_mutation: std::sync::Mutex::new(Instant::now()),
             active_embed_passes: AtomicU32::new(0),
+            background_embed_paused: AtomicBool::new(false),
             last_activity_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
@@ -1453,6 +1459,21 @@ impl DaemonState {
         self.active_embed_passes.load(Ordering::SeqCst) > 0
     }
 
+    /// True when the background embedding worker should stand down.
+    pub fn background_embed_paused(&self) -> bool {
+        self.background_embed_paused.load(Ordering::SeqCst)
+    }
+
+    /// Pause background embedding. Explicit `kin embed` requests can still run.
+    pub fn pause_background_embed(&self) {
+        self.background_embed_paused.store(true, Ordering::SeqCst);
+    }
+
+    /// Resume background embedding after unbounded or fully completed embed work.
+    pub fn resume_background_embed(&self) {
+        self.background_embed_paused.store(false, Ordering::SeqCst);
+    }
+
     /// Mark a daemon-side embed pass as in flight for the lifetime of the
     /// returned guard. Counter-based so overlapping callers compose; the
     /// guard decrements on drop, including error returns and panic unwinds
@@ -1624,6 +1645,7 @@ mod tests {
             last_save: std::sync::Mutex::new(Instant::now()),
             last_mutation: std::sync::Mutex::new(Instant::now()),
             active_embed_passes: AtomicU32::new(0),
+            background_embed_paused: AtomicBool::new(false),
             last_activity_ms: AtomicU64::new(0),
             active_requests: AtomicU64::new(0),
             lsp_enrichment_tx: None,
@@ -1753,6 +1775,20 @@ mod tests {
 
         drop(outer);
         assert!(!state.embed_pass_active());
+    }
+
+    #[test]
+    fn background_embed_pause_latch_round_trips() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+        assert!(!state.background_embed_paused());
+
+        state.pause_background_embed();
+        assert!(state.background_embed_paused());
+
+        state.resume_background_embed();
+        assert!(!state.background_embed_paused());
     }
 
     #[test]

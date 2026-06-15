@@ -65,8 +65,13 @@ fn should_queue_missing_embedding_pass(indexed: usize, total: usize) -> bool {
     indexed < total
 }
 
-fn effective_batch_size(requested: usize) -> usize {
-    requested.max(1)
+fn effective_batch_size(requested: usize, bounded: bool) -> usize {
+    let requested = requested.max(1);
+    if bounded {
+        requested.min(DEFAULT_BATCH_SIZE)
+    } else {
+        requested
+    }
 }
 
 /// Ask the repo daemon to build embeddings for the current repo's graph.
@@ -179,7 +184,7 @@ pub fn build_embed_response(
         graph.queue_missing_for_embedding();
         graph.queue_missing_artifacts_for_embedding();
     }
-    let effective_batch_size = effective_batch_size(request.batch_size);
+    let effective_batch_size = effective_batch_size(request.batch_size, deadline.is_some());
 
     // Embed entities with per-batch progress
     let embed_start = std::time::Instant::now();
@@ -290,12 +295,23 @@ mod tests {
 
     #[test]
     fn effective_batch_size_respects_nonzero_request() {
-        assert_eq!(effective_batch_size(512), 512);
+        assert_eq!(effective_batch_size(512, false), 512);
+    }
+
+    #[test]
+    fn effective_batch_size_caps_bounded_requests_to_default() {
+        assert_eq!(effective_batch_size(512, true), DEFAULT_BATCH_SIZE);
+    }
+
+    #[test]
+    fn effective_batch_size_keeps_small_bounded_requests() {
+        assert_eq!(effective_batch_size(16, true), 16);
     }
 
     #[test]
     fn effective_batch_size_clamps_zero_to_one() {
-        assert_eq!(effective_batch_size(0), 1);
+        assert_eq!(effective_batch_size(0, false), 1);
+        assert_eq!(effective_batch_size(0, true), 1);
     }
 
     #[test]

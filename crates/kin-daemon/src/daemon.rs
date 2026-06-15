@@ -817,6 +817,14 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                 if *embed_cancel.borrow() {
                     break 'wake;
                 }
+                if embed_state.background_embed_paused() {
+                    debug!("embedding worker paused after bounded explicit embed");
+                    break;
+                }
+                if embed_state.embed_pass_active() {
+                    debug!("embedding worker yielding to explicit embed pass");
+                    break;
+                }
                 let pending = embed_state.graph.pending_embeddings();
                 let pending_artifacts = embed_state.graph.pending_artifact_embeddings();
                 if pending == 0 && pending_artifacts == 0 {

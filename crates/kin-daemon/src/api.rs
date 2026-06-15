@@ -3193,6 +3193,16 @@ async fn embed(
 
     let state_for_embed = Arc::clone(&state);
     let result = tokio::task::spawn_blocking(move || {
+        let bounded_request = req.max_seconds.is_some_and(|seconds| seconds > 0);
+        if bounded_request {
+            state_for_embed.pause_background_embed();
+        } else {
+            state_for_embed.resume_background_embed();
+        }
+        // Mark the explicit pass before waiting on the embedding mutex. The
+        // background worker checks this flag between batches and stands down,
+        // so a foreground bounded embed cannot be starved by worker re-locks.
+        let _embed_pass = state_for_embed.begin_embed_pass();
         let _guard = state_for_embed
             .embedding_work
             .lock()
@@ -3200,7 +3210,6 @@ async fn embed(
         // Suppress the background idle flush for the duration of the pass —
         // this handler does its own pre/per-batch/post persistence, and a
         // full-graph flush per feed gap amplifies FS churn on large repos.
-        let _embed_pass = state_for_embed.begin_embed_pass();
 
         // Pin graph.kndb on disk at the current root hash H before embedding so
         // the per-batch kvec flushes (which tag metadata with H) match on reopen.
@@ -3266,6 +3275,9 @@ async fn embed(
             is_cancelled,
         )
         .map_err(|error| format!("embed build failed: {error:#}"))?;
+        if !bounded_request || !result.result.time_limited {
+            state_for_embed.resume_background_embed();
+        }
         if result.result.total_entities > 0 || result.result.total_artifacts > 0 {
             state_for_embed.bump_version();
             state_for_embed
