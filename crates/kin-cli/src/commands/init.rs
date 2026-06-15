@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{anyhow, Context, Result};
-use kin_index::{link_cross_file_against_entities, FileClassification, FileClassifier};
+use kin_index::{FileClassification, FileClassifier};
 use kin_model::ChangeStore;
 use kin_model::EntityStore;
 use kin_model::VerificationStore;
@@ -10,7 +10,7 @@ use kin_model::{
     ArtifactId, AuthorId, Entity, EntityDelta, EntityFilter, EntityId, FileLayout, FilePathId,
     GraphNodeId, Hash256, OpaqueArtifact, ParseCompleteness, Relation, RelationDelta, RelationId,
     RelationKind, RelationOrigin, SemanticChange, SemanticChangeId, ShallowTrackedFile,
-    StructuredArtifact, TestCase, TestId, TestKind, TestRunner, Timestamp, WorkScope,
+    SourceRegion, StructuredArtifact, TestCase, TestId, TestKind, TestRunner, Timestamp, WorkScope,
 };
 use kin_projection::build_layout;
 use rayon::prelude::*;
@@ -29,7 +29,7 @@ const SNAPSHOT_SKIP_DIRS: &[&str] = &[".git/objects", ".git/pack"];
 
 const INIT_WARM_CACHE_SCHEMA_VERSION: &str = "v1";
 pub(crate) const INIT_WARM_CACHE_PIPELINE_EPOCH: &str =
-    "init-warm-2026-06-12-content-addressed-change-id";
+    "init-warm-2026-06-15-stable-delta-entity-ids";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct WarmCacheBundleManifestEntry {
@@ -1399,10 +1399,86 @@ fn reconcile_imported_file_entities(
     (entity_deltas, current_entities)
 }
 
+fn stabilize_reparsed_file_entities(
+    old_entities: &[Entity],
+    parsed_entities: &mut [Entity],
+    layout: &mut FileLayout,
+    discovered_tests: &mut [DiscoveredTest],
+) {
+    let mut remap = HashMap::<EntityId, EntityId>::new();
+    let mut matched_old_entities = HashSet::<EntityId>::new();
+
+    for parsed_entity in parsed_entities.iter_mut() {
+        let parser_id = parsed_entity.id;
+        let existing = old_entities
+            .iter()
+            .filter(|candidate| !matched_old_entities.contains(&candidate.id))
+            .find(|candidate| {
+                candidate.name == parsed_entity.name && candidate.kind == parsed_entity.kind
+            });
+
+        if let Some(old) = existing {
+            parsed_entity.id = old.id;
+            parsed_entity.lineage_parent = old.lineage_parent.clone();
+            parsed_entity.created_in = old.created_in;
+            matched_old_entities.insert(old.id);
+            remap.insert(parser_id, old.id);
+        } else {
+            remap.insert(parser_id, parser_id);
+        }
+    }
+
+    remap_layout_entity_ids(layout, &remap);
+    remap_discovered_test_entity_ids(discovered_tests, &remap);
+}
+
+fn remap_layout_entity_ids(layout: &mut FileLayout, remap: &HashMap<EntityId, EntityId>) {
+    for region in &mut layout.regions {
+        if let SourceRegion::EntityRef { entity_id, .. } = region {
+            if let Some(stable_id) = remap.get(entity_id) {
+                *entity_id = *stable_id;
+            }
+        }
+    }
+}
+
+fn remap_discovered_test_entity_ids(
+    discovered_tests: &mut [DiscoveredTest],
+    remap: &HashMap<EntityId, EntityId>,
+) {
+    for discovered in discovered_tests {
+        if let Some(entity_id) = discovered.entity_id.as_mut() {
+            if let Some(stable_id) = remap.get(entity_id) {
+                *entity_id = *stable_id;
+            }
+        }
+        for target_id in &mut discovered.target_entity_ids {
+            if let Some(stable_id) = remap.get(target_id) {
+                *target_id = *stable_id;
+            }
+        }
+    }
+}
+
 fn index_files(
     graph: &kin_db::InMemoryGraph,
     blob_store: &kin_blobs::BlobStore,
     files: &[IndexableFile],
+) -> Result<(
+    usize,
+    usize,
+    Vec<kin_index::FileParseData>,
+    Vec<DiscoveredTest>,
+    Vec<Relation>,
+)> {
+    index_files_with_stable_entity_ids(graph, blob_store, files, &HashMap::new())
+}
+
+fn index_files_with_stable_entity_ids(
+    graph: &kin_db::InMemoryGraph,
+    blob_store: &kin_blobs::BlobStore,
+    files: &[IndexableFile],
+    prior_entities_by_file: &HashMap<String, Vec<Entity>>,
 ) -> Result<(
     usize,
     usize,
@@ -1418,7 +1494,7 @@ fn index_files(
 
     // Phase 1: parallel parse — read files, write blobs, parse with tree-sitter.
     // Each thread gets its own AdapterRegistry (tree-sitter parsers are per-thread).
-    let parse_results: Vec<ParsedFileResult> = files
+    let mut parse_results: Vec<ParsedFileResult> = files
         .par_iter()
         .map(|file| {
             let source = match fs::read(&file.abs_path) {
@@ -1566,6 +1642,27 @@ fn index_files(
             }
         })
         .collect();
+
+    if !prior_entities_by_file.is_empty() {
+        for result in &mut parse_results {
+            let ParsedFileResult::EntitySource {
+                rel_path,
+                entities,
+                discovered_tests,
+                layout,
+                ..
+            } = result
+            else {
+                continue;
+            };
+
+            let Some(prior_entities) = prior_entities_by_file.get(rel_path) else {
+                continue;
+            };
+
+            stabilize_reparsed_file_entities(prior_entities, entities, layout, discovered_tests);
+        }
+    }
 
     eprintln!();
 
@@ -2058,70 +2155,108 @@ fn apply_warm_cache_delta(
         };
     }
 
-    let mut impacted_files = reverse_dependency_closure(
-        graph,
-        diff.modified_files.iter().chain(diff.removed_files.iter()),
-    )?;
-    impacted_files.extend(diff.modified_files.iter().cloned());
+    let file_map: HashMap<&str, &IndexableFile> = indexable_files
+        .iter()
+        .map(|file| (file.rel_path.as_str(), file))
+        .collect();
+
+    let old_entities_by_file = collect_prior_entities_by_file(graph, diff.modified_files.iter())?;
+    let old_source_relations =
+        collect_source_relations_for_files(graph, diff.modified_files.iter())?;
     dphase!(
-        "reverse_dependency_closure",
-        "impacted={}",
-        impacted_files.len()
+        "snapshot_changed_file_state",
+        "modified={} source_rels={}",
+        old_entities_by_file.len(),
+        old_source_relations.len()
     );
 
-    let mut files_to_clear = impacted_files.clone();
-    files_to_clear.extend(diff.removed_files.iter().cloned());
-    for path in &files_to_clear {
+    let removed_artifact_relation_ids =
+        collect_artifact_relation_ids_for_files(graph, diff.removed_files.iter())?;
+    remove_relations_batch_by_id(graph, &removed_artifact_relation_ids)?;
+    for path in &diff.removed_files {
         clear_file_semantic_state(graph, path)?;
     }
     dphase!(
-        "clear_file_semantic_state",
-        "cleared={}",
-        files_to_clear.len()
+        "clear_removed_file_state",
+        "removed={} artifact_rels={}",
+        diff.removed_files.len(),
+        removed_artifact_relation_ids.len()
     );
 
-    let mut reparsed_paths = impacted_files;
+    let mut reparsed_paths = BTreeSet::new();
+    reparsed_paths.extend(diff.modified_files.iter().cloned());
     reparsed_paths.extend(diff.added_files.iter().cloned());
     if reparsed_paths.is_empty() {
         return Ok(WarmCacheDeltaResult::default());
     }
 
-    let file_map: HashMap<&str, &IndexableFile> = indexable_files
-        .iter()
-        .map(|file| (file.rel_path.as_str(), file))
-        .collect();
     let selected_files: Vec<IndexableFile> = reparsed_paths
         .iter()
         .filter_map(|path| file_map.get(path.as_str()).copied().cloned())
         .collect();
+    let selected_paths: BTreeSet<String> = selected_files
+        .iter()
+        .map(|file| file.rel_path.clone())
+        .collect();
+    let unindexed_modified_files: Vec<String> = diff
+        .modified_files
+        .iter()
+        .filter(|path| !selected_paths.contains(*path))
+        .cloned()
+        .collect();
+    for path in &unindexed_modified_files {
+        clear_file_semantic_state(graph, path)?;
+    }
+    for file in &selected_files {
+        clear_file_tracking_for_reparse(graph, &file.rel_path, &file.classification)?;
+    }
     dphase!(
         "select_files_to_reparse",
-        "selected={}",
-        selected_files.len()
+        "selected={} unindexed_modified={}",
+        selected_files.len(),
+        unindexed_modified_files.len()
     );
 
-    let (_, _, file_parse_data, _, projection_relations) =
-        index_files(graph, blob_store, &selected_files)?;
+    let (_, _, file_parse_data, _, projection_relations) = index_files_with_stable_entity_ids(
+        graph,
+        blob_store,
+        &selected_files,
+        &old_entities_by_file,
+    )?;
     dphase!("index_files (reparse)");
+
+    remove_stale_reparsed_entities(graph, &old_entities_by_file, &file_parse_data)?;
+    dphase!("remove_stale_reparsed_entities");
 
     let queued_embeddings = file_parse_data
         .iter()
         .flat_map(|file| file.entities.iter().map(|entity| entity.id))
         .collect();
-    let universe_entities = graph.query_entities(&EntityFilter::default())?;
+    let incremental_linker = build_incremental_linker_from_graph(graph)?;
     dphase!(
-        "query_entities (universe)",
-        "universe={}",
-        universe_entities.len()
+        "build_incremental_linker",
+        "known_files={}",
+        incremental_linker.known_files.len()
     );
 
     let mut linked_relations =
-        link_cross_file_against_entities(&file_parse_data, &universe_entities);
+        kin_index::link_cross_file_incremental(&file_parse_data, &incremental_linker);
     linked_relations.extend(projection_relations);
+    let new_relation_ids: HashSet<RelationId> = linked_relations
+        .iter()
+        .map(|relation| relation.id)
+        .collect();
+    let stale_source_relation_ids: Vec<RelationId> = old_source_relations
+        .keys()
+        .filter(|relation_id| !new_relation_ids.contains(relation_id))
+        .copied()
+        .collect();
+    remove_relations_batch_by_id(graph, &stale_source_relation_ids)?;
     dphase!(
-        "link_cross_file_against_entities",
-        "relations={}",
-        linked_relations.len()
+        "link_changed_files_incremental",
+        "relations={} stale_source_rels={}",
+        linked_relations.len(),
+        stale_source_relation_ids.len()
     );
 
     graph.upsert_relations_batch(&linked_relations)?;
@@ -2133,39 +2268,169 @@ fn apply_warm_cache_delta(
     })
 }
 
-fn reverse_dependency_closure<'a, I>(
+fn collect_prior_entities_by_file<'a, I>(
     graph: &kin_db::InMemoryGraph,
-    seed_files: I,
-) -> Result<BTreeSet<String>>
+    files: I,
+) -> Result<HashMap<String, Vec<Entity>>>
 where
     I: IntoIterator<Item = &'a String>,
 {
-    let _span = tracing::info_span!("kin.init.reverse_dependency_closure").entered();
-    let mut visited = BTreeSet::new();
+    let mut by_file = HashMap::new();
+    for file in files {
+        let entities = entities_for_file(graph, file)?;
+        if !entities.is_empty() {
+            by_file.insert(file.clone(), entities);
+        }
+    }
+    Ok(by_file)
+}
 
-    for file in seed_files {
-        visited.insert(file.clone());
-        for entity in entities_for_file(graph, &file)? {
+fn collect_source_relations_for_files<'a, I>(
+    graph: &kin_db::InMemoryGraph,
+    files: I,
+) -> Result<HashMap<RelationId, Relation>>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let mut relations = HashMap::new();
+    for file in files {
+        for entity in entities_for_file(graph, file)? {
             for relation in graph.get_all_relations_for_entity(&entity.id)? {
-                if relation.dst != GraphNodeId::Entity(entity.id) {
-                    continue;
+                if relation.src == GraphNodeId::Entity(entity.id) {
+                    relations.insert(relation.id, relation);
                 }
-                let Some(src_entity_id) = relation.src.as_entity() else {
-                    continue;
-                };
-                let Some(src_entity) = graph.get_entity(&src_entity_id)? else {
-                    continue;
-                };
-                let Some(src_file) = src_entity.file_origin.as_ref().map(|path| path.0.clone())
-                else {
-                    continue;
-                };
-                visited.insert(src_file);
+            }
+        }
+
+        let artifact_node = GraphNodeId::Artifact(artifact_id_for_file(graph, file));
+        for relation in graph.get_all_relations_for_node(&artifact_node)? {
+            if relation.src == artifact_node {
+                relations.insert(relation.id, relation);
             }
         }
     }
+    Ok(relations)
+}
 
-    Ok(visited)
+fn collect_artifact_relation_ids_for_files<'a, I>(
+    graph: &kin_db::InMemoryGraph,
+    files: I,
+) -> Result<Vec<RelationId>>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let mut relation_ids = HashSet::new();
+    for file in files {
+        let artifact_node = GraphNodeId::Artifact(artifact_id_for_file(graph, file));
+        for relation in graph.get_all_relations_for_node(&artifact_node)? {
+            relation_ids.insert(relation.id);
+        }
+    }
+    Ok(relation_ids.into_iter().collect())
+}
+
+fn artifact_id_for_file(graph: &kin_db::InMemoryGraph, path: &str) -> ArtifactId {
+    graph
+        .artifact_id_for_path(&FilePathId::new(path))
+        .unwrap_or_else(|| {
+            #[allow(deprecated)]
+            {
+                ArtifactId::from_path(path)
+            }
+        })
+}
+
+fn remove_relations_batch_by_id(
+    graph: &kin_db::InMemoryGraph,
+    relation_ids: &[RelationId],
+) -> Result<()> {
+    let relation_refs: Vec<&RelationId> = relation_ids.iter().collect();
+    graph.remove_relations_batch(&relation_refs)?;
+    Ok(())
+}
+
+fn clear_file_tracking_for_reparse(
+    graph: &kin_db::InMemoryGraph,
+    path: &str,
+    classification: &FileClassification,
+) -> Result<()> {
+    let file_id = FilePathId::new(path);
+    match classification {
+        FileClassification::EntitySource => {
+            graph.delete_shallow_file(&file_id)?;
+            graph.delete_structured_artifact(&file_id)?;
+            graph.delete_opaque_artifact(&file_id)?;
+        }
+        FileClassification::ShallowSyntax { .. } => {
+            graph.delete_file_layout(&file_id)?;
+            graph.delete_structured_artifact(&file_id)?;
+            graph.delete_opaque_artifact(&file_id)?;
+        }
+        FileClassification::StructuredArtifact(_) => {
+            graph.delete_file_layout(&file_id)?;
+            graph.delete_shallow_file(&file_id)?;
+            graph.delete_opaque_artifact(&file_id)?;
+        }
+        FileClassification::OpaqueArtifact { .. } => {
+            graph.delete_file_layout(&file_id)?;
+            graph.delete_shallow_file(&file_id)?;
+            graph.delete_structured_artifact(&file_id)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_stale_reparsed_entities(
+    graph: &kin_db::InMemoryGraph,
+    old_entities_by_file: &HashMap<String, Vec<Entity>>,
+    file_parse_data: &[kin_index::FileParseData],
+) -> Result<()> {
+    let current_ids_by_file: HashMap<&str, HashSet<EntityId>> = file_parse_data
+        .iter()
+        .map(|file| {
+            (
+                file.file_path.as_str(),
+                file.entities.iter().map(|entity| entity.id).collect(),
+            )
+        })
+        .collect();
+
+    for (file, old_entities) in old_entities_by_file {
+        let current_ids = current_ids_by_file.get(file.as_str());
+        let stale_ids: Vec<EntityId> = old_entities
+            .iter()
+            .filter(|entity| {
+                current_ids
+                    .map(|ids| !ids.contains(&entity.id))
+                    .unwrap_or(true)
+            })
+            .map(|entity| entity.id)
+            .collect();
+        graph.remove_entities_batch(&stale_ids)?;
+    }
+    Ok(())
+}
+
+fn build_incremental_linker_from_graph(
+    graph: &kin_db::InMemoryGraph,
+) -> Result<kin_index::IncrementalLinker> {
+    let mut linker = kin_index::IncrementalLinker::new();
+    for path in graph.indexed_file_paths() {
+        linker.known_files.insert(path);
+    }
+
+    let mut entities_by_file = BTreeMap::<String, Vec<Entity>>::new();
+    for entity in graph.query_entities(&EntityFilter::default())? {
+        let Some(file_path) = entity.file_origin.as_ref().map(|path| path.0.clone()) else {
+            continue;
+        };
+        entities_by_file.entry(file_path).or_default().push(entity);
+    }
+    for (file_path, entities) in entities_by_file {
+        linker.add_file(&file_path, &entities);
+    }
+
+    Ok(linker)
 }
 
 fn entities_for_file(graph: &kin_db::InMemoryGraph, path: &str) -> Result<Vec<Entity>> {
@@ -2187,6 +2452,7 @@ fn clear_file_semantic_state(graph: &kin_db::InMemoryGraph, path: &str) -> Resul
     graph.delete_shallow_file(&file_id)?;
     graph.delete_structured_artifact(&file_id)?;
     graph.delete_opaque_artifact(&file_id)?;
+    graph.delete_file_layout(&file_id)?;
     Ok(())
 }
 
@@ -3193,6 +3459,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn warm_cache_delta_reuses_entity_ids_and_remaps_relation_endpoints() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let blob_dir = tempfile::tempdir().unwrap();
+        let root = repo_dir.path();
+
+        let tools_path = root.join("src/utils/tools.ts");
+        let api_path = root.join("src/routes/api.ts");
+        fs::create_dir_all(tools_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(api_path.parent().unwrap()).unwrap();
+        fs::write(&tools_path, "export function executeTool() { return 1; }\n").unwrap();
+        fs::write(
+            &api_path,
+            "import { executeTool } from '../utils/tools';\nexport function handler() { executeTool(); }\n",
+        )
+        .unwrap();
+
+        let blob_store = kin_blobs::BlobStore::new(blob_dir.path().join("objects")).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        let all_files = collect_source_files(root).unwrap();
+        let indexable_files = collect_indexable_files(root, &all_files).unwrap();
+        parse_and_index(&graph, &blob_store, &indexable_files).unwrap();
+
+        let handler_before = entity_by_name(&graph, "src/routes/api.ts", "handler");
+        let handler_start_line_before = handler_before.span.as_ref().unwrap().start_line;
+        let callee = entity_by_name(&graph, "src/utils/tools.ts", "executeTool");
+        assert!(
+            has_call_relation(&graph, handler_before.id, callee.id),
+            "initial graph should link handler -> executeTool"
+        );
+
+        fs::write(
+            &api_path,
+            "// inserted header shifts parser start_line\nimport { executeTool } from '../utils/tools';\nexport function handler() { executeTool(); }\n",
+        )
+        .unwrap();
+        let all_files = collect_source_files(root).unwrap();
+        let indexable_files = collect_indexable_files(root, &all_files).unwrap();
+        let diff = kin_db::engine::IncrementalDiff {
+            added_files: Vec::new(),
+            modified_files: vec!["src/routes/api.ts".to_string()],
+            removed_files: Vec::new(),
+        };
+
+        let delta = apply_warm_cache_delta(&graph, &blob_store, &indexable_files, &diff).unwrap();
+        assert_eq!(delta.reparsed_files, 1);
+
+        let handler_after = entity_by_name(&graph, "src/routes/api.ts", "handler");
+        assert_eq!(
+            handler_after.id, handler_before.id,
+            "warm delta must preserve stable entity ID across parser start_line drift"
+        );
+        assert!(
+            handler_after.span.as_ref().unwrap().start_line > handler_start_line_before,
+            "the entity span should reflect the shifted source location"
+        );
+        assert!(
+            has_call_relation(&graph, handler_after.id, callee.id),
+            "relation endpoints must be remapped to stable entity IDs"
+        );
+    }
+
     fn artifact_delta(
         file_path: &str,
         kind: kin_model::ArtifactDeltaKind,
@@ -3233,6 +3561,36 @@ mod tests {
             },
             git_oid: hex::encode(id_bytes),
         }
+    }
+
+    fn entity_by_name(graph: &kin_db::InMemoryGraph, file: &str, name: &str) -> Entity {
+        let matches = entities_for_file(graph, file)
+            .unwrap()
+            .into_iter()
+            .filter(|entity| entity.name == name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one entity named {name} in {file}, got {matches:?}"
+        );
+        matches.into_iter().next().unwrap()
+    }
+
+    fn has_call_relation(
+        graph: &kin_db::InMemoryGraph,
+        src_entity: EntityId,
+        dst_entity: EntityId,
+    ) -> bool {
+        graph
+            .get_all_relations_for_entity(&src_entity)
+            .unwrap()
+            .into_iter()
+            .any(|relation| {
+                relation.kind == RelationKind::Calls
+                    && relation.src == GraphNodeId::Entity(src_entity)
+                    && relation.dst == GraphNodeId::Entity(dst_entity)
+            })
     }
 
     fn test_entity(name: &str, file: &str) -> Entity {

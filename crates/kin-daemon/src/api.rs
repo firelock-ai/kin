@@ -8,7 +8,7 @@ use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use crate::state::DaemonEvent;
+use crate::state::{DaemonEvent, DaemonState, ProjectionChangedSet};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -27,8 +27,6 @@ use serde_json::json;
 use socket2::{Domain, Protocol, Socket, Type};
 use tracing::info;
 use uuid::Uuid;
-
-use crate::state::DaemonState;
 
 static BOOTSTRAP_EXPORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
@@ -1673,10 +1671,9 @@ async fn graph_commit(
         graph.record_audit_event(audit).map_err(internal_error)?;
     }
 
-    // Broadcast root hash change and mark dirty for background persistence.
-    // The background persistence task will flush to disk asynchronously —
-    // the CLI doesn't wait for disk I/O.
+    // Broadcast root hash change and compact the delta journal at the commit boundary.
     state.bump_version();
+    state.save_snapshot_full().map_err(internal_error)?;
     state.emit_event(DaemonEvent::GraphRootChanged {
         old_root_hash: None,
         new_root_hash: request.change.id.to_string(),
@@ -2440,6 +2437,7 @@ async fn command_commit(
 
     // Broadcast events and mark dirty for background persistence.
     state.bump_version();
+    state.save_snapshot_full().map_err(internal_error)?;
     state.emit_event(DaemonEvent::GraphRootChanged {
         old_root_hash: None,
         new_root_hash: change_id.to_string(),
@@ -5549,6 +5547,10 @@ async fn vfs_file_changed(
                     .persist_projection_truth_from_reconcile(&reconciler, &outcome)
                     .map_err(internal_error)?;
             }
+            let mut projection_changed = ProjectionChangedSet::default();
+            if should_apply {
+                projection_changed.record_reconcile_outcome(&outcome);
+            }
             drop(wc);
             drop(reconciler);
             tracing::debug!(path = %request.path, ?outcome, "reconciled file change");
@@ -5599,12 +5601,12 @@ async fn vfs_file_changed(
                 _ => (0, 0, 0),
             };
 
-            // Bump version counter and rebuild projection so subsequent
+            // Bump version counter and refresh projection so subsequent
             // VFS reads serve updated FileLayouts.
-            if added_count + modified_count + removed_count > 0 {
+            if !projection_changed.is_empty() {
                 state.bump_version(); // marks dirty for background persistence
-                if let Err(e) = state.rebuild_projection().await {
-                    tracing::warn!(error = %e, "failed to rebuild projection after write-back");
+                if let Err(e) = state.refresh_projection(&projection_changed).await {
+                    tracing::warn!(error = %e, "failed to refresh projection after write-back");
                 }
             }
 
@@ -5708,6 +5710,10 @@ async fn vfs_write_notify(
                     .persist_projection_truth_from_reconcile(&reconciler, &outcome)
                     .map_err(internal_error)?;
             }
+            let mut projection_changed = ProjectionChangedSet::default();
+            if should_apply {
+                projection_changed.record_reconcile_outcome(&outcome);
+            }
 
             let entity_count = match &outcome {
                 kin_reconcile::ReconcileOutcome::Updated {
@@ -5756,10 +5762,10 @@ async fn vfs_write_notify(
             drop(wc);
             drop(reconciler);
 
-            if entity_count > 0 {
+            if !projection_changed.is_empty() {
                 state.bump_version(); // marks dirty for background persistence
-                if let Err(e) = state.rebuild_projection().await {
-                    tracing::warn!(error = %e, "failed to rebuild projection after write-notify");
+                if let Err(e) = state.refresh_projection(&projection_changed).await {
+                    tracing::warn!(error = %e, "failed to refresh projection after write-notify");
                 }
             }
 

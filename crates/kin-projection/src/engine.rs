@@ -69,6 +69,12 @@ impl ProjectionState {
         self.file_contents.insert(file_id, content);
     }
 
+    /// Remove a file from the projection cache.
+    pub fn remove_file(&mut self, file_id: &FilePathId) {
+        self.layouts.remove(file_id);
+        self.file_contents.remove(file_id);
+    }
+
     /// Get the layout for a file.
     pub fn get_layout(&self, file_id: &FilePathId) -> Option<&FileLayout> {
         self.layouts.get(file_id)

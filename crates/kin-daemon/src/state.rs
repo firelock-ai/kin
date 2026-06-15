@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use kin_blobs::BlobStore;
 use kin_core::KinLayout;
 use kin_db::StorageBackend;
-use kin_model::{EntityId, EntityStore, GraphOverlay, WorkingCopy};
+use kin_model::{EntityId, EntityStore, FilePathId, GraphOverlay, WorkingCopy};
 use kin_projection::ProjectionState;
 use kin_reconcile::Reconciler;
 use tokio::sync::RwLock;
@@ -69,6 +69,40 @@ pub struct LspEnrichmentRequest {
     pub file_path: std::path::PathBuf,
     /// Entity IDs that were added or modified — only these get queried via LSP.
     pub changed_entity_ids: Vec<kin_model::EntityId>,
+}
+
+#[derive(Debug, Default)]
+pub struct ProjectionChangedSet {
+    pub upserted: HashSet<FilePathId>,
+    pub removed: HashSet<FilePathId>,
+}
+
+impl ProjectionChangedSet {
+    pub fn is_empty(&self) -> bool {
+        self.upserted.is_empty() && self.removed.is_empty()
+    }
+
+    pub fn record_reconcile_outcome(&mut self, outcome: &kin_reconcile::ReconcileOutcome) {
+        match outcome {
+            kin_reconcile::ReconcileOutcome::Updated { file_id, .. } => {
+                self.upsert(file_id.clone());
+            }
+            kin_reconcile::ReconcileOutcome::FileRemoved { file_id, .. } => {
+                self.remove(file_id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    pub fn upsert(&mut self, file_id: FilePathId) {
+        self.removed.remove(&file_id);
+        self.upserted.insert(file_id);
+    }
+
+    pub fn remove(&mut self, file_id: FilePathId) {
+        self.upserted.remove(&file_id);
+        self.removed.insert(file_id);
+    }
 }
 
 /// Messages sent to the LSP enrichment worker.
@@ -1052,6 +1086,14 @@ impl DaemonState {
     /// `.kin/kindb/generation` so CLI and MCP processes can detect
     /// when their loaded snapshot is stale (P2-2.7).
     pub fn save_snapshot(&self) -> Result<()> {
+        self.save_snapshot_impl(false)
+    }
+
+    pub fn save_snapshot_full(&self) -> Result<()> {
+        self.save_snapshot_impl(true)
+    }
+
+    fn save_snapshot_impl(&self, force_full: bool) -> Result<()> {
         // Serialize the whole kndb + generation-marker + kidx write sequence
         // against any other save (persist loop, idle flush, embed worker).
         // Without this, two concurrent saves race on the shared tmp paths and
@@ -1063,33 +1105,57 @@ impl DaemonState {
             .map_err(|_| DaemonError::Io(std::io::Error::other("persist lock poisoned")))?;
 
         let repo_id = self.cached_repo_id.as_str();
+        let expected_gen = self.snapshot_generation.load(Ordering::SeqCst);
 
         let new_gen = if let Some(backend) = &self.storage_backend {
-            let (bytes, _) = self
-                .graph
-                .serialize_snapshot_borrowed()
-                .map_err(DaemonError::from)?;
-            let expected_gen = self.snapshot_generation.load(Ordering::SeqCst);
-
-            backend
-                .save_snapshot(repo_id, &bytes, expected_gen)
-                .map_err(DaemonError::from)?
-        } else {
+            if force_full || self.graph.full_snapshot_required() {
+                let (bytes, _) = self
+                    .graph
+                    .serialize_snapshot_borrowed()
+                    .map_err(DaemonError::from)?;
+                let generation = backend
+                    .save_snapshot(repo_id, &bytes, expected_gen)
+                    .map_err(DaemonError::from)?;
+                backend.clear_deltas(repo_id).map_err(DaemonError::from)?;
+                self.graph.clear_pending_delta();
+                self.graph.clear_full_snapshot_required();
+                generation
+            } else if let Some(delta) = self.graph.pending_delta_snapshot(expected_gen) {
+                let bytes = delta.to_bytes().map_err(DaemonError::from)?;
+                let generation = backend
+                    .save_delta(repo_id, &bytes, expected_gen)
+                    .map_err(DaemonError::from)?;
+                self.graph.clear_pending_delta();
+                self.graph.flush_text_index().map_err(DaemonError::from)?;
+                generation
+            } else {
+                self.graph.flush_text_index().map_err(DaemonError::from)?;
+                expected_gen
+            }
+        } else if force_full {
             kin_db::SnapshotManager::save_graph(
                 self.layout.kindb_snapshot_path(),
                 self.graph.as_ref(),
             )
             .map_err(DaemonError::from)?;
-            self.snapshot_generation
-                .load(Ordering::SeqCst)
-                .saturating_add(1)
+            expected_gen.saturating_add(1)
+        } else {
+            kin_db::SnapshotManager::save_graph_delta(
+                self.layout.kindb_snapshot_path(),
+                self.graph.as_ref(),
+                expected_gen,
+            )
+            .map_err(DaemonError::from)?
+            .unwrap_or(expected_gen)
         };
 
         self.snapshot_generation.store(new_gen, Ordering::SeqCst);
 
-        // Write generation marker so CLI/MCP can detect stale snapshots.
-        self.write_generation_marker(new_gen);
-        self.save_read_index()?;
+        if new_gen != expected_gen || force_full {
+            // Write generation marker so CLI/MCP can detect stale snapshots.
+            self.write_generation_marker(new_gen);
+            self.save_read_index()?;
+        }
 
         // The on-disk snapshot now reflects the current graph; advance the
         // anti-wipe baseline so a later shutdown is measured against what was
@@ -1229,6 +1295,79 @@ impl DaemonState {
             disk_fallback = disk_fallback,
             skipped = skipped,
             "rebuilt projection state via per-file fallback (older snapshot without file hashes)"
+        );
+        Ok(())
+    }
+
+    /// Refresh projection state for a touched-file set.
+    ///
+    /// This is the warm path after reconcile/VFS writes: removed files are
+    /// evicted from the projection cache, and added/modified files are loaded
+    /// from graph-owned layout + blob content. Missing hashes retain the same
+    /// per-file working-tree fallback used by `rebuild_projection`.
+    pub async fn refresh_projection(&self, changed: &ProjectionChangedSet) -> Result<()> {
+        if changed.is_empty() {
+            return Ok(());
+        }
+
+        let mut projection = self.projection.write().await;
+        let mut loaded = 0usize;
+        let mut disk_fallback = 0usize;
+        let mut removed = 0usize;
+        let mut skipped = 0usize;
+
+        for file_id in &changed.removed {
+            projection.remove_file(file_id);
+            removed += 1;
+        }
+
+        for file_id in &changed.upserted {
+            let Some(layout) = self
+                .graph
+                .get_file_layout(file_id)
+                .map_err(DaemonError::from)?
+            else {
+                projection.remove_file(file_id);
+                skipped += 1;
+                continue;
+            };
+
+            let blob_content = self
+                .graph
+                .get_file_hash(&file_id.0)
+                .and_then(|raw| self.blobs.read(&kin_blobs::Hash256::from_bytes(raw)).ok());
+
+            if let Some(content) = blob_content {
+                projection.register_file(layout, content);
+                loaded += 1;
+                continue;
+            }
+
+            let file_path = self.layout.working_dir().join(file_id.0.as_str());
+            match std::fs::read(&file_path) {
+                Ok(content) => {
+                    projection.register_file(layout, content);
+                    disk_fallback += 1;
+                }
+                Err(e) => {
+                    projection.remove_file(file_id);
+                    warn!(
+                        file = %file_id,
+                        error = %e,
+                        "skipping projection refresh for file not in blobs or disk"
+                    );
+                    skipped += 1;
+                }
+            }
+        }
+
+        info!(
+            upserted = loaded + disk_fallback,
+            graph_backed = loaded,
+            disk_fallback,
+            removed,
+            skipped,
+            "refreshed projection state for changed files"
         );
         Ok(())
     }

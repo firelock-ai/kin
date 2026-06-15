@@ -13,7 +13,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::{DaemonError, Result};
 use crate::state::{
-    ChangeType, DaemonEvent, DaemonState, LspEnrichmentRequest, RECON_IDLE, RECON_PROCESSING,
+    ChangeType, DaemonEvent, DaemonState, LspEnrichmentRequest, ProjectionChangedSet, RECON_IDLE,
+    RECON_PROCESSING,
 };
 
 /// Configuration for the reconciliation loop.
@@ -175,6 +176,7 @@ pub async fn run_loop(
         let mut reconciler = state.reconciler.write().await;
         let mut working_copy = state.working_copy.write().await;
         let mut graph_changed = false;
+        let mut projection_changed = ProjectionChangedSet::default();
 
         let mut lsp_changed: Vec<(PathBuf, Vec<kin_model::EntityId>)> = Vec::new();
 
@@ -206,6 +208,7 @@ pub async fn run_loop(
                         {
                             warn!(error = %e, "failed to persist projection truth after reconcile");
                         }
+                        projection_changed.record_reconcile_outcome(&outcome);
                         graph_changed = true;
                     }
 
@@ -332,13 +335,18 @@ pub async fn run_loop(
             });
         }
 
-        // Rebuild projection cache so VFS reads serve fresh content.
+        // Refresh projection cache so VFS reads serve fresh content.
         // Persistence is handled by the background save task — the reconcile
-        // loop just marks the graph dirty and rebuilds the projection.
+        // loop just marks the graph dirty and refreshes touched projection rows.
         if graph_changed {
             state.mark_dirty();
-            if let Err(e) = state.rebuild_projection().await {
-                error!(error = %e, "failed to rebuild projection after reconciliation");
+            let projection_result = if projection_changed.is_empty() {
+                state.rebuild_projection().await
+            } else {
+                state.refresh_projection(&projection_changed).await
+            };
+            if let Err(e) = projection_result {
+                error!(error = %e, "failed to refresh projection after reconciliation");
             }
         }
 
@@ -593,6 +601,7 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
     let mut reconciler = state.reconciler.write().await;
     let mut working_copy = state.working_copy.write().await;
     let mut graph_changed = false;
+    let mut projection_changed = ProjectionChangedSet::default();
 
     for event in events {
         match reconciler.reconcile_file_change(
@@ -620,6 +629,7 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
                     {
                         warn!(error = %e, "failed to persist projection truth after sync");
                     }
+                    projection_changed.record_reconcile_outcome(&outcome);
 
                     // Call the cleanup if it's a FileRemoved outcome!
                     if let ReconcileOutcome::FileRemoved {
@@ -658,8 +668,13 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
     if graph_changed {
         state.mark_dirty();
         state.bump_version();
-        if let Err(e) = state.rebuild_projection().await {
-            error!(error = %e, "failed to rebuild projection after sync");
+        let projection_result = if projection_changed.is_empty() {
+            state.rebuild_projection().await
+        } else {
+            state.refresh_projection(&projection_changed).await
+        };
+        if let Err(e) = projection_result {
+            error!(error = %e, "failed to refresh projection after sync");
         }
     }
 
