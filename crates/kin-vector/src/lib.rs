@@ -103,6 +103,8 @@ const EF_CONSTRUCTION: usize = 200;
 /// Default beam width during search.
 const EF_SEARCH: usize = 50;
 
+type CanonicalOrderItem<Id> = (u64, Vec<u8>, Id, Vec<f32>, usize);
+
 /// Normalization factor for level generation: 1 / ln(M).
 fn ml() -> f64 {
     1.0 / (M as f64).ln()
@@ -818,8 +820,7 @@ impl<Id: VectorId> HnswGraph<Id> {
         let dimensions = self.dimensions;
         let rng_state = self.rng_state;
         let descriptor = self.descriptor.clone();
-        let mut items: Vec<(u64, Vec<u8>, Id, Vec<f32>, usize)> =
-            Vec::with_capacity(self.id_to_idx.len());
+        let mut items: Vec<CanonicalOrderItem<Id>> = Vec::with_capacity(self.id_to_idx.len());
 
         for (&id, &idx) in &self.id_to_idx {
             let node = self.nodes.get(idx).ok_or_else(|| {
