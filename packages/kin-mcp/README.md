@@ -31,7 +31,7 @@ For a pinned alpha:
   "mcpServers": {
     "kin": {
       "command": "npx",
-      "args": ["-y", "kin-mcp@0.1.0-alpha.25"]
+      "args": ["-y", "kin-mcp@0.1.0-alpha.26"]
     }
   }
 }
