@@ -689,51 +689,11 @@ mod tests {
             .unwrap();
 
         // Save a delta
-        let delta = crate::storage::delta::GraphSnapshotDelta {
-            base_generation: gen1,
-            entities: Default::default(),
-            relations: Default::default(),
-            outgoing: Default::default(),
-            incoming: Default::default(),
-            changes: Default::default(),
-            change_children: Default::default(),
-            branches: Default::default(),
-            work_items: Default::default(),
-            annotations: Default::default(),
-            work_links: Default::default(),
-            reviews: Default::default(),
-            review_decisions: Default::default(),
-            review_notes: Default::default(),
-            review_discussions: Default::default(),
-            review_assignments: Default::default(),
-            test_cases: Default::default(),
-            assertions: Default::default(),
-            verification_runs: Default::default(),
-            test_covers_entity: Default::default(),
-            test_covers_contract: Default::default(),
-            test_verifies_work: Default::default(),
-            run_proves_entity: Default::default(),
-            run_proves_work: Default::default(),
-            mock_hints: Default::default(),
-            contracts: Default::default(),
-            actors: Default::default(),
-            delegations: Default::default(),
-            approvals: Default::default(),
-            audit_events: Default::default(),
-            shallow_files: Default::default(),
-            file_layouts: Default::default(),
-            structured_artifacts: Default::default(),
-            opaque_artifacts: Default::default(),
-            file_hashes: crate::storage::delta::CollectionDelta {
-                added: vec![("new.rs".to_string(), [42; 32])],
-                modified: vec![],
-                removed: vec![],
-            },
-            sessions: Default::default(),
-            intents: Default::default(),
-            downstream_warnings: Default::default(),
-            entity_revisions: Default::default(),
-        };
+        let mut delta = crate::storage::delta::GraphSnapshotDelta::empty(gen1);
+        delta
+            .file_hashes
+            .added
+            .push(("new.rs".to_string(), [42; 32]));
         let delta_bytes = delta.to_bytes().unwrap();
         let gen2 = backend.save_delta("test-repo", &delta_bytes, gen1).unwrap();
         assert_eq!(gen2, 2);

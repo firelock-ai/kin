@@ -151,6 +151,8 @@ pub struct GraphSnapshotDelta {
     #[serde(default)]
     pub opaque_artifacts: VecDelta<OpaqueArtifact>,
     pub file_hashes: CollectionDelta<String, [u8; 32]>,
+    #[serde(default)]
+    pub artifact_index: CollectionDelta<FilePathId, ArtifactId>,
 
     // Sessions/intents
     pub sessions: CollectionDelta<SessionId, AgentSession>,
@@ -169,6 +171,52 @@ impl GraphSnapshotDelta {
 
     /// Size of the SHA-256 checksum appended to the wire format.
     pub const CHECKSUM_LEN: usize = 32;
+
+    /// Construct an empty delta rooted at `base_generation`.
+    pub fn empty(base_generation: Generation) -> Self {
+        Self {
+            base_generation,
+            entities: CollectionDelta::default(),
+            relations: CollectionDelta::default(),
+            outgoing: CollectionDelta::default(),
+            incoming: CollectionDelta::default(),
+            changes: CollectionDelta::default(),
+            change_children: CollectionDelta::default(),
+            branches: CollectionDelta::default(),
+            work_items: CollectionDelta::default(),
+            annotations: CollectionDelta::default(),
+            work_links: VecDelta::default(),
+            reviews: CollectionDelta::default(),
+            review_decisions: CollectionDelta::default(),
+            review_notes: VecDelta::default(),
+            review_discussions: VecDelta::default(),
+            review_assignments: CollectionDelta::default(),
+            test_cases: CollectionDelta::default(),
+            assertions: CollectionDelta::default(),
+            verification_runs: CollectionDelta::default(),
+            test_covers_entity: VecDelta::default(),
+            test_covers_contract: VecDelta::default(),
+            test_verifies_work: VecDelta::default(),
+            run_proves_entity: VecDelta::default(),
+            run_proves_work: VecDelta::default(),
+            mock_hints: VecDelta::default(),
+            contracts: CollectionDelta::default(),
+            actors: CollectionDelta::default(),
+            delegations: VecDelta::default(),
+            approvals: VecDelta::default(),
+            audit_events: VecDelta::default(),
+            shallow_files: VecDelta::default(),
+            file_layouts: VecDelta::default(),
+            structured_artifacts: VecDelta::default(),
+            opaque_artifacts: VecDelta::default(),
+            file_hashes: CollectionDelta::default(),
+            artifact_index: CollectionDelta::default(),
+            sessions: CollectionDelta::default(),
+            intents: CollectionDelta::default(),
+            downstream_warnings: VecDelta::default(),
+            entity_revisions: CollectionDelta::default(),
+        }
+    }
 
     /// Returns true if this delta contains no changes.
     pub fn is_empty(&self) -> bool {
@@ -206,9 +254,11 @@ impl GraphSnapshotDelta {
             && self.structured_artifacts.is_empty()
             && self.opaque_artifacts.is_empty()
             && self.file_hashes.is_empty()
+            && self.artifact_index.is_empty()
             && self.sessions.is_empty()
             && self.intents.is_empty()
             && self.downstream_warnings.is_empty()
+            && self.entity_revisions.is_empty()
     }
 
     /// Total number of individual changes across all collections.
@@ -229,6 +279,7 @@ impl GraphSnapshotDelta {
             + self.actors.change_count()
             + self.file_layouts.change_count()
             + self.file_hashes.change_count()
+            + self.artifact_index.change_count()
             + self.sessions.change_count()
             + self.intents.change_count()
     }
@@ -462,6 +513,7 @@ pub fn compute_graph_delta(
         structured_artifacts: diff_vecs(&old.structured_artifacts, &new.structured_artifacts),
         opaque_artifacts: diff_vecs(&old.opaque_artifacts, &new.opaque_artifacts),
         file_hashes: diff_maps_eq(&old.file_hashes, &new.file_hashes),
+        artifact_index: diff_maps(&old.artifact_index, &new.artifact_index),
         sessions: diff_maps(&old.sessions, &new.sessions),
         intents: diff_maps(&old.intents, &new.intents),
         downstream_warnings: diff_vecs(&old.downstream_warnings, &new.downstream_warnings),
@@ -573,6 +625,7 @@ pub fn apply_graph_delta(snapshot: &mut GraphSnapshot, delta: &GraphSnapshotDelt
     );
     apply_vec_delta(&mut snapshot.opaque_artifacts, &delta.opaque_artifacts);
     apply_map_delta(&mut snapshot.file_hashes, &delta.file_hashes);
+    apply_map_delta(&mut snapshot.artifact_index, &delta.artifact_index);
 
     // Sessions/intents
     apply_map_delta(&mut snapshot.sessions, &delta.sessions);

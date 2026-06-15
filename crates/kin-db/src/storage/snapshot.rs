@@ -10,6 +10,8 @@ use std::sync::Arc;
 
 use crate::engine::InMemoryGraph;
 use crate::error::KinDbError;
+use crate::storage::backend::Generation;
+use crate::storage::delta::{apply_graph_delta, GraphSnapshotDelta};
 use crate::storage::format::CompactionStats;
 use crate::storage::merkle::compute_graph_root_hash;
 use crate::storage::mmap;
@@ -43,6 +45,122 @@ fn text_index_dir_for(snapshot_path: &Path) -> Option<PathBuf> {
 
 fn locate_cache_path_for(snapshot_path: &Path) -> PathBuf {
     snapshot_path.with_extension("kloc")
+}
+
+fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = std::ffi::OsString::from(path.as_os_str());
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn local_delta_dir_for(snapshot_path: &Path) -> PathBuf {
+    append_suffix(snapshot_path, ".deltas")
+}
+
+fn local_delta_path(snapshot_path: &Path, generation: u64) -> PathBuf {
+    local_delta_dir_for(snapshot_path).join(format!("{generation:020}.kndd"))
+}
+
+fn local_delta_generation(path: &Path) -> Option<u64> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.parse::<u64>().ok())
+}
+
+fn local_delta_files(snapshot_path: &Path) -> Result<Vec<(u64, PathBuf)>, KinDbError> {
+    let dir = local_delta_dir_for(snapshot_path);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(|err| {
+        KinDbError::StorageError(format!(
+            "failed to read local delta directory {}: {err}",
+            dir.display()
+        ))
+    })? {
+        let entry = entry.map_err(|err| {
+            KinDbError::StorageError(format!(
+                "failed to read local delta entry in {}: {err}",
+                dir.display()
+            ))
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("kndd") {
+            continue;
+        }
+        if let Some(generation) = local_delta_generation(&path) {
+            files.push((generation, path));
+        }
+    }
+    files.sort_by_key(|(generation, _)| *generation);
+    Ok(files)
+}
+
+fn local_delta_count(snapshot_path: &Path) -> Result<usize, KinDbError> {
+    Ok(local_delta_files(snapshot_path)?.len())
+}
+
+fn apply_local_deltas(
+    snapshot_path: &Path,
+    mut snapshot: crate::storage::GraphSnapshot,
+    persisted_root_hash: Option<[u8; 32]>,
+) -> Result<(crate::storage::GraphSnapshot, Option<[u8; 32]>, usize), KinDbError> {
+    let files = local_delta_files(snapshot_path)?;
+    if files.is_empty() {
+        return Ok((snapshot, persisted_root_hash, 0));
+    }
+
+    for (_, path) in &files {
+        let bytes = std::fs::read(path).map_err(|err| {
+            KinDbError::StorageError(format!(
+                "failed to read local delta {}: {err}",
+                path.display()
+            ))
+        })?;
+        let delta = GraphSnapshotDelta::from_bytes(&bytes)?;
+        apply_graph_delta(&mut snapshot, &delta);
+    }
+    Ok((snapshot, None, files.len()))
+}
+
+fn write_local_delta(
+    snapshot_path: &Path,
+    delta: &GraphSnapshotDelta,
+    fallback_generation: u64,
+) -> Result<u64, KinDbError> {
+    let dir = local_delta_dir_for(snapshot_path);
+    std::fs::create_dir_all(&dir).map_err(|err| {
+        KinDbError::StorageError(format!(
+            "failed to create local delta directory {}: {err}",
+            dir.display()
+        ))
+    })?;
+    let next_generation = local_delta_files(snapshot_path)?
+        .last()
+        .map(|(generation, _)| generation.saturating_add(1))
+        .unwrap_or_else(|| fallback_generation.saturating_add(1));
+    let path = local_delta_path(snapshot_path, next_generation);
+    let bytes = delta.to_bytes()?;
+    mmap::atomic_write_bytes_no_magic(&path, &bytes)?;
+    Ok(next_generation)
+}
+
+fn clear_local_deltas(snapshot_path: &Path) -> Result<(), KinDbError> {
+    let dir = local_delta_dir_for(snapshot_path);
+    if !dir.exists() {
+        return Ok(());
+    }
+    for (_, path) in local_delta_files(snapshot_path)? {
+        std::fs::remove_file(&path).map_err(|err| {
+            KinDbError::StorageError(format!(
+                "failed to remove local delta {}: {err}",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "vector")]
@@ -822,6 +940,9 @@ impl SnapshotManager {
             ))
         })?;
 
+        let (snapshot, persisted_root_hash, _) =
+            apply_local_deltas(path, snapshot, persisted_root_hash)?;
+
         Ok(Self::graph_from_snapshot(
             snapshot,
             text_index_path,
@@ -850,13 +971,24 @@ impl SnapshotManager {
                 let _span = tracing::info_span!("kindb.snapshot.open_mmap").entered();
                 mmap::MmapReader::open_with_persisted_root_hash(path)
             } {
-                Ok(snapshot) => Ok(Self::graph_from_snapshot(
-                    snapshot.0,
-                    text_index_path,
-                    read_only,
-                    skip_text_index,
-                    snapshot.1,
-                )),
+                Ok(snapshot) => {
+                    let (snapshot, persisted_root_hash, delta_count) =
+                        apply_local_deltas(path, snapshot.0, snapshot.1)?;
+                    if delta_count > 0 {
+                        tracing::info!(
+                            path = %path.display(),
+                            delta_count,
+                            "replayed local snapshot deltas on open"
+                        );
+                    }
+                    Ok(Self::graph_from_snapshot(
+                        snapshot,
+                        text_index_path,
+                        read_only,
+                        skip_text_index,
+                        persisted_root_hash,
+                    ))
+                }
                 Err(err) => Self::recover_graph_from_tmp(
                     path,
                     Some(&err),
@@ -940,6 +1072,13 @@ impl SnapshotManager {
             persistent_text_index = text_index_path.is_some()
         )
         .entered();
+        if path.exists() && local_delta_count(path)? > 0 {
+            tracing::info!(
+                path = %path.display(),
+                "bypassing locate cache because local snapshot deltas are pending"
+            );
+            return Self::open_graph(path, text_index_path, true, false);
+        }
         let (graph, graph_root_hash) = if path.exists() {
             let hinted_root_hash = mmap::MmapReader::read_persisted_root_hash_unverified(path)?;
             if let Some(root_hash) = hinted_root_hash {
@@ -1199,7 +1338,44 @@ impl SnapshotManager {
             Self::save_vector_index_bundle(&path, graph, graph_root_hash, None)?;
         }
 
+        clear_local_deltas(&path)?;
+        graph.clear_pending_delta();
+        graph.clear_full_snapshot_required();
+
         Ok(graph_root_hash)
+    }
+
+    /// Append the graph's mutation-time delta to the local journal.
+    ///
+    /// This is the steady-state durability path between semantic commits. It
+    /// never diffs the old snapshot against a cloned current graph; callers
+    /// supply the current durable generation marker and the graph supplies the
+    /// already-recorded mutation delta. If a full snapshot is required, or no
+    /// base snapshot exists yet, this falls back to a full save/compaction.
+    pub fn save_graph_delta(
+        path: impl Into<PathBuf>,
+        graph: &InMemoryGraph,
+        base_generation: Generation,
+    ) -> Result<Option<Generation>, KinDbError> {
+        let path = normalize_snapshot_path(path.into());
+        if graph.full_snapshot_required() || !path.exists() {
+            Self::save_graph_with_hash(path.clone(), graph, None)?;
+            return Ok(Some(base_generation.saturating_add(1)));
+        }
+
+        let Some(delta) = graph.pending_delta_snapshot(base_generation) else {
+            graph.flush_text_index()?;
+            return Ok(None);
+        };
+        if delta.is_empty() {
+            graph.flush_text_index()?;
+            return Ok(None);
+        }
+
+        let generation = write_local_delta(&path, &delta, base_generation)?;
+        graph.clear_pending_delta();
+        graph.flush_text_index()?;
+        Ok(Some(generation))
     }
 
     /// Persist the vector sidecar and matching metadata for a live graph.
@@ -1230,8 +1406,10 @@ impl SnapshotManager {
         // for the live graph's current content — it diverged across byte-identical
         // preps in the FIR-814 identity experiment (ROOT_HASH_MATCH=0/26). The
         // canonical recompute is prep-invariant and equals what the load-time gate
-        // compares against; the hint remains in use for the lock-guarded kndb trailer.
-        let graph_root_hash = compute_graph_root_hash(&graph.to_snapshot());
+        // compares against; the hint remains in use for the lock-guarded kndb
+        // trailer. Use the borrowed live graph so this does not clone the full
+        // snapshot just to stamp the sidecar.
+        let graph_root_hash = graph.recompute_root_hash();
         Self::save_vector_index_bundle(&path, graph, graph_root_hash, embedder_identity)
     }
 
@@ -1248,20 +1426,7 @@ impl SnapshotManager {
             return Ok(None);
         }
 
-        let old_snapshot = mmap::MmapReader::open(&self.path)?;
-        let current_snapshot = self.graph().to_snapshot();
-
-        let delta = crate::storage::delta::compute_graph_delta(
-            &old_snapshot,
-            &current_snapshot,
-            0, // generation is set by the StorageBackend on save
-        );
-
-        if delta.is_empty() {
-            return Ok(None);
-        }
-
-        Ok(Some(delta))
+        Ok(self.graph().pending_delta_snapshot(0))
     }
 
     /// Replace the current graph with a new one (RCU swap).
@@ -1386,6 +1551,51 @@ mod tests {
         let graph2 = mgr2.graph();
         let fetched = graph2.get_entity(&id).unwrap().unwrap();
         assert_eq!(fetched.name, "save_test");
+    }
+
+    #[test]
+    fn local_delta_save_replays_on_reopen_and_full_save_compacts() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let mgr = SnapshotManager::new(&path);
+        let graph = mgr.graph();
+        let mut entity = test_entity("delta_fn");
+        graph.upsert_entity(&entity).unwrap();
+        graph.set_file_hash("src/main.rs", [1; 32]);
+        mgr.save().unwrap();
+        assert_eq!(local_delta_count(&path).unwrap(), 0);
+
+        entity.signature = "fn delta_fn() -> i32".to_string();
+        graph.upsert_entity(&entity).unwrap();
+        graph.set_file_hash("src/main.rs", [2; 32]);
+
+        let generation = SnapshotManager::save_graph_delta(&path, graph.as_ref(), 1)
+            .unwrap()
+            .expect("changed graph should write a local delta");
+        assert_eq!(generation, 2);
+        assert!(!graph.has_pending_delta());
+        assert_eq!(local_delta_count(&path).unwrap(), 1);
+
+        let reopened = SnapshotManager::open_read_only(&path).unwrap();
+        let reopened_graph = reopened.graph();
+        let loaded = reopened_graph
+            .get_entity(&entity.id)
+            .unwrap()
+            .expect("delta entity should replay on reopen");
+        assert_eq!(loaded.signature, "fn delta_fn() -> i32");
+        assert_eq!(
+            reopened_graph.get_file_hash("src/main.rs"),
+            Some([2; 32]),
+            "delta file hash should replay on reopen"
+        );
+
+        SnapshotManager::save_graph(&path, reopened_graph.as_ref()).unwrap();
+        assert_eq!(
+            local_delta_count(&path).unwrap(),
+            0,
+            "full save should compact local delta journal"
+        );
     }
 
     #[test]

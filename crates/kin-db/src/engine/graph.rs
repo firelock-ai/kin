@@ -17,7 +17,7 @@ use crate::search::{
 };
 use crate::storage::format::LocateGraphSnapshot;
 use crate::storage::merkle::{compute_graph_root_hash, compute_root_hash_generic, GraphHashSource};
-use crate::storage::GraphSnapshot;
+use crate::storage::{CollectionDelta, Generation, GraphSnapshot, GraphSnapshotDelta, VecDelta};
 use crate::store::{
     ChangeStore, EntityStore, GraphStore, ProvenanceStore, ReviewStore, SessionStore,
     VerificationStore, WorkStore,
@@ -579,6 +579,156 @@ struct SessionData {
     downstream_warnings: Vec<(IntentId, EntityId, String)>,
 }
 
+#[derive(Debug)]
+struct PendingGraphDelta {
+    delta: GraphSnapshotDelta,
+}
+
+impl Default for PendingGraphDelta {
+    fn default() -> Self {
+        Self {
+            delta: GraphSnapshotDelta::empty(0),
+        }
+    }
+}
+
+fn delta_map_upsert<K, V>(delta: &mut CollectionDelta<K, V>, key: K, value: V)
+where
+    K: Eq + Clone,
+    V: Clone,
+{
+    delta.removed.retain(|removed| removed != &key);
+    if let Some((_, existing)) = delta
+        .added
+        .iter_mut()
+        .find(|(existing_key, _)| existing_key == &key)
+    {
+        *existing = value;
+        return;
+    }
+    if let Some((_, existing)) = delta
+        .modified
+        .iter_mut()
+        .find(|(existing_key, _)| existing_key == &key)
+    {
+        *existing = value;
+        return;
+    }
+    delta.modified.push((key, value));
+}
+
+fn delta_map_remove<K, V>(delta: &mut CollectionDelta<K, V>, key: K)
+where
+    K: Eq + Clone,
+{
+    delta.added.retain(|(existing_key, _)| existing_key != &key);
+    delta
+        .modified
+        .retain(|(existing_key, _)| existing_key != &key);
+    if !delta.removed.iter().any(|removed| removed == &key) {
+        delta.removed.push(key);
+    }
+}
+
+fn delta_values_equal<V>(left: &V, right: &V) -> bool
+where
+    V: serde::Serialize,
+{
+    match (rmp_serde::to_vec(left), rmp_serde::to_vec(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn delta_vec_upsert_by_key<K, V, F>(delta: &mut VecDelta<V>, old: Option<V>, new: V, key_of: F)
+where
+    K: Eq,
+    V: Clone + serde::Serialize,
+    F: Fn(&V) -> K,
+{
+    let new_key = key_of(&new);
+    delta.added.retain(|existing| key_of(existing) != new_key);
+
+    let mut restored_base = false;
+    delta.removed.retain(|removed| {
+        if key_of(removed) != new_key {
+            return true;
+        }
+        if delta_values_equal(removed, &new) {
+            restored_base = true;
+            false
+        } else {
+            true
+        }
+    });
+    if restored_base {
+        return;
+    }
+
+    if let Some(old) = old {
+        if delta_values_equal(&old, &new) {
+            return;
+        }
+        if !delta
+            .removed
+            .iter()
+            .any(|removed| key_of(removed) == new_key)
+        {
+            delta.removed.push(old);
+        }
+    }
+    delta.added.push(new);
+}
+
+fn delta_vec_remove_by_key<K, V, F>(delta: &mut VecDelta<V>, old: Option<V>, key: K, key_of: F)
+where
+    K: Eq,
+    V: Clone,
+    F: Fn(&V) -> K,
+{
+    let mut had_pending_add = false;
+    delta.added.retain(|existing| {
+        if key_of(existing) == key {
+            had_pending_add = true;
+            false
+        } else {
+            true
+        }
+    });
+    if had_pending_add {
+        return;
+    }
+    if let Some(old) = old {
+        if !delta.removed.iter().any(|removed| key_of(removed) == key) {
+            delta.removed.push(old);
+        }
+    }
+}
+
+fn record_edge_list_delta(pending: &mut PendingGraphDelta, ent: &EntityData, entity_id: EntityId) {
+    match ent.outgoing.get(&entity_id).cloned() {
+        Some(outgoing) => delta_map_upsert(&mut pending.delta.outgoing, entity_id, outgoing),
+        None => delta_map_remove(&mut pending.delta.outgoing, entity_id),
+    }
+    match ent.incoming.get(&entity_id).cloned() {
+        Some(incoming) => delta_map_upsert(&mut pending.delta.incoming, entity_id, incoming),
+        None => delta_map_remove(&mut pending.delta.incoming, entity_id),
+    }
+}
+
+fn record_relation_edge_delta(
+    pending: &mut PendingGraphDelta,
+    ent: &EntityData,
+    relation: &Relation,
+) {
+    if let Some(src) = relation.src.as_entity() {
+        record_edge_list_delta(pending, ent, src);
+    }
+    if let Some(dst) = relation.dst.as_entity() {
+        record_edge_list_delta(pending, ent, dst);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Embedding queue — deterministic priority ordering
 // ---------------------------------------------------------------------------
@@ -831,6 +981,10 @@ pub struct InMemoryGraph {
     text_index: Option<TextIndex>,
     /// Cached Merkle root hash for the current graph state.
     snapshot_root_hash: parking_lot::RwLock<Option<[u8; 32]>>,
+    /// Mutation-time delta journal for O(change) persistence flushes between commits.
+    pending_delta: parking_lot::Mutex<PendingGraphDelta>,
+    /// True when a mutation touched a domain not yet covered by the O(change) journal.
+    full_snapshot_required: AtomicBool,
     /// True when the text index has uncommitted writes (upsert/remove without commit).
     text_dirty: AtomicBool,
     /// True when relation-derived text fields are stale and a full rebuild is
@@ -938,6 +1092,8 @@ impl InMemoryGraph {
             }),
             text_index,
             snapshot_root_hash: parking_lot::RwLock::new(None),
+            pending_delta: parking_lot::Mutex::new(PendingGraphDelta::default()),
+            full_snapshot_required: AtomicBool::new(false),
             text_dirty: AtomicBool::new(false),
             text_full_rebuild_required: AtomicBool::new(false),
             #[cfg(feature = "embeddings")]
@@ -1316,6 +1472,8 @@ impl InMemoryGraph {
             }),
             text_index,
             snapshot_root_hash: parking_lot::RwLock::new(None),
+            pending_delta: parking_lot::Mutex::new(PendingGraphDelta::default()),
+            full_snapshot_required: AtomicBool::new(false),
             text_dirty: AtomicBool::new(false),
             text_full_rebuild_required: AtomicBool::new(false),
             #[cfg(feature = "embeddings")]
@@ -1530,6 +1688,8 @@ impl InMemoryGraph {
             }),
             text_index,
             snapshot_root_hash: parking_lot::RwLock::new(None),
+            pending_delta: parking_lot::Mutex::new(PendingGraphDelta::default()),
+            full_snapshot_required: AtomicBool::new(false),
             text_dirty: AtomicBool::new(false),
             text_full_rebuild_required: AtomicBool::new(false),
             #[cfg(feature = "embeddings")]
@@ -1624,8 +1784,218 @@ impl InMemoryGraph {
     }
 
     #[inline]
+    pub fn has_pending_delta(&self) -> bool {
+        !self.pending_delta.lock().delta.is_empty()
+    }
+
+    pub fn take_pending_delta(&self, base_generation: Generation) -> Option<GraphSnapshotDelta> {
+        let mut pending = self.pending_delta.lock();
+        if pending.delta.is_empty() {
+            return None;
+        }
+        let mut delta = GraphSnapshotDelta::empty(base_generation);
+        std::mem::swap(&mut pending.delta, &mut delta);
+        delta.base_generation = base_generation;
+        Some(delta)
+    }
+
+    pub fn clear_pending_delta(&self) {
+        self.pending_delta.lock().delta = GraphSnapshotDelta::empty(0);
+    }
+
+    pub fn pending_delta_snapshot(
+        &self,
+        base_generation: Generation,
+    ) -> Option<GraphSnapshotDelta> {
+        let pending = self.pending_delta.lock();
+        if pending.delta.is_empty() {
+            return None;
+        }
+        let mut delta = pending.delta.clone();
+        delta.base_generation = base_generation;
+        Some(delta)
+    }
+
+    pub fn full_snapshot_required(&self) -> bool {
+        self.full_snapshot_required.load(Ordering::Acquire)
+    }
+
+    pub fn clear_full_snapshot_required(&self) {
+        self.full_snapshot_required.store(false, Ordering::Release);
+    }
+
+    fn require_full_snapshot(&self) {
+        self.full_snapshot_required.store(true, Ordering::Release);
+    }
+
+    #[inline]
     fn invalidate_snapshot_root_hash(&self) {
         *self.snapshot_root_hash.write() = None;
+    }
+
+    fn record_entity_delta_upsert(&self, entity: Entity) {
+        let mut pending = self.pending_delta.lock();
+        delta_map_upsert(&mut pending.delta.entities, entity.id, entity);
+    }
+
+    fn record_entity_delta_remove(&self, entity_id: EntityId) {
+        let mut pending = self.pending_delta.lock();
+        delta_map_remove(&mut pending.delta.entities, entity_id);
+        delta_map_remove(&mut pending.delta.entity_revisions, entity_id);
+    }
+
+    fn record_entity_revisions_delta_upsert(
+        &self,
+        entity_id: EntityId,
+        revisions: Vec<EntityRevision>,
+    ) {
+        let mut pending = self.pending_delta.lock();
+        delta_map_upsert(&mut pending.delta.entity_revisions, entity_id, revisions);
+    }
+
+    fn record_change_delta_upsert(&self, change: SemanticChange) {
+        let mut pending = self.pending_delta.lock();
+        delta_map_upsert(&mut pending.delta.changes, change.id, change);
+    }
+
+    fn record_change_children_delta_upsert(
+        &self,
+        change_id: SemanticChangeId,
+        children: Vec<SemanticChangeId>,
+    ) {
+        let mut pending = self.pending_delta.lock();
+        delta_map_upsert(&mut pending.delta.change_children, change_id, children);
+    }
+
+    fn record_branch_delta_upsert(&self, branch: Branch) {
+        let mut pending = self.pending_delta.lock();
+        delta_map_upsert(&mut pending.delta.branches, branch.name.clone(), branch);
+    }
+
+    fn record_branch_delta_remove(&self, name: BranchName) {
+        let mut pending = self.pending_delta.lock();
+        delta_map_remove(&mut pending.delta.branches, name);
+    }
+
+    fn record_relation_delta_upsert(&self, ent: &EntityData, relation: Relation) {
+        let mut pending = self.pending_delta.lock();
+        delta_map_upsert(&mut pending.delta.relations, relation.id, relation.clone());
+        record_relation_edge_delta(&mut pending, ent, &relation);
+    }
+
+    fn record_relation_delta_remove(&self, ent: &EntityData, relation: &Relation) {
+        let mut pending = self.pending_delta.lock();
+        delta_map_remove(&mut pending.delta.relations, relation.id);
+        record_relation_edge_delta(&mut pending, ent, relation);
+    }
+
+    fn record_file_hash_delta_upsert(&self, path: String, hash: [u8; 32]) {
+        let mut pending = self.pending_delta.lock();
+        delta_map_upsert(&mut pending.delta.file_hashes, path, hash);
+    }
+
+    fn record_file_hash_delta_remove(&self, path: String) {
+        let mut pending = self.pending_delta.lock();
+        delta_map_remove(&mut pending.delta.file_hashes, path);
+    }
+
+    fn record_artifact_index_delta_upsert(&self, path: FilePathId, artifact_id: ArtifactId) {
+        let mut pending = self.pending_delta.lock();
+        delta_map_upsert(&mut pending.delta.artifact_index, path, artifact_id);
+    }
+
+    fn record_artifact_index_delta_remove(&self, path: FilePathId) {
+        let mut pending = self.pending_delta.lock();
+        delta_map_remove(&mut pending.delta.artifact_index, path);
+    }
+
+    fn record_shallow_file_delta_upsert(
+        &self,
+        old: Option<ShallowTrackedFile>,
+        new: ShallowTrackedFile,
+    ) {
+        let mut pending = self.pending_delta.lock();
+        delta_vec_upsert_by_key(&mut pending.delta.shallow_files, old, new, |file| {
+            file.file_id.clone()
+        });
+    }
+
+    fn record_shallow_file_delta_remove(
+        &self,
+        old: Option<ShallowTrackedFile>,
+        file_id: FilePathId,
+    ) {
+        let mut pending = self.pending_delta.lock();
+        delta_vec_remove_by_key(&mut pending.delta.shallow_files, old, file_id, |file| {
+            file.file_id.clone()
+        });
+    }
+
+    fn record_file_layout_delta_upsert(&self, old: Option<FileLayout>, new: FileLayout) {
+        let mut pending = self.pending_delta.lock();
+        delta_vec_upsert_by_key(&mut pending.delta.file_layouts, old, new, |layout| {
+            layout.file_id.clone()
+        });
+    }
+
+    fn record_file_layout_delta_remove(&self, old: Option<FileLayout>, file_id: FilePathId) {
+        let mut pending = self.pending_delta.lock();
+        delta_vec_remove_by_key(&mut pending.delta.file_layouts, old, file_id, |layout| {
+            layout.file_id.clone()
+        });
+    }
+
+    fn record_structured_artifact_delta_upsert(
+        &self,
+        old: Option<StructuredArtifact>,
+        new: StructuredArtifact,
+    ) {
+        let mut pending = self.pending_delta.lock();
+        delta_vec_upsert_by_key(
+            &mut pending.delta.structured_artifacts,
+            old,
+            new,
+            |artifact| artifact.file_id.clone(),
+        );
+    }
+
+    fn record_structured_artifact_delta_remove(
+        &self,
+        old: Option<StructuredArtifact>,
+        file_id: FilePathId,
+    ) {
+        let mut pending = self.pending_delta.lock();
+        delta_vec_remove_by_key(
+            &mut pending.delta.structured_artifacts,
+            old,
+            file_id,
+            |artifact| artifact.file_id.clone(),
+        );
+    }
+
+    fn record_opaque_artifact_delta_upsert(
+        &self,
+        old: Option<OpaqueArtifact>,
+        new: OpaqueArtifact,
+    ) {
+        let mut pending = self.pending_delta.lock();
+        delta_vec_upsert_by_key(&mut pending.delta.opaque_artifacts, old, new, |artifact| {
+            artifact.file_id.clone()
+        });
+    }
+
+    fn record_opaque_artifact_delta_remove(
+        &self,
+        old: Option<OpaqueArtifact>,
+        file_id: FilePathId,
+    ) {
+        let mut pending = self.pending_delta.lock();
+        delta_vec_remove_by_key(
+            &mut pending.delta.opaque_artifacts,
+            old,
+            file_id,
+            |artifact| artifact.file_id.clone(),
+        );
     }
 
     fn refresh_text_index_for_entities(&self, entity_ids: &[EntityId]) {
@@ -1876,6 +2246,7 @@ impl InMemoryGraph {
             let new_id = ArtifactId::from_path(&path.0);
             ent.artifact_index.insert(path.clone(), new_id);
             ent.artifact_reverse.insert(new_id, path.clone());
+            self.record_artifact_index_delta_upsert(path.clone(), new_id);
             new_id
         }
     }
@@ -1890,6 +2261,9 @@ impl InMemoryGraph {
         let id = ent.artifact_index.remove(old_path)?;
         ent.artifact_index.insert(new_path.clone(), id);
         ent.artifact_reverse.insert(id, new_path.clone());
+        self.record_artifact_index_delta_remove(old_path.clone());
+        self.record_artifact_index_delta_upsert(new_path.clone(), id);
+        self.invalidate_snapshot_root_hash();
         Some(id)
     }
 
@@ -1973,6 +2347,15 @@ impl InMemoryGraph {
         if let Some(root_hash) = self.snapshot_root_hash_hint() {
             return root_hash;
         }
+        let ent = self.entities.read();
+        let root_hash = compute_root_hash_generic(&*ent, None);
+        self.record_snapshot_root_hash(root_hash);
+        root_hash
+    }
+
+    /// Recompute the canonical Merkle root hash directly from the live entity
+    /// stores, ignoring any cached snapshot-root hint.
+    pub fn recompute_root_hash(&self) -> crate::storage::merkle::MerkleHash {
         let ent = self.entities.read();
         let root_hash = compute_root_hash_generic(&*ent, None);
         self.record_snapshot_root_hash(root_hash);
@@ -3671,6 +4054,9 @@ impl InMemoryGraph {
             }
             ent.entities.insert(entity.id, entity.clone());
         }
+        for entity in entities {
+            self.record_entity_delta_upsert(entity.clone());
+        }
         let affected = collect_entity_refresh_targets(&ent, &entity_ids);
         drop(ent);
         self.refresh_text_index_for_entities(&affected);
@@ -3720,7 +4106,11 @@ impl InMemoryGraph {
                     entity.kind,
                 );
             }
-            remove_relations_for_entity(&mut ent, id);
+            let removed_relations = remove_relations_for_entity(&mut ent, id);
+            self.record_entity_delta_remove(*id);
+            for relation in &removed_relations {
+                self.record_relation_delta_remove(&ent, relation);
+            }
         }
         drop(ent);
 
@@ -3770,6 +4160,7 @@ impl InMemoryGraph {
                 if let Some(rel) = ent.relations.remove(rel_id) {
                     affected.extend(entity_ids_for_relation(&rel));
                     remove_relation_indexes(&mut ent, &rel);
+                    self.record_relation_delta_remove(&ent, &rel);
                 }
             }
         }
@@ -3790,12 +4181,14 @@ impl InMemoryGraph {
         });
 
         let mut ent = self.entities.write();
-        ent.shallow_files.remove(file_id);
+        let old = ent.shallow_files.remove(file_id);
+        self.record_shallow_file_delta_remove(old, file_id.clone());
         if !ent.structured_artifacts.contains_key(file_id)
             && !ent.opaque_artifacts.contains_key(file_id)
         {
             ent.artifact_index.remove(file_id);
             ent.artifact_reverse.remove(&artifact_id);
+            self.record_artifact_index_delta_remove(file_id.clone());
         }
         drop(ent);
 
@@ -3806,6 +4199,7 @@ impl InMemoryGraph {
         {
             self.artifact_embedding_queue.lock().remove(&artifact_id);
         }
+        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -3884,6 +4278,7 @@ impl InMemoryGraph {
             *entity_id,
             reason.to_string(),
         ));
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -3897,6 +4292,8 @@ impl InMemoryGraph {
             .write()
             .file_hashes
             .insert(path.to_string(), hash);
+        self.record_file_hash_delta_upsert(path.to_string(), hash);
+        self.invalidate_snapshot_root_hash();
     }
 
     /// Get the recorded hash for a file.
@@ -3918,6 +4315,8 @@ impl InMemoryGraph {
 
         if entity_ids.is_empty() {
             ent.file_hashes.remove(path);
+            self.record_file_hash_delta_remove(path.to_string());
+            self.invalidate_snapshot_root_hash();
             return Vec::new();
         }
 
@@ -3932,6 +4331,7 @@ impl InMemoryGraph {
                     entity.file_origin.as_ref(),
                     entity.kind,
                 );
+                self.record_entity_delta_remove(eid);
             }
 
             // Remove all outgoing relations from this entity.
@@ -3939,6 +4339,7 @@ impl InMemoryGraph {
                 for rid in &out_rids {
                     if let Some(rel) = ent.relations.remove(rid) {
                         remove_relation_indexes(&mut ent, &rel);
+                        self.record_relation_delta_remove(&ent, &rel);
                     }
                 }
             }
@@ -3948,6 +4349,10 @@ impl InMemoryGraph {
             // entity_ids). For incoming relations from OTHER files, keep them as
             // dangling. We only need to clean up the incoming vec for this entity.
             if let Some(inc_rids) = ent.incoming.remove(&eid) {
+                {
+                    let mut pending = self.pending_delta.lock();
+                    delta_map_remove(&mut pending.delta.incoming, eid);
+                }
                 for rid in &inc_rids {
                     // If the relation still exists, it's from an external file — keep it
                     // in the relations map but just remove from this entity's incoming vec
@@ -3973,6 +4378,7 @@ impl InMemoryGraph {
 
         // Also remove the file hash entry.
         ent.file_hashes.remove(path);
+        self.record_file_hash_delta_remove(path.to_string());
         self.invalidate_snapshot_root_hash();
 
         entity_ids
@@ -4017,7 +4423,7 @@ impl std::fmt::Debug for InMemoryGraph {
 /// This is a shared helper used by `remove_entity` and `remove_entities_for_file`
 /// to ensure relations are fully cleaned up (no dangling entries in `ent.relations`,
 /// `ent.outgoing`, or `ent.incoming`).
-fn remove_relations_for_entity(ent: &mut EntityData, entity_id: &EntityId) {
+fn remove_relations_for_entity(ent: &mut EntityData, entity_id: &EntityId) -> Vec<Relation> {
     // Collect all relation IDs from both directions
     let mut relation_ids = Vec::new();
     if let Some(outgoing) = ent.outgoing.get(entity_id) {
@@ -4028,15 +4434,18 @@ fn remove_relations_for_entity(ent: &mut EntityData, entity_id: &EntityId) {
     }
 
     // Remove each relation and clean up the other side's edge list
+    let mut removed = Vec::new();
     for rel_id in &relation_ids {
         if let Some(rel) = ent.relations.remove(rel_id) {
             remove_relation_indexes(ent, &rel);
+            removed.push(rel);
         }
     }
 
     // Remove the entity's own edge lists
     ent.outgoing.remove(entity_id);
     ent.incoming.remove(entity_id);
+    removed
 }
 
 fn collect_artifact_text_index_docs<'a>(
@@ -4641,6 +5050,7 @@ impl EntityStore for InMemoryGraph {
 
         ent.entities.insert(entity.id, entity.clone());
         let affected = collect_entity_refresh_targets(&ent, &[entity.id]);
+        self.record_entity_delta_upsert(entity.clone());
         drop(ent); // Release write lock before text index + embedding work.
 
         self.refresh_text_index_for_entities(&affected);
@@ -4658,11 +5068,13 @@ impl EntityStore for InMemoryGraph {
         if let Some(old) = ent.relations.remove(&relation.id) {
             affected.extend(entity_ids_for_relation(&old));
             remove_relation_indexes(&mut ent, &old);
+            self.record_relation_delta_remove(&ent, &old);
         }
 
         // Insert new edge entries
         insert_relation_indexes(&mut ent, relation);
         ent.relations.insert(relation.id, relation.clone());
+        self.record_relation_delta_upsert(&ent, relation.clone());
         affected.extend(entity_ids_for_relation(relation));
         let affected: Vec<EntityId> = affected.into_iter().collect();
         drop(ent);
@@ -4711,7 +5123,11 @@ impl EntityStore for InMemoryGraph {
         }
 
         // Clean up all connected relations and edge maps
-        remove_relations_for_entity(&mut ent, id);
+        let removed_relations = remove_relations_for_entity(&mut ent, id);
+        self.record_entity_delta_remove(*id);
+        for relation in &removed_relations {
+            self.record_relation_delta_remove(&ent, relation);
+        }
         drop(ent);
 
         // Remove vector for deleted entity.
@@ -4773,7 +5189,11 @@ impl EntityStore for InMemoryGraph {
 
         // Clean up all connected relations and edge maps
         for id in ids {
-            remove_relations_for_entity(&mut ent, id);
+            let removed_relations = remove_relations_for_entity(&mut ent, id);
+            self.record_entity_delta_remove(*id);
+            for relation in &removed_relations {
+                self.record_relation_delta_remove(&ent, relation);
+            }
         }
         drop(ent);
 
@@ -4812,6 +5232,7 @@ impl EntityStore for InMemoryGraph {
         if let Some(rel) = ent.relations.remove(id) {
             affected.extend(entity_ids_for_relation(&rel));
             remove_relation_indexes(&mut ent, &rel);
+            self.record_relation_delta_remove(&ent, &rel);
         }
 
         drop(ent);
@@ -4823,14 +5244,17 @@ impl EntityStore for InMemoryGraph {
 
     fn upsert_shallow_file(&self, shallow: &ShallowTrackedFile) -> Result<(), KinDbError> {
         let artifact_id = self.ensure_artifact_id(&shallow.file_id);
-        self.entities
+        let old = self
+            .entities
             .write()
             .shallow_files
             .insert(shallow.file_id.clone(), shallow.clone());
+        self.record_shallow_file_delta_upsert(old, shallow.clone());
         let key = RetrievalKey::Artifact(artifact_id);
         let fields = shallow_file_fields(shallow);
         self.upsert_retrievable_text_index(key, &fields)?;
         self.invalidate_artifact_for_embedding(artifact_id)?;
+        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -4853,14 +5277,17 @@ impl EntityStore for InMemoryGraph {
 
     fn upsert_structured_artifact(&self, artifact: &StructuredArtifact) -> Result<(), KinDbError> {
         let artifact_id = self.ensure_artifact_id(&artifact.file_id);
-        self.entities
+        let old = self
+            .entities
             .write()
             .structured_artifacts
             .insert(artifact.file_id.clone(), artifact.clone());
+        self.record_structured_artifact_delta_upsert(old, artifact.clone());
         let key = RetrievalKey::Artifact(artifact_id);
         let fields = structured_artifact_fields(artifact);
         self.upsert_retrievable_text_index(key, &fields)?;
         self.invalidate_artifact_for_embedding(artifact_id)?;
+        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -4894,11 +5321,13 @@ impl EntityStore for InMemoryGraph {
         });
 
         let mut ent = self.entities.write();
-        ent.structured_artifacts.remove(file_id);
+        let old = ent.structured_artifacts.remove(file_id);
+        self.record_structured_artifact_delta_remove(old, file_id.clone());
         // Only remove the index if there are no other artifact types using this path
         if !ent.shallow_files.contains_key(file_id) && !ent.opaque_artifacts.contains_key(file_id) {
             ent.artifact_index.remove(file_id);
             ent.artifact_reverse.remove(&artifact_id);
+            self.record_artifact_index_delta_remove(file_id.clone());
         }
         drop(ent);
 
@@ -4909,19 +5338,23 @@ impl EntityStore for InMemoryGraph {
         {
             self.artifact_embedding_queue.lock().remove(&artifact_id);
         }
+        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
     fn upsert_opaque_artifact(&self, artifact: &OpaqueArtifact) -> Result<(), KinDbError> {
         let artifact_id = self.ensure_artifact_id(&artifact.file_id);
-        self.entities
+        let old = self
+            .entities
             .write()
             .opaque_artifacts
             .insert(artifact.file_id.clone(), artifact.clone());
+        self.record_opaque_artifact_delta_upsert(old, artifact.clone());
         let key = RetrievalKey::Artifact(artifact_id);
         let fields = opaque_artifact_fields(artifact);
         self.upsert_retrievable_text_index(key, &fields)?;
         self.invalidate_artifact_for_embedding(artifact_id)?;
+        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -4950,13 +5383,15 @@ impl EntityStore for InMemoryGraph {
         });
 
         let mut ent = self.entities.write();
-        ent.opaque_artifacts.remove(file_id);
+        let old = ent.opaque_artifacts.remove(file_id);
+        self.record_opaque_artifact_delta_remove(old, file_id.clone());
         // Only remove the index if there are no other artifact types using this path
         if !ent.shallow_files.contains_key(file_id)
             && !ent.structured_artifacts.contains_key(file_id)
         {
             ent.artifact_index.remove(file_id);
             ent.artifact_reverse.remove(&artifact_id);
+            self.record_artifact_index_delta_remove(file_id.clone());
         }
         drop(ent);
 
@@ -4967,15 +5402,19 @@ impl EntityStore for InMemoryGraph {
         {
             self.artifact_embedding_queue.lock().remove(&artifact_id);
         }
+        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
     fn upsert_file_layout(&self, layout: &FileLayout) -> Result<(), KinDbError> {
         self.ensure_artifact_id(&layout.file_id);
-        self.entities
+        let old = self
+            .entities
             .write()
             .file_layouts
             .insert(layout.file_id.clone(), layout.clone());
+        self.record_file_layout_delta_upsert(old, layout.clone());
+        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -5011,14 +5450,17 @@ impl EntityStore for InMemoryGraph {
         });
 
         let mut ent = self.entities.write();
-        ent.file_layouts.remove(file_id);
+        let old = ent.file_layouts.remove(file_id);
+        self.record_file_layout_delta_remove(old, file_id.clone());
         if !ent.shallow_files.contains_key(file_id)
             && !ent.structured_artifacts.contains_key(file_id)
             && !ent.opaque_artifacts.contains_key(file_id)
         {
             ent.artifact_index.remove(file_id);
             ent.artifact_reverse.remove(&artifact_id);
+            self.record_artifact_index_delta_remove(file_id.clone());
         }
+        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -5062,6 +5504,7 @@ impl EntityStore for InMemoryGraph {
                         }
 
                         ent.entities.insert(entity.id, entity.clone());
+                        self.record_entity_delta_upsert(entity.clone());
                         affected.insert(entity.id);
                     }
                     EntityDelta::Removed(id) => {
@@ -5101,7 +5544,11 @@ impl EntityStore for InMemoryGraph {
                                 }
                             }
                         }
-                        remove_relations_for_entity(&mut ent, id);
+                        let removed_relations = remove_relations_for_entity(&mut ent, id);
+                        self.record_entity_delta_remove(*id);
+                        for relation in &removed_relations {
+                            self.record_relation_delta_remove(&ent, relation);
+                        }
                     }
                 }
             }
@@ -5113,15 +5560,18 @@ impl EntityStore for InMemoryGraph {
                         if let Some(old) = ent.relations.remove(&relation.id) {
                             affected.extend(entity_ids_for_relation(&old));
                             remove_relation_indexes(&mut ent, &old);
+                            self.record_relation_delta_remove(&ent, &old);
                         }
                         insert_relation_indexes(&mut ent, relation);
                         ent.relations.insert(relation.id, relation.clone());
+                        self.record_relation_delta_upsert(&ent, relation.clone());
                         affected.extend(entity_ids_for_relation(relation));
                     }
                     RelationDelta::Removed(id) => {
                         if let Some(rel) = ent.relations.remove(id) {
                             affected.extend(entity_ids_for_relation(&rel));
                             remove_relation_indexes(&mut ent, &rel);
+                            self.record_relation_delta_remove(&ent, &rel);
                         }
                     }
                 }
@@ -5187,6 +5637,7 @@ impl EntityStore for InMemoryGraph {
                 }
 
                 ent.entities.insert(entity.id, entity.clone());
+                self.record_entity_delta_upsert(entity.clone());
                 all_affected.push(entity.id);
             }
 
@@ -5212,10 +5663,12 @@ impl EntityStore for InMemoryGraph {
             for relation in relations {
                 if let Some(old) = ent.relations.remove(&relation.id) {
                     remove_relation_indexes(&mut ent, &old);
+                    self.record_relation_delta_remove(&ent, &old);
                 }
 
                 insert_relation_indexes(&mut ent, relation);
                 ent.relations.insert(relation.id, relation.clone());
+                self.record_relation_delta_upsert(&ent, relation.clone());
             }
         }
 
@@ -5257,9 +5710,14 @@ impl EntityStore for InMemoryGraph {
             let mut ent = self.entities.write();
 
             // Remove all relations of this kind — O(N) scan, no per-relation index work
-            let before = ent.relations.len();
+            let removed_relations: Vec<Relation> = ent
+                .relations
+                .values()
+                .filter(|rel| rel.kind == kind)
+                .cloned()
+                .collect();
+            let removed = removed_relations.len();
             ent.relations.retain(|_, rel| rel.kind != kind);
-            let removed = before - ent.relations.len();
 
             if removed == 0 && new_map.is_empty() {
                 return Ok(());
@@ -5279,6 +5737,12 @@ impl EntityStore for InMemoryGraph {
             ent.incoming = incoming;
             ent.node_outgoing = node_outgoing;
             ent.node_incoming = node_incoming;
+            for relation in &removed_relations {
+                self.record_relation_delta_remove(&ent, relation);
+            }
+            for relation in ent.relations.values().filter(|rel| rel.kind == kind) {
+                self.record_relation_delta_upsert(&ent, relation.clone());
+            }
         }
 
         self.text_full_rebuild_required
@@ -5298,6 +5762,7 @@ impl EntityStore for InMemoryGraph {
             for id in ids {
                 if let Some(rel) = ent.relations.remove(*id) {
                     remove_relation_indexes(&mut ent, &rel);
+                    self.record_relation_delta_remove(&ent, &rel);
                 }
             }
         }
@@ -5392,19 +5857,39 @@ impl ChangeStore for InMemoryGraph {
     fn create_change(&self, change: &SemanticChange) -> Result<(), KinDbError> {
         let mut ent = self.entities.write();
         append_entity_revisions(&mut ent, change);
+        let revision_updates: Vec<(EntityId, Vec<EntityRevision>)> = change
+            .entity_deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                EntityDelta::Added(entity) | EntityDelta::Modified { new: entity, .. } => {
+                    Some(entity.id)
+                }
+                EntityDelta::Removed(id) => Some(*id),
+            })
+            .filter_map(|entity_id| {
+                ent.entity_revisions
+                    .get(&entity_id)
+                    .cloned()
+                    .map(|revisions| (entity_id, revisions))
+            })
+            .collect();
+        for (entity_id, revisions) in revision_updates {
+            self.record_entity_revisions_delta_upsert(entity_id, revisions);
+        }
         drop(ent);
 
         let mut chg = self.changes.write();
 
         // Register in parent → children index
         for parent in &change.parents {
-            chg.change_children
-                .entry(*parent)
-                .or_default()
-                .push(change.id);
+            let children = chg.change_children.entry(*parent).or_default();
+            children.push(change.id);
+            self.record_change_children_delta_upsert(*parent, children.clone());
         }
 
         chg.changes.insert(change.id, change.clone());
+        self.record_change_delta_upsert(change.clone());
+        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -5456,6 +5941,8 @@ impl ChangeStore for InMemoryGraph {
             )));
         }
         chg.branches.insert(branch.name.clone(), branch.clone());
+        self.record_branch_delta_upsert(branch.clone());
+        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -5468,6 +5955,8 @@ impl ChangeStore for InMemoryGraph {
         match chg.branches.get_mut(name) {
             Some(branch) => {
                 branch.head = *new_head;
+                self.record_branch_delta_upsert(branch.clone());
+                self.invalidate_snapshot_root_hash();
                 Ok(())
             }
             None => Err(KinDbError::NotFound(format!("branch '{}'", name))),
@@ -5476,6 +5965,8 @@ impl ChangeStore for InMemoryGraph {
 
     fn delete_branch(&self, name: &BranchName) -> Result<(), KinDbError> {
         self.changes.write().branches.remove(name);
+        self.record_branch_delta_remove(name.clone());
+        self.invalidate_snapshot_root_hash();
         Ok(())
     }
 
@@ -5780,6 +6271,7 @@ impl WorkStore for InMemoryGraph {
             .write()
             .work_items
             .insert(item.work_id, item.clone());
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -5820,6 +6312,7 @@ impl WorkStore for InMemoryGraph {
         match wrk.work_items.get_mut(id) {
             Some(item) => {
                 item.status = status;
+                self.require_full_snapshot();
                 Ok(())
             }
             None => Err(KinDbError::NotFound(format!("work item '{}'", id))),
@@ -5837,6 +6330,7 @@ impl WorkStore for InMemoryGraph {
             WorkLink::Implements { work_id, .. } => work_id != id,
             _ => true,
         });
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -5854,6 +6348,7 @@ impl WorkStore for InMemoryGraph {
             ann.anchored_fingerprint = self.capture_entity_anchor(&ann.scopes);
         }
         self.work.write().annotations.insert(ann.annotation_id, ann);
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -5896,6 +6391,7 @@ impl WorkStore for InMemoryGraph {
         match wrk.annotations.get_mut(id) {
             Some(ann) => {
                 ann.staleness = staleness;
+                self.require_full_snapshot();
                 Ok(())
             }
             None => Err(KinDbError::NotFound(format!("annotation '{}'", id))),
@@ -5911,6 +6407,7 @@ impl WorkStore for InMemoryGraph {
             WorkLink::Supersedes { new_id, old_id } => new_id != id && old_id != id,
             _ => true,
         });
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -5923,12 +6420,14 @@ impl WorkStore for InMemoryGraph {
         // Avoid duplicates
         if !wrk.work_links.contains(link) {
             wrk.work_links.push(link.clone());
+            self.require_full_snapshot();
         }
         Ok(())
     }
 
     fn delete_work_link(&self, link: &WorkLink) -> Result<(), KinDbError> {
         self.work.write().work_links.retain(|l| l != link);
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -6085,6 +6584,7 @@ impl ReviewStore for InMemoryGraph {
             .write()
             .reviews
             .insert(review.review_id, review.clone());
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -6133,6 +6633,7 @@ impl ReviewStore for InMemoryGraph {
             Some(review) => {
                 review.state = state;
                 review.updated_at = Timestamp::now();
+                self.require_full_snapshot();
                 Ok(())
             }
             None => Err(KinDbError::NotFound(format!("review '{}'", id))),
@@ -6149,6 +6650,7 @@ impl ReviewStore for InMemoryGraph {
         // Remove discussions belonging to this review
         rev.review_discussions
             .retain(|_, disc| disc.review_id != *id);
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -6165,6 +6667,7 @@ impl ReviewStore for InMemoryGraph {
             .entry(*id)
             .or_default()
             .push(decision.clone());
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -6184,6 +6687,7 @@ impl ReviewStore for InMemoryGraph {
             return Err(KinDbError::NotFound(format!("review '{}'", note.review_id)));
         }
         rev.review_notes.insert(note.note_id, note.clone());
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -6200,6 +6704,7 @@ impl ReviewStore for InMemoryGraph {
 
     fn delete_review_note(&self, note_id: &ReviewNoteId) -> Result<(), KinDbError> {
         self.reviews.write().review_notes.remove(note_id);
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -6213,6 +6718,7 @@ impl ReviewStore for InMemoryGraph {
         }
         rev.review_discussions
             .insert(discussion.discussion_id, discussion.clone());
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -6236,6 +6742,7 @@ impl ReviewStore for InMemoryGraph {
         match rev.review_discussions.get_mut(id) {
             Some(disc) => {
                 disc.comments.push(comment.clone());
+                self.require_full_snapshot();
                 Ok(())
             }
             None => Err(KinDbError::NotFound(format!("review discussion '{}'", id))),
@@ -6251,6 +6758,7 @@ impl ReviewStore for InMemoryGraph {
         match rev.review_discussions.get_mut(id) {
             Some(disc) => {
                 disc.state = state;
+                self.require_full_snapshot();
                 Ok(())
             }
             None => Err(KinDbError::NotFound(format!("review discussion '{}'", id))),
@@ -6269,6 +6777,7 @@ impl ReviewStore for InMemoryGraph {
             .entry(assignment.review_id)
             .or_default()
             .push(assignment.clone());
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -6287,6 +6796,7 @@ impl ReviewStore for InMemoryGraph {
         if let Some(assignments) = rev.review_assignments.get_mut(review_id) {
             assignments.retain(|a| a.reviewer.name != reviewer);
         }
+        self.require_full_snapshot();
         Ok(())
     }
 }
@@ -6330,6 +6840,7 @@ impl VerificationStore for InMemoryGraph {
                 .collect();
             self.upsert_relations_batch(&relations)?;
         }
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -6376,6 +6887,7 @@ impl VerificationStore for InMemoryGraph {
                 remove_relation_indexes(&mut ent, &relation);
             }
         }
+        self.require_full_snapshot();
         self.invalidate_snapshot_root_hash();
         Ok(())
     }
@@ -6385,6 +6897,7 @@ impl VerificationStore for InMemoryGraph {
             .write()
             .assertions
             .insert(assertion.assertion_id, assertion.clone());
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -6439,6 +6952,7 @@ impl VerificationStore for InMemoryGraph {
             .write()
             .verification_runs
             .insert(run.run_id, run.clone());
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -6572,6 +7086,7 @@ impl VerificationStore for InMemoryGraph {
 
     fn create_mock_hint(&self, hint: &MockHint) -> Result<(), KinDbError> {
         self.verification.write().mock_hints.push(hint.clone());
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -6685,6 +7200,7 @@ impl VerificationStore for InMemoryGraph {
             .write()
             .contracts
             .insert(key, contract.clone());
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -6761,6 +7277,7 @@ impl ProvenanceStore for InMemoryGraph {
             .write()
             .actors
             .insert(actor.actor_id, actor.clone());
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -6774,6 +7291,7 @@ impl ProvenanceStore for InMemoryGraph {
 
     fn create_delegation(&self, delegation: &Delegation) -> Result<(), KinDbError> {
         self.provenance.write().delegations.push(delegation.clone());
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -6790,6 +7308,7 @@ impl ProvenanceStore for InMemoryGraph {
 
     fn create_approval(&self, approval: &Approval) -> Result<(), KinDbError> {
         self.provenance.write().approvals.push(approval.clone());
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -6806,6 +7325,7 @@ impl ProvenanceStore for InMemoryGraph {
 
     fn record_audit_event(&self, event: &AuditEvent) -> Result<(), KinDbError> {
         self.provenance.write().audit_events.push(event.clone());
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -6841,6 +7361,7 @@ impl SessionStore for InMemoryGraph {
             .write()
             .sessions
             .insert(session.session_id, session.clone());
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -6850,6 +7371,7 @@ impl SessionStore for InMemoryGraph {
 
     fn delete_session(&self, session_id: &SessionId) -> Result<(), KinDbError> {
         self.sessions.write().sessions.remove(session_id);
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -6864,6 +7386,7 @@ impl SessionStore for InMemoryGraph {
     ) -> Result<(), KinDbError> {
         if let Some(session) = self.sessions.write().sessions.get_mut(session_id) {
             session.last_heartbeat = heartbeat.clone();
+            self.require_full_snapshot();
         }
         Ok(())
     }
@@ -6873,6 +7396,7 @@ impl SessionStore for InMemoryGraph {
             .write()
             .intents
             .insert(intent.intent_id, intent.clone());
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -6882,6 +7406,7 @@ impl SessionStore for InMemoryGraph {
 
     fn delete_intent(&self, intent_id: &IntentId) -> Result<(), KinDbError> {
         self.sessions.write().intents.remove(intent_id);
+        self.require_full_snapshot();
         Ok(())
     }
 
@@ -9646,7 +10171,10 @@ mod tests {
     /// superseded by revision 2, both retained in history) and return its
     /// (old, new) revision ids.
     #[cfg(feature = "vector")]
-    fn two_revision_entity(graph: &InMemoryGraph, e1: &Entity) -> (EntityRevisionId, EntityRevisionId) {
+    fn two_revision_entity(
+        graph: &InMemoryGraph,
+        e1: &Entity,
+    ) -> (EntityRevisionId, EntityRevisionId) {
         apply_init_change(graph, 0x01, std::slice::from_ref(e1));
         let mut changed = e1.clone();
         changed.signature = "fn foo(x: i32)".to_string();
@@ -9749,10 +10277,16 @@ mod tests {
         assert_eq!((rev_old, rev_new), (rev_old2, rev_new2));
 
         let loaded = graph.load_vector_index(&sidecar).unwrap();
-        assert_eq!(loaded, 3, "sidecar carries both revisions + the head entity");
+        assert_eq!(
+            loaded, 3,
+            "sidecar carries both revisions + the head entity"
+        );
 
         let evicted = graph.prune_orphaned_vectors();
-        assert_eq!(evicted, 1, "load-time reclaim retires the superseded revision");
+        assert_eq!(
+            evicted, 1,
+            "load-time reclaim retires the superseded revision"
+        );
 
         let vi = graph.vector_index.lock().clone().unwrap();
         assert!(vi
