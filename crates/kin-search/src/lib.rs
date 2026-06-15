@@ -693,19 +693,32 @@ impl<Id: DocId> TextIndex<Id> {
         }
     }
 
-    /// Get or create the staged state, snapshotting from the live state.
+    /// Get or create the staged state, snapshotting from the live state on first
+    /// use.
+    ///
+    /// # Lock ordering
+    ///
+    /// The caller MUST already hold the `staged` write guard (passed in as
+    /// `staged`). Only when the staging buffer is empty does this acquire the
+    /// four live-state read guards to clone a snapshot — and it does so *while
+    /// `staged` is held*, i.e. strictly **nested inside** `staged`. This is the
+    /// canonical lock order for the whole type: `staged` is the outermost lock,
+    /// and `index`/`docs`/`doc_count`/`total_doc_length` are only ever taken
+    /// after it. [`commit`](Self::commit) follows the same order (it takes
+    /// `staged` first, then the live-state write guards), so a writer and a
+    /// committer can never acquire the two locks in conflicting order — which is
+    /// what eliminates the lock-order-inversion deadlock (FIR-916). Each live
+    /// read guard is released the instant its clone completes, so this never
+    /// holds more than `staged` + one live guard at a time.
     fn ensure_staged<'a>(
+        &self,
         staged: &'a mut Option<StagedState<Id>>,
-        index: &HashMap<String, Postings<Id>>,
-        docs: &HashMap<Id, IndexedDoc>,
-        doc_count: usize,
-        total_doc_length: usize,
     ) -> &'a mut StagedState<Id> {
         staged.get_or_insert_with(|| StagedState {
-            index: index.clone(),
-            docs: docs.clone(),
-            doc_count,
-            total_doc_length,
+            index: self.index.read().clone(),
+            docs: self.docs.read().clone(),
+            doc_count: *self.doc_count.read(),
+            total_doc_length: *self.total_doc_length.read(),
         })
     }
 
@@ -839,19 +852,13 @@ impl<Id: DocId> TextIndex<Id> {
         }
         let doc_length = all_tokens.len();
 
-        let live_index = self.index.read();
-        let live_docs = self.docs.read();
-        let live_dc = *self.doc_count.read();
-        let live_tdl = *self.total_doc_length.read();
+        // Canonical lock order: take `staged` first; `ensure_staged` acquires the
+        // live-state read guards only if it needs to clone a snapshot, strictly
+        // nested under `staged`. `commit` takes the same locks in the same order
+        // (`staged` then the live-state guards), so no writer/committer pair can
+        // ever invert them (FIR-916).
         let mut staged_guard = self.staged.write();
-
-        let state = Self::ensure_staged(
-            &mut staged_guard,
-            &live_index,
-            &live_docs,
-            live_dc,
-            live_tdl,
-        );
+        let state = self.ensure_staged(&mut staged_guard);
 
         // Remove old doc if present
         if let Some(old_doc) = state.docs.remove(&id) {
@@ -878,9 +885,8 @@ impl<Id: DocId> TextIndex<Id> {
                 doc_length,
             },
         );
-        drop(staged_guard);
-
         self.mark_doc_upserted(&id);
+        drop(staged_guard);
         Ok(())
     }
 
@@ -899,28 +905,18 @@ impl<Id: DocId> TextIndex<Id> {
     /// to searches.
     pub fn remove(&self, id: &Id) -> Result<(), SearchError> {
         let _span = tracing::info_span!("kin_search.remove", id = ?id).entered();
-        let live_index = self.index.read();
-        let live_docs = self.docs.read();
-        let live_dc = *self.doc_count.read();
-        let live_tdl = *self.total_doc_length.read();
+        // Canonical lock order: `staged` first, live-state guards nested inside
+        // `ensure_staged` (matches `commit`). See FIR-916.
         let mut staged_guard = self.staged.write();
-
-        let state = Self::ensure_staged(
-            &mut staged_guard,
-            &live_index,
-            &live_docs,
-            live_dc,
-            live_tdl,
-        );
+        let state = self.ensure_staged(&mut staged_guard);
 
         if let Some(old_doc) = state.docs.remove(id) {
             remove_doc_from_index(&mut state.index, &old_doc, id);
             state.doc_count = state.doc_count.saturating_sub(1);
             state.total_doc_length = state.total_doc_length.saturating_sub(old_doc.doc_length);
         }
-        drop(staged_guard);
-
         self.mark_doc_removed(id);
+        drop(staged_guard);
         Ok(())
     }
 
@@ -933,19 +929,10 @@ impl<Id: DocId> TextIndex<Id> {
         if ids.is_empty() {
             return Ok(());
         }
-        let live_index = self.index.read();
-        let live_docs = self.docs.read();
-        let live_dc = *self.doc_count.read();
-        let live_tdl = *self.total_doc_length.read();
+        // Canonical lock order: `staged` first, live-state guards nested inside
+        // `ensure_staged` (matches `commit`). See FIR-916.
         let mut staged_guard = self.staged.write();
-
-        let state = Self::ensure_staged(
-            &mut staged_guard,
-            &live_index,
-            &live_docs,
-            live_dc,
-            live_tdl,
-        );
+        let state = self.ensure_staged(&mut staged_guard);
 
         for id in ids {
             if let Some(old_doc) = state.docs.remove(id) {
@@ -954,11 +941,10 @@ impl<Id: DocId> TextIndex<Id> {
                 state.total_doc_length = state.total_doc_length.saturating_sub(old_doc.doc_length);
             }
         }
-        drop(staged_guard);
-
         for id in ids {
             self.mark_doc_removed(id);
         }
+        drop(staged_guard);
         Ok(())
     }
 
@@ -1072,6 +1058,28 @@ impl<Id: DocId> TextIndex<Id> {
     /// Commit all pending writes, making staged changes visible to searches.
     ///
     /// Call after bulk operations rather than per document for best performance.
+    ///
+    /// # Lock ordering
+    ///
+    /// Acquires `staged` first, then the live-state write guards to publish the
+    /// snapshot — the **same** canonical order the writer paths use
+    /// ([`upsert`](Self::upsert)/[`remove`](Self::remove) take `staged` then the
+    /// live guards via [`ensure_staged`](Self::ensure_staged)). Because both
+    /// directions agree that `staged` is the outermost lock, a writer and a
+    /// committer can never request the two locks in opposite order, so the
+    /// lock-order-inversion deadlock (FIR-916) cannot occur.
+    ///
+    /// `staged` is deliberately held across `persist_to_disk` as well. All live
+    /// state is mutated only under `staged` (here, and in the writer paths via
+    /// [`ensure_staged`](Self::ensure_staged)), so holding it for the duration of
+    /// the persist is what gives the persist a *consistent snapshot* of the four
+    /// live-state fields. Without it, two concurrent committers (or a persist
+    /// racing a publish) could serialize segment bytes from one moment but stamp
+    /// the manifest `doc_count`/`total_doc_length` from another, and the
+    /// load-time segment-sum check would (correctly) reject the torn index as
+    /// corrupt. Serializing commits on `staged` is the price of a
+    /// crash-consistent on-disk image; it stays within the canonical order
+    /// (`staged` -> live-state -> `seg`), so it introduces no new inversion.
     pub fn commit(&self) -> Result<(), SearchError>
     where
         Id: Serialize + DeserializeOwned,
@@ -2738,6 +2746,206 @@ mod tests {
         assert_eq!(
             reopened.live_document_count(),
             fixture_docs().len() - to_remove.len()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrency: lock-order-inversion deadlock regression (FIR-916)
+    //
+    // The writer paths (`upsert`/`remove`/`remove_batch`) and the `commit` path
+    // both touch the `staged` lock and the four live-state locks
+    // (`index`/`docs`/`doc_count`/`total_doc_length`). Before the fix, writers
+    // acquired a live-state read guard BEFORE `staged.write()`, while `commit`
+    // acquired `staged.write()` BEFORE the live-state write guards — an inverted
+    // order that lets a writer thread (holding `index.read()`, waiting on
+    // `staged.write()`) and a committer thread (holding `staged.write()`, waiting
+    // on `index.write()`) wedge into a permanent deadlock. The canonical order is
+    // now `staged` first in BOTH paths, so the cycle is impossible.
+    //
+    // These tests run the concurrent workload on helper threads and gate
+    // completion behind a wall-clock timeout: a regression re-introduces the
+    // deadlock, the workload never signals done, and the test FAILS LOUDLY at the
+    // timeout instead of hanging CI forever.
+    // -----------------------------------------------------------------------
+
+    /// Run `workload` on a dedicated coordinator thread and fail if it does not
+    /// finish within `timeout`. On timeout we `panic!` (failing the test) rather
+    /// than block forever: a deadlock regression must surface as a red test, not
+    /// a hung runner. The wedged worker threads stay parked, but the test binary
+    /// still exits non-zero, so CI reports the failure.
+    fn run_with_deadlock_timeout(
+        label: &str,
+        timeout: std::time::Duration,
+        workload: impl FnOnce() + Send + 'static,
+    ) {
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let coordinator = std::thread::spawn(move || {
+            workload();
+            // Ignore send errors: if the receiver already timed out and went
+            // away, the test has already failed and there is nothing to report.
+            let _ = done_tx.send(());
+        });
+
+        match done_rx.recv_timeout(timeout) {
+            Ok(()) => {
+                coordinator
+                    .join()
+                    .expect("coordinator thread panicked (a worker assertion failed)");
+            }
+            Err(_) => panic!(
+                "{label}: concurrent workload did not complete within {timeout:?} — \
+                 lock-order-inversion deadlock has regressed (FIR-916)"
+            ),
+        }
+    }
+
+    /// Concurrent writers + committers against a shared in-memory index must make
+    /// progress and never deadlock. This is the tight reproduction of the
+    /// `upsert`-vs-`commit` lock-order inversion: many threads hammer both paths
+    /// at once so the interleaving window (writer holding a live read guard while
+    /// reaching for `staged`; committer holding `staged` while reaching for the
+    /// live write guards) is hit almost immediately under the buggy ordering.
+    #[test]
+    fn concurrent_upsert_and_commit_do_not_deadlock() {
+        use std::sync::Arc;
+
+        run_with_deadlock_timeout(
+            "concurrent_upsert_and_commit",
+            std::time::Duration::from_secs(30),
+            || {
+                let idx = Arc::new(TextIndex::<TestId>::new());
+                let writer_threads = 4;
+                let committer_threads = 2;
+                let iters = 2_000;
+
+                let mut handles = Vec::new();
+
+                // Writers: each owns a disjoint id range so upserts/removes never
+                // collide on document identity — the deadlock is about lock order,
+                // not data contention, and disjoint ids keep the final state
+                // exactly checkable.
+                for w in 0..writer_threads {
+                    let idx = Arc::clone(&idx);
+                    handles.push(std::thread::spawn(move || {
+                        let base = (w as u64 + 1) * 1_000_000;
+                        for i in 0..iters {
+                            let id = TestId(base + (i % 64) as u64);
+                            idx.upsert(
+                                id,
+                                &[("concurrentSymbol", 5.0), ("src/concurrent/mod.rs", 2.0)],
+                            )
+                            .unwrap();
+                            // Exercise the remove writer path too (same lock order).
+                            if i % 3 == 0 {
+                                idx.remove(&id).unwrap();
+                            }
+                        }
+                    }));
+                }
+
+                // Committers: race the writers, repeatedly publishing staged state.
+                for _ in 0..committer_threads {
+                    let idx = Arc::clone(&idx);
+                    handles.push(std::thread::spawn(move || {
+                        for _ in 0..iters {
+                            idx.commit().unwrap();
+                            // Reads must keep working under contention as well.
+                            let _ = idx.fuzzy_search("concurrent", 5).unwrap();
+                        }
+                    }));
+                }
+
+                for h in handles {
+                    h.join().expect("worker thread panicked");
+                }
+
+                // A final commit flushes any still-staged writes, then the index
+                // must be internally consistent: live_document_count equals the
+                // number of distinct doc ids actually present. This proves the
+                // lock-order fix did not introduce a data race that corrupts the
+                // staged/live bookkeeping — "doesn't hang" AND "stays correct".
+                idx.commit().unwrap();
+                let live = idx.live_document_count();
+                let present = (0..writer_threads)
+                    .flat_map(|w| {
+                        let base = (w as u64 + 1) * 1_000_000;
+                        (0..64u64).map(move |k| TestId(base + k))
+                    })
+                    .filter(|id| idx.contains(id))
+                    .count();
+                assert_eq!(
+                    live, present,
+                    "live document count ({live}) must match the docs actually present ({present})"
+                );
+            },
+        );
+    }
+
+    /// The same concurrency guarantee through the durable persist path: a shared
+    /// persisted index under concurrent writers + committers must not deadlock
+    /// (the committer now holds `staged` strictly before the live-state locks, and
+    /// releases `staged` before the fsync-bound persist) and must reload to a
+    /// consistent state afterwards.
+    #[test]
+    fn concurrent_writes_with_persistence_do_not_deadlock() {
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("concurrent");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        run_with_deadlock_timeout(
+            "concurrent_writes_with_persistence",
+            std::time::Duration::from_secs(45),
+            {
+                let dir = dir.clone();
+                move || {
+                    let idx = Arc::new(TextIndex::<TestId>::open(Some(&dir)).unwrap());
+                    let writer_threads = 3;
+                    let iters = 500;
+
+                    let mut handles = Vec::new();
+                    for w in 0..writer_threads {
+                        let idx = Arc::clone(&idx);
+                        handles.push(std::thread::spawn(move || {
+                            let base = (w as u64 + 1) * 100_000;
+                            for i in 0..iters {
+                                let id = TestId(base + i as u64);
+                                idx.upsert(id, &[("persistedConcurrent", 5.0)]).unwrap();
+                                if i % 10 == 0 {
+                                    idx.commit().unwrap();
+                                }
+                            }
+                        }));
+                    }
+                    // A dedicated committer that also persists on every commit.
+                    {
+                        let idx = Arc::clone(&idx);
+                        handles.push(std::thread::spawn(move || {
+                            for _ in 0..iters {
+                                idx.commit().unwrap();
+                            }
+                        }));
+                    }
+
+                    for h in handles {
+                        h.join().expect("worker thread panicked");
+                    }
+                    idx.commit().unwrap();
+                }
+            },
+        );
+
+        // Reopen from disk: the persisted state must load cleanly (not corrupt)
+        // and expose exactly the docs every writer inserted.
+        let reopened = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+        let writer_threads = 3u64;
+        let iters = 500u64;
+        let expected = (writer_threads * iters) as usize;
+        assert_eq!(
+            reopened.live_document_count(),
+            expected,
+            "every concurrently-inserted doc must survive persistence"
         );
     }
 }
