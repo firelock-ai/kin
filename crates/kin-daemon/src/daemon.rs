@@ -141,7 +141,7 @@ fn endpoint_files_missing(state: &DaemonState) -> bool {
 }
 
 fn control_plane_missing(state: &DaemonState) -> bool {
-    !state.layout.root().exists()
+    !state.layout.root().exists() || endpoint_files_missing(state)
 }
 
 fn ready_for_idle_shutdown(state: &DaemonState, idle_timeout: Duration) -> bool {
