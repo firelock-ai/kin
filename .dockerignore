@@ -1,8 +1,8 @@
 target/
 .git/
 .kin/
-# Exclude local path patches — Docker builds use git remote deps from Cargo.toml
-.cargo/config.toml
+# Keep the tracked cargo config in the build context; it carries the registry
+# alias and public Git pins required until every kin-* crate is published.
 node_modules/
 *.log
 .pre-commit-config.yaml
