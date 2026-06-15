@@ -9,10 +9,10 @@ index = "sparse+https://kinlab.ai/registry/cargo/"
 
 [patch.kin]
 kin-blobs = { git = "https://github.com/firelock-ai/kin-blobs.git", rev = "5e8b3c3a596163fe6c4b276bcd27c02ffacd694f" }
-kin-db = { git = "https://github.com/firelock-ai/kin-db.git", rev = "a9e5aea16d9a592e4b8e260a05758031ab8a4143" }
+kin-db = { git = "https://github.com/firelock-ai/kin-db.git", rev = "0f7ae046fd710480f217fe054762b545d6626fbe" }
 kin-infer = { git = "https://github.com/firelock-ai/kin-infer.git", rev = "16a0ee267b6b59c75c55f552b5edb4edbee150ac" }
 kin-lsp = { git = "https://github.com/firelock-ai/kin-lsp.git", rev = "f4f2b5fee92af5caee737c673f8202ce070b46b6" }
 kin-model = { git = "https://github.com/firelock-ai/kin-model.git", rev = "99344c94e961efbfff40d5e5350d8e4943bc7913" }
 kin-search = { git = "https://github.com/firelock-ai/kin-search.git", rev = "a766b0f219459e1d290da6282133279d499c5ce6" }
-kin-vector = { git = "https://github.com/firelock-ai/kin-vector.git", rev = "afac0e7958067d14ad7fb566e788985dd1243a7e" }
+kin-vector = { git = "https://github.com/firelock-ai/kin-vector.git", rev = "c738bc2b93df82bd63ab1a697ea2b32597bfb8e1" }
 kin-vfs-core = { git = "https://github.com/firelock-ai/kin-vfs.git", rev = "4e59b7d17d8df53be54c3845968518cc135f20e6" }

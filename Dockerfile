@@ -10,15 +10,9 @@ COPY . /build/kin
 
 # Build from kin directory
 WORKDIR /build/kin
-# .cargo/config.toml is gitignored. Docker builds resolve every kin-* crate
-# (incl. kin-lsp) from the live Kin sparse registry, which serves complete
-# dep/feature metadata. Verified 2026-06-10: a registry-only checkout of this
-# repo resolves, fetches, and compiles the full `kin` binary with no [patch]
-# fallback. The former git-repo [patch.kin] block is no longer needed.
-RUN mkdir -p .cargo && printf '\
-[registries.kin]\n\
-index = "sparse+https://kinlab.ai/registry/cargo/"\n\
-' > .cargo/config.toml
+# Keep the committed cargo config intact: it contains the public Git [patch.kin]
+# pins needed until every kin-* crate is published in the sparse registry.
+RUN test -f .cargo/config.toml && grep -q '^\[registries\.kin\]' .cargo/config.toml
 # kin-daemon needs --features gcs for GCS StorageBackend in cloud deployment.
 RUN cargo build --release --features gcs --bin kin-daemon --bin kin
 

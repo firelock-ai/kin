@@ -99,6 +99,7 @@ struct InitResultPayload {
 struct WarmCacheDeltaResult {
     reparsed_files: usize,
     queued_embeddings: Vec<EntityId>,
+    queued_artifacts: Vec<ArtifactId>,
 }
 
 /// Take an independent copy-based snapshot of the working tree before `kin init`
@@ -2116,6 +2117,7 @@ fn try_warm_init_from_cache(
         cache_graph.as_ref(),
         Some(cache_graph_path.with_extension("kvec").as_path()),
         &delta.queued_embeddings,
+        &delta.queued_artifacts,
     )?;
     wphase!("restore_warm_embedding_state");
     let local_graph = local_snap.graph();
@@ -2232,6 +2234,19 @@ fn apply_warm_cache_delta(
         .iter()
         .flat_map(|file| file.entities.iter().map(|entity| entity.id))
         .collect();
+    let mut queued_artifacts: Vec<ArtifactId> = selected_files
+        .iter()
+        .filter_map(|file| match file.classification {
+            FileClassification::EntitySource => None,
+            FileClassification::ShallowSyntax { .. }
+            | FileClassification::StructuredArtifact(_)
+            | FileClassification::OpaqueArtifact { .. } => {
+                Some(artifact_id_for_file(graph, &file.rel_path))
+            }
+        })
+        .collect();
+    queued_artifacts.sort_unstable();
+    queued_artifacts.dedup();
     let incremental_linker = build_incremental_linker_from_graph(graph)?;
     dphase!(
         "build_incremental_linker",
@@ -2265,6 +2280,7 @@ fn apply_warm_cache_delta(
     Ok(WarmCacheDeltaResult {
         reparsed_files: selected_files.len(),
         queued_embeddings,
+        queued_artifacts,
     })
 }
 
@@ -2671,29 +2687,41 @@ fn restore_warm_embedding_state(
     source_graph: &kin_db::InMemoryGraph,
     source_vector_path: Option<&Path>,
     queued_embeddings: &[EntityId],
+    queued_artifacts: &[ArtifactId],
 ) -> Result<WarmEmbeddingRestoreStatus> {
     let _span = tracing::info_span!(
         "kin.init.restore_warm_embedding_state",
-        queued_embeddings = queued_embeddings.len()
+        queued_embeddings = queued_embeddings.len(),
+        queued_artifacts = queued_artifacts.len()
     )
     .entered();
     let local_vector_path = layout.kindb_vector_index_path();
+    let has_delta_embedding_work = !queued_embeddings.is_empty() || !queued_artifacts.is_empty();
     if let Some(source_vector_path) = source_vector_path {
         if source_vector_path.exists() {
             if let Some(parent) = local_vector_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            tracing::debug!(
-                source = %source_vector_path.display(),
-                destination = %local_vector_path.display(),
-                "copying warm cache vector index sidecar"
-            );
-            fs::copy(source_vector_path, &local_vector_path)?;
+            if has_delta_embedding_work {
+                tracing::debug!(
+                    source = %source_vector_path.display(),
+                    destination = %local_vector_path.display(),
+                    "saving delta-mutated warm cache vector index sidecar"
+                );
+                source_graph.save_vector_index(&local_vector_path)?;
+            } else {
+                tracing::debug!(
+                    source = %source_vector_path.display(),
+                    destination = %local_vector_path.display(),
+                    "copying warm cache vector index sidecar"
+                );
+                fs::copy(source_vector_path, &local_vector_path)?;
 
-            let source_metadata_path = source_vector_path.with_extension("kvec.meta.json");
-            let local_metadata_path = local_vector_path.with_extension("kvec.meta.json");
-            if source_metadata_path.exists() {
-                fs::copy(source_metadata_path, local_metadata_path)?;
+                let source_metadata_path = source_vector_path.with_extension("kvec.meta.json");
+                let local_metadata_path = local_vector_path.with_extension("kvec.meta.json");
+                if source_metadata_path.exists() {
+                    fs::copy(source_metadata_path, local_metadata_path)?;
+                }
             }
         } else {
             source_graph.save_vector_index(&local_vector_path)?;
@@ -2715,6 +2743,7 @@ fn restore_warm_embedding_state(
     );
     if indexed == 0 {
         local_graph.queue_all_for_embedding();
+        local_graph.queue_all_artifacts_for_embedding();
         return Ok(WarmEmbeddingRestoreStatus {
             vector_index_reused: false,
             requeued_embeddings: local_graph.embedding_status().pending,
@@ -2723,6 +2752,9 @@ fn restore_warm_embedding_state(
 
     if !queued_embeddings.is_empty() {
         local_graph.queue_for_embedding(queued_embeddings);
+    }
+    if !queued_artifacts.is_empty() {
+        local_graph.queue_artifacts_for_embedding(queued_artifacts);
     }
 
     Ok(WarmEmbeddingRestoreStatus {
@@ -2765,6 +2797,7 @@ fn restore_warm_embedding_state(
     _source_graph: &kin_db::InMemoryGraph,
     _source_vector_path: Option<&Path>,
     _queued_embeddings: &[EntityId],
+    _queued_artifacts: &[ArtifactId],
 ) -> Result<WarmEmbeddingRestoreStatus> {
     Ok(WarmEmbeddingRestoreStatus::default())
 }
@@ -4101,6 +4134,7 @@ mod tests {
             &source_graph,
             Some(&source_vector_path),
             &[entity_b.id],
+            &[],
         )
         .unwrap();
 

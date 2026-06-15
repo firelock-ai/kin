@@ -1022,7 +1022,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1121,7 +1121,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3060,7 +3060,7 @@ dependencies = [
 [[package]]
 name = "kin-db"
 version = "0.1.0"
-source = "git+https://github.com/firelock-ai/kin-db.git?rev=a9e5aea16d9a592e4b8e260a05758031ab8a4143#a9e5aea16d9a592e4b8e260a05758031ab8a4143"
+source = "git+https://github.com/firelock-ai/kin-db.git?rev=0f7ae046fd710480f217fe054762b545d6626fbe#0f7ae046fd710480f217fe054762b545d6626fbe"
 dependencies = [
  "bincode",
  "bytes",
@@ -3458,7 +3458,7 @@ dependencies = [
 [[package]]
 name = "kin-vector"
 version = "0.1.0"
-source = "git+https://github.com/firelock-ai/kin-vector.git?rev=afac0e7958067d14ad7fb566e788985dd1243a7e#afac0e7958067d14ad7fb566e788985dd1243a7e"
+source = "git+https://github.com/firelock-ai/kin-vector.git?rev=c738bc2b93df82bd63ab1a697ea2b32597bfb8e1#c738bc2b93df82bd63ab1a697ea2b32597bfb8e1"
 dependencies = [
  "fs2",
  "hashbrown 0.15.5",
@@ -3848,7 +3848,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4730,7 +4730,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5349,7 +5349,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6325,7 +6325,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

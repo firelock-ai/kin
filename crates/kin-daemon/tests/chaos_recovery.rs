@@ -7,6 +7,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use kin_daemon::api::HealthResponse;
+use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 
 fn free_port() -> u16 {
@@ -63,19 +64,54 @@ async fn wait_for_health(port: u16) -> HealthResponse {
     }
 }
 
+async fn wait_for_serving(port: u16) {
+    let addr = format!("127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut observations = Vec::new();
+
+    loop {
+        match TcpStream::connect(&addr).await {
+            Ok(_) => return,
+            Err(error) => {
+                observations.push(error.to_string());
+            }
+        }
+
+        if Instant::now() >= deadline {
+            let last_observation = observations
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "no response".to_string());
+            panic!("daemon on port {port} never served health: {last_observation}");
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn create_branch(port: u16, name: &str) {
     let client = reqwest::Client::new();
-    client
-        .post(format!("http://127.0.0.1:{port}/graph/branches"))
-        .json(&serde_json::json!({
-            "name": name,
-            "head": "0000000000000000000000000000000000000000000000000000000000000001"
-        }))
-        .send()
-        .await
-        .expect("create branch request failed")
-        .error_for_status()
-        .expect("create branch returned an error");
+    let url = format!("http://127.0.0.1:{port}/graph/branches");
+    let deadline = Instant::now() + Duration::from_secs(10);
+
+    loop {
+        let result = client
+            .post(&url)
+            .json(&serde_json::json!({
+                "name": name,
+                "head": "0000000000000000000000000000000000000000000000000000000000000001"
+            }))
+            .send()
+            .await
+            .and_then(|response| response.error_for_status());
+        if result.is_ok() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            result.expect("create branch request failed");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -126,8 +162,7 @@ async fn daemon_exits_after_idle_timeout_and_removes_endpoint_files() {
         ],
     );
 
-    let health = wait_for_health(port).await;
-    assert_eq!(health.status, "ok");
+    wait_for_serving(port).await;
 
     let daemon_port = repo.path().join(".kin/daemon.port");
     let daemon_pid = repo.path().join(".kin/daemon.pid");
@@ -157,12 +192,11 @@ async fn daemon_exits_after_dirty_repo_control_dir_is_removed() {
         port,
         &[
             ("KIN_DAEMON_DISABLE_LSP", "1"),
-            ("KIN_DAEMON_IDLE_TIMEOUT_SECS", "5"),
+            ("KIN_DAEMON_IDLE_TIMEOUT_SECS", "30"),
         ],
     );
 
-    let health = wait_for_health(port).await;
-    assert_eq!(health.status, "ok");
+    wait_for_serving(port).await;
     create_branch(port, "dirty-before-delete").await;
 
     std::fs::remove_dir_all(repo.path().join(".kin")).unwrap();

@@ -48,18 +48,13 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - name: Configure kin cargo registry
-        # .cargo/config.toml is gitignored (it carries local-dev [patch] paths),
-        # so CI writes only the registry alias the committed Cargo.toml needs to
-        # resolve the published kin-* crates (kin-model, kin-db, kin-lsp, …) from
-        # the kinlab.ai sparse registry. Mirrors release.yml / Dockerfile and the
-        # kin-bench CI(Linux) workflow.
+      - name: Verify kin cargo registry config
+        # The tracked config carries both the registry alias and temporary public
+        # Git [patch.kin] pins for kin-* crates that are not all registry-published yet.
         run: |
-          mkdir -p .cargo
-          cat > .cargo/config.toml <<'TOML'
-          [registries.kin]
-          index = "sparse+https://kinlab.ai/registry/cargo/"
-          TOML
+          test -f .cargo/config.toml
+          grep -q '^\[registries\.kin\]' .cargo/config.toml
+          grep -q '^kin-blobs = { git = ' .cargo/config.toml
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
@@ -140,12 +135,8 @@ jobs:
       - name: Check Private Repo Coupling
         run: bash scripts/check_private_repo_coupling.sh
 
-      # The committed Cargo.lock is registry-flavoured: kin-* deps resolve from
-      # the kinlab.ai sparse registry with recorded checksums (regenerated via
-      # `cargo generate-lockfile` with only the [registries.kin] alias in
-      # .cargo/config.toml — no [patch]). --locked therefore enforces a frozen,
-      # reproducible resolve here, matching what an external registry-only build
-      # sees. Re-run that regen (no [patch]) when bumping published kin-* deps.
+      # The committed Cargo.lock plus .cargo/config.toml pins kin-* dependencies
+      # to public source until every crate is registry-published.
       - name: Build
         run: cargo build --all-targets --locked
 
@@ -163,15 +154,12 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.96.0
 
-      - name: Configure kin cargo registry
-        # Same registry alias the check job writes; tarpaulin resolves the
-        # published kin-* crates from the kinlab.ai sparse registry too.
+      - name: Verify kin cargo registry config
+        # Same tracked config the check job verifies.
         run: |
-          mkdir -p .cargo
-          cat > .cargo/config.toml <<'TOML'
-          [registries.kin]
-          index = "sparse+https://kinlab.ai/registry/cargo/"
-          TOML
+          test -f .cargo/config.toml
+          grep -q '^\[registries\.kin\]' .cargo/config.toml
+          grep -q '^kin-blobs = { git = ' .cargo/config.toml
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
