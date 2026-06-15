@@ -14,12 +14,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # `-D warnings` is the enforcing gate for ALL steps (clippy, build, test).
-  # `-A deprecated` rides here (not only on the clippy step) because RUSTFLAGS
-  # applies to build + test too, and the ArtifactId::from_path deprecation debt
-  # would otherwise fail `cargo build`/`cargo test` even though clippy allow-lists
-  # it. TEMPORARY — drops when the ArtifactId migration lands. (clippy::* lints
-  # stay on the clippy command: plain rustc rejects the `clippy` tool namespace.)
-  RUSTFLAGS: "-D warnings -A deprecated"
+  # The ArtifactId migration has landed, so the `ArtifactId::from_path` /
+  # `from_file_id` deprecation is now enforced: graph-assigned IDs resolve via the
+  # `artifact_index`, and the few genuinely snapshot-less call sites carry local
+  # `#[allow(deprecated)]` justifications. (clippy::* lints stay on the clippy
+  # command: plain rustc rejects the `clippy` tool namespace.)
+  RUSTFLAGS: "-D warnings"
 
 jobs:
   dco:
@@ -75,10 +75,10 @@ jobs:
       # Enumerated from `cargo clippy --all-targets --all-features` on main against
       # the CI toolchain (rustc/clippy 1.96.0, dtolnay rust-toolchain@stable):
       # 45 distinct clippy lints (the 1.96 bump from 1.94 added collapsible_match,
-      # manual_checked_ops, useless_conversion). The trailing `-A deprecated` is a rustc
-      # (non-clippy) lint covering the ArtifactId::from_path deprecation warnings; it is
-      # required for the -Dwarnings gate to pass until that migration lands. The `--` keeps
-      # these allows AFTER the RUSTFLAGS=-Dwarnings group so each specific lint overrides it.
+      # manual_checked_ops, useless_conversion). The `--` keeps these allows AFTER the
+      # RUSTFLAGS=-Dwarnings group so each specific lint overrides it. (The ArtifactId
+      # deprecation is now enforced — its `-A deprecated` rustc allow was removed once the
+      # graph-assigned ArtifactId migration landed.)
       - name: Clippy
         run: >
           cargo clippy --all-targets --all-features --
@@ -127,7 +127,6 @@ jobs:
           -A clippy::unnecessary_sort_by
           -A clippy::unnecessary_unwrap
           -A clippy::useless_conversion
-          -A deprecated
 
       - name: Check Runtime Boundaries
         run: bash scripts/check_runtime_boundaries.sh

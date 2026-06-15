@@ -729,7 +729,10 @@ mod tests {
     #[test]
     fn pending_embedding_work_counts_artifact_only_queue() {
         let graph = kin_db::InMemoryGraph::new();
-        graph.queue_artifacts_for_embedding(&[ArtifactId::from_path("Makefile")]);
+        // Synthetic test ID: empty in-test graph has no artifact_index entry.
+        #[allow(deprecated)]
+        let makefile_id = ArtifactId::from_path("Makefile");
+        graph.queue_artifacts_for_embedding(&[makefile_id]);
 
         assert_eq!(graph.pending_embeddings(), 0);
         assert_eq!(graph.pending_artifact_embeddings(), 1);

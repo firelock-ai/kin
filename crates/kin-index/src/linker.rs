@@ -599,6 +599,15 @@ fn make_relation(kind: RelationKind, src: EntityId, dst: EntityId, confidence: f
     }
 }
 
+// Graph-less caller: the cross-file linker pipeline builds these artifact
+// import/include edges purely from parse data (`FileParseData` + `known_files`)
+// before any `GraphSnapshot`/`artifact_index` exists — its output is what the
+// graph is later constructed from (commit/init/import/migrate/ref_view). There
+// is no `artifact_index` to resolve graph-assigned IDs against here, so we keep
+// the deterministic path derivation. This matches the canonical kin-db approach
+// for index-time, snapshot-less artifact IDs (e.g. `ensure_artifact_id` /
+// `build_artifact_indexes_from_paths`), which also stay path-derived.
+#[allow(deprecated)]
 fn make_artifact_import_relation<S>(
     importer_file: &str,
     import: &FileImport,
@@ -1458,6 +1467,11 @@ fn normalize_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
+// Test fixtures construct artifact endpoints by path because they assert on
+// the linker's snapshot-less output (see `make_artifact_import_relation`),
+// where graph-assigned IDs are path-derived. Matches kin-model's own test
+// module, which also allows the deprecated path constructor.
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use kin_model::{
