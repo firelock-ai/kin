@@ -1309,6 +1309,10 @@ fn parse_language(s: &str) -> Option<LanguageId> {
 }
 
 #[cfg(test)]
+// Test fixtures construct artifact RetrievalKeys by path to assert on context
+// rendering; graph-assigned IDs are path-derived for these in-test records, so
+// the deprecated path constructor is the correct fixture tool here.
+#[allow(deprecated)]
 mod tests {
     use super::{
         enforce_precise_search_mode, looks_precise_name, parse_kinds, record_display_context,

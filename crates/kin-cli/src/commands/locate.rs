@@ -2497,7 +2497,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         );
     }
     let file_provenance = if explain {
-        collect_result_provenance(&results, &projection_provenance)
+        collect_result_provenance(graph, &results, &projection_provenance)
     } else {
         HashMap::new()
     };
@@ -8159,6 +8159,7 @@ fn compute_import_centrality(
 }
 
 fn collect_result_provenance(
+    graph: &kin_db::InMemoryGraph,
     results: &[(String, f32)],
     projection_provenance: &HashMap<String, LocateFileProvenance>,
 ) -> HashMap<String, LocateFileProvenance> {
@@ -8171,7 +8172,7 @@ fn collect_result_provenance(
                     .cloned()
                     .unwrap_or_else(|| LocateFileProvenance {
                         objects: vec![artifact_graph_object(
-                            kin_model::ArtifactId::from_path(path),
+                            graph_artifact_id_for_path(graph, path),
                             path,
                         )],
                         edges: Vec::new(),
@@ -8179,6 +8180,18 @@ fn collect_result_provenance(
             (path.clone(), provenance)
         })
         .collect()
+}
+
+/// Resolve the graph-assigned `ArtifactId` for `path` from the graph's
+/// artifact index, falling back to the deterministic path derivation only when
+/// the path is not yet indexed. Mirrors the canonical kin-db lookup
+/// (`artifact_index.get(..).unwrap_or_else(|| ArtifactId::from_file_id(..))`).
+fn graph_artifact_id_for_path(graph: &kin_db::InMemoryGraph, path: &str) -> kin_model::ArtifactId {
+    let file_id = kin_model::FilePathId::new(path);
+    #[allow(deprecated)]
+    graph
+        .artifact_id_for_path(&file_id)
+        .unwrap_or_else(|| kin_model::ArtifactId::from_path(path))
 }
 
 fn artifact_graph_object(artifact_id: kin_model::ArtifactId, path: &str) -> LocateGraphObject {
@@ -13338,6 +13351,10 @@ fn output_text(result: &LocateResult) {
 }
 
 #[cfg(test)]
+// Test fixtures build synthetic artifact relations by path; graph-assigned
+// IDs are path-derived for these in-test graphs, so the deprecated path
+// constructor is the correct fixture tool here.
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use kin_model::ArtifactId;
