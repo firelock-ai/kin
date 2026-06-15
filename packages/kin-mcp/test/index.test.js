@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import cp from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import http from 'node:http';
@@ -26,21 +27,29 @@ async function exists(filePath) {
 test('resolveReleaseAsset maps supported targets', () => {
   assert.deepEqual(resolveReleaseAsset('darwin', 'arm64'), {
     assetName: 'kin-macos-aarch64',
+    archiveName: 'kin-macos-aarch64.tar.gz',
     binaryName: 'kin'
   });
   assert.deepEqual(resolveReleaseAsset('darwin', 'x64'), {
     assetName: 'kin-macos-x86_64',
+    archiveName: 'kin-macos-x86_64.tar.gz',
     binaryName: 'kin'
   });
   assert.deepEqual(resolveReleaseAsset('linux', 'x64'), {
     assetName: 'kin-linux-x86_64',
+    archiveName: 'kin-linux-x86_64.tar.gz',
+    binaryName: 'kin'
+  });
+  assert.deepEqual(resolveReleaseAsset('linux', 'arm64'), {
+    assetName: 'kin-linux-aarch64',
+    archiveName: 'kin-linux-aarch64.tar.gz',
     binaryName: 'kin'
   });
 });
 
 test('resolveReleaseAsset rejects unsupported targets', () => {
   assert.throws(
-    () => resolveReleaseAsset('linux', 'arm64'),
+    () => resolveReleaseAsset('win32', 'x64'),
     /does not have a published Kin binary/
   );
 });
@@ -52,20 +61,29 @@ test('resolveReleaseTag prefixes versions with v', () => {
 
 test('ensureKinBinary downloads and verifies a release asset', async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-download-'));
+  const assetName = 'kin-linux-x86_64';
   const assetBytes = Buffer.from('#!/bin/sh\necho kin\n', 'utf8');
-  const checksum = crypto.createHash('sha256').update(assetBytes).digest('hex');
+  const packageDir = path.join(tmpDir, assetName);
+  const archivePath = path.join(tmpDir, `${assetName}.tar.gz`);
   const version = '9.9.9-test';
 
+  await fs.mkdir(packageDir);
+  await fs.writeFile(path.join(packageDir, 'kin'), assetBytes, { mode: 0o755 });
+  cp.execFileSync('tar', ['-czf', archivePath, '-C', tmpDir, assetName]);
+
+  const archiveBytes = await fs.readFile(archivePath);
+  const checksum = crypto.createHash('sha256').update(archiveBytes).digest('hex');
+
   const server = http.createServer((req, res) => {
-    if (req.url === `/v${version}/kin-linux-x86_64`) {
+    if (req.url === `/v${version}/${assetName}.tar.gz`) {
       res.writeHead(200, { 'content-type': 'application/octet-stream' });
-      res.end(assetBytes);
+      res.end(archiveBytes);
       return;
     }
 
-    if (req.url === `/v${version}/kin-linux-x86_64.sha256`) {
+    if (req.url === `/v${version}/${assetName}.tar.gz.sha256`) {
       res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
-      res.end(`${checksum}  kin-linux-x86_64\n`);
+      res.end(`${checksum}  ${assetName}.tar.gz\n`);
       return;
     }
 
