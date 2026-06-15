@@ -8185,13 +8185,12 @@ fn collect_result_provenance(
 /// Resolve the graph-assigned `ArtifactId` for `path` from the graph's
 /// artifact index, falling back to the deterministic path derivation only when
 /// the path is not yet indexed. Mirrors the canonical kin-db lookup
-/// (`artifact_index.get(..).unwrap_or_else(|| ArtifactId::from_file_id(..))`).
+/// (`artifact_index.get(..).unwrap_or_else(|| ArtifactId::seed_from_file_id(..))`).
 fn graph_artifact_id_for_path(graph: &kin_db::InMemoryGraph, path: &str) -> kin_model::ArtifactId {
     let file_id = kin_model::FilePathId::new(path);
-    #[allow(deprecated)]
     graph
         .artifact_id_for_path(&file_id)
-        .unwrap_or_else(|| kin_model::ArtifactId::from_path(path))
+        .unwrap_or_else(|| kin_model::ArtifactId::seed_from_path(path))
 }
 
 fn artifact_graph_object(artifact_id: kin_model::ArtifactId, path: &str) -> LocateGraphObject {
@@ -13354,7 +13353,6 @@ fn output_text(result: &LocateResult) {
 // Test fixtures build synthetic artifact relations by path; graph-assigned
 // IDs are path-derived for these in-test graphs, so the deprecated path
 // constructor is the correct fixture tool here.
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use kin_model::ArtifactId;
@@ -16874,10 +16872,10 @@ mod tests {
             .upsert_relation(&Relation {
                 id: RelationId::new(),
                 kind: RelationKind::Includes,
-                src: GraphNodeId::Artifact(ArtifactId::from_path(
+                src: GraphNodeId::Artifact(ArtifactId::seed_from_path(
                     "include/nlohmann/detail/iterators/iter_impl.hpp",
                 )),
-                dst: GraphNodeId::Artifact(ArtifactId::from_path(
+                dst: GraphNodeId::Artifact(ArtifactId::seed_from_path(
                     "include/nlohmann/detail/iterators/internal_iterator.hpp",
                 )),
                 confidence: 1.0,
@@ -17121,8 +17119,8 @@ mod tests {
             .upsert_relation(&Relation {
                 id: RelationId::new(),
                 kind: RelationKind::Includes,
-                src: GraphNodeId::Artifact(ArtifactId::from_path("src/app.cpp")),
-                dst: GraphNodeId::Artifact(ArtifactId::from_path("include/app.hpp")),
+                src: GraphNodeId::Artifact(ArtifactId::seed_from_path("src/app.cpp")),
+                dst: GraphNodeId::Artifact(ArtifactId::seed_from_path("include/app.hpp")),
                 confidence: 1.0,
                 origin: RelationOrigin::Parsed,
                 created_in: None,
@@ -17140,8 +17138,8 @@ mod tests {
             .upsert_relation(&Relation {
                 id: RelationId::from_bytes([0xff; 16]),
                 kind: RelationKind::Includes,
-                src: GraphNodeId::Artifact(ArtifactId::from_path("include/app.hpp")),
-                dst: GraphNodeId::Artifact(ArtifactId::from_path("include/detail/internal.hpp")),
+                src: GraphNodeId::Artifact(ArtifactId::seed_from_path("include/app.hpp")),
+                dst: GraphNodeId::Artifact(ArtifactId::seed_from_path("include/detail/internal.hpp")),
                 confidence: 1.0,
                 origin: RelationOrigin::Parsed,
                 created_in: None,
@@ -17159,8 +17157,8 @@ mod tests {
             .upsert_relation(&Relation {
                 id: RelationId::from_bytes([0x00; 16]),
                 kind: RelationKind::Includes,
-                src: GraphNodeId::Artifact(ArtifactId::from_path("tests/test_app.cpp")),
-                dst: GraphNodeId::Artifact(ArtifactId::from_path("include/app.hpp")),
+                src: GraphNodeId::Artifact(ArtifactId::seed_from_path("tests/test_app.cpp")),
+                dst: GraphNodeId::Artifact(ArtifactId::seed_from_path("include/app.hpp")),
                 confidence: 1.0,
                 origin: RelationOrigin::Parsed,
                 created_in: None,

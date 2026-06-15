@@ -1312,7 +1312,6 @@ fn parse_language(s: &str) -> Option<LanguageId> {
 // Test fixtures construct artifact RetrievalKeys by path to assert on context
 // rendering; graph-assigned IDs are path-derived for these in-test records, so
 // the deprecated path constructor is the correct fixture tool here.
-#[allow(deprecated)]
 mod tests {
     use super::{
         enforce_precise_search_mode, looks_precise_name, parse_kinds, record_display_context,
@@ -1470,7 +1469,7 @@ mod tests {
     #[test]
     fn artifact_context_strings_include_object_class() {
         let shallow = SearchRecord::Resolved {
-            key: RetrievalKey::Artifact(ArtifactId::from_path("src/lib.rs")),
+            key: RetrievalKey::Artifact(ArtifactId::seed_from_path("src/lib.rs")),
             item: ResolvedRetrievalItem::ShallowFile(ShallowTrackedFile {
                 file_id: FilePathId::new("src/lib.rs"),
                 language_hint: "rust".to_string(),
@@ -1493,7 +1492,7 @@ mod tests {
         );
 
         let structured = SearchRecord::Resolved {
-            key: RetrievalKey::Artifact(ArtifactId::from_path("Makefile")),
+            key: RetrievalKey::Artifact(ArtifactId::seed_from_path("Makefile")),
             item: ResolvedRetrievalItem::StructuredArtifact(StructuredArtifact {
                 file_id: FilePathId::new("Makefile"),
                 kind: ArtifactKind::Makefile,
@@ -1515,7 +1514,7 @@ mod tests {
         );
 
         let opaque = SearchRecord::Resolved {
-            key: RetrievalKey::Artifact(ArtifactId::from_path("image.png")),
+            key: RetrievalKey::Artifact(ArtifactId::seed_from_path("image.png")),
             item: ResolvedRetrievalItem::OpaqueArtifact(OpaqueArtifact {
                 file_id: FilePathId::new("image.png"),
                 content_hash: Hash256::from_bytes([4; 32]),

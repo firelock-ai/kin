@@ -1140,7 +1140,6 @@ fn rebuild_entity_source_file_layouts(
     Ok(())
 }
 
-#[allow(deprecated)]
 fn snapshot_artifact_id_for_path(snapshot: &GraphSnapshot, path: &str) -> Option<ArtifactId> {
     let file_id = FilePathId::new(path);
     Some(
@@ -1148,7 +1147,7 @@ fn snapshot_artifact_id_for_path(snapshot: &GraphSnapshot, path: &str) -> Option
             .artifact_index
             .get(&file_id)
             .copied()
-            .unwrap_or_else(|| ArtifactId::from_file_id(&file_id)),
+            .unwrap_or_else(|| ArtifactId::seed_from_file_id(&file_id)),
     )
 }
 
@@ -2188,7 +2187,7 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
         let e2 = EntityId::new();
         let e3 = EntityId::new();
         let artifact_key =
-            kin_model::RetrievalKey::Artifact(kin_model::ArtifactId::from_path("README.md"));
+            kin_model::RetrievalKey::Artifact(kin_model::ArtifactId::seed_from_path("README.md"));
 
         let mut scoped = HashSet::new();
         scoped.insert(e1);

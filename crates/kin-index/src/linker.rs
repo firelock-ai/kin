@@ -607,7 +607,6 @@ fn make_relation(kind: RelationKind, src: EntityId, dst: EntityId, confidence: f
 // the deterministic path derivation. This matches the canonical kin-db approach
 // for index-time, snapshot-less artifact IDs (e.g. `ensure_artifact_id` /
 // `build_artifact_indexes_from_paths`), which also stay path-derived.
-#[allow(deprecated)]
 fn make_artifact_import_relation<S>(
     importer_file: &str,
     import: &FileImport,
@@ -622,8 +621,8 @@ where
     } else {
         RelationKind::Imports
     };
-    let src = GraphNodeId::Artifact(ArtifactId::from_path(importer_file));
-    let dst = GraphNodeId::Artifact(ArtifactId::from_path(&resolved_path));
+    let src = GraphNodeId::Artifact(ArtifactId::seed_from_path(importer_file));
+    let dst = GraphNodeId::Artifact(ArtifactId::seed_from_path(&resolved_path));
     let evidence = RelationEvidence {
         source_path: Some(import.module_path.clone()),
         resolved_path: Some(resolved_path.clone()),
@@ -1471,7 +1470,6 @@ fn normalize_path(path: &Path) -> PathBuf {
 // the linker's snapshot-less output (see `make_artifact_import_relation`),
 // where graph-assigned IDs are path-derived. Matches kin-model's own test
 // module, which also allows the deprecated path constructor.
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use kin_model::{
@@ -1598,11 +1596,11 @@ mod tests {
             .expect("expected Imports relation");
         assert_eq!(
             imports.src,
-            GraphNodeId::Artifact(ArtifactId::from_path("src/routes/api.ts"))
+            GraphNodeId::Artifact(ArtifactId::seed_from_path("src/routes/api.ts"))
         );
         assert_eq!(
             imports.dst,
-            GraphNodeId::Artifact(ArtifactId::from_path("src/utils/tools.ts"))
+            GraphNodeId::Artifact(ArtifactId::seed_from_path("src/utils/tools.ts"))
         );
         assert_eq!(imports.import_source.as_deref(), Some("../utils/tools"));
     }
@@ -1649,11 +1647,11 @@ mod tests {
             .expect("expected Imports relation");
         assert_eq!(
             imports.src,
-            GraphNodeId::Artifact(ArtifactId::from_path("src/routes/api.ts"))
+            GraphNodeId::Artifact(ArtifactId::seed_from_path("src/routes/api.ts"))
         );
         assert_eq!(
             imports.dst,
-            GraphNodeId::Artifact(ArtifactId::from_path("src/utils/tools.ts"))
+            GraphNodeId::Artifact(ArtifactId::seed_from_path("src/utils/tools.ts"))
         );
         assert_eq!(imports.import_source.as_deref(), Some("../utils/tools"));
     }
@@ -1733,9 +1731,9 @@ mod tests {
         assert!(
             result.iter().any(|rel| {
                 rel.kind == RelationKind::Includes
-                    && rel.src == GraphNodeId::Artifact(ArtifactId::from_path("src/app.cpp"))
+                    && rel.src == GraphNodeId::Artifact(ArtifactId::seed_from_path("src/app.cpp"))
                     && rel.dst
-                        == GraphNodeId::Artifact(ArtifactId::from_path("include/json/macros.hpp"))
+                        == GraphNodeId::Artifact(ArtifactId::seed_from_path("include/json/macros.hpp"))
             }),
             "include directive should be preserved as an artifact edge"
         );
@@ -1792,7 +1790,7 @@ mod tests {
             &known_files,
             |path| {
                 if known_files.contains(path) {
-                    Some(ArtifactId::from_path(path))
+                    Some(ArtifactId::seed_from_path(path))
                 } else {
                     None
                 }
@@ -1803,7 +1801,7 @@ mod tests {
         assert!(relations.iter().all(|rel| {
             rel.kind == RelationKind::DerivedFrom
                 && rel.src
-                    == GraphNodeId::Artifact(ArtifactId::from_path(
+                    == GraphNodeId::Artifact(ArtifactId::seed_from_path(
                         "single_include/nlohmann/json.hpp",
                     ))
         }));
@@ -1811,7 +1809,7 @@ mod tests {
             .iter()
             .find(|rel| {
                 rel.dst
-                    == GraphNodeId::Artifact(ArtifactId::from_path(
+                    == GraphNodeId::Artifact(ArtifactId::seed_from_path(
                         "include/nlohmann/detail/exceptions.hpp",
                     ))
             })
@@ -2164,11 +2162,11 @@ void f();
             .expect("expected Imports relation");
         assert_eq!(
             imports.src,
-            GraphNodeId::Artifact(ArtifactId::from_path("src/api.ts"))
+            GraphNodeId::Artifact(ArtifactId::seed_from_path("src/api.ts"))
         );
         assert_eq!(
             imports.dst,
-            GraphNodeId::Artifact(ArtifactId::from_path("src/utils.ts"))
+            GraphNodeId::Artifact(ArtifactId::seed_from_path("src/utils.ts"))
         );
         assert_eq!(imports.import_source.as_deref(), Some("./utils"));
     }
@@ -2205,11 +2203,11 @@ void f();
         assert_eq!(result[0].kind, RelationKind::Imports);
         assert_eq!(
             result[0].src,
-            GraphNodeId::Artifact(ArtifactId::from_path("src/routes/api.ts"))
+            GraphNodeId::Artifact(ArtifactId::seed_from_path("src/routes/api.ts"))
         );
         assert_eq!(
             result[0].dst,
-            GraphNodeId::Artifact(ArtifactId::from_path("src/utils/tools.ts"))
+            GraphNodeId::Artifact(ArtifactId::seed_from_path("src/utils/tools.ts"))
         );
         assert_eq!(result[0].import_source.as_deref(), Some("../utils/tools"));
     }
@@ -2250,11 +2248,11 @@ void f();
         assert_eq!(result[0].kind, RelationKind::Includes);
         assert_eq!(
             result[0].src,
-            GraphNodeId::Artifact(ArtifactId::from_path("src/main.cpp"))
+            GraphNodeId::Artifact(ArtifactId::seed_from_path("src/main.cpp"))
         );
         assert_eq!(
             result[0].dst,
-            GraphNodeId::Artifact(ArtifactId::from_path(
+            GraphNodeId::Artifact(ArtifactId::seed_from_path(
                 "include/nlohmann/detail/input/binary_reader.hpp"
             ))
         );
@@ -2342,11 +2340,11 @@ void f();
         assert_eq!(result[0].kind, RelationKind::Imports);
         assert_eq!(
             result[0].src,
-            GraphNodeId::Artifact(ArtifactId::from_path("src/api.ts"))
+            GraphNodeId::Artifact(ArtifactId::seed_from_path("src/api.ts"))
         );
         assert_eq!(
             result[0].dst,
-            GraphNodeId::Artifact(ArtifactId::from_path("src/util.ts"))
+            GraphNodeId::Artifact(ArtifactId::seed_from_path("src/util.ts"))
         );
     }
 
