@@ -54,9 +54,68 @@ fn relation_weight(kind: &RelationKind) -> f64 {
 /// `OwnedByFile`, `DocumentedBy`) carry weight 0.5 — they are graph plumbing, not
 /// dependencies, and were padding packs with same-file/same-crate noise (FIR-939).
 /// Requiring at least a `References`-grade (1.0) connection keeps every semantic
-/// edge while dropping pure structural neighbours. Direct deps (any edge to the
-/// focal), tests, and contracts are unaffected — this gates only transitive fill.
+/// edge while dropping pure structural neighbours. Direct deps (any *dependency*
+/// edge to the focal), tests, and contracts are unaffected — this gates only
+/// transitive fill.
 const TRANSITIVE_RELEVANCE_FLOOR: f64 = 1.0;
+
+/// Whether an edge expresses a real **code dependency** — the kind of edge that
+/// belongs in the "dependencies / what you need to understand this" sections of a
+/// context pack.
+///
+/// This is the membership gate behind FIR-939: `get_context_pack`'s dependency
+/// sections must be the focal entity's actual graph dependencies, not whatever
+/// shares *any* edge with it. Two edge classes are explicitly NOT dependencies and
+/// were flooding the pack:
+///
+/// * [`RelationKind::CoChanges`] — git co-change mining. Statistical history
+///   signal (`Inferred` origin), not a code dependency. On a typical function its
+///   co-change set dwarfs the real callees, so without this gate the "dependencies"
+///   are dominated by whatever happened to land in the same commits (e.g.
+///   `stash::push`, `buildinfo::get`). Useful as co-change *risk*, never as "what
+///   this function depends on."
+/// * Structural-containment plumbing ([`RelationKind::Contains`],
+///   [`RelationKind::OwnedBy`], [`RelationKind::OwnedByFile`],
+///   [`RelationKind::DocumentedBy`]) — graph plumbing, not a dependency.
+///
+/// Test (`Tests`/`Covers`) edges are intentionally excluded here too: tests have
+/// their own pack section and are handled separately, not as dependencies.
+///
+/// This gate governs **membership** in the dependency sections only; ordering
+/// within a section still uses [`relation_weight`], and the broader BFS expansion
+/// weighting is unchanged.
+fn is_dependency_edge(kind: &RelationKind) -> bool {
+    match kind {
+        // Real code dependencies / usage / wiring.
+        RelationKind::Calls
+        | RelationKind::Instantiates
+        | RelationKind::References
+        | RelationKind::UsesMacro
+        | RelationKind::UsesType
+        | RelationKind::Imports
+        | RelationKind::Includes
+        | RelationKind::DependsOn
+        | RelationKind::Implements
+        | RelationKind::Extends
+        | RelationKind::Overrides
+        | RelationKind::DefinesContract
+        | RelationKind::ConsumesContract
+        | RelationKind::EmitsEvent
+        | RelationKind::SubscribesTo
+        | RelationKind::SendsMessage
+        | RelationKind::Spawns
+        | RelationKind::DerivedFrom => true,
+        // Not dependencies: git co-change mining, test edges, structural plumbing,
+        // ownership/doc metadata.
+        RelationKind::CoChanges
+        | RelationKind::Tests
+        | RelationKind::Covers
+        | RelationKind::Contains
+        | RelationKind::OwnedBy
+        | RelationKind::OwnedByFile
+        | RelationKind::DocumentedBy => false,
+    }
+}
 
 /// Build a map from entity ID to its maximum relation weight relative to the focal entity.
 ///
@@ -100,6 +159,32 @@ fn build_weight_map(
         }
     }
     weights
+}
+
+/// Collect every entity in the subgraph that is touched by at least one real
+/// **dependency** edge ([`is_dependency_edge`]).
+///
+/// Used to gate transitive fill: a 2+-hop neighbour may clear the relevance floor
+/// purely on a high-weight `CoChanges` edge (weight 3.5), which would re-introduce
+/// the same git-history noise this fix removes from the direct section. Requiring
+/// the neighbour to also sit on a dependency edge keeps transitive fill edge-driven
+/// rather than co-change-driven (FIR-939).
+fn dependency_edge_entities(
+    relations: &[kin_model::Relation],
+) -> std::collections::HashSet<EntityId> {
+    let mut ids = std::collections::HashSet::new();
+    for rel in relations {
+        if !is_dependency_edge(&rel.kind) {
+            continue;
+        }
+        if let Some(id) = rel.src.as_entity() {
+            ids.insert(id);
+        }
+        if let Some(id) = rel.dst.as_entity() {
+            ids.insert(id);
+        }
+    }
+    ids
 }
 
 /// Hint for which assistant is requesting context, enabling tuned strategies.
@@ -184,23 +269,42 @@ where
         .get_all_relations_for_entity(focal_id)
         .map_err(|e| ContextError::Graph(e.to_string()))?;
 
+    // The non-focal endpoint of a direct edge, regardless of direction.
+    let direct_neighbor = |r: &kin_model::Relation| -> Option<EntityId> {
+        if r.src == GraphNodeId::Entity(*focal_id) {
+            r.dst.as_entity()
+        } else if r.dst == GraphNodeId::Entity(*focal_id) {
+            r.src.as_entity()
+        } else {
+            None
+        }
+    };
+
+    // Every 1-hop neighbour (any edge kind, either direction). Used only to
+    // populate the subgraph so test/contract entities reached via incoming-only
+    // edges (e.g. a `Tests` edge pointing at the focal) can still land in their
+    // own pack sections.
+    let all_direct_related_ids: Vec<EntityId> = direct_relations
+        .iter()
+        .filter_map(direct_neighbor)
+        .collect();
+
+    // A direct *dependency* must ride a real dependency edge (Calls, Imports,
+    // UsesType, …), not git co-change or structural plumbing. Without this gate
+    // the "dependencies" section is dominated by `CoChanges` neighbours and
+    // same-file containment noise rather than the entity's actual callees
+    // (FIR-939). An entity counts as a dependency if *any* of its edges to the
+    // focal is a dependency edge.
     let direct_dep_ids: Vec<EntityId> = direct_relations
         .iter()
-        .filter_map(|r| {
-            if r.src == GraphNodeId::Entity(*focal_id) {
-                r.dst.as_entity()
-            } else if r.dst == GraphNodeId::Entity(*focal_id) {
-                r.src.as_entity()
-            } else {
-                None
-            }
-        })
+        .filter(|r| is_dependency_edge(&r.kind))
+        .filter_map(direct_neighbor)
         .collect();
 
     // BFS only follows outgoing edges, so entities with only incoming edges to
     // the focal (e.g. test entities with a Tests relation pointing at the focal)
     // may be missing from the subgraph. Backfill them so they can be ranked.
-    for dep_id in &direct_dep_ids {
+    for dep_id in &all_direct_related_ids {
         if !subgraph.entities.contains_key(dep_id) {
             if let Ok(Some(entity)) = graph.get_entity(dep_id) {
                 subgraph.entities.insert(*dep_id, entity);
@@ -248,6 +352,11 @@ where
 
     // 3. Build relation-weight map and sort entities by priority.
     let weight_map = build_weight_map(focal_id, &subgraph.relations);
+
+    // Entities sitting on at least one real dependency edge. Transitive fill is
+    // restricted to this set so co-change neighbours (which clear the weight floor
+    // on their own) cannot pad the pack with git-history noise (FIR-939).
+    let dependency_entities = dependency_edge_entities(&subgraph.relations);
 
     // Sort subgraph entities by descending relation weight so that when the
     // token budget is tight, high-signal entities (Calls, DependsOn) are
@@ -342,9 +451,13 @@ where
                 });
             }
         } else {
-            // Transitive fill must be reached via a semantic edge, not pure
-            // structural containment — otherwise the budget pads with same-file /
-            // same-crate plumbing (FIR-939). Direct deps bypass this (handled above).
+            // Transitive fill must be reached via a real dependency edge, not pure
+            // structural containment and not git co-change — otherwise the budget
+            // pads with same-file/same-crate plumbing or co-change history noise
+            // (FIR-939). Direct deps bypass this (handled above).
+            if !dependency_entities.contains(eid) {
+                continue;
+            }
             let weight = weight_map.get(eid).copied().unwrap_or(0.0);
             if weight < TRANSITIVE_RELEVANCE_FLOOR {
                 continue;
@@ -1545,6 +1658,121 @@ mod tests {
         assert!(
             transitive.iter().all(|c| !c.contains("structural_B")),
             "structural-only (Contains) transitive neighbour must be filtered (FIR-939)"
+        );
+    }
+
+    #[test]
+    fn dependencies_are_real_edges_not_cochange_filler() {
+        // FIR-939: the dependency section must be the focal entity's real call/use
+        // dependencies, NOT git co-change neighbours or structural plumbing. This
+        // reproduces the dogfood failure shape (a real callee + plenty of
+        // CoChanges/Contains noise sharing edges with the focal) and asserts the
+        // pack surfaces the callee and drops the noise.
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+        let mk_rel = |kind, src: EntityId, dst: EntityId| Relation {
+            id: kin_model::ids::RelationId::new(),
+            kind,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("project_after_mcp_commit", EntityKind::Function);
+        let real_callee = make_entity("project_overlay_to_files", EntityKind::Function);
+        // Co-change neighbours: high relation weight (3.5, above DependsOn) but NOT
+        // a dependency — exactly the `stash::push` / `buildinfo::get` noise.
+        let cochange_a = make_entity("stash_push", EntityKind::Function);
+        let cochange_b = make_entity("buildinfo_get", EntityKind::Function);
+        // Structural-containment neighbour (module owns focal): plumbing, not a dep.
+        let structural = make_entity("projection_wiring_mod", EntityKind::Module);
+        for e in [&focal, &real_callee, &cochange_a, &cochange_b, &structural] {
+            store.upsert_entity(e).unwrap();
+        }
+        // The one real dependency.
+        store
+            .upsert_relation(&mk_rel(RelationKind::Calls, focal.id, real_callee.id))
+            .unwrap();
+        // Noise that currently floods the "dependencies" section.
+        store
+            .upsert_relation(&mk_rel(RelationKind::CoChanges, focal.id, cochange_a.id))
+            .unwrap();
+        store
+            .upsert_relation(&mk_rel(RelationKind::CoChanges, focal.id, cochange_b.id))
+            .unwrap();
+        store
+            .upsert_relation(&mk_rel(RelationKind::Contains, structural.id, focal.id))
+            .unwrap();
+
+        let pack = build_context_pack(&store, &focal.id, &ContextOptions::default()).unwrap();
+
+        // Every entry across both dependency sections, by content.
+        let dep_blob: String = pack
+            .dependency_signatures
+            .iter()
+            .chain(pack.transitive_deps.iter())
+            .map(|e| e.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            dep_blob.contains("project_overlay_to_files"),
+            "real callee must be present in dependencies, got: {dep_blob}"
+        );
+        assert!(
+            !dep_blob.contains("stash_push") && !dep_blob.contains("buildinfo_get"),
+            "co-change neighbours must NOT appear as dependencies (FIR-939), got: {dep_blob}"
+        );
+        assert!(
+            !dep_blob.contains("projection_wiring_mod"),
+            "structural-containment neighbour must NOT appear as a dependency, got: {dep_blob}"
+        );
+        // The single real dep is the only dependency-section entry — no count-driven
+        // padding with the co-change/structural neighbours that share edges.
+        assert_eq!(
+            pack.dependency_signatures.len() + pack.transitive_deps.len(),
+            1,
+            "dependency sections must contain only the real dep, not filler"
+        );
+    }
+
+    #[test]
+    fn cochange_only_neighbor_does_not_trigger_same_file_fallback_as_dep() {
+        // A focal whose ONLY edges are co-change has no real dependencies. The pack
+        // must not present those co-change neighbours as dependencies; the honest
+        // result is an empty dependency section (FIR-939: fewer-but-correct beats a
+        // misleading full pack).
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+        let mk_rel = |kind, src: EntityId, dst: EntityId| Relation {
+            id: kin_model::ids::RelationId::new(),
+            kind,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let store = kin_db::InMemoryGraph::new();
+        // No file_origin → the same-file fallback cannot fire, isolating the
+        // co-change gating behaviour.
+        let focal = make_entity("focal_no_real_deps", EntityKind::Function);
+        let cochange = make_entity("unrelated_cochange", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+        store.upsert_entity(&cochange).unwrap();
+        store
+            .upsert_relation(&mk_rel(RelationKind::CoChanges, focal.id, cochange.id))
+            .unwrap();
+
+        let pack = build_context_pack(&store, &focal.id, &ContextOptions::default()).unwrap();
+        assert!(
+            pack.dependency_signatures.is_empty() && pack.transitive_deps.is_empty(),
+            "co-change-only focal must yield no dependencies, not co-change filler"
         );
     }
 
