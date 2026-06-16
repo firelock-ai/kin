@@ -35,6 +35,14 @@ pub enum VfsRequest {
 
     /// Register for push invalidation events.
     Subscribe,
+
+    /// Interposition canary handshake. Sent once by the shim when it loads and
+    /// activates with a `KIN_VFS_CANARY` launch token, so the daemon can record
+    /// that this process is genuinely graph-native. A process whose
+    /// `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD` was stripped never loads the shim
+    /// and therefore never sends this — letting a launcher fail it loud instead
+    /// of trusting raw-disk reads as graph truth.
+    Announce { pid: u32, token: String },
 }
 
 /// Response from daemon to VFS shim.
@@ -63,6 +71,9 @@ pub enum VfsResponse {
 
     /// Push invalidation from daemon to shim.
     Invalidate { paths: Vec<String> },
+
+    /// Acknowledge an interposition canary [`VfsRequest::Announce`].
+    Announced,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
