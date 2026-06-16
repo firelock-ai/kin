@@ -17139,7 +17139,9 @@ mod tests {
                 id: RelationId::from_bytes([0xff; 16]),
                 kind: RelationKind::Includes,
                 src: GraphNodeId::Artifact(ArtifactId::seed_from_path("include/app.hpp")),
-                dst: GraphNodeId::Artifact(ArtifactId::seed_from_path("include/detail/internal.hpp")),
+                dst: GraphNodeId::Artifact(ArtifactId::seed_from_path(
+                    "include/detail/internal.hpp",
+                )),
                 confidence: 1.0,
                 origin: RelationOrigin::Parsed,
                 created_in: None,

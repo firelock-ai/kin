@@ -654,12 +654,14 @@ where
         {
             entries.push(ArtifactContextEntry {
                 retrieval_key: RetrievalKey::Artifact(
-                    graph.artifact_id_for_path(&file.file_id).unwrap_or_else(|| {
-                        // Fallback only for stores without an artifact index
-                        // (e.g. mocks) or untracked paths; production graph
-                        // returns the graph-assigned id above.
-                        ArtifactId::seed_from_path(file.file_id.0.as_str())
-                    }),
+                    graph
+                        .artifact_id_for_path(&file.file_id)
+                        .unwrap_or_else(|| {
+                            // Fallback only for stores without an artifact index
+                            // (e.g. mocks) or untracked paths; production graph
+                            // returns the graph-assigned id above.
+                            ArtifactId::seed_from_path(file.file_id.0.as_str())
+                        }),
                 ),
                 file_path: file.file_id.clone(),
                 kind: ArtifactContextKind::ShallowFile,
@@ -673,9 +675,9 @@ where
         {
             entries.push(ArtifactContextEntry {
                 retrieval_key: RetrievalKey::Artifact(
-                    graph.artifact_id_for_path(&artifact.file_id).unwrap_or_else(|| {
-                        ArtifactId::seed_from_path(artifact.file_id.0.as_str())
-                    }),
+                    graph
+                        .artifact_id_for_path(&artifact.file_id)
+                        .unwrap_or_else(|| ArtifactId::seed_from_path(artifact.file_id.0.as_str())),
                 ),
                 file_path: artifact.file_id.clone(),
                 kind: ArtifactContextKind::StructuredArtifact(artifact.kind),
@@ -689,9 +691,9 @@ where
         {
             entries.push(ArtifactContextEntry {
                 retrieval_key: RetrievalKey::Artifact(
-                    graph.artifact_id_for_path(&artifact.file_id).unwrap_or_else(|| {
-                        ArtifactId::seed_from_path(artifact.file_id.0.as_str())
-                    }),
+                    graph
+                        .artifact_id_for_path(&artifact.file_id)
+                        .unwrap_or_else(|| ArtifactId::seed_from_path(artifact.file_id.0.as_str())),
                 ),
                 file_path: artifact.file_id.clone(),
                 kind: ArtifactContextKind::OpaqueArtifact,
