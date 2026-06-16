@@ -604,9 +604,23 @@ fn prompt_yn(prompt: &str, default_yes: bool, interactive: bool) -> bool {
 // ---------------------------------------------------------------------------
 
 /// The MCP server entry we inject for Kin.
+///
+/// Prefers an absolute path to the `kin` binary (resolved from the current
+/// executable) so the entry works in agent processes that do not inherit the
+/// user's PATH.
 fn kin_mcp_entry() -> serde_json::Value {
+    // Try to resolve an absolute path from the running executable.  The
+    // installed binary lives alongside the other kin-* binaries, so
+    // current_exe() gives us the right directory.
+    let command = if let Ok(exe) = env::current_exe() {
+        // current_exe may be e.g. /Users/foo/.cargo/bin/kin — use it directly.
+        exe.to_string_lossy().into_owned()
+    } else {
+        // Fallback: bare name relying on PATH (previous behaviour).
+        "kin".to_string()
+    };
     serde_json::json!({
-        "command": "kin",
+        "command": command,
         "args": ["mcp", "start", "--global"]
     })
 }
@@ -618,11 +632,24 @@ struct AiAssistant {
     install_hint: &'static str,
 }
 
+// Assistant index constants — keep in sync with detect_ai_assistants() order.
+const IDX_CLAUDE_CODE: usize = 0;
+const IDX_CURSOR: usize = 1;
+const IDX_CODEX: usize = 2;
+const IDX_GEMINI: usize = 3;
+const IDX_WINDSURF: usize = 4;
+
 fn detect_ai_assistants() -> Vec<AiAssistant> {
     let claude_detected = check_binary_in_path("claude").is_some();
     let cursor_detected = check_binary_in_path("cursor").is_some()
         || PathBuf::from("/Applications/Cursor.app").exists();
     let codex_detected = check_binary_in_path("codex").is_some();
+    let gemini_detected = check_binary_in_path("gemini").is_some()
+        || home_dir()
+            .map(|h| h.join(".gemini").exists())
+            .unwrap_or(false);
+    let windsurf_detected = check_binary_in_path("windsurf").is_some()
+        || PathBuf::from("/Applications/Windsurf.app").exists();
 
     vec![
         AiAssistant {
@@ -639,6 +666,16 @@ fn detect_ai_assistants() -> Vec<AiAssistant> {
             name: "Codex CLI",
             detected: codex_detected,
             install_hint: "install from github.com/openai/codex",
+        },
+        AiAssistant {
+            name: "Gemini CLI",
+            detected: gemini_detected,
+            install_hint: "install via: npm install -g @google/gemini-cli",
+        },
+        AiAssistant {
+            name: "Windsurf",
+            detected: windsurf_detected,
+            install_hint: "install from windsurf.com",
         },
     ]
 }
@@ -718,6 +755,85 @@ fn configure_codex() -> Result<PathBuf> {
     let target = home.join(".codex").join("mcp.json");
     merge_mcp_config(&target)?;
     Ok(target)
+}
+
+/// Configure MCP for Gemini CLI.
+///
+/// Gemini CLI persists MCP servers in `~/.gemini/settings.json` under the
+/// top-level `mcpServers` key (same shape as other agents: `command` + `args`).
+fn configure_gemini_cli() -> Result<PathBuf> {
+    let home = home_dir()?;
+    let target = home.join(".gemini").join("settings.json");
+    merge_mcp_config(&target)?;
+    Ok(target)
+}
+
+/// Configure MCP for Windsurf.
+///
+/// Windsurf reads its MCP server list from `~/.codeium/windsurf/mcp_config.json`.
+fn configure_windsurf() -> Result<PathBuf> {
+    let home = home_dir()?;
+    let target = home
+        .join(".codeium")
+        .join("windsurf")
+        .join("mcp_config.json");
+    merge_mcp_config(&target)?;
+    Ok(target)
+}
+
+// ---------------------------------------------------------------------------
+// Discovery reminder injection
+// ---------------------------------------------------------------------------
+
+/// Kin-first discovery reminder appended to agent instruction files.
+///
+/// Tells the agent to lead with Kin's semantic tools (`semantic_locate`,
+/// `get_context_pack`, `trace_data_flow`) instead of grep/read loops.
+const KIN_DISCOVERY_REMINDER: &str = r#"
+## Kin-first discovery (added by `kin setup`)
+
+When exploring a Kin repository, always start with Kin's semantic MCP tools
+before falling back to grep or raw file reads:
+
+1. `semantic_locate`    — find symbols, functions, types by semantic meaning
+2. `get_context_pack`  — get a structured context bundle for a file or symbol
+3. `trace_data_flow`   — trace data lineage and cross-file dependencies
+
+These tools operate on the graph-native substrate and return richer, more
+accurate results than filesystem heuristics. Use them first.
+"#;
+
+/// Append the Kin-first discovery reminder to an agent instruction file
+/// (e.g. `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`).
+///
+/// Idempotent: skips if the marker is already present.
+fn inject_discovery_reminder(path: &PathBuf) -> Result<()> {
+    const MARKER: &str = "## Kin-first discovery (added by `kin setup`)";
+
+    let existing = if path.exists() {
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?
+    } else {
+        String::new()
+    };
+
+    if existing.contains(MARKER) {
+        return Ok(());
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+
+    let mut content = existing;
+    if !content.ends_with('\n') && !content.is_empty() {
+        content.push('\n');
+    }
+    content.push_str(KIN_DISCOVERY_REMINDER);
+
+    fs::write(path, &content).with_context(|| format!("failed to write {}", path.display()))?;
+
+    Ok(())
 }
 
 /// Check if a given MCP config file already has the "kin" server entry.
@@ -885,32 +1001,24 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
 
         for idx in &selections {
             let a = &assistants[*idx];
-            match *idx {
-                0 => match configure_claude_code() {
-                    Ok(path) => configured_assistants.push((a.name.to_string(), Some(path))),
-                    Err(e) => {
-                        println!(
-                            "  {} Claude Code configuration failed: {e}",
-                            style("✗").red()
-                        );
-                        configured_assistants.push((a.name.to_string(), None));
-                    }
-                },
-                1 => match configure_cursor() {
-                    Ok(path) => configured_assistants.push((a.name.to_string(), Some(path))),
-                    Err(e) => {
-                        println!("  {} Cursor configuration failed: {e}", style("✗").red());
-                        configured_assistants.push((a.name.to_string(), None));
-                    }
-                },
-                2 => match configure_codex() {
-                    Ok(path) => configured_assistants.push((a.name.to_string(), Some(path))),
-                    Err(e) => {
-                        println!("  {} Codex CLI configuration failed: {e}", style("✗").red());
-                        configured_assistants.push((a.name.to_string(), None));
-                    }
-                },
-                _ => {}
+            let result = match *idx {
+                IDX_CLAUDE_CODE => configure_claude_code(),
+                IDX_CURSOR => configure_cursor(),
+                IDX_CODEX => configure_codex(),
+                IDX_GEMINI => configure_gemini_cli(),
+                IDX_WINDSURF => configure_windsurf(),
+                _ => continue,
+            };
+            match result {
+                Ok(path) => configured_assistants.push((a.name.to_string(), Some(path))),
+                Err(e) => {
+                    println!(
+                        "  {} {} configuration failed: {e}",
+                        style("✗").red(),
+                        a.name
+                    );
+                    configured_assistants.push((a.name.to_string(), None));
+                }
             }
         }
 
@@ -930,9 +1038,11 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
         for (i, a) in assistants.iter().enumerate() {
             if a.detected {
                 let result = match i {
-                    0 => configure_claude_code(),
-                    1 => configure_cursor(),
-                    2 => configure_codex(),
+                    IDX_CLAUDE_CODE => configure_claude_code(),
+                    IDX_CURSOR => configure_cursor(),
+                    IDX_CODEX => configure_codex(),
+                    IDX_GEMINI => configure_gemini_cli(),
+                    IDX_WINDSURF => configure_windsurf(),
                     _ => continue,
                 };
                 match result {
@@ -965,6 +1075,41 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
                 name,
                 p.display()
             );
+        }
+    }
+    println!();
+
+    // Step 4b: Inject discovery reminders into agent instruction files.
+    //
+    // Claude Code reads ~/.claude/CLAUDE.md; Codex CLI reads ~/.codex/AGENTS.md.
+    // We append a non-blocking reminder that steers agents toward Kin-native
+    // discovery tools (semantic_locate, get_context_pack, trace_data_flow)
+    // before grep/read loops.  Idempotent — skipped if the marker is present.
+    println!("Agent discovery reminders:");
+    println!();
+    {
+        let home = home_dir()?;
+
+        // Claude Code reminder
+        let claude_reminder_path = home.join(".claude").join("CLAUDE.md");
+        match inject_discovery_reminder(&claude_reminder_path) {
+            Ok(()) => println!(
+                "  {} Claude Code discovery reminder written ({})",
+                style("✓").green(),
+                claude_reminder_path.display()
+            ),
+            Err(e) => println!("  {} Claude Code reminder failed: {e}", style("!").yellow()),
+        }
+
+        // Codex CLI reminder
+        let codex_reminder_path = home.join(".codex").join("AGENTS.md");
+        match inject_discovery_reminder(&codex_reminder_path) {
+            Ok(()) => println!(
+                "  {} Codex CLI discovery reminder written ({})",
+                style("✓").green(),
+                codex_reminder_path.display()
+            ),
+            Err(e) => println!("  {} Codex CLI reminder failed: {e}", style("!").yellow()),
         }
     }
     println!();
@@ -1112,6 +1257,11 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     println!("  kin init             -- initialize a Kin repository in the current directory");
     println!("  kin setup status     -- show what's installed");
     println!("  kin setup doctor     -- run health checks");
+    println!();
+    println!("Try this next prompt in your AI agent:");
+    println!();
+    println!("  Use Kin to explore this codebase: run semantic_locate to find the");
+    println!("  main entry point, then get_context_pack on that file.");
     println!();
 
     Ok(())
