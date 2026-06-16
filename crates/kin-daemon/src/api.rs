@@ -3679,13 +3679,20 @@ fn persist_mcp_transactions(state: &DaemonState, registry: &kin_mcp::SessionRegi
     for transaction in registry.list_transactions() {
         store.insert(transaction.transaction_id.clone(), transaction);
     }
+    // FIR-795: mirror the in-flight set to disk so a restart does not silently
+    // drop staged-but-uncommitted transactions.
+    crate::state::write_persisted_mcp_transactions(&state.layout, &store);
 }
 
 /// Drop a transaction from the durable store once it reaches a terminal state
 /// (committed/aborted), so finished transactions do not accumulate. Called only
 /// after the terminal tool call succeeds.
 fn forget_mcp_transaction(state: &DaemonState, transaction_id: &str) {
-    lock_recover(&state.mcp_transactions).remove(transaction_id);
+    let mut store = lock_recover(&state.mcp_transactions);
+    store.remove(transaction_id);
+    // FIR-795: keep the durable mirror in step with the in-memory eviction so a
+    // committed/aborted transaction does not reappear after a restart.
+    crate::state::write_persisted_mcp_transactions(&state.layout, &store);
 }
 
 /// Collect the current graph state of all entities referenced in a commit
@@ -7134,6 +7141,63 @@ mod tests {
         assert!(
             !state.mcp_transactions.lock().unwrap().contains_key(&tx_id),
             "committed transaction must be evicted from the durable store"
+        );
+    }
+
+    #[test]
+    fn mcp_transaction_survives_daemon_restart() {
+        // FIR-795: staged-but-uncommitted transactions must survive a daemon
+        // restart, not just HTTP calls — otherwise a mid-transaction bounce
+        // silently drops the agent's staged work. Persist on one DaemonState,
+        // re-open on the SAME layout (a restart), and assert the staged op +
+        // body are restored intact.
+        install_test_registry_override();
+        let dir = std::env::temp_dir().join(format!("kin-daemon-tx-restart-{}", Uuid::new_v4()));
+        let kin_dir = dir.join(".kin");
+        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
+        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
+        kin_core::manifest::KinManifest::new()
+            .save(&kin_core::KinLayout::new(kin_dir.clone()).manifest_path())
+            .unwrap();
+
+        let tx_id;
+        {
+            let state = Arc::new(DaemonState::open(kin_core::KinLayout::new(kin_dir.clone())).unwrap());
+            let registry = kin_mcp::SessionRegistry::new();
+            let tx = registry
+                .begin_transaction("sess-restart", "file:src/lib.rs")
+                .unwrap();
+            tx_id = tx.transaction_id.clone();
+            let op = kin_mcp::McpMutationOperation {
+                verb: "update".into(),
+                target: String::new(),
+                payload: None,
+                body: Some("pub fn greet() {}".into()),
+                description: "restart-durability".into(),
+            };
+            registry.stage_transaction(&tx_id, vec![op]).unwrap();
+            persist_mcp_transactions(&state, &registry);
+        } // state dropped — models daemon shutdown.
+
+        // Re-open on the SAME layout — models the restart.
+        let restarted =
+            Arc::new(DaemonState::open(kin_core::KinLayout::new(kin_dir)).unwrap());
+        let store = restarted
+            .mcp_transactions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let restored = store
+            .get(&tx_id)
+            .expect("staged transaction must survive a daemon restart (FIR-795)");
+        assert_eq!(
+            restored.staged_operations.len(),
+            1,
+            "staged operation must survive the restart"
+        );
+        assert_eq!(
+            restored.staged_operations[0].body.as_deref(),
+            Some("pub fn greet() {}"),
+            "the staged body must survive the restart intact"
         );
     }
 
