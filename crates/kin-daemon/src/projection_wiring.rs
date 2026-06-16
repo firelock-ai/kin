@@ -843,7 +843,10 @@ mod tests {
             .find(|e| e.name == "foo")
             .cloned()
             .expect("foo must be present in the reconcile overlay");
-        let span = pre_commit_entity.span.clone().expect("foo must have a span");
+        let span = pre_commit_entity
+            .span
+            .clone()
+            .expect("foo must have a span");
         apply_overlay_to_graph(state.graph.as_ref(), &mut overlay)
             .expect("apply overlay must succeed");
 
