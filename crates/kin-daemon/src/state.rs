@@ -1939,6 +1939,105 @@ mod tests {
         );
     }
 
+    #[test]
+    fn first_publish_commit_persists_under_v2_repo_prefix_and_reloads_with_refs() {
+        // FIR-983 hosted publish->serve: a full-content commit into the served
+        // graph must persist through the StorageBackend at `<prefix>/<repo>/graph.kndb`
+        // (the GCS `v2/<repo>/` layout, reproduced here with a LocalFileBackend rooted
+        // at `v2/`) and survive a pod restart with its branch refs intact. A fresh
+        // served graph has no branch, so the branch is created before the head update
+        // (update_branch_head errors NotFound otherwise).
+        use kin_db::LocalFileBackend;
+        use kin_model::{
+            AuthorId, Branch, BranchName, ChangeStore, EntityDelta, SemanticChange,
+            SemanticChangeId, Timestamp,
+        };
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+
+        let storage = tempfile::tempdir().unwrap();
+        let v2_root = storage.path().join("v2");
+        let repo_id = "kin";
+        let branch_name = BranchName::new("main");
+
+        let state = DaemonState::open_with_backend(
+            layout.clone(),
+            Box::new(LocalFileBackend::new(&v2_root)),
+            repo_id,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            state.graph.entity_count(),
+            0,
+            "a fresh hosted repo starts with an empty served graph"
+        );
+
+        let entity = test_entity("served_fn", "src/lib.rs");
+        state.graph.upsert_entity(&entity).unwrap();
+
+        let change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([7; 32])),
+            parents: vec![],
+            author: AuthorId::new("tester"),
+            message: "first publish".to_string(),
+            timestamp: Timestamp::now(),
+            entity_deltas: vec![EntityDelta::Added(entity.clone())],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+        let change_id = change.id;
+        state
+            .graph
+            .create_branch(&Branch {
+                name: branch_name.clone(),
+                head: change_id,
+            })
+            .unwrap();
+        state.graph.create_change(&change).unwrap();
+        state
+            .graph
+            .update_branch_head(&branch_name, &change_id)
+            .unwrap();
+        state.save_snapshot_full().unwrap();
+
+        let persisted = v2_root.join(repo_id).join("graph.kndb");
+        assert!(
+            persisted.exists(),
+            "served commit must persist under v2/<repo>/graph.kndb at {}",
+            persisted.display()
+        );
+
+        drop(state);
+
+        let reopened = DaemonState::open_with_backend(
+            layout,
+            Box::new(LocalFileBackend::new(&v2_root)),
+            repo_id,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.graph.entity_count(),
+            1,
+            "published content must survive reload from the v2 backend"
+        );
+        let branches = reopened.graph.list_branches().unwrap();
+        assert!(
+            branches
+                .iter()
+                .any(|b| b.name == branch_name && b.head == change_id),
+            "published branch head must be visible after reload (refs non-empty)"
+        );
+    }
+
     fn make_scoped_graph_with_entity(name: &str, file_path: &str) -> Arc<kin_db::InMemoryGraph> {
         let graph = Arc::new(kin_db::InMemoryGraph::new());
         graph.upsert_entity(&test_entity(name, file_path)).unwrap();
