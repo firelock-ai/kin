@@ -22,6 +22,77 @@ use crate::session_registry::SessionCoordinator;
 pub const RECON_IDLE: u8 = 0;
 pub const RECON_PROCESSING: u8 = 1;
 
+/// FIR-795: on-disk home for in-flight MCP transactions.
+///
+/// Lives under `.kin/` (not the working tree), so it is never reconciled or
+/// committed. The in-memory `DaemonState::mcp_transactions` is the live copy;
+/// this file is its durable mirror so a daemon restart mid-transaction does not
+/// silently drop staged-but-uncommitted work — stdio-MCP and HTTP-MCP then
+/// behave identically across a restart, not just across HTTP calls.
+pub(crate) fn mcp_transactions_disk_path(layout: &KinLayout) -> std::path::PathBuf {
+    layout.root().join("mcp_transactions.json")
+}
+
+/// Load persisted in-flight MCP transactions on daemon startup. A missing file
+/// (clean start) or an unreadable/corrupt one yields an empty set — startup must
+/// never fail on transaction-state recovery — but corruption is surfaced loudly
+/// in the log so the loss is never silent.
+pub(crate) fn load_persisted_mcp_transactions(
+    layout: &KinLayout,
+) -> HashMap<String, kin_mcp::McpTransaction> {
+    let path = mcp_transactions_disk_path(layout);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(err) => {
+            warn!(path = %path.display(), error = %err, "failed to read persisted MCP transactions; starting with none");
+            return HashMap::new();
+        }
+    };
+    match serde_json::from_slice::<HashMap<String, kin_mcp::McpTransaction>>(&bytes) {
+        Ok(store) => {
+            if !store.is_empty() {
+                info!(
+                    count = store.len(),
+                    "restored in-flight MCP transactions from disk across daemon restart"
+                );
+            }
+            store
+        }
+        Err(err) => {
+            warn!(path = %path.display(), error = %err, "persisted MCP transactions are corrupt; starting with none");
+            HashMap::new()
+        }
+    }
+}
+
+/// Durably mirror the in-memory MCP transaction store to disk. Writes via a
+/// temp file + atomic rename so a crash mid-write can never leave a torn file.
+/// Best-effort: a write failure is logged, never propagated — the in-memory
+/// store remains authoritative for the running daemon.
+pub(crate) fn write_persisted_mcp_transactions(
+    layout: &KinLayout,
+    store: &HashMap<String, kin_mcp::McpTransaction>,
+) {
+    let path = mcp_transactions_disk_path(layout);
+    let bytes = match serde_json::to_vec(store) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            warn!(error = %err, "failed to serialize MCP transactions for durable persistence");
+            return;
+        }
+    };
+    let tmp = path.with_extension("json.tmp");
+    if let Err(err) = std::fs::write(&tmp, &bytes) {
+        warn!(path = %tmp.display(), error = %err, "failed to write MCP transactions temp file");
+        return;
+    }
+    if let Err(err) = std::fs::rename(&tmp, &path) {
+        warn!(path = %path.display(), error = %err, "failed to commit MCP transactions file");
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 /// SSE invalidation events pushed to subscribers (VFS daemon, spine, KinLab).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
@@ -496,6 +567,14 @@ impl DaemonState {
             embed_worker_failed: AtomicBool::new(false),
             mcp_transactions: Mutex::new(HashMap::new()),
         };
+        // FIR-795: restore in-flight MCP transactions persisted before a restart
+        // so staged-but-uncommitted work is not silently dropped across a daemon
+        // bounce — stdio-MCP and HTTP-MCP behave identically across a restart.
+        *state
+            .mcp_transactions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            load_persisted_mcp_transactions(&state.layout);
         Ok(state)
     }
 
@@ -619,6 +698,13 @@ impl DaemonState {
             embed_worker_failed: AtomicBool::new(false),
             mcp_transactions: Mutex::new(HashMap::new()),
         };
+
+        // FIR-795: restore in-flight MCP transactions persisted before a restart.
+        *state
+            .mcp_transactions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            load_persisted_mcp_transactions(&state.layout);
 
         // Pre-load repos into the map BEFORE any async context.
         // We use get_mut() since no one else has a reference yet.
@@ -2410,5 +2496,52 @@ mod tests {
             pending >= 1,
             "the unembedded entity must remain pending (no embedder ran); got {pending}"
         );
+    }
+
+    #[test]
+    fn persisted_mcp_transactions_missing_file_loads_empty() {
+        // FIR-795: a clean start (no mcp_transactions.json) yields an empty set,
+        // never an error — startup must not fail on transaction recovery.
+        let dir = tempfile::tempdir().unwrap();
+        let layout = KinLayout::new(dir.path().to_path_buf());
+        assert!(load_persisted_mcp_transactions(&layout).is_empty());
+    }
+
+    #[test]
+    fn persisted_mcp_transactions_round_trip_through_disk() {
+        // FIR-795: a staged transaction written to the durable mirror reloads
+        // intact — the mechanism that lets begin/stage survive a daemon restart.
+        let dir = tempfile::tempdir().unwrap();
+        let layout = KinLayout::new(dir.path().to_path_buf());
+        let mut store = HashMap::new();
+        store.insert(
+            "tx-1".to_string(),
+            kin_mcp::McpTransaction {
+                transaction_id: "tx-1".to_string(),
+                session_id: "sess".to_string(),
+                scope: "file:src/lib.rs".to_string(),
+                state: "active".to_string(),
+                staged_operations: Vec::new(),
+            },
+        );
+        write_persisted_mcp_transactions(&layout, &store);
+        assert!(mcp_transactions_disk_path(&layout).exists());
+
+        let restored = load_persisted_mcp_transactions(&layout);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(
+            restored.get("tx-1").map(|t| t.scope.as_str()),
+            Some("file:src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn persisted_mcp_transactions_corrupt_file_degrades_to_empty() {
+        // FIR-795: a torn/corrupt mirror degrades to empty (logged loud, never a
+        // startup crash) rather than poisoning daemon boot.
+        let dir = tempfile::tempdir().unwrap();
+        let layout = KinLayout::new(dir.path().to_path_buf());
+        std::fs::write(mcp_transactions_disk_path(&layout), b"{not valid json").unwrap();
+        assert!(load_persisted_mcp_transactions(&layout).is_empty());
     }
 }
