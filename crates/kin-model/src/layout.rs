@@ -8,8 +8,9 @@ use crate::entity::ParseState;
 use crate::ids::*;
 
 /// How complete the persisted layout is relative to the latest parse attempt.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ParseCompleteness {
+    #[default]
     Full,
     Partial(String),
     Failed(String),
@@ -35,12 +36,6 @@ impl ParseCompleteness {
             Self::Partial(_) => "partial",
             Self::Failed(_) => "failed",
         }
-    }
-}
-
-impl Default for ParseCompleteness {
-    fn default() -> Self {
-        Self::Full
     }
 }
 

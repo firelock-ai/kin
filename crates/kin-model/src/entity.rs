@@ -85,21 +85,16 @@ pub enum Visibility {
 }
 
 /// Role of a semantic entity within the project.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityRole {
+    #[default]
     Source,
     Test,
     External,
     Docs,
     Generated,
     Vendored,
-}
-
-impl Default for EntityRole {
-    fn default() -> Self {
-        EntityRole::Source
-    }
 }
 
 /// Extensible metadata bag for entities.

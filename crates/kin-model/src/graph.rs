@@ -758,6 +758,10 @@ pub struct EntityFilter {
     pub roles: Option<Vec<EntityRole>>,
 }
 
+/// Success payload of [`collect_changes_topologically`]: the topologically
+/// ordered changes plus their ordinal-position map.
+type TopoOrderedChanges = (Vec<SemanticChange>, HashMap<SemanticChangeId, u64>);
+
 /// Topologically ordered changes with an ordinal position map.
 ///
 /// The ordinal map assigns 0 to the oldest (genesis) change and N to the
@@ -766,12 +770,12 @@ pub struct EntityFilter {
 fn collect_changes_topologically<G: ChangeStore + ?Sized>(
     store: &G,
     head: &SemanticChangeId,
-) -> std::result::Result<(Vec<SemanticChange>, HashMap<SemanticChangeId, u64>), G::Error> {
+) -> std::result::Result<TopoOrderedChanges, G::Error> {
     let mut visited = HashSet::new();
     let mut ordered = Vec::new();
     enum Frame {
         Visit(SemanticChangeId),
-        Emit(SemanticChange),
+        Emit(Box<SemanticChange>),
     }
 
     let mut stack = vec![Frame::Visit(*head)];
@@ -785,12 +789,12 @@ fn collect_changes_topologically<G: ChangeStore + ?Sized>(
                     continue;
                 };
 
-                stack.push(Frame::Emit(change.clone()));
+                stack.push(Frame::Emit(Box::new(change.clone())));
                 for parent in change.parents.iter().rev() {
                     stack.push(Frame::Visit(*parent));
                 }
             }
-            Frame::Emit(change) => ordered.push(change),
+            Frame::Emit(change) => ordered.push(*change),
         }
     }
 
