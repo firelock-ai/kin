@@ -2350,11 +2350,7 @@ where
 fn artifact_id_for_file(graph: &kin_db::InMemoryGraph, path: &str) -> ArtifactId {
     graph
         .artifact_id_for_path(&FilePathId::new(path))
-        .unwrap_or_else(|| {
-            {
-                ArtifactId::seed_from_path(path)
-            }
-        })
+        .unwrap_or_else(|| ArtifactId::seed_from_path(path))
 }
 
 fn remove_relations_batch_by_id(

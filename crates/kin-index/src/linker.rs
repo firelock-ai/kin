@@ -1733,7 +1733,9 @@ mod tests {
                 rel.kind == RelationKind::Includes
                     && rel.src == GraphNodeId::Artifact(ArtifactId::seed_from_path("src/app.cpp"))
                     && rel.dst
-                        == GraphNodeId::Artifact(ArtifactId::seed_from_path("include/json/macros.hpp"))
+                        == GraphNodeId::Artifact(ArtifactId::seed_from_path(
+                            "include/json/macros.hpp",
+                        ))
             }),
             "include directive should be preserved as an artifact edge"
         );
