@@ -779,6 +779,13 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
             }
         }
         info!("embedding worker started");
+        // FIR-944: re-queue every object the persisted index still lacks a vector
+        // for, so the worker resumes after a restart drained the in-memory queue
+        // (the queue is not persisted; coverage is, via graph-vs-index truth).
+        // Idempotent (HashSet queues) — a fresh start that already enqueued via
+        // reconcile is unaffected.
+        embed_state.graph.queue_missing_for_embedding();
+        embed_state.graph.queue_missing_artifacts_for_embedding();
         let mut consecutive_panics: u32 = 0;
         const MAX_CONSECUTIVE_PANICS: u32 = 3;
         // Recovery + backoff state for vector-index errors (e.g. a stale on-disk
@@ -874,29 +881,23 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                         // Run inside spawn_blocking so the std persist Mutex is held
                         // only across the synchronous write, never across an await.
                         let state_for_persist = Arc::clone(&embed_state);
+                        // FIR-944: flush this batch incrementally — the vector
+                        // sidecar plus any concurrent LSP-enrichment graph delta —
+                        // instead of relying on the periodic full-graph save that
+                        // re-serializes the whole ~1 GB graph each tick. The method
+                        // holds the persist lock and advances the generation cursor
+                        // (mirrors save_snapshot), so the two paths never tear.
                         let persist_result = tokio::task::spawn_blocking(move || {
-                            let _persist_guard =
-                                state_for_persist.persist_lock.lock().map_err(|_| {
-                                    kin_db::KinDbError::ConcurrentAccessError(
-                                        "persist lock poisoned".to_string(),
-                                    )
-                                })?;
-                            let embedder_identity =
-                                kin_buildinfo::sha_with_dirty(kin_buildinfo::get());
-                            kin_db::SnapshotManager::save_vector_index_for_graph(
-                                state_for_persist.layout.kindb_snapshot_path(),
-                                state_for_persist.graph.as_ref(),
-                                Some(embedder_identity.as_str()),
-                            )
+                            state_for_persist.flush_embed_progress()
                         })
                         .await;
                         match persist_result {
-                            Ok(Ok(())) => {}
+                            Ok(Ok(_pending)) => {}
                             Ok(Err(e)) => {
-                                error!(error = %e, "failed to persist vector index");
+                                error!(error = %e, "failed to flush embed progress");
                             }
                             Err(e) => {
-                                error!(error = %e, "vector index persist task panicked");
+                                error!(error = %e, "embed progress flush task panicked");
                             }
                         }
                     }
