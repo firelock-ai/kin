@@ -1,5 +1,5 @@
 {
-  "name": "kin-mcp",
+  "name": "@kinlab/kin-mcp",
   "version": "0.2.0",
   "description": "Start Kin's MCP server through an npm-friendly wrapper.",
   "type": "module",

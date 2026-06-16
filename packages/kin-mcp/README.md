@@ -1,6 +1,7 @@
-# kin-mcp
+# @kinlab/kin-mcp
 
-`kin-mcp` is the npm-friendly launcher for Kin's MCP server.
+`@kinlab/kin-mcp` is the npm-friendly launcher for Kin's MCP server (the installed
+command is still `kin-mcp`).
 
 It downloads the matching Kin release archive from GitHub, verifies the published
 SHA-256 checksum, extracts the `kin` binary into a local cache, and runs:
@@ -18,20 +19,20 @@ Use it directly from an MCP client with `npx`:
   "mcpServers": {
     "kin": {
       "command": "npx",
-      "args": ["-y", "kin-mcp@alpha"]
+      "args": ["-y", "@kinlab/kin-mcp"]
     }
   }
 }
 ```
 
-For a pinned alpha:
+For a pinned version:
 
 ```json
 {
   "mcpServers": {
     "kin": {
       "command": "npx",
-      "args": ["-y", "kin-mcp@0.1.0-alpha.26"]
+      "args": ["-y", "@kinlab/kin-mcp@0.2.0"]
     }
   }
 }
@@ -65,7 +66,7 @@ Set `KIN_MCP_CACHE_DIR` to override the cache location.
 ## Local Check
 
 ```sh
-npx -y kin-mcp@alpha --print-bin
+npx -y @kinlab/kin-mcp --print-bin
 ```
 
 Then initialize a repository and let the MCP client launch `kin-mcp`.

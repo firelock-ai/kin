@@ -300,6 +300,14 @@ jobs:
     name: Publish npm Wrapper
     needs: publish
     runs-on: ubuntu-latest
+    # Trusted Publishing (OIDC): npm authenticates this workflow via a short-lived
+    # OIDC token instead of a long-lived NPM_TOKEN secret — no token to leak or
+    # rotate, and it satisfies the @kinlab org's 2FA-for-publish policy. Requires a
+    # Trusted Publisher configured on npm for @kinlab/kin-mcp pointing at
+    # firelock-ai/kin + this workflow (release.yml).
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -309,6 +317,9 @@ jobs:
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
+
+      - name: Upgrade npm for OIDC trusted publishing (needs >= 11.5.1)
+        run: npm install -g npm@latest
 
       - name: Verify npm package version matches tag
         run: |
@@ -329,10 +340,9 @@ jobs:
           esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-      - name: Publish npm package
+      - name: Publish npm package (Trusted Publishing via OIDC)
         run: npm publish ./packages/kin-mcp --access public --tag "${NPM_DIST_TAG}"
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_DIST_TAG: ${{ steps.dist-tag.outputs.tag }}
 
   publish_boundary_contracts:
