@@ -2330,4 +2330,51 @@ mod tests {
         state.persisted_entity_count.store(n * 2, Ordering::SeqCst);
         assert!(!state.shutdown_flush_would_wipe_graph());
     }
+
+    #[test]
+    fn persisted_mcp_transactions_missing_file_loads_empty() {
+        // FIR-795: a clean start (no mcp_transactions.json) yields an empty set,
+        // never an error — startup must not fail on transaction recovery.
+        let dir = tempfile::tempdir().unwrap();
+        let layout = KinLayout::new(dir.path().to_path_buf());
+        assert!(load_persisted_mcp_transactions(&layout).is_empty());
+    }
+
+    #[test]
+    fn persisted_mcp_transactions_round_trip_through_disk() {
+        // FIR-795: a staged transaction written to the durable mirror reloads
+        // intact — the mechanism that lets begin/stage survive a daemon restart.
+        let dir = tempfile::tempdir().unwrap();
+        let layout = KinLayout::new(dir.path().to_path_buf());
+        let mut store = HashMap::new();
+        store.insert(
+            "tx-1".to_string(),
+            kin_mcp::McpTransaction {
+                transaction_id: "tx-1".to_string(),
+                session_id: "sess".to_string(),
+                scope: "file:src/lib.rs".to_string(),
+                state: "active".to_string(),
+                staged_operations: Vec::new(),
+            },
+        );
+        write_persisted_mcp_transactions(&layout, &store);
+        assert!(mcp_transactions_disk_path(&layout).exists());
+
+        let restored = load_persisted_mcp_transactions(&layout);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(
+            restored.get("tx-1").map(|t| t.scope.as_str()),
+            Some("file:src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn persisted_mcp_transactions_corrupt_file_degrades_to_empty() {
+        // FIR-795: a torn/corrupt mirror degrades to empty (logged loud, never a
+        // startup crash) rather than poisoning daemon boot.
+        let dir = tempfile::tempdir().unwrap();
+        let layout = KinLayout::new(dir.path().to_path_buf());
+        std::fs::write(mcp_transactions_disk_path(&layout), b"{not valid json").unwrap();
+        assert!(load_persisted_mcp_transactions(&layout).is_empty());
+    }
 }
