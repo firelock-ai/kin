@@ -20,14 +20,15 @@ There is no paid bug-bounty program at this time.
 
 ## Supported Versions
 
-Kin is pre-1.0 and currently published as `0.1.0-alpha.*` prereleases. Only
-the most recent alpha release receives security fixes; older alpha tags are
-not patched. Fixes are shipped in a new alpha release rather than backported.
+Kin is pre-1.0 and published as `0.x` releases (alpha-grade: APIs and formats
+may change between minor versions). Only the most recent `0.x` release receives
+security fixes; older tags are not patched. Fixes are shipped in a new `0.x`
+release rather than backported.
 
-| Version            | Supported          |
-| ------------------ | ------------------ |
-| Latest `0.1.0-alpha.*` release | :white_check_mark: |
-| Older `0.1.0-alpha.*` tags     | :x:                |
+| Version              | Supported          |
+| -------------------- | ------------------ |
+| Latest `0.x` release | :white_check_mark: |
+| Older `0.x` tags     | :x:                |
 
 When a 1.0 line is published, this table will be updated with a concrete
 support window.

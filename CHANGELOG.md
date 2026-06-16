@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-16
+
+First `0.2.0` release. Supersedes the `0.1.0-alpha.*` line.
+
+### Added
+
+- macOS transparent VFS interposition: an unmodified process now reads graph-backed files — including paths that do not exist on disk — through the shim's `__DATA,__interpose` table, verified end-to-end (FIR-909).
+- Graph-assigned artifact identity on the `GraphStore` trait (`artifact_id_for_path`); the context-pack builder resolves graph-owned ids instead of re-deriving them from paths (FIR-855).
+
+### Changed
+
+- VFS write authority is now graph-first: write-notify is lossless (unbounded channel, replacing the 64-slot drop-on-full queue) and materialize-on-write seeds from graph content rather than trusting a stale on-disk copy (FIR-950).
+- `ArtifactId::from_path`/`from_file_id` deprecation is fully enforced — every internal caller uses the non-deprecated seed primitives and the `-A deprecated` CI mask is removed (FIR-855).
+
+### Fixed
+
+- kinlab release-publish and branch-protection gates no longer trust client-asserted booleans; gate decisions derive only from server-authoritative state (FIR-959, FIR-915).
+- kin-search lock-order inversion between mutation and commit that could deadlock the staged/live/segment path (FIR-916).
+
+### Security
+
+- Closed a control-plane gate bypass where forged request booleans could approve a protected release or push (FIR-959, FIR-915).
+
 ## [0.1.0-alpha.25] - 2026-03-28
 
 ### Added
@@ -104,7 +127,8 @@ Historical note: this snapshot predates the public GitHub prerelease series and 
 - Daemon mode for background file watching (`kin-daemon`)
 - 19-crate workspace architecture
 
-[unreleased]: https://github.com/firelock-ai/kin/compare/v0.1.0-alpha.25...HEAD
+[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/firelock-ai/kin/compare/v0.1.0-alpha.25...v0.2.0
 [0.1.0-alpha.25]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0-alpha.25
 [0.1.0-alpha.5]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0-alpha.5
 [0.1.0-alpha.4]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0-alpha.4
