@@ -16058,6 +16058,54 @@ mod tests {
     }
 
     #[test]
+    fn source_basename_seed_beats_same_named_entities_in_other_files() {
+        // FIR-986, the real dogfood case: the gold file is
+        // crates/kin-core/src/manifest.rs (resolve_repo_id), but the repo also
+        // has many `manifest`-named entities in another file (the npm-registry
+        // put_manifest/get_manifest/ManifestStore in api.rs). Those win on
+        // lexical/graph signal, so the gold file lost. The basename seed must
+        // give the file the term NAMES the strong, injectable seat — and only
+        // that file, not the same-named entities' file.
+        let graph = kin_db::InMemoryGraph::new();
+        let mut gold = test_entity("resolve_repo_id", "crates/kin-core/src/manifest.rs", 71, 90);
+        gold.metadata.extra.insert(
+            "file_surface_context".into(),
+            serde_json::Value::String(
+                "surface manifest resolve_repo_id canonical repository id".into(),
+            ),
+        );
+        graph.upsert_entity(&gold).unwrap();
+        for name in ["put_manifest", "get_manifest", "ManifestStore", "manifest_string"] {
+            let mut e = test_entity(name, "crates/kin-daemon/src/api.rs", 1, 20);
+            e.metadata.extra.insert(
+                "file_surface_context".into(),
+                serde_json::Value::String(format!("surface manifest {name} npm registry")),
+            );
+            graph.upsert_entity(&e).unwrap();
+        }
+
+        let scores =
+            extract_priority_files("Where is a repository's canonical id resolved from its manifest?", &graph);
+
+        let manifest_score = scores
+            .iter()
+            .find(|(path, _)| path == "crates/kin-core/src/manifest.rs")
+            .map(|(_, score)| *score);
+        assert!(
+            manifest_score.is_some_and(|score| score >= 75.0),
+            "gold manifest.rs must get the strong basename seat (>=75); got {manifest_score:?}"
+        );
+        // The same-named entities' file must NOT be basename-seeded — only the
+        // file the term actually names earns the seat.
+        assert!(
+            !scores
+                .iter()
+                .any(|(path, _)| path == "crates/kin-daemon/src/api.rs"),
+            "api.rs (same-named entities, different basename) must not be basename-seeded; got {scores:?}"
+        );
+    }
+
+    #[test]
     fn curate_search_terms_keeps_source_artifact_backed_macro_terms() {
         let graph = kin_db::InMemoryGraph::new();
 
