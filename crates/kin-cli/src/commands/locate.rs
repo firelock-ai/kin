@@ -13049,9 +13049,18 @@ fn entity_span_pair(entity: &kin_model::Entity) -> Vec<[u32; 2]> {
     // KIN_LOCATE_SPAN_FULL_EXTENT=1 emits the full node extent instead.
     let full_extent = locate_env_bool("KIN_LOCATE_SPAN_FULL_EXTENT", false);
     let head_threshold = locate_env_usize("KIN_LOCATE_SPAN_CLASS_HEAD_THRESHOLD", 60) as u32;
+    // FIR-990: only class-like nodes get head-truncated today, so a coarse
+    // non-class entity — above all a File-kind node whose span is the entire
+    // file (700-1600 lines) — is emitted at full extent and tanks symbol/line
+    // precision. KIN_LOCATE_SPAN_TRUNCATE_OVERLONG extends the same head-window
+    // truncation to ANY over-threshold entity (File-kind, oversized functions).
+    // Gated OFF so the default behavior is byte-identical; the precision↔recall
+    // trade is a line-F1 question decided by ContextBench before the default flips.
+    let head_truncate =
+        is_class_like || locate_env_bool("KIN_LOCATE_SPAN_TRUNCATE_OVERLONG", false);
     vec![entity_span_lines(
         s,
-        is_class_like,
+        head_truncate,
         full_extent,
         head_threshold,
     )]
@@ -13066,11 +13075,11 @@ fn entity_span_pair(entity: &kin_model::Entity) -> Vec<[u32; 2]> {
 /// 1-indexed traceback spans instead of landing one line short).
 fn entity_span_lines(
     s: &kin_model::SourceSpan,
-    is_class_like: bool,
+    head_truncate: bool,
     full_extent: bool,
     head_threshold: u32,
 ) -> [u32; 2] {
-    let (start, end, end_is_real) = if is_class_like && !full_extent {
+    let (start, end, end_is_real) = if head_truncate && !full_extent {
         let len = s.end_line.saturating_sub(s.start_line);
         if len > head_threshold {
             // Synthetic head window; `end` is start+4, not the node's real end
@@ -13738,6 +13747,37 @@ mod tests {
         assert_eq!(entity_span_lines(&span(0, 100), false, false, 30), [1, 101]);
         // Short class (len <= threshold) is not truncated even with OFF.
         assert_eq!(entity_span_lines(&span(0, 10), true, false, 30), [1, 11]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn span_truncate_overlong_lever_tightens_coarse_file_kind() {
+        // FIR-990: a File-kind entity spans the whole file (700-1600 lines) and
+        // is emitted at full extent by default — tanking symbol/line precision.
+        // The gated lever extends class-like head-truncation to any over-threshold
+        // entity. Default OFF keeps the span byte-identical (no regression risk);
+        // the precision↔recall trade is a ContextBench line-F1 call before flip.
+        std::env::remove_var("KIN_LOCATE_SPAN_FULL_EXTENT");
+        std::env::remove_var("KIN_LOCATE_SPAN_CLASS_HEAD_THRESHOLD");
+        std::env::remove_var("KIN_LOCATE_SPAN_TRUNCATE_OVERLONG");
+
+        let mut coarse = test_entity("whole_module", "src/big.rs", 0, 1500);
+        coarse.kind = EntityKind::File;
+
+        assert_eq!(
+            entity_span_pair(&coarse),
+            vec![[1, 1501]],
+            "default OFF: a coarse File-kind entity emits its full extent (unchanged)"
+        );
+
+        std::env::set_var("KIN_LOCATE_SPAN_TRUNCATE_OVERLONG", "1");
+        let tightened = entity_span_pair(&coarse);
+        std::env::remove_var("KIN_LOCATE_SPAN_TRUNCATE_OVERLONG");
+        assert_eq!(
+            tightened,
+            vec![[1, 5]],
+            "lever ON: the over-long File-kind span is head-truncated to a 5-line window"
+        );
     }
 
     #[test]
