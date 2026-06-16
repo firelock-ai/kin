@@ -132,8 +132,16 @@ New-Item -ItemType Directory -Path $KinLib -Force | Out-Null
 
 Expand-Archive -Path (Join-Path $TmpDir $Archive) -DestinationPath $TmpDir -Force
 
-# Move binaries
-foreach ($bin in @("kin.exe", "kin-vfs.exe")) {
+# FIR-967: kin-daemon is mandatory — kin status/search and the MCP server all
+# require it. Assert it is present BEFORE moving anything so a daemon-less
+# archive aborts cleanly instead of leaving a half-installed environment.
+if (-not (Test-Path (Join-Path $TmpDir "kin-daemon.exe"))) {
+    Write-Err "kin-daemon.exe missing from the downloaded archive. Refusing a daemon-less install."
+    exit 1
+}
+
+# Move binaries. kin-daemon.exe is mandatory (asserted above); kin-vfs.exe is optional.
+foreach ($bin in @("kin.exe", "kin-daemon.exe", "kin-vfs.exe")) {
     $src = Join-Path $TmpDir $bin
     if (Test-Path $src) {
         Move-Item -Path $src -Destination (Join-Path $KinBin $bin) -Force
