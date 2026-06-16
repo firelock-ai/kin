@@ -93,17 +93,25 @@ fn read_encrypted_file(path: &PathBuf) -> Result<Option<Vec<u8>>> {
     Ok(Some(plaintext))
 }
 
+/// Whether the platform keyring may be accessed (off under test and when
+/// `KIN_NO_KEYRING=1`, so background paths and `cargo test` never raise an
+/// interactive Keychain prompt).
+fn keyring_enabled() -> bool {
+    !cfg!(test) && !matches!(std::env::var("KIN_NO_KEYRING").as_deref(), Ok("1"))
+}
+
 fn store_credential(base_url: &str, credential: &StoredCredential) -> Result<()> {
     let serialized = serde_json::to_vec(credential)?;
     let key = account_key(base_url);
 
-    // Try macOS Keychain / platform keyring first.
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &key) {
-        if entry
-            .set_password(&String::from_utf8_lossy(&serialized))
-            .is_ok()
-        {
-            return Ok(());
+    if keyring_enabled() {
+        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &key) {
+            if entry
+                .set_password(&String::from_utf8_lossy(&serialized))
+                .is_ok()
+            {
+                return Ok(());
+            }
         }
     }
 
@@ -124,11 +132,13 @@ fn store_credential(base_url: &str, credential: &StoredCredential) -> Result<()>
     Ok(())
 }
 
-fn load_credential(base_url: &str) -> Result<Option<StoredCredential>> {
+fn load_credential(base_url: &str, allow_keyring: bool) -> Result<Option<StoredCredential>> {
     let key = account_key(base_url);
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &key) {
-        if let Ok(value) = entry.get_password() {
-            return Ok(Some(serde_json::from_str(&value)?));
+    if allow_keyring && keyring_enabled() {
+        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &key) {
+            if let Ok(value) = entry.get_password() {
+                return Ok(Some(serde_json::from_str(&value)?));
+            }
         }
     }
 
@@ -149,8 +159,10 @@ fn load_credential(base_url: &str) -> Result<Option<StoredCredential>> {
 
 fn delete_credential(base_url: &str) -> Result<()> {
     let key = account_key(base_url);
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &key) {
-        let _ = entry.delete_credential();
+    if keyring_enabled() {
+        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &key) {
+            let _ = entry.delete_credential();
+        }
     }
     let path = fallback_credential_path(base_url)?;
     if path.exists() {
@@ -281,7 +293,7 @@ fn prompt_for_code() -> Result<String> {
 }
 
 pub(crate) fn load_saved_bearer_token(base_url: &str) -> Option<String> {
-    load_credential(base_url)
+    load_credential(base_url, true)
         .ok()
         .flatten()
         .map(|credential| credential.token)
@@ -310,7 +322,7 @@ pub(crate) fn has_stored_credential(base_url: &str) -> bool {
 }
 
 pub(crate) fn default_cli_actor_id(base_url: &str) -> String {
-    let identity = load_credential(base_url)
+    let identity = load_credential(base_url, false)
         .ok()
         .flatten()
         .map(|credential| credential.user_email)
@@ -420,7 +432,7 @@ pub async fn login(base_url: Option<String>, no_browser: bool) -> Result<()> {
 
 pub async fn status(base_url: Option<String>) -> Result<()> {
     let base_url = normalized_base_url(base_url);
-    match load_credential(&base_url)? {
+    match load_credential(&base_url, true)? {
         Some(credential) => {
             println!("KinLab auth is configured for {}.", base_url);
             println!("  User:    {}", credential.user_email);
@@ -435,7 +447,7 @@ pub async fn status(base_url: Option<String>) -> Result<()> {
 
 pub async fn whoami(base_url: Option<String>) -> Result<()> {
     let base_url = normalized_base_url(base_url);
-    let credential = load_credential(&base_url)?
+    let credential = load_credential(&base_url, true)?
         .ok_or_else(|| anyhow::anyhow!("no KinLab auth credential stored for {}", base_url))?;
     let response = reqwest::Client::new()
         .get(format!("{}/api/session", base_url))
@@ -458,7 +470,7 @@ pub async fn whoami(base_url: Option<String>) -> Result<()> {
 
 pub async fn logout(base_url: Option<String>) -> Result<()> {
     let base_url = normalized_base_url(base_url);
-    if let Some(credential) = load_credential(&base_url)? {
+    if let Some(credential) = load_credential(&base_url, true)? {
         let _ = reqwest::Client::new()
             .post(format!("{}/api/cli/auth/logout", base_url))
             .bearer_auth(&credential.token)
