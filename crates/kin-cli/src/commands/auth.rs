@@ -287,6 +287,28 @@ pub(crate) fn load_saved_bearer_token(base_url: &str) -> Option<String> {
         .map(|credential| credential.token)
 }
 
+/// The default KinLab base URL used by the health engine.
+pub(crate) fn default_base_url_for_health() -> String {
+    normalized_base_url(None)
+}
+
+/// Whether a stored KinLab credential exists for `base_url`.
+///
+/// Probes only the on-disk fallback credential files (plaintext or encrypted).
+/// The platform keyring is intentionally not queried here: on macOS a
+/// `get_password` call can raise an interactive Keychain prompt, which would
+/// block a non-interactive health probe. A keyring-only credential therefore
+/// reads as absent rather than risk hanging.
+pub(crate) fn has_stored_credential(base_url: &str) -> bool {
+    if let Ok(encrypted_path) = fallback_credential_path(base_url) {
+        let plaintext_path = encrypted_path.with_extension("json");
+        if plaintext_path.exists() || encrypted_path.exists() {
+            return true;
+        }
+    }
+    false
+}
+
 pub(crate) fn default_cli_actor_id(base_url: &str) -> String {
     let identity = load_credential(base_url)
         .ok()

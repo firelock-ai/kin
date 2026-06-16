@@ -28,6 +28,7 @@ pub mod git;
 pub mod graph;
 pub mod graph_health;
 pub mod graph_viz;
+pub mod health;
 pub mod history;
 pub mod impact;
 pub mod import;
