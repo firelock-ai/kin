@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-06-16
+
+Corrective public install release for first-run setup.
+
+### Changed
+
+- Release archives now include `kin-daemon` alongside `kin`, so clean public installs can run daemon-backed commands without relying on a developer PATH or pre-existing daemon (FIR-967).
+- Generated MCP setup config now defaults to the small `agent-default` tool profile while preserving the full surface for advanced users (FIR-963).
+
+### Fixed
+
+- Public installers now hard-fail on daemon-less archives and support checksum-verified release downloads for first-run install proof (FIR-967).
+
 ## [0.2.0] - 2026-06-16
 
 First `0.2.0` release. Supersedes the `0.1.0-alpha.*` line.
@@ -127,7 +140,8 @@ Historical note: this snapshot predates the public GitHub prerelease series and 
 - Daemon mode for background file watching (`kin-daemon`)
 - 19-crate workspace architecture
 
-[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.0...HEAD
+[unreleased]: https://github.com/firelock-ai/kin/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/firelock-ai/kin/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/firelock-ai/kin/compare/v0.1.0-alpha.25...v0.2.0
 [0.1.0-alpha.25]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0-alpha.25
 [0.1.0-alpha.5]: https://github.com/firelock-ai/kin/releases/tag/v0.1.0-alpha.5
