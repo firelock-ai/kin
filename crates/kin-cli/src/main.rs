@@ -769,6 +769,12 @@ enum Command {
         #[command(subcommand)]
         action: Option<RegistryAction>,
     },
+    /// Probe first-run health and optionally apply safe repairs
+    Doctor {
+        /// Apply safe automatic repairs (shell hook, MCP configs, config dirs)
+        #[arg(long, default_value_t = false)]
+        fix: bool,
+    },
     /// First-time setup and health checks for the Kin system
     Setup {
         #[command(subcommand)]
@@ -1446,9 +1452,17 @@ enum ApprovalsAction {
 #[derive(Subcommand)]
 enum SetupAction {
     /// Show what's installed
-    Status,
+    Status {
+        /// Emit the machine-readable health report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Quick health check
-    Doctor,
+    Doctor {
+        /// Apply safe automatic repairs (shell hook, MCP configs, config dirs)
+        #[arg(long, default_value_t = false)]
+        fix: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2340,6 +2354,7 @@ fn main() -> Result<()> {
                     Some(RegistryAction::Clean) => commands::registry::clean().await,
                     None => commands::registry::list().await,
                 },
+                Command::Doctor { fix } => commands::setup::doctor(fix).await,
                 Command::Setup {
                     action,
                     mode,
@@ -2347,8 +2362,8 @@ fn main() -> Result<()> {
                     auto_daemon,
                     no_interactive,
                 } => match action {
-                    Some(SetupAction::Status) => commands::setup::status().await,
-                    Some(SetupAction::Doctor) => commands::setup::doctor().await,
+                    Some(SetupAction::Status { json }) => commands::setup::status(json).await,
+                    Some(SetupAction::Doctor { fix }) => commands::setup::doctor(fix).await,
                     None => {
                         commands::setup::run_wizard(commands::setup::WizardOptions {
                             mode,
