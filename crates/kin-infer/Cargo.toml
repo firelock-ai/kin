@@ -20,6 +20,11 @@ default = []
 metal = ["dep:metal", "dep:objc2", "dep:block"]
 # Linux/Windows: NVIDIA CUDA via driver API (no toolkit needed at build time)
 cuda = []
+# CPU BLAS: Apple Accelerate (macOS) via the system framework — no build-time
+# deps, raw cblas FFI (same posture as the CUDA driver-API backend). Linked and
+# auto-selected at runtime when present; force the deterministic pure-Rust path
+# with KIN_INFER_CPU_BACKEND=pure-rust for bit-reproducible runs.
+accelerate = []
 
 [dependencies]
 ndarray = "0.16"

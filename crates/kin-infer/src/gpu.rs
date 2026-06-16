@@ -706,6 +706,127 @@ fn should_parallelize(work_items: usize) -> bool {
 // CPU compute backend (always available)
 // ---------------------------------------------------------------------------
 
+/// CPU matmul backend, selected once on first use — the GPU selector
+/// (`create_compute`) one tier down: Apple Accelerate when compiled in + present
+/// (macOS), else the always-available pure-Rust path. Force the deterministic
+/// pure-Rust path with `KIN_INFER_CPU_BACKEND=pure-rust` for bit-reproducible
+/// runs (BLAS differs from the pure-Rust reduction in the last ULPs).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CpuBackend {
+    PureRust,
+    #[cfg(all(feature = "accelerate", target_os = "macos"))]
+    Accelerate,
+}
+
+/// Resolve the CPU backend from the `KIN_INFER_CPU_BACKEND` override (or its
+/// absence). Pure function of the override so it is unit-testable; `cpu_backend`
+/// wraps it with the real env var and a one-shot cache.
+fn select_cpu_backend(override_var: Option<&str>) -> CpuBackend {
+    match override_var {
+        Some("pure-rust") | Some("pure_rust") => return CpuBackend::PureRust,
+        #[cfg(all(feature = "accelerate", target_os = "macos"))]
+        Some("accelerate") => return CpuBackend::Accelerate,
+        _ => {}
+    }
+    #[cfg(all(feature = "accelerate", target_os = "macos"))]
+    {
+        return CpuBackend::Accelerate;
+    }
+    #[allow(unreachable_code)]
+    CpuBackend::PureRust
+}
+
+fn cpu_backend() -> CpuBackend {
+    static BACKEND: std::sync::OnceLock<CpuBackend> = std::sync::OnceLock::new();
+    *BACKEND
+        .get_or_init(|| select_cpu_backend(std::env::var("KIN_INFER_CPU_BACKEND").ok().as_deref()))
+}
+
+/// Pure-Rust matmul `C[m,n] = A[m,k] · B[n,k]ᵀ`: cache-blocked GEMM kernel
+/// (ndarray/matrixmultiply) tiled over row-blocks with rayon. Deterministic —
+/// each output element depends only on its row of A and column of Bᵀ, computed
+/// inside a single block, so the result is independent of thread scheduling.
+fn pure_rust_matmul(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    use ndarray::ArrayView2;
+    let mut c = vec![0.0f32; m * n];
+    if m == 0 || n == 0 {
+        return c;
+    }
+    let bt = ArrayView2::from_shape((n, k), b).expect("matmul B shape [n,k]");
+    let bt = bt.t(); // [k, n] view
+    if should_parallelize(m * n * k) {
+        const BLOCK: usize = 64;
+        c.par_chunks_mut(BLOCK * n)
+            .enumerate()
+            .for_each(|(bi, cblk)| {
+                let r0 = bi * BLOCK;
+                let rows = cblk.len() / n;
+                let a_blk = ArrayView2::from_shape((rows, k), &a[r0 * k..r0 * k + rows * k])
+                    .expect("matmul A block shape");
+                let prod = a_blk.dot(&bt);
+                cblk.copy_from_slice(prod.as_slice().expect("dot output is standard layout"));
+            });
+    } else {
+        let a2 = ArrayView2::from_shape((m, k), a).expect("matmul A shape [m,k]");
+        let prod = a2.dot(&bt);
+        c.copy_from_slice(prod.as_slice().expect("dot output is standard layout"));
+    }
+    c
+}
+
+/// Apple Accelerate `cblas_sgemm` matmul `C[m,n] = A[m,k] · B[n,k]ᵀ`. Linked
+/// from the macOS system framework via raw cblas FFI (no build-time deps).
+#[cfg(all(feature = "accelerate", target_os = "macos"))]
+fn accelerate_matmul(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    #[link(name = "Accelerate", kind = "framework")]
+    extern "C" {
+        #[allow(clippy::too_many_arguments)]
+        fn cblas_sgemm(
+            order: i32,
+            transa: i32,
+            transb: i32,
+            m: i32,
+            n: i32,
+            k: i32,
+            alpha: f32,
+            a: *const f32,
+            lda: i32,
+            b: *const f32,
+            ldb: i32,
+            beta: f32,
+            c: *mut f32,
+            ldc: i32,
+        );
+    }
+    const ROW_MAJOR: i32 = 101;
+    const NO_TRANS: i32 = 111;
+    const TRANS: i32 = 112;
+    let mut c = vec![0.0f32; m * n];
+    if m == 0 || n == 0 {
+        return c;
+    }
+    // Row-major A[m,k] (lda=k), B[n,k] used transposed (ldb=k) → C[m,n] (ldc=n).
+    unsafe {
+        cblas_sgemm(
+            ROW_MAJOR,
+            NO_TRANS,
+            TRANS,
+            m as i32,
+            n as i32,
+            k as i32,
+            1.0,
+            a.as_ptr(),
+            k as i32,
+            b.as_ptr(),
+            k as i32,
+            0.0,
+            c.as_mut_ptr(),
+            n as i32,
+        );
+    }
+    c
+}
+
 /// CPU compute using SIMD-accelerated operations from the main engine.
 pub struct CpuCompute;
 
@@ -718,25 +839,12 @@ impl GpuCompute for CpuCompute {
         n: usize,
         k: usize,
     ) -> Result<Vec<f32>, InferError> {
-        // A is [M, K] row-major, B is [N, K] row-major (we compute A × B^T)
-        let mut c = vec![0.0f32; m * n];
-        if should_parallelize(m * n * k) {
-            c.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
-                let a_row = &a[i * k..(i + 1) * k];
-                for (j, slot) in row.iter_mut().enumerate() {
-                    let b_row = &b[j * k..(j + 1) * k];
-                    *slot = crate::dot_product(a_row, b_row);
-                }
-            });
-        } else {
-            for i in 0..m {
-                let a_row = &a[i * k..(i + 1) * k];
-                for j in 0..n {
-                    let b_row = &b[j * k..(j + 1) * k];
-                    c[i * n + j] = crate::dot_product(a_row, b_row);
-                }
-            }
-        }
+        // A is [M, K] row-major, B is [N, K] row-major (we compute A × B^T).
+        let c = match cpu_backend() {
+            #[cfg(all(feature = "accelerate", target_os = "macos"))]
+            CpuBackend::Accelerate => accelerate_matmul(a, b, m, n, k),
+            CpuBackend::PureRust => pure_rust_matmul(a, b, m, n, k),
+        };
         Ok(c)
     }
 
@@ -1089,6 +1197,62 @@ mod tests {
         assert_eq!(outs.len(), 2);
         assert_eq!(outs[0], vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(outs[1], vec![4.0, 5.0, 10.0, 11.0]);
+    }
+
+    #[test]
+    fn cpu_backend_override_resolves_correctly() {
+        // The override forces pure-rust in any build.
+        assert_eq!(select_cpu_backend(Some("pure-rust")), CpuBackend::PureRust);
+        assert_eq!(select_cpu_backend(Some("pure_rust")), CpuBackend::PureRust);
+        #[cfg(not(all(feature = "accelerate", target_os = "macos")))]
+        {
+            // No Accelerate compiled in → default and unknown values are pure-rust.
+            assert_eq!(select_cpu_backend(None), CpuBackend::PureRust);
+            assert_eq!(select_cpu_backend(Some("nonsense")), CpuBackend::PureRust);
+        }
+        #[cfg(all(feature = "accelerate", target_os = "macos"))]
+        {
+            // Accelerate present → auto-selected by default; override still wins.
+            assert_eq!(select_cpu_backend(None), CpuBackend::Accelerate);
+            assert_eq!(
+                select_cpu_backend(Some("accelerate")),
+                CpuBackend::Accelerate
+            );
+            assert_eq!(select_cpu_backend(Some("pure-rust")), CpuBackend::PureRust);
+        }
+    }
+
+    #[test]
+    fn cpu_matmul_matches_naive_reference_multiblock() {
+        // Non-integer data + m > block size exercises the blocked/parallel kernel
+        // (and BLAS when compiled) against a naive A·Bᵀ reference.
+        let (m, n, k) = (100usize, 24usize, 33usize);
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.125)
+            .collect();
+        let b: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.0625)
+            .collect();
+        let mut want = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut s = 0.0f32;
+                for t in 0..k {
+                    s += a[i * k + t] * b[j * k + t];
+                }
+                want[i * n + j] = s;
+            }
+        }
+        let got = CpuCompute.matmul(&a, &b, m, n, k).unwrap();
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert!((g - w).abs() < 1e-3, "matmul {g} vs ref {w}");
+        }
+        // The pure-rust path must agree with the reference regardless of build.
+        let pr = pure_rust_matmul(&a, &b, m, n, k);
+        for (g, w) in pr.iter().zip(want.iter()) {
+            assert!((g - w).abs() < 1e-3, "pure-rust {g} vs ref {w}");
+        }
     }
 
     #[test]
