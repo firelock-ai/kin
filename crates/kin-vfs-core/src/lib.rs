@@ -8,12 +8,14 @@
 //! This crate is standalone-valuable — usable by any project, not just Kin.
 
 pub mod cache;
+pub mod canary;
 pub mod error;
 pub mod protocol;
 pub mod provider;
 pub mod stat;
 pub mod tree;
 
+pub use canary::{CanaryRegistry, InterposeStatus};
 pub use error::{VfsError, VfsResult};
 pub use provider::{AsyncContentProvider, ContentProvider};
 pub use stat::{DirEntry, FileType, VirtualStat};
