@@ -1374,10 +1374,11 @@ pub async fn doctor(fix: bool) -> Result<()> {
     println!();
     let mut applied: Vec<String> = Vec::new();
 
-    let shell_needs_fix = report
-        .checks
-        .iter()
-        .any(|c| c.id == "shell_path" && c.fixable && !matches!(c.status, crate::commands::health::HealthStatus::Healthy));
+    let shell_needs_fix = report.checks.iter().any(|c| {
+        c.id == "shell_path"
+            && c.fixable
+            && !matches!(c.status, crate::commands::health::HealthStatus::Healthy)
+    });
     if shell_needs_fix {
         match reinstall_shell_hook() {
             Ok(path) => {
