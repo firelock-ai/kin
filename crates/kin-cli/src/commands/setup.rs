@@ -454,11 +454,11 @@ fn home_dir() -> Result<PathBuf> {
         .context("could not determine home directory")
 }
 
-fn kin_dir() -> Result<PathBuf> {
+pub(crate) fn kin_dir() -> Result<PathBuf> {
     Ok(home_dir()?.join(".kin"))
 }
 
-fn shim_filename() -> &'static str {
+pub(crate) fn shim_filename() -> &'static str {
     if cfg!(target_os = "macos") {
         "libkin_vfs_shim.dylib"
     } else if cfg!(target_os = "windows") {
@@ -504,7 +504,7 @@ fn find_shim() -> Option<PathBuf> {
     None
 }
 
-fn detect_shell() -> &'static str {
+pub(crate) fn detect_shell() -> &'static str {
     if env::var("PSModulePath").is_ok() || env::var("PSVersionTable").is_ok() {
         return "powershell";
     }
@@ -522,7 +522,7 @@ fn detect_shell() -> &'static str {
     "zsh"
 }
 
-fn shell_rc(shell: &str) -> Result<PathBuf> {
+pub(crate) fn shell_rc(shell: &str) -> Result<PathBuf> {
     let home = home_dir()?;
     match shell {
         "zsh" => Ok(home.join(".zshrc")),
@@ -541,7 +541,7 @@ fn shell_rc(shell: &str) -> Result<PathBuf> {
     }
 }
 
-fn hook_filename(shell: &str) -> &'static str {
+pub(crate) fn hook_filename(shell: &str) -> &'static str {
     match shell {
         "bash" => "kin-vfs.bash",
         "fish" => "kin-vfs.fish",
@@ -559,7 +559,7 @@ fn hook_content(shell: &str) -> &'static str {
     }
 }
 
-fn check_binary_in_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn check_binary_in_path(name: &str) -> Option<PathBuf> {
     which::which(name).ok()
 }
 
@@ -913,6 +913,31 @@ fn install_shell_hook(shell_name: &str) -> Result<(PathBuf, String)> {
     }
 
     Ok((hook_file, source_line))
+}
+
+/// Reinstall the shell hook + rc source line for the detected shell.
+///
+/// Used by `kin doctor --fix` to repair the `shell_path` check. Returns the
+/// hook file path it wrote.
+pub(crate) fn reinstall_shell_hook() -> Result<PathBuf> {
+    let shell_name = detect_shell();
+    let (hook_file, _source_line) = install_shell_hook(shell_name)?;
+    Ok(hook_file)
+}
+
+/// Re-merge the kin MCP server entry (with the agent-default profile) into the
+/// config files of every AI client that already has a config present.
+///
+/// Used by `kin doctor --fix` to repair `mcp_client_*` checks. Returns the
+/// paths that were re-merged.
+pub(crate) fn remerge_existing_mcp_configs() -> Vec<PathBuf> {
+    let mut repaired = Vec::new();
+    for (_id, _label, path) in crate::commands::health::mcp_client_config_paths() {
+        if path.exists() && merge_mcp_config(&path).is_ok() {
+            repaired.push(path);
+        }
+    }
+    repaired
 }
 
 // ---------------------------------------------------------------------------
@@ -1272,146 +1297,154 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
 // `kin setup status`
 // ---------------------------------------------------------------------------
 
-pub async fn status() -> Result<()> {
-    let kin_home = kin_dir()?;
-    let shell_name = detect_shell();
+pub async fn status(json: bool) -> Result<()> {
+    let report = crate::commands::health::run_health_checks().await;
 
-    let kin_version = env!("CARGO_PKG_VERSION");
-    if let Ok(exe) = env::current_exe() {
-        println!("kin binary:    v{kin_version} ({})", exe.display());
-    } else {
-        println!("kin binary:    v{kin_version}");
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
     }
 
-    match check_binary_in_path("kin-daemon") {
-        Some(p) => println!("kin-daemon:    found ({})", p.display()),
-        None => println!("kin-daemon:    not found in PATH"),
-    }
-
-    match check_binary_in_path("kin-vfs") {
-        Some(p) => println!("kin-vfs:       found ({})", p.display()),
-        None => println!("kin-vfs:       not found in PATH"),
-    }
-
-    let shim_path = kin_home.join("lib").join(shim_filename());
-    if shim_path.exists() {
-        println!("VFS shim:      installed ({})", shim_path.display());
-    } else {
-        println!("VFS shim:      not installed");
-    }
-
-    let hook_path = kin_home.join("shell").join(hook_filename(shell_name));
-    if hook_path.exists() {
-        println!("Shell hook:    installed ({})", hook_path.display());
-    } else {
-        println!("Shell hook:    not installed");
-    }
-
-    let rc_path = shell_rc(shell_name)?;
-    let rc_sourced = if rc_path.exists() {
-        fs::read_to_string(&rc_path)
-            .map(|c| c.contains("kin-vfs"))
-            .unwrap_or(false)
-    } else {
-        false
-    };
-    if rc_sourced {
-        println!("Shell rc:      configured ({})", rc_path.display());
-    } else {
-        println!("Shell rc:      not configured");
-    }
-
-    println!("kin-mcp:       bundled (run `kin mcp start`)");
-    println!("kin-editor:    extension surface (see kin README)");
-    let config_path = kin_home.join("config/setup.toml");
-    if config_path.exists() {
-        let content = fs::read_to_string(&config_path).unwrap_or_default();
-        if content.contains("auto_start = true") {
-            println!("Auto-daemon:   enabled");
-        } else {
-            println!("Auto-daemon:   disabled");
-        }
-    } else {
-        println!("Auto-daemon:   not configured");
-    }
-
+    print_human_report(&report);
     Ok(())
+}
+
+/// Map a status to a short human label for the text table.
+fn status_label(status: &crate::commands::health::HealthStatus) -> &'static str {
+    use crate::commands::health::HealthStatus;
+    match status {
+        HealthStatus::Healthy => "ok",
+        HealthStatus::Missing => "MISSING",
+        HealthStatus::Stale => "STALE",
+        HealthStatus::Misconfigured => "MISCONFIGURED",
+        HealthStatus::Unsupported => "n/a",
+    }
+}
+
+/// Render a [`HealthReport`] as the human-readable table used by
+/// `kin setup status` and `kin doctor`.
+fn print_human_report(report: &crate::commands::health::HealthReport) {
+    use crate::commands::health::HealthStatus;
+    println!("Platform: {}", report.platform);
+    println!();
+    for check in &report.checks {
+        let mark = match check.status {
+            HealthStatus::Healthy => style("✓").green(),
+            HealthStatus::Missing | HealthStatus::Misconfigured => style("✗").red(),
+            HealthStatus::Stale => style("!").yellow(),
+            HealthStatus::Unsupported => style("→").cyan(),
+        };
+        println!(
+            "  {mark} {:<26} {:<14} {}",
+            check.label,
+            status_label(&check.status),
+            check.detail
+        );
+        if let Some(note) = &check.platform_note {
+            println!("      note: {note}");
+        }
+        if !matches!(check.status, HealthStatus::Healthy) {
+            if let Some(fix) = &check.manual_fix {
+                println!("      fix:  {fix}");
+            }
+        }
+    }
+    println!();
+    if report.healthy {
+        println!("All checks passed.");
+    } else {
+        println!("Some checks need attention. Run `kin doctor --fix` to apply safe repairs.");
+    }
 }
 
 // ---------------------------------------------------------------------------
 // `kin setup doctor`
 // ---------------------------------------------------------------------------
 
-pub async fn doctor() -> Result<()> {
-    let kin_home = kin_dir()?;
-    let shell_name = detect_shell();
-    let mut all_ok = true;
+pub async fn doctor(fix: bool) -> Result<()> {
+    let report = crate::commands::health::run_health_checks().await;
 
-    print!("kin binary .............. ");
-    println!("ok (v{})", env!("CARGO_PKG_VERSION"));
-
-    print!("kin-vfs daemon .......... ");
-    if check_binary_in_path("kin-vfs").is_some() {
-        println!("ok");
-    } else {
-        println!("MISSING");
-        all_ok = false;
+    if !fix {
+        print_human_report(&report);
+        return Ok(());
     }
 
-    print!("VFS shim library ........ ");
-    let shim_path = kin_home.join("lib").join(shim_filename());
-    let shim_size = shim_path.metadata().map(|m| m.len()).unwrap_or(0);
-    if shim_path.exists() && shim_size > 0 {
-        println!("ok ({} bytes)", shim_size);
-    } else if shim_path.exists() && shim_size == 0 {
-        println!("BROKEN (0 bytes — will crash all processes via DYLD)");
-        eprintln!("  fix: rm {:?} && kin setup install", shim_path);
-        all_ok = false;
-    } else {
-        println!("MISSING");
-        all_ok = false;
-    }
+    // Apply only the safe, fixable repairs. Each maps to a check id family.
+    println!("Applying safe repairs...");
+    println!();
+    let mut applied: Vec<String> = Vec::new();
 
-    print!("Shell hook ({shell_name}) ........ ");
-    let hook_installed = kin_home
-        .join("shell")
-        .join(hook_filename(shell_name))
-        .exists();
-    if hook_installed {
-        println!("ok");
-    } else {
-        println!("MISSING (run: kin setup)");
-        all_ok = false;
-    }
-
-    print!("kin-daemon ................. ");
-    if let Some(layout) =
-        kin_core::KinLayout::discover(&std::env::current_dir().unwrap_or_default())
-    {
-        match crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await {
-            Some(url) => println!("ok (supervisor route {})", url),
-            None => {
-                println!("NOT SUPERVISOR-ROUTED (will auto-start on next command)");
+    let shell_needs_fix = report.checks.iter().any(|c| {
+        c.id == "shell_path"
+            && c.fixable
+            && !matches!(c.status, crate::commands::health::HealthStatus::Healthy)
+    });
+    if shell_needs_fix {
+        match reinstall_shell_hook() {
+            Ok(path) => {
+                applied.push(format!("reinstalled shell hook ({})", path.display()));
             }
+            Err(e) => println!("  {} shell hook reinstall failed: {e}", style("✗").red()),
         }
-    } else {
-        println!("SKIPPED (not in a kin repo)");
     }
 
-    // Check for orphaned daemons across all registered repos
-    print!("Stale daemon cleanup ....... ");
+    let mcp_needs_fix = report.checks.iter().any(|c| {
+        c.id.starts_with("mcp_client_")
+            && c.fixable
+            && !matches!(c.status, crate::commands::health::HealthStatus::Healthy)
+    });
+    if mcp_needs_fix {
+        let repaired = remerge_existing_mcp_configs();
+        for path in repaired {
+            applied.push(format!("re-merged MCP config ({})", path.display()));
+        }
+    }
+
+    // Ensure the config directory scaffold exists (idempotent).
+    if let Ok(kin_home) = kin_dir() {
+        let config_dir = kin_home.join("config");
+        if !config_dir.exists() && fs::create_dir_all(&config_dir).is_ok() {
+            applied.push(format!("created config dir ({})", config_dir.display()));
+        }
+    }
+
+    // Clean orphaned daemon PID/port files across registered repos.
     let cleaned = cleanup_stale_daemons();
     if cleaned > 0 {
-        println!("cleaned {} stale daemon(s)", cleaned);
-    } else {
-        println!("ok (no stale daemons)");
+        applied.push(format!("cleaned {cleaned} stale daemon(s)"));
     }
 
-    println!();
-    if all_ok {
-        println!("All checks passed.");
+    if applied.is_empty() {
+        println!("  Nothing to repair automatically.");
     } else {
-        println!("Some checks failed. Run `kin setup` to install missing components.");
+        for line in &applied {
+            println!("  {} {line}", style("✓").green());
+        }
+    }
+    println!();
+
+    // Re-run the checks to report the post-fix state.
+    println!("Re-running checks...");
+    println!();
+    let after = crate::commands::health::run_health_checks().await;
+    print_human_report(&after);
+
+    let still_manual: Vec<&crate::commands::health::HealthCheck> = after
+        .checks
+        .iter()
+        .filter(|c| {
+            !matches!(c.status, crate::commands::health::HealthStatus::Healthy)
+                && c.manual_fix.is_some()
+        })
+        .collect();
+    if !still_manual.is_empty() {
+        println!();
+        println!("Still needs manual steps:");
+        for check in still_manual {
+            if let Some(fix) = &check.manual_fix {
+                println!("  - {}: {fix}", check.label);
+            }
+        }
     }
 
     Ok(())
