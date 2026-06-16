@@ -29,22 +29,6 @@ steps:
           .
     id: 'build-kin-daemon'
 
-  # Build kin-graph-service (Node.js) — runs in parallel with kin-daemon
-  - name: 'gcr.io/cloud-builders/docker'
-    entrypoint: 'bash'
-    args:
-      - '-ceu'
-      - |
-        branch_tag="$(echo "${BRANCH_NAME:-detached}" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9._-]#-#g' | sed 's#-\{2,\}#-#g' | sed 's#^-##; s#-$##' | cut -c1-120)"
-        branch_tag="${branch_tag:-detached}"
-        docker build \
-          -t "${_AR_REGISTRY}/kin-graph-service:${COMMIT_SHA}" \
-          -t "${_AR_REGISTRY}/kin-graph-service:${branch_tag}" \
-          -f Dockerfile.graph-service \
-          .
-    id: 'build-kin-graph-service'
-    waitFor: ['-']
-
   # Tag as staging-latest when pushing to main
   - name: 'gcr.io/cloud-builders/docker'
     entrypoint: 'bash'
@@ -53,19 +37,16 @@ steps:
       - |
         if [ "$BRANCH_NAME" = "main" ]; then
           docker tag ${_AR_REGISTRY}/kin-daemon:${COMMIT_SHA} ${_AR_REGISTRY}/kin-daemon:staging-latest
-          docker tag ${_AR_REGISTRY}/kin-graph-service:${COMMIT_SHA} ${_AR_REGISTRY}/kin-graph-service:staging-latest
           docker push ${_AR_REGISTRY}/kin-daemon:staging-latest
-          docker push ${_AR_REGISTRY}/kin-graph-service:staging-latest
           echo "Tagged as staging-latest"
         else
           echo "Not main branch ($BRANCH_NAME), skipping staging tag"
         fi
     id: 'tag-staging'
-    waitFor: ['build-kin-daemon', 'build-kin-graph-service']
+    waitFor: ['build-kin-daemon']
 
 images:
   - '${_AR_REGISTRY}/kin-daemon:${COMMIT_SHA}'
-  - '${_AR_REGISTRY}/kin-graph-service:${COMMIT_SHA}'
 
 substitutions:
   _AR_REGISTRY: 'us-central1-docker.pkg.dev/kin-ecosystem/kin-ecosystem'
