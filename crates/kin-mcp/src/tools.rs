@@ -1005,7 +1005,11 @@ mod tests {
             .iter()
             .filter(|t| allowed.contains(t.name.as_str()))
             .count();
-        assert_eq!(visible, profile.len(), "every profile tool should be listable");
+        assert_eq!(
+            visible,
+            profile.len(),
+            "every profile tool should be listable"
+        );
     }
 
     #[test]
