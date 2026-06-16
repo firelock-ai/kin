@@ -31,12 +31,15 @@ pub async fn start() -> Result<()> {
     eprintln!("Kin MCP: forwarding graph tools to repo daemon at {daemon_url}");
 
     let mut config = build_mcp_start_config();
-    if matches!(
-        std::env::var("KIN_MCP_TOOL_PROFILE").ok().as_deref(),
-        Some("benchmark")
-    ) {
+    let profile_tools: Option<&'static [&'static str]> =
+        match std::env::var("KIN_MCP_TOOL_PROFILE").ok().as_deref() {
+            Some("agent-default") => Some(kin_mcp::agent_default_tool_names()),
+            Some("benchmark") => Some(kin_mcp::benchmark_tool_names()),
+            _ => None,
+        };
+    if let Some(names) = profile_tools {
         config.allowed_tools = Some(
-            kin_mcp::benchmark_tool_names()
+            names
                 .iter()
                 .map(|name| (*name).to_string())
                 .collect::<HashSet<_>>(),
