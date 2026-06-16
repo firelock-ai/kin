@@ -18,6 +18,10 @@ jobs:
   build:
     name: Build (${{ matrix.artifact }})
     runs-on: ${{ matrix.os }}
+    # Windows is a work-in-progress release target (FIR-847 / stale kin-model
+    # path in the vector-free patch). It must not block the macOS/Linux release:
+    # the experimental leg is non-blocking so Publish Release + npm still run.
+    continue-on-error: ${{ matrix.experimental || false }}
     # macOS signing/notarization secrets are surfaced as env so they can be used
     # in step `if:` guards. The `secrets` context is NOT available in `if:`
     # conditions, so guarding on `env.MACOS_CERTIFICATE != ''` is the supported
@@ -55,6 +59,7 @@ jobs:
             artifact: kin-windows-x86_64
             shim_name: kin_vfs_shim.dll
             skip_vector: true
+            experimental: true
 
     steps:
       - name: Checkout
