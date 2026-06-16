@@ -64,6 +64,18 @@ printf '\n'
 
 info "Platform: $OS ($ARCH)"
 
+# ── Detect an existing install (reinstall / upgrade) ──────────────────
+
+PREVIOUS_VERSION=""
+if [ -x "$KIN_BIN/kin" ]; then
+    PREVIOUS_VERSION=$("$KIN_BIN/kin" --version 2>/dev/null | awk '{print $NF}')
+    if [ -n "$PREVIOUS_VERSION" ]; then
+        info "Existing install found: kin $PREVIOUS_VERSION (will be replaced)"
+    else
+        info "Existing install found in $KIN_DIR (will be replaced)"
+    fi
+fi
+
 # ── Resolve version ────────────────────────────────────────────────────
 
 if [ -n "${KIN_VERSION:-}" ]; then
@@ -159,32 +171,44 @@ if [ -z "$EXTRACT_DIR" ]; then
     EXTRACT_DIR="$TMPDIR"
 fi
 
-# FIR-967: kin-daemon is mandatory — `kin status`/`kin search` and the MCP
-# server all require it. Assert it is present in the extracted archive BEFORE
-# moving anything, so a daemon-less archive (e.g. a stale build) aborts cleanly
-# instead of leaving a half-installed, daemon-less environment.
+# kin-daemon is mandatory — `kin status`/`kin search` and the MCP server all
+# require it. Assert it is present in the extracted archive BEFORE moving
+# anything, so a daemon-less archive (e.g. a stale build) aborts cleanly instead
+# of leaving a half-installed, daemon-less environment.
 if [ ! -f "$EXTRACT_DIR/kin-daemon" ]; then
     err "kin-daemon missing from the downloaded archive."
     err "kin status/search and the MCP server require it. Refusing a daemon-less install. Aborting."
     exit 1
 fi
 
-# Move binaries. kin-daemon is mandatory (asserted above); kin-vfs is optional.
+# Move binaries. kin-daemon is mandatory (asserted above); kin-vfs is the
+# optional filesystem-projection client.
+HAVE_VFS=0
 for bin in kin kin-daemon kin-vfs; do
     if [ -f "$EXTRACT_DIR/$bin" ]; then
         mv "$EXTRACT_DIR/$bin" "$KIN_BIN/$bin"
         chmod +x "$KIN_BIN/$bin"
+        [ "$bin" = "kin-vfs" ] && HAVE_VFS=1
     fi
 done
 
-# Move shim library
+# Move the projection shim library if the archive bundled it (Linux .so /
+# macOS .dylib). It is consumed by the shell hooks via $KIN_DIR/lib.
+HAVE_SHIM=0
 for lib in libkin_vfs_shim.so libkin_vfs_shim.dylib; do
     if [ -f "$EXTRACT_DIR/$lib" ]; then
         mv "$EXTRACT_DIR/$lib" "$KIN_LIB/$lib"
+        HAVE_SHIM=1
     fi
 done
 
-ok "Binaries installed"
+ok "Binaries installed (kin, kin-daemon)"
+
+if [ "$HAVE_VFS" = "1" ] && [ "$HAVE_SHIM" = "1" ]; then
+    ok "Filesystem projection installed (kin-vfs + shim)"
+else
+    info "Filesystem projection (kin-vfs) not bundled in this archive — core CLI and daemon are fully functional without it."
+fi
 
 # ── PATH setup ──────────────────────────────────────────────────────────
 
@@ -224,7 +248,12 @@ esac
 export PATH="$KIN_BIN:$PATH"
 
 if has_cmd "$KIN_BIN/kin"; then
-    ok "kin $(\"$KIN_BIN/kin\" --version 2>/dev/null || echo 'installed')"
+    INSTALLED_VERSION=$("$KIN_BIN/kin" --version 2>/dev/null | awk '{print $NF}')
+    if [ -n "$PREVIOUS_VERSION" ] && [ -n "$INSTALLED_VERSION" ] && [ "$PREVIOUS_VERSION" != "$INSTALLED_VERSION" ]; then
+        ok "kin upgraded: $PREVIOUS_VERSION → $INSTALLED_VERSION"
+    else
+        ok "kin ${INSTALLED_VERSION:-installed}"
+    fi
 else
     err "Installation failed — kin binary not found"
     exit 1
