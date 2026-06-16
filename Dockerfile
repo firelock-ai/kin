@@ -10,8 +10,9 @@ COPY . /build/kin
 
 # Build from kin directory
 WORKDIR /build/kin
-# Keep the committed cargo config intact: it contains the public Git [patch.kin]
-# pins needed until every kin-* crate is published in the sparse registry.
+# Keep the committed cargo config intact: it defines the [registries.kin] sparse
+# registry that kin-* crates resolve from (the Git [patch.kin] pins were dropped
+# at the registry cutover — kin no longer depends on GitHub for crate deps).
 RUN test -f .cargo/config.toml && grep -q '^\[registries\.kin\]' .cargo/config.toml
 # kin-daemon needs --features gcs for GCS StorageBackend in cloud deployment.
 RUN cargo build --release --features gcs --bin kin-daemon --bin kin
