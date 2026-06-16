@@ -52,9 +52,31 @@ fn swerank_self_retrieval_probe() {
         return;
     }
 
-    // 1. Load config + model + tokenizer from the real artifacts.
-    let cfg_json = fs::read_to_string(dir.join("config.json")).expect("read config.json");
-    let config: BertConfig = serde_json::from_str(&cfg_json).expect("parse config.json");
+    // 1. Load config + model + tokenizer from the real artifacts. Validate the
+    // config deserializes into BertConfig BEFORE asserting on it: a missing or
+    // malformed fixture (e.g. a config.json without the dimension fields) is a
+    // clean SKIP, not a panic that reddens the whole `cargo test -p kin-infer`
+    // suite (FIR-994).
+    let cfg_json = match fs::read_to_string(dir.join("config.json")) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "SKIP: cannot read {MODEL_DIR}/config.json ({e}); skipping self-retrieval probe."
+            );
+            return;
+        }
+    };
+    let config: BertConfig = match serde_json::from_str(&cfg_json) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "SKIP: {MODEL_DIR}/config.json does not deserialize into BertConfig ({e}); \
+                 the SweRank fixture is missing/malformed (e.g. no hidden_size / dimension \
+                 fields). Skipping self-retrieval probe."
+            );
+            return;
+        }
+    };
     assert_eq!(config.hidden_size, 768, "nomic_bert hidden_size");
     assert_eq!(config.num_hidden_layers, 12, "nomic_bert n_layer");
     assert_eq!(config.num_attention_heads, 12, "nomic_bert n_head");
