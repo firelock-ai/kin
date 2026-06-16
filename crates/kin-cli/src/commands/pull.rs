@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::process::Command;
-
 use anyhow::Result;
 use kin_core::{KinConfig, RemoteRefConfig, RemoteTransportKind};
 use kin_model::ChangeStore;
@@ -149,48 +147,17 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
         return Ok(());
     }
 
-    // Git-export transport: fetch into the hidden transport mirror, then re-import into Kin.
-    let working_dir = layout.working_dir();
-    let transport_repo = crate::commands::git::sync_export_path(&layout);
-    println!(
-        "Pulling branch '{}' from Git remote '{}' via transport mirror...",
-        branch_name, remote.name
-    );
-
-    let transport_remote_url = {
-        crate::commands::git::ensure_transport_repo(
-            &transport_repo,
-            Some(working_dir),
-            remote.url.as_deref(),
-        )?;
-        let status = Command::new("git")
-            .args(["fetch", "origin"])
-            .current_dir(&transport_repo)
-            .status()
-            .map_err(|e| anyhow::anyhow!("failed to run git fetch: {}", e))?;
-        if !status.success() {
-            anyhow::bail!("git fetch failed with exit code {}", status);
-        }
-        remote.url.clone().unwrap_or_else(|| "origin".to_string())
-    };
-
-    let remote_ref = format!("refs/remotes/origin/{}", branch_name);
-    if !crate::commands::git::git_ref_exists(&transport_repo, &remote_ref)? {
-        anyhow::bail!(
-            "remote branch '{}' not found on {}. Push it first with `kin push` or choose a branch that exists remotely.",
-            branch_name,
-            transport_remote_url
-        );
-    }
-    crate::commands::git::set_transport_branch_head(
-        &transport_repo,
-        &branch_name.to_string(),
-        &remote_ref,
-    )?;
-
+    // Git-export transport pull is not yet enabled: re-importing a fetched Git
+    // history into Kin would mutate local graph snapshots directly, bypassing the
+    // daemon-owned authority. Fail fast with a clear, friendly message instead of
+    // doing throwaway fetch work and erroring at the end. (`kin push` over
+    // git-export already works; only the inbound re-import is pending.)
     anyhow::bail!(
-        "Git-transport pull re-import is disabled because it mutates local graph snapshots. \
-         Configure a native Kin remote for daemon-owned pull, or run an explicit offline migration."
+        "Pull over a git-export remote ('{remote}') is not yet enabled in this build.\n\
+         Inbound Git re-import would rewrite local graph snapshots outside the daemon, so it is coming in a later alpha.\n\
+         For a working pull today, configure a native Kin remote: `kin remote add {remote} --transport native-kin --url <url> --default`.\n\
+         To bring in external Git history offline, use `kin init --git-history ...` or `kin migrate`.",
+        remote = remote.name
     );
 }
 

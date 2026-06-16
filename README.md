@@ -33,6 +33,21 @@ Configure the installer with environment variables:
 - `KIN_DIR`: Custom installation directory (defaults to `~/.kin`).
 - `KIN_NO_SETUP`: Set to `1` to skip the interactive setup wizard after the binaries are downloaded.
 
+### Runtime configuration
+
+The Kin daemon is the canonical authority for graph truth. Commands that analyze the
+graph in-process (`kin merge`, `kin release`, `kin semver`, `kin rollback`, `kin git export`)
+read from the daemon and auto-start it as needed — no configuration required for normal use.
+
+- `KIN_NO_DAEMON`: Set to `1` to disable daemon auto-start. The CLI will only use an
+  already-running daemon (or `KIN_DAEMON_URL`).
+- `KIN_DAEMON_URL`: Point the CLI at an explicit daemon endpoint instead of the
+  repo-local one.
+- `KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN`: Offline/admin escape hatch. Set to `1` to let
+  the above read-only commands fall back to reading the local `.kin` snapshot directly
+  when the daemon cannot be reached. Not needed for normal use, and never used for
+  writes — all graph mutations still route through the daemon.
+
 ---
 
 ## Quickstart
