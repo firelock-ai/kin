@@ -223,6 +223,48 @@ pub fn execute_migration<G: GraphStore>(
     Ok(result)
 }
 
+/// Open a KinDB snapshot, retrying briefly on transient exclusive-lock
+/// contention.
+///
+/// kin-db's `SnapshotManager::open` takes the graph's OS-level lock with a
+/// *non-blocking* `flock(LOCK_EX|LOCK_NB)`, so it fails immediately with
+/// `EAGAIN` ("Resource temporarily unavailable") if a previous handle on the
+/// same graph has not finished releasing yet. A persisted migration opens the
+/// freshly-created target graph several times in quick succession (align default
+/// branch, main index pass, verify), and these transient self-overlaps would
+/// otherwise surface as flaky `LockError`s even though no other process is
+/// involved. Retrying with a short bounded backoff turns the non-blocking
+/// acquire into an effectively-blocking one without modifying kin-db.
+fn open_snapshot_retrying(path: impl AsRef<Path>) -> Result<kin_db::SnapshotManager> {
+    // ~5s worst case (200 * 25ms); the uncontended path returns on attempt 1.
+    const MAX_ATTEMPTS: u32 = 200;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(25);
+
+    let path = path.as_ref();
+    let mut attempt: u32 = 1;
+    loop {
+        match kin_db::SnapshotManager::open(path) {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(e) => {
+                let msg = e.to_string();
+                let transient = msg.contains("lock error")
+                    || msg.to_lowercase().contains("temporarily unavailable");
+                if !transient || attempt >= MAX_ATTEMPTS {
+                    return Err(MigrateError::Graph(msg));
+                }
+                if attempt == 1 {
+                    tracing::debug!(
+                        path = %path.display(),
+                        "graph lock contended on open; retrying with bounded backoff"
+                    );
+                }
+                std::thread::sleep(BACKOFF);
+                attempt += 1;
+            }
+        }
+    }
+}
+
 /// Execute a migration against a snapshot-backed KinDB and verify that the
 /// migrated repository has persisted semantic state before returning success.
 pub fn execute_migration_persisted(plan: &MigrationPlan) -> Result<MigrationResult> {
@@ -281,8 +323,7 @@ pub fn execute_migration_persisted(plan: &MigrationPlan) -> Result<MigrationResu
             path = %snapshot_path.display()
         )
         .entered();
-        kin_db::SnapshotManager::open(&snapshot_path)
-            .map_err(|e| MigrateError::Graph(e.to_string()))?
+        open_snapshot_retrying(&snapshot_path)?
     };
     let graph = snapshot.graph();
 
@@ -530,8 +571,7 @@ fn align_default_branch(
         return Ok(branch_name);
     }
 
-    let snapshot = kin_db::SnapshotManager::open(layout.kindb_snapshot_path())
-        .map_err(|e| MigrateError::Graph(e.to_string()))?;
+    let snapshot = open_snapshot_retrying(layout.kindb_snapshot_path())?;
     let graph = snapshot.graph();
     let new_branch = Branch {
         name: BranchName::new(&branch_name),
@@ -567,8 +607,7 @@ fn verify_persisted_migration(
     planned_source_files: usize,
     files_indexed: usize,
 ) -> Result<()> {
-    let snapshot = kin_db::SnapshotManager::open(snapshot_path)
-        .map_err(|e| MigrateError::Graph(e.to_string()))?;
+    let snapshot = open_snapshot_retrying(snapshot_path)?;
     let graph = snapshot.graph();
 
     let branch = graph
@@ -1641,7 +1680,7 @@ mod tests {
             "master"
         );
 
-        let snapshot = kin_db::SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
+        let snapshot = open_snapshot_retrying(layout.kindb_snapshot_path()).unwrap();
         let graph = snapshot.graph();
         let branch = graph.get_branch(&BranchName::new("master")).unwrap();
         assert!(branch.is_some());
@@ -1682,7 +1721,7 @@ mod tests {
         assert!(target.join(".kin").exists());
 
         let layout = kin_core::KinLayout::new(target.join(".kin"));
-        let snapshot = kin_db::SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
+        let snapshot = open_snapshot_retrying(layout.kindb_snapshot_path()).unwrap();
         let graph = snapshot.graph();
         assert!(graph.entity_count() > 0);
     }
