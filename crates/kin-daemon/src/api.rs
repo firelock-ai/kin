@@ -1077,10 +1077,30 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
         blobs_dir: go_dir,
     }));
 
-    // Merge daemon routes (with DaemonState) and registry routes (each with own state).
+    // The package registries (cargo/npm/oci/go) are PUBLIC services with their
+    // own per-write gates (cargo: `KIN_REGISTRY_CARGO_TOKEN`; npm:
+    // `KIN_REGISTRY_NPM_AUTH_URL` introspection); their reads stay open. The
+    // daemon API is a PROTECTED control surface. So `daemon_auth` is scoped to
+    // ONLY the daemon routes — applied as an inner `.layer()` on the daemon
+    // sub-router before it is merged — and must NOT wrap the registry routers.
+    //
+    // Why this matters: the cloud daemon binds `0.0.0.0` (its k8s Service routes
+    // to the pod IP), which `bind_listener` permits only when a daemon auth
+    // token is set. If `daemon_auth` wrapped the whole app, enabling that token
+    // would also gate the registry — and `cargo` does not send credentials on
+    // reads (its `config.json` has no `auth-required`), so the public index and
+    // downloads would 401. Scoping `daemon_auth` to the daemon routes keeps a
+    // 0.0.0.0-bound, token-protected daemon serving a public registry.
+    //
+    // The outer layers below (`daemon_activity`, `api_version_header`,
+    // `validate_host_and_origin`) still apply to EVERYTHING, registry included.
     let daemon_routes = Router::new()
         .merge(routes.clone())
         .nest("/v1", routes)
+        .layer(middleware::from_fn_with_state(
+            DaemonAuthState { auth_token },
+            daemon_auth,
+        ))
         .with_state(state);
 
     let app = Router::new()
@@ -1089,10 +1109,6 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
         .merge(npm_routes)
         .merge(oci_routes)
         .merge(go_routes)
-        .layer(middleware::from_fn_with_state(
-            DaemonAuthState { auth_token },
-            daemon_auth,
-        ))
         .layer(middleware::from_fn_with_state(
             activity_state,
             daemon_activity,
@@ -8908,6 +8924,178 @@ mod tests {
                 "path {path} returned {status} — public route should not require auth"
             );
         }
+    }
+
+    // FIR-971: the package registries are public services with their own
+    // per-write gates; `daemon_auth` must be scoped to the daemon API and must
+    // NOT wrap the registry routers, so a 0.0.0.0-bound (therefore daemon-token-
+    // protected) daemon can still serve a public registry. `KIN_REGISTRY_*` env
+    // is process-global and read by `router_with_auth` at construction, so the
+    // env-touching publish test serializes on this `tokio::sync::Mutex` (held
+    // across `.await`, so a std guard would trip `clippy::await_holding_lock`)
+    // and restores the var via `RegistryEnvGuard`.
+    static REGISTRY_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct RegistryEnvGuard(&'static str);
+    impl Drop for RegistryEnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.0);
+        }
+    }
+
+    /// Build a minimal valid `.crate` blob (gzip-tar containing
+    /// `{name}-{version}/Cargo.toml`) so the cargo publish path passes coordinate
+    /// verification. Mirrors `kin_registry::cargo` test helpers, inlined here
+    /// because those are private to that crate's test module.
+    fn build_valid_crate(name: &str, version: &str) -> Vec<u8> {
+        use flate2::{write::GzEncoder, Compression};
+        let cargo_toml =
+            format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n");
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(cargo_toml.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(
+                &mut header,
+                format!("{name}-{version}/Cargo.toml"),
+                cargo_toml.as_bytes(),
+            )
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn registry_routes_public_even_with_daemon_auth_token() {
+        // With a daemon auth token configured, the cargo registry's read routes
+        // (config.json + a sparse-index lookup) must still answer WITHOUT any
+        // Authorization header — `daemon_auth` is scoped to the daemon API only.
+        let state = test_state();
+        let app = router_with_auth(state, Some("secret-token".to_string()));
+
+        for path in ["/registry/cargo/config.json", "/registry/cargo/se/rd/serde"] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            // config.json -> 200; an unknown crate index -> 404. Neither may be
+            // 401/403, which would mean daemon_auth wrongly gated the registry.
+            assert!(
+                status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
+                "registry path {path} returned {status} — registry must be public"
+            );
+        }
+
+        // config.json specifically must be a clean 200 (it has no preconditions).
+        let config = app
+            .oneshot(
+                Request::get("/registry/cargo/config.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(config.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn daemon_api_protected_while_registry_public_in_same_app() {
+        // The security-critical invariant of FIR-971: in ONE token-configured
+        // app, the daemon API stays protected (401 without bearer, 200 with it)
+        // while the registry stays open (200 with no auth). Proves the layer
+        // split gates exactly the daemon routes and nothing else.
+        let state = test_state();
+        let app = router_with_auth(state, Some("secret-token".to_string()));
+
+        // Daemon API route: rejected without a bearer token.
+        let rejected = app
+            .clone()
+            .oneshot(Request::get("/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+        // Daemon API route: accepted with the bearer token.
+        let accepted = app
+            .clone()
+            .oneshot(
+                Request::get("/status")
+                    .header("authorization", "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+
+        // Registry route in the SAME app: open with no Authorization header.
+        let registry = app
+            .oneshot(
+                Request::get("/registry/cargo/config.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registry.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cargo_publish_requires_registry_cargo_token_through_daemon_router() {
+        // Cargo publish remains gated by KIN_REGISTRY_CARGO_TOKEN even with the
+        // daemon API behind its own token: the registry's own publish gate is
+        // preserved end-to-end through the full daemon router.
+        let _lock = REGISTRY_ENV_LOCK.lock().await;
+
+        let crate_body = build_valid_crate("demo", "0.1.0");
+        let publish_uri = "/registry/cargo/api/v1/crates/publish?name=demo&version=0.1.0";
+
+        // (1) No KIN_REGISTRY_CARGO_TOKEN configured -> publish fails closed
+        // (503) even with a daemon token set and a Bearer header present.
+        std::env::remove_var("KIN_REGISTRY_CARGO_TOKEN");
+        let app = router_with_auth(test_state(), Some("daemon-token".to_string()));
+        let disabled = app
+            .oneshot(
+                Request::post(publish_uri)
+                    .header("authorization", "Bearer anything")
+                    .body(Body::from(crate_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disabled.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // (2) KIN_REGISTRY_CARGO_TOKEN configured: publish without the matching
+        // bearer -> 401 (the daemon token does NOT satisfy the registry gate).
+        let _env = RegistryEnvGuard("KIN_REGISTRY_CARGO_TOKEN");
+        std::env::set_var("KIN_REGISTRY_CARGO_TOKEN", "cargo-secret");
+        let app = router_with_auth(test_state(), Some("daemon-token".to_string()));
+        let unauthorized = app
+            .oneshot(
+                Request::post(publish_uri)
+                    .body(Body::from(crate_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        // (3) Same config: publish WITH the matching cargo bearer -> 200.
+        let app = router_with_auth(test_state(), Some("daemon-token".to_string()));
+        let ok = app
+            .oneshot(
+                Request::post(publish_uri)
+                    .header("authorization", "Bearer cargo-secret")
+                    .body(Body::from(crate_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
     }
 
     fn test_packages_dir(state: &Arc<DaemonState>) -> std::path::PathBuf {
