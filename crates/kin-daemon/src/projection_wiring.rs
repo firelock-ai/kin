@@ -147,6 +147,55 @@ pub async fn project_after_mcp_commit(
     let mut reconciler = state.reconciler.write().await;
 
     // -----------------------------------------------------------------------
+    // FIR-984: Cold-projection priming.
+    //
+    // The reconciler's projection state (file layouts + content) is the map
+    // `project_overlay_to_files` uses to locate each entity's byte region and
+    // splice the new body in. On a freshly-started or restarted daemon that map
+    // is cold: `DaemonState::open` seeds the reconciler's LKG from the persisted
+    // graph but never registers any file layout (no reconcile tick has run yet).
+    // With no layout for the entity's file, `project_entity_mutations_with_policy`
+    // finds no region for the mutation and silently skips it — the graph commit
+    // lands (root hash advances, ops_applied > 0) but `modified_files` comes back
+    // empty and the working file is never touched. That is the FIR-984 silent
+    // no-op the MCP write loop hit on the first commit after daemon start.
+    //
+    // Prime the projection from graph + disk truth before projecting: reconcile
+    // each referenced file that is not yet registered, which parses the current
+    // source and registers its layout + content. The detected overlay is
+    // discarded — we only need the projection registration here, not a graph
+    // mutation (the agent's commit already landed, and the FIR-934 no-clobber
+    // resync below reconverges the graph onto the projected source afterwards).
+    // Files missing from disk are left to the existing structured-error path.
+    {
+        let mut primed: HashSet<FilePathId> = HashSet::new();
+        for entity in temp_overlay.entity_mods.values() {
+            let Some(span) = &entity.span else {
+                continue;
+            };
+            if reconciler.projection().get_content(&span.file).is_some() {
+                continue;
+            }
+            if !primed.insert(span.file.clone()) {
+                continue;
+            }
+            let path = state.layout.working_dir().join(span.file.0.as_str());
+            if !path.exists() {
+                continue;
+            }
+            let mut prime_overlay = GraphOverlay::default();
+            reconciler
+                .reconcile_file_change(
+                    &FileEvent::Changed(path),
+                    state.blobs.as_ref(),
+                    state.graph.as_ref(),
+                    &mut prime_overlay,
+                )
+                .map_err(|e| reconcile_err_to_projection_err(e, pre_commit_entities))?;
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // FIR-904·3: Conflict detection — skip-conflicted semantics.
     //
     // For each entity in the overlay, compare the current on-disk file bytes at
@@ -745,6 +794,106 @@ mod tests {
         // changes. The body edit changed the bytes, but the FIR-934 resync drove
         // the reconciler LKG + graph onto the projected source, so the next
         // reconcile sees no delta — the agent's edit is NOT clobbered.
+        let mut reconciler2 = state.reconciler.write().await;
+        assert_no_clobber(&mut reconciler2, &state, &file_path);
+    }
+
+    // ------------------------------------------------------------------
+    // Test 1c (FIR-984): a body edit projected against a COLD reconciler
+    // projection (no prior reconcile tick — the daemon-restart state) still
+    // reaches disk. This is the silent-no-op regression: the graph commit
+    // landed but `modified_files` came back empty because the reconciler's
+    // projection had no layout for the entity's file. The fix primes the
+    // projection from graph + disk truth before projecting.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn project_body_edit_primes_cold_projection_and_reaches_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = make_test_state(dir.path());
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let rel = "src/lib.rs";
+        let file_path = dir.path().join(rel);
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        let original = b"pub fn foo() -> i32 { 1 }\npub fn bar() -> i32 { 2 }\n";
+        std::fs::write(&file_path, original).unwrap();
+
+        let blob_store = BlobStore::new(state.layout.objects_dir()).expect("blob store must open");
+
+        // Discover the entity (with its deterministic id + span) and seed the
+        // graph using a SEPARATE reconciler, so the daemon's own
+        // `state.reconciler` projection stays COLD — exactly the post-restart
+        // state where no reconcile tick has registered a file layout yet.
+        let mut discover = Reconciler::new(dir.path().to_path_buf());
+        let mut overlay = GraphOverlay::default();
+        discover
+            .reconcile_file_change(
+                &FileEvent::Changed(file_path.clone()),
+                &blob_store,
+                state.graph.as_ref(),
+                &mut overlay,
+            )
+            .expect("discovery reconcile must succeed");
+        let pre_commit_entity = overlay
+            .entity_adds
+            .values()
+            .find(|e| e.name == "foo")
+            .cloned()
+            .expect("foo must be present in the reconcile overlay");
+        let span = pre_commit_entity
+            .span
+            .clone()
+            .expect("foo must have a span");
+        apply_overlay_to_graph(state.graph.as_ref(), &mut overlay)
+            .expect("apply overlay must succeed");
+
+        // Sanity: the daemon's projection is cold — no layout/content for the file.
+        {
+            let reconciler = state.reconciler.read().await;
+            assert!(
+                reconciler.projection().get_content(&span.file).is_none(),
+                "precondition: daemon reconciler projection must be cold for this file"
+            );
+        }
+
+        let orig_region = &original[span.start_byte..span.end_byte];
+        let new_body = String::from_utf8_lossy(orig_region)
+            .replace("{ 1 }", "{ 42 }")
+            .into_bytes();
+
+        let mut bodies = HashMap::new();
+        bodies.insert(pre_commit_entity.id, new_body.clone());
+        let (modified_files, _warnings, conflicts) =
+            project_after_mcp_commit(&state, std::slice::from_ref(&pre_commit_entity), &bodies)
+                .await
+                .expect("projection must succeed");
+
+        assert_eq!(
+            modified_files.len(),
+            1,
+            "cold-projection body edit must still project exactly one file (FIR-984); \
+             empty here is the silent no-op"
+        );
+        assert!(conflicts.is_empty(), "no conflicts expected");
+
+        let on_disk = std::fs::read(&file_path).expect("projected file must exist");
+        let on_disk_str = String::from_utf8(on_disk).expect("projected file is utf-8");
+        assert!(
+            on_disk_str.contains("{ 42 }"),
+            "file must contain the new body literal; got: {on_disk_str}"
+        );
+        assert!(
+            !on_disk_str.contains("{ 1 }"),
+            "old body literal must be gone; got: {on_disk_str}"
+        );
+        assert!(
+            on_disk_str.contains("pub fn bar() -> i32 { 2 }"),
+            "sibling entity bar must be preserved; got: {on_disk_str}"
+        );
+
         let mut reconciler2 = state.reconciler.write().await;
         assert_no_clobber(&mut reconciler2, &state, &file_path);
     }
