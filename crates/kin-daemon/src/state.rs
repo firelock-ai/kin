@@ -1176,6 +1176,47 @@ impl DaemonState {
         Ok(())
     }
 
+    /// FIR-944: incremental per-batch embed-progress flush for the background
+    /// embed worker.
+    ///
+    /// Persists this batch's vectors — plus any concurrent graph delta from LSP
+    /// enrichment that kept the graph dirty during embed — via
+    /// `SnapshotManager::flush_embed_progress`, which appends only the delta and
+    /// the vector sidecar and NEVER re-serializes the whole (~1 GB) graph. The
+    /// old worker leaned on the periodic full `save_snapshot` to land the graph
+    /// side, which is O(graph) per tick and is what wedged the daemon at scale.
+    ///
+    /// Mirrors `save_snapshot_impl`'s persist-lock + generation-cursor + marker
+    /// discipline so the two persistence paths compose safely (the shared
+    /// `persist_lock` serializes them and keeps `snapshot_generation` consistent).
+    /// Returns the persisted resume `pending` count — derived from graph-vs-index
+    /// truth, so it survives a crash/reopen and reaches zero only at full
+    /// coverage.
+    pub fn flush_embed_progress(&self) -> Result<usize> {
+        let _persist_guard = self
+            .persist_lock
+            .lock()
+            .map_err(|_| DaemonError::Io(std::io::Error::other("persist lock poisoned")))?;
+        let base_gen = self.snapshot_generation.load(Ordering::SeqCst);
+        let embedder_identity = kin_buildinfo::sha_with_dirty(kin_buildinfo::get());
+        let outcome = kin_db::SnapshotManager::flush_embed_progress(
+            self.layout.kindb_snapshot_path(),
+            self.graph.as_ref(),
+            base_gen,
+            Some(embedder_identity.as_str()),
+        )
+        .map_err(DaemonError::from)?;
+        // The graph moved (a delta was appended) only when `generation` is Some;
+        // advance the cursor + publish the marker so CLI/MCP reload, exactly as
+        // save_snapshot_impl does. A vectors-only batch leaves the graph at
+        // `base_gen`, so the cursor stays put.
+        if let Some(generation) = outcome.generation {
+            self.snapshot_generation.store(generation, Ordering::SeqCst);
+            self.write_generation_marker(generation);
+        }
+        Ok(outcome.status.pending)
+    }
+
     fn save_read_index(&self) -> Result<()> {
         let index =
             kin_db::ReadIndex::from_graph(self.graph.as_ref()).map_err(DaemonError::from)?;
@@ -2243,5 +2284,32 @@ mod tests {
         // A moderate drop (50%) is a legitimate edit, NOT a wipe.
         state.persisted_entity_count.store(n * 2, Ordering::SeqCst);
         assert!(!state.shutdown_flush_would_wipe_graph());
+    }
+
+    #[test]
+    fn flush_embed_progress_persists_snapshot_and_reports_pending() {
+        // FIR-944: the incremental flush persists the snapshot (full bundle on
+        // the first write) and returns the persisted resume count. With no
+        // embedder run the lone entity stays unembedded, so `pending` reflects it
+        // — proving the flush composes the graph-delta + sidecar write and reads
+        // coverage from persisted graph-vs-index truth.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = Arc::new(test_state(init.layout, repo_dir.path()));
+        state
+            .graph
+            .upsert_entity(&test_entity("embed_me", "src/lib.rs"))
+            .unwrap();
+        state.graph.queue_missing_for_embedding();
+
+        let pending = state.flush_embed_progress().expect("flush must succeed");
+        assert!(
+            state.layout.kindb_snapshot_path().exists(),
+            "flush must persist the snapshot bundle"
+        );
+        assert!(
+            pending >= 1,
+            "the unembedded entity must remain pending (no embedder ran); got {pending}"
+        );
     }
 }
