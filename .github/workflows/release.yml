@@ -365,7 +365,14 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Publish npm package (Trusted Publishing via OIDC)
-        run: npm publish ./packages/kin-mcp --access public --tag "${NPM_DIST_TAG}"
+        run: |
+          PKG=$(node -p "require('./packages/kin-mcp/package.json').name")
+          VER=$(node -p "require('./packages/kin-mcp/package.json').version")
+          if npm view "${PKG}@${VER}" version >/dev/null 2>&1; then
+            echo "${PKG}@${VER} already published — skipping (idempotent recut)."
+            exit 0
+          fi
+          npm publish ./packages/kin-mcp --access public --tag "${NPM_DIST_TAG}"
         env:
           NPM_DIST_TAG: ${{ steps.dist-tag.outputs.tag }}
 
