@@ -437,8 +437,28 @@ pub struct ModelWeights {
     lm_head_weight: Option<Array2<f32>>,
     lm_head_bias: Option<Array1<f32>>,
     /// Classification head for cross-encoder models.
-    classifier_weight: Option<Array2<f32>>,
-    classifier_bias: Option<Array1<f32>>,
+    classifier: Option<ClassifierHead>,
+}
+
+/// Cross-encoder classification head.
+///
+/// Two shapes occur in the wild and both must score correctly:
+/// - `Linear` — a single `classifier.weight` `[num_labels, hidden]` (+ optional bias),
+///   e.g. `BertForSequenceClassification` rerankers.
+/// - `Roberta` — the two-layer `RobertaClassificationHead`: `dense` (`[hidden, hidden]`) →
+///   `tanh` → `out_proj` (`[num_labels, hidden]`), e.g. `XLMRobertaForSequenceClassification`
+///   (`BAAI/bge-reranker-base`).
+enum ClassifierHead {
+    Linear {
+        weight: Array2<f32>,
+        bias: Option<Array1<f32>>,
+    },
+    Roberta {
+        dense_weight: Array2<f32>,
+        dense_bias: Option<Array1<f32>>,
+        out_proj_weight: Array2<f32>,
+        out_proj_bias: Option<Array1<f32>>,
+    },
 }
 
 /// The loaded, ready-to-run model.
@@ -729,6 +749,37 @@ fn try_load_2d_flexible(
         Ok(name) => load_2d(tensors, &name, rows, cols).map(Some),
         Err(_) => Ok(None),
     }
+}
+
+/// Load the cross-encoder classification head, if present.
+///
+/// Prefers the two-layer `RobertaClassificationHead` (`classifier.dense` → tanh →
+/// `classifier.out_proj`) when its tensors exist; otherwise falls back to a single
+/// linear head (`classifier.weight`/`score.weight`). Returns `None` for models with
+/// no head (plain encoders). Rerankers are single-label, so the output projection is
+/// loaded as `[1, hidden]`.
+fn load_classifier_head(
+    tensors: &SafeTensors,
+    h: usize,
+) -> Result<Option<ClassifierHead>, InferError> {
+    if let Some(dense_weight) = try_load_2d_flexible(tensors, &["classifier.dense.weight"], h, h)? {
+        let dense_bias = try_load_1d_flexible(tensors, &["classifier.dense.bias"], h)?;
+        let out_proj_weight = load_2d_flexible(tensors, &["classifier.out_proj.weight"], 1, h)?;
+        let out_proj_bias = try_load_1d_flexible(tensors, &["classifier.out_proj.bias"], 1)?;
+        return Ok(Some(ClassifierHead::Roberta {
+            dense_weight,
+            dense_bias,
+            out_proj_weight,
+            out_proj_bias,
+        }));
+    }
+    if let Some(weight) =
+        try_load_2d_flexible(tensors, &["classifier.weight", "score.weight"], 1, h)?
+    {
+        let bias = try_load_1d_flexible(tensors, &["classifier.bias", "score.bias"], 1)?;
+        return Ok(Some(ClassifierHead::Linear { weight, bias }));
+    }
+    Ok(None)
 }
 
 /// Load tensors from potentially sharded safetensors files.
@@ -1179,14 +1230,7 @@ impl BertModel {
         let lm_head_bias = try_load_1d_flexible(tensors, &["lm_head.bias"], vocab)?;
 
         // Classification head (for cross-encoders)
-        let classifier_weight = try_load_2d_flexible(
-            tensors,
-            &["classifier.dense.weight", "classifier.weight"],
-            1,
-            h,
-        )?;
-        let classifier_bias =
-            try_load_1d_flexible(tensors, &["classifier.dense.bias", "classifier.bias"], 1)?;
+        let classifier = load_classifier_head(tensors, h)?;
 
         let head_dim = h / config.num_attention_heads;
         let kv_head_dim = h / config.num_attention_heads;
@@ -1215,8 +1259,7 @@ impl BertModel {
                 final_norm_bias,
                 lm_head_weight,
                 lm_head_bias,
-                classifier_weight,
-                classifier_bias,
+                classifier,
             },
             head_dim,
             kv_head_dim,
@@ -2118,17 +2161,36 @@ impl BertModel {
             cls_tokens.row_mut(b).assign(&cls);
         }
 
-        let weight = self.weights.classifier_weight.as_ref().ok_or_else(|| {
-            InferError::ModelError("cross-encoder requires classifier_weight".into())
-        })?;
-        let bias = self.weights.classifier_bias.as_ref();
-
-        let logits = self.linear(&cls_tokens, weight, bias)?;
+        let logits = self.classify_pooled(&cls_tokens)?;
         let mut results = Vec::with_capacity(batch_size);
         for b in 0..batch_size {
             results.push(logits[[b, 0]]);
         }
         Ok(results)
+    }
+
+    /// Apply the cross-encoder classification head to pooled `[CLS]` representations,
+    /// returning `[batch, num_labels]` logits. The two-layer RoBERTa head computes
+    /// `out_proj(tanh(dense(x)))`; the single-linear head computes `x·Wᵀ + b`.
+    fn classify_pooled(&self, pooled: &Array2<f32>) -> Result<Array2<f32>, InferError> {
+        match self.weights.classifier.as_ref() {
+            Some(ClassifierHead::Linear { weight, bias }) => {
+                self.linear(pooled, weight, bias.as_ref())
+            }
+            Some(ClassifierHead::Roberta {
+                dense_weight,
+                dense_bias,
+                out_proj_weight,
+                out_proj_bias,
+            }) => {
+                let mut hidden = self.linear(pooled, dense_weight, dense_bias.as_ref())?;
+                hidden.mapv_inplace(|v| v.tanh());
+                self.linear(&hidden, out_proj_weight, out_proj_bias.as_ref())
+            }
+            None => Err(InferError::ModelError(
+                "cross-encoder requires a classification head".into(),
+            )),
+        }
     }
 
     /// GPU-accelerated linear projection helper.
@@ -4939,8 +5001,7 @@ mod tests {
             final_norm_bias: None,
             lm_head_weight: None,
             lm_head_bias: None,
-            classifier_weight: None,
-            classifier_bias: None,
+            classifier: None,
         };
         BertModel {
             config,
@@ -4951,6 +5012,105 @@ mod tests {
             rope_sin: None,
             gpu: None,
         }
+    }
+
+    /// Minimal CPU model (gpu = None, no layers) carrying only a classification head,
+    /// for exercising the cross-encoder scoring path in isolation.
+    fn mock_classifier_model(h: usize, head: ClassifierHead) -> BertModel {
+        let json = format!(
+            r#"{{ "n_embd": {h}, "n_layer": 0, "n_head": 1, "n_inner": {h},
+                  "n_positions": 16, "vocab_size": 4 }}"#
+        );
+        let config: BertConfig = serde_json::from_str(&json).expect("parse config");
+        let weights = ModelWeights {
+            word_embeddings: Array2::zeros((config.vocab_size, h)),
+            position_embeddings: None,
+            token_type_embeddings: None,
+            embed_ln_weight: None,
+            embed_ln_bias: None,
+            embed_projection: None,
+            layers: vec![],
+            final_norm_weight: None,
+            final_norm_bias: None,
+            lm_head_weight: None,
+            lm_head_bias: None,
+            classifier: Some(head),
+        };
+        BertModel {
+            config,
+            weights,
+            head_dim: h,
+            kv_head_dim: h,
+            rope_cos: None,
+            rope_sin: None,
+            gpu: None,
+        }
+    }
+
+    #[test]
+    fn cross_encoder_two_layer_roberta_head_matches_hand_computed() {
+        use ndarray::{arr1, arr2};
+        // RobertaClassificationHead: out_proj(tanh(dense(x) + dense_bias)) + out_proj_bias.
+        let dense_weight = arr2(&[[0.1f32, 0.2, -0.3], [-0.4, 0.5, 0.6], [0.7, -0.8, 0.9]]);
+        let dense_bias = arr1(&[0.05f32, -0.1, 0.2]);
+        let out_proj_weight = arr2(&[[0.3f32, -0.6, 0.9]]);
+        let out_proj_bias = arr1(&[0.25f32]);
+        let model = mock_classifier_model(
+            3,
+            ClassifierHead::Roberta {
+                dense_weight: dense_weight.clone(),
+                dense_bias: Some(dense_bias.clone()),
+                out_proj_weight: out_proj_weight.clone(),
+                out_proj_bias: Some(out_proj_bias.clone()),
+            },
+        );
+
+        let x = arr2(&[[1.0f32, -2.0, 0.5]]);
+        let logit = model.classify_pooled(&x).expect("classify")[[0, 0]];
+
+        let tanhd = (dense_weight.dot(&x.row(0)) + &dense_bias).mapv(|v| v.tanh());
+        let expected = out_proj_weight.row(0).dot(&tanhd) + out_proj_bias[0];
+        assert!(
+            (logit - expected).abs() < 1e-5,
+            "two-layer head logit {logit} != hand-computed {expected}"
+        );
+    }
+
+    #[test]
+    fn cross_encoder_single_linear_head_matches_hand_computed() {
+        use ndarray::{arr1, arr2};
+        // Single-linear head must not regress: logits = x·Wᵀ + b.
+        let weight = arr2(&[[0.5f32, -1.0, 2.0]]);
+        let bias = arr1(&[0.1f32]);
+        let model = mock_classifier_model(
+            3,
+            ClassifierHead::Linear {
+                weight: weight.clone(),
+                bias: Some(bias.clone()),
+            },
+        );
+
+        let x = arr2(&[[1.0f32, 2.0, -0.5]]);
+        let logit = model.classify_pooled(&x).expect("classify")[[0, 0]];
+
+        let expected = weight.row(0).dot(&x.row(0)) + bias[0];
+        assert!(
+            (logit - expected).abs() < 1e-5,
+            "single-linear head logit {logit} != hand-computed {expected}"
+        );
+    }
+
+    #[test]
+    fn cross_encoder_missing_head_is_typed_error() {
+        // No classification head -> typed error, not a panic.
+        let model = mock_encoder(mock_layer(4, 4, None, None));
+        let err = model
+            .classify_pooled(&Array2::zeros((1, 4)))
+            .expect_err("a model with no classification head must surface a typed error");
+        assert!(
+            matches!(err, InferError::ModelError(_)),
+            "expected ModelError for missing head, got {err:?}"
+        );
     }
 
     #[test]
