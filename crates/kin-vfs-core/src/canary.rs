@@ -29,6 +29,7 @@
 use std::collections::HashSet;
 
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 
 /// Environment variable carrying the launch-time canary token, injected by the
 /// launcher into a child it starts under interposition. Its presence means
@@ -47,7 +48,7 @@ const MAX_TOKEN_LEN: usize = 128;
 /// Outcome of comparing what interposition was expected against what was
 /// confirmed. `Active`/`NotRequired` are graph-native-safe; `Stripped` is the
 /// fail-loud case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InterposeStatus {
     /// Interposition was expected and the shim confirmed it loaded. The process
     /// is graph-native.

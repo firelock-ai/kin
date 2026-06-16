@@ -6,6 +6,7 @@
 //! This is the single source of truth. Both `kin-vfs-daemon` and `kin-vfs-shim`
 //! re-export these types rather than defining their own copies.
 
+use crate::canary::InterposeStatus;
 use crate::{DirEntry, VirtualStat};
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +44,16 @@ pub enum VfsRequest {
     /// and therefore never sends this — letting a launcher fail it loud instead
     /// of trusting raw-disk reads as graph truth.
     Announce { pid: u32, token: String },
+
+    /// A launcher registers, before it starts a child under interposition, that
+    /// it expects `token` to be announced. Recorded in the daemon's canary
+    /// registry so a never-confirmed token reads back as stripped.
+    CanaryExpect { token: String },
+
+    /// A launcher queries the interposition verdict for a token it previously
+    /// expected (after the child has run). The daemon answers with
+    /// [`VfsResponse::CanaryStatus`].
+    CanaryVerdict { token: String },
 }
 
 /// Response from daemon to VFS shim.
@@ -72,8 +83,12 @@ pub enum VfsResponse {
     /// Push invalidation from daemon to shim.
     Invalidate { paths: Vec<String> },
 
-    /// Acknowledge an interposition canary [`VfsRequest::Announce`].
+    /// Acknowledge an interposition canary [`VfsRequest::Announce`] or
+    /// [`VfsRequest::CanaryExpect`].
     Announced,
+
+    /// Interposition verdict for a [`VfsRequest::CanaryVerdict`] query.
+    CanaryStatus(InterposeStatus),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
