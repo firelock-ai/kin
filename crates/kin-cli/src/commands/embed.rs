@@ -74,7 +74,55 @@ fn effective_batch_size(requested: usize, bounded: bool) -> usize {
     }
 }
 
+/// Default per-pass time budget (seconds) for the drive-to-completion loop used
+/// when `kin embed` runs with no explicit `--max-seconds`. Each pass returns
+/// well inside the CLI→daemon HTTP timeout, so a pass never has to be severed
+/// mid-flight (a severed pass orphans the server-side work behind the embedding
+/// lock and makes retries stack). Overridable via `KIN_EMBED_PASS_SECONDS`.
+pub const DEFAULT_PASS_SECONDS: u64 = 300;
+
+/// Safety ceiling on drive-to-completion passes so a pathological daemon cannot
+/// loop forever even if it keeps reporting a sliver of progress. At the default
+/// pass budget this is far above any real corpus. Overridable via
+/// `KIN_EMBED_MAX_PASSES`.
+pub const DEFAULT_MAX_PASSES: usize = 1000;
+
+fn pass_budget_seconds() -> u64 {
+    std::env::var("KIN_EMBED_PASS_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(DEFAULT_PASS_SECONDS)
+}
+
+fn max_passes() -> usize {
+    std::env::var("KIN_EMBED_MAX_PASSES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_PASSES)
+}
+
+/// Whether the drive-to-completion loop should issue another embed pass.
+///
+/// Continue only while retrievable work remains AND the last pass actually
+/// embedded something. A pass that persisted nothing while objects are still
+/// pending is stalled (e.g. objects that repeatedly fail inference); re-issuing
+/// would spin without converging, so stop and report the residual instead.
+pub fn embed_pass_should_continue(result: &EmbedResult, made_progress: bool) -> bool {
+    let pending = result.pending_entities + result.pending_artifacts;
+    pending > 0 && made_progress
+}
+
 /// Ask the repo daemon to build embeddings for the current repo's graph.
+///
+/// With an explicit `--max-seconds` this issues a single bounded pass and
+/// returns whatever coverage that timebox buys. With no `--max-seconds` the
+/// intent is full coverage, so the CLI transparently re-issues bounded passes
+/// until the daemon reports zero pending (FIR-926). Each pass persists its
+/// batches, so the next pass resumes where the last left off; coverage is
+/// therefore decoupled from any single request's HTTP timeout — a large corpus
+/// that cannot finish inside one request still completes across several.
 pub async fn run(
     batch_size: usize,
     json: bool,
@@ -91,22 +139,86 @@ pub async fn run(
     .entered();
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
-    let response = run_daemon_embed(
-        &layout,
-        &EmbedRequest {
-            batch_size,
-            json,
-            max_seconds,
-            rebuild,
-        },
-    )
-    .await?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&response.result)?);
-    } else {
-        for line in response.lines {
-            println!("{line}");
+
+    if let Some(seconds) = max_seconds {
+        let response = run_daemon_embed(
+            &layout,
+            &EmbedRequest {
+                batch_size,
+                json,
+                max_seconds: Some(seconds),
+                rebuild,
+            },
+        )
+        .await?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&response.result)?);
+        } else {
+            for line in response.lines {
+                println!("{line}");
+            }
         }
+        return Ok(());
+    }
+
+    let pass_seconds = pass_budget_seconds();
+    let max_passes = max_passes();
+    let mut pass = 0usize;
+    let mut embedded_entities = 0usize;
+    let mut embedded_artifacts = 0usize;
+    let final_result = loop {
+        pass += 1;
+        let response = run_daemon_embed(
+            &layout,
+            &EmbedRequest {
+                batch_size,
+                json,
+                max_seconds: Some(pass_seconds),
+                // Only the first pass may rebuild — re-issuing `rebuild` would
+                // drop the index every pass and discard the vectors the prior
+                // passes just persisted, so the loop could never converge.
+                rebuild: rebuild && pass == 1,
+            },
+        )
+        .await?;
+        let result = response.result;
+        embedded_entities += result.embedded_entities;
+        embedded_artifacts += result.embedded_artifacts;
+        let made_progress = result.embedded_entities + result.embedded_artifacts > 0;
+
+        if !json {
+            println!(
+                "Pass {pass}: +{} entities, +{} artifacts ({} entities, {} artifacts still pending)",
+                result.embedded_entities,
+                result.embedded_artifacts,
+                result.pending_entities,
+                result.pending_artifacts
+            );
+        }
+
+        if !embed_pass_should_continue(&result, made_progress) || pass >= max_passes {
+            break result;
+        }
+    };
+    let pending = final_result.pending_entities + final_result.pending_artifacts;
+    if json {
+        let aggregate = EmbedResult {
+            embedded_entities,
+            embedded_artifacts,
+            time_limited: pending > 0,
+            ..final_result
+        };
+        println!("{}", serde_json::to_string_pretty(&aggregate)?);
+    } else if pending == 0 {
+        println!(
+            "Done. Full coverage: {} entities, {} artifacts embedded across {pass} pass(es), index saved to {}",
+            embedded_entities, embedded_artifacts, final_result.vector_index_path
+        );
+    } else {
+        println!(
+            "Stopped with {} entities + {} artifacts still pending after {pass} pass(es) — the daemon made no progress on the last pass. Re-run `kin embed` or inspect the daemon log.",
+            final_result.pending_entities, final_result.pending_artifacts
+        );
     }
     Ok(())
 }
@@ -286,7 +398,43 @@ pub fn build_embed_response(
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_batch_size, should_queue_missing_embedding_pass, DEFAULT_BATCH_SIZE};
+    use super::{
+        effective_batch_size, embed_pass_should_continue, should_queue_missing_embedding_pass,
+        EmbedResult, DEFAULT_BATCH_SIZE,
+    };
+
+    fn result_with(pending_entities: usize, pending_artifacts: usize) -> EmbedResult {
+        EmbedResult {
+            total_entities: 100,
+            embedded_entities: 0,
+            pending_entities,
+            total_artifacts: 0,
+            embedded_artifacts: 0,
+            pending_artifacts,
+            time_limited: false,
+            vector_index_path: String::new(),
+        }
+    }
+
+    #[test]
+    fn drive_loop_continues_while_pending_and_progressing() {
+        assert!(embed_pass_should_continue(&result_with(40, 0), true));
+        assert!(embed_pass_should_continue(&result_with(0, 5), true));
+    }
+
+    #[test]
+    fn drive_loop_stops_on_full_coverage() {
+        // No pending work left → done regardless of whether the last pass moved.
+        assert!(!embed_pass_should_continue(&result_with(0, 0), true));
+        assert!(!embed_pass_should_continue(&result_with(0, 0), false));
+    }
+
+    #[test]
+    fn drive_loop_stops_when_stalled_to_avoid_spin() {
+        // Pending work remains but the pass embedded nothing — re-issuing would
+        // spin forever, so the loop must stop and surface the residual.
+        assert!(!embed_pass_should_continue(&result_with(40, 3), false));
+    }
 
     #[test]
     fn default_batch_size_is_progress_friendly() {
