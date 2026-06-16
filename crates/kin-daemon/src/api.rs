@@ -7162,7 +7162,8 @@ mod tests {
 
         let tx_id;
         {
-            let state = Arc::new(DaemonState::open(kin_core::KinLayout::new(kin_dir.clone())).unwrap());
+            let state =
+                Arc::new(DaemonState::open(kin_core::KinLayout::new(kin_dir.clone())).unwrap());
             let registry = kin_mcp::SessionRegistry::new();
             let tx = registry
                 .begin_transaction("sess-restart", "file:src/lib.rs")
@@ -7180,8 +7181,7 @@ mod tests {
         } // state dropped — models daemon shutdown.
 
         // Re-open on the SAME layout — models the restart.
-        let restarted =
-            Arc::new(DaemonState::open(kin_core::KinLayout::new(kin_dir)).unwrap());
+        let restarted = Arc::new(DaemonState::open(kin_core::KinLayout::new(kin_dir)).unwrap());
         let store = restarted
             .mcp_transactions
             .lock()

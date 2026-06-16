@@ -16075,7 +16075,12 @@ mod tests {
             ),
         );
         graph.upsert_entity(&gold).unwrap();
-        for name in ["put_manifest", "get_manifest", "ManifestStore", "manifest_string"] {
+        for name in [
+            "put_manifest",
+            "get_manifest",
+            "ManifestStore",
+            "manifest_string",
+        ] {
             let mut e = test_entity(name, "crates/kin-daemon/src/api.rs", 1, 20);
             e.metadata.extra.insert(
                 "file_surface_context".into(),
@@ -16084,8 +16089,10 @@ mod tests {
             graph.upsert_entity(&e).unwrap();
         }
 
-        let scores =
-            extract_priority_files("Where is a repository's canonical id resolved from its manifest?", &graph);
+        let scores = extract_priority_files(
+            "Where is a repository's canonical id resolved from its manifest?",
+            &graph,
+        );
 
         let manifest_score = scores
             .iter()
