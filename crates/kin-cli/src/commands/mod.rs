@@ -27,6 +27,7 @@ pub mod exec;
 pub mod git;
 pub mod graph;
 pub mod graph_health;
+pub mod health;
 pub mod graph_viz;
 pub mod history;
 pub mod impact;
