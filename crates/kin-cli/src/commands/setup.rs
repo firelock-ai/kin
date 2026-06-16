@@ -621,7 +621,8 @@ fn kin_mcp_entry() -> serde_json::Value {
     };
     serde_json::json!({
         "command": command,
-        "args": ["mcp", "start", "--global"]
+        "args": ["mcp", "start", "--global"],
+        "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
     })
 }
 
