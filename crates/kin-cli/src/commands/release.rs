@@ -39,7 +39,7 @@ pub async fn semver() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let _snap =
-        crate::backend::open_snapshot_explicit_admin_read_only(&layout, "kin release").await?;
+        crate::backend::open_snapshot_explicit_admin_read_only(&layout, "kin semver").await?;
     let graph = &*_snap.graph();
 
     let branch_name = kin_core::read_current_branch(&layout)?;
@@ -250,7 +250,7 @@ pub async fn rollback_with_options(change_id_str: String, feature: Option<String
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
     let snap =
-        crate::backend::open_snapshot_explicit_admin_read_only(&layout, "kin release").await?;
+        crate::backend::open_snapshot_explicit_admin_read_only(&layout, "kin rollback").await?;
     let graph = &*snap.graph();
 
     let branch_name = kin_core::read_current_branch(&layout)?;

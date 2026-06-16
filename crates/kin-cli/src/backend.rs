@@ -124,26 +124,55 @@ pub async fn open_snapshot_daemon_first_read_only(
     open_snapshot_daemon_first_with_mode(layout, true).await
 }
 
-/// Explicit escape hatch for legacy admin/debug/sync commands that have not
-/// been promoted to daemon-live endpoints yet.
+/// Read-only graph open for commands that analyze graph truth in-process
+/// (e.g. `kin merge`, `kin release`, `kin git export`) and route every
+/// mutation back through daemon endpoints.
 ///
-/// Normal product paths must not call this. It is intentionally gated so a
-/// command cannot silently hydrate an in-process graph snapshot and present it
-/// as live daemon authority.
+/// Authority order (graph-first):
+/// 1. The repo daemon (`/graph/bootstrap`). This is the canonical live
+///    authority and is auto-started if needed, so these commands work by
+///    default in a warm repo.
+/// 2. If the daemon is unavailable AND `KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN` is
+///    set, a direct local read-only snapshot is used. This is the explicit
+///    offline/admin/debug escape hatch — never the default product path.
+/// 3. Otherwise, a clear, actionable error (not a raw storage failure).
+///
+/// `command_name` is the user-facing verb (e.g. "kin merge") used only in the
+/// fallback message.
 pub async fn open_snapshot_explicit_admin_read_only(
     layout: &kin_core::KinLayout,
     command_name: &str,
 ) -> std::result::Result<kin_db::SnapshotManager, kin_db::KinDbError> {
-    let allowed = std::env::var("KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN")
+    // 1. Daemon-first: the canonical live authority. Auto-starts if needed.
+    match open_snapshot_daemon_first_read_only(layout).await {
+        Ok(snapshot) => return Ok(snapshot),
+        Err(daemon_err) => {
+            // 2. Offline/admin escape hatch: explicit local snapshot read.
+            if daemon_bootstrap_admin_allowed() {
+                tracing::warn!(
+                    command = command_name,
+                    error = %daemon_err,
+                    "daemon unavailable; reading local snapshot directly (KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN)"
+                );
+                return open_snapshot_local(layout);
+            }
+            // 3. Friendly, actionable failure — no internal jargon.
+            Err(kin_db::KinDbError::StorageError(format!(
+                "{command_name} needs the Kin daemon, which could not be reached.\n\
+                 Start it with `kin status` (it auto-starts the daemon) or run inside a Kin repo with a live daemon, then retry.\n\
+                 For offline/admin use only, set KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN=1 to read the local snapshot directly.\n\
+                 (daemon error: {daemon_err})"
+            )))
+        }
+    }
+}
+
+/// Whether the offline/admin local-snapshot escape hatch is enabled.
+fn daemon_bootstrap_admin_allowed() -> bool {
+    std::env::var("KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN")
         .ok()
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false);
-    if !allowed {
-        return Err(kin_db::KinDbError::StorageError(format!(
-            "{command_name} is not daemon-live yet; direct CLI graph snapshot hydration is disabled. Route this command through a daemon endpoint, or set KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN=1 for explicit admin/debug use."
-        )));
-    }
-    open_snapshot_daemon_first_read_only(layout).await
+        .unwrap_or(false)
 }
 
 async fn open_snapshot_daemon_first_with_mode(
