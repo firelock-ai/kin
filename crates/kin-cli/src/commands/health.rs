@@ -217,10 +217,7 @@ fn check_vfs_projection() -> HealthCheck {
                 lib_path.display()
             ),
         )
-        .with_manual_fix(format!(
-            "rm {} && kin setup",
-            lib_path.display()
-        ))
+        .with_manual_fix(format!("rm {} && kin setup", lib_path.display()))
     } else {
         HealthCheck::new(
             "vfs_projection",
@@ -292,9 +289,7 @@ fn check_shell_path() -> HealthCheck {
 
     if hook_installed && rc_sources {
         let detail = if on_path {
-            format!(
-                "{shell} hook installed and sourced from {rc_display}; ~/.kin/bin on PATH"
-            )
+            format!("{shell} hook installed and sourced from {rc_display}; ~/.kin/bin on PATH")
         } else {
             format!("{shell} hook installed and sourced from {rc_display}")
         };
@@ -491,9 +486,7 @@ fn check_editor() -> HealthCheck {
             "kin-editor extension not detected in ~/.vscode/extensions (cannot be \
              determined from the CLI for non-VS Code editors)",
         )
-        .with_manual_fix(
-            "install the kin-editor VS Code extension (see the kin-editor README)",
-        )
+        .with_manual_fix("install the kin-editor VS Code extension (see the kin-editor README)")
     }
 }
 
