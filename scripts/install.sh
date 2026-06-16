@@ -21,7 +21,9 @@ KIN_BIN="$KIN_DIR/bin"
 KIN_LIB="$KIN_DIR/lib"
 GITHUB_ORG="firelock-ai"
 GITHUB_REPO="kin"
-BASE_URL="https://github.com/$GITHUB_ORG/$GITHUB_REPO/releases"
+# Override KIN_BASE_URL to install from a mirror or a local `file://` path
+# (offline/airgapped installs and CI smoke tests).
+BASE_URL="${KIN_BASE_URL:-https://github.com/$GITHUB_ORG/$GITHUB_REPO/releases}"
 
 # ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -157,8 +159,18 @@ if [ -z "$EXTRACT_DIR" ]; then
     EXTRACT_DIR="$TMPDIR"
 fi
 
-# Move binaries
-for bin in kin kin-vfs; do
+# FIR-967: kin-daemon is mandatory — `kin status`/`kin search` and the MCP
+# server all require it. Assert it is present in the extracted archive BEFORE
+# moving anything, so a daemon-less archive (e.g. a stale build) aborts cleanly
+# instead of leaving a half-installed, daemon-less environment.
+if [ ! -f "$EXTRACT_DIR/kin-daemon" ]; then
+    err "kin-daemon missing from the downloaded archive."
+    err "kin status/search and the MCP server require it. Refusing a daemon-less install. Aborting."
+    exit 1
+fi
+
+# Move binaries. kin-daemon is mandatory (asserted above); kin-vfs is optional.
+for bin in kin kin-daemon kin-vfs; do
     if [ -f "$EXTRACT_DIR/$bin" ]; then
         mv "$EXTRACT_DIR/$bin" "$KIN_BIN/$bin"
         chmod +x "$KIN_BIN/$bin"
