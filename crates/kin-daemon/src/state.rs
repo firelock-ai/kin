@@ -1262,6 +1262,47 @@ impl DaemonState {
         Ok(())
     }
 
+    /// FIR-944: incremental per-batch embed-progress flush for the background
+    /// embed worker.
+    ///
+    /// Persists this batch's vectors — plus any concurrent graph delta from LSP
+    /// enrichment that kept the graph dirty during embed — via
+    /// `SnapshotManager::flush_embed_progress`, which appends only the delta and
+    /// the vector sidecar and NEVER re-serializes the whole (~1 GB) graph. The
+    /// old worker leaned on the periodic full `save_snapshot` to land the graph
+    /// side, which is O(graph) per tick and is what wedged the daemon at scale.
+    ///
+    /// Mirrors `save_snapshot_impl`'s persist-lock + generation-cursor + marker
+    /// discipline so the two persistence paths compose safely (the shared
+    /// `persist_lock` serializes them and keeps `snapshot_generation` consistent).
+    /// Returns the persisted resume `pending` count — derived from graph-vs-index
+    /// truth, so it survives a crash/reopen and reaches zero only at full
+    /// coverage.
+    pub fn flush_embed_progress(&self) -> Result<usize> {
+        let _persist_guard = self
+            .persist_lock
+            .lock()
+            .map_err(|_| DaemonError::Io(std::io::Error::other("persist lock poisoned")))?;
+        let base_gen = self.snapshot_generation.load(Ordering::SeqCst);
+        let embedder_identity = kin_buildinfo::sha_with_dirty(kin_buildinfo::get());
+        let outcome = kin_db::SnapshotManager::flush_embed_progress(
+            self.layout.kindb_snapshot_path(),
+            self.graph.as_ref(),
+            base_gen,
+            Some(embedder_identity.as_str()),
+        )
+        .map_err(DaemonError::from)?;
+        // The graph moved (a delta was appended) only when `generation` is Some;
+        // advance the cursor + publish the marker so CLI/MCP reload, exactly as
+        // save_snapshot_impl does. A vectors-only batch leaves the graph at
+        // `base_gen`, so the cursor stays put.
+        if let Some(generation) = outcome.generation {
+            self.snapshot_generation.store(generation, Ordering::SeqCst);
+            self.write_generation_marker(generation);
+        }
+        Ok(outcome.status.pending)
+    }
+
     fn save_read_index(&self) -> Result<()> {
         let index =
             kin_db::ReadIndex::from_graph(self.graph.as_ref()).map_err(DaemonError::from)?;
@@ -1984,6 +2025,105 @@ mod tests {
         );
     }
 
+    #[test]
+    fn first_publish_commit_persists_under_v2_repo_prefix_and_reloads_with_refs() {
+        // FIR-983 hosted publish->serve: a full-content commit into the served
+        // graph must persist through the StorageBackend at `<prefix>/<repo>/graph.kndb`
+        // (the GCS `v2/<repo>/` layout, reproduced here with a LocalFileBackend rooted
+        // at `v2/`) and survive a pod restart with its branch refs intact. A fresh
+        // served graph has no branch, so the branch is created before the head update
+        // (update_branch_head errors NotFound otherwise).
+        use kin_db::LocalFileBackend;
+        use kin_model::{
+            AuthorId, Branch, BranchName, ChangeStore, EntityDelta, SemanticChange,
+            SemanticChangeId, Timestamp,
+        };
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+
+        let storage = tempfile::tempdir().unwrap();
+        let v2_root = storage.path().join("v2");
+        let repo_id = "kin";
+        let branch_name = BranchName::new("main");
+
+        let state = DaemonState::open_with_backend(
+            layout.clone(),
+            Box::new(LocalFileBackend::new(&v2_root)),
+            repo_id,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            state.graph.entity_count(),
+            0,
+            "a fresh hosted repo starts with an empty served graph"
+        );
+
+        let entity = test_entity("served_fn", "src/lib.rs");
+        state.graph.upsert_entity(&entity).unwrap();
+
+        let change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([7; 32])),
+            parents: vec![],
+            author: AuthorId::new("tester"),
+            message: "first publish".to_string(),
+            timestamp: Timestamp::now(),
+            entity_deltas: vec![EntityDelta::Added(entity.clone())],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+        let change_id = change.id;
+        state
+            .graph
+            .create_branch(&Branch {
+                name: branch_name.clone(),
+                head: change_id,
+            })
+            .unwrap();
+        state.graph.create_change(&change).unwrap();
+        state
+            .graph
+            .update_branch_head(&branch_name, &change_id)
+            .unwrap();
+        state.save_snapshot_full().unwrap();
+
+        let persisted = v2_root.join(repo_id).join("graph.kndb");
+        assert!(
+            persisted.exists(),
+            "served commit must persist under v2/<repo>/graph.kndb at {}",
+            persisted.display()
+        );
+
+        drop(state);
+
+        let reopened = DaemonState::open_with_backend(
+            layout,
+            Box::new(LocalFileBackend::new(&v2_root)),
+            repo_id,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.graph.entity_count(),
+            1,
+            "published content must survive reload from the v2 backend"
+        );
+        let branches = reopened.graph.list_branches().unwrap();
+        assert!(
+            branches
+                .iter()
+                .any(|b| b.name == branch_name && b.head == change_id),
+            "published branch head must be visible after reload (refs non-empty)"
+        );
+    }
+
     fn make_scoped_graph_with_entity(name: &str, file_path: &str) -> Arc<kin_db::InMemoryGraph> {
         let graph = Arc::new(kin_db::InMemoryGraph::new());
         graph.upsert_entity(&test_entity(name, file_path)).unwrap();
@@ -2329,6 +2469,33 @@ mod tests {
         // A moderate drop (50%) is a legitimate edit, NOT a wipe.
         state.persisted_entity_count.store(n * 2, Ordering::SeqCst);
         assert!(!state.shutdown_flush_would_wipe_graph());
+    }
+
+    #[test]
+    fn flush_embed_progress_persists_snapshot_and_reports_pending() {
+        // FIR-944: the incremental flush persists the snapshot (full bundle on
+        // the first write) and returns the persisted resume count. With no
+        // embedder run the lone entity stays unembedded, so `pending` reflects it
+        // — proving the flush composes the graph-delta + sidecar write and reads
+        // coverage from persisted graph-vs-index truth.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = Arc::new(test_state(init.layout, repo_dir.path()));
+        state
+            .graph
+            .upsert_entity(&test_entity("embed_me", "src/lib.rs"))
+            .unwrap();
+        state.graph.queue_missing_for_embedding();
+
+        let pending = state.flush_embed_progress().expect("flush must succeed");
+        assert!(
+            state.layout.kindb_snapshot_path().exists(),
+            "flush must persist the snapshot bundle"
+        );
+        assert!(
+            pending >= 1,
+            "the unembedded entity must remain pending (no embedder ran); got {pending}"
+        );
     }
 
     #[test]
