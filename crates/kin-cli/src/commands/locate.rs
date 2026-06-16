@@ -2878,6 +2878,7 @@ fn priority_reason_allows_injection(kind: &str) -> bool {
             | "tracked_explicit_name"
             | "tracked_term_match"
             | "directory_name_match"
+            | "source_basename_match"
     )
 }
 
@@ -3747,6 +3748,87 @@ fn extract_priority_file_traces(
                 reason_kind,
                 term_lower.clone(),
             );
+        }
+    }
+
+    // (b3) FIR-986: source-file basename parity with grep.
+    //
+    // `query_backed_tracked_file_score` gives a tracked file a strong, injectable
+    // seat when a query term matches its basename — but the loop above only scans
+    // `tracked_non_entity` files (configs, docs, shallow artifacts). An
+    // entity-bearing source file whose basename IS the query term — term
+    // "manifest" → crates/.../manifest.rs — was never seeded at the file level,
+    // so it lost to an incidental `mod manifest` declaration in another file even
+    // though grep finds the file directly by its path. Seed those source files
+    // here on a strong basename hit (stem == term, or term is an exact basename
+    // segment) so Kin's lexical floor is at least grep's: the file the term names
+    // gets the same injectable seat a non-entity basename match would.
+    {
+        let mut entity_file_paths: HashSet<String> = HashSet::new();
+        if let Ok(all_entities) = graph.query_entities(&EntityFilter::default()) {
+            for entity in &all_entities {
+                if let Some(ref fo) = entity.file_origin {
+                    if !tracked_non_entity_paths.contains(&fo.0) {
+                        entity_file_paths.insert(fo.0.clone());
+                    }
+                }
+            }
+        }
+
+        let source_basename_limit = locate_env_usize("KIN_LOCATE_SOURCE_BASENAME_LIMIT", 4);
+        for term in tracked_term_candidates.iter().take(tracked_term_limit) {
+            let term_lower = term.to_ascii_lowercase();
+            if term_lower.len() < 4 || is_common_english_word(&term_lower) {
+                continue;
+            }
+
+            let mut matches: Vec<(String, f32)> = entity_file_paths
+                .iter()
+                .filter(|path| {
+                    if is_license_or_notice_path(path) {
+                        return false;
+                    }
+                    if is_test_path(path) && !allow_test_artifact_priority {
+                        return false;
+                    }
+                    if require_named_test_artifacts && !is_named_test_artifact_path(path) {
+                        return false;
+                    }
+                    true
+                })
+                .filter_map(|path| {
+                    // Only a strong basename hit (>= 75: stem-exact or exact
+                    // basename segment) earns a seat — incidental substring or
+                    // manifest-family matches are too loose to mirror grep here.
+                    query_backed_tracked_file_score(path, &term_lower)
+                        .filter(|score| *score >= 75.0)
+                        .map(|score| (path.clone(), score))
+                })
+                .collect();
+            if matches.is_empty() {
+                continue;
+            }
+            // A term that strongly names many basenames is too generic to seed
+            // like grep would; skip rather than blanket the tree.
+            if matches.len() > source_basename_limit {
+                continue;
+            }
+
+            matches.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.matches('/').count().cmp(&b.0.matches('/').count()))
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            for (path, score) in matches {
+                note_priority_reason(
+                    &mut file_scores,
+                    path,
+                    score,
+                    "source_basename_match",
+                    term_lower.clone(),
+                );
+            }
         }
     }
 
@@ -12967,9 +13049,18 @@ fn entity_span_pair(entity: &kin_model::Entity) -> Vec<[u32; 2]> {
     // KIN_LOCATE_SPAN_FULL_EXTENT=1 emits the full node extent instead.
     let full_extent = locate_env_bool("KIN_LOCATE_SPAN_FULL_EXTENT", false);
     let head_threshold = locate_env_usize("KIN_LOCATE_SPAN_CLASS_HEAD_THRESHOLD", 60) as u32;
+    // FIR-990: only class-like nodes get head-truncated today, so a coarse
+    // non-class entity — above all a File-kind node whose span is the entire
+    // file (700-1600 lines) — is emitted at full extent and tanks symbol/line
+    // precision. KIN_LOCATE_SPAN_TRUNCATE_OVERLONG extends the same head-window
+    // truncation to ANY over-threshold entity (File-kind, oversized functions).
+    // Gated OFF so the default behavior is byte-identical; the precision↔recall
+    // trade is a line-F1 question decided by ContextBench before the default flips.
+    let head_truncate =
+        is_class_like || locate_env_bool("KIN_LOCATE_SPAN_TRUNCATE_OVERLONG", false);
     vec![entity_span_lines(
         s,
-        is_class_like,
+        head_truncate,
         full_extent,
         head_threshold,
     )]
@@ -12984,11 +13075,11 @@ fn entity_span_pair(entity: &kin_model::Entity) -> Vec<[u32; 2]> {
 /// 1-indexed traceback spans instead of landing one line short).
 fn entity_span_lines(
     s: &kin_model::SourceSpan,
-    is_class_like: bool,
+    head_truncate: bool,
     full_extent: bool,
     head_threshold: u32,
 ) -> [u32; 2] {
-    let (start, end, end_is_real) = if is_class_like && !full_extent {
+    let (start, end, end_is_real) = if head_truncate && !full_extent {
         let len = s.end_line.saturating_sub(s.start_line);
         if len > head_threshold {
             // Synthetic head window; `end` is start+4, not the node's real end
@@ -13656,6 +13747,37 @@ mod tests {
         assert_eq!(entity_span_lines(&span(0, 100), false, false, 30), [1, 101]);
         // Short class (len <= threshold) is not truncated even with OFF.
         assert_eq!(entity_span_lines(&span(0, 10), true, false, 30), [1, 11]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn span_truncate_overlong_lever_tightens_coarse_file_kind() {
+        // FIR-990: a File-kind entity spans the whole file (700-1600 lines) and
+        // is emitted at full extent by default — tanking symbol/line precision.
+        // The gated lever extends class-like head-truncation to any over-threshold
+        // entity. Default OFF keeps the span byte-identical (no regression risk);
+        // the precision↔recall trade is a ContextBench line-F1 call before flip.
+        std::env::remove_var("KIN_LOCATE_SPAN_FULL_EXTENT");
+        std::env::remove_var("KIN_LOCATE_SPAN_CLASS_HEAD_THRESHOLD");
+        std::env::remove_var("KIN_LOCATE_SPAN_TRUNCATE_OVERLONG");
+
+        let mut coarse = test_entity("whole_module", "src/big.rs", 0, 1500);
+        coarse.kind = EntityKind::File;
+
+        assert_eq!(
+            entity_span_pair(&coarse),
+            vec![[1, 1501]],
+            "default OFF: a coarse File-kind entity emits its full extent (unchanged)"
+        );
+
+        std::env::set_var("KIN_LOCATE_SPAN_TRUNCATE_OVERLONG", "1");
+        let tightened = entity_span_pair(&coarse);
+        std::env::remove_var("KIN_LOCATE_SPAN_TRUNCATE_OVERLONG");
+        assert_eq!(
+            tightened,
+            vec![[1, 5]],
+            "lever ON: the over-long File-kind span is head-truncated to a 5-line window"
+        );
     }
 
     #[test]
@@ -15941,6 +16063,93 @@ mod tests {
         assert!(terms
             .iter()
             .any(|term| term.eq_ignore_ascii_case("autocomplete")));
+    }
+
+    #[test]
+    fn source_basename_match_seeds_entity_bearing_file_like_grep() {
+        // FIR-986: a query term that names a source file's basename must seat
+        // THAT file at the file level, the way grep finds it — even though the
+        // file is entity-bearing (so it is absent from tracked_non_entity_files)
+        // and an incidental `mod manifest` declaration lives in another file.
+        let graph = kin_db::InMemoryGraph::new();
+
+        let mut manifest_file =
+            test_entity("ManifestStore", "crates/kin-core/src/manifest.rs", 1, 40);
+        manifest_file.metadata.extra.insert(
+            "file_surface_context".into(),
+            serde_json::Value::String("surface manifest ManifestStore manifest".into()),
+        );
+        // The incidental declaration that previously outscored the real file.
+        let mod_decl = test_entity("manifest", "crates/kin-core/src/lib.rs", 3, 3);
+
+        graph.upsert_entity(&manifest_file).unwrap();
+        graph.upsert_entity(&mod_decl).unwrap();
+
+        let scores = extract_priority_files("where does the manifest get loaded", &graph);
+        let manifest_score = scores
+            .iter()
+            .find(|(path, _)| path == "crates/kin-core/src/manifest.rs")
+            .map(|(_, score)| *score);
+
+        assert!(
+            manifest_score.is_some_and(|score| score >= 75.0),
+            "manifest.rs must get a strong basename seat (>=75) so it ranks like grep; got {manifest_score:?}"
+        );
+    }
+
+    #[test]
+    fn source_basename_seed_beats_same_named_entities_in_other_files() {
+        // FIR-986, the real dogfood case: the gold file is
+        // crates/kin-core/src/manifest.rs (resolve_repo_id), but the repo also
+        // has many `manifest`-named entities in another file (the npm-registry
+        // put_manifest/get_manifest/ManifestStore in api.rs). Those win on
+        // lexical/graph signal, so the gold file lost. The basename seed must
+        // give the file the term NAMES the strong, injectable seat — and only
+        // that file, not the same-named entities' file.
+        let graph = kin_db::InMemoryGraph::new();
+        let mut gold = test_entity("resolve_repo_id", "crates/kin-core/src/manifest.rs", 71, 90);
+        gold.metadata.extra.insert(
+            "file_surface_context".into(),
+            serde_json::Value::String(
+                "surface manifest resolve_repo_id canonical repository id".into(),
+            ),
+        );
+        graph.upsert_entity(&gold).unwrap();
+        for name in [
+            "put_manifest",
+            "get_manifest",
+            "ManifestStore",
+            "manifest_string",
+        ] {
+            let mut e = test_entity(name, "crates/kin-daemon/src/api.rs", 1, 20);
+            e.metadata.extra.insert(
+                "file_surface_context".into(),
+                serde_json::Value::String(format!("surface manifest {name} npm registry")),
+            );
+            graph.upsert_entity(&e).unwrap();
+        }
+
+        let scores = extract_priority_files(
+            "Where is a repository's canonical id resolved from its manifest?",
+            &graph,
+        );
+
+        let manifest_score = scores
+            .iter()
+            .find(|(path, _)| path == "crates/kin-core/src/manifest.rs")
+            .map(|(_, score)| *score);
+        assert!(
+            manifest_score.is_some_and(|score| score >= 75.0),
+            "gold manifest.rs must get the strong basename seat (>=75); got {manifest_score:?}"
+        );
+        // The same-named entities' file must NOT be basename-seeded — only the
+        // file the term actually names earns the seat.
+        assert!(
+            !scores
+                .iter()
+                .any(|(path, _)| path == "crates/kin-daemon/src/api.rs"),
+            "api.rs (same-named entities, different basename) must not be basename-seeded; got {scores:?}"
+        );
     }
 
     #[test]

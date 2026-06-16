@@ -105,7 +105,7 @@ jobs:
           # platform; only kin-db needs the local vector-disabled override here.
           TOML
 
-      - name: Build kin-cli (native)
+      - name: Build kin-cli + kin-daemon (native)
         if: ${{ !matrix.cross }}
         shell: bash
         run: |
@@ -113,14 +113,17 @@ jobs:
           if [ "$SKIP_VECTOR" = "true" ]; then
             FLAGS="--no-default-features"
           fi
-          cargo build --release --target "$TARGET" -p kin-cli $FLAGS
+          # FIR-967: the daemon IS the runtime — `kin init` works without it but
+          # `kin status`/`kin search`/the MCP server all require kin-daemon on
+          # PATH, so a clean public install must ship it alongside `kin`.
+          cargo build --release --target "$TARGET" -p kin-cli -p kin-daemon $FLAGS
         env:
           TARGET: ${{ matrix.target }}
           SKIP_VECTOR: ${{ matrix.skip_vector }}
 
-      - name: Build kin-cli (cross)
+      - name: Build kin-cli + kin-daemon (cross)
         if: ${{ matrix.cross }}
-        run: cross build --release --target "$TARGET" -p kin-cli
+        run: cross build --release --target "$TARGET" -p kin-cli -p kin-daemon
         env:
           TARGET: ${{ matrix.target }}
 
@@ -167,6 +170,7 @@ jobs:
         run: |
           for f in \
             "target/${TARGET}/release/kin" \
+            "target/${TARGET}/release/kin-daemon" \
             "kin-vfs/target/${TARGET}/release/kin-vfs" \
             "kin-vfs/target/${TARGET}/release/${SHIM_NAME}"; do
             if [ -f "$f" ]; then
@@ -186,6 +190,7 @@ jobs:
           FILES=()
           for f in \
             "target/${TARGET}/release/kin" \
+            "target/${TARGET}/release/kin-daemon" \
             "kin-vfs/target/${TARGET}/release/kin-vfs" \
             "kin-vfs/target/${TARGET}/release/${SHIM_NAME}"; do
             [ -f "$f" ] && FILES+=("$f")
@@ -211,9 +216,19 @@ jobs:
         run: |
           mkdir "$ARTIFACT"
           cp "target/${TARGET}/release/kin" "$ARTIFACT/"
+          # FIR-967: kin-daemon is mandatory (no `|| true`) — a daemon-less
+          # archive lets `kin init` succeed but then `kin status`/`kin search`
+          # fail with no daemon on PATH, so a missing daemon must fail the build.
+          cp "target/${TARGET}/release/kin-daemon" "$ARTIFACT/"
           cp "kin-vfs/target/${TARGET}/release/kin-vfs" "$ARTIFACT/" 2>/dev/null || true
           cp "kin-vfs/target/${TARGET}/release/${SHIM_NAME}" "$ARTIFACT/" 2>/dev/null || true
           tar czf "${ARTIFACT}.tar.gz" "$ARTIFACT"
+          # FIR-967: assert the published archive actually contains kin-daemon so
+          # a daemon-less build can never be released green.
+          if ! tar tzf "${ARTIFACT}.tar.gz" | grep -q "/kin-daemon$"; then
+            echo "::error::kin-daemon missing from ${ARTIFACT}.tar.gz — refusing to publish a daemon-less archive"
+            exit 1
+          fi
           shasum -a 256 "${ARTIFACT}.tar.gz" > "${ARTIFACT}.tar.gz.sha256"
         env:
           TARGET: ${{ matrix.target }}
@@ -226,9 +241,18 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path $env:ARTIFACT
           Copy-Item "target/$env:TARGET/release/kin.exe" "$env:ARTIFACT/"
+          # FIR-967: kin-daemon is mandatory — fail hard if it's missing rather
+          # than ship a daemon-less archive that can `kin init` but nothing else.
+          Copy-Item "target/$env:TARGET/release/kin-daemon.exe" "$env:ARTIFACT/" -ErrorAction Stop
           Copy-Item "kin-vfs/target/$env:TARGET/release/kin-vfs.exe" "$env:ARTIFACT/" -ErrorAction SilentlyContinue
           Copy-Item "kin-vfs/target/$env:TARGET/release/$env:SHIM_NAME" "$env:ARTIFACT/" -ErrorAction SilentlyContinue
           Compress-Archive -Path "$env:ARTIFACT/*" -DestinationPath "$env:ARTIFACT.zip"
+          # FIR-967: assert the produced zip actually contains kin-daemon.exe.
+          $entries = [System.IO.Compression.ZipFile]::OpenRead("$PWD/$env:ARTIFACT.zip").Entries.Name
+          if ($entries -notcontains "kin-daemon.exe") {
+            Write-Error "kin-daemon.exe missing from $env:ARTIFACT.zip — refusing to publish a daemon-less archive"
+            exit 1
+          }
           Get-FileHash -Algorithm SHA256 "$env:ARTIFACT.zip" | Format-List Hash | Out-File -Encoding utf8 "$env:ARTIFACT.zip.sha256"
         env:
           TARGET: ${{ matrix.target }}
