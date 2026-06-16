@@ -100,7 +100,9 @@ jobs:
           cat >> .cargo/config.toml << 'TOML'
           [patch."https://github.com/firelock-ai/kin-db.git"]
           kin-db = { path = "kin-db-local/crates/kin-db" }
-          kin-model = { path = "kin-db-local/crates/kin-model" }
+          # kin-model is its own repo (no longer vendored under kin-db/crates) —
+          # it resolves from the main [patch.kin] git pin like every other
+          # platform; only kin-db needs the local vector-disabled override here.
           TOML
 
       - name: Build kin-cli (native)
