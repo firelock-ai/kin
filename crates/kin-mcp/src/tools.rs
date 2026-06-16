@@ -897,6 +897,25 @@ pub fn benchmark_tool_names() -> &'static [&'static str] {
     ]
 }
 
+/// Tool names for the small default agent profile.
+pub fn agent_default_tool_names() -> &'static [&'static str] {
+    &[
+        "kin_graph_status",
+        "semantic_locate",
+        "semantic_search",
+        "get_context_pack",
+        "trace_data_flow",
+        "find_references",
+        "graph_neighborhood",
+        "kin_session_start",
+        "kin_session_end",
+        "kin_transaction_begin",
+        "kin_transaction_stage",
+        "kin_transaction_commit",
+        "kin_provenance_query",
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -942,6 +961,51 @@ mod tests {
         let list = tool_definitions();
         // 54 + 5 transaction tools + 1 semantic_locate = 60
         assert_eq!(list.tools.len(), 60);
+    }
+
+    #[test]
+    fn agent_default_profile_is_small_and_valid() {
+        let list = tool_definitions();
+        let all: std::collections::HashSet<&str> =
+            list.tools.iter().map(|t| t.name.as_str()).collect();
+        let profile = agent_default_tool_names();
+
+        assert!(
+            profile.len() >= 10 && profile.len() <= 16,
+            "agent-default should be small but cover the wedge; got {}",
+            profile.len()
+        );
+        assert!(
+            profile.len() < list.tools.len() / 2,
+            "agent-default ({}) must be far smaller than the full surface ({})",
+            profile.len(),
+            list.tools.len()
+        );
+        for name in profile {
+            assert!(
+                all.contains(name),
+                "agent-default tool '{name}' is not in tool_definitions()"
+            );
+        }
+        for required in [
+            "semantic_locate",
+            "get_context_pack",
+            "kin_transaction_commit",
+            "kin_provenance_query",
+        ] {
+            assert!(
+                profile.contains(&required),
+                "agent-default must include {required}"
+            );
+        }
+
+        let allowed: std::collections::HashSet<&str> = profile.iter().copied().collect();
+        let visible = list
+            .tools
+            .iter()
+            .filter(|t| allowed.contains(t.name.as_str()))
+            .count();
+        assert_eq!(visible, profile.len(), "every profile tool should be listable");
     }
 
     #[test]
