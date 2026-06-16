@@ -15,19 +15,23 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use crate::state::DaemonState;
 
 const SUPERVISOR_PID_FILE: &str = "supervisor.pid";
 const SUPERVISOR_PORT_FILE: &str = "supervisor.port";
+const SUPERVISOR_TOKEN_FILE: &str = "supervisor.token";
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_TTL: Duration = Duration::from_secs(20);
 
@@ -397,8 +401,269 @@ pub async fn repo_daemon_registration_loop(
     }
 }
 
+// ===== Control-plane hardening =====
+//
+// The supervisor is a local control plane (process discovery + routing for repo
+// daemons). It MUST be guarded exactly like the per-repo daemon HTTP surface
+// (`api.rs`): a DNS-rebinding Host/Origin guard plus an optional loopback bearer
+// token. The helpers below mirror `api.rs` one-for-one, swapping the
+// `KIN_DAEMON_*` env vars for `KIN_SUPERVISOR_*` and the `daemon.token` file for
+// `supervisor.token`, so the two surfaces stay symmetric. See FIR-914.
+
+/// `.kin/supervisor.token` — auto-provisioned per-install loopback token.
+fn supervisor_token_path() -> PathBuf {
+    supervisor_dir().join(SUPERVISOR_TOKEN_FILE)
+}
+
+/// Strip an optional `:port` suffix from a Host/authority value, correctly
+/// handling bracketed IPv6 literals like `[::1]:4319` (returns `::1`). Mirrors
+/// `api::host_without_port`.
+fn host_without_port(value: &str) -> &str {
+    let value = value.trim();
+    if let Some(rest) = value.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &rest[..end];
+        }
+        return value;
+    }
+    match value.split_once(':') {
+        Some((host, _port)) => host,
+        None => value,
+    }
+}
+
+/// Whether `host` is an allowed Host/Origin for the supervisor. Loopback is
+/// always allowed; a non-loopback `KIN_SUPERVISOR_BIND_HOST` is allowed only for
+/// the host the operator explicitly bound to (or a wildcard bind). Mirrors
+/// `api::is_host_allowed`, keyed on `KIN_SUPERVISOR_BIND_HOST`.
+fn is_host_allowed(host: &str) -> bool {
+    let host = host.trim();
+    if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]" {
+        return true;
+    }
+    if let Ok(bind_host) = std::env::var("KIN_SUPERVISOR_BIND_HOST") {
+        let bind_host = bind_host.trim();
+        if bind_host == "0.0.0.0" || bind_host == "::" || bind_host == "[::]" {
+            return true;
+        }
+        if !bind_host.is_empty() && host == bind_host {
+            return true;
+        }
+    }
+    false
+}
+
+/// Liveness routes that stay reachable without a Host header or bearer token so
+/// health-probe tooling is unaffected. Mirrors `api::is_public_route`.
+fn is_public_route(path: &str) -> bool {
+    matches!(path, "/health" | "/readiness")
+}
+
+/// DNS-rebinding defense: reject forged `Host` and cross-origin requests.
+/// Byte-for-byte the same policy as `api::validate_host_and_origin`.
+async fn validate_host_and_origin(
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let path = request.uri().path().to_string();
+
+    // 1. Validate the Host header.
+    //
+    // HTTP/1.1 makes Host mandatory and every browser (the DNS-rebinding
+    // drive-by threat) always sends it, so a rebound request carries the
+    // attacker's Host and is rejected by the allowlist below. A *missing* Host
+    // can only come from a hand-rolled raw-socket client deliberately skipping
+    // the browser contract; on a sensitive (non-public) route we reject it so
+    // the allowlist cannot be bypassed by simply omitting the header. Public
+    // liveness routes (/health, /readiness) stay reachable without a Host so
+    // health-probe tooling is unaffected.
+    match request.headers().get(header::HOST) {
+        Some(host_val) => {
+            if let Ok(host_str) = host_val.to_str() {
+                let host_part = host_without_port(host_str);
+                if !is_host_allowed(host_part) {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({ "error": format!("Host forbidden: {}", host_str) })),
+                    )
+                        .into_response();
+                }
+            } else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "Invalid Host header encoding" })),
+                )
+                    .into_response();
+            }
+        }
+        None => {
+            if !is_public_route(&path) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "Host header required" })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // 2. Validate Origin header if present.
+    if let Some(origin_val) = request.headers().get(header::ORIGIN) {
+        if let Ok(origin_str) = origin_val.to_str() {
+            let origin_str = origin_str.trim();
+            if origin_str == "null" {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "Null origin is forbidden" })),
+                )
+                    .into_response();
+            }
+
+            let mut valid = false;
+            if let Ok(uri) = origin_str.parse::<axum::http::Uri>() {
+                if let Some(host) = uri.host() {
+                    if is_host_allowed(host) {
+                        valid = true;
+                    }
+                }
+            }
+
+            if !valid {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": format!("Origin forbidden: {}", origin_str) })),
+                )
+                    .into_response();
+            }
+        } else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Invalid Origin header encoding" })),
+            )
+                .into_response();
+        }
+    }
+
+    next.run(request).await
+}
+
+fn auth_error(status: StatusCode, message: &str) -> Response {
+    let mut response = (status, Json(json!({ "error": message }))).into_response();
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Bearer realm=\"kin supervisor\""),
+    );
+    response
+}
+
+#[derive(Clone)]
+struct SupervisorAuthState {
+    auth_token: Option<String>,
+}
+
+/// Bearer-token guard for the supervisor control plane. No-ops when no token is
+/// enforced and on public liveness routes; otherwise requires a matching
+/// `Authorization: Bearer <token>`. Mirrors `api::daemon_auth`.
+async fn supervisor_auth(
+    State(auth_state): State<SupervisorAuthState>,
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if auth_state.auth_token.is_none() || is_public_route(request.uri().path()) {
+        return next.run(request).await;
+    }
+
+    let expected_token = auth_state.auth_token.as_deref().unwrap_or_default();
+    let provided = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim);
+
+    if provided != Some(expected_token) {
+        return auth_error(StatusCode::UNAUTHORIZED, "Authentication required");
+    }
+
+    next.run(request).await
+}
+
+fn resolve_auth_token(auth_token: Option<String>) -> Option<String> {
+    auth_token
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn auth_token_from_env() -> Option<String> {
+    resolve_auth_token(std::env::var("KIN_SUPERVISOR_AUTH_TOKEN").ok())
+}
+
+/// Load the per-install supervisor loopback token, generating and persisting one
+/// (mode 0600 on unix) on first run. Mirrors `api::ensure_loopback_token`.
+fn ensure_loopback_token() -> std::io::Result<String> {
+    let path = supervisor_token_path();
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let trimmed = existing.trim().to_string();
+        if !trimmed.is_empty() {
+            return Ok(trimmed);
+        }
+    }
+    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, &token)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(token)
+}
+
+/// Whether the supervisor should ENFORCE the per-install loopback token.
+/// Opt-in via `KIN_SUPERVISOR_REQUIRE_TOKEN`, mirroring the repo daemon's
+/// `KIN_DAEMON_REQUIRE_TOKEN`. The Host/Origin guard is always active regardless.
+fn loopback_token_enforced() -> bool {
+    std::env::var("KIN_SUPERVISOR_REQUIRE_TOKEN")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Resolve the auth token the serving supervisor enforces: an explicit
+/// `KIN_SUPERVISOR_AUTH_TOKEN` override always wins. Otherwise the per-install
+/// loopback token is auto-provisioned under `.kin/` (so local clients can adopt
+/// it) but only returned for enforcement when `KIN_SUPERVISOR_REQUIRE_TOKEN`
+/// is set. Mirrors `api::resolve_serve_auth_token`.
+fn resolve_serve_auth_token() -> Option<String> {
+    if let Some(env_token) = auth_token_from_env() {
+        return Some(env_token);
+    }
+    match ensure_loopback_token() {
+        Ok(token) => loopback_token_enforced().then_some(token),
+        Err(error) => {
+            warn!(
+                %error,
+                "failed to provision supervisor loopback auth token; supervisor will run without bearer auth"
+            );
+            None
+        }
+    }
+}
+
+/// Public router used by tests and callers that do not enforce a token. Mirrors
+/// `api::router` delegating to `router_with_auth(state, None)`.
 pub fn router(state: Arc<SupervisorState>) -> Router {
-    Router::new()
+    router_with_auth(state, None)
+}
+
+fn router_with_auth(state: Arc<SupervisorState>, auth_token: Option<String>) -> Router {
+    let app = Router::new()
         .route("/health", get(health))
         .route("/readiness", get(readiness))
         .route("/repos", get(list_repos))
@@ -408,6 +673,41 @@ pub fn router(state: Arc<SupervisorState>) -> Router {
         .route("/daemons/{repo_id}/heartbeat", post(heartbeat_daemon))
         .route("/daemons/{repo_id}", delete(deregister_daemon))
         .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            SupervisorAuthState { auth_token },
+            supervisor_auth,
+        ))
+        .layer(middleware::from_fn(validate_host_and_origin));
+
+    // Synthetic in-process tower test requests (`Request::get("/…")`) omit the
+    // Host header that every real HTTP/1.1 client — and the production
+    // `axum::serve` path — always sends. Without it the
+    // `validate_host_and_origin` missing-Host guard would 403 the entire unit
+    // suite. This cfg(test)-only shim restores that realism by defaulting an
+    // absent Host to loopback; it layers OUTSIDE (runs before) the guard and is
+    // compiled out of production and integration builds. The guard's
+    // missing-Host behaviour is covered directly by
+    // `supervisor_host_header_required_on_non_public_routes`.
+    #[cfg(test)]
+    let app = app.layer(middleware::from_fn(inject_loopback_host_in_tests));
+
+    app
+}
+
+/// Test-only: default an absent `Host` header to loopback so synthetic tower
+/// requests survive the `validate_host_and_origin` missing-Host guard. Never
+/// compiled into production builds (`#[cfg(test)]`). Mirrors the api.rs shim.
+#[cfg(test)]
+async fn inject_loopback_host_in_tests(
+    mut request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if !request.headers().contains_key(header::HOST) {
+        request
+            .headers_mut()
+            .insert(header::HOST, HeaderValue::from_static("127.0.0.1"));
+    }
+    next.run(request).await
 }
 
 async fn health(State(state): State<Arc<SupervisorState>>) -> impl IntoResponse {
@@ -582,6 +882,20 @@ pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::i
         .map_err(|error| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
         })?;
+
+    // Resolve the bearer token the control plane enforces, then refuse to expose
+    // the supervisor beyond loopback without one — mirrors `api::bind_listener`,
+    // which rejects a non-loopback daemon bind that has no auth token. The
+    // Host/Origin guard is always active; the token is the second layer for
+    // non-browser local/LAN callers.
+    let auth_token = resolve_serve_auth_token();
+    if !addr.ip().is_loopback() && auth_token.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "KIN_SUPERVISOR_AUTH_TOKEN (or KIN_SUPERVISOR_REQUIRE_TOKEN) is required when binding the supervisor to a non-loopback host",
+        ));
+    }
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound_port = listener.local_addr()?.port();
     write_supervisor_endpoint_files(bound_port);
@@ -636,7 +950,7 @@ pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::i
     }
 
     info!(port = bound_port, "kin supervisor listening");
-    let result = axum::serve(listener, router(state))
+    let result = axum::serve(listener, router_with_auth(state, auth_token))
         .with_graceful_shutdown(async move {
             while !*shutdown_rx.borrow() {
                 if shutdown_rx.changed().await.is_err() {
@@ -2176,5 +2490,278 @@ mod tests {
         assert!(!same_binary(None, Some(path)));
         assert!(!same_binary(Some(path), None));
         assert!(!same_binary(None, None));
+    }
+
+    // ===== Control-plane hardening (FIR-914) =====
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    /// Serialize tests that mutate process-global `KIN_SUPERVISOR_*` /
+    /// `KIN_REGISTRY_PATH` env so they cannot race. Mirrors `api::env_test_lock`.
+    fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Point `supervisor_dir()` (via `KIN_REGISTRY_PATH`) at a unique temp dir so
+    /// `supervisor.token` provisioning is hermetic. Returns the `.kin` dir.
+    fn isolate_supervisor_dir() -> PathBuf {
+        let root = std::env::temp_dir().join(format!("kin-supervisor-test-{}", Uuid::new_v4()));
+        let kin_dir = root.join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        std::env::set_var("KIN_REGISTRY_PATH", kin_dir.join("registry.toml"));
+        kin_dir
+    }
+
+    #[tokio::test]
+    async fn supervisor_host_and_origin_allowlist_validation() {
+        // Loopback Host/Origin pass; a forged Host, a cross-origin Origin, and a
+        // null Origin are all rejected — the same policy as the repo daemon.
+        let app = router(Arc::new(SupervisorState::new()));
+
+        let ok = app
+            .clone()
+            .oneshot(
+                Request::get("/repos")
+                    .header(header::HOST, "127.0.0.1:7421")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        let forged_host = app
+            .clone()
+            .oneshot(
+                Request::get("/repos")
+                    .header(header::HOST, "attacker.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forged_host.status(), StatusCode::FORBIDDEN);
+
+        let cross_origin = app
+            .clone()
+            .oneshot(
+                Request::get("/repos")
+                    .header(header::HOST, "localhost")
+                    .header(header::ORIGIN, "http://attacker.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross_origin.status(), StatusCode::FORBIDDEN);
+
+        let loopback_origin = app
+            .clone()
+            .oneshot(
+                Request::get("/repos")
+                    .header(header::HOST, "localhost")
+                    .header(header::ORIGIN, "http://localhost:7421")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(loopback_origin.status(), StatusCode::OK);
+
+        let null_origin = app
+            .oneshot(
+                Request::get("/repos")
+                    .header(header::HOST, "localhost")
+                    .header(header::ORIGIN, "null")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(null_origin.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn supervisor_host_header_required_on_non_public_routes() {
+        // Exercise the production missing-Host guard directly: a minimal router
+        // with ONLY `validate_host_and_origin` (no cfg(test) loopback-Host
+        // injector). A raw-socket client that omits Host to dodge the allowlist
+        // must be rejected on sensitive routes, while public liveness routes
+        // stay reachable for health probes.
+        let app = Router::new()
+            .route("/repos", get(|| async { StatusCode::OK }))
+            .route("/health", get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn(validate_host_and_origin));
+
+        let rejected = app
+            .clone()
+            .oneshot(Request::get("/repos").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+        let allowed = app
+            .clone()
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+
+        let with_host = app
+            .oneshot(
+                Request::get("/repos")
+                    .header(header::HOST, "127.0.0.1:7421")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(with_host.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn supervisor_bearer_token_protects_control_routes() {
+        // With a token enforced: a tokenless / wrong-token request to a control
+        // route is 401 (with a Bearer challenge); the matching token passes; and
+        // public liveness routes stay reachable without any token.
+        let token = "supervisor-secret-token";
+        let app = router_with_auth(Arc::new(SupervisorState::new()), Some(token.to_string()));
+
+        let missing = app
+            .clone()
+            .oneshot(Request::get("/repos").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            missing
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer realm=\"kin supervisor\"")
+        );
+
+        let wrong = app
+            .clone()
+            .oneshot(
+                Request::get("/repos")
+                    .header(header::AUTHORIZATION, "Bearer not-the-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+        let ok = app
+            .clone()
+            .oneshot(
+                Request::get("/repos")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        // Public liveness route reachable without a token.
+        let health = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn supervisor_no_token_means_no_auth_required() {
+        // Default (no token enforced): control routes are reachable without a
+        // bearer token — this is what keeps the normal local flow working. The
+        // Host/Origin guard still applies (covered above).
+        let app = router(Arc::new(SupervisorState::new()));
+        let res = app
+            .oneshot(Request::get("/repos").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn supervisor_is_host_allowed_honors_bind_host_env() {
+        let _env = env_test_lock();
+        std::env::remove_var("KIN_SUPERVISOR_BIND_HOST");
+
+        // Loopback always allowed; arbitrary hosts rejected by default.
+        assert!(is_host_allowed("127.0.0.1"));
+        assert!(is_host_allowed("localhost"));
+        assert!(is_host_allowed("::1"));
+        assert!(!is_host_allowed("attacker.com"));
+        assert!(!is_host_allowed("10.0.0.5"));
+
+        // An explicit non-loopback bind host is allowed only for that host.
+        std::env::set_var("KIN_SUPERVISOR_BIND_HOST", "10.0.0.5");
+        assert!(is_host_allowed("10.0.0.5"));
+        assert!(!is_host_allowed("attacker.com"));
+
+        // A wildcard bind allows any host (operator opted into exposure).
+        std::env::set_var("KIN_SUPERVISOR_BIND_HOST", "0.0.0.0");
+        assert!(is_host_allowed("attacker.com"));
+
+        std::env::remove_var("KIN_SUPERVISOR_BIND_HOST");
+    }
+
+    #[test]
+    fn supervisor_host_without_port_handles_ipv6() {
+        assert_eq!(host_without_port("127.0.0.1:7421"), "127.0.0.1");
+        assert_eq!(host_without_port("localhost"), "localhost");
+        assert_eq!(host_without_port("[::1]:7421"), "::1");
+        assert_eq!(host_without_port("[::1]"), "::1");
+    }
+
+    #[tokio::test]
+    async fn supervisor_loopback_token_provisioned_persisted_and_enforced() {
+        let _env = env_test_lock();
+        std::env::remove_var("KIN_SUPERVISOR_AUTH_TOKEN");
+        std::env::remove_var("KIN_SUPERVISOR_REQUIRE_TOKEN");
+        let _kin_dir = isolate_supervisor_dir();
+
+        // First provisioning persists a token; re-provisioning returns the SAME
+        // token (mode 0600 on unix).
+        let token = ensure_loopback_token().unwrap();
+        assert!(!token.is_empty());
+        assert_eq!(ensure_loopback_token().unwrap(), token);
+        let on_disk = std::fs::read_to_string(supervisor_token_path()).unwrap();
+        assert_eq!(on_disk.trim(), token);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(supervisor_token_path())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "supervisor token file must be 0600");
+        }
+
+        // Default: enforcement OFF — the file is provisioned but not required, so
+        // existing unauthenticated local clients keep working.
+        assert!(resolve_serve_auth_token().is_none());
+
+        // Opt-in via KIN_SUPERVISOR_REQUIRE_TOKEN returns the provisioned token.
+        std::env::set_var("KIN_SUPERVISOR_REQUIRE_TOKEN", "1");
+        assert_eq!(resolve_serve_auth_token().as_deref(), Some(token.as_str()));
+
+        // An explicit KIN_SUPERVISOR_AUTH_TOKEN override always wins.
+        std::env::set_var("KIN_SUPERVISOR_AUTH_TOKEN", "explicit-override");
+        assert_eq!(
+            resolve_serve_auth_token().as_deref(),
+            Some("explicit-override")
+        );
+
+        std::env::remove_var("KIN_SUPERVISOR_AUTH_TOKEN");
+        std::env::remove_var("KIN_SUPERVISOR_REQUIRE_TOKEN");
+        std::env::remove_var("KIN_REGISTRY_PATH");
     }
 }
