@@ -18,7 +18,7 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use kin_model::session::{Intent, IntentScope, IntentSummary, LockType};
 use kin_model::{
-    BranchName, ChangeStore, ContractId, EntityId, EntityStore, FileLayout, FilePathId,
+    Branch, BranchName, ChangeStore, ContractId, EntityId, EntityStore, FileLayout, FilePathId,
     GraphNodeId, IntentId, ProvenanceStore, SessionCapabilities, SessionId, SessionStore,
     SessionTransport, WorkStore,
 };
@@ -1679,9 +1679,22 @@ async fn graph_commit(
     graph
         .create_change(&request.change)
         .map_err(internal_error)?;
-    graph
-        .update_branch_head(&request.branch_name, &request.change.id)
-        .map_err(internal_error)?;
+    if graph
+        .get_branch(&request.branch_name)
+        .map_err(internal_error)?
+        .is_some()
+    {
+        graph
+            .update_branch_head(&request.branch_name, &request.change.id)
+            .map_err(internal_error)?;
+    } else {
+        graph
+            .create_branch(&Branch {
+                name: request.branch_name.clone(),
+                head: request.change.id,
+            })
+            .map_err(internal_error)?;
+    }
 
     if let Some(audit) = &request.audit_event {
         graph.record_audit_event(audit).map_err(internal_error)?;
@@ -6665,6 +6678,59 @@ mod tests {
         assert!(!json.build.built_at.is_empty());
         // Additive freshness marker present; 0 before any snapshot is committed.
         assert_eq!(json.graph_generation, 0);
+    }
+
+    #[tokio::test]
+    async fn graph_commit_creates_missing_branch_for_first_hosted_publish() {
+        let state = test_state();
+        let entity = test_entity("served_fn", "src/lib.py");
+        let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x83; 32]));
+        let payload = serde_json::json!({
+            "change": {
+                "id": change_id,
+                "parents": [],
+                "timestamp": Timestamp::now(),
+                "author": "tester",
+                "message": "first hosted publish",
+                "entity_deltas": [{ "Added": entity }],
+                "relation_deltas": [],
+                "artifact_deltas": [],
+                "projected_files": [],
+                "spec_link": null,
+                "evidence": [],
+                "risk_summary": null,
+                "authored_on": "main",
+            },
+            "branch_name": "main",
+        });
+        let app = router(Arc::clone(&state));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let refs_path = format!("/repos/{}/refs", state.cached_repo_id);
+        let refs_response = app
+            .oneshot(Request::get(refs_path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(refs_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(refs_response.into_body(), 8192)
+            .await
+            .unwrap();
+        let refs: RepoRefsResponse = serde_json::from_slice(&body).unwrap();
+        let change_id_string = change_id.to_string();
+        assert_eq!(refs.branch_name.as_deref(), Some("main"));
+        assert_eq!(refs.head_ref.as_deref(), Some(change_id_string.as_str()));
+        assert_eq!(state.graph.entity_count(), 1);
     }
 
     #[tokio::test]

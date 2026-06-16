@@ -529,7 +529,7 @@ impl DaemonState {
         // from the on-disk snapshot. Read before `graph` is moved into the state.
         let loaded_entity_count = graph.entity_count();
 
-        let state = Self {
+        let mut state = Self {
             layout,
             graph,
             blobs: Arc::new(blobs),
@@ -575,6 +575,10 @@ impl DaemonState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             load_persisted_mcp_transactions(&state.layout);
+        state
+            .repo_graphs
+            .get_mut()
+            .insert(state.cached_repo_id.clone(), Arc::clone(&state.graph));
         Ok(state)
     }
 
