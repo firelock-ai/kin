@@ -129,6 +129,11 @@ pub(crate) fn git_ref_exists(repo_path: &Path, ref_name: &str) -> Result<bool> {
     }
 }
 
+// Reserved for the deferred inbound git-transport pull re-import path (see
+// `commands::pull`): updates a transport-mirror branch to a fetched ref before
+// re-import. Kept (with test coverage) so the path can be re-enabled in a later
+// alpha without re-deriving it.
+#[allow(dead_code)]
 pub(crate) fn set_transport_branch_head(
     repo_path: &Path,
     branch_name: &str,
