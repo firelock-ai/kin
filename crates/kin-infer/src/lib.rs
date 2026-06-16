@@ -773,7 +773,8 @@ fn load_classifier_head(
             out_proj_bias,
         }));
     }
-    if let Some(weight) = try_load_2d_flexible(tensors, &["classifier.weight", "score.weight"], 1, h)?
+    if let Some(weight) =
+        try_load_2d_flexible(tensors, &["classifier.weight", "score.weight"], 1, h)?
     {
         let bias = try_load_1d_flexible(tensors, &["classifier.bias", "score.bias"], 1)?;
         return Ok(Some(ClassifierHead::Linear { weight, bias }));
