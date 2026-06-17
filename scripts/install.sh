@@ -271,11 +271,16 @@ else
     if [ -t 0 ]; then
         # Already in a TTY — run directly
         "$KIN_BIN/kin" setup
-    elif [ -e /dev/tty ]; then
-        # Piped but TTY available — redirect stdin from /dev/tty
+    elif [ -e /dev/tty ] && { : < /dev/tty; } 2>/dev/null; then
+        # Piped but a usable controlling TTY is available — read keyboard input
+        # from it. The `: < /dev/tty` probe confirms the device can actually be
+        # OPENED — on CI/Docker /dev/tty often exists but has no controlling
+        # terminal, so opening it errors ("cannot open /dev/tty") and the bare
+        # `[ -e /dev/tty ]` check is not enough.
         "$KIN_BIN/kin" setup < /dev/tty
     else
-        # No TTY at all (CI, Docker, etc.) — run non-interactive
+        # No usable TTY (CI, Docker, piped without a controlling terminal) —
+        # run non-interactive so the install never exits non-zero here.
         "$KIN_BIN/kin" setup --no-interactive
     fi
 fi
