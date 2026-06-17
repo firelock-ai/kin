@@ -21,9 +21,21 @@ Install Kin with a single command:
 curl -fsSL https://get.kinlab.dev/install | sh
 ```
 
-The installer downloads the latest release from GitHub, places the `kin` and `kin-vfs`
-binaries into `~/.kin/bin`, updates your shell profile (`.zshrc` / `.bashrc`), and then
-runs the interactive setup wizard.
+The installer downloads the latest release from GitHub, verifies its SHA-256 checksum
+(and refuses to install an unverified or tampered download), places the `kin` and
+`kin-daemon` binaries — plus the optional `kin-vfs` projection client where bundled —
+into `~/.kin/bin`, updates your shell profile (`.zshrc` / `.bashrc`), and then runs the
+interactive setup wizard. Re-running the installer upgrades an existing install in place.
+
+On **Windows**, use PowerShell:
+
+```powershell
+irm https://get.kinlab.dev/install.ps1 | iex
+```
+
+The native Windows build is a limited, vector-free convenience binary with no filesystem
+projection. For the complete, vector-enabled Kin with working projection, install under
+WSL2 — see [docs/windows-wsl2.md](docs/windows-wsl2.md).
 
 ### Installer configuration
 
@@ -32,6 +44,7 @@ Configure the installer with environment variables:
 - `KIN_VERSION`: Pin a specific version to download (e.g. `0.1.0`). If omitted, the latest release is resolved automatically.
 - `KIN_DIR`: Custom installation directory (defaults to `~/.kin`).
 - `KIN_NO_SETUP`: Set to `1` to skip the interactive setup wizard after the binaries are downloaded.
+- `KIN_BASE_URL`: Install from a mirror or local path instead of GitHub releases (offline/airgapped installs and CI smoke tests). Supported by both the `sh` and PowerShell installers.
 
 ### Runtime configuration
 

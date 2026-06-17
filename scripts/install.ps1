@@ -10,6 +10,11 @@
 #   $env:KIN_VERSION = "0.1.0"   Pin a specific version (default: latest)
 #   $env:KIN_DIR = "$HOME\.kin"  Install directory (default: ~/.kin)
 #   $env:KIN_NO_SETUP = "1"     Skip interactive setup after install
+#   $env:KIN_BASE_URL = "..."   Install from a mirror (CI smoke tests / offline)
+#
+# Note: the native Windows build is a limited, vector-free convenience binary
+# with no filesystem projection. For the full experience, install under WSL2
+# (see docs/windows-wsl2.md).
 
 $ErrorActionPreference = "Stop"
 
@@ -20,7 +25,9 @@ $KinBin = Join-Path $KinDir "bin"
 $KinLib = Join-Path $KinDir "lib"
 $GitHubOrg = "firelock-ai"
 $GitHubRepo = "kin"
-$BaseUrl = "https://github.com/$GitHubOrg/$GitHubRepo/releases"
+# Override KIN_BASE_URL to install from a mirror or a local path (offline /
+# airgapped installs and CI smoke tests). Mirrors the install.sh override.
+$BaseUrl = if ($env:KIN_BASE_URL) { $env:KIN_BASE_URL } else { "https://github.com/$GitHubOrg/$GitHubRepo/releases" }
 
 # ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -46,6 +53,29 @@ Write-Host "  Semantic development environment"
 Write-Host ""
 
 Write-Info "Platform: windows ($Arch)"
+
+# The native Windows binary is a limited convenience build: it is vector-free
+# (semantic search disabled) and does NOT provide the transparent filesystem
+# projection. Projection relies on Unix library-injection (LD_PRELOAD /
+# DYLD_INSERT_LIBRARIES), which native Windows does not offer. For the complete,
+# vector-enabled Kin with working projection, install under WSL2 instead — see
+# docs/windows-wsl2.md.
+Write-Host "  ! Native Windows build is vector-free and has no filesystem projection." -ForegroundColor Yellow
+Write-Host "    For the full experience, install under WSL2 (see docs/windows-wsl2.md)." -ForegroundColor DarkGray
+Write-Host ""
+
+# ── Detect an existing install (reinstall / upgrade) ──────────────────
+
+$PreviousVersion = $null
+$ExistingKinExe = Join-Path $KinBin "kin.exe"
+if (Test-Path $ExistingKinExe) {
+    $PreviousVersion = (& $ExistingKinExe --version 2>$null | Select-Object -First 1)
+    if ($PreviousVersion) {
+        Write-Info "Existing install found: kin $PreviousVersion (will be replaced)"
+    } else {
+        Write-Info "Existing install found in $KinDir (will be replaced)"
+    }
+}
 
 # ── Resolve version ─────────────────────────────────────────────────────
 
@@ -132,29 +162,41 @@ New-Item -ItemType Directory -Path $KinLib -Force | Out-Null
 
 Expand-Archive -Path (Join-Path $TmpDir $Archive) -DestinationPath $TmpDir -Force
 
-# FIR-967: kin-daemon is mandatory — kin status/search and the MCP server all
-# require it. Assert it is present BEFORE moving anything so a daemon-less
-# archive aborts cleanly instead of leaving a half-installed environment.
+# kin-daemon is mandatory — kin status/search and the MCP server all require it.
+# Assert it is present BEFORE moving anything so a daemon-less archive aborts
+# cleanly instead of leaving a half-installed environment.
 if (-not (Test-Path (Join-Path $TmpDir "kin-daemon.exe"))) {
     Write-Err "kin-daemon.exe missing from the downloaded archive. Refusing a daemon-less install."
     exit 1
 }
 
-# Move binaries. kin-daemon.exe is mandatory (asserted above); kin-vfs.exe is optional.
+# Move binaries. kin-daemon.exe is mandatory (asserted above); kin-vfs.exe ships
+# only when the archive includes the (Unix-only) projection client.
+$HaveVfs = $false
 foreach ($bin in @("kin.exe", "kin-daemon.exe", "kin-vfs.exe")) {
     $src = Join-Path $TmpDir $bin
     if (Test-Path $src) {
         Move-Item -Path $src -Destination (Join-Path $KinBin $bin) -Force
+        if ($bin -eq "kin-vfs.exe") { $HaveVfs = $true }
     }
 }
 
-# Move shim library
+# Move the projection shim if the archive bundled it. The native Windows release
+# is vector-free and ships no shim, so this is normally absent.
+$HaveShim = $false
 $shimSrc = Join-Path $TmpDir "kin_vfs_shim.dll"
 if (Test-Path $shimSrc) {
     Move-Item -Path $shimSrc -Destination (Join-Path $KinLib "kin_vfs_shim.dll") -Force
+    $HaveShim = $true
 }
 
-Write-Ok "Binaries installed"
+Write-Ok "Binaries installed (kin, kin-daemon)"
+
+if ($HaveVfs -and $HaveShim) {
+    Write-Ok "Filesystem projection installed (kin-vfs + shim)"
+} else {
+    Write-Info "Filesystem projection is not available on native Windows. Use WSL2 for projection (see docs/windows-wsl2.md)."
+}
 
 # ── PATH setup ──────────────────────────────────────────────────────────
 
@@ -171,8 +213,12 @@ if ($CurrentPath -notlike "*$KinBin*") {
 
 $KinExe = Join-Path $KinBin "kin.exe"
 if (Test-Path $KinExe) {
-    $ver = & $KinExe --version 2>$null
-    Write-Ok "kin $ver"
+    $InstalledVersion = (& $KinExe --version 2>$null | Select-Object -First 1)
+    if ($PreviousVersion -and $InstalledVersion -and ($PreviousVersion -ne $InstalledVersion)) {
+        Write-Ok "kin upgraded: $PreviousVersion -> $InstalledVersion"
+    } else {
+        Write-Ok "kin $InstalledVersion"
+    }
 } else {
     Write-Err "Installation failed — kin.exe not found"
     exit 1
