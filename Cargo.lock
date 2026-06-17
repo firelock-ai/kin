@@ -3057,9 +3057,9 @@ dependencies = [
 
 [[package]]
 name = "kin-db"
-version = "0.2.2"
+version = "0.2.3"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "e2b45a27678a8de06d1e13898068fdc871f3fe53694195a7d3ae39b9ca86184b"
+checksum = "ab5ca4f070ca83e772e8aaa289cbb72d4732166a0df22bab746dd873706266b1"
 dependencies = [
  "bincode",
  "bytes",
@@ -6329,7 +6329,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
