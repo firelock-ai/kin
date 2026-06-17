@@ -20,33 +20,40 @@ export function resolveReleaseTag(version = PACKAGE_VERSION) {
   return version.startsWith('v') ? version : `v${version}`;
 }
 
+export const PRIMARY_BINARY_NAME = 'kin';
+export const DAEMON_BINARY_NAME = 'kin-daemon';
+
 export function resolveReleaseAsset(platform = process.platform, arch = process.arch) {
   if (platform === 'darwin' && arch === 'arm64') {
     return {
       assetName: 'kin-macos-aarch64',
       archiveName: 'kin-macos-aarch64.tar.gz',
-      binaryName: 'kin'
+      binaryName: PRIMARY_BINARY_NAME,
+      daemonBinaryName: DAEMON_BINARY_NAME
     };
   }
   if (platform === 'darwin' && arch === 'x64') {
     return {
       assetName: 'kin-macos-x86_64',
       archiveName: 'kin-macos-x86_64.tar.gz',
-      binaryName: 'kin'
+      binaryName: PRIMARY_BINARY_NAME,
+      daemonBinaryName: DAEMON_BINARY_NAME
     };
   }
   if (platform === 'linux' && arch === 'x64') {
     return {
       assetName: 'kin-linux-x86_64',
       archiveName: 'kin-linux-x86_64.tar.gz',
-      binaryName: 'kin'
+      binaryName: PRIMARY_BINARY_NAME,
+      daemonBinaryName: DAEMON_BINARY_NAME
     };
   }
   if (platform === 'linux' && arch === 'arm64') {
     return {
       assetName: 'kin-linux-aarch64',
       archiveName: 'kin-linux-aarch64.tar.gz',
-      binaryName: 'kin'
+      binaryName: PRIMARY_BINARY_NAME,
+      daemonBinaryName: DAEMON_BINARY_NAME
     };
   }
 
@@ -115,11 +122,16 @@ export async function ensureKinBinary({
     cacheRoot
   });
 
-  if (await isRunnable(binaryPath, platform)) {
+  const daemonPath = path.join(path.dirname(binaryPath), DAEMON_BINARY_NAME);
+  if (
+    (await isRunnable(binaryPath, platform)) &&
+    (await isRunnable(daemonPath, platform))
+  ) {
     return binaryPath;
   }
 
   await installKinBinary({ binaryPath, env, platform, arch, version });
+  await assertDaemonProvisioned(binaryPath, platform);
   return binaryPath;
 }
 
@@ -127,6 +139,7 @@ export async function runKinMcp(argv = [], options = {}) {
   const stdout = options.stdout || process.stdout;
   const stderr = options.stderr || process.stderr;
   const env = options.env || process.env;
+  const platform = options.platform || process.platform;
 
   if (argv.includes('--help') || argv.includes('-h')) {
     stdout.write(renderHelp());
@@ -138,9 +151,18 @@ export async function runKinMcp(argv = [], options = {}) {
     return 0;
   }
 
-  if (argv.includes('--print-bin')) {
-    const binaryPath = await ensureKinBinary(options);
-    stdout.write(`${binaryPath}\n`);
+  if (argv.includes('--print-bin') || argv.includes('--print-daemon-bin')) {
+    let binaryPath;
+    try {
+      binaryPath = await ensureKinBinary(options);
+    } catch (error) {
+      stderr.write(`${guidedProvisioningFailure(error)}\n`);
+      return 1;
+    }
+    const target = argv.includes('--print-daemon-bin')
+      ? resolveDaemonBinaryPath(binaryPath)
+      : binaryPath;
+    stdout.write(`${target}\n`);
     return 0;
   }
 
@@ -151,7 +173,18 @@ export async function runKinMcp(argv = [], options = {}) {
     return 2;
   }
 
-  const binaryPath = await ensureKinBinary(options);
+  let binaryPath;
+  try {
+    binaryPath = await ensureKinBinary(options);
+  } catch (error) {
+    stderr.write(`${guidedProvisioningFailure(error)}\n`);
+    return 1;
+  }
+
+  const spawnOptions = {
+    ...options,
+    env: childEnv(env, binaryPath, platform)
+  };
 
   const cwd = options.cwd || process.cwd();
   if (!await kinRepoExists(cwd)) {
@@ -162,14 +195,45 @@ export async function runKinMcp(argv = [], options = {}) {
       return 2;
     }
     stderr.write('No .kin/ found; KIN_MCP_AUTO_INIT=1, running kin init...\n');
-    const initCode = await spawnKin(binaryPath, ['init', '.'], { ...options, cwd });
+    const initCode = await spawnKin(binaryPath, ['init', '.'], { ...spawnOptions, cwd });
     if (initCode !== 0) {
       stderr.write('kin init failed. Cannot start MCP server.\n');
       return initCode;
     }
   }
 
-  return spawnKin(binaryPath, ['mcp', 'start'], options);
+  return spawnKin(binaryPath, ['mcp', 'start'], spawnOptions);
+}
+
+export function resolveDaemonBinaryPath(kinBinaryPath) {
+  return path.join(path.dirname(kinBinaryPath), DAEMON_BINARY_NAME);
+}
+
+export function childEnv(env, kinBinaryPath, platform = process.platform) {
+  const next = { ...env };
+
+  if (!next.KIN_MCP_TOOL_PROFILE) {
+    next.KIN_MCP_TOOL_PROFILE = 'agent-default';
+  }
+
+  const usesManagedBinary = !(env.KIN_MCP_KIN_BINARY || env.KIN_BINARY_PATH);
+  if (usesManagedBinary && !next.KIN_DAEMON_BIN) {
+    next.KIN_DAEMON_BIN = resolveDaemonBinaryPath(kinBinaryPath);
+  }
+
+  return next;
+}
+
+function guidedProvisioningFailure(error) {
+  const detail = error && error.message ? error.message : String(error);
+  return [
+    `kin-mcp could not provision a runnable Kin: ${detail}`,
+    'Fixes:',
+    '  - Install Kin directly and run `kin setup` to configure your agent, then point',
+    '    this wrapper at it with KIN_MCP_KIN_BINARY=/path/to/kin.',
+    '  - Or retry on a supported target (macOS/Linux). On Windows use WSL2 for this alpha.',
+    '  - Or override the release source with KIN_MCP_RELEASE_BASE_URL if you mirror releases.'
+  ].join('\n');
 }
 
 function isTruthyEnv(value) {
@@ -182,25 +246,34 @@ function renderHelp() {
 Usage:
   kin-mcp
   kin-mcp --print-bin
+  kin-mcp --print-daemon-bin
   kin-mcp --version
 
-This wrapper downloads a matching Kin release binary on demand, caches it
-locally, and then runs:
+This wrapper downloads a matching Kin release archive on demand, extracts both
+the kin CLI and the kin-daemon it depends on into a local cache, and then runs:
 
   kin mcp start
 
+It defaults KIN_MCP_TOOL_PROFILE=agent-default so first-run agents see the small
+curated tool surface, and points the kin CLI at the cached kin-daemon via
+KIN_DAEMON_BIN so it never depends on a stale daemon on PATH.
+
 Environment:
-  KIN_MCP_KIN_BINARY   Use a specific kin binary
+  KIN_MCP_KIN_BINARY   Use a specific kin binary (you manage its kin-daemon)
   KIN_BINARY_PATH      Alias for KIN_MCP_KIN_BINARY
   KIN_MCP_CACHE_DIR    Override the cache directory
   KIN_MCP_AUTO_INIT    Set to 1 to allow wrapper-initiated kin init
+  KIN_MCP_TOOL_PROFILE Override the default agent-default tool profile
   KIN_MCP_RELEASE_BASE_URL
                        Override the release download base URL
 `;
 }
 
 async function installKinBinary({ binaryPath, env, platform, arch, version }) {
-  const { assetName, archiveName, binaryName } = resolveReleaseAsset(platform, arch);
+  const { assetName, archiveName, binaryName, daemonBinaryName } = resolveReleaseAsset(
+    platform,
+    arch
+  );
   const tag = resolveReleaseTag(version);
   const baseUrl = (env.KIN_MCP_RELEASE_BASE_URL || DEFAULT_RELEASE_BASE_URL).replace(
     /\/$/,
@@ -227,6 +300,7 @@ async function installKinBinary({ binaryPath, env, platform, arch, version }) {
     archiveName,
     assetName,
     binaryName,
+    daemonBinaryName,
     binaryPath,
     platform
   });
@@ -237,30 +311,80 @@ async function installFromArchive({
   archiveName,
   assetName,
   binaryName,
+  daemonBinaryName,
   binaryPath,
   platform
 }) {
   const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-install-'));
   const archivePath = path.join(tmpRoot, archiveName);
-  const tmpPath = `${binaryPath}.download`;
+  const installDir = path.dirname(binaryPath);
+  const daemonPath = path.join(installDir, daemonBinaryName);
+  const staged = [];
 
   try {
     await fsp.writeFile(archivePath, archiveBytes);
     await execFile('tar', ['-xzf', archivePath, '-C', tmpRoot]);
 
-    const extractedBinary = path.join(tmpRoot, assetName, binaryName);
-    await fsp.access(extractedBinary, fs.constants.R_OK);
-    await fsp.copyFile(extractedBinary, tmpPath);
-    if (platform !== 'win32') {
-      await fsp.chmod(tmpPath, 0o755);
+    const kinStaged = await stageBinary({
+      tmpRoot,
+      assetName,
+      sourceName: binaryName,
+      destination: binaryPath,
+      platform,
+      required: true
+    });
+    staged.push(kinStaged);
+
+    const daemonStaged = await stageBinary({
+      tmpRoot,
+      assetName,
+      sourceName: daemonBinaryName,
+      destination: daemonPath,
+      platform,
+      required: true,
+      missingHint:
+        'the published release archive is missing kin-daemon; the daemon is required for MCP'
+    });
+    staged.push(daemonStaged);
+
+    for (const item of staged) {
+      await fsp.rename(item.tmpPath, item.destination);
     }
-    await fsp.rename(tmpPath, binaryPath);
   } catch (error) {
-    await fsp.unlink(tmpPath).catch(() => {});
-    throw new Error(`failed to install ${binaryName} from ${archiveName}: ${error.message}`);
+    await Promise.all(staged.map(item => fsp.unlink(item.tmpPath).catch(() => {})));
+    throw new Error(
+      `failed to install ${binaryName} from ${archiveName}: ${error.message}`
+    );
   } finally {
     await fsp.rm(tmpRoot, { recursive: true, force: true });
   }
+}
+
+async function stageBinary({
+  tmpRoot,
+  assetName,
+  sourceName,
+  destination,
+  platform,
+  required,
+  missingHint
+}) {
+  const extracted = path.join(tmpRoot, assetName, sourceName);
+  try {
+    await fsp.access(extracted, fs.constants.R_OK);
+  } catch {
+    if (required) {
+      throw new Error(missingHint || `archive is missing ${sourceName}`);
+    }
+    return null;
+  }
+
+  const tmpPath = `${destination}.download`;
+  await fsp.copyFile(extracted, tmpPath);
+  if (platform !== 'win32') {
+    await fsp.chmod(tmpPath, 0o755);
+  }
+  return { destination, tmpPath };
 }
 
 function execFile(file, args, options = {}) {
@@ -328,6 +452,15 @@ async function kinRepoExists(cwd) {
 async function assertRunnable(filePath, platform) {
   if (!(await isRunnable(filePath, platform))) {
     throw new Error(`kin binary not found or not executable: ${filePath}`);
+  }
+}
+
+async function assertDaemonProvisioned(kinBinaryPath, platform) {
+  const daemonPath = resolveDaemonBinaryPath(kinBinaryPath);
+  if (!(await isRunnable(daemonPath, platform))) {
+    throw new Error(
+      `kin-daemon was not provisioned next to ${kinBinaryPath}; the MCP server cannot start without it`
+    );
   }
 }
 
