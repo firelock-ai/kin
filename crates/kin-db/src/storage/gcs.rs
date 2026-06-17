@@ -40,6 +40,12 @@ pub struct GcsBackend {
     /// Used for UpdateVersion on subsequent writes so we don't lose
     /// fidelity by round-tripping through u64.
     etags: Mutex<HashMap<String, String>>,
+    /// Maps object paths to their last-seen object version (the GCS object
+    /// generation). GCS conditional updates are generation-based, so
+    /// object_store requires this `version` — not just the e_tag — or it
+    /// rejects the write with "Version required for conditional update".
+    /// Captured on load and after every successful write.
+    versions: Mutex<HashMap<String, String>>,
 }
 
 impl GcsBackend {
@@ -61,6 +67,7 @@ impl GcsBackend {
             prefix: prefix.into(),
             fallback_rt: OnceLock::new(),
             etags: Mutex::new(HashMap::new()),
+            versions: Mutex::new(HashMap::new()),
         })
     }
 
@@ -72,6 +79,7 @@ impl GcsBackend {
             prefix: prefix.into(),
             fallback_rt: OnceLock::new(),
             etags: Mutex::new(HashMap::new()),
+            versions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -104,13 +112,22 @@ impl StorageBackend for GcsBackend {
                 // Parse generation from ETag for the trait interface, but also
                 // stash the raw ETag so save_snapshot can use it verbatim.
                 let raw_etag = get_result.meta.e_tag.clone();
+                // An object we just loaded exists, so its generation must be
+                // above GENERATION_INIT — otherwise the next save would take the
+                // Create branch and fail "already exists". (Real GCS generations
+                // are large timestamps; this only matters for backends whose
+                // first object has etag/generation 0, e.g. the in-memory store.)
                 let generation = raw_etag
                     .as_ref()
                     .and_then(|etag| etag.trim_matches('"').parse::<Generation>().ok())
-                    .unwrap_or(1);
+                    .unwrap_or(1)
+                    .max(GENERATION_INIT + 1);
 
                 if let Some(ref etag) = raw_etag {
                     self.etags.lock().insert(path.to_string(), etag.clone());
+                }
+                if let Some(version) = get_result.meta.version.clone() {
+                    self.versions.lock().insert(path.to_string(), version);
                 }
 
                 let bytes = self.block_on(get_result.bytes()).map_err(|e| {
@@ -140,18 +157,23 @@ impl StorageBackend for GcsBackend {
                 ..PutOptions::default()
             }
         } else {
-            // Use the raw ETag stored from load_snapshot when available.
-            // Falls back to stringified generation for backwards compat.
-            let etag = self
-                .etags
+            // GCS conditional updates are generation-based: object_store's GCS
+            // backend requires the object `version` (generation), not just the
+            // e_tag, or it rejects the write with "Version required for
+            // conditional update". Prefer the version captured on load/last
+            // write; fall back to the expected generation so a cold writer
+            // still sends a precondition.
+            let etag = self.etags.lock().get(&path.to_string()).cloned();
+            let version = self
+                .versions
                 .lock()
                 .get(&path.to_string())
                 .cloned()
                 .unwrap_or_else(|| format!("{expected_gen}"));
             PutOptions {
                 mode: PutMode::Update(UpdateVersion {
-                    e_tag: Some(etag),
-                    version: None,
+                    e_tag: etag,
+                    version: Some(version),
                 }),
                 ..PutOptions::default()
             }
@@ -164,6 +186,12 @@ impl StorageBackend for GcsBackend {
         // Stash the new ETag for the next CAS write.
         if let Some(ref etag) = result.e_tag {
             self.etags.lock().insert(path.to_string(), etag.clone());
+        }
+        // Stash the new object version (generation) for the next conditional update.
+        if let Some(ref version) = result.version {
+            self.versions
+                .lock()
+                .insert(path.to_string(), version.clone());
         }
 
         // Parse generation for the trait return value. Clamp to at least
@@ -451,5 +479,37 @@ mod tests {
         // The etag map should have an entry for this path
         let etags = backend.etags.lock();
         assert!(!etags.is_empty());
+    }
+
+    /// Real-GCS reproduction of the FIR-983 conditional-update bug. InMemory
+    /// keys CAS on the e_tag and so never exercised GCS's generation-based
+    /// precondition; this hits the live bucket via ADC. Run explicitly:
+    /// `KINDB_GCS_CAS_BUCKET=kin-ecosystem-kin-graphs-dev \
+    ///  cargo test -p kin-db --features gcs gcs_real_conditional_update -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires real GCS + ADC credentials"]
+    fn gcs_real_conditional_update_roundtrip() {
+        let Ok(bucket) = std::env::var("KINDB_GCS_CAS_BUCKET") else {
+            eprintln!("KINDB_GCS_CAS_BUCKET not set; skipping");
+            return;
+        };
+        let prefix = format!("v2-cas-check/{}", std::process::id());
+        let backend = GcsBackend::new(&bucket, prefix).unwrap();
+        let repo = "cas-test-repo";
+
+        let bytes = GraphSnapshot::empty().to_bytes().unwrap();
+        let gen1 = backend
+            .save_snapshot(repo, &bytes, GENERATION_INIT)
+            .expect("first save (Create) should succeed");
+        let (_loaded, gen_loaded) = backend.load_snapshot(repo).unwrap().unwrap();
+        // The previously-failing conditional Update against real GCS:
+        let gen2 = backend
+            .save_snapshot(repo, &bytes, gen_loaded)
+            .expect("second save (conditional Update) must succeed against real GCS");
+        let gen3 = backend
+            .save_snapshot(repo, &bytes, gen2)
+            .expect("third save (conditional Update) must also succeed");
+        eprintln!("gens: create={gen1} loaded={gen_loaded} update1={gen2} update2={gen3}");
+        assert!(gen2 > GENERATION_INIT && gen3 > GENERATION_INIT);
     }
 }
