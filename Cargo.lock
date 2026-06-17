@@ -1019,7 +1019,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1118,7 +1118,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2935,7 +2935,7 @@ dependencies = [
  "kin-lsp",
  "kin-mcp",
  "kin-migrate",
- "kin-model",
+ "kin-model 0.2.0",
  "kin-parser",
  "kin-projection",
  "kin-ranking",
@@ -2976,7 +2976,7 @@ version = "0.2.1"
 dependencies = [
  "kin-blobs",
  "kin-db",
- "kin-model",
+ "kin-model 0.2.0",
  "pretty_assertions",
  "serde",
  "serde_json",
@@ -2996,7 +2996,7 @@ dependencies = [
  "kin-blobs",
  "kin-db",
  "kin-index",
- "kin-model",
+ "kin-model 0.2.0",
  "kin-parser",
  "pretty_assertions",
  "serde",
@@ -3029,7 +3029,7 @@ dependencies = [
  "kin-index",
  "kin-lsp",
  "kin-mcp",
- "kin-model",
+ "kin-model 0.2.0",
  "kin-parser",
  "kin-projection",
  "kin-reconcile",
@@ -3057,9 +3057,9 @@ dependencies = [
 
 [[package]]
 name = "kin-db"
-version = "0.2.0"
+version = "0.2.1"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "2ff9121965d0478b886f69994b4bb35ddb3510397189cc96a1b309521d0047a6"
+checksum = "03591add611183366774df136d6f28c9d9dabb636d71435e669b767dd58c9c5b"
 dependencies = [
  "bincode",
  "bytes",
@@ -3071,7 +3071,7 @@ dependencies = [
  "hex",
  "hf-hub",
  "kin-infer",
- "kin-model",
+ "kin-model 0.2.0",
  "kin-search",
  "kin-vector",
  "memmap2",
@@ -3104,7 +3104,7 @@ dependencies = [
  "hex",
  "kin-blobs",
  "kin-db",
- "kin-model",
+ "kin-model 0.2.0",
  "pretty_assertions",
  "rayon",
  "sha2",
@@ -3120,7 +3120,7 @@ dependencies = [
  "hex",
  "kin-blobs",
  "kin-db",
- "kin-model",
+ "kin-model 0.2.0",
  "kin-parser",
  "kin-projection",
  "notify",
@@ -3169,7 +3169,7 @@ dependencies = [
  "kin-git",
  "kin-index",
  "kin-migrate",
- "kin-model",
+ "kin-model 0.2.0",
  "kin-parser",
  "kin-projection",
  "kin-reconcile",
@@ -3189,7 +3189,7 @@ version = "0.1.0"
 source = "sparse+https://kinlab.ai/registry/cargo/"
 checksum = "508c8fca105f311561412de969104cd29a153a1666dfe6cb48e41b6bb89280e4"
 dependencies = [
- "kin-model",
+ "kin-model 0.1.0",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3206,7 +3206,7 @@ dependencies = [
  "kin-context",
  "kin-core",
  "kin-db",
- "kin-model",
+ "kin-model 0.2.0",
  "kin-parser",
  "kin-ranking",
  "kin-review",
@@ -3234,7 +3234,7 @@ dependencies = [
  "kin-db",
  "kin-git",
  "kin-index",
- "kin-model",
+ "kin-model 0.2.0",
  "kin-parser",
  "pretty_assertions",
  "reqwest",
@@ -3265,10 +3265,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "kin-model"
+version = "0.2.0"
+source = "sparse+https://kinlab.ai/registry/cargo/"
+checksum = "e941e72effaa65527d22cc60b391a936629d01215ff4fecdc3838e8378457c1d"
+dependencies = [
+ "chrono",
+ "hex",
+ "kin-blobs",
+ "kin-vector",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "kin-parser"
 version = "0.2.1"
 dependencies = [
- "kin-model",
+ "kin-model 0.2.0",
  "pretty_assertions",
  "serde_json",
  "sha2",
@@ -3299,7 +3317,7 @@ version = "0.2.1"
 dependencies = [
  "kin-blobs",
  "kin-db",
- "kin-model",
+ "kin-model 0.2.0",
  "pretty_assertions",
  "proptest",
  "serde_json",
@@ -3312,7 +3330,7 @@ dependencies = [
 name = "kin-ranking"
 version = "0.2.1"
 dependencies = [
- "kin-model",
+ "kin-model 0.2.0",
  "serde",
  "serde_json",
 ]
@@ -3324,7 +3342,7 @@ dependencies = [
  "kin-blobs",
  "kin-db",
  "kin-index",
- "kin-model",
+ "kin-model 0.2.0",
  "kin-parser",
  "kin-projection",
  "notify",
@@ -3347,7 +3365,7 @@ dependencies = [
  "flate2",
  "hex",
  "kin-blobs",
- "kin-model",
+ "kin-model 0.2.0",
  "percent-encoding",
  "serde",
  "serde_json",
@@ -3367,7 +3385,7 @@ name = "kin-remote"
 version = "0.2.1"
 dependencies = [
  "chrono",
- "kin-model",
+ "kin-model 0.2.0",
  "pretty_assertions",
  "serde",
  "serde_json",
@@ -3384,7 +3402,7 @@ version = "0.2.1"
 dependencies = [
  "kin-blobs",
  "kin-db",
- "kin-model",
+ "kin-model 0.2.0",
  "pretty_assertions",
  "serde",
  "serde_json",
@@ -3400,7 +3418,7 @@ dependencies = [
  "chrono",
  "hex",
  "kin-blobs",
- "kin-model",
+ "kin-model 0.2.0",
  "pretty_assertions",
  "serde",
  "serde_json",
@@ -3429,7 +3447,7 @@ name = "kin-semantic-contracts"
 version = "0.2.1"
 dependencies = [
  "kin-db",
- "kin-model",
+ "kin-model 0.2.0",
  "pretty_assertions",
  "serde",
  "serde_json",
@@ -3445,7 +3463,7 @@ version = "0.2.1"
 dependencies = [
  "chrono",
  "hashbrown 0.15.5",
- "kin-model",
+ "kin-model 0.2.0",
  "parking_lot",
  "pretty_assertions",
  "reqwest",
@@ -3853,7 +3871,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4735,7 +4753,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5354,7 +5372,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6329,7 +6347,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
