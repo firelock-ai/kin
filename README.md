@@ -65,9 +65,41 @@ read from the daemon and auto-start it as needed — no configuration required f
 
 ## Quickstart
 
+There is **one recommended first-run path**, and it's the same on macOS, Linux, and
+Windows (via WSL2): install → run the guided `kin setup` wizard → build the graph → verify.
 See [docs/quickstart.md](docs/quickstart.md) for the full end-to-end walkthrough.
 
-### 1. Initialize a repository
+### 1. Run guided setup
+
+The installer above already launches `kin setup` for you (run it again any time). It opens
+with **"What do you want Kin for?"** and asks for your **intent**, then configures the
+matching pieces:
+
+```sh
+kin setup
+```
+
+- **AI agents** (default) — wires Kin's MCP server into every detected AI client
+  (Claude Code, Cursor, Codex, Gemini, Windsurf), plus shell integration and daemon
+  auto-start. The smallest path to value.
+- **Local-only** — shell integration + daemon auto-start; no AI client config.
+- **Editor** — local-only, plus how to install the `kin-editor` VS Code extension.
+- **Hosted / KinLab** — local setup, plus a note that hosted connect is coming soon (not
+  yet a first-run flow).
+- **Advanced / manual** — choose shell, per-client MCP, and daemon options yourself.
+
+*Flags* (global; `kin setup --intent agent --no-interactive` for scripts/CI):
+- `--intent <local|agent|editor|hosted|advanced>`: pick the first-run intent up front.
+- `--shell <zsh|bash|powershell>`: target shell for profile updates.
+- `--auto-daemon`: force daemon auto-start on (default on for every intent).
+- `--no-interactive`: run with defaults / provided flags (default intent: `agent`).
+
+*Subcommands:*
+- `kin setup status [--json]`: probe and show what's installed (the health checklist).
+- `kin setup doctor [--fix]` (or top-level `kin doctor [--fix]`): run health checks and
+  optionally apply safe repairs.
+
+### 2. Initialize a repository
 
 Build a semantic graph over your codebase:
 
@@ -81,7 +113,7 @@ kin init
 - `--git-history <off|recent|full>`: Git history import depth (default: `recent`).
 - `--no-lsp`: Skip LSP enrichment for a faster, tree-sitter-only init.
 
-### 2. Add embeddings (enables semantic search)
+### 3. Add embeddings (enables semantic search)
 
 `kin init` builds the graph instantly without embeddings. Run `kin embed` to add the
 vector index that powers semantic search and `kin locate`:
@@ -94,22 +126,23 @@ Embeddings are generated locally with `nomic-embed-text-v1.5` (768 dimensions; o
 via `KIN_EMBED_MODEL_ID`). `kin status --json` reports embedding coverage under its
 `enrichment` block (`embeddingsIndexed` / `embeddingsPending` / `embeddingsTotal`).
 
-### 3. Configure your system and shell
+### 4. Verify
 
-Run the setup wizard, or run health checks at any time:
+Run the health checklist any time — it probes real filesystem, daemon, and agent state:
 
 ```sh
-kin setup
+kin setup status
 ```
 
-*Options:*
-- `status`: Show what's installed.
-- `doctor`: Run a quick health check.
-- `--mode <native|compatibility>`: Repository operation mode.
-- `--shell <zsh|bash|powershell>`: Target shell for profile updates.
-- `--auto-daemon`: Auto-start `kin-daemon` when entering workspaces.
+Checks cover the `kin` and `kin-daemon` binaries, VFS projection (macOS/Linux; **n/a** on
+native Windows), shell integration, repository init, AI-client MCP config (the
+`agent-default` profile), editor extension, KinLab connect (**n/a** — coming soon), and
+semantic query readiness (**STALE** until you run `kin embed`). Failing checks print their
+own `fix:` line; `kin doctor --fix` applies the safe repairs. See
+[docs/quickstart.md](docs/quickstart.md#8-verify-your-setup-kin-setup-status) for the full
+check table and what to do for each state.
 
-### 4. Everyday commands
+### 5. Everyday commands
 
 - **Status of the working copy**:
   ```sh
@@ -145,14 +178,16 @@ kin setup
 ## MCP Server Integration
 
 Kin ships with a built-in MCP (Model Context Protocol) server that exposes semantic tools
-to AI assistants (Claude, Cursor, Gemini, Codex, etc.). It runs as a stdio server that the
-MCP client launches as a subprocess:
+to AI assistants (Claude, Cursor, Gemini, Codex, Windsurf, etc.). The **AI agents** intent
+in `kin setup` wires this up for every detected client automatically — there is nothing
+else to configure. The wizard writes a `kin` server entry running `kin mcp start --global`
+with `KIN_MCP_TOOL_PROFILE=agent-default` (the small curated tool surface).
 
-```sh
-kin mcp start
-```
-
-For the full tool surface, see [docs/mcp-tools.md](docs/mcp-tools.md).
+`kin mcp start` runs as a stdio server that the MCP client launches as a subprocess; you
+normally do not run it by hand. To wire up a client manually, use the npm wrapper
+(`@kinlab/kin-mcp`), or see the exact config and config-file locations, read the
+[Advanced configuration](docs/quickstart.md#9-advanced-configuration) section of the
+quickstart. For the full tool surface, see [docs/mcp-tools.md](docs/mcp-tools.md).
 
 ---
 

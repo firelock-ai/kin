@@ -12,6 +12,35 @@ daemon; `semantic_locate` returns an explicit error in offline/no-daemon mode.
 
 ---
 
+## Configuring the server
+
+The recommended way to expose these tools is the guided wizard: run `kin setup` and choose
+the **AI agents** intent. It writes Kin's MCP server entry into every detected client
+(Claude Code, Cursor, Codex CLI, Gemini CLI, Windsurf) with the curated tool profile, and
+adds a Kin-first discovery reminder to your agent instruction files. `kin setup status`
+then verifies each client config.
+
+The wizard writes this entry (and `KIN_MCP_TOOL_PROFILE=agent-default` is what selects the
+small curated surface below instead of the full internal one):
+
+```json
+{
+  "mcpServers": {
+    "kin": {
+      "command": "kin",
+      "args": ["mcp", "start", "--global"],
+      "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
+    }
+  }
+}
+```
+
+To wire a client up by hand, or to use the npm wrapper (`@kinlab/kin-mcp`, which defaults
+to the same `agent-default` profile), see
+[Advanced configuration](quickstart.md#9-advanced-configuration) in the quickstart.
+
+---
+
 ## 1. Retrieval & Codebase Exploration
 *Tools:* `semantic_search`, `semantic_locate`, `get_entity`, `get_entity_source`, `get_entity_body`, `get_context_pack`, `explore_codebase`, `graph_neighborhood`
 
