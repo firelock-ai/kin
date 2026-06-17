@@ -2373,8 +2373,33 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                             let budget_ms =
                                 locate_env_usize("KIN_LOCATE_RERANK_LATENCY_BUDGET_MS", 0) as u128;
                             if rerank_within_budget(elapsed_ms, budget_ms) {
-                                for (i, score) in scores.into_iter().enumerate() {
-                                    candidates[i].1 = score;
+                                // M1 (FIR-986/987): additive, promotion-only blend.
+                                // Legacy (default) OVERWRITES the fused score with the raw
+                                // cross-encoder logit and re-sorts purely by it — substitutive,
+                                // so it evicts multi-signal-corroborated golds whenever the
+                                // encoder prefers a single-signal filler. The blend squashes
+                                // each logit to (0,1), spread-normalizes, and ADDS a bounded
+                                // term so scores are monotonically non-decreasing (a gold can
+                                // only move up, never below its fused floor); confidence-gated
+                                // to skip flat distributions where the encoder isn't separating.
+                                if locate_env_bool("KIN_LOCATE_RERANK_BLEND", false) {
+                                    let sig: Vec<f32> =
+                                        scores.iter().map(|&l| 1.0 / (1.0 + (-l).exp())).collect();
+                                    let mn = sig.iter().copied().fold(f32::INFINITY, f32::min);
+                                    let mx = sig.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                                    let spread = mx - mn;
+                                    let w = locate_env_f32("KIN_LOCATE_RERANK_BLEND_WEIGHT", 0.04);
+                                    let min_spread =
+                                        locate_env_f32("KIN_LOCATE_RERANK_MIN_SPREAD", 0.10);
+                                    if spread >= min_spread {
+                                        for (i, s) in sig.iter().enumerate() {
+                                            candidates[i].1 += w * (s - mn) / spread.max(1e-6);
+                                        }
+                                    }
+                                } else {
+                                    for (i, s) in scores.iter().enumerate() {
+                                        candidates[i].1 = *s;
+                                    }
                                 }
                                 candidates.sort_by(|a, b| {
                                     b.1.partial_cmp(&a.1)
