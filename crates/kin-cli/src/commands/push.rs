@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{Context, Result};
-use kin_model::ChangeStore;
+use kin_model::{ChangeStore, Hash256, SemanticChange, SemanticChangeId};
 use serde::Deserialize;
 use serde_json::json;
 use std::process::Command;
@@ -67,6 +67,30 @@ fn ensure_native_publish_succeeded(payload: &str) -> Result<()> {
     }
 
     anyhow::bail!("native publish blocked: {}", detail);
+}
+
+fn parse_semantic_change_id(value: &str, label: &str) -> Result<SemanticChangeId> {
+    let hash = Hash256::from_hex(value)
+        .with_context(|| format!("{label} is not a valid semantic change id: {value}"))?;
+    Ok(SemanticChangeId::from_hash(hash))
+}
+
+fn collect_native_publish_changes<G>(
+    graph: &G,
+    previous_local_head: Option<&str>,
+    local_head: &str,
+) -> Result<Vec<SemanticChange>>
+where
+    G: ChangeStore,
+{
+    let base = match previous_local_head {
+        Some(previous) => parse_semantic_change_id(previous, "previous local head")?,
+        None => kin_core::build_genesis_change().id,
+    };
+    let head = parse_semantic_change_id(local_head, "local head")?;
+    graph
+        .get_changes_since(&base, &head)
+        .context("failed to collect semantic changes for native publish")
 }
 
 pub async fn run(remote_name: Option<String>) -> Result<()> {
@@ -164,38 +188,29 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
             );
         }
 
-        // Extract entity-level mutations from the change DAG for delta push.
+        // Extract full semantic changes for hosted materialization, plus the
+        // legacy entity-level mutation bridge for older control planes.
         let sync_state_store = kin_core::SyncStateStore::load(&layout);
-        let entity_mutations = {
+        let has_previous_sync = sync_state_store.get(&plan.remote.name).is_some();
+        let publish_changes = {
             let snap =
                 crate::backend::open_snapshot_explicit_admin_read_only(&layout, "kin push").await?;
             let graph = &*snap.graph();
-
-            if let Some(prev_state) = sync_state_store.get(&plan.remote.name) {
-                // Collect changes since last sync for delta push
-                let prev_head_hash = kin_model::Hash256::from_hex(&prev_state.local_head)
-                    .unwrap_or(kin_model::Hash256::from_bytes([0; 32]));
-                let prev_head = kin_model::SemanticChangeId(prev_head_hash);
-                let current_head_hash = kin_model::Hash256::from_hex(local_head)
-                    .unwrap_or(kin_model::Hash256::from_bytes([0; 32]));
-                let current_head = kin_model::SemanticChangeId(current_head_hash);
-
-                match graph.get_changes_since(&prev_head, &current_head) {
-                    Ok(changes) if !changes.is_empty() => {
-                        let mutations = kin_remote::delta_bridge::mutations_from_changes(&changes);
-                        println!(
-                            "  Delta push: {} entity mutation(s) from {} change(s) since last sync.",
-                            mutations.len(),
-                            changes.len()
-                        );
-                        Some(mutations)
-                    }
-                    _ => None,
-                }
-            } else {
-                None
+            let previous = sync_state_store
+                .get(&plan.remote.name)
+                .map(|state| state.local_head.as_str());
+            let changes = collect_native_publish_changes(graph, previous, local_head)?;
+            if !changes.is_empty() {
+                let mode = if previous.is_some() { "Delta" } else { "Full" };
+                println!(
+                    "  {} push: {} semantic change(s) for hosted materialization.",
+                    mode,
+                    changes.len()
+                );
             }
+            changes
         };
+        let entity_mutations = kin_remote::delta_bridge::mutations_from_changes(&publish_changes);
 
         let endpoint = target.remote_endpoint(&plan.remote.name);
         let actor = remote::default_cli_actor_id(&target.base_url);
@@ -221,10 +236,12 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
             "leaseFenceEpoch": lease.fence_epoch,
         });
 
-        if let Some(ref mutations) = entity_mutations {
-            if !mutations.is_empty() {
-                publish_body["entityMutations"] = json!(mutations);
-            }
+        if !publish_changes.is_empty() {
+            publish_body["semanticChanges"] = json!(&publish_changes);
+        }
+
+        if !entity_mutations.is_empty() {
+            publish_body["entityMutations"] = json!(entity_mutations);
         }
 
         let response = remote::attach_native_remote_auth(
@@ -248,11 +265,7 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
             eprintln!("warning: failed to save push sync state: {}", e);
         }
 
-        let mode = if entity_mutations.is_some() {
-            "delta"
-        } else {
-            "full"
-        };
+        let mode = if has_previous_sync { "delta" } else { "full" };
         println!(
             "Published semantic head {} to native Kin remote {} via {} (session {}, {} push).",
             local_head, plan.remote.name, endpoint, lease.session_id, mode
@@ -266,6 +279,59 @@ pub async fn run(remote_name: Option<String>) -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn change_with_parent(byte: u8, parents: Vec<SemanticChangeId>) -> SemanticChange {
+        SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([byte; 32])),
+            parents,
+            timestamp: kin_model::Timestamp::now(),
+            author: kin_model::AuthorId::new("test"),
+            message: format!("change {byte}"),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(kin_model::BranchName::new("main")),
+        }
+    }
+
+    #[test]
+    fn native_publish_first_push_collects_changes_since_genesis() {
+        let graph = kin_db::InMemoryGraph::new();
+        let genesis = kin_core::build_genesis_change();
+        graph.create_change(&genesis).unwrap();
+        let child = change_with_parent(0x42, vec![genesis.id]);
+        graph.create_change(&child).unwrap();
+
+        let changes = collect_native_publish_changes(&graph, None, &child.id.to_string()).unwrap();
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].id, child.id);
+    }
+
+    #[test]
+    fn native_publish_delta_collects_changes_since_previous_sync() {
+        let graph = kin_db::InMemoryGraph::new();
+        let genesis = kin_core::build_genesis_change();
+        graph.create_change(&genesis).unwrap();
+        let first = change_with_parent(0x42, vec![genesis.id]);
+        graph.create_change(&first).unwrap();
+        let second = change_with_parent(0x43, vec![first.id]);
+        graph.create_change(&second).unwrap();
+
+        let changes = collect_native_publish_changes(
+            &graph,
+            Some(&first.id.to_string()),
+            &second.id.to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].id, second.id);
+    }
 
     #[test]
     fn git_init_creates_repo_in_export_dir() {
