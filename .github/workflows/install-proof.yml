@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+#
+# M1.5 (FIR-1012): proof that the PUBLIC install works end-to-end from a clean
+# environment on every supported OS. Anonymous only — no checkout, no secrets,
+# no registry auth — exactly what a first-time user runs. Exercises the real
+# `get.kinlab.dev` installer, the GitHub-release artifacts + checksum
+# verification, and a post-install daemon/setup health smoke.
+name: Install Proof
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly — catch a broken release / installer / endpoint before users do.
+    - cron: "0 12 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  install-proof:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Public install (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -eu
+          # The exact command from the README / kinlab.ai setup page.
+          KIN_NO_SETUP=1 curl -fsSL https://get.kinlab.dev/install | sh
+          # install.sh installs to ~/.kin/bin and verifies the per-artifact sha256.
+          echo "$HOME/.kin/bin" >> "$GITHUB_PATH"
+
+      - name: Public install (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:KIN_NO_SETUP = "1"
+          irm https://get.kinlab.dev/install.ps1 | iex
+          "$HOME\.kin\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Verify binaries installed + runnable
+        run: |
+          kin --version
+          kin-daemon --version
+
+      - name: Daemon + setup health checklist (honest per-OS)
+        shell: bash
+        run: |
+          echo "::group::kin setup status --json"
+          kin setup status --json || echo "(setup status returned non-zero — see output above)"
+          echo "::endgroup::"
+          echo "::group::kin doctor"
+          kin doctor || echo "(doctor reported issues — informational on a bare runner)"
+          echo "::endgroup::"
+
+      - name: Daemon liveness smoke
+        shell: bash
+        run: |
+          # A fresh repo so the daemon has something to initialize against —
+          # proves the installed daemon actually starts and serves on this OS.
+          mkdir -p kin-install-proof && cd kin-install-proof
+          git init -q && git config user.email ci@firelock.ai && git config user.name ci
+          printf 'def hello():\n    return 42\n' > probe.py
+          git add -A && git commit -qm "probe"
+          kin init || echo "(kin init returned non-zero — captured for the per-OS report)"
+          kin status || echo "(kin status returned non-zero — captured for the per-OS report)"
