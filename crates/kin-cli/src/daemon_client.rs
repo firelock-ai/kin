@@ -1468,15 +1468,36 @@ fn open_daemon_log(kin_root: &Path) -> Result<File> {
         .with_context(|| format!("open daemon log at {}", daemon_log_path(kin_root).display()))
 }
 
-fn daemon_log_tail(kin_root: &Path) -> String {
+/// Byte length of the daemon log at the moment a new start attempt begins.
+/// Anything written at or after this offset belongs to the current attempt;
+/// anything before it is the stale tail of a prior run.
+fn daemon_log_len(kin_root: &Path) -> u64 {
+    std::fs::metadata(daemon_log_path(kin_root))
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+/// Render the daemon log output produced by the current start attempt only —
+/// the bytes written at or after `since_offset` (the log length captured just
+/// before the daemon was spawned). This avoids surfacing the stale tail of a
+/// prior run's log as if it were the cause of this failure. When the failing
+/// process wrote nothing, we say so explicitly rather than echoing old lines.
+fn daemon_log_tail_since(kin_root: &Path, since_offset: u64) -> String {
     let path = daemon_log_path(kin_root);
     let Ok(content) = std::fs::read_to_string(&path) else {
         return format!("daemon log unavailable at {}", path.display());
     };
-    let lines: Vec<&str> = content.lines().rev().take(20).collect();
-    if lines.is_empty() {
-        return format!("daemon log is empty at {}", path.display());
+    let fresh = content
+        .get(since_offset as usize..)
+        .unwrap_or(&content)
+        .trim();
+    if fresh.is_empty() {
+        return format!(
+            "no fresh daemon output captured for this start attempt at {}",
+            path.display()
+        );
     }
+    let lines: Vec<&str> = fresh.lines().rev().take(20).collect();
     lines.into_iter().rev().collect::<Vec<_>>().join("\n")
 }
 
@@ -1680,6 +1701,7 @@ async fn wait_for_daemon_ready(
     child: &mut Child,
     port: u16,
     deadline: Instant,
+    log_offset: u64,
 ) -> Result<String> {
     let timeout = deadline.saturating_duration_since(Instant::now());
     let client = daemon_health_client();
@@ -1690,7 +1712,7 @@ async fn wait_for_daemon_ready(
         if let Some(status) = child.try_wait().context("check daemon child status")? {
             bail!(
                 "daemon exited during startup with status {status}; recent log:\n{}",
-                daemon_log_tail(kin_root)
+                daemon_log_tail_since(kin_root, log_offset)
             );
         }
 
@@ -1737,7 +1759,7 @@ async fn wait_for_daemon_ready(
         "daemon failed to become ready within {:.1}s: {}; recent log:\n{}",
         timeout.as_secs_f64(),
         last_error,
-        daemon_log_tail(kin_root)
+        daemon_log_tail_since(kin_root, log_offset)
     )
 }
 
@@ -2191,6 +2213,7 @@ pub async fn ensure_daemon_running_with_idle_timeout(
         "--port",
         &port.to_string(),
     ]);
+    let log_offset = daemon_log_len(kin_root);
     let log = open_daemon_log(kin_root)?;
     let stderr = log
         .try_clone()
@@ -2220,7 +2243,7 @@ pub async fn ensure_daemon_running_with_idle_timeout(
 
     let timeout_secs = daemon_ready_timeout_secs();
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    let base_url = wait_for_daemon_ready(kin_root, &mut child, port, deadline).await?;
+    let base_url = wait_for_daemon_ready(kin_root, &mut child, port, deadline, log_offset).await?;
     register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url).await?;
     info!(port, "daemon is up and ready");
     Ok(base_url)
@@ -2308,6 +2331,43 @@ mod urlencoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_log_tail_since_omits_stale_prior_run_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = daemon_log_path(dir.path());
+        let stale = "ERROR 2026-06-09 embedding dimension mismatch: expected 384, got 768\n";
+        std::fs::write(&path, stale).unwrap();
+        let offset = daemon_log_len(dir.path());
+
+        // No fresh output written by the failing attempt -> explicit message,
+        // never the stale tail.
+        let tail = daemon_log_tail_since(dir.path(), offset);
+        assert!(
+            tail.contains("no fresh daemon output captured"),
+            "expected fresh-output notice, got: {tail}"
+        );
+        assert!(
+            !tail.contains("384, got 768"),
+            "stale prior-run line must not be surfaced: {tail}"
+        );
+
+        // Fresh output appended after the offset is the only thing surfaced.
+        std::fs::write(
+            &path,
+            format!("{stale}ERROR 2026-06-16 incompatible graph schema version\n"),
+        )
+        .unwrap();
+        let tail = daemon_log_tail_since(dir.path(), offset);
+        assert!(
+            tail.contains("incompatible graph schema version"),
+            "fresh line must be surfaced: {tail}"
+        );
+        assert!(
+            !tail.contains("384, got 768"),
+            "stale prior-run line must not be surfaced even when fresh output exists: {tail}"
+        );
+    }
 
     #[test]
     fn live_daemon_endpoint_returns_alive_pid_even_before_port_binds() {

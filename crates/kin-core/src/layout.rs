@@ -26,7 +26,11 @@ impl KinLayout {
 
     /// Discover the `.kin/` directory by walking up from `start`.
     ///
-    /// Returns `None` if no `.kin/` directory is found.
+    /// Returns `None` if no `.kin/` directory is found. The global home
+    /// `~/.kin` is the cross-repo registry/cache root, not a servable repo: it
+    /// holds `registry.toml` but never a `manifest.json`. Discovery skips it so
+    /// running outside any repo does not resolve to the home directory and spawn
+    /// a daemon that fails `resolve_repo_id` against a non-existent manifest.
     pub fn discover(start: &Path) -> Option<Self> {
         if std::env::var("KIN_DAEMON_URL").is_ok() {
             return Some(Self::new(start.join(".kin")));
@@ -34,7 +38,7 @@ impl KinLayout {
         let mut current = start.to_path_buf();
         loop {
             let candidate = current.join(".kin");
-            if candidate.is_dir() {
+            if candidate.is_dir() && !is_global_home_kin_dir(&candidate) {
                 return Some(Self::new(candidate));
             }
             if !current.pop() {
@@ -281,6 +285,33 @@ impl KinLayout {
     }
 }
 
+/// The global home Kin directory `~/.kin` — the cross-repo registry/cache root,
+/// not a servable repo. Returns `None` when no home directory is resolvable.
+pub fn global_home_kin_dir() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(".kin"))
+}
+
+/// Whether `candidate` is the global home `~/.kin` registry/cache root rather
+/// than a real repository. The home root holds `registry.toml` but never a
+/// `manifest.json`; a candidate that carries a manifest is a real repo even if
+/// it happens to live at `~/.kin`, so it is not treated as the home root.
+fn is_global_home_kin_dir(candidate: &Path) -> bool {
+    let Some(home_kin) = global_home_kin_dir() else {
+        return false;
+    };
+    if candidate != home_kin {
+        // Compare canonical forms too, so symlinked or non-normalized paths
+        // (e.g. a `/var` vs `/private/var` HOME on macOS) still match.
+        let canonical_candidate = candidate.canonicalize().ok();
+        let canonical_home = home_kin.canonicalize().ok();
+        match (canonical_candidate, canonical_home) {
+            (Some(a), Some(b)) if a == b => {}
+            _ => return false,
+        }
+    }
+    !candidate.join("manifest.json").exists()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +369,29 @@ mod tests {
     fn discover_returns_none_when_missing() {
         let dir = tempfile::tempdir().unwrap();
         assert!(KinLayout::discover(dir.path()).is_none());
+    }
+
+    #[test]
+    fn is_global_home_kin_dir_rejects_unrelated_and_repo_paths() {
+        // A normal repo `.kin` (carrying a manifest) is never the home root.
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir(&kin_dir).unwrap();
+        std::fs::write(kin_dir.join("manifest.json"), "{}").unwrap();
+        assert!(!is_global_home_kin_dir(&kin_dir));
+
+        // An unrelated `.kin` path that is not the home root is never the home
+        // root either, regardless of manifest presence.
+        let bare = dir.path().join("sub").join(".kin");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert!(!is_global_home_kin_dir(&bare));
+    }
+
+    #[test]
+    fn global_home_kin_dir_targets_home_dot_kin() {
+        if let Some(home_kin) = global_home_kin_dir() {
+            assert_eq!(home_kin.file_name().and_then(|n| n.to_str()), Some(".kin"));
+        }
     }
 
     fn empty_kin_layout() -> (tempfile::TempDir, KinLayout) {
