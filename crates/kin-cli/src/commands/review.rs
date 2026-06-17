@@ -542,6 +542,15 @@ fn create_review_with_graph(
         };
         graph.add_review_note(&note)?;
     }
+    crate::provenance::record_cli_audit_event(
+        graph,
+        "review.create",
+        None,
+        Some(format!(
+            "review_id={}; title={}; base={}; head={}",
+            review.review_id, title, base, head
+        )),
+    )?;
     Ok(ReviewExecution {
         response: ReviewResponse {
             text: format!(
@@ -598,6 +607,12 @@ fn decide_review_with_graph(
     };
 
     graph.add_review_decision(&rid, &decision)?;
+    crate::provenance::record_cli_audit_event(
+        graph,
+        "review.decide",
+        None,
+        Some(format!("review_id={}; decision={}", review_id, state)),
+    )?;
     Ok(ReviewExecution {
         response: ReviewResponse {
             text: format!("Recorded decision '{}' on review {}\n", state, review_id),
@@ -972,5 +987,68 @@ fn inline_comment_severity(kind: kin_review::InlineCommentKind) -> &'static str 
         | InlineCommentKind::Renamed
         | InlineCommentKind::AgentUnreviewed => "warning",
         InlineCommentKind::Added | InlineCommentKind::Removed => "info",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kin_model::ProvenanceStore;
+
+    #[test]
+    fn create_review_records_audit_event() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        create_review_with_graph(
+            &graph,
+            "Fix login".into(),
+            "main".into(),
+            "feature/login".into(),
+            Some("body edit".into()),
+        )
+        .unwrap();
+
+        let events = graph.query_audit_events(None, 10).unwrap();
+        assert_eq!(events.len(), 1, "review create must record one audit event");
+        assert_eq!(events[0].action, "review.create");
+        let details = events[0].details.as_deref().unwrap_or_default();
+        assert!(
+            details.contains("base=main") && details.contains("head=feature/login"),
+            "audit details should carry review refs: {details}"
+        );
+    }
+
+    #[test]
+    fn decide_review_records_audit_event() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        let execution = create_review_with_graph(
+            &graph,
+            "Fix login".into(),
+            "main".into(),
+            "feature/login".into(),
+            None,
+        )
+        .unwrap();
+        // Recover the review id from the create response text.
+        let review_id = execution
+            .response
+            .text
+            .lines()
+            .find_map(|line| line.strip_prefix("Created review "))
+            .map(|s| s.trim().to_string())
+            .expect("review id in create response");
+
+        decide_review_with_graph(&graph, review_id, "approved".into(), None).unwrap();
+
+        let events = graph.query_audit_events(None, 10).unwrap();
+        assert_eq!(
+            events.len(),
+            2,
+            "create + decide must each record an audit event"
+        );
+        // query_audit_events returns most-recent first.
+        assert_eq!(events[0].action, "review.decide");
+        assert_eq!(events[1].action, "review.create");
     }
 }
