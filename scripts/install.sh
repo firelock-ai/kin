@@ -83,14 +83,20 @@ if [ -n "${KIN_VERSION:-}" ]; then
     info "Version: $VERSION (pinned)"
 else
     info "Fetching latest version..."
+    # Resolve the latest tag via the `releases/latest` REDIRECT
+    # (Location -> .../releases/tag/vX.Y.Z) instead of api.github.com, whose
+    # 60-requests/hour ANONYMOUS rate limit is trivially hit from a shared,
+    # NAT'd, corporate, or CI IP and returns 403.
+    LATEST_URL="https://github.com/$GITHUB_ORG/$GITHUB_REPO/releases/latest"
     if has_cmd curl; then
-        VERSION=$(curl -fsSL "https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases/latest" | grep '"tag_name"' | sed 's/.*"v\(.*\)".*/\1/')
+        RESOLVED=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$LATEST_URL")
     elif has_cmd wget; then
-        VERSION=$(wget -qO- "https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases/latest" | grep '"tag_name"' | sed 's/.*"v\(.*\)".*/\1/')
+        RESOLVED=$(wget -q -S -O /dev/null "$LATEST_URL" 2>&1 | sed -n 's/.*[Ll]ocation: *//p' | tail -1)
     else
         err "Neither curl nor wget found. Install one and retry."
         exit 1
     fi
+    VERSION=$(printf '%s' "$RESOLVED" | sed -n 's#.*/releases/tag/v\([^/[:space:]]*\).*#\1#p')
 
     if [ -z "$VERSION" ]; then
         err "Could not determine latest version. Set KIN_VERSION manually."
