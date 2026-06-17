@@ -32,7 +32,20 @@ jobs:
           fetch-depth: 0
 
       - name: Check DCO sign-off
-        uses: christophebedard/dco-check@v1.2.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          missing=0
+          while IFS= read -r commit; do
+            body="$(git log -1 --format=%B "$commit")"
+            if ! grep -Eq '^Signed-off-by: .+ <[^>]+>$' <<<"$body"; then
+              echo "::error title=Missing DCO sign-off::Commit $commit is missing a Signed-off-by trailer"
+              missing=1
+            fi
+          done < <(git rev-list "${base}..${head}")
+          exit "$missing"
 
   check:
     name: Check & Test
