@@ -38,6 +38,33 @@ use kin_model::{
     ArtifactKind, Entity, EntityKind, OpaqueArtifact, ShallowTrackedFile, StructuredArtifact,
 };
 
+/// Parse a HuggingFace `config.json` into the target config type, dropping a
+/// serde-alias key whenever its canonical counterpart is also present. Some
+/// published configs (nomic-bert) ship both `layer_norm_eps` and
+/// `layer_norm_epsilon`, which `#[serde(alias)]` otherwise rejects as a
+/// duplicate field — so the parse must tolerate the canonical+alias pair.
+#[cfg(feature = "embeddings")]
+fn parse_model_config<T: serde::de::DeserializeOwned>(data: &str) -> serde_json::Result<T> {
+    let mut value: serde_json::Value = serde_json::from_str(data)?;
+    if let Some(obj) = value.as_object_mut() {
+        const ALIAS_PAIRS: &[(&str, &str)] = &[
+            ("hidden_size", "n_embd"),
+            ("num_hidden_layers", "n_layer"),
+            ("num_attention_heads", "n_head"),
+            ("intermediate_size", "n_inner"),
+            ("max_position_embeddings", "n_positions"),
+            ("layer_norm_eps", "layer_norm_epsilon"),
+            ("rope_theta", "rotary_emb_base"),
+        ];
+        for (canonical, alias) in ALIAS_PAIRS {
+            if obj.contains_key(*canonical) {
+                obj.remove(*alias);
+            }
+        }
+    }
+    serde_json::from_value(value)
+}
+
 /// Default HuggingFace model ID.
 ///
 /// The default nomic-embed-text-v1.5 keeps semantic search local while bringing
@@ -272,7 +299,7 @@ impl CodeEmbedder {
 
         let config_data = std::fs::read_to_string(&config_path)
             .map_err(|e| KinDbError::IndexError(format!("failed to read config: {e}")))?;
-        let config: BertConfig = serde_json::from_str(&config_data)
+        let config: BertConfig = parse_model_config(&config_data)
             .map_err(|e| KinDbError::IndexError(format!("failed to parse model config: {e}")))?;
 
         let dimensions = config.hidden_size;
@@ -1053,7 +1080,7 @@ impl BertEmbedder {
         };
 
         let built = if let Some(source) = source {
-            let config: BertConfig = serde_json::from_str(&source.config_json).map_err(|e| {
+            let config: BertConfig = parse_model_config(&source.config_json).map_err(|e| {
                 KinDbError::IndexError(format!("cpu twin config parse failed: {e}"))
             })?;
 
@@ -2675,6 +2702,20 @@ mod tests {
 
         let vectors = parse_openai_embedding_response(body, 2).unwrap();
         assert_eq!(vectors, vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn parse_model_config_tolerates_canonical_plus_alias() {
+        #[derive(serde::Deserialize)]
+        struct Cfg {
+            #[serde(alias = "layer_norm_epsilon")]
+            layer_norm_eps: f64,
+        }
+        let json = r#"{"layer_norm_eps":1e-12,"layer_norm_epsilon":1e-12}"#;
+        assert!(serde_json::from_str::<Cfg>(json).is_err());
+        let cfg: Cfg = parse_model_config(json).expect("tolerant parse drops the alias");
+        assert_eq!(cfg.layer_norm_eps, 1e-12);
     }
 
     #[cfg(feature = "embeddings")]

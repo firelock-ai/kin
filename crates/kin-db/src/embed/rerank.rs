@@ -38,7 +38,7 @@ impl CrossEncoder {
 
         let config_data = std::fs::read_to_string(&config_path)
             .map_err(|e| KinDbError::IndexError(format!("failed to read config: {e}")))?;
-        let config: BertConfig = serde_json::from_str(&config_data)
+        let config: BertConfig = super::parse_model_config(&config_data)
             .map_err(|e| KinDbError::IndexError(format!("failed to parse model config: {e}")))?;
 
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
