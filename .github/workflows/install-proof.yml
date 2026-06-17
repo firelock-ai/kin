@@ -30,8 +30,11 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           set -eu
-          # The exact command from the README / kinlab.ai setup page.
-          KIN_NO_SETUP=1 curl -fsSL https://get.kinlab.dev/install | sh
+          # CI/non-interactive install. NOTE the env var binds to `sh`, not
+          # `curl` — `KIN_NO_SETUP=1 curl … | sh` would set it only for curl and
+          # the piped script would never see it (it would then try the
+          # interactive setup against a non-controlling /dev/tty).
+          curl -fsSL https://get.kinlab.dev/install | KIN_NO_SETUP=1 sh
           # install.sh installs to ~/.kin/bin and verifies the per-artifact sha256.
           echo "$HOME/.kin/bin" >> "$GITHUB_PATH"
 
