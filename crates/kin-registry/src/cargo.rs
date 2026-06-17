@@ -217,8 +217,10 @@ fn authorize_publish(
 /// Validates the body (non-empty, size cap, valid gzip-tar whose embedded
 /// `Cargo.toml` `[package]` name/version match the query params), computes the
 /// SHA-256 checksum, stores the .crate file, and registers the version.
-/// Existing versions are immutable: re-publishing returns `409` rather than
-/// silently overwriting.
+/// Existing versions are immutable: re-publishing different bytes returns
+/// `409` before touching the stored blob. Re-publishing identical bytes is
+/// idempotent and may repair a missing or corrupted blob for the indexed
+/// checksum.
 async fn publish_crate(
     State(state): State<Arc<CargoRegistryState>>,
     Query(params): Query<PublishParams>,
@@ -277,20 +279,62 @@ async fn publish_crate(
     // Compute SHA-256 checksum of the .crate bytes
     let checksum = hex::encode(Sha256::digest(&body));
 
-    // Ensure blobs directory exists
-    if let Err(e) = std::fs::create_dir_all(&state.blobs_dir) {
+    let crate_path = state
+        .blobs_dir
+        .join(format!("{}-{}.crate", params.name, params.version));
+
+    let existing_versions = match state
+        .manifest_store
+        .get_versions(Ecosystem::Cargo, &params.name)
+    {
+        Ok(versions) => versions,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("{e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    if let Some(existing) = existing_versions
+        .iter()
+        .find(|version| version.version == params.version)
+    {
+        if existing.checksum != checksum {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "version {} of crate {} already exists with a different checksum",
+                        params.version, params.name
+                    )
+                })),
+            )
+                .into_response();
+        }
+
+        if let Err(e) = write_crate_blob(&state.blobs_dir, &crate_path, &body) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to write crate file: {e}") })),
+            )
+                .into_response();
+        }
+
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("failed to create blobs dir: {e}") })),
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "name": params.name,
+                "version": params.version,
+                "checksum": checksum,
+                "already_published": true,
+            })),
         )
             .into_response();
     }
 
-    // Write .crate file to blobs directory
-    let crate_path = state
-        .blobs_dir
-        .join(format!("{}-{}.crate", params.name, params.version));
-    if let Err(e) = std::fs::write(&crate_path, &body) {
+    if let Err(e) = write_crate_blob(&state.blobs_dir, &crate_path, &body) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("failed to write crate file: {e}") })),
@@ -328,26 +372,31 @@ async fn publish_crate(
             })),
         )
             .into_response(),
-        Err(crate::RegistryError::VersionExists(_, _)) => {
-            // Published versions are immutable. Refuse to overwrite an existing
-            // version so a republish cannot swap crate contents under consumers.
-            (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "version {} of crate {} already exists and cannot be overwritten",
-                        params.version, params.name
-                    )
-                })),
-            )
-                .into_response()
-        }
+        Err(crate::RegistryError::VersionExists(_, _)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "version {} of crate {} already exists and cannot be overwritten",
+                    params.version, params.name
+                )
+            })),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("{e}") })),
         )
             .into_response(),
     }
+}
+
+fn write_crate_blob(
+    blobs_dir: &std::path::Path,
+    crate_path: &std::path::Path,
+    body: &[u8],
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(blobs_dir)?;
+    std::fs::write(crate_path, body)
 }
 
 /// Verify an uploaded `.crate` blob is a well-formed gzip-tar whose embedded
@@ -953,29 +1002,22 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
     }
 
     #[tokio::test]
-    async fn republishing_existing_version_conflicts() {
-        // (d) Re-publishing the same version -> 409 (immutable, no overwrite).
+    async fn republishing_existing_version_is_idempotent_for_same_checksum() {
+        // (d) Re-publishing the same version with identical bytes repairs the
+        // blob if needed, without adding another index entry.
         let (_root, state) = registry_state_with_token(Some("s3cret"));
+        let body = valid_crate("demo", "0.1.0");
 
-        let first = publish(
-            state.clone(),
-            "demo",
-            "0.1.0",
-            Some("s3cret"),
-            valid_crate("demo", "0.1.0"),
-        )
-        .await;
+        let first = publish(state.clone(), "demo", "0.1.0", Some("s3cret"), body.clone()).await;
         assert_eq!(first, StatusCode::OK);
 
-        let second = publish(
-            state.clone(),
-            "demo",
-            "0.1.0",
-            Some("s3cret"),
-            valid_crate("demo", "0.1.0"),
-        )
-        .await;
-        assert_eq!(second, StatusCode::CONFLICT);
+        let blob_path = state.blobs_dir.join("demo-0.1.0.crate");
+        assert_eq!(std::fs::read(&blob_path).unwrap(), body);
+        std::fs::remove_file(&blob_path).unwrap();
+
+        let second = publish(state.clone(), "demo", "0.1.0", Some("s3cret"), body.clone()).await;
+        assert_eq!(second, StatusCode::OK);
+        assert_eq!(std::fs::read(&blob_path).unwrap(), body);
 
         // The original version must still be intact (a single entry).
         let versions = state
@@ -983,6 +1025,37 @@ kin-blobs = { version = "0.1.0", registry = "kin", features = ["schema"] }
             .get_versions(Ecosystem::Cargo, "demo")
             .unwrap();
         assert_eq!(versions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn republishing_existing_version_with_different_checksum_does_not_overwrite_blob() {
+        let (_root, state) = registry_state_with_token(Some("s3cret"));
+        let original = valid_crate("demo", "0.1.0");
+        let modified = build_test_crate(
+            "demo",
+            "0.1.0",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\ndescription = \"different bytes\"\n",
+        );
+        assert_ne!(
+            hex::encode(Sha256::digest(&original)),
+            hex::encode(Sha256::digest(&modified))
+        );
+
+        let first = publish(
+            state.clone(),
+            "demo",
+            "0.1.0",
+            Some("s3cret"),
+            original.clone(),
+        )
+        .await;
+        assert_eq!(first, StatusCode::OK);
+
+        let second = publish(state.clone(), "demo", "0.1.0", Some("s3cret"), modified).await;
+        assert_eq!(second, StatusCode::CONFLICT);
+
+        let blob_path = state.blobs_dir.join("demo-0.1.0.crate");
+        assert_eq!(std::fs::read(blob_path).unwrap(), original);
     }
 
     #[tokio::test]
