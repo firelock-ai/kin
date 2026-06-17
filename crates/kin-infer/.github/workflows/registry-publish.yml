@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+# Registry safety net + idempotent auto-publish.
+#
+# registry_smoke: builds the crate against the PUBLISHED Kin registry only —
+# .cargo/config.toml is replaced with one carrying ONLY the registry alias, no
+# [patch.*] redirects. This guards against a future local-checkout patch
+# masking a crate that cannot resolve/build from the published registry (the
+# version-skew failure this workflow exists to prevent). Runs on PRs and main.
+#
+# registry_publish: on a push to main, packages the crate and POSTs it to the
+# registry. The version is read from Cargo.toml (cargo metadata), so a
+# version-bump merge auto-publishes without a git tag. A 409 (already
+# published) is treated as success, so re-running on an unchanged version is a
+# no-op. It only runs after registry_smoke passes.
+
+name: Registry Publish
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  registry_smoke:
+    name: Registry-only build (no local patches)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Write registry-only .cargo/config.toml
+        # Carry ONLY the registry alias — no [patch.*] redirects — so the build
+        # must resolve every dependency from the published registry / crates.io.
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [registries.kin]
+          index = "sparse+https://kinlab.ai/registry/cargo/"
+          EOF
+          echo "Registry-only .cargo/config.toml:"
+          cat .cargo/config.toml
+
+      - name: Build from registry
+        run: cargo build
+
+  registry_publish:
+    name: Publish crate to KinLab registry
+    needs: registry_smoke
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Publish kin-infer
+        run: bash ./scripts/publish-kinlab-crates.sh
+        env:
+          KINLAB_CARGO_REGISTRY_URL: ${{ vars.KINLAB_CARGO_REGISTRY_URL }}
+          KINLAB_CARGO_TOKEN: ${{ secrets.KINLAB_CARGO_TOKEN }}
