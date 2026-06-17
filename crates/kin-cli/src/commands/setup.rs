@@ -442,6 +442,77 @@ pub struct WizardOptions {
     pub shell: Option<String>,
     pub auto_daemon: bool,
     pub no_interactive: bool,
+    /// First-run intent, when provided non-interactively (or to preselect the
+    /// interactive menu): one of `local`, `agent`, `editor`, `hosted`,
+    /// `advanced`. When absent, interactive runs ask and non-interactive runs
+    /// default to `agent` (the smallest path to value).
+    pub intent: Option<String>,
+}
+
+/// First-run intent — what the user wants out of Kin. Each intent maps to a
+/// [`SetupPlan`] of concrete actions; the wizard asks for the intent rather
+/// than a bag of independent toggles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupIntent {
+    /// CLI development on this machine: shell hook + auto-daemon, no MCP config.
+    LocalOnly,
+    /// The agent wedge: write the agent-default MCP config to detected AI
+    /// clients + auto-daemon. The smallest path to value.
+    AgentOnly,
+    /// Local-only plus a pointer to the kin-editor VS Code extension.
+    Editor,
+    /// Hosted / KinLab — not yet a first-run flow (honest gap).
+    Hosted,
+    /// Expose the granular toggles (shell, per-client MCP, daemon).
+    Advanced,
+}
+
+impl SetupIntent {
+    fn from_flag(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "local" | "local-only" | "cli" => Some(Self::LocalOnly),
+            "agent" | "agent-only" | "mcp" => Some(Self::AgentOnly),
+            "editor" | "vscode" => Some(Self::Editor),
+            "hosted" | "kinlab" | "cloud" => Some(Self::Hosted),
+            "advanced" | "manual" => Some(Self::Advanced),
+            _ => None,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::LocalOnly => "Local-only (CLI development)",
+            Self::AgentOnly => "AI agents (the wedge)",
+            Self::Editor => "Editor (VS Code + kin-editor)",
+            Self::Hosted => "Hosted / KinLab (coming soon)",
+            Self::Advanced => "Advanced / manual (all toggles)",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::LocalOnly => "shell integration + auto-daemon; no AI client config",
+            Self::AgentOnly => "configure Kin's MCP server for detected AI clients + auto-daemon",
+            Self::Editor => "local-only, plus how to install the kin-editor extension",
+            Self::Hosted => "connect to a KinLab workspace (no first-run flow yet)",
+            Self::Advanced => "choose shell, per-client MCP, and daemon options yourself",
+        }
+    }
+}
+
+/// The full setup model an intent maps to. Every interactive and
+/// non-interactive path produces one of these and then applies it, so behaviour
+/// stays identical regardless of how the answers were collected.
+struct SetupPlan {
+    install_shell_hook: bool,
+    configure_mcp: bool,
+    /// Which detected AI clients to configure (indices into
+    /// [`detect_ai_assistants`]). Empty unless `configure_mcp` is true.
+    mcp_assistant_indices: Vec<usize>,
+    inject_discovery_reminders: bool,
+    auto_daemon: bool,
+    show_editor_hint: bool,
+    show_hosted_hint: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -962,40 +1033,166 @@ fn write_auto_daemon_config(enabled: bool) -> Result<()> {
 pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     let interactive = !opts.no_interactive && is_tty();
 
-    // Step 1: Welcome
     println!();
-    println!("Welcome to Kin setup. Let's configure your environment.");
+    println!("Welcome to Kin setup. Let's get you to value in a few questions.");
     println!();
 
-    // Step 2: Shell detection + hook install
+    let assistants = detect_ai_assistants();
+    let intent = resolve_intent(&opts, interactive);
+
+    println!();
+    println!(
+        "Plan: {} — {}",
+        style(intent.title()).bold(),
+        intent.description()
+    );
+    println!();
+
     let shell_name = opts.shell.as_deref().unwrap_or_else(|| detect_shell());
+    let plan = build_plan(intent, &opts, &assistants, shell_name, interactive)?;
 
-    println!("Detected shell: {shell_name}");
-    let install_shell = prompt_yn(
+    let configured_assistants = apply_plan(&plan, &assistants, shell_name).await?;
+
+    print_intent_followups(&plan);
+
+    // The final checklist is the real first-run health engine — not a parallel
+    // set of hardcoded probes. Every line below reflects probed state.
+    println!();
+    println!("=== Health checklist ===");
+    println!();
+    let report = crate::commands::health::run_health_checks().await;
+    print_human_report(&report);
+
+    print_next_steps(intent, plan.install_shell_hook, &configured_assistants);
+
+    Ok(())
+}
+
+/// Decide the first-run intent: explicit flag, else interactive menu, else the
+/// non-interactive default (`AgentOnly`, the smallest path to value).
+fn resolve_intent(opts: &WizardOptions, interactive: bool) -> SetupIntent {
+    if let Some(flag) = opts.intent.as_deref() {
+        if let Some(intent) = SetupIntent::from_flag(flag) {
+            return intent;
+        }
+        println!(
+            "  {} unrecognized --intent '{}'; falling back to a prompt/default",
+            style("!").yellow(),
+            flag
+        );
+    }
+
+    if !interactive {
+        return SetupIntent::AgentOnly;
+    }
+
+    let intents = [
+        SetupIntent::AgentOnly,
+        SetupIntent::LocalOnly,
+        SetupIntent::Editor,
+        SetupIntent::Hosted,
+        SetupIntent::Advanced,
+    ];
+    let items: Vec<String> = intents
+        .iter()
+        .map(|i| format!("{:<34} {}", i.title(), i.description()))
+        .collect();
+
+    println!("What do you want Kin for?");
+    match dialoguer::Select::new().items(&items).default(0).interact() {
+        Ok(idx) => intents[idx],
+        Err(_) => SetupIntent::AgentOnly,
+    }
+}
+
+/// Map an intent to the concrete [`SetupPlan`]. The Advanced intent re-exposes
+/// the granular toggles; the rest apply opinionated, platform-safe defaults.
+fn build_plan(
+    intent: SetupIntent,
+    opts: &WizardOptions,
+    assistants: &[AiAssistant],
+    shell_name: &str,
+    interactive: bool,
+) -> Result<SetupPlan> {
+    let all_detected: Vec<usize> = assistants
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.detected)
+        .map(|(i, _)| i)
+        .collect();
+
+    let plan = match intent {
+        SetupIntent::LocalOnly => SetupPlan {
+            install_shell_hook: true,
+            configure_mcp: false,
+            mcp_assistant_indices: Vec::new(),
+            inject_discovery_reminders: false,
+            auto_daemon: true,
+            show_editor_hint: false,
+            show_hosted_hint: false,
+        },
+        SetupIntent::AgentOnly => SetupPlan {
+            install_shell_hook: true,
+            configure_mcp: true,
+            mcp_assistant_indices: all_detected,
+            inject_discovery_reminders: true,
+            auto_daemon: true,
+            show_editor_hint: false,
+            show_hosted_hint: false,
+        },
+        SetupIntent::Editor => SetupPlan {
+            install_shell_hook: true,
+            configure_mcp: false,
+            mcp_assistant_indices: Vec::new(),
+            inject_discovery_reminders: false,
+            auto_daemon: true,
+            show_editor_hint: true,
+            show_hosted_hint: false,
+        },
+        SetupIntent::Hosted => SetupPlan {
+            install_shell_hook: true,
+            configure_mcp: false,
+            mcp_assistant_indices: Vec::new(),
+            inject_discovery_reminders: false,
+            auto_daemon: true,
+            show_editor_hint: false,
+            show_hosted_hint: true,
+        },
+        SetupIntent::Advanced => {
+            build_advanced_plan(opts, assistants, shell_name, interactive, &all_detected)
+        }
+    };
+
+    // The `--auto-daemon` flag and `--shell` are honored across every intent so
+    // scripts can still steer behaviour without selecting Advanced.
+    Ok(SetupPlan {
+        auto_daemon: plan.auto_daemon || opts.auto_daemon,
+        ..plan
+    })
+}
+
+/// Granular toggles for the Advanced intent. Non-interactive Advanced reuses the
+/// same defaults as the other intents (shell on, all detected clients, daemon
+/// on) so scripted Advanced is predictable.
+fn build_advanced_plan(
+    opts: &WizardOptions,
+    assistants: &[AiAssistant],
+    shell_name: &str,
+    interactive: bool,
+    all_detected: &[usize],
+) -> SetupPlan {
+    let install_shell_hook = prompt_yn(
         &format!(
             "Install shell integration to {}?",
-            shell_rc(shell_name)?.display()
+            shell_rc(shell_name)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| shell_name.to_string())
         ),
         true,
         interactive,
     );
 
-    if install_shell {
-        install_shell_hook(shell_name)?;
-        println!("  Shell integration installed.");
-    } else {
-        println!("  Skipped shell integration.");
-    }
-    println!();
-
-    // Step 4: AI Assistants — MCP auto-configuration
-    println!("AI Assistants (MCP configuration):");
-    println!();
-
-    let assistants = detect_ai_assistants();
-    let mut configured_assistants: Vec<(String, Option<PathBuf>)> = Vec::new();
-
-    if interactive {
+    let mcp_assistant_indices = if interactive {
         let items: Vec<String> = assistants
             .iter()
             .map(|a| {
@@ -1007,148 +1204,17 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
                 format!("{:<14} [{}]", a.name, status)
             })
             .collect();
-
-        // Default: select all detected assistants
         let defaults: Vec<bool> = assistants.iter().map(|a| a.detected).collect();
-
-        let selections = MultiSelect::new()
+        println!("Configure Kin's MCP server for which AI clients?");
+        MultiSelect::new()
             .items(&items)
             .defaults(&defaults)
             .interact()
-            .unwrap_or_else(|_| {
-                // Fallback: select all detected
-                assistants
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, a)| a.detected)
-                    .map(|(i, _)| i)
-                    .collect()
-            });
-
-        for idx in &selections {
-            let a = &assistants[*idx];
-            let result = match *idx {
-                IDX_CLAUDE_CODE => configure_claude_code(),
-                IDX_CURSOR => configure_cursor(),
-                IDX_CODEX => configure_codex(),
-                IDX_GEMINI => configure_gemini_cli(),
-                IDX_WINDSURF => configure_windsurf(),
-                _ => continue,
-            };
-            match result {
-                Ok(path) => configured_assistants.push((a.name.to_string(), Some(path))),
-                Err(e) => {
-                    println!(
-                        "  {} {} configuration failed: {e}",
-                        style("✗").red(),
-                        a.name
-                    );
-                    configured_assistants.push((a.name.to_string(), None));
-                }
-            }
-        }
-
-        // Report on non-selected but not-detected assistants
-        for (i, a) in assistants.iter().enumerate() {
-            if !selections.contains(&i) && !a.detected {
-                println!(
-                    "  {} {} not detected — {}",
-                    style("→").cyan(),
-                    a.name,
-                    a.install_hint
-                );
-            }
-        }
+            .unwrap_or_else(|_| all_detected.to_vec())
     } else {
-        // Non-interactive: auto-configure all detected assistants
-        for (i, a) in assistants.iter().enumerate() {
-            if a.detected {
-                let result = match i {
-                    IDX_CLAUDE_CODE => configure_claude_code(),
-                    IDX_CURSOR => configure_cursor(),
-                    IDX_CODEX => configure_codex(),
-                    IDX_GEMINI => configure_gemini_cli(),
-                    IDX_WINDSURF => configure_windsurf(),
-                    _ => continue,
-                };
-                match result {
-                    Ok(path) => configured_assistants.push((a.name.to_string(), Some(path))),
-                    Err(e) => {
-                        println!(
-                            "  {} {} configuration failed: {e}",
-                            style("✗").red(),
-                            a.name,
-                        );
-                        configured_assistants.push((a.name.to_string(), None));
-                    }
-                }
-            } else {
-                println!(
-                    "  {} {} not detected — {}",
-                    style("→").cyan(),
-                    a.name,
-                    a.install_hint
-                );
-            }
-        }
-    }
+        all_detected.to_vec()
+    };
 
-    for (name, path) in &configured_assistants {
-        if let Some(p) = path {
-            println!(
-                "  {} {} configured (wrote {})",
-                style("✓").green(),
-                name,
-                p.display()
-            );
-        }
-    }
-    println!();
-
-    // Step 4b: Inject discovery reminders into agent instruction files.
-    //
-    // Claude Code reads ~/.claude/CLAUDE.md; Codex CLI reads ~/.codex/AGENTS.md.
-    // We append a non-blocking reminder that steers agents toward Kin-native
-    // discovery tools (semantic_locate, get_context_pack, trace_data_flow)
-    // before grep/read loops.  Idempotent — skipped if the marker is present.
-    println!("Agent discovery reminders:");
-    println!();
-    {
-        let home = home_dir()?;
-
-        // Claude Code reminder
-        let claude_reminder_path = home.join(".claude").join("CLAUDE.md");
-        match inject_discovery_reminder(&claude_reminder_path) {
-            Ok(()) => println!(
-                "  {} Claude Code discovery reminder written ({})",
-                style("✓").green(),
-                claude_reminder_path.display()
-            ),
-            Err(e) => println!("  {} Claude Code reminder failed: {e}", style("!").yellow()),
-        }
-
-        // Codex CLI reminder
-        let codex_reminder_path = home.join(".codex").join("AGENTS.md");
-        match inject_discovery_reminder(&codex_reminder_path) {
-            Ok(()) => println!(
-                "  {} Codex CLI discovery reminder written ({})",
-                style("✓").green(),
-                codex_reminder_path.display()
-            ),
-            Err(e) => println!("  {} Codex CLI reminder failed: {e}", style("!").yellow()),
-        }
-    }
-    println!();
-
-    // Step 5: Active Kin surfaces
-    println!("Active Kin surfaces:");
-    println!();
-    println!("  kin-vfs    -- transparent filesystem projection for native mode");
-    println!("  kin-mcp    -- bundled MCP server (run `kin mcp start`)");
-    println!("  kin-editor -- lightweight VS Code extension surface");
-    println!();
-
-    // Step 6: Daemon configuration
     let auto_daemon = if opts.auto_daemon {
         true
     } else {
@@ -1158,139 +1224,238 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
             interactive,
         )
     };
-    write_auto_daemon_config(auto_daemon)?;
-    println!(
-        "  Daemon auto-start: {}",
-        if auto_daemon { "enabled" } else { "disabled" }
-    );
+
+    let configure_mcp = !mcp_assistant_indices.is_empty();
+    SetupPlan {
+        install_shell_hook,
+        configure_mcp,
+        mcp_assistant_indices,
+        inject_discovery_reminders: configure_mcp,
+        auto_daemon,
+        show_editor_hint: false,
+        show_hosted_hint: false,
+    }
+}
+
+/// Apply a [`SetupPlan`]: install the shell hook, write MCP configs, inject
+/// discovery reminders, and persist the daemon config. Existing config is
+/// detected and the user is told what changes before it is touched.
+async fn apply_plan(
+    plan: &SetupPlan,
+    assistants: &[AiAssistant],
+    shell_name: &str,
+) -> Result<Vec<(String, Option<PathBuf>)>> {
+    // Shell integration.
+    if plan.install_shell_hook {
+        let rc_path = shell_rc(shell_name)?;
+        let already = rc_path.exists()
+            && std::fs::read_to_string(&rc_path)
+                .map(|c| c.contains("kin-vfs"))
+                .unwrap_or(false);
+        if already {
+            println!(
+                "Shell integration: {} already sources the kin-vfs hook — refreshing the hook file in place, leaving your rc untouched.",
+                rc_path.display()
+            );
+        } else {
+            println!(
+                "Shell integration: adding one `source` line to {}.",
+                rc_path.display()
+            );
+        }
+        install_shell_hook(shell_name)?;
+        if cfg!(target_os = "windows") {
+            println!(
+                "  {} On Windows the VFS shim/ProjFS is an optional feature and is not \
+                 shell-auto-injected — the PowerShell hook only manages env state.",
+                style("!").yellow()
+            );
+        }
+        println!("  Shell integration installed.");
+    } else {
+        println!("Shell integration: skipped.");
+    }
     println!();
 
-    // Step 7: Verify installation
-    println!("Verifying installation...");
-
-    let kin_home = kin_dir()?;
-
-    // kin binary
-    println!(
-        "  {} kin binary working (v{})",
-        style("✓").green(),
-        env!("CARGO_PKG_VERSION")
-    );
-
-    // Shell hook
-    let hook_path = kin_home.join("shell").join(hook_filename(shell_name));
-    if install_shell && hook_path.exists() {
-        println!("  {} Shell hook installed", style("✓").green());
-    } else if install_shell {
-        println!(
-            "  {} Shell hook not found at {}",
-            style("✗").red(),
-            hook_path.display()
-        );
-    } else {
-        println!("  {} Shell hook skipped", style("!").yellow());
-    }
-
-    // VFS shim
-    let shim_path = kin_home.join("lib").join(shim_filename());
-    if shim_path.exists() {
-        println!("  {} VFS shim found", style("✓").green());
-    } else {
-        println!(
-            "  {} VFS shim not found (build with: cargo build --release -p kin-vfs-shim)",
-            style("!").yellow()
-        );
-    }
-
-    // AI assistant MCP configs
-    for (name, path) in &configured_assistants {
-        if let Some(p) = path {
-            if has_kin_mcp_config(p) {
-                println!("  {} {} MCP configured", style("✓").green(), name);
-            } else {
-                println!(
-                    "  {} {} MCP config written but verification failed",
-                    style("!").yellow(),
-                    name
-                );
+    // AI client MCP configuration.
+    let mut configured_assistants: Vec<(String, Option<PathBuf>)> = Vec::new();
+    if plan.configure_mcp {
+        println!("AI client MCP configuration:");
+        for idx in &plan.mcp_assistant_indices {
+            let Some(a) = assistants.get(*idx) else {
+                continue;
+            };
+            let existing_path = mcp_config_path_for_index(*idx);
+            if let Some(p) = &existing_path {
+                if has_kin_mcp_config(p) {
+                    println!(
+                        "  {} {} already has a kin MCP entry at {} — re-merging to the agent-default profile (other servers untouched).",
+                        style("→").cyan(),
+                        a.name,
+                        p.display()
+                    );
+                } else if p.exists() {
+                    println!(
+                        "  {} {} has a config at {} — merging the kin server entry in (other servers untouched).",
+                        style("→").cyan(),
+                        a.name,
+                        p.display()
+                    );
+                }
+            }
+            let result = configure_assistant_by_index(*idx);
+            match result {
+                Some(Ok(path)) => {
+                    println!(
+                        "  {} {} configured ({})",
+                        style("✓").green(),
+                        a.name,
+                        path.display()
+                    );
+                    configured_assistants.push((a.name.to_string(), Some(path)));
+                }
+                Some(Err(e)) => {
+                    println!(
+                        "  {} {} configuration failed: {e}",
+                        style("✗").red(),
+                        a.name
+                    );
+                    configured_assistants.push((a.name.to_string(), None));
+                }
+                None => {}
             }
         }
-    }
-
-    // kin-vfs daemon
-    if check_binary_in_path("kin-vfs").is_some() {
-        println!("  {} kin-vfs daemon in PATH", style("✓").green());
-    } else {
-        println!(
-            "  {} kin-vfs daemon not in PATH (native mode requires kin-vfs)",
-            style("!").yellow()
-        );
-    }
-
-    // kin-daemon connectivity
-    let daemon_url = if let Some(layout) =
-        kin_core::KinLayout::discover(&std::env::current_dir().unwrap_or_default())
-    {
-        crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await
-    } else {
-        None
-    };
-    if let Some(daemon_url) = daemon_url {
-        println!(
-            "  {} kin-daemon supervisor route reachable ({daemon_url})",
-            style("✓").green()
-        );
-    } else {
-        println!(
-            "  {} kin-daemon not supervisor-routed (will auto-start on next command)",
-            style("!").yellow()
-        );
-    }
-
-    println!();
-
-    // Step 8: Summary
-    println!("=== Setup complete ===");
-    println!();
-    println!(
-        "  Shell integration: {}",
-        if install_shell {
-            "installed"
-        } else {
-            "skipped"
+        for a in assistants.iter().filter(|a| !a.detected) {
+            println!(
+                "  {} {} not detected — {}",
+                style("→").cyan(),
+                a.name,
+                a.install_hint
+            );
         }
-    );
-    println!(
-        "  Daemon auto-start: {}",
-        if auto_daemon { "yes" } else { "no" }
-    );
-    for (name, path) in &configured_assistants {
-        let status = if path.is_some() {
-            "configured"
-        } else {
-            "failed"
-        };
-        println!("  {:<19}{}", format!("{}:", name), status);
-    }
-    println!();
-
-    if install_shell {
-        println!("Open a new shell session to load the shell hook.");
         println!();
     }
 
+    // Agent discovery reminders.
+    if plan.inject_discovery_reminders {
+        println!("Agent discovery reminders:");
+        let home = home_dir()?;
+        for (label, path) in [
+            ("Claude Code", home.join(".claude").join("CLAUDE.md")),
+            ("Codex CLI", home.join(".codex").join("AGENTS.md")),
+        ] {
+            match inject_discovery_reminder(&path) {
+                Ok(()) => println!(
+                    "  {} {label} discovery reminder ensured ({})",
+                    style("✓").green(),
+                    path.display()
+                ),
+                Err(e) => println!("  {} {label} reminder failed: {e}", style("!").yellow()),
+            }
+        }
+        println!();
+    }
+
+    // Daemon auto-start config.
+    write_auto_daemon_config(plan.auto_daemon)?;
+    println!(
+        "Daemon auto-start: {}.",
+        if plan.auto_daemon {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+
+    Ok(configured_assistants)
+}
+
+/// The MCP config path an assistant index writes to, if any.
+fn mcp_config_path_for_index(idx: usize) -> Option<PathBuf> {
+    let home = home_dir().ok()?;
+    match idx {
+        IDX_CLAUDE_CODE => {
+            let primary = home.join(".claude.json");
+            let alt = home.join(".claude").join("config.json");
+            Some(if alt.exists() && !primary.exists() {
+                alt
+            } else {
+                primary
+            })
+        }
+        IDX_CURSOR => Some(home.join(".cursor").join("mcp.json")),
+        IDX_CODEX => Some(home.join(".codex").join("mcp.json")),
+        IDX_GEMINI => Some(home.join(".gemini").join("settings.json")),
+        IDX_WINDSURF => Some(
+            home.join(".codeium")
+                .join("windsurf")
+                .join("mcp_config.json"),
+        ),
+        _ => None,
+    }
+}
+
+/// Run the matching `configure_*` for an assistant index.
+fn configure_assistant_by_index(idx: usize) -> Option<Result<PathBuf>> {
+    match idx {
+        IDX_CLAUDE_CODE => Some(configure_claude_code()),
+        IDX_CURSOR => Some(configure_cursor()),
+        IDX_CODEX => Some(configure_codex()),
+        IDX_GEMINI => Some(configure_gemini_cli()),
+        IDX_WINDSURF => Some(configure_windsurf()),
+        _ => None,
+    }
+}
+
+/// Intent-specific guidance shown before the health checklist, driven by the
+/// applied [`SetupPlan`].
+fn print_intent_followups(plan: &SetupPlan) {
+    if plan.show_editor_hint {
+        println!();
+        println!("Editor extension:");
+        println!(
+            "  {} Install the kin-editor VS Code extension for the entity explorer,",
+            style("→").cyan()
+        );
+        println!("    semantic search, and trace surfaces. See the kin-editor README.");
+    }
+    if plan.show_hosted_hint {
+        println!();
+        println!("Hosted / KinLab:");
+        println!(
+            "  {} Hosted connect is not a first-run flow yet. There is no public",
+            style("!").yellow()
+        );
+        println!("    `kin login`/connect command shipped. This is coming soon —");
+        println!("    your local setup above is fully functional in the meantime.");
+    }
+}
+
+/// Closing next-steps block, tailored to the chosen intent.
+fn print_next_steps(
+    intent: SetupIntent,
+    installed_shell: bool,
+    configured_assistants: &[(String, Option<PathBuf>)],
+) {
+    println!();
+    if installed_shell {
+        println!("Open a new shell session to load the shell hook.");
+        println!();
+    }
     println!("Next steps:");
     println!("  kin init             -- initialize a Kin repository in the current directory");
     println!("  kin setup status     -- show what's installed");
-    println!("  kin setup doctor     -- run health checks");
-    println!();
-    println!("Try this next prompt in your AI agent:");
-    println!();
-    println!("  Use Kin to explore this codebase: run semantic_locate to find the");
-    println!("  main entry point, then get_context_pack on that file.");
-    println!();
+    println!("  kin setup doctor     -- run health checks (use --fix to repair)");
 
-    Ok(())
+    let configured_any = configured_assistants.iter().any(|(_, p)| p.is_some());
+    if matches!(intent, SetupIntent::AgentOnly | SetupIntent::Advanced) && configured_any {
+        println!();
+        println!("Try this next prompt in your AI agent:");
+        println!();
+        println!("  Use Kin to explore this codebase: run semantic_locate to find the");
+        println!("  main entry point, then get_context_pack on that file.");
+    }
+    println!();
 }
 
 // ---------------------------------------------------------------------------
@@ -1476,7 +1641,17 @@ fn cleanup_stale_daemons() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{BASH_HOOK, ZSH_HOOK};
+    use super::*;
+
+    fn opts() -> WizardOptions {
+        WizardOptions {
+            mode: None,
+            shell: Some("zsh".to_string()),
+            auto_daemon: false,
+            no_interactive: true,
+            intent: None,
+        }
+    }
 
     #[test]
     fn zsh_hook_clears_stale_preload_state() {
@@ -1490,5 +1665,88 @@ mod tests {
         assert!(BASH_HOOK.contains("_kin_vfs_clear_preload"));
         assert!(BASH_HOOK.contains("_kin_vfs_refresh_preload"));
         assert!(BASH_HOOK.contains("else\n            _kin_vfs_refresh_preload"));
+    }
+
+    #[test]
+    fn intent_flag_parses_aliases() {
+        assert_eq!(
+            SetupIntent::from_flag("local"),
+            Some(SetupIntent::LocalOnly)
+        );
+        assert_eq!(SetupIntent::from_flag("CLI"), Some(SetupIntent::LocalOnly));
+        assert_eq!(
+            SetupIntent::from_flag("agent"),
+            Some(SetupIntent::AgentOnly)
+        );
+        assert_eq!(SetupIntent::from_flag("mcp"), Some(SetupIntent::AgentOnly));
+        assert_eq!(SetupIntent::from_flag("editor"), Some(SetupIntent::Editor));
+        assert_eq!(SetupIntent::from_flag("hosted"), Some(SetupIntent::Hosted));
+        assert_eq!(SetupIntent::from_flag("kinlab"), Some(SetupIntent::Hosted));
+        assert_eq!(
+            SetupIntent::from_flag("advanced"),
+            Some(SetupIntent::Advanced)
+        );
+        assert_eq!(SetupIntent::from_flag("nonsense"), None);
+    }
+
+    #[test]
+    fn non_interactive_defaults_to_agent_intent() {
+        assert_eq!(resolve_intent(&opts(), false), SetupIntent::AgentOnly);
+    }
+
+    #[test]
+    fn intent_flag_overrides_default() {
+        let mut o = opts();
+        o.intent = Some("local".to_string());
+        assert_eq!(resolve_intent(&o, false), SetupIntent::LocalOnly);
+    }
+
+    #[test]
+    fn agent_intent_configures_mcp_and_daemon() {
+        let assistants = detect_ai_assistants();
+        let plan = build_plan(SetupIntent::AgentOnly, &opts(), &assistants, "zsh", false).unwrap();
+        assert!(plan.configure_mcp);
+        assert!(plan.install_shell_hook);
+        assert!(plan.inject_discovery_reminders);
+        assert!(plan.auto_daemon);
+        assert!(!plan.show_hosted_hint);
+    }
+
+    #[test]
+    fn local_intent_skips_mcp_keeps_shell_and_daemon() {
+        let assistants = detect_ai_assistants();
+        let plan = build_plan(SetupIntent::LocalOnly, &opts(), &assistants, "zsh", false).unwrap();
+        assert!(!plan.configure_mcp);
+        assert!(plan.mcp_assistant_indices.is_empty());
+        assert!(!plan.inject_discovery_reminders);
+        assert!(plan.install_shell_hook);
+        assert!(plan.auto_daemon);
+    }
+
+    #[test]
+    fn editor_intent_shows_editor_hint_no_mcp() {
+        let assistants = detect_ai_assistants();
+        let plan = build_plan(SetupIntent::Editor, &opts(), &assistants, "zsh", false).unwrap();
+        assert!(plan.show_editor_hint);
+        assert!(!plan.configure_mcp);
+        assert!(plan.install_shell_hook);
+    }
+
+    #[test]
+    fn hosted_intent_shows_hosted_hint_no_mcp() {
+        let assistants = detect_ai_assistants();
+        let plan = build_plan(SetupIntent::Hosted, &opts(), &assistants, "zsh", false).unwrap();
+        assert!(plan.show_hosted_hint);
+        assert!(!plan.configure_mcp);
+        assert!(!plan.show_editor_hint);
+    }
+
+    #[test]
+    fn auto_daemon_flag_forces_daemon_on_every_intent() {
+        let assistants = detect_ai_assistants();
+        let mut o = opts();
+        o.auto_daemon = true;
+        let plan = build_plan(SetupIntent::Editor, &o, &assistants, "zsh", false).unwrap();
+        assert!(plan.auto_daemon);
     }
 }

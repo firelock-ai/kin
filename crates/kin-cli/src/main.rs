@@ -779,6 +779,9 @@ enum Command {
     Setup {
         #[command(subcommand)]
         action: Option<SetupAction>,
+        /// First-run intent: local, agent, editor, hosted, or advanced
+        #[arg(long, global = true, value_parser = ["local", "agent", "editor", "hosted", "advanced"])]
+        intent: Option<String>,
         /// Repository mode: native or compatibility
         #[arg(long, global = true)]
         mode: Option<String>,
@@ -2357,6 +2360,7 @@ fn main() -> Result<()> {
                 Command::Doctor { fix } => commands::setup::doctor(fix).await,
                 Command::Setup {
                     action,
+                    intent,
                     mode,
                     shell,
                     auto_daemon,
@@ -2370,6 +2374,7 @@ fn main() -> Result<()> {
                             shell,
                             auto_daemon,
                             no_interactive,
+                            intent,
                         })
                         .await
                     }
