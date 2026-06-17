@@ -2960,9 +2960,9 @@ impl InMemoryGraph {
         }
     }
 
-    /// Reconstructs the vector index for a scoped graph by copying unchanged embeddings from
-    /// a source graph (HEAD) and queueing/embedding any modified or new entities/artifacts.
-    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    /// Returns `(dimensions, indexed_count)` for the loaded vector index, or
+    /// `None` when no index is loaded for this graph. Available with the
+    /// `vector` feature alone — it reads index metadata and needs no embedder.
     #[cfg(feature = "vector")]
     pub fn vector_index_stats(&self) -> Option<(usize, usize)> {
         self.vector_index
