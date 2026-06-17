@@ -444,6 +444,7 @@ export interface NativeRemotePublishRequest {
   approved: boolean;
   publishReviewState: boolean;
   publishProofs: boolean;
+  semanticChanges?: Record<string, unknown>[];
   actor?: string;
   actorKind?: ActorKind;
   leaseSessionId?: string;
