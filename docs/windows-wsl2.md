@@ -33,17 +33,25 @@ against.
    Reboot if prompted, then open the **Ubuntu** shell to finish first-time
    user setup.
 
-2. Inside the WSL2 Linux shell, install Kin the same way you would on Linux:
+2. Inside the WSL2 Linux shell, install Kin the same way you would on Linux —
+   this is the **same one-path flow** documented in the
+   [quickstart](./quickstart.md):
 
    ```sh
    curl -fsSL https://get.kinlab.dev/install | sh
    ```
 
+   The installer launches the `kin setup` guided wizard for you. Answer its
+   "What do you want Kin for?" prompt (the **AI agents** intent is the default),
+   then verify with `kin setup status` — inside WSL2 the VFS projection check is
+   supported, unlike native Windows.
+
 3. Work on your repositories from inside the WSL2 filesystem (e.g.
-   `~/projects/...`). Initialize and use Kin as usual:
+   `~/projects/...`). Initialize, embed, and use Kin as usual:
 
    ```sh
    kin init
+   kin embed     # build the vector index for semantic search / kin locate
    kin status
    ```
 
@@ -53,7 +61,19 @@ against.
 
 ## Native Windows binary (limited)
 
-If you only need the core CLI and cannot use WSL2, the release page publishes a
-native `kin-windows-x86_64.zip`. It is **vector-free** and does not provide the
-transparent filesystem projection. Treat it as experimental; WSL2 remains the
-recommended path.
+If you only need the core CLI and cannot use WSL2, install with PowerShell:
+
+```powershell
+irm https://get.kinlab.dev/install.ps1 | iex
+```
+
+The installer prints the limitation up front, verifies the download's SHA-256
+checksum, and still requires `kin-daemon` (it aborts on a daemon-less archive).
+The native `kin-windows-x86_64.zip` it installs is **vector-free** (semantic
+search disabled) and does **not** provide the transparent filesystem projection:
+projection relies on Unix library injection (`LD_PRELOAD` /
+`DYLD_INSERT_LIBRARIES`), which native Windows does not offer. Windows projection
+is planned via ProjFS — an optional feature started by an explicit daemon init,
+not injected by the shell hook — so on native Windows the `vfs_projection` health
+check reports **n/a** rather than ok. Treat the native binary as experimental;
+WSL2 remains the recommended path.
