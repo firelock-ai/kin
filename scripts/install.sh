@@ -266,6 +266,11 @@ if [ "${KIN_NO_SETUP:-}" = "1" ]; then
     info "Skipping setup (KIN_NO_SETUP=1). Run 'kin setup' when ready."
 else
     printf '\n'
+    # Setup is a best-effort post-install convenience — the binaries are already
+    # installed and verified above, so a non-zero exit from `kin setup` (e.g. no
+    # agent clients to configure on a bare CI/Docker host) must NOT fail the
+    # install under `set -e`.
+    set +e
     # When piped (curl | sh), stdin is consumed by the pipe.
     # Reopen /dev/tty so the interactive wizard can read keyboard input.
     if [ -t 0 ]; then
@@ -283,6 +288,7 @@ else
         # run non-interactive so the install never exits non-zero here.
         "$KIN_BIN/kin" setup --no-interactive
     fi
+    set -e
 fi
 
 printf '\n'
