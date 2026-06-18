@@ -635,6 +635,9 @@ impl GraphHashSource for EntityData {
     fn hash_entity_ids(&self) -> Vec<EntityId> {
         self.entities.keys().copied().collect()
     }
+    fn hash_entity_count(&self) -> usize {
+        self.entities.len()
+    }
 }
 
 /// Semantic change DAG + branches.
@@ -1074,6 +1077,20 @@ fn embed_sort_key_for(ent: &EntityData, key: RetrievalKey, recency: EmbedRecency
 ///
 /// **Lock ordering** (to prevent deadlocks when acquiring multiple locks):
 /// entities → changes → work → reviews → verification → provenance → sessions
+/// Deferred Merkle refresh state: dirty seeds accumulated since the last root
+/// reconciliation. See [`InMemoryGraph::flush_merkle`].
+#[derive(Default)]
+struct PendingMerkle {
+    dirty: bool,
+    seeds: HashSet<EntityId>,
+}
+
+/// Counts how many times a deferred Merkle refresh actually ran. Used by tests
+/// to prove that a burst of single-entity mutations collapses into one batch
+/// reconciliation instead of one O(component) refresh per mutation.
+#[cfg(test)]
+static MERKLE_FLUSH_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub struct InMemoryGraph {
     /// Core entity/relation graph.
     entities: RwLock<EntityData>,
@@ -1091,8 +1108,14 @@ pub struct InMemoryGraph {
     sessions: RwLock<SessionData>,
     /// Optional full-text search index for ranked search queries.
     text_index: Option<TextIndex>,
-    /// Continuously-current Merkle state for the entity/relation graph.
+    /// Merkle state for the entity/relation graph, reconciled lazily.
     merkle: parking_lot::RwLock<MerkleCache>,
+    /// Deferred Merkle refresh state. Each mutation records its touched entities
+    /// here; the root is reconciled against the live graph the next time it is
+    /// read. The frozen subgraph hash makes a single refresh inherently
+    /// O(component), so deferring keeps bulk ingestion to one batch Merkle build
+    /// rather than one O(component) refresh per upsert.
+    merkle_pending: parking_lot::Mutex<PendingMerkle>,
     /// Mutation-time delta journal for O(change) persistence flushes between commits.
     pending_delta: parking_lot::Mutex<PendingGraphDelta>,
     /// True when a mutation touched a domain not yet covered by the O(change) journal.
@@ -1204,6 +1227,7 @@ impl InMemoryGraph {
             }),
             text_index,
             merkle: parking_lot::RwLock::new(MerkleCache::new()),
+            merkle_pending: parking_lot::Mutex::new(PendingMerkle::default()),
             pending_delta: parking_lot::Mutex::new(PendingGraphDelta::default()),
             full_snapshot_required: AtomicBool::new(false),
             text_dirty: AtomicBool::new(false),
@@ -1605,6 +1629,7 @@ impl InMemoryGraph {
             }),
             text_index,
             merkle: parking_lot::RwLock::new(merkle),
+            merkle_pending: parking_lot::Mutex::new(PendingMerkle::default()),
             pending_delta: parking_lot::Mutex::new(PendingGraphDelta::default()),
             full_snapshot_required: AtomicBool::new(false),
             text_dirty: AtomicBool::new(false),
@@ -1823,6 +1848,7 @@ impl InMemoryGraph {
             }),
             text_index,
             merkle: parking_lot::RwLock::new(merkle),
+            merkle_pending: parking_lot::Mutex::new(PendingMerkle::default()),
             pending_delta: parking_lot::Mutex::new(PendingGraphDelta::default()),
             full_snapshot_required: AtomicBool::new(false),
             text_dirty: AtomicBool::new(false),
@@ -1909,12 +1935,39 @@ impl InMemoryGraph {
         Some(self.compute_root_hash())
     }
 
+    /// Record entities whose Merkle hashes are now stale.
+    ///
+    /// This only journals the touched seeds; the root is reconciled lazily by
+    /// [`Self::flush_merkle`] on the next read. Deferring is what keeps bulk
+    /// ingestion linear — thousands of single-relation upserts collapse into one
+    /// batch Merkle build instead of one O(component) refresh apiece.
     #[inline]
-    fn refresh_merkle_for_entities<I>(&self, ent: &EntityData, seeds: I) -> [u8; 32]
+    fn refresh_merkle_for_entities<I>(&self, _ent: &EntityData, seeds: I)
     where
         I: IntoIterator<Item = EntityId>,
     {
-        self.merkle.write().refresh_affected(ent, seeds)
+        let mut pending = self.merkle_pending.lock();
+        pending.seeds.extend(seeds);
+        pending.dirty = true;
+    }
+
+    /// Reconcile the deferred Merkle root against the live graph.
+    ///
+    /// Callers that read the root must run this first while holding a guard on
+    /// `self.entities` (read or write) so the graph cannot mutate mid-refresh.
+    /// `ent` is that already-held guard, passed in to avoid re-locking.
+    fn flush_merkle(&self, ent: &EntityData) {
+        let seeds = {
+            let mut pending = self.merkle_pending.lock();
+            if !pending.dirty {
+                return;
+            }
+            pending.dirty = false;
+            std::mem::take(&mut pending.seeds)
+        };
+        self.merkle.write().refresh_affected(ent, seeds);
+        #[cfg(test)]
+        MERKLE_FLUSH_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
@@ -2294,6 +2347,7 @@ impl InMemoryGraph {
         let graph_root_hash = {
             let _span =
                 tracing::info_span!("kindb.graph.serialize_snapshot.compute_root_hash").entered();
+            self.flush_merkle(&ent);
             let current = self.merkle.read().root_hash();
             precomputed_hash
                 .filter(|hash| *hash == current)
@@ -2472,7 +2526,8 @@ impl InMemoryGraph {
     /// Compute the Merkle root hash directly from the live entity stores,
     /// without materialising a full `GraphSnapshot`.
     pub fn compute_root_hash(&self) -> crate::storage::merkle::MerkleHash {
-        let _ent = self.entities.read();
+        let ent = self.entities.read();
+        self.flush_merkle(&ent);
         self.merkle.read().root_hash()
     }
 
@@ -7695,6 +7750,69 @@ mod tests {
             import_source: None,
             evidence: Vec::new(),
         }
+    }
+
+    /// Once the graph is one connected component, adding relations one at a time
+    /// (as test-materialization does) must not refresh the Merkle root per
+    /// upsert — that is O(component) each, i.e. O(N^2) over the burst. Deferral
+    /// collapses the whole burst into a single batch Merkle build at the next
+    /// root read.
+    #[test]
+    fn single_relation_upserts_defer_to_one_batch_merkle() {
+        let graph = InMemoryGraph::new();
+        let n: usize = 12_000;
+        let entities: Vec<Entity> = (0..n as u128)
+            .map(|i| test_entity_with_id(i + 1, &format!("entity_{i}")))
+            .collect();
+        graph.batch_upsert_entities(&entities).unwrap();
+
+        // Chain every entity so the whole graph is one weakly-connected
+        // component — this is what makes a per-mutation refresh touch the entire
+        // graph in the buggy path.
+        let chain: Vec<Relation> = entities
+            .windows(2)
+            .map(|window| test_relation(window[0].id, window[1].id, RelationKind::Calls))
+            .collect();
+        graph.upsert_relations_batch(&chain).unwrap();
+
+        MERKLE_FLUSH_COUNT.store(0, Ordering::Relaxed);
+        let start = std::time::Instant::now();
+        // Thousands of single-relation upserts, exactly like
+        // materialize_discovered_tests' per-test `upsert_relation` loop.
+        for i in 0..3_000usize {
+            let src = entities[i % n].id;
+            let dst = entities[(i * 7 + 1) % n].id;
+            graph
+                .upsert_relation(&test_relation(src, dst, RelationKind::Tests))
+                .unwrap();
+        }
+
+        // Nothing has read the root, so not one refresh should have run.
+        assert_eq!(
+            MERKLE_FLUSH_COUNT.load(Ordering::Relaxed),
+            0,
+            "single-entity upserts must defer Merkle work, not refresh eagerly"
+        );
+
+        // The first root read reconciles everything in exactly one batch build.
+        let root = graph.compute_root_hash();
+        let elapsed = start.elapsed();
+        assert_eq!(
+            MERKLE_FLUSH_COUNT.load(Ordering::Relaxed),
+            1,
+            "reconciliation must be a single batch refresh, not one per mutation"
+        );
+        assert_eq!(
+            root,
+            compute_graph_root_hash(&graph.to_snapshot()),
+            "deferred root must equal the cold frozen root"
+        );
+        // The old O(N^2) path is minutes for this size; deferral is well under
+        // this generous bound.
+        assert!(
+            elapsed.as_secs() < 30,
+            "3000 single-relation upserts + reconcile took {elapsed:?} — non-linear regression"
+        );
     }
 
     // ----------------------------------------------------------------------

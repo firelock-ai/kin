@@ -11,6 +11,7 @@
 //!
 //! This enables O(log n) verification of any sub-graph without hashing the entire repository.
 
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -28,6 +29,11 @@ pub trait GraphHashSource {
     fn hash_outgoing(&self, id: &EntityId) -> Option<&[RelationId]>;
     fn hash_incoming(&self, id: &EntityId) -> Option<&[RelationId]>;
     fn hash_entity_ids(&self) -> Vec<EntityId>;
+    /// Number of entities in the source. Used to size the incremental-vs-full
+    /// refresh decision without materialising the full id list.
+    fn hash_entity_count(&self) -> usize {
+        self.hash_entity_ids().len()
+    }
 }
 
 impl GraphHashSource for GraphSnapshot {
@@ -45,6 +51,9 @@ impl GraphHashSource for GraphSnapshot {
     }
     fn hash_entity_ids(&self) -> Vec<EntityId> {
         self.entities.keys().copied().collect()
+    }
+    fn hash_entity_count(&self) -> usize {
+        self.entities.len()
     }
 }
 
@@ -91,18 +100,34 @@ impl MerkleCache {
     }
 
     /// Warm the cache from any graph hash source (bulk build/cold open).
+    ///
+    /// This is an O(entities + relations) batch build. Per-entity content hashes
+    /// are order-independent, so they are computed in parallel across the rayon
+    /// pool; the subgraph and root folds stay sequential over a fixed sorted
+    /// order so the cycle-breaking traversal — and therefore the root — remains
+    /// bit-identical to [`compute_graph_root_hash`].
     pub fn from_source(source: &impl GraphHashSource) -> Self {
         let mut cache = Self::new();
-        let mut subgraph_cache = HashMap::new();
         let mut entity_ids = source.hash_entity_ids();
         entity_ids.sort_by_key(|entity_id| *entity_id.0.as_bytes());
 
+        // Phase 1 (parallel, order-free): every entity's content hash is an
+        // independent SHA-256 over its own fields. Collecting into a keyed map
+        // makes the result independent of completion order.
+        let entities_to_hash: Vec<(EntityId, &Entity)> = entity_ids
+            .iter()
+            .filter_map(|entity_id| source.hash_entity(entity_id).map(|e| (*entity_id, e)))
+            .collect();
+        cache.entity_hashes = entities_to_hash
+            .par_iter()
+            .map(|(entity_id, entity)| (*entity_id, compute_entity_hash(entity)))
+            .collect();
+
+        // Phase 2 (sequential): subgraph hashes share a traversal cache and
+        // break cycles at whichever node the sorted DFS reaches first, so the
+        // fixed sorted order is load-bearing for determinism.
+        let mut subgraph_cache = HashMap::new();
         for entity_id in entity_ids {
-            if let Some(entity) = source.hash_entity(&entity_id) {
-                cache
-                    .entity_hashes
-                    .insert(entity_id, compute_entity_hash(entity));
-            }
             let subgraph_hash = compute_subgraph_hash_generic(
                 &entity_id,
                 source,
@@ -158,18 +183,36 @@ impl MerkleCache {
 
     /// Refresh the root after mutation seeds changed.
     ///
-    /// The dirty set is the touched entity component. A pure DAG only needs the
-    /// reverse-dependency closure, but the frozen hash algorithm has explicit
-    /// cycle handling and a shared traversal cache; preserving bit-identical
-    /// roots therefore requires recomputing the component whose traversal
-    /// context can change.
+    /// The dirty set is the touched entity component (see
+    /// [`collect_touched_entity_component`]): the frozen subgraph algorithm's
+    /// cycle handling makes per-mutation refresh inherently O(component), so the
+    /// way to keep bulk ingestion linear is to refresh once over many
+    /// accumulated seeds rather than once per mutation.
+    ///
+    /// When the work covers a large fraction of the graph — the initial bulk
+    /// load touches nearly every entity — a single [`Self::from_source`] batch
+    /// build is both simpler and faster (its per-entity hashing runs in
+    /// parallel), so we fall back to it. The two fast-path checks bound the cost
+    /// at O(entities + relations): the first skips the component walk when the
+    /// seeds alone already dominate the graph, the second catches the case where
+    /// the walked component does.
     pub fn refresh_affected<I>(&mut self, source: &impl GraphHashSource, seeds: I) -> MerkleHash
     where
         I: IntoIterator<Item = EntityId>,
     {
+        let entity_count = source.hash_entity_count();
+        let seeds: Vec<EntityId> = seeds.into_iter().collect();
+        if seeds.len().saturating_mul(2) >= entity_count && entity_count > 0 {
+            return self.rebuild_from_source(source);
+        }
+
         let dirty = collect_touched_entity_component(source, seeds);
         if dirty.is_empty() {
             return self.root_hash;
+        }
+
+        if dirty.len().saturating_mul(2) >= entity_count {
+            return self.rebuild_from_source(source);
         }
 
         for entity_id in &dirty {
@@ -254,6 +297,18 @@ where
     hash
 }
 
+/// Collect the touched entity component: the seeds plus every entity weakly
+/// connected to them through relations (walked in both directions).
+///
+/// A narrower reverse-reachability closure (ancestors only) would be tempting —
+/// a subgraph hash folds in only the entity's forward-reachable set, so naively
+/// only ancestors of a changed entity should move. But the frozen subgraph
+/// algorithm breaks cycles with a `ZERO_HASH` sentinel at whichever node a
+/// shared, globally-sorted DFS reaches first. Adding or removing any node can
+/// shift that entry point, which rewrites the subgraph hashes of every node in
+/// the affected cycle — including pure descendants that cannot reach the change.
+/// Reproducing bit-identical roots therefore requires recomputing the whole
+/// connected component whose traversal context can change.
 fn collect_touched_entity_component<I>(source: &impl GraphHashSource, seeds: I) -> Vec<EntityId>
 where
     I: IntoIterator<Item = EntityId>,
@@ -1422,5 +1477,95 @@ mod tests {
                 "incremental root diverged from cold recompute at step {step}: {op}"
             );
         }
+    }
+
+    /// Build a sizeable graph with a forward chain plus periodic back-edges, so
+    /// it has many overlapping cycles — the case where the parallel batch build
+    /// and the frozen cold path must still agree bit-for-bit.
+    fn large_cyclic_snapshot(n: u128) -> (Vec<Entity>, GraphSnapshot) {
+        let entities: Vec<Entity> = (0..n)
+            .map(|i| {
+                let mut entity = test_entity(&format!("entity_{i}"));
+                entity.id = EntityId(uuid::Uuid::from_u128(i + 1));
+                entity
+            })
+            .collect();
+        let mut relations = Vec::new();
+        for window in entities.windows(2) {
+            relations.push(test_relation(
+                window[0].id,
+                window[1].id,
+                RelationKind::Calls,
+            ));
+        }
+        for i in (0..n as usize).step_by(7) {
+            let dst = i / 2;
+            if dst < i {
+                relations.push(test_relation(
+                    entities[i].id,
+                    entities[dst].id,
+                    RelationKind::References,
+                ));
+            }
+        }
+        let snapshot = build_snapshot(entities.clone(), relations);
+        (entities, snapshot)
+    }
+
+    #[test]
+    fn from_source_is_deterministic_and_matches_cold_on_large_graph() {
+        let (_entities, snapshot) = large_cyclic_snapshot(4_000);
+        let cold = compute_graph_root_hash(&snapshot);
+
+        // The per-entity hashing in from_source runs across the rayon pool; the
+        // root must not depend on completion order.
+        let build1 = MerkleCache::from_source(&snapshot);
+        let build2 = MerkleCache::from_source(&snapshot);
+
+        assert_eq!(
+            build1.root_hash(),
+            cold,
+            "parallel batch build must equal the frozen cold root"
+        );
+        assert_eq!(build2.root_hash(), cold);
+        assert_eq!(
+            build1.root_hash(),
+            build2.root_hash(),
+            "batch build must be deterministic across runs"
+        );
+    }
+
+    #[test]
+    fn refresh_affected_bulk_then_incremental_match_cold_on_large_graph() {
+        let (mut entities, mut snapshot) = large_cyclic_snapshot(2_000);
+        let mut cache = MerkleCache::from_snapshot(&snapshot);
+        assert_eq!(cache.root_hash(), compute_graph_root_hash(&snapshot));
+
+        // Mutate nearly every entity and refresh with a bulk seed set: this
+        // exercises the seeds-dominate fast path (a single batch rebuild) and
+        // must still reconcile to the frozen cold root.
+        for entity in entities.iter_mut() {
+            entity.signature = format!("{}::v2", entity.signature);
+        }
+        let relations: Vec<Relation> = snapshot.relations.values().cloned().collect();
+        let seeds: Vec<EntityId> = entities.iter().map(|entity| entity.id).collect();
+        snapshot = build_snapshot(entities.clone(), relations.clone());
+        cache.refresh_affected(&snapshot, seeds);
+        assert_eq!(
+            cache.root_hash(),
+            compute_graph_root_hash(&snapshot),
+            "bulk refresh diverged from cold recompute"
+        );
+
+        // A subsequent small mutation must still reconcile to cold via the
+        // incremental component path.
+        entities[1].name = "renamed_entity".to_string();
+        snapshot = build_snapshot(entities.clone(), relations);
+        cache.refresh_affected(&snapshot, std::iter::once(entities[1].id));
+        assert_eq!(
+            cache.root_hash(),
+            compute_graph_root_hash(&snapshot),
+            "incremental refresh after bulk diverged from cold recompute"
+        );
     }
 }
