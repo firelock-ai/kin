@@ -77,21 +77,23 @@ pub fn handle_semantic_search<G: GraphStore>(
 }
 
 pub const SEMANTIC_LOCATE_DESC: &str = "\
-Rank the code most relevant to a natural-language query using Kin's real vector index — \
-the same embedding-backed retrieval that powers `kin locate`, not a name/metadata filter. \
+Rank the code most relevant to a natural-language query by embedding similarity against \
+Kin's real vector index — a graph-native semantic ranking, not a name/metadata filter. \
 This is the tool to reach for when you are looking for \"where is the code that does X\" \
 and you only have a description of the behavior, not an exact symbol name. Unlike \
 semantic_search (which matches declarations by name/kind/language and ignores the query \
-for ranking), semantic_locate embeds your query and scores entities by semantic \
-similarity against the graph's vector index, returning a ranked list with relevance \
-scores. Set granularity to \"entity\" (default) for ranked declarations or \"file\" to \
-roll results up to the most relevant files. The response also reports semantic_coverage \
-— the fraction of the graph that has embeddings indexed — so you can tell whether a thin \
-result set means \"not relevant\" or \"not yet embedded\". Requires the Kin daemon: vector \
-search runs against the daemon's live graph and HNSW index, so this tool returns an error \
-in offline/no-daemon mode. On an empty result the additive `negative` object's \
-`safe_to_conclude_absent` flag distinguishes an authoritative \"no match\" from \
-\"not yet embedded\".";
+for ranking), semantic_locate embeds your query and scores entities by cosine similarity \
+against the graph's HNSW index, returning a ranked list with relevance scores. It is a \
+single-vector ranking: it does NOT add the lexical and graph-structure fusion or the \
+cross-encoder reranking that the full `kin locate` CLI pipeline layers on top, so for the \
+product's best-ranked retrieval prefer `kin locate`. Set granularity to \"entity\" \
+(default) for ranked declarations or \"file\" to roll results up to the most relevant \
+files. The response also reports semantic_coverage — the fraction of the graph that has \
+embeddings indexed — so you can tell whether a thin result set means \"not relevant\" or \
+\"not yet embedded\". Requires the Kin daemon: vector search runs against the daemon's \
+live graph and HNSW index, so this tool returns an error in offline/no-daemon mode. On an \
+empty result the additive `negative` object's `safe_to_conclude_absent` flag distinguishes \
+an authoritative \"no match\" from \"not yet embedded\".";
 
 /// Offline/generic dispatch arm for `semantic_locate`.
 ///
@@ -465,10 +467,6 @@ pub async fn handle_find_references<G: GraphStore>(
     };
 
     let mut rows = collect_graph_reference_rows(store, &target.id, &relation_kinds)?;
-    if let Some(source_root) = resolve_reference_source_root() {
-        let text_refs = kin_core::find_text_references(&source_root, &target, &relation_kinds);
-        merge_text_reference_rows(&mut rows, text_refs);
-    }
     rows.sort_by(|left, right| {
         left.file_path
             .cmp(&right.file_path)
@@ -1853,6 +1851,53 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["error"], "invalid entity_id (not a UUID)");
         assert_eq!(rows[1]["error"], "entity not found");
+    }
+
+    #[tokio::test]
+    async fn find_references_returns_only_graph_edges() {
+        let store = InMemoryGraph::new();
+        let caller = make_entity("caller", "src/a.rs");
+        let target = make_entity("target", "src/b.rs");
+        let caller_id = caller.id;
+        let target_id = target.id;
+
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&target).unwrap();
+        store
+            .upsert_relation(&make_relation(caller_id, target_id, RelationKind::Calls))
+            .unwrap();
+
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_id".to_string(),
+            serde_json::json!(target_id.to_string()),
+        );
+
+        let body = parsed_response(&handle_find_references(&args, &store).await.unwrap());
+        assert_eq!(body["total_upstream"], 1);
+        let refs = body["references"].as_array().unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0]["name"], "caller");
+        assert_eq!(refs[0]["file_path"], "src/a.rs");
+        assert_eq!(refs[0]["kind"], "Function");
+    }
+
+    #[tokio::test]
+    async fn find_references_reports_empty_graph_gap_without_backfill() {
+        let store = InMemoryGraph::new();
+        let target = make_entity("orphan", "src/orphan.rs");
+        let target_id = target.id;
+        store.upsert_entity(&target).unwrap();
+
+        let mut args = HashMap::new();
+        args.insert(
+            "entity_id".to_string(),
+            serde_json::json!(target_id.to_string()),
+        );
+
+        let body = parsed_response(&handle_find_references(&args, &store).await.unwrap());
+        assert_eq!(body["total_upstream"], 0);
+        assert!(body["references"].as_array().unwrap().is_empty());
     }
 
     #[test]
