@@ -28,7 +28,9 @@ pub fn migrate(
             7 => migrate_v7_to_v8(&data)?,
             _ => {
                 return Err(KinDbError::StorageError(format!(
-                    "no migration path from snapshot version {version}"
+                    "no migration path from snapshot schema version {version}; this graph \
+                     predates the migratable schema range and must be rebuilt: run \
+                     `kin migrate` or `kin embed --rebuild`"
                 )));
             }
         };
@@ -359,7 +361,8 @@ mod tests {
         let result = migrate(&[], 3, 6);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("no migration path from snapshot version 3"));
+        assert!(err.contains("no migration path from snapshot schema version 3"));
+        assert!(err.contains("kin migrate") || err.contains("kin embed --rebuild"));
     }
 
     #[test]

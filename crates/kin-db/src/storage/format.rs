@@ -302,6 +302,11 @@ impl GraphSnapshot {
     /// Current format version.
     pub const CURRENT_VERSION: u32 = 8;
 
+    /// Oldest on-disk format version this binary can load (directly or via
+    /// migration). Snapshots below this predate a schema we no longer read and
+    /// must be rebuilt.
+    pub const MIN_SUPPORTED_VERSION: u32 = 1;
+
     /// Magic bytes for the file header: "KNDB"
     pub const MAGIC: [u8; 4] = *b"KNDB";
 
@@ -778,10 +783,18 @@ impl GraphSnapshot {
                     checksum_end,
                 })
             }
-            _ => Err(crate::error::KinDbError::StorageError(format!(
-                "unsupported format version: {version} (expected 1 through {})",
-                Self::CURRENT_VERSION
-            ))),
+            version if version < Self::MIN_SUPPORTED_VERSION => {
+                Err(crate::error::KinDbError::snapshot_schema_too_old(
+                    version,
+                    Self::MIN_SUPPORTED_VERSION,
+                    Self::CURRENT_VERSION,
+                ))
+            }
+            _ => Err(crate::error::KinDbError::snapshot_schema_too_new(
+                version,
+                Self::MIN_SUPPORTED_VERSION,
+                Self::CURRENT_VERSION,
+            )),
         }
     }
 
@@ -2315,6 +2328,77 @@ mod tests {
 
         let loaded = GraphSnapshot::from_bytes(&bytes).unwrap();
         assert!(loaded.entities.is_empty());
+    }
+
+    /// A snapshot written by an older Kin (schema predating the supported
+    /// range) must fail fast with an explicit, actionable error naming the
+    /// version gap and remediation — never a panic/crash during load.
+    #[test]
+    fn old_schema_snapshot_fails_fast_with_actionable_error() {
+        // Build a well-formed KNDB frame whose format version predates the
+        // minimum supported version (stand-in for a pre-versioning 0.1.x graph).
+        let stale_version = GraphSnapshot::MIN_SUPPORTED_VERSION - 1;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&GraphSnapshot::MAGIC);
+        bytes.extend_from_slice(&stale_version.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // empty body
+
+        let err = GraphSnapshot::from_bytes(&bytes).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::KinDbError::IncompatibleSnapshotVersion { found, .. }
+                    if found == stale_version
+            ),
+            "expected IncompatibleSnapshotVersion, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("older than"),
+            "missing version-gap wording: {msg}"
+        );
+        assert!(
+            msg.contains(&format!(
+                "versions {} through {}",
+                GraphSnapshot::MIN_SUPPORTED_VERSION,
+                GraphSnapshot::CURRENT_VERSION
+            )),
+            "missing supported-range wording: {msg}"
+        );
+        assert!(
+            msg.contains("kin migrate") || msg.contains("kin embed --rebuild"),
+            "missing remediation command: {msg}"
+        );
+    }
+
+    /// A snapshot written by a newer Kin must also fail fast with a typed,
+    /// actionable error (upgrade guidance) rather than crashing.
+    #[test]
+    fn future_schema_snapshot_fails_fast_with_actionable_error() {
+        let future_version = GraphSnapshot::CURRENT_VERSION + 1;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&GraphSnapshot::MAGIC);
+        bytes.extend_from_slice(&future_version.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+
+        let err = GraphSnapshot::from_bytes(&bytes).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::KinDbError::IncompatibleSnapshotVersion { found, .. }
+                    if found == future_version
+            ),
+            "expected IncompatibleSnapshotVersion, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("newer than"),
+            "missing version-gap wording: {msg}"
+        );
+        assert!(
+            msg.contains("upgrade Kin"),
+            "missing upgrade remediation: {msg}"
+        );
     }
 
     #[test]
