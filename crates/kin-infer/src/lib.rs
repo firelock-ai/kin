@@ -45,6 +45,8 @@ pub enum InferError {
     BackendError(String),
     #[error("internal invariant violated: {0}")]
     Internal(String),
+    #[error("non-finite model output: {0}")]
+    NonFiniteOutput(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -1396,6 +1398,7 @@ impl BertModel {
             results.push(normalized.to_vec());
         }
 
+        ensure_finite_embeddings(&results)?;
         Ok(results)
     }
 
@@ -2045,7 +2048,9 @@ impl BertModel {
         // 4. Per-input mean/CLS pooling + L2 normalize
         let _pool_span =
             tracing::info_span!("kin_infer.model.forward_batched.pool_and_normalize").entered();
-        Ok(self.pool_and_normalize(&hidden, &masks, max_len))
+        let results = self.pool_and_normalize(&hidden, &masks, max_len);
+        ensure_finite_embeddings(&results)?;
+        Ok(results)
     }
 
     /// Per-input mean/CLS pooling + L2 normalize over an encoded batch.
@@ -2138,6 +2143,7 @@ impl BertModel {
                 results[orig] = pooled[slot].clone();
             }
         }
+        ensure_finite_embeddings(&results)?;
         Ok(results)
     }
 
@@ -4128,6 +4134,23 @@ fn l2_normalize(v: &Array1<f32>) -> Array1<f32> {
     }
 }
 
+/// Fail loud with a typed error if any output embedding contains a non-finite
+/// value (NaN or ±Inf), so a corrupt vector can never silently reach the vector
+/// index. Backend-agnostic and O(batch × dim) — negligible against the forward
+/// pass — it catches a non-finite produced anywhere upstream at the kin-infer
+/// output boundary instead of letting `l2_normalize` pass it through unchanged.
+fn ensure_finite_embeddings(rows: &[Vec<f32>]) -> Result<(), InferError> {
+    for (i, row) in rows.iter().enumerate() {
+        if let Some(j) = row.iter().position(|x| !x.is_finite()) {
+            return Err(InferError::NonFiniteOutput(format!(
+                "embedding {i} dim {j} is {}; refusing to emit a corrupt vector",
+                row[j]
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// SIMD-accelerated dot product with platform-specific implementations.
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "aarch64")]
@@ -4769,6 +4792,29 @@ mod tests {
         assert!((norm - 1.0).abs() < 1e-5);
         assert!((n[0] - 0.6).abs() < 1e-5);
         assert!((n[1] - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn ensure_finite_embeddings_passes_clean_output() {
+        let rows = vec![vec![0.1, -0.2, 0.3], vec![1.0, 2.0, 3.0]];
+        assert!(ensure_finite_embeddings(&rows).is_ok());
+        // Zero vector (degenerate but finite) is allowed through.
+        assert!(ensure_finite_embeddings(&[vec![0.0; 4]]).is_ok());
+        assert!(ensure_finite_embeddings(&[]).is_ok());
+    }
+
+    #[test]
+    fn ensure_finite_embeddings_rejects_nonfinite() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let rows = vec![vec![0.1, 0.2, 0.3], vec![0.4, bad, 0.6]];
+            let err = ensure_finite_embeddings(&rows).unwrap_err();
+            match err {
+                InferError::NonFiniteOutput(msg) => {
+                    assert!(msg.contains("embedding 1 dim 1"), "msg: {msg}");
+                }
+                other => panic!("expected NonFiniteOutput, got {other:?}"),
+            }
+        }
     }
 
     #[test]
