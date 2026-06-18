@@ -357,6 +357,114 @@ fn build_relation_indexes(
     (outgoing, incoming, node_outgoing, node_incoming)
 }
 
+/// Whether a snapshot load reused the persisted entity-level adjacency or had
+/// to rebuild it from `relations` (FIR-853).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdjacencyReuse {
+    /// The persisted `outgoing`/`incoming` maps were consistent with
+    /// `relations` and were moved into the graph as-is (no rebuild).
+    Reused,
+    /// The persisted adjacency was missing or inconsistent, so the entity-level
+    /// maps were rebuilt from `relations`.
+    Rebuilt,
+}
+
+/// Build the relation adjacency indexes for a freshly loaded snapshot, reusing
+/// the persisted entity-level `outgoing`/`incoming` maps when they are
+/// consistent with `relations` (FIR-853).
+///
+/// The snapshot persists the entity-level adjacency (`outgoing`/`incoming`) but
+/// historically `from_snapshot_inner` threw it away and rebuilt all four
+/// adjacency maps from `relations` on every boot. This helper instead:
+///
+///   1. Always derives the node-level maps (`node_outgoing`/`node_incoming`)
+///      from `relations` — those are keyed by `GraphNodeId` and are NOT
+///      persisted, so they cannot be reused.
+///   2. In that same single pass, tallies how many entity-keyed edges
+///      `relations` implies.
+///   3. If the persisted `outgoing`/`incoming` edge tallies match, the
+///      persisted maps are trusted and moved in without reallocating or
+///      re-hashing every entity key — the boot-time win. Otherwise (old
+///      snapshot with no persisted adjacency, or an inconsistent one) the
+///      entity-level maps are rebuilt from `relations` so a stale/missing
+///      persisted adjacency can never yield an inconsistent in-memory graph.
+///
+/// Trust boundary: the snapshot body is SHA-256 checksum-verified before this
+/// runs (see `GraphSnapshot::from_bytes`), and the writer maintains these maps
+/// in lockstep with `relations`, so an edge-count match is a sound validity
+/// signal — corruption is caught upstream and a writer that desynced the maps
+/// would already have corrupted the live graph before saving.
+pub(crate) fn build_relation_indexes_with_reuse(
+    relations: &HashMap<RelationId, Relation>,
+    persisted_outgoing: HashMap<EntityId, Vec<RelationId>>,
+    persisted_incoming: HashMap<EntityId, Vec<RelationId>>,
+) -> (
+    HashMap<EntityId, Vec<RelationId>>,
+    HashMap<EntityId, Vec<RelationId>>,
+    HashMap<GraphNodeId, Vec<RelationId>>,
+    HashMap<GraphNodeId, Vec<RelationId>>,
+    AdjacencyReuse,
+) {
+    let mut node_outgoing: HashMap<GraphNodeId, Vec<RelationId>> = HashMap::new();
+    let mut node_incoming: HashMap<GraphNodeId, Vec<RelationId>> = HashMap::new();
+    let mut expected_outgoing_edges: usize = 0;
+    let mut expected_incoming_edges: usize = 0;
+
+    for relation in relations.values() {
+        node_outgoing
+            .entry(relation.src)
+            .or_default()
+            .push(relation.id);
+        node_incoming
+            .entry(relation.dst)
+            .or_default()
+            .push(relation.id);
+        if relation.src.as_entity().is_some() {
+            expected_outgoing_edges += 1;
+        }
+        if relation.dst.as_entity().is_some() {
+            expected_incoming_edges += 1;
+        }
+    }
+
+    let persisted_outgoing_edges: usize = persisted_outgoing.values().map(Vec::len).sum();
+    let persisted_incoming_edges: usize = persisted_incoming.values().map(Vec::len).sum();
+
+    if persisted_outgoing_edges == expected_outgoing_edges
+        && persisted_incoming_edges == expected_incoming_edges
+    {
+        // Persisted entity-level adjacency is consistent with the loaded
+        // relations — reuse it directly instead of rebuilding.
+        (
+            persisted_outgoing,
+            persisted_incoming,
+            node_outgoing,
+            node_incoming,
+            AdjacencyReuse::Reused,
+        )
+    } else {
+        // Stale / missing / inconsistent persisted adjacency — rebuild the
+        // entity-level maps from relations so the in-memory graph is correct.
+        let mut outgoing: HashMap<EntityId, Vec<RelationId>> = HashMap::new();
+        let mut incoming: HashMap<EntityId, Vec<RelationId>> = HashMap::new();
+        for relation in relations.values() {
+            if let Some(src) = relation.src.as_entity() {
+                outgoing.entry(src).or_default().push(relation.id);
+            }
+            if let Some(dst) = relation.dst.as_entity() {
+                incoming.entry(dst).or_default().push(relation.id);
+            }
+        }
+        (
+            outgoing,
+            incoming,
+            node_outgoing,
+            node_incoming,
+            AdjacencyReuse::Rebuilt,
+        )
+    }
+}
+
 fn verification_relation_id(kind: RelationKind, src: GraphNodeId, dst: GraphNodeId) -> RelationId {
     let payload = format!("{kind:?}|{src}|{dst}");
     RelationId(uuid::Uuid::new_v5(
@@ -1234,8 +1342,8 @@ impl InMemoryGraph {
             version: _,
             entities,
             relations,
-            outgoing: _,
-            incoming: _,
+            outgoing: persisted_outgoing,
+            incoming: persisted_incoming,
             changes,
             change_children,
             branches,
@@ -1295,10 +1403,28 @@ impl InMemoryGraph {
         )
         .entered();
         let relations: HashMap<RelationId, Relation> = relations.into_iter().collect();
+        let persisted_outgoing: HashMap<EntityId, Vec<RelationId>> =
+            persisted_outgoing.into_iter().collect();
+        let persisted_incoming: HashMap<EntityId, Vec<RelationId>> =
+            persisted_incoming.into_iter().collect();
         let (outgoing, incoming, node_outgoing, node_incoming) = {
             let _span =
                 tracing::info_span!("kindb.graph.from_snapshot.build_relation_indexes").entered();
-            build_relation_indexes(&relations)
+            // FIR-853: reuse the persisted entity-level adjacency when it is
+            // consistent with the loaded relations rather than discarding and
+            // rebuilding it on every boot. Node-level maps are always derived
+            // (they are not persisted).
+            let (outgoing, incoming, node_outgoing, node_incoming, reuse) =
+                build_relation_indexes_with_reuse(
+                    &relations,
+                    persisted_outgoing,
+                    persisted_incoming,
+                );
+            tracing::debug!(
+                adjacency_reuse = ?reuse,
+                "kindb.graph.from_snapshot.adjacency"
+            );
+            (outgoing, incoming, node_outgoing, node_incoming)
         };
         let text_index = if skip_text_index {
             None
@@ -7569,6 +7695,173 @@ mod tests {
             import_source: None,
             evidence: Vec::new(),
         }
+    }
+
+    // ----------------------------------------------------------------------
+    // FIR-853: boot-time adjacency reuse
+    // ----------------------------------------------------------------------
+
+    /// When the persisted entity-level adjacency is consistent with relations,
+    /// the loader reuses it as-is instead of recomputing from relations.
+    #[test]
+    fn adjacency_reuse_when_persisted_consistent() {
+        let e1 = EntityId::new();
+        let e2 = EntityId::new();
+        let rel = test_relation(e1, e2, RelationKind::Calls);
+        let rid = rel.id;
+        let mut relations: HashMap<RelationId, Relation> = HashMap::new();
+        relations.insert(rid, rel);
+
+        // The exact adjacency a correct writer would persist.
+        let mut persisted_outgoing: HashMap<EntityId, Vec<RelationId>> = HashMap::new();
+        persisted_outgoing.insert(e1, vec![rid]);
+        let mut persisted_incoming: HashMap<EntityId, Vec<RelationId>> = HashMap::new();
+        persisted_incoming.insert(e2, vec![rid]);
+
+        let (outgoing, incoming, node_outgoing, node_incoming, reuse) =
+            build_relation_indexes_with_reuse(&relations, persisted_outgoing, persisted_incoming);
+
+        assert_eq!(reuse, AdjacencyReuse::Reused);
+        assert_eq!(outgoing.get(&e1), Some(&vec![rid]));
+        assert_eq!(incoming.get(&e2), Some(&vec![rid]));
+        // Node-level maps are never persisted, so they are always derived.
+        assert_eq!(
+            node_outgoing.get(&GraphNodeId::Entity(e1)),
+            Some(&vec![rid])
+        );
+        assert_eq!(
+            node_incoming.get(&GraphNodeId::Entity(e2)),
+            Some(&vec![rid])
+        );
+    }
+
+    /// Definitive "reuse, not recompute" proof: feed a persisted adjacency that
+    /// is edge-count-consistent but maps the edge to DIFFERENT entities than the
+    /// relations imply. A recompute would derive the correct mapping; reuse
+    /// returns the persisted (deliberately divergent) mapping verbatim.
+    #[test]
+    fn adjacency_reuse_returns_persisted_not_recomputed() {
+        let e1 = EntityId::new();
+        let e2 = EntityId::new();
+        let decoy_src = EntityId::new();
+        let decoy_dst = EntityId::new();
+        let rel = test_relation(e1, e2, RelationKind::Calls);
+        let rid = rel.id;
+        let mut relations: HashMap<RelationId, Relation> = HashMap::new();
+        relations.insert(rid, rel);
+
+        // Same edge COUNT (1 outgoing, 1 incoming) but mapped to decoy entities.
+        let mut persisted_outgoing: HashMap<EntityId, Vec<RelationId>> = HashMap::new();
+        persisted_outgoing.insert(decoy_src, vec![rid]);
+        let mut persisted_incoming: HashMap<EntityId, Vec<RelationId>> = HashMap::new();
+        persisted_incoming.insert(decoy_dst, vec![rid]);
+
+        let (outgoing, incoming, _node_outgoing, _node_incoming, reuse) =
+            build_relation_indexes_with_reuse(&relations, persisted_outgoing, persisted_incoming);
+
+        assert_eq!(reuse, AdjacencyReuse::Reused);
+        // Reused verbatim — the decoy mapping survives, proving no recompute ran.
+        assert_eq!(outgoing.get(&decoy_src), Some(&vec![rid]));
+        assert!(outgoing.get(&e1).is_none());
+        assert_eq!(incoming.get(&decoy_dst), Some(&vec![rid]));
+        assert!(incoming.get(&e2).is_none());
+    }
+
+    /// An empty persisted adjacency (e.g. an older snapshot that never wrote it)
+    /// alongside real relations must be rebuilt, never trusted.
+    #[test]
+    fn adjacency_rebuild_when_persisted_empty() {
+        let e1 = EntityId::new();
+        let e2 = EntityId::new();
+        let e3 = EntityId::new();
+        let r1 = test_relation(e1, e2, RelationKind::Calls);
+        let r2 = test_relation(e2, e3, RelationKind::Contains);
+        let (rid1, rid2) = (r1.id, r2.id);
+        let mut relations: HashMap<RelationId, Relation> = HashMap::new();
+        relations.insert(rid1, r1);
+        relations.insert(rid2, r2);
+
+        let (outgoing, incoming, _node_outgoing, _node_incoming, reuse) =
+            build_relation_indexes_with_reuse(&relations, HashMap::new(), HashMap::new());
+
+        assert_eq!(reuse, AdjacencyReuse::Rebuilt);
+        assert_eq!(outgoing.get(&e1), Some(&vec![rid1]));
+        assert_eq!(outgoing.get(&e2), Some(&vec![rid2]));
+        assert_eq!(incoming.get(&e2), Some(&vec![rid1]));
+        assert_eq!(incoming.get(&e3), Some(&vec![rid2]));
+    }
+
+    /// A persisted adjacency whose edge tally disagrees with relations is
+    /// inconsistent and must be rebuilt rather than reused.
+    #[test]
+    fn adjacency_rebuild_when_persisted_inconsistent() {
+        let e1 = EntityId::new();
+        let e2 = EntityId::new();
+        let r1 = test_relation(e1, e2, RelationKind::Calls);
+        let r2 = test_relation(e2, e1, RelationKind::Calls);
+        let (rid1, rid2) = (r1.id, r2.id);
+        let mut relations: HashMap<RelationId, Relation> = HashMap::new();
+        relations.insert(rid1, r1);
+        relations.insert(rid2, r2);
+
+        // Persisted outgoing only records ONE of the two outgoing edges → tally
+        // mismatch (1 != 2) forces a rebuild.
+        let mut persisted_outgoing: HashMap<EntityId, Vec<RelationId>> = HashMap::new();
+        persisted_outgoing.insert(e1, vec![rid1]);
+        let mut persisted_incoming: HashMap<EntityId, Vec<RelationId>> = HashMap::new();
+        persisted_incoming.insert(e2, vec![rid1]);
+        persisted_incoming.insert(e1, vec![rid2]);
+
+        let (outgoing, incoming, _node_outgoing, _node_incoming, reuse) =
+            build_relation_indexes_with_reuse(&relations, persisted_outgoing, persisted_incoming);
+
+        assert_eq!(reuse, AdjacencyReuse::Rebuilt);
+        // Rebuilt correctly from relations: both edges present on both sides.
+        assert_eq!(outgoing.get(&e1), Some(&vec![rid1]));
+        assert_eq!(outgoing.get(&e2), Some(&vec![rid2]));
+        assert_eq!(incoming.get(&e2), Some(&vec![rid1]));
+        assert_eq!(incoming.get(&e1), Some(&vec![rid2]));
+    }
+
+    /// Empty relations + empty persisted adjacency is the trivial consistent
+    /// case and counts as a (no-op) reuse.
+    #[test]
+    fn adjacency_reuse_when_graph_empty() {
+        let relations: HashMap<RelationId, Relation> = HashMap::new();
+        let (outgoing, incoming, node_outgoing, node_incoming, reuse) =
+            build_relation_indexes_with_reuse(&relations, HashMap::new(), HashMap::new());
+        assert_eq!(reuse, AdjacencyReuse::Reused);
+        assert!(outgoing.is_empty());
+        assert!(incoming.is_empty());
+        assert!(node_outgoing.is_empty());
+        assert!(node_incoming.is_empty());
+    }
+
+    /// End-to-end boot path: a snapshot carrying persisted adjacency loads into a
+    /// graph whose neighbor queries match the relations (the reuse branch must
+    /// produce a correct in-memory graph, not just a fast one).
+    #[test]
+    fn from_snapshot_with_persisted_adjacency_resolves_neighbors() {
+        let e1 = test_entity("caller", "a.rs");
+        let e2 = test_entity("callee", "b.rs");
+        let rel = test_relation(e1.id, e2.id, RelationKind::Calls);
+        let rid = rel.id;
+
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.entities.insert(e1.id, e1.clone());
+        snapshot.entities.insert(e2.id, e2.clone());
+        snapshot.relations.insert(rid, rel);
+        // Persist a CONSISTENT entity-level adjacency so the reuse branch runs.
+        snapshot.outgoing.insert(e1.id, vec![rid]);
+        snapshot.incoming.insert(e2.id, vec![rid]);
+
+        let graph = InMemoryGraph::from_snapshot(snapshot);
+        assert_eq!(graph.relation_count(), 1);
+        // Reads the (reused) entity-level `outgoing` adjacency.
+        let outgoing = graph.get_relations(&e1.id, &[]).unwrap();
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0].id, rid);
+        assert_eq!(outgoing[0].dst, GraphNodeId::Entity(e2.id));
     }
 
     #[test]
