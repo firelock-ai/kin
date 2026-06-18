@@ -1796,6 +1796,123 @@ mod tests {
     }
 
     #[test]
+    fn open_read_only_for_locate_decodes_snapshot_with_file_hashes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let mgr = SnapshotManager::new(&path);
+        let graph = mgr.graph();
+
+        let caller = test_entity("caller");
+        let mut callee = test_entity("callee");
+        callee.file_origin = Some(FilePathId::new("src/lib.rs"));
+        let helper = test_entity("helper");
+
+        let change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([8; 32])),
+            parents: Vec::new(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("tester"),
+            message: "cochange".into(),
+            entity_deltas: vec![EntityDelta::Added(caller.clone())],
+            relation_deltas: Vec::new(),
+            artifact_deltas: Vec::new(),
+            projected_files: vec![FilePathId::new("src/main.rs")],
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            authored_on: Some(BranchName::new("main")),
+        };
+
+        let calls = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(caller.id),
+            dst: GraphNodeId::Entity(callee.id),
+            confidence: 0.9,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let cochange = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::CoChanges,
+            src: GraphNodeId::Entity(caller.id),
+            dst: GraphNodeId::Entity(helper.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Inferred,
+            created_in: Some(change.id),
+            import_source: None,
+            evidence: Vec::new(),
+        };
+
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        graph.upsert_entity(&helper).unwrap();
+        graph.create_change(&change).unwrap();
+        graph.upsert_relation(&calls).unwrap();
+        graph.upsert_relation(&cochange).unwrap();
+
+        // file_hashes is HashMap<String, [u8; 32]>; the 32-byte values serialize
+        // as a sequence. A non-empty map exercises the snapshot field that the
+        // locate decoder must skip rather than misread as artifact_index
+        // (FastHashMap<FilePathId, ArtifactId>) — the latter expects 16-byte
+        // UUID values and fails with "expected a 16 byte array" when drifted.
+        graph.set_file_hash("src/main.rs", [7u8; 32]);
+        graph.set_file_hash("src/lib.rs", [9u8; 32]);
+
+        graph
+            .upsert_shallow_file(&ShallowTrackedFile {
+                file_id: FilePathId::new("src/main.rs"),
+                language_hint: "rust".into(),
+                declaration_count: 1,
+                import_count: 0,
+                syntax_hash: Hash256::from_bytes([3; 32]),
+                signature_hash: Some(Hash256::from_bytes([4; 32])),
+                declaration_names: vec!["caller".into()],
+                import_paths: Vec::new(),
+            })
+            .unwrap();
+        mgr.save().unwrap();
+
+        let reopened = SnapshotManager::open_read_only_for_locate(&path).unwrap();
+        let graph = reopened.graph();
+
+        assert_eq!(
+            graph.get_entity(&caller.id).unwrap().unwrap().name,
+            "caller"
+        );
+        assert_eq!(
+            graph.get_entity(&callee.id).unwrap().unwrap().name,
+            "callee"
+        );
+        assert_eq!(
+            graph.get_entity(&helper.id).unwrap().unwrap().name,
+            "helper"
+        );
+        assert_eq!(
+            graph
+                .get_relations(&caller.id, &[RelationKind::Calls])
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            graph
+                .get_relations(&caller.id, &[RelationKind::CoChanges])
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            graph.get_change(&change.id).unwrap().unwrap().message,
+            "cochange"
+        );
+        assert_eq!(graph.list_shallow_files().unwrap().len(), 1);
+    }
+
+    #[test]
     fn open_read_only_for_locate_populates_locate_cache() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("graph.kndb");

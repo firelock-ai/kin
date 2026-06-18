@@ -1129,10 +1129,14 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(33, &self))?;
 
-                // Depending on the snapshot version, artifact_index might be missing or exist.
-                // We map it loosely here.
-                let artifact_index = seq.next_element()?.unwrap_or_default();
-
+                // Everything after opaque_artifacts (file_hashes, sessions,
+                // intents, downstream_warnings, entity_revisions, the tombstone
+                // maps, change_order, artifact_index) is drained rather than
+                // read by index. Those trailing fields grow over time and the
+                // borrowed save path stops before artifact_index, so any fixed
+                // position drifts against the canonical layout. artifact_index
+                // is rebuilt from artifact file paths in from_locate_snapshot,
+                // so locate starts from an empty map here.
                 while let Some(_) = seq.next_element::<IgnoredAny>()? {}
 
                 Ok(LocateGraphSnapshot {
@@ -1144,7 +1148,7 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                     file_layouts,
                     structured_artifacts,
                     opaque_artifacts,
-                    artifact_index,
+                    artifact_index: FastHashMap::default(),
                 })
             }
         }
