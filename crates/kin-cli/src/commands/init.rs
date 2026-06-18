@@ -23,9 +23,128 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{info, warn};
 
-/// Directories to skip during snapshot.
-/// Uses the canonical `kin_index::SKIP_DIRS` plus git internals.
-const SNAPSHOT_SKIP_DIRS: &[&str] = &[".git/objects", ".git/pack"];
+/// Discovery cap for `kin init`. When more than this many indexable files are
+/// found, init refuses to grind unless the caller explicitly opts in (`--force`)
+/// or raises the limit via `KIN_INIT_MAX_FILES`.
+const INIT_MAX_DISCOVERED_FILES: usize = 100_000;
+
+fn init_max_discovered_files() -> usize {
+    std::env::var("KIN_INIT_MAX_FILES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(INIT_MAX_DISCOVERED_FILES)
+}
+
+/// Repo-scoped ignore rules loaded from a `.kinignore` file at the repo root.
+///
+/// Each non-empty, non-`#` line is a pattern. A pattern without a `/` matches a
+/// path component (basename) at any nesting level; a pattern containing a `/`
+/// matches a repo-relative path or subtree prefix. No glob expansion — patterns
+/// are matched literally so behavior is predictable.
+#[derive(Debug, Default)]
+struct KinIgnore {
+    names: HashSet<String>,
+    prefixes: Vec<String>,
+}
+
+impl KinIgnore {
+    fn load(root: &Path) -> Self {
+        let mut ignore = KinIgnore::default();
+        let Ok(content) = fs::read_to_string(root.join(".kinignore")) else {
+            return ignore;
+        };
+        for raw in content.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let pattern = line.trim_end_matches('/');
+            let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
+            if pattern.is_empty() {
+                continue;
+            }
+            if pattern.contains('/') {
+                ignore.prefixes.push(pattern.to_string());
+            } else {
+                ignore.names.insert(pattern.to_string());
+            }
+        }
+        ignore
+    }
+
+    fn matches(&self, rel: &Path, name: &str) -> bool {
+        if self.names.contains(name) {
+            return true;
+        }
+        if self.prefixes.is_empty() {
+            return false;
+        }
+        let rel_str = rel.to_string_lossy();
+        self.prefixes
+            .iter()
+            .any(|prefix| rel_str == prefix.as_str() || rel_str.starts_with(&format!("{prefix}/")))
+    }
+}
+
+/// True when a directory or file entry must never enter the init snapshot.
+///
+/// Matched by component name at every nesting level so nested sub-repos
+/// (`.git`), nested or renamed Kin graph dirs (`.kin*`), and nested vendored
+/// trees (`node_modules`, `target`, …) are all pruned — not just the ones at the
+/// repo root.
+fn snapshot_entry_ignored(name: &str, rel: &Path, ignore: &KinIgnore) -> bool {
+    if kin_index::should_skip_dir(name) || name.starts_with(".kin") {
+        return true;
+    }
+    ignore.matches(rel, name)
+}
+
+/// Count indexable files under `root`, applying the same pruning as the snapshot
+/// walk. Stops early once `cap` is exceeded so a huge tree is never fully walked.
+fn count_discoverable_files(
+    root: &Path,
+    dir: &Path,
+    ignore: &KinIgnore,
+    count: &mut usize,
+    cap: usize,
+) -> bool {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        if snapshot_entry_ignored(&name_str, rel, ignore) {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if count_discoverable_files(root, &path, ignore, count, cap) {
+                return true;
+            }
+        } else if file_type.is_file() {
+            *count += 1;
+            if *count > cap {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// True when the prune-aware file count under `root` exceeds `cap`.
+fn discovery_exceeds_cap(root: &Path, ignore: &KinIgnore, cap: usize) -> bool {
+    let mut count = 0usize;
+    count_discoverable_files(root, root, ignore, &mut count, cap)
+}
 
 const INIT_WARM_CACHE_SCHEMA_VERSION: &str = "v1";
 pub(crate) const INIT_WARM_CACHE_PIPELINE_EPOCH: &str =
@@ -112,7 +231,7 @@ struct WarmCacheDeltaResult {
 /// Returns `(snapshot_path, manifest_json)`.  The manifest is NOT written to
 /// disk here — the caller must write it *after* `collect_source_files` has
 /// finished so that `manifest.json` never appears in `file_hashes`.
-fn snapshot_repo(dir: &Path) -> Result<(PathBuf, serde_json::Value)> {
+fn snapshot_repo(dir: &Path, force: bool) -> Result<(PathBuf, serde_json::Value)> {
     let _span = tracing::info_span!(
         "kin.init.snapshot_repo",
         root = %dir.display()
@@ -122,13 +241,38 @@ fn snapshot_repo(dir: &Path) -> Result<(PathBuf, serde_json::Value)> {
     if tmp_snapshot.exists() {
         fs::remove_dir_all(&tmp_snapshot)?;
     }
+
+    let ignore = KinIgnore::load(dir);
+    let cap = init_max_discovered_files();
+    if discovery_exceeds_cap(dir, &ignore, cap) {
+        if !force {
+            anyhow::bail!(
+                "kin init discovered more than {cap} indexable files under {} — refusing to \
+                 index a tree this large. Scope it with a .kinignore file (e.g. exclude \
+                 vendored or generated-data directories), or re-run with --force to index \
+                 anyway. Raise the limit with KIN_INIT_MAX_FILES.",
+                dir.display()
+            );
+        }
+        warn!(
+            cap,
+            root = %dir.display(),
+            "kin init indexing a tree larger than the discovery cap because --force was set"
+        );
+    }
+
     fs::create_dir_all(&tmp_snapshot)?;
     let snapshot_dir = &tmp_snapshot;
 
     let mut file_count: u64 = 0;
     let mut total_bytes: u64 = 0;
 
-    walk_and_snapshot(dir, dir, &snapshot_dir, &mut file_count, &mut total_bytes)?;
+    if let Err(err) =
+        walk_and_snapshot(dir, dir, snapshot_dir, &ignore, &mut file_count, &mut total_bytes)
+    {
+        let _ = fs::remove_dir_all(&tmp_snapshot);
+        return Err(err);
+    }
 
     // Try to capture git HEAD for the manifest.
     let git_head = read_git_head(dir);
@@ -156,6 +300,7 @@ fn walk_and_snapshot(
     root: &Path,
     current: &Path,
     snapshot_dir: &Path,
+    ignore: &KinIgnore,
     file_count: &mut u64,
     total_bytes: &mut u64,
 ) -> Result<()> {
@@ -168,15 +313,16 @@ fn walk_and_snapshot(
         let entry = entry?;
         let path = entry.path();
         let rel = path.strip_prefix(root)?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
 
-        // Check if this path starts with any skipped directory.
-        if should_skip(rel) {
+        if snapshot_entry_ignored(&name_str, rel, ignore) {
             continue;
         }
 
         let ft = entry.file_type()?;
         if ft.is_dir() {
-            walk_and_snapshot(root, &path, snapshot_dir, file_count, total_bytes)?;
+            walk_and_snapshot(root, &path, snapshot_dir, ignore, file_count, total_bytes)?;
         } else if ft.is_file() {
             let dest = snapshot_dir.join(rel);
             if let Some(parent) = dest.parent() {
@@ -194,41 +340,6 @@ fn walk_and_snapshot(
     }
 
     Ok(())
-}
-
-fn should_skip(rel: &Path) -> bool {
-    let rel_str = rel.to_string_lossy();
-    if rel_str == ".kin-snapshot-tmp" || rel_str.starts_with(".kin-snapshot-tmp/") {
-        return true;
-    }
-    if rel_str.starts_with(".kin-") {
-        return true;
-    }
-    // VCS plumbing is never code semantics, and it must never enter graph truth.
-    // In a normal repo `.git` is a directory of internal state; in a git
-    // *worktree* the repo-root `.git` is a FILE whose contents are a `gitdir:`
-    // pointer baking in a machine-absolute path. Excluding the entire `.git`
-    // subtree (file or directory) keeps machine paths and serialization-unstable
-    // git internals out of the snapshot — and therefore out of the indexed
-    // entity set. Mirrors `kin_index::should_skip_dir(".git")`, applied here to
-    // the worktree pointer FILE as well. (Subsumes the `.git/objects` and
-    // `.git/pack` SNAPSHOT_SKIP_DIRS entries below.)
-    if rel_str == ".git" || rel_str.starts_with(".git/") {
-        return true;
-    }
-    // Snapshot-specific skips (git internals that aren't full directories).
-    for skip in SNAPSHOT_SKIP_DIRS {
-        if rel_str == *skip || rel_str.starts_with(&format!("{}/", skip)) {
-            return true;
-        }
-    }
-    // Canonical indexing skip dirs (shared with commit and migrate).
-    for skip in kin_index::SKIP_DIRS {
-        if rel_str == *skip || rel_str.starts_with(&format!("{}/", skip)) {
-            return true;
-        }
-    }
-    false
 }
 
 fn read_git_head(dir: &Path) -> Option<String> {
@@ -281,7 +392,7 @@ pub async fn run(
     }
 
     // Snapshot the working tree once and reuse that frozen view for indexing.
-    let (tmp_snapshot, snapshot_manifest) = snapshot_repo(&dir)?;
+    let (tmp_snapshot, snapshot_manifest) = snapshot_repo(&dir, force)?;
     phase!("snapshot_repo");
 
     let kin_dir = dir.join(".kin");
@@ -3804,7 +3915,7 @@ mod tests {
         fs::create_dir_all(root.join("node_modules/foo")).unwrap();
         fs::write(root.join("node_modules/foo/index.js"), "skip me").unwrap();
 
-        let (snapshot, manifest) = snapshot_repo(root).unwrap();
+        let (snapshot, manifest) = snapshot_repo(root, false).unwrap();
         assert!(snapshot.join("README.md").exists());
         assert!(snapshot.join("src/main.rs").exists());
         assert!(!snapshot.join("node_modules").exists());
@@ -3824,7 +3935,7 @@ mod tests {
         fs::create_dir_all(root.join("sub")).unwrap();
         fs::write(root.join("sub/c.txt"), "ccc").unwrap();
 
-        let (_snapshot, manifest) = snapshot_repo(root).unwrap();
+        let (_snapshot, manifest) = snapshot_repo(root, false).unwrap();
 
         assert_eq!(manifest["file_count"], 3);
         assert_eq!(manifest["total_bytes"], 9); // 3 + 3 + 3
@@ -3845,7 +3956,7 @@ mod tests {
         // One real file.
         fs::write(root.join("keep.txt"), "keep").unwrap();
 
-        let (snapshot, _manifest) = snapshot_repo(root).unwrap();
+        let (snapshot, _manifest) = snapshot_repo(root, false).unwrap();
         assert!(snapshot.join("keep.txt").exists());
         assert!(!snapshot.join("node_modules").exists());
         assert!(!snapshot.join("target").exists());
@@ -3866,10 +3977,181 @@ mod tests {
         fs::write(root.join(".kin-other/tmp/file.txt"), "skip").unwrap();
         fs::write(root.join("keep.txt"), "keep").unwrap();
 
-        let (snapshot, _manifest) = snapshot_repo(root).unwrap();
+        let (snapshot, _manifest) = snapshot_repo(root, false).unwrap();
         assert!(snapshot.join("keep.txt").exists());
         assert!(!snapshot.join(".kin-snapshot-tmp").exists());
         assert!(!snapshot.join(".kin-other").exists());
+    }
+
+    #[test]
+    fn snapshot_prunes_nested_vendored_git_and_kin_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn f() {}").unwrap();
+
+        // Nested vendored dir (not at the repo root).
+        fs::create_dir_all(root.join("pkg/inner/node_modules/dep")).unwrap();
+        fs::write(root.join("pkg/inner/node_modules/dep/index.js"), "vendored").unwrap();
+
+        // Nested sub-repo `.git` directory.
+        fs::create_dir_all(root.join("sub/.git/objects")).unwrap();
+        fs::write(root.join("sub/.git/config"), "[core]").unwrap();
+
+        // Nested Kin graph dir and a renamed Kin graph dir.
+        fs::create_dir_all(root.join("sub/.kin/snapshot")).unwrap();
+        fs::write(root.join("sub/.kin/graph.bin"), "graph").unwrap();
+        fs::create_dir_all(root.join("data/.kindb")).unwrap();
+        fs::write(root.join("data/.kindb/blob"), "blob").unwrap();
+
+        let (snapshot, manifest) = snapshot_repo(root, false).unwrap();
+        let rels: BTreeSet<String> = collect_source_files(&snapshot)
+            .unwrap()
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&snapshot)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+
+        assert!(rels.contains("src/lib.rs"), "got: {:?}", rels);
+        assert!(
+            !rels.iter().any(|p| p.contains("node_modules")),
+            "nested vendored dir leaked: {:?}",
+            rels
+        );
+        assert!(
+            !rels.iter().any(|p| p.contains(".git")),
+            "nested sub-repo git plumbing leaked: {:?}",
+            rels
+        );
+        assert!(
+            !rels.iter().any(|p| p.contains(".kin")),
+            "nested/renamed Kin graph dir leaked: {:?}",
+            rels
+        );
+        assert_eq!(manifest["file_count"], 1);
+    }
+
+    #[test]
+    fn snapshot_honors_kinignore_names_and_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        fs::write(
+            root.join(".kinignore"),
+            "# scope discovery\ngenerated\nthirdparty/big/\n",
+        )
+        .unwrap();
+
+        fs::write(root.join("keep.rs"), "fn k() {}").unwrap();
+        fs::create_dir_all(root.join("generated/sub")).unwrap();
+        fs::write(root.join("generated/sub/g.rs"), "fn g() {}").unwrap();
+        fs::create_dir_all(root.join("thirdparty/big/x")).unwrap();
+        fs::write(root.join("thirdparty/big/x/t.rs"), "fn t() {}").unwrap();
+        fs::create_dir_all(root.join("thirdparty/small")).unwrap();
+        fs::write(root.join("thirdparty/small/s.rs"), "fn s() {}").unwrap();
+
+        let (snapshot, _manifest) = snapshot_repo(root, false).unwrap();
+        let rels: BTreeSet<String> = collect_source_files(&snapshot)
+            .unwrap()
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&snapshot)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+
+        assert!(rels.contains("keep.rs"), "got: {:?}", rels);
+        assert!(rels.contains("thirdparty/small/s.rs"), "got: {:?}", rels);
+        assert!(
+            !rels.iter().any(|p| p.starts_with("generated")),
+            "name-pattern dir leaked: {:?}",
+            rels
+        );
+        assert!(
+            !rels.iter().any(|p| p.starts_with("thirdparty/big")),
+            "prefix-pattern dir leaked: {:?}",
+            rels
+        );
+    }
+
+    #[test]
+    fn discovery_cap_trips_on_oversized_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for i in 0..8 {
+            fs::write(root.join(format!("f{i}.rs")), "x").unwrap();
+        }
+
+        let ignore = KinIgnore::load(root);
+        assert!(discovery_exceeds_cap(root, &ignore, 5));
+        assert!(!discovery_exceeds_cap(root, &ignore, 100));
+    }
+
+    #[test]
+    fn discovery_cap_excludes_pruned_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("real.rs"), "x").unwrap();
+        fs::create_dir_all(root.join("node_modules")).unwrap();
+        for i in 0..20 {
+            fs::write(root.join(format!("node_modules/v{i}.js")), "x").unwrap();
+        }
+
+        let ignore = KinIgnore::load(root);
+        assert!(!discovery_exceeds_cap(root, &ignore, 5));
+    }
+
+    #[test]
+    fn snapshot_entry_ignored_prunes_internal_and_vendored() {
+        let ignore = KinIgnore::default();
+        let rel = Path::new("x");
+        for name in [
+            ".kin",
+            ".kindb",
+            ".kin-snapshot-tmp",
+            ".git",
+            ".git-export",
+            "node_modules",
+            "target",
+            "vendor",
+        ] {
+            assert!(
+                snapshot_entry_ignored(name, rel, &ignore),
+                "should prune {name}"
+            );
+        }
+        for name in ["src", "main.rs", ".gitignore", ".github"] {
+            assert!(
+                !snapshot_entry_ignored(name, rel, &ignore),
+                "should keep {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn kinignore_matches_basenames_and_path_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join(".kinignore"),
+            "build\n# comment\nthirdparty/large/\n./out\n",
+        )
+        .unwrap();
+
+        let ignore = KinIgnore::load(root);
+        assert!(ignore.matches(Path::new("a/b/build"), "build"));
+        assert!(ignore.matches(Path::new("out"), "out"));
+        assert!(ignore.matches(Path::new("thirdparty/large"), "large"));
+        assert!(ignore.matches(Path::new("thirdparty/large/x"), "x"));
+        assert!(!ignore.matches(Path::new("thirdparty/small"), "small"));
+        assert!(!ignore.matches(Path::new("src/keep.rs"), "keep.rs"));
     }
 
     #[test]
@@ -3905,7 +4187,7 @@ mod tests {
             .current_dir(root)
             .output();
 
-        let (_snapshot, manifest) = snapshot_repo(root).unwrap();
+        let (_snapshot, manifest) = snapshot_repo(root, false).unwrap();
 
         // git_head should be a 40-char hex SHA.
         let head = manifest["git_head"]
@@ -4398,7 +4680,7 @@ mod tests {
             files.iter().map(|(p, _)| (*p).to_string()).collect();
 
         // Phase 1: snapshot (returns deferred manifest — not yet on disk).
-        let (snapshot_path, manifest) = snapshot_repo(root).unwrap();
+        let (snapshot_path, manifest) = snapshot_repo(root, false).unwrap();
         assert!(
             !snapshot_path.join("manifest.json").exists(),
             "manifest.json must not exist before write_snapshot_manifest"
@@ -4520,7 +4802,7 @@ mod tests {
         fs::write(root.join(".github/workflows/ci.yml"), "name: ci\n").unwrap();
 
         // Phase 1: the snapshot must not copy the worktree `.git` pointer file.
-        let (snapshot_path, _manifest) = snapshot_repo(root).unwrap();
+        let (snapshot_path, _manifest) = snapshot_repo(root, false).unwrap();
         assert!(
             !snapshot_path.join(".git").exists(),
             "worktree `.git` pointer file leaked into the snapshot"
