@@ -84,6 +84,7 @@ fn build_graph_at_ref_with_repo_inner(
     git_oid_hint: Option<&str>,
 ) -> Result<InMemoryGraph> {
     let build_start = std::time::Instant::now();
+    let timing = std::env::var("KIN_SCOPE_TIMING").is_ok();
     let build_timeout_secs = std::env::var("KIN_BUILD_GRAPH_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
@@ -93,6 +94,12 @@ fn build_graph_at_ref_with_repo_inner(
     let resolved = graph
         .resolve_graph_at(head)
         .map_err(|err| KinError::Graph(err.to_string()))?;
+    if timing {
+        eprintln!(
+            "[scope-timing] after collect+resolve: {}ms",
+            build_start.elapsed().as_millis()
+        );
+    }
 
     let git_repair = repo_path.and_then(|path| {
         match GitBlobRepair::new(path, head, &changes, oid_cache, git_oid_hint) {
@@ -131,6 +138,12 @@ fn build_graph_at_ref_with_repo_inner(
         }
         None => resolved.file_tree.clone(),
     };
+    if timing {
+        eprintln!(
+            "[scope-timing] after materialize_file_tree: {}ms",
+            build_start.elapsed().as_millis()
+        );
+    }
 
     let mut snapshot = GraphSnapshot::empty();
     snapshot.entities = resolved.entities;
@@ -197,6 +210,12 @@ fn build_graph_at_ref_with_repo_inner(
         build_timeout_secs,
     )?;
     filter_temporal_cochange_relations(&mut snapshot);
+    if timing {
+        eprintln!(
+            "[scope-timing] TOTAL build_graph_at_ref: {}ms",
+            build_start.elapsed().as_millis()
+        );
+    }
 
     Ok(InMemoryGraph::from_snapshot(snapshot))
 }
@@ -418,6 +437,8 @@ impl GitBlobRepair {
         &self,
         blob_store: &BlobStore,
     ) -> std::result::Result<HashMap<FilePathId, Hash256>, String> {
+        let timing = std::env::var("KIN_SCOPE_TIMING").is_ok();
+        let t_lstree = std::time::Instant::now();
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.repo_path)
@@ -433,7 +454,10 @@ impl GitBlobRepair {
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
+        let lstree_ms = t_lstree.elapsed().as_millis();
 
+        let t_loop = std::time::Instant::now();
+        let mut blob_count = 0usize;
         let mut file_tree = HashMap::new();
         for raw in output.stdout.split(|byte| *byte == 0) {
             if raw.is_empty() {
@@ -455,6 +479,7 @@ impl GitBlobRepair {
             if kind != "blob" {
                 continue;
             }
+            blob_count += 1;
 
             let content = Command::new("git")
                 .arg("-C")
@@ -475,6 +500,12 @@ impl GitBlobRepair {
                 .write(&content.stdout)
                 .map_err(|err| format!("failed to write git blob for {path}: {err}"))?;
             file_tree.insert(FilePathId::new(path), hash);
+        }
+        if timing {
+            eprintln!(
+                "[scope-timing] materialize_file_tree: {blob_count} blobs, ls-tree {lstree_ms}ms, cat-file loop {}ms",
+                t_loop.elapsed().as_millis()
+            );
         }
 
         Ok(file_tree)
