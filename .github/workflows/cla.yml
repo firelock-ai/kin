@@ -22,7 +22,7 @@ jobs:
       - name: Check CLA author allowlist/signature
         env:
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          ALLOWLIST: "troyfortinjr,dependabot[bot],github-actions[bot]"
+          ALLOWLIST: "troyjr4103,troyfortinjr,dependabot[bot],github-actions[bot]"
         shell: bash
         run: |
           set -euo pipefail
@@ -48,7 +48,7 @@ jobs:
             if type == "array" then
               any(.[]; candidate == $user)
             elif type == "object" then
-              (.[$user]? != null) or (((.signatures? // .contributors? // []) | any(.[]; candidate == $user)))
+              (.[$user]? != null) or (((.signedContributors? // .signatures? // .contributors? // []) | any(.[]; candidate == $user)))
             else
               false
             end
