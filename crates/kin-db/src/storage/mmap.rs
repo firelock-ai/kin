@@ -43,6 +43,33 @@ pub(crate) fn recovery_marker_path(path: &Path) -> PathBuf {
     append_suffix(path, ".tmp.meta")
 }
 
+/// Path a corrupt snapshot is moved aside to when verify-on-read fails.
+///
+/// `tag` is a short hex fingerprint of the offending content so repeated
+/// corruption of the same bytes lands on a stable name instead of piling up.
+pub(crate) fn quarantine_path(path: &Path, tag: &str) -> PathBuf {
+    append_suffix(path, &format!(".corrupt-{tag}"))
+}
+
+/// Atomically move a corrupt primary snapshot aside so it is never served and
+/// the path is free for a healed snapshot to take its place.
+///
+/// Mirrors the corrupt-object quarantine kin-blobs performs on a failed
+/// verify-on-read: the bad bytes are preserved for forensics under a distinct
+/// name rather than deleted or silently overwritten.
+pub(crate) fn quarantine_corrupt_snapshot(path: &Path, tag: &str) -> Result<PathBuf, KinDbError> {
+    let dest = quarantine_path(path, tag);
+    std::fs::rename(path, &dest).map_err(|e| {
+        KinDbError::StorageError(format!(
+            "failed to quarantine corrupt snapshot {} → {}: {e}",
+            path.display(),
+            dest.display()
+        ))
+    })?;
+    sync_parent_dir(path);
+    Ok(dest)
+}
+
 fn write_bytes_and_fsync(path: &Path, bytes: &[u8]) -> Result<(), KinDbError> {
     let mut file = File::create(path).map_err(|e| {
         KinDbError::StorageError(format!("failed to create {}: {e}", path.display()))

@@ -937,6 +937,74 @@ impl SnapshotManager {
         }
     }
 
+    /// Short hex fingerprint of a Merkle root, used in quarantine file names
+    /// and verify-on-read diagnostics.
+    fn root_hash_tag(hash: [u8; 32]) -> String {
+        hash.iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// Compare a freshly loaded graph against its persisted Merkle commitment.
+    ///
+    /// Returns `Some((committed, actual))` when the graph's recomputed content
+    /// root does not match the committed root (corruption), or `None` when it
+    /// matches or there is no commitment to verify against. The recomputed root
+    /// is read from the Merkle cache the load already built, so a clean read
+    /// costs only the comparison.
+    fn graph_truth_corruption(
+        graph: &InMemoryGraph,
+        persisted_root_hash: Option<[u8; 32]>,
+    ) -> Option<([u8; 32], [u8; 32])> {
+        let committed = persisted_root_hash?;
+        let actual = graph.compute_root_hash();
+        (actual != committed).then_some((committed, actual))
+    }
+
+    /// Quarantine a corrupt primary snapshot and self-heal from the recovery
+    /// candidate, mirroring the corrupt-object quarantine kin-blobs performs on
+    /// a failed verify-on-read. Fails loud when no trustworthy redundant copy
+    /// exists rather than serving corrupt graph truth.
+    fn quarantine_and_heal_graph_truth(
+        path: &Path,
+        committed_root: [u8; 32],
+        actual_root: [u8; 32],
+        text_index_path: Option<&PathBuf>,
+        read_only: bool,
+        skip_text_index: bool,
+    ) -> Result<(InMemoryGraph, [u8; 32]), KinDbError> {
+        if read_only {
+            return Err(KinDbError::StorageError(format!(
+                "graph snapshot {} failed verify-on-read (content root {} != committed root {}); \
+                 refusing to self-heal under a shared read-only lock",
+                path.display(),
+                Self::root_hash_tag(actual_root),
+                Self::root_hash_tag(committed_root)
+            )));
+        }
+        let quarantined =
+            mmap::quarantine_corrupt_snapshot(path, &Self::root_hash_tag(actual_root))?;
+        tracing::warn!(
+            path = %path.display(),
+            quarantined = %quarantined.display(),
+            "quarantined corrupt graph snapshot; healing from recovery candidate"
+        );
+        let cause = KinDbError::StorageError(format!(
+            "graph snapshot {} failed verify-on-read: content root {} does not match committed root {}",
+            path.display(),
+            Self::root_hash_tag(actual_root),
+            Self::root_hash_tag(committed_root)
+        ));
+        Self::recover_graph_from_tmp(
+            path,
+            Some(&cause),
+            text_index_path,
+            read_only,
+            skip_text_index,
+        )
+    }
+
     fn recover_graph_from_tmp(
         path: &Path,
         primary_error: Option<&KinDbError>,
@@ -980,6 +1048,21 @@ impl SnapshotManager {
                     tmp_path.display()
                 ))
             })?;
+
+        // Verify the recovery candidate against its own Merkle commitment before
+        // promoting it. Healing must never replace a corrupt primary with an
+        // equally corrupt recovery copy.
+        if let Some(committed_root) = persisted_root_hash {
+            let actual_root = compute_graph_root_hash(&snapshot);
+            if actual_root != committed_root {
+                return Err(KinDbError::StorageError(format!(
+                    "recovery snapshot {} failed verify-on-read: content root {} does not match committed root {}",
+                    tmp_path.display(),
+                    Self::root_hash_tag(actual_root),
+                    Self::root_hash_tag(committed_root)
+                )));
+            }
+        }
 
         mmap::promote_recovery_candidate(path).map_err(|err| {
             KinDbError::StorageError(format!(
@@ -1030,13 +1113,31 @@ impl SnapshotManager {
                             "replayed local snapshot deltas on open"
                         );
                     }
-                    Ok(Self::graph_from_snapshot(
+                    let (graph, graph_root_hash) = Self::graph_from_snapshot(
                         snapshot,
                         text_index_path,
                         read_only,
                         skip_text_index,
                         persisted_root_hash,
-                    ))
+                    );
+                    // Verify-on-read: the load already recomputed the Merkle root
+                    // from entity/relation content, so confirm it matches the
+                    // committed root before serving. On mismatch, quarantine and
+                    // self-heal rather than handing back corrupt graph truth.
+                    match Self::graph_truth_corruption(&graph, persisted_root_hash) {
+                        None => Ok((graph, graph_root_hash)),
+                        Some((committed_root, actual_root)) => {
+                            drop(graph);
+                            Self::quarantine_and_heal_graph_truth(
+                                path,
+                                committed_root,
+                                actual_root,
+                                text_index_path,
+                                read_only,
+                                skip_text_index,
+                            )
+                        }
+                    }
                 }
                 Err(err) => Self::recover_graph_from_tmp(
                     path,
@@ -2018,6 +2119,119 @@ mod tests {
         let fetched = recovered_graph.get_entity(&entity_id).unwrap().unwrap();
         assert_eq!(fetched.name, "recover_corrupted_primary");
         assert!(!tmp_path.exists(), "recovery tmp should be consumed");
+    }
+
+    #[test]
+    fn open_quarantines_and_heals_corrupt_graph_truth() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        // Non-trivial graph: two entities (16-byte ids) joined by a relation.
+        let caller = test_entity("caller");
+        let callee = test_entity("callee");
+        let caller_id = caller.id;
+        let relation = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(caller.id),
+            dst: GraphNodeId::Entity(callee.id),
+            confidence: 0.9,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        let mut good = GraphSnapshot::empty();
+        good.entities.insert(caller.id, caller.clone());
+        good.entities.insert(callee.id, callee.clone());
+        good.relations.insert(relation.id, relation.clone());
+        good.outgoing.insert(caller.id, vec![relation.id]);
+        good.incoming.insert(callee.id, vec![relation.id]);
+
+        let committed_root = compute_graph_root_hash(&good);
+        let good_bytes = good
+            .to_bytes_with_persisted_root_hash(committed_root)
+            .unwrap();
+
+        // Corrupt an entity's content on disk while keeping the original
+        // committed root: the bytes still decode and pass their checksum, but
+        // the content no longer matches the Merkle commitment.
+        let mut corrupt = good.clone();
+        corrupt.entities.get_mut(&caller_id).unwrap().signature = "fn tampered()".into();
+        let corrupt_root = compute_graph_root_hash(&corrupt);
+        assert_ne!(corrupt_root, committed_root);
+        let corrupt_bytes = corrupt
+            .to_bytes_with_persisted_root_hash(committed_root)
+            .unwrap();
+
+        // Primary holds the corrupt truth; the recovery candidate holds the
+        // verified good truth to heal from.
+        std::fs::write(&path, &corrupt_bytes).unwrap();
+        mmap::write_recovery_candidate_bytes(&path, &good_bytes).unwrap();
+
+        let healed = SnapshotManager::open(&path).unwrap();
+        let graph = healed.graph();
+
+        // The tampered signature must have been rejected and self-healed.
+        let restored = graph.get_entity(&caller_id).unwrap().unwrap();
+        assert_eq!(restored.signature, "fn caller()");
+        assert_eq!(graph.entity_count(), 2);
+        assert_eq!(graph.relation_count(), 1);
+
+        // The corrupt primary was quarantined, not deleted and not served.
+        let quarantine =
+            mmap::quarantine_path(&path, &SnapshotManager::root_hash_tag(corrupt_root));
+        assert!(
+            quarantine.exists(),
+            "corrupt snapshot should be quarantined at {}",
+            quarantine.display()
+        );
+        assert!(
+            !mmap::recovery_tmp_path(&path).exists(),
+            "recovery candidate should be consumed by the heal"
+        );
+    }
+
+    #[test]
+    fn open_fails_loud_on_corrupt_graph_truth_without_recovery() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kndb");
+
+        let entity = test_entity("lonely");
+        let mut good = GraphSnapshot::empty();
+        good.entities.insert(entity.id, entity.clone());
+        let committed_root = compute_graph_root_hash(&good);
+
+        let mut corrupt = good.clone();
+        corrupt.entities.get_mut(&entity.id).unwrap().signature = "fn tampered()".into();
+        let corrupt_root = compute_graph_root_hash(&corrupt);
+        let corrupt_bytes = corrupt
+            .to_bytes_with_persisted_root_hash(committed_root)
+            .unwrap();
+        std::fs::write(&path, &corrupt_bytes).unwrap();
+        // No recovery candidate exists — there is nothing trustworthy to heal from.
+
+        let err = match SnapshotManager::open(&path) {
+            Ok(_) => panic!("corrupt graph truth must fail loud, never be served"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("verify-on-read"),
+            "expected a verify-on-read failure, got: {msg}"
+        );
+
+        // The corrupt primary was quarantined rather than left in place.
+        let quarantine =
+            mmap::quarantine_path(&path, &SnapshotManager::root_hash_tag(corrupt_root));
+        assert!(
+            quarantine.exists(),
+            "corrupt snapshot should be quarantined"
+        );
+        assert!(
+            !path.exists(),
+            "corrupt primary must not remain in place after fail-loud quarantine"
+        );
     }
 
     #[test]
