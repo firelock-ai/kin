@@ -3,7 +3,7 @@
 
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use kin_model::entity::{Entity, EntityKind, SourceSpan};
 use kin_model::graph::{EntityFilter, GraphStore};
@@ -929,48 +929,6 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
     Ok(rows)
 }
 
-pub fn merge_text_reference_rows(
-    rows: &mut Vec<ReferenceRow>,
-    text_refs: Vec<kin_core::TextReferenceMatch>,
-) {
-    let mut index_by_key = HashMap::new();
-    for (index, row) in rows.iter().enumerate() {
-        index_by_key.insert(
-            reference_row_key(row.file_path.as_deref(), &row.name),
-            index,
-        );
-        if let Some(path) = row.file_path.as_deref() {
-            index_by_key.insert(path.to_string(), index);
-        }
-    }
-
-    for text_ref in text_refs {
-        let key = text_ref.file_path.clone();
-        if let Some(existing) = index_by_key.get(&key).copied() {
-            let row = &mut rows[existing];
-            if row.start_line.is_none() {
-                row.start_line = text_ref.start_line;
-            }
-            for kind in text_ref.relation_kinds {
-                push_reference_kind(&mut row.relation_kinds, kind);
-            }
-            row.relation_kinds.sort_by_key(relation_kind_rank);
-            continue;
-        }
-
-        let index = rows.len();
-        rows.push(ReferenceRow {
-            name: label_from_path(&text_ref.file_path),
-            kind: None,
-            file_path: Some(text_ref.file_path.clone()),
-            start_line: text_ref.start_line,
-            signature: None,
-            relation_kinds: text_ref.relation_kinds,
-        });
-        index_by_key.insert(key, index);
-    }
-}
-
 pub fn reference_row_key(file_path: Option<&str>, name: &str) -> String {
     file_path
         .map(|path| path.to_string())
@@ -980,22 +938,10 @@ pub fn reference_row_key(file_path: Option<&str>, name: &str) -> String {
 pub const MCP_SOURCE_MAX_LINES: usize = 40;
 pub const MCP_SOURCE_MAX_CHARS: usize = 2400;
 
-pub fn label_from_path(rel_path: &str) -> String {
-    Path::new(rel_path)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or(rel_path)
-        .to_string()
-}
-
 pub fn push_reference_kind(kinds: &mut Vec<RelationKind>, kind: RelationKind) {
     if !kinds.contains(&kind) {
         kinds.push(kind);
     }
-}
-
-pub fn resolve_reference_source_root() -> Option<PathBuf> {
-    candidate_source_roots().into_iter().next()
 }
 
 pub fn candidate_source_roots() -> Vec<PathBuf> {
