@@ -644,6 +644,16 @@ enum Command {
         #[arg(long)]
         resume: bool,
     },
+    /// Reclaim space from the global ~/.kin warm-start cache
+    Gc {
+        /// Report what would be reclaimed without deleting anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Reclaim cache bundles older than this many days (default 14).
+        /// The active (current) bundle of each repo is always preserved.
+        #[arg(long, value_name = "DAYS")]
+        max_age_days: Option<u64>,
+    },
     /// Inspect and validate the semantic graph
     Graph {
         #[command(subcommand)]
@@ -2193,6 +2203,10 @@ fn main() -> Result<()> {
                     depth,
                     resume,
                 } => commands::migrate::run(source, depth, resume).await,
+                Command::Gc {
+                    dry_run,
+                    max_age_days,
+                } => commands::gc::run(dry_run, max_age_days).await,
                 Command::Graph { action } => match action {
                     GraphAction::Status => commands::graph::status().await,
                     GraphAction::Validate => commands::graph::validate().await,
