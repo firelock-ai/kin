@@ -83,22 +83,30 @@ pub enum LoadStrategy {
     MmapBacked,
 }
 
-/// Tiered graph storage: hot in-memory tier + cold mmap tier.
+/// Tiered graph storage: a hot in-memory tier plus a cold mmap tier.
 ///
-/// For graphs that fit in RAM, this behaves identically to InMemoryGraph.
-/// For oversized graphs, the mmap remains open and the OS page cache
-/// transparently pages cold data in/out — no manual eviction needed.
+/// **Status: implemented but not yet wired into the default load/serve path.**
+/// The live runtime path ([`crate::storage::SnapshotManager`]) always fully
+/// deserializes a snapshot into a single [`InMemoryGraph`]; it never constructs
+/// a `TieredGraph`, and the cold mmap tier is not consulted when serving graph
+/// truth. This type exists so an oversized-graph path can be adopted later, but
+/// until it is wired into the serve path (and validated against a measured
+/// memory ceiling) it backs no production read. Treat it as a candidate
+/// mechanism, not a shipping capability.
 ///
-/// # How it works
+/// # Intended mechanism
 ///
-/// 1. On open, we check the snapshot file size vs available RAM.
-/// 2. If it fits (< 50% of free RAM), we fully deserialize into InMemoryGraph.
-/// 3. If it doesn't fit, we keep the mmap open. The OS virtual memory subsystem
-///    acts as our tiering engine — recently accessed pages stay in RAM,
-///    cold pages get evicted to disk automatically.
+/// 1. On open, compare the snapshot file size against available RAM.
+/// 2. If it fits (estimated in-memory size within the hot budget), fully
+///    deserialize into [`InMemoryGraph`] — identical to the non-tiered path.
+/// 3. If it does not fit, keep the mmap open and hydrate a bounded hot subset.
+///    Cold lookups fall back to the mmap-backed snapshot, leaving the OS page
+///    cache to keep hot pages resident and page cold data back from disk.
 ///
-/// The key insight: mmap + OS page cache IS memory/disk tiering.
-/// We don't need a separate eviction policy — the kernel already has one.
+/// The design bet behind the `MmapBacked` strategy is that mmap plus the OS
+/// page cache can stand in for an explicit eviction policy. That is a design
+/// intent, not a benchmarked guarantee: the actual graph size this sustains is
+/// unmeasured, so this type makes no specific large-graph capacity claim.
 pub struct TieredGraph {
     /// Hot tier: in-memory graph for fast indexed access.
     hot: Arc<InMemoryGraph>,
