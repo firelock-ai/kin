@@ -2477,6 +2477,18 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         );
     }
 
+    if locate_env_bool("KIN_LOCATE_LEXICAL_FLOOR_READMIT", false) {
+        apply_lexical_parity_floor(&mut fused, graph, text);
+        if explain {
+            record_debug_stage(
+                &mut score_breakdown,
+                &mut debug_info,
+                &fused,
+                "after_lexical_parity_floor",
+            );
+        }
+    }
+
     if explain {
         record_full_debug_stage(&mut debug_info, &fused, "pre_cap_full");
     }
@@ -4113,6 +4125,221 @@ fn signal_support_count_refs(path: &str, signal_sets: &[&HashMap<String, Vec<Fil
         .iter()
         .filter(|signal_set| signal_set.contains_key(path))
         .count()
+}
+
+#[derive(Default)]
+struct LexicalFileMatch {
+    best_quality: f32,
+    name_terms: HashSet<String>,
+    text_terms: HashSet<String>,
+    context_terms: HashSet<String>,
+    weighted_strength: f32,
+    exact_hit: bool,
+}
+
+fn lexical_term_rarity(graph: &kin_db::InMemoryGraph, term: &str) -> f32 {
+    let df = graph.text_doc_frequency(term);
+    let n = graph.text_document_count();
+    if df == 0 || n == 0 {
+        return 1.0;
+    }
+    let common_frac = locate_env_f32("KIN_LOCATE_LEXICAL_FLOOR_COMMON_FRAC", 0.02);
+    let common = (common_frac * n as f32).max(1.0);
+    (common / df as f32).clamp(0.05, 1.0)
+}
+
+fn lexical_parity_matches(
+    graph: &kin_db::InMemoryGraph,
+    terms: &[String],
+) -> HashMap<String, LexicalFileMatch> {
+    let mut matches: HashMap<String, LexicalFileMatch> = HashMap::new();
+    let quality_floor = locate_env_f32("KIN_LOCATE_LEXICAL_FLOOR_QUALITY", 3.0);
+
+    let scored_terms: Vec<(String, f32)> = terms
+        .iter()
+        .map(|term| term.to_ascii_lowercase())
+        .filter(|term| term.len() >= 4 && !is_english_stopword(term))
+        .map(|term| {
+            let rarity = lexical_term_rarity(graph, &term);
+            (term, rarity)
+        })
+        .collect();
+    if scored_terms.is_empty() {
+        return matches;
+    }
+
+    let Ok(entities) = graph.query_entities(&EntityFilter {
+        kinds: Some(vec![
+            EntityKind::Function,
+            EntityKind::Method,
+            EntityKind::Class,
+            EntityKind::TraitDef,
+            EntityKind::Interface,
+            EntityKind::EnumDef,
+            EntityKind::Module,
+        ]),
+        ..Default::default()
+    }) else {
+        return matches;
+    };
+
+    let mut per_term_files: HashMap<String, HashSet<String>> = HashMap::new();
+    for entity in &entities {
+        let Some(file_origin) = entity.file_origin.as_ref() else {
+            continue;
+        };
+        if entity.role == EntityRole::Docs || is_test_path(&file_origin.0) {
+            continue;
+        }
+        for (term, rarity) in &scored_terms {
+            let quality = score_name_match(term, &entity.name);
+            if quality < quality_floor {
+                continue;
+            }
+            let record = matches.entry(file_origin.0.clone()).or_default();
+            record.best_quality = record.best_quality.max(quality);
+            record.name_terms.insert(term.clone());
+            if per_term_files
+                .entry(term.clone())
+                .or_default()
+                .insert(file_origin.0.clone())
+            {
+                record.weighted_strength += (quality / 5.0) * rarity;
+            }
+            if quality >= 5.0 {
+                record.exact_hit = true;
+            }
+        }
+
+        let mut context = String::new();
+        context.push_str(&entity.signature.to_ascii_lowercase());
+        if let Some(doc) = entity.doc_summary.as_ref() {
+            context.push(' ');
+            context.push_str(&doc.to_ascii_lowercase());
+        }
+        if context.is_empty() {
+            continue;
+        }
+        for (term, rarity) in &scored_terms {
+            if context.contains(term.as_str()) {
+                let record = matches.entry(file_origin.0.clone()).or_default();
+                if record.context_terms.insert(term.clone())
+                    && !record.name_terms.contains(term)
+                    && !record.text_terms.contains(term)
+                {
+                    record.weighted_strength += 0.25 * rarity;
+                }
+            }
+        }
+    }
+
+    let text_hit_limit = locate_env_usize("KIN_LOCATE_LEXICAL_FLOOR_TEXT_HITS", 40);
+    for (term, rarity) in &scored_terms {
+        let Ok(hits) = graph.text_search(term, text_hit_limit) else {
+            continue;
+        };
+        let mut term_files: HashSet<String> = HashSet::new();
+        for (key, _score) in hits {
+            let Some(path) = file_path_from_retrieval_key(graph, &key) else {
+                continue;
+            };
+            if is_test_path(&path) || is_license_or_notice_path(&path) {
+                continue;
+            }
+            term_files.insert(path);
+        }
+        for path in term_files {
+            let record = matches.entry(path).or_default();
+            if record.text_terms.insert(term.clone()) && !record.name_terms.contains(term) {
+                record.weighted_strength += 0.5 * rarity;
+            }
+        }
+    }
+
+    matches
+}
+
+fn apply_lexical_parity_floor(
+    fused: &mut Vec<(String, f32)>,
+    graph: &kin_db::InMemoryGraph,
+    text: &str,
+) {
+    let mut terms: Vec<String> = extract_loose_query_terms(text)
+        .into_iter()
+        .filter(|term| {
+            let lower = term.to_ascii_lowercase();
+            lower.len() >= 4 && !is_english_stopword(&lower) && !is_common_english_word(&lower)
+        })
+        .collect();
+    terms.sort();
+    terms.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    if terms.is_empty() {
+        return;
+    }
+
+    let matches = lexical_parity_matches(graph, &terms);
+    if matches.is_empty() {
+        return;
+    }
+
+    let name_anchored: HashSet<&String> = matches
+        .iter()
+        .filter(|(_, record)| !record.name_terms.is_empty())
+        .map(|(path, _)| path)
+        .collect();
+    let in_fused: HashSet<String> = fused.iter().map(|(path, _)| path.clone()).collect();
+    let nonlexical_top = fused
+        .iter()
+        .filter(|(path, _)| !name_anchored.contains(path))
+        .map(|(_, score)| *score)
+        .fold(0.0_f32, f32::max);
+    let top_score = fused
+        .iter()
+        .map(|(_, score)| *score)
+        .fold(0.0_f32, f32::max);
+    let lift_gain = locate_env_f32("KIN_LOCATE_LEXICAL_FLOOR_LIFT", 1.05);
+    let admit_min_strength = locate_env_f32("KIN_LOCATE_LEXICAL_FLOOR_ADMIT_STRENGTH", 0.6);
+    let strong_strength = locate_env_f32("KIN_LOCATE_LEXICAL_FLOOR_STRONG_STRENGTH", 1.0);
+    let lift_present = locate_env_bool("KIN_LOCATE_LEXICAL_FLOOR_LIFT_PRESENT", true);
+    let mut existing: HashMap<String, usize> = HashMap::new();
+    for (idx, (path, _)) in fused.iter().enumerate() {
+        existing.insert(path.clone(), idx);
+    }
+
+    let mut admitted: Vec<(String, f32)> = Vec::new();
+    for (path, record) in &matches {
+        if record.name_terms.is_empty() {
+            continue;
+        }
+        let present = in_fused.contains(path);
+        let admit_ok = record.exact_hit || record.weighted_strength >= admit_min_strength;
+        let quality_scale = (record.best_quality / 5.0).clamp(0.0, 1.0);
+        let strength_scale = (record.weighted_strength / strong_strength).clamp(0.0, 1.0);
+        let lexical_strength = quality_scale.max(strength_scale).clamp(0.0, 1.0);
+        let ceiling = nonlexical_top + (top_score - nonlexical_top) * strength_scale;
+        let parity = ceiling.max(nonlexical_top) * lift_gain * lexical_strength;
+        if present {
+            if !lift_present {
+                continue;
+            }
+            if let Some(&idx) = existing.get(path) {
+                let original = fused[idx].1;
+                if parity > original {
+                    let tiebreak = locate_env_f32("KIN_LOCATE_LEXICAL_FLOOR_TIEBREAK", 0.05);
+                    fused[idx].1 = parity + tiebreak * original;
+                }
+            }
+        } else if admit_ok {
+            admitted.push((path.clone(), parity));
+        }
+    }
+    fused.extend(admitted);
+
+    fused.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
 }
 
 fn companion_query_match_count(
@@ -13484,6 +13711,34 @@ mod tests {
             score,
             spans: vec![],
         }]
+    }
+
+    #[test]
+    fn lexical_parity_floor_is_noop_when_no_entities_match() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut fused = vec![
+            ("crates/a.rs".to_string(), 1.0_f32),
+            ("crates/b.rs".to_string(), 0.5_f32),
+        ];
+        let before = fused.clone();
+        apply_lexical_parity_floor(&mut fused, &graph, "resolve repository identifier manifest");
+        assert_eq!(
+            fused, before,
+            "empty graph yields no lexical matches, so the floor must not change fusion"
+        );
+    }
+
+    #[test]
+    fn lexical_file_match_records_part_named_entity() {
+        let record = LexicalFileMatch {
+            best_quality: 3.0,
+            name_terms: HashSet::from(["commit".to_string()]),
+            ..Default::default()
+        };
+        assert!(!record.name_terms.is_empty());
+        assert_eq!(record.best_quality, 3.0);
+        assert!(!record.exact_hit);
+        assert!(record.text_terms.is_empty());
     }
 
     #[test]
