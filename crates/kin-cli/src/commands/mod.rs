@@ -24,6 +24,7 @@ pub mod diff;
 pub mod eject;
 pub mod embed;
 pub mod exec;
+pub mod gc;
 pub mod git;
 pub mod graph;
 pub mod graph_health;
