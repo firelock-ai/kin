@@ -379,14 +379,46 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
     let _daemon_lock = match crate::lifecycle::acquire_singleton_lock(state.layout.root()) {
         Ok(Some(lock)) => lock,
         Ok(None) => {
+            // Contended. Either a live daemon already owns this repo, or a
+            // forked child leaked the flock fd past its dead parent (os error 35
+            // with no live owner). Reclaim clears only the latter — it is a
+            // no-op unless the recorded owner PID is present and dead — so a
+            // genuine second daemon still refuses to start.
+            let cleared = crate::lifecycle::reclaim_stale_locks(state.layout.root());
+            if cleared.is_empty() {
+                warn!(
+                    repo = %state.layout.root().display(),
+                    "another kin daemon already owns this repo — refusing to start a second daemon"
+                );
+                return Ok(());
+            }
             warn!(
                 repo = %state.layout.root().display(),
-                "another kin daemon already owns this repo — refusing to start a second daemon"
+                cleared = cleared.len(),
+                "reclaimed stale repo locks left by a dead daemon; retrying singleton acquire"
             );
-            return Ok(());
+            match crate::lifecycle::acquire_singleton_lock(state.layout.root()) {
+                Ok(Some(lock)) => lock,
+                Ok(None) => {
+                    warn!(
+                        repo = %state.layout.root().display(),
+                        "singleton lock still contended after stale-lock reclaim — refusing to start"
+                    );
+                    return Ok(());
+                }
+                Err(error) => return Err(DaemonError::Io(error)),
+            }
         }
         Err(error) => return Err(DaemonError::Io(error)),
     };
+
+    // Stamp ownership immediately, before the slower migrate / LSP-discovery
+    // steps below. A contending starter consults `daemon.pid` to decide whether
+    // a contended lock is a live owner (refuse) or a dead-owner stale lock
+    // (reclaim); recording our live PID now closes the window where a lingering
+    // dead-owner PID could be mistaken for reclaimable while we already hold the
+    // lock. The port file is still written later, once the port is bound.
+    crate::lifecycle::write_pid_file(state.layout.root());
 
     // Refuse to serve an incompatible `.kin/` layout. We now hold the singleton
     // lock (sole writer for this repo) but have not bound a port, written
@@ -425,10 +457,10 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
 
     let state = Arc::new(state);
 
-    // Write PID and port files so CLI processes can discover and auto-connect.
-    // Each repo gets its own daemon on its own port — the port file enables
-    // per-repo isolation (critical for benchmark worktrees).
-    crate::lifecycle::write_pid_file(state.layout.root());
+    // Write the port file so CLI processes can discover and auto-connect. Each
+    // repo gets its own daemon on its own port — the port file enables per-repo
+    // isolation (critical for benchmark worktrees). The PID file was written
+    // earlier, immediately after acquiring the singleton lock.
     crate::lifecycle::write_port_file(state.layout.root(), config.api_port);
 
     // Shutdown signal: when set to true, all loops exit.
