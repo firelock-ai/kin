@@ -827,6 +827,111 @@ fn accelerate_matmul(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<
     c
 }
 
+/// Single-threaded cache-blocked GEMM `C[m,n] = A[m,k] · B[n,k]ᵀ`
+/// (ndarray/matrixmultiply). Per-head attention helper: the caller parallelizes
+/// over heads, so this stays single-threaded to avoid nested rayon.
+fn blocked_gemm_nt(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    use ndarray::ArrayView2;
+    if m == 0 || n == 0 {
+        return vec![0.0f32; m * n];
+    }
+    let a2 = ArrayView2::from_shape((m, k), a).expect("gemm A [m,k]");
+    let b2 = ArrayView2::from_shape((n, k), b).expect("gemm B [n,k]");
+    let prod = a2.dot(&b2.t());
+    prod.as_slice()
+        .expect("dot output is standard layout")
+        .to_vec()
+}
+
+/// Single-threaded cache-blocked GEMM `C[m,n] = A[m,k] · B[k,n]` (no transpose).
+/// Per-head attention helper (scores · V).
+fn blocked_gemm_nn(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    use ndarray::ArrayView2;
+    if m == 0 || n == 0 {
+        return vec![0.0f32; m * n];
+    }
+    let a2 = ArrayView2::from_shape((m, k), a).expect("gemm A [m,k]");
+    let b2 = ArrayView2::from_shape((k, n), b).expect("gemm B [k,n]");
+    let prod = a2.dot(&b2);
+    prod.as_slice()
+        .expect("dot output is standard layout")
+        .to_vec()
+}
+
+/// Apple Accelerate `cblas_sgemm` GEMM `C[m,n] = A[m,k] · B[k,n]` (no transpose).
+#[cfg(all(feature = "accelerate", target_os = "macos"))]
+fn accelerate_matmul_nn(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    #[link(name = "Accelerate", kind = "framework")]
+    extern "C" {
+        #[allow(clippy::too_many_arguments)]
+        fn cblas_sgemm(
+            order: i32,
+            transa: i32,
+            transb: i32,
+            m: i32,
+            n: i32,
+            k: i32,
+            alpha: f32,
+            a: *const f32,
+            lda: i32,
+            b: *const f32,
+            ldb: i32,
+            beta: f32,
+            c: *mut f32,
+            ldc: i32,
+        );
+    }
+    const ROW_MAJOR: i32 = 101;
+    const NO_TRANS: i32 = 111;
+    let mut c = vec![0.0f32; m * n];
+    if m == 0 || n == 0 {
+        return c;
+    }
+    // Row-major A[m,k] (lda=k), B[k,n] (ldb=n) → C[m,n] (ldc=n).
+    unsafe {
+        cblas_sgemm(
+            ROW_MAJOR,
+            NO_TRANS,
+            NO_TRANS,
+            m as i32,
+            n as i32,
+            k as i32,
+            1.0,
+            a.as_ptr(),
+            k as i32,
+            b.as_ptr(),
+            n as i32,
+            0.0,
+            c.as_mut_ptr(),
+            n as i32,
+        );
+    }
+    c
+}
+
+/// Per-head GEMM dispatch for batched attention: Accelerate when selected, else
+/// the single-threaded blocked pure-Rust kernel (the caller owns head-level
+/// parallelism). `nt` selects `A·Bᵀ` (scores = Q·Kᵀ) vs `A·B` (out = scores·V).
+fn cpu_head_gemm(a: &[f32], b: &[f32], m: usize, n: usize, k: usize, nt: bool) -> Vec<f32> {
+    match cpu_backend() {
+        #[cfg(all(feature = "accelerate", target_os = "macos"))]
+        CpuBackend::Accelerate => {
+            if nt {
+                accelerate_matmul(a, b, m, n, k)
+            } else {
+                accelerate_matmul_nn(a, b, m, n, k)
+            }
+        }
+        CpuBackend::PureRust => {
+            if nt {
+                blocked_gemm_nt(a, b, m, n, k)
+            } else {
+                blocked_gemm_nn(a, b, m, n, k)
+            }
+        }
+    }
+}
+
 /// CPU compute using SIMD-accelerated operations from the main engine.
 pub struct CpuCompute;
 
@@ -856,41 +961,31 @@ impl GpuCompute for CpuCompute {
         seq_len: usize,
         head_dim: usize,
     ) -> Result<Vec<f32>, InferError> {
-        // Q, K are [num_heads, seq_len, head_dim] flattened
-        // Output is [num_heads, seq_len, seq_len]
-        let mut scores = vec![0.0f32; num_heads * seq_len * seq_len];
+        // Q, K are [num_heads, seq_len, head_dim] flattened; output is
+        // [num_heads, seq_len, seq_len]. Per head: scores[h] = Q[h] · K[h]ᵀ, a
+        // cache-blocked GEMM. Heads are independent → deterministic regardless of
+        // scheduling. Parallelize over heads for pure-Rust (single-thread kernel);
+        // run heads sequentially under Accelerate (it threads each GEMM itself).
         let head_stride = seq_len * head_dim;
         let out_stride = seq_len * seq_len;
-
-        if should_parallelize(num_heads * seq_len * seq_len * head_dim) {
-            // Parallelize over (head x query-row): num_heads*seq_len work units, so
-            // all cores engage even when num_heads (e.g. 12) < core count (18).
-            // One output score-row [seq_len] per unit.
+        let mut scores = vec![0.0f32; num_heads * out_stride];
+        let head = |h: usize, out: &mut [f32]| {
+            let q_head = &q[h * head_stride..(h + 1) * head_stride];
+            let k_head = &k[h * head_stride..(h + 1) * head_stride];
+            out.copy_from_slice(&cpu_head_gemm(
+                q_head, k_head, seq_len, seq_len, head_dim, true,
+            ));
+        };
+        if matches!(cpu_backend(), CpuBackend::PureRust)
+            && should_parallelize(num_heads * seq_len * seq_len * head_dim)
+        {
             scores
-                .par_chunks_mut(seq_len)
+                .par_chunks_mut(out_stride)
                 .enumerate()
-                .for_each(|(unit, row)| {
-                    let h = unit / seq_len;
-                    let i = unit % seq_len;
-                    let q_head = &q[h * head_stride..(h + 1) * head_stride];
-                    let k_head = &k[h * head_stride..(h + 1) * head_stride];
-                    let q_row = &q_head[i * head_dim..(i + 1) * head_dim];
-                    for (j, slot) in row.iter_mut().enumerate() {
-                        let k_row = &k_head[j * head_dim..(j + 1) * head_dim];
-                        *slot = crate::dot_product(q_row, k_row);
-                    }
-                });
+                .for_each(|(h, out)| head(h, out));
         } else {
-            for h in 0..num_heads {
-                let q_head = &q[h * head_stride..(h + 1) * head_stride];
-                let k_head = &k[h * head_stride..(h + 1) * head_stride];
-                for i in 0..seq_len {
-                    let q_row = &q_head[i * head_dim..(i + 1) * head_dim];
-                    for j in 0..seq_len {
-                        let k_row = &k_head[j * head_dim..(j + 1) * head_dim];
-                        scores[h * out_stride + i * seq_len + j] = crate::dot_product(q_row, k_row);
-                    }
-                }
+            for (h, out) in scores.chunks_mut(out_stride).enumerate() {
+                head(h, out);
             }
         }
         Ok(scores)
@@ -904,42 +999,30 @@ impl GpuCompute for CpuCompute {
         seq_len: usize,
         head_dim: usize,
     ) -> Result<Vec<f32>, InferError> {
-        // scores is [num_heads, seq_len, seq_len], V is [num_heads, seq_len, head_dim]
-        // output is [num_heads, seq_len, head_dim]
+        // scores is [num_heads, seq_len, seq_len], V is [num_heads, seq_len,
+        // head_dim]; output is [num_heads, seq_len, head_dim]. Per head:
+        // out[h] = scores[h] · V[h] (no transpose), a cache-blocked GEMM. Same
+        // head-parallel / Accelerate-sequential strategy as batched_matmul.
         let s_stride = seq_len * seq_len;
         let v_stride = seq_len * head_dim;
         let mut result = vec![0.0f32; num_heads * v_stride];
-
-        if should_parallelize(num_heads * seq_len * seq_len * head_dim) {
-            // Parallelize over (head x query-row): one output row [head_dim] per
-            // unit, so all cores engage even when num_heads < core count.
+        let head = |h: usize, out: &mut [f32]| {
+            let s_head = &scores[h * s_stride..(h + 1) * s_stride];
+            let v_head = &v[h * v_stride..(h + 1) * v_stride];
+            out.copy_from_slice(&cpu_head_gemm(
+                s_head, v_head, seq_len, head_dim, seq_len, false,
+            ));
+        };
+        if matches!(cpu_backend(), CpuBackend::PureRust)
+            && should_parallelize(num_heads * seq_len * seq_len * head_dim)
+        {
             result
-                .par_chunks_mut(head_dim)
+                .par_chunks_mut(v_stride)
                 .enumerate()
-                .for_each(|(unit, row)| {
-                    let h = unit / seq_len;
-                    let i = unit % seq_len;
-                    for (j, slot) in row.iter_mut().enumerate() {
-                        let mut sum = 0.0f32;
-                        for k_idx in 0..seq_len {
-                            sum += scores[h * s_stride + i * seq_len + k_idx]
-                                * v[h * v_stride + k_idx * head_dim + j];
-                        }
-                        *slot = sum;
-                    }
-                });
+                .for_each(|(h, out)| head(h, out));
         } else {
-            for h in 0..num_heads {
-                for i in 0..seq_len {
-                    for j in 0..head_dim {
-                        let mut sum = 0.0f32;
-                        for k_idx in 0..seq_len {
-                            sum += scores[h * s_stride + i * seq_len + k_idx]
-                                * v[h * v_stride + k_idx * head_dim + j];
-                        }
-                        result[h * v_stride + i * head_dim + j] = sum;
-                    }
-                }
+            for (h, out) in result.chunks_mut(v_stride).enumerate() {
+                head(h, out);
             }
         }
         Ok(result)
@@ -1252,6 +1335,60 @@ mod tests {
         let pr = pure_rust_matmul(&a, &b, m, n, k);
         for (g, w) in pr.iter().zip(want.iter()) {
             assert!((g - w).abs() < 1e-3, "pure-rust {g} vs ref {w}");
+        }
+    }
+
+    #[test]
+    fn cpu_batched_attention_matches_naive_reference() {
+        // nh*seq*seq*hd = 9600 >= 4096 → exercises the head-parallel blocked path
+        // (and BLAS when compiled) against naive per-head Q·Kᵀ and scores·V.
+        let (nh, seq, hd) = (3usize, 20usize, 8usize);
+        let q: Vec<f32> = (0..nh * seq * hd)
+            .map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.1)
+            .collect();
+        let k: Vec<f32> = (0..nh * seq * hd)
+            .map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.1)
+            .collect();
+        // scores[h] = Q[h] · K[h]ᵀ
+        let mut want_s = vec![0.0f32; nh * seq * seq];
+        for h in 0..nh {
+            for i in 0..seq {
+                for j in 0..seq {
+                    let mut s = 0.0f32;
+                    for t in 0..hd {
+                        s += q[h * seq * hd + i * hd + t] * k[h * seq * hd + j * hd + t];
+                    }
+                    want_s[h * seq * seq + i * seq + j] = s;
+                }
+            }
+        }
+        let got_s = CpuCompute.batched_matmul(&q, &k, nh, seq, hd).unwrap();
+        assert_eq!(got_s.len(), want_s.len());
+        for (g, w) in got_s.iter().zip(want_s.iter()) {
+            assert!((g - w).abs() < 1e-3, "scores {g} vs ref {w}");
+        }
+        // out[h] = scores[h] · V[h]
+        let v: Vec<f32> = (0..nh * seq * hd)
+            .map(|i| ((i * 3 % 7) as f32 - 3.0) * 0.1)
+            .collect();
+        let mut want_o = vec![0.0f32; nh * seq * hd];
+        for h in 0..nh {
+            for i in 0..seq {
+                for j in 0..hd {
+                    let mut s = 0.0f32;
+                    for t in 0..seq {
+                        s += want_s[h * seq * seq + i * seq + t] * v[h * seq * hd + t * hd + j];
+                    }
+                    want_o[h * seq * hd + i * hd + j] = s;
+                }
+            }
+        }
+        let got_o = CpuCompute
+            .batched_attn_values(&want_s, &v, nh, seq, hd)
+            .unwrap();
+        assert_eq!(got_o.len(), want_o.len());
+        for (g, w) in got_o.iter().zip(want_o.iter()) {
+            assert!((g - w).abs() < 1e-3, "attn_values {g} vs ref {w}");
         }
     }
 
