@@ -672,12 +672,20 @@ impl GraphSnapshot {
                 "body_len bytes: expected 8-byte slice".to_string(),
             )
         })?) as usize;
-        if data.len() < 16 + body_len {
+        // Checked add: an adversarial body_len near usize::MAX would otherwise
+        // wrap `16 + body_len`, defeating the bounds check and panicking on the
+        // `data[16..16 + body_len]` slice below (FIR-1031, found by fuzzing).
+        let body_end = 16usize.checked_add(body_len).ok_or_else(|| {
+            crate::error::KinDbError::StorageError(
+                "snapshot header body length overflows usize".to_string(),
+            )
+        })?;
+        if data.len() < body_end {
             return Err(crate::error::KinDbError::StorageError(
                 "snapshot file truncated: body extends past end of data".to_string(),
             ));
         }
-        let body = &data[16..16 + body_len];
+        let body = &data[16..body_end];
 
         match version {
             1 | 2 => Ok(SnapshotFrame {
@@ -839,8 +847,15 @@ impl GraphSnapshot {
         body_len: usize,
         version_label: &str,
     ) -> Result<usize, crate::error::KinDbError> {
-        let checksum_start = 16 + body_len;
-        let checksum_end = checksum_start + Self::CHECKSUM_LEN;
+        // Checked add to avoid wrapping on an adversarial body_len (FIR-1031).
+        let checksum_end = 16usize
+            .checked_add(body_len)
+            .and_then(|start| start.checked_add(Self::CHECKSUM_LEN))
+            .ok_or_else(|| {
+                crate::error::KinDbError::StorageError(format!(
+                    "{version_label} snapshot body length overflows usize"
+                ))
+            })?;
         if data.len() < checksum_end {
             return Err(crate::error::KinDbError::StorageError(format!(
                 "{version_label} snapshot missing checksum"
@@ -1646,6 +1661,23 @@ impl From<GraphSnapshotV4Legacy> for GraphSnapshot {
 mod tests {
     use super::*;
     use kin_model::{EntityStore, VerificationStore};
+
+    /// FIR-1031 regression (found by fuzzing): a snapshot header whose body_len
+    /// is near usize::MAX must be rejected with an error, never wrap `16 +
+    /// body_len` and panic on the body slice.
+    #[test]
+    fn from_bytes_rejects_overflowing_body_len_without_panic() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&GraphSnapshot::MAGIC);
+        data.extend_from_slice(&GraphSnapshot::CURRENT_VERSION.to_le_bytes());
+        data.extend_from_slice(&u64::MAX.to_le_bytes()); // absurd body_len
+        data.extend_from_slice(&[0u8; 16]); // some trailing bytes
+        let result = GraphSnapshot::from_bytes(&data);
+        assert!(
+            result.is_err(),
+            "overflowing body_len must error, not panic"
+        );
+    }
 
     fn test_entity(name: &str) -> Entity {
         Entity {

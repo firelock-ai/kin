@@ -334,12 +334,22 @@ impl GraphSnapshotDelta {
                 .map_err(|_| KinDbError::SliceConversionError("body_len bytes".to_string()))?,
         ) as usize;
 
-        if data.len() < 16 + body_len + Self::CHECKSUM_LEN {
+        // Checked add: an adversarial body_len near usize::MAX would otherwise
+        // wrap `16 + body_len + CHECKSUM_LEN`, defeating the bounds check and
+        // panicking on the body/checksum slices below (FIR-1031, found by
+        // fuzzing).
+        let body_end = 16usize.checked_add(body_len).ok_or_else(|| {
+            KinDbError::StorageError("delta header body length overflows usize".to_string())
+        })?;
+        let checksum_end = body_end.checked_add(Self::CHECKSUM_LEN).ok_or_else(|| {
+            KinDbError::StorageError("delta header body length overflows usize".to_string())
+        })?;
+        if data.len() < checksum_end {
             return Err(KinDbError::StorageError("delta file truncated".to_string()));
         }
 
-        let body = &data[16..16 + body_len];
-        let stored_hash = &data[16 + body_len..16 + body_len + Self::CHECKSUM_LEN];
+        let body = &data[16..body_end];
+        let stored_hash = &data[body_end..checksum_end];
         let computed_hash = Sha256::digest(body);
 
         if stored_hash != computed_hash.as_slice() {
@@ -644,6 +654,23 @@ pub fn apply_graph_delta(snapshot: &mut GraphSnapshot, delta: &GraphSnapshotDelt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FIR-1031 regression (found by fuzzing): a delta header whose body_len is
+    /// near usize::MAX must error, never wrap `16 + body_len + CHECKSUM_LEN`
+    /// and panic on the body/checksum slices.
+    #[test]
+    fn delta_from_bytes_rejects_overflowing_body_len_without_panic() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&GraphSnapshotDelta::MAGIC);
+        data.extend_from_slice(&GraphSnapshotDelta::CURRENT_VERSION.to_le_bytes());
+        data.extend_from_slice(&u64::MAX.to_le_bytes()); // absurd body_len
+        data.extend_from_slice(&[0u8; 16]);
+        let result = GraphSnapshotDelta::from_bytes(&data);
+        assert!(
+            result.is_err(),
+            "overflowing body_len must error, not panic"
+        );
+    }
 
     // -- Helpers -----------------------------------------------------------
 

@@ -26,3 +26,13 @@ doc = false
 name = "fuzz_delta_deser"
 path = "fuzz_targets/fuzz_delta_deser.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_delta_apply"
+path = "fuzz_targets/fuzz_delta_apply.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_graph_ingest"
+path = "fuzz_targets/fuzz_graph_ingest.rs"
+doc = false
