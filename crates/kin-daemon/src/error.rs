@@ -26,6 +26,9 @@ pub enum DaemonError {
     #[error("Not initialized: no .kin/ directory found")]
     NotInitialized,
 
+    #[error("{0}")]
+    IncompatibleRepo(String),
+
     #[error("Already running")]
     AlreadyRunning,
 

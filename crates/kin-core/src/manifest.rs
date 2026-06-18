@@ -7,6 +7,14 @@ use std::path::Path;
 use crate::error::{KinError, Result};
 use crate::layout::KinLayout;
 
+/// Minimum `kin_version` (major, minor) this binary can open an existing repo
+/// with. A repo created by an older Kin (e.g. 0.1.x) carries an on-disk graph
+/// and vector index built before a breaking format change; the post-load embed
+/// and readiness path cannot serve it, so opening it must be refused up front
+/// with an actionable error instead of loading and then being SIGTERM-killed by
+/// the CLI supervisor when readiness never arrives.
+pub const MIN_COMPATIBLE_KIN_VERSION: (u64, u64) = (0, 2);
+
 /// Repo identity stored in `.kin/manifest.json`.
 ///
 /// This records the Kin version that created the repo, detected languages,
@@ -37,6 +45,76 @@ impl Default for KinManifest {
     }
 }
 
+/// Outcome of comparing a repo's recorded `kin_version` against this binary's
+/// minimum-compatible floor ([`MIN_COMPATIBLE_KIN_VERSION`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestCompatibility {
+    /// The recorded version meets or exceeds the floor (or is unparseable and
+    /// therefore not provably old — see [`classify_kin_version`]).
+    Compatible,
+    /// The recorded version predates the floor and the repo must be rebuilt
+    /// before this binary can open it.
+    TooOld { found: String },
+}
+
+impl ManifestCompatibility {
+    /// Whether the repo can be opened by this binary.
+    pub fn is_compatible(&self) -> bool {
+        matches!(self, ManifestCompatibility::Compatible)
+    }
+
+    /// An actionable, user-facing message describing the version gap and how to
+    /// resolve it, or `None` when the repo is compatible. Names the recorded
+    /// version, the required floor, and the two rebuild paths (`kin migrate` /
+    /// `kin embed --rebuild`).
+    pub fn incompatibility_message(&self) -> Option<String> {
+        match self {
+            ManifestCompatibility::Compatible => None,
+            ManifestCompatibility::TooOld { found } => Some(format!(
+                "this repository was created by kin {found}, but this kin build \
+                 requires a repository created by kin {}.{}.x or newer. Its \
+                 on-disk graph and vector index predate a breaking format change \
+                 and cannot be served as-is. Run `kin migrate` to rebuild the \
+                 graph from source, or `kin embed --rebuild` to rebuild the \
+                 vector index at the current model dimension.",
+                MIN_COMPATIBLE_KIN_VERSION.0, MIN_COMPATIBLE_KIN_VERSION.1
+            )),
+        }
+    }
+}
+
+/// Parse the leading `MAJOR.MINOR` from a `kin_version` string, ignoring any
+/// patch / pre-release suffix. Returns `None` when major or minor are not
+/// numeric.
+fn parse_major_minor(version: &str) -> Option<(u64, u64)> {
+    let mut parts = version.trim().split('.');
+    let major = parts.next()?.trim().parse::<u64>().ok()?;
+    // A patch/pre-release suffix may ride on the minor segment (e.g. "2-rc1");
+    // take the leading run of digits so it still parses.
+    let minor_segment = parts.next()?.trim();
+    let minor_digits: String = minor_segment
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let minor = minor_digits.parse::<u64>().ok()?;
+    Some((major, minor))
+}
+
+/// Classify a recorded `kin_version` against [`MIN_COMPATIBLE_KIN_VERSION`].
+///
+/// An unparseable version is treated as [`ManifestCompatibility::Compatible`]:
+/// the gate only blocks a version it can prove is older than the floor, never a
+/// version it merely fails to understand. (`KinManifest::new` always stamps a
+/// valid semver, so unparseable should not occur for repos this binary made.)
+pub fn classify_kin_version(version: &str) -> ManifestCompatibility {
+    match parse_major_minor(version) {
+        Some(found) if found < MIN_COMPATIBLE_KIN_VERSION => ManifestCompatibility::TooOld {
+            found: version.trim().to_string(),
+        },
+        _ => ManifestCompatibility::Compatible,
+    }
+}
+
 impl KinManifest {
     /// Create a new manifest for a freshly initialized repository.
     pub fn new() -> Self {
@@ -62,6 +140,43 @@ impl KinManifest {
         std::fs::write(path, contents).map_err(|e| KinError::io(path, e))?;
         Ok(())
     }
+
+    /// Classify this manifest's recorded `kin_version` against the
+    /// minimum-compatible floor ([`MIN_COMPATIBLE_KIN_VERSION`]).
+    pub fn compatibility(&self) -> ManifestCompatibility {
+        classify_kin_version(&self.kin_version)
+    }
+
+    /// Whether a repo with this manifest can be opened by this binary.
+    pub fn is_compatible(&self) -> bool {
+        self.compatibility().is_compatible()
+    }
+}
+
+/// Read ONLY the `kin_version` from a `.kin/manifest.json` and classify it
+/// against [`MIN_COMPATIBLE_KIN_VERSION`].
+///
+/// Deliberately resilient: it deserializes just the version field, so an older
+/// or partial manifest (one that predates fields this build expects) still
+/// gates correctly rather than failing with an opaque parse error. A missing
+/// file yields [`ManifestCompatibility::Compatible`] — callers decide how to
+/// treat an absent manifest — and a manifest with no `kin_version` is likewise
+/// treated as compatible rather than blocked.
+pub fn check_manifest_compatibility(path: &Path) -> Result<ManifestCompatibility> {
+    if !path.exists() {
+        return Ok(ManifestCompatibility::Compatible);
+    }
+    #[derive(Deserialize)]
+    struct VersionProbe {
+        #[serde(default)]
+        kin_version: Option<String>,
+    }
+    let contents = std::fs::read_to_string(path).map_err(|e| KinError::io(path, e))?;
+    let probe: VersionProbe = serde_json::from_str(&contents)?;
+    Ok(match probe.kin_version {
+        Some(version) => classify_kin_version(&version),
+        None => ManifestCompatibility::Compatible,
+    })
 }
 
 /// Resolve the canonical repo id for a discovered Kin layout.
@@ -136,5 +251,125 @@ mod tests {
 
         let resolved = resolve_repo_id(&layout, None).unwrap();
         assert_eq!(resolved, manifest.repo_id);
+    }
+
+    #[test]
+    fn classify_rejects_pre_floor_versions() {
+        assert_eq!(
+            classify_kin_version("0.1.0"),
+            ManifestCompatibility::TooOld {
+                found: "0.1.0".to_string()
+            }
+        );
+        assert_eq!(
+            classify_kin_version("0.0.9"),
+            ManifestCompatibility::TooOld {
+                found: "0.0.9".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn classify_accepts_floor_and_newer() {
+        assert_eq!(
+            classify_kin_version("0.2.0"),
+            ManifestCompatibility::Compatible
+        );
+        assert_eq!(
+            classify_kin_version("0.2.5"),
+            ManifestCompatibility::Compatible
+        );
+        assert_eq!(
+            classify_kin_version("0.3.0"),
+            ManifestCompatibility::Compatible
+        );
+        assert_eq!(
+            classify_kin_version("1.0.0"),
+            ManifestCompatibility::Compatible
+        );
+    }
+
+    #[test]
+    fn classify_is_lenient_on_unparseable_versions() {
+        // A version we cannot understand is never blocked — only provably-old
+        // versions are refused.
+        assert_eq!(classify_kin_version(""), ManifestCompatibility::Compatible);
+        assert_eq!(
+            classify_kin_version("garbage"),
+            ManifestCompatibility::Compatible
+        );
+        assert_eq!(classify_kin_version("0"), ManifestCompatibility::Compatible);
+    }
+
+    #[test]
+    fn classify_handles_prerelease_suffix_on_minor() {
+        assert_eq!(
+            classify_kin_version("0.1-rc1"),
+            ManifestCompatibility::TooOld {
+                found: "0.1-rc1".to_string()
+            }
+        );
+        assert_eq!(
+            classify_kin_version("0.2-rc1"),
+            ManifestCompatibility::Compatible
+        );
+    }
+
+    #[test]
+    fn current_build_version_is_compatible() {
+        // The version this binary stamps into fresh manifests must always pass
+        // its own floor — otherwise `kin init` would create unopenable repos.
+        assert!(KinManifest::new().is_compatible());
+    }
+
+    #[test]
+    fn incompatibility_message_names_gap_and_fix_commands() {
+        let message = classify_kin_version("0.1.0")
+            .incompatibility_message()
+            .expect("0.1.0 is below the floor");
+        assert!(message.contains("0.1.0"));
+        assert!(message.contains("0.2"));
+        assert!(message.contains("kin migrate"));
+        assert!(message.contains("kin embed --rebuild"));
+        // Compatible versions carry no message.
+        assert!(classify_kin_version("0.2.0")
+            .incompatibility_message()
+            .is_none());
+    }
+
+    #[test]
+    fn check_manifest_compatibility_gates_tiny_old_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        // A minimal manifest with only the version field — the probe reads just
+        // `kin_version`, so it gates without the other fields being present.
+        std::fs::write(&path, r#"{"kin_version":"0.1.0"}"#).unwrap();
+        assert_eq!(
+            check_manifest_compatibility(&path).unwrap(),
+            ManifestCompatibility::TooOld {
+                found: "0.1.0".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn check_manifest_compatibility_missing_file_is_compatible() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.json");
+        assert_eq!(
+            check_manifest_compatibility(&path).unwrap(),
+            ManifestCompatibility::Compatible
+        );
+    }
+
+    #[test]
+    fn check_manifest_compatibility_accepts_current_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        KinManifest::new().save(&path).unwrap();
+        assert_eq!(
+            check_manifest_compatibility(&path).unwrap(),
+            ManifestCompatibility::Compatible
+        );
     }
 }

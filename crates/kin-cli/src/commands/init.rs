@@ -267,9 +267,14 @@ fn snapshot_repo(dir: &Path, force: bool) -> Result<(PathBuf, serde_json::Value)
     let mut file_count: u64 = 0;
     let mut total_bytes: u64 = 0;
 
-    if let Err(err) =
-        walk_and_snapshot(dir, dir, snapshot_dir, &ignore, &mut file_count, &mut total_bytes)
-    {
+    if let Err(err) = walk_and_snapshot(
+        dir,
+        dir,
+        snapshot_dir,
+        &ignore,
+        &mut file_count,
+        &mut total_bytes,
+    ) {
         let _ = fs::remove_dir_all(&tmp_snapshot);
         return Err(err);
     }
