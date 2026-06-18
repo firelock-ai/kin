@@ -10,6 +10,7 @@
 pub mod cache;
 pub mod canary;
 pub mod error;
+pub mod pathmap;
 pub mod protocol;
 pub mod provider;
 pub mod stat;
