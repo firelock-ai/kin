@@ -82,6 +82,25 @@ pub struct BlobStore {
     root: PathBuf,
 }
 
+/// Summary of a single [`gc`](BlobStore::gc) pass over the store.
+///
+/// All counts are over blobs enumerated at the start of the pass: `scanned` is
+/// the total observed, `retained` the subset kept because it was in the
+/// caller-supplied live set, and `reclaimed` the subset removed. `bytes_reclaimed`
+/// is the summed on-disk size of the removed blobs (best-effort; a blob whose
+/// size could not be read at sweep time contributes 0).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GcReport {
+    /// Total number of stored blobs observed by the sweep.
+    pub scanned: usize,
+    /// Number of blobs kept because they were present in the live set.
+    pub retained: usize,
+    /// Number of blobs removed because they were absent from the live set.
+    pub reclaimed: usize,
+    /// Total on-disk bytes freed by the reclaimed blobs.
+    pub bytes_reclaimed: u64,
+}
+
 impl BlobStore {
     /// Create or open a blob store at the given root directory.
     ///
@@ -215,6 +234,149 @@ impl BlobStore {
         Ok(())
     }
 
+    /// Enumerate every blob hash currently stored under `root`.
+    ///
+    /// Walks the Git-style shard directories (`{root}/{hash[0..2]}/...`) and
+    /// reconstructs each blob's [`Hash256`] from `{shard}{name}`. This is the
+    /// enumeration primitive that [`gc`](Self::gc) sweeps over.
+    ///
+    /// Robust to a partially-populated store: the `.corrupt/` quarantine area is
+    /// skipped entirely, as are leftover `.tmp-*` temp files and any other entry
+    /// whose name does not parse as a valid 64-hex-char hash. Top-level entries
+    /// that are not 2-hex-char shard directories are ignored, and a missing root
+    /// yields an empty result rather than an error.
+    pub fn list_hashes(&self) -> Result<Vec<Hash256>> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            // A store that has never been written to (or whose root was reaped by
+            // a prior compaction) simply holds nothing.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(BlobError::io(&self.root, e)),
+        };
+
+        let mut hashes = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| BlobError::io(&self.root, e))?;
+            let shard = entry.file_name();
+            let shard = shard.to_string_lossy();
+            // Only real 2-hex-char shard dirs hold blobs. This skips `.corrupt`
+            // (leading dot, wrong length) and any stray top-level files.
+            if shard.len() != 2 || !is_hex(&shard) {
+                continue;
+            }
+            let shard_path = entry.path();
+            if !shard_path.is_dir() {
+                continue;
+            }
+            let shard_entries =
+                fs::read_dir(&shard_path).map_err(|e| BlobError::io(&shard_path, e))?;
+            for shard_entry in shard_entries {
+                let shard_entry = shard_entry.map_err(|e| BlobError::io(&shard_path, e))?;
+                let name = shard_entry.file_name();
+                let name = name.to_string_lossy();
+                // Skip `.tmp-*` temp files and anything else that isn't a valid
+                // remainder of a content address. `from_hex` enforces both the
+                // 64-char total length and hex-only content.
+                match Hash256::from_hex(&format!("{shard}{name}")) {
+                    Ok(hash) => hashes.push(hash),
+                    Err(_) => continue,
+                }
+            }
+        }
+        Ok(hashes)
+    }
+
+    /// Reachability-based garbage collection (mark-and-sweep) with compaction.
+    ///
+    /// Reclaims every stored blob whose hash is absent from the caller-supplied
+    /// `live` set — the live-root set the caller has determined is still
+    /// reachable from the graph. Enumeration is via [`list_hashes`](Self::list_hashes),
+    /// and each unreferenced blob is removed through [`delete`](Self::delete).
+    /// After sweeping, now-empty shard directories are pruned (compaction) so the
+    /// on-disk layout does not accumulate empty 2-char dirs.
+    ///
+    /// Contract:
+    /// - GC reclaims **only** blobs absent from `live`. Anything in `live` is
+    ///   retained untouched.
+    /// - The `.corrupt/` quarantine area is **never** touched: corrupt-object
+    ///   evidence survives GC, and the `.corrupt` directory is never pruned.
+    /// - Concurrency: enumeration takes a point-in-time snapshot of the store. A
+    ///   blob written *after* enumeration is simply not seen and therefore never
+    ///   collected — GC can never race-delete a freshly-written object it didn't
+    ///   observe. Conversely, a blob deleted concurrently (its [`delete`](Self::delete)
+    ///   returning [`BlobError::NotFound`]) is counted as already-reclaimed rather
+    ///   than treated as an error.
+    pub fn gc(&self, live: &std::collections::HashSet<Hash256>) -> Result<GcReport> {
+        let _span = tracing::info_span!("kin_blobs.gc", live = live.len()).entered();
+
+        let stored = self.list_hashes()?;
+        let scanned = stored.len();
+        let mut report = GcReport {
+            scanned,
+            ..GcReport::default()
+        };
+
+        for hash in stored {
+            if live.contains(&hash) {
+                report.retained += 1;
+                continue;
+            }
+            // Record the on-disk size before removal (best-effort: a concurrent
+            // delete may already have removed it).
+            let blob_path = self.blob_path(&hash);
+            let size = fs::metadata(&blob_path).map(|m| m.len()).unwrap_or(0);
+            match self.delete(&hash) {
+                Ok(()) => {
+                    report.reclaimed += 1;
+                    report.bytes_reclaimed += size;
+                }
+                // A concurrent delete already reclaimed it: count it, don't fail.
+                Err(BlobError::NotFound { .. }) => {
+                    report.reclaimed += 1;
+                    report.bytes_reclaimed += size;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        self.prune_empty_shards();
+
+        debug!(
+            scanned = report.scanned,
+            retained = report.retained,
+            reclaimed = report.reclaimed,
+            bytes_reclaimed = report.bytes_reclaimed,
+            "gc complete"
+        );
+        Ok(report)
+    }
+
+    /// Best-effort compaction: remove empty 2-hex-char shard directories left
+    /// behind after a sweep. The `.corrupt/` area and any non-shard entry are
+    /// never removed. Errors are intentionally swallowed — a non-empty or
+    /// concurrently-repopulated shard simply stays, which is harmless.
+    fn prune_empty_shards(&self) {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let shard = entry.file_name();
+            let shard = shard.to_string_lossy();
+            // Only ever consider real 2-hex-char shard dirs; this leaves
+            // `.corrupt` and any other top-level entry untouched.
+            if shard.len() != 2 || !is_hex(&shard) {
+                continue;
+            }
+            let shard_path = entry.path();
+            if shard_path.is_dir() {
+                // `remove_dir` only succeeds on an empty directory, so a shard
+                // that still holds (or just regained) a blob is left alone.
+                let _ = fs::remove_dir(&shard_path);
+            }
+        }
+    }
+
     /// Move a corrupt object aside into a `.corrupt/` area under the store root.
     ///
     /// Preserves the bad bytes as evidence (quarantine never deletes data) and,
@@ -265,6 +427,14 @@ impl BlobStore {
         let hex = hash.to_string();
         self.root.join(&hex[..2]).join(&hex[2..])
     }
+}
+
+/// Whether every character in `s` is an ASCII hex digit (`0-9`, `a-f`, `A-F`).
+///
+/// Used by enumeration and compaction to recognize genuine shard directories and
+/// reject stray entries (`.corrupt`, `.tmp-*`, etc.) without erroring.
+fn is_hex(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Write `data` to `path` and `fsync` the file so its bytes are durable on disk
@@ -870,5 +1040,237 @@ mod tests {
         assert_eq!(retrieved, data);
         // No spurious quarantine of healthy data.
         assert!(corrupt_dir_entries(&store).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // list_hashes / GC / compaction tests
+    // -----------------------------------------------------------------------
+
+    use std::collections::HashSet;
+
+    /// Count the 2-hex-char shard directories currently present under the root.
+    fn shard_dir_count(store: &BlobStore) -> usize {
+        std::fs::read_dir(store.root())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                name.len() == 2 && name.bytes().all(|b| b.is_ascii_hexdigit()) && e.path().is_dir()
+            })
+            .count()
+    }
+
+    #[test]
+    fn list_hashes_roundtrips() {
+        let (_dir, store) = make_store();
+        let mut expected = HashSet::new();
+        for i in 0..12 {
+            let data = format!("list-hashes blob {i}");
+            expected.insert(store.write(data.as_bytes()).unwrap());
+        }
+        let listed: HashSet<Hash256> = store.list_hashes().unwrap().into_iter().collect();
+        assert_eq!(listed, expected);
+    }
+
+    #[test]
+    fn list_hashes_empty_store_is_empty() {
+        let (_dir, store) = make_store();
+        assert!(store.list_hashes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_hashes_missing_root_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        // Construct a store, then remove its root entirely.
+        let root = dir.path().join("gone");
+        let store = BlobStore::new(root.clone()).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(store.list_hashes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_hashes_ignores_non_hash_files() {
+        let (_dir, store) = make_store();
+        let hash = store.write(b"real blob").unwrap();
+        // Drop a stray non-hex file into the same shard dir.
+        let shard_dir = on_disk_path(&store, &hash).parent().unwrap().to_path_buf();
+        std::fs::write(shard_dir.join("not-a-hash.txt"), b"junk").unwrap();
+        // And a leftover temp file with a `.tmp-` prefix.
+        std::fs::write(shard_dir.join(".tmp-leftover"), b"abandoned").unwrap();
+
+        let listed: Vec<Hash256> = store.list_hashes().unwrap();
+        assert_eq!(listed, vec![hash], "only the real blob should be listed");
+
+        // And GC must not choke on the stray entries.
+        let report = store.gc(&HashSet::new()).unwrap();
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.reclaimed, 1);
+    }
+
+    #[test]
+    fn list_hashes_skips_corrupt_dir() {
+        let (_dir, store) = make_store();
+        let data = b"corrupt-skip blob".to_vec();
+        let hash = store.write(&data).unwrap();
+        // Corrupt and read to trigger quarantine, populating `.corrupt/`.
+        std::fs::write(on_disk_path(&store, &hash), b"corrupt").unwrap();
+        let _ = store.read(&hash).unwrap_err();
+        assert!(!corrupt_dir_entries(&store).is_empty());
+
+        // The quarantined object must not appear in the listing.
+        assert!(store.list_hashes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn gc_reclaims_unreferenced() {
+        let (_dir, store) = make_store();
+        let keep = store.write(b"keep this blob").unwrap();
+        let drop1 = store.write(b"drop this blob one").unwrap();
+        let drop2 = store.write(b"drop this blob two").unwrap();
+
+        let mut live = HashSet::new();
+        live.insert(keep);
+
+        let report = store.gc(&live).unwrap();
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.retained, 1);
+        assert_eq!(report.reclaimed, 2);
+
+        // The live blob still reads back correctly.
+        assert_eq!(store.read(&keep).unwrap(), b"keep this blob");
+        // The unreferenced blobs are gone.
+        assert!(!store.exists(&drop1).unwrap());
+        assert!(!store.exists(&drop2).unwrap());
+    }
+
+    #[test]
+    fn gc_empty_live_reclaims_all() {
+        let (_dir, store) = make_store();
+        let mut hashes = Vec::new();
+        for i in 0..5 {
+            hashes.push(store.write(format!("blob {i}").as_bytes()).unwrap());
+        }
+        let report = store.gc(&HashSet::new()).unwrap();
+        assert_eq!(report.scanned, 5);
+        assert_eq!(report.retained, 0);
+        assert_eq!(report.reclaimed, 5);
+        for h in &hashes {
+            assert!(!store.exists(h).unwrap());
+        }
+    }
+
+    #[test]
+    fn gc_all_live_reclaims_nothing() {
+        let (_dir, store) = make_store();
+        let mut live = HashSet::new();
+        for i in 0..5 {
+            live.insert(store.write(format!("blob {i}").as_bytes()).unwrap());
+        }
+        let report = store.gc(&live).unwrap();
+        assert_eq!(report.scanned, 5);
+        assert_eq!(report.retained, 5);
+        assert_eq!(report.reclaimed, 0);
+        assert_eq!(report.bytes_reclaimed, 0);
+        for h in &live {
+            assert!(store.exists(h).unwrap());
+        }
+    }
+
+    #[test]
+    fn gc_reports_accurate_byte_count() {
+        let (_dir, store) = make_store();
+        // Distinct-length payloads so the summed byte count is unambiguous.
+        let keep_data = vec![1u8; 100];
+        let drop_a = vec![2u8; 250];
+        let drop_b = vec![3u8; 777];
+        let keep = store.write(&keep_data).unwrap();
+        store.write(&drop_a).unwrap();
+        store.write(&drop_b).unwrap();
+
+        let mut live = HashSet::new();
+        live.insert(keep);
+
+        let report = store.gc(&live).unwrap();
+        assert_eq!(report.reclaimed, 2);
+        assert_eq!(
+            report.bytes_reclaimed,
+            (drop_a.len() + drop_b.len()) as u64,
+            "bytes_reclaimed must equal the summed lengths of the reclaimed blobs"
+        );
+    }
+
+    #[test]
+    fn gc_preserves_corrupt_quarantine() {
+        let (_dir, store) = make_store();
+        let data = b"this blob will be corrupted".to_vec();
+        let hash = store.write(&data).unwrap();
+
+        // Corrupt the backing file, then read to trigger quarantine.
+        std::fs::write(on_disk_path(&store, &hash), b"corrupted bytes").unwrap();
+        let err = store.read(&hash).unwrap_err();
+        assert!(matches!(err, BlobError::HashMismatch { .. }));
+        let before = corrupt_dir_entries(&store);
+        assert_eq!(before.len(), 1, "quarantine should hold one object");
+
+        // GC with an empty live set must NOT touch the `.corrupt/` evidence.
+        let _ = store.gc(&HashSet::new()).unwrap();
+
+        let after = corrupt_dir_entries(&store);
+        assert_eq!(after, before, "quarantine evidence must survive GC");
+        assert!(
+            store.root().join(".corrupt").is_dir(),
+            ".corrupt directory must still exist after GC"
+        );
+    }
+
+    #[test]
+    fn gc_prunes_empty_shard_dirs() {
+        let (_dir, store) = make_store();
+        for i in 0..6 {
+            store.write(format!("prune blob {i}").as_bytes()).unwrap();
+        }
+        assert!(shard_dir_count(&store) > 0, "expected shard dirs to exist");
+
+        let report = store.gc(&HashSet::new()).unwrap();
+        assert_eq!(report.reclaimed, 6);
+
+        // All shard dirs should be pruned, but GC succeeds and root survives.
+        assert_eq!(
+            shard_dir_count(&store),
+            0,
+            "empty shard dirs should be pruned"
+        );
+        assert!(
+            store.root().exists(),
+            "store root must still exist after GC"
+        );
+    }
+
+    #[test]
+    fn gc_on_empty_store_is_noop() {
+        let (_dir, store) = make_store();
+        let report = store.gc(&HashSet::new()).unwrap();
+        assert_eq!(report, GcReport::default());
+    }
+
+    #[test]
+    fn gc_does_not_prune_shard_with_live_blob() {
+        let (_dir, store) = make_store();
+        let keep = store.write(b"survivor").unwrap();
+        let drop = store.write(b"casualty").unwrap();
+
+        let mut live = HashSet::new();
+        live.insert(keep);
+        let report = store.gc(&live).unwrap();
+        assert_eq!(report.reclaimed, 1);
+
+        // The surviving blob's shard dir must still hold it.
+        assert!(store.exists(&keep).unwrap());
+        assert_eq!(store.read(&keep).unwrap(), b"survivor");
+        assert!(!store.exists(&drop).unwrap());
+        // Its shard directory still exists.
+        let keep_shard = on_disk_path(&store, &keep).parent().unwrap().to_path_buf();
+        assert!(keep_shard.is_dir());
     }
 }
