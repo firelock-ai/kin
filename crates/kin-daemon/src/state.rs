@@ -455,6 +455,14 @@ impl DaemonState {
             }
         }
 
+        // Reclaim stale repo locks (daemon.lock + kin-db's graph.lock) left by a
+        // dead daemon whose forked child leaked the flock fd — otherwise the
+        // SnapshotManager::open below fails with a spurious lock error (os error
+        // 35) even though no live daemon owns the repo. A no-op unless the
+        // recorded owner PID is present and dead, so a live daemon's locks are
+        // never touched.
+        let _ = crate::lifecycle::reclaim_stale_locks(layout.root());
+
         let text_index_path = layout.text_index_dir();
         let locate_only = Self::locate_only_snapshot_mode();
         let (graph, loaded_snapshot) = if let Some(kndb_path) = Self::find_kndb_path(&layout) {
