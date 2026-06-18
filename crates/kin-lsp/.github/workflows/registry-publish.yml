@@ -59,6 +59,8 @@ jobs:
     needs: registry_smoke
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    env:
+      KINLAB_CARGO_TOKEN: ${{ secrets.KINLAB_CARGO_TOKEN }}
     steps:
       - uses: actions/checkout@v6
 
@@ -66,6 +68,14 @@ jobs:
         uses: dtolnay/rust-toolchain@1.96.0
 
       - name: Publish kin-lsp
+        # Publishing is Troy-gated: it runs only when the KINLAB_CARGO_TOKEN
+        # secret is provisioned (the registry credential). A fork or any
+        # environment without the secret skips this step cleanly and stays green
+        # instead of red-failing on every push to main with a missing/anonymous
+        # token. Secrets can't be referenced in a job-level `if:`, so the guard
+        # lives on the step via the job-level env mapping — the same pattern the
+        # CI workflow uses for DISPATCH_TOKEN.
+        if: env.KINLAB_CARGO_TOKEN != ''
         run: bash ./scripts/publish-kinlab-crates.sh
         env:
           KINLAB_CARGO_REGISTRY_URL: ${{ vars.KINLAB_CARGO_REGISTRY_URL }}
