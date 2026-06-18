@@ -437,6 +437,24 @@ impl DaemonState {
 
     /// Open an existing .kin/ directory and create daemon state.
     pub fn open(layout: KinLayout) -> Result<Self> {
+        // Up-front compatibility gate. A repo created by a pre-0.2 kin carries
+        // an on-disk graph/index that this build's post-load embed/readiness
+        // path cannot serve. Without this gate the daemon loads the snapshot,
+        // then readiness never arrives and the CLI supervisor kills the process
+        // with a bare SIGTERM — opaque to the user. Refuse here, before opening
+        // kin-db or starting the embed worker, with an actionable error naming
+        // the version gap and the rebuild commands.
+        match kin_core::manifest::check_manifest_compatibility(&layout.manifest_path())
+            .map_err(DaemonError::from)?
+        {
+            kin_core::manifest::ManifestCompatibility::Compatible => {}
+            incompatible => {
+                if let Some(message) = incompatible.incompatibility_message() {
+                    return Err(DaemonError::IncompatibleRepo(message));
+                }
+            }
+        }
+
         let text_index_path = layout.text_index_dir();
         let locate_only = Self::locate_only_snapshot_mode();
         let (graph, loaded_snapshot) = if let Some(kndb_path) = Self::find_kndb_path(&layout) {
@@ -1981,6 +1999,51 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("failed to load persisted graph snapshot"));
         assert!(message.contains("graph.kndb"));
+    }
+
+    #[test]
+    fn open_rejects_pre_0_2_repo_with_actionable_error() {
+        // FIR-978: a repo created by a pre-0.2 kin must be refused UP FRONT with
+        // a clear, actionable error — never loaded into a daemon that then fails
+        // readiness and gets SIGTERM-killed by the supervisor. The gate fires
+        // before the graph snapshot is touched, so a tiny manifest fixture (just
+        // the version field) is enough to reproduce it.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let kin_dir = repo_dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        std::fs::write(kin_dir.join("manifest.json"), r#"{"kin_version":"0.1.0"}"#).unwrap();
+        let layout = kin_core::KinLayout::new(kin_dir);
+
+        let err = match DaemonState::open(layout) {
+            Ok(_) => panic!("expected pre-0.2 repo open to be refused"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, DaemonError::IncompatibleRepo(_)),
+            "expected IncompatibleRepo, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("0.1.0"),
+            "message must name the found version: {message}"
+        );
+        assert!(
+            message.contains("0.2"),
+            "message must name the required floor: {message}"
+        );
+        assert!(
+            message.contains("kin migrate") && message.contains("kin embed --rebuild"),
+            "message must name the rebuild commands: {message}"
+        );
+    }
+
+    #[test]
+    fn open_accepts_current_version_repo() {
+        // The complement to the gate test: a repo stamped at the current build
+        // version opens cleanly (the gate must not false-positive on fresh repos).
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        DaemonState::open(init.layout).expect("current-version repo must open");
     }
 
     #[test]
