@@ -165,24 +165,45 @@ where
     .entered();
     let (touch_counts, pair_counts) = {
         let _span = tracing::info_span!("kin.git.cochange.count_pairs").entered();
-        change_sets
+        // Intern file paths to dense u32 indices once, then key the hot pairwise
+        // counting loop on Copy integers instead of cloning two Strings per
+        // ordered pair. On a deep change-DAG the old String-keyed loop allocated
+        // O(commits x files^2) short-lived Strings (the scoped-session set_scope
+        // hotspot, FIR-1054); interning moves that to one owned String per UNIQUE
+        // file/pair at materialization. The per-key counts are identical, so the
+        // mined relations are byte-for-byte unchanged.
+        let mut interner: HashMap<&str, u32> = HashMap::new();
+        let mut file_names: Vec<&str> = Vec::new();
+        for files in change_sets {
+            for file in files {
+                if !interner.contains_key(file.as_str()) {
+                    interner.insert(file.as_str(), file_names.len() as u32);
+                    file_names.push(file.as_str());
+                }
+            }
+        }
+        let indexed_sets: Vec<Vec<u32>> = change_sets
+            .iter()
+            .map(|files| files.iter().map(|file| interner[file.as_str()]).collect())
+            .collect();
+
+        let (touch_idx, pair_idx) = indexed_sets
             .par_iter()
             .fold(
                 || {
                     (
-                        HashMap::<String, usize>::new(),
-                        HashMap::<(String, String), usize>::new(),
+                        HashMap::<u32, usize>::new(),
+                        HashMap::<(u32, u32), usize>::new(),
                     )
                 },
                 |(mut tc, mut pc), files| {
-                    let files: Vec<_> = files.iter().collect();
-                    for file in &files {
-                        *tc.entry((**file).clone()).or_default() += 1;
+                    for &file in files {
+                        *tc.entry(file).or_default() += 1;
                     }
-                    for src in &files {
-                        for dst in &files {
+                    for &src in files {
+                        for &dst in files {
                             if src != dst {
-                                *pc.entry(((**src).clone(), (**dst).clone())).or_default() += 1;
+                                *pc.entry((src, dst)).or_default() += 1;
                             }
                         }
                     }
@@ -200,7 +221,27 @@ where
                     }
                     (tc1, pc1)
                 },
-            )
+            );
+
+        // Re-key back to owned Strings for the (unchanged) downstream logic —
+        // one allocation per unique file / unique pair, not per commit-pair.
+        let touch_counts: HashMap<String, usize> = touch_idx
+            .into_iter()
+            .map(|(idx, count)| (file_names[idx as usize].to_string(), count))
+            .collect();
+        let pair_counts: HashMap<(String, String), usize> = pair_idx
+            .into_iter()
+            .map(|((src, dst), count)| {
+                (
+                    (
+                        file_names[src as usize].to_string(),
+                        file_names[dst as usize].to_string(),
+                    ),
+                    count,
+                )
+            })
+            .collect();
+        (touch_counts, pair_counts)
     };
 
     // Pre-populate entity cache in parallel
@@ -246,8 +287,6 @@ where
             .collect::<Result<HashMap<_, _>>>()?
     };
 
-    let mut seen_relation_ids = HashSet::new();
-    let mut relations = Vec::new();
     let mut sorted_pairs = pair_counts.into_iter().collect::<Vec<_>>();
     sorted_pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -277,51 +316,70 @@ where
     }
     sorted_pairs.retain(|((src, dst), _)| !hub_files.contains(src) && !hub_files.contains(dst));
 
-    {
+    // Generate each file-pair's co-change relations in parallel. The per-pair
+    // SHA256 relation-id + struct construction over up to MAX_ENTITIES_PER_FILE^2
+    // entity pairs is the dominant cost of mining a deep change-DAG (FIR-1054 —
+    // the scoped-session set_scope re-mine); the count/preload phases are cheap
+    // by comparison. rayon's indexed collect preserves `sorted_pairs` order, and
+    // each ordered entity-pair belongs to exactly one file-pair (an entity has a
+    // single file origin), so the sequential first-wins dedup pass below
+    // reproduces the previous sequential output byte-for-byte.
+    let per_pair: Vec<Vec<Relation>> = {
         let _span = tracing::info_span!(
             "kin.git.cochange.materialize_relations",
             pairs = sorted_pairs.len()
         )
         .entered();
-        for ((src_file, dst_file), pair_count) in sorted_pairs {
-            let Some(src_touch_count) = touch_counts.get(&src_file).copied() else {
-                continue;
-            };
-            if src_touch_count == 0 {
-                continue;
-            }
-
-            let (Some(src_entities), Some(dst_entities)) =
-                (entity_cache.get(&src_file), entity_cache.get(&dst_file))
-            else {
-                continue;
-            };
-            if src_entities.is_empty() || dst_entities.is_empty() {
-                continue;
-            }
-
-            let confidence = pair_count as f32 / src_touch_count as f32;
-            for src_entity in src_entities {
-                for dst_entity in dst_entities {
-                    if src_entity.id == dst_entity.id {
-                        continue;
-                    }
-                    let relation_id = cochange_relation_id(src_entity.id, dst_entity.id);
-                    if !seen_relation_ids.insert(relation_id) {
-                        continue;
-                    }
-                    relations.push(Relation {
-                        id: relation_id,
-                        kind: RelationKind::CoChanges,
-                        src: kin_model::GraphNodeId::Entity(src_entity.id),
-                        dst: kin_model::GraphNodeId::Entity(dst_entity.id),
-                        confidence,
-                        origin: RelationOrigin::Inferred,
-                        created_in: None,
-                        import_source: None,
-                        evidence: Vec::new(),
-                    });
+        sorted_pairs
+            .par_iter()
+            .map(|((src_file, dst_file), pair_count)| {
+                let mut out = Vec::new();
+                let Some(src_touch_count) = touch_counts.get(src_file).copied() else {
+                    return out;
+                };
+                if src_touch_count == 0 {
+                    return out;
                 }
+                let (Some(src_entities), Some(dst_entities)) =
+                    (entity_cache.get(src_file), entity_cache.get(dst_file))
+                else {
+                    return out;
+                };
+                if src_entities.is_empty() || dst_entities.is_empty() {
+                    return out;
+                }
+                let confidence = *pair_count as f32 / src_touch_count as f32;
+                for src_entity in src_entities {
+                    for dst_entity in dst_entities {
+                        if src_entity.id == dst_entity.id {
+                            continue;
+                        }
+                        out.push(Relation {
+                            id: cochange_relation_id(src_entity.id, dst_entity.id),
+                            kind: RelationKind::CoChanges,
+                            src: kin_model::GraphNodeId::Entity(src_entity.id),
+                            dst: kin_model::GraphNodeId::Entity(dst_entity.id),
+                            confidence,
+                            origin: RelationOrigin::Inferred,
+                            created_in: None,
+                            import_source: None,
+                            evidence: Vec::new(),
+                        });
+                    }
+                }
+                out
+            })
+            .collect()
+    };
+
+    // Sequential first-wins dedup preserving the original ordering (a safety net:
+    // ordered entity-pairs are already unique across file-pairs).
+    let mut seen_relation_ids = HashSet::new();
+    let mut relations = Vec::with_capacity(per_pair.iter().map(Vec::len).sum());
+    for pair_relations in per_pair {
+        for relation in pair_relations {
+            if seen_relation_ids.insert(relation.id) {
+                relations.push(relation);
             }
         }
     }
@@ -400,6 +458,197 @@ mod tests {
             }
             _ => false,
         }
+    }
+
+    /// Build a synthetic change-DAG: `num_commits` changes over `num_files`
+    /// files, each commit touching `files_per_commit` files chosen by a
+    /// deterministic LCG (no wall-clock / RNG, so the DAG is reproducible). Also
+    /// registers one entity per file in `graph` so co-change relations
+    /// materialize. Returns the change vector.
+    fn synthetic_change_dag(
+        graph: &kin_db::InMemoryGraph,
+        num_commits: usize,
+        num_files: usize,
+        files_per_commit: usize,
+        seed: u64,
+    ) -> Vec<SemanticChange> {
+        for i in 0..num_files {
+            let path = format!("src/f{i}.rs");
+            graph
+                .upsert_entity(&test_entity(&format!("fn_{i}"), &path, 1))
+                .unwrap();
+        }
+        synthetic_change_dag_no_entities(num_commits, num_files, files_per_commit, seed)
+    }
+
+    /// Build the change vector only (caller registers entities). Same windowed
+    /// file selection as `synthetic_change_dag`.
+    fn synthetic_change_dag_no_entities(
+        num_commits: usize,
+        num_files: usize,
+        files_per_commit: usize,
+        seed: u64,
+    ) -> Vec<SemanticChange> {
+        let mut state = seed | 1;
+        let mut next = || {
+            // xorshift64* — deterministic, no external RNG.
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545F4914F6CDD1D)
+        };
+        let mut changes = Vec::with_capacity(num_commits);
+        let mut parent: Option<kin_model::SemanticChangeId> = None;
+        for c in 0..num_commits {
+            // Touch a contiguous window of files starting at a random base, so
+            // each file co-changes only with nearby neighbours (bounded fan-out,
+            // like files in one module) — otherwise the hub-file filter
+            // (KIN_COCHANGE_MAX_FAN_OUT) prunes everything.
+            let base = (next() as usize) % num_files;
+            let mut files = std::collections::BTreeSet::new();
+            for k in 0..files_per_commit {
+                files.insert((base + k) % num_files);
+            }
+            let artifact_deltas = files
+                .iter()
+                .map(|&f| ArtifactDelta {
+                    file_id: FilePathId::new(format!("src/f{f}.rs")),
+                    kind: ArtifactDeltaKind::Modified,
+                    old_hash: None,
+                    new_hash: None,
+                })
+                .collect();
+            let mut id_bytes = [0u8; 32];
+            id_bytes[..8].copy_from_slice(&(c as u64 + 1).to_le_bytes());
+            let id = kin_model::SemanticChangeId::from_hash(Hash256::from_bytes(id_bytes));
+            changes.push(SemanticChange {
+                id,
+                parents: parent.into_iter().collect(),
+                timestamp: kin_model::Timestamp::now(),
+                author: kin_model::AuthorId::new("test"),
+                message: format!("c{c}"),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas,
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            });
+            parent = Some(id);
+        }
+        changes
+    }
+
+    /// Regression guard: mining is deterministic and stable. The FIR-1054
+    /// interning optimization must leave the mined relation set byte-identical;
+    /// this locks that by asserting two runs over the same synthetic DAG produce
+    /// the exact same sorted (src, dst, confidence) set.
+    #[test]
+    fn change_dag_mining_is_deterministic() {
+        let graph = kin_db::InMemoryGraph::new();
+        let changes = synthetic_change_dag(&graph, 800, 60, 4, 0xC0FFEE);
+
+        let mut a = mine_from_change_dag(&graph, &changes).unwrap();
+        let mut b = mine_from_change_dag(&graph, &changes).unwrap();
+        let key = |r: &Relation| format!("{:?}->{:?}@{}", r.src, r.dst, r.confidence.to_bits());
+        a.sort_by_key(key);
+        b.sort_by_key(key);
+        assert!(
+            !a.is_empty(),
+            "synthetic DAG should yield co-change relations"
+        );
+        assert_eq!(a.len(), b.len(), "mining must be deterministic");
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(key(x), key(y), "mined relation set must be stable");
+        }
+    }
+
+    /// Manual timing harness for the FIR-1054 hotspot (the `set_scope` per-task
+    /// cochange re-mine over a deep ancestry). Ignored by default — run with
+    /// `cargo test -p kin-git change_dag_mining_deep_timing -- --ignored --nocapture`.
+    ///
+    /// Mines a deep synthetic DAG via both a naive String-keyed pair counter
+    /// (the pre-FIR-1054 shape) and the production interned path, asserts they
+    /// produce identical pair counts, and prints both wall-clocks so the
+    /// allocation win is visible.
+    #[test]
+    #[ignore = "timing harness; run explicitly with --ignored --nocapture"]
+    fn change_dag_mining_deep_timing() {
+        // Stress BOTH axes: deep ancestry (commits) AND a large graph (many
+        // files x entities), so the per-file `query_entities` preload cost is
+        // visible — a tiny graph hides it.
+        let graph = kin_db::InMemoryGraph::new();
+        let num_commits = 25_000;
+        let num_files = 3_000;
+        let entities_per_file = 8;
+        for f in 0..num_files {
+            let path = format!("src/f{f}.rs");
+            for e in 0..entities_per_file {
+                graph
+                    .upsert_entity(&test_entity(&format!("fn_{f}_{e}"), &path, e as u32 + 1))
+                    .unwrap();
+            }
+        }
+        let changes = synthetic_change_dag_no_entities(num_commits, num_files, 6, 0xABCDEF);
+
+        let change_sets: Vec<BTreeSet<String>> = changes
+            .iter()
+            .filter(|c| !is_genesis_change(c))
+            .map(changed_files_from_change)
+            .filter(|f| f.len() >= 2 && f.len() <= 20)
+            .collect();
+
+        // Isolate count_pairs (naive String-keyed, pre-optimization shape).
+        let t0 = std::time::Instant::now();
+        let mut naive_pairs: HashMap<(String, String), usize> = HashMap::new();
+        for files in &change_sets {
+            let files: Vec<_> = files.iter().collect();
+            for src in &files {
+                for dst in &files {
+                    if src != dst {
+                        *naive_pairs
+                            .entry(((**src).clone(), (**dst).clone()))
+                            .or_default() += 1;
+                    }
+                }
+            }
+        }
+        let naive_ms = t0.elapsed().as_millis();
+
+        // Isolate the per-file query_entities preload (the suspected real driver).
+        let unique_files: HashSet<String> = naive_pairs
+            .keys()
+            .flat_map(|(s, d)| [s.clone(), d.clone()])
+            .collect();
+        let t_pre = std::time::Instant::now();
+        let mut preloaded = 0usize;
+        for file in &unique_files {
+            let filter = EntityFilter {
+                file_path: Some(FilePathId::new(file)),
+                ..Default::default()
+            };
+            preloaded += graph.query_entities(&filter).unwrap().len();
+        }
+        let preload_ms = t_pre.elapsed().as_millis();
+
+        // Full production mine.
+        let t1 = std::time::Instant::now();
+        let relations = mine_from_change_dag(&graph, &changes).unwrap();
+        let prod_ms = t1.elapsed().as_millis();
+
+        eprintln!(
+            "[fir-1054] commits={num_commits} files={num_files} entities={} change_sets={} \
+             unique_files={} unique_pairs={} relations={} | count_pairs(naive)={naive_ms}ms \
+             preload_query_entities={preload_ms}ms (loaded {preloaded}) full_mine={prod_ms}ms",
+            num_files * entities_per_file,
+            change_sets.len(),
+            unique_files.len(),
+            naive_pairs.len(),
+            relations.len(),
+        );
+        assert!(!relations.is_empty());
     }
 
     #[test]
