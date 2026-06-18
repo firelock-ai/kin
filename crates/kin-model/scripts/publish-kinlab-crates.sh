@@ -63,6 +63,38 @@ raise SystemExit(f"package not found in cargo metadata: {package_name}")
 PY
 }
 
+# Cargo sparse-index path for a crate name (1/2/3/4+ char prefix sharding).
+index_path_for() {
+  local name="$1"
+  local len=${#name}
+  case "$len" in
+    1) printf '1/%s' "$name" ;;
+    2) printf '2/%s' "$name" ;;
+    3) printf '3/%s/%s' "${name:0:1}" "$name" ;;
+    *) printf '%s/%s/%s' "${name:0:2}" "${name:2:2}" "$name" ;;
+  esac
+}
+
+# Immutability guard. The kin cargo registry is append-only per (name, version):
+# a published version's bytes must NEVER be replaced. Before packaging or POSTing
+# we read the published sparse index and, if this exact version is already
+# present, the publish is a no-op. This keeps the client from ever ATTEMPTING an
+# overwrite POST — protection that does not depend on the server returning 409
+# (the 409 path below stays as a backstop for the publish-race window). Reads are
+# open, so this runs without the token. Returns 0 when the version is present.
+registry_has_version() {
+  local name="$1" version="$2"
+  local url="${registry_url}/registry/cargo/$(index_path_for "$name")"
+  local body code
+  body="$(curl -sS -w $'\n%{http_code}' "$url" 2>/dev/null || true)"
+  code="${body##*$'\n'}"
+  body="${body%$'\n'*}"
+  # 404 → crate not yet published (publish proceeds). Non-200/404 → treat as
+  # unknown and let the publish proceed (the 409 backstop still protects bytes).
+  [[ "$code" == "200" ]] || return 1
+  grep -q "\"vers\":\"${version}\"" <<<"$body"
+}
+
 publish_package() {
   local package_name="$1"
   local package_version
@@ -71,6 +103,12 @@ publish_package() {
   if [[ -n "$expected_version" && "$package_version" != "$expected_version" ]]; then
     echo "Version mismatch for $package_name: tag expects $expected_version but Cargo metadata resolved $package_version" >&2
     exit 1
+  fi
+
+  # Never attempt to overwrite an already-published, immutable version.
+  if registry_has_version "$package_name" "$package_version"; then
+    echo "$package_name@$package_version already present in registry index; skipping publish (immutable — no overwrite attempted)"
+    return
   fi
 
   local crate_file="target/package/${package_name}-${package_version}.crate"

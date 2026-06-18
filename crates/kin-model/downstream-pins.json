@@ -1,0 +1,25 @@
+{
+  "$comment": "Version source-of-truth manifest for kin-model. kin-model holds the canonical Kin types; downstream crates pin it from the 'kin' cargo registry. This file is the DECLARED compatibility contract: each entry is a downstream consumer and the kin-model version requirement it pins. scripts/check-downstream-pins.sh verifies every declared `req` accepts the version this repo is about to publish (the version in Cargo.toml). A breaking (major, or pre-1.0 minor) bump of kin-model MUST update both Cargo.toml AND the affected `req` values here in the same change, which is the explicit signal that those downstream repos must bump and re-smoke. Reading downstream Cargo.toml files seeds these values; this manifest is the authority kin-model CI checks against (kin-model cannot edit downstream repos).",
+  "crate": "kin-model",
+  "registry": "kin",
+  "downstream": [
+    {
+      "repo": "firelock-ai/kin",
+      "consumer": "kin (workspace root)",
+      "manifest": "Cargo.toml",
+      "req": "0.2.0"
+    },
+    {
+      "repo": "firelock-ai/kin-db",
+      "consumer": "kin-db",
+      "manifest": "crates/kin-db/Cargo.toml",
+      "req": "0.2.0"
+    },
+    {
+      "repo": "firelock-ai/kin-bench",
+      "consumer": "kin-bench (workspace root)",
+      "manifest": "Cargo.toml",
+      "req": "0.2.0"
+    }
+  ]
+}
