@@ -738,13 +738,36 @@ impl SnapshotManager {
 
         let metadata_path = vector_index_metadata_path_for(path);
         let metadata = read_vector_index_metadata(&metadata_path)?;
-        // FIR-901: A .kvec present with no .kvec.meta.json must NOT default to
-        // load — that bypassed the root-hash gate entirely. Absent sidecar ⇒
-        // stale: clear out-of-date vectors and queue a clean rebuild.
-        let should_load = metadata
-            .as_ref()
-            .map(|m| vector_metadata_matches_graph(m, graph_root_hash, expected_embedder_identity))
-            .unwrap_or(false);
+        let canonical_root_hash = graph.recompute_root_hash();
+        let matched_root = metadata.as_ref().and_then(|m| {
+            if vector_metadata_matches_graph(m, graph_root_hash, expected_embedder_identity) {
+                Some(graph_root_hash)
+            } else if vector_metadata_matches_graph(
+                m,
+                canonical_root_hash,
+                expected_embedder_identity,
+            ) {
+                Some(canonical_root_hash)
+            } else {
+                None
+            }
+        });
+        let should_load = matched_root.is_some();
+
+        if std::env::var("KINDB_DEBUG_KVEC").is_ok() {
+            eprintln!(
+                "[KVEC-DBG] should_load={} matched_root={:?} stamp_root={:?} canonical_root={} passed_root={} meta_embedder={:?} expected_embedder={:?} meta_dims={:?} meta_model={:?}",
+                should_load,
+                matched_root.map(hex::encode),
+                metadata.as_ref().map(|m| m.graph_root_hash.clone()),
+                hex::encode(canonical_root_hash),
+                hex::encode(graph_root_hash),
+                metadata.as_ref().and_then(|m| m.embedder_identity.clone()),
+                expected_embedder_identity,
+                metadata.as_ref().map(|m| m.dimensions),
+                metadata.as_ref().and_then(|m| m.embedding_model_id.clone()),
+            );
+        }
 
         if !should_load {
             // Sidecar/graph-root staleness is transient (the graph may reconcile
@@ -773,7 +796,7 @@ impl SnapshotManager {
         let (_, runtime_model_id, _, _, _) = current_embedding_runtime_fields();
         let expected = crate::vector::IndexDescriptor {
             model_id: runtime_model_id,
-            graph_root: Some(hex::encode(graph_root_hash)),
+            graph_root: matched_root.map(hex::encode),
         };
 
         let count = match graph.load_vector_index_compatible(&vector_path, &expected) {
@@ -1427,9 +1450,6 @@ impl SnapshotManager {
         embedder_identity: Option<&str>,
     ) -> Result<(), KinDbError> {
         let path = normalize_snapshot_path(path.into());
-        // FIR-955: the live graph maintains a continuously-current root. Stamp
-        // that root instead of forcing a full Merkle recompute on every vector
-        // sidecar flush.
         let graph_root_hash = graph.compute_root_hash();
         Self::save_vector_index_bundle(&path, graph, graph_root_hash, embedder_identity)
     }
