@@ -626,6 +626,11 @@ fn ensure_cuda_init() -> bool {
 /// Safe wrapper for CUDA device memory.
 struct CudaBuffer {
     ptr: CUdeviceptr,
+    // Allocation size in bytes. Retained for buffer bookkeeping and symmetry
+    // with `alloc`/`from_slice`; not all callers read it back yet on the
+    // (non-default, behind `--features cuda`) CUDA path. Scoped allow keeps the
+    // `-Dwarnings` acceleration matrix green without masking dead code elsewhere.
+    #[allow(dead_code)]
     bytes: usize,
 }
 
@@ -641,7 +646,7 @@ impl CudaBuffer {
     }
 
     fn from_slice(data: &[f32]) -> Option<Self> {
-        let bytes = data.len() * std::mem::size_of::<f32>();
+        let bytes = std::mem::size_of_val(data);
         let buf = Self::alloc(bytes)?;
         let res = unsafe { cuMemcpyHtoD_v2(buf.ptr, data.as_ptr() as *const c_void, bytes) };
         if res == CUDA_SUCCESS {
@@ -668,17 +673,22 @@ impl CudaBuffer {
             cuMemcpyDtoH_v2(
                 dst.as_mut_ptr() as *mut c_void,
                 self.ptr,
-                dst.len() * std::mem::size_of::<f32>(),
+                std::mem::size_of_val(dst),
             );
         }
     }
 
+    // Host-to-device counterpart of `read_into`. Part of the complete buffer
+    // API; the in-place HtoD upload path is not exercised yet on the
+    // (non-default, behind `--features cuda`) CUDA backend. Scoped allow keeps
+    // the `-Dwarnings` acceleration matrix green without a blanket crate allow.
+    #[allow(dead_code)]
     fn write_from(&self, src: &[f32]) {
         unsafe {
             cuMemcpyHtoD_v2(
                 self.ptr,
                 src.as_ptr() as *const c_void,
-                src.len() * std::mem::size_of::<f32>(),
+                std::mem::size_of_val(src),
             );
         }
     }
@@ -774,7 +784,7 @@ impl CudaCompute {
 
     fn launch_1d(&self, func: CUfunction, params: &mut [*mut c_void], total: usize) {
         let block = 256usize;
-        let grid = (total + block - 1) / block;
+        let grid = total.div_ceil(block);
         unsafe {
             cuLaunchKernel(
                 func,
@@ -796,8 +806,8 @@ impl CudaCompute {
     fn launch_2d(&self, func: CUfunction, params: &mut [*mut c_void], width: usize, height: usize) {
         let block_x = 16usize;
         let block_y = 16usize;
-        let grid_x = (width + block_x - 1) / block_x;
-        let grid_y = (height + block_y - 1) / block_y;
+        let grid_x = width.div_ceil(block_x);
+        let grid_y = height.div_ceil(block_y);
         unsafe {
             cuLaunchKernel(
                 func,

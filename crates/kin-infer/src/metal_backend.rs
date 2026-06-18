@@ -2140,7 +2140,7 @@ impl MetalCompute {
 
     /// Create a Metal buffer from a slice and copy data in.
     fn buf_from_slice(&self, data: &[f32]) -> Result<Buffer, InferError> {
-        let bytes = data.len() * std::mem::size_of::<f32>();
+        let bytes = std::mem::size_of_val(data);
         try_new_buffer_with_bytes(&self.device, data.as_ptr() as *const u8, bytes).ok_or_else(
             || InferError::OutOfMemory(format!("metal buffer alloc failed: {bytes} bytes")),
         )
@@ -2243,7 +2243,7 @@ impl MetalCompute {
     /// silently apply the WRONG mask. Masks are tiny (`batch*max_len` u32s), so a
     /// fresh upload per attention call is negligible and strictly correct.
     fn buf_u32_slice(&self, data: &[u32]) -> Result<Buffer, InferError> {
-        let bytes = data.len() * std::mem::size_of::<u32>();
+        let bytes = std::mem::size_of_val(data);
         try_new_buffer_with_bytes(&self.device, data.as_ptr() as *const u8, bytes).ok_or_else(
             || InferError::OutOfMemory(format!("metal u32 buffer alloc failed: {bytes} bytes")),
         )
@@ -2378,7 +2378,6 @@ impl MetalCompute {
     }
 
     /// Dispatch a 1D compute kernel.
-
     fn encode_1d(
         &self,
         cmd: &CommandBufferRef,
@@ -2825,7 +2824,7 @@ impl GpuCompute for MetalCompute {
                 enc.set_buffer(5, Some(&buf_kv_dim), 0);
                 enc.set_buffer(6, Some(&buf_kv_dim), 0);
                 let threads = metal::MTLSize::new(total_qkv as u64, total_rows as u64, 1);
-                let tw = split_p.thread_execution_width() as u64;
+                let tw = split_p.thread_execution_width();
                 let tg = metal::MTLSize::new(
                     tw.min(total_qkv as u64).max(1),
                     16.min(total_rows as u64).max(1),
@@ -3584,7 +3583,7 @@ impl GpuCompute for MetalCompute {
             }
             retains3.push(buf_ffn_out);
 
-            self.commit_wait(&cmd3);
+            self.commit_wait(cmd3);
 
             let out = Self::read_buf(current_hidden.buffer(), total_rows * h);
             Ok(Some(out))
@@ -4004,7 +4003,7 @@ impl GpuCompute for MetalCompute {
                 enc.set_buffer(1, Some(buf_act.buffer()), 0);
                 enc.set_buffer(2, Some(&buf_inter), 0);
                 let total = (rows * inter) as u64;
-                let tw = swi.thread_execution_width() as u64;
+                let tw = swi.thread_execution_width();
                 enc.dispatch_threads(
                     MTLSize::new(total, 1, 1),
                     MTLSize::new(tw.min(total).max(1), 1, 1),
@@ -4150,7 +4149,7 @@ impl GpuCompute for MetalCompute {
                 enc.set_buffer(1, Some(buf_act.buffer()), 0);
                 enc.set_buffer(2, Some(&buf_inter), 0);
                 let total = (rows * inter) as u64;
-                let tw = swi.thread_execution_width() as u64;
+                let tw = swi.thread_execution_width();
                 enc.dispatch_threads(
                     MTLSize::new(total, 1, 1),
                     MTLSize::new(tw.min(total).max(1), 1, 1),
@@ -4198,7 +4197,7 @@ impl GpuCompute for MetalCompute {
                 enc.set_buffer(0, Some(buf_out.buffer()), 0);
                 enc.set_buffer(1, Some(buf_residual.buffer()), 0);
                 let total = (rows * hidden) as u64;
-                let tw = add.thread_execution_width() as u64;
+                let tw = add.thread_execution_width();
                 enc.dispatch_threads(
                     MTLSize::new(total, 1, 1),
                     MTLSize::new(tw.min(total).max(1), 1, 1),
@@ -4215,7 +4214,7 @@ impl GpuCompute for MetalCompute {
                 enc.set_buffer(2, Some(&buf_beta), 0);
                 enc.set_buffer(3, Some(&buf_hidden), 0);
                 enc.set_buffer(4, Some(&buf_eps), 0);
-                let tw = ln.thread_execution_width() as u64;
+                let tw = ln.thread_execution_width();
                 let rows_u = rows as u64;
                 enc.dispatch_threads(
                     MTLSize::new(rows_u, 1, 1),
@@ -4321,7 +4320,7 @@ impl GpuCompute for MetalCompute {
                 enc.set_buffer(0, Some(buf_proj.buffer()), 0);
                 enc.set_buffer(1, Some(buf_residual.buffer()), 0);
                 let total = (rows * hidden) as u64;
-                let tw = add.thread_execution_width() as u64;
+                let tw = add.thread_execution_width();
                 enc.dispatch_threads(
                     MTLSize::new(total, 1, 1),
                     MTLSize::new(tw.min(total).max(1), 1, 1),
@@ -4338,7 +4337,7 @@ impl GpuCompute for MetalCompute {
                 enc.set_buffer(2, Some(&buf_beta), 0);
                 enc.set_buffer(3, Some(&buf_hidden), 0);
                 enc.set_buffer(4, Some(&buf_eps), 0);
-                let tw = ln.thread_execution_width() as u64;
+                let tw = ln.thread_execution_width();
                 let rows_u = rows as u64;
                 enc.dispatch_threads(
                     MTLSize::new(rows_u, 1, 1),

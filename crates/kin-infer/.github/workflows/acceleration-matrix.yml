@@ -1,0 +1,109 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+# Acceleration backend COMPILE matrix — separately gated from the M0 release.
+#
+# Purpose: prove every acceleration backend still COMPILES (Metal on macOS,
+# Apple-Accelerate CPU/BLAS on macOS, pure-Rust default everywhere, CUDA on
+# Linux) on each push/PR. This is the FIR-999 acceleration lane's guard rail.
+#
+# It is deliberately decoupled from `release.yml` and `registry-publish.yml`:
+#
+#   * BUILD ONLY. It runs `cargo build` / `cargo clippy --lib` for each feature
+#     and NEVER `cargo test`/examples, so no GPU/Metal/CUDA kernel is ever
+#     executed in CI. Compilation needs no device; execution would.
+#   * It does NOT gate publishing and is NOT a dependency of the release or
+#     registry-publish jobs, so an acceleration backend can never sneak into the
+#     M0 release artifact. The PUBLISHED crate is built with `default = []`
+#     (pure Rust); `metal`/`accelerate`/`cuda` are opt-in features a consumer
+#     turns on explicitly, so they are never bundled into the default artifact.
+#
+# If you need to release an acceleration backend, that is a deliberate, separate
+# decision — not a side effect of the M0 publish lane.
+
+name: Acceleration Matrix
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  macos_backends:
+    name: macOS backends (compile only)
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # pure-Rust default, Apple-Accelerate CPU/BLAS, Metal GPU — all compiled,
+        # none executed.
+        feature: ["", "accelerate", "metal"]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy
+
+      - name: Build (feature='${{ matrix.feature }}', no kernel execution)
+        env:
+          FEATURE: ${{ matrix.feature }}
+        run: |
+          if [ -z "$FEATURE" ]; then
+            cargo build
+          else
+            cargo build --features "$FEATURE"
+          fi
+
+      - name: Clippy lib (feature='${{ matrix.feature }}')
+        env:
+          FEATURE: ${{ matrix.feature }}
+        run: |
+          if [ -z "$FEATURE" ]; then
+            cargo clippy --lib -- -D warnings
+          else
+            cargo clippy --lib --features "$FEATURE" -- -D warnings
+          fi
+
+  linux_backends:
+    name: Linux backends (compile only)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # pure-Rust default and CUDA. The CUDA backend is a driver-API FFI lib;
+        # building the rlib needs no CUDA toolkit and never links/executes it.
+        feature: ["", "cuda"]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy
+
+      - name: Build (feature='${{ matrix.feature }}', no kernel execution)
+        env:
+          FEATURE: ${{ matrix.feature }}
+        run: |
+          if [ -z "$FEATURE" ]; then
+            cargo build
+          else
+            cargo build --features "$FEATURE"
+          fi
+
+      - name: Clippy lib (feature='${{ matrix.feature }}')
+        env:
+          FEATURE: ${{ matrix.feature }}
+        run: |
+          if [ -z "$FEATURE" ]; then
+            cargo clippy --lib -- -D warnings
+          else
+            cargo clippy --lib --features "$FEATURE" -- -D warnings
+          fi
