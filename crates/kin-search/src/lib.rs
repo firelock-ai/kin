@@ -707,7 +707,7 @@ impl<Id: DocId> TextIndex<Id> {
     /// after it. [`commit`](Self::commit) follows the same order (it takes
     /// `staged` first, then the live-state write guards), so a writer and a
     /// committer can never acquire the two locks in conflicting order — which is
-    /// what eliminates the lock-order-inversion deadlock (FIR-916). Each live
+    /// what eliminates the lock-order-inversion deadlock. Each live
     /// read guard is released the instant its clone completes, so this never
     /// holds more than `staged` + one live guard at a time.
     fn ensure_staged<'a>(
@@ -856,7 +856,7 @@ impl<Id: DocId> TextIndex<Id> {
         // live-state read guards only if it needs to clone a snapshot, strictly
         // nested under `staged`. `commit` takes the same locks in the same order
         // (`staged` then the live-state guards), so no writer/committer pair can
-        // ever invert them (FIR-916).
+        // ever invert them.
         let mut staged_guard = self.staged.write();
         let state = self.ensure_staged(&mut staged_guard);
 
@@ -906,7 +906,7 @@ impl<Id: DocId> TextIndex<Id> {
     pub fn remove(&self, id: &Id) -> Result<(), SearchError> {
         let _span = tracing::info_span!("kin_search.remove", id = ?id).entered();
         // Canonical lock order: `staged` first, live-state guards nested inside
-        // `ensure_staged` (matches `commit`). See FIR-916.
+        // `ensure_staged` (matches `commit`).
         let mut staged_guard = self.staged.write();
         let state = self.ensure_staged(&mut staged_guard);
 
@@ -930,7 +930,7 @@ impl<Id: DocId> TextIndex<Id> {
             return Ok(());
         }
         // Canonical lock order: `staged` first, live-state guards nested inside
-        // `ensure_staged` (matches `commit`). See FIR-916.
+        // `ensure_staged` (matches `commit`).
         let mut staged_guard = self.staged.write();
         let state = self.ensure_staged(&mut staged_guard);
 
@@ -1067,7 +1067,7 @@ impl<Id: DocId> TextIndex<Id> {
     /// live guards via [`ensure_staged`](Self::ensure_staged)). Because both
     /// directions agree that `staged` is the outermost lock, a writer and a
     /// committer can never request the two locks in opposite order, so the
-    /// lock-order-inversion deadlock (FIR-916) cannot occur.
+    /// lock-order-inversion deadlock cannot occur.
     ///
     /// `staged` is deliberately held across `persist_to_disk` as well. All live
     /// state is mutated only under `staged` (here, and in the writer paths via
@@ -2750,7 +2750,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Concurrency: lock-order-inversion deadlock regression (FIR-916)
+    // Concurrency: lock-order-inversion deadlock regression
     //
     // The writer paths (`upsert`/`remove`/`remove_batch`) and the `commit` path
     // both touch the `staged` lock and the four live-state locks
@@ -2794,7 +2794,7 @@ mod tests {
             }
             Err(_) => panic!(
                 "{label}: concurrent workload did not complete within {timeout:?} — \
-                 lock-order-inversion deadlock has regressed (FIR-916)"
+                 lock-order-inversion deadlock has regressed"
             ),
         }
     }
