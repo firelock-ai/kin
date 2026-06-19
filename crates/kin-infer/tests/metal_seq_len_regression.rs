@@ -3,10 +3,10 @@
 
 //! Regression test for the Metal BERT NaN-at-seq-512 bug.
 //!
-//! See `planning/metal-bert-nan-bug.md`. The pre-existing
-//! `test_metal_fused_attention_batched_matches_cpu` only exercised seq_len=7,
-//! masking a numerical-stability bug in the Metal attention kernels at the
-//! seq_len=512 regime that BGE-small-en-v1.5 hits during entity embedding.
+//! The pre-existing `test_metal_fused_attention_batched_matches_cpu` only
+//! exercised seq_len=7, masking a numerical-stability bug in the Metal
+//! attention kernels at the seq_len=512 regime that BGE-small-en-v1.5 hits
+//! during entity embedding.
 //!
 //! This sweep exercises seq_lens around the 512-token boundary on both the
 //! grouped (batched) and non-grouped fused attention paths. Each Metal output

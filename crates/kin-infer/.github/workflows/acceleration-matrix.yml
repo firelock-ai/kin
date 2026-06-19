@@ -5,7 +5,7 @@
 #
 # Purpose: prove every acceleration backend still COMPILES (Metal on macOS,
 # Apple-Accelerate CPU/BLAS on macOS, pure-Rust default everywhere, CUDA on
-# Linux) on each push/PR. This is the FIR-999 acceleration lane's guard rail.
+# Linux) on each push/PR. This is the acceleration backend guard rail.
 #
 # It is deliberately decoupled from `release.yml` and `registry-publish.yml`:
 #
@@ -14,12 +14,12 @@
 #     executed in CI. Compilation needs no device; execution would.
 #   * It does NOT gate publishing and is NOT a dependency of the release or
 #     registry-publish jobs, so an acceleration backend can never sneak into the
-#     M0 release artifact. The PUBLISHED crate is built with `default = []`
+#     default release artifact. The PUBLISHED crate is built with `default = []`
 #     (pure Rust); `metal`/`accelerate`/`cuda` are opt-in features a consumer
 #     turns on explicitly, so they are never bundled into the default artifact.
 #
 # If you need to release an acceleration backend, that is a deliberate, separate
-# decision — not a side effect of the M0 publish lane.
+# decision — not a side effect of the default publish lane.
 
 name: Acceleration Matrix
 

@@ -56,7 +56,7 @@ fn swerank_self_retrieval_probe() {
     // config deserializes into BertConfig BEFORE asserting on it: a missing or
     // malformed fixture (e.g. a config.json without the dimension fields) is a
     // clean SKIP, not a panic that reddens the whole `cargo test -p kin-infer`
-    // suite (FIR-994).
+    // suite.
     let cfg_json = match fs::read_to_string(dir.join("config.json")) {
         Ok(s) => s,
         Err(e) => {

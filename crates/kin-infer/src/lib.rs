@@ -1413,8 +1413,8 @@ impl BertModel {
     ///
     /// **Trap**: the bucketing gate must fire before the global `max_len` allocation
     /// (`[batch_size * max_len, hidden_size]`). Allocating that buffer first — then
-    /// bucketing — produces no benefit and was the defect fixed by FIR-902. Keep the
-    /// `bucket_enabled()` check above the `max_len` computation.
+    /// bucketing — produces no benefit and was the defect this path guards against.
+    /// Keep the `bucket_enabled()` check above the `max_len` computation.
     // Multi-output tensor op (inline tuple clearer than an alias) with flat-offset index loops over ndarray rows.
     #[allow(clippy::type_complexity, clippy::needless_range_loop)]
     pub fn encode_batched(
@@ -2106,7 +2106,8 @@ impl BertModel {
     ///
     /// Side-effect note: bucketing changes the order in which entities ride each
     /// sub-batch call, which changes HNSW insert order downstream. This is
-    /// irrelevant to embedding values but tracked in FIR-823/FIR-825.
+    /// irrelevant to embedding values, but downstream callers that depend on stable
+    /// insertion order must account for it.
     fn forward_batched_bucketed(
         &self,
         token_ids: &[Vec<u32>],
@@ -4580,7 +4581,7 @@ mod tests {
         }
     }
 
-    /// Batch-composition parity gate for length-bucketed batching (FIR-902).
+    /// Batch-composition parity gate for length-bucketed batching.
     ///
     /// Asserts that per-entity embeddings are bit-identical (Metal) or
     /// cosine ≥ 1 − 1e-5 (all backends) regardless of how inputs are batched:
@@ -4596,7 +4597,8 @@ mod tests {
     /// Corpus mixes short entities (len 20, bin 64) with a long one (len 200,
     /// bin 256): in the legacy path all four pad to max_len = 200; after the
     /// fix shorts pad only to 20. This is the docstring-heavy pattern that
-    /// collapsed sympy throughput to 8 ents/s and motivated FIR-902.
+    /// collapsed sympy throughput to 8 ents/s and motivated this regression
+    /// coverage.
     ///
     /// Requires `/tmp/nomic` (model.safetensors + config.json); skips if absent.
     #[test]
