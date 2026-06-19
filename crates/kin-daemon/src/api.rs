@@ -7811,7 +7811,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trace_endpoint_renders_file_paths_in_daemon() {
+    async fn trace_endpoint_resolves_file_paths_to_graph_entities() {
+        let state = test_state();
+        state
+            .graph
+            .upsert_entity(&test_entity("handler", "src/lib.py"))
+            .unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::post("/trace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "entity": "src/lib.py",
+                            "json": false,
+                            "compact": false,
+                            "budget": "8k",
+                            "max_lines": 20,
+                            "nearby_limit": 2,
+                            "transitive_limit": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::trace::TraceResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(result
+            .lines
+            .iter()
+            .any(|line| line == "--- entities declared in src/lib.py ---"));
+        assert!(result.lines.iter().any(|line| line.contains("handler")));
+    }
+
+    #[tokio::test]
+    async fn trace_endpoint_file_path_without_graph_entities_returns_guidance() {
         let state = test_state();
         std::fs::create_dir_all(state.layout.working_dir().join("src")).unwrap();
         std::fs::write(
@@ -7850,8 +7895,15 @@ mod tests {
             .unwrap();
         let result: kin_cli::commands::trace::TraceResponse =
             serde_json::from_slice(&body).unwrap();
-        assert!(result.lines.iter().any(|line| line == "--- src/lib.py ---"));
-        assert!(result.lines.iter().any(|line| line.contains("def handler")));
+        let joined = result.lines.join("\n");
+        assert!(
+            joined.contains("expects an entity name, not a file path"),
+            "untracked file path must return guidance, not a raw disk dump: {joined}"
+        );
+        assert!(
+            !joined.contains("def handler"),
+            "file body must not be served from disk: {joined}"
+        );
     }
 
     #[tokio::test]
