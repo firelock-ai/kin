@@ -4,7 +4,6 @@
 use anyhow::{Context, Result};
 use kin_model::{Entity, GraphStore, TokenBudget};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 /// Resolve session id from KIN_SESSION_ID env var.
 ///
@@ -171,7 +170,7 @@ pub fn build_trace_json_response(
         matches
     };
 
-    if let Some(best_id) = select_best_match_with_layout(layout, entity, &matches).map(|e| e.id) {
+    if let Some(best_id) = select_best_match_with_layout(entity, &matches).map(|e| e.id) {
         matches.sort_by_key(|candidate| (candidate.id != best_id, candidate.name.len()));
     }
 
@@ -212,11 +211,10 @@ fn build_trace_lines(
     nearby_limit: usize,
     transitive_limit: usize,
 ) -> Result<Vec<String>> {
-    // Detect file path arguments inside the daemon-owned renderer. Agents sometimes
-    // pass file paths instead of entity names; the daemon returns the rendered file
-    // content without giving the CLI a local source read path.
+    // Agents sometimes pass file paths instead of entity names; resolve those to
+    // the graph-owned entities declared in that file rather than a raw file read.
     if looks_like_file_path(entity) {
-        return Ok(render_file_path_trace_lines(layout, entity));
+        return Ok(render_file_path_trace_lines(layout, graph, entity));
     }
 
     build_trace_lines_with_graph(
@@ -301,34 +299,12 @@ fn build_trace_lines_with_graph(
     };
 
     if matches.is_empty() {
-        if let Some(fallback) =
-            source_symbol_fallback(layout, entity, focal_max_lines, snippet_max_chars)?
-        {
-            return Ok(render_source_fallback_lines(
-                layout,
-                entity,
-                &fallback,
-                followup_limit,
-            ));
-        }
         return Ok(trace_not_found_guidance(entity));
     }
 
-    let target = match select_best_match_with_layout(layout, entity, &matches) {
+    let target = match select_best_match_with_layout(entity, &matches) {
         Some(target) => target,
-        None => {
-            if let Some(fallback) =
-                source_symbol_fallback(layout, entity, focal_max_lines, snippet_max_chars)?
-            {
-                return Ok(render_source_fallback_lines(
-                    layout,
-                    entity,
-                    &fallback,
-                    followup_limit,
-                ));
-            }
-            return Ok(trace_not_found_guidance(entity));
-        }
+        None => return Ok(trace_not_found_guidance(entity)),
     };
 
     let opts = kin_context::ContextOptions {
@@ -364,7 +340,8 @@ fn build_trace_lines_with_graph(
         ));
     }
 
-    if let Some(content) = render_entity_source(layout, target, focal_max_lines, snippet_max_chars)
+    if let Some(content) =
+        render_entity_source(layout, graph, target, focal_max_lines, snippet_max_chars)
     {
         if !compact {
             lines.push("\n--- Focal ---".to_string());
@@ -436,9 +413,13 @@ fn build_trace_lines_with_graph(
                 if let Some(dep) = graph.get_entity(&entry.entity_id)? {
                     let same_file = dep.file_origin == target.file_origin;
                     if same_file && expanded_same_file < 4 {
-                        if let Some(content) =
-                            render_neighbor_source(layout, &dep, focal_max_lines, snippet_max_chars)
-                        {
+                        if let Some(content) = render_neighbor_source(
+                            layout,
+                            graph,
+                            &dep,
+                            focal_max_lines,
+                            snippet_max_chars,
+                        ) {
                             lines.push(content);
                             expanded_same_file += 1;
                             continue;
@@ -517,298 +498,87 @@ fn select_best_match<'a>(query: &str, matches: &'a [Entity]) -> Option<&'a Entit
     })
 }
 
-fn select_best_match_with_layout<'a>(
-    layout: &kin_core::KinLayout,
-    query: &str,
-    matches: &'a [Entity],
-) -> Option<&'a Entity> {
+fn select_best_match_with_layout<'a>(query: &str, matches: &'a [Entity]) -> Option<&'a Entity> {
     kin_core::select_best_match(query, matches, |entity, hint| {
-        entity_or_file_mentions_qualifier(layout, entity, hint)
+        entity_mentions_qualifier(entity, hint)
     })
 }
 
-struct SourceSymbolFallback {
-    path: PathBuf,
-    snippet: String,
-}
-
-fn source_symbol_fallback(
+fn render_file_path_trace_lines(
     layout: &kin_core::KinLayout,
-    query: &str,
-    max_lines: usize,
-    max_chars: usize,
-) -> Result<Option<SourceSymbolFallback>> {
-    let source_root = kin_core::source_dir(layout);
-    if !source_root.exists() {
-        return Ok(None);
-    }
-
-    let search_patterns = textual_patterns_for_query(query);
-    if search_patterns.is_empty() {
-        return Ok(None);
-    }
-
-    let mut stack = vec![source_root.clone()];
-    let mut best: Option<(i32, PathBuf, String)> = None;
-
-    while let Some(path) = stack.pop() {
-        let entries = match std::fs::read_dir(&path) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(_) => continue,
-            };
-
-            if file_type.is_dir() {
-                stack.push(path);
-                continue;
-            }
-
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if !matches!(
-                ext,
-                "ts" | "tsx" | "js" | "jsx" | "rs" | "py" | "go" | "java"
-            ) {
-                continue;
-            }
-
-            let content = match std::fs::read_to_string(&path) {
-                Ok(content) => content,
-                Err(_) => continue,
-            };
-
-            if let Some((score, snippet)) = best_source_snippet_for_patterns(
-                &path,
-                &content,
-                &search_patterns,
-                max_lines,
-                max_chars,
-            ) {
-                match &best {
-                    Some((best_score, _, _)) if *best_score >= score => {}
-                    _ => best = Some((score, path.clone(), snippet)),
-                }
-            }
-        }
-    }
-
-    Ok(best.map(|(_, path, snippet)| SourceSymbolFallback { path, snippet }))
-}
-
-fn textual_patterns_for_query(query: &str) -> Vec<String> {
-    let query = query.trim();
-    let mut patterns = Vec::new();
-
-    if !query.is_empty() {
-        patterns.push(query.to_string());
-    }
-
-    let dotted = query.replace("::", ".");
-    if dotted != query {
-        patterns.push(dotted.clone());
-    }
-
-    let qualifier = kin_core::qualifier_hint_from_query(query)
-        .map(|q| q.replace('$', ""))
-        .unwrap_or_default();
-    let leaf = query
-        .rfind("::")
-        .map(|idx| &query[idx + 2..])
-        .or_else(|| query.rfind('.').map(|idx| &query[idx + 1..]))
-        .unwrap_or(query)
-        .trim();
-
-    if !qualifier.is_empty() && !leaf.is_empty() {
-        patterns.push(leaf.to_string());
-        patterns.push(format!("{}.{}", qualifier, leaf));
-        patterns.push(format!("{}::{}", qualifier, leaf));
-        patterns.push(format!(".{}", leaf));
-    } else if !leaf.is_empty() {
-        patterns.push(leaf.to_string());
-        patterns.push(format!(".{}", leaf));
-    }
-
-    patterns.sort();
-    patterns.dedup();
-    patterns
-}
-
-fn best_source_snippet_for_patterns(
-    path: &std::path::Path,
-    content: &str,
-    patterns: &[String],
-    max_lines: usize,
-    max_chars: usize,
-) -> Option<(i32, String)> {
-    let mut best: Option<(i32, usize)> = None;
-    let path_str = path.to_string_lossy();
-
-    for pattern in patterns {
-        if pattern.is_empty() {
-            continue;
-        }
-        for (idx, _) in content.match_indices(pattern) {
-            let mut score = match pattern.as_str() {
-                p if p == patterns[0] => 300,
-                p if p.starts_with('.') => 120,
-                _ => 180,
-            };
-
-            if path_str.contains("/tests/")
-                || path_str.contains("/test/")
-                || path_str.contains(".test.")
-                || path_str.contains(".spec.")
-                || path_str.contains("/fixtures/")
-                || path_str.contains("/fixture/")
-                || path_str.contains("/examples/")
-                || path_str.contains("/example/")
-            {
-                score -= 220;
-            }
-            if path_str.contains("/bench/") {
-                score -= 120;
-            }
-            score += local_symbol_context_bonus(content, idx, pattern);
-
-            match best {
-                Some((best_score, _)) if best_score >= score => {}
-                _ => best = Some((score, idx)),
-            }
-        }
-    }
-
-    let (score, idx) = best?;
-    let snippet = snippet_around_index(content, idx, max_lines, max_chars);
-    Some((
-        score,
-        format!("// source fallback ({})\n{}", path.display(), snippet),
-    ))
-}
-
-fn local_symbol_context_bonus(content: &str, idx: usize, pattern: &str) -> i32 {
-    let window = safe_char_window_around_byte(content, idx, 160, 240);
-    let leaf = pattern
-        .trim_start_matches('.')
-        .rsplit("::")
-        .next()
-        .and_then(|s| s.rsplit('.').next())
-        .unwrap_or(pattern)
-        .trim();
-    if leaf.is_empty() {
-        return 0;
-    }
-
-    let mut score = 0;
-    for needle in [
-        format!("function {}", leaf),
-        format!("const {} =", leaf),
-        format!("let {} =", leaf),
-        format!("var {} =", leaf),
-        format!("class {}", leaf),
-        format!("{} =", leaf),
-        format!("{}(", leaf),
-        format!("{}:", leaf),
-    ] {
-        if window.contains(&needle) {
-            score += 35;
-        }
-    }
-
-    if window.contains("describe(") || window.contains("it(") || window.contains("test(") {
-        score -= 80;
-    }
-
-    score
-}
-
-fn safe_char_window_around_byte(content: &str, idx: usize, before: usize, after: usize) -> &str {
-    let mut start = idx.saturating_sub(before).min(content.len());
-    while start > 0 && !content.is_char_boundary(start) {
-        start -= 1;
-    }
-
-    let mut end = (idx + after).min(content.len());
-    while end < content.len() && !content.is_char_boundary(end) {
-        end += 1;
-    }
-
-    &content[start..end]
-}
-
-fn snippet_around_index(content: &str, index: usize, max_lines: usize, max_chars: usize) -> String {
-    let mut current = 0usize;
-    let mut target_line = 0usize;
-    for (line_no, line) in content.lines().enumerate() {
-        let next = current + line.len() + 1;
-        if index < next {
-            target_line = line_no;
-            break;
-        }
-        current = next;
-    }
-
-    let start_line = target_line.saturating_sub(max_lines / 2);
-    let end_line = start_line + max_lines;
-    let snippet = content
-        .lines()
-        .enumerate()
-        .filter(|(i, _)| *i >= start_line && *i < end_line)
-        .map(|(_, line)| line)
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    clip_rendered_text_with_cap(&snippet, max_lines, max_chars)
-}
-
-fn render_file_path_trace_lines(layout: &kin_core::KinLayout, entity: &str) -> Vec<String> {
-    let source_root = kin_core::source_dir(layout);
-    let file_path = source_root.join(entity);
-    let read_path = display_read_path(layout, entity);
-    if file_path.is_file() {
-        let mut lines = vec![format!("--- {} ---", read_path)];
-        if let Ok(content) = std::fs::read_to_string(&file_path) {
-            // Use generous limits for file auto-reads; these are usually small
-            // files and truncation causes agents to re-read redundantly.
-            lines.push(clip_rendered_text_with_cap(&content, 40, 2400));
-        }
-        return lines;
-    }
-
-    vec![format!(
-        "`kin trace` expects an entity name, not a file path.\n\
-         To read this file: Read {}\n\
-         To find entities: kin search <EntityName> --show-body",
-        read_path
-    )]
-}
-
-fn render_source_fallback_lines(
-    layout: &kin_core::KinLayout,
-    query: &str,
-    fallback: &SourceSymbolFallback,
-    followup_limit: usize,
+    graph: &impl GraphStore,
+    entity: &str,
 ) -> Vec<String> {
-    let display_path = display_source_path(layout, &fallback.path);
-    let mut lines = vec![
-        format!("Trace for '{}' -> source match ({})", query, display_path),
-        "\n--- Focal ---".to_string(),
-        fallback.snippet.clone(),
-    ];
-    let followups = extract_textual_followups(&fallback.snippet);
-    if !followups.is_empty() {
-        lines.push("\n--- Follow-ups ---".to_string());
-        for item in followups.iter().take(followup_limit) {
-            lines.push(format!("- {}", item));
-        }
+    let read_path = display_read_path(layout, entity);
+    let entities = graph_entities_for_file(graph, entity);
+
+    if entities.is_empty() {
+        return vec![format!(
+            "`kin trace` expects an entity name, not a file path.\n\
+             To read this file: Read {}\n\
+             To find entities: kin search <EntityName> --show-body",
+            read_path
+        )];
     }
-    lines.push("\nCounts: contracts=0 tests=0 work_items=0 annotations=0".to_string());
-    lines.push(fallback_trace_tip(&display_path));
+
+    let mut lines = vec![format!("--- entities declared in {} ---", read_path)];
+    for entity in entities.iter().take(40) {
+        let line = entity
+            .span
+            .as_ref()
+            .map(|span| span.start_line)
+            .unwrap_or(0);
+        lines.push(format!(
+            "  {} ({:?}) @ {}:{}",
+            entity.name, entity.kind, read_path, line
+        ));
+    }
+    lines.push(
+        "\nTip: `kin trace <EntityName>` to follow data flow from one of these declarations."
+            .to_string(),
+    );
     lines
+}
+
+fn graph_entities_for_file(graph: &impl GraphStore, path: &str) -> Vec<Entity> {
+    let direct = graph
+        .query_entities(&kin_model::EntityFilter {
+            file_path: Some(kin_model::FilePathId::new(path)),
+            ..Default::default()
+        })
+        .unwrap_or_default();
+    if !direct.is_empty() {
+        return sort_entities_by_line(direct);
+    }
+
+    let suffix = path.trim_start_matches("./");
+    let matched = graph
+        .query_entities(&kin_model::EntityFilter::default())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entity| {
+            entity
+                .file_origin
+                .as_ref()
+                .map(|origin| origin.0 == path || origin.0.ends_with(suffix))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    sort_entities_by_line(matched)
+}
+
+fn sort_entities_by_line(mut entities: Vec<Entity>) -> Vec<Entity> {
+    entities.sort_by_key(|entity| {
+        (
+            entity
+                .span
+                .as_ref()
+                .map(|span| span.start_line)
+                .unwrap_or(0),
+            entity.name.clone(),
+        )
+    });
+    entities
 }
 
 fn focused_trace_tip(_read_path: &str, target_name: &str) -> String {
@@ -822,14 +592,6 @@ fn focused_trace_tip(_read_path: &str, target_name: &str) -> String {
             "Tip: after 2-3 traces you likely have enough to answer. Use `kin context {}` only if you need a broader view.",
             target_name
         )
-    }
-}
-
-fn fallback_trace_tip(_display_path: &str) -> String {
-    if native_content_restricted() {
-        "Tip: you have enough context to summarize the flow. Stop tracing and answer.".to_string()
-    } else {
-        "Tip: after 2-3 traces you likely have enough to answer. Stop and summarize.".to_string()
     }
 }
 
@@ -856,37 +618,32 @@ fn looks_like_file_path(s: &str) -> bool {
     extensions.iter().any(|ext| s.ends_with(ext))
 }
 
-fn entity_or_file_mentions_qualifier(
-    layout: &kin_core::KinLayout,
-    entity: &Entity,
-    qualifier_hint: &str,
-) -> bool {
+fn entity_mentions_qualifier(entity: &Entity, qualifier_hint: &str) -> bool {
     if kin_core::normalize_symbol_hint(&entity.name).contains(qualifier_hint) {
         return true;
     }
 
-    let Some(file_origin) = entity.file_origin.as_ref() else {
-        return false;
-    };
+    if kin_core::normalize_symbol_hint(&entity.signature).contains(qualifier_hint) {
+        return true;
+    }
 
-    let path = kin_core::source_dir(layout).join(&file_origin.0);
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    let normalized = kin_core::normalize_symbol_hint(&content);
-    normalized.contains(qualifier_hint)
+    entity
+        .doc_summary
+        .as_ref()
+        .map(|summary| kin_core::normalize_symbol_hint(summary).contains(qualifier_hint))
+        .unwrap_or(false)
 }
 
 fn render_entity_source(
     layout: &kin_core::KinLayout,
+    graph: &impl GraphStore,
     entity: &Entity,
     max_lines: usize,
     max_chars: usize,
 ) -> Option<String> {
     let span = entity.span.as_ref()?;
     let file_origin = entity.file_origin.as_ref()?;
-    let path = kin_core::source_dir(layout).join(&file_origin.0);
-    let bytes = std::fs::read(&path).ok()?;
+    let bytes = graph_owned_source_bytes(layout, graph, file_origin)?;
     let start = span.start_byte.min(bytes.len());
     let end = span.end_byte.min(bytes.len());
     if start >= end {
@@ -908,12 +665,17 @@ fn render_entity_source(
     ))
 }
 
-fn display_source_path(layout: &kin_core::KinLayout, path: &std::path::Path) -> String {
-    let source_root = kin_core::source_dir(layout);
-    if let Ok(rel) = path.strip_prefix(&source_root) {
-        return display_read_path(layout, &rel.to_string_lossy());
+fn graph_owned_source_bytes(
+    layout: &kin_core::KinLayout,
+    graph: &impl GraphStore,
+    file_origin: &kin_model::FilePathId,
+) -> Option<Vec<u8>> {
+    let hash = graph.get_file_hash(file_origin).ok().flatten()?;
+    let bytes = kin_core::read_blob_from_layout(layout, &hash)?;
+    if kin_blobs::digest(&bytes) != hash {
+        return None;
     }
-    path.display().to_string()
+    Some(bytes)
 }
 
 fn display_read_path(_layout: &kin_core::KinLayout, rel_path: &str) -> String {
@@ -922,11 +684,12 @@ fn display_read_path(_layout: &kin_core::KinLayout, rel_path: &str) -> String {
 
 fn render_neighbor_source(
     layout: &kin_core::KinLayout,
+    graph: &impl GraphStore,
     entity: &Entity,
     max_lines: usize,
     max_chars: usize,
 ) -> Option<String> {
-    let content = render_entity_source(layout, entity, max_lines, max_chars)?;
+    let content = render_entity_source(layout, graph, entity, max_lines, max_chars)?;
     Some(format!("// same-file neighbor\n{}", content))
 }
 
@@ -1037,7 +800,7 @@ fn trace_not_found_guidance(entity: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        best_source_snippet_for_patterns, fallback_leaf_trace_matches, query_trace_matches,
+        entity_mentions_qualifier, fallback_leaf_trace_matches, query_trace_matches,
         select_best_match, trace_not_found_guidance,
     };
     use kin_core::normalize_trace_name;
@@ -1226,61 +989,55 @@ issues.map((iss) => util.finalizeItem(iss, ctx, core.config()));
     }
 
     #[test]
-    fn source_fallback_prefers_implementation_over_test_file() {
-        let impl_content = r#"
-export const parseStrict = <T>(schema: $MyType<T>, value: unknown) => {
-  const result = schema.engine.run({ value, issues: [] }, { async: false });
-  return result;
-};
-"#;
-        let test_content = r#"
-test("parseStrict works", () => {
-  expect(schema.parseStrict("x").success).toBe(true);
-});
-"#;
+    fn entity_mentions_qualifier_uses_graph_signature_not_disk() {
+        let mut entity = make_entity("parse");
+        entity.signature = "fn parse(input: &Config) -> Result<()>".to_string();
+        assert!(entity_mentions_qualifier(&entity, "config"));
 
-        let impl_score = best_source_snippet_for_patterns(
-            std::path::Path::new("/repo/packages/app/src/core/parse.ts"),
-            impl_content,
-            &["parseStrict".to_string(), ".parseStrict".to_string()],
-            20,
-            2400,
-        )
-        .unwrap()
-        .0;
-
-        let test_score = best_source_snippet_for_patterns(
-            std::path::Path::new("/repo/packages/app/src/core/tests/index.test.ts"),
-            test_content,
-            &["parseStrict".to_string(), ".parseStrict".to_string()],
-            20,
-            2400,
-        )
-        .unwrap()
-        .0;
-
-        assert!(
-            impl_score > test_score,
-            "{impl_score} should outrank {test_score}"
-        );
+        let unrelated = make_entity("parse");
+        assert!(!entity_mentions_qualifier(&unrelated, "config"));
     }
 
     #[test]
-    fn source_fallback_handles_unicode_without_panicking() {
-        let content = r#"
-test("Georgian locale uses 'ველი' instead of 'სტრინგი'", () => {
-  expect(schema.parseStrict("x").success).toBe(true);
-});
-"#;
+    fn entity_mentions_qualifier_uses_graph_doc_summary() {
+        let mut entity = make_entity("run");
+        entity.signature = "fn run()".to_string();
+        entity.doc_summary = Some("Drives the Scheduler loop".to_string());
+        assert!(entity_mentions_qualifier(&entity, "scheduler"));
+    }
 
-        let found = best_source_snippet_for_patterns(
-            std::path::Path::new("/repo/src/tests/index.test.ts"),
-            content,
-            &["parseStrict".to_string()],
-            20,
-            2400,
+    #[test]
+    fn trace_graph_miss_returns_guidance_without_disk_fallback() {
+        let graph = InMemoryGraph::new();
+        let layout = kin_core::KinLayout::discover(&std::env::current_dir().unwrap())
+            .or_else(|| kin_core::KinLayout::discover(std::path::Path::new(".")));
+        let layout = match layout {
+            Some(layout) => layout,
+            None => return,
+        };
+        let response = super::build_trace_response(
+            &layout,
+            &graph,
+            &super::TraceRequest {
+                entity: "definitelyMissingEntity".to_string(),
+                json: false,
+                compact: false,
+                budget: "8k".to_string(),
+                assistant: None,
+                max_lines: 20,
+                nearby_limit: 3,
+                transitive_limit: 0,
+            },
+        )
+        .unwrap();
+        let joined = response.lines.join("\n");
+        assert!(
+            joined.contains("not found"),
+            "graph-miss guidance: {joined}"
         );
-
-        assert!(found.is_some());
+        assert!(
+            joined.contains("kin search definitelyMissingEntity"),
+            "offers search instead of disk fallback: {joined}"
+        );
     }
 }
