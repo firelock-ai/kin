@@ -749,6 +749,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/graph/commit", post(graph_commit))
         .route("/graph/mutations", post(graph_mutations))
         .route("/commands/status", post(command_status))
+        .route("/commands/resources", post(command_resources))
         .route("/commands/graph", post(command_graph))
         .route("/commands/overview", post(command_overview))
         .route("/commands/dead-code", post(command_dead_code))
@@ -1795,6 +1796,49 @@ async fn command_status(
         summary,
         request.json,
         Some(build),
+    )
+    .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+/// POST /commands/resources — detect the resource plan for a profile and attach
+/// live daemon embedding state. Inspect-only: never loads a model or embeds.
+async fn command_resources(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_cli::commands::resources::CommandResourcesRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let profile = kin_cli::commands::resources::parse_profile(request.profile.as_deref())
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    let plan = kin_infer::resource::ResourcePlan::detect(profile);
+
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let embed_status = graph.embedding_status();
+    let embed_runtime = kin_cli::commands::resources::EmbedRuntimeState {
+        embed_worker_failed: state
+            .embed_worker_failed
+            .load(std::sync::atomic::Ordering::Relaxed),
+        embedding_work_busy: state.embedding_work.try_lock().is_err(),
+        embeddings_indexed: embed_status.indexed,
+        embeddings_pending: embed_status.pending,
+        embeddings_total: embed_status.total,
+    };
+
+    let response = kin_cli::commands::resources::build_command_resources_response(
+        plan,
+        embed_runtime,
+        request.json,
     )
     .map_err(internal_error)?;
     Ok(Json(response))

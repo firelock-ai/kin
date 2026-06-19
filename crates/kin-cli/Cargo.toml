@@ -41,6 +41,7 @@ kin-runtime = { workspace = true }
 kin-buildinfo = { workspace = true }
 kin-mcp = { workspace = true }
 kin-db = { workspace = true }
+kin-infer = { version = ">=0.2.1", registry = "kin", default-features = false }
 kin-ranking = { workspace = true }
 kin-lsp = { workspace = true }
 kin-remote = { workspace = true }
@@ -92,3 +93,4 @@ libc = "0.2"
 # block is absent and metal is never requested, keeping the Linux build green.
 [target.'cfg(target_os = "macos")'.dependencies]
 kin-db = { workspace = true, features = ["metal"] }
+kin-infer = { version = ">=0.2.1", registry = "kin", features = ["metal"] }

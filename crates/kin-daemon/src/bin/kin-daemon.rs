@@ -353,7 +353,15 @@ async fn async_main() -> i32 {
     };
 
     let embed_batch_size = match embed_batch_size_from_env() {
-        Ok(size) => size.unwrap_or_else(|| DaemonConfig::default().embed_batch_size),
+        Ok(explicit) => {
+            let resource_profile = env::var("KIN_RESOURCE_PROFILE").ok();
+            kin_cli::commands::resources::resolve_embed_batch_size(
+                explicit,
+                resource_profile.as_deref(),
+                DaemonConfig::default().embed_batch_size,
+                kin_cli::commands::resources::throughput_embed_batch_size,
+            )
+        }
         Err(error) => {
             eprintln!("kin-daemon: {error}");
             process::exit(1);

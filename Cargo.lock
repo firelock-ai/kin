@@ -2932,6 +2932,7 @@ dependencies = [
  "kin-db",
  "kin-git",
  "kin-index",
+ "kin-infer",
  "kin-lsp",
  "kin-mcp",
  "kin-migrate",
@@ -3027,6 +3028,7 @@ dependencies = [
  "kin-db",
  "kin-git",
  "kin-index",
+ "kin-infer",
  "kin-lsp",
  "kin-mcp",
  "kin-model",
@@ -3057,9 +3059,9 @@ dependencies = [
 
 [[package]]
 name = "kin-db"
-version = "0.2.6"
+version = "0.2.7"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "3e7a5367844e9688a9b86254f878b86e8ca16f1a640669e14d226634318dca11"
+checksum = "42f0bb9b81de21d2bb50d4eb8e234115c35f5769b8465e1699dd4bd395ac7830"
 dependencies = [
  "bincode",
  "bytes",
@@ -3135,9 +3137,9 @@ dependencies = [
 
 [[package]]
 name = "kin-infer"
-version = "0.2.0"
+version = "0.2.2"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "55723a3b66a0c8c530129dbfaa6a0d45c5c1247d539d37447fc767c1feb5f72f"
+checksum = "d1388f2de69b783d6cddf92842c5914bc1855aa23770decf81c05823a57756db"
 dependencies = [
  "block",
  "half",
@@ -6329,7 +6331,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
