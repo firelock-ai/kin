@@ -1,34 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 Firelock, LLC
-
-# Registry safety net + idempotent, immutable auto-publish.
-#
-# registry_smoke: builds the crate against the PUBLISHED Kin registry only —
-# .cargo/config.toml is replaced with one carrying ONLY the registry alias, no
-# [patch.*] redirects. This guards against a future local-checkout patch
-# masking a crate that cannot resolve/build from the published registry (the
-# version-skew failure this workflow exists to prevent). Runs on PRs, main, and
-# release tags.
-#
-# consumer_smoke: spins up a throwaway downstream consumer that pulls kin-infer
-# via `registry = "kin"` and builds it with an EMPTY cargo cache (fresh
-# CARGO_HOME). On PRs / pre-publish this proves the LATEST already-published
-# version is consumable from a clean cache (skips cleanly if nothing is
-# published yet).
-#
-# registry_publish: on a push to main OR a release tag (v*.*.*), packages the
-# crate and POSTs it to the registry. The version is read from Cargo.toml
-# (cargo metadata), so a version-bump merge auto-publishes without a tag; a tag
-# push additionally asserts the tag matches the Cargo version. The publish
-# script reads the sparse index first and SKIPS an already-published version
-# (immutable — never attempts an overwrite POST); a server 409 stays as a
-# backstop. Requires the repo registry token/secret. Runs only after
-# registry_smoke passes.
-#
-# published_consumer_smoke: after a publish, re-runs the fresh-cache consumer
-# smoke pinned to the EXACT just-published version, proving the new bytes
-# actually resolve and build for a downstream consumer.
-
 name: Registry Publish
 
 on:
@@ -38,81 +7,15 @@ on:
   pull_request:
     branches: [main]
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  registry_smoke:
-    name: Registry-only build (no local patches)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.96.0
-
-      - name: Write registry-only .cargo/config.toml
-        # Carry ONLY the registry alias — no [patch.*] redirects — so the build
-        # must resolve every dependency from the published registry / crates.io.
-        run: |
-          mkdir -p .cargo
-          cat > .cargo/config.toml <<'EOF'
-          [registries.kin]
-          index = "sparse+https://kinlab.ai/registry/cargo/"
-          EOF
-          echo "Registry-only .cargo/config.toml:"
-          cat .cargo/config.toml
-
-      - name: Build from registry
-        run: cargo build
-
-  consumer_smoke:
-    name: Fresh-cache consumer smoke (latest published)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.96.0
-
-      - name: Consumer pulls kin-infer from the kin registry (fresh cache)
-        run: bash ./scripts/registry-consumer-smoke.sh latest
-
-  registry_publish:
-    name: Publish crate to KinLab registry
-    needs: registry_smoke
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.96.0
-
-      - name: Publish kin-infer
-        # On a tag push, GITHUB_REF_TYPE/GITHUB_REF_NAME are picked up by the
-        # script to assert the tag (vX.Y.Z) matches the Cargo version. On a main
-        # push there is no tag and the Cargo version is the source of truth.
-        run: bash ./scripts/publish-kinlab-crates.sh
-        env:
-          KINLAB_CARGO_REGISTRY_URL: ${{ vars.KINLAB_CARGO_REGISTRY_URL }}
-          KINLAB_CARGO_TOKEN: ${{ secrets.KINLAB_CARGO_TOKEN }}
-
-  published_consumer_smoke:
-    name: Fresh-cache consumer smoke (exact published version)
-    needs: registry_publish
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.96.0
-
-      - name: Resolve crate version from Cargo.toml
-        id: ver
-        run: echo "version=$(awk -F'\"' '/^version[[:space:]]*=/{print $2; exit}' Cargo.toml)" >> "$GITHUB_OUTPUT"
-
-      - name: Consumer pulls the just-published version (fresh cache)
-        env:
-          CRATE_VERSION: ${{ steps.ver.outputs.version }}
-        run: bash ./scripts/registry-consumer-smoke.sh "$CRATE_VERSION"
+  release:
+    uses: firelock-ai/kin-actions/.github/workflows/cargo-registry-release.yml@v0.1.1
+    with:
+      package: kin-infer
+      manifest: Cargo.toml
+      source-paths: src Cargo.toml
+      test-command: cargo test
+    secrets:
+      KINLAB_CARGO_TOKEN: ${{ secrets.KINLAB_CARGO_TOKEN }}
+      KIN_CI_BOT_TOKEN: ${{ secrets.KIN_CI_BOT_TOKEN }}
+      KIN_DOWNSTREAM_DISPATCH_TOKEN: ${{ secrets.KIN_DOWNSTREAM_DISPATCH_TOKEN }}
