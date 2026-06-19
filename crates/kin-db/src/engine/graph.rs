@@ -1085,12 +1085,6 @@ struct PendingMerkle {
     seeds: HashSet<EntityId>,
 }
 
-/// Counts how many times a deferred Merkle refresh actually ran. Used by tests
-/// to prove that a burst of single-entity mutations collapses into one batch
-/// reconciliation instead of one O(component) refresh per mutation.
-#[cfg(test)]
-static MERKLE_FLUSH_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 pub struct InMemoryGraph {
     /// Core entity/relation graph.
     entities: RwLock<EntityData>,
@@ -1144,6 +1138,14 @@ pub struct InMemoryGraph {
     /// work targeted instead of forcing a full artifact pass on every embed run.
     #[cfg(feature = "vector")]
     artifact_embedding_queue: parking_lot::Mutex<RecencyQueue<ArtifactId>>,
+    /// Per-graph count of deferred Merkle refreshes that actually ran.
+    /// Used by tests to prove that burst mutations collapse into one batch
+    /// reconciliation. A per-instance counter avoids interference from other
+    /// tests running in parallel (the old global counter was shared across the
+    /// whole test process, causing spurious failures when concurrent tests
+    /// triggered their own flushes).
+    #[cfg(test)]
+    merkle_flush_count: std::sync::atomic::AtomicUsize,
 }
 
 impl InMemoryGraph {
@@ -1240,6 +1242,8 @@ impl InMemoryGraph {
             embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
             #[cfg(feature = "vector")]
             artifact_embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
+            #[cfg(test)]
+            merkle_flush_count: std::sync::atomic::AtomicUsize::new(0),
         };
 
         graph
@@ -1642,6 +1646,8 @@ impl InMemoryGraph {
             embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
             #[cfg(feature = "vector")]
             artifact_embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
+            #[cfg(test)]
+            merkle_flush_count: std::sync::atomic::AtomicUsize::new(0),
         };
 
         if !skip_text_index && (!text_index_current || !text_index_entity_coverage_current) {
@@ -1861,6 +1867,8 @@ impl InMemoryGraph {
             embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
             #[cfg(feature = "vector")]
             artifact_embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
+            #[cfg(test)]
+            merkle_flush_count: std::sync::atomic::AtomicUsize::new(0),
         };
 
         if !text_index_current {
@@ -1967,7 +1975,8 @@ impl InMemoryGraph {
         };
         self.merkle.write().refresh_affected(ent, seeds);
         #[cfg(test)]
-        MERKLE_FLUSH_COUNT.fetch_add(1, Ordering::Relaxed);
+        self.merkle_flush_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[inline]
@@ -7775,7 +7784,13 @@ mod tests {
             .collect();
         graph.upsert_relations_batch(&chain).unwrap();
 
-        MERKLE_FLUSH_COUNT.store(0, Ordering::Relaxed);
+        // Reset per-graph counter after the setup batches so we only count
+        // flushes triggered by the single-relation upsert loop below.
+        // Using an instance counter (rather than the old process-wide global)
+        // eliminates interference from other tests running concurrently.
+        graph
+            .merkle_flush_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         let start = std::time::Instant::now();
         // Thousands of single-relation upserts, exactly like
         // materialize_discovered_tests' per-test `upsert_relation` loop.
@@ -7789,7 +7804,9 @@ mod tests {
 
         // Nothing has read the root, so not one refresh should have run.
         assert_eq!(
-            MERKLE_FLUSH_COUNT.load(Ordering::Relaxed),
+            graph
+                .merkle_flush_count
+                .load(std::sync::atomic::Ordering::Relaxed),
             0,
             "single-entity upserts must defer Merkle work, not refresh eagerly"
         );
@@ -7798,7 +7815,9 @@ mod tests {
         let root = graph.compute_root_hash();
         let elapsed = start.elapsed();
         assert_eq!(
-            MERKLE_FLUSH_COUNT.load(Ordering::Relaxed),
+            graph
+                .merkle_flush_count
+                .load(std::sync::atomic::Ordering::Relaxed),
             1,
             "reconciliation must be a single batch refresh, not one per mutation"
         );
@@ -11053,6 +11072,12 @@ mod tests {
         );
     }
 
+    // This test exercises the stub path compiled when neither embeddings nor
+    // vector features are active. With the default features ("vector" +
+    // "embeddings" both on) the full implementation is compiled instead; that
+    // path requires a real embedder and would fail here. Gate the test so it
+    // only runs under the feature combination it was written for.
+    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
     #[test]
     fn process_embedding_queue_without_embeddings_is_noop() {
         // With just "vector" feature (no "embeddings"), process should return 0
