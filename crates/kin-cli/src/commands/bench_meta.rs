@@ -521,7 +521,8 @@ mod tests {
 
         let mut meta_commit = meta.clone();
         meta_commit.kin_commit = "ffffffffffff";
-        let (prepared_b, repo_base_b) = build_prepared_manifests(&meta_commit, repo.path()).unwrap();
+        let (prepared_b, repo_base_b) =
+            build_prepared_manifests(&meta_commit, repo.path()).unwrap();
         assert_ne!(
             prepared_a.cache_key, prepared_b.cache_key,
             "prepared-state cache must miss when the Kin commit changes"
