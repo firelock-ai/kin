@@ -29,7 +29,8 @@ fn bench_meta_json_reports_cache_key_dimensions() {
     assert!(payload["layout_schema_version"].is_u64());
     assert!(payload["graph_snapshot_version"].is_u64());
     assert!(payload["text_index_format_version"].is_u64());
-    assert!(payload["kin_binary_sha256"].is_string());
+    assert!(payload["kin_commit"].is_string());
+    assert!(payload["kin_dirty"].is_boolean());
 
     let embeddings = payload["embeddings"]
         .as_object()
