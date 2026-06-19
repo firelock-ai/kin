@@ -2373,7 +2373,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                             let budget_ms =
                                 locate_env_usize("KIN_LOCATE_RERANK_LATENCY_BUDGET_MS", 0) as u128;
                             if rerank_within_budget(elapsed_ms, budget_ms) {
-                                // M1 (FIR-986/987): additive, promotion-only blend.
+                                // additive, promotion-only blend.
                                 // Legacy (default) OVERWRITES the fused score with the raw
                                 // cross-encoder logit and re-sorts purely by it — substitutive,
                                 // so it evicts multi-signal-corroborated golds whenever the
@@ -2550,7 +2550,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // D_empty lever (default ON — measurement-backed: 51/51 official scorer,
     // symbol-F1 +17% with precision EXACTLY flat, a clean Pareto win). Files
     // located by a file-level/lexical signal with no resolved entity emit zero
-    // symbols and are a guaranteed symbol+line miss; backfill their symbol list
+    // symbols and are a certain symbol+line miss; backfill their symbol list
     // from the file's graph definitions, ranked by query proximity. Set
     // KIN_LOCATE_ENRICH_EMPTY_FILES=0 to disable.
     if locate_env_bool("KIN_LOCATE_ENRICH_EMPTY_FILES", true) {
@@ -3445,7 +3445,7 @@ fn extract_priority_file_traces(
             // Suffix match: scan entities for file paths containing the fragment
             if let Ok(mut all) = graph.query_entities(&EntityFilter::default()) {
                 // Determinism: sort before the take() clip so the scanned subset
-                // is stable across processes (query order is not guaranteed).
+                // is stable across processes (query order is not stable on its own).
                 all.sort_by(|a, b| a.id.cmp(&b.id));
                 let mut seen_paths = HashSet::new();
                 let mut matched_paths = Vec::new();
@@ -3788,7 +3788,7 @@ fn extract_priority_file_traces(
         }
     }
 
-    // (b3) FIR-986: source-file basename parity with grep.
+    // (b3) source-file basename parity with grep.
     //
     // `query_backed_tracked_file_score` gives a tracked file a strong, injectable
     // seat when a query term matches its basename — but the loop above only scans
@@ -6042,7 +6042,7 @@ fn curate_search_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<
         }
     }
 
-    // Compound identifiers get guaranteed slots — they're almost certainly
+    // Compound identifiers get reserved slots — they're almost certainly
     // real code identifiers (__array_ufunc__, FITSDiff, NdarrayMixin).
     compound_terms.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
@@ -8432,7 +8432,7 @@ fn compute_import_centrality(
             Ok(e) => e,
             Err(_) => continue,
         };
-        // Determinism: query_entities order is not guaranteed stable across
+        // Determinism: query_entities order is not inherently stable across
         // processes, and the take() below clips it. Without a stable sort, which
         // entities feed the centrality count varies per run, perturbing the
         // import-centrality bonus on the fused.take(15) boundary and flipping
@@ -9349,7 +9349,7 @@ fn reciprocal_rank_fusion_entities(
 ///
 /// This is the architecture-bet ON path: entity ranking survives INTO fusion
 /// rather than terminating at discovery. Deliberate first-cut limits, to be
-/// validated by the post-freeze A/B (see the flip-plan):
+/// validated by a controlled A/B before it becomes the default:
 /// 1. Projection happens at the fusion boundary, so dominance/floors/adaptive_cap
 ///    stay file-granular (re-keying the ~40-function post-fusion pipeline to
 ///    entities is out of scope under freeze and risks the proven determinism).
@@ -12913,7 +12913,7 @@ fn rank_enriched_symbols(
 /// D_empty lever (`KIN_LOCATE_ENRICH_EMPTY_FILES`, default ON — set to 0 to
 /// disable). For final result files that surfaced via a file-level/lexical
 /// signal but had NO entity resolved to them — so their per-file symbol list is
-/// empty and the symbol+line metrics are a guaranteed miss even though the FILE
+/// empty and the symbol+line metrics are a certain miss even though the FILE
 /// was located correctly — enumerate the file's definitions from the graph and
 /// emit the top query-relevant ones (`KIN_LOCATE_ENRICH_TOPK`, default 3).
 /// GPU-free; only touches files that currently emit nothing, so files that
@@ -13301,7 +13301,7 @@ fn entity_span_pair(entity: &kin_model::Entity) -> Vec<[u32; 2]> {
     // KIN_LOCATE_SPAN_FULL_EXTENT=1 emits the full node extent instead.
     let full_extent = locate_env_bool("KIN_LOCATE_SPAN_FULL_EXTENT", false);
     let head_threshold = locate_env_usize("KIN_LOCATE_SPAN_CLASS_HEAD_THRESHOLD", 60) as u32;
-    // FIR-990: only class-like nodes get head-truncated today, so a coarse
+    // only class-like nodes get head-truncated today, so a coarse
     // non-class entity — above all a File-kind node whose span is the entire
     // file (700-1600 lines) — is emitted at full extent and tanks symbol/line
     // precision. KIN_LOCATE_SPAN_TRUNCATE_OVERLONG extends the same head-window
@@ -14032,7 +14032,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn span_truncate_overlong_lever_tightens_coarse_file_kind() {
-        // FIR-990: a File-kind entity spans the whole file (700-1600 lines) and
+        // a File-kind entity spans the whole file (700-1600 lines) and
         // is emitted at full extent by default — tanking symbol/line precision.
         // The gated lever extends class-like head-truncation to any over-threshold
         // entity. Default OFF keeps the span byte-identical (no regression risk);
@@ -16347,7 +16347,7 @@ mod tests {
 
     #[test]
     fn source_basename_match_seeds_entity_bearing_file_like_grep() {
-        // FIR-986: a query term that names a source file's basename must seat
+        // a query term that names a source file's basename must seat
         // THAT file at the file level, the way grep finds it — even though the
         // file is entity-bearing (so it is absent from tracked_non_entity_files)
         // and an incidental `mod manifest` declaration lives in another file.
@@ -16379,7 +16379,7 @@ mod tests {
 
     #[test]
     fn source_basename_seed_beats_same_named_entities_in_other_files() {
-        // FIR-986, the real dogfood case: the gold file is
+        // the real dogfood case: the gold file is
         // crates/kin-core/src/manifest.rs (resolve_repo_id), but the repo also
         // has many `manifest`-named entities in another file (the npm-registry
         // put_manifest/get_manifest/ManifestStore in api.rs). Those win on
@@ -19406,7 +19406,7 @@ mod tests {
 
     #[test]
     fn entity_fusion_is_disabled_by_default() {
-        // The architecture bet must stay OFF until the post-freeze A/B flips it.
+        // The architecture bet must stay OFF until controlled A/B validation flips it.
         // No test in this module sets the var, so the default governs.
         assert!(
             !locate_env_bool("KIN_LOCATE_ENTITY_FUSION", false),

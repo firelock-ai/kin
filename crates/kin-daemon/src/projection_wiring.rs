@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! FIR-929: Graph→file projection seam for MCP transaction commits.
+//! Graph→file projection seam for MCP transaction commits.
 //!
 //! After `kin_transaction_commit` applies entity mutations to the graph,
 //! [`project_after_mcp_commit`] drives `project_overlay_to_files` so the
@@ -10,15 +10,15 @@
 //! mismatch (or a name mismatch for renames), and silently overwrites the
 //! agent's graph mutations — file-wins LWW.
 //!
-//! # Chosen failure semantics (FIR-929)
+//! # Chosen failure semantics
 //!
 //! The graph mutation is committed before projection is attempted. If projection
 //! fails, the graph already reflects the agent's intent; the error is surfaced
 //! loud to the caller (structured `McpProjectionError`) but the graph mutation
 //! is **not rolled back**. This keeps the graph-side commit atomic and lets the
-//! agent retry the projection or inspect the failure. See FIR-929 for rationale.
+//! agent retry the projection or inspect the failure.
 //!
-//! # Conflict detection (FIR-904·3)
+//! # Conflict detection
 //!
 //! Before each splice is attempted, the current on-disk file content is compared
 //! against the projection cache's last-reconciled snapshot at the entity's span.
@@ -28,7 +28,7 @@
 //! Non-conflicted entities in the same overlay still project normally
 //! (skip-conflicted, not abort-all).
 //!
-//! # Reparse-equivalence invariant (FIR-904·5)
+//! # Reparse-equivalence invariant
 //!
 //! After every successful splice, the projected bytes at the entity's span are
 //! compared with the pre-projection cached bytes.  A mismatch means the CST
@@ -94,7 +94,7 @@ impl std::fmt::Display for McpProjectionError {
 ///   `file_origin` populated (set during the preceding reconcile). Entities
 ///   without a span are silently skipped — new graph-only entities have no
 ///   file placement yet.
-/// * `supplied_bodies` — FIR-934: new full UTF-8 source bytes for entities whose
+/// * `supplied_bodies` — new full UTF-8 source bytes for entities whose
 ///   staged operation carried a `body`, keyed by `EntityId`. When an entity has
 ///   a supplied body the projection writes that text into the file (rather than
 ///   re-splicing the file's own bytes — an identity no-op), so the agent's graph
@@ -108,7 +108,7 @@ impl std::fmt::Display for McpProjectionError {
 ///
 /// `Ok((modified_files, collision_warnings, conflicts))` on success, where
 /// `conflicts` lists any entities that were skipped due to concurrent file edits
-/// (FIR-904·3 skip-conflicted semantics).  A non-empty `conflicts` vec means
+/// (skip-conflicted semantics).  A non-empty `conflicts` vec means
 /// some entities were NOT projected; the caller should surface each conflict to
 /// the agent.  Returns [`McpProjectionError`] naming the first failing entity +
 /// file on a hard projection error.
@@ -147,7 +147,7 @@ pub async fn project_after_mcp_commit(
     let mut reconciler = state.reconciler.write().await;
 
     // -----------------------------------------------------------------------
-    // FIR-984: Cold-projection priming.
+    // Cold-projection priming.
     //
     // The reconciler's projection state (file layouts + content) is the map
     // `project_overlay_to_files` uses to locate each entity's byte region and
@@ -157,14 +157,14 @@ pub async fn project_after_mcp_commit(
     // With no layout for the entity's file, `project_entity_mutations_with_policy`
     // finds no region for the mutation and silently skips it — the graph commit
     // lands (root hash advances, ops_applied > 0) but `modified_files` comes back
-    // empty and the working file is never touched. That is the FIR-984 silent
+    // empty and the working file is never touched. That is the silent
     // no-op the MCP write loop hit on the first commit after daemon start.
     //
     // Prime the projection from graph + disk truth before projecting: reconcile
     // each referenced file that is not yet registered, which parses the current
     // source and registers its layout + content. The detected overlay is
     // discarded — we only need the projection registration here, not a graph
-    // mutation (the agent's commit already landed, and the FIR-934 no-clobber
+    // mutation (the agent's commit already landed, and the no-clobber
     // resync below reconverges the graph onto the projected source afterwards).
     // Files missing from disk are left to the existing structured-error path.
     {
@@ -196,7 +196,7 @@ pub async fn project_after_mcp_commit(
     }
 
     // -----------------------------------------------------------------------
-    // FIR-904·3: Conflict detection — skip-conflicted semantics.
+    // Conflict detection — skip-conflicted semantics.
     //
     // For each entity in the overlay, compare the current on-disk file bytes at
     // the entity's span against the projection cache's last-reconciled content.
@@ -267,7 +267,7 @@ pub async fn project_after_mcp_commit(
                 tracing::warn!(
                     entity_id = %entity_id,
                     file = %span.file,
-                    "FIR-904·3: concurrent file edit at entity span — skipping projection, \
+                    "concurrent file edit at entity span — skipping projection, \
                      conflict surfaced to caller"
                 );
                 conflicts.push(conflict);
@@ -278,7 +278,7 @@ pub async fn project_after_mcp_commit(
         clean_overlay.entity_mods.insert(*entity_id, entity.clone());
     }
 
-    // FIR-934: carry the agent-supplied new source text for each non-conflicted
+    // Carry the agent-supplied new source text for each non-conflicted
     // entity onto the overlay. `project_overlay_to_files` prefers this over the
     // identity span-extract, so the file is written with the agent's new body.
     let clean_ids: Vec<EntityId> = clean_overlay.entity_mods.keys().copied().collect();
@@ -319,7 +319,7 @@ pub async fn project_after_mcp_commit(
         .map_err(|e| reconcile_err_to_projection_err(e, pre_commit_entities))?;
 
     // -----------------------------------------------------------------------
-    // FIR-904·5: Reparse-equivalence invariant.
+    // Reparse-equivalence invariant.
     //
     // For each entity that was projected, verify that the projected file content
     // at the entity's span is byte-identical to the pre-projection cached content.
@@ -332,7 +332,7 @@ pub async fn project_after_mcp_commit(
     // reconcile must NOT see the projected entity as changed (no-clobber invariant).
     // -----------------------------------------------------------------------
     for entity in clean_overlay.entity_mods.values() {
-        // FIR-934: a body edit intentionally rewrites the bytes at the entity's
+        // A body edit intentionally rewrites the bytes at the entity's
         // span, so byte preservation does NOT apply. The no-clobber guarantee for
         // body edits is enforced instead by the LKG/graph resync below (which
         // re-derives the entity from the projected source). The check still
@@ -388,7 +388,7 @@ pub async fn project_after_mcp_commit(
                 entity_id: entity.id,
                 reason: format!(
                     "reparse-equivalence violation: splice altered entity bytes at {}..{} \
-                     in {} (FIR-904·5); {pre_len} pre-projection bytes → {post_len} \
+                     in {}; {pre_len} pre-projection bytes → {post_len} \
                      post-projection bytes",
                     span.start_byte,
                     span.end_byte,
@@ -401,7 +401,7 @@ pub async fn project_after_mcp_commit(
     }
 
     // -----------------------------------------------------------------------
-    // FIR-934: no-clobber resync.
+    // No-clobber resync.
     //
     // A body edit rewrote the file's bytes, so the reconciler's LKG fingerprint
     // baseline (recorded by the previous reconcile) and the committed graph
@@ -661,7 +661,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Test 1b (FIR-934): project a REAL body edit → file gets the agent's new
+    // Test 1b: project a REAL body edit → file gets the agent's new
     // source text (not an identity no-op), then reconcile → no clobber.
     // ------------------------------------------------------------------
 
@@ -729,18 +729,18 @@ mod tests {
         committed.fingerprint.ast_hash = Hash256::from_bytes([0xcd; 32]);
         state.graph.upsert_entity(&committed).unwrap();
 
-        // FIR-934↔FIR-937 guard (baseline): the no-clobber resync must converge
+        // Revision-churn guard (baseline): the no-clobber resync must converge
         // LKG + graph via REVISION-FREE upsert — it must NOT mint a SemanticChange
-        // or append an EntityRevision generation. Under FIR-937 a new head
-        // revision retires the prior vector and re-embeds, so a revision minted
-        // here would mean spurious re-embed churn on every MCP body edit. Capture
-        // the change-DAG and revision-generation counts now; assert them identical
-        // immediately after project_after_mcp_commit below.
+        // or append an EntityRevision generation. A new head revision retires the
+        // prior vector and re-embeds, so a revision minted here would mean spurious
+        // re-embed churn on every MCP body edit. Capture the change-DAG and
+        // revision-generation counts now; assert them identical immediately after
+        // project_after_mcp_commit below.
         let snap_before = state.graph.to_snapshot();
         let changes_before = snap_before.changes.len();
         let revisions_before: usize = snap_before.entity_revisions.values().map(|v| v.len()).sum();
 
-        // Step 3: project with the supplied body (the FIR-934 carrier).
+        // Step 3: project with the supplied body (the body carrier).
         let mut bodies = HashMap::new();
         bodies.insert(pre_commit_entity.id, new_body.clone());
         let (modified_files, warnings, conflicts) =
@@ -752,10 +752,10 @@ mod tests {
         assert!(warnings.is_empty(), "no collision warnings expected");
         assert!(conflicts.is_empty(), "no conflicts expected");
 
-        // FIR-934↔FIR-937 guard (assertion): the resync minted NO new change and
+        // Revision-churn guard (assertion): the resync minted NO new change and
         // NO new revision generation — convergence was revision-free, so there is
         // no spurious vector re-embed churn on a body edit. This pins the
-        // FIR-934↔FIR-937 seam against future refactors that might route the resync
+        // resync seam against future refactors that might route it
         // through the change-minting commit path.
         let snap_after = state.graph.to_snapshot();
         assert_eq!(
@@ -766,7 +766,7 @@ mod tests {
         let revisions_after: usize = snap_after.entity_revisions.values().map(|v| v.len()).sum();
         assert_eq!(
             revisions_after, revisions_before,
-            "no-clobber resync must append no EntityRevision generation (no FIR-937 re-embed churn)"
+            "no-clobber resync must append no EntityRevision generation (no re-embed churn)"
         );
 
         // Step 4 (assertion a): the file now holds the agent's NEW text — a real
@@ -791,7 +791,7 @@ mod tests {
         );
 
         // Step 5 (assertion b): a subsequent reconcile must produce NO entity
-        // changes. The body edit changed the bytes, but the FIR-934 resync drove
+        // changes. The body edit changed the bytes, but the no-clobber resync drove
         // the reconciler LKG + graph onto the projected source, so the next
         // reconcile sees no delta — the agent's edit is NOT clobbered.
         let mut reconciler2 = state.reconciler.write().await;
@@ -799,7 +799,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Test 1c (FIR-984): a body edit projected against a COLD reconciler
+    // Test 1c: a body edit projected against a COLD reconciler
     // projection (no prior reconcile tick — the daemon-restart state) still
     // reaches disk. This is the silent-no-op regression: the graph commit
     // landed but `modified_files` came back empty because the reconciler's
@@ -874,7 +874,7 @@ mod tests {
         assert_eq!(
             modified_files.len(),
             1,
-            "cold-projection body edit must still project exactly one file (FIR-984); \
+            "cold-projection body edit must still project exactly one file; \
              empty here is the silent no-op"
         );
         assert!(conflicts.is_empty(), "no conflicts expected");
@@ -1022,7 +1022,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Test 4 (FIR-904·3): concurrent file edit → conflict surfaced, not spliced.
+    // Test 4: concurrent file edit → conflict surfaced, not spliced.
     // ------------------------------------------------------------------
 
     #[tokio::test]
@@ -1102,7 +1102,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Test 5 (FIR-904·4): persist + reopen projection state cleanly.
+    // Test 5: persist + reopen projection state cleanly.
     // ------------------------------------------------------------------
     // Verifies that rebuild_projection succeeds on a fresh DaemonState
     // without any persisted file layouts (the empty-graph case).
@@ -1128,7 +1128,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Test 6 (FIR-904·4): restart rebuild from persisted graph + blobs.
+    // Test 6: restart rebuild from persisted graph + blobs.
     // ------------------------------------------------------------------
     #[tokio::test]
     async fn rebuild_projection_restores_from_persisted_graph_truth() {

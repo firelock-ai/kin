@@ -617,7 +617,7 @@ impl Reconciler {
 
         // Process relations: diff existing relations against newly parsed ones.
         //
-        // Origin-filtered stale removal (FIR-905): a single-file reconcile is only
+        // Origin-filtered stale removal: a single-file reconcile is only
         // authoritative for relations it could have re-derived from this file's index
         // pass — those where the origin is parser-derived (Parsed or Inferred) AND both
         // endpoints belong to entities of the file being reconciled.  Cross-file linker
@@ -722,7 +722,7 @@ impl Reconciler {
         // computed during indexing) instead of re-reading from disk. This
         // eliminates a TOCTOU race where the file could be modified between
         // the initial parse (which produced the entities/spans) and this
-        // layout registration. The blob content is guaranteed to match the
+        // layout registration. The blob content is known to match the
         // byte ranges in entity spans.
         let file_content = blob_store.read(&indexed.blob_hash)?;
         let mut layout = indexed.file_layout.clone();
@@ -833,7 +833,7 @@ impl Reconciler {
         //
         // RACE CONDITION HARDENING: Prefer the projection state's cached content
         // (registered during the reconcile that produced these entity spans) over
-        // re-reading from disk. The cached content is guaranteed to match the
+        // re-reading from disk. The cached content is known to match the
         // byte ranges in entity spans. A disk read could see a newer version of
         // the file (written by a concurrent editor), causing span misalignment
         // and corrupt body extraction.
@@ -2666,7 +2666,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // FIR-905 conviction test: origin-filtered stale-removal
+    // origin-filtered stale-removal regression test
     // ---------------------------------------------------------------
 
     /// Verify that a single-file reconcile only removes relations it could have

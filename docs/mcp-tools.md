@@ -69,7 +69,7 @@ to the same `agent-default` profile), see
 *Tools:* `impact_analysis`, `semantic_diff`, `semantic_review`
 
 - **`semantic_diff`**: Compute an entity-level diff — which declarations were added, removed, or changed — rather than a line-by-line text diff. Target it by base/head change IDs, entity IDs, file paths, or a list of change IDs.
-- **`impact_analysis`**: Walk the relation graph from what changed to find every downstream entity that could be affected ("if I change this, what else might break?").
+- **`impact_analysis`**: Walk the relation graph from what changed to find the downstream entities that could be affected ("if I change this, what else might break?").
 - **`semantic_review`**: Produce a complete review of a change in one call — entity-level diff, downstream impact, and an overall risk assessment — in `text` or `json` form.
 
 ---

@@ -573,7 +573,7 @@ pub async fn handle_transaction_commit<G: GraphStore>(
 ) -> Result<ToolCallResult> {
     let transaction_id = get_string_param(args, "transaction_id")?;
 
-    // FIR-942: If operations are provided, validate and stage them in one shot
+    // If operations are provided, validate and stage them in one shot
     // to bypass state-loss across HTTP calls.
     let mut inline_ops = None;
     if let Some(ops_val) = args.get("operations") {
@@ -647,7 +647,7 @@ pub async fn handle_transaction_commit<G: GraphStore>(
                 McpMutationPayload::Entity(entity) => {
                     let mut old_opt = store.get_entity(&entity.id).ok().flatten();
 
-                    // FIR-940: Fall back to lookup by name+kind if ID lookup fails (common for upserts)
+                    // Fall back to lookup by name+kind if ID lookup fails (common for upserts)
                     if old_opt.is_none() {
                         let filter = kin_model::EntityFilter {
                             name_pattern: Some(entity.name.clone()),
@@ -661,7 +661,7 @@ pub async fn handle_transaction_commit<G: GraphStore>(
                         }
                     }
 
-                    // FIR-940: an agent knows an entity's name/id and the field it's
+                    // An agent knows an entity's name/id and the field it's
                     // changing but not Kin's file placement, so a partial payload
                     // often carries file_origin/span = None. Carry placement
                     // forward from the existing entity when the payload omits it.
@@ -743,7 +743,7 @@ pub async fn handle_transaction_commit<G: GraphStore>(
         }
     }
 
-    // FIR-935: count the deltas the commit will actually apply so the response
+    // Count the deltas the commit will actually apply so the response
     // distinguishes a real commit from a no-op. A relation delete that matched
     // nothing, or a transaction with no staged ops, lands here as zero.
     let ops_applied = entity_deltas.len() + relation_deltas.len();
@@ -763,7 +763,7 @@ pub async fn handle_transaction_commit<G: GraphStore>(
         .commit_transaction(&transaction_id)
         .map_err(|e| crate::error::McpError::InvalidParams(e))?;
 
-    // FIR-935: report what the commit did. `ops_applied`/`empty` make a zero-op
+    // Report what the commit did. `ops_applied`/`empty` make a zero-op
     // commit unambiguous; the daemon path further enriches this with the real
     // `new_root_hash`, `modified_files`, `collision_warnings`, and `conflicts`
     // once the graph→file projection has run.

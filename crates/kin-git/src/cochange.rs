@@ -169,7 +169,7 @@ where
         // counting loop on Copy integers instead of cloning two Strings per
         // ordered pair. On a deep change-DAG the old String-keyed loop allocated
         // O(commits x files^2) short-lived Strings (the scoped-session set_scope
-        // hotspot, FIR-1054); interning moves that to one owned String per UNIQUE
+        // hotspot); interning moves that to one owned String per UNIQUE
         // file/pair at materialization. The per-key counts are identical, so the
         // mined relations are byte-for-byte unchanged.
         let mut interner: HashMap<&str, u32> = HashMap::new();
@@ -318,8 +318,8 @@ where
 
     // Generate each file-pair's co-change relations in parallel. The per-pair
     // SHA256 relation-id + struct construction over up to MAX_ENTITIES_PER_FILE^2
-    // entity pairs is the dominant cost of mining a deep change-DAG (FIR-1054 —
-    // the scoped-session set_scope re-mine); the count/preload phases are cheap
+    // entity pairs is the dominant cost of mining a deep change-DAG (the
+    // scoped-session set_scope re-mine); the count/preload phases are cheap
     // by comparison. rayon's indexed collect preserves `sorted_pairs` order, and
     // each ordered entity-pair belongs to exactly one file-pair (an entity has a
     // single file origin), so the sequential first-wins dedup pass below
@@ -541,8 +541,8 @@ mod tests {
         changes
     }
 
-    /// Regression guard: mining is deterministic and stable. The FIR-1054
-    /// interning optimization must leave the mined relation set byte-identical;
+    /// Regression guard: mining is deterministic and stable. The interning
+    /// optimization must leave the mined relation set byte-identical;
     /// this locks that by asserting two runs over the same synthetic DAG produce
     /// the exact same sorted (src, dst, confidence) set.
     #[test]
@@ -565,12 +565,12 @@ mod tests {
         }
     }
 
-    /// Manual timing harness for the FIR-1054 hotspot (the `set_scope` per-task
+    /// Manual timing harness for the interning hotspot (the `set_scope` per-task
     /// cochange re-mine over a deep ancestry). Ignored by default — run with
     /// `cargo test -p kin-git change_dag_mining_deep_timing -- --ignored --nocapture`.
     ///
     /// Mines a deep synthetic DAG via both a naive String-keyed pair counter
-    /// (the pre-FIR-1054 shape) and the production interned path, asserts they
+    /// (the pre-interning shape) and the production interned path, asserts they
     /// produce identical pair counts, and prints both wall-clocks so the
     /// allocation win is visible.
     #[test]
@@ -639,7 +639,7 @@ mod tests {
         let prod_ms = t1.elapsed().as_millis();
 
         eprintln!(
-            "[fir-1054] commits={num_commits} files={num_files} entities={} change_sets={} \
+            "[cochange-timing] commits={num_commits} files={num_files} entities={} change_sets={} \
              unique_files={} unique_pairs={} relations={} | count_pairs(naive)={naive_ms}ms \
              preload_query_entities={preload_ms}ms (loaded {preloaded}) full_mine={prod_ms}ms",
             num_files * entities_per_file,

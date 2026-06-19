@@ -119,7 +119,7 @@ pub fn embed_pass_should_continue(result: &EmbedResult, made_progress: bool) -> 
 /// With an explicit `--max-seconds` this issues a single bounded pass and
 /// returns whatever coverage that timebox buys. With no `--max-seconds` the
 /// intent is full coverage, so the CLI transparently re-issues bounded passes
-/// until the daemon reports zero pending (FIR-926). Each pass persists its
+/// until the daemon reports zero pending. Each pass persists its
 /// batches, so the next pass resumes where the last left off; coverage is
 /// therefore decoupled from any single request's HTTP timeout — a large corpus
 /// that cannot finish inside one request still completes across several.
