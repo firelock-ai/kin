@@ -884,9 +884,9 @@ impl SnapshotManager {
     /// graph construction, so a separate post-open call is only needed for code
     /// paths that build a graph without going through `SnapshotManager` — and it
     /// must replace, not supplement, any unchecked `load_vector_index` call.
-    /// **FOLLOW-UP WIRING (FIR-901):** the kin daemon's post-open vector load
-    /// path must pass `Some(kin_binary_sha256)` as `expected_embedder_identity`
-    /// once `save_vector_index_for_graph` is updated to supply the identity on
+    /// **Follow-up wiring:** the kin daemon's post-open vector load path must
+    /// pass `Some(kin_binary_sha256)` as `expected_embedder_identity` once
+    /// `save_vector_index_for_graph` is updated to supply the identity on
     /// write. Until then `None` is non-breaking (legacy warn+load).
     #[cfg(feature = "vector")]
     pub fn load_vector_index_into_graph_if_valid(
@@ -1540,8 +1540,8 @@ impl SnapshotManager {
     /// leaves `model+epoch` unchanged cannot silently serve stale vectors.
     /// Pass `None` for legacy callers that do not yet supply an identity.
     ///
-    /// **FOLLOW-UP WIRING (FIR-901):** the kin daemon's embed-worker must be
-    /// updated to pass `Some(kin_binary_sha256)` (or equivalent build id) as
+    /// **Follow-up wiring:** the kin daemon's embed-worker must be updated to
+    /// pass `Some(kin_binary_sha256)` (or equivalent build id) as
     /// `embedder_identity`. Until that wiring lands, `None` is accepted and
     /// triggers a legacy-store warning on load (non-breaking).
     #[cfg(feature = "vector")]
@@ -2844,7 +2844,7 @@ mod tests {
         assert_eq!(graph.pending_embeddings(), 0);
     }
 
-    /// FIR-944 resume contract for a *partial* embed: a per-batch
+    /// Resume contract for a *partial* embed: a per-batch
     /// `flush_embed_progress` taken mid-stream (only some objects embedded) is
     /// durable, and a cold reopen recovers exactly the flushed vectors and
     /// reports the correct outstanding `pending` count — so an interrupted large
@@ -2907,9 +2907,9 @@ mod tests {
         assert_eq!(graph.pending_embeddings(), 0);
     }
 
-    /// FIR-944 hot-path guarantee: an incremental `flush_embed_progress` batch
-    /// must NOT re-serialize the whole graph snapshot (the O(graph) full save is
-    /// what killed the daemon on mui's ~1 GB graph). Proven by asserting the
+    /// Hot-path guarantee: an incremental `flush_embed_progress` batch must NOT
+    /// re-serialize the whole graph snapshot (the O(graph) full save is what
+    /// killed the daemon on a large ~1 GB graph). Proven by asserting the
     /// `graph.kndb` bytes are byte-identical across the flush while the vector
     /// sidecar is written.
     #[test]
@@ -2950,7 +2950,7 @@ mod tests {
         );
     }
 
-    /// FIR-944: during a large embed, concurrent LSP enrichment keeps the graph
+    /// During a large embed, concurrent LSP enrichment keeps the graph
     /// dirty. `flush_embed_progress` must persist that graph mutation
     /// incrementally (as a delta, not a full rewrite) AND stamp the vector
     /// sidecar against the *post-delta* root, so on reopen both the enrichment
@@ -3096,7 +3096,7 @@ mod tests {
     /// and the entities are requeued for a clean rebuild. No crash-loop.
     #[test]
     fn model_swapped_vector_index_is_archived_on_reopen() {
-        // FIR-901: a model-swapped index is archived when a SIDECAR is present
+        // A model-swapped index is archived when a SIDECAR is present
         // (the sidecar is the authoritative validation gate). Without a sidecar
         // the index is treated as stale rather than archived — see the
         // torn_sidecar test above. This test validates the sidecar-present path.
@@ -3153,7 +3153,7 @@ mod tests {
         );
     }
 
-    /// FIR-901: a .kvec without a .kvec.meta.json sidecar is now treated as
+    /// A .kvec without a .kvec.meta.json sidecar is now treated as
     /// stale regardless of whether the index is stamped or unstamped. The old
     /// grandfather behavior (load-without-sidecar) is closed because it bypassed
     /// the root-hash gate. An orphaned .kvec simply triggers a clean rebuild;
@@ -3176,7 +3176,7 @@ mod tests {
         vectors.save(&vector_path).unwrap();
 
         let reloaded = SnapshotManager::open(&snapshot_path).unwrap();
-        // FIR-901: absent sidecar = stale; NOT loaded, NOT archived.
+        // Absent sidecar = stale; NOT loaded, NOT archived.
         assert!(
             vector_path.exists(),
             ".kvec must be preserved (not deleted/archived) — only the sidecar is the gate"
@@ -3489,7 +3489,7 @@ mod tests {
         );
     }
 
-    /// FIR-901: with the no-sidecar grandfather bypass closed, a read-only open
+    /// With the no-sidecar grandfather bypass closed, a read-only open
     /// where only .kvec exists (no .kvec.meta.json) must NOT load the vector
     /// index — no sidecar means no provenance, treat as stale. The .kvec is
     /// preserved (not modified), and the read-only flag means no metadata is
@@ -3516,7 +3516,7 @@ mod tests {
         }
 
         let reloaded = SnapshotManager::open_read_only(&snapshot_path).unwrap();
-        // FIR-901: absent sidecar = stale; the vector index is NOT loaded.
+        // Absent sidecar = stale; the vector index is NOT loaded.
         assert_eq!(
             reloaded.graph().embedding_status().indexed,
             0,
@@ -3818,7 +3818,7 @@ mod tests {
         assert_eq!(reopened_graph.compute_root_hash(), root_hash);
     }
 
-    // ── FIR-901 tests ────────────────────────────────────────────────────────
+    // ── sidecar provenance tests ─────────────────────────────────────────────
 
     /// A .kvec present without its .kvec.meta.json sidecar must NOT be loaded:
     /// the absent sidecar bypassed the root-hash gate in the old `unwrap_or(true)`.

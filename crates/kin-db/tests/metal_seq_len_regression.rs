@@ -5,9 +5,8 @@
 //!
 //! Embeds a single synthetic text at a range of token lengths to map where
 //! `kin_infer::BertModel` produces non-finite output on Metal. This is the
-//! failure-boundary probe for the bug tracked in
-//! `planning/metal-bert-nan-bug.md`: Metal attention kernels return NaN at
-//! seq_len in the ~500+ regime while CPU is correct.
+//! failure-boundary probe for the known Metal attention NaN issue: the kernels
+//! return NaN at seq_len in the ~500+ regime while CPU is correct.
 //!
 //! The test is parameterized on `KIN_EMBED_BACKEND` so the same harness
 //! verifies both the failure on Metal and the pass on CPU once the fallback
@@ -116,8 +115,7 @@ fn metal_seq_len_sweep_single() {
         for (len, nf, n) in &failures {
             eprintln!(
                 "FAIL seq_len~{len}: non_finite={nf}, norm={n:.6} \
-                 — likely Metal BERT attention NaN at long sequences; see \
-                 planning/metal-bert-nan-bug.md"
+                 — likely Metal BERT attention NaN at long sequences"
             );
         }
         panic!(
@@ -190,8 +188,7 @@ fn metal_seq_len_sweep_batched() {
                 "FAIL seq_len~{len} (batched): non_finite={nf}, zero_norm={zero} \
                  — Metal BERT attention NaN at long sequences through forward_batched. \
                  CPU fallback in kin-db/src/embed/mod.rs should route this through \
-                 GpuBackend::Cpu once KIN_EMBED_BACKEND dispatcher lands. \
-                 See planning/metal-bert-nan-bug.md."
+                 GpuBackend::Cpu once KIN_EMBED_BACKEND dispatcher lands."
             );
         }
         panic!(

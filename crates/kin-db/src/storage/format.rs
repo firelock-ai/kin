@@ -679,7 +679,7 @@ impl GraphSnapshot {
         })?) as usize;
         // Checked add: an adversarial body_len near usize::MAX would otherwise
         // wrap `16 + body_len`, defeating the bounds check and panicking on the
-        // `data[16..16 + body_len]` slice below (FIR-1031, found by fuzzing).
+        // `data[16..16 + body_len]` slice below (found by fuzzing).
         let body_end = 16usize.checked_add(body_len).ok_or_else(|| {
             crate::error::KinDbError::StorageError(
                 "snapshot header body length overflows usize".to_string(),
@@ -860,7 +860,7 @@ impl GraphSnapshot {
         body_len: usize,
         version_label: &str,
     ) -> Result<usize, crate::error::KinDbError> {
-        // Checked add to avoid wrapping on an adversarial body_len (FIR-1031).
+        // Checked add to avoid wrapping on an adversarial body_len.
         let checksum_end = 16usize
             .checked_add(body_len)
             .and_then(|start| start.checked_add(Self::CHECKSUM_LEN))
@@ -1679,9 +1679,9 @@ mod tests {
     use super::*;
     use kin_model::{EntityStore, VerificationStore};
 
-    /// FIR-1031 regression (found by fuzzing): a snapshot header whose body_len
-    /// is near usize::MAX must be rejected with an error, never wrap `16 +
-    /// body_len` and panic on the body slice.
+    /// Regression (found by fuzzing): a snapshot header whose body_len is near
+    /// usize::MAX must be rejected with an error, never wrap `16 + body_len`
+    /// and panic on the body slice.
     #[test]
     fn from_bytes_rejects_overflowing_body_len_without_panic() {
         let mut data = Vec::new();

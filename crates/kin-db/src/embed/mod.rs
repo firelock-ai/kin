@@ -650,8 +650,7 @@ impl BertEmbedder {
             // TODO(metal): seq_len > ~500 produces NaN in kin-infer Metal attention
             // kernels for the batched code path (fused_attention_batched —
             // scale_mask_alibi_grouped.metal / softmax_rows.metal — likely softmax
-            // max-subtract missing). See embedder agent diagnosis 2026-04-14 and
-            // planning/metal-bert-nan-bug.md.
+            // max-subtract missing), so long sequences route to the CPU backend.
             let backend_choice = resolve_embed_backend(longest);
             let vectors = match backend_choice {
                 EmbedBackendChoice::Metal { reason } => {
@@ -1951,8 +1950,8 @@ pub fn format_graph_entity_text_with_context(entity: &Entity, context_lines: &[S
     parts.push(entity_kind_label(entity.kind).to_string());
 
     if let Some(file_origin) = &entity.file_origin {
-        // FIR-826: machine-absolute paths must never enter embed text — they
-        // bake machine-specific prefixes into vectors, breaking cross-host
+        // Machine-absolute paths must never enter embed text — they bake
+        // machine-specific prefixes into vectors, breaking cross-host
         // reproducibility. The parser layer is responsible for storing
         // repo-relative paths; this guard catches regressions at the embed
         // boundary where the damage would be silent.
@@ -2763,7 +2762,7 @@ mod tests {
         assert_ne!(base.runtime_revision(), tuned.runtime_revision());
     }
 
-    // ── FIR-826: no-absolute-path guard ─────────────────────────────────────
+    // ── no-absolute-path guard ───────────────────────────────────────────────
 
     /// Guard test (durable artifact): a machine-absolute path in file_origin
     /// triggers the debug_assert! guard, documenting that this is a bug.

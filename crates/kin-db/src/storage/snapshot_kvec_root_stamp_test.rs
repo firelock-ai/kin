@@ -1,4 +1,4 @@
-//! FIR-930/FIR-955 regression: the kvec sidecar's `graph_root_hash` must be the
+//! Regression: the kvec sidecar's `graph_root_hash` must be the
 //! continuously-maintained current graph root.
 //!
 //! Included as a child module of `storage::snapshot` (rather than an external
@@ -81,8 +81,8 @@ fn kvec_stamp_uses_continuously_maintained_root() {
 }
 
 /// Two graphs built with identical entity content stamp identical sidecar roots.
-/// This is the property the FIR-814 identity experiment (ROOT_HASH_MATCH=0/26)
-/// actually needed.
+/// This is the cross-instance root-hash identity property prepared-state reuse
+/// depends on.
 #[test]
 fn kvec_stamp_is_prep_invariant() {
     fn stamp_one(dir: &TempDir, file: &str) -> String {

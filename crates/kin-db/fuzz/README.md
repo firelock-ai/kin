@@ -64,7 +64,7 @@ A crash fails the job and uploads the reproducing artifact.
 
 > Found by this harness: `seed_body_len_overflow` — a header `body_len` near
 > `usize::MAX` wrapped `16 + body_len` and panicked on the body slice in both
-> the snapshot and delta decoders. Fixed with checked arithmetic (FIR-1031);
+> the snapshot and delta decoders. Fixed with checked arithmetic;
 > the seed is committed as a permanent regression guard.
 
 ### Reproduce the seed corpus locally
@@ -78,5 +78,4 @@ cargo +nightly fuzz run fuzz_snapshot_deser -- -runs=0   # replay seeds, no muta
 
 A finding must be tied to a concrete decoder/ingestion fixture (commit the
 reproducing input under `corpus/<target>/`), then either fixed in kin-db or
-filed as a child of the parser/ingestion hardening epic (FIR-894) before that
-epic closes.
+filed as parser/ingestion hardening work before that workstream closes.

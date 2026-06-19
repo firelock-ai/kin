@@ -358,7 +358,7 @@ fn build_relation_indexes(
 }
 
 /// Whether a snapshot load reused the persisted entity-level adjacency or had
-/// to rebuild it from `relations` (FIR-853).
+/// to rebuild it from `relations`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AdjacencyReuse {
     /// The persisted `outgoing`/`incoming` maps were consistent with
@@ -371,7 +371,7 @@ pub(crate) enum AdjacencyReuse {
 
 /// Build the relation adjacency indexes for a freshly loaded snapshot, reusing
 /// the persisted entity-level `outgoing`/`incoming` maps when they are
-/// consistent with `relations` (FIR-853).
+/// consistent with `relations`.
 ///
 /// The snapshot persists the entity-level adjacency (`outgoing`/`incoming`) but
 /// historically `from_snapshot_inner` threw it away and rebuilt all four
@@ -1438,10 +1438,10 @@ impl InMemoryGraph {
         let (outgoing, incoming, node_outgoing, node_incoming) = {
             let _span =
                 tracing::info_span!("kindb.graph.from_snapshot.build_relation_indexes").entered();
-            // FIR-853: reuse the persisted entity-level adjacency when it is
-            // consistent with the loaded relations rather than discarding and
-            // rebuilding it on every boot. Node-level maps are always derived
-            // (they are not persisted).
+            // Reuse the persisted entity-level adjacency when it is consistent
+            // with the loaded relations rather than discarding and rebuilding
+            // it on every boot. Node-level maps are always derived (they are
+            // not persisted).
             let (outgoing, incoming, node_outgoing, node_incoming, reuse) =
                 build_relation_indexes_with_reuse(
                     &relations,
@@ -3361,8 +3361,8 @@ impl InMemoryGraph {
     /// Only the latest revision of each entity is queued — superseded
     /// generations are not retrieval truth and would be evicted by
     /// `prune_orphaned_vectors`, so embedding them on a rebuild is pure waste
-    /// (and reintroduces the doubled-vector state this convergence fixes,
-    /// FIR-937). This matches the target set of `graph_truth_retrievable_keys`.
+    /// (and reintroduces the doubled-vector state this convergence fixes).
+    /// This matches the target set of `graph_truth_retrievable_keys`.
     #[cfg(feature = "vector")]
     pub fn queue_all_for_embedding(&self) {
         let mut queue = self.embedding_queue.lock();
@@ -3403,7 +3403,7 @@ impl InMemoryGraph {
         // generations are deliberately NOT enqueued: they are not retrieval
         // truth (see `graph_truth_retrievable_keys`) and `prune_orphaned_vectors`
         // evicts them — enqueuing them would re-embed a key the prune removes on
-        // the next pass, churning forever (FIR-937).
+        // the next pass, churning forever.
         for key in latest_revision_ids(&ent).map(RetrievalKey::EntityRevision) {
             let missing = vector_index
                 .as_ref()
@@ -4087,7 +4087,7 @@ impl InMemoryGraph {
     /// each entity accumulated one vector per edit and `semantic_locate`
     /// returned it once per generation. Pinning truth to the head revision lets
     /// the existing prune reclaim those superseded generations, leaving one
-    /// revision vector per live entity (FIR-937).
+    /// revision vector per live entity.
     #[cfg(feature = "vector")]
     fn graph_truth_retrievable_keys(&self) -> hashbrown::HashSet<RetrievalKey> {
         let ent = self.entities.read();
@@ -4115,7 +4115,7 @@ impl InMemoryGraph {
     ///   each time an entity's content changes while its earlier generation
     ///   stays in the revision history. The superseded vector lingers because the
     ///   old revision is still "referenced"; truth (`graph_truth_retrievable_keys`)
-    ///   admits only the head revision, so it falls out here (FIR-937).
+    ///   admits only the head revision, so it falls out here.
     ///
     /// Across re-init/re-embed cycles the index otherwise accumulates
     /// generations that all compete in ANN retrieval and return the same entity
@@ -7835,7 +7835,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------
-    // FIR-853: boot-time adjacency reuse
+    // boot-time adjacency reuse
     // ----------------------------------------------------------------------
 
     /// When the persisted entity-level adjacency is consistent with relations,
@@ -10698,7 +10698,7 @@ mod tests {
         pair
     }
 
-    /// FIR-937 (live re-embed retire): a re-embed that appends a new revision
+    /// Live re-embed retire: a re-embed that appends a new revision
     /// for an entity must leave exactly ONE vector for that entity — the new
     /// revision's. The superseded generation is still referenced by the entity's
     /// revision history, so before the fix `prune_orphaned_vectors` (whose truth
@@ -10750,8 +10750,8 @@ mod tests {
         assert_eq!(graph.prune_orphaned_vectors(), 0);
     }
 
-    /// FIR-937 (load-time reclaim): an index already doubled on disk (tonight's
-    /// persisted state — both revision generations of an entity) self-heals when
+    /// Load-time reclaim: an index already doubled on disk (a persisted state
+    /// holding both revision generations of an entity) self-heals when
     /// reopened. Mirrors `load_vector_index_if_valid`'s load-then-prune sequence.
     /// Discriminating: the reclaim evicts 0 on the old truth, 1 on the fix.
     #[cfg(feature = "vector")]

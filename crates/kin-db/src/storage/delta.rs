@@ -336,8 +336,7 @@ impl GraphSnapshotDelta {
 
         // Checked add: an adversarial body_len near usize::MAX would otherwise
         // wrap `16 + body_len + CHECKSUM_LEN`, defeating the bounds check and
-        // panicking on the body/checksum slices below (FIR-1031, found by
-        // fuzzing).
+        // panicking on the body/checksum slices below (found by fuzzing).
         let body_end = 16usize.checked_add(body_len).ok_or_else(|| {
             KinDbError::StorageError("delta header body length overflows usize".to_string())
         })?;
@@ -655,9 +654,9 @@ pub fn apply_graph_delta(snapshot: &mut GraphSnapshot, delta: &GraphSnapshotDelt
 mod tests {
     use super::*;
 
-    /// FIR-1031 regression (found by fuzzing): a delta header whose body_len is
-    /// near usize::MAX must error, never wrap `16 + body_len + CHECKSUM_LEN`
-    /// and panic on the body/checksum slices.
+    /// Regression (found by fuzzing): a delta header whose body_len is near
+    /// usize::MAX must error, never wrap `16 + body_len + CHECKSUM_LEN` and
+    /// panic on the body/checksum slices.
     #[test]
     fn delta_from_bytes_rejects_overflowing_body_len_without_panic() {
         let mut data = Vec::new();

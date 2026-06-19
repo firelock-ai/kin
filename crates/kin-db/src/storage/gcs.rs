@@ -481,8 +481,8 @@ mod tests {
         assert!(!etags.is_empty());
     }
 
-    /// Real-GCS reproduction of the FIR-983 conditional-update bug. InMemory
-    /// keys CAS on the e_tag and so never exercised GCS's generation-based
+    /// Real-GCS reproduction of the conditional-update bug. InMemory keys CAS
+    /// on the e_tag and so never exercised GCS's generation-based
     /// precondition; this hits the live bucket via ADC. Run explicitly:
     /// `KINDB_GCS_CAS_BUCKET=kin-ecosystem-kin-graphs-dev \
     ///  cargo test -p kin-db --features gcs gcs_real_conditional_update -- --ignored --nocapture`
