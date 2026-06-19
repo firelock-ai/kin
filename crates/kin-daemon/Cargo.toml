@@ -26,6 +26,7 @@ firestore = ["kin-spine/firestore"]
 kin-model = { workspace = true }
 kin-core = { workspace = true }
 kin-db = { workspace = true }
+kin-infer = { version = ">=0.2.1", registry = "kin", default-features = false }
 kin-blobs = { workspace = true }
 kin-index = { workspace = true }
 kin-projection = { workspace = true }
@@ -66,6 +67,7 @@ libc = "0.2"
 # Additive via feature unification; absent on Linux so the Linux build stays green.
 [target.'cfg(target_os = "macos")'.dependencies]
 kin-db = { workspace = true, features = ["metal"] }
+kin-infer = { version = ">=0.2.1", registry = "kin", features = ["metal"] }
 
 [dev-dependencies]
 kin-git = { workspace = true }

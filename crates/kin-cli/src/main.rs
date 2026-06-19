@@ -275,9 +275,11 @@ enum Command {
     /// `--rebuild` to drop the stale index and re-embed every entity at the
     /// current model's dimension.
     Embed {
-        /// Embedding batch size (entities per inference pass).
-        #[arg(long, default_value_t = crate::commands::embed::DEFAULT_BATCH_SIZE)]
-        batch_size: usize,
+        /// Embedding batch size (entities per inference pass). Defaults to 64, or
+        /// the throughput resource plan's per-chunk budget when
+        /// KIN_RESOURCE_PROFILE=throughput is set.
+        #[arg(long)]
+        batch_size: Option<usize>,
         /// Stop after this many seconds, persist completed vectors, and leave the rest pending.
         #[arg(long, value_name = "SECONDS")]
         max_seconds: Option<u64>,
@@ -820,6 +822,24 @@ enum Command {
     HostedRelease {
         #[command(subcommand)]
         action: HostedReleaseAction,
+    },
+    /// Inspect host/accelerator/memory resources and per-profile budgets
+    Resources {
+        #[command(subcommand)]
+        action: ResourcesAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ResourcesAction {
+    /// Report the detected resource plan and live daemon embedding state
+    Inspect {
+        /// Output the stable JSON resource plan instead of a human summary
+        #[arg(long)]
+        json: bool,
+        /// Resource profile to plan for: proof, interactive, throughput, or ci
+        #[arg(long)]
+        profile: Option<String>,
     },
 }
 
@@ -1610,6 +1630,11 @@ fn main() -> Result<()> {
                         commands::status::run().await
                     }
                 }
+                Command::Resources { action } => match action {
+                    ResourcesAction::Inspect { json, profile } => {
+                        commands::resources::run(json, profile).await
+                    }
+                },
                 Command::Commit {
                     message,
                     quiet,

@@ -60,6 +60,7 @@ pub mod release_cmd;
 pub mod remote;
 pub mod rename;
 pub mod resolve;
+pub mod resources;
 pub mod review;
 pub mod scope;
 pub mod search;

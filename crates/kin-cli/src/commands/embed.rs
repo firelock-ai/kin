@@ -124,11 +124,17 @@ pub fn embed_pass_should_continue(result: &EmbedResult, made_progress: bool) -> 
 /// therefore decoupled from any single request's HTTP timeout — a large corpus
 /// that cannot finish inside one request still completes across several.
 pub async fn run(
-    batch_size: usize,
+    batch_size: Option<usize>,
     json: bool,
     max_seconds: Option<u64>,
     rebuild: bool,
 ) -> Result<()> {
+    let batch_size = crate::commands::resources::resolve_embed_batch_size(
+        batch_size,
+        std::env::var("KIN_RESOURCE_PROFILE").ok().as_deref(),
+        DEFAULT_BATCH_SIZE,
+        crate::commands::resources::throughput_embed_batch_size,
+    );
     let _span = tracing::info_span!(
         "kin.embed",
         batch_size = batch_size,
