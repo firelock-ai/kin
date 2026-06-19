@@ -120,6 +120,22 @@ pub fn link_cross_file_with_tests(files: &[FileParseDataWithTests]) -> Vec<Relat
     link_cross_file(&linkable)
 }
 
+/// Total order over entities so cross-file linking is order-independent.
+fn entity_link_order(a: &Entity, b: &Entity) -> std::cmp::Ordering {
+    let file_a = a.file_origin.as_ref().map(|f| f.0.as_str()).unwrap_or("");
+    let file_b = b.file_origin.as_ref().map(|f| f.0.as_str()).unwrap_or("");
+    let line_a = a.span.as_ref().map(|s| s.start_line).unwrap_or(u32::MAX);
+    let line_b = b.span.as_ref().map(|s| s.start_line).unwrap_or(u32::MAX);
+    let col_a = a.span.as_ref().map(|s| s.start_col).unwrap_or(u32::MAX);
+    let col_b = b.span.as_ref().map(|s| s.start_col).unwrap_or(u32::MAX);
+    file_a
+        .cmp(file_b)
+        .then_with(|| line_a.cmp(&line_b))
+        .then_with(|| col_a.cmp(&col_b))
+        .then_with(|| a.name.cmp(&b.name))
+        .then_with(|| a.id.0.cmp(&b.id.0))
+}
+
 /// Resolve cross-file relations for `files` against a broader target universe.
 ///
 /// This is used by warm/incremental indexing paths where only a subset of files
@@ -137,12 +153,18 @@ pub fn link_cross_file_against_entities(
         universe_entities = universe_entities.len()
     )
     .entered();
+    // Sort for deterministic relation materialization.
+    let sorted_universe: Vec<&Entity> = {
+        let mut sorted: Vec<&Entity> = universe_entities.iter().collect();
+        sorted.sort_by(|a, b| entity_link_order(a, b));
+        sorted
+    };
     // Step 1: Build entity indices
     //   (file_path, entity_name) -> EntityId
     let (entity_by_file_name, entity_by_name, entity_by_bare_name, entity_kind_by_id, known_files) = {
         let _span = tracing::info_span!(
             "kin.index.link_cross_file.build_entity_indices",
-            universe_entities = universe_entities.len()
+            universe_entities = sorted_universe.len()
         )
         .entered();
         let mut entity_by_file_name: HashMap<(&str, &str), EntityId> = HashMap::new();
@@ -151,7 +173,7 @@ pub fn link_cross_file_against_entities(
         let mut entity_kind_by_id: HashMap<EntityId, EntityKind> = HashMap::new();
         let mut known_files: HashSet<&str> = HashSet::new();
 
-        for entity in universe_entities {
+        for &entity in &sorted_universe {
             entity_kind_by_id.insert(entity.id, entity.kind);
             let Some(file_path) = entity.file_origin.as_ref().map(|path| path.0.as_str()) else {
                 continue;
@@ -317,7 +339,7 @@ pub fn link_cross_file_against_entities(
                                 direct
                             } else if original_name == "default" {
                                 // Default import: fall back to first entity in target file
-                                resolve_default_export(&target_file, universe_entities)
+                                resolve_default_export(&target_file, &sorted_universe)
                             } else {
                                 None
                             };
@@ -915,14 +937,16 @@ where
     }
 
     let suffix = format!("/{module_path}");
+    // Pick the smallest match for stable resolution across HashSet order.
+    let mut best: Option<&str> = None;
     for file in known_files.iter() {
         let file_str = file.borrow();
-        if file_str.ends_with(&suffix) {
-            return Some(file_str.to_string());
+        if file_str.ends_with(&suffix) && best.is_none_or(|b| file_str < b) {
+            best = Some(file_str);
         }
     }
 
-    None
+    best.map(|s| s.to_string())
 }
 
 fn is_header_like_module_path(module_path: &str) -> bool {
@@ -1026,14 +1050,16 @@ where
     // For multi-module projects (e.g., jib-core/src/main/java/...),
     // try each known file that ends with the class path
     let suffix = format!("{}.java", dir_path);
+    // Pick the smallest match for stable resolution across HashSet order.
+    let mut best: Option<&str> = None;
     for file in known_files.iter() {
         let file_str = file.borrow();
-        if file_str.ends_with(&suffix) {
-            return Some(file_str.to_string());
+        if file_str.ends_with(&suffix) && best.is_none_or(|b| file_str < b) {
+            best = Some(file_str);
         }
     }
 
-    None
+    best.map(|s| s.to_string())
 }
 
 /// Resolve a Go module import to a directory of Go files.
@@ -1059,16 +1085,21 @@ where
         if local_path.is_empty() {
             continue;
         }
-        // Look for any .go file in this directory
+        // Pick the smallest .go file as the package's stable representative.
+        let mut best: Option<&str> = None;
         for file in known_files.iter() {
             let file_str = file.borrow();
             if file_str.starts_with(&local_path)
                 && file_str.ends_with(".go")
                 && file_str[local_path.len()..].starts_with('/')
                 && !file_str[local_path.len() + 1..].contains('/')
+                && best.is_none_or(|b| file_str < b)
             {
-                return Some(file_str.to_string());
+                best = Some(file_str);
             }
+        }
+        if let Some(best) = best {
+            return Some(best.to_string());
         }
     }
 
@@ -1141,7 +1172,7 @@ fn package_dir_candidates(pkg_name: &str) -> Vec<String> {
 /// default export is typically the file's primary declaration. We find it by
 /// looking for the first entity in the target file that is Public (exported).
 /// If none are Public, fall back to the first entity in the file.
-fn resolve_default_export(target_file: &str, universe_entities: &[Entity]) -> Option<EntityId> {
+fn resolve_default_export(target_file: &str, universe_entities: &[&Entity]) -> Option<EntityId> {
     let mut first_in_file: Option<EntityId> = None;
     for entity in universe_entities {
         let Some(ref file_path) = entity.file_origin else {
@@ -1657,6 +1688,43 @@ mod tests {
     }
 
     #[test]
+    fn cross_file_resolution_is_independent_of_universe_entity_order() {
+        let caller = make_entity("run", "src/app.ts");
+        let earlier_target = make_entity("helper", "src/a/helper.ts");
+        let later_target = make_entity("helper", "src/z/helper.ts");
+
+        let reparsed = vec![FileParseData {
+            file_path: "src/app.ts".to_string(),
+            entities: vec![caller.clone()],
+            relations: vec![ExtractedRelation {
+                kind: RelationKind::Calls,
+                src_name: "run".to_string(),
+                dst_name: "helper".to_string(),
+                import_source: None,
+            }],
+            imports: vec![],
+        }];
+
+        let forward = vec![caller.clone(), earlier_target.clone(), later_target.clone()];
+        let reverse = vec![later_target, earlier_target.clone(), caller.clone()];
+
+        let forward_result = link_cross_file_against_entities(&reparsed, &forward);
+        let reverse_result = link_cross_file_against_entities(&reparsed, &reverse);
+
+        let relation_key = |rel: &Relation| (rel.kind, rel.src, rel.dst, rel.confidence.to_bits());
+        assert_eq!(
+            forward_result.iter().map(relation_key).collect::<Vec<_>>(),
+            reverse_result.iter().map(relation_key).collect::<Vec<_>>()
+        );
+        let calls = forward_result
+            .iter()
+            .find(|rel| rel.kind == RelationKind::Calls)
+            .expect("ambiguous global fallback should still pick one stable target");
+        assert_eq!(calls.src, GraphNodeId::Entity(caller.id));
+        assert_eq!(calls.dst, GraphNodeId::Entity(earlier_target.id));
+    }
+
+    #[test]
     fn global_name_fallback() {
         let caller = make_entity("main", "src/app.ts");
         let target = make_entity("helper", "src/lib/helper.ts");
@@ -2114,6 +2182,27 @@ void f();
             result,
             Some("include/nlohmann/detail/input/binary_reader.hpp".to_string())
         );
+    }
+
+    #[test]
+    fn go_module_import_resolution_uses_stable_package_representative() {
+        let known: HashSet<&str> = [
+            "pkg/cmd/create/zz_generated.go",
+            "pkg/cmd/create/create.go",
+            "pkg/cmd/create/create_test.go",
+            "pkg/cmd/create/nested/skip.go",
+            "pkg/cmd/delete/delete.go",
+        ]
+        .into_iter()
+        .collect();
+
+        let result = resolve_module_path(
+            "cmd/gh/main.go",
+            "github.com/cli/cli/v2/pkg/cmd/create",
+            &known,
+        );
+
+        assert_eq!(result, Some("pkg/cmd/create/create.go".to_string()));
     }
 
     #[test]

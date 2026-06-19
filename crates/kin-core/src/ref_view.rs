@@ -1055,12 +1055,14 @@ fn rebuild_entity_source_file_layouts(
             |path| snapshot_artifact_id_for_path(snapshot, path),
         ));
 
-        let file_entities = snapshot
+        let mut file_entities = snapshot
             .entities
             .values()
             .filter(|entity| entity.file_origin.as_ref() == Some(file_id))
             .cloned()
             .collect::<Vec<_>>();
+        // Sort for deterministic reparse-to-persisted entity binding.
+        file_entities.sort_by(|a, b| ref_entity_order(a, b));
         let indexed = if file_entities.is_empty()
             || should_probe_sparse_historical_source(&file_entities, content.len())
         {
@@ -1365,6 +1367,19 @@ fn merge_historical_file_entities(
 
 fn entity_match_key(entity: &kin_model::Entity) -> (EntityKind, String) {
     (entity.kind, entity.name.clone())
+}
+
+/// Total order over a file's entities for deterministic reparse binding.
+fn ref_entity_order(a: &kin_model::Entity, b: &kin_model::Entity) -> std::cmp::Ordering {
+    let line_a = a.span.as_ref().map(|s| s.start_line).unwrap_or(u32::MAX);
+    let line_b = b.span.as_ref().map(|s| s.start_line).unwrap_or(u32::MAX);
+    let col_a = a.span.as_ref().map(|s| s.start_col).unwrap_or(u32::MAX);
+    let col_b = b.span.as_ref().map(|s| s.start_col).unwrap_or(u32::MAX);
+    line_a
+        .cmp(&line_b)
+        .then_with(|| col_a.cmp(&col_b))
+        .then_with(|| a.name.cmp(&b.name))
+        .then_with(|| a.id.0.cmp(&b.id.0))
 }
 
 struct HistoricalSourceFileEnrichment {
