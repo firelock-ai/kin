@@ -2264,6 +2264,8 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash 0.2.0",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -3444,7 +3446,7 @@ name = "kin-spine"
 version = "0.2.1"
 dependencies = [
  "chrono",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
  "kin-model",
  "parking_lot",
  "pretty_assertions",

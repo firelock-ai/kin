@@ -24,7 +24,7 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
-hashbrown = { version = "0.15", features = ["serde"] }
+hashbrown = { version = "0.17", features = ["serde"] }
 parking_lot = { workspace = true }
 
 # Optional: Firestore REST API support
