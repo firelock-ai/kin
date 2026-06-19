@@ -190,7 +190,9 @@ async fn run_daemon_resources(
         .map(Some)
         .unwrap_or(crate::daemon_client::resolve_daemon_url(&layout).await?);
     let base_url = daemon_url.ok_or_else(|| {
-        anyhow::anyhow!("Kin daemon is required for resource inspection but no daemon endpoint is available")
+        anyhow::anyhow!(
+            "Kin daemon is required for resource inspection but no daemon endpoint is available"
+        )
     })?;
     let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
     client
@@ -291,7 +293,10 @@ mod tests {
         let never = || panic!("throughput batch evaluated off the throughput path");
         assert_eq!(resolve_embed_batch_size(None, None, 512, never), 512);
         assert_eq!(resolve_embed_batch_size(None, None, 64, never), 64);
-        assert_eq!(resolve_embed_batch_size(None, Some("proof"), 512, never), 512);
+        assert_eq!(
+            resolve_embed_batch_size(None, Some("proof"), 512, never),
+            512
+        );
         assert_eq!(
             resolve_embed_batch_size(None, Some("interactive"), 64, never),
             64
