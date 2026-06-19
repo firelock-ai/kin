@@ -161,6 +161,21 @@ mod tests {
         approvals_by_change: HashMap<SemanticChangeId, Vec<kin_model::provenance::Approval>>,
     }
 
+    thread_local! {
+        static TEST_FILE_HASHES: std::cell::RefCell<HashMap<FilePathId, Hash256>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+
+    fn reset_trace_source_registry() {
+        TEST_FILE_HASHES.with(|map| map.borrow_mut().clear());
+    }
+
+    fn register_trace_source(file_id: &FilePathId, hash: Hash256) {
+        TEST_FILE_HASHES.with(|map| {
+            map.borrow_mut().insert(file_id.clone(), hash);
+        });
+    }
+
     impl kin_model::graph::EntityStore for EmptyStore {
         type Error = KinDbError;
 
@@ -350,7 +365,10 @@ mod tests {
             &self,
             file_id: &FilePathId,
         ) -> std::result::Result<Option<kin_model::Hash256>, Self::Error> {
-            Ok(self.file_hashes.get(file_id).copied())
+            if let Some(hash) = self.file_hashes.get(file_id).copied() {
+                return Ok(Some(hash));
+            }
+            Ok(TEST_FILE_HASHES.with(|map| map.borrow().get(file_id).copied()))
         }
     }
 
@@ -1269,11 +1287,28 @@ mod tests {
         assert!(kinds.contains(&EntityKind::Method));
     }
 
-    fn make_source_backed_entity(content: &str) -> (tempfile::TempDir, Entity) {
+    struct GraphBackedSource {
+        _dir: tempfile::TempDir,
+        _env: EnvVarGuard,
+        entity: Entity,
+        hash: Hash256,
+    }
+
+    /// Build an entity whose body is materialized only in a graph-owned blob
+    /// store (no source file on disk), discoverable via `KIN_SOURCE_ROOT`. The
+    /// caller registers `hash` against the entity's file path in its store so
+    /// the graph-first read path can resolve the body. Callers must hold
+    /// `ENV_MUTEX` for the lifetime of the returned guard.
+    fn make_source_backed_entity(content: &str) -> GraphBackedSource {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("validate.ts");
-        fs::write(&path, content).unwrap();
-        let file_id = kin_model::ids::FilePathId::new(path.to_string_lossy());
+        let kin_dir = dir.path().join(".kin");
+        fs::create_dir_all(&kin_dir).unwrap();
+        let env = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+
+        let blob_store = kin_blobs::BlobStore::new(kin_dir.join("objects")).unwrap();
+        let hash = blob_store.write(content.as_bytes()).unwrap();
+
+        let file_id = kin_model::ids::FilePathId::new("validate.ts");
 
         let entity = Entity {
             id: EntityId::new(),
@@ -1307,14 +1342,24 @@ mod tests {
             superseded_by: None,
         };
 
-        (dir, entity)
+        GraphBackedSource {
+            _dir: dir,
+            _env: env,
+            entity,
+            hash,
+        }
     }
 
-    fn make_signature_only_python_entity(content: &str) -> (tempfile::TempDir, Entity) {
+    fn make_signature_only_python_entity(content: &str) -> GraphBackedSource {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("validate.py");
-        fs::write(&path, content).unwrap();
-        let file_id = kin_model::ids::FilePathId::new(path.to_string_lossy());
+        let kin_dir = dir.path().join(".kin");
+        fs::create_dir_all(&kin_dir).unwrap();
+        let env = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
+
+        let blob_store = kin_blobs::BlobStore::new(kin_dir.join("objects")).unwrap();
+        let hash = blob_store.write(content.as_bytes()).unwrap();
+
+        let file_id = kin_model::ids::FilePathId::new("validate.py");
         let signature = content
             .lines()
             .next()
@@ -1355,7 +1400,12 @@ mod tests {
             superseded_by: None,
         };
 
-        (dir, entity)
+        GraphBackedSource {
+            _dir: dir,
+            _env: env,
+            entity,
+            hash,
+        }
     }
 
     fn make_dead_code_entity(file_path: &str, name: &str, start_line: u32) -> Entity {
@@ -1393,6 +1443,10 @@ mod tests {
         }
     }
 
+    /// Build a trace entity whose body is materialized in the graph-owned blob
+    /// store under `dir/.kin` and registered against the entity's relative file
+    /// path. Callers must set `KIN_SOURCE_ROOT` to `dir` (so the layout is
+    /// discoverable) and `reset_trace_source_registry()` at test entry.
     fn make_trace_entity(
         dir: &tempfile::TempDir,
         rel_path: &str,
@@ -1401,12 +1455,11 @@ mod tests {
         signature: &str,
         content: &str,
     ) -> Entity {
-        let path = dir.path().join(rel_path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        fs::write(&path, content).unwrap();
-        let file_id = kin_model::ids::FilePathId::new(path.to_string_lossy());
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join(".kin").join("objects")).unwrap();
+        let hash = blob_store.write(content.as_bytes()).unwrap();
+
+        let file_id = kin_model::ids::FilePathId::new(rel_path);
+        register_trace_source(&file_id, hash);
 
         Entity {
             id: EntityId::new(),
@@ -1472,16 +1525,20 @@ mod tests {
 
     #[test]
     fn entity_response_json_includes_real_source_excerpt() {
-        // read_path is only the raw file_origin while KIN_SOURCE_ROOT is unset;
-        // hold ENV_MUTEX so the EnvVarGuard tests can't set it mid-assertion.
         let _lock = ENV_MUTEX
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  if (value < minVal) {\n    return false;\n  }\n  return value <= maxVal;\n}\n";
-        let (_dir, entity) = make_source_backed_entity(content);
+        let source = make_source_backed_entity(content);
+        let entity = &source.entity;
 
-        let value = entity_response_json(&EmptyStore::default(), &entity).unwrap();
+        let mut store = EmptyStore::default();
+        store
+            .file_hashes
+            .insert(entity.file_origin.clone().unwrap(), source.hash);
+
+        let value = entity_response_json(&store, entity).unwrap();
         let object = value.as_object().unwrap();
         let excerpt = object
             .get("source_excerpt")
@@ -1489,55 +1546,69 @@ mod tests {
             .unwrap();
 
         assert!(excerpt.contains("return value <= maxVal;"));
+        assert_eq!(object.get("source").unwrap().as_str().unwrap(), "graph");
         assert_eq!(object.get("start_line").unwrap(), 1);
-        assert_eq!(
-            object
-                .get("read_path")
-                .and_then(|value| value.as_str())
-                .unwrap(),
-            entity.file_origin.as_ref().unwrap().0
-        );
     }
 
     #[test]
     fn focal_context_json_prefers_real_source_excerpt() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  if (value < minVal) {\n    return false;\n  }\n  return value <= maxVal;\n}\n";
-        let (_dir, entity) = make_source_backed_entity(content);
+        let source = make_source_backed_entity(content);
+        let entity = &source.entity;
         let entry = kin_model::ContextEntry {
             entity_id: entity.id,
             projection_level: kin_model::ProjectionLevel::FullBody,
             content: entity.signature.clone(),
         };
 
-        let value = focal_context_json(&EmptyStore::default(), &entry, &entity, false);
+        let mut store = EmptyStore::default();
+        store
+            .file_hashes
+            .insert(entity.file_origin.clone().unwrap(), source.hash);
+
+        let value = focal_context_json(&store, &entry, entity, false);
         let object = value.as_object().unwrap();
         let body = object.get("body").and_then(|value| value.as_str()).unwrap();
 
         assert!(body.contains("return value <= maxVal;"));
         assert_ne!(body, entity.signature);
+        assert_eq!(object.get("source").unwrap().as_str().unwrap(), "graph");
         assert_eq!(object.get("start_line").unwrap(), 1);
     }
 
     #[test]
     fn focal_context_json_surfaces_source_and_stale_markers() {
-        // W1-B contract: get_context_pack's focal entity must carry the
-        // graph/disk source marker and staleness flag in the response payload,
-        // matching get_entity_source.
+        // get_context_pack's focal entity must carry the graph source marker and
+        // staleness flag in the response payload, matching get_entity_source.
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  return value <= maxVal;\n}\n";
-        let (_dir, entity) = make_source_backed_entity(content);
+        let source = make_source_backed_entity(content);
+        let entity = &source.entity;
         let entry = kin_model::ContextEntry {
             entity_id: entity.id,
             projection_level: kin_model::ProjectionLevel::FullBody,
             content: entity.signature.clone(),
         };
 
-        let value = focal_context_json(&EmptyStore::default(), &entry, &entity, false);
+        let mut store = EmptyStore::default();
+        store
+            .file_hashes
+            .insert(entity.file_origin.clone().unwrap(), source.hash);
+
+        let value = focal_context_json(&store, &entry, entity, false);
         let object = value.as_object().unwrap();
 
-        let source = object.get("source").and_then(|v| v.as_str()).unwrap();
-        assert!(
-            source == "graph" || source == "disk",
-            "focal source marker must reflect the read path, got: {source}"
+        let marker = object.get("source").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(
+            marker, "graph",
+            "focal source marker must reflect the graph read path, got: {marker}"
         );
         assert!(
             object.get("stale").map(|v| v.is_boolean()).unwrap_or(false),
@@ -1547,15 +1618,25 @@ mod tests {
 
     #[test]
     fn focal_context_json_expands_signature_only_python_span() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let content = "def validate_probe_range_f0cc1f1d(value: float, min_val: float, max_val: float) -> bool:\n    return min_val <= value and value <= max_val\n";
-        let (_dir, entity) = make_signature_only_python_entity(content);
+        let source = make_signature_only_python_entity(content);
+        let entity = &source.entity;
         let entry = kin_model::ContextEntry {
             entity_id: entity.id,
             projection_level: kin_model::ProjectionLevel::FullBody,
             content: entity.signature.clone(),
         };
 
-        let value = focal_context_json(&EmptyStore::default(), &entry, &entity, false);
+        let mut store = EmptyStore::default();
+        store
+            .file_hashes
+            .insert(entity.file_origin.clone().unwrap(), source.hash);
+
+        let value = focal_context_json(&store, &entry, entity, false);
         let object = value.as_object().unwrap();
         let body = object.get("body").and_then(|value| value.as_str()).unwrap();
 
@@ -1565,7 +1646,13 @@ mod tests {
 
     #[test]
     fn handle_explore_codebase_trace_returns_ordered_bodies_and_constants() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_trace_source_registry();
         let dir = tempdir().unwrap();
+        let _env = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
         let tag = "trace9f31";
 
         let entry = make_trace_entity(
@@ -1694,7 +1781,13 @@ mod tests {
 
     #[test]
     fn handle_explore_codebase_trace_infers_constants_without_graph_edges() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_trace_source_registry();
         let dir = tempdir().unwrap();
+        let _env = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
         let tag = "traceconst";
 
         let step = make_trace_entity(
@@ -1739,7 +1832,13 @@ mod tests {
 
     #[test]
     fn handle_explore_codebase_trace_evaluates_rust_call_query() {
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_trace_source_registry();
         let dir = tempdir().unwrap();
+        let _env = EnvVarGuard::set("KIN_SOURCE_ROOT", dir.path());
         let tag = "traceeval";
 
         let entry = make_trace_entity(
@@ -2098,10 +2197,16 @@ mod tests {
         // get_context_pack response, through the real graph surfaces — no fake
         // or demo data, the same create/query path the product uses.
         use kin_model::graph::EntityStore;
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  return value <= maxVal;\n}\n";
-        let (_dir, entity) = make_source_backed_entity(content);
+        let source = make_source_backed_entity(content);
+        let entity = &source.entity;
         let store = InMemoryGraph::default();
-        store.upsert_entity(&entity).unwrap();
+        store.upsert_entity(entity).unwrap();
+        store.set_file_hash(&entity.file_origin.as_ref().unwrap().0, *source.hash.as_bytes());
 
         // Deposit via the real add handler against the entity scope.
         let mut add_args = HashMap::new();
@@ -2145,10 +2250,16 @@ mod tests {
     #[test]
     fn handle_trace_computation_returns_focal_body_for_entity_id() {
         use kin_model::graph::EntityStore;
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  if (value < minVal) {\n    return false;\n  }\n  return value <= maxVal;\n}\n";
-        let (_dir, entity) = make_source_backed_entity(content);
+        let source = make_source_backed_entity(content);
+        let entity = &source.entity;
         let store = InMemoryGraph::default();
-        store.upsert_entity(&entity).unwrap();
+        store.upsert_entity(entity).unwrap();
+        store.set_file_hash(&entity.file_origin.as_ref().unwrap().0, *source.hash.as_bytes());
 
         let sessions = SessionRegistry::new();
         let mut args = HashMap::new();
@@ -2177,10 +2288,16 @@ mod tests {
     #[test]
     fn handle_trace_computation_resolves_query_to_entity() {
         use kin_model::graph::EntityStore;
+        let _lock = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let content = "export function validate_probe_range_1d8f8275(value: number, minVal: number, maxVal: number): boolean {\n  if (value < minVal) {\n    return false;\n  }\n  return value <= maxVal;\n}\n";
-        let (_dir, entity) = make_source_backed_entity(content);
+        let source = make_source_backed_entity(content);
+        let entity = &source.entity;
         let store = InMemoryGraph::default();
-        store.upsert_entity(&entity).unwrap();
+        store.upsert_entity(entity).unwrap();
+        store.set_file_hash(&entity.file_origin.as_ref().unwrap().0, *source.hash.as_bytes());
 
         let sessions = SessionRegistry::new();
         let mut args = HashMap::new();
@@ -2437,7 +2554,7 @@ mod tests {
     }
 
     #[test]
-    fn test_disk_fallback_stale_flag() {
+    fn test_graph_blob_miss_reports_gap_without_disk_fallback() {
         let _lock = ENV_MUTEX
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -2495,21 +2612,19 @@ mod tests {
 
         let value = entity_response_json(&store, &entity).unwrap();
         let object = value.as_object().unwrap();
-        let excerpt = object
-            .get("source_excerpt")
-            .and_then(|v| v.as_str())
-            .unwrap();
 
-        assert_eq!(excerpt, disk_content);
-        assert_eq!(object.get("stale").unwrap().as_bool().unwrap(), true);
-        assert_eq!(object.get("source").unwrap().as_str().unwrap(), "disk");
+        assert!(
+            object.get("source_excerpt").is_none(),
+            "graph blob-miss must not serve a disk excerpt"
+        );
+        assert_eq!(object.get("source").unwrap().as_str().unwrap(), "graph-miss");
 
         let after_misses = GRAPH_MISS_COUNT.load(std::sync::atomic::Ordering::SeqCst);
         assert!(after_misses >= before_misses + 1);
     }
 
     #[test]
-    fn test_hash_mismatch_falls_back_to_disk() {
+    fn test_hash_mismatch_reports_gap_without_disk_fallback() {
         let _lock = ENV_MUTEX
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -2522,11 +2637,10 @@ mod tests {
         let objects_dir = kin_dir.join("objects");
         let blob_store = kin_blobs::BlobStore::new(objects_dir).unwrap();
 
-        // correct content
         let content = "export function test_mismatch() { return 42; }";
         let correct_hash = kin_blobs::digest(content.as_bytes());
 
-        // Write incorrect bytes to the correct hash path to simulate corrupt/mismatched blob
+        // Write incorrect bytes to the correct hash path to simulate a corrupt blob
         let bad_content = "corrupt content";
         let hex = correct_hash.to_string();
         let shard_dir = blob_store.root().join(&hex[..2]);
@@ -2534,7 +2648,7 @@ mod tests {
         let blob_file = shard_dir.join(&hex[2..]);
         fs::write(&blob_file, bad_content.as_bytes()).unwrap();
 
-        // Write the correct file on disk
+        // The correct content exists on disk, but the graph blob is corrupt
         let file_path = "src/lib.rs";
         let full_path = dir.path().join(file_path);
         fs::create_dir_all(full_path.parent().unwrap()).unwrap();
@@ -2580,16 +2694,13 @@ mod tests {
 
         let value = entity_response_json(&store, &entity).unwrap();
         let object = value.as_object().unwrap();
-        let excerpt = object
-            .get("source_excerpt")
-            .and_then(|v| v.as_str())
-            .unwrap();
 
-        // It should verify incorrect blob, discard it, fall back to disk, which has the correct content
-        assert_eq!(excerpt, content);
-        // Since disk matches correct_hash, it should NOT be stale
-        assert_eq!(object.get("stale").unwrap().as_bool().unwrap(), false);
-        assert_eq!(object.get("source").unwrap().as_str().unwrap(), "disk");
+        // The corrupt blob is discarded and the graph gap is reported — no disk read.
+        assert!(
+            object.get("source_excerpt").is_none(),
+            "corrupt blob must not fall back to disk"
+        );
+        assert_eq!(object.get("source").unwrap().as_str().unwrap(), "graph-miss");
 
         let after_misses = GRAPH_MISS_COUNT.load(std::sync::atomic::Ordering::SeqCst);
         assert!(after_misses >= before_misses + 1);

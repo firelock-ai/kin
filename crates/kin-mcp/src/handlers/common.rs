@@ -978,19 +978,6 @@ pub fn entity_read_path(entity: &Entity) -> Option<String> {
         .map(|path| display_read_path(path.0.as_str()))
 }
 
-pub fn resolve_entity_source_path(entity: &Entity) -> Option<PathBuf> {
-    let rel_path = entity.file_origin.as_ref()?.0.as_str();
-
-    for root in candidate_source_roots() {
-        let candidate = root.join(rel_path);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-
-    None
-}
-
 pub fn read_entity_source_excerpt_detailed<G: GraphStore>(
     store: &G,
     entity: &Entity,
@@ -1045,49 +1032,9 @@ pub fn read_entity_source_excerpt_detailed<G: GraphStore>(
             .or(excerpt);
     }
 
-    // Fall back to disk
     GRAPH_MISS_COUNT.fetch_add(1, Ordering::SeqCst);
-    LAST_READ_SOURCE.with(|f| f.set("disk"));
-
-    let path = resolve_entity_source_path(entity)?;
-    let disk_bytes = std::fs::read(&path).ok()?;
-
-    // Verify span bounds sanity
-    if span.start_byte > disk_bytes.len() || span.end_byte > disk_bytes.len() {
-        tracing::warn!(
-            "Span bounds sanity check failed for entity {} on file {:?}: start_byte={}, end_byte={}, file size={}",
-            entity.id,
-            path,
-            span.start_byte,
-            span.end_byte,
-            disk_bytes.len()
-        );
-        return None;
-    }
-
-    // Detect if disk content is stale
-    if let Some(ref gh) = graph_hash {
-        let disk_hash = kin_blobs::digest(&disk_bytes);
-        if disk_hash != *gh {
-            LAST_READ_STALE.with(|f| f.set(true));
-            tracing::warn!(
-                "Disk content stale for {:?}: disk hash {} != graph hash {}",
-                path,
-                disk_hash,
-                gh
-            );
-        }
-    }
-
-    let excerpt = excerpt_from_span_bytes(&disk_bytes, span, max_lines, max_chars);
-    if let Some(ref excerpt) = excerpt {
-        if !should_expand_excerpt(entity, excerpt) {
-            return Some(excerpt.clone());
-        }
-    }
-
-    let text = String::from_utf8_lossy(&disk_bytes);
-    expand_entity_source_excerpt(entity, &text, span.start_byte, max_lines, max_chars).or(excerpt)
+    LAST_READ_SOURCE.with(|f| f.set("graph-miss"));
+    None
 }
 
 pub fn excerpt_from_span_bytes(
