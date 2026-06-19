@@ -1455,7 +1455,8 @@ mod tests {
         signature: &str,
         content: &str,
     ) -> Entity {
-        let blob_store = kin_blobs::BlobStore::new(dir.path().join(".kin").join("objects")).unwrap();
+        let blob_store =
+            kin_blobs::BlobStore::new(dir.path().join(".kin").join("objects")).unwrap();
         let hash = blob_store.write(content.as_bytes()).unwrap();
 
         let file_id = kin_model::ids::FilePathId::new(rel_path);
@@ -2206,7 +2207,10 @@ mod tests {
         let entity = &source.entity;
         let store = InMemoryGraph::default();
         store.upsert_entity(entity).unwrap();
-        store.set_file_hash(&entity.file_origin.as_ref().unwrap().0, *source.hash.as_bytes());
+        store.set_file_hash(
+            &entity.file_origin.as_ref().unwrap().0,
+            *source.hash.as_bytes(),
+        );
 
         // Deposit via the real add handler against the entity scope.
         let mut add_args = HashMap::new();
@@ -2259,7 +2263,10 @@ mod tests {
         let entity = &source.entity;
         let store = InMemoryGraph::default();
         store.upsert_entity(entity).unwrap();
-        store.set_file_hash(&entity.file_origin.as_ref().unwrap().0, *source.hash.as_bytes());
+        store.set_file_hash(
+            &entity.file_origin.as_ref().unwrap().0,
+            *source.hash.as_bytes(),
+        );
 
         let sessions = SessionRegistry::new();
         let mut args = HashMap::new();
@@ -2297,7 +2304,10 @@ mod tests {
         let entity = &source.entity;
         let store = InMemoryGraph::default();
         store.upsert_entity(entity).unwrap();
-        store.set_file_hash(&entity.file_origin.as_ref().unwrap().0, *source.hash.as_bytes());
+        store.set_file_hash(
+            &entity.file_origin.as_ref().unwrap().0,
+            *source.hash.as_bytes(),
+        );
 
         let sessions = SessionRegistry::new();
         let mut args = HashMap::new();
@@ -2617,7 +2627,10 @@ mod tests {
             object.get("source_excerpt").is_none(),
             "graph blob-miss must not serve a disk excerpt"
         );
-        assert_eq!(object.get("source").unwrap().as_str().unwrap(), "graph-miss");
+        assert_eq!(
+            object.get("source").unwrap().as_str().unwrap(),
+            "graph-miss"
+        );
 
         let after_misses = GRAPH_MISS_COUNT.load(std::sync::atomic::Ordering::SeqCst);
         assert!(after_misses >= before_misses + 1);
@@ -2700,7 +2713,10 @@ mod tests {
             object.get("source_excerpt").is_none(),
             "corrupt blob must not fall back to disk"
         );
-        assert_eq!(object.get("source").unwrap().as_str().unwrap(), "graph-miss");
+        assert_eq!(
+            object.get("source").unwrap().as_str().unwrap(),
+            "graph-miss"
+        );
 
         let after_misses = GRAPH_MISS_COUNT.load(std::sync::atomic::Ordering::SeqCst);
         assert!(after_misses >= before_misses + 1);

@@ -523,7 +523,11 @@ fn render_file_path_trace_lines(
 
     let mut lines = vec![format!("--- entities declared in {} ---", read_path)];
     for entity in entities.iter().take(40) {
-        let line = entity.span.as_ref().map(|span| span.start_line).unwrap_or(0);
+        let line = entity
+            .span
+            .as_ref()
+            .map(|span| span.start_line)
+            .unwrap_or(0);
         lines.push(format!(
             "  {} ({:?}) @ {}:{}",
             entity.name, entity.kind, read_path, line
@@ -566,7 +570,11 @@ fn graph_entities_for_file(graph: &impl GraphStore, path: &str) -> Vec<Entity> {
 fn sort_entities_by_line(mut entities: Vec<Entity>) -> Vec<Entity> {
     entities.sort_by_key(|entity| {
         (
-            entity.span.as_ref().map(|span| span.start_line).unwrap_or(0),
+            entity
+                .span
+                .as_ref()
+                .map(|span| span.start_line)
+                .unwrap_or(0),
             entity.name.clone(),
         )
     });
@@ -1023,7 +1031,10 @@ issues.map((iss) => util.finalizeItem(iss, ctx, core.config()));
         )
         .unwrap();
         let joined = response.lines.join("\n");
-        assert!(joined.contains("not found"), "graph-miss guidance: {joined}");
+        assert!(
+            joined.contains("not found"),
+            "graph-miss guidance: {joined}"
+        );
         assert!(
             joined.contains("kin search definitelyMissingEntity"),
             "offers search instead of disk fallback: {joined}"
