@@ -9,7 +9,7 @@ on:
 
 jobs:
   dependency-wave:
-    uses: firelock-ai/kin-actions/.github/workflows/cargo-dependency-wave.yml@v0.1.1
+    uses: firelock-ai/kin-actions/.github/workflows/cargo-dependency-wave.yml@v0.1.2
     with:
       manifests: Cargo.toml
       test-command: cargo test
