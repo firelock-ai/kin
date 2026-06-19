@@ -31,7 +31,8 @@ const VALIDATION_KEYS: &[&str] = &[
     "embeddings_enabled",
     "vector_enabled",
     "metal_enabled",
-    "kin_binary_sha256",
+    "kin_commit",
+    "kin_dirty",
 ];
 
 #[derive(Debug, Serialize)]
