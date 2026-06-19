@@ -3310,6 +3310,26 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    fn open_snapshot_with_retry(
+        path: impl Into<std::path::PathBuf>,
+    ) -> kin_db::SnapshotManager {
+        let path = path.into();
+        for attempt in 0..10u32 {
+            match kin_db::SnapshotManager::open(path.clone()) {
+                Ok(s) => return s,
+                Err(e) => {
+                    if attempt == 9 {
+                        panic!("SnapshotManager::open({path:?}) failed after 10 attempts: {e}");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        50 * u64::from(attempt + 1),
+                    ));
+                }
+            }
+        }
+        unreachable!()
+    }
+
     #[test]
     fn git_history_import_options_supports_recent_full_and_off() {
         assert!(git_history_import_options("off").is_none());
@@ -4229,7 +4249,7 @@ mod tests {
         .unwrap();
 
         let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
-        let snap = kin_db::SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
+        let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
         let graph = snap.graph();
 
         assert!(repo_dir.path().join(".kin/snapshot/manifest.json").exists());
@@ -4279,7 +4299,7 @@ mod tests {
         assert_eq!(daemon_hits.load(Ordering::SeqCst), 0);
 
         let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
-        let snap = kin_db::SnapshotManager::open(layout.kindb_snapshot_path()).unwrap();
+        let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
         let graph = snap.graph();
         assert_repo_owned_graph_truth(graph.as_ref(), &expected_paths);
         assert_makefile_is_text_searchable(graph.as_ref());
@@ -4299,7 +4319,7 @@ mod tests {
 
         let init_result = kin_core::init(repo_dir.path()).unwrap();
         let local_snap =
-            kin_db::SnapshotManager::open(init_result.layout.kindb_snapshot_path()).unwrap();
+            open_snapshot_with_retry(init_result.layout.kindb_snapshot_path());
         let blob_store = kin_blobs::BlobStore::new(init_result.layout.objects_dir()).unwrap();
 
         let all_files = collect_source_files(repo_dir.path()).unwrap();
@@ -4396,7 +4416,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = kin_core::init(dir.path()).unwrap();
         let local_snap =
-            kin_db::SnapshotManager::open(result.layout.kindb_snapshot_path()).unwrap();
+            open_snapshot_with_retry(result.layout.kindb_snapshot_path());
 
         let source_graph = kin_db::InMemoryGraph::new();
         let entity_a = test_entity("alpha", "src/lib.rs");
@@ -4434,7 +4454,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = kin_core::init(dir.path()).unwrap();
         let local_snap =
-            kin_db::SnapshotManager::open(result.layout.kindb_snapshot_path()).unwrap();
+            open_snapshot_with_retry(result.layout.kindb_snapshot_path());
 
         let cache_graph_path = dir.path().join("warm-cache/graph.kndb");
         let cache_snap = kin_db::SnapshotManager::new(&cache_graph_path);
@@ -4463,7 +4483,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = kin_core::init(dir.path()).unwrap();
         let local_snap =
-            kin_db::SnapshotManager::open(result.layout.kindb_snapshot_path()).unwrap();
+            open_snapshot_with_retry(result.layout.kindb_snapshot_path());
 
         let source_graph = kin_db::InMemoryGraph::new();
         let shallow = kin_model::ShallowTrackedFile {
@@ -4516,7 +4536,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = kin_core::init(dir.path()).unwrap();
         let local_snap =
-            kin_db::SnapshotManager::open(result.layout.kindb_snapshot_path()).unwrap();
+            open_snapshot_with_retry(result.layout.kindb_snapshot_path());
 
         let source_graph = kin_db::InMemoryGraph::new();
         let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32]));
@@ -4917,7 +4937,7 @@ mod tests {
 
         // Initialize kin so we get a valid graph.
         let init_result = kin_core::init(root).unwrap();
-        let snap = kin_db::SnapshotManager::open(init_result.layout.kindb_snapshot_path()).unwrap();
+        let snap = open_snapshot_with_retry(init_result.layout.kindb_snapshot_path());
         let graph = snap.graph();
         let blob_store = kin_blobs::BlobStore::new(init_result.layout.objects_dir()).unwrap();
 
@@ -4930,7 +4950,7 @@ mod tests {
         drop(graph);
         drop(snap);
         let snap2 =
-            kin_db::SnapshotManager::open(init_result.layout.kindb_snapshot_path()).unwrap();
+            open_snapshot_with_retry(init_result.layout.kindb_snapshot_path());
         let graph2 = snap2.graph();
         let entities = graph2.list_all_entities().unwrap();
 
@@ -5023,7 +5043,7 @@ fn test_parse_json() {
         .unwrap();
 
         let init_result = kin_core::init(root).unwrap();
-        let snap = kin_db::SnapshotManager::open(init_result.layout.kindb_snapshot_path()).unwrap();
+        let snap = open_snapshot_with_retry(init_result.layout.kindb_snapshot_path());
         let graph = snap.graph();
         let blob_store = kin_blobs::BlobStore::new(init_result.layout.objects_dir()).unwrap();
 
@@ -5112,7 +5132,7 @@ pub struct Config {
 
         // Init and index
         let init_result = kin_core::init(root).unwrap();
-        let snap = kin_db::SnapshotManager::open(init_result.layout.kindb_snapshot_path()).unwrap();
+        let snap = open_snapshot_with_retry(init_result.layout.kindb_snapshot_path());
         let graph = snap.graph();
         let blob_store = kin_blobs::BlobStore::new(init_result.layout.objects_dir()).unwrap();
         let all_files = collect_source_files(root).unwrap();
@@ -5124,7 +5144,7 @@ pub struct Config {
         drop(graph);
         drop(snap);
         let snap2 =
-            kin_db::SnapshotManager::open(init_result.layout.kindb_snapshot_path()).unwrap();
+            open_snapshot_with_retry(init_result.layout.kindb_snapshot_path());
         let graph2 = snap2.graph();
         let entities = graph2.list_all_entities().unwrap();
 
