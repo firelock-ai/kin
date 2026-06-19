@@ -1,0 +1,17 @@
+name: Kin Dependency Wave
+
+on:
+  repository_dispatch:
+    types: [kin-registry-release]
+  workflow_dispatch:
+  schedule:
+    - cron: "29 * * * *"
+
+jobs:
+  dependency-wave:
+    uses: firelock-ai/kin-actions/.github/workflows/cargo-dependency-wave.yml@v0.1.1
+    with:
+      manifests: Cargo.toml
+      test-command: cargo test
+    secrets:
+      KIN_CI_BOT_TOKEN: ${{ secrets.KIN_CI_BOT_TOKEN }}

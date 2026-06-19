@@ -1,0 +1,8 @@
+{
+  "downstreams": [
+    { "repo": "firelock-ai/kin-db" },
+    { "repo": "firelock-ai/kin" },
+    { "repo": "firelock-ai/kin-lsp" },
+    { "repo": "firelock-ai/kin-bench" }
+  ]
+}
