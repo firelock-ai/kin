@@ -454,7 +454,7 @@ mod tests {
         assert_eq!(coverage.total, 10);
         assert_eq!(coverage.pending, 0);
         assert!(coverage.complete);
-        // Honest: no fabricated degradation note when truly complete.
+        // no degradation note when truly complete.
         assert!(coverage.note.is_none());
     }
 

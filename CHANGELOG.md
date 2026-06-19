@@ -13,12 +13,12 @@ Corrective public install release for first-run setup.
 
 ### Changed
 
-- Release archives now include `kin-daemon` alongside `kin`, so clean public installs can run daemon-backed commands without relying on a developer PATH or pre-existing daemon (FIR-967).
-- Generated MCP setup config now defaults to the small `agent-default` tool profile while preserving the full surface for advanced users (FIR-963).
+- Release archives now include `kin-daemon` alongside `kin`, so clean public installs can run daemon-backed commands without relying on a developer PATH or pre-existing daemon.
+- Generated MCP setup config now defaults to the small `agent-default` tool profile while preserving the full surface for advanced users.
 
 ### Fixed
 
-- Public installers now hard-fail on daemon-less archives and support checksum-verified release downloads for first-run install proof (FIR-967).
+- Public installers now hard-fail on daemon-less archives and support checksum-verified release downloads for first-run install proof.
 
 ## [0.2.0] - 2026-06-16
 
@@ -26,22 +26,22 @@ First `0.2.0` release. Supersedes the `0.1.0-alpha.*` line.
 
 ### Added
 
-- macOS transparent VFS interposition: an unmodified process now reads graph-backed files — including paths that do not exist on disk — through the shim's `__DATA,__interpose` table, verified end-to-end (FIR-909).
-- Graph-assigned artifact identity on the `GraphStore` trait (`artifact_id_for_path`); the context-pack builder resolves graph-owned ids instead of re-deriving them from paths (FIR-855).
+- macOS transparent VFS interposition: an unmodified process now reads graph-backed files — including paths that do not exist on disk — through the shim's `__DATA,__interpose` table, verified end-to-end.
+- Graph-assigned artifact identity on the `GraphStore` trait (`artifact_id_for_path`); the context-pack builder resolves graph-owned ids instead of re-deriving them from paths.
 
 ### Changed
 
-- VFS write authority is now graph-first: write-notify is lossless (unbounded channel, replacing the 64-slot drop-on-full queue) and materialize-on-write seeds from graph content rather than trusting a stale on-disk copy (FIR-950).
-- `ArtifactId::from_path`/`from_file_id` deprecation is fully enforced — every internal caller uses the non-deprecated seed primitives and the `-A deprecated` CI mask is removed (FIR-855).
+- VFS write authority is now graph-first: write-notify is lossless (unbounded channel, replacing the 64-slot drop-on-full queue) and materialize-on-write seeds from graph content rather than trusting a stale on-disk copy.
+- `ArtifactId::from_path`/`from_file_id` deprecation is fully enforced; every internal caller uses the non-deprecated seed primitives and the `-A deprecated` CI mask is removed.
 
 ### Fixed
 
-- kinlab release-publish and branch-protection gates no longer trust client-asserted booleans; gate decisions derive only from server-authoritative state (FIR-959, FIR-915).
-- kin-search lock-order inversion between mutation and commit that could deadlock the staged/live/segment path (FIR-916).
+- kinlab release-publish and branch-protection gates no longer trust client-asserted booleans; gate decisions derive only from server-authoritative state.
+- kin-search lock-order inversion between mutation and commit that could deadlock the staged/live/segment path.
 
 ### Security
 
-- Closed a control-plane gate bypass where forged request booleans could approve a protected release or push (FIR-959, FIR-915).
+- Closed a control-plane gate bypass where forged request booleans could approve a protected release or push.
 
 ## [0.1.0-alpha.25] - 2026-03-28
 

@@ -660,7 +660,7 @@ mod tests {
 
     #[test]
     fn mutation_operation_deserializes_without_target() {
-        // The tool schema declares `target` optional with default "" (FIR-936);
+        // The tool schema declares `target` optional with default "";
         // the deserializer must accept schema-conformant payloads that omit it.
         let json = serde_json::json!({
             "verb": "update",

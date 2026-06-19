@@ -661,7 +661,7 @@ mod tests {
 
     #[test]
     fn reclaim_clears_locks_when_owner_pid_is_dead() {
-        // FIR-982: a SIGKILLed daemon whose forked child leaked the flock fd
+        // A SIGKILLed daemon whose forked child leaked the flock fd
         // leaves a dead-owner PID and lingering lock files. The reclaim path
         // clears them so startup proceeds instead of failing with os error 35.
         let dir = tempfile::tempdir().unwrap();

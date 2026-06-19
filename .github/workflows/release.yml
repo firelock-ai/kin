@@ -18,8 +18,8 @@ jobs:
   build:
     name: Build (${{ matrix.artifact }})
     runs-on: ${{ matrix.os }}
-    # Windows is a work-in-progress release target (FIR-847 / stale kin-model
-    # path in the vector-free patch). It must not block the macOS/Linux release:
+    # Windows is a work-in-progress release target while the vector-free
+    # dependency path is hardened. It must not block the macOS/Linux release:
     # the experimental leg is non-blocking so Publish Release + npm still run.
     continue-on-error: ${{ matrix.experimental || false }}
     # macOS signing/notarization secrets are surfaced as env so they can be used
@@ -113,7 +113,7 @@ jobs:
           if [ "$SKIP_VECTOR" = "true" ]; then
             FLAGS="--no-default-features"
           fi
-          # FIR-967: the daemon IS the runtime — `kin init` works without it but
+          # The daemon is the runtime: `kin init` works without it but
           # `kin status`/`kin search`/the MCP server all require kin-daemon on
           # PATH, so a clean public install must ship it alongside `kin`.
           cargo build --release --target "$TARGET" -p kin-cli -p kin-daemon $FLAGS
@@ -216,14 +216,14 @@ jobs:
         run: |
           mkdir "$ARTIFACT"
           cp "target/${TARGET}/release/kin" "$ARTIFACT/"
-          # FIR-967: kin-daemon is mandatory (no `|| true`) — a daemon-less
+          # kin-daemon is mandatory (no `|| true`): a daemon-less
           # archive lets `kin init` succeed but then `kin status`/`kin search`
           # fail with no daemon on PATH, so a missing daemon must fail the build.
           cp "target/${TARGET}/release/kin-daemon" "$ARTIFACT/"
           cp "kin-vfs/target/${TARGET}/release/kin-vfs" "$ARTIFACT/" 2>/dev/null || true
           cp "kin-vfs/target/${TARGET}/release/${SHIM_NAME}" "$ARTIFACT/" 2>/dev/null || true
           tar czf "${ARTIFACT}.tar.gz" "$ARTIFACT"
-          # FIR-967: assert the published archive actually contains kin-daemon so
+          # Assert the published archive actually contains kin-daemon so
           # a daemon-less build can never be released green.
           if ! tar tzf "${ARTIFACT}.tar.gz" | grep -q "/kin-daemon$"; then
             echo "::error::kin-daemon missing from ${ARTIFACT}.tar.gz — refusing to publish a daemon-less archive"
@@ -241,13 +241,13 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path $env:ARTIFACT
           Copy-Item "target/$env:TARGET/release/kin.exe" "$env:ARTIFACT/"
-          # FIR-967: kin-daemon is mandatory — fail hard if it's missing rather
+          # kin-daemon is mandatory: fail hard if it's missing rather
           # than ship a daemon-less archive that can `kin init` but nothing else.
           Copy-Item "target/$env:TARGET/release/kin-daemon.exe" "$env:ARTIFACT/" -ErrorAction Stop
           Copy-Item "kin-vfs/target/$env:TARGET/release/kin-vfs.exe" "$env:ARTIFACT/" -ErrorAction SilentlyContinue
           Copy-Item "kin-vfs/target/$env:TARGET/release/$env:SHIM_NAME" "$env:ARTIFACT/" -ErrorAction SilentlyContinue
           Compress-Archive -Path "$env:ARTIFACT/*" -DestinationPath "$env:ARTIFACT.zip"
-          # FIR-967: assert the produced zip actually contains kin-daemon.exe.
+          # Assert the produced zip actually contains kin-daemon.exe.
           $entries = [System.IO.Compression.ZipFile]::OpenRead("$PWD/$env:ARTIFACT.zip").Entries.Name
           if ($entries -notcontains "kin-daemon.exe") {
             Write-Error "kin-daemon.exe missing from $env:ARTIFACT.zip — refusing to publish a daemon-less archive"

@@ -410,7 +410,7 @@ pub fn link_cross_file_against_entities(
                 // the bare-name index only when unambiguous — exactly one method of
                 // that name in another file. Ambiguous names (`new`, `run`, `get`) have
                 // an unknowable receiver type, so linking every candidate would mint
-                // spurious callers; leave those to the FIR-938 inconclusive-absence gate.
+                // spurious callers; leave those to the inconclusive-absence gate.
                 if !linked && !bare_candidates.is_empty() {
                     let mut distinct_targets: HashSet<EntityId> = HashSet::new();
                     for &(fp, dst_id) in bare_candidates {
@@ -2059,7 +2059,7 @@ void f();
     fn receiver_method_call_skipped_when_bare_name_ambiguous() {
         // A call to bare `new` could target either `Foo::new` or `Bar::new`; the
         // receiver type is unknowable from the name, so linking to either would mint
-        // a spurious caller. Leave it unlinked for the FIR-938 inconclusive gate.
+        // a spurious caller. Leave it unlinked for the inconclusive gate.
         let caller = make_entity("build", "src/caller.rs");
         let foo_new = make_entity("Foo::new", "src/foo.rs");
         let bar_new = make_entity("Bar::new", "src/bar.rs");

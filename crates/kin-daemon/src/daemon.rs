@@ -811,7 +811,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
             }
         }
         info!("embedding worker started");
-        // FIR-944: re-queue every object the persisted index still lacks a vector
+        // Re-queue every object the persisted index still lacks a vector
         // for, so the worker resumes after a restart drained the in-memory queue
         // (the queue is not persisted; coverage is, via graph-vs-index truth).
         // Idempotent (HashSet queues) — a fresh start that already enqueued via
@@ -913,7 +913,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                         // Run inside spawn_blocking so the std persist Mutex is held
                         // only across the synchronous write, never across an await.
                         let state_for_persist = Arc::clone(&embed_state);
-                        // FIR-944: flush this batch incrementally — the vector
+                        // Flush this batch incrementally — the vector
                         // sidecar plus any concurrent LSP-enrichment graph delta —
                         // instead of relying on the periodic full-graph save that
                         // re-serializes the whole ~1 GB graph each tick. The method

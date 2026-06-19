@@ -3264,7 +3264,7 @@ async fn embed(
             })?;
             // Stamp the sidecar with this daemon build's identity so vectors
             // written by one embedder stack are never silently trusted by
-            // another (FIR-901).
+            // another.
             let embedder_identity = kin_buildinfo::sha_with_dirty(kin_buildinfo::get());
             kin_db::SnapshotManager::save_vector_index_for_graph(
                 persist_state.layout.kindb_snapshot_path(),
@@ -3692,7 +3692,7 @@ fn persist_mcp_transactions(state: &DaemonState, registry: &kin_mcp::SessionRegi
     for transaction in registry.list_transactions() {
         store.insert(transaction.transaction_id.clone(), transaction);
     }
-    // FIR-795: mirror the in-flight set to disk so a restart does not silently
+    // Mirror the in-flight set to disk so a restart does not silently
     // drop staged-but-uncommitted transactions.
     crate::state::write_persisted_mcp_transactions(&state.layout, &store);
 }
@@ -3703,7 +3703,7 @@ fn persist_mcp_transactions(state: &DaemonState, registry: &kin_mcp::SessionRegi
 fn forget_mcp_transaction(state: &DaemonState, transaction_id: &str) {
     let mut store = lock_recover(&state.mcp_transactions);
     store.remove(transaction_id);
-    // FIR-795: keep the durable mirror in step with the in-memory eviction so a
+    // Keep the durable mirror in step with the in-memory eviction so a
     // committed/aborted transaction does not reappear after a restart.
     crate::state::write_persisted_mcp_transactions(&state.layout, &store);
 }
@@ -3743,7 +3743,7 @@ fn collect_pre_commit_entities(
         let Some(kin_mcp::McpMutationPayload::Entity(payload_entity)) = op.payload.as_ref() else {
             continue;
         };
-        // FIR-934: capture the agent-supplied new source text (if present) keyed
+        // Capture the agent-supplied new source text (if present) keyed
         // by entity id, so the post-commit projection writes it to the working
         // file instead of re-splicing the file's own bytes (an identity no-op).
         if let Some(body) = op.body.as_ref() {
@@ -3817,7 +3817,7 @@ fn build_semantic_locate_result(
     };
 
     // Over-fetch so post-resolution dedupe can still fill `limit`: by file for
-    // file granularity, by resolved entity for entity granularity (FIR-941).
+    // file granularity, by resolved entity for entity granularity.
     // Every entity carries both an `Entity(E)` and an `EntityRevision(head)`
     // vector in the index, both resolving to the same entity, so without the
     // entity dedup below each entity would appear ~twice and effective recall@k
@@ -3874,7 +3874,7 @@ fn build_semantic_locate_result(
                 None => continue,
             }
         } else if !seen_entities.insert(entity_id.clone()) {
-            // FIR-941: collapse the two index keys per entity (`Entity(E)` +
+            // Collapse the two index keys per entity (`Entity(E)` +
             // `EntityRevision(head)`) into a single result. `raw` is rank-ordered
             // by distance, so the first occurrence of an entity is its best hit.
             continue;
@@ -4082,7 +4082,7 @@ async fn mcp_tools_call(
 
     let sessions = mcp_session_registry_snapshot(&state)?;
 
-    // FIR-929: snapshot entity state before the commit so we can project the
+    // Snapshot entity state before the commit so we can project the
     // mutations into working-directory files after the graph is updated.
     // Entities without a span (new creates, relation-only ops) are included but
     // silently skipped by project_after_mcp_commit.
@@ -4126,21 +4126,20 @@ async fn mcp_tools_call(
         });
     }
 
-    // FIR-929/FIR-904·3/FIR-934/FIR-935: project entity mutations into
-    // working-directory files (so the next reconcile does not silently clobber
-    // the graph — file-wins LWW) and enrich the commit response with what the
-    // commit actually did.
+    // Project entity mutations into working-directory files (so the next
+    // reconcile does not silently clobber the graph — file-wins LWW) and enrich
+    // the commit response with what the commit actually did.
     //
     // The graph commit has already landed and the version counter already
     // reflects it above.  A projection failure does NOT roll back the graph —
     // the agent's intent is preserved and the caller is told loudly so it can
     // retry or inspect the source file.
     //
-    // Conflicts (FIR-904·3 skip-conflicted semantics): entities where a
+    // Conflicts (skip-conflicted semantics): entities where a
     // concurrent human file edit was detected are NOT projected; the commit is
     // surfaced as an error so the agent can resolve.
     if request.name == "kin_transaction_commit" && result.is_error != Some(true) {
-        // FIR-935: the real graph Merkle root, now that the delta has landed.
+        // The real graph Merkle root, now that the delta has landed.
         let new_root_hash = hex::encode(state.graph.compute_root_hash());
 
         let (modified_files, collision_warnings) = if pre_commit_entities.is_empty() {
@@ -4189,7 +4188,7 @@ async fn mcp_tools_call(
             }
         };
 
-        // FIR-935: fold the projection outcome and root hash into the success
+        // Fold the projection outcome and root hash into the success
         // response so a commit reports what it did instead of an opaque
         // "committed". `ops_applied`/`empty` already rode in from the handler.
         result = enrich_commit_result(result, &new_root_hash, &modified_files, &collision_warnings);
@@ -4198,7 +4197,7 @@ async fn mcp_tools_call(
     Ok(Json(result))
 }
 
-/// FIR-935: enrich a successful `kin_transaction_commit` text result with the
+/// Enrich a successful `kin_transaction_commit` text result with the
 /// post-commit graph root hash and the graph→file projection outcome.
 ///
 /// The base handler returns `{transaction_id, state, status, ops_applied,
@@ -7212,7 +7211,7 @@ mod tests {
 
     #[test]
     fn mcp_transaction_survives_daemon_restart() {
-        // FIR-795: staged-but-uncommitted transactions must survive a daemon
+        // Staged-but-uncommitted transactions must survive a daemon
         // restart, not just HTTP calls — otherwise a mid-transaction bounce
         // silently drops the agent's staged work. Persist on one DaemonState,
         // re-open on the SAME layout (a restart), and assert the staged op +
@@ -7254,7 +7253,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let restored = store
             .get(&tx_id)
-            .expect("staged transaction must survive a daemon restart (FIR-795)");
+            .expect("staged transaction must survive a daemon restart");
         assert_eq!(
             restored.staged_operations.len(),
             1,
@@ -9108,7 +9107,7 @@ mod tests {
         }
     }
 
-    // FIR-971: the package registries are public services with their own
+    // The package registries are public services with their own
     // per-write gates; `daemon_auth` must be scoped to the daemon API and must
     // NOT wrap the registry routers, so a 0.0.0.0-bound (therefore daemon-token-
     // protected) daemon can still serve a public registry. `KIN_REGISTRY_*` env
@@ -9186,7 +9185,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_api_protected_while_registry_public_in_same_app() {
-        // The security-critical invariant of FIR-971: in ONE token-configured
+        // The security-critical invariant: in ONE token-configured
         // app, the daemon API stays protected (401 without bearer, 200 with it)
         // while the registry stays open (200 with no auth). Proves the layer
         // split gates exactly the daemon routes and nothing else.

@@ -2282,7 +2282,7 @@ pub async fn resolve_daemon_url(layout: &KinLayout) -> Result<Option<String>> {
 /// of the 60-second CLI default when autostarting a daemon.
 ///
 /// Call from `kin mcp start` so the first daemon spawned on the MCP path gets
-/// the same long idle window as the FIR-910 auto-revival path.  An explicit
+/// the same long idle window as the auto-revival path.  An explicit
 /// `KIN_DAEMON_IDLE_TIMEOUT_SECS` env var always overrides this.
 pub async fn resolve_daemon_url_for_mcp(layout: &KinLayout) -> Result<Option<String>> {
     resolve_daemon_url_inner(layout, Some(MCP_IDLE_TIMEOUT_SECS)).await
@@ -2527,7 +2527,7 @@ mod tests {
         assert!(!startup_lock_is_stale(&lock, Duration::from_secs(60)));
     }
 
-    // ── idle-timeout env-assembly (FIR-927) ────────────────────────────────
+    // ── idle-timeout env-assembly ──────────────────────────────────────────
 
     #[test]
     fn resolve_idle_timeout_uses_default_when_nothing_set() {
