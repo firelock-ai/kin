@@ -22,7 +22,7 @@ use crate::session_registry::SessionCoordinator;
 pub const RECON_IDLE: u8 = 0;
 pub const RECON_PROCESSING: u8 = 1;
 
-/// FIR-795: on-disk home for in-flight MCP transactions.
+/// On-disk home for in-flight MCP transactions.
 ///
 /// Lives under `.kin/` (not the working tree), so it is never reconciled or
 /// committed. The in-memory `DaemonState::mcp_transactions` is the live copy;
@@ -593,7 +593,7 @@ impl DaemonState {
             embed_worker_failed: AtomicBool::new(false),
             mcp_transactions: Mutex::new(HashMap::new()),
         };
-        // FIR-795: restore in-flight MCP transactions persisted before a restart
+        // Restore in-flight MCP transactions persisted before a restart
         // so staged-but-uncommitted work is not silently dropped across a daemon
         // bounce — stdio-MCP and HTTP-MCP behave identically across a restart.
         *state
@@ -729,7 +729,7 @@ impl DaemonState {
             mcp_transactions: Mutex::new(HashMap::new()),
         };
 
-        // FIR-795: restore in-flight MCP transactions persisted before a restart.
+        // Restore in-flight MCP transactions persisted before a restart.
         *state
             .mcp_transactions
             .lock()
@@ -1292,7 +1292,7 @@ impl DaemonState {
         Ok(())
     }
 
-    /// FIR-944: incremental per-batch embed-progress flush for the background
+    /// Incremental per-batch embed-progress flush for the background
     /// embed worker.
     ///
     /// Persists this batch's vectors — plus any concurrent graph delta from LSP
@@ -1374,8 +1374,8 @@ impl DaemonState {
     /// base content from graph truth via [`ProjectionState::from_graph`].
     ///
     /// Fallback path: if a file layout exists in the graph but its file hash
-    /// has not yet been persisted (older snapshots from before FIR-929 started
-    /// writing hashes), `from_graph` returns
+    /// has not yet been persisted (older snapshots from before file hashes were
+    /// always written), `from_graph` returns
     /// [`ProjectionError::BaseContentUnavailable`].  Rather than hard-failing
     /// and leaving the daemon unable to serve VFS reads or accept projected
     /// writes, the fallback iterates layouts individually: files whose hash IS
@@ -1407,7 +1407,7 @@ impl DaemonState {
         // Fallback path: some file hashes are absent (older snapshot).
         // Build the projection file-by-file, reading from disk when blobs lack
         // the content.  This is migration debt — once all snapshots are on the
-        // FIR-929 schema (hashes always persisted) this path becomes unreachable.
+        // current schema (hashes always persisted) this path becomes unreachable.
         let layouts = self.graph.list_file_layouts().map_err(DaemonError::from)?;
         let mut new_projection = ProjectionState::new();
         let mut loaded = 0usize;
@@ -1443,7 +1443,7 @@ impl DaemonState {
                     warn!(
                         file = %file_id,
                         error = %e,
-                        "FIR-904·4: skipping projection rebuild for file not in blobs or disk \
+                        "skipping projection rebuild for file not in blobs or disk \
                          (migration-debt fallback)"
                     );
                     skipped += 1;
@@ -2011,7 +2011,7 @@ mod tests {
 
     #[test]
     fn open_rejects_pre_0_2_repo_with_actionable_error() {
-        // FIR-978: a repo created by a pre-0.2 kin must be refused UP FRONT with
+        // A repo created by a pre-0.2 kin must be refused UP FRONT with
         // a clear, actionable error — never loaded into a daemon that then fails
         // readiness and gets SIGTERM-killed by the supervisor. The gate fires
         // before the graph snapshot is touched, so a tiny manifest fixture (just
@@ -2102,7 +2102,7 @@ mod tests {
 
     #[test]
     fn first_publish_commit_persists_under_v2_repo_prefix_and_reloads_with_refs() {
-        // FIR-983 hosted publish->serve: a full-content commit into the served
+        // Hosted publish->serve: a full-content commit into the served
         // graph must persist through the StorageBackend at `<prefix>/<repo>/graph.kndb`
         // (the GCS `v2/<repo>/` layout, reproduced here with a LocalFileBackend rooted
         // at `v2/`) and survive a pod restart with its branch refs intact. A fresh
@@ -2548,7 +2548,7 @@ mod tests {
 
     #[test]
     fn flush_embed_progress_persists_snapshot_and_reports_pending() {
-        // FIR-944: the incremental flush persists the snapshot (full bundle on
+        // The incremental flush persists the snapshot (full bundle on
         // the first write) and returns the persisted resume count. With no
         // embedder run the lone entity stays unembedded, so `pending` reflects it
         // — proving the flush composes the graph-delta + sidecar write and reads
@@ -2575,7 +2575,7 @@ mod tests {
 
     #[test]
     fn persisted_mcp_transactions_missing_file_loads_empty() {
-        // FIR-795: a clean start (no mcp_transactions.json) yields an empty set,
+        // A clean start (no mcp_transactions.json) yields an empty set,
         // never an error — startup must not fail on transaction recovery.
         let dir = tempfile::tempdir().unwrap();
         let layout = KinLayout::new(dir.path().to_path_buf());
@@ -2584,7 +2584,7 @@ mod tests {
 
     #[test]
     fn persisted_mcp_transactions_round_trip_through_disk() {
-        // FIR-795: a staged transaction written to the durable mirror reloads
+        // A staged transaction written to the durable mirror reloads
         // intact — the mechanism that lets begin/stage survive a daemon restart.
         let dir = tempfile::tempdir().unwrap();
         let layout = KinLayout::new(dir.path().to_path_buf());
@@ -2612,7 +2612,7 @@ mod tests {
 
     #[test]
     fn persisted_mcp_transactions_corrupt_file_degrades_to_empty() {
-        // FIR-795: a torn/corrupt mirror degrades to empty (logged loud, never a
+        // A torn/corrupt mirror degrades to empty (logged loud, never a
         // startup crash) rather than poisoning daemon boot.
         let dir = tempfile::tempdir().unwrap();
         let layout = KinLayout::new(dir.path().to_path_buf());

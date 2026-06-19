@@ -1096,7 +1096,7 @@ mod tests {
     }
 
     /// Verify that `reqwest::Error` from a connection-refused qualifies as a
-    /// transport error.  Uses a loopback port that is guaranteed to be closed.
+    /// transport error.  Uses a loopback port that is expected to be closed.
     /// No real daemon is spawned.
     #[tokio::test]
     async fn connection_refused_is_a_transport_error() {

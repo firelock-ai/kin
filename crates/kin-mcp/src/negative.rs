@@ -212,7 +212,7 @@ fn build_advice(spec: &RetrievalSpec, envelope: &Envelope, trustworthy: bool) ->
 }
 
 /// True when `payload.focal_entity.kind` is a method — the entity kind whose
-/// incoming call edges the linker under-resolves (FIR-938), so absence of
+/// incoming call edges the linker under-resolves, so absence of
 /// references must not be certified as authoritative.
 fn focal_entity_is_method(payload: &Value) -> bool {
     payload
@@ -237,7 +237,7 @@ pub fn negative_for(tool: &str, payload: &Value, envelope: &Envelope) -> Option<
 
     let (mut trustworthy, mut trust_reason) = envelope.negative_trust(spec.class);
 
-    // FIR-938: receiver-method calls (`x.method()`) are resolved by bare name in
+    // Receiver-method calls (`x.method()`) are resolved by bare name in
     // the linker while method entities are keyed by their qualified name, so a
     // method's incoming `Calls` edges are frequently dropped. An empty
     // `find_references` for a method is therefore NOT an authoritative "unused"
@@ -442,7 +442,7 @@ mod tests {
 
     #[test]
     fn find_references_on_method_is_inconclusive_despite_loaded_graph() {
-        // FIR-938: receiver-method call edges are under-resolved by the linker
+        // Receiver-method call edges are under-resolved by the linker
         // (method entities are keyed by qualified name; calls arrive bare), so an
         // empty find_references for a method must NOT be certified authoritative
         // ("safe to delete") even on a healthy, loaded graph.

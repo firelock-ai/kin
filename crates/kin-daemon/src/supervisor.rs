@@ -408,7 +408,7 @@ pub async fn repo_daemon_registration_loop(
 // (`api.rs`): a DNS-rebinding Host/Origin guard plus an optional loopback bearer
 // token. The helpers below mirror `api.rs` one-for-one, swapping the
 // `KIN_DAEMON_*` env vars for `KIN_SUPERVISOR_*` and the `daemon.token` file for
-// `supervisor.token`, so the two surfaces stay symmetric. See FIR-914.
+// `supervisor.token`, so the two surfaces stay symmetric.
 
 /// `.kin/supervisor.token` — auto-provisioned per-install loopback token.
 fn supervisor_token_path() -> PathBuf {
@@ -1248,7 +1248,7 @@ fn classify_daemon(obs: &DaemonObservation, policy: &ReapPolicy) -> DaemonDecisi
             return DaemonDecision::Reap(ReapReason::DuplicateOrphanTwin);
         }
 
-        // (b) Orphaned busy-spinner: healthy but idle (guaranteed by `!active`)
+        // (b) Orphaned busy-spinner: healthy but idle (ensured by `!active`)
         //     and CPU-pinned across enough consecutive sweeps.
         if policy.cpu_heuristic_enabled
             && obs.orphaned
@@ -1258,7 +1258,7 @@ fn classify_daemon(obs: &DaemonObservation, policy: &ReapPolicy) -> DaemonDecisi
             return DaemonDecision::Reap(ReapReason::OrphanedBusyNoClients);
         }
 
-        // Build-aware rolling redeploy: a healthy IDLE daemon (idleness guaranteed
+        // Build-aware rolling redeploy: a healthy IDLE daemon (idleness ensured
         // by `!active`) running a stale binary is killed so it respawns on demand
         // into the fresh build. Reaped above first, so reap wins; placed before the
         // adopt block below, so redeploy wins over adoption for idle stale daemons.
@@ -2492,7 +2492,7 @@ mod tests {
         assert!(!same_binary(None, None));
     }
 
-    // ===== Control-plane hardening (FIR-914) =====
+    // ===== Control-plane hardening =====
 
     use axum::body::Body;
     use axum::http::Request;
