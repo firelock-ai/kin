@@ -509,30 +509,33 @@ fn persist_semantic_index<G: GraphStore>(
         index_planned_files_parallel(plan, blob_store, &workspace_root)?
     };
 
+    let mut all_entities: Vec<kin_model::Entity> = Vec::new();
+    let mut all_relations: Vec<kin_model::Relation> = Vec::new();
     for indexed in indexed_files {
-        for entity in &indexed.indexed_file.entities {
-            graph
-                .upsert_entity(entity)
-                .map_err(|e| MigrateError::Graph(e.to_string()))?;
-        }
-        for relation in &indexed.indexed_file.relations {
-            graph
-                .upsert_relation(relation)
-                .map_err(|e| MigrateError::Graph(e.to_string()))?;
-        }
+        let entity_count = indexed.indexed_file.entities.len();
+        let relation_count = indexed.indexed_file.relations.len();
+        all_entities.extend(indexed.indexed_file.entities.iter().cloned());
+        all_relations.extend(indexed.indexed_file.relations);
 
         file_parse_data.push(kin_index::linker::FileParseDataWithTests {
             file_path: indexed.indexed_file.file_id.0.clone(),
-            entities: indexed.indexed_file.entities.clone(),
+            entities: indexed.indexed_file.entities,
             relations: indexed.indexed_file.extracted_relations,
             imports: indexed.indexed_file.imports,
             tests: indexed.tests,
         });
 
         files_indexed += 1;
-        entities_extracted += indexed.indexed_file.entities.len();
-        relations_extracted += indexed.indexed_file.relations.len();
+        entities_extracted += entity_count;
+        relations_extracted += relation_count;
     }
+
+    graph
+        .upsert_entities_batch(&all_entities)
+        .map_err(|e| MigrateError::Graph(e.to_string()))?;
+    graph
+        .upsert_relations_batch(&all_relations)
+        .map_err(|e| MigrateError::Graph(e.to_string()))?;
 
     // Cross-file relation linking
     let cross_file_relations = {
@@ -541,11 +544,9 @@ fn persist_semantic_index<G: GraphStore>(
                 .entered();
         kin_index::linker::link_cross_file_with_tests(&file_parse_data)
     };
-    for rel in &cross_file_relations {
-        graph
-            .upsert_relation(rel)
-            .map_err(|e| MigrateError::Graph(e.to_string()))?;
-    }
+    graph
+        .upsert_relations_batch(&cross_file_relations)
+        .map_err(|e| MigrateError::Graph(e.to_string()))?;
     relations_extracted += cross_file_relations.len();
 
     Ok((files_indexed, entities_extracted, relations_extracted))
