@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use kin_blobs::BlobStore;
 use kin_core::{build_genesis_change, init, KinConfig, KinLayout};
 use kin_model::{Branch, BranchName, ChangeStore, GraphStore};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -16,6 +17,7 @@ use crate::checkpoint::{
 };
 use crate::converter::convert;
 use crate::error::{MigrateError, Result};
+use crate::resource_threads::{proof_profile_requested, with_resource_rayon_pool};
 use crate::scanner::scan_repo;
 use crate::strategy::{plan_migration, MigrationPlan, MigrationStrategy};
 
@@ -495,26 +497,19 @@ fn persist_semantic_index<G: GraphStore>(
     blob_store: &BlobStore,
     graph: &G,
 ) -> Result<(usize, usize, usize)> {
-    let pipeline = kin_index::IndexPipeline::new();
     let workspace_root = materialized_workspace_root(plan);
     let mut files_indexed = 0usize;
     let mut entities_extracted = 0usize;
     let mut relations_extracted = 0usize;
     let mut file_parse_data: Vec<kin_index::linker::FileParseDataWithTests> = Vec::new();
 
-    for rel_path in &plan.source_files {
-        let abs_path = workspace_root.join(rel_path);
-        if !abs_path.exists() {
-            return Err(MigrateError::Other(format!(
-                "planned source file missing at execution time: {}",
-                abs_path.display()
-            )));
-        }
+    let indexed_files = if proof_profile_requested()? {
+        index_planned_files_serial(plan, blob_store, &workspace_root)?
+    } else {
+        index_planned_files_parallel(plan, blob_store, &workspace_root)?
+    };
 
-        let indexed = pipeline
-            .index_file_relative_with_tests(&abs_path, blob_store, workspace_root)
-            .map_err(|e| MigrateError::Index(e.to_string()))?;
-
+    for indexed in indexed_files {
         for entity in &indexed.indexed_file.entities {
             graph
                 .upsert_entity(entity)
@@ -554,6 +549,49 @@ fn persist_semantic_index<G: GraphStore>(
     relations_extracted += cross_file_relations.len();
 
     Ok((files_indexed, entities_extracted, relations_extracted))
+}
+
+fn index_planned_file(
+    workspace_root: &Path,
+    rel_path: &Path,
+    blob_store: &BlobStore,
+) -> Result<kin_index::pipeline::IndexedFileWithTests> {
+    let abs_path = workspace_root.join(rel_path);
+    if !abs_path.exists() {
+        return Err(MigrateError::Other(format!(
+            "planned source file missing at execution time: {}",
+            abs_path.display()
+        )));
+    }
+
+    let pipeline = kin_index::IndexPipeline::new();
+    pipeline
+        .index_file_relative_with_tests(&abs_path, blob_store, workspace_root)
+        .map_err(|e| MigrateError::Index(e.to_string()))
+}
+
+fn index_planned_files_serial(
+    plan: &MigrationPlan,
+    blob_store: &BlobStore,
+    workspace_root: &Path,
+) -> Result<Vec<kin_index::pipeline::IndexedFileWithTests>> {
+    plan.source_files
+        .iter()
+        .map(|rel_path| index_planned_file(workspace_root, rel_path, blob_store))
+        .collect()
+}
+
+fn index_planned_files_parallel(
+    plan: &MigrationPlan,
+    blob_store: &BlobStore,
+    workspace_root: &Path,
+) -> Result<Vec<kin_index::pipeline::IndexedFileWithTests>> {
+    with_resource_rayon_pool("persist_semantic_index.index_files", || {
+        plan.source_files
+            .par_iter()
+            .map(|rel_path| index_planned_file(workspace_root, rel_path, blob_store))
+            .collect::<Result<Vec<_>>>()
+    })
 }
 
 fn align_default_branch(

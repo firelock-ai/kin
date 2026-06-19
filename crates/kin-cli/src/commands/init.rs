@@ -3,6 +3,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use kin_index::{FileClassification, FileClassifier};
+use kin_infer::resource::{Profile, ResourcePlan};
 use kin_model::ChangeStore;
 use kin_model::EntityStore;
 use kin_model::VerificationStore;
@@ -27,6 +28,63 @@ use tracing::{info, warn};
 /// found, init refuses to grind unless the caller explicitly opts in (`--force`)
 /// or raises the limit via `KIN_INIT_MAX_FILES`.
 const INIT_MAX_DISCOVERED_FILES: usize = 100_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResourcePoolConfig {
+    profile: Profile,
+    logical_cores: usize,
+    rayon_threads: usize,
+    reserve_logical_cores: usize,
+}
+
+fn init_resource_pool_config() -> Result<Option<ResourcePoolConfig>> {
+    let Some(raw_profile) = std::env::var("KIN_RESOURCE_PROFILE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let profile = super::resources::parse_profile(Some(&raw_profile))
+        .map_err(|error| anyhow!("invalid KIN_RESOURCE_PROFILE for kin init: {error}"))?;
+    if profile == Profile::Proof {
+        return Ok(None);
+    }
+
+    let plan = ResourcePlan::detect(profile);
+    Ok(Some(ResourcePoolConfig {
+        profile,
+        logical_cores: plan.host.logical_cores,
+        rayon_threads: plan.host.rayon_threads.max(1),
+        reserve_logical_cores: plan.host.reserve_logical_cores,
+    }))
+}
+
+fn run_with_init_resource_pool<T, F>(phase: &'static str, work: F) -> Result<T>
+where
+    T: Send,
+    F: FnOnce() -> Result<T> + Send,
+{
+    let Some(config) = init_resource_pool_config()? else {
+        return work();
+    };
+    tracing::info!(
+        target: "kin.resource",
+        phase,
+        profile = ?config.profile,
+        logical_cores = config.logical_cores,
+        rayon_threads = config.rayon_threads,
+        reserve_logical_cores = config.reserve_logical_cores,
+        "using resource-plan Rayon pool"
+    );
+
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(config.rayon_threads)
+        .thread_name(move |idx| format!("kin-init-{phase}-{idx}"))
+        .build()
+        .map_err(|error| anyhow!("failed to build kin init Rayon pool: {error}"))?
+        .install(work)
+}
 
 fn init_max_discovered_files() -> usize {
     std::env::var("KIN_INIT_MAX_FILES")
@@ -1611,156 +1669,171 @@ fn index_files_with_stable_entity_ids(
     let start = std::time::Instant::now();
     let parsed_count = AtomicUsize::new(0);
 
-    // Phase 1: parallel parse — read files, write blobs, parse with tree-sitter.
-    // Each thread gets its own AdapterRegistry (tree-sitter parsers are per-thread).
-    let mut parse_results: Vec<ParsedFileResult> = files
-        .par_iter()
-        .map(|file| {
-            let source = match fs::read(&file.abs_path) {
-                Ok(source) => source,
-                Err(_) => return ParsedFileResult::Skipped,
-            };
-
-            let _ = blob_store.write(&source);
-
-            let file_id = FilePathId::new(&file.rel_path);
-            let projection_markers =
-                kin_index::extract_projection_source_markers(&file.rel_path, &source);
-
-            let done = parsed_count.fetch_add(1, Ordering::Relaxed) + 1;
-            if done % 100 == 0 || done == total {
-                eprint!(
-                    "\r  [parse {}/{}] {}% | {:.1}s",
-                    done,
-                    total,
-                    (done * 100) / total,
-                    start.elapsed().as_secs_f64()
-                );
-            }
-
-            match &file.classification {
-                FileClassification::EntitySource => {
-                    let registry = kin_parser::AdapterRegistry::new();
-                    let ext = file
-                        .abs_path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("");
-                    let adapter = match registry.get_by_extension(ext) {
-                        Some(adapter) => adapter,
-                        None => return ParsedFileResult::Skipped,
-                    };
-
-                    let tree = match adapter.parse(&source) {
-                        Ok(tree) => tree,
+    let mut parse_results: Vec<ParsedFileResult> =
+        run_with_init_resource_pool("index_files", || {
+            // Phase 1: parallel parse — read files, write blobs, parse with tree-sitter.
+            // Each thread gets its own AdapterRegistry (tree-sitter parsers are per-thread).
+            Ok(files
+                .par_iter()
+                .map(|file| {
+                    let source = match fs::read(&file.abs_path) {
+                        Ok(source) => source,
                         Err(_) => return ParsedFileResult::Skipped,
                     };
 
-                    let parse_output = match adapter.extract(&tree, &source, &file_id) {
-                        Ok(output) => output,
-                        Err(_) => return ParsedFileResult::Skipped,
-                    };
+                    let _ = blob_store.write(&source);
 
-                    let extracted_relations = parse_output.relations;
-                    let file_imports = parse_output.imports;
-                    let extracted_tests = parse_output.tests;
-                    let parse_state = parse_output.parse_state;
-                    let language = adapter.language_id();
-                    let mut file_entities = Vec::new();
+                    let file_id = FilePathId::new(&file.rel_path);
+                    let projection_markers =
+                        kin_index::extract_projection_source_markers(&file.rel_path, &source);
 
-                    for extracted in parse_output.entities {
-                        let mut entity =
-                            extracted.into_entity_with_source(language, &file_id, Some(&source));
-                        entity.role = kin_index::classify_file_role(&file.rel_path);
-                        kin_parser::attach_file_context_metadata(
-                            std::slice::from_mut(&mut entity),
-                            &file_id,
-                            &file_imports,
+                    let done = parsed_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % 100 == 0 || done == total {
+                        eprint!(
+                            "\r  [parse {}/{}] {}% | {:.1}s",
+                            done,
+                            total,
+                            (done * 100) / total,
+                            start.elapsed().as_secs_f64()
                         );
-                        file_entities.push(entity);
                     }
-                    let discovered_tests =
-                        promote_discovered_tests(&file_id, &mut file_entities, extracted_tests);
 
-                    let layout = build_layout(
-                        &file_id,
-                        &file_entities,
-                        source.len(),
-                        &[],
-                        ParseCompleteness::from_parse_state(&parse_state),
-                    );
+                    match &file.classification {
+                        FileClassification::EntitySource => {
+                            let registry = kin_parser::AdapterRegistry::new();
+                            let ext = file
+                                .abs_path
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .unwrap_or("");
+                            let adapter = match registry.get_by_extension(ext) {
+                                Some(adapter) => adapter,
+                                None => return ParsedFileResult::Skipped,
+                            };
 
-                    ParsedFileResult::EntitySource {
-                        rel_path: file.rel_path.clone(),
-                        hash: file.hash,
-                        entities: file_entities,
-                        discovered_tests,
-                        relations: extracted_relations,
-                        imports: file_imports,
-                        projection_markers,
-                        layout,
-                    }
-                }
-                FileClassification::ShallowSyntax { language_hint } => {
-                    if let Some(shallow) =
-                        kin_parser::parse_shallow_file(&source, &file_id, language_hint)
-                    {
-                        ParsedFileResult::ShallowSyntax {
-                            rel_path: file.rel_path.clone(),
-                            hash: file.hash,
-                            shallow: ShallowTrackedFile {
-                                file_id,
-                                language_hint: language_hint.clone(),
-                                declaration_count: shallow.declarations.len(),
-                                import_count: shallow.imports.len(),
-                                syntax_hash: shallow.fingerprint.syntax_hash,
-                                signature_hash: shallow.fingerprint.signature_hash,
-                                declaration_names: summarize_shallow_items(
-                                    shallow.declarations.iter().map(|decl| decl.name.clone()),
-                                ),
-                                import_paths: summarize_shallow_items(
-                                    shallow.imports.iter().map(|import| import.raw_path.clone()),
-                                ),
-                            },
-                            projection_markers,
+                            let tree = match adapter.parse(&source) {
+                                Ok(tree) => tree,
+                                Err(_) => return ParsedFileResult::Skipped,
+                            };
+
+                            let parse_output = match adapter.extract(&tree, &source, &file_id) {
+                                Ok(output) => output,
+                                Err(_) => return ParsedFileResult::Skipped,
+                            };
+
+                            let extracted_relations = parse_output.relations;
+                            let file_imports = parse_output.imports;
+                            let extracted_tests = parse_output.tests;
+                            let parse_state = parse_output.parse_state;
+                            let language = adapter.language_id();
+                            let mut file_entities = Vec::new();
+
+                            for extracted in parse_output.entities {
+                                let mut entity = extracted.into_entity_with_source(
+                                    language,
+                                    &file_id,
+                                    Some(&source),
+                                );
+                                entity.role = kin_index::classify_file_role(&file.rel_path);
+                                kin_parser::attach_file_context_metadata(
+                                    std::slice::from_mut(&mut entity),
+                                    &file_id,
+                                    &file_imports,
+                                );
+                                file_entities.push(entity);
+                            }
+                            let discovered_tests = promote_discovered_tests(
+                                &file_id,
+                                &mut file_entities,
+                                extracted_tests,
+                            );
+
+                            let layout = build_layout(
+                                &file_id,
+                                &file_entities,
+                                source.len(),
+                                &[],
+                                ParseCompleteness::from_parse_state(&parse_state),
+                            );
+
+                            ParsedFileResult::EntitySource {
+                                rel_path: file.rel_path.clone(),
+                                hash: file.hash,
+                                entities: file_entities,
+                                discovered_tests,
+                                relations: extracted_relations,
+                                imports: file_imports,
+                                projection_markers,
+                                layout,
+                            }
                         }
-                    } else {
-                        ParsedFileResult::Skipped
+                        FileClassification::ShallowSyntax { language_hint } => {
+                            if let Some(shallow) =
+                                kin_parser::parse_shallow_file(&source, &file_id, language_hint)
+                            {
+                                ParsedFileResult::ShallowSyntax {
+                                    rel_path: file.rel_path.clone(),
+                                    hash: file.hash,
+                                    shallow: ShallowTrackedFile {
+                                        file_id,
+                                        language_hint: language_hint.clone(),
+                                        declaration_count: shallow.declarations.len(),
+                                        import_count: shallow.imports.len(),
+                                        syntax_hash: shallow.fingerprint.syntax_hash,
+                                        signature_hash: shallow.fingerprint.signature_hash,
+                                        declaration_names: summarize_shallow_items(
+                                            shallow
+                                                .declarations
+                                                .iter()
+                                                .map(|decl| decl.name.clone()),
+                                        ),
+                                        import_paths: summarize_shallow_items(
+                                            shallow
+                                                .imports
+                                                .iter()
+                                                .map(|import| import.raw_path.clone()),
+                                        ),
+                                    },
+                                    projection_markers,
+                                }
+                            } else {
+                                ParsedFileResult::Skipped
+                            }
+                        }
+                        FileClassification::StructuredArtifact(kind) => {
+                            let artifact = kin_index::extract_artifact(*kind, &source, &file_id)
+                                .unwrap_or(StructuredArtifact {
+                                    file_id,
+                                    kind: *kind,
+                                    content_hash: Hash256::from_bytes(file.hash),
+                                    text_preview: preview_text(&source),
+                                });
+                            ParsedFileResult::StructuredArtifact {
+                                rel_path: file.rel_path.clone(),
+                                hash: file.hash,
+                                artifact,
+                                projection_markers,
+                            }
+                        }
+                        FileClassification::OpaqueArtifact { mime_hint } => {
+                            let text_preview =
+                                preview_text_if_likely_text(&source, mime_hint.as_deref());
+                            ParsedFileResult::OpaqueArtifact {
+                                rel_path: file.rel_path.clone(),
+                                hash: file.hash,
+                                artifact: OpaqueArtifact {
+                                    file_id,
+                                    content_hash: Hash256::from_bytes(file.hash),
+                                    mime_type: mime_hint.clone(),
+                                    text_preview,
+                                },
+                                projection_markers,
+                            }
+                        }
                     }
-                }
-                FileClassification::StructuredArtifact(kind) => {
-                    let artifact = kin_index::extract_artifact(*kind, &source, &file_id).unwrap_or(
-                        StructuredArtifact {
-                            file_id,
-                            kind: *kind,
-                            content_hash: Hash256::from_bytes(file.hash),
-                            text_preview: preview_text(&source),
-                        },
-                    );
-                    ParsedFileResult::StructuredArtifact {
-                        rel_path: file.rel_path.clone(),
-                        hash: file.hash,
-                        artifact,
-                        projection_markers,
-                    }
-                }
-                FileClassification::OpaqueArtifact { mime_hint } => {
-                    let text_preview = preview_text_if_likely_text(&source, mime_hint.as_deref());
-                    ParsedFileResult::OpaqueArtifact {
-                        rel_path: file.rel_path.clone(),
-                        hash: file.hash,
-                        artifact: OpaqueArtifact {
-                            file_id,
-                            content_hash: Hash256::from_bytes(file.hash),
-                            mime_type: mime_hint.clone(),
-                            text_preview,
-                        },
-                        projection_markers,
-                    }
-                }
-            }
-        })
-        .collect();
+                })
+                .collect())
+        })?;
 
     if !prior_entities_by_file.is_empty() {
         for result in &mut parse_results {
@@ -2115,23 +2188,25 @@ fn collect_indexable_files(
     )
     .entered();
 
-    let files: Vec<IndexableFile> = all_files
-        .par_iter()
-        .filter_map(|file_path| {
-            let source = fs::read(file_path).ok()?;
-            let classification = FileClassifier::classify(file_path);
-            Some(IndexableFile {
-                abs_path: file_path.clone(),
-                rel_path: file_path
-                    .strip_prefix(source_root)
-                    .unwrap_or(file_path)
-                    .to_string_lossy()
-                    .to_string(),
-                hash: kin_blobs::digest_bytes(&source),
-                classification,
+    let files = run_with_init_resource_pool("collect_indexable_files", || {
+        Ok(all_files
+            .par_iter()
+            .filter_map(|file_path| {
+                let source = fs::read(file_path).ok()?;
+                let classification = FileClassifier::classify(file_path);
+                Some(IndexableFile {
+                    abs_path: file_path.clone(),
+                    rel_path: file_path
+                        .strip_prefix(source_root)
+                        .unwrap_or(file_path)
+                        .to_string_lossy()
+                        .to_string(),
+                    hash: kin_blobs::digest_bytes(&source),
+                    classification,
+                })
             })
-        })
-        .collect();
+            .collect())
+    })?;
 
     Ok(files)
 }
@@ -3189,7 +3264,17 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 pub(crate) fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     collect_source_files_recursive(root, root, &mut files)?;
+    files.sort_by(|left, right| {
+        source_file_sort_key(root, left).cmp(&source_file_sort_key(root, right))
+    });
     Ok(files)
+}
+
+fn source_file_sort_key(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/")
 }
 
 fn collect_source_files_recursive(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -3339,6 +3424,66 @@ mod tests {
         let full = git_history_import_options("full").unwrap();
         assert_eq!(full.max_commits, 0);
         assert!(!full.shallow);
+    }
+
+    fn with_env_var<T>(name: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let prior = std::env::var_os(name);
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+        let result = f();
+        match prior {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+        result
+    }
+
+    #[test]
+    #[serial]
+    fn init_resource_pool_is_opt_in_and_proof_safe() {
+        with_env_var("KIN_RESOURCE_PROFILE", None, || {
+            assert!(init_resource_pool_config().unwrap().is_none());
+        });
+
+        with_env_var("KIN_RESOURCE_PROFILE", Some("proof"), || {
+            assert!(init_resource_pool_config().unwrap().is_none());
+        });
+
+        with_env_var("KIN_RESOURCE_PROFILE", Some("throughput"), || {
+            let config = init_resource_pool_config().unwrap().unwrap();
+            assert_eq!(config.profile, Profile::Throughput);
+            assert!(config.rayon_threads > 0);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn init_resource_pool_rejects_unknown_profile() {
+        with_env_var("KIN_RESOURCE_PROFILE", Some("turbo"), || {
+            let error = init_resource_pool_config().unwrap_err().to_string();
+            assert!(error.contains("invalid KIN_RESOURCE_PROFILE"));
+        });
+    }
+
+    #[test]
+    fn collect_source_files_returns_sorted_repo_relative_paths() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let root = repo_dir.path();
+        fs::create_dir_all(root.join("z")).unwrap();
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::write(root.join("z/mod.rs"), "pub fn zed() {}\n").unwrap();
+        fs::write(root.join("a/mod.rs"), "pub fn alpha() {}\n").unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let rels = collect_source_files(root)
+            .unwrap()
+            .into_iter()
+            .map(|path| source_file_sort_key(root, &path))
+            .collect::<Vec<_>>();
+
+        assert_eq!(rels, vec!["a/mod.rs", "main.rs", "z/mod.rs"]);
     }
 
     fn single_added_function_id(deltas: &[EntityDelta]) -> EntityId {

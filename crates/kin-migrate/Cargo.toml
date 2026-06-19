@@ -16,6 +16,7 @@ kin-core = { workspace = true }
 kin-git = { workspace = true }
 kin-parser = { workspace = true }
 kin-index = { workspace = true }
+kin-infer = { version = ">=0.2.1", registry = "kin", default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
@@ -23,6 +24,7 @@ chrono = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
