@@ -20,7 +20,8 @@ pub(crate) struct BenchMeta {
     vector_index_metadata_version: Option<u32>,
     feature_flags: Vec<&'static str>,
     embeddings: EmbeddingMeta,
-    kin_binary_sha256: String,
+    kin_commit: &'static str,
+    kin_dirty: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -54,7 +55,8 @@ pub(crate) struct PreparedManifest {
     embeddings_enabled: bool,
     vector_enabled: bool,
     metal_enabled: bool,
-    kin_binary_sha256: String,
+    kin_commit: &'static str,
+    kin_dirty: bool,
     kin_version: &'static str,
 }
 
@@ -76,7 +78,8 @@ pub(crate) struct RepoBaseManifest {
     embeddings_enabled: bool,
     vector_enabled: bool,
     metal_enabled: bool,
-    kin_binary_sha256: String,
+    kin_commit: &'static str,
+    kin_dirty: bool,
     kin_version: &'static str,
     source_git_head: String,
     source_git_tree: String,
@@ -128,7 +131,8 @@ pub async fn run(json: bool, prepared_state: bool) -> Result<()> {
             println!("vector_index_metadata_version: disabled");
         }
         println!("feature_flags: {}", meta.feature_flags.join(","));
-        println!("kin_binary_sha256: {}", meta.kin_binary_sha256);
+        println!("kin_commit: {}", meta.kin_commit);
+        println!("kin_dirty: {}", meta.kin_dirty);
         if let Some(model_id) = meta.embeddings.model_id.as_deref() {
             println!("embedding_model_id: {}", model_id);
         }
@@ -144,6 +148,7 @@ pub async fn run(json: bool, prepared_state: bool) -> Result<()> {
 }
 
 pub(crate) fn build_meta() -> Result<BenchMeta> {
+    let build = kin_buildinfo::get();
     Ok(BenchMeta {
         schema: "kin.bench-meta.v1",
         kin_version: env!("CARGO_PKG_VERSION"),
@@ -155,14 +160,9 @@ pub(crate) fn build_meta() -> Result<BenchMeta> {
         vector_index_metadata_version: vector_index_metadata_version(),
         feature_flags: feature_flags(),
         embeddings: embedding_meta(),
-        kin_binary_sha256: current_binary_sha256()?,
+        kin_commit: build.sha,
+        kin_dirty: build.dirty,
     })
-}
-
-fn current_binary_sha256() -> Result<String> {
-    let exe = std::env::current_exe()?;
-    let bytes = std::fs::read(exe)?;
-    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 /// Whether the Metal embedding backend is *actually* compiled into this binary.
@@ -258,10 +258,8 @@ pub(crate) fn build_prepared_manifests(
         "embeddings_enabled": meta.embeddings.embeddings_enabled,
         "vector_enabled": meta.embeddings.vector_enabled,
         "metal_enabled": meta.embeddings.metal_enabled,
-        // Prepared graph truth is parser/linker/runtime output, not only a
-        // storage-format artifact. Bind cache entries to the exact Kin binary
-        // so parser or linker changes cannot silently reuse stale graph state.
-        "kin_binary_sha256": &meta.kin_binary_sha256,
+        "kin_commit": meta.kin_commit,
+        "kin_dirty": meta.kin_dirty,
     }));
     let repo_base_key = hash_json(&serde_json::json!({
         "repo_identity": &repo_identity,
@@ -278,7 +276,8 @@ pub(crate) fn build_prepared_manifests(
         "embeddings_enabled": meta.embeddings.embeddings_enabled,
         "vector_enabled": meta.embeddings.vector_enabled,
         "metal_enabled": meta.embeddings.metal_enabled,
-        "kin_binary_sha256": &meta.kin_binary_sha256,
+        "kin_commit": meta.kin_commit,
+        "kin_dirty": meta.kin_dirty,
     }));
 
     let prepared = PreparedManifest {
@@ -300,7 +299,8 @@ pub(crate) fn build_prepared_manifests(
         embeddings_enabled: meta.embeddings.embeddings_enabled,
         vector_enabled: meta.embeddings.vector_enabled,
         metal_enabled: meta.embeddings.metal_enabled,
-        kin_binary_sha256: meta.kin_binary_sha256.clone(),
+        kin_commit: meta.kin_commit,
+        kin_dirty: meta.kin_dirty,
         kin_version: meta.kin_version,
         repo_base_key: repo_base_key.clone(),
     };
@@ -321,7 +321,8 @@ pub(crate) fn build_prepared_manifests(
         embeddings_enabled: meta.embeddings.embeddings_enabled,
         vector_enabled: meta.embeddings.vector_enabled,
         metal_enabled: meta.embeddings.metal_enabled,
-        kin_binary_sha256: meta.kin_binary_sha256.clone(),
+        kin_commit: meta.kin_commit,
+        kin_dirty: meta.kin_dirty,
         kin_version: meta.kin_version,
         source_git_head: prepared.git_head.clone(),
         source_git_tree: prepared.git_tree.clone(),
@@ -476,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_manifest_cache_keys_track_kin_binary_hash() {
+    fn prepared_manifest_cache_keys_track_kin_commit_and_dirty() {
         let repo = tempdir().unwrap();
         fs::write(repo.path().join("README.md"), "hello\n").unwrap();
         Command::new("git")
@@ -507,17 +508,40 @@ mod tests {
 
         let meta = build_meta().unwrap();
         let (prepared_a, repo_base_a) = build_prepared_manifests(&meta, repo.path()).unwrap();
-        let mut meta_b = meta.clone();
-        meta_b.kin_binary_sha256 = format!("{}-changed", meta.kin_binary_sha256);
-        let (prepared_b, repo_base_b) = build_prepared_manifests(&meta_b, repo.path()).unwrap();
 
+        let (prepared_a2, repo_base_a2) = build_prepared_manifests(&meta, repo.path()).unwrap();
+        assert_eq!(
+            prepared_a.cache_key, prepared_a2.cache_key,
+            "prepared-state cache key must be STABLE across rebuilds of the same commit"
+        );
+        assert_eq!(
+            repo_base_a.repo_base_key, repo_base_a2.repo_base_key,
+            "warm init cache key must be STABLE across rebuilds of the same commit"
+        );
+
+        let mut meta_commit = meta.clone();
+        meta_commit.kin_commit = "ffffffffffff";
+        let (prepared_b, repo_base_b) =
+            build_prepared_manifests(&meta_commit, repo.path()).unwrap();
         assert_ne!(
             prepared_a.cache_key, prepared_b.cache_key,
-            "prepared-state cache must miss when the Kin binary changes"
+            "prepared-state cache must miss when the Kin commit changes"
         );
         assert_ne!(
             repo_base_a.repo_base_key, repo_base_b.repo_base_key,
-            "warm init cache must miss when the Kin binary changes"
+            "warm init cache must miss when the Kin commit changes"
+        );
+
+        let mut meta_dirty = meta.clone();
+        meta_dirty.kin_dirty = !meta.kin_dirty;
+        let (prepared_c, repo_base_c) = build_prepared_manifests(&meta_dirty, repo.path()).unwrap();
+        assert_ne!(
+            prepared_a.cache_key, prepared_c.cache_key,
+            "prepared-state cache must miss when the dirty flag changes"
+        );
+        assert_ne!(
+            repo_base_a.repo_base_key, repo_base_c.repo_base_key,
+            "warm init cache must miss when the dirty flag changes"
         );
     }
 }
