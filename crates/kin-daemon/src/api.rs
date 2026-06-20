@@ -1871,6 +1871,7 @@ fn metal_profile_runtime() -> Option<kin_cli::commands::resources::MetalProfileR
     })
 }
 
+#[cfg(any(test, all(feature = "metal", target_os = "macos")))]
 fn nanos_per_forward(total_nanos: u64, forward_calls: u64) -> Option<u64> {
     (forward_calls > 0).then(|| total_nanos / forward_calls)
 }
