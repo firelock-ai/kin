@@ -108,6 +108,19 @@ impl VectorIndex {
             .map_err(|e| KinDbError::IndexError(e.to_string()))
     }
 
+    /// Add or update the embeddings for a batch of retrieval keys.
+    pub fn upsert_retrievable_batch(
+        &self,
+        items: Vec<(RetrievalKey, Vec<f32>)>,
+    ) -> Result<(), KinDbError> {
+        let _span =
+            tracing::info_span!("kindb.vector_index.upsert_batch", batch_size = items.len())
+                .entered();
+        self.inner
+            .upsert_batch(items)
+            .map_err(|e| KinDbError::IndexError(e.to_string()))
+    }
+
     /// Remove the embedding for an entity.
     pub fn remove(&self, entity_id: &EntityId) -> Result<(), KinDbError> {
         let _span = tracing::info_span!("kindb.vector_index.remove").entered();

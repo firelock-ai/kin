@@ -1030,3 +1030,53 @@ mod tests {
         assert!(!results.is_empty());
     }
 }
+
+impl TextIndex {
+    pub fn upsert_retrievable_batch<'a, I>(&self, batch: I) -> Result<(), KinDbError>
+    where
+        I: IntoIterator<Item = (RetrievalKey, &'a [(String, f32)])> + 'a,
+    {
+        let batch_vec: Vec<_> = batch
+            .into_iter()
+            .map(|(key, fields)| {
+                let field_refs: Vec<(&str, f32)> = fields
+                    .iter()
+                    .map(|(text, weight)| (text.as_str(), *weight))
+                    .collect();
+                (key, field_refs)
+            })
+            .collect();
+
+        self.inner
+            .upsert_batch(&batch_vec)
+            .map_err(|e| KinDbError::IndexError(e.to_string()))
+    }
+}
+
+impl TextIndex {
+    pub fn upsert_with_extra_fields_batch<'a, I>(&self, batch: I) -> Result<(), KinDbError>
+    where
+        I: IntoIterator<Item = (&'a Entity, &'a [(String, f32)])> + 'a,
+    {
+        let owned_fields: Vec<(RetrievalKey, Vec<(String, f32)>)> = batch
+            .into_iter()
+            .map(|(entity, extra_fields)| {
+                let fields = if extra_fields.is_empty() {
+                    entity_fields(entity)
+                } else {
+                    entity_fields_with_extra(entity, extra_fields)
+                };
+                (RetrievalKey::Entity(entity.id), fields)
+            })
+            .collect();
+
+        let refs_batch: Vec<(RetrievalKey, Vec<(&str, f32)>)> = owned_fields
+            .iter()
+            .map(|(key, fields)| (*key, fields.iter().map(|(s, w)| (s.as_str(), *w)).collect()))
+            .collect();
+
+        self.inner
+            .upsert_batch(&refs_batch)
+            .map_err(|e| KinDbError::IndexError(e.to_string()))
+    }
+}

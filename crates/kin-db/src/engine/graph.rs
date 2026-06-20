@@ -2213,9 +2213,10 @@ impl InMemoryGraph {
                 .collect()
         };
 
-        for (entity, extra_fields) in docs {
-            let _ = ti.upsert_with_extra_fields(&entity, &extra_fields);
-        }
+        let batch: Vec<(&Entity, &[(String, f32)])> =
+            docs.iter().map(|(e, f)| (e, f.as_slice())).collect();
+        let _ = ti.upsert_with_extra_fields_batch(batch);
+
         if !entity_ids.is_empty() {
             self.text_dirty.store(true, Ordering::Release);
         }
@@ -3650,10 +3651,13 @@ impl InMemoryGraph {
                 .map(|(key, recency)| (embed_sort_key_for(&ent, key, recency), key, recency))
                 .collect()
         };
-        keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-
         let take = batch_size.min(keyed.len());
+        if take < keyed.len() {
+            let (_, _, _) = keyed.select_nth_unstable_by(take, |a, b| a.0.cmp(&b.0));
+        }
+
         let leftover = keyed.split_off(take);
+        keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         if !leftover.is_empty() {
             let mut queue = self.embedding_queue.lock();
             for (_, key, recency) in leftover {
@@ -3738,9 +3742,6 @@ impl InMemoryGraph {
         if initial_pending > 0 {
             eprintln!();
         }
-        // Drain complete — reconcile the index to graph truth so superseded
-        // revision generations do not survive the pass.
-        self.prune_orphaned_vectors();
         Ok(total)
     }
 
@@ -3925,25 +3926,26 @@ impl InMemoryGraph {
                     return Err(err);
                 }
             };
-            for (item_idx, ((key, _), vec)) in chunk.iter().zip(vectors.iter()).enumerate() {
-                if let Err(err) = vi.upsert_retrievable(*key, vec) {
-                    let mut remaining_keys: Vec<RetrievalKey> = chunk[item_idx..]
-                        .iter()
-                        .map(|(rest_key, _)| *rest_key)
-                        .collect();
+            let batch_items: Vec<(RetrievalKey, Vec<f32>)> = chunk
+                .iter()
+                .zip(vectors.into_iter())
+                .map(|((key, _), vec)| (*key, vec))
+                .collect();
 
-                    let next_chunk_start =
-                        ((chunk_idx + 1) * embed_batch_size).min(entity_data.len());
-                    remaining_keys.extend(
-                        entity_data[next_chunk_start..]
-                            .iter()
-                            .map(|(rest_key, _)| *rest_key),
-                    );
-                    requeue(&remaining_keys);
-                    return Err(err);
-                }
-                count += 1;
+            if let Err(err) = vi.upsert_retrievable_batch(batch_items) {
+                let mut remaining_keys: Vec<RetrievalKey> =
+                    chunk.iter().map(|(rest_key, _)| *rest_key).collect();
+
+                let next_chunk_start = ((chunk_idx + 1) * embed_batch_size).min(entity_data.len());
+                remaining_keys.extend(
+                    entity_data[next_chunk_start..]
+                        .iter()
+                        .map(|(rest_key, _)| *rest_key),
+                );
+                requeue(&remaining_keys);
+                return Err(err);
             }
+            count += chunk.len();
         }
 
         // Live retire: when this batch drains the entity queue, a re-embed that
