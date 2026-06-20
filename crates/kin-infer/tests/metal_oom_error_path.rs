@@ -51,7 +51,7 @@ use metal::Device;
 fn max_buffer_length() -> u64 {
     Device::system_default()
         .expect("a system-default Metal device")
-        .max_buffer_length() as u64
+        .max_buffer_length()
 }
 
 /// A count of f32 elements whose byte footprint strictly exceeds the device's

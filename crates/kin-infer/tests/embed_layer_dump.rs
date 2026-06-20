@@ -74,7 +74,7 @@ fn layer_divergence_trace() {
 
     eprintln!("===== SINGLE forward(entity0 len32 salt0) =====");
     let single = model
-        .forward(&[ent0.0.clone()], &[ent0.1.clone()])
+        .forward(std::slice::from_ref(&ent0.0), std::slice::from_ref(&ent0.1))
         .expect("single");
     eprintln!(
         "single_emb_first3=[{:.6},{:.6},{:.6}]",

@@ -201,10 +201,12 @@ pub struct EmbeddingPlan {
 ///
 /// All-off (the [`Default`]) is the proven fp32 single-buffer 32x32-MMA path with
 /// the host-side attention reshape — bit-identical across runs and the only shape
-/// the proof profile ever uses. The throughput profile turns the fast,
-/// parity-cleared kernels on. kin-infer's Metal backend resolves these into its
-/// per-process kernel gates; a `KIN_INFER_*` env override still wins per lever so
-/// each can be A/B-measured in isolation.
+/// the proof profile ever uses. Profiles currently keep the alternate,
+/// parity-cleared kernels off until they beat the baseline. kin-infer's Metal
+/// backend resolves these into its per-process kernel gates; a `KIN_INFER_*` env
+/// override still wins per lever so each can be A/B-measured in isolation.
+/// `flash_attention` is schema-only for a future fused attention path and must
+/// remain default-off until runtime support exists and is parity-cleared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct GpuKernelPlan {
     /// fp16-operand MMA GEMM (`KIN_INFER_GEMM_FP16`).
@@ -219,6 +221,9 @@ pub struct GpuKernelPlan {
     /// On-device head-major attention reshape (`KIN_INFER_RESHAPE_GPU`).
     #[serde(default)]
     pub reshape_gpu: bool,
+    /// Future fused flash-attention kernel family. Schema support only.
+    #[serde(default)]
+    pub flash_attention: bool,
 }
 
 impl GpuKernelPlan {
@@ -751,6 +756,45 @@ mod tests {
     }
 
     #[test]
+    fn gpu_kernel_plan_defaults_future_flash_attention_off() {
+        let plan = GpuKernelPlan::default();
+
+        assert!(!plan.gemm_fp16);
+        assert!(!plan.steel);
+        assert!(!plan.mma_wide);
+        assert!(!plan.reshape_gpu);
+        assert!(!plan.flash_attention);
+    }
+
+    #[test]
+    fn gpu_kernel_plan_deserializes_missing_flash_attention_as_off() {
+        let plan: GpuKernelPlan = serde_json::from_value(serde_json::json!({
+            "gemm_fp16": false,
+            "steel": false,
+            "mma_wide": false,
+            "reshape_gpu": false
+        }))
+        .unwrap();
+
+        assert_eq!(plan, GpuKernelPlan::default());
+        assert!(!plan.flash_attention);
+    }
+
+    #[test]
+    fn gpu_kernel_plan_accepts_explicit_flash_attention_schema_value() {
+        let plan: GpuKernelPlan = serde_json::from_value(serde_json::json!({
+            "flash_attention": true
+        }))
+        .unwrap();
+
+        assert!(plan.flash_attention);
+        assert!(!plan.gemm_fp16);
+        assert!(!plan.steel);
+        assert!(!plan.mma_wide);
+        assert!(!plan.reshape_gpu);
+    }
+
+    #[test]
     fn env_flag_override_parses_both_directions() {
         assert_eq!(env_flag_override("KIN_INFER_NONEXISTENT_FLAG_XYZ"), None);
     }
@@ -866,10 +910,29 @@ mod tests {
         let value: serde_json::Value = serde_json::to_value(&plan).unwrap();
         assert_eq!(value["schema_version"], "kin.resource_plan.v1");
         assert_eq!(value["profile"], "proof");
+        assert_eq!(value["embedding"]["gpu_kernels"]["flash_attention"], false);
 
         let json = serde_json::to_string(&plan).unwrap();
         let back: ResourcePlan = serde_json::from_str(&json).unwrap();
         assert_eq!(plan, back);
+    }
+
+    #[test]
+    fn resource_plan_deserializes_missing_flash_attention_as_off() {
+        let host = host_with(18);
+        let accel = metal_accel();
+        let mem = mem_with(Some(128 * GIB));
+        let plan = ResourcePlan::for_profile(Profile::Proof, &host, &accel, &mem);
+        let mut value = serde_json::to_value(&plan).unwrap();
+
+        value["embedding"]["gpu_kernels"]
+            .as_object_mut()
+            .unwrap()
+            .remove("flash_attention");
+
+        let back: ResourcePlan = serde_json::from_value(value).unwrap();
+        assert!(!back.embedding.gpu_kernels.flash_attention);
+        assert_eq!(back.embedding.gpu_kernels, GpuKernelPlan::default());
     }
 
     #[test]

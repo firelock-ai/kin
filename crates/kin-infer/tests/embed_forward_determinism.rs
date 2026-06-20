@@ -67,7 +67,7 @@ fn forward_determinism() {
 
     let (ids, m) = synth(64, 131);
     let ref0 = model
-        .forward(&[ids.clone()], &[m.clone()])
+        .forward(std::slice::from_ref(&ids), std::slice::from_ref(&m))
         .unwrap()
         .pop()
         .unwrap();
@@ -76,7 +76,7 @@ fn forward_determinism() {
     const REPEATS: usize = 40;
     for k in 1..=REPEATS {
         let e = model
-            .forward(&[ids.clone()], &[m.clone()])
+            .forward(std::slice::from_ref(&ids), std::slice::from_ref(&m))
             .unwrap()
             .pop()
             .unwrap();

@@ -115,7 +115,9 @@ fn forward_batched_is_call_history_independent() {
     // Secondary: batched vs single (batch=1 `forward`) ground truth for G.
     let mut min_cos_single = 1.0f64;
     for (i, e) in g.iter().enumerate() {
-        let single = model.forward(&[e.0.clone()], &[e.1.clone()]).unwrap();
+        let single = model
+            .forward(std::slice::from_ref(&e.0), std::slice::from_ref(&e.1))
+            .unwrap();
         min_cos_single = min_cos_single.min(cos(&ref_g[i], &single[0]));
     }
     eprintln!(

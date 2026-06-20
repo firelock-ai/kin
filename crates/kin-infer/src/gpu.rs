@@ -1416,6 +1416,195 @@ mod tests {
         }
     }
 
+    fn patterned_attention_input(len: usize, mul: usize, modulo: usize, scale: f32) -> Vec<f32> {
+        let midpoint = (modulo as f32 - 1.0) * 0.5;
+        (0..len)
+            .map(|i| (((i * mul + 3) % modulo) as f32 - midpoint) * scale)
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn online_softmax_attention_reference(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        num_groups: usize,
+        heads_per_group: usize,
+        seq_len: usize,
+        head_dim: usize,
+        scale: f32,
+        alibi_slopes: &[f32],
+        masks: &[u32],
+    ) -> Vec<f32> {
+        let total_heads = num_groups * heads_per_group;
+        let elems = total_heads * seq_len * head_dim;
+        assert_eq!(q.len(), elems);
+        assert_eq!(k.len(), elems);
+        assert_eq!(v.len(), elems);
+        assert_eq!(masks.len(), num_groups * seq_len);
+        assert!(alibi_slopes.is_empty() || alibi_slopes.len() == heads_per_group);
+
+        let mut out = vec![0.0f32; elems];
+        let has_alibi = !alibi_slopes.is_empty();
+
+        for group in 0..num_groups {
+            let mask = &masks[group * seq_len..(group + 1) * seq_len];
+            for head in 0..heads_per_group {
+                let head_idx = group * heads_per_group + head;
+                let head_base = head_idx * seq_len * head_dim;
+                let slope = alibi_slopes.get(head).copied().unwrap_or(0.0);
+
+                for query_pos in 0..seq_len {
+                    let q_off = head_base + query_pos * head_dim;
+                    let out_off = q_off;
+                    let mut row_max = f32::NEG_INFINITY;
+                    let mut denom = 0.0f32;
+                    let mut acc = vec![0.0f32; head_dim];
+
+                    for (key_pos, &keep) in mask.iter().enumerate().take(seq_len) {
+                        if keep == 0 {
+                            continue;
+                        }
+
+                        let k_off = head_base + key_pos * head_dim;
+                        let v_off = k_off;
+                        let mut score = 0.0f32;
+                        for dim in 0..head_dim {
+                            score += q[q_off + dim] * k[k_off + dim];
+                        }
+                        score *= scale;
+                        if has_alibi {
+                            score += slope * query_pos.abs_diff(key_pos) as f32;
+                        }
+
+                        let next_max = row_max.max(score);
+                        let old_weight = (row_max - next_max).exp();
+                        let new_weight = (score - next_max).exp();
+                        for dim in 0..head_dim {
+                            acc[dim] = acc[dim] * old_weight + new_weight * v[v_off + dim];
+                        }
+                        denom = denom * old_weight + new_weight;
+                        row_max = next_max;
+                    }
+
+                    for dim in 0..head_dim {
+                        out[out_off + dim] = acc[dim] / denom;
+                    }
+                }
+            }
+        }
+
+        out
+    }
+
+    fn assert_attention_close(got: &[f32], want: &[f32], tolerance: f32) {
+        assert_eq!(got.len(), want.len());
+        for (idx, (&got, &want)) in got.iter().zip(want.iter()).enumerate() {
+            let delta = (got - want).abs();
+            assert!(
+                delta <= tolerance,
+                "attention mismatch at {idx}: got {got}, want {want}, delta {delta}, tolerance {tolerance}"
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_fused_attention_batched_matches_online_softmax_oracle_grouped_odd_shapes() {
+        let cpu = CpuCompute;
+        let num_groups = 3;
+        let heads_per_group = 3;
+        let seq_len = 7;
+        let head_dim = 5;
+        let total_heads = num_groups * heads_per_group;
+        let elems = total_heads * seq_len * head_dim;
+        let q = patterned_attention_input(elems, 7, 41, 0.03125);
+        let k = patterned_attention_input(elems, 11, 43, 0.02734375);
+        let v = patterned_attention_input(elems, 13, 47, 0.01953125);
+        let masks = vec![
+            1, 1, 0, 1, 1, 0, 1, // group 0
+            1, 0, 1, 1, 0, 1, 1, // group 1
+            0, 1, 1, 0, 1, 1, 1, // group 2
+        ];
+        let alibi = vec![-0.015625, 0.0, 0.0234375];
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let got = cpu
+            .fused_attention_batched(
+                &q,
+                &k,
+                &v,
+                num_groups,
+                heads_per_group,
+                seq_len,
+                head_dim,
+                scale,
+                &alibi,
+                &masks,
+            )
+            .unwrap();
+        let want = online_softmax_attention_reference(
+            &q,
+            &k,
+            &v,
+            num_groups,
+            heads_per_group,
+            seq_len,
+            head_dim,
+            scale,
+            &alibi,
+            &masks,
+        );
+
+        assert_attention_close(&got, &want, 2e-4);
+    }
+
+    #[test]
+    fn cpu_fused_attention_batched_matches_online_softmax_oracle_bgeish_seq() {
+        let cpu = CpuCompute;
+        let num_groups = 1;
+        let heads_per_group = 1;
+        let seq_len = 384;
+        let head_dim = 16;
+        let elems = num_groups * heads_per_group * seq_len * head_dim;
+        let q = patterned_attention_input(elems, 5, 53, 0.015625);
+        let k = patterned_attention_input(elems, 17, 59, 0.013671875);
+        let v = patterned_attention_input(elems, 19, 61, 0.01171875);
+        let masks: Vec<u32> = (0..seq_len)
+            .map(|pos| u32::from(pos % 11 != 3 && pos % 17 != 5))
+            .collect();
+        let alibi = vec![-0.001953125];
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let got = cpu
+            .fused_attention_batched(
+                &q,
+                &k,
+                &v,
+                num_groups,
+                heads_per_group,
+                seq_len,
+                head_dim,
+                scale,
+                &alibi,
+                &masks,
+            )
+            .unwrap();
+        let want = online_softmax_attention_reference(
+            &q,
+            &k,
+            &v,
+            num_groups,
+            heads_per_group,
+            seq_len,
+            head_dim,
+            scale,
+            &alibi,
+            &masks,
+        );
+
+        assert_attention_close(&got, &want, 2e-4);
+    }
+
     #[test]
     fn test_cpu_softmax() {
         let cpu = CpuCompute;

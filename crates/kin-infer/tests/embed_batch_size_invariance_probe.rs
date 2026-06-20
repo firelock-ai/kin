@@ -113,7 +113,7 @@ fn run_for_model(model_dir: &str) {
     const TLEN: usize = 12;
     let (t, tm) = synth(TLEN, 7);
     let baseline = model
-        .forward(&[t.clone()], &[tm.clone()])
+        .forward(std::slice::from_ref(&t), std::slice::from_ref(&tm))
         .unwrap()
         .pop()
         .unwrap();

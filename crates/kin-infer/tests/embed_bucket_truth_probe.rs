@@ -99,7 +99,7 @@ fn bucketing_vs_ground_truth() {
         .iter()
         .map(|e| {
             model
-                .forward(&[e.0.clone()], &[e.1.clone()])
+                .forward(std::slice::from_ref(&e.0), std::slice::from_ref(&e.1))
                 .unwrap()
                 .pop()
                 .unwrap()
@@ -159,8 +159,8 @@ fn bucketing_vs_ground_truth() {
             n_corrupt += 1;
             let mut best_j = i;
             let mut best = self_cos;
-            for j in 0..single.len() {
-                let c = cos(&binned[i], &single[j]);
+            for (j, single_emb) in single.iter().enumerate() {
+                let c = cos(&binned[i], single_emb);
                 if c > best {
                     best = c;
                     best_j = j;

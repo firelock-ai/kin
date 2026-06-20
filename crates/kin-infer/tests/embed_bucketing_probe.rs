@@ -32,6 +32,8 @@ use std::time::Instant;
 
 use kin_infer::{BertConfig, BertModel};
 
+type Entity = (Vec<u32>, Vec<u32>);
+
 const MODEL_DIR: &str = "/tmp/swerank";
 
 fn synth_sequence(len: usize, salt: u32) -> (Vec<u32>, Vec<u32>) {
@@ -62,16 +64,16 @@ fn time_mixed(model: &BertModel, corpus: &[(Vec<u32>, Vec<u32>)]) -> f64 {
 /// `bin_of` lets us model exact-length grouping (bin = len) or coarse bins.
 fn time_bucketed(
     model: &BertModel,
-    corpus: &[(Vec<u32>, Vec<u32>)],
+    corpus: &[Entity],
     bin_of: impl Fn(usize) -> usize,
 ) -> (f64, usize) {
-    let mut groups: BTreeMap<usize, Vec<&(Vec<u32>, Vec<u32>)>> = BTreeMap::new();
+    let mut groups: BTreeMap<usize, Vec<&Entity>> = BTreeMap::new();
     for e in corpus {
         groups.entry(bin_of(e.0.len())).or_default().push(e);
     }
     let n_groups = groups.len();
     let mut total = 0.0f64;
-    for (_, members) in &groups {
+    for members in groups.values() {
         let ids: Vec<Vec<u32>> = members.iter().map(|e| e.0.clone()).collect();
         let masks: Vec<Vec<u32>> = members.iter().map(|e| e.1.clone()).collect();
         let _ = model.forward_batched(&ids, &masks).expect("warm group");
@@ -196,7 +198,7 @@ fn embed_length_bucketing_ab() {
             groups.entry(bin_of(e.0.len())).or_default().push(i);
         }
         let mut grouped_emb = vec![Vec::<f32>::new(); corpus_a.len()];
-        for (_, idxs) in &groups {
+        for idxs in groups.values() {
             let gids: Vec<Vec<u32>> = idxs.iter().map(|&i| corpus_a[i].0.clone()).collect();
             let gms: Vec<Vec<u32>> = idxs.iter().map(|&i| corpus_a[i].1.clone()).collect();
             let gout = model.forward_batched(&gids, &gms).expect("group emb");

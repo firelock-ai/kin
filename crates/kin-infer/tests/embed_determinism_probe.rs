@@ -79,16 +79,24 @@ fn embed_determinism_interleaved_shapes() {
 
     // Discard the cold first forward (pipeline/shader warm-up, first weight-cache
     // population); pin the reference from a steady-state pass.
-    let _cold = model.forward(&[short.clone()], &[smask.clone()]).unwrap();
-    let reference = model.forward(&[short.clone()], &[smask.clone()]).unwrap();
+    let _cold = model
+        .forward(std::slice::from_ref(&short), std::slice::from_ref(&smask))
+        .unwrap();
+    let reference = model
+        .forward(std::slice::from_ref(&short), std::slice::from_ref(&smask))
+        .unwrap();
     let n = 12;
     let mut ok = 0usize;
     for _ in 0..n {
         // Perturb GPU state with a different-shaped forward in between. Before the
         // buf_zeros zero-init fix this leaked process-stale garbage from the
         // long-shape op into the short-shape output, making `again` diverge.
-        let _ = model.forward(&[long.clone()], &[lmask.clone()]).unwrap();
-        let again = model.forward(&[short.clone()], &[smask.clone()]).unwrap();
+        let _ = model
+            .forward(std::slice::from_ref(&long), std::slice::from_ref(&lmask))
+            .unwrap();
+        let again = model
+            .forward(std::slice::from_ref(&short), std::slice::from_ref(&smask))
+            .unwrap();
         if again == reference {
             ok += 1;
         }

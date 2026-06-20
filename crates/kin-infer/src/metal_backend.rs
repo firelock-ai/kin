@@ -257,6 +257,26 @@ fn use_fp16_mma(m: usize, n: usize, k: usize) -> bool {
     mma_fp16_enabled() && FP16_MMA_AVAILABLE.load(Ordering::Relaxed) && use_mma(m, n, k)
 }
 
+/// Whether the C7 flash-attention path is selected. Default OFF: selected only
+/// by the resource plan or `KIN_INFER_FLASH_ATTENTION=1`, and currently used
+/// solely to attempt optional pipeline registration during Metal construction.
+/// No runtime attention dispatch is routed through C7 until kernels are added
+/// and parity-cleared.
+fn c7_flash_attention_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        crate::resource::env_flag_override("KIN_INFER_FLASH_ATTENTION")
+            .unwrap_or_else(|| crate::resource::active_gpu_kernel_plan().flash_attention)
+    })
+}
+
+/// Whether the optional C7 flash-attention pipelines compiled on this device.
+/// Defaults false so the baseline Metal attention path stays authoritative when
+/// C7 is disabled, absent, or rejected by the Metal toolchain.
+static C7_FLASH_ATTENTION_AVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Whether the steel double-buffered K-loop MMA path is selected. The steel
 /// kernels overlap the next K-tile's global load with the current tile's MMA
 /// (2-stage software pipeline) but are numerically IDENTICAL to the single-buffer
@@ -1645,6 +1665,21 @@ kernel void batched_matmul_ab_simdgroup_fp16(
 "#;
 
 // ---------------------------------------------------------------------------
+// C7 flash-attention — SEPARATE shader library skeleton
+// ---------------------------------------------------------------------------
+// Kept separate from the baseline Metal shader library for the same reason as
+// the fp16 MMA library: an experimental C7 compile/pipeline failure must only
+// disable C7, never Metal itself. The kernel list intentionally starts empty;
+// adding a real C7 shader later is a small registration change instead of a
+// control-flow change.
+const C7_FLASH_ATTENTION_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+"#;
+
+const C7_FLASH_ATTENTION_KERNEL_NAMES: &[&str] = &[];
+
+// ---------------------------------------------------------------------------
 // Bounded in-flight submission
 // ---------------------------------------------------------------------------
 //
@@ -2182,6 +2217,55 @@ impl MetalCompute {
         }
         FP16_MMA_AVAILABLE.store(fp16_mma_available, Ordering::Relaxed);
 
+        // C7 flash-attention — OPTIONAL, compiled as a SEPARATE library only
+        // when opt-in enabled. The skeleton currently registers no kernels, so
+        // C7 availability remains false and all runtime attention calls continue
+        // through the baseline Metal path. Future C7 kernels can be added to
+        // C7_FLASH_ATTENTION_KERNEL_NAMES without making the main library depend
+        // on them.
+        let mut c7_flash_attention_available = false;
+        if c7_flash_attention_enabled() {
+            match device.new_library_with_source(C7_FLASH_ATTENTION_SHADER_SOURCE, &opts) {
+                Ok(c7_library) => {
+                    if C7_FLASH_ATTENTION_KERNEL_NAMES.is_empty() {
+                        eprintln!(
+                            "kin-infer: Metal C7 flash-attention requested, but no C7 \
+                             kernels are registered yet; baseline attention stays enabled"
+                        );
+                    } else {
+                        let mut ok = true;
+                        for &name in C7_FLASH_ATTENTION_KERNEL_NAMES {
+                            let pipeline = c7_library.get_function(name, None).and_then(|func| {
+                                device.new_compute_pipeline_state_with_function(&func)
+                            });
+                            match pipeline {
+                                Ok(pipeline) => {
+                                    pipelines.insert(name, pipeline);
+                                }
+                                Err(err) => {
+                                    eprintln!(
+                                        "kin-infer: Metal C7 flash-attention kernel {name} \
+                                         unavailable ({err}); C7 disabled (baseline \
+                                         attention stays enabled)"
+                                    );
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        c7_flash_attention_available = ok;
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "kin-infer: Metal C7 flash-attention shader library failed to \
+                         compile ({err}); C7 disabled (baseline attention stays enabled)"
+                    );
+                }
+            }
+        }
+        C7_FLASH_ATTENTION_AVAILABLE.store(c7_flash_attention_available, Ordering::Relaxed);
+
         let pool = Arc::new(BufferPool::new(device.clone()));
         Some(Self {
             device,
@@ -2322,7 +2406,7 @@ impl MetalCompute {
     #[inline]
     #[allow(dead_code)]
     fn count_nonfinite(name: &str, data: &[f32]) -> usize {
-        if std::env::var_os("KIN_INFER_METAL_NAN_CHECK").is_none() {
+        if !Self::metal_nan_check_enabled() {
             return 0;
         }
         let n = data.iter().filter(|x| !x.is_finite()).count();
@@ -2334,6 +2418,17 @@ impl MetalCompute {
             );
         }
         n
+    }
+
+    #[inline]
+    fn metal_nan_check_enabled() -> bool {
+        std::env::var_os("KIN_INFER_METAL_NAN_CHECK").is_some()
+    }
+
+    fn readback_count_nonfinite(name: &str, buf: &Buffer, count: usize) {
+        let mut data = vec![0.0; count];
+        Self::read_buf_into(buf, &mut data);
+        Self::count_nonfinite(name, &data);
     }
 
     /// Read floats from a shared buffer in-place into a mutable slice. Timed into
@@ -3109,7 +3204,7 @@ impl MetalCompute {
             // ---------------------------------------------------------
             // Command Buffer 2: RoPE + Fused Attention Posmajor + Attn Out Projection + Add Residual
             // ---------------------------------------------------------
-            let cmd2 = self.queue.new_command_buffer();
+            let mut cmd2 = self.queue.new_command_buffer();
             let mut retains2 = Vec::new();
 
             // Only apply RoPE if cos/sin are provided
@@ -3221,6 +3316,8 @@ impl MetalCompute {
             let buf_has_alibi = self.buf_u32(0)?;
             let buf_alibi = self.buf_slice_pooled(&[0.0f32])?;
             let buf_out_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
+            let nan_check = Self::metal_nan_check_enabled();
+            let score_len = total_q_heads * max_len * max_len;
 
             let qk_bufs = [
                 buf_q_reshaped.buffer(),
@@ -3251,11 +3348,15 @@ impl MetalCompute {
                 );
             }
 
-            self.commit_wait(cmd2);
-            let mut out_scores = vec![0.0; total_q_heads * max_len * max_len];
-            Self::read_buf_into(buf_scores.buffer(), &mut out_scores);
-            Self::count_nonfinite("after batched_matmul_transb", &out_scores);
-            let cmd2 = self.queue.new_command_buffer();
+            if nan_check {
+                self.commit_wait(cmd2);
+                Self::readback_count_nonfinite(
+                    "after batched_matmul_transb",
+                    buf_scores.buffer(),
+                    score_len,
+                );
+                cmd2 = self.queue.new_command_buffer();
+            }
 
             self.encode_3d(
                 cmd2,
@@ -3274,13 +3375,15 @@ impl MetalCompute {
                 total_q_heads,
             );
 
-            self.commit_wait(cmd2);
-
-            let mut out_scores = vec![0.0; total_q_heads * max_len * max_len];
-            Self::read_buf_into(buf_scores.buffer(), &mut out_scores);
-            Self::count_nonfinite("after scale_mask_alibi_grouped", &out_scores);
-
-            let cmd2 = self.queue.new_command_buffer();
+            if nan_check {
+                self.commit_wait(cmd2);
+                Self::readback_count_nonfinite(
+                    "after scale_mask_alibi_grouped",
+                    buf_scores.buffer(),
+                    score_len,
+                );
+                cmd2 = self.queue.new_command_buffer();
+            }
 
             self.encode_rows_simdgroup(
                 cmd2,
@@ -3289,10 +3392,15 @@ impl MetalCompute {
                 total_q_heads * max_len,
             );
 
-            self.commit_wait(cmd2);
-            Self::read_buf_into(buf_scores.buffer(), &mut out_scores);
-            Self::count_nonfinite("after softmax_rows", &out_scores);
-            let cmd2 = self.queue.new_command_buffer();
+            if nan_check {
+                self.commit_wait(cmd2);
+                Self::readback_count_nonfinite(
+                    "after softmax_rows",
+                    buf_scores.buffer(),
+                    score_len,
+                );
+                cmd2 = self.queue.new_command_buffer();
+            }
 
             let sv_bufs = [
                 buf_scores.buffer(),
@@ -4025,14 +4133,20 @@ impl GpuCompute for MetalCompute {
         )
         .entered();
         let buf = self.buf_slice_pooled(data)?;
-        let buf_gamma = self.buf_cached(gamma)?;
-        let buf_beta = self.buf_cached(beta)?;
+        let buf_gamma = self.buf_slice_pooled(gamma)?;
+        let buf_beta = self.buf_slice_pooled(beta)?;
         let buf_cols = self.buf_u32(cols as u32)?;
         let buf_eps = self.buf_f32(eps)?;
         time_phase(Phase::Norm, || {
             self.dispatch_rows_simdgroup(
                 "layer_norm",
-                &[buf.buffer(), &buf_gamma, &buf_beta, &buf_cols, &buf_eps],
+                &[
+                    buf.buffer(),
+                    buf_gamma.buffer(),
+                    buf_beta.buffer(),
+                    &buf_cols,
+                    &buf_eps,
+                ],
                 rows,
             )
         });
@@ -4057,13 +4171,13 @@ impl GpuCompute for MetalCompute {
         )
         .entered();
         let buf = self.buf_slice_pooled(data)?;
-        let buf_weight = self.buf_cached(weight)?;
+        let buf_weight = self.buf_slice_pooled(weight)?;
         let buf_cols = self.buf_u32(cols as u32)?;
         let buf_eps = self.buf_f32(eps)?;
         time_phase(Phase::Norm, || {
             self.dispatch_rows_simdgroup(
                 "rms_norm",
-                &[buf.buffer(), &buf_weight, &buf_cols, &buf_eps],
+                &[buf.buffer(), buf_weight.buffer(), &buf_cols, &buf_eps],
                 rows,
             )
         });
@@ -6271,7 +6385,7 @@ mod tests {
         let many = metal
             .matmul_many(&a, &[&b0, &b1, &b2], m, &[n, n, n], k)
             .unwrap();
-        let single = vec![
+        let single = [
             metal.matmul(&a, &b0, m, n, k).unwrap(),
             metal.matmul(&a, &b1, m, n, k).unwrap(),
             metal.matmul(&a, &b2, m, n, k).unwrap(),
