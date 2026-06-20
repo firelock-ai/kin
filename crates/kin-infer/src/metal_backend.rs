@@ -1662,20 +1662,61 @@ kernel void batched_matmul_ab_simdgroup_fp16(
 // `wait_until_completed`, so ~145 of these round-trips serialize the host
 // against the GPU per forward pass (measured ~69% of wall on M5 Max). The
 // bounded submitter instead commits WITHOUT waiting and registers a completion
-// handler; a depth counter capped at `MAX_INFLIGHT` keeps at most a few command
-// buffers (and their resident intermediates) outstanding. When the cap is hit
-// the submitter PARKS on a condvar — it does not busy-spin (the unbounded
-// busy-spin pile-up is exactly what hung large cold embeds). This caps resident
-// intermediate memory at ~MAX_INFLIGHT× a layer's working set regardless of
-// repo size.
+// handler; a depth counter capped at the resolved in-flight depth keeps at most
+// a few command buffers (and their resident intermediates) outstanding. When the
+// cap is hit the submitter PARKS on a condvar — it does not busy-spin (the
+// unbounded busy-spin pile-up is exactly what hung large cold embeds). This caps
+// resident intermediate memory at ~cap× a layer's working set regardless of repo
+// size.
 
-/// Maximum number of committed-but-incomplete command buffers. 2–3 is the
-/// documented sweet spot: low enough to bound resident memory, high enough to
-/// overlap host encoding with GPU execution.
-const MAX_INFLIGHT: u32 = 3;
+/// Default committed-but-incomplete command-buffer depth when nothing raises it.
+/// 2–3 is the conservative sweet spot: low enough to bound resident memory, high
+/// enough to overlap host encoding with GPU execution.
+const DEFAULT_MAX_INFLIGHT: u32 = 3;
+
+/// Resolve the bounded in-flight command-buffer depth for this process.
+///
+/// Priority:
+/// 1. `KIN_INFER_MAX_INFLIGHT` — explicit override for tuning and watchdog
+///    ceiling probing (any value ≥ 1).
+/// 2. The active resource profile's `max_inflight_command_buffers`, selected by
+///    `KIN_RESOURCE_PROFILE` (the same switch kin-db's BatchBudget reads), so the
+///    hardware-scaled throughput depth takes effect instead of a fixed constant.
+/// 3. [`DEFAULT_MAX_INFLIGHT`].
+fn resolve_max_inflight() -> u32 {
+    resolve_max_inflight_inner(
+        std::env::var("KIN_INFER_MAX_INFLIGHT").ok().as_deref(),
+        std::env::var("KIN_RESOURCE_PROFILE").ok().as_deref(),
+    )
+}
+
+/// Pure core of [`resolve_max_inflight`]: explicit override (≥ 1) wins, else the
+/// named profile's accelerator depth, else [`DEFAULT_MAX_INFLIGHT`].
+fn resolve_max_inflight_inner(override_raw: Option<&str>, profile_raw: Option<&str>) -> u32 {
+    if let Some(n) = override_raw
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|n| *n >= 1)
+    {
+        return n;
+    }
+    let profile = profile_raw.and_then(|raw| match raw.trim().to_ascii_lowercase().as_str() {
+        "proof" => Some(crate::resource::Profile::Proof),
+        "interactive" => Some(crate::resource::Profile::Interactive),
+        "throughput" => Some(crate::resource::Profile::Throughput),
+        "ci" => Some(crate::resource::Profile::Ci),
+        _ => None,
+    });
+    match profile {
+        Some(p) => (crate::resource::ResourcePlan::detect(p)
+            .accelerator
+            .max_inflight_command_buffers as u32)
+            .max(1),
+        None => DEFAULT_MAX_INFLIGHT,
+    }
+}
 
 /// Shared in-flight depth counter + condvar. The submitter increments on commit
-/// and parks while depth ≥ MAX_INFLIGHT; the completion handler decrements and
+/// and parks while depth ≥ the in-flight cap; the completion handler decrements and
 /// notifies — on BOTH success and Error, so an errored buffer can never deadlock
 /// the submitter.
 type InflightGate = Arc<(Mutex<u32>, Condvar)>;
@@ -1914,6 +1955,9 @@ pub struct MetalCompute {
     concat_cache: Mutex<HashMap<Vec<(usize, usize)>, Buffer>>,
     /// Bounded in-flight depth gate shared with completion handlers.
     inflight: InflightGate,
+    /// Maximum committed-but-incomplete command buffers, resolved once at
+    /// construction from override/profile (see [`resolve_max_inflight`]).
+    max_inflight: u32,
     /// Size-classed activation/output buffer pool.
     pool: Arc<BufferPool>,
 }
@@ -2157,6 +2201,7 @@ impl MetalCompute {
             weight_cache: Mutex::new(HashMap::new()),
             concat_cache: Mutex::new(HashMap::new()),
             inflight: Arc::new((Mutex::new(0), Condvar::new())),
+            max_inflight: resolve_max_inflight(),
             pool,
         })
     }
@@ -2316,7 +2361,7 @@ impl MetalCompute {
     /// Unlike `commit_and_wait`, this does NOT block on `wait_until_completed`:
     /// it registers a completion handler that decrements the in-flight depth and
     /// recycles the `retain`ed pooled buffers once the GPU is done, then commits.
-    /// The submitter parks (does not spin) when depth reaches `MAX_INFLIGHT`, so
+    /// The submitter parks (does not spin) when depth reaches the in-flight cap, so
     /// at most a few command buffers — and their resident intermediates — are
     /// outstanding at once. `retain` must hold every pooled buffer the command
     /// buffer reads or writes, so none is recycled while still GPU-resident.
@@ -2330,20 +2375,23 @@ impl MetalCompute {
         {
             let (lock, cvar) = &*self.inflight;
             let mut depth = lock.lock();
-            while *depth >= MAX_INFLIGHT {
+            while *depth >= self.max_inflight {
                 let timed_out = cvar
                     .wait_for(&mut depth, std::time::Duration::from_secs(30))
                     .timed_out();
-                if timed_out && *depth >= MAX_INFLIGHT {
+                if timed_out && *depth >= self.max_inflight {
                     tracing::warn!(
                         depth = *depth,
-                        max_inflight = MAX_INFLIGHT,
+                        max_inflight = self.max_inflight,
                         "kin_infer.metal.commit_bounded: in-flight depth has not drained for 30s — a completion handler may have failed to fire"
                     );
                 }
             }
             *depth += 1;
-            debug_assert!(*depth <= MAX_INFLIGHT, "in-flight depth exceeded the cap");
+            debug_assert!(
+                *depth <= self.max_inflight,
+                "in-flight depth exceeded the cap"
+            );
         }
         if let Some(start) = blocked_start {
             STALL_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -6248,6 +6296,30 @@ mod tests {
                 .fold(0.0f32, f32::max);
             assert!(max_err < 1e-4, "matmul_many max err: {}", max_err);
         }
+    }
+
+    #[test]
+    fn resolve_max_inflight_prefers_override_then_profile_then_default() {
+        // Explicit override (≥ 1) wins regardless of profile.
+        assert_eq!(resolve_max_inflight_inner(Some("6"), Some("proof")), 6);
+        assert_eq!(resolve_max_inflight_inner(Some(" 2 "), None), 2);
+        // Invalid/zero override is ignored; no profile -> default.
+        assert_eq!(
+            resolve_max_inflight_inner(Some("0"), None),
+            DEFAULT_MAX_INFLIGHT
+        );
+        assert_eq!(
+            resolve_max_inflight_inner(Some("nope"), None),
+            DEFAULT_MAX_INFLIGHT
+        );
+        assert_eq!(resolve_max_inflight_inner(None, None), DEFAULT_MAX_INFLIGHT);
+        assert_eq!(
+            resolve_max_inflight_inner(None, Some("bogus")),
+            DEFAULT_MAX_INFLIGHT
+        );
+        // A known profile resolves to its plan depth (machine-dependent but valid).
+        assert!(resolve_max_inflight_inner(None, Some("throughput")) >= 1);
+        assert!(resolve_max_inflight_inner(None, Some("proof")) >= 1);
     }
 
     #[test]
