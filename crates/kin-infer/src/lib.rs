@@ -18,6 +18,7 @@ pub mod cuda_backend;
 pub mod gpu;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal_backend;
+pub mod resource;
 pub mod watchdog;
 
 use half::{bf16, f16};
