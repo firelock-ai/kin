@@ -2892,6 +2892,8 @@ dependencies = [
 [[package]]
 name = "kin-blobs"
 version = "0.1.0"
+source = "sparse+https://kinlab.ai/registry/cargo/"
+checksum = "44903add90c5bdc9cd68dabe4babc846729caa795b4d50c9c3a138d560646216"
 dependencies = [
  "hex",
  "schemars",
@@ -3058,6 +3060,8 @@ dependencies = [
 [[package]]
 name = "kin-db"
 version = "0.2.8"
+source = "sparse+https://kinlab.ai/registry/cargo/"
+checksum = "2b4d7107f77f05d4a2f15863c861f9286785023dc300585e12d63c746e93eb00"
 dependencies = [
  "bincode",
  "bytes",
@@ -3135,6 +3139,8 @@ dependencies = [
 [[package]]
 name = "kin-infer"
 version = "0.2.3"
+source = "sparse+https://kinlab.ai/registry/cargo/"
+checksum = "f4dd1a8f2e9853919eb15eb4442c2d2a91c380735cbfa43ff8236884a5cfd99b"
 dependencies = [
  "block",
  "half",
@@ -3248,6 +3254,8 @@ dependencies = [
 [[package]]
 name = "kin-model"
 version = "0.2.0"
+source = "sparse+https://kinlab.ai/registry/cargo/"
+checksum = "e941e72effaa65527d22cc60b391a936629d01215ff4fecdc3838e8378457c1d"
 dependencies = [
  "chrono",
  "hex",
@@ -3411,6 +3419,8 @@ dependencies = [
 [[package]]
 name = "kin-search"
 version = "0.1.0"
+source = "sparse+https://kinlab.ai/registry/cargo/"
+checksum = "7b22b97ae1e3891601574147d39c51e4bb2063041ee6c97c8051623f9943332d"
 dependencies = [
  "bincode",
  "parking_lot",
@@ -3456,6 +3466,8 @@ dependencies = [
 [[package]]
 name = "kin-vector"
 version = "0.1.0"
+source = "sparse+https://kinlab.ai/registry/cargo/"
+checksum = "2191212c42d82b8b594c1a7768ee67665b4ada7ce2ef449757ce563ee6519881"
 dependencies = [
  "fs2",
  "hashbrown 0.15.5",
@@ -6322,7 +6334,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
