@@ -1833,6 +1833,7 @@ async fn command_resources(
         embeddings_indexed: embed_status.indexed,
         embeddings_pending: embed_status.pending,
         embeddings_total: embed_status.total,
+        metal_profile: metal_profile_runtime(),
     };
 
     let response = kin_cli::commands::resources::build_command_resources_response(
@@ -1842,6 +1843,39 @@ async fn command_resources(
     )
     .map_err(internal_error)?;
     Ok(Json(response))
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn metal_profile_runtime() -> Option<kin_cli::commands::resources::MetalProfileRuntime> {
+    if std::env::var_os("KIN_INFER_METAL_PROFILE").is_none() {
+        return None;
+    }
+    let forward_calls = kin_infer::metal_backend::profile_forward_calls();
+    let gpu_phase_nanos = kin_infer::metal_backend::profile_gpu_phase_nanos()
+        .into_iter()
+        .map(
+            |(phase, nanos)| kin_cli::commands::resources::MetalPhaseRuntime {
+                phase: phase.to_string(),
+                nanos,
+            },
+        )
+        .collect::<Vec<_>>();
+    let gpu_total_nanos = gpu_phase_nanos.iter().map(|phase| phase.nanos).sum();
+    Some(kin_cli::commands::resources::MetalProfileRuntime {
+        submissions: kin_infer::metal_backend::profile_submissions(),
+        round_trips: kin_infer::metal_backend::profile_round_trips(),
+        forward_calls,
+        host_blocked_nanos: kin_infer::metal_backend::profile_host_blocked_nanos(),
+        host_blocked_nanos_per_forward: (forward_calls > 0)
+            .then(|| kin_infer::metal_backend::profile_host_blocked_nanos() / forward_calls),
+        gpu_phase_nanos,
+        gpu_total_nanos,
+    })
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn metal_profile_runtime() -> Option<kin_cli::commands::resources::MetalProfileRuntime> {
+    None
 }
 
 /// POST /commands/graph — render graph CLI commands from daemon-owned graph state.

@@ -25,6 +25,26 @@ pub struct EmbedRuntimeState {
     pub embeddings_indexed: usize,
     pub embeddings_pending: usize,
     pub embeddings_total: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metal_profile: Option<MetalProfileRuntime>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetalProfileRuntime {
+    pub submissions: u64,
+    pub round_trips: u64,
+    pub forward_calls: u64,
+    pub host_blocked_nanos: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_blocked_nanos_per_forward: Option<u64>,
+    pub gpu_phase_nanos: Vec<MetalPhaseRuntime>,
+    pub gpu_total_nanos: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetalPhaseRuntime {
+    pub phase: String,
+    pub nanos: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,6 +274,7 @@ mod tests {
             embeddings_indexed: 3,
             embeddings_pending: 7,
             embeddings_total: 10,
+            ..EmbedRuntimeState::default()
         };
         let response =
             build_command_resources_response(sample_plan(Profile::Interactive), embed, true)
@@ -268,6 +289,40 @@ mod tests {
         assert_eq!(value["embed_runtime"]["embeddings_indexed"], 3);
         assert_eq!(value["embed_runtime"]["embeddings_pending"], 7);
         assert_eq!(value["embed_runtime"]["embeddings_total"], 10);
+    }
+
+    #[test]
+    fn json_response_carries_metal_profile_when_present() {
+        let embed = EmbedRuntimeState {
+            metal_profile: Some(MetalProfileRuntime {
+                submissions: 120,
+                round_trips: 4,
+                forward_calls: 2,
+                host_blocked_nanos: 900,
+                host_blocked_nanos_per_forward: Some(450),
+                gpu_phase_nanos: vec![MetalPhaseRuntime {
+                    phase: "matmul".to_string(),
+                    nanos: 700,
+                }],
+                gpu_total_nanos: 700,
+            }),
+            ..EmbedRuntimeState::default()
+        };
+        let response =
+            build_command_resources_response(sample_plan(Profile::Throughput), embed, true)
+                .unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_str(&response.json.expect("json requested")).unwrap();
+        let profile = &value["embed_runtime"]["metal_profile"];
+        assert_eq!(profile["submissions"], 120);
+        assert_eq!(profile["round_trips"], 4);
+        assert_eq!(profile["forward_calls"], 2);
+        assert_eq!(profile["host_blocked_nanos"], 900);
+        assert_eq!(profile["host_blocked_nanos_per_forward"], 450);
+        assert_eq!(profile["gpu_total_nanos"], 700);
+        assert_eq!(profile["gpu_phase_nanos"][0]["phase"], "matmul");
+        assert_eq!(profile["gpu_phase_nanos"][0]["nanos"], 700);
     }
 
     #[test]
