@@ -2805,7 +2805,7 @@ impl MetalCompute {
                 }
                 let buf_norm1_w = self.buf_cached(weights.norm1_weight)?;
                 if config.use_rms {
-                    self.encode_1d(
+                    self.encode_rows_simdgroup(
                         cmd1,
                         "rms_norm",
                         &[buf.buffer(), &buf_norm1_w, &buf_h, &buf_eps],
@@ -2813,7 +2813,7 @@ impl MetalCompute {
                     );
                 } else {
                     let buf_norm1_b = self.buf_cached(weights.norm1_bias.unwrap_or(&[]))?;
-                    self.encode_1d(
+                    self.encode_rows_simdgroup(
                         cmd1,
                         "layer_norm",
                         &[buf.buffer(), &buf_norm1_w, &buf_norm1_b, &buf_h, &buf_eps],
@@ -2904,7 +2904,7 @@ impl MetalCompute {
                 if let Some(q_ln_w) = weights.q_ln_weight {
                     let q_ln_w_buf = self.buf_cached(q_ln_w)?;
                     let q_ln_b_buf = self.buf_cached(weights.q_ln_bias.unwrap_or(&[]))?;
-                    self.encode_1d(
+                    self.encode_rows_simdgroup(
                         cmd1,
                         "layer_norm",
                         &[
@@ -2920,7 +2920,7 @@ impl MetalCompute {
                 if let Some(k_ln_w) = weights.k_ln_weight {
                     let k_ln_w_buf = self.buf_cached(k_ln_w)?;
                     let k_ln_b_buf = self.buf_cached(weights.k_ln_bias.unwrap_or(&[]))?;
-                    self.encode_1d(
+                    self.encode_rows_simdgroup(
                         cmd1,
                         "layer_norm",
                         &[
@@ -3213,6 +3213,12 @@ impl MetalCompute {
                 );
             }
 
+            self.commit_wait(cmd2);
+            let mut out_scores = vec![0.0; total_q_heads * max_len * max_len];
+            Self::read_buf_into(buf_scores.buffer(), &mut out_scores);
+            Self::count_nonfinite("after batched_matmul_transb", &out_scores);
+            let cmd2 = self.queue.new_command_buffer();
+
             self.encode_3d(
                 cmd2,
                 "scale_mask_alibi_grouped",
@@ -3230,12 +3236,25 @@ impl MetalCompute {
                 total_q_heads,
             );
 
+            self.commit_wait(cmd2);
+
+            let mut out_scores = vec![0.0; total_q_heads * max_len * max_len];
+            Self::read_buf_into(buf_scores.buffer(), &mut out_scores);
+            Self::count_nonfinite("after scale_mask_alibi_grouped", &out_scores);
+
+            let cmd2 = self.queue.new_command_buffer();
+
             self.encode_rows_simdgroup(
                 cmd2,
                 "softmax_rows",
                 &[buf_scores.buffer(), &buf_seq],
                 total_q_heads * max_len,
             );
+
+            self.commit_wait(cmd2);
+            Self::read_buf_into(buf_scores.buffer(), &mut out_scores);
+            Self::count_nonfinite("after softmax_rows", &out_scores);
+            let cmd2 = self.queue.new_command_buffer();
 
             let sv_bufs = [
                 buf_scores.buffer(),
@@ -3337,7 +3356,7 @@ impl MetalCompute {
             if !config.pre_ln {
                 let buf_norm1_w = self.buf_cached(weights.norm1_weight)?;
                 if config.use_rms {
-                    self.encode_1d(
+                    self.encode_rows_simdgroup(
                         cmd2,
                         "rms_norm",
                         &[current_hidden.buffer(), &buf_norm1_w, &buf_h, &buf_eps],
@@ -3345,7 +3364,7 @@ impl MetalCompute {
                     );
                 } else {
                     let buf_norm1_b = self.buf_cached(weights.norm1_bias.unwrap_or(&[]))?;
-                    self.encode_1d(
+                    self.encode_rows_simdgroup(
                         cmd2,
                         "layer_norm",
                         &[
@@ -3396,7 +3415,7 @@ impl MetalCompute {
                 }
                 let buf_norm2_w = self.buf_cached(weights.norm2_weight)?;
                 if config.use_rms {
-                    self.encode_1d(
+                    self.encode_rows_simdgroup(
                         cmd3,
                         "rms_norm",
                         &[buf.buffer(), &buf_norm2_w, &buf_h, &buf_eps],
@@ -3404,7 +3423,7 @@ impl MetalCompute {
                     );
                 } else {
                     let buf_norm2_b = self.buf_cached(weights.norm2_bias.unwrap_or(&[]))?;
-                    self.encode_1d(
+                    self.encode_rows_simdgroup(
                         cmd3,
                         "layer_norm",
                         &[buf.buffer(), &buf_norm2_w, &buf_norm2_b, &buf_h, &buf_eps],
@@ -3623,7 +3642,7 @@ impl MetalCompute {
             if !config.pre_ln {
                 let buf_norm2_w = self.buf_cached(weights.norm2_weight)?;
                 if config.use_rms {
-                    self.encode_1d(
+                    self.encode_rows_simdgroup(
                         cmd3,
                         "rms_norm",
                         &[current_hidden.buffer(), &buf_norm2_w, &buf_h, &buf_eps],
@@ -3631,7 +3650,7 @@ impl MetalCompute {
                     );
                 } else {
                     let buf_norm2_b = self.buf_cached(weights.norm2_bias.unwrap_or(&[]))?;
-                    self.encode_1d(
+                    self.encode_rows_simdgroup(
                         cmd3,
                         "layer_norm",
                         &[
@@ -6229,5 +6248,153 @@ mod tests {
                 .fold(0.0f32, f32::max);
             assert!(max_err < 1e-4, "matmul_many max err: {}", max_err);
         }
+    }
+
+    #[test]
+    fn test_metal_norm_softmax_cpu_parity_widths() {
+        let Some(metal) = get_metal() else { return };
+        let cpu = crate::gpu::CpuCompute;
+
+        fn assert_close(metal: &[f32], cpu: &[f32], what: &str) {
+            assert_eq!(metal.len(), cpu.len(), "{what}: length mismatch");
+            for (i, (m, c)) in metal.iter().zip(cpu.iter()).enumerate() {
+                assert!(m.is_finite(), "{what}: metal[{i}] not finite ({m})");
+                // GPU and CPU differ only in fp32 accumulation order. Accept when
+                // either the absolute or the relative difference is tiny — relative
+                // error alone is meaningless near zero.
+                let abs = (m - c).abs();
+                let rel = abs / m.abs().max(c.abs()).max(f32::MIN_POSITIVE);
+                assert!(
+                    abs < 1e-4 || rel < 1e-3,
+                    "{what}: idx {i} metal={m} cpu={c} abs={abs} rel={rel}"
+                );
+            }
+        }
+
+        // Hidden widths the embedder actually uses (384, 768) plus a deliberate
+        // non-multiple-of-32 (100): the simd-reduced kernels stride past the
+        // 32-lane simdgroup, so idle lanes must still reduce exactly.
+        for &cols in &[384usize, 768, 100] {
+            for &rows in &[1usize, 3, 40] {
+                let n = rows * cols;
+                let data: Vec<f32> = (0..n).map(|i| ((i % 17) as f32 - 8.0) * 0.13).collect();
+                let gamma: Vec<f32> = (0..cols).map(|j| 1.0 + (j % 5) as f32 * 0.01).collect();
+                let beta: Vec<f32> = (0..cols).map(|j| (j % 3) as f32 * 0.02).collect();
+
+                let (mut m, mut c) = (data.clone(), data.clone());
+                metal.softmax(&mut m, rows, cols).unwrap();
+                cpu.softmax(&mut c, rows, cols).unwrap();
+                assert_close(&m, &c, &format!("softmax rows={rows} cols={cols}"));
+
+                let (mut m, mut c) = (data.clone(), data.clone());
+                metal
+                    .layer_norm(&mut m, &gamma, &beta, rows, cols, 1e-5)
+                    .unwrap();
+                cpu.layer_norm(&mut c, &gamma, &beta, rows, cols, 1e-5)
+                    .unwrap();
+                assert_close(&m, &c, &format!("layer_norm rows={rows} cols={cols}"));
+
+                let (mut m, mut c) = (data.clone(), data.clone());
+                metal.rms_norm(&mut m, &gamma, rows, cols, 1e-6).unwrap();
+                cpu.rms_norm(&mut c, &gamma, rows, cols, 1e-6).unwrap();
+                assert_close(&m, &c, &format!("rms_norm rows={rows} cols={cols}"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_metal_forward_layer_bert_is_finite() {
+        let Some(metal) = get_metal() else { return };
+
+        // A plain post-LN BERT encoder layer through the fused resident stack.
+        // total_rows = 2*5 = 10 is intentionally not a multiple of the 32-lane
+        // simdgroup width: the stack's norm kernels must dispatch one simdgroup
+        // per row, not one thread per row, or simd_sum folds uninitialized lanes
+        // and the embedding goes NaN.
+        let batch_size = 2usize;
+        let max_len = 5usize;
+        let hidden = 64usize;
+        let num_heads = 2usize;
+        let head_dim = 32usize;
+        let inter = 128usize;
+        let total_rows = batch_size * max_len;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_heads * head_dim;
+
+        let mk = |n: usize, salt: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i as f32) * 0.7 + salt).sin() * 0.05)
+                .collect()
+        };
+
+        let norm1_weight = vec![1.0f32; hidden];
+        let norm1_bias = vec![0.0f32; hidden];
+        let norm2_weight = vec![1.0f32; hidden];
+        let norm2_bias = vec![0.0f32; hidden];
+        let qkv_weight = mk((q_dim + 2 * kv_dim) * hidden, 1.0);
+        let attn_out_weight = mk(hidden * (num_heads * head_dim), 2.0);
+        let ffn_up_weight = mk(inter * hidden, 3.0);
+        let ffn_down_weight = mk(hidden * inter, 4.0);
+
+        let weights = crate::gpu::LayerTensors {
+            norm1_weight: &norm1_weight,
+            norm1_bias: Some(&norm1_bias),
+            qkv_weight: Some(&qkv_weight),
+            qkv_bias: None,
+            q_weight: None,
+            q_bias: None,
+            k_weight: None,
+            k_bias: None,
+            v_weight: None,
+            v_bias: None,
+            q_ln_weight: None,
+            q_ln_bias: None,
+            k_ln_weight: None,
+            k_ln_bias: None,
+            attn_out_weight: &attn_out_weight,
+            attn_out_bias: None,
+            norm2_weight: &norm2_weight,
+            norm2_bias: Some(&norm2_bias),
+            ffn_gate_weight: None,
+            ffn_up_weight: Some(&ffn_up_weight),
+            ffn_up_bias: None,
+            ffn_down_weight: &ffn_down_weight,
+            ffn_down_bias: None,
+            ffn_up_gated_weight: None,
+            relative_attention_bias: None,
+            rel_pos_embeddings: None,
+        };
+
+        let config = crate::gpu::LayerConfig {
+            batch_size,
+            max_len,
+            hidden_size: hidden,
+            num_heads,
+            head_dim,
+            inter_size: inter,
+            eps: 1e-5,
+            rms_eps: 1e-6,
+            use_rms: false,
+            pre_ln: false,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            alibi_slopes: None,
+        };
+
+        let hidden_in = mk(total_rows * hidden, 0.0);
+        let masks = vec![1u32; total_rows];
+
+        let out = metal
+            .forward_layer_batched(&hidden_in, &masks, &weights, &config, &[], &[])
+            .expect("forward_layer_batched errored")
+            .expect("metal backend returned None for forward_layer_batched");
+
+        assert_eq!(out.len(), total_rows * hidden);
+        let nonfinite = out.iter().filter(|x| !x.is_finite()).count();
+        assert_eq!(
+            nonfinite,
+            0,
+            "fused BERT layer produced {nonfinite}/{} non-finite outputs",
+            out.len()
+        );
     }
 }
