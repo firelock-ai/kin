@@ -19,6 +19,7 @@ use std::{cmp::Reverse, fs, fs::File, fs::OpenOptions};
 use fs2::FileExt;
 use hashbrown::{HashMap, HashSet};
 use parking_lot::RwLock;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -102,6 +103,12 @@ const EF_CONSTRUCTION: usize = 200;
 
 /// Default beam width during search.
 const EF_SEARCH: usize = 50;
+
+/// Number of nodes inserted serially to warm a cold graph before the parallel
+/// batch path engages. Parallel candidate search needs a non-empty graph to
+/// search against; a small serial seed provides one. Kept modest so the serial
+/// prefix is cheap while still giving the first parallel chunk a connected graph.
+const PARALLEL_SEED: usize = 128;
 
 type CanonicalOrderItem<Id> = (u64, Vec<u8>, Id, Vec<f32>, usize);
 
@@ -425,6 +432,18 @@ pub struct HnswGraph<Id: VectorId = DefaultId> {
     pub canonical_order_dirty: bool,
 }
 
+/// Read-only result of planning a node's insertion against a fixed graph state.
+///
+/// Splitting "where would this node link" (a pure, parallelizable read over the
+/// graph) from "apply those links" (a serial mutation) lets a batch compute many
+/// plans concurrently and then commit them one at a time. `per_layer[lc]` holds
+/// the selected neighbor indices at layer `lc`, for `lc` in `0..=insert_top`. An
+/// empty `per_layer` means the graph had no entry point when planned, so the node
+/// becomes the entry point on commit.
+struct InsertionPlan {
+    per_layer: Vec<Vec<usize>>,
+}
+
 impl<Id: VectorId> HnswGraph<Id> {
     fn new(dimensions: usize) -> Self {
         Self {
@@ -444,6 +463,26 @@ impl<Id: VectorId> HnswGraph<Id> {
 
     fn active_count(&self) -> usize {
         self.id_to_idx.len()
+    }
+
+    /// A persistence snapshot of the graph: the serialized fields copied, with the
+    /// rebuilt-on-load reverse index dropped and the canonical-order flag cleared.
+    /// Taken under the graph lock so the heavy serialize + fsync can run after the
+    /// lock is released, without blocking concurrent upserts.
+    fn clone_for_persist(&self) -> HnswGraph<Id> {
+        HnswGraph {
+            nodes: self.nodes.clone(),
+            entry_point: self.entry_point,
+            max_level: self.max_level,
+            dimensions: self.dimensions,
+            id_to_idx: self.id_to_idx.clone(),
+            idx_to_id: self.idx_to_id.clone(),
+            free_list: self.free_list.clone(),
+            rng_state: self.rng_state,
+            descriptor: self.descriptor.clone(),
+            backlinks: Vec::new(),
+            canonical_order_dirty: false,
+        }
     }
 
     // -- greedy search helpers -----------------------------------------------
@@ -719,15 +758,76 @@ impl<Id: VectorId> HnswGraph<Id> {
         vector: &[f32],
         level: usize,
     ) -> Result<(), VectorError> {
-        let dims = self.dimensions;
-        if vector.len() != dims {
+        if vector.len() != self.dimensions {
             return Err(VectorError::IndexError(format!(
                 "embedding dimension mismatch: expected {}, got {}",
-                dims,
+                self.dimensions,
                 vector.len()
             )));
         }
 
+        // Plan the node's links against the current graph (read-only), then apply
+        // them. Computing the plan before the node is allocated yields identical
+        // neighbors to the historical interleaved insert: the new node carries no
+        // inbound edges, so it is unreachable during its own candidate search, and
+        // each layer's search reads only that layer's connections — never the
+        // links the same insert mutates at other layers.
+        let plan = self.compute_insertion_plan(vector, level);
+        self.commit_insertion(entity_id, vector, level, plan);
+        Ok(())
+    }
+
+    /// Plan where `vector` (at `level`) would link, as a pure read over the
+    /// current graph. Returns the selected neighbor indices per layer. Safe to run
+    /// concurrently for many nodes against the same immutable graph.
+    fn compute_insertion_plan(&self, vector: &[f32], level: usize) -> InsertionPlan {
+        let entry = match self.entry_point {
+            None => {
+                return InsertionPlan {
+                    per_layer: Vec::new(),
+                }
+            }
+            Some(ep) => ep,
+        };
+
+        let mut current = entry;
+
+        // Greedy descent from max_level down to level+1.
+        if self.max_level > level {
+            current = self.greedy_closest(vector, current, self.max_level, level);
+        }
+
+        // Beam search and neighbor selection at each layer from
+        // min(level, max_level) down to 0.
+        let insert_top = level.min(self.max_level);
+        let mut per_layer: Vec<Vec<usize>> = vec![Vec::new(); insert_top + 1];
+        for lc in (0..=insert_top).rev() {
+            let neighbors_found = self.search_layer(vector, current, EF_CONSTRUCTION, lc, None);
+            let m_max = if lc == 0 { M_MAX_0 } else { M };
+            per_layer[lc] = Self::select_neighbors(&neighbors_found, m_max)
+                .into_iter()
+                .filter(|&nb| lc < self.nodes[nb].connections.len())
+                .collect();
+
+            // Use the closest found neighbor as the entry for the next layer.
+            if let Some(&(_, closest)) = neighbors_found.first() {
+                current = closest;
+            }
+        }
+
+        InsertionPlan { per_layer }
+    }
+
+    /// Allocate a slot for `entity_id` and wire up the links from a previously
+    /// computed [`InsertionPlan`]. This is the only mutating half of an insert and
+    /// runs serially.
+    fn commit_insertion(
+        &mut self,
+        entity_id: Id,
+        vector: &[f32],
+        level: usize,
+        plan: InsertionPlan,
+    ) {
         let node = HnswNode {
             vector: vector.to_vec(),
             connections: vec![Vec::new(); level + 1],
@@ -752,38 +852,26 @@ impl<Id: VectorId> HnswGraph<Id> {
         };
         self.id_to_idx.insert(entity_id, idx);
 
-        // If the graph was empty, this is the entry point.
-        let entry = match self.entry_point {
-            None => {
-                self.entry_point = Some(idx);
-                self.max_level = level;
-                return Ok(());
-            }
-            Some(ep) => ep,
-        };
-
-        let mut current = entry;
-
-        // Phase 1: greedy descent from max_level down to level+1
-        if self.max_level > level {
-            current = self.greedy_closest(vector, current, self.max_level, level);
+        // If the graph was empty, this node is the entry point.
+        if self.entry_point.is_none() {
+            self.entry_point = Some(idx);
+            self.max_level = level;
+            return;
         }
 
-        // Phase 2: insert at each layer from min(level, max_level) down to 0
-        let insert_top = level.min(self.max_level);
-        for lc in (0..=insert_top).rev() {
-            let neighbors_found = self.search_layer(vector, current, EF_CONSTRUCTION, lc, None);
-            let m_max = if lc == 0 { M_MAX_0 } else { M };
-            let selected: Vec<usize> = Self::select_neighbors(&neighbors_found, m_max)
-                .into_iter()
-                .filter(|&nb| lc < self.nodes[nb].connections.len())
-                .collect();
+        self.apply_insertion_links(idx, level, plan);
+    }
 
+    /// Apply the per-layer neighbor links from a plan to node `idx`, adding the
+    /// bidirectional edges and pruning over-full neighbors. Mirrors the historical
+    /// in-place insert mutation exactly.
+    fn apply_insertion_links(&mut self, idx: usize, level: usize, plan: InsertionPlan) {
+        for (lc, selected) in plan.per_layer.iter().enumerate().rev() {
             // Set this node's connections at this layer.
             self.set_connections(idx, lc, selected.clone());
 
-            // Add bidirectional connections
-            for &nb in &selected {
+            // Add bidirectional connections.
+            for &nb in selected {
                 if lc >= self.nodes[nb].connections.len() {
                     continue;
                 }
@@ -803,20 +891,13 @@ impl<Id: VectorId> HnswGraph<Id> {
                     self.set_connections(nb, lc, pruned);
                 }
             }
-
-            // Use the closest found neighbor as the entry for the next layer
-            if let Some(&(_, closest)) = neighbors_found.first() {
-                current = closest;
-            }
         }
 
-        // Update entry point if this node has a higher level
+        // Update entry point if this node has a higher level.
         if level > self.max_level {
             self.entry_point = Some(idx);
             self.max_level = level;
         }
-
-        Ok(())
     }
 
     fn ensure_canonical_order(&mut self) -> Result<(), VectorError> {
@@ -1461,23 +1542,103 @@ impl<Id: VectorId> VectorIndex<Id> {
         graph.insert(entity_id, embedding)
     }
 
-    /// Add or update a batch of embeddings for entities under a single write lock.
+    /// Add or update a batch of embeddings under a single write lock, using all
+    /// available cores for the expensive candidate search.
+    ///
+    /// Insertion is split into a read-only planning phase and a serial commit. The
+    /// per-node candidate search (the cost that dominates HNSW build) is run for a
+    /// whole chunk in parallel against a frozen graph snapshot via the ambient
+    /// rayon pool; the cheap graph mutation is then applied serially in canonical
+    /// key order. Chunks grow with the graph so it stays populated as it fills.
+    ///
+    /// Determinism: the resulting intermediate graph is a pure function of the key
+    /// set (commit order is canonical, planning is order-independent), and — like
+    /// the single-key path — it is canonicalized to the byte-identical authoritative
+    /// topology by [`VectorIndex::ensure_canonical_order`] / `save` before any
+    /// query result is taken. Parallel batch build and serial single upserts
+    /// therefore produce identical query results after canonicalization.
     pub fn upsert_batch(&self, items: Vec<(Id, Vec<f32>)>) -> Result<(), VectorError> {
         let _span = tracing::info_span!("kin_vector.upsert_batch", count = items.len()).entered();
         let mut graph = self.graph.write();
+        let dims = graph.dimensions;
 
-        for (entity_id, embedding) in items {
-            if embedding.len() != graph.dimensions {
+        for (_, embedding) in &items {
+            if embedding.len() != dims {
                 return Err(VectorError::IndexError(format!(
                     "embedding dimension mismatch: expected {}, got {}",
-                    graph.dimensions,
+                    dims,
                     embedding.len()
                 )));
             }
-            graph.remove(&entity_id);
-            graph.insert(entity_id, &embedding)?;
+        }
+        if items.is_empty() {
+            return Ok(());
         }
 
+        // Resolve duplicate keys within the batch (last value wins), matching a
+        // sequence of single upserts of the same key.
+        let mut resolved: HashMap<Id, Vec<f32>> = HashMap::with_capacity(items.len());
+        for (id, embedding) in items {
+            resolved.insert(id, embedding);
+        }
+
+        // Drop any existing node for these keys so each is a fresh insert.
+        let existing: Vec<Id> = resolved.keys().copied().collect();
+        for id in &existing {
+            graph.remove(id);
+        }
+
+        // Order the inserts by canonical key order — the same order
+        // canonicalization uses — so the intermediate graph is a deterministic
+        // function of the key set rather than of caller order or planning
+        // parallelism.
+        let mut keyed: Vec<CanonicalOrderItem<Id>> = Vec::with_capacity(resolved.len());
+        for (id, embedding) in resolved {
+            let level = hnsw_level_for_key(&id);
+            let bytes = HnswGraph::<Id>::canonical_id_bytes(&id)?;
+            keyed.push((key_hash(&id), bytes, id, embedding, level));
+        }
+        keyed.sort_by(|a, b| HnswGraph::<Id>::canonical_id_cmp(&(a.0, &a.1), &(b.0, &b.1)));
+
+        // Warm a cold graph serially so parallel planning always has a non-empty
+        // graph to search against (and stays connected).
+        let mut cursor = 0usize;
+        if graph.entry_point.is_none() {
+            let seed = keyed.len().min(PARALLEL_SEED);
+            for (_, _, id, embedding, level) in &keyed[..seed] {
+                graph.insert_with_level(*id, embedding, *level)?;
+            }
+            cursor = seed;
+        }
+
+        // Doubling chunks: plan a chunk in parallel against the frozen graph, then
+        // commit serially. Chunk size tracks the live graph size so the graph stays
+        // populated as it grows and intra-chunk link loss stays bounded.
+        while cursor < keyed.len() {
+            let chunk_len = graph
+                .active_count()
+                .max(PARALLEL_SEED)
+                .min(keyed.len() - cursor);
+            let end = cursor + chunk_len;
+            let chunk = &keyed[cursor..end];
+
+            let plans: Vec<InsertionPlan> = {
+                let frozen: &HnswGraph<Id> = &graph;
+                chunk
+                    .par_iter()
+                    .map(|(_, _, _, embedding, level)| {
+                        frozen.compute_insertion_plan(embedding, *level)
+                    })
+                    .collect()
+            };
+
+            for ((_, _, id, embedding, level), plan) in chunk.iter().zip(plans) {
+                graph.commit_insertion(*id, embedding, *level, plan);
+            }
+            cursor = end;
+        }
+
+        graph.canonical_order_dirty = true;
         Ok(())
     }
 
@@ -1572,27 +1733,18 @@ impl<Id: VectorId> VectorIndex<Id> {
             path = %path.display()
         )
         .entered();
-        let bytes = self.with_canonical_graph(|graph| {
-            let snapshot = HnswSnapshot {
+        // Canonicalize (if needed) and copy a consistent snapshot under the graph
+        // lock, then release the lock BEFORE the heavy serialize + fsync so the
+        // GPU-fed upsert path is not blocked by index IO. Concurrent upserts after
+        // this point simply land in the next save.
+        let snapshot = self.with_canonical_graph(|graph| {
+            Ok(HnswSnapshot {
                 format_version: HNSW_FORMAT_VERSION,
-                graph: HnswGraph {
-                    nodes: graph.nodes.clone(),
-                    entry_point: graph.entry_point,
-                    max_level: graph.max_level,
-                    dimensions: graph.dimensions,
-                    id_to_idx: graph.id_to_idx.clone(),
-                    idx_to_id: graph.idx_to_id.clone(),
-                    free_list: graph.free_list.clone(),
-                    rng_state: graph.rng_state,
-                    descriptor: graph.descriptor.clone(),
-                    backlinks: Vec::new(),
-                    canonical_order_dirty: false,
-                },
-            };
-            rmp_serde::to_vec(&snapshot).map_err(|e| {
-                VectorError::IndexError(format!("failed to serialize HNSW index: {e}"))
+                graph: graph.clone_for_persist(),
             })
         })?;
+        let bytes = rmp_serde::to_vec(&snapshot)
+            .map_err(|e| VectorError::IndexError(format!("failed to serialize HNSW index: {e}")))?;
         atomic_save_bytes(path, &bytes, "vector index")
     }
 
@@ -2213,29 +2365,51 @@ mod tests {
         }
     }
 
-    /// A batched upsert under a single write lock must land the index in exactly
-    /// the same state as the equivalent sequence of single-key upserts: same
-    /// internal layout (idx_to_id, entry point, per-node levels + connections) and
-    /// identical kNN — both before and after canonicalization. The batch is purely
-    /// a lock-amortization throughput path; it must not change a single result.
-    #[test]
-    fn upsert_batch_matches_sequential_upserts() {
-        fn vec_for(i: u64, dim: usize) -> Vec<f32> {
-            (0..dim)
-                .map(|d| {
-                    let x =
-                        (i.wrapping_mul(2654435761).wrapping_add(d as u64 * 40503) % 1000) as f32;
-                    ((x / 1000.0) * std::f32::consts::TAU).sin()
-                        + ((i as f32) * 0.013 * (d as f32 + 1.0)).cos()
-                })
-                .collect()
-        }
+    fn batch_test_vec(i: u64, dim: usize) -> Vec<f32> {
+        (0..dim)
+            .map(|d| {
+                let x = (i.wrapping_mul(2654435761).wrapping_add(d as u64 * 40503) % 1000) as f32;
+                ((x / 1000.0) * std::f32::consts::TAU).sin()
+                    + ((i as f32) * 0.013 * (d as f32 + 1.0)).cos()
+            })
+            .collect()
+    }
 
-        let n: u64 = 250;
+    type BatchFingerprint = (Vec<u64>, Option<u64>, Vec<(usize, Vec<Vec<usize>>)>);
+
+    fn batch_fingerprint(idx: &VectorIndex<u64>) -> BatchFingerprint {
+        let g = idx.graph.read();
+        let entry = g.entry_point.map(|ep| g.idx_to_id[ep]);
+        let nodes = g
+            .nodes
+            .iter()
+            .map(|node| (node.level, node.connections.clone()))
+            .collect();
+        (g.idx_to_id.clone(), entry, nodes)
+    }
+
+    fn batch_knn(idx: &VectorIndex<u64>, q: &[f32], limit: usize) -> Vec<(u64, u32)> {
+        idx.search_similar(q, limit)
+            .unwrap()
+            .into_iter()
+            .map(|(id, d)| (id, d.to_bits()))
+            .collect()
+    }
+
+    /// The parallel batch build is a throughput path, not a result path: once the
+    /// graph is canonicalized at the search/save boundary, a parallel
+    /// `upsert_batch` and the equivalent sequence of serial single upserts must
+    /// produce the byte-identical authoritative topology AND identical kNN. This is
+    /// the determinism guarantee the citable proof depends on — parallel-built
+    /// index == serial-built index after canonicalization. `n` spans several
+    /// doubling chunks so the real parallel planning path is exercised.
+    #[test]
+    fn upsert_batch_canonicalizes_identically_to_sequential() {
+        let n: u64 = 1500;
         let dim = 32;
         let limit = 20;
-        let items: Vec<(u64, Vec<f32>)> = (0..n).map(|k| (k, vec_for(k, dim))).collect();
-        let queries: Vec<Vec<f32>> = (0..8).map(|q| vec_for(70_000 + q, dim)).collect();
+        let items: Vec<(u64, Vec<f32>)> = (0..n).map(|k| (k, batch_test_vec(k, dim))).collect();
+        let queries: Vec<Vec<f32>> = (0..8).map(|q| batch_test_vec(90_000 + q, dim)).collect();
 
         let batched = VectorIndex::<u64>::new(dim).unwrap();
         batched.upsert_batch(items.clone()).unwrap();
@@ -2247,56 +2421,76 @@ mod tests {
 
         assert_eq!(batched.len(), sequential.len());
 
-        // Full internal-state fingerprint: the exact graph structure, not just an
-        // approximate search result.
-        type Fingerprint = (Vec<u64>, Option<u64>, Vec<(usize, Vec<Vec<usize>>)>);
-        let fingerprint = |idx: &VectorIndex<u64>| -> Fingerprint {
-            let g = idx.graph.read();
-            let entry = g.entry_point.map(|ep| g.idx_to_id[ep]);
-            let nodes = g
-                .nodes
-                .iter()
-                .map(|node| (node.level, node.connections.clone()))
-                .collect();
-            (g.idx_to_id.clone(), entry, nodes)
-        };
-        let knn = |idx: &VectorIndex<u64>, q: &[f32]| -> Vec<(u64, u32)> {
-            idx.search_similar(q, limit)
-                .unwrap()
-                .into_iter()
-                .map(|(id, d)| (id, d.to_bits()))
-                .collect()
-        };
-
-        // Identical even before canonicalization: both apply the same remove+insert
-        // sequence, in the same order, against the same fresh graph.
-        assert_eq!(
-            fingerprint(&batched),
-            fingerprint(&sequential),
-            "batch upsert produced a different graph than sequential upserts"
-        );
-        for (qi, q) in queries.iter().enumerate() {
+        // Pre-canonicalization the parallel intermediate is intentionally a
+        // different (approximate) topology, but it must still be a valid, populated
+        // search index.
+        for q in &queries {
             assert_eq!(
-                knn(&batched, q),
-                knn(&sequential, q),
-                "batch vs sequential kNN diverged (pre-canonicalization) on query {qi}"
+                batch_knn(&batched, q, limit).len(),
+                limit,
+                "parallel batch intermediate is not searchable"
             );
         }
 
-        // And identical after the canonicalization boundary that save/search use.
+        // After the canonicalization boundary that save/search use, parallel batch
+        // and serial single upserts collapse to the identical authoritative graph.
         batched.ensure_canonical_order().unwrap();
         sequential.ensure_canonical_order().unwrap();
         assert_eq!(
-            fingerprint(&batched),
-            fingerprint(&sequential),
-            "batch vs sequential diverged after canonicalization"
+            batch_fingerprint(&batched),
+            batch_fingerprint(&sequential),
+            "parallel batch and serial upserts diverged after canonicalization"
         );
         for (qi, q) in queries.iter().enumerate() {
             assert_eq!(
-                knn(&batched, q),
-                knn(&sequential, q),
-                "batch vs sequential kNN diverged (post-canonicalization) on query {qi}"
+                batch_knn(&batched, q, limit),
+                batch_knn(&sequential, q, limit),
+                "parallel batch vs serial kNN diverged (post-canonicalization) on query {qi}"
             );
+        }
+    }
+
+    /// The parallel batch's intermediate graph is a pure function of the key set:
+    /// it is byte-identical regardless of caller input order (the commit order is
+    /// canonical and planning is order-independent) and stable across repeated
+    /// runs despite the parallelism. This is what makes the parallelism safe — no
+    /// thread-interleaving or caller-order signal leaks into the topology.
+    #[test]
+    fn parallel_batch_build_is_order_and_run_independent() {
+        let n: u64 = 1200;
+        let dim = 24;
+        let limit = 15;
+        let forward: Vec<(u64, Vec<f32>)> = (0..n).map(|k| (k, batch_test_vec(k, dim))).collect();
+        let mut shuffled = forward.clone();
+        // Deterministic shuffle (no RNG): swap symmetric pairs.
+        let len = shuffled.len();
+        for i in 0..len / 2 {
+            shuffled.swap(i, len - 1 - i);
+        }
+
+        let a = VectorIndex::<u64>::new(dim).unwrap();
+        a.upsert_batch(forward.clone()).unwrap();
+        let b = VectorIndex::<u64>::new(dim).unwrap();
+        b.upsert_batch(shuffled).unwrap();
+        let c = VectorIndex::<u64>::new(dim).unwrap();
+        c.upsert_batch(forward).unwrap();
+
+        // Caller order independent AND run-to-run stable, even before canonicalization.
+        assert_eq!(
+            batch_fingerprint(&a),
+            batch_fingerprint(&b),
+            "parallel batch intermediate depended on caller input order"
+        );
+        assert_eq!(
+            batch_fingerprint(&a),
+            batch_fingerprint(&c),
+            "parallel batch intermediate varied across identical runs"
+        );
+
+        for q in 0..8u64 {
+            let query = batch_test_vec(120_000 + q, dim);
+            assert_eq!(batch_knn(&a, &query, limit), batch_knn(&b, &query, limit));
+            assert_eq!(batch_knn(&a, &query, limit), batch_knn(&c, &query, limit));
         }
     }
 
