@@ -653,6 +653,30 @@ pub trait GpuCompute: Send + Sync {
         Ok(None)
     }
 
+    /// Evaluates the full stack of transformer layers in one pass, keeping the
+    /// residual activations resident on-device across every layer and
+    /// synchronizing with the host exactly once at the end — instead of reading
+    /// the hidden state back and re-uploading it between layers.
+    ///
+    /// `layers` holds one `LayerTensors` per executed layer (repeating shared
+    /// groups), all sharing the single `config`/`rope` parameters. The output is
+    /// bit-identical to looping `forward_layer_batched` over the same layers; only
+    /// residency and host-synchronization timing differ.
+    ///
+    /// Returns `Ok(None)` to fall back to the per-layer path (the reference).
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layers_batched(
+        &self,
+        _hidden: &[f32],
+        _masks: &[u32],
+        _layers: &[LayerTensors],
+        _config: &LayerConfig,
+        _rope_cos: &[f32],
+        _rope_sin: &[f32],
+    ) -> Result<Option<Vec<f32>>, InferError> {
+        Ok(None)
+    }
+
     /// Which backend this compute instance uses.
     fn backend(&self) -> GpuBackend;
 
