@@ -1788,7 +1788,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19753d40da53d0ec41604750eeb969097a90fb2d7f7992730d904541c04e2c19"
 dependencies = [
  "bstr",
- "hashbrown 0.17.1",
+ "hashbrown 0.16.1",
 ]
 
 [[package]]
@@ -3061,9 +3061,9 @@ dependencies = [
 
 [[package]]
 name = "kin-db"
-version = "0.2.11"
+version = "0.2.12"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "e24306d81b02cc141cafe14e60d7a5691c777911c12b19a699620fdd7043b0d3"
+checksum = "3ae5c452075c9e39dc933c37fc83355475dcdd36e13daaab9f487fabaef4aa7f"
 dependencies = [
  "bincode",
  "bytes",
@@ -3140,9 +3140,9 @@ dependencies = [
 
 [[package]]
 name = "kin-infer"
-version = "0.2.9"
+version = "0.2.11"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "140d3b820dc35f6a310ef2fa5632ebe3dc63e15f78d84d13d00197f8f9f2c055"
+checksum = "edbcdd6e280b51c684d199da2a4ff778c5a8ed5663850a3086aa16435d3eb8d1"
 dependencies = [
  "block",
  "half",
@@ -6357,7 +6357,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
