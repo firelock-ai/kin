@@ -184,6 +184,11 @@ pub struct ResourcePlan {
     pub host: HostInfo,
     pub memory: MemoryInfo,
     pub accelerator: AcceleratorInfo,
+    /// Detected GPU core count (Apple-silicon `gpu-core-count`), when available.
+    /// Reported for inspection. Populated by [`ResourcePlan::detect`]; left
+    /// `None` when a plan is built directly via [`ResourcePlan::for_profile`].
+    #[serde(default)]
+    pub gpu_core_count: Option<usize>,
     pub embedding: EmbeddingPlan,
     pub locate_search: LocateSearchPlan,
     pub bench: BenchPlan,
@@ -269,6 +274,40 @@ fn detect_system_total_bytes() -> Option<u64> {
     None
 }
 
+/// Best-effort GPU core count via the IORegistry `gpu-core-count` property
+/// (Apple silicon). Returns `None` off macOS or when the property is absent.
+#[cfg(target_os = "macos")]
+fn detect_gpu_cores() -> Option<usize> {
+    let out = std::process::Command::new("ioreg")
+        .args(["-l", "-k", "gpu-core-count"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    const KEY: &str = "\"gpu-core-count\"";
+    for line in text.lines() {
+        if let Some(pos) = line.find(KEY) {
+            let value: String = line[pos + KEY.len()..]
+                .chars()
+                .filter(char::is_ascii_digit)
+                .collect();
+            if let Ok(n) = value.parse::<usize>() {
+                if n > 0 {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn detect_gpu_cores() -> Option<usize> {
+    None
+}
+
 /// Detect the best accelerator from read-only device discovery. Does not create
 /// a compute instance or load a model. `max_inflight_command_buffers` /
 /// `allow_cpu_fallback` are defaulted here and finalized by
@@ -306,13 +345,40 @@ pub fn detect_accelerator() -> AcceleratorInfo {
 // Profile budgets
 // ---------------------------------------------------------------------------
 
+/// Throughput budget multiplier for unified-memory Metal, keyed off total
+/// unified memory. On Apple silicon memory size tracks GPU class (Max/Ultra
+/// parts ship both more memory and more GPU cores), so this scales the batch and
+/// attention budgets with effective GPU throughput while keeping the O(seq²)
+/// attention area inside the macOS GPU watchdog's wall-time budget. Parts below
+/// the smallest tier keep the historical budgets unchanged.
+fn unified_throughput_scale(system_total_bytes: Option<u64>) -> usize {
+    match system_total_bytes {
+        Some(b) if b >= 96 * GIB => 4,
+        Some(b) if b >= 64 * GIB => 3,
+        Some(b) if b >= 32 * GIB => 2,
+        _ => 1,
+    }
+}
+
+/// In-flight Metal command-buffer depth for unified-memory throughput, scaled by
+/// memory tier so larger parts pipeline more work without starving submission.
+fn unified_inflight(system_total_bytes: Option<u64>) -> usize {
+    match system_total_bytes {
+        Some(b) if b >= 96 * GIB => 4,
+        Some(b) if b >= 32 * GIB => 3,
+        _ => 2,
+    }
+}
+
 impl ResourcePlan {
     /// Detect host/accelerator/memory and derive the plan for `profile`.
     pub fn detect(profile: Profile) -> ResourcePlan {
         let host = detect_host();
         let accelerator = detect_accelerator();
         let memory = detect_memory();
-        ResourcePlan::for_profile(profile, &host, &accelerator, &memory)
+        let mut plan = ResourcePlan::for_profile(profile, &host, &accelerator, &memory);
+        plan.gpu_core_count = detect_gpu_cores();
+        plan
     }
 
     /// Derive a plan for `profile` from detected resources. Proof reproduces the
@@ -382,10 +448,18 @@ impl ResourcePlan {
                 host.reserve_logical_cores = 1;
                 host.rayon_threads = logical.saturating_sub(1).max(1);
                 embedding.max_entities_per_graph_chunk = (logical * 32).clamp(128, 512);
-                // Unified-memory Metal lifts the token budget but keeps the
-                // attention area fixed — raising it trips the macOS GPU watchdog.
                 if backend == AcceleratorBackend::Metal && accel.unified_memory {
-                    embedding.max_batch_tokens = 65536;
+                    // Scale the batch + attention budgets with the unified-memory
+                    // tier (a proxy for GPU class). The attention area stays inside
+                    // the macOS GPU watchdog's wall-time budget because higher tiers
+                    // also have proportionally more GPU cores.
+                    let scale = unified_throughput_scale(memory.system_total_bytes);
+                    embedding.max_batch_tokens = 65_536 * scale;
+                    embedding.max_attention_area = proof_attention_area.map(|a| a * scale as u64);
+                    accel.max_inflight_command_buffers =
+                        unified_inflight(memory.system_total_bytes);
+                } else {
+                    accel.max_inflight_command_buffers = 2;
                 }
                 embedding.hybrid_mode = if memory.system_total_bytes.is_some_and(|b| b >= 32 * GIB)
                 {
@@ -393,7 +467,6 @@ impl ResourcePlan {
                 } else {
                     HybridMode::Off
                 };
-                accel.max_inflight_command_buffers = 2;
                 bench.explore_fast_jobs = Some(logical.saturating_sub(2).max(1));
                 bench.artifact_mode = ArtifactMode::NonCitableExplore;
             }
@@ -421,6 +494,7 @@ impl ResourcePlan {
             host,
             memory: memory.clone(),
             accelerator: accel,
+            gpu_core_count: None,
             embedding,
             locate_search,
             bench,
@@ -543,31 +617,90 @@ mod tests {
     }
 
     #[test]
-    fn throughput_keeps_attention_area_capped() {
+    fn throughput_scales_budgets_on_high_memory_unified_metal() {
         let host = host_with(18);
         let accel = metal_accel();
         let mem = mem_with(Some(128 * GIB));
         let plan = ResourcePlan::for_profile(Profile::Throughput, &host, &accel, &mem);
 
-        // Watchdog guard: token budget rises on unified Metal, attention area does not.
-        assert_eq!(plan.embedding.max_attention_area, Some(8_388_608));
-        assert_eq!(plan.embedding.max_batch_tokens, 65536);
+        // 128 GiB unified -> top tier (4x) over the historical 8.38M / 65536 base.
+        assert_eq!(plan.embedding.max_attention_area, Some(33_554_432));
+        assert_eq!(plan.embedding.max_batch_tokens, 262_144);
+        assert_eq!(plan.accelerator.max_inflight_command_buffers, 4);
         assert_eq!(plan.embedding.max_entities_per_graph_chunk, 512);
         assert_eq!(plan.embedding.hybrid_mode, HybridMode::Balanced);
         assert_eq!(plan.host.rayon_threads, 17);
         assert_eq!(plan.host.reserve_logical_cores, 1);
-        assert_eq!(plan.accelerator.max_inflight_command_buffers, 2);
         assert_eq!(plan.bench.explore_fast_jobs, Some(16));
         assert_eq!(plan.bench.artifact_mode, ArtifactMode::NonCitableExplore);
     }
 
     #[test]
-    fn throughput_hybrid_off_below_32gib() {
+    fn throughput_mid_memory_tiers_scale_proportionally() {
+        let host = host_with(18);
+        let accel = metal_accel();
+
+        let plan = ResourcePlan::for_profile(
+            Profile::Throughput,
+            &host,
+            &accel,
+            &mem_with(Some(64 * GIB)),
+        );
+        assert_eq!(plan.embedding.max_attention_area, Some(25_165_824));
+        assert_eq!(plan.embedding.max_batch_tokens, 196_608);
+        assert_eq!(plan.accelerator.max_inflight_command_buffers, 3);
+
+        let plan = ResourcePlan::for_profile(
+            Profile::Throughput,
+            &host,
+            &accel,
+            &mem_with(Some(32 * GIB)),
+        );
+        assert_eq!(plan.embedding.max_attention_area, Some(16_777_216));
+        assert_eq!(plan.embedding.max_batch_tokens, 131_072);
+        assert_eq!(plan.accelerator.max_inflight_command_buffers, 3);
+    }
+
+    #[test]
+    fn throughput_keeps_historical_budgets_below_32gib() {
         let host = host_with(18);
         let accel = metal_accel();
         let mem = mem_with(Some(16 * GIB));
         let plan = ResourcePlan::for_profile(Profile::Throughput, &host, &accel, &mem);
+        // Smallest tier (1x): unchanged from the pre-scaling throughput budgets.
+        assert_eq!(plan.embedding.max_attention_area, Some(8_388_608));
+        assert_eq!(plan.embedding.max_batch_tokens, 65_536);
+        assert_eq!(plan.accelerator.max_inflight_command_buffers, 2);
         assert_eq!(plan.embedding.hybrid_mode, HybridMode::Off);
+    }
+
+    #[test]
+    fn throughput_does_not_scale_non_unified_metal() {
+        let host = host_with(18);
+        let mut accel = metal_accel();
+        accel.unified_memory = false;
+        let mem = mem_with(Some(128 * GIB));
+        let plan = ResourcePlan::for_profile(Profile::Throughput, &host, &accel, &mem);
+        // Discrete-memory Metal has no unified headroom: keep the proof budgets.
+        assert_eq!(plan.embedding.max_attention_area, Some(8_388_608));
+        assert_eq!(plan.embedding.max_batch_tokens, 16_384);
+        assert_eq!(plan.accelerator.max_inflight_command_buffers, 2);
+    }
+
+    #[test]
+    fn for_profile_leaves_gpu_core_count_none() {
+        let host = host_with(18);
+        let accel = metal_accel();
+        let mem = mem_with(Some(128 * GIB));
+        for profile in [
+            Profile::Proof,
+            Profile::Interactive,
+            Profile::Throughput,
+            Profile::Ci,
+        ] {
+            let plan = ResourcePlan::for_profile(profile, &host, &accel, &mem);
+            assert_eq!(plan.gpu_core_count, None);
+        }
     }
 
     #[test]
