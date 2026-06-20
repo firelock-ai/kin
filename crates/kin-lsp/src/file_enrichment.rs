@@ -299,6 +299,7 @@ mod tests {
     /// (definition resolution is position-dependent). This isolates the only
     /// work a "single-pass / batch" refactor could remove.
     #[test]
+    #[ignore = "wall-clock microbench; run explicitly with --ignored on a quiet machine"]
     fn measure_identifier_scan_throughput_on_large_unicode_file() {
         let lines = 5_000usize;
         let content = synth_large_file(lines);
