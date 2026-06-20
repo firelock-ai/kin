@@ -3,7 +3,7 @@
 
 [package]
 name = "kin-vector"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Troy Fortin <troy@firelock.ai>"]
@@ -15,12 +15,13 @@ doctest = false
 
 [features]
 default = ["simd"]
-# SIMD distance kernel (aarch64 NEON), enabled by default. With this feature
+# SIMD distance kernel (aarch64 NEON). Compiled in by default, but gated OFF at
+# runtime: the scalar reduction is the default result path and is bit-identical to
+# the frozen benchmark on every target. Enable the NEON kernel with
+# `KIN_VECTOR_SIMD=1` once its ~2-ulp delta from scalar is measured and approved
+# (the delta can transpose effectively-equidistant neighbors). With this feature
 # disabled the crate compiles to the scalar reduction only, byte-for-byte
-# unchanged. When compiled in, the SIMD path is additionally gated at runtime by
-# `KIN_VECTOR_SIMD` (default on; set to 0/false/no/off to force the scalar path).
-# The NEON result tracks the scalar reduction within a bounded epsilon
-# characterized in the `simd` tests. See `cosine_distance`.
+# unchanged. The bound is characterized in the `simd` tests. See `cosine_distance`.
 simd = []
 
 [dependencies]
