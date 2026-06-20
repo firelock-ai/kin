@@ -173,35 +173,44 @@ fn entity_unchanged_since_last_revision(ent: &EntityData, entity: &Entity) -> bo
         .is_some_and(|last| entity_matches_revision(&last.entity, entity))
 }
 
-fn append_entity_revisions(ent: &mut EntityData, change: &SemanticChange) {
+/// Apply a change's entity deltas to the revision chains, returning the prior
+/// HEAD revision id of every entity that gained a new generation. Those
+/// superseded revisions are no longer current truth, so any vector still indexed
+/// under their key is an orphan — the returned ids let `prune_orphaned_vectors`
+/// evict exactly that set without rescanning the whole index.
+fn append_entity_revisions(ent: &mut EntityData, change: &SemanticChange) -> Vec<EntityRevisionId> {
+    let mut superseded = Vec::new();
     for delta in &change.entity_deltas {
         match delta {
             EntityDelta::Added(entity) => {
                 if entity_unchanged_since_last_revision(ent, entity) {
                     continue;
                 }
-                ent.entity_revisions
-                    .entry(entity.id)
-                    .or_default()
-                    .push(EntityRevision::new(entity.clone(), change.id, None));
+                let chain = ent.entity_revisions.entry(entity.id).or_default();
+                if let Some(prev) = chain.last() {
+                    superseded.push(prev.revision_id);
+                }
+                chain.push(EntityRevision::new(entity.clone(), change.id, None));
             }
             EntityDelta::Modified { old, new } => {
                 if entity_unchanged_since_last_revision(ent, new) {
                     continue;
                 }
                 let previous_revision = lookup_entity_revision_id(&ent.entity_revisions, old);
-                ent.entity_revisions
-                    .entry(new.id)
-                    .or_default()
-                    .push(EntityRevision::new(
-                        new.clone(),
-                        change.id,
-                        previous_revision,
-                    ));
+                let chain = ent.entity_revisions.entry(new.id).or_default();
+                if let Some(prev) = chain.last() {
+                    superseded.push(prev.revision_id);
+                }
+                chain.push(EntityRevision::new(
+                    new.clone(),
+                    change.id,
+                    previous_revision,
+                ));
             }
             EntityDelta::Removed(_) => {}
         }
     }
+    superseded
 }
 
 /// The most recent (HEAD) revision id of every entity's revision chain.
@@ -1089,6 +1098,66 @@ struct PendingMerkle {
     seeds: HashSet<EntityId>,
 }
 
+/// Incremental reconcile bookkeeping for the vector index.
+///
+/// `prune_orphaned_vectors` evicts index keys that have fallen out of graph
+/// truth. The vast majority of those orphans come from one path — a live
+/// re-embed appends a new entity revision, leaving the prior generation's
+/// revision vector behind — whose exact key is known at mutation time. Tracking
+/// that key set lets prune evict precisely those entries (`superseded`) without
+/// the O(index) rescan. `full` forces the exhaustive scan after an untracked
+/// truth change (a fresh build, a sidecar load, or an entity removal) where the
+/// orphan set cannot be enumerated cheaply. It starts `true` so the first prune
+/// of any graph always reconciles fully.
+#[cfg(feature = "vector")]
+struct VectorReconcileState {
+    full: bool,
+    superseded: HashSet<RetrievalKey>,
+}
+
+#[cfg(feature = "vector")]
+impl Default for VectorReconcileState {
+    fn default() -> Self {
+        Self {
+            full: true,
+            superseded: HashSet::new(),
+        }
+    }
+}
+
+/// A drained, text-formatted embedding batch ready for inference.
+///
+/// Splitting the embed pipeline at this boundary lets a caller hold the graph
+/// read lock for ONLY the CPU prep stage ([`InMemoryGraph::prepare_pending_embedding_batch`]),
+/// run inference graph-lock-free ([`InMemoryGraph::embed_prepared_batch`]), then
+/// persist under the vector-index lock ([`InMemoryGraph::persist_embedded_batch`]).
+/// Prep for batch N+1, inference for batch N, and persist for batch N-1 can then
+/// overlap instead of serializing behind a single lock held across the whole
+/// pipeline. [`InMemoryGraph::process_embedding_queue`] composes the three stages.
+#[cfg(all(feature = "embeddings", feature = "vector"))]
+pub struct PreparedEmbedBatch {
+    /// Keys whose text was successfully formatted (the work to embed).
+    keys: Vec<RetrievalKey>,
+    /// Formatted text, parallel to `keys`. Owned once here and never recopied.
+    texts: Vec<String>,
+    /// Recency for every drained key (including any whose entity was missing),
+    /// so an error-requeue cannot demote changed-this-sync work to backfill.
+    recency: hashbrown::HashMap<RetrievalKey, EmbedRecency>,
+}
+
+#[cfg(all(feature = "embeddings", feature = "vector"))]
+impl PreparedEmbedBatch {
+    /// Number of entities prepared for embedding.
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Whether the batch holds no embeddable entities.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+}
+
 pub struct InMemoryGraph {
     /// Core entity/relation graph.
     entities: RwLock<EntityData>,
@@ -1142,6 +1211,13 @@ pub struct InMemoryGraph {
     /// work targeted instead of forcing a full artifact pass on every embed run.
     #[cfg(feature = "vector")]
     artifact_embedding_queue: parking_lot::Mutex<RecencyQueue<ArtifactId>>,
+    /// Incremental reconcile state for `prune_orphaned_vectors`. Tracks the exact
+    /// set of vector keys orphaned by re-embeds (superseded entity revisions) so
+    /// the common live-re-embed prune evicts only those keys instead of rescanning
+    /// the whole index, and a `full` flag for untracked truth changes (load,
+    /// (re)build, entity removal) that still demand a full index↔truth scan.
+    #[cfg(feature = "vector")]
+    vector_reconcile: parking_lot::Mutex<VectorReconcileState>,
     /// Per-graph count of deferred Merkle refreshes that actually ran.
     /// Used by tests to prove that burst mutations collapse into one batch
     /// reconciliation. A per-instance counter avoids interference from other
@@ -1246,6 +1322,8 @@ impl InMemoryGraph {
             embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
             #[cfg(feature = "vector")]
             artifact_embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
+            #[cfg(feature = "vector")]
+            vector_reconcile: parking_lot::Mutex::new(VectorReconcileState::default()),
             #[cfg(test)]
             merkle_flush_count: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -1650,6 +1728,8 @@ impl InMemoryGraph {
             embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
             #[cfg(feature = "vector")]
             artifact_embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
+            #[cfg(feature = "vector")]
+            vector_reconcile: parking_lot::Mutex::new(VectorReconcileState::default()),
             #[cfg(test)]
             merkle_flush_count: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -1871,6 +1951,8 @@ impl InMemoryGraph {
             embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
             #[cfg(feature = "vector")]
             artifact_embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
+            #[cfg(feature = "vector")]
+            vector_reconcile: parking_lot::Mutex::new(VectorReconcileState::default()),
             #[cfg(test)]
             merkle_flush_count: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -3074,6 +3156,9 @@ impl InMemoryGraph {
         let loaded = VectorIndex::load_from_disk(path)?;
         let count = loaded.len();
         *self.vector_index.lock() = Some(Arc::new(loaded));
+        // A loaded sidecar can carry stale-generation vectors that are orphans
+        // relative to this graph's truth; force the next prune to scan fully.
+        self.mark_vector_full_reconcile();
         Ok(count)
     }
 
@@ -3097,6 +3182,7 @@ impl InMemoryGraph {
             IndexLoadOutcome::Loaded(index) => {
                 let count = index.len();
                 *self.vector_index.lock() = Some(Arc::new(index));
+                self.mark_vector_full_reconcile();
                 VectorIndexLoad::Loaded(count)
             }
             IndexLoadOutcome::Incompatible(reason) => VectorIndexLoad::Incompatible(reason),
@@ -3690,11 +3776,20 @@ impl InMemoryGraph {
         // Deterministic total order: recency first (changed-this-sync before
         // backfill), then the artifact id as the stable tiebreak. (Artifacts
         // carry less semantic structure than entities, so recency + id is the
-        // honest priority signal available without extra lookups.)
-        all.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-
+        // honest priority signal available without extra lookups.) The id is a
+        // unique tiebreak, so this is a strict total order with no ties:
+        // partition the top `take` with `select_nth_unstable` (O(n)) and sort
+        // only that prefix — identical output to a full sort of the whole queue,
+        // without paying O(n log n) on the leftover that is requeued anyway.
+        let order = |a: &(ArtifactId, EmbedRecency), b: &(ArtifactId, EmbedRecency)| {
+            a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0))
+        };
         let take = batch_size.min(all.len());
+        if take < all.len() {
+            all.select_nth_unstable_by(take, order);
+        }
         let leftover = all.split_off(take);
+        all.sort_unstable_by(order);
         if !leftover.is_empty() {
             let mut queue = self.artifact_embedding_queue.lock();
             for (id, recency) in leftover {
@@ -3808,54 +3903,49 @@ impl InMemoryGraph {
     pub fn process_embedding_queue(&self, batch_size: usize) -> Result<usize, KinDbError> {
         let _span =
             tracing::info_span!("kindb.process_embedding_queue", batch_size = batch_size).entered();
+
+        // Compose the three staged methods. A pipelining caller can instead drive
+        // them on separate threads so prep for batch N+1, inference for batch N,
+        // and persist for batch N-1 overlap; here they run back to back.
+        let prepared = self.prepare_pending_embedding_batch(batch_size);
+        if prepared.is_empty() {
+            return Ok(0);
+        }
+        let embedded = self.embed_prepared_batch(&prepared)?;
+        self.persist_embedded_batch(embedded, &prepared)
+    }
+
+    /// Stage 1 of the embed pipeline: drain a deterministic, priority-ordered
+    /// batch and format each entity's text. This is the ONLY stage that touches
+    /// the entity graph — it acquires the `entities` read lock, formats every
+    /// item, and releases it before returning — so a caller can run it for the
+    /// next batch while the current batch is on the GPU.
+    ///
+    /// `drain_embedding_batch` is the single ordering authority: batch
+    /// composition depends only on queue contents and graph state, never on map
+    /// iteration order, so it is identical across processes.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    pub fn prepare_pending_embedding_batch(&self, batch_size: usize) -> PreparedEmbedBatch {
         use crate::embed::format_graph_entity_text;
         use crate::embed::format_graph_entity_text_with_context;
 
         let batch_size = batch_size.max(1);
-
-        // Drain a deterministic, priority-ordered batch. `drain_embedding_batch`
-        // is the single ordering authority: it sorts queued work by a stable
-        // total order, so batch composition depends only on queue contents and
-        // graph state — never on map iteration order — and is identical across
-        // processes.
         let batch = self.drain_embedding_batch(batch_size);
-        if batch.is_empty() {
-            return Ok(0);
-        }
-
-        // Preserve each key's recency so an error-requeue cannot silently demote
-        // changed-this-sync work to backfill.
-        let batch_recency: hashbrown::HashMap<RetrievalKey, EmbedRecency> =
+        let recency: hashbrown::HashMap<RetrievalKey, EmbedRecency> =
             batch.iter().copied().collect();
-        let batch_keys: Vec<RetrievalKey> = batch.iter().map(|(key, _)| *key).collect();
 
-        let requeue = |keys: &[RetrievalKey]| {
-            if keys.is_empty() {
-                return;
-            }
-            let mut queue = self.embedding_queue.lock();
-            for key in keys {
-                let recency = batch_recency
-                    .get(key)
-                    .copied()
-                    .unwrap_or(EmbedRecency::Backfill);
-                queue.insert(*key, recency);
-            }
-        };
-
-        // Collect text representations under read lock, then drop before inference.
-        let mut entity_data: Vec<(RetrievalKey, String)> = Vec::with_capacity(batch_keys.len());
-        {
+        let mut keys: Vec<RetrievalKey> = Vec::with_capacity(batch.len());
+        let mut texts: Vec<String> = Vec::with_capacity(batch.len());
+        if !batch.is_empty() {
             let ent = self.entities.read();
 
-            // Build a lookup map for any EntityRevisionId in the batch
+            // Build a lookup map for any EntityRevisionId in the batch.
             let mut rev_ids = hashbrown::HashSet::new();
-            for key in &batch_keys {
+            for (key, _) in &batch {
                 if let RetrievalKey::EntityRevision(rev_id) = key {
                     rev_ids.insert(*rev_id);
                 }
             }
-
             let mut rev_lookup = hashbrown::HashMap::new();
             if !rev_ids.is_empty() {
                 'outer: for revisions_vec in ent.entity_revisions.values() {
@@ -3870,20 +3960,19 @@ impl InMemoryGraph {
                 }
             }
 
-            for key in &batch_keys {
+            for (key, _) in &batch {
                 match key {
                     RetrievalKey::Entity(entity_id) => {
                         if let Some(e) = ent.entities.get(entity_id) {
                             let context_lines = collect_embedding_context_lines(&ent, entity_id);
-                            entity_data.push((
-                                *key,
-                                format_graph_entity_text_with_context(e, &context_lines),
-                            ));
+                            keys.push(*key);
+                            texts.push(format_graph_entity_text_with_context(e, &context_lines));
                         }
                     }
                     RetrievalKey::EntityRevision(rev_id) => {
                         if let Some(rev) = rev_lookup.get(rev_id) {
-                            entity_data.push((*key, format_graph_entity_text(&rev.entity)));
+                            keys.push(*key);
+                            texts.push(format_graph_entity_text(&rev.entity));
                         }
                     }
                     _ => {}
@@ -3891,61 +3980,82 @@ impl InMemoryGraph {
             }
         }
 
-        if entity_data.is_empty() {
-            return Ok(0);
+        PreparedEmbedBatch {
+            keys,
+            texts,
+            recency,
+        }
+    }
+
+    /// Stage 2 of the embed pipeline: run inference for a prepared batch. Holds
+    /// no graph lock — only the brief embedder/index Arc clones — so it can run
+    /// concurrently with another batch's prep or persist. On failure the batch is
+    /// requeued (preserving recency) so no work is lost.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    pub fn embed_prepared_batch(
+        &self,
+        prepared: &PreparedEmbedBatch,
+    ) -> Result<Vec<(RetrievalKey, Vec<f32>)>, KinDbError> {
+        if prepared.keys.is_empty() {
+            return Ok(Vec::new());
         }
 
         let embedder = match self.get_embedder() {
             Ok(embedder) => embedder,
             Err(err) => {
-                requeue(&batch_keys);
+                self.requeue_embedding_keys(prepared.recency.keys().copied(), &prepared.recency);
                 return Err(err);
             }
         };
+        // Acquire the index now, before inference, so a stale-dimension reset (and
+        // its full requeue) happens up front exactly as the monolithic path did.
+        if let Err(err) = self.get_vector_index() {
+            self.requeue_embedding_keys(prepared.recency.keys().copied(), &prepared.recency);
+            return Err(err);
+        }
+
+        let vectors = match embedder.embed_batch(&prepared.texts) {
+            Ok(vectors) => vectors,
+            Err(err) => {
+                self.requeue_embedding_keys(prepared.keys.iter().copied(), &prepared.recency);
+                return Err(err);
+            }
+        };
+        Ok(prepared
+            .keys
+            .iter()
+            .copied()
+            .zip(vectors.into_iter())
+            .collect())
+    }
+
+    /// Stage 3 of the embed pipeline: persist embedded vectors into the index and
+    /// reconcile orphans when the queue drains. Touches only the vector index, so
+    /// it can run concurrently with another batch's prep or inference. On failure
+    /// the embedded keys are requeued.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    pub fn persist_embedded_batch(
+        &self,
+        embedded: Vec<(RetrievalKey, Vec<f32>)>,
+        prepared: &PreparedEmbedBatch,
+    ) -> Result<usize, KinDbError> {
+        if embedded.is_empty() {
+            return Ok(0);
+        }
+        let keys: Vec<RetrievalKey> = embedded.iter().map(|(key, _)| *key).collect();
+
         let vi = match self.get_vector_index() {
             Ok(index) => index,
             Err(err) => {
-                requeue(&batch_keys);
+                self.requeue_embedding_keys(keys.iter().copied(), &prepared.recency);
                 return Err(err);
             }
         };
 
-        let embed_batch_size = batch_size.max(1);
-        let mut count = 0;
-        for (chunk_idx, chunk) in entity_data.chunks(embed_batch_size).enumerate() {
-            let texts: Vec<String> = chunk.iter().map(|(_, t)| t.clone()).collect();
-            let vectors = match embedder.embed_batch(&texts) {
-                Ok(vectors) => vectors,
-                Err(err) => {
-                    let start_idx = (chunk_idx * embed_batch_size).min(entity_data.len());
-                    let remaining_keys: Vec<RetrievalKey> = entity_data[start_idx..]
-                        .iter()
-                        .map(|(key, _)| *key)
-                        .collect();
-                    requeue(&remaining_keys);
-                    return Err(err);
-                }
-            };
-            let batch_items: Vec<(RetrievalKey, Vec<f32>)> = chunk
-                .iter()
-                .zip(vectors.into_iter())
-                .map(|((key, _), vec)| (*key, vec))
-                .collect();
-
-            if let Err(err) = vi.upsert_retrievable_batch(batch_items) {
-                let mut remaining_keys: Vec<RetrievalKey> =
-                    chunk.iter().map(|(rest_key, _)| *rest_key).collect();
-
-                let next_chunk_start = ((chunk_idx + 1) * embed_batch_size).min(entity_data.len());
-                remaining_keys.extend(
-                    entity_data[next_chunk_start..]
-                        .iter()
-                        .map(|(rest_key, _)| *rest_key),
-                );
-                requeue(&remaining_keys);
-                return Err(err);
-            }
-            count += chunk.len();
+        let count = embedded.len();
+        if let Err(err) = vi.upsert_retrievable_batch(embedded) {
+            self.requeue_embedding_keys(keys.iter().copied(), &prepared.recency);
+            return Err(err);
         }
 
         // Live retire: when this batch drains the entity queue, a re-embed that
@@ -3953,13 +4063,27 @@ impl InMemoryGraph {
         // prior revision vector behind. Reconcile the index to graph truth so the
         // superseded generation is retired now, instead of accumulating until the
         // next daemon boot's load-time reclaim. Gated on the queue being empty so
-        // a multi-batch backfill prunes once at the end (O(index) per drain, not
-        // per batch) rather than rescanning the whole index after every chunk.
+        // a multi-batch backfill prunes once at the end rather than per batch.
         if count > 0 && self.embedding_queue.lock().is_empty() {
             self.prune_orphaned_vectors();
         }
 
         Ok(count)
+    }
+
+    /// Requeue embedding keys, restoring each key's recency so an error-requeue
+    /// never silently demotes changed-this-sync work to backfill.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn requeue_embedding_keys<I: IntoIterator<Item = RetrievalKey>>(
+        &self,
+        keys: I,
+        recency: &hashbrown::HashMap<RetrievalKey, EmbedRecency>,
+    ) {
+        let mut queue = self.embedding_queue.lock();
+        for key in keys {
+            let recency = recency.get(&key).copied().unwrap_or(EmbedRecency::Backfill);
+            queue.insert(key, recency);
+        }
     }
 
     /// Process embedding queue (stub when features are disabled).
@@ -4139,6 +4263,24 @@ impl InMemoryGraph {
             None => return 0,
         };
 
+        // Take the reconcile decision under the lock: a full scan resets the
+        // tracked state, the incremental path drains exactly the keys orphaned by
+        // re-embeds since the last prune.
+        let do_full = {
+            let mut state = self.vector_reconcile.lock();
+            if state.full {
+                state.full = false;
+                state.superseded.clear();
+                true
+            } else {
+                false
+            }
+        };
+
+        if !do_full {
+            return self.prune_tracked_orphans(&vi);
+        }
+
         let truth = self.graph_truth_retrievable_keys();
         let mut orphans: Vec<RetrievalKey> = vi
             .retrievable_keys()
@@ -4164,6 +4306,70 @@ impl InMemoryGraph {
             tracing::info!(evicted, "pruned orphaned vectors from index");
         }
         evicted
+    }
+
+    /// Incremental prune: evict only the vector keys recorded as superseded by
+    /// re-embeds since the last reconcile, instead of rescanning the entire
+    /// index or rebuilding the full truth set.
+    ///
+    /// Each tracked key is the prior HEAD revision of an entity that gained a
+    /// newer generation. A revision id is `hash(entity_id, change_id)`, so a
+    /// superseded revision can never be any entity's current HEAD again — it is
+    /// definitively an orphan and is evicted directly. (Any untracked truth
+    /// change — load, rebuild, removal — sets `full` instead, routing to the
+    /// exhaustive scan, so this fast path only runs when the tracked set is the
+    /// complete orphan set.) Evicting in sorted order keeps the resulting
+    /// `free_list` deterministic, exactly as the full scan does.
+    #[cfg(feature = "vector")]
+    fn prune_tracked_orphans(&self, vi: &VectorIndex) -> usize {
+        let mut tracked: Vec<RetrievalKey> = {
+            let mut state = self.vector_reconcile.lock();
+            state.superseded.drain().collect()
+        };
+        if tracked.is_empty() {
+            return 0;
+        }
+        tracked.sort_unstable();
+
+        let mut evicted = 0usize;
+        for key in &tracked {
+            if vi.remove_retrievable(key).is_ok() {
+                evicted += 1;
+            }
+        }
+        if evicted > 0 {
+            tracing::info!(evicted, "pruned tracked orphaned vectors from index");
+        }
+        evicted
+    }
+
+    /// Record vectors orphaned by a tracked supersession (prior entity
+    /// revisions replaced by a newer generation) for targeted eviction by the
+    /// next [`InMemoryGraph::prune_orphaned_vectors`]. A no-op once a full
+    /// reconcile is already pending — the full scan will subsume them.
+    #[cfg(feature = "vector")]
+    fn note_superseded_vectors(&self, revisions: &[EntityRevisionId]) {
+        if revisions.is_empty() {
+            return;
+        }
+        let mut state = self.vector_reconcile.lock();
+        if state.full {
+            return;
+        }
+        for rev in revisions {
+            state.superseded.insert(RetrievalKey::EntityRevision(*rev));
+        }
+    }
+
+    /// Force the next [`InMemoryGraph::prune_orphaned_vectors`] to scan the whole
+    /// index against graph truth. Called after an untracked truth change — a
+    /// fresh build, a sidecar load, or an entity removal — whose orphan set
+    /// cannot be enumerated incrementally.
+    #[cfg(feature = "vector")]
+    fn mark_vector_full_reconcile(&self) {
+        let mut state = self.vector_reconcile.lock();
+        state.full = true;
+        state.superseded.clear();
     }
 
     /// Prune orphaned vectors (stub when vector feature is disabled).
@@ -5345,6 +5551,9 @@ impl EntityStore for InMemoryGraph {
             if let Some(ref vi) = *self.vector_index.lock() {
                 let _ = vi.remove(id);
             }
+            // Removal can leave revision-key vectors behind that the incremental
+            // tracker does not enumerate; force a full reconcile to be safe.
+            self.mark_vector_full_reconcile();
         }
 
         self.refresh_text_index_for_entities(&affected_neighbors);
@@ -5424,6 +5633,7 @@ impl EntityStore for InMemoryGraph {
             if let Some(ref vi) = *self.vector_index.lock() {
                 let _ = vi.remove_batch(ids)?;
             }
+            self.mark_vector_full_reconcile();
         }
 
         affected_neighbors.sort_unstable();
@@ -6076,7 +6286,11 @@ impl ChangeStore for InMemoryGraph {
 
     fn create_change(&self, change: &SemanticChange) -> Result<(), KinDbError> {
         let mut ent = self.entities.write();
-        append_entity_revisions(&mut ent, change);
+        let superseded_revisions = append_entity_revisions(&mut ent, change);
+        #[cfg(feature = "vector")]
+        self.note_superseded_vectors(&superseded_revisions);
+        #[cfg(not(feature = "vector"))]
+        let _ = superseded_revisions;
         let revision_updates: Vec<(EntityId, Vec<EntityRevision>)> = change
             .entity_deltas
             .iter()
@@ -10756,6 +10970,102 @@ mod tests {
         assert_eq!(graph.prune_orphaned_vectors(), 0);
     }
 
+    /// Incremental prune: after the first full reconcile, a subsequent re-embed
+    /// supersession is retired by evicting ONLY the tracked orphan key — without
+    /// rescanning the whole index — and the result matches what a full scan would
+    /// have produced. Guards the incremental-prune fast path.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn prune_incremental_evicts_only_tracked_superseded_vectors() {
+        let graph = InMemoryGraph::new();
+        let e1 = test_entity("foo", "src/a.rs");
+        let (rev_old, rev_new) = two_revision_entity(&graph, &e1);
+
+        // Index the doubled state (retrievable keyspace, as the embed path does)
+        // and let the FIRST prune reconcile fully (fresh graph ⇒ `full` is set),
+        // retiring the generation-1 vector.
+        let vi = VectorIndex::new(2).unwrap();
+        vi.upsert_retrievable(RetrievalKey::EntityRevision(rev_old), &[1.0, 0.0])
+            .unwrap();
+        vi.upsert_retrievable(RetrievalKey::EntityRevision(rev_new), &[0.0, 1.0])
+            .unwrap();
+        vi.upsert_retrievable(RetrievalKey::Entity(e1.id), &[0.0, 1.0])
+            .unwrap();
+        *graph.vector_index.lock() = Some(Arc::new(vi));
+        assert_eq!(
+            graph.prune_orphaned_vectors(),
+            1,
+            "full reconcile retires the generation-1 revision"
+        );
+
+        // A second content change supersedes revision 2 through the normal
+        // `create_change` path, which records revision 2 as a tracked orphan and
+        // leaves the reconcile state incremental (no forced full scan).
+        let mut changed = e1.clone();
+        changed.signature = "fn foo(x: i64)".to_string();
+        changed.fingerprint.signature_hash = Hash256::from_bytes([9; 32]);
+        apply_init_change(&graph, 0x03, &[changed]);
+        {
+            let state = graph.vector_reconcile.lock();
+            assert!(
+                !state.full,
+                "a tracked supersession must not force a full reconcile"
+            );
+            assert!(
+                state
+                    .superseded
+                    .contains(&RetrievalKey::EntityRevision(rev_new)),
+                "the superseded revision must be recorded for targeted eviction"
+            );
+        }
+        let rev_newer = {
+            let ent = graph.entities.read();
+            ent.entity_revisions
+                .get(&e1.id)
+                .unwrap()
+                .last()
+                .unwrap()
+                .revision_id
+        };
+        assert_ne!(rev_newer, rev_new);
+
+        // Simulate the re-embed re-indexing the HEAD entity + new revision (the
+        // upsert path invalidated the entity key); revision 2 lingers as the
+        // orphan to reclaim.
+        {
+            let vi = graph.vector_index.lock().clone().unwrap();
+            vi.upsert_retrievable(RetrievalKey::Entity(e1.id), &[0.5, 0.5])
+                .unwrap();
+            vi.upsert_retrievable(RetrievalKey::EntityRevision(rev_newer), &[0.5, 0.5])
+                .unwrap();
+        }
+
+        // Incremental prune evicts exactly the tracked revision-2 vector.
+        assert_eq!(
+            graph.prune_orphaned_vectors(),
+            1,
+            "incremental prune retires the tracked superseded revision"
+        );
+        let vi = graph.vector_index.lock().clone().unwrap();
+        assert!(
+            vi.get_retrievable(&RetrievalKey::EntityRevision(rev_new))
+                .is_none(),
+            "superseded revision-2 vector must be gone"
+        );
+        assert!(
+            vi.get_retrievable(&RetrievalKey::EntityRevision(rev_newer))
+                .is_some(),
+            "the new head revision vector must survive"
+        );
+        assert!(
+            vi.get_retrievable(&RetrievalKey::Entity(e1.id)).is_some(),
+            "HEAD entity vector must remain"
+        );
+
+        // Nothing tracked ⇒ idempotent no-op.
+        assert_eq!(graph.prune_orphaned_vectors(), 0);
+    }
+
     /// Load-time reclaim: an index already doubled on disk (a persisted state
     /// holding both revision generations of an entity) self-heals when
     /// reopened. Mirrors `load_vector_index_if_valid`'s load-then-prune sequence.
@@ -11769,6 +12079,339 @@ mod tests {
         let mut expected = vec![id1];
         expected.extend(backfill);
         assert_eq!(order, expected);
+    }
+
+    /// Parity gate: the small-batch partial-selection drain must yield the
+    /// IDENTICAL sequence to draining the whole queue in one shot (a pure full
+    /// sort). `drain_embedding_batch(huge)` takes the entire queue, so its
+    /// `take == len` skips `select_nth_unstable` and the result is the reference
+    /// full sort; the small-batch path exercises `select_nth_unstable` every
+    /// round. Equality proves the top-K selection orders work exactly as the
+    /// prior whole-queue sort — the invariant the citable proof depends on.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn drain_embedding_batch_partial_select_matches_full_sort() {
+        let build = || {
+            let g = InMemoryGraph::new();
+            for i in 0..60u128 {
+                let mut e = test_entity_with_id(0x200 + i, "e");
+                e.visibility = match i % 4 {
+                    0 => Visibility::Public,
+                    1 => Visibility::Crate,
+                    2 => Visibility::Internal,
+                    _ => Visibility::Private,
+                };
+                if i.is_multiple_of(5) {
+                    e.kind = EntityKind::Interface;
+                }
+                g.upsert_entity(&e).unwrap();
+            }
+            g
+        };
+
+        let g_full = build();
+        let full: Vec<RetrievalKey> = g_full
+            .drain_embedding_batch(10_000)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+
+        let g_batched = build();
+        let mut batched: Vec<RetrievalKey> = Vec::new();
+        loop {
+            let chunk = g_batched.drain_embedding_batch(7);
+            if chunk.is_empty() {
+                break;
+            }
+            batched.extend(chunk.into_iter().map(|(k, _)| k));
+        }
+
+        assert_eq!(
+            full.len(),
+            60,
+            "the full drain must return every queued entity once"
+        );
+        assert_eq!(
+            full, batched,
+            "small-batch partial selection must equal the full-sorted drain order"
+        );
+    }
+
+    /// Artifact-queue twin of the entity parity gate: the converted
+    /// `select_nth_unstable` artifact drain must match the prior full-sort order.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn drain_artifact_embedding_batch_partial_select_matches_full_sort() {
+        let ids: Vec<ArtifactId> = (0..50).map(|_| ArtifactId::new()).collect();
+        let fill = |g: &InMemoryGraph| {
+            let mut q = g.artifact_embedding_queue.lock();
+            for (i, id) in ids.iter().enumerate() {
+                let recency = if i.is_multiple_of(3) {
+                    EmbedRecency::ChangedThisSync
+                } else {
+                    EmbedRecency::Backfill
+                };
+                q.insert(*id, recency);
+            }
+        };
+
+        let g_full = InMemoryGraph::new();
+        fill(&g_full);
+        let full: Vec<ArtifactId> = g_full
+            .drain_artifact_embedding_batch(10_000)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        let g_batched = InMemoryGraph::new();
+        fill(&g_batched);
+        let mut batched: Vec<ArtifactId> = Vec::new();
+        loop {
+            let chunk = g_batched.drain_artifact_embedding_batch(6);
+            if chunk.is_empty() {
+                break;
+            }
+            batched.extend(chunk.into_iter().map(|(id, _)| id));
+        }
+
+        assert_eq!(
+            full.len(),
+            50,
+            "the full drain must return every artifact once"
+        );
+        assert_eq!(
+            full, batched,
+            "artifact partial selection must equal the full-sorted drain order"
+        );
+    }
+
+    /// Stage-1 of the split embed pipeline: `prepare_pending_embedding_batch`
+    /// drains the queue under the same deterministic ordering authority as
+    /// `process_embedding_queue` and formats each entity's text — all under the
+    /// graph read lock, with no GPU. (Stages 2/3 reach the embedder/index and are
+    /// exercised on the GPU validation path.)
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
+    fn prepare_pending_embedding_batch_drains_in_priority_order() {
+        let g = InMemoryGraph::new();
+        let mut api = test_entity_with_id(0x90, "api");
+        api.kind = EntityKind::Interface; // tier PUBLIC_API
+        let pubfn = test_entity_with_id(0x91, "pubfn"); // tier PUBLIC_SOURCE
+        g.upsert_entity(&api).unwrap();
+        g.upsert_entity(&pubfn).unwrap();
+
+        let prepared = g.prepare_pending_embedding_batch(100);
+        assert_eq!(prepared.len(), 2);
+        assert!(!prepared.is_empty());
+        // Same drain authority as the monolithic path: API surface embeds first.
+        assert_eq!(
+            prepared.keys,
+            vec![RetrievalKey::Entity(api.id), RetrievalKey::Entity(pubfn.id),],
+            "prepare must drain in the deterministic priority order"
+        );
+        // Text is formatted parallel to keys and non-empty.
+        assert_eq!(prepared.texts.len(), prepared.keys.len());
+        assert!(prepared.texts.iter().all(|t| !t.is_empty()));
+        // Prepare IS the draining stage: the queue is now empty.
+        assert_eq!(g.pending_embeddings(), 0, "prepare drains the queue");
+        // An empty queue prepares a no-op batch.
+        assert!(g.prepare_pending_embedding_batch(100).is_empty());
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
+    fn prepare_pending_embedding_batch_formats_revision_and_preserves_skipped_recency() {
+        let g = InMemoryGraph::new();
+        let entity = test_entity_with_id(0x92, "rev_target");
+        let (_rev_old, rev_new) = two_revision_entity(&g, &entity);
+        let missing = RetrievalKey::Entity(EntityId(uuid::Uuid::from_u128(0xdead_beef)));
+
+        {
+            let mut queue = g.embedding_queue.lock();
+            queue.clear();
+            queue.insert(missing, EmbedRecency::ChangedThisSync);
+            queue.insert(
+                RetrievalKey::EntityRevision(rev_new),
+                EmbedRecency::Backfill,
+            );
+        }
+
+        let prepared = g.prepare_pending_embedding_batch(100);
+        assert_eq!(
+            prepared.keys,
+            vec![RetrievalKey::EntityRevision(rev_new)],
+            "only retrievable graph-backed keys should be prepared"
+        );
+        assert_eq!(prepared.texts.len(), 1);
+        assert!(
+            prepared.texts[0].contains("rev_target"),
+            "revision text must be formatted from the revision entity"
+        );
+        assert_eq!(
+            prepared.recency.get(&missing),
+            Some(&EmbedRecency::ChangedThisSync),
+            "recency metadata is retained for skipped keys so error requeue can preserve priority"
+        );
+        assert_eq!(
+            prepared.recency.get(&RetrievalKey::EntityRevision(rev_new)),
+            Some(&EmbedRecency::Backfill)
+        );
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
+    fn staged_embedding_helpers_handle_empty_batches_and_preserve_requeue_recency() {
+        let g = InMemoryGraph::new();
+        assert_eq!(g.process_embedding_queue(8).unwrap(), 0);
+
+        let empty = PreparedEmbedBatch {
+            keys: Vec::new(),
+            texts: Vec::new(),
+            recency: hashbrown::HashMap::new(),
+        };
+        assert!(g.embed_prepared_batch(&empty).unwrap().is_empty());
+        assert_eq!(g.persist_embedded_batch(Vec::new(), &empty).unwrap(), 0);
+
+        let changed = RetrievalKey::Entity(EntityId(uuid::Uuid::from_u128(0xbeef)));
+        let defaulted = RetrievalKey::Entity(EntityId(uuid::Uuid::from_u128(0xcafe)));
+        let mut recency = hashbrown::HashMap::new();
+        recency.insert(changed, EmbedRecency::ChangedThisSync);
+
+        g.requeue_embedding_keys([changed, defaulted], &recency);
+
+        let queue = g.embedding_queue.lock();
+        assert_eq!(
+            queue.items.get(&changed),
+            Some(&EmbedRecency::ChangedThisSync)
+        );
+        assert_eq!(queue.items.get(&defaulted), Some(&EmbedRecency::Backfill));
+    }
+
+    /// CPU microbench for the embed hot-path changes. Ignored by default;
+    /// run with `cargo test -p kin-db --lib embed_hot_path_microbench -- --ignored --nocapture`.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
+    #[ignore = "perf microbench; run with --ignored --nocapture"]
+    fn embed_hot_path_microbench() {
+        use std::time::Instant;
+
+        // S1 — per-batch text cloning vs borrowing the owned text buffer.
+        let n = 5_000usize;
+        let texts: Vec<String> = (0..n).map(|i| format!("{}{i}", "x".repeat(1024))).collect();
+        let rounds = 50;
+        let mut sink = 0usize;
+        let t = Instant::now();
+        for _ in 0..rounds {
+            let cloned: Vec<String> = texts.to_vec();
+            sink = sink.wrapping_add(cloned.len());
+        }
+        let old_clone = t.elapsed();
+        let t = Instant::now();
+        for _ in 0..rounds {
+            let borrowed: &[String] = &texts[..];
+            sink = sink.wrapping_add(borrowed.len());
+        }
+        let new_slice = t.elapsed();
+        eprintln!(
+            "[S1] text reuse {rounds}x{n} (~{} MB cloned/round): old clone {old_clone:?} vs new borrow {new_slice:?} (sink={sink})",
+            n * 1024 / (1024 * 1024)
+        );
+
+        // S2 — selection strategy in isolation (both on a Vec, so the shared
+        // HashMap drain/reinsert cost is excluded): full sort of the remaining
+        // queue every batch vs `select_nth_unstable` + sort only the taken prefix.
+        let m = 20_000usize;
+        let ids: Vec<ArtifactId> = (0..m).map(|_| ArtifactId::new()).collect();
+        let batch = 256usize;
+        let recency_of = |i: usize| {
+            if i.is_multiple_of(4) {
+                EmbedRecency::ChangedThisSync
+            } else {
+                EmbedRecency::Backfill
+            }
+        };
+        let order = |a: &(ArtifactId, EmbedRecency), b: &(ArtifactId, EmbedRecency)| {
+            a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0))
+        };
+        // Each real batch drains the leftover back out of the HashMap in random
+        // order, so every batch sorts/selects UNSORTED input — model one such
+        // batch over `reps` fresh copies.
+        let base: Vec<(ArtifactId, EmbedRecency)> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, recency_of(i)))
+            .collect();
+        let reps = 200;
+
+        let t = Instant::now();
+        let mut sink2 = 0u128;
+        for _ in 0..reps {
+            let mut q = base.clone();
+            q.sort_unstable_by(order);
+            sink2 ^= q[0].0 .0.as_u128();
+        }
+        let old_select = t.elapsed();
+
+        let t = Instant::now();
+        for _ in 0..reps {
+            let mut q = base.clone();
+            if batch < q.len() {
+                q.select_nth_unstable_by(batch, order);
+            }
+            q[..batch].sort_unstable_by(order);
+            sink2 ^= q[0].0 .0.as_u128();
+        }
+        let new_select = t.elapsed();
+        eprintln!(
+            "[S2] per-batch selection m={m} take={batch} x{reps} (unsorted input): old full-sort {old_select:?} vs new partial-select {new_select:?} (sink={sink2})"
+        );
+
+        // S3 — prune: full index scan vs incremental tracked eviction.
+        let k = 30_000usize;
+        let entities: Vec<Entity> = (0..k as u128)
+            .map(|i| test_entity_with_id(0x10000 + i, "e"))
+            .collect();
+        let g = InMemoryGraph::new();
+        g.batch_upsert_entities(&entities).unwrap();
+        let orphan_keys: Vec<RetrievalKey> = (0..10u128)
+            .map(|i| RetrievalKey::Entity(test_entity_with_id(0x9990_0000 + i, "orphan").id))
+            .collect();
+        let vi = VectorIndex::new(2).unwrap();
+        for e in &entities {
+            vi.upsert_retrievable(RetrievalKey::Entity(e.id), &[1.0, 0.0])
+                .unwrap();
+        }
+        for key in &orphan_keys {
+            vi.upsert_retrievable(*key, &[0.0, 1.0]).unwrap();
+        }
+        *g.vector_index.lock() = Some(Arc::new(vi));
+
+        let t = Instant::now();
+        let evicted_full = g.prune_orphaned_vectors();
+        let full_scan = t.elapsed();
+
+        {
+            let vi = g.vector_index.lock().clone().unwrap();
+            for key in &orphan_keys {
+                vi.upsert_retrievable(*key, &[0.0, 1.0]).unwrap();
+            }
+        }
+        {
+            let mut st = g.vector_reconcile.lock();
+            st.full = false;
+            for key in &orphan_keys {
+                st.superseded.insert(*key);
+            }
+        }
+        let t = Instant::now();
+        let evicted_inc = g.prune_orphaned_vectors();
+        let incremental = t.elapsed();
+        eprintln!(
+            "[S3] prune index={} truth={k}: old full-scan {full_scan:?} (evicted {evicted_full}) vs new incremental {incremental:?} (evicted {evicted_inc})",
+            k + orphan_keys.len()
+        );
+        assert_eq!(evicted_full, orphan_keys.len());
+        assert_eq!(evicted_inc, orphan_keys.len());
     }
 
     /// Rider 1: the live invalidate (re-enqueue) path must UPGRADE an item

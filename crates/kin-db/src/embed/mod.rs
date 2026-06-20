@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "embeddings")]
 use sha2::{Digest, Sha256};
 #[cfg(feature = "embeddings")]
+use std::borrow::Cow;
+#[cfg(feature = "embeddings")]
 use std::collections::HashMap;
 #[cfg(feature = "embeddings")]
 use std::path::{Path, PathBuf};
@@ -741,7 +743,9 @@ impl CodeEmbedder {
 
         let prepared_texts = self.prepare_inputs(texts, role);
         let mut cached_results: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
-        let mut missing_texts = Vec::new();
+        // Cache-missing inputs are borrowed from `prepared_texts`, never copied —
+        // the inference backend only needs to read them.
+        let mut missing_texts: Vec<&str> = Vec::new();
         let mut missing_slots: Vec<Vec<usize>> = Vec::new();
         let mut missing_keys = Vec::new();
 
@@ -759,14 +763,14 @@ impl CodeEmbedder {
                     None => {
                         missing_by_key.insert(key.clone(), missing_texts.len());
                         missing_keys.push(key);
-                        missing_texts.push(text.clone());
+                        missing_texts.push(text.as_str());
                         missing_slots.push(vec![idx]);
                     }
                 }
             }
         } else {
             for (idx, text) in prepared_texts.iter().enumerate() {
-                missing_texts.push(text.clone());
+                missing_texts.push(text.as_str());
                 missing_slots.push(vec![idx]);
             }
         }
@@ -793,10 +797,7 @@ impl CodeEmbedder {
 
         for (miss_idx, vector) in missing_results.into_iter().enumerate() {
             let vector = sanitize_embedding(vector, self.dimensions, || {
-                missing_texts
-                    .get(miss_idx)
-                    .map(String::as_str)
-                    .unwrap_or("")
+                missing_texts.get(miss_idx).copied().unwrap_or("")
             });
             if let Some(cache) = self.cache.as_ref() {
                 if let Some(key) = missing_keys.get(miss_idx) {
@@ -820,7 +821,11 @@ impl CodeEmbedder {
     }
 
     #[cfg(feature = "embeddings")]
-    fn prepare_inputs(&self, texts: &[String], role: EmbeddingInputRole) -> Vec<String> {
+    fn prepare_inputs<'a>(
+        &self,
+        texts: &'a [String],
+        role: EmbeddingInputRole,
+    ) -> Cow<'a, [String]> {
         match &self.backend {
             CodeEmbedderBackend::Bert(embedder) => embedder.prepare_inputs(texts, role),
             CodeEmbedderBackend::OpenAiCompat(embedder) => embedder.prepare_inputs(texts, role),
@@ -828,7 +833,7 @@ impl CodeEmbedder {
     }
 
     #[cfg(feature = "embeddings")]
-    fn embed_uncached_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, KinDbError> {
+    fn embed_uncached_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, KinDbError> {
         match &self.backend {
             CodeEmbedderBackend::Bert(embedder) => {
                 embedder.embed_uncached_batch(texts, self.dimensions)
@@ -874,19 +879,25 @@ impl CodeEmbedder {
 
 #[cfg(feature = "embeddings")]
 impl BertEmbedder {
-    fn prepare_inputs(&self, texts: &[String], role: EmbeddingInputRole) -> Vec<String> {
+    fn prepare_inputs<'a>(
+        &self,
+        texts: &'a [String],
+        role: EmbeddingInputRole,
+    ) -> Cow<'a, [String]> {
         if self.query_prefix.is_empty() || role != EmbeddingInputRole::Query {
-            return texts.to_vec();
+            return Cow::Borrowed(texts);
         }
-        texts
-            .iter()
-            .map(|text| format!("{}{}", self.query_prefix, text))
-            .collect()
+        Cow::Owned(
+            texts
+                .iter()
+                .map(|text| format!("{}{}", self.query_prefix, text))
+                .collect(),
+        )
     }
 
     fn embed_uncached_batch(
         &self,
-        texts: &[String],
+        texts: &[&str],
         dimensions: usize,
     ) -> Result<Vec<Vec<f32>>, KinDbError> {
         let encodings = {
@@ -1636,7 +1647,7 @@ impl OpenAiCompatEmbedder {
             }
         }
         if embedder.dimensions == 0 {
-            let probe = embedder.embed_batch_raw(&["kin embedding dimension probe".to_string()])?;
+            let probe = embedder.embed_batch_raw(&["kin embedding dimension probe"])?;
             embedder.dimensions = probe.first().map(Vec::len).ok_or_else(|| {
                 KinDbError::IndexError("embedding probe returned no vectors".into())
             })?;
@@ -1644,18 +1655,22 @@ impl OpenAiCompatEmbedder {
         Ok(embedder)
     }
 
-    fn prepare_inputs(&self, texts: &[String], role: EmbeddingInputRole) -> Vec<String> {
+    fn prepare_inputs<'a>(
+        &self,
+        texts: &'a [String],
+        role: EmbeddingInputRole,
+    ) -> Cow<'a, [String]> {
         let prefix = match role {
             EmbeddingInputRole::Query => &self.query_prefix,
             EmbeddingInputRole::Document => &self.document_prefix,
         };
         if prefix.is_empty() {
-            return texts.to_vec();
+            return Cow::Borrowed(texts);
         }
-        texts.iter().map(|text| format!("{prefix}{text}")).collect()
+        Cow::Owned(texts.iter().map(|text| format!("{prefix}{text}")).collect())
     }
 
-    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, KinDbError> {
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, KinDbError> {
         let vectors = self.embed_batch_raw(texts)?;
         for vector in &vectors {
             if vector.len() != self.dimensions {
@@ -1669,7 +1684,7 @@ impl OpenAiCompatEmbedder {
         Ok(vectors)
     }
 
-    fn embed_batch_raw(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, KinDbError> {
+    fn embed_batch_raw(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, KinDbError> {
         let mut body = serde_json::Map::new();
         body.insert(
             "model".to_string(),
@@ -3832,6 +3847,72 @@ mod tests {
         );
 
         assert_ne!(base.runtime_revision(), tuned.runtime_revision());
+    }
+
+    #[cfg(feature = "embeddings")]
+    fn test_openai_embedder(query_prefix: &str, document_prefix: &str) -> OpenAiCompatEmbedder {
+        OpenAiCompatEmbedder {
+            client: BlockingHttpClient::new(),
+            endpoint: "http://localhost:1234/v1/embeddings".into(),
+            model_id: "test-embed".into(),
+            api_key: None,
+            dimensions: 2,
+            request_overrides: serde_json::Map::new(),
+            query_prefix: query_prefix.into(),
+            document_prefix: document_prefix.into(),
+        }
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn code_embedder_prepare_inputs_borrows_without_prefixes() {
+        let embedder = CodeEmbedder {
+            backend: CodeEmbedderBackend::OpenAiCompat(test_openai_embedder("", "")),
+            dimensions: 2,
+            cache: None,
+        };
+        let texts = vec!["alpha".to_string(), "beta".to_string()];
+
+        let prepared = embedder.prepare_inputs(&texts, EmbeddingInputRole::Document);
+        match prepared {
+            Cow::Borrowed(slice) => assert!(std::ptr::eq(slice.as_ptr(), texts.as_ptr())),
+            Cow::Owned(_) => panic!("unprefixed document inputs should be borrowed"),
+        }
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn code_embedder_prepare_inputs_owns_prefixed_roles() {
+        let embedder = CodeEmbedder {
+            backend: CodeEmbedderBackend::OpenAiCompat(test_openai_embedder(
+                "search_query: ",
+                "search_document: ",
+            )),
+            dimensions: 2,
+            cache: None,
+        };
+        let texts = vec!["alpha".to_string(), "beta".to_string()];
+
+        let queries = embedder.prepare_inputs(&texts, EmbeddingInputRole::Query);
+        assert!(matches!(queries, Cow::Owned(_)));
+        assert_eq!(
+            queries.as_ref(),
+            &[
+                "search_query: alpha".to_string(),
+                "search_query: beta".to_string()
+            ]
+        );
+
+        let documents = embedder.prepare_inputs(&texts, EmbeddingInputRole::Document);
+        assert!(matches!(documents, Cow::Owned(_)));
+        assert_eq!(
+            documents.as_ref(),
+            &[
+                "search_document: alpha".to_string(),
+                "search_document: beta".to_string()
+            ]
+        );
+        assert_eq!(texts, vec!["alpha".to_string(), "beta".to_string()]);
     }
 
     // ── no-absolute-path guard ───────────────────────────────────────────────
