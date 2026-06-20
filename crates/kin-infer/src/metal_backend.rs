@@ -8,7 +8,9 @@
 
 #![cfg(feature = "metal")]
 
-use crate::gpu::{GpuBackend, GpuCompute, GpuDeviceInfo, LayerConfig, LayerTensors, PoolingMode};
+use crate::gpu::{
+    EmbeddingPrelude, GpuBackend, GpuCompute, GpuDeviceInfo, LayerConfig, LayerTensors, PoolingMode,
+};
 use crate::InferError;
 use metal::{
     Buffer, CommandBufferRef, CommandQueue, CompileOptions, ComputePipelineState, Device,
@@ -2492,12 +2494,6 @@ impl MetalCompute {
         std::env::var_os("KIN_INFER_METAL_NAN_CHECK").is_some()
     }
 
-    fn readback_count_nonfinite(name: &str, buf: &Buffer, count: usize) {
-        let mut data = vec![0.0; count];
-        Self::read_buf_into(buf, &mut data);
-        Self::count_nonfinite(name, &data);
-    }
-
     /// Read floats from a shared buffer in-place into a mutable slice. Timed into
     /// the copy/readback phase.
     fn read_buf_into(buf: &Buffer, dst: &mut [f32]) {
@@ -2939,574 +2935,513 @@ fn steel_mma_name(base: &str) -> &str {
 }
 
 impl MetalCompute {
-    /// Encode one transformer layer against the resident
-    /// `current_hidden` residual buffer. Does not upload the input or read the
-    /// output back: the caller owns `current_hidden` and keeps it on-device across
-    /// layers. Only the final layer (`is_last`) blocks the host; earlier layers
-    /// commit asynchronously so the GPU stays fed across the whole stack.
-    #[allow(clippy::too_many_arguments)]
-    fn encode_layer_resident(
+    /// Encode optional embedding projection and embedding LayerNorm into the
+    /// caller's command buffer, returning the resident hidden buffer consumed by
+    /// the transformer stack.
+    fn encode_embedding_prelude_into(
         &self,
+        cmd: &CommandBufferRef,
+        hidden: &[f32],
+        embedding: &EmbeddingPrelude<'_>,
+        config: &LayerConfig,
+        retains: &mut Vec<PooledBuffer>,
+    ) -> Result<PooledBuffer, InferError> {
+        let total_rows = config.batch_size * config.max_len;
+        let h = config.hidden_size;
+        let input_dim = embedding.input_dim;
+        let expected = total_rows
+            .checked_mul(input_dim)
+            .ok_or_else(|| InferError::Internal("embedding prelude input shape overflow".into()))?;
+        if hidden.len() != expected {
+            return Err(InferError::Internal(format!(
+                "embedding prelude input not {total_rows}x{input_dim}: len={}",
+                hidden.len()
+            )));
+        }
+
+        let current_hidden = if let Some(projection) = embedding.projection {
+            let projection_expected = h.checked_mul(input_dim).ok_or_else(|| {
+                InferError::Internal("embedding projection shape overflow".into())
+            })?;
+            if projection.len() != projection_expected {
+                return Err(InferError::Internal(format!(
+                    "embedding projection not {h}x{input_dim}: len={}",
+                    projection.len()
+                )));
+            }
+
+            let input = self.buf_slice_pooled(hidden)?;
+            let projected = self.pool.acquire_uninit(total_rows * h * 4)?;
+            let projection = self.buf_cached(projection)?;
+            let buf_rows = self.buf_u32(total_rows as u32)?;
+            let buf_h = self.buf_u32(h as u32)?;
+            let buf_input_dim = self.buf_u32(input_dim as u32)?;
+
+            if use_mma(total_rows, h, input_dim) {
+                self.encode_mma(
+                    cmd,
+                    "matmul_transb_simdgroup",
+                    &[
+                        input.buffer(),
+                        &projection,
+                        projected.buffer(),
+                        &buf_rows,
+                        &buf_h,
+                        &buf_input_dim,
+                    ],
+                    total_rows,
+                    h,
+                    input_dim,
+                    1,
+                );
+            } else {
+                Self::encode_matmul(
+                    cmd,
+                    &self.pipelines["matmul_transb"],
+                    input.buffer(),
+                    &projection,
+                    projected.buffer(),
+                    &buf_rows,
+                    &buf_h,
+                    &buf_input_dim,
+                    h,
+                    total_rows,
+                );
+            }
+
+            retains.push(input);
+            projected
+        } else {
+            if input_dim != h {
+                return Err(InferError::Internal(format!(
+                    "embedding prelude missing projection for {input_dim}->{h}"
+                )));
+            }
+            self.buf_slice_pooled(hidden)?
+        };
+
+        if let (Some(weight), Some(bias)) = (embedding.norm_weight, embedding.norm_bias) {
+            if weight.len() != h || bias.len() != h {
+                return Err(InferError::Internal(format!(
+                    "embedding norm not hidden-sized: weight={} bias={} hidden={h}",
+                    weight.len(),
+                    bias.len()
+                )));
+            }
+            let weight = self.buf_cached(weight)?;
+            let bias = self.buf_cached(bias)?;
+            let buf_h = self.buf_u32(h as u32)?;
+            let buf_eps = self.buf_f32(embedding.eps)?;
+            self.encode_rows_simdgroup(
+                cmd,
+                "layer_norm",
+                &[current_hidden.buffer(), &weight, &bias, &buf_h, &buf_eps],
+                total_rows,
+            );
+        }
+
+        Ok(current_hidden)
+    }
+
+    /// Encode one transformer layer into an existing command buffer against the
+    /// resident `current_hidden` residual buffer. Does not upload the input,
+    /// commit, or read back: the caller owns the command-buffer boundary and must
+    /// retain every pooled transient until that buffer has completed.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_layer_resident_into(
+        &self,
+        cmd: &CommandBufferRef,
         current_hidden: &PooledBuffer,
         masks: &[u32],
         weights: &LayerTensors,
         config: &LayerConfig,
         rope_cos: &[f32],
         rope_sin: &[f32],
-        is_last: bool,
+        retains: &mut Vec<PooledBuffer>,
     ) -> Result<(), InferError> {
-        autoreleasepool(|_| {
-            let kv_heads = if let Some(k) = weights.k_weight {
-                k.len() / (config.hidden_size * config.head_dim)
-            } else if let Some(qkv) = weights.qkv_weight {
-                let total_qkv_dim = qkv.len() / config.hidden_size;
-                let q_dim = config.num_heads * config.head_dim;
-                (total_qkv_dim - q_dim) / (2 * config.head_dim)
-            } else {
-                config.num_heads
-            };
+        let kv_heads = if let Some(k) = weights.k_weight {
+            k.len() / (config.hidden_size * config.head_dim)
+        } else if let Some(qkv) = weights.qkv_weight {
+            let total_qkv_dim = qkv.len() / config.hidden_size;
+            let q_dim = config.num_heads * config.head_dim;
+            (total_qkv_dim - q_dim) / (2 * config.head_dim)
+        } else {
+            config.num_heads
+        };
 
-            let _span = tracing::info_span!("kin_infer.metal.encode_layer_resident").entered();
+        let _span = tracing::info_span!("kin_infer.metal.encode_layer_resident").entered();
 
-            let batch_size = config.batch_size;
-            let max_len = config.max_len;
-            let total_rows = batch_size * max_len;
-            let h = config.hidden_size;
-            let heads = config.num_heads;
-            let head_dim = config.head_dim;
-            let inter = config.inter_size;
-            let q_dim = heads * head_dim;
-            let kv_dim = kv_heads * head_dim;
+        let batch_size = config.batch_size;
+        let max_len = config.max_len;
+        let total_rows = batch_size * max_len;
+        let h = config.hidden_size;
+        let heads = config.num_heads;
+        let head_dim = config.head_dim;
+        let inter = config.inter_size;
+        let q_dim = heads * head_dim;
+        let kv_dim = kv_heads * head_dim;
 
-            // ---------------------------------------------------------
-            // Single production command buffer for the full layer. Diagnostic
-            // NaN readbacks below intentionally split it only when enabled.
-            // ---------------------------------------------------------
-            let mut cmd = self.queue.new_command_buffer();
-            let mut retains = Vec::new();
+        let buf_rows = self.buf_u32(total_rows as u32)?;
+        let buf_h = self.buf_u32(h as u32)?;
+        let buf_eps = self.buf_f32(if config.use_rms {
+            config.rms_eps
+        } else {
+            config.eps
+        })?;
 
-            let buf_rows = self.buf_u32(total_rows as u32)?;
-            let buf_h = self.buf_u32(h as u32)?;
-            let buf_eps = self.buf_f32(if config.use_rms {
-                config.rms_eps
-            } else {
-                config.eps
-            })?;
-
-            // Layer norm 1
-            let mut buf_normed1 = None;
-            let mut qkv_in = current_hidden.buffer();
-            if config.pre_ln {
-                let buf = self.pool.acquire_uninit(total_rows * h * 4)?;
-                {
-                    let blit = cmd.new_blit_command_encoder();
-                    blit.copy_from_buffer(
-                        current_hidden.buffer(),
-                        0,
-                        buf.buffer(),
-                        0,
-                        (total_rows * h * 4) as u64,
-                    );
-                    blit.end_encoding();
-                }
-                let buf_norm1_w = self.buf_cached(weights.norm1_weight)?;
-                if config.use_rms {
-                    self.encode_rows_simdgroup(
-                        cmd,
-                        "rms_norm",
-                        &[buf.buffer(), &buf_norm1_w, &buf_h, &buf_eps],
-                        total_rows,
-                    );
-                } else {
-                    let buf_norm1_b = self.buf_cached(weights.norm1_bias.unwrap_or(&[]))?;
-                    self.encode_rows_simdgroup(
-                        cmd,
-                        "layer_norm",
-                        &[buf.buffer(), &buf_norm1_w, &buf_norm1_b, &buf_h, &buf_eps],
-                        total_rows,
-                    );
-                }
-                buf_normed1 = Some(buf);
-                qkv_in = buf_normed1
-                    .as_ref()
-                    .expect("buf_normed1 was just assigned in this pre_ln branch")
-                    .buffer();
+        // Layer norm 1
+        let mut buf_normed1 = None;
+        let mut qkv_in = current_hidden.buffer();
+        if config.pre_ln {
+            let buf = self.pool.acquire_uninit(total_rows * h * 4)?;
+            {
+                let blit = cmd.new_blit_command_encoder();
+                blit.copy_from_buffer(
+                    current_hidden.buffer(),
+                    0,
+                    buf.buffer(),
+                    0,
+                    (total_rows * h * 4) as u64,
+                );
+                blit.end_encoding();
             }
+            let buf_norm1_w = self.buf_cached(weights.norm1_weight)?;
+            if config.use_rms {
+                self.encode_rows_simdgroup(
+                    cmd,
+                    "rms_norm",
+                    &[buf.buffer(), &buf_norm1_w, &buf_h, &buf_eps],
+                    total_rows,
+                );
+            } else {
+                let buf_norm1_b = self.buf_cached(weights.norm1_bias.unwrap_or(&[]))?;
+                self.encode_rows_simdgroup(
+                    cmd,
+                    "layer_norm",
+                    &[buf.buffer(), &buf_norm1_w, &buf_norm1_b, &buf_h, &buf_eps],
+                    total_rows,
+                );
+            }
+            buf_normed1 = Some(buf);
+            qkv_in = buf_normed1
+                .as_ref()
+                .expect("buf_normed1 was just assigned in this pre_ln branch")
+                .buffer();
+        }
 
-            let buf_q_dim = self.buf_u32(q_dim as u32)?;
-            let buf_kv_dim = self.buf_u32(kv_dim as u32)?;
-            let buf_q = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
-            let buf_k = self.pool.acquire_uninit(total_rows * kv_dim * 4)?;
-            let buf_v = self.pool.acquire_uninit(total_rows * kv_dim * 4)?;
+        let buf_q_dim = self.buf_u32(q_dim as u32)?;
+        let buf_kv_dim = self.buf_u32(kv_dim as u32)?;
+        let buf_q = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
+        let buf_k = self.pool.acquire_uninit(total_rows * kv_dim * 4)?;
+        let buf_v = self.pool.acquire_uninit(total_rows * kv_dim * 4)?;
 
-            if let Some(qkv_weight) = weights.qkv_weight {
-                let total_qkv = q_dim + 2 * kv_dim;
-                let buf_qkv_dim = self.buf_u32(total_qkv as u32)?;
-                let buf_qkv = self.pool.acquire_uninit(total_rows * total_qkv * 4)?;
-                let buf_qkv_w = self.buf_cached(qkv_weight)?;
+        if let Some(qkv_weight) = weights.qkv_weight {
+            let total_qkv = q_dim + 2 * kv_dim;
+            let buf_qkv_dim = self.buf_u32(total_qkv as u32)?;
+            let buf_qkv = self.pool.acquire_uninit(total_rows * total_qkv * 4)?;
+            let buf_qkv_w = self.buf_cached(qkv_weight)?;
 
-                if use_mma(total_rows, total_qkv, h) {
-                    self.encode_mma(
-                        cmd,
-                        "matmul_transb_simdgroup",
-                        &[
-                            qkv_in,
-                            &buf_qkv_w,
-                            buf_qkv.buffer(),
-                            &buf_rows,
-                            &buf_qkv_dim,
-                            &buf_h,
-                        ],
-                        total_rows,
-                        total_qkv,
-                        h,
-                        1,
-                    );
-                } else {
-                    Self::encode_matmul(
-                        cmd,
-                        &self.pipelines["matmul_transb"],
+            if use_mma(total_rows, total_qkv, h) {
+                self.encode_mma(
+                    cmd,
+                    "matmul_transb_simdgroup",
+                    &[
                         qkv_in,
                         &buf_qkv_w,
                         buf_qkv.buffer(),
                         &buf_rows,
                         &buf_qkv_dim,
                         &buf_h,
-                        total_qkv,
-                        total_rows,
-                    );
-                }
-
-                if let Some(qkv_bias) = weights.qkv_bias {
-                    let b_bias = self.buf_cached(qkv_bias)?;
-                    self.encode_1d(
-                        cmd,
-                        "elementwise_add_broadcast",
-                        &[buf_qkv.buffer(), &b_bias, &buf_qkv_dim],
-                        total_rows * total_qkv,
-                    );
-                }
-
-                let split_p = &self.pipelines["split_qkv_packed"];
-                let enc = cmd.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(split_p);
-                enc.set_buffer(0, Some(buf_qkv.buffer()), 0);
-                enc.set_buffer(1, Some(buf_q.buffer()), 0);
-                enc.set_buffer(2, Some(buf_k.buffer()), 0);
-                enc.set_buffer(3, Some(buf_v.buffer()), 0);
-                enc.set_buffer(4, Some(&buf_q_dim), 0);
-                enc.set_buffer(5, Some(&buf_kv_dim), 0);
-                enc.set_buffer(6, Some(&buf_kv_dim), 0);
-                let threads = metal::MTLSize::new(total_qkv as u64, total_rows as u64, 1);
-                let tw = split_p.thread_execution_width();
-                let tg = metal::MTLSize::new(
-                    tw.min(total_qkv as u64).max(1),
-                    16.min(total_rows as u64).max(1),
+                    ],
+                    total_rows,
+                    total_qkv,
+                    h,
                     1,
                 );
-                enc.dispatch_threads(threads, tg);
-                enc.end_encoding();
-
-                if let Some(q_ln_w) = weights.q_ln_weight {
-                    let q_ln_w_buf = self.buf_cached(q_ln_w)?;
-                    let q_ln_b_buf = self.buf_cached(weights.q_ln_bias.unwrap_or(&[]))?;
-                    self.encode_rows_simdgroup(
-                        cmd,
-                        "layer_norm",
-                        &[
-                            buf_q.buffer(),
-                            &q_ln_w_buf,
-                            &q_ln_b_buf,
-                            &buf_q_dim,
-                            &buf_eps,
-                        ],
-                        total_rows,
-                    );
-                }
-                if let Some(k_ln_w) = weights.k_ln_weight {
-                    let k_ln_w_buf = self.buf_cached(k_ln_w)?;
-                    let k_ln_b_buf = self.buf_cached(weights.k_ln_bias.unwrap_or(&[]))?;
-                    self.encode_rows_simdgroup(
-                        cmd,
-                        "layer_norm",
-                        &[
-                            buf_k.buffer(),
-                            &k_ln_w_buf,
-                            &k_ln_b_buf,
-                            &buf_kv_dim,
-                            &buf_eps,
-                        ],
-                        total_rows,
-                    );
-                }
-                retains.push(buf_qkv);
             } else {
-                let buf_qw = self.buf_cached(weights.q_weight.ok_or_else(|| {
-                    InferError::ModelIncompatible("attention requires q_weight".into())
-                })?)?;
-                let buf_kw = self.buf_cached(weights.k_weight.ok_or_else(|| {
-                    InferError::ModelIncompatible("attention requires k_weight".into())
-                })?)?;
-                let buf_vw = self.buf_cached(weights.v_weight.ok_or_else(|| {
-                    InferError::ModelIncompatible("attention requires v_weight".into())
-                })?)?;
-                if use_mma(total_rows, q_dim, h) {
-                    self.encode_mma(
-                        cmd,
-                        "matmul_transb_simdgroup",
-                        &[
-                            qkv_in,
-                            &buf_qw,
-                            buf_q.buffer(),
-                            &buf_rows,
-                            &buf_q_dim,
-                            &buf_h,
-                        ],
-                        total_rows,
-                        q_dim,
-                        h,
-                        1,
-                    );
-                } else {
-                    Self::encode_matmul(
-                        cmd,
-                        &self.pipelines["matmul_transb"],
+                Self::encode_matmul(
+                    cmd,
+                    &self.pipelines["matmul_transb"],
+                    qkv_in,
+                    &buf_qkv_w,
+                    buf_qkv.buffer(),
+                    &buf_rows,
+                    &buf_qkv_dim,
+                    &buf_h,
+                    total_qkv,
+                    total_rows,
+                );
+            }
+
+            if let Some(qkv_bias) = weights.qkv_bias {
+                let b_bias = self.buf_cached(qkv_bias)?;
+                self.encode_1d(
+                    cmd,
+                    "elementwise_add_broadcast",
+                    &[buf_qkv.buffer(), &b_bias, &buf_qkv_dim],
+                    total_rows * total_qkv,
+                );
+            }
+
+            let split_p = &self.pipelines["split_qkv_packed"];
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(split_p);
+            enc.set_buffer(0, Some(buf_qkv.buffer()), 0);
+            enc.set_buffer(1, Some(buf_q.buffer()), 0);
+            enc.set_buffer(2, Some(buf_k.buffer()), 0);
+            enc.set_buffer(3, Some(buf_v.buffer()), 0);
+            enc.set_buffer(4, Some(&buf_q_dim), 0);
+            enc.set_buffer(5, Some(&buf_kv_dim), 0);
+            enc.set_buffer(6, Some(&buf_kv_dim), 0);
+            let threads = metal::MTLSize::new(total_qkv as u64, total_rows as u64, 1);
+            let tw = split_p.thread_execution_width();
+            let tg = metal::MTLSize::new(
+                tw.min(total_qkv as u64).max(1),
+                16.min(total_rows as u64).max(1),
+                1,
+            );
+            enc.dispatch_threads(threads, tg);
+            enc.end_encoding();
+
+            if let Some(q_ln_w) = weights.q_ln_weight {
+                let q_ln_w_buf = self.buf_cached(q_ln_w)?;
+                let q_ln_b_buf = self.buf_cached(weights.q_ln_bias.unwrap_or(&[]))?;
+                self.encode_rows_simdgroup(
+                    cmd,
+                    "layer_norm",
+                    &[
+                        buf_q.buffer(),
+                        &q_ln_w_buf,
+                        &q_ln_b_buf,
+                        &buf_q_dim,
+                        &buf_eps,
+                    ],
+                    total_rows,
+                );
+            }
+            if let Some(k_ln_w) = weights.k_ln_weight {
+                let k_ln_w_buf = self.buf_cached(k_ln_w)?;
+                let k_ln_b_buf = self.buf_cached(weights.k_ln_bias.unwrap_or(&[]))?;
+                self.encode_rows_simdgroup(
+                    cmd,
+                    "layer_norm",
+                    &[
+                        buf_k.buffer(),
+                        &k_ln_w_buf,
+                        &k_ln_b_buf,
+                        &buf_kv_dim,
+                        &buf_eps,
+                    ],
+                    total_rows,
+                );
+            }
+            retains.push(buf_qkv);
+        } else {
+            let buf_qw = self.buf_cached(weights.q_weight.ok_or_else(|| {
+                InferError::ModelIncompatible("attention requires q_weight".into())
+            })?)?;
+            let buf_kw = self.buf_cached(weights.k_weight.ok_or_else(|| {
+                InferError::ModelIncompatible("attention requires k_weight".into())
+            })?)?;
+            let buf_vw = self.buf_cached(weights.v_weight.ok_or_else(|| {
+                InferError::ModelIncompatible("attention requires v_weight".into())
+            })?)?;
+            if use_mma(total_rows, q_dim, h) {
+                self.encode_mma(
+                    cmd,
+                    "matmul_transb_simdgroup",
+                    &[
                         qkv_in,
                         &buf_qw,
                         buf_q.buffer(),
                         &buf_rows,
                         &buf_q_dim,
                         &buf_h,
-                        q_dim,
-                        total_rows,
-                    );
-                }
-                if use_mma(total_rows, kv_dim, h) {
-                    self.encode_mma(
-                        cmd,
-                        "matmul_transb_simdgroup",
-                        &[
-                            qkv_in,
-                            &buf_kw,
-                            buf_k.buffer(),
-                            &buf_rows,
-                            &buf_kv_dim,
-                            &buf_h,
-                        ],
-                        total_rows,
-                        kv_dim,
-                        h,
-                        1,
-                    );
-                    self.encode_mma(
-                        cmd,
-                        "matmul_transb_simdgroup",
-                        &[
-                            qkv_in,
-                            &buf_vw,
-                            buf_v.buffer(),
-                            &buf_rows,
-                            &buf_kv_dim,
-                            &buf_h,
-                        ],
-                        total_rows,
-                        kv_dim,
-                        h,
-                        1,
-                    );
-                } else {
-                    Self::encode_matmul(
-                        cmd,
-                        &self.pipelines["matmul_transb"],
+                    ],
+                    total_rows,
+                    q_dim,
+                    h,
+                    1,
+                );
+            } else {
+                Self::encode_matmul(
+                    cmd,
+                    &self.pipelines["matmul_transb"],
+                    qkv_in,
+                    &buf_qw,
+                    buf_q.buffer(),
+                    &buf_rows,
+                    &buf_q_dim,
+                    &buf_h,
+                    q_dim,
+                    total_rows,
+                );
+            }
+            if use_mma(total_rows, kv_dim, h) {
+                self.encode_mma(
+                    cmd,
+                    "matmul_transb_simdgroup",
+                    &[
                         qkv_in,
                         &buf_kw,
                         buf_k.buffer(),
                         &buf_rows,
                         &buf_kv_dim,
                         &buf_h,
-                        kv_dim,
-                        total_rows,
-                    );
-                    Self::encode_matmul(
-                        cmd,
-                        &self.pipelines["matmul_transb"],
+                    ],
+                    total_rows,
+                    kv_dim,
+                    h,
+                    1,
+                );
+                self.encode_mma(
+                    cmd,
+                    "matmul_transb_simdgroup",
+                    &[
                         qkv_in,
                         &buf_vw,
                         buf_v.buffer(),
                         &buf_rows,
                         &buf_kv_dim,
                         &buf_h,
-                        kv_dim,
-                        total_rows,
-                    );
-                }
-                if let Some(q_bias) = weights.q_bias {
-                    let b = self.buf_cached(q_bias)?;
-                    self.encode_1d(
-                        cmd,
-                        "elementwise_add_broadcast",
-                        &[buf_q.buffer(), &b, &buf_q_dim],
-                        total_rows * q_dim,
-                    );
-                }
-                if let Some(k_bias) = weights.k_bias {
-                    let b = self.buf_cached(k_bias)?;
-                    self.encode_1d(
-                        cmd,
-                        "elementwise_add_broadcast",
-                        &[buf_k.buffer(), &b, &buf_kv_dim],
-                        total_rows * kv_dim,
-                    );
-                }
-                if let Some(v_bias) = weights.v_bias {
-                    let b = self.buf_cached(v_bias)?;
-                    self.encode_1d(
-                        cmd,
-                        "elementwise_add_broadcast",
-                        &[buf_v.buffer(), &b, &buf_kv_dim],
-                        total_rows * kv_dim,
-                    );
-                }
-            }
-
-            if let Some(b) = buf_normed1 {
-                retains.push(b);
-            }
-
-            // ---------------------------------------------------------
-            // RoPE + Fused Attention Posmajor + Attn Out Projection + Add Residual
-            // ---------------------------------------------------------
-            // Only apply RoPE if cos/sin are provided
-            if !rope_cos.is_empty() {
-                let buf_cos = self.buf_cached(rope_cos)?;
-                let buf_sin = self.buf_cached(rope_sin)?;
-                let buf_max_len = self.buf_u32(max_len as u32)?;
-                let buf_head_dim = self.buf_u32(head_dim as u32)?;
-                let buf_actual = self.buf_u32(max_len as u32)?;
-
-                let rope_p = &self.pipelines["rope_apply_batched"];
-
-                // Q RoPE
-                {
-                    let enc = cmd.new_compute_command_encoder();
-                    let num_pairs = q_dim / head_dim * (head_dim / 2);
-                    enc.set_compute_pipeline_state(rope_p);
-                    enc.set_buffer(0, Some(buf_q.buffer()), 0);
-                    enc.set_buffer(1, Some(&buf_cos), 0);
-                    enc.set_buffer(2, Some(&buf_sin), 0);
-                    enc.set_buffer(3, Some(&buf_max_len), 0);
-                    enc.set_buffer(4, Some(&buf_head_dim), 0);
-                    enc.set_buffer(5, Some(&buf_q_dim), 0);
-                    enc.set_buffer(6, Some(&buf_head_dim), 0);
-                    enc.set_buffer(7, Some(&buf_actual), 0);
-                    let threads = metal::MTLSize::new(num_pairs as u64, total_rows as u64, 1);
-                    let tg =
-                        metal::MTLSize::new(16.min(num_pairs) as u64, 16.min(total_rows) as u64, 1);
-                    enc.dispatch_threads(threads, tg);
-                    enc.end_encoding();
-                }
-
-                // K RoPE
-                {
-                    let enc = cmd.new_compute_command_encoder();
-                    let num_pairs = kv_dim / head_dim * (head_dim / 2);
-                    enc.set_compute_pipeline_state(rope_p);
-                    enc.set_buffer(0, Some(buf_k.buffer()), 0);
-                    enc.set_buffer(1, Some(&buf_cos), 0);
-                    enc.set_buffer(2, Some(&buf_sin), 0);
-                    enc.set_buffer(3, Some(&buf_max_len), 0);
-                    enc.set_buffer(4, Some(&buf_head_dim), 0);
-                    enc.set_buffer(5, Some(&buf_kv_dim), 0);
-                    enc.set_buffer(6, Some(&buf_head_dim), 0);
-                    enc.set_buffer(7, Some(&buf_actual), 0);
-                    let threads = metal::MTLSize::new(num_pairs as u64, total_rows as u64, 1);
-                    let tg =
-                        metal::MTLSize::new(16.min(num_pairs) as u64, 16.min(total_rows) as u64, 1);
-                    enc.dispatch_threads(threads, tg);
-                    enc.end_encoding();
-                }
-            }
-
-            let buf_q_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
-            let buf_k_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
-            let buf_v_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
-            let buf_heads = self.buf_u32(heads as u32)?;
-            let buf_seq = self.buf_u32(max_len as u32)?;
-            let buf_head_dim = self.buf_u32(head_dim as u32)?;
-            let total_q_heads = batch_size * heads;
-
-            if kv_heads == heads {
-                self.encode_3d(
-                    cmd,
-                    "reshape_qkv_pos_to_head",
-                    &[
-                        buf_q.buffer(),
-                        buf_k.buffer(),
-                        buf_v.buffer(),
-                        buf_q_reshaped.buffer(),
-                        buf_k_reshaped.buffer(),
-                        buf_v_reshaped.buffer(),
-                        &buf_heads,
-                        &buf_seq,
-                        &buf_head_dim,
                     ],
-                    head_dim,
-                    max_len,
-                    total_q_heads,
+                    total_rows,
+                    kv_dim,
+                    h,
+                    1,
                 );
             } else {
-                let buf_kv_heads = self.buf_u32(kv_heads as u32)?;
-                let p = &self.pipelines["reshape_qkv_pos_to_head_gqa"];
-                let enc = cmd.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(p);
-                enc.set_buffer(0, Some(buf_q.buffer()), 0);
-                enc.set_buffer(1, Some(buf_k.buffer()), 0);
-                enc.set_buffer(2, Some(buf_v.buffer()), 0);
-                enc.set_buffer(3, Some(buf_q_reshaped.buffer()), 0);
-                enc.set_buffer(4, Some(buf_k_reshaped.buffer()), 0);
-                enc.set_buffer(5, Some(buf_v_reshaped.buffer()), 0);
-                enc.set_buffer(6, Some(&buf_heads), 0);
-                enc.set_buffer(7, Some(&buf_seq), 0);
-                enc.set_buffer(8, Some(&buf_head_dim), 0);
-                enc.set_buffer(9, Some(&buf_kv_heads), 0);
+                Self::encode_matmul(
+                    cmd,
+                    &self.pipelines["matmul_transb"],
+                    qkv_in,
+                    &buf_kw,
+                    buf_k.buffer(),
+                    &buf_rows,
+                    &buf_kv_dim,
+                    &buf_h,
+                    kv_dim,
+                    total_rows,
+                );
+                Self::encode_matmul(
+                    cmd,
+                    &self.pipelines["matmul_transb"],
+                    qkv_in,
+                    &buf_vw,
+                    buf_v.buffer(),
+                    &buf_rows,
+                    &buf_kv_dim,
+                    &buf_h,
+                    kv_dim,
+                    total_rows,
+                );
+            }
+            if let Some(q_bias) = weights.q_bias {
+                let b = self.buf_cached(q_bias)?;
+                self.encode_1d(
+                    cmd,
+                    "elementwise_add_broadcast",
+                    &[buf_q.buffer(), &b, &buf_q_dim],
+                    total_rows * q_dim,
+                );
+            }
+            if let Some(k_bias) = weights.k_bias {
+                let b = self.buf_cached(k_bias)?;
+                self.encode_1d(
+                    cmd,
+                    "elementwise_add_broadcast",
+                    &[buf_k.buffer(), &b, &buf_kv_dim],
+                    total_rows * kv_dim,
+                );
+            }
+            if let Some(v_bias) = weights.v_bias {
+                let b = self.buf_cached(v_bias)?;
+                self.encode_1d(
+                    cmd,
+                    "elementwise_add_broadcast",
+                    &[buf_v.buffer(), &b, &buf_kv_dim],
+                    total_rows * kv_dim,
+                );
+            }
+        }
 
-                let threads =
-                    metal::MTLSize::new(head_dim as u64, max_len as u64, total_q_heads as u64);
-                let tg = metal::MTLSize::new(16.min(head_dim) as u64, 16.min(max_len) as u64, 1);
+        if let Some(b) = buf_normed1 {
+            retains.push(b);
+        }
+
+        // ---------------------------------------------------------
+        // RoPE + Fused Attention Posmajor + Attn Out Projection + Add Residual
+        // ---------------------------------------------------------
+        // Only apply RoPE if cos/sin are provided
+        if !rope_cos.is_empty() {
+            let buf_cos = self.buf_cached(rope_cos)?;
+            let buf_sin = self.buf_cached(rope_sin)?;
+            let buf_max_len = self.buf_u32(max_len as u32)?;
+            let buf_head_dim = self.buf_u32(head_dim as u32)?;
+            let buf_actual = self.buf_u32(max_len as u32)?;
+
+            let rope_p = &self.pipelines["rope_apply_batched"];
+
+            // Q RoPE
+            {
+                let enc = cmd.new_compute_command_encoder();
+                let num_pairs = q_dim / head_dim * (head_dim / 2);
+                enc.set_compute_pipeline_state(rope_p);
+                enc.set_buffer(0, Some(buf_q.buffer()), 0);
+                enc.set_buffer(1, Some(&buf_cos), 0);
+                enc.set_buffer(2, Some(&buf_sin), 0);
+                enc.set_buffer(3, Some(&buf_max_len), 0);
+                enc.set_buffer(4, Some(&buf_head_dim), 0);
+                enc.set_buffer(5, Some(&buf_q_dim), 0);
+                enc.set_buffer(6, Some(&buf_head_dim), 0);
+                enc.set_buffer(7, Some(&buf_actual), 0);
+                let threads = metal::MTLSize::new(num_pairs as u64, total_rows as u64, 1);
+                let tg =
+                    metal::MTLSize::new(16.min(num_pairs) as u64, 16.min(total_rows) as u64, 1);
                 enc.dispatch_threads(threads, tg);
                 enc.end_encoding();
             }
 
-            let buf_scores = self
-                .pool
-                .acquire_uninit(total_q_heads * max_len * max_len * 4)?;
-            let buf_scale = self.buf_f32(config.scale)?;
-            let buf_masks = self.buf_u32_slice(masks)?;
-            let buf_has_alibi = self.buf_u32(0)?;
-            let buf_alibi = self.buf_slice_pooled(&[0.0f32])?;
-            let buf_out_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
-            let nan_check = Self::metal_nan_check_enabled();
-            let score_len = total_q_heads * max_len * max_len;
-
-            let qk_bufs = [
-                buf_q_reshaped.buffer(),
-                buf_k_reshaped.buffer(),
-                buf_scores.buffer(),
-                &buf_seq,
-                &buf_head_dim,
-                &self.buf_u32(1)?,
-            ];
-            if use_mma(max_len, max_len, head_dim) {
-                self.encode_mma(
-                    cmd,
-                    "batched_matmul_transb_simdgroup",
-                    &qk_bufs,
-                    max_len,
-                    max_len,
-                    head_dim,
-                    total_q_heads,
-                );
-            } else {
-                self.encode_3d(
-                    cmd,
-                    "batched_matmul_transb",
-                    &qk_bufs,
-                    max_len,
-                    max_len,
-                    total_q_heads,
-                );
+            // K RoPE
+            {
+                let enc = cmd.new_compute_command_encoder();
+                let num_pairs = kv_dim / head_dim * (head_dim / 2);
+                enc.set_compute_pipeline_state(rope_p);
+                enc.set_buffer(0, Some(buf_k.buffer()), 0);
+                enc.set_buffer(1, Some(&buf_cos), 0);
+                enc.set_buffer(2, Some(&buf_sin), 0);
+                enc.set_buffer(3, Some(&buf_max_len), 0);
+                enc.set_buffer(4, Some(&buf_head_dim), 0);
+                enc.set_buffer(5, Some(&buf_kv_dim), 0);
+                enc.set_buffer(6, Some(&buf_head_dim), 0);
+                enc.set_buffer(7, Some(&buf_actual), 0);
+                let threads = metal::MTLSize::new(num_pairs as u64, total_rows as u64, 1);
+                let tg =
+                    metal::MTLSize::new(16.min(num_pairs) as u64, 16.min(total_rows) as u64, 1);
+                enc.dispatch_threads(threads, tg);
+                enc.end_encoding();
             }
+        }
 
-            if nan_check {
-                self.commit_wait(cmd);
-                Self::readback_count_nonfinite(
-                    "after batched_matmul_transb",
-                    buf_scores.buffer(),
-                    score_len,
-                );
-                cmd = self.queue.new_command_buffer();
-            }
+        let buf_q_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
+        let buf_k_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
+        let buf_v_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
+        let buf_heads = self.buf_u32(heads as u32)?;
+        let buf_seq = self.buf_u32(max_len as u32)?;
+        let buf_head_dim = self.buf_u32(head_dim as u32)?;
+        let total_q_heads = batch_size * heads;
 
+        if kv_heads == heads {
             self.encode_3d(
                 cmd,
-                "scale_mask_alibi_grouped",
+                "reshape_qkv_pos_to_head",
                 &[
-                    buf_scores.buffer(),
-                    buf_alibi.buffer(),
-                    &buf_masks,
-                    &buf_scale,
-                    &buf_seq,
-                    &buf_has_alibi,
-                    &buf_heads,
-                ],
-                max_len,
-                max_len,
-                total_q_heads,
-            );
-
-            if nan_check {
-                self.commit_wait(cmd);
-                Self::readback_count_nonfinite(
-                    "after scale_mask_alibi_grouped",
-                    buf_scores.buffer(),
-                    score_len,
-                );
-                cmd = self.queue.new_command_buffer();
-            }
-
-            self.encode_rows_simdgroup(
-                cmd,
-                "softmax_rows",
-                &[buf_scores.buffer(), &buf_seq],
-                total_q_heads * max_len,
-            );
-
-            if nan_check {
-                self.commit_wait(cmd);
-                Self::readback_count_nonfinite(
-                    "after softmax_rows",
-                    buf_scores.buffer(),
-                    score_len,
-                );
-                cmd = self.queue.new_command_buffer();
-            }
-
-            let sv_bufs = [
-                buf_scores.buffer(),
-                buf_v_reshaped.buffer(),
-                buf_out_reshaped.buffer(),
-                &buf_seq,
-                &buf_head_dim,
-                &self.buf_u32(1)?,
-            ];
-            if use_mma(max_len, head_dim, max_len) {
-                self.encode_mma(
-                    cmd,
-                    "batched_matmul_ab_simdgroup",
-                    &sv_bufs,
-                    max_len,
-                    head_dim,
-                    max_len,
-                    total_q_heads,
-                );
-            } else {
-                self.encode_3d(
-                    cmd,
-                    "batched_matmul_ab",
-                    &sv_bufs,
-                    head_dim,
-                    max_len,
-                    total_q_heads,
-                );
-            }
-
-            let buf_attn_out = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
-            self.encode_3d(
-                cmd,
-                "reshape_head_to_pos",
-                &[
-                    buf_out_reshaped.buffer(),
-                    buf_attn_out.buffer(),
+                    buf_q.buffer(),
+                    buf_k.buffer(),
+                    buf_v.buffer(),
+                    buf_q_reshaped.buffer(),
+                    buf_k_reshaped.buffer(),
+                    buf_v_reshaped.buffer(),
                     &buf_heads,
                     &buf_seq,
                     &buf_head_dim,
@@ -3515,379 +3450,501 @@ impl MetalCompute {
                 max_len,
                 total_q_heads,
             );
+        } else {
+            let buf_kv_heads = self.buf_u32(kv_heads as u32)?;
+            let p = &self.pipelines["reshape_qkv_pos_to_head_gqa"];
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(p);
+            enc.set_buffer(0, Some(buf_q.buffer()), 0);
+            enc.set_buffer(1, Some(buf_k.buffer()), 0);
+            enc.set_buffer(2, Some(buf_v.buffer()), 0);
+            enc.set_buffer(3, Some(buf_q_reshaped.buffer()), 0);
+            enc.set_buffer(4, Some(buf_k_reshaped.buffer()), 0);
+            enc.set_buffer(5, Some(buf_v_reshaped.buffer()), 0);
+            enc.set_buffer(6, Some(&buf_heads), 0);
+            enc.set_buffer(7, Some(&buf_seq), 0);
+            enc.set_buffer(8, Some(&buf_head_dim), 0);
+            enc.set_buffer(9, Some(&buf_kv_heads), 0);
 
-            let buf_proj_out = self.pool.acquire_uninit(total_rows * h * 4)?;
-            let buf_out_w = self.buf_cached(weights.attn_out_weight)?;
+            let threads =
+                metal::MTLSize::new(head_dim as u64, max_len as u64, total_q_heads as u64);
+            let tg = metal::MTLSize::new(16.min(head_dim) as u64, 16.min(max_len) as u64, 1);
+            enc.dispatch_threads(threads, tg);
+            enc.end_encoding();
+        }
 
-            if use_mma(total_rows, h, q_dim) {
-                self.encode_mma(
-                    cmd,
-                    "matmul_transb_simdgroup",
-                    &[
-                        buf_attn_out.buffer(),
-                        &buf_out_w,
-                        buf_proj_out.buffer(),
-                        &buf_rows,
-                        &buf_h,
-                        &buf_q_dim,
-                    ],
-                    total_rows,
-                    h,
-                    q_dim,
-                    1,
-                );
-            } else {
-                Self::encode_matmul(
-                    cmd,
-                    &self.pipelines["matmul_transb"],
+        let buf_scores = self
+            .pool
+            .acquire_uninit(total_q_heads * max_len * max_len * 4)?;
+        let buf_scale = self.buf_f32(config.scale)?;
+        let buf_masks = self.buf_u32_slice(masks)?;
+        let buf_has_alibi = self.buf_u32(0)?;
+        let buf_alibi = self.buf_slice_pooled(&[0.0f32])?;
+        let buf_out_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
+        let qk_bufs = [
+            buf_q_reshaped.buffer(),
+            buf_k_reshaped.buffer(),
+            buf_scores.buffer(),
+            &buf_seq,
+            &buf_head_dim,
+            &self.buf_u32(1)?,
+        ];
+        if use_mma(max_len, max_len, head_dim) {
+            self.encode_mma(
+                cmd,
+                "batched_matmul_transb_simdgroup",
+                &qk_bufs,
+                max_len,
+                max_len,
+                head_dim,
+                total_q_heads,
+            );
+        } else {
+            self.encode_3d(
+                cmd,
+                "batched_matmul_transb",
+                &qk_bufs,
+                max_len,
+                max_len,
+                total_q_heads,
+            );
+        }
+
+        self.encode_3d(
+            cmd,
+            "scale_mask_alibi_grouped",
+            &[
+                buf_scores.buffer(),
+                buf_alibi.buffer(),
+                &buf_masks,
+                &buf_scale,
+                &buf_seq,
+                &buf_has_alibi,
+                &buf_heads,
+            ],
+            max_len,
+            max_len,
+            total_q_heads,
+        );
+
+        self.encode_rows_simdgroup(
+            cmd,
+            "softmax_rows",
+            &[buf_scores.buffer(), &buf_seq],
+            total_q_heads * max_len,
+        );
+
+        let sv_bufs = [
+            buf_scores.buffer(),
+            buf_v_reshaped.buffer(),
+            buf_out_reshaped.buffer(),
+            &buf_seq,
+            &buf_head_dim,
+            &self.buf_u32(1)?,
+        ];
+        if use_mma(max_len, head_dim, max_len) {
+            self.encode_mma(
+                cmd,
+                "batched_matmul_ab_simdgroup",
+                &sv_bufs,
+                max_len,
+                head_dim,
+                max_len,
+                total_q_heads,
+            );
+        } else {
+            self.encode_3d(
+                cmd,
+                "batched_matmul_ab",
+                &sv_bufs,
+                head_dim,
+                max_len,
+                total_q_heads,
+            );
+        }
+
+        let buf_attn_out = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
+        self.encode_3d(
+            cmd,
+            "reshape_head_to_pos",
+            &[
+                buf_out_reshaped.buffer(),
+                buf_attn_out.buffer(),
+                &buf_heads,
+                &buf_seq,
+                &buf_head_dim,
+            ],
+            head_dim,
+            max_len,
+            total_q_heads,
+        );
+
+        let buf_proj_out = self.pool.acquire_uninit(total_rows * h * 4)?;
+        let buf_out_w = self.buf_cached(weights.attn_out_weight)?;
+
+        if use_mma(total_rows, h, q_dim) {
+            self.encode_mma(
+                cmd,
+                "matmul_transb_simdgroup",
+                &[
                     buf_attn_out.buffer(),
                     &buf_out_w,
                     buf_proj_out.buffer(),
                     &buf_rows,
                     &buf_h,
                     &buf_q_dim,
-                    h,
+                ],
+                total_rows,
+                h,
+                q_dim,
+                1,
+            );
+        } else {
+            Self::encode_matmul(
+                cmd,
+                &self.pipelines["matmul_transb"],
+                buf_attn_out.buffer(),
+                &buf_out_w,
+                buf_proj_out.buffer(),
+                &buf_rows,
+                &buf_h,
+                &buf_q_dim,
+                h,
+                total_rows,
+            );
+        }
+
+        if let Some(attn_out_bias) = weights.attn_out_bias {
+            let b = self.buf_cached(attn_out_bias)?;
+            self.encode_1d(
+                cmd,
+                "elementwise_add_broadcast",
+                &[buf_proj_out.buffer(), &b, &buf_h],
+                total_rows * h,
+            );
+        }
+
+        self.encode_1d(
+            cmd,
+            "elementwise_add",
+            &[current_hidden.buffer(), buf_proj_out.buffer()],
+            total_rows * h,
+        );
+
+        if !config.pre_ln {
+            let buf_norm1_w = self.buf_cached(weights.norm1_weight)?;
+            if config.use_rms {
+                self.encode_rows_simdgroup(
+                    cmd,
+                    "rms_norm",
+                    &[current_hidden.buffer(), &buf_norm1_w, &buf_h, &buf_eps],
+                    total_rows,
+                );
+            } else {
+                let buf_norm1_b = self.buf_cached(weights.norm1_bias.unwrap_or(&[]))?;
+                self.encode_rows_simdgroup(
+                    cmd,
+                    "layer_norm",
+                    &[
+                        current_hidden.buffer(),
+                        &buf_norm1_w,
+                        &buf_norm1_b,
+                        &buf_h,
+                        &buf_eps,
+                    ],
                     total_rows,
                 );
             }
+        }
 
-            if let Some(attn_out_bias) = weights.attn_out_bias {
-                let b = self.buf_cached(attn_out_bias)?;
-                self.encode_1d(
+        retains.push(buf_q);
+        retains.push(buf_k);
+        retains.push(buf_v);
+        retains.push(buf_alibi);
+        retains.push(buf_q_reshaped);
+        retains.push(buf_k_reshaped);
+        retains.push(buf_v_reshaped);
+        retains.push(buf_scores);
+        retains.push(buf_out_reshaped);
+        retains.push(buf_attn_out);
+        retains.push(buf_proj_out);
+
+        // ---------------------------------------------------------
+        // Norm 2 + FFN + Residual
+        // ---------------------------------------------------------
+        // Layer norm 2
+        let mut buf_normed2 = None;
+        if config.pre_ln {
+            let buf = self.pool.acquire_uninit(total_rows * h * 4)?;
+            {
+                let blit = cmd.new_blit_command_encoder();
+                blit.copy_from_buffer(
+                    current_hidden.buffer(),
+                    0,
+                    buf.buffer(),
+                    0,
+                    (total_rows * h * 4) as u64,
+                );
+                blit.end_encoding();
+            }
+            let buf_norm2_w = self.buf_cached(weights.norm2_weight)?;
+            if config.use_rms {
+                self.encode_rows_simdgroup(
                     cmd,
-                    "elementwise_add_broadcast",
-                    &[buf_proj_out.buffer(), &b, &buf_h],
-                    total_rows * h,
+                    "rms_norm",
+                    &[buf.buffer(), &buf_norm2_w, &buf_h, &buf_eps],
+                    total_rows,
+                );
+            } else {
+                let buf_norm2_b = self.buf_cached(weights.norm2_bias.unwrap_or(&[]))?;
+                self.encode_rows_simdgroup(
+                    cmd,
+                    "layer_norm",
+                    &[buf.buffer(), &buf_norm2_w, &buf_norm2_b, &buf_h, &buf_eps],
+                    total_rows,
                 );
             }
+            buf_normed2 = Some(buf);
+        }
 
-            self.encode_1d(
-                cmd,
-                "elementwise_add",
-                &[current_hidden.buffer(), buf_proj_out.buffer()],
-                total_rows * h,
-            );
+        let ffn_in = if let Some(ref b) = buf_normed2 {
+            b.buffer()
+        } else {
+            current_hidden.buffer()
+        };
+        let buf_inter = self.buf_u32(inter as u32)?;
+        let buf_ffn_out = self.pool.acquire_uninit(total_rows * h * 4)?;
+        let buf_wdown = self.buf_cached(weights.ffn_down_weight)?;
 
-            if !config.pre_ln {
-                let buf_norm1_w = self.buf_cached(weights.norm1_weight)?;
-                if config.use_rms {
-                    self.encode_rows_simdgroup(
-                        cmd,
-                        "rms_norm",
-                        &[current_hidden.buffer(), &buf_norm1_w, &buf_h, &buf_eps],
-                        total_rows,
-                    );
-                } else {
-                    let buf_norm1_b = self.buf_cached(weights.norm1_bias.unwrap_or(&[]))?;
-                    self.encode_rows_simdgroup(
-                        cmd,
-                        "layer_norm",
-                        &[
-                            current_hidden.buffer(),
-                            &buf_norm1_w,
-                            &buf_norm1_b,
-                            &buf_h,
-                            &buf_eps,
-                        ],
-                        total_rows,
-                    );
-                }
-            }
+        if let Some(gate_weight) = weights.ffn_gate_weight {
+            // SwiGLU FFN. The fat GEMM needs `[w_gate | w_up]` stacked rows-first
+            // (gate's full [inter, h] block, then up's), so the `swiglu_activation_fat`
+            // kernel reads columns [0, inter) as gate and [inter, 2*inter) as up. This
+            // is the SAME layout `buf_cached_concat` builds and the SAME cache key the
+            // per-op `fused_ffn_swiglu` paths use, so all three share one cached buffer
+            // instead of racing to populate the key with conflicting layouts.
+            let up_weight = weights.ffn_up_weight.ok_or_else(|| {
+                InferError::ModelIncompatible("SwiGLU FFN requires ffn_up_weight".into())
+            })?;
+            let buf_wgateup = self.buf_cached_concat(&[gate_weight, up_weight])?;
 
-            retains.push(buf_q);
-            retains.push(buf_k);
-            retains.push(buf_v);
-            retains.push(buf_alibi);
-            retains.push(buf_q_reshaped);
-            retains.push(buf_k_reshaped);
-            retains.push(buf_v_reshaped);
-            retains.push(buf_scores);
-            retains.push(buf_out_reshaped);
-            retains.push(buf_attn_out);
-            retains.push(buf_proj_out);
+            let buf_gateup = self.pool.acquire_uninit(total_rows * 2 * inter * 4)?;
+            let buf_act = self.pool.acquire_uninit(total_rows * inter * 4)?;
+            let buf_two_inter = self.buf_u32((2 * inter) as u32)?;
 
-            // ---------------------------------------------------------
-            // Norm 2 + FFN + Residual
-            // ---------------------------------------------------------
-            // Layer norm 2
-            let mut buf_normed2 = None;
-            if config.pre_ln {
-                let buf = self.pool.acquire_uninit(total_rows * h * 4)?;
-                {
-                    let blit = cmd.new_blit_command_encoder();
-                    blit.copy_from_buffer(
-                        current_hidden.buffer(),
-                        0,
-                        buf.buffer(),
-                        0,
-                        (total_rows * h * 4) as u64,
-                    );
-                    blit.end_encoding();
-                }
-                let buf_norm2_w = self.buf_cached(weights.norm2_weight)?;
-                if config.use_rms {
-                    self.encode_rows_simdgroup(
-                        cmd,
-                        "rms_norm",
-                        &[buf.buffer(), &buf_norm2_w, &buf_h, &buf_eps],
-                        total_rows,
-                    );
-                } else {
-                    let buf_norm2_b = self.buf_cached(weights.norm2_bias.unwrap_or(&[]))?;
-                    self.encode_rows_simdgroup(
-                        cmd,
-                        "layer_norm",
-                        &[buf.buffer(), &buf_norm2_w, &buf_norm2_b, &buf_h, &buf_eps],
-                        total_rows,
-                    );
-                }
-                buf_normed2 = Some(buf);
-            }
-
-            let ffn_in = if let Some(ref b) = buf_normed2 {
-                b.buffer()
-            } else {
-                current_hidden.buffer()
-            };
-            let buf_inter = self.buf_u32(inter as u32)?;
-            let buf_ffn_out = self.pool.acquire_uninit(total_rows * h * 4)?;
-            let buf_wdown = self.buf_cached(weights.ffn_down_weight)?;
-
-            if let Some(gate_weight) = weights.ffn_gate_weight {
-                // SwiGLU FFN. The fat GEMM needs `[w_gate | w_up]` stacked rows-first
-                // (gate's full [inter, h] block, then up's), so the `swiglu_activation_fat`
-                // kernel reads columns [0, inter) as gate and [inter, 2*inter) as up. This
-                // is the SAME layout `buf_cached_concat` builds and the SAME cache key the
-                // per-op `fused_ffn_swiglu` paths use, so all three share one cached buffer
-                // instead of racing to populate the key with conflicting layouts.
-                let up_weight = weights.ffn_up_weight.ok_or_else(|| {
-                    InferError::ModelIncompatible("SwiGLU FFN requires ffn_up_weight".into())
-                })?;
-                let buf_wgateup = self.buf_cached_concat(&[gate_weight, up_weight])?;
-
-                let buf_gateup = self.pool.acquire_uninit(total_rows * 2 * inter * 4)?;
-                let buf_act = self.pool.acquire_uninit(total_rows * inter * 4)?;
-                let buf_two_inter = self.buf_u32((2 * inter) as u32)?;
-
-                if use_mma(total_rows, inter, h) {
-                    self.encode_mma(
-                        cmd,
-                        "matmul_transb_simdgroup",
-                        &[
-                            ffn_in,
-                            &buf_wgateup,
-                            buf_gateup.buffer(),
-                            &buf_rows,
-                            &buf_two_inter,
-                            &buf_h,
-                        ],
-                        total_rows,
-                        2 * inter,
-                        h,
-                        1,
-                    );
-                } else {
-                    Self::encode_matmul(
-                        cmd,
-                        &self.pipelines["matmul_transb"],
+            if use_mma(total_rows, inter, h) {
+                self.encode_mma(
+                    cmd,
+                    "matmul_transb_simdgroup",
+                    &[
                         ffn_in,
                         &buf_wgateup,
                         buf_gateup.buffer(),
                         &buf_rows,
                         &buf_two_inter,
                         &buf_h,
-                        2 * inter,
-                        total_rows,
-                    );
-                }
-
-                self.encode_1d(
-                    cmd,
-                    "swiglu_activation_fat",
-                    &[buf_gateup.buffer(), buf_act.buffer(), &buf_inter],
-                    total_rows * inter,
+                    ],
+                    total_rows,
+                    2 * inter,
+                    h,
+                    1,
                 );
+            } else {
+                Self::encode_matmul(
+                    cmd,
+                    &self.pipelines["matmul_transb"],
+                    ffn_in,
+                    &buf_wgateup,
+                    buf_gateup.buffer(),
+                    &buf_rows,
+                    &buf_two_inter,
+                    &buf_h,
+                    2 * inter,
+                    total_rows,
+                );
+            }
 
-                if use_mma(total_rows, h, inter) {
-                    self.encode_mma(
-                        cmd,
-                        "matmul_transb_simdgroup",
-                        &[
-                            buf_act.buffer(),
-                            &buf_wdown,
-                            buf_ffn_out.buffer(),
-                            &buf_rows,
-                            &buf_h,
-                            &buf_inter,
-                        ],
-                        total_rows,
-                        h,
-                        inter,
-                        1,
-                    );
-                } else {
-                    Self::encode_matmul(
-                        cmd,
-                        &self.pipelines["matmul_transb"],
+            self.encode_1d(
+                cmd,
+                "swiglu_activation_fat",
+                &[buf_gateup.buffer(), buf_act.buffer(), &buf_inter],
+                total_rows * inter,
+            );
+
+            if use_mma(total_rows, h, inter) {
+                self.encode_mma(
+                    cmd,
+                    "matmul_transb_simdgroup",
+                    &[
                         buf_act.buffer(),
                         &buf_wdown,
                         buf_ffn_out.buffer(),
                         &buf_rows,
                         &buf_h,
                         &buf_inter,
-                        h,
-                        total_rows,
-                    );
-                }
-
-                retains.push(buf_gateup);
-                retains.push(buf_act);
+                    ],
+                    total_rows,
+                    h,
+                    inter,
+                    1,
+                );
             } else {
-                // Standard GELU FFN
-                let up_weight = weights.ffn_up_weight.ok_or_else(|| {
-                    InferError::ModelIncompatible("FFN requires ffn_up_weight".into())
-                })?;
-                let buf_wup = self.buf_cached(up_weight)?;
-                let buf_up = self.pool.acquire_uninit(total_rows * inter * 4)?;
+                Self::encode_matmul(
+                    cmd,
+                    &self.pipelines["matmul_transb"],
+                    buf_act.buffer(),
+                    &buf_wdown,
+                    buf_ffn_out.buffer(),
+                    &buf_rows,
+                    &buf_h,
+                    &buf_inter,
+                    h,
+                    total_rows,
+                );
+            }
 
-                if use_mma(total_rows, inter, h) {
-                    self.encode_mma(
-                        cmd,
-                        "matmul_transb_simdgroup",
-                        &[
-                            ffn_in,
-                            &buf_wup,
-                            buf_up.buffer(),
-                            &buf_rows,
-                            &buf_inter,
-                            &buf_h,
-                        ],
-                        total_rows,
-                        inter,
-                        h,
-                        1,
-                    );
-                } else {
-                    Self::encode_matmul(
-                        cmd,
-                        &self.pipelines["matmul_transb"],
+            retains.push(buf_gateup);
+            retains.push(buf_act);
+        } else {
+            // Standard GELU FFN
+            let up_weight = weights.ffn_up_weight.ok_or_else(|| {
+                InferError::ModelIncompatible("FFN requires ffn_up_weight".into())
+            })?;
+            let buf_wup = self.buf_cached(up_weight)?;
+            let buf_up = self.pool.acquire_uninit(total_rows * inter * 4)?;
+
+            if use_mma(total_rows, inter, h) {
+                self.encode_mma(
+                    cmd,
+                    "matmul_transb_simdgroup",
+                    &[
                         ffn_in,
                         &buf_wup,
                         buf_up.buffer(),
                         &buf_rows,
                         &buf_inter,
                         &buf_h,
-                        inter,
-                        total_rows,
-                    );
-                }
+                    ],
+                    total_rows,
+                    inter,
+                    h,
+                    1,
+                );
+            } else {
+                Self::encode_matmul(
+                    cmd,
+                    &self.pipelines["matmul_transb"],
+                    ffn_in,
+                    &buf_wup,
+                    buf_up.buffer(),
+                    &buf_rows,
+                    &buf_inter,
+                    &buf_h,
+                    inter,
+                    total_rows,
+                );
+            }
 
-                if let Some(up_bias) = weights.ffn_up_bias {
-                    let b = self.buf_cached(up_bias)?;
-                    self.encode_1d(
-                        cmd,
-                        "elementwise_add_broadcast",
-                        &[buf_up.buffer(), &b, &buf_inter],
-                        total_rows * inter,
-                    );
-                }
-
+            if let Some(up_bias) = weights.ffn_up_bias {
+                let b = self.buf_cached(up_bias)?;
                 self.encode_1d(
                     cmd,
-                    "gelu_activation",
-                    &[buf_up.buffer()],
+                    "elementwise_add_broadcast",
+                    &[buf_up.buffer(), &b, &buf_inter],
                     total_rows * inter,
                 );
+            }
 
-                if use_mma(total_rows, h, inter) {
-                    self.encode_mma(
-                        cmd,
-                        "matmul_transb_simdgroup",
-                        &[
-                            buf_up.buffer(),
-                            &buf_wdown,
-                            buf_ffn_out.buffer(),
-                            &buf_rows,
-                            &buf_h,
-                            &buf_inter,
-                        ],
-                        total_rows,
-                        h,
-                        inter,
-                        1,
-                    );
-                } else {
-                    Self::encode_matmul(
-                        cmd,
-                        &self.pipelines["matmul_transb"],
+            self.encode_1d(
+                cmd,
+                "gelu_activation",
+                &[buf_up.buffer()],
+                total_rows * inter,
+            );
+
+            if use_mma(total_rows, h, inter) {
+                self.encode_mma(
+                    cmd,
+                    "matmul_transb_simdgroup",
+                    &[
                         buf_up.buffer(),
                         &buf_wdown,
                         buf_ffn_out.buffer(),
                         &buf_rows,
                         &buf_h,
                         &buf_inter,
-                        h,
-                        total_rows,
-                    );
-                }
-                retains.push(buf_up);
-            }
-
-            if let Some(down_bias) = weights.ffn_down_bias {
-                let b = self.buf_cached(down_bias)?;
-                self.encode_1d(
+                    ],
+                    total_rows,
+                    h,
+                    inter,
+                    1,
+                );
+            } else {
+                Self::encode_matmul(
                     cmd,
-                    "elementwise_add_broadcast",
-                    &[buf_ffn_out.buffer(), &b, &buf_h],
-                    total_rows * h,
+                    &self.pipelines["matmul_transb"],
+                    buf_up.buffer(),
+                    &buf_wdown,
+                    buf_ffn_out.buffer(),
+                    &buf_rows,
+                    &buf_h,
+                    &buf_inter,
+                    h,
+                    total_rows,
                 );
             }
+            retains.push(buf_up);
+        }
 
+        if let Some(down_bias) = weights.ffn_down_bias {
+            let b = self.buf_cached(down_bias)?;
             self.encode_1d(
                 cmd,
-                "elementwise_add",
-                &[current_hidden.buffer(), buf_ffn_out.buffer()],
+                "elementwise_add_broadcast",
+                &[buf_ffn_out.buffer(), &b, &buf_h],
                 total_rows * h,
             );
+        }
 
-            if !config.pre_ln {
-                let buf_norm2_w = self.buf_cached(weights.norm2_weight)?;
-                if config.use_rms {
-                    self.encode_rows_simdgroup(
-                        cmd,
-                        "rms_norm",
-                        &[current_hidden.buffer(), &buf_norm2_w, &buf_h, &buf_eps],
-                        total_rows,
-                    );
-                } else {
-                    let buf_norm2_b = self.buf_cached(weights.norm2_bias.unwrap_or(&[]))?;
-                    self.encode_rows_simdgroup(
-                        cmd,
-                        "layer_norm",
-                        &[
-                            current_hidden.buffer(),
-                            &buf_norm2_w,
-                            &buf_norm2_b,
-                            &buf_h,
-                            &buf_eps,
-                        ],
-                        total_rows,
-                    );
-                }
-            }
+        self.encode_1d(
+            cmd,
+            "elementwise_add",
+            &[current_hidden.buffer(), buf_ffn_out.buffer()],
+            total_rows * h,
+        );
 
-            if let Some(b) = buf_normed2 {
-                retains.push(b);
-            }
-            retains.push(buf_ffn_out);
-
-            if is_last {
-                self.commit_wait(cmd);
+        if !config.pre_ln {
+            let buf_norm2_w = self.buf_cached(weights.norm2_weight)?;
+            if config.use_rms {
+                self.encode_rows_simdgroup(
+                    cmd,
+                    "rms_norm",
+                    &[current_hidden.buffer(), &buf_norm2_w, &buf_h, &buf_eps],
+                    total_rows,
+                );
             } else {
-                self.commit_bounded(cmd, retains);
+                let buf_norm2_b = self.buf_cached(weights.norm2_bias.unwrap_or(&[]))?;
+                self.encode_rows_simdgroup(
+                    cmd,
+                    "layer_norm",
+                    &[
+                        current_hidden.buffer(),
+                        &buf_norm2_w,
+                        &buf_norm2_b,
+                        &buf_h,
+                        &buf_eps,
+                    ],
+                    total_rows,
+                );
             }
-            Ok(())
-        })
+        }
+
+        if let Some(b) = buf_normed2 {
+            retains.push(b);
+        }
+        retains.push(buf_ffn_out);
+
+        Ok(())
     }
 }
 
@@ -3903,20 +3960,24 @@ impl GpuCompute for MetalCompute {
     ) -> Result<Option<Vec<f32>>, InferError> {
         let total_rows = config.batch_size * config.max_len;
         let h = config.hidden_size;
-        let current_hidden = self.buf_slice_pooled(hidden)?;
-        self.encode_layer_resident(
-            &current_hidden,
-            masks,
-            weights,
-            config,
-            rope_cos,
-            rope_sin,
-            true,
-        )?;
-        Ok(Some(Self::read_buf(
-            current_hidden.buffer(),
-            total_rows * h,
-        )))
+        let out = autoreleasepool(|_| -> Result<Vec<f32>, InferError> {
+            let current_hidden = self.buf_slice_pooled(hidden)?;
+            let cmd = self.queue.new_command_buffer();
+            let mut retains = Vec::new();
+            self.encode_layer_resident_into(
+                cmd,
+                &current_hidden,
+                masks,
+                weights,
+                config,
+                rope_cos,
+                rope_sin,
+                &mut retains,
+            )?;
+            self.commit_wait(cmd);
+            Ok(Self::read_buf(current_hidden.buffer(), total_rows * h))
+        })?;
+        Ok(Some(out))
     }
 
     fn forward_layers_batched(
@@ -3938,23 +3999,26 @@ impl GpuCompute for MetalCompute {
         .entered();
         let total_rows = config.batch_size * config.max_len;
         let h = config.hidden_size;
-        let current_hidden = self.buf_slice_pooled(hidden)?;
-        let last = layers.len() - 1;
-        for (i, weights) in layers.iter().enumerate() {
-            self.encode_layer_resident(
-                &current_hidden,
-                masks,
-                weights,
-                config,
-                rope_cos,
-                rope_sin,
-                i == last,
-            )?;
-        }
-        Ok(Some(Self::read_buf(
-            current_hidden.buffer(),
-            total_rows * h,
-        )))
+        let out = autoreleasepool(|_| -> Result<Vec<f32>, InferError> {
+            let current_hidden = self.buf_slice_pooled(hidden)?;
+            let cmd = self.queue.new_command_buffer();
+            let mut retains = Vec::new();
+            for weights in layers {
+                self.encode_layer_resident_into(
+                    cmd,
+                    &current_hidden,
+                    masks,
+                    weights,
+                    config,
+                    rope_cos,
+                    rope_sin,
+                    &mut retains,
+                )?;
+            }
+            self.commit_wait(cmd);
+            Ok(Self::read_buf(current_hidden.buffer(), total_rows * h))
+        })?;
+        Ok(Some(out))
     }
 
     fn forward_layers_batched_pooled(
@@ -3963,6 +4027,7 @@ impl GpuCompute for MetalCompute {
         masks: &[u32],
         layers: &[LayerTensors],
         config: &LayerConfig,
+        embedding: &EmbeddingPrelude<'_>,
         rope_cos: &[f32],
         rope_sin: &[f32],
         pooling: PoolingMode,
@@ -3976,43 +4041,49 @@ impl GpuCompute for MetalCompute {
         )
         .entered();
         let h = config.hidden_size;
-        let current_hidden = self.buf_slice_pooled(hidden)?;
-        for weights in layers {
-            self.encode_layer_resident(
-                &current_hidden,
-                masks,
-                weights,
-                config,
-                rope_cos,
-                rope_sin,
-                false,
-            )?;
-        }
+        let out = autoreleasepool(|_| -> Result<Vec<f32>, InferError> {
+            let cmd = self.queue.new_command_buffer();
+            let mut retains = Vec::new();
+            let current_hidden =
+                self.encode_embedding_prelude_into(cmd, hidden, embedding, config, &mut retains)?;
+            for weights in layers {
+                self.encode_layer_resident_into(
+                    cmd,
+                    &current_hidden,
+                    masks,
+                    weights,
+                    config,
+                    rope_cos,
+                    rope_sin,
+                    &mut retains,
+                )?;
+            }
 
-        let pooled = self.pool.acquire_uninit(config.batch_size * h * 4)?;
-        let mask_buf = self.buf_u32_slice(masks)?;
-        let buf_max_len = self.buf_u32(config.max_len as u32)?;
-        let buf_h = self.buf_u32(h as u32)?;
-        let buf_cls_pooling = self.buf_u32(matches!(pooling, PoolingMode::Cls) as u32)?;
+            let pooled = self.pool.acquire_uninit(config.batch_size * h * 4)?;
+            let mask_buf = self.buf_u32_slice(masks)?;
+            let buf_max_len = self.buf_u32(config.max_len as u32)?;
+            let buf_h = self.buf_u32(h as u32)?;
+            let buf_cls_pooling = self.buf_u32(matches!(pooling, PoolingMode::Cls) as u32)?;
 
-        let cmd = self.queue.new_command_buffer();
-        let pipeline = &self.pipelines["pool_rows"];
-        let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(pipeline);
-        enc.set_buffer(0, Some(current_hidden.buffer()), 0);
-        enc.set_buffer(1, Some(&mask_buf), 0);
-        enc.set_buffer(2, Some(pooled.buffer()), 0);
-        enc.set_buffer(3, Some(&buf_max_len), 0);
-        enc.set_buffer(4, Some(&buf_h), 0);
-        enc.set_buffer(5, Some(&buf_cls_pooling), 0);
-        let tw = pipeline.thread_execution_width().max(1);
-        let threads = MTLSize::new(config.batch_size as u64 * tw, 1, 1);
-        let tg = MTLSize::new(tw, 1, 1);
-        enc.dispatch_threads(threads, tg);
-        enc.end_encoding();
-        self.commit_wait(cmd);
+            let pipeline = &self.pipelines["pool_rows"];
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(pipeline);
+            enc.set_buffer(0, Some(current_hidden.buffer()), 0);
+            enc.set_buffer(1, Some(&mask_buf), 0);
+            enc.set_buffer(2, Some(pooled.buffer()), 0);
+            enc.set_buffer(3, Some(&buf_max_len), 0);
+            enc.set_buffer(4, Some(&buf_h), 0);
+            enc.set_buffer(5, Some(&buf_cls_pooling), 0);
+            let tw = pipeline.thread_execution_width().max(1);
+            let threads = MTLSize::new(config.batch_size as u64 * tw, 1, 1);
+            let tg = MTLSize::new(tw, 1, 1);
+            enc.dispatch_threads(threads, tg);
+            enc.end_encoding();
+            self.commit_wait(cmd);
 
-        Ok(Some(Self::read_buf(pooled.buffer(), config.batch_size * h)))
+            Ok(Self::read_buf(pooled.buffer(), config.batch_size * h))
+        })?;
+        Ok(Some(out))
     }
 
     fn matmul(
@@ -6718,6 +6789,122 @@ mod tests {
             0,
             "fused BERT layer produced {nonfinite}/{} non-finite outputs",
             out.len()
+        );
+    }
+
+    #[test]
+    fn test_metal_pooled_stack_uses_single_submission_when_profiled() {
+        reset_profile();
+        if !profile_enabled() {
+            return;
+        }
+        let Some(metal) = get_metal() else { return };
+
+        let batch_size = 1usize;
+        let max_len = 3usize;
+        let hidden = 32usize;
+        let num_heads = 1usize;
+        let head_dim = 32usize;
+        let inter = 64usize;
+        let total_rows = batch_size * max_len;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_heads * head_dim;
+
+        let mk = |n: usize, salt: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i as f32) * 0.17 + salt).sin() * 0.03)
+                .collect()
+        };
+
+        let norm1_weight = vec![1.0f32; hidden];
+        let norm1_bias = vec![0.0f32; hidden];
+        let norm2_weight = vec![1.0f32; hidden];
+        let norm2_bias = vec![0.0f32; hidden];
+        let embed_norm_weight = vec![1.0f32; hidden];
+        let embed_norm_bias = vec![0.0f32; hidden];
+        let qkv_weight = mk((q_dim + 2 * kv_dim) * hidden, 1.0);
+        let attn_out_weight = mk(hidden * q_dim, 2.0);
+        let ffn_up_weight = mk(inter * hidden, 3.0);
+        let ffn_down_weight = mk(hidden * inter, 4.0);
+
+        let weights = crate::gpu::LayerTensors {
+            norm1_weight: &norm1_weight,
+            norm1_bias: Some(&norm1_bias),
+            qkv_weight: Some(&qkv_weight),
+            qkv_bias: None,
+            q_weight: None,
+            q_bias: None,
+            k_weight: None,
+            k_bias: None,
+            v_weight: None,
+            v_bias: None,
+            q_ln_weight: None,
+            q_ln_bias: None,
+            k_ln_weight: None,
+            k_ln_bias: None,
+            attn_out_weight: &attn_out_weight,
+            attn_out_bias: None,
+            norm2_weight: &norm2_weight,
+            norm2_bias: Some(&norm2_bias),
+            ffn_gate_weight: None,
+            ffn_up_weight: Some(&ffn_up_weight),
+            ffn_up_bias: None,
+            ffn_down_weight: &ffn_down_weight,
+            ffn_down_bias: None,
+            ffn_up_gated_weight: None,
+            relative_attention_bias: None,
+            rel_pos_embeddings: None,
+        };
+        let layers = [weights];
+
+        let config = crate::gpu::LayerConfig {
+            batch_size,
+            max_len,
+            hidden_size: hidden,
+            num_heads,
+            head_dim,
+            inter_size: inter,
+            eps: 1e-5,
+            rms_eps: 1e-6,
+            use_rms: false,
+            pre_ln: false,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            alibi_slopes: None,
+        };
+        let embedding = crate::gpu::EmbeddingPrelude {
+            input_dim: hidden,
+            projection: None,
+            norm_weight: Some(&embed_norm_weight),
+            norm_bias: Some(&embed_norm_bias),
+            eps: 1e-5,
+        };
+
+        let hidden_in = mk(total_rows * hidden, 0.0);
+        let masks = vec![1u32; total_rows];
+        let out = metal
+            .forward_layers_batched_pooled(
+                &hidden_in,
+                &masks,
+                &layers,
+                &config,
+                &embedding,
+                &[],
+                &[],
+                crate::gpu::PoolingMode::Mean,
+            )
+            .expect("forward_layers_batched_pooled errored")
+            .expect("metal backend returned None for pooled stack");
+
+        assert_eq!(out.len(), batch_size * hidden);
+        assert_eq!(
+            profile_submissions(),
+            1,
+            "pooled resident stack should submit one command buffer"
+        );
+        assert_eq!(
+            profile_round_trips(),
+            1,
+            "pooled resident stack should wait once at final readback"
         );
     }
 

@@ -201,6 +201,21 @@ pub enum PoolingMode {
     Cls,
 }
 
+/// Optional embedding-stage GPU work that precedes the transformer stack.
+///
+/// `hidden` passed to `forward_layers_batched_pooled` is `[batch * max_len,
+/// input_dim]`. Backends that can keep the pooled path resident apply the
+/// optional projection and embedding LayerNorm on device before the first layer,
+/// avoiding a separate pre-stack GPU readback.
+#[derive(Clone, Copy, Debug)]
+pub struct EmbeddingPrelude<'a> {
+    pub input_dim: usize,
+    pub projection: Option<&'a [f32]>,
+    pub norm_weight: Option<&'a [f32]>,
+    pub norm_bias: Option<&'a [f32]>,
+    pub eps: f32,
+}
+
 /// GPU-accelerated tensor operations for transformer inference.
 ///
 /// Each method mirrors a CPU operation in lib.rs. Implementations
@@ -696,6 +711,7 @@ pub trait GpuCompute: Send + Sync {
         _masks: &[u32],
         _layers: &[LayerTensors],
         _config: &LayerConfig,
+        _embedding: &EmbeddingPrelude<'_>,
         _rope_cos: &[f32],
         _rope_sin: &[f32],
         _pooling: PoolingMode,

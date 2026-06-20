@@ -2228,16 +2228,6 @@ impl BertModel {
             masks.push(padded_mask);
         }
 
-        if let Some(ref proj) = self.weights.embed_projection {
-            hidden = self.linear(&hidden, proj, None)?;
-        }
-        self.optional_layer_norm(
-            &mut hidden,
-            self.weights.embed_ln_weight.as_ref(),
-            self.weights.embed_ln_bias.as_ref(),
-            self.config.layer_norm_eps as f32,
-        )?;
-
         let num_heads = self.config.num_attention_heads;
         let head_dim = h / num_heads;
         let eps = self.config.layer_norm_eps as f32;
@@ -2293,6 +2283,28 @@ impl BertModel {
         } else {
             crate::gpu::PoolingMode::Mean
         };
+        let projection = self
+            .weights
+            .embed_projection
+            .as_ref()
+            .map(|proj| proj.as_slice().expect("embed projection is contiguous"));
+        let norm_weight = self
+            .weights
+            .embed_ln_weight
+            .as_ref()
+            .map(|weight| weight.as_slice().expect("embed norm weight is contiguous"));
+        let norm_bias = self
+            .weights
+            .embed_ln_bias
+            .as_ref()
+            .map(|bias| bias.as_slice().expect("embed norm bias is contiguous"));
+        let embedding = crate::gpu::EmbeddingPrelude {
+            input_dim: embed_dim,
+            projection,
+            norm_weight,
+            norm_bias,
+            eps,
+        };
 
         let Some(flat) = gpu.forward_layers_batched_pooled(
             hidden
@@ -2301,6 +2313,7 @@ impl BertModel {
             &flat_masks,
             &layer_tensors,
             &layer_config,
+            &embedding,
             rope_cos_slice,
             rope_sin_slice,
             pooling,
@@ -4672,6 +4685,7 @@ mod tests {
             masks: &[u32],
             layers: &[gpu::LayerTensors],
             config: &gpu::LayerConfig,
+            embedding: &gpu::EmbeddingPrelude<'_>,
             _rope_cos: &[f32],
             _rope_sin: &[f32],
             pooling: gpu::PoolingMode,
@@ -4683,6 +4697,10 @@ mod tests {
             assert_eq!(hidden.len(), 4);
             assert_eq!(masks, &[1, 1]);
             assert!(layers.is_empty());
+            assert_eq!(embedding.input_dim, 2);
+            assert!(embedding.projection.is_none());
+            assert!(embedding.norm_weight.is_none());
+            assert!(embedding.norm_bias.is_none());
             assert_eq!(pooling, gpu::PoolingMode::Mean);
             Ok(Some(vec![3.0, 4.0]))
         }
