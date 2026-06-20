@@ -1865,11 +1865,14 @@ fn metal_profile_runtime() -> Option<kin_cli::commands::resources::MetalProfileR
         round_trips: kin_infer::metal_backend::profile_round_trips(),
         forward_calls,
         host_blocked_nanos,
-        host_blocked_nanos_per_forward: (forward_calls > 0)
-            .then_some(host_blocked_nanos / forward_calls),
+        host_blocked_nanos_per_forward: nanos_per_forward(host_blocked_nanos, forward_calls),
         gpu_phase_nanos,
         gpu_total_nanos,
     })
+}
+
+fn nanos_per_forward(total_nanos: u64, forward_calls: u64) -> Option<u64> {
+    (forward_calls > 0).then(|| total_nanos / forward_calls)
 }
 
 #[cfg(not(all(feature = "metal", target_os = "macos")))]
@@ -6617,6 +6620,12 @@ mod tests {
         });
 
         std::env::set_var("KIN_REGISTRY_PATH", path);
+    }
+
+    #[test]
+    fn nanos_per_forward_is_absent_without_forward_calls() {
+        assert_eq!(nanos_per_forward(42, 0), None);
+        assert_eq!(nanos_per_forward(42, 2), Some(21));
     }
 
     fn test_state() -> Arc<DaemonState> {
