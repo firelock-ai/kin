@@ -3,7 +3,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use rayon::prelude::*;
 use tracing::debug;
 
 use sha2::{Digest, Sha256};
@@ -153,6 +155,76 @@ pub fn link_cross_file_against_entities(
         universe_entities = universe_entities.len()
     )
     .entered();
+
+    let ctx = build_link_context(files, universe_entities);
+
+    let total_files = files.len();
+    let progress_interval = std::cmp::max(total_files / 50, 1);
+    let link_start = std::time::Instant::now();
+
+    // Resolve each file independently: every relation's source entity is owned
+    // by its own file, so the (src, dst, kind) triples produced by different
+    // files never collide. Per-file resolution carries its own dedup state and
+    // is therefore order-independent; results are collected in input-file order
+    // (`par_iter().collect()` preserves order) and merged serially below so the
+    // materialized relation set and ordering are identical to a serial pass.
+    let per_file_relations: Vec<Vec<Relation>> = {
+        let _span = tracing::info_span!(
+            "kin.index.link_cross_file.resolve_relations",
+            files = files.len()
+        )
+        .entered();
+        let completed = AtomicUsize::new(0);
+        let found = AtomicUsize::new(0);
+        files
+            .par_iter()
+            .map(|file| {
+                let relations = resolve_one_file(file, &ctx);
+                if total_files > 50 {
+                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    let total =
+                        found.fetch_add(relations.len(), Ordering::Relaxed) + relations.len();
+                    if done % progress_interval == 0 || done == total_files {
+                        eprint!(
+                            "\r  Linking: [{}/{}] {}% | {} relations | {:.1}s",
+                            done,
+                            total_files,
+                            (done * 100) / total_files,
+                            total,
+                            link_start.elapsed().as_secs_f64()
+                        );
+                    }
+                }
+                relations
+            })
+            .collect()
+    };
+
+    let resolved = merge_resolved(per_file_relations, files, &ctx);
+
+    if total_files > 0 {
+        eprintln!(); // newline after \r progress
+    }
+    debug!(resolved = resolved.len(), "cross-file linking complete");
+    resolved
+}
+
+/// Read-only indices shared across per-file relation resolution.
+struct LinkContext<'a> {
+    sorted_universe: Vec<&'a Entity>,
+    entity_by_file_name: HashMap<(&'a str, &'a str), EntityId>,
+    entity_by_name: HashMap<&'a str, Vec<(&'a str, EntityId)>>,
+    entity_by_bare_name: HashMap<&'a str, Vec<(&'a str, EntityId)>>,
+    entity_kind_by_id: HashMap<EntityId, EntityKind>,
+    known_files: HashSet<&'a str>,
+    import_map: HashMap<&'a str, HashMap<&'a str, (&'a str, &'a str)>>,
+    include_graph: HashMap<String, Vec<String>>,
+}
+
+fn build_link_context<'a>(
+    files: &'a [FileParseData],
+    universe_entities: &'a [Entity],
+) -> LinkContext<'a> {
     // Sort for deterministic relation materialization.
     let sorted_universe: Vec<&Entity> = {
         let mut sorted: Vec<&Entity> = universe_entities.iter().collect();
@@ -237,207 +309,220 @@ pub fn link_cross_file_against_entities(
         import_map
     };
 
-    let mut resolved = Vec::new();
-    let mut seen: HashSet<(EntityId, EntityId, RelationKind)> = HashSet::new();
-    let mut seen_artifact: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
     let include_graph = build_include_graph(files, &known_files);
 
-    let total_files = files.len();
-    let progress_interval = std::cmp::max(total_files / 50, 1);
-    let link_start = std::time::Instant::now();
+    LinkContext {
+        sorted_universe,
+        entity_by_file_name,
+        entity_by_name,
+        entity_by_bare_name,
+        entity_kind_by_id,
+        known_files,
+        import_map,
+        include_graph,
+    }
+}
 
-    {
-        let _span = tracing::info_span!(
-            "kin.index.link_cross_file.resolve_relations",
-            files = files.len()
-        )
-        .entered();
-        for (file_idx, file) in files.iter().enumerate() {
-            if total_files > 50
-                && (file_idx % progress_interval == 0 || file_idx + 1 == total_files)
-            {
-                eprint!(
-                    "\r  Linking: [{}/{}] {}% | {} relations | {:.1}s",
-                    file_idx + 1,
-                    total_files,
-                    ((file_idx + 1) * 100) / total_files,
-                    resolved.len(),
-                    link_start.elapsed().as_secs_f64()
+/// Resolve the name-based relations of a single file into entity-ID relations.
+///
+/// All reads are against the shared read-only [`LinkContext`]; the only mutable
+/// state is a file-local dedup set, so this is pure with respect to other files.
+fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation> {
+    let mut resolved = Vec::new();
+    let mut seen: HashSet<(EntityId, EntityId, RelationKind)> = HashSet::new();
+
+    for rel in &file.relations {
+        let src_id = ctx
+            .entity_by_file_name
+            .get(&(file.file_path.as_str(), rel.src_name.as_str()));
+        let dst_same_file = ctx
+            .entity_by_file_name
+            .get(&(file.file_path.as_str(), rel.dst_name.as_str()));
+
+        let src_id = match src_id {
+            Some(id) => *id,
+            None => {
+                debug!(
+                    src = %rel.src_name,
+                    dst = %rel.dst_name,
+                    file = %file.file_path,
+                    "linker: src entity not found, skipping"
                 );
+                continue;
             }
-            for rel in &file.relations {
-                let src_id =
-                    entity_by_file_name.get(&(file.file_path.as_str(), rel.src_name.as_str()));
-                let dst_same_file =
-                    entity_by_file_name.get(&(file.file_path.as_str(), rel.dst_name.as_str()));
+        };
 
-                let src_id = match src_id {
-                    Some(id) => *id,
-                    None => {
-                        debug!(
-                            src = %rel.src_name,
-                            dst = %rel.dst_name,
-                            file = %file.file_path,
-                            "linker: src entity not found, skipping"
-                        );
-                        continue;
-                    }
-                };
-
-                if rel.kind == RelationKind::UsesMacro {
-                    if let Some(&dst_id) = dst_same_file {
-                        if entity_kind_by_id.get(&dst_id) == Some(&EntityKind::Macro) {
-                            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                                resolved.push(make_relation(rel.kind, src_id, dst_id, 1.0));
-                            }
-                            continue;
-                        }
-                    }
-
-                    if let Some(dst_id) = resolve_reachable_macro_target(
-                        &file.file_path,
-                        &rel.dst_name,
-                        &include_graph,
-                        &entity_by_file_name,
-                        &entity_kind_by_id,
-                    ) {
-                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                            resolved.push(make_relation(rel.kind, src_id, dst_id, 0.95));
-                        }
-                        continue;
-                    }
-
-                    debug!(
-                        src = %rel.src_name,
-                        dst = %rel.dst_name,
-                        file = %file.file_path,
-                        "linker: macro use unresolved through same-file/include closure"
-                    );
-                    continue;
-                }
-
-                // (a) Same-file resolution
-                if let Some(&dst_id) = dst_same_file {
+        if rel.kind == RelationKind::UsesMacro {
+            if let Some(&dst_id) = dst_same_file {
+                if ctx.entity_kind_by_id.get(&dst_id) == Some(&EntityKind::Macro) {
                     if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
                         resolved.push(make_relation(rel.kind, src_id, dst_id, 1.0));
                     }
                     continue;
                 }
+            }
 
-                // (b) Import-based cross-file resolution
-                if let Some(file_imports) = import_map.get(file.file_path.as_str()) {
-                    if let Some(&(module_path, original_name)) =
-                        file_imports.get(rel.dst_name.as_str())
-                    {
-                        if let Some(target_file) =
-                            resolve_module_path(&file.file_path, module_path, &known_files)
-                        {
-                            let direct = entity_by_file_name
-                                .get(&(target_file.as_str(), original_name))
-                                .copied();
-                            let dst_id = if direct.is_some() {
-                                direct
-                            } else if original_name == "default" {
-                                // Default import: fall back to first entity in target file
-                                resolve_default_export(&target_file, &sorted_universe)
-                            } else {
-                                None
-                            };
-                            if let Some(dst_id) = dst_id {
-                                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                                    resolved.push(make_relation(rel.kind, src_id, dst_id, 0.95));
-                                }
-                                continue;
-                            }
-                        }
-                    }
-
-                    // (b2) Namespace/package import member resolution:
-                    //   JS/TS: `util.finalizeIssue` via `import * as util from "./util"`
-                    //   Go:    `create.NewCmdCreate` via `import "github.com/.../create"`
-                    if let Some((import_name, member_name)) =
-                        split_member_access(rel.dst_name.as_str())
-                    {
-                        if let Some(&(module_path, _original_name)) = file_imports.get(import_name)
-                        {
-                            // Try resolving module path and looking up the member
-                            if let Some(target_file) =
-                                resolve_module_path(&file.file_path, module_path, &known_files)
-                            {
-                                if let Some(&dst_id) =
-                                    entity_by_file_name.get(&(target_file.as_str(), member_name))
-                                {
-                                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                                        resolved.push(make_relation(rel.kind, src_id, dst_id, 0.9));
-                                    }
-                                    continue;
-                                }
-                            }
-                        }
-                    }
+            if let Some(dst_id) = resolve_reachable_macro_target(
+                &file.file_path,
+                &rel.dst_name,
+                &ctx.include_graph,
+                &ctx.entity_by_file_name,
+                &ctx.entity_kind_by_id,
+            ) {
+                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                    resolved.push(make_relation(rel.kind, src_id, dst_id, 0.95));
                 }
+                continue;
+            }
 
-                // (c) Global name-match fallback
-                let exact_candidates = entity_by_name
-                    .get(rel.dst_name.as_str())
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]);
+            debug!(
+                src = %rel.src_name,
+                dst = %rel.dst_name,
+                file = %file.file_path,
+                "linker: macro use unresolved through same-file/include closure"
+            );
+            continue;
+        }
 
-                let bare_candidates = if rel.kind == RelationKind::Calls {
-                    entity_by_bare_name
-                        .get(rel.dst_name.as_str())
-                        .map(|v| v.as_slice())
-                        .unwrap_or(&[])
-                } else {
-                    &[]
-                };
+        // (a) Same-file resolution
+        if let Some(&dst_id) = dst_same_file {
+            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                resolved.push(make_relation(rel.kind, src_id, dst_id, 1.0));
+            }
+            continue;
+        }
 
-                let mut linked = false;
-
-                // Pick the first exact candidate from a different file
-                if let Some(&(_, dst_id)) = exact_candidates
-                    .iter()
-                    .find(|(fp, _)| *fp != file.file_path.as_str())
+        // (b) Import-based cross-file resolution
+        if let Some(file_imports) = ctx.import_map.get(file.file_path.as_str()) {
+            if let Some(&(module_path, original_name)) = file_imports.get(rel.dst_name.as_str()) {
+                if let Some(target_file) =
+                    resolve_module_path(&file.file_path, module_path, &ctx.known_files)
                 {
-                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                        resolved.push(make_relation(rel.kind, src_id, dst_id, 0.7));
-                        linked = true;
-                    }
-                }
-
-                // (c2) Receiver-method calls (`x.method()`) arrive as the bare method
-                // name and never match (b)'s `Type::method` key. Resolve them through
-                // the bare-name index only when unambiguous — exactly one method of
-                // that name in another file. Ambiguous names (`new`, `run`, `get`) have
-                // an unknowable receiver type, so linking every candidate would mint
-                // spurious callers; leave those to the inconclusive-absence gate.
-                if !linked && !bare_candidates.is_empty() {
-                    let mut distinct_targets: HashSet<EntityId> = HashSet::new();
-                    for &(fp, dst_id) in bare_candidates {
-                        if fp != file.file_path.as_str() {
-                            distinct_targets.insert(dst_id);
-                        }
-                    }
-                    if distinct_targets.len() == 1 {
-                        let dst_id = *distinct_targets.iter().next().expect("len checked == 1");
+                    let direct = ctx
+                        .entity_by_file_name
+                        .get(&(target_file.as_str(), original_name))
+                        .copied();
+                    let dst_id = if direct.is_some() {
+                        direct
+                    } else if original_name == "default" {
+                        // Default import: fall back to first entity in target file
+                        resolve_default_export(&target_file, &ctx.sorted_universe)
+                    } else {
+                        None
+                    };
+                    if let Some(dst_id) = dst_id {
                         if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                            resolved.push(make_relation(rel.kind, src_id, dst_id, 0.3));
-                            linked = true;
+                            resolved.push(make_relation(rel.kind, src_id, dst_id, 0.95));
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            // (b2) Namespace/package import member resolution:
+            //   JS/TS: `util.finalizeIssue` via `import * as util from "./util"`
+            //   Go:    `create.NewCmdCreate` via `import "github.com/.../create"`
+            if let Some((import_name, member_name)) = split_member_access(rel.dst_name.as_str()) {
+                if let Some(&(module_path, _original_name)) = file_imports.get(import_name) {
+                    // Try resolving module path and looking up the member
+                    if let Some(target_file) =
+                        resolve_module_path(&file.file_path, module_path, &ctx.known_files)
+                    {
+                        if let Some(&dst_id) = ctx
+                            .entity_by_file_name
+                            .get(&(target_file.as_str(), member_name))
+                        {
+                            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                                resolved.push(make_relation(rel.kind, src_id, dst_id, 0.9));
+                            }
+                            continue;
                         }
                     }
                 }
+            }
+        }
 
-                if linked {
-                    continue;
+        // (c) Global name-match fallback
+        let exact_candidates = ctx
+            .entity_by_name
+            .get(rel.dst_name.as_str())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+
+        let bare_candidates = if rel.kind == RelationKind::Calls {
+            ctx.entity_by_bare_name
+                .get(rel.dst_name.as_str())
+                .map(|v| v.as_slice())
+                .unwrap_or(&[])
+        } else {
+            &[]
+        };
+
+        let mut linked = false;
+
+        // Pick the first exact candidate from a different file
+        if let Some(&(_, dst_id)) = exact_candidates
+            .iter()
+            .find(|(fp, _)| *fp != file.file_path.as_str())
+        {
+            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                resolved.push(make_relation(rel.kind, src_id, dst_id, 0.7));
+                linked = true;
+            }
+        }
+
+        // (c2) Receiver-method calls (`x.method()`) arrive as the bare method
+        // name and never match (b)'s `Type::method` key. Resolve them through
+        // the bare-name index only when unambiguous — exactly one method of
+        // that name in another file. Ambiguous names (`new`, `run`, `get`) have
+        // an unknowable receiver type, so linking every candidate would mint
+        // spurious callers; leave those to the inconclusive-absence gate.
+        if !linked && !bare_candidates.is_empty() {
+            let mut distinct_targets: HashSet<EntityId> = HashSet::new();
+            for &(fp, dst_id) in bare_candidates {
+                if fp != file.file_path.as_str() {
+                    distinct_targets.insert(dst_id);
                 }
+            }
+            if distinct_targets.len() == 1 {
+                let dst_id = *distinct_targets.iter().next().expect("len checked == 1");
+                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                    resolved.push(make_relation(rel.kind, src_id, dst_id, 0.3));
+                    linked = true;
+                }
+            }
+        }
 
-                debug!(
-                    src = %rel.src_name,
-                    dst = %rel.dst_name,
-                    file = %file.file_path,
-                    kind = ?rel.kind,
-                    "linker: cross-file relation unresolved"
-                );
+        if linked {
+            continue;
+        }
+
+        debug!(
+            src = %rel.src_name,
+            dst = %rel.dst_name,
+            file = %file.file_path,
+            kind = ?rel.kind,
+            "linker: cross-file relation unresolved"
+        );
+    }
+
+    resolved
+}
+
+/// Merge per-file resolved relations in input-file order, deduplicating across
+/// files (a no-op when sources are disjoint, but kept so output is identical to
+/// a single serial pass), then append artifact-level import/include edges.
+fn merge_resolved(
+    per_file_relations: Vec<Vec<Relation>>,
+    files: &[FileParseData],
+    ctx: &LinkContext<'_>,
+) -> Vec<Relation> {
+    let mut resolved = Vec::new();
+    let mut seen: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
+    for file_relations in per_file_relations {
+        for rel in file_relations {
+            if seen.insert((rel.src, rel.dst, rel.kind)) {
+                resolved.push(rel);
             }
         }
     }
@@ -447,6 +532,7 @@ pub fn link_cross_file_against_entities(
     // Import/include syntax belongs to the file/module surface. Do not anchor it
     // to an arbitrary "first entity" in the file; that makes the graph lie about
     // which symbol owns the dependency and drops files with no parsed entities.
+    let mut seen_artifact: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
     {
         let _span = tracing::info_span!(
             "kin.index.link_cross_file.build_import_edges",
@@ -455,7 +541,8 @@ pub fn link_cross_file_against_entities(
         .entered();
         for file in files {
             for imp in &file.imports {
-                if let Some(rel) = make_artifact_import_relation(&file.file_path, imp, &known_files)
+                if let Some(rel) =
+                    make_artifact_import_relation(&file.file_path, imp, &ctx.known_files)
                 {
                     let key = (rel.src, rel.dst, rel.kind);
                     if seen_artifact.insert(key) {
@@ -466,11 +553,22 @@ pub fn link_cross_file_against_entities(
         }
     }
 
-    if total_files > 0 {
-        eprintln!(); // newline after \r progress
-    }
-    debug!(resolved = resolved.len(), "cross-file linking complete");
     resolved
+}
+
+/// Serial counterpart of [`link_cross_file_against_entities`], retained as the
+/// byte-identical reference for the parallel resolution path.
+#[cfg(test)]
+fn link_cross_file_against_entities_serial(
+    files: &[FileParseData],
+    universe_entities: &[Entity],
+) -> Vec<Relation> {
+    let ctx = build_link_context(files, universe_entities);
+    let per_file_relations: Vec<Vec<Relation>> = files
+        .iter()
+        .map(|file| resolve_one_file(file, &ctx))
+        .collect();
+    merge_resolved(per_file_relations, files, &ctx)
 }
 
 fn build_include_graph<S>(
@@ -1722,6 +1820,98 @@ mod tests {
             .expect("ambiguous global fallback should still pick one stable target");
         assert_eq!(calls.src, GraphNodeId::Entity(caller.id));
         assert_eq!(calls.dst, GraphNodeId::Entity(earlier_target.id));
+    }
+
+    #[test]
+    fn parallel_resolution_is_byte_identical_to_serial() {
+        let calls = |src: &str, dst: &str| ExtractedRelation {
+            kind: RelationKind::Calls,
+            src_name: src.to_string(),
+            dst_name: dst.to_string(),
+            import_source: None,
+        };
+        let import = |module: &str, name: &str| FileImport {
+            module_path: module.to_string(),
+            specifiers: vec![kin_parser::ImportedName {
+                local_name: name.to_string(),
+                original_name: None,
+                is_default: false,
+            }],
+        };
+
+        let mut files = vec![
+            // Same-file resolution.
+            FileParseData {
+                file_path: "src/a.ts".to_string(),
+                entities: vec![
+                    make_entity("funcA", "src/a.ts"),
+                    make_entity("helperA", "src/a.ts"),
+                ],
+                relations: vec![calls("funcA", "helperA")],
+                imports: vec![],
+            },
+            // Import-based cross-file resolution + artifact import edge.
+            FileParseData {
+                file_path: "src/b.ts".to_string(),
+                entities: vec![make_entity("handler", "src/b.ts")],
+                relations: vec![calls("handler", "executeTool")],
+                imports: vec![import("./utils/tools", "executeTool")],
+            },
+            FileParseData {
+                file_path: "src/utils/tools.ts".to_string(),
+                entities: vec![make_entity("executeTool", "src/utils/tools.ts")],
+                relations: vec![],
+                imports: vec![],
+            },
+            // Ambiguous global name fallback across two files.
+            FileParseData {
+                file_path: "src/c.ts".to_string(),
+                entities: vec![make_entity("runner", "src/c.ts")],
+                relations: vec![calls("runner", "shared")],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/d/shared.ts".to_string(),
+                entities: vec![make_entity("shared", "src/d/shared.ts")],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/z/shared.ts".to_string(),
+                entities: vec![make_entity("shared", "src/z/shared.ts")],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        // Pad with self-contained files so the parallel pass spreads real work
+        // and any ordering hazard would surface.
+        for i in 0..32 {
+            let path = format!("src/pad/m{i}.ts");
+            files.push(FileParseData {
+                file_path: path.clone(),
+                entities: vec![make_entity("a", &path), make_entity("b", &path)],
+                relations: vec![calls("a", "b"), calls("b", "missing")],
+                imports: vec![],
+            });
+        }
+
+        let universe: Vec<Entity> = files
+            .iter()
+            .flat_map(|file| file.entities.iter().cloned())
+            .collect();
+
+        let parallel = link_cross_file_against_entities(&files, &universe);
+        let serial = link_cross_file_against_entities_serial(&files, &universe);
+
+        assert_eq!(
+            format!("{parallel:?}"),
+            format!("{serial:?}"),
+            "parallel linking must produce byte-identical relations to the serial path"
+        );
+        // Re-running the parallel path must also be byte-stable.
+        let parallel_again = link_cross_file_against_entities(&files, &universe);
+        assert_eq!(format!("{parallel:?}"), format!("{parallel_again:?}"));
     }
 
     #[test]
