@@ -236,22 +236,19 @@ fn default_true() -> bool {
 }
 
 /// Whether the batched attention path passes Q/K/V to the accelerator in the
-/// native position-major `[batch*seq, hidden]` layout ("Lever A"), letting the
-/// backend do the head-major reshape on-device instead of the host scattering
-/// `qf`/`kf`/`vf` every layer. Sampled once per process.
+/// native position-major `[batch*seq, hidden]` layout, letting the backend do the
+/// head-major reshape on-device instead of the host scattering `qf`/`kf`/`vf`
+/// every layer. Sampled once per process.
 ///
-/// Opt-in for now (`KIN_INFER_RESHAPE_GPU=1`): OFF reproduces the original host
-/// scatter byte-for-byte. Flip the default to ON once the GPU reshape clears the
-/// cosine/swerank parity gate, keeping the OFF env override as the safe
-/// fallback — the pattern used for the MMA flip.
+/// Selected by the throughput resource profile; `KIN_INFER_RESHAPE_GPU=1/0`
+/// overrides the profile in either direction. Off under proof, where the host
+/// scatter reproduces the original layout byte-for-byte.
 fn reshape_on_gpu() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("KIN_INFER_RESHAPE_GPU").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
+        crate::resource::env_flag_override("KIN_INFER_RESHAPE_GPU")
+            .unwrap_or_else(|| crate::resource::active_gpu_kernel_plan().reshape_gpu)
     })
 }
 

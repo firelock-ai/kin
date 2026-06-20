@@ -190,20 +190,17 @@ fn use_mma(m: usize, n: usize, k: usize) -> bool {
     mma_enabled() && MMA_AVAILABLE.load(Ordering::Relaxed) && m >= 32 && n >= 32 && k >= 16
 }
 
-/// Whether the wider 64x64 MMA tile (Lever #5 phase 1) is selected. OPT-IN for
-/// now (`KIN_INFER_MMA_WIDE=1`): default OFF keeps every GEMM on the proven 32x32
-/// MMA so the parity gate stays green untouched. Flip the default ON only after
-/// the wider tile clears the cosine/swerank gate (it is numerically identical, so
-/// it should), keeping the OFF override as the safe fallback — the MMA-flip
-/// pattern. Sampled once per process.
+/// Whether the wider 64x64 MMA tile is selected. Selected by the throughput
+/// resource profile (the kernel is numerically identical to the 32x32 MMA);
+/// `KIN_INFER_MMA_WIDE=1/0` overrides the profile in either direction. Off
+/// everywhere else, including proof, so the bit-identical path is untouched.
+/// Sampled once per process.
 fn mma_wide_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("KIN_INFER_MMA_WIDE").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
+        crate::resource::env_flag_override("KIN_INFER_MMA_WIDE")
+            .unwrap_or_else(|| crate::resource::active_gpu_kernel_plan().mma_wide)
     })
 }
 
@@ -227,21 +224,18 @@ fn use_wide_mma(m: usize, n: usize, k: usize) -> bool {
         && n >= 64
 }
 
-/// Whether the fp16-operand MMA path (Lever #4) is selected. OPT-IN
-/// (`KIN_INFER_GEMM_FP16=1`): default OFF keeps every GEMM on the proven
-/// fp32-operand MMA so the strict cosine gate stays green untouched. fp16
-/// operands lose ~half the mantissa, so this is EXPECTED to lower cosine and may
-/// fail the strict 1e-7 floor on projection GEMMs — it is measured on its own and
-/// only flipped on (or restricted to error-absorbing GEMMs) once a parity number
-/// exists. Sampled once per process.
+/// Whether the fp16-operand MMA path is selected. Selected by the throughput
+/// resource profile; `KIN_INFER_GEMM_FP16=1/0` overrides the profile in either
+/// direction. fp16 operands lose ~half the mantissa, so this is a throughput-only
+/// path and stays off under proof (the bit-identical fp32 MMA). Sampled once per
+/// process; gates whether the separate fp16 shader library is compiled in
+/// `try_new`.
 fn mma_fp16_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("KIN_INFER_GEMM_FP16").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
+        crate::resource::env_flag_override("KIN_INFER_GEMM_FP16")
+            .unwrap_or_else(|| crate::resource::active_gpu_kernel_plan().gemm_fp16)
     })
 }
 
@@ -263,23 +257,19 @@ fn use_fp16_mma(m: usize, n: usize, k: usize) -> bool {
     mma_fp16_enabled() && FP16_MMA_AVAILABLE.load(Ordering::Relaxed) && use_mma(m, n, k)
 }
 
-/// Whether the steel double-buffered K-loop MMA path (Step 1) is selected. OPT-IN
-/// (`KIN_INFER_STEEL=1`): default OFF keeps every GEMM on the proven single-buffer
-/// 32x32 MMA so the parity gate stays green untouched. The steel kernels overlap
-/// the next K-tile's global load with the current tile's MMA (2-stage software
-/// pipeline) but are numerically IDENTICAL to the single-buffer path (same fp32
-/// accumulate, same per-fragment 8-wide reduction order — only WHEN the loads are
-/// issued changes), so the cosine/swerank gate should be unchanged; any drift is a
-/// barrier/ordering bug, not precision. Flip the default ON only after the gate is
-/// green AND a measured ent/s win — the MMA-flip pattern. Sampled once per process.
+/// Whether the steel double-buffered K-loop MMA path is selected. The steel
+/// kernels overlap the next K-tile's global load with the current tile's MMA
+/// (2-stage software pipeline) but are numerically IDENTICAL to the single-buffer
+/// path (same fp32 accumulate, same per-fragment 8-wide reduction order — only
+/// WHEN the loads are issued changes). Selected by the throughput resource
+/// profile; `KIN_INFER_STEEL=1/0` overrides the profile in either direction. Off
+/// under proof. Sampled once per process.
 fn steel_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("KIN_INFER_STEEL").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
+        crate::resource::env_flag_override("KIN_INFER_STEEL")
+            .unwrap_or_else(|| crate::resource::active_gpu_kernel_plan().steel)
     })
 }
 

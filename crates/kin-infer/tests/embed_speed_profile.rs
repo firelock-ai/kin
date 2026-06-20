@@ -31,6 +31,13 @@ use kin_infer::{BertConfig, BertModel};
 
 const MODEL_DIR: &str = "/tmp/swerank";
 
+/// Model directory, overridable with `KIN_INFER_PROBE_MODEL_DIR` so a fixture
+/// carrying a fully-specified `config.json` can be substituted for a checkpoint
+/// whose upstream config omits the explicit dimension fields the loader needs.
+fn probe_model_dir() -> String {
+    std::env::var("KIN_INFER_PROBE_MODEL_DIR").unwrap_or_else(|_| MODEL_DIR.to_string())
+}
+
 /// Build a deterministic, valid token-id sequence of length `len`. Token ids
 /// are kept inside a conservative vocab band so the embedding lookup never
 /// indexes out of bounds, with an attention mask that is all-ones (no padding)
@@ -101,10 +108,11 @@ fn build_stamp() -> String {
 
 #[test]
 fn metal_embed_forward_profile() {
-    let dir = Path::new(MODEL_DIR);
+    let model_dir = probe_model_dir();
+    let dir = Path::new(&model_dir);
     if !dir.join("model.safetensors").exists() {
         eprintln!(
-            "SKIP: model not found at {MODEL_DIR} (model.safetensors absent); \
+            "SKIP: model not found at {model_dir} (model.safetensors absent); \
              skipping embed-speed profile."
         );
         return;
@@ -361,6 +369,51 @@ fn metal_embed_forward_profile() {
              not GPU-timed; absolute throughput = release async wall-clock, distribution = \
              GPU-timestamp, build-invariant)"
         );
+    }
+
+    // --- Long-sequence batched throughput (matmul-bound regime) ---
+    // Large code entities (seq ~1024-2048) are where the projection/FFN GEMMs and
+    // O(seq^2) attention dominate, so this is the regime the GEMM/MMA kernel levers
+    // most affect. Embed a batch of long sequences, report ent/s and the
+    // GPU-timestamp phase split, and assert every output is finite — the long path
+    // is exactly where the historical non-finite norm/attention bugs lived.
+    eprintln!("\n=== Long-sequence batched throughput (seq=1024) ===");
+    let long_len = 1024usize;
+    let long_n = 8usize;
+    let mut lt: Vec<Vec<u32>> = Vec::new();
+    let mut lm: Vec<Vec<u32>> = Vec::new();
+    for j in 0..long_n {
+        let (ids, mask) = synth_sequence(long_len, 9000 + j as u32);
+        lt.push(ids);
+        lm.push(mask);
+    }
+    let warm_long = model.forward_batched(&lt, &lm).expect("warm long batched");
+    assert!(
+        warm_long.iter().all(|v| v.iter().all(|x| x.is_finite())),
+        "long-sequence batched forward produced non-finite output"
+    );
+    metal_backend::reset_profile();
+    let t_l = Instant::now();
+    let long_out = model.forward_batched(&lt, &lm).expect("long batched fwd");
+    let lw = t_l.elapsed().as_secs_f64();
+    assert!(
+        long_out.iter().all(|v| v.iter().all(|x| x.is_finite())),
+        "long-sequence batched forward produced non-finite output"
+    );
+    let long_gpu = metal_backend::profile_gpu_phase_nanos();
+    let long_gpu_tot: u64 = long_gpu.iter().map(|(_, ns)| *ns).sum();
+    eprintln!(
+        "LONG-BATCHED(seq={long_len} x{long_n}) {:.2} ent/s",
+        long_n as f64 / lw.max(1e-9),
+    );
+    if long_gpu_tot > 0 {
+        let denom = long_gpu_tot as f64;
+        let dist = long_gpu
+            .iter()
+            .map(|(name, ns)| format!("{name} {:.0}%", *ns as f64 / denom * 100.0))
+            .collect::<Vec<_>>()
+            .join(" / ");
+        eprintln!("  GPU-timestamp dist: {dist}");
     }
     eprintln!();
 }

@@ -53,6 +53,50 @@ pub enum Profile {
     Ci,
 }
 
+impl Profile {
+    /// Resolve the active runtime profile from the canonical `KIN_RESOURCE_PROFILE`
+    /// selector (the same selector the embedding budgets key off). An unset or
+    /// unrecognized value resolves to [`Profile::Proof`] — the safe, bit-identical
+    /// default, so nothing turns on a throughput-only fast path by accident.
+    pub fn from_env() -> Profile {
+        match std::env::var("KIN_RESOURCE_PROFILE") {
+            Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "throughput" => Profile::Throughput,
+                "interactive" => Profile::Interactive,
+                "ci" => Profile::Ci,
+                _ => Profile::Proof,
+            },
+            Err(_) => Profile::Proof,
+        }
+    }
+}
+
+/// Parse a boolean env override: `1/true/yes/on` → `Some(true)`,
+/// `0/false/no/off` → `Some(false)`, anything else (incl. unset) → `None`.
+/// Used by per-lever `KIN_INFER_*` overrides to take precedence over the
+/// profile-resolved kernel plan in both directions (force-on and force-off).
+pub fn env_flag_override(name: &str) -> Option<bool> {
+    match std::env::var(name).ok().as_deref().map(str::trim) {
+        Some("1") | Some("true") | Some("yes") | Some("on") => Some(true),
+        Some("0") | Some("false") | Some("no") | Some("off") => Some(false),
+        _ => None,
+    }
+}
+
+/// The GPU kernel-family selection for the active embedding process, resolved
+/// once from the canonical [`Profile::from_env`] selector and the detected
+/// accelerator backend. kin-infer's Metal forward path consults this to decide
+/// whether to take the parity-cleared fast GEMM/attention kernels. Per-lever
+/// `KIN_INFER_*` env overrides still win at the gate (see the metal backend).
+pub fn active_gpu_kernel_plan() -> GpuKernelPlan {
+    use std::sync::OnceLock;
+    static PLAN: OnceLock<GpuKernelPlan> = OnceLock::new();
+    *PLAN.get_or_init(|| {
+        let backend = detect_accelerator().backend;
+        GpuKernelPlan::resolve(Profile::from_env(), backend)
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AcceleratorBackend {
@@ -148,6 +192,47 @@ pub struct EmbeddingPlan {
     pub hybrid_mode: HybridMode,
     pub oom_retry: OomRetry,
     pub nonfinite_policy: NonfinitePolicy,
+    /// GPU GEMM/attention kernel-family selection for the forward pass.
+    #[serde(default)]
+    pub gpu_kernels: GpuKernelPlan,
+}
+
+/// Metal GEMM/attention kernel-family selection for the embedding forward pass.
+///
+/// All-off (the [`Default`]) is the proven fp32 single-buffer 32x32-MMA path with
+/// the host-side attention reshape — bit-identical across runs and the only shape
+/// the proof profile ever uses. The throughput profile turns the fast,
+/// parity-cleared kernels on. kin-infer's Metal backend resolves these into its
+/// per-process kernel gates; a `KIN_INFER_*` env override still wins per lever so
+/// each can be A/B-measured in isolation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct GpuKernelPlan {
+    /// fp16-operand MMA GEMM (`KIN_INFER_GEMM_FP16`).
+    #[serde(default)]
+    pub gemm_fp16: bool,
+    /// Double-buffered K-loop ("steel") MMA GEMM (`KIN_INFER_STEEL`).
+    #[serde(default)]
+    pub steel: bool,
+    /// Wider 64x64 MMA register tile (`KIN_INFER_MMA_WIDE`).
+    #[serde(default)]
+    pub mma_wide: bool,
+    /// On-device head-major attention reshape (`KIN_INFER_RESHAPE_GPU`).
+    #[serde(default)]
+    pub reshape_gpu: bool,
+}
+
+impl GpuKernelPlan {
+    /// Kernel selection for `profile` on `backend`. Every alternate Metal
+    /// GEMM/attention kernel is currently OFF for all profiles: each one is
+    /// parity-clean (bit-identical, finite) but measures throughput-neutral to
+    /// regressive against the baseline simdgroup MMA on Apple silicon, so the
+    /// throughput profile stays on the proven path rather than shipping a
+    /// regression. This is the per-profile seam to flip a field on once a kernel
+    /// actually beats the baseline; the matching `KIN_INFER_*` env override stays
+    /// available for A/B-measuring any of them in isolation.
+    pub fn resolve(_profile: Profile, _backend: AcceleratorBackend) -> GpuKernelPlan {
+        GpuKernelPlan::default()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -420,6 +505,7 @@ impl ResourcePlan {
             hybrid_mode: HybridMode::Off,
             oom_retry: OomRetry::SplitBatchThenCpu,
             nonfinite_policy: NonfinitePolicy::Error,
+            gpu_kernels: GpuKernelPlan::resolve(profile, backend),
         };
 
         let mut locate_search = LocateSearchPlan {
@@ -574,6 +660,8 @@ mod tests {
         assert_eq!(plan.embedding.hybrid_mode, HybridMode::Off);
         assert_eq!(plan.embedding.oom_retry, OomRetry::SplitBatchThenCpu);
         assert_eq!(plan.embedding.nonfinite_policy, NonfinitePolicy::Error);
+        // Proof keeps every fast GPU kernel off for a bit-identical forward pass.
+        assert_eq!(plan.embedding.gpu_kernels, GpuKernelPlan::default());
 
         // locate/search
         assert_eq!(plan.locate_search.max_concurrent_requests, 1);
@@ -633,6 +721,38 @@ mod tests {
         assert_eq!(plan.host.reserve_logical_cores, 1);
         assert_eq!(plan.bench.explore_fast_jobs, Some(16));
         assert_eq!(plan.bench.artifact_mode, ArtifactMode::NonCitableExplore);
+        // The alternate Metal kernels measure throughput-neutral-to-regressive vs
+        // the baseline MMA, so even throughput keeps them off (proven path).
+        assert_eq!(plan.embedding.gpu_kernels, GpuKernelPlan::default());
+    }
+
+    #[test]
+    fn gpu_kernel_plan_stays_off_for_every_profile() {
+        // No alternate kernel is a measured throughput win, so the plan resolves
+        // off for every profile/backend; a winning kernel is flipped on here.
+        for profile in [
+            Profile::Proof,
+            Profile::Interactive,
+            Profile::Throughput,
+            Profile::Ci,
+        ] {
+            for backend in [
+                AcceleratorBackend::Metal,
+                AcceleratorBackend::Cuda,
+                AcceleratorBackend::Cpu,
+            ] {
+                assert_eq!(
+                    GpuKernelPlan::resolve(profile, backend),
+                    GpuKernelPlan::default(),
+                    "{profile:?}/{backend:?} must keep alternate kernels off"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn env_flag_override_parses_both_directions() {
+        assert_eq!(env_flag_override("KIN_INFER_NONEXISTENT_FLAG_XYZ"), None);
     }
 
     #[test]
