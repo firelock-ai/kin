@@ -6469,4 +6469,31 @@ mod tests {
             out.len()
         );
     }
+
+    #[test]
+    fn test_fused_attention_batched_finite_long_seq() {
+        let Some(metal) = get_metal() else { return };
+        let heads = 2usize;
+        let head_dim = 64usize;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        for &seq in &[600usize, 1024, 2048] {
+            let n = heads * seq * head_dim;
+            let q: Vec<f32> = (0..n).map(|i| ((i % 23) as f32 - 11.0) * 0.02).collect();
+            let k = q.clone();
+            let v = q.clone();
+            // num_groups=heads, heads_per_group=1 -> all-valid mask (no padding),
+            // no alibi: isolates the QK GEMM + softmax from any masking effect.
+            let masks = vec![1u32; heads * seq];
+            let out = metal
+                .fused_attention_batched(&q, &k, &v, heads, 1, seq, head_dim, scale, &[], &masks)
+                .expect("fused_attention_batched");
+            let nonfinite = out.iter().filter(|x| !x.is_finite()).count();
+            assert_eq!(
+                nonfinite,
+                0,
+                "seq={seq}: {nonfinite}/{} non-finite attention outputs",
+                out.len()
+            );
+        }
+    }
 }
