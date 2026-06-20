@@ -3,7 +3,7 @@
 
 [package]
 name = "kin-infer"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Troy Fortin <troy@firelock.ai>"]
@@ -38,6 +38,7 @@ thiserror = "2"
 parking_lot = "0.12"
 rayon = "1"
 tracing = "0.1"
+memmap2 = "0.9"
 
 # Unix-only: getppid() for the embed parent-death watchdog (orphan self-exit).
 # Already present transitively (metal/objc2); named directly so the watchdog can

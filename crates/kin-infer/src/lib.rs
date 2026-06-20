@@ -16,6 +16,7 @@
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
 pub mod gpu;
+pub mod macos_qos;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal_backend;
 pub mod resource;
@@ -792,12 +793,19 @@ fn load_classifier_head(
     Ok(None)
 }
 
-/// Load tensors from potentially sharded safetensors files.
-/// If `weights_path` ends in `.safetensors`, load it directly.
-/// If a `model.safetensors.index.json` exists alongside, load the shard map.
-fn load_safetensors_bytes(weights_path: &Path) -> Result<Vec<u8>, InferError> {
-    std::fs::read(weights_path)
-        .map_err(|e| InferError::ModelError(format!("failed to read weights: {e}")))
+/// Memory-maps a safetensors file for zero-copy deserialization.
+///
+/// The mapping exposes the same bytes as reading the file into a `Vec<u8>`, so
+/// parsed tensors and downstream embeddings are unchanged; it only avoids the
+/// up-front heap copy of the full weight file.
+fn load_safetensors_mmap(weights_path: &Path) -> Result<memmap2::Mmap, InferError> {
+    let file = std::fs::File::open(weights_path)
+        .map_err(|e| InferError::ModelError(format!("failed to open weights: {e}")))?;
+    unsafe {
+        memmap2::MmapOptions::new()
+            .map(&file)
+            .map_err(|e| InferError::ModelError(format!("failed to mmap weights: {e}")))
+    }
 }
 
 /// Load sharded safetensors: reads index.json, merges all shards into one
@@ -836,8 +844,8 @@ impl BertModel {
             architecture = ?config.architecture()
         )
         .entered();
-        let data = load_safetensors_bytes(weights_path)?;
-        let tensors = SafeTensors::deserialize(&data)
+        let mmap = load_safetensors_mmap(weights_path)?;
+        let tensors = SafeTensors::deserialize(&mmap)
             .map_err(|e| InferError::ModelError(format!("failed to parse safetensors: {e}")))?;
         Self::load_from_tensors(&tensors, config)
     }
@@ -4323,6 +4331,19 @@ fn dot_product_scalar(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
+/// Configures the global Rayon pool so its workers run at an elevated QoS class
+/// (performance cores) on macOS.
+///
+/// Safe to call repeatedly and from a host process whose global Rayon pool is
+/// already initialized: `build_global` returns an error on a duplicate
+/// initialization, which is intentionally ignored, so the call never panics or
+/// errors and a pre-existing global pool is left untouched.
+pub fn init_performance_threads() {
+    let _ = rayon::ThreadPoolBuilder::new()
+        .start_handler(|_| macos_qos::set_thread_qos_user_initiated())
+        .build_global();
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -5367,5 +5388,43 @@ mod tests {
         assert!(r1 != r2 && r2 != r3);
         assert!((0.0..1.0).contains(&r1));
         assert!((0.0..1.0).contains(&r2));
+    }
+
+    #[test]
+    fn test_init_performance_threads_is_idempotent() {
+        init_performance_threads();
+        init_performance_threads();
+        init_performance_threads();
+    }
+
+    #[test]
+    fn test_mmap_load_matches_fs_read() {
+        use std::io::Write;
+
+        let mut bytes = Vec::with_capacity(8192 + 123);
+        for i in 0..(8192u32 + 123) {
+            bytes.push((i % 256) as u8);
+        }
+
+        let path =
+            std::env::temp_dir().join(format!("kin_infer_mmap_parity_{}.bin", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&path).expect("create temp weights");
+            f.write_all(&bytes).expect("write temp weights");
+            f.flush().expect("flush temp weights");
+        }
+
+        let via_fs = std::fs::read(&path).expect("fs read");
+        let mmap = load_safetensors_mmap(&path).expect("mmap load");
+
+        assert_eq!(
+            &via_fs[..],
+            &mmap[..],
+            "mmap bytes must match fs::read bytes"
+        );
+        assert_eq!(&bytes[..], &mmap[..], "mmap bytes must match written bytes");
+
+        drop(mmap);
+        let _ = std::fs::remove_file(&path);
     }
 }

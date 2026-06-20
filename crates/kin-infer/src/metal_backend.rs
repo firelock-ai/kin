@@ -455,7 +455,7 @@ static inline void block_mma(
     device const float* B,
     device float* C,
     uint M, uint N, uint K,
-    uint3 tgid, uint sgid, uint lane,
+    uint3 tgid, uint sgid, uint lane, uint tpsg,
     threadgroup float (*As)[MMA_BK],
     threadgroup float (*Bs)[MMA_BK],
     threadgroup float (*store_tile)[MMA_F][MMA_F])
@@ -468,7 +468,7 @@ static inline void block_mma(
     const uint sn = sgid % WN;           // simdgroup col
     const uint block_row = tgid.y * BM;  // M offset of this block
     const uint block_col = tgid.x * BN;  // N offset of this block
-    const uint tid = sgid * 32u + lane;  // flat thread index 0..127
+    const uint tid = sgid * tpsg + lane;  // flat thread index 0..127
 
     simdgroup_float8x8 acc[TM][TN];
     for (uint i = 0; i < TM; i++)
@@ -534,7 +534,7 @@ static inline void block_mma(
                 threadgroup float* scratch = &store_tile[sgid][0][0];
                 simdgroup_store(acc[i][j], scratch, F, ulong2(0, 0), false);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (uint e = lane; e < F * F; e += 32u) {
+                for (uint e = lane; e < F * F; e += tpsg) {
                     uint er = e / F, ec = e % F;
                     uint gr = cr + er, gc = cc + ec;
                     if (gr < M && gc < N) {
@@ -557,12 +557,13 @@ kernel void matmul_transb_simdgroup(
     constant uint& K        [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     threadgroup float As[MMA_BM][MMA_BK];
     threadgroup float Bs[MMA_BN][MMA_BK];
     threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
-    block_mma<true>(A, B, C, M, N, K, tgid, sgid, lane, As, Bs, store_tile);
+    block_mma<true>(A, B, C, M, N, K, tgid, sgid, lane, tpsg, As, Bs, store_tile);
 }
 
 // Batched QK^T: per head (gid.z) C[h] = Q[h][seq,dim] * K[h][seq,dim]^T.
@@ -576,7 +577,8 @@ kernel void batched_matmul_transb_simdgroup(
     constant uint& hpg      [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     uint h = tgid.z;
     uint kv_h = h / hpg;
@@ -586,7 +588,7 @@ kernel void batched_matmul_transb_simdgroup(
     threadgroup float As[MMA_BM][MMA_BK];
     threadgroup float Bs[MMA_BN][MMA_BK];
     threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
-    block_mma<true>(Ah, Bh, Ch, seq, seq, dim, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+    block_mma<true>(Ah, Bh, Ch, seq, seq, dim, uint3(tgid.x, tgid.y, 0), sgid, lane, tpsg, As, Bs, store_tile);
 }
 
 // Batched scores*V: per head (gid.z) C[h] = S[h][seq,seq] * V[h][seq,dim].
@@ -600,7 +602,8 @@ kernel void batched_matmul_ab_simdgroup(
     constant uint& hpg      [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     uint h = tgid.z;
     uint kv_h = h / hpg;
@@ -610,7 +613,7 @@ kernel void batched_matmul_ab_simdgroup(
     threadgroup float As[MMA_BM][MMA_BK];
     threadgroup float Bs[MMA_BN][MMA_BK];
     threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
-    block_mma<false>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+    block_mma<false>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, tpsg, As, Bs, store_tile);
 }
 
 // ---- Wider 64x64 MMA tile variants (Lever #5 phase 1) ----
@@ -630,12 +633,13 @@ kernel void matmul_transb_simdgroup_wide(
     constant uint& K        [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     threadgroup float As[64][MMA_BK];
     threadgroup float Bs[64][MMA_BK];
     threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
-    block_mma<true, 64, 64>(A, B, C, M, N, K, tgid, sgid, lane, As, Bs, store_tile);
+    block_mma<true, 64, 64>(A, B, C, M, N, K, tgid, sgid, lane, tpsg, As, Bs, store_tile);
 }
 
 kernel void batched_matmul_transb_simdgroup_wide(
@@ -647,7 +651,8 @@ kernel void batched_matmul_transb_simdgroup_wide(
     constant uint& hpg      [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     uint h = tgid.z;
     uint kv_h = h / hpg;
@@ -657,7 +662,7 @@ kernel void batched_matmul_transb_simdgroup_wide(
     threadgroup float As[64][MMA_BK];
     threadgroup float Bs[64][MMA_BK];
     threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
-    block_mma<true, 64, 64>(Ah, Bh, Ch, seq, seq, dim, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+    block_mma<true, 64, 64>(Ah, Bh, Ch, seq, seq, dim, uint3(tgid.x, tgid.y, 0), sgid, lane, tpsg, As, Bs, store_tile);
 }
 
 kernel void batched_matmul_ab_simdgroup_wide(
@@ -669,7 +674,8 @@ kernel void batched_matmul_ab_simdgroup_wide(
     constant uint& hpg      [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     uint h = tgid.z;
     uint kv_h = h / hpg;
@@ -679,7 +685,7 @@ kernel void batched_matmul_ab_simdgroup_wide(
     threadgroup float As[64][MMA_BK];
     threadgroup float Bs[64][MMA_BK];
     threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
-    block_mma<false, 64, 64>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+    block_mma<false, 64, 64>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, tpsg, As, Bs, store_tile);
 }
 
 // ---- Steel double-buffered K-loop MMA (Step 1) ----
@@ -705,7 +711,7 @@ static inline void block_mma_db(
     device const float* B,
     device float* C,
     uint M, uint N, uint K,
-    uint3 tgid, uint sgid, uint lane,
+    uint3 tgid, uint sgid, uint lane, uint tpsg,
     threadgroup float (*As)[32][MMA_BK],      // As[2][32][MMA_BK] ping-pong
     threadgroup float (*Bs)[32][MMA_BK],      // Bs[2][32][MMA_BK] ping-pong
     threadgroup float (*store_tile)[MMA_F][MMA_F])
@@ -718,7 +724,7 @@ static inline void block_mma_db(
     const uint sn = sgid % WN;           // simdgroup col
     const uint block_row = tgid.y * BM;  // M offset of this block
     const uint block_col = tgid.x * BN;  // N offset of this block
-    const uint tid = sgid * 32u + lane;  // flat thread index 0..127
+    const uint tid = sgid * tpsg + lane;  // flat thread index 0..127
 
     simdgroup_float8x8 acc[TM][TN];
     for (uint i = 0; i < TM; i++)
@@ -814,7 +820,7 @@ static inline void block_mma_db(
                 threadgroup float* scratch = &store_tile[sgid][0][0];
                 simdgroup_store(acc[i][j], scratch, F, ulong2(0, 0), false);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (uint e = lane; e < F * F; e += 32u) {
+                for (uint e = lane; e < F * F; e += tpsg) {
                     uint er = e / F, ec = e % F;
                     uint gr = cr + er, gc = cc + ec;
                     if (gr < M && gc < N) {
@@ -837,12 +843,13 @@ kernel void matmul_transb_simdgroup_steel(
     constant uint& K        [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     threadgroup float As[2][32][MMA_BK];
     threadgroup float Bs[2][32][MMA_BK];
     threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
-    block_mma_db<true>(A, B, C, M, N, K, tgid, sgid, lane, As, Bs, store_tile);
+    block_mma_db<true>(A, B, C, M, N, K, tgid, sgid, lane, tpsg, As, Bs, store_tile);
 }
 
 // Batched QK^T per head, double-buffered (see batched_matmul_transb_simdgroup).
@@ -855,7 +862,8 @@ kernel void batched_matmul_transb_simdgroup_steel(
     constant uint& hpg      [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     uint h = tgid.z;
     uint kv_h = h / hpg;
@@ -865,7 +873,7 @@ kernel void batched_matmul_transb_simdgroup_steel(
     threadgroup float As[2][32][MMA_BK];
     threadgroup float Bs[2][32][MMA_BK];
     threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
-    block_mma_db<true>(Ah, Bh, Ch, seq, seq, dim, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+    block_mma_db<true>(Ah, Bh, Ch, seq, seq, dim, uint3(tgid.x, tgid.y, 0), sgid, lane, tpsg, As, Bs, store_tile);
 }
 
 // Batched scores*V per head, double-buffered (see batched_matmul_ab_simdgroup).
@@ -878,7 +886,8 @@ kernel void batched_matmul_ab_simdgroup_steel(
     constant uint& hpg      [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     uint h = tgid.z;
     uint kv_h = h / hpg;
@@ -888,91 +897,102 @@ kernel void batched_matmul_ab_simdgroup_steel(
     threadgroup float As[2][32][MMA_BK];
     threadgroup float Bs[2][32][MMA_BK];
     threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
-    block_mma_db<false>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+    block_mma_db<false>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, tpsg, As, Bs, store_tile);
 }
 
-// ---- Softmax over rows ----
-// data is [rows, cols], normalize each row independently
+// ---- Softmax over rows (SIMD-reduced) ----
+// 1 threadgroup (size tw) per row.
 kernel void softmax_rows(
     device float* data          [[buffer(0)]],
     constant uint& cols         [[buffer(1)]],
-    uint gid                    [[thread_position_in_grid]]
+    uint tgid                   [[threadgroup_position_in_grid]],
+    uint tiitg                  [[thread_index_in_threadgroup]],
+    uint tptg                   [[threads_per_threadgroup]]
 ) {
-    uint row_offset = gid * cols;
+    uint row_offset = tgid * cols;
 
     // Find max
     float max_val = -INFINITY;
-    for (uint j = 0; j < cols; j++) {
+    for (uint j = tiitg; j < cols; j += tptg) {
         max_val = max(max_val, data[row_offset + j]);
     }
+    max_val = simd_max(max_val);
 
     // Exp and sum
     float sum = 0.0;
-    for (uint j = 0; j < cols; j++) {
+    for (uint j = tiitg; j < cols; j += tptg) {
         float v = exp(data[row_offset + j] - max_val);
         data[row_offset + j] = v;
         sum += v;
     }
+    sum = simd_sum(sum);
 
     // Normalize
     if (sum > 0.0) {
         float inv_sum = 1.0 / sum;
-        for (uint j = 0; j < cols; j++) {
+        for (uint j = tiitg; j < cols; j += tptg) {
             data[row_offset + j] *= inv_sum;
         }
     }
 }
 
-// ---- LayerNorm ----
+// ---- LayerNorm (SIMD-reduced) ----
+// 1 threadgroup (size tw) per row.
 kernel void layer_norm(
     device float* data          [[buffer(0)]],
     device const float* gamma   [[buffer(1)]],
     device const float* beta    [[buffer(2)]],
     constant uint& cols         [[buffer(3)]],
     constant float& eps         [[buffer(4)]],
-    uint gid                    [[thread_position_in_grid]]
+    uint tgid                   [[threadgroup_position_in_grid]],
+    uint tiitg                  [[thread_index_in_threadgroup]],
+    uint tptg                   [[threads_per_threadgroup]]
 ) {
-    uint off = gid * cols;
+    uint off = tgid * cols;
     float len = float(cols);
 
     // Mean
-    float mean = 0.0;
-    for (uint j = 0; j < cols; j++) mean += data[off + j];
-    mean /= len;
+    float local_sum = 0.0;
+    for (uint j = tiitg; j < cols; j += tptg) local_sum += data[off + j];
+    float mean = simd_sum(local_sum) / len;
 
     // Variance
-    float var = 0.0;
-    for (uint j = 0; j < cols; j++) {
+    float local_var = 0.0;
+    for (uint j = tiitg; j < cols; j += tptg) {
         float d = data[off + j] - mean;
-        var += d * d;
+        local_var += d * d;
     }
-    var /= len;
+    float var = simd_sum(local_var) / len;
 
     float inv_std = rsqrt(var + eps);
-    for (uint j = 0; j < cols; j++) {
+    for (uint j = tiitg; j < cols; j += tptg) {
         data[off + j] = (data[off + j] - mean) * inv_std * gamma[j] + beta[j];
     }
 }
 
-// ---- RMSNorm ----
+// ---- RMSNorm (SIMD-reduced) ----
+// 1 threadgroup (size tw) per row.
 kernel void rms_norm(
     device float* data          [[buffer(0)]],
     device const float* weight  [[buffer(1)]],
     constant uint& cols         [[buffer(2)]],
     constant float& eps         [[buffer(3)]],
-    uint gid                    [[thread_position_in_grid]]
+    uint tgid                   [[threadgroup_position_in_grid]],
+    uint tiitg                  [[thread_index_in_threadgroup]],
+    uint tptg                   [[threads_per_threadgroup]]
 ) {
-    uint off = gid * cols;
+    uint off = tgid * cols;
     float len = float(cols);
 
-    float sq_sum = 0.0;
-    for (uint j = 0; j < cols; j++) {
+    float local_sq_sum = 0.0;
+    for (uint j = tiitg; j < cols; j += tptg) {
         float v = data[off + j];
-        sq_sum += v * v;
+        local_sq_sum += v * v;
     }
+    float sq_sum = simd_sum(local_sq_sum);
     float inv_rms = rsqrt(sq_sum / len + eps);
 
-    for (uint j = 0; j < cols; j++) {
+    for (uint j = tiitg; j < cols; j += tptg) {
         data[off + j] = data[off + j] * inv_rms * weight[j];
     }
 }
@@ -1490,7 +1510,7 @@ static inline void block_mma_fp16(
     device const float* B,
     device float* C,
     uint M, uint N, uint K,
-    uint3 tgid, uint sgid, uint lane,
+    uint3 tgid, uint sgid, uint lane, uint tpsg,
     threadgroup half (*As)[MMA_BK],
     threadgroup half (*Bs)[MMA_BK],
     threadgroup float (*store_tile)[MMA_F][MMA_F])
@@ -1503,7 +1523,7 @@ static inline void block_mma_fp16(
     const uint sn = sgid % WN;
     const uint block_row = tgid.y * BM;
     const uint block_col = tgid.x * BN;
-    const uint tid = sgid * 32u + lane;
+    const uint tid = sgid * tpsg + lane;
 
     // fp32 accumulator — the parity invariant. Do NOT switch to half.
     simdgroup_float8x8 acc[TM][TN];
@@ -1560,7 +1580,7 @@ static inline void block_mma_fp16(
                 threadgroup float* scratch = &store_tile[sgid][0][0];
                 simdgroup_store(acc[i][j], scratch, F, ulong2(0, 0), false);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (uint e = lane; e < F * F; e += 32u) {
+                for (uint e = lane; e < F * F; e += tpsg) {
                     uint er = e / F, ec = e % F;
                     uint gr = cr + er, gc = cc + ec;
                     if (gr < M && gc < N) {
@@ -1582,12 +1602,13 @@ kernel void matmul_transb_simdgroup_fp16(
     constant uint& K        [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     threadgroup half As[32][MMA_BK];
     threadgroup half Bs[32][MMA_BK];
     threadgroup float store_tile[2 * 2][MMA_F][MMA_F];
-    block_mma_fp16<true>(A, B, C, M, N, K, tgid, sgid, lane, As, Bs, store_tile);
+    block_mma_fp16<true>(A, B, C, M, N, K, tgid, sgid, lane, tpsg, As, Bs, store_tile);
 }
 
 kernel void batched_matmul_transb_simdgroup_fp16(
@@ -1598,7 +1619,8 @@ kernel void batched_matmul_transb_simdgroup_fp16(
     constant uint& dim      [[buffer(4)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     uint h = tgid.z;
     device const float* Ah = Q  + h * seq * dim;
@@ -1607,7 +1629,7 @@ kernel void batched_matmul_transb_simdgroup_fp16(
     threadgroup half As[32][MMA_BK];
     threadgroup half Bs[32][MMA_BK];
     threadgroup float store_tile[2 * 2][MMA_F][MMA_F];
-    block_mma_fp16<true>(Ah, Bh, Ch, seq, seq, dim, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+    block_mma_fp16<true>(Ah, Bh, Ch, seq, seq, dim, uint3(tgid.x, tgid.y, 0), sgid, lane, tpsg, As, Bs, store_tile);
 }
 
 kernel void batched_matmul_ab_simdgroup_fp16(
@@ -1618,7 +1640,8 @@ kernel void batched_matmul_ab_simdgroup_fp16(
     constant uint& dim      [[buffer(4)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     uint h = tgid.z;
     device const float* Ah = S + h * seq * seq;
@@ -1627,7 +1650,7 @@ kernel void batched_matmul_ab_simdgroup_fp16(
     threadgroup half As[32][MMA_BK];
     threadgroup half Bs[32][MMA_BK];
     threadgroup float store_tile[2 * 2][MMA_F][MMA_F];
-    block_mma_fp16<false>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+    block_mma_fp16<false>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, tpsg, As, Bs, store_tile);
 }
 "#;
 
@@ -2398,6 +2421,27 @@ impl MetalCompute {
         enc.end_encoding();
     }
 
+    /// Dispatch a kernel that reduces over rows using simdgroups (one threadgroup of size `tw` per row).
+    fn encode_rows_simdgroup(
+        &self,
+        cmd: &CommandBufferRef,
+        pipeline_name: &str,
+        buffers: &[&Buffer],
+        rows: usize,
+    ) {
+        let pipeline = &self.pipelines[pipeline_name];
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(pipeline);
+        for (i, buf) in buffers.iter().enumerate() {
+            enc.set_buffer(i as u64, Some(buf), 0);
+        }
+        let tw = pipeline.thread_execution_width() as usize;
+        let threads = MTLSize::new((rows * tw) as u64, 1, 1);
+        let tg_size = MTLSize::new(tw as u64, 1, 1);
+        enc.dispatch_threads(threads, tg_size);
+        enc.end_encoding();
+    }
+
     fn encode_3d(
         &self,
         cmd: &CommandBufferRef,
@@ -2433,11 +2477,6 @@ impl MetalCompute {
         )
         .entered();
         let pipeline = &self.pipelines[pipeline_name];
-        // The command buffer and encoder are autoreleased (+0) by the metal
-        // crate. On a worker thread with no ambient pool (e.g. tokio
-        // spawn_blocking, where embedding runs) they would otherwise accumulate
-        // for the thread's whole life and back the queue up against its
-        // in-flight cap. Drain them per dispatch.
         autoreleasepool(|_| {
             let cmd = self.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
@@ -2451,9 +2490,33 @@ impl MetalCompute {
             let tg_size = MTLSize::new(thread_w.min(total_threads) as u64, 1, 1);
             enc.dispatch_threads(threads, tg_size);
             enc.end_encoding();
-            // The buffers are caller-owned (read back after this returns), so no
-            // pooled buffers to retain; commit bounded-async then sync at the
-            // data-consuming boundary.
+            self.commit_wait(cmd);
+        });
+    }
+
+    /// Dispatch a kernel that reduces over rows using simdgroups (one threadgroup of size `tw` per row).
+    fn dispatch_rows_simdgroup(&self, pipeline_name: &str, buffers: &[&Buffer], rows: usize) {
+        let _span = tracing::info_span!(
+            "kin_infer.metal.dispatch_rows_simdgroup",
+            pipeline = pipeline_name,
+            buffer_count = buffers.len(),
+            rows = rows
+        )
+        .entered();
+        let pipeline = &self.pipelines[pipeline_name];
+        autoreleasepool(|_| {
+            let cmd = self.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(pipeline);
+            for (i, buf) in buffers.iter().enumerate() {
+                enc.set_buffer(i as u64, Some(buf), 0);
+            }
+
+            let tw = pipeline.thread_execution_width() as usize;
+            let threads = MTLSize::new((rows * tw) as u64, 1, 1);
+            let tg_size = MTLSize::new(tw as u64, 1, 1);
+            enc.dispatch_threads(threads, tg_size);
+            enc.end_encoding();
             self.commit_wait(cmd);
         });
     }
@@ -3167,7 +3230,7 @@ impl MetalCompute {
                 total_q_heads,
             );
 
-            self.encode_1d(
+            self.encode_rows_simdgroup(
                 cmd2,
                 "softmax_rows",
                 &[buf_scores.buffer(), &buf_seq],
@@ -3881,7 +3944,7 @@ impl GpuCompute for MetalCompute {
         let buf = self.buf_slice_pooled(data)?;
         let buf_cols = self.buf_u32(cols as u32)?;
         time_phase(Phase::Norm, || {
-            self.dispatch_1d("softmax_rows", &[buf.buffer(), &buf_cols], rows)
+            self.dispatch_rows_simdgroup("softmax_rows", &[buf.buffer(), &buf_cols], rows)
         });
         Self::read_buf_into(buf.buffer(), data);
         Self::count_nonfinite(&format!("softmax_out rows={rows} cols={cols}"), data);
@@ -3910,7 +3973,7 @@ impl GpuCompute for MetalCompute {
         let buf_cols = self.buf_u32(cols as u32)?;
         let buf_eps = self.buf_f32(eps)?;
         time_phase(Phase::Norm, || {
-            self.dispatch_1d(
+            self.dispatch_rows_simdgroup(
                 "layer_norm",
                 &[buf.buffer(), &buf_gamma, &buf_beta, &buf_cols, &buf_eps],
                 rows,
@@ -3941,7 +4004,7 @@ impl GpuCompute for MetalCompute {
         let buf_cols = self.buf_u32(cols as u32)?;
         let buf_eps = self.buf_f32(eps)?;
         time_phase(Phase::Norm, || {
-            self.dispatch_1d(
+            self.dispatch_rows_simdgroup(
                 "rms_norm",
                 &[buf.buffer(), &buf_weight, &buf_cols, &buf_eps],
                 rows,
@@ -4291,10 +4354,7 @@ impl GpuCompute for MetalCompute {
                 enc.set_buffer(4, Some(&buf_eps), 0);
                 let tw = ln.thread_execution_width();
                 let rows_u = rows as u64;
-                enc.dispatch_threads(
-                    MTLSize::new(rows_u, 1, 1),
-                    MTLSize::new(tw.min(rows_u).max(1), 1, 1),
-                );
+                enc.dispatch_threads(MTLSize::new(rows_u * tw, 1, 1), MTLSize::new(tw, 1, 1));
                 enc.end_encoding();
             }
 
@@ -4414,10 +4474,7 @@ impl GpuCompute for MetalCompute {
                 enc.set_buffer(4, Some(&buf_eps), 0);
                 let tw = ln.thread_execution_width();
                 let rows_u = rows as u64;
-                enc.dispatch_threads(
-                    MTLSize::new(rows_u, 1, 1),
-                    MTLSize::new(tw.min(rows_u).max(1), 1, 1),
-                );
+                enc.dispatch_threads(MTLSize::new(rows_u * tw, 1, 1), MTLSize::new(tw, 1, 1));
                 enc.end_encoding();
             }
 
@@ -4715,9 +4772,9 @@ impl GpuCompute for MetalCompute {
                 let buf_cols = self.buf_u32(seq_len as u32)?;
                 enc.set_buffer(1, Some(&buf_cols), 0);
                 let total_rows = num_heads * seq_len;
-                let tw = p.thread_execution_width() as usize;
-                let threads = MTLSize::new(total_rows as u64, 1, 1);
-                let tg = MTLSize::new(tw.min(total_rows) as u64, 1, 1);
+                let tw = p.thread_execution_width();
+                let threads = MTLSize::new((total_rows as u64) * tw, 1, 1);
+                let tg = MTLSize::new(tw, 1, 1);
                 enc.dispatch_threads(threads, tg);
                 enc.end_encoding();
             }
@@ -4893,8 +4950,8 @@ impl GpuCompute for MetalCompute {
                 enc.set_buffer(1, Some(&buf_cols), 0);
                 let total_rows = total_heads * seq_len;
                 let tw = p.thread_execution_width() as usize;
-                let threads = MTLSize::new(total_rows as u64, 1, 1);
-                let tg = MTLSize::new(tw.min(total_rows) as u64, 1, 1);
+                let threads = MTLSize::new((total_rows * tw) as u64, 1, 1);
+                let tg = MTLSize::new(tw as u64, 1, 1);
                 enc.dispatch_threads(threads, tg);
                 enc.end_encoding();
             }
@@ -5117,8 +5174,8 @@ impl GpuCompute for MetalCompute {
                 enc.set_buffer(1, Some(&buf_cols), 0);
                 let total_rows = total_heads * seq_len;
                 let tw = p.thread_execution_width() as usize;
-                let threads = MTLSize::new(total_rows as u64, 1, 1);
-                let tg = MTLSize::new(tw.min(total_rows) as u64, 1, 1);
+                let threads = MTLSize::new((total_rows * tw) as u64, 1, 1);
+                let tg = MTLSize::new(tw as u64, 1, 1);
                 enc.dispatch_threads(threads, tg);
                 enc.end_encoding();
             }
@@ -5382,6 +5439,7 @@ mod tests {
             .layer_norm(&mut data, &gamma, &beta, 1, 4, 1e-5)
             .unwrap();
         let mean: f32 = data.iter().sum::<f32>() / 4.0;
+
         assert!(mean.abs() < 1e-3, "mean={}", mean);
     }
 
