@@ -594,6 +594,29 @@ impl DaemonClient {
             .context("parse daemon command status response")?)
     }
 
+    pub async fn command_resources(
+        &self,
+        request: &crate::commands::resources::CommandResourcesRequest,
+    ) -> Result<crate::commands::resources::CommandResourcesResponse> {
+        let resp = self
+            .send(
+                self.client
+                    .post(format!("{}/commands/resources", self.base_url))
+                    .json(request),
+                "send daemon command resources request",
+            )
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon command resources error (HTTP {}): {}", status, body);
+        }
+        Ok(resp
+            .json()
+            .await
+            .context("parse daemon command resources response")?)
+    }
+
     pub async fn graph_command(
         &self,
         request: &crate::commands::graph::GraphCommandRequest,
