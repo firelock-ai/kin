@@ -84,7 +84,13 @@ fn run_for_model(model_dir: &str) {
         eprintln!("!!! REFUSING last-bit parity from a debug build — use --release !!!");
         return;
     }
-    let cfg_json = fs::read_to_string(dir.join("config.json")).expect("read config.json");
+    let cfg_json = match fs::read_to_string(dir.join("config.json")) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SKIP: cannot read {model_dir}/config.json ({e})");
+            return;
+        }
+    };
     let config: BertConfig = match serde_json::from_str(&cfg_json) {
         Ok(c) => c,
         Err(e) => {

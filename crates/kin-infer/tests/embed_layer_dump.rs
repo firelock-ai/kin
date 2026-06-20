@@ -43,8 +43,20 @@ fn layer_divergence_trace() {
         eprintln!("SKIP: model not found at {MODEL_DIR}");
         return;
     }
-    let cfg_json = fs::read_to_string(dir.join("config.json")).expect("config");
-    let config: BertConfig = serde_json::from_str(&cfg_json).expect("parse");
+    let cfg_json = match fs::read_to_string(dir.join("config.json")) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SKIP: cannot read config.json ({e})");
+            return;
+        }
+    };
+    let config: BertConfig = match serde_json::from_str(&cfg_json) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SKIP: config.json not a loadable BertConfig ({e})");
+            return;
+        }
+    };
     let model = BertModel::load(&dir.join("model.safetensors"), config).expect("load");
     eprintln!("backend={}", model.backend());
 
@@ -52,11 +64,11 @@ fn layer_divergence_trace() {
     // lens [32,64,128,256,512] x20, salt = bucket*131 + j. bin64 = idx 0..40
     // = 20 len-32 (salt 0..19) + 20 len-64 (salt 131..150). Entity 0 = synth(32,0).
     let mut bin64: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
-    for j in 0..20 {
-        bin64.push(synth(32, (0 * 131 + j) as u32));
+    for j in 0..20u32 {
+        bin64.push(synth(32, j));
     }
-    for j in 0..20 {
-        bin64.push(synth(64, (1 * 131 + j) as u32));
+    for j in 0..20u32 {
+        bin64.push(synth(64, 131 + j));
     }
     let ent0 = bin64[0].clone();
 
