@@ -164,6 +164,14 @@ pub fn throughput_embed_batch_size() -> usize {
         .max_entities_per_graph_chunk
 }
 
+/// Whether the background embed worker should overlap a batch's persist with the
+/// next batch's prep + GPU forward. Enabled only under the throughput profile;
+/// the proof and default paths stay serial so the persisted vector order is
+/// fully deterministic.
+pub fn embed_pipeline_overlap_default(resource_profile: Option<&str>) -> bool {
+    resource_profile.map(str::trim) == Some("throughput")
+}
+
 pub async fn run(json: bool, profile: Option<String>) -> Result<()> {
     let response = run_daemon_resources(&CommandResourcesRequest { json, profile }).await?;
     if json {
@@ -323,5 +331,15 @@ mod tests {
             resolve_embed_batch_size(Some(7), Some("throughput"), 512, never),
             7
         );
+    }
+
+    #[test]
+    fn embed_pipeline_overlap_only_under_throughput() {
+        assert!(embed_pipeline_overlap_default(Some("throughput")));
+        assert!(embed_pipeline_overlap_default(Some(" throughput ")));
+        assert!(!embed_pipeline_overlap_default(None));
+        assert!(!embed_pipeline_overlap_default(Some("proof")));
+        assert!(!embed_pipeline_overlap_default(Some("interactive")));
+        assert!(!embed_pipeline_overlap_default(Some("ci")));
     }
 }
