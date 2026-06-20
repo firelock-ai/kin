@@ -3,6 +3,9 @@
 
 #[cfg(feature = "gcs")]
 use std::collections::HashSet;
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process;
