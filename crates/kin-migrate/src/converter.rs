@@ -7,9 +7,11 @@ use kin_blobs::BlobStore;
 use kin_git::{import_git_history_with_blobs, ImportOptions, ImportedChange};
 use kin_index::IndexPipeline;
 use kin_model::SemanticChangeId;
+use rayon::prelude::*;
 use tracing::info;
 
 use crate::error::{MigrateError, Result};
+use crate::resource_threads::{proof_profile_requested, with_resource_rayon_pool};
 use crate::strategy::{MigrationPlan, MigrationStrategy};
 
 /// Result of the conversion phase.
@@ -23,6 +25,73 @@ pub struct ConversionResult {
     pub entities_extracted: usize,
     /// Total relations extracted.
     pub relations_extracted: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct SourceIndexCounts {
+    files_indexed: usize,
+    entities_extracted: usize,
+    relations_extracted: usize,
+}
+
+fn merge_source_index_counts(
+    left: SourceIndexCounts,
+    right: SourceIndexCounts,
+) -> SourceIndexCounts {
+    SourceIndexCounts {
+        files_indexed: left.files_indexed + right.files_indexed,
+        entities_extracted: left.entities_extracted + right.entities_extracted,
+        relations_extracted: left.relations_extracted + right.relations_extracted,
+    }
+}
+
+fn index_source_file_counts(
+    plan: &MigrationPlan,
+    blob_store: &BlobStore,
+    rel_path: &std::path::Path,
+) -> SourceIndexCounts {
+    let abs_path = plan.source.join(rel_path);
+    if !abs_path.exists() {
+        return SourceIndexCounts::default();
+    }
+
+    let pipeline = IndexPipeline::new();
+    match pipeline.index_file(&abs_path, blob_store) {
+        Ok(indexed) => SourceIndexCounts {
+            files_indexed: 1,
+            entities_extracted: indexed.entities.len(),
+            relations_extracted: indexed.relations.len(),
+        },
+        Err(e) => {
+            // Non-fatal: skip files that can't be parsed.
+            tracing::debug!(
+                path = %rel_path.display(),
+                error = %e,
+                "skipping file during migration"
+            );
+            SourceIndexCounts::default()
+        }
+    }
+}
+
+fn index_source_files_serial(plan: &MigrationPlan, blob_store: &BlobStore) -> SourceIndexCounts {
+    plan.source_files
+        .iter()
+        .map(|rel_path| index_source_file_counts(plan, blob_store, rel_path))
+        .fold(SourceIndexCounts::default(), merge_source_index_counts)
+}
+
+fn index_source_files_parallel(
+    plan: &MigrationPlan,
+    blob_store: &BlobStore,
+) -> Result<SourceIndexCounts> {
+    with_resource_rayon_pool("convert.index_source_files", || {
+        Ok(plan
+            .source_files
+            .par_iter()
+            .map(|rel_path| index_source_file_counts(plan, blob_store, rel_path))
+            .reduce(SourceIndexCounts::default, merge_source_index_counts))
+    })
 }
 
 /// Convert a Git repository into Kin's semantic model.
@@ -70,51 +139,29 @@ pub fn convert(
     );
 
     // Step 2: Index source files for entity extraction.
-    let pipeline = IndexPipeline::new();
-    let mut files_indexed = 0usize;
-    let mut entities_extracted = 0usize;
-    let mut relations_extracted = 0usize;
-
     let _span = tracing::info_span!(
         "kin.migrate.convert.index_source_files",
         files = plan.source_files.len()
     )
     .entered();
-    for rel_path in &plan.source_files {
-        let abs_path = plan.source.join(rel_path);
-        if !abs_path.exists() {
-            continue;
-        }
-
-        match pipeline.index_file(&abs_path, blob_store) {
-            Ok(indexed) => {
-                files_indexed += 1;
-                entities_extracted += indexed.entities.len();
-                relations_extracted += indexed.relations.len();
-            }
-            Err(e) => {
-                // Non-fatal: skip files that can't be parsed.
-                tracing::debug!(
-                    path = %rel_path.display(),
-                    error = %e,
-                    "skipping file during migration"
-                );
-            }
-        }
-    }
+    let counts = if proof_profile_requested()? {
+        index_source_files_serial(plan, blob_store)
+    } else {
+        index_source_files_parallel(plan, blob_store)?
+    };
 
     info!(
-        files_indexed = files_indexed,
-        entities = entities_extracted,
-        relations = relations_extracted,
+        files_indexed = counts.files_indexed,
+        entities = counts.entities_extracted,
+        relations = counts.relations_extracted,
         "source file indexing complete"
     );
 
     Ok(ConversionResult {
         imported_changes: imported,
-        files_indexed,
-        entities_extracted,
-        relations_extracted,
+        files_indexed: counts.files_indexed,
+        entities_extracted: counts.entities_extracted,
+        relations_extracted: counts.relations_extracted,
     })
 }
 

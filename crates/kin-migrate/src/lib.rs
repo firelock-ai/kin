@@ -19,6 +19,7 @@ pub mod error;
 pub mod executor;
 pub mod finalize;
 pub mod forge;
+pub(crate) mod resource_threads;
 pub mod scanner;
 pub mod strategy;
 
