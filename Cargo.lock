@@ -3061,9 +3061,9 @@ dependencies = [
 
 [[package]]
 name = "kin-db"
-version = "0.2.10"
+version = "0.2.11"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "88cda9d01efc1b8c4435b52a9e2121de5ad20357206be96e32702cc90f7e3395"
+checksum = "e24306d81b02cc141cafe14e60d7a5691c777911c12b19a699620fdd7043b0d3"
 dependencies = [
  "bincode",
  "bytes",
@@ -3140,9 +3140,9 @@ dependencies = [
 
 [[package]]
 name = "kin-infer"
-version = "0.2.7"
+version = "0.2.9"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "8aae4e0fbcd059033706d983bf1e82b71d2b2410a00163d619aa4ab5b8b06d6d"
+checksum = "140d3b820dc35f6a310ef2fa5632ebe3dc63e15f78d84d13d00197f8f9f2c055"
 dependencies = [
  "block",
  "half",
@@ -3191,9 +3191,9 @@ dependencies = [
 
 [[package]]
 name = "kin-lsp"
-version = "0.2.0"
+version = "0.2.1"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "ce704b8a25f37b58311502fe0bcfb4ad275fdcfc50ab09eddb94bd9301f2c515"
+checksum = "9c7c7e73c7a2baadbecfc93e3c9603346b688d49359bf75f341cba6c5549f3a2"
 dependencies = [
  "kin-model",
  "serde",
@@ -3421,9 +3421,9 @@ dependencies = [
 
 [[package]]
 name = "kin-search"
-version = "0.1.1"
+version = "0.1.2"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "160bf55ac9c6851277c67b9132bc07fe5b88d1f3514aca3a42f3553881900738"
+checksum = "370ae50ac9eede78dba38b45ff5e9ea24f5c3c634b626a2408a20981db5c2769"
 dependencies = [
  "bincode",
  "parking_lot",
