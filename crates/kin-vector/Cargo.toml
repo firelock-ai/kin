@@ -3,7 +3,7 @@
 
 [package]
 name = "kin-vector"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Troy Fortin <troy@firelock.ai>"]
@@ -14,11 +14,13 @@ repository = "https://github.com/firelock-ai/kin-vector"
 doctest = false
 
 [features]
-# Opt-in SIMD distance kernel (aarch64 NEON). DEFAULT OFF: with this feature
+default = ["simd"]
+# SIMD distance kernel (aarch64 NEON), enabled by default. With this feature
 # disabled the crate compiles to the scalar reduction only, byte-for-byte
-# unchanged. Even when compiled in, the SIMD path is additionally gated at
-# runtime by `KIN_VECTOR_SIMD` (default OFF) so the scalar path stays the
-# default until the kernel swap is measured and approved. See `cosine_distance`.
+# unchanged. When compiled in, the SIMD path is additionally gated at runtime by
+# `KIN_VECTOR_SIMD` (default on; set to 0/false/no/off to force the scalar path).
+# The NEON result tracks the scalar reduction within a bounded epsilon
+# characterized in the `simd` tests. See `cosine_distance`.
 simd = []
 
 [dependencies]

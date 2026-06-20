@@ -182,14 +182,15 @@ fn hnsw_level_for_key<Id: Hash>(id: &Id) -> usize {
 
 /// Cosine distance: 1.0 - cosine_similarity.  Lower is more similar.
 ///
-/// Default path is the scalar reduction in [`cosine_distance_scalar`] and is the
-/// one the frozen benchmark and every shipped build use. The aarch64 NEON kernel
-/// in [`cosine_distance_neon`] is compiled in only under the `simd` feature AND
-/// taken only when the `KIN_VECTOR_SIMD` env gate is on (both default OFF), so
-/// enabling the feature alone never changes a single result. The two kernels are
-/// NOT bit-identical — SIMD reduces four lanes then folds, a different (but
-/// fixed, cross-run-deterministic) summation order than the scalar sequential
-/// sum; the magnitude of that delta is characterized in the `simd` tests.
+/// On aarch64 the default path is the NEON kernel in [`cosine_distance_neon`]:
+/// the `simd` feature is on by default and the `KIN_VECTOR_SIMD` env gate
+/// defaults to on, so unless the feature is disabled at build time or the gate
+/// is set to an off value at runtime, the NEON kernel is taken. The scalar
+/// reduction in [`cosine_distance_scalar`] remains the fallback (feature off,
+/// gate off, or non-aarch64 targets). The two kernels are NOT bit-identical —
+/// SIMD reduces four lanes then folds, a different (but fixed,
+/// cross-run-deterministic) summation order than the scalar sequential sum; the
+/// magnitude of that delta is characterized and bounded in the `simd` tests.
 #[inline]
 pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
@@ -209,10 +210,11 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     cosine_distance_scalar(a, b)
 }
 
-/// Scalar cosine distance — the canonical, default reduction. Assumes `a` and `b`
-/// are non-empty and equal length (the public [`cosine_distance`] guards that).
-/// This is intentionally a separate `#[inline]` fn so that with the `simd`
-/// feature OFF the public entry point is byte-for-byte the original scalar code.
+/// Scalar cosine distance — the canonical reduction and the fallback whenever the
+/// NEON kernel is not taken. Assumes `a` and `b` are non-empty and equal length
+/// (the public [`cosine_distance`] guards that). This is intentionally a separate
+/// `#[inline]` fn so that with the `simd` feature OFF the public entry point is
+/// byte-for-byte the original scalar code.
 #[inline]
 fn cosine_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
     let mut dot = 0.0f32;
@@ -230,16 +232,18 @@ fn cosine_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
     1.0 - dot / denom
 }
 
-/// Runtime gate for the SIMD distance kernel (`KIN_VECTOR_SIMD`, default OFF).
+/// Runtime gate for the SIMD distance kernel (`KIN_VECTOR_SIMD`, default ON).
 /// Sampled once per process so the hot path never re-reads the environment.
-#[cfg(feature = "simd")]
+/// Gated to aarch64 to match its only caller (the NEON branch of
+/// [`cosine_distance`]); on other targets there is no SIMD kernel to gate.
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
 fn simd_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("KIN_VECTOR_SIMD").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
+            Some("0") | Some("false") | Some("no") | Some("off")
         )
     })
 }
@@ -1454,6 +1458,32 @@ impl<Id: VectorId> VectorIndex<Id> {
         graph.insert(entity_id, embedding)
     }
 
+    /// Add or update a batch of embeddings for entities under a single write lock.
+    pub fn upsert_batch(&self, items: Vec<(Id, Vec<f32>)>) -> Result<(), VectorError> {
+        let _span = tracing::info_span!("kin_vector.upsert_batch", count = items.len()).entered();
+        let mut graph = self.graph.write();
+
+        for (entity_id, embedding) in items {
+            if embedding.len() != graph.dimensions {
+                return Err(VectorError::IndexError(format!(
+                    "embedding dimension mismatch: expected {}, got {}",
+                    graph.dimensions,
+                    embedding.len()
+                )));
+            }
+            graph.remove(&entity_id);
+            graph.insert(entity_id, &embedding)?;
+        }
+
+        Ok(())
+    }
+
+    /// Rebuilds the graph from scratch in canonical insertion order to ensure deterministic serialization.
+    pub fn ensure_canonical_order(&self) -> Result<(), VectorError> {
+        let mut graph = self.graph.write();
+        graph.ensure_canonical_order()
+    }
+
     /// Remove the embedding for an entity.
     pub fn remove(&self, entity_id: &Id) -> Result<(), VectorError> {
         let _span = tracing::info_span!("kin_vector.remove").entered();
@@ -1476,21 +1506,20 @@ impl<Id: VectorId> VectorIndex<Id> {
             limit = limit
         )
         .entered();
-        self.with_canonical_graph(|graph| {
-            if embedding.len() != graph.dimensions {
-                return Err(VectorError::IndexError(format!(
-                    "query dimension mismatch: expected {}, got {}",
-                    graph.dimensions,
-                    embedding.len()
-                )));
-            }
+        let graph = self.graph.read();
+        if embedding.len() != graph.dimensions {
+            return Err(VectorError::IndexError(format!(
+                "query dimension mismatch: expected {}, got {}",
+                graph.dimensions,
+                embedding.len()
+            )));
+        }
 
-            if graph.active_count() == 0 {
-                return Ok(Vec::new());
-            }
+        if graph.active_count() == 0 {
+            return Ok(Vec::new());
+        }
 
-            Ok(graph.search(embedding, limit, None))
-        })
+        Ok(graph.search(embedding, limit, None))
     }
 
     /// Search for the `limit` most similar entities to the given embedding, filtering by a predicate.
@@ -1509,21 +1538,20 @@ impl<Id: VectorId> VectorIndex<Id> {
         )
         .entered();
         let pred_dyn: &dyn Fn(&Id) -> bool = &predicate;
-        self.with_canonical_graph(|graph| {
-            if embedding.len() != graph.dimensions {
-                return Err(VectorError::IndexError(format!(
-                    "query dimension mismatch: expected {}, got {}",
-                    graph.dimensions,
-                    embedding.len()
-                )));
-            }
+        let graph = self.graph.read();
+        if embedding.len() != graph.dimensions {
+            return Err(VectorError::IndexError(format!(
+                "query dimension mismatch: expected {}, got {}",
+                graph.dimensions,
+                embedding.len()
+            )));
+        }
 
-            if graph.active_count() == 0 {
-                return Ok(Vec::new());
-            }
+        if graph.active_count() == 0 {
+            return Ok(Vec::new());
+        }
 
-            Ok(graph.search(embedding, limit, Some(pred_dyn)))
-        })
+        Ok(graph.search(embedding, limit, Some(pred_dyn)))
     }
 
     /// Set the persistence path for this index.
@@ -2049,6 +2077,8 @@ mod tests {
 
         let a = build(&sorted, dim);
         let b = build(&reversed, dim);
+        a.ensure_canonical_order().unwrap();
+        b.ensure_canonical_order().unwrap();
         assert_eq!(a.len(), b.len(), "same vector SET must give same size");
 
         let limit = 20;
@@ -2088,6 +2118,194 @@ mod tests {
                 "insert order changed kNN for probe {q} (sorted vs reversed)"
             );
         }
+    }
+
+    /// Canonicalization is now deferred (lazy): public search no longer rebuilds
+    /// the graph on every call; callers run [`VectorIndex::ensure_canonical_order`]
+    /// (or `save`, which canonicalizes via `with_canonical_graph`) at the boundary
+    /// where order-independence is required. This pins the two guarantees that make
+    /// that safe: (1) the lazy explicit canonicalization and the eager save-path
+    /// canonicalization produce bit-identical query results, even from different
+    /// insert orders; and (2) the canonical node ordering is a deterministic
+    /// function of the key set alone — identical regardless of insert order — and
+    /// re-canonicalizing a clean graph is a no-op.
+    #[test]
+    fn canonicalization_lazy_matches_eager_and_is_deterministic() {
+        fn vec_for(i: u64, dim: usize) -> Vec<f32> {
+            (0..dim)
+                .map(|d| {
+                    let x =
+                        (i.wrapping_mul(2654435761).wrapping_add(d as u64 * 40503) % 1000) as f32;
+                    ((x / 1000.0) * std::f32::consts::TAU).sin()
+                        + ((i as f32) * 0.013 * (d as f32 + 1.0)).cos()
+                })
+                .collect()
+        }
+        fn build(order: &[u64], dim: usize) -> VectorIndex<u64> {
+            let idx = VectorIndex::<u64>::new(dim).unwrap();
+            for &k in order {
+                idx.upsert(k, &vec_for(k, dim)).unwrap();
+            }
+            idx
+        }
+
+        let n: u64 = 300;
+        let dim = 32;
+        let limit = 20;
+        let sorted: Vec<u64> = (0..n).collect();
+        let reversed: Vec<u64> = (0..n).rev().collect();
+        let queries: Vec<Vec<f32>> = (0..8).map(|q| vec_for(50_000 + q, dim)).collect();
+
+        // kNN as (id, distance bits) so the comparison is exact, not approximate.
+        let knn = |idx: &VectorIndex<u64>, q: &[f32]| -> Vec<(u64, u32)> {
+            idx.search_similar(q, limit)
+                .unwrap()
+                .into_iter()
+                .map(|(id, d)| (id, d.to_bits()))
+                .collect()
+        };
+
+        // Eager: `save` canonicalizes the in-memory graph in place via
+        // `with_canonical_graph` (the pre-existing canonicalization entry point).
+        let eager = build(&reversed, dim);
+        let dir = tempfile::tempdir().unwrap();
+        eager.save(&dir.path().join("eager.hnsw")).unwrap();
+
+        // Lazy: defer to the explicit API, from a DIFFERENT insert order.
+        let lazy = build(&sorted, dim);
+        lazy.ensure_canonical_order().unwrap();
+
+        for (qi, q) in queries.iter().enumerate() {
+            assert_eq!(
+                knn(&eager, q),
+                knn(&lazy, q),
+                "lazy explicit canonicalization diverged from eager save-path canonicalization on query {qi}"
+            );
+        }
+
+        // The canonical node ordering itself is a deterministic function of the key
+        // set — identical idx_to_id sequence regardless of insert order.
+        let canonical_keys =
+            |idx: &VectorIndex<u64>| -> Vec<u64> { idx.graph.read().idx_to_id.clone() };
+        assert_eq!(
+            canonical_keys(&eager),
+            canonical_keys(&lazy),
+            "canonical node order is not insert-order independent"
+        );
+
+        // Idempotent: re-canonicalizing a clean graph changes nothing.
+        let before = canonical_keys(&lazy);
+        lazy.ensure_canonical_order().unwrap();
+        assert_eq!(
+            before,
+            canonical_keys(&lazy),
+            "re-canonicalizing a clean graph mutated it"
+        );
+        for (qi, q) in queries.iter().enumerate() {
+            assert_eq!(
+                knn(&eager, q),
+                knn(&lazy, q),
+                "second canonicalization perturbed query {qi}"
+            );
+        }
+    }
+
+    /// A batched upsert under a single write lock must land the index in exactly
+    /// the same state as the equivalent sequence of single-key upserts: same
+    /// internal layout (idx_to_id, entry point, per-node levels + connections) and
+    /// identical kNN — both before and after canonicalization. The batch is purely
+    /// a lock-amortization throughput path; it must not change a single result.
+    #[test]
+    fn upsert_batch_matches_sequential_upserts() {
+        fn vec_for(i: u64, dim: usize) -> Vec<f32> {
+            (0..dim)
+                .map(|d| {
+                    let x =
+                        (i.wrapping_mul(2654435761).wrapping_add(d as u64 * 40503) % 1000) as f32;
+                    ((x / 1000.0) * std::f32::consts::TAU).sin()
+                        + ((i as f32) * 0.013 * (d as f32 + 1.0)).cos()
+                })
+                .collect()
+        }
+
+        let n: u64 = 250;
+        let dim = 32;
+        let limit = 20;
+        let items: Vec<(u64, Vec<f32>)> = (0..n).map(|k| (k, vec_for(k, dim))).collect();
+        let queries: Vec<Vec<f32>> = (0..8).map(|q| vec_for(70_000 + q, dim)).collect();
+
+        let batched = VectorIndex::<u64>::new(dim).unwrap();
+        batched.upsert_batch(items.clone()).unwrap();
+
+        let sequential = VectorIndex::<u64>::new(dim).unwrap();
+        for (k, v) in &items {
+            sequential.upsert(*k, v).unwrap();
+        }
+
+        assert_eq!(batched.len(), sequential.len());
+
+        // Full internal-state fingerprint: the exact graph structure, not just an
+        // approximate search result.
+        type Fingerprint = (Vec<u64>, Option<u64>, Vec<(usize, Vec<Vec<usize>>)>);
+        let fingerprint = |idx: &VectorIndex<u64>| -> Fingerprint {
+            let g = idx.graph.read();
+            let entry = g.entry_point.map(|ep| g.idx_to_id[ep]);
+            let nodes = g
+                .nodes
+                .iter()
+                .map(|node| (node.level, node.connections.clone()))
+                .collect();
+            (g.idx_to_id.clone(), entry, nodes)
+        };
+        let knn = |idx: &VectorIndex<u64>, q: &[f32]| -> Vec<(u64, u32)> {
+            idx.search_similar(q, limit)
+                .unwrap()
+                .into_iter()
+                .map(|(id, d)| (id, d.to_bits()))
+                .collect()
+        };
+
+        // Identical even before canonicalization: both apply the same remove+insert
+        // sequence, in the same order, against the same fresh graph.
+        assert_eq!(
+            fingerprint(&batched),
+            fingerprint(&sequential),
+            "batch upsert produced a different graph than sequential upserts"
+        );
+        for (qi, q) in queries.iter().enumerate() {
+            assert_eq!(
+                knn(&batched, q),
+                knn(&sequential, q),
+                "batch vs sequential kNN diverged (pre-canonicalization) on query {qi}"
+            );
+        }
+
+        // And identical after the canonicalization boundary that save/search use.
+        batched.ensure_canonical_order().unwrap();
+        sequential.ensure_canonical_order().unwrap();
+        assert_eq!(
+            fingerprint(&batched),
+            fingerprint(&sequential),
+            "batch vs sequential diverged after canonicalization"
+        );
+        for (qi, q) in queries.iter().enumerate() {
+            assert_eq!(
+                knn(&batched, q),
+                knn(&sequential, q),
+                "batch vs sequential kNN diverged (post-canonicalization) on query {qi}"
+            );
+        }
+    }
+
+    /// Dimension mismatches inside a batch are rejected, mirroring single upsert.
+    #[test]
+    fn upsert_batch_rejects_dimension_mismatch() {
+        let idx = VectorIndex::<u64>::new(4).unwrap();
+        let result = idx.upsert_batch(vec![
+            (1u64, vec![1.0, 0.0, 0.0, 0.0]),
+            (2u64, vec![1.0, 0.0]),
+        ]);
+        assert!(result.is_err());
     }
 
     /// The key-hash level source must reproduce the HNSW geometric level
@@ -2621,6 +2839,87 @@ mod tests {
         assert!(
             max_abs < 1e-4,
             "NEON delta vs scalar exceeds documented bound: max_abs={max_abs:.3e} (max_ulp={max_ulp})"
+        );
+    }
+
+    /// Characterizes how the SIMD default ranks neighbors relative to the scalar
+    /// reduction. The two kernels differ by a bounded sub-ulp epsilon (see the test
+    /// above), so the NEON order is NOT guaranteed bit-identical to scalar: it can
+    /// transpose candidates whose true distances fall within that epsilon. This
+    /// pins the two properties that keep that safe and deterministic:
+    ///   (1) the NEON ranking is reproducible across repeated computation — a pure
+    ///       function of the vectors, exactly like the scalar ranking; and
+    ///   (2) any disagreement with the scalar order is a near-tie transposition
+    ///       only: wherever the NEON order inverts the scalar distance order, the
+    ///       inversion magnitude is below a tight epsilon, so the SIMD default never
+    ///       coarsely reorders the result set — only swaps effectively-equidistant
+    ///       neighbors.
+    /// A regression that grows the kernel delta (e.g. an accidental FMA or
+    /// reassociation) would push an inversion past the epsilon and trip this.
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    #[test]
+    fn simd_ranking_only_transposes_near_ties_vs_scalar() {
+        fn vec_for(seed: u64, dim: usize) -> Vec<f32> {
+            (0..dim)
+                .map(|d| {
+                    let h = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add((d as u64).wrapping_mul(1442695040888963407))
+                        .wrapping_add(0x9E3779B97F4A7C15);
+                    ((h >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0
+                })
+                .collect()
+        }
+
+        let dim = 768;
+        let candidates: Vec<(u64, Vec<f32>)> = (0..256u64).map(|k| (k, vec_for(k, dim))).collect();
+
+        // Rank by a distance fn using the SAME (distance, key_hash) order the index
+        // applies, returning ranked (id, distance) pairs.
+        let rank = |q: &[f32], dist: &dyn Fn(&[f32], &[f32]) -> f32| -> Vec<(u64, f32)> {
+            let mut scored: Vec<(f32, u64)> =
+                candidates.iter().map(|(k, v)| (dist(q, v), *k)).collect();
+            scored.sort_by(|a, b| {
+                a.0.total_cmp(&b.0)
+                    .then_with(|| key_hash(&a.1).cmp(&key_hash(&b.1)))
+            });
+            scored.into_iter().map(|(d, k)| (k, d)).collect()
+        };
+
+        let mut max_inversion = 0.0f32;
+        for qi in 0..16u64 {
+            let q = vec_for(900_000 + qi, dim);
+
+            // (1) NEON ranking is reproducible across calls.
+            let neon = rank(&q, &|a, b| unsafe { cosine_distance_neon(a, b) });
+            let neon_again = rank(&q, &|a, b| unsafe { cosine_distance_neon(a, b) });
+            let neon_ids: Vec<u64> = neon.iter().map(|(k, _)| *k).collect();
+            let neon_ids_again: Vec<u64> = neon_again.iter().map(|(k, _)| *k).collect();
+            assert_eq!(
+                neon_ids, neon_ids_again,
+                "NEON ranking is not reproducible for query {qi}"
+            );
+
+            // (2) Any inversion of the scalar distance order under the NEON order is
+            // a near-tie only.
+            let scalar = rank(&q, &|a, b| cosine_distance_scalar(a, b));
+            let scalar_dist: std::collections::HashMap<u64, f32> = scalar.iter().copied().collect();
+            for pair in neon.windows(2) {
+                let d_here = scalar_dist[&pair[0].0];
+                let d_next = scalar_dist[&pair[1].0];
+                if d_here > d_next {
+                    let inversion = d_here - d_next;
+                    max_inversion = max_inversion.max(inversion);
+                    assert!(
+                        inversion < 1e-5,
+                        "query {qi}: NEON order inverts scalar distances by {inversion:.3e} \
+                         (exceeds near-tie epsilon) — kernel delta has grown"
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "[simd-rank] max scalar-distance inversion under NEON order: {max_inversion:.3e}"
         );
     }
 
