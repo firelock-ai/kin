@@ -632,7 +632,7 @@ impl BertEmbedder {
 
         let budget = BatchBudget::from_env(self.model.backend());
 
-        let mode = hybrid_mode();
+        let mode = hybrid_mode(self.model.backend());
         if mode != HybridMode::Off {
             return self.embed_hybrid(encoded, dimensions, budget, texts.len(), mode);
         }
@@ -1816,31 +1816,61 @@ enum HybridMode {
 }
 
 #[cfg(feature = "embeddings")]
-fn hybrid_mode() -> HybridMode {
-    let raw = match std::env::var("KIN_EMBED_HYBRID") {
-        Ok(v) => v.trim().to_ascii_lowercase(),
-        Err(_) => return HybridMode::Off,
-    };
-    let enabled = !matches!(raw.as_str(), "" | "0" | "false" | "off" | "no");
-    if !enabled || EMBED_AUTO_PREFERS_CPU {
-        return HybridMode::Off;
-    }
-    let backend = std::env::var("KIN_EMBED_BACKEND")
-        .ok()
-        .map(|v| v.trim().to_ascii_lowercase())
-        .unwrap_or_else(|| "auto".to_string());
-    if !matches!(backend.as_str(), "auto" | "") {
-        return HybridMode::Off;
-    }
-    if matches!(raw.as_str(), "seq" | "floor" | "seqfloor" | "seq_floor") {
-        return HybridMode::SeqFloor;
-    }
+fn balanced_from_ratio_env() -> HybridMode {
     let gpu_tput_ratio = std::env::var("KIN_EMBED_HYBRID_GPU_TPUT_RATIO")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v > 0.0)
         .unwrap_or(HYBRID_DEFAULT_GPU_TPUT_RATIO);
     HybridMode::Balanced { gpu_tput_ratio }
+}
+
+/// Resolve the hybrid CPU/GPU split for `backend`.
+///
+/// Precedence mirrors `BatchBudget::from_env`: an explicit `KIN_EMBED_HYBRID`
+/// value wins; otherwise the throughput resource profile derives the mode from
+/// `ResourcePlan`; otherwise hybrid stays `Off`. The unset/non-throughput path
+/// is byte-identical to the prior default (`Off`), so proof embeddings are
+/// unchanged — only `KIN_RESOURCE_PROFILE=throughput` (a non-citable mode) may
+/// engage the CPU twin. The `EMBED_AUTO_PREFERS_CPU` and `KIN_EMBED_BACKEND`
+/// guards apply to whichever path produced a non-`Off` mode.
+#[cfg(feature = "embeddings")]
+fn hybrid_mode(backend: GpuBackend) -> HybridMode {
+    let desired = match std::env::var("KIN_EMBED_HYBRID") {
+        Ok(value) => {
+            let raw = value.trim().to_ascii_lowercase();
+            if matches!(raw.as_str(), "" | "0" | "false" | "off" | "no") {
+                return HybridMode::Off;
+            }
+            if matches!(raw.as_str(), "seq" | "floor" | "seqfloor" | "seq_floor") {
+                HybridMode::SeqFloor
+            } else {
+                balanced_from_ratio_env()
+            }
+        }
+        Err(_) => {
+            if !resource_profile_is_throughput() {
+                return HybridMode::Off;
+            }
+            match throughput_embedding_plan(backend).hybrid_mode {
+                kin_infer::resource::HybridMode::Off => return HybridMode::Off,
+                kin_infer::resource::HybridMode::SequentialFloor => HybridMode::SeqFloor,
+                kin_infer::resource::HybridMode::Balanced => balanced_from_ratio_env(),
+            }
+        }
+    };
+
+    if EMBED_AUTO_PREFERS_CPU {
+        return HybridMode::Off;
+    }
+    let backend_env = std::env::var("KIN_EMBED_BACKEND")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "auto".to_string());
+    if !matches!(backend_env.as_str(), "auto" | "") {
+        return HybridMode::Off;
+    }
+    desired
 }
 
 #[cfg(feature = "embeddings")]
@@ -2697,6 +2727,9 @@ mod tests {
         profile: Option<String>,
         max_tokens: Option<String>,
         max_area: Option<String>,
+        hybrid: Option<String>,
+        hybrid_ratio: Option<String>,
+        backend: Option<String>,
     }
 
     #[cfg(feature = "embeddings")]
@@ -2710,10 +2743,16 @@ mod tests {
                 profile: std::env::var("KIN_RESOURCE_PROFILE").ok(),
                 max_tokens: std::env::var("KIN_EMBED_MAX_BATCH_TOKENS").ok(),
                 max_area: std::env::var("KIN_EMBED_MAX_ATTENTION_AREA").ok(),
+                hybrid: std::env::var("KIN_EMBED_HYBRID").ok(),
+                hybrid_ratio: std::env::var("KIN_EMBED_HYBRID_GPU_TPUT_RATIO").ok(),
+                backend: std::env::var("KIN_EMBED_BACKEND").ok(),
             };
             std::env::remove_var("KIN_RESOURCE_PROFILE");
             std::env::remove_var("KIN_EMBED_MAX_BATCH_TOKENS");
             std::env::remove_var("KIN_EMBED_MAX_ATTENTION_AREA");
+            std::env::remove_var("KIN_EMBED_HYBRID");
+            std::env::remove_var("KIN_EMBED_HYBRID_GPU_TPUT_RATIO");
+            std::env::remove_var("KIN_EMBED_BACKEND");
             guard
         }
     }
@@ -2728,6 +2767,9 @@ mod tests {
             restore("KIN_RESOURCE_PROFILE", &self.profile);
             restore("KIN_EMBED_MAX_BATCH_TOKENS", &self.max_tokens);
             restore("KIN_EMBED_MAX_ATTENTION_AREA", &self.max_area);
+            restore("KIN_EMBED_HYBRID", &self.hybrid);
+            restore("KIN_EMBED_HYBRID_GPU_TPUT_RATIO", &self.hybrid_ratio);
+            restore("KIN_EMBED_BACKEND", &self.backend);
         }
     }
 
@@ -2766,9 +2808,7 @@ mod tests {
     #[cfg(feature = "embeddings")]
     #[test]
     fn resolve_embed_backend_honors_env_and_metal_default() {
-        // Use a unique env var sequence; reset at the end to avoid bleed
-        // into sibling tests that share process env.
-        let prev = std::env::var("KIN_EMBED_BACKEND").ok();
+        let _env = ResourceEnvGuard::acquire();
 
         std::env::set_var("KIN_EMBED_BACKEND", "auto");
         // `EMBED_AUTO_PREFERS_CPU` is `false`: auto stays on Metal. CPU is an
@@ -2809,11 +2849,68 @@ mod tests {
             resolve_embed_backend(EMBED_CPU_SEQ_THRESHOLD + 1),
             EmbedBackendChoice::Metal { .. }
         ));
+    }
 
-        match prev {
-            Some(v) => std::env::set_var("KIN_EMBED_BACKEND", v),
-            None => std::env::remove_var("KIN_EMBED_BACKEND"),
-        }
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn hybrid_mode_default_is_off_for_proof() {
+        let _env = ResourceEnvGuard::acquire();
+        assert_eq!(hybrid_mode(GpuBackend::Metal), HybridMode::Off);
+        assert_eq!(hybrid_mode(GpuBackend::Cpu), HybridMode::Off);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn hybrid_mode_proof_profile_is_off() {
+        let _env = ResourceEnvGuard::acquire();
+        std::env::set_var("KIN_RESOURCE_PROFILE", "proof");
+        assert_eq!(hybrid_mode(GpuBackend::Metal), HybridMode::Off);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn hybrid_mode_throughput_matches_resource_plan() {
+        let _env = ResourceEnvGuard::acquire();
+        std::env::set_var("KIN_RESOURCE_PROFILE", "throughput");
+        let expected = match throughput_embedding_plan(GpuBackend::Metal).hybrid_mode {
+            kin_infer::resource::HybridMode::Off => HybridMode::Off,
+            kin_infer::resource::HybridMode::SequentialFloor => HybridMode::SeqFloor,
+            kin_infer::resource::HybridMode::Balanced => HybridMode::Balanced {
+                gpu_tput_ratio: HYBRID_DEFAULT_GPU_TPUT_RATIO,
+            },
+        };
+        assert_eq!(hybrid_mode(GpuBackend::Metal), expected);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn hybrid_mode_explicit_off_overrides_throughput() {
+        let _env = ResourceEnvGuard::acquire();
+        std::env::set_var("KIN_RESOURCE_PROFILE", "throughput");
+        std::env::set_var("KIN_EMBED_HYBRID", "0");
+        assert_eq!(hybrid_mode(GpuBackend::Metal), HybridMode::Off);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn hybrid_mode_explicit_balanced_wins_without_profile() {
+        let _env = ResourceEnvGuard::acquire();
+        std::env::set_var("KIN_EMBED_HYBRID", "1");
+        assert_eq!(
+            hybrid_mode(GpuBackend::Metal),
+            HybridMode::Balanced {
+                gpu_tput_ratio: HYBRID_DEFAULT_GPU_TPUT_RATIO,
+            }
+        );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn hybrid_mode_non_auto_backend_disables_throughput_hybrid() {
+        let _env = ResourceEnvGuard::acquire();
+        std::env::set_var("KIN_RESOURCE_PROFILE", "throughput");
+        std::env::set_var("KIN_EMBED_BACKEND", "cpu");
+        assert_eq!(hybrid_mode(GpuBackend::Metal), HybridMode::Off);
     }
 
     #[cfg(feature = "embeddings")]
