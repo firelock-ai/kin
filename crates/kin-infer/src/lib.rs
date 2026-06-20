@@ -252,6 +252,17 @@ fn reshape_on_gpu() -> bool {
     })
 }
 
+/// Whether the batched embed path may return pooled embeddings directly from the
+/// accelerator instead of reading the full hidden matrix back to the host.
+fn pooled_output_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        crate::resource::env_flag_override("KIN_INFER_POOLED_OUTPUT")
+            .unwrap_or_else(|| crate::resource::active_gpu_kernel_plan().pooled_output)
+    })
+}
+
 /// Length-bucketing gate for `forward_batched`. When ON, mixed-length batches are
 /// split into coarse length bins so the projection/FFN GEMMs stop running short
 /// sequences padded to the batch's global `max_len`; when OFF the default
@@ -1322,6 +1333,8 @@ impl BertModel {
         )
         .entered();
         let mut results = Vec::with_capacity(batch_size);
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        crate::metal_backend::record_forward_calls(batch_size);
 
         for b in 0..batch_size {
             let ids = &token_ids[b];
@@ -2128,6 +2141,13 @@ impl BertModel {
         if bucket_enabled() {
             return self.forward_batched_bucketed(token_ids, attention_masks);
         }
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        crate::metal_backend::record_forward_calls(1);
+
+        if let Some(results) = self.try_forward_batched_pooled(token_ids, attention_masks)? {
+            ensure_finite_embeddings(&results)?;
+            return Ok(results);
+        }
 
         let (hidden, masks, max_len) = self.encode_batched(token_ids, attention_masks)?;
 
@@ -2137,6 +2157,145 @@ impl BertModel {
         let results = self.pool_and_normalize(&hidden, &masks, max_len);
         ensure_finite_embeddings(&results)?;
         Ok(results)
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    fn try_forward_batched_pooled(
+        &self,
+        token_ids: &[Vec<u32>],
+        attention_masks: &[Vec<u32>],
+    ) -> Result<Option<Vec<Vec<f32>>>, InferError> {
+        if !pooled_output_enabled() || resident_stack_disabled() || dump_layer_enabled() {
+            return Ok(None);
+        }
+        let Some(gpu) = self.gpu.as_ref() else {
+            return Ok(None);
+        };
+
+        let batch_size = token_ids.len();
+        let h = self.config.hidden_size;
+        let embed_dim = self.config.embedding_size.unwrap_or(h);
+        let max_len = token_ids.iter().map(|t| t.len()).max().unwrap_or(0);
+        let total_rows = batch_size * max_len;
+
+        let mut hidden = Array2::<f32>::zeros((total_rows, embed_dim));
+        let mut masks: Vec<Vec<u8>> = Vec::with_capacity(batch_size);
+        for b in 0..batch_size {
+            let ids = &token_ids[b];
+            let mask_in = &attention_masks[b];
+            let base = b * max_len;
+            let mut padded_mask = vec![0u8; max_len];
+            for (pos, &id) in ids.iter().enumerate() {
+                let word = self.weights.word_embeddings.row(id as usize);
+                for j in 0..embed_dim {
+                    let mut val = word[j];
+                    if let Some(ref tte) = self.weights.token_type_embeddings {
+                        val += tte[[0, j]];
+                    }
+                    if let Some(ref pe) = self.weights.position_embeddings {
+                        if pos < pe.nrows() {
+                            val += pe[[pos, j]];
+                        }
+                    }
+                    hidden[[base + pos, j]] = val;
+                }
+                padded_mask[pos] = mask_in[pos] as u8;
+            }
+            masks.push(padded_mask);
+        }
+
+        if let Some(ref proj) = self.weights.embed_projection {
+            hidden = self.linear(&hidden, proj, None)?;
+        }
+        self.optional_layer_norm(
+            &mut hidden,
+            self.weights.embed_ln_weight.as_ref(),
+            self.weights.embed_ln_bias.as_ref(),
+            self.config.layer_norm_eps as f32,
+        )?;
+
+        let num_heads = self.config.num_attention_heads;
+        let head_dim = h / num_heads;
+        let eps = self.config.layer_norm_eps as f32;
+        let rms_eps = eps;
+        let pre_ln = self.config.effective_pre_ln();
+        let use_rms = self.config.uses_rmsnorm();
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let alibi_slopes = if self.config.position_embedding_type.as_deref() == Some("alibi") {
+            Some(alibi_head_slopes(num_heads))
+        } else {
+            None
+        };
+        let flat_masks: Vec<u32> = masks
+            .iter()
+            .flat_map(|mask| mask.iter().map(|&value| value as u32))
+            .collect();
+        let num_groups = self.weights.layers.len();
+        let layer_config = crate::gpu::LayerConfig {
+            batch_size,
+            max_len,
+            hidden_size: h,
+            num_heads,
+            head_dim,
+            inter_size: self.config.intermediate_size,
+            eps,
+            rms_eps,
+            use_rms,
+            pre_ln,
+            scale,
+            alibi_slopes: alibi_slopes.as_deref(),
+        };
+        let layer_tensors: Vec<crate::gpu::LayerTensors> = (0..self.config.num_hidden_layers)
+            .map(|i| self.layer_tensors(&self.weights.layers[i % num_groups]))
+            .collect();
+        let rope_cos_slice = if self.weights.position_embeddings.is_none() {
+            self.rope_cos
+                .as_ref()
+                .and_then(|x| x.as_slice())
+                .unwrap_or(&[])
+        } else {
+            &[]
+        };
+        let rope_sin_slice = if self.weights.position_embeddings.is_none() {
+            self.rope_sin
+                .as_ref()
+                .and_then(|x| x.as_slice())
+                .unwrap_or(&[])
+        } else {
+            &[]
+        };
+        let pooling = if self.config.uses_cls_pooling() {
+            crate::gpu::PoolingMode::Cls
+        } else {
+            crate::gpu::PoolingMode::Mean
+        };
+
+        let Some(flat) = gpu.forward_layers_batched_pooled(
+            hidden
+                .as_slice()
+                .expect("activation buffer is row-major contiguous"),
+            &flat_masks,
+            &layer_tensors,
+            &layer_config,
+            rope_cos_slice,
+            rope_sin_slice,
+            pooling,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        if flat.len() != batch_size * h {
+            return Err(InferError::Internal(format!(
+                "pooled GPU output not {batch_size}x{h}: len={}",
+                flat.len()
+            )));
+        }
+        Ok(Some(
+            flat.chunks_exact(h)
+                .map(|row| l2_normalize(&Array1::from_vec(row.to_vec())).to_vec())
+                .collect(),
+        ))
     }
 
     /// Per-input mean/CLS pooling + L2 normalize over an encoded batch.
@@ -2214,6 +2373,8 @@ impl BertModel {
             groups = groups.len()
         )
         .entered();
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        crate::metal_backend::record_forward_calls(groups.len());
 
         // One empty slot per input; every index lands in exactly one group and
         // every group writes its results back, so all slots are filled.
@@ -2224,8 +2385,13 @@ impl BertModel {
                 .iter()
                 .map(|&i| attention_masks[i].clone())
                 .collect();
-            let (hidden, masks, max_len) = self.encode_batched(&group_ids, &group_masks)?;
-            let pooled = self.pool_and_normalize(&hidden, &masks, max_len);
+            let pooled =
+                if let Some(pooled) = self.try_forward_batched_pooled(&group_ids, &group_masks)? {
+                    pooled
+                } else {
+                    let (hidden, masks, max_len) = self.encode_batched(&group_ids, &group_masks)?;
+                    self.pool_and_normalize(&hidden, &masks, max_len)
+                };
             for (slot, &orig) in indices.iter().enumerate() {
                 results[orig] = pooled[slot].clone();
             }

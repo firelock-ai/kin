@@ -205,8 +205,8 @@ pub struct EmbeddingPlan {
 /// parity-cleared kernels off until they beat the baseline. kin-infer's Metal
 /// backend resolves these into its per-process kernel gates; a `KIN_INFER_*` env
 /// override still wins per lever so each can be A/B-measured in isolation.
-/// `flash_attention` is schema-only for a future fused attention path and must
-/// remain default-off until runtime support exists and is parity-cleared.
+/// `flash_attention` and `pooled_output` remain default-off until runtime
+/// support exists, is parity-cleared, and measures as a win.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct GpuKernelPlan {
     /// fp16-operand MMA GEMM (`KIN_INFER_GEMM_FP16`).
@@ -224,6 +224,9 @@ pub struct GpuKernelPlan {
     /// Future fused flash-attention kernel family. Schema support only.
     #[serde(default)]
     pub flash_attention: bool,
+    /// Final pooled-output readback instead of full hidden-state readback.
+    #[serde(default)]
+    pub pooled_output: bool,
 }
 
 impl GpuKernelPlan {
@@ -756,7 +759,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_kernel_plan_defaults_future_flash_attention_off() {
+    fn gpu_kernel_plan_defaults_future_kernels_off() {
         let plan = GpuKernelPlan::default();
 
         assert!(!plan.gemm_fp16);
@@ -764,10 +767,11 @@ mod tests {
         assert!(!plan.mma_wide);
         assert!(!plan.reshape_gpu);
         assert!(!plan.flash_attention);
+        assert!(!plan.pooled_output);
     }
 
     #[test]
-    fn gpu_kernel_plan_deserializes_missing_flash_attention_as_off() {
+    fn gpu_kernel_plan_deserializes_missing_future_fields_as_off() {
         let plan: GpuKernelPlan = serde_json::from_value(serde_json::json!({
             "gemm_fp16": false,
             "steel": false,
@@ -778,16 +782,19 @@ mod tests {
 
         assert_eq!(plan, GpuKernelPlan::default());
         assert!(!plan.flash_attention);
+        assert!(!plan.pooled_output);
     }
 
     #[test]
-    fn gpu_kernel_plan_accepts_explicit_flash_attention_schema_value() {
+    fn gpu_kernel_plan_accepts_explicit_future_schema_values() {
         let plan: GpuKernelPlan = serde_json::from_value(serde_json::json!({
-            "flash_attention": true
+            "flash_attention": true,
+            "pooled_output": true
         }))
         .unwrap();
 
         assert!(plan.flash_attention);
+        assert!(plan.pooled_output);
         assert!(!plan.gemm_fp16);
         assert!(!plan.steel);
         assert!(!plan.mma_wide);
@@ -911,6 +918,7 @@ mod tests {
         assert_eq!(value["schema_version"], "kin.resource_plan.v1");
         assert_eq!(value["profile"], "proof");
         assert_eq!(value["embedding"]["gpu_kernels"]["flash_attention"], false);
+        assert_eq!(value["embedding"]["gpu_kernels"]["pooled_output"], false);
 
         let json = serde_json::to_string(&plan).unwrap();
         let back: ResourcePlan = serde_json::from_str(&json).unwrap();
@@ -918,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_plan_deserializes_missing_flash_attention_as_off() {
+    fn resource_plan_deserializes_missing_future_kernel_fields_as_off() {
         let host = host_with(18);
         let accel = metal_accel();
         let mem = mem_with(Some(128 * GIB));
@@ -929,9 +937,14 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("flash_attention");
+        value["embedding"]["gpu_kernels"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pooled_output");
 
         let back: ResourcePlan = serde_json::from_value(value).unwrap();
         assert!(!back.embedding.gpu_kernels.flash_attention);
+        assert!(!back.embedding.gpu_kernels.pooled_output);
         assert_eq!(back.embedding.gpu_kernels, GpuKernelPlan::default());
     }
 

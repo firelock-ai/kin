@@ -195,6 +195,12 @@ pub struct LayerConfig<'a> {
     pub alibi_slopes: Option<&'a [f32]>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolingMode {
+    Mean,
+    Cls,
+}
+
 /// GPU-accelerated tensor operations for transformer inference.
 ///
 /// Each method mirrors a CPU operation in lib.rs. Implementations
@@ -673,6 +679,26 @@ pub trait GpuCompute: Send + Sync {
         _config: &LayerConfig,
         _rope_cos: &[f32],
         _rope_sin: &[f32],
+    ) -> Result<Option<Vec<f32>>, InferError> {
+        Ok(None)
+    }
+
+    /// Evaluates the full transformer stack and returns only final pooled
+    /// embeddings `[batch_size, hidden_size]`.
+    ///
+    /// This avoids reading back the full `[batch_size * max_len, hidden_size]`
+    /// hidden matrix when a backend can keep pooling on-device. Defaults to
+    /// `Ok(None)` so unsupported backends keep the proven host-pooling path.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layers_batched_pooled(
+        &self,
+        _hidden: &[f32],
+        _masks: &[u32],
+        _layers: &[LayerTensors],
+        _config: &LayerConfig,
+        _rope_cos: &[f32],
+        _rope_sin: &[f32],
+        _pooling: PoolingMode,
     ) -> Result<Option<Vec<f32>>, InferError> {
         Ok(None)
     }

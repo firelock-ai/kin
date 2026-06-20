@@ -210,30 +210,36 @@ fn metal_embed_forward_profile() {
         checksum += v[0] as f64; // keep the optimizer honest
     }
     let wall = start.elapsed();
-    let stall_ns = metal_backend::profile_stall_nanos();
+    let host_blocked_ns = metal_backend::profile_host_blocked_nanos();
     let submissions = metal_backend::profile_submissions();
+    let round_trips = metal_backend::profile_round_trips();
+    let forward_calls = metal_backend::profile_forward_calls().max(1);
 
     let wall_s = wall.as_secs_f64();
-    let stall_s = stall_ns as f64 / 1e9;
-    let rest_s = (wall_s - stall_s).max(0.0);
+    let host_blocked_s = host_blocked_ns as f64 / 1e9;
+    let rest_s = (wall_s - host_blocked_s).max(0.0);
     let ent_per_s = total as f64 / wall_s;
-    let stall_pct = if wall_s > 0.0 {
-        stall_s / wall_s * 100.0
+    let host_blocked_pct = if wall_s > 0.0 {
+        host_blocked_s / wall_s * 100.0
     } else {
         0.0
     };
-    let subs_per_fwd = submissions as f64 / total as f64;
+    let subs_per_fwd = submissions as f64 / forward_calls as f64;
+    let trips_per_fwd = round_trips as f64 / forward_calls as f64;
+    let blocked_ns_per_fwd = host_blocked_ns as f64 / forward_calls as f64;
 
     eprintln!(
         "\nentities={total}  wall={wall_s:.3}s  ent/s={ent_per_s:.2}  (checksum={checksum:.3})"
     );
-    eprintln!("host-stall (commit+wait)  = {stall_s:.3}s  ({stall_pct:.1}% of wall)");
     eprintln!(
-        "rest (CPU glue + copies)  = {rest_s:.3}s  ({:.1}% of wall)",
-        100.0 - stall_pct
+        "host-blocked = {host_blocked_s:.3}s  ({host_blocked_pct:.1}% of wall, {blocked_ns_per_fwd:.0} ns/forward)"
     );
     eprintln!(
-        "GPU submissions = {submissions}  ->  {subs_per_fwd:.1} commit+wait per forward pass"
+        "rest (CPU glue + copies)  = {rest_s:.3}s  ({:.1}% of wall)",
+        100.0 - host_blocked_pct
+    );
+    eprintln!(
+        "forward_calls={forward_calls}  GPU submissions={submissions} ({subs_per_fwd:.1}/forward)  round_trips={round_trips} ({trips_per_fwd:.1}/forward)"
     );
 
     if submissions == 0 {
@@ -241,14 +247,14 @@ fn metal_embed_forward_profile() {
             "\nNOTE: 0 submissions recorded — set KIN_INFER_METAL_PROFILE=1 to enable the \
              stall profiler (the timing/ent-s numbers above are still valid)."
         );
-    } else if stall_pct >= 50.0 {
+    } else if host_blocked_pct >= 50.0 {
         eprintln!(
-            "\nVERDICT: STALL-BOUND ({stall_pct:.0}% of wall in commit+wait, \
-             {subs_per_fwd:.0} round-trips/forward) -> command-buffer pipelining is the lever."
+            "\nVERDICT: STALL-BOUND ({host_blocked_pct:.0}% of wall host-blocked, \
+             {trips_per_fwd:.0} blocking waits/forward) -> round-trip collapse is the lever."
         );
     } else {
         eprintln!(
-            "\nVERDICT: not stall-dominated ({stall_pct:.0}% in commit+wait) -> \
+            "\nVERDICT: not stall-dominated ({host_blocked_pct:.0}% host-blocked) -> \
              kernel/copy-bound; pipelining helps less, evaluate kernel-level work."
         );
     }
@@ -325,12 +331,17 @@ fn metal_embed_forward_profile() {
         metal_backend::profile_phase_nanos();
     let tot = (mm + attn + norm + act + copy).max(1) as f64;
     let subs_b = metal_backend::profile_submissions();
+    let trips_b = metal_backend::profile_round_trips();
+    let fwd_b = metal_backend::profile_forward_calls().max(1);
+    let host_blocked_b = metal_backend::profile_host_blocked_nanos();
     eprintln!(
-        "BATCHED({}) {:.1} ent/s  |  subs={subs_b}  ({:.1} per forward over {} layers)",
+        "BATCHED({}) {:.1} ent/s  |  forward_calls={fwd_b}  subs={subs_b} ({:.1}/forward over {} layers)  round_trips={trips_b} ({:.1}/forward)  host_blocked_ns/forward={:.0}",
         bt.len(),
         bt.len() as f64 / bw.max(1e-9),
-        subs_b as f64,
+        subs_b as f64 / fwd_b as f64,
         layers,
+        trips_b as f64 / fwd_b as f64,
+        host_blocked_b as f64 / fwd_b as f64,
     );
     eprintln!(
         "host-wall phase split: matmul {:.0}% / attention {:.0}% / norm-softmax {:.0}% / activation {:.0}% / copy-readback {:.0}%",
