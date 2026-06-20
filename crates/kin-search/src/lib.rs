@@ -634,6 +634,93 @@ fn remove_doc_from_index<Id: DocId>(
     removed
 }
 
+// ── Trigram candidate index ──────────────────────────────────────────────────
+
+/// Minimum token length (in bytes) eligible for substring/fuzzy matching. A
+/// query token shorter than this never enters the substring branch, and an
+/// indexed token shorter than this is never a substring candidate — so the
+/// trigram index only needs to hold tokens of at least this length.
+const MIN_SUBSTRING_LEN: usize = 3;
+
+/// Total scored token occurrences at or above which BM25 scoring fans out across
+/// the ambient rayon pool. Below it, the serial single-pass path avoids both the
+/// candidate-set collection and the parallel dispatch overhead, which dominate at
+/// small/medium result sets. The two paths are bit-for-bit identical, so this
+/// only trades latency, never results.
+const PARALLEL_SCORE_THRESHOLD: usize = 32_768;
+
+/// A byte trigram: three consecutive bytes of a token. Substring matching keys
+/// on raw bytes (not chars) so it stays exactly consistent with `str::contains`,
+/// which is itself a byte-substring test.
+type Trigram = [u8; 3];
+
+/// Inverted trigram index over the live vocabulary, used to generate substring
+/// match candidates without scanning every key.
+///
+/// The substring branch of [`TextIndex::fuzzy_search`] matches an indexed token
+/// `t` against a query token `q` when either contains the other (both at least
+/// [`MIN_SUBSTRING_LEN`] bytes). Either direction implies `t` and `q` share at
+/// least one byte trigram: if `t` contains `q`, every trigram of `q` is in `t`;
+/// if `q` contains `t`, every trigram of `t` is in `q`. So the union of the
+/// posting lists for `q`'s trigrams is a *complete* superset of `q`'s substring
+/// matches — never missing one — and the exact `contains` predicate is then
+/// applied to that small candidate set to drop false positives. The matched set,
+/// and therefore every score, is identical to a full vocabulary scan.
+struct TrigramIndex {
+    /// Live-index generation this was built for; rebuilt when it falls behind.
+    epoch: u64,
+    /// Vocabulary tokens of at least [`MIN_SUBSTRING_LEN`] bytes, addressed by
+    /// the `u32` ids stored in `postings`.
+    tokens: Vec<Box<str>>,
+    /// Trigram -> sorted, de-duplicated token ids containing that trigram.
+    postings: HashMap<Trigram, Vec<u32>>,
+}
+
+impl TrigramIndex {
+    /// Build the trigram index from the current inverted-index vocabulary.
+    fn build<Id: DocId>(index: &HashMap<String, Postings<Id>>, epoch: u64) -> Self {
+        let mut tokens: Vec<Box<str>> = Vec::new();
+        let mut postings: HashMap<Trigram, Vec<u32>> = HashMap::new();
+        let mut seen: HashSet<Trigram> = HashSet::new();
+        for token in index.keys() {
+            let bytes = token.as_bytes();
+            if bytes.len() < MIN_SUBSTRING_LEN {
+                continue;
+            }
+            let token_id = tokens.len() as u32;
+            tokens.push(token.as_str().into());
+            seen.clear();
+            for window in bytes.windows(MIN_SUBSTRING_LEN) {
+                let tri: Trigram = [window[0], window[1], window[2]];
+                // Skip a trigram already recorded for this token so each posting
+                // list holds a token at most once.
+                if seen.insert(tri) {
+                    postings.entry(tri).or_default().push(token_id);
+                }
+            }
+        }
+        Self {
+            epoch,
+            tokens,
+            postings,
+        }
+    }
+
+    /// Collect the token ids that share at least one trigram with `query_token`.
+    /// A complete superset of the query's substring matches (see type docs); the
+    /// caller still applies the exact `contains` predicate to each candidate.
+    fn candidate_ids(&self, query_token: &str) -> HashSet<u32> {
+        let mut candidates: HashSet<u32> = HashSet::new();
+        for window in query_token.as_bytes().windows(MIN_SUBSTRING_LEN) {
+            let tri: Trigram = [window[0], window[1], window[2]];
+            if let Some(ids) = self.postings.get(&tri) {
+                candidates.extend(ids.iter().copied());
+            }
+        }
+        candidates
+    }
+}
+
 // ── TextIndex ───────────────────────────────────────────────────────────────
 
 /// Lightweight in-memory inverted index for full-text search.
@@ -670,6 +757,14 @@ pub struct TextIndex<Id: DocId = u64> {
     /// Segmented-persistence bookkeeping (segment count, on-disk generations,
     /// dirty set). Only consulted on the segmented write/load paths.
     seg: RwLock<SegmentPersistState<Id>>,
+    /// Monotonic generation of the live inverted index, bumped on every wholesale
+    /// replacement (commit/rebuild/load). Stamps `trigram` so a stale candidate
+    /// index is detected and rebuilt lazily on the next fuzzy query.
+    index_epoch: AtomicU64,
+    /// Lazily-built trigram candidate index over the live vocabulary, used to
+    /// keep substring matching sublinear in vocabulary size. Rebuilt on demand
+    /// whenever its stamped epoch falls behind `index_epoch`.
+    trigram: RwLock<Option<TrigramIndex>>,
 }
 
 impl<Id: DocId> Default for TextIndex<Id> {
@@ -691,6 +786,8 @@ impl<Id: DocId> TextIndex<Id> {
             graph_root_hash: RwLock::new(None),
             incremental_enabled: incremental_persist_enabled(),
             seg: RwLock::new(SegmentPersistState::new(resolve_default_segment_count())),
+            index_epoch: AtomicU64::new(0),
+            trigram: RwLock::new(None),
         }
     }
 
@@ -772,6 +869,8 @@ impl<Id: DocId> TextIndex<Id> {
             graph_root_hash: RwLock::new(None),
             incremental_enabled: incremental_persist_enabled(),
             seg: RwLock::new(SegmentPersistState::new(resolve_default_segment_count())),
+            index_epoch: AtomicU64::new(0),
+            trigram: RwLock::new(None),
         }
     }
 
@@ -1060,8 +1159,15 @@ impl<Id: DocId> TextIndex<Id> {
             );
         }
 
-        // Replace live state directly, no staging needed.
-        *self.index.write() = index;
+        // Replace live state directly, no staging needed. The epoch is bumped
+        // while the index write guard is held so a fuzzy reader observes a
+        // consistent (index, epoch) pair and rebuilds its trigram candidate
+        // index against this vocabulary.
+        {
+            let mut live = self.index.write();
+            *live = index;
+            self.index_epoch.fetch_add(1, Ordering::Relaxed);
+        }
         *self.docs.write() = docs;
         *self.doc_count.write() = doc_count;
         *self.total_doc_length.write() = total_doc_length;
@@ -1128,7 +1234,11 @@ impl<Id: DocId> TextIndex<Id> {
             );
         }
 
-        *self.index.write() = index;
+        {
+            let mut live = self.index.write();
+            *live = index;
+            self.index_epoch.fetch_add(1, Ordering::Relaxed);
+        }
         *self.docs.write() = docs;
         *self.doc_count.write() = doc_count;
         *self.total_doc_length.write() = total_doc_length;
@@ -1171,7 +1281,11 @@ impl<Id: DocId> TextIndex<Id> {
             .entered();
         let mut staged_guard = self.staged.write();
         if let Some(state) = staged_guard.take() {
-            *self.index.write() = state.index;
+            {
+                let mut live = self.index.write();
+                *live = state.index;
+                self.index_epoch.fetch_add(1, Ordering::Relaxed);
+            }
             *self.docs.write() = state.docs;
             *self.doc_count.write() = state.doc_count;
             *self.total_doc_length.write() = state.total_doc_length;
@@ -1215,73 +1329,151 @@ impl<Id: DocId> TextIndex<Id> {
             1.0
         };
 
-        let mut scores: HashMap<Id, f32> = HashMap::new();
-
-        for qt in &query_tokens {
-            // Exact token match with BM25
-            if let Some(postings) = index.get(qt) {
-                let df = postings.len() as f32;
-                // BM25 IDF: log((N - df + 0.5) / (df + 0.5) + 1)
-                let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln().max(0.0);
-
-                // Each posting updates a DISTINCT entity's accumulator, so the
-                // unspecified cross-document iteration order of `Postings` does
-                // not affect any final per-entity score (a document's own
-                // occurrences are still summed in field order).
-                for (eid, weight) in postings.iter() {
-                    let dl = docs.get(eid).map(|d| d.doc_length as f32).unwrap_or(avgdl);
-                    // BM25 TF saturation: (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl/avgdl))
-                    // Use weight as a proxy for tf (field-weighted)
-                    let tf = *weight;
-                    let tf_saturated = (tf * (BM25_K1 + 1.0))
-                        / (tf + BM25_K1 * (1.0 - BM25_B + BM25_B * dl / avgdl));
-                    *scores.entry(*eid).or_insert(0.0) += idf * tf_saturated;
+        // Substring/fuzzy matching is sublinear in vocabulary size: a trigram
+        // candidate index (built lazily, reused until the live index changes)
+        // replaces the former full vocabulary scan. It is consulted only for
+        // query tokens long enough to take the substring branch, so a query of
+        // purely short tokens skips the build entirely.
+        let needs_substring = query_tokens.iter().any(|qt| qt.len() >= MIN_SUBSTRING_LEN);
+        let trigram_guard = if needs_substring {
+            let epoch = self.index_epoch.load(Ordering::Relaxed);
+            let current = {
+                let cache = self.trigram.read();
+                matches!(cache.as_ref(), Some(t) if t.epoch == epoch)
+            };
+            if !current {
+                let built = TrigramIndex::build(&index, epoch);
+                let mut cache = self.trigram.write();
+                // The epoch cannot advance while this read guard on `index` is
+                // held, so any entry already present for this epoch (rebuilt by a
+                // concurrent query) is equivalent — only install ours if absent.
+                if !matches!(cache.as_ref(), Some(t) if t.epoch == epoch) {
+                    *cache = Some(built);
                 }
             }
+            Some(self.trigram.read())
+        } else {
+            None
+        };
 
-            // Substring match: query token is a substring of an indexed token
-            // (or vice versa) — with minimum 3-char tokens for substring matching.
-            // Iterate matching tokens in sorted order: `index` is a HashMap with
-            // process-randomized iteration, and the per-entity score below is a
-            // float `+=` accumulation. Float addition is non-associative, so an
-            // unordered walk yields low-bit-different scores run to run, which
-            // turns genuine ties into spurious orderings and makes the downstream
-            // `truncate(limit)` keep different docs each run. Sorting the matched
-            // tokens makes the accumulation order — and the result — deterministic.
-            if qt.len() >= 3 {
-                let mut matched_tokens: Vec<&String> = index
-                    .keys()
-                    .filter(|indexed_token| {
-                        indexed_token.as_str() != qt.as_str()
-                            && indexed_token.len() >= 3
-                            && (indexed_token.contains(qt.as_str())
-                                || qt.contains(indexed_token.as_str()))
+        let idf_of = |postings: &Postings<Id>| -> f32 {
+            let df = postings.len() as f32;
+            // BM25 IDF: log((N - df + 0.5) / (df + 0.5) + 1)
+            ((n - df + 0.5) / (df + 0.5) + 1.0).ln().max(0.0)
+        };
+
+        // Assemble scoring terms in the exact order a serial scan would visit
+        // them: for each query token, the exact-match posting first, then each
+        // substring match in sorted-token order. Float addition is
+        // non-associative, so fixing this order is what lets the per-entity
+        // reduction below fan out across threads yet stay bit-identical to a
+        // serial accumulation. `penalty` is 1.0 for an exact match and 0.5 for a
+        // substring match; multiplying by 1.0 is exact, so the unified form
+        // reproduces the former exact-match score bit-for-bit.
+        let mut scoring_terms: Vec<(f32, f32, &Postings<Id>)> = Vec::new();
+        for qt in &query_tokens {
+            if let Some(postings) = index.get(qt) {
+                scoring_terms.push((idf_of(postings), 1.0, postings));
+            }
+
+            if qt.len() >= MIN_SUBSTRING_LEN {
+                let trigram = trigram_guard
+                    .as_ref()
+                    .and_then(|g| g.as_ref())
+                    .expect("trigram index populated for substring query");
+                let candidates = trigram.candidate_ids(qt);
+                // Identical predicate to a full vocabulary scan; every cached
+                // token already satisfies the minimum-length bound. The trigram
+                // candidate set is a complete superset of the matches, so the
+                // resulting set — sorted for deterministic accumulation — is
+                // exactly what a full scan would produce.
+                let mut matched: Vec<&str> = candidates
+                    .iter()
+                    .filter_map(|&token_id| {
+                        let token = trigram.tokens[token_id as usize].as_ref();
+                        (token != qt.as_str()
+                            && (token.contains(qt.as_str()) || qt.contains(token)))
+                        .then_some(token)
                     })
                     .collect();
-                matched_tokens.sort_unstable();
-                for indexed_token in matched_tokens {
-                    let postings = &index[indexed_token];
-                    let df = postings.len() as f32;
-                    let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln().max(0.0);
-                    let substring_penalty = 0.5;
+                matched.sort_unstable();
+                for token in matched {
+                    if let Some(postings) = index.get(token) {
+                        scoring_terms.push((idf_of(postings), 0.5, postings));
+                    }
+                }
+            }
+        }
+
+        // The trigram arena is no longer referenced once terms are assembled
+        // (terms borrow `index`, not the arena), so release it before scoring.
+        drop(trigram_guard);
+
+        // Score each matched entity by summing its term contributions in
+        // canonical order (term order, then field order within a term). Float
+        // addition is non-associative, so both paths below fix that order and
+        // give one entity a single private accumulator — never a cross-thread
+        // reduction — which makes them bit-for-bit identical to each other and to
+        // a fully serial scan. The parallel path is taken only when there is
+        // enough scoring work to outweigh dispatch cost and the ambient pool has
+        // more than one worker, so it trades latency only, never results.
+        let total_occurrences: usize = scoring_terms.iter().map(|(_, _, p)| p.len()).sum();
+        let scored: Vec<(Id, f32)> =
+            if total_occurrences >= PARALLEL_SCORE_THRESHOLD && rayon::current_num_threads() > 1 {
+                // Collect the distinct candidate entities, then score each by probing
+                // every term. No per-entity allocation: each worker reads shared
+                // posting maps and owns only its own running sum.
+                let mut candidates: HashSet<Id> = HashSet::new();
+                for (_, _, postings) in &scoring_terms {
+                    candidates.extend(postings.by_doc.keys().copied());
+                }
+                let candidates: Vec<Id> = candidates.into_iter().collect();
+                let docs_ref: &HashMap<Id, IndexedDoc> = &docs;
+                let terms_ref = &scoring_terms;
+                candidates
+                    .par_iter()
+                    .map(|eid| {
+                        let dl = docs_ref
+                            .get(eid)
+                            .map(|d| d.doc_length as f32)
+                            .unwrap_or(avgdl);
+                        // The document-length factor depends only on this entity's
+                        // `dl`, constant across its terms, so hoist it once.
+                        let length_norm = BM25_K1 * (1.0 - BM25_B + BM25_B * dl / avgdl);
+                        let mut score = 0.0f32;
+                        for (idf, penalty, postings) in terms_ref {
+                            if let Some(weights) = postings.by_doc.get(eid) {
+                                for weight in weights {
+                                    let tf = *weight;
+                                    let tf_saturated = (tf * (BM25_K1 + 1.0)) / (tf + length_norm);
+                                    score += (idf * tf_saturated) * penalty;
+                                }
+                            }
+                        }
+                        (*eid, score)
+                    })
+                    .collect()
+            } else {
+                // Serial single-pass accumulation in the same canonical order.
+                let mut scores: HashMap<Id, f32> = HashMap::new();
+                for (idf, penalty, postings) in &scoring_terms {
                     for (eid, weight) in postings.iter() {
                         let dl = docs.get(eid).map(|d| d.doc_length as f32).unwrap_or(avgdl);
                         let tf = *weight;
                         let tf_saturated = (tf * (BM25_K1 + 1.0))
                             / (tf + BM25_K1 * (1.0 - BM25_B + BM25_B * dl / avgdl));
-                        *scores.entry(*eid).or_insert(0.0) +=
-                            idf * tf_saturated * substring_penalty;
+                        *scores.entry(*eid).or_insert(0.0) += (idf * tf_saturated) * penalty;
                     }
                 }
-            }
-        }
+                scores.into_iter().collect()
+            };
 
         // Sort by score descending, then by a stable id tie-break so results are
         // deterministic regardless of the HashMap's process-randomized iteration
         // order (otherwise tied scores at the `truncate(limit)` cutoff vary run to
         // run). DocId guarantees Debug but not Ord, so tie-break on the Debug repr,
         // precomputed once to keep the comparator allocation-free.
-        let mut keyed: Vec<(String, Id, f32)> = scores
+        let mut keyed: Vec<(String, Id, f32)> = scored
             .into_iter()
             .map(|(id, score)| (format!("{id:?}"), id, score))
             .collect();
@@ -1342,6 +1534,7 @@ where
         if manifest_path(&storage_path).exists() {
             let loaded = Self::load_segmented(&storage_path)?;
             *index.index.write() = loaded.index;
+            index.index_epoch.fetch_add(1, Ordering::Relaxed);
             *index.docs.write() = loaded.docs;
             *index.doc_count.write() = loaded.doc_count;
             *index.total_doc_length.write() = loaded.total_doc_length;
@@ -1353,6 +1546,7 @@ where
             seg.dirty = SegmentDirty::Tracked(HashSet::new());
         } else if let Some(persisted) = Self::load_persisted(&storage_path)? {
             *index.index.write() = persisted.index;
+            index.index_epoch.fetch_add(1, Ordering::Relaxed);
             *index.docs.write() = persisted.docs;
             *index.doc_count.write() = persisted.doc_count;
             *index.total_doc_length.write() = persisted.total_doc_length;
@@ -3229,5 +3423,230 @@ mod tests {
             n,
             "the trailing re-upsert of an existing id must not add a new live doc"
         );
+    }
+
+    /// Reference search: the original full-vocabulary-scan substring match with a
+    /// fully serial BM25 accumulation. The production [`TextIndex::fuzzy_search`]
+    /// — which uses the trigram candidate index and a parallel score reduction —
+    /// must reproduce this bit-for-bit.
+    fn brute_force_fuzzy(idx: &TextIndex<TestId>, query: &str, limit: usize) -> Vec<(TestId, f32)> {
+        let query_tokens = tokenize(query);
+        if query_tokens.is_empty() {
+            return Vec::new();
+        }
+        let index = idx.index.read();
+        let docs = idx.docs.read();
+        let total_docs = *idx.doc_count.read();
+        let total_doc_len = *idx.total_doc_length.read();
+        if total_docs == 0 {
+            return Vec::new();
+        }
+        let n = total_docs as f32;
+        let avgdl = total_doc_len as f32 / total_docs as f32;
+
+        let mut scores: HashMap<TestId, f32> = HashMap::new();
+        for qt in &query_tokens {
+            if let Some(postings) = index.get(qt) {
+                let df = postings.len() as f32;
+                let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln().max(0.0);
+                for (eid, weight) in postings.iter() {
+                    let dl = docs.get(eid).map(|d| d.doc_length as f32).unwrap_or(avgdl);
+                    let tf = *weight;
+                    let tf_saturated = (tf * (BM25_K1 + 1.0))
+                        / (tf + BM25_K1 * (1.0 - BM25_B + BM25_B * dl / avgdl));
+                    *scores.entry(*eid).or_insert(0.0) += idf * tf_saturated;
+                }
+            }
+            if qt.len() >= 3 {
+                let mut matched: Vec<&String> = index
+                    .keys()
+                    .filter(|t| {
+                        t.as_str() != qt.as_str()
+                            && t.len() >= 3
+                            && (t.contains(qt.as_str()) || qt.contains(t.as_str()))
+                    })
+                    .collect();
+                matched.sort_unstable();
+                for t in matched {
+                    let postings = &index[t];
+                    let df = postings.len() as f32;
+                    let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln().max(0.0);
+                    for (eid, weight) in postings.iter() {
+                        let dl = docs.get(eid).map(|d| d.doc_length as f32).unwrap_or(avgdl);
+                        let tf = *weight;
+                        let tf_saturated = (tf * (BM25_K1 + 1.0))
+                            / (tf + BM25_K1 * (1.0 - BM25_B + BM25_B * dl / avgdl));
+                        *scores.entry(*eid).or_insert(0.0) += idf * tf_saturated * 0.5;
+                    }
+                }
+            }
+        }
+
+        let mut keyed: Vec<(String, TestId, f32)> = scores
+            .into_iter()
+            .map(|(id, score)| (format!("{id:?}"), id, score))
+            .collect();
+        keyed.sort_by(|a, b| {
+            let a_score = if a.2.is_nan() { 0.0 } else { a.2 };
+            let b_score = if b.2.is_nan() { 0.0 } else { b.2 };
+            b_score
+                .partial_cmp(&a_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        keyed.truncate(limit);
+        keyed.into_iter().map(|(_, id, s)| (id, s)).collect()
+    }
+
+    /// Assert two result lists are identical in id order and bit-for-bit in score
+    /// (compared on raw bits so no float rounding slips through).
+    fn assert_identical(label: &str, got: &[(TestId, f32)], want: &[(TestId, f32)]) {
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "{label}: result count {} != reference {}",
+            got.len(),
+            want.len()
+        );
+        for (rank, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(g.0, w.0, "{label}: id mismatch at rank {rank}");
+            assert_eq!(
+                g.1.to_bits(),
+                w.1.to_bits(),
+                "{label}: score bits differ at rank {rank} ({} vs {})",
+                g.1,
+                w.1
+            );
+        }
+    }
+
+    /// Gate: trigram-candidate substring matching must return exactly what the
+    /// full vocabulary scan returns — same ids, same bit-for-bit scores — across
+    /// both substring directions, multibyte tokens, and queries with no match.
+    #[test]
+    fn trigram_fuzzy_matches_full_scan() {
+        let idx = TextIndex::<TestId>::new();
+        let names = [
+            "renderWidget",
+            "widgetFactory",
+            "WidgetTreeBuilder",
+            "parseTable",
+            "tableParser",
+            "htmlParser",
+            "parse",
+            "table",
+            "renderer",
+            "lexicalSearch",
+            "searchIndex",
+            "reindex",
+            "caféMenu",
+        ];
+        for (i, name) in names.iter().cycle().take(150).enumerate() {
+            let (id, doc) = make_doc(name, &format!("src/mod{}/{}.rs", i % 9, i), "Function");
+            idx.upsert_searchable(id, &doc).unwrap();
+        }
+        idx.commit().unwrap();
+
+        for q in [
+            "widget",     // matched by WidgetTreeBuilder, widgetfactory (dir A) + own token
+            "table",      // exact + parsetable/tableparser substrings
+            "parse",      // exact + parser substrings
+            "parser",     // query contains "parse" (dir B) + htmlparser (dir A)
+            "search",     // substring of lexicalsearch/searchindex
+            "index",      // substring of searchindex/reindex
+            "render",     // substring of renderwidget/renderer
+            "café",       // multibyte token: byte-trigram correctness
+            "WidgetTree", // multi-token query
+            "table parser",
+            "zzznomatch", // no candidates
+            "ab",         // short token: skips the substring branch entirely
+        ] {
+            let got = idx.fuzzy_search(q, 50).unwrap();
+            let want = brute_force_fuzzy(&idx, q, 50);
+            assert_identical(q, &got, &want);
+        }
+    }
+
+    /// Gate: the parallel BM25 score reduction must equal a fully serial
+    /// accumulation bit-for-bit. The corpus is sized past
+    /// [`PARALLEL_SCORE_THRESHOLD`] and the query is run inside a multi-thread
+    /// rayon pool so the parallel path is taken regardless of host core count.
+    /// Every entity accumulates across multiple terms (exact "widget", a
+    /// within-document repeat, and the substring sibling "widgets"), which is the
+    /// float-associativity-sensitive case the canonical ordering must preserve.
+    #[test]
+    fn parallel_bm25_scoring_matches_serial() {
+        let idx = TextIndex::<TestId>::new();
+        // Each doc contributes three scored occurrences for query "widget" (the
+        // exact token in two fields plus the substring sibling "widgets"), so the
+        // corpus is sized so total occurrences (3 * n) clears the parallel
+        // threshold and the fan-out path is actually taken.
+        let n = 15_000usize;
+        let occurrences_per_doc = 3usize;
+        assert!(
+            n * occurrences_per_doc >= PARALLEL_SCORE_THRESHOLD,
+            "corpus must be sized to exercise the parallel scoring path"
+        );
+        let doc_names: Vec<String> = (0..n).map(|i| format!("doc{i}")).collect();
+        let mut batch: Vec<(TestId, Vec<(&str, f32)>)> = Vec::with_capacity(n);
+        for (i, doc_name) in doc_names.iter().enumerate() {
+            batch.push((
+                TestId(i as u64 + 1),
+                vec![
+                    ("widget widgets rendering", 5.0),
+                    ("widget core", 3.0),
+                    (doc_name.as_str(), 2.0),
+                ],
+            ));
+        }
+        idx.upsert_batch(&batch).unwrap();
+        idx.commit().unwrap();
+
+        let want = brute_force_fuzzy(&idx, "widget", n);
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let got = pool.install(|| idx.fuzzy_search("widget", n).unwrap());
+
+        assert_eq!(
+            got.len(),
+            n,
+            "every document carrying the query token scores"
+        );
+        assert_identical("widget(parallel)", &got, &want);
+
+        // The same query off the default pool must also match the reference.
+        let got_default = idx.fuzzy_search("widget", n).unwrap();
+        assert_identical("widget(default)", &got_default, &want);
+    }
+
+    /// Determinism: a fuzzy query that mixes exact and substring matches must
+    /// return byte-identical results across repeated runs, even though the
+    /// underlying inverted index and trigram candidate sets iterate in
+    /// process-randomized HashMap order.
+    #[test]
+    fn fuzzy_search_is_run_to_run_deterministic() {
+        let idx = TextIndex::<TestId>::new();
+        let names = [
+            "renderWidget",
+            "widgetFactory",
+            "parseTable",
+            "tableParser",
+            "searchIndex",
+            "reindex",
+        ];
+        for (i, name) in names.iter().cycle().take(200).enumerate() {
+            let (id, doc) = make_doc(name, &format!("src/{}/{}.rs", i % 5, i), "Function");
+            idx.upsert_searchable(id, &doc).unwrap();
+        }
+        idx.commit().unwrap();
+
+        let baseline = idx.fuzzy_search("widget table index", 40).unwrap();
+        for _ in 0..16 {
+            let again = idx.fuzzy_search("widget table index", 40).unwrap();
+            assert_identical("repeat", &again, &baseline);
+        }
     }
 }
