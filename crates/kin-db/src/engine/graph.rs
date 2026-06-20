@@ -38,9 +38,13 @@ fn default_embedding_batch_size() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|threads| (threads.get() * 16).clamp(64, 192))
-                .unwrap_or(128)
+            if crate::embed::resource_profile_is_throughput() {
+                crate::embed::throughput_graph_chunk_size()
+            } else {
+                std::thread::available_parallelism()
+                    .map(|threads| (threads.get() * 16).clamp(64, 192))
+                    .unwrap_or(128)
+            }
         })
 }
 

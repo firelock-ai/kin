@@ -1639,6 +1639,63 @@ fn default_max_attention_area(backend: GpuBackend) -> usize {
     }
 }
 
+/// True only when `KIN_RESOURCE_PROFILE` is explicitly set to `throughput`.
+/// Read live (never cached) so behavior tracks the current environment.
+#[cfg(feature = "embeddings")]
+pub(crate) fn resource_profile_is_throughput() -> bool {
+    std::env::var("KIN_RESOURCE_PROFILE")
+        .map(|value| value.trim().eq_ignore_ascii_case("throughput"))
+        .unwrap_or(false)
+}
+
+/// Throughput-profile embedding plan for `backend`, detected once per backend.
+/// Host detection is cached; the plan is otherwise deterministic for a backend.
+#[cfg(feature = "embeddings")]
+fn throughput_embedding_plan(backend: GpuBackend) -> &'static kin_infer::resource::EmbeddingPlan {
+    use kin_infer::resource::{
+        detect_host, detect_memory, AcceleratorBackend, AcceleratorInfo, Profile, ResourcePlan,
+    };
+    use std::sync::OnceLock;
+
+    static METAL: OnceLock<kin_infer::resource::EmbeddingPlan> = OnceLock::new();
+    static CUDA: OnceLock<kin_infer::resource::EmbeddingPlan> = OnceLock::new();
+    static CPU: OnceLock<kin_infer::resource::EmbeddingPlan> = OnceLock::new();
+
+    let (cell, accel_backend, unified_memory) = match backend {
+        GpuBackend::Metal => (&METAL, AcceleratorBackend::Metal, true),
+        GpuBackend::Cuda => (&CUDA, AcceleratorBackend::Cuda, false),
+        GpuBackend::Cpu => (&CPU, AcceleratorBackend::Cpu, false),
+    };
+
+    cell.get_or_init(|| {
+        let accel = AcceleratorInfo {
+            backend: accel_backend,
+            device_index: 0,
+            unified_memory,
+            device_total_bytes: None,
+            device_available_bytes: None,
+            recommended_working_set_bytes: None,
+            max_single_buffer_bytes: None,
+            max_inflight_command_buffers: 1,
+            reserve_device_bytes: None,
+            allow_cpu_fallback: true,
+        };
+        ResourcePlan::for_profile(
+            Profile::Throughput,
+            &detect_host(),
+            &accel,
+            &detect_memory(),
+        )
+        .embedding
+    })
+}
+
+/// Throughput-profile graph entity-chunk size (backend-independent).
+#[cfg(all(feature = "embeddings", feature = "vector"))]
+pub(crate) fn throughput_graph_chunk_size() -> usize {
+    throughput_embedding_plan(GpuBackend::Cpu).max_entities_per_graph_chunk
+}
+
 /// The two budgets that bound a single embed GPU dispatch, and the rule that packs
 /// a length-sorted run of entities into one.
 ///
@@ -1670,15 +1727,25 @@ impl BatchBudget {
                 .filter(|value| *value > 0)
                 .unwrap_or(fallback)
         };
-        Self {
-            max_tokens: env_usize(
-                "KIN_EMBED_MAX_BATCH_TOKENS",
+        // Fallbacks default to today's hardcoded budgets; under the throughput
+        // profile they become the throughput plan's budgets. An explicit
+        // KIN_EMBED_* override still wins over both.
+        let (default_tokens, default_area) = if resource_profile_is_throughput() {
+            let plan = throughput_embedding_plan(backend);
+            let area = match plan.max_attention_area {
+                Some(value) => value as usize,
+                None => usize::MAX,
+            };
+            (plan.max_batch_tokens, area)
+        } else {
+            (
                 default_max_batch_tokens(backend),
-            ),
-            max_attention_area: env_usize(
-                "KIN_EMBED_MAX_ATTENTION_AREA",
                 default_max_attention_area(backend),
-            ),
+            )
+        };
+        Self {
+            max_tokens: env_usize("KIN_EMBED_MAX_BATCH_TOKENS", default_tokens),
+            max_attention_area: env_usize("KIN_EMBED_MAX_ATTENTION_AREA", default_area),
         }
     }
 
@@ -2617,6 +2684,83 @@ mod tests {
             "over-budget lone entity admitted; next not packed with it"
         );
         assert_eq!(longest, 2048);
+    }
+
+    #[cfg(feature = "embeddings")]
+    static RESOURCE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serializes process-env access for the resource-profile tests and snapshots
+    /// the relevant vars, restoring them on drop so the suite never leaks state.
+    #[cfg(feature = "embeddings")]
+    struct ResourceEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        profile: Option<String>,
+        max_tokens: Option<String>,
+        max_area: Option<String>,
+    }
+
+    #[cfg(feature = "embeddings")]
+    impl ResourceEnvGuard {
+        fn acquire() -> Self {
+            let lock = RESOURCE_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let guard = Self {
+                _lock: lock,
+                profile: std::env::var("KIN_RESOURCE_PROFILE").ok(),
+                max_tokens: std::env::var("KIN_EMBED_MAX_BATCH_TOKENS").ok(),
+                max_area: std::env::var("KIN_EMBED_MAX_ATTENTION_AREA").ok(),
+            };
+            std::env::remove_var("KIN_RESOURCE_PROFILE");
+            std::env::remove_var("KIN_EMBED_MAX_BATCH_TOKENS");
+            std::env::remove_var("KIN_EMBED_MAX_ATTENTION_AREA");
+            guard
+        }
+    }
+
+    #[cfg(feature = "embeddings")]
+    impl Drop for ResourceEnvGuard {
+        fn drop(&mut self) {
+            let restore = |key: &str, prev: &Option<String>| match prev {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            };
+            restore("KIN_RESOURCE_PROFILE", &self.profile);
+            restore("KIN_EMBED_MAX_BATCH_TOKENS", &self.max_tokens);
+            restore("KIN_EMBED_MAX_ATTENTION_AREA", &self.max_area);
+        }
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn batch_budget_unset_profile_matches_today() {
+        let _env = ResourceEnvGuard::acquire();
+        let budget = BatchBudget::from_env(GpuBackend::Metal);
+        assert_eq!(budget.max_tokens, METAL_MAX_BATCH_TOKENS);
+        assert_eq!(budget.max_tokens, 16_384);
+        assert_eq!(budget.max_attention_area, METAL_MAX_ATTENTION_AREA);
+        assert_eq!(budget.max_attention_area, 8_388_608);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn batch_budget_throughput_lifts_metal_tokens_keeps_area() {
+        let _env = ResourceEnvGuard::acquire();
+        std::env::set_var("KIN_RESOURCE_PROFILE", "throughput");
+        let budget = BatchBudget::from_env(GpuBackend::Metal);
+        assert_eq!(budget.max_tokens, 65_536);
+        assert_eq!(budget.max_attention_area, 8_388_608);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn batch_budget_env_override_wins_over_throughput() {
+        let _env = ResourceEnvGuard::acquire();
+        std::env::set_var("KIN_RESOURCE_PROFILE", "throughput");
+        std::env::set_var("KIN_EMBED_MAX_BATCH_TOKENS", "12345");
+        let budget = BatchBudget::from_env(GpuBackend::Metal);
+        assert_eq!(budget.max_tokens, 12_345);
+        assert_eq!(budget.max_attention_area, 8_388_608);
     }
 
     #[cfg(feature = "embeddings")]
