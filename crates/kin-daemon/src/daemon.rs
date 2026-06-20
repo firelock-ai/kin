@@ -30,6 +30,11 @@ pub struct DaemonConfig {
     /// bursts can reuse warm state without leaving background processes alive
     /// indefinitely.
     pub idle_timeout: Option<Duration>,
+    /// Overlap the background embed worker's per-batch persist with the next
+    /// batch's prep + GPU forward, so the accelerator is never idle during a
+    /// flush. Off by default: the serial path is deterministic and is what the
+    /// proof profile relies on. Enabled only under the throughput profile.
+    pub embed_pipeline_overlap: bool,
 }
 
 impl Default for DaemonConfig {
@@ -42,6 +47,7 @@ impl Default for DaemonConfig {
             embed_batch_size: 512,
             lsp_enabled: true,
             idle_timeout: None,
+            embed_pipeline_overlap: false,
         }
     }
 }
@@ -56,6 +62,26 @@ fn idle_check_interval(idle_timeout: Duration) -> Duration {
 /// pure so the no-tight-spin guarantee is unit-testable.
 fn next_embed_error_backoff(current: Option<Duration>, base: Duration, max: Duration) -> Duration {
     current.unwrap_or(base).saturating_mul(2).min(max)
+}
+
+/// Await an in-flight embed-progress flush, logging any persistence or task
+/// failure. Awaiting before the next flush is scheduled is what serializes
+/// successive flushes: at most one persist runs at a time, so two flushes can
+/// never interleave and the persisted generation cursor advances monotonically.
+/// Returns once the handle is cleared so callers can use this both to overlap a
+/// flush with the next batch's prep and to drain the tail at every loop exit.
+async fn drain_pending_flush(pending: &mut Option<tokio::task::JoinHandle<Result<usize>>>) {
+    if let Some(handle) = pending.take() {
+        match handle.await {
+            Ok(Ok(_pending)) => {}
+            Ok(Err(e)) => {
+                error!(error = %e, "failed to flush embed progress");
+            }
+            Err(e) => {
+                error!(error = %e, "embed progress flush task panicked");
+            }
+        }
+    }
 }
 
 /// Default grace the shutdown-escalation watchdog grants — once graceful
@@ -797,6 +823,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
     let embed_state = Arc::clone(&state);
     let embed_interval = config.embed_interval;
     let embed_batch_size = config.embed_batch_size;
+    let embed_pipeline_overlap = config.embed_pipeline_overlap;
     let mut embed_cancel = cancel_rx.clone();
     let embed_handle = tokio::spawn(async move {
         // Wait for the daemon to finish its first reconciliation cycle
@@ -852,8 +879,16 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
             // persistence, and cancellation stay responsive, then fall back to the
             // idle sleep once the queue is empty. Incremental trickle (a handful of
             // newly-reconciled entities) drains in a single pass and is unchanged.
+            // At most one batch's flush is in flight at a time. Under the
+            // throughput profile its flush stays here while the next batch's
+            // prep + GPU forward runs, so the accelerator is never idle during a
+            // persist; it is drained before the next flush is scheduled and at
+            // every loop exit so two flushes never interleave and the tail is
+            // always awaited.
+            let mut pending_flush: Option<tokio::task::JoinHandle<Result<usize>>> = None;
             loop {
                 if *embed_cancel.borrow() {
+                    drain_pending_flush(&mut pending_flush).await;
                     break 'wake;
                 }
                 if embed_state.background_embed_paused() {
@@ -907,6 +942,14 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                         index_reset_triggered = false;
                         error_backoff = None;
                         info!(count, remaining = remaining.saturating_sub(count), label);
+                        // Serialize successive flushes: the previous batch's
+                        // flush — which may still be running concurrently with
+                        // this batch's prep + GPU forward under the throughput
+                        // profile — must finish before this batch's flush starts.
+                        // This guarantees at most one persist runs at a time, so
+                        // two flushes never interleave and the persisted
+                        // generation cursor advances monotonically.
+                        drain_pending_flush(&mut pending_flush).await;
                         // Persist the vector index under the shared persist lock so
                         // this kvec write can never interleave with a snapshot save
                         // running in the persistence loop or idle-shutdown flush.
@@ -919,18 +962,16 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                         // re-serializes the whole ~1 GB graph each tick. The method
                         // holds the persist lock and advances the generation cursor
                         // (mirrors save_snapshot), so the two paths never tear.
-                        let persist_result = tokio::task::spawn_blocking(move || {
+                        let flush = tokio::task::spawn_blocking(move || {
                             state_for_persist.flush_embed_progress()
-                        })
-                        .await;
-                        match persist_result {
-                            Ok(Ok(_pending)) => {}
-                            Ok(Err(e)) => {
-                                error!(error = %e, "failed to flush embed progress");
-                            }
-                            Err(e) => {
-                                error!(error = %e, "embed progress flush task panicked");
-                            }
+                        });
+                        pending_flush = Some(flush);
+                        // Throughput leaves the flush in flight and loops straight
+                        // to the next batch so the GPU is fed while the persist
+                        // runs; proof/serial blocks on it now so the persisted
+                        // order is fully deterministic.
+                        if !embed_pipeline_overlap {
+                            drain_pending_flush(&mut pending_flush).await;
                         }
                     }
                     Ok(Ok(_)) => {
@@ -1005,6 +1046,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                                 consecutive_panics,
                                 "embedding worker permanently failed — vector index will not update until daemon restart; daemon continues in embed-degraded mode (see /health embed_worker_failed)"
                             );
+                            drain_pending_flush(&mut pending_flush).await;
                             break 'wake;
                         }
                         error!(
@@ -1024,6 +1066,7 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                 // signal) is left for the bounded teardown to handle.
                 if *embed_cancel.borrow() {
                     info!("embedding worker stopping mid-drain on shutdown");
+                    drain_pending_flush(&mut pending_flush).await;
                     break 'wake;
                 }
 
@@ -1034,6 +1077,11 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                 tokio::task::yield_now().await;
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
+            // Drain the tail flush at every drain-loop exit (pause, queue empty,
+            // transient error, or panic respawn) so a persist started under the
+            // throughput profile is always awaited before the worker idles or
+            // re-enters the next wake — no flush outlives the loop unobserved.
+            drain_pending_flush(&mut pending_flush).await;
         }
     });
 
@@ -1856,9 +1904,12 @@ async fn select_with_signals(
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        next_embed_error_backoff, parse_duration_secs, should_flush_now, watched_process_is_alive,
-        DaemonConfig, DEFAULT_RUNTIME_SHUTDOWN_GRACE, DEFAULT_SHUTDOWN_ESCALATION_GRACE,
+        drain_pending_flush, next_embed_error_backoff, parse_duration_secs, should_flush_now,
+        watched_process_is_alive, DaemonConfig, DEFAULT_RUNTIME_SHUTDOWN_GRACE,
+        DEFAULT_SHUTDOWN_ESCALATION_GRACE,
     };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[test]
@@ -1999,5 +2050,93 @@ mod tests {
         let pid = child.id() as i32;
         child.wait().expect("reap child");
         assert!(!watched_process_is_alive(pid));
+    }
+
+    #[test]
+    fn pipeline_overlap_off_by_default() {
+        // The deterministic serial persist path is the default; only the
+        // throughput profile opts into overlap (wired in the daemon binary).
+        assert!(!DaemonConfig::default().embed_pipeline_overlap);
+    }
+
+    // The embed worker keeps at most one flush in flight and always awaits it
+    // before scheduling the next. Modeling that bookkeeping with the real
+    // `drain_pending_flush` helper proves two flushes can never run at once,
+    // regardless of how long any single persist takes — the stable persisted
+    // vector order depends on flushes never interleaving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pipelined_flushes_never_interleave() {
+        let concurrent = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        let mut pending: Option<tokio::task::JoinHandle<super::Result<usize>>> = None;
+        const BATCHES: usize = 8;
+        for _ in 0..BATCHES {
+            // Serialize the previous flush before scheduling the next, exactly as
+            // the drain loop does between successful batches.
+            drain_pending_flush(&mut pending).await;
+            let concurrent = Arc::clone(&concurrent);
+            let peak = Arc::clone(&peak);
+            let completed = Arc::clone(&completed);
+            pending = Some(tokio::task::spawn_blocking(move || {
+                let now = concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(5));
+                concurrent.fetch_sub(1, Ordering::SeqCst);
+                completed.fetch_add(1, Ordering::SeqCst);
+                Ok(0)
+            }));
+        }
+        // The tail flush must always be drained at loop exit.
+        drain_pending_flush(&mut pending).await;
+
+        assert!(pending.is_none(), "tail flush must be cleared on drain");
+        assert_eq!(completed.load(Ordering::SeqCst), BATCHES, "every flush ran");
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "at most one flush may run at a time"
+        );
+    }
+
+    // The point of the lever: when a flush is left in flight (throughput
+    // profile), the next batch's prep + GPU forward proceeds concurrently
+    // instead of blocking on the persist. The flush parks until the "next
+    // batch" signals it has started; if the loop had instead drained the flush
+    // before running the next batch, this would deadlock — the timeout guards
+    // against that regression.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn in_flight_flush_overlaps_next_batch() {
+        let flush_started = Arc::new(AtomicBool::new(false));
+        let next_batch_started = Arc::new(AtomicBool::new(false));
+
+        let flush_started_w = Arc::clone(&flush_started);
+        let next_batch_started_r = Arc::clone(&next_batch_started);
+        let mut pending: Option<tokio::task::JoinHandle<super::Result<usize>>> =
+            Some(tokio::task::spawn_blocking(move || {
+                flush_started_w.store(true, Ordering::SeqCst);
+                // Hold the "persist" open until the next batch is underway.
+                while !next_batch_started_r.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok(0)
+            }));
+
+        // The next batch runs WITHOUT first draining the in-flight flush.
+        let overlap = tokio::time::timeout(Duration::from_secs(5), async {
+            while !flush_started.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            next_batch_started.store(true, Ordering::SeqCst);
+        })
+        .await;
+        assert!(
+            overlap.is_ok(),
+            "next batch must make progress while a flush is in flight"
+        );
+
+        drain_pending_flush(&mut pending).await;
+        assert!(pending.is_none());
     }
 }

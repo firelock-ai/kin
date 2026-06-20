@@ -150,3 +150,4 @@ kin-vfs-core = { version = "0.1.0", registry = "kin" }
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+

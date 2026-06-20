@@ -1019,7 +1019,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1118,7 +1118,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1788,7 +1788,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19753d40da53d0ec41604750eeb969097a90fb2d7f7992730d904541c04e2c19"
 dependencies = [
  "bstr",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -2948,6 +2948,7 @@ dependencies = [
  "kin-spine",
  "kin-vfs-core",
  "libc",
+ "mimalloc",
  "open",
  "pretty_assertions",
  "rayon",
@@ -3038,6 +3039,7 @@ dependencies = [
  "kin-registry",
  "kin-spine",
  "libc",
+ "mimalloc",
  "pretty_assertions",
  "reqwest",
  "serde",
@@ -3059,9 +3061,9 @@ dependencies = [
 
 [[package]]
 name = "kin-db"
-version = "0.2.8"
+version = "0.2.9"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "2b4d7107f77f05d4a2f15863c861f9286785023dc300585e12d63c746e93eb00"
+checksum = "192e625e97c63f2fe560853e36065d5b10f6803b944065e0a9f64b041a003722"
 dependencies = [
  "bincode",
  "bytes",
@@ -3138,14 +3140,15 @@ dependencies = [
 
 [[package]]
 name = "kin-infer"
-version = "0.2.3"
+version = "0.2.7"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "f4dd1a8f2e9853919eb15eb4442c2d2a91c380735cbfa43ff8236884a5cfd99b"
+checksum = "8aae4e0fbcd059033706d983bf1e82b71d2b2410a00163d619aa4ab5b8b06d6d"
 dependencies = [
  "block",
  "half",
  "hashbrown 0.15.5",
  "libc",
+ "memmap2",
  "metal",
  "ndarray",
  "objc2",
@@ -3418,12 +3421,13 @@ dependencies = [
 
 [[package]]
 name = "kin-search"
-version = "0.1.0"
+version = "0.1.1"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "7b22b97ae1e3891601574147d39c51e4bb2063041ee6c97c8051623f9943332d"
+checksum = "160bf55ac9c6851277c67b9132bc07fe5b88d1f3514aca3a42f3553881900738"
 dependencies = [
  "bincode",
  "parking_lot",
+ "rayon",
  "serde",
  "thiserror 2.0.18",
  "tracing",
@@ -3465,13 +3469,14 @@ dependencies = [
 
 [[package]]
 name = "kin-vector"
-version = "0.1.0"
+version = "0.1.3"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "2191212c42d82b8b594c1a7768ee67665b4ada7ce2ef449757ce563ee6519881"
+checksum = "c0194335bc27f7fd154e4b47e660bd5410947a23d988c0a256cdd0d0d8f65801"
 dependencies = [
  "fs2",
  "hashbrown 0.15.5",
  "parking_lot",
+ "rayon",
  "rmp-serde",
  "serde",
  "serde_json",
@@ -3541,6 +3546,15 @@ name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+
+[[package]]
+name = "libmimalloc-sys"
+version = "0.1.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "libredox"
@@ -3712,6 +3726,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mimalloc"
+version = "0.1.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
+dependencies = [
+ "libmimalloc-sys",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3858,7 +3881,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4740,7 +4763,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5356,10 +5379,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6334,7 +6357,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

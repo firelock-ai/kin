@@ -25,6 +25,7 @@ name = "kin"
 path = "src/main.rs"
 
 [dependencies]
+mimalloc = { version = "0.1", default-features = false }
 kin-model = { workspace = true }
 kin-core = { workspace = true }
 kin-blobs = { workspace = true }
