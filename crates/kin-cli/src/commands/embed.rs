@@ -14,6 +14,10 @@ use serde::{Deserialize, Serialize};
 /// still raise it explicitly for tuned hardware runs.
 pub const DEFAULT_BATCH_SIZE: usize = 64;
 
+fn default_cap_batch_size() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbedRequest {
     pub batch_size: usize,
@@ -28,6 +32,13 @@ pub struct EmbedRequest {
     /// the daemon wire protocol.
     #[serde(default)]
     pub rebuild: bool,
+    /// Keep user-specified bounded passes conservative: the daemon only checks
+    /// `max_seconds` between batches, so a very large batch can overrun the
+    /// requested timebox. The CLI's internal drive-to-completion loop already
+    /// owns retry/progress semantics and disables this cap so throughput-profile
+    /// resource planning is not silently forced back to the default batch size.
+    #[serde(default = "default_cap_batch_size")]
+    pub cap_batch_size: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +165,7 @@ pub async fn run(
                 json,
                 max_seconds: Some(seconds),
                 rebuild,
+                cap_batch_size: true,
             },
         )
         .await?;
@@ -184,6 +196,7 @@ pub async fn run(
                 // drop the index every pass and discard the vectors the prior
                 // passes just persisted, so the loop could never converge.
                 rebuild: rebuild && pass == 1,
+                cap_batch_size: false,
             },
         )
         .await?;
@@ -302,7 +315,10 @@ pub fn build_embed_response(
         graph.queue_missing_for_embedding();
         graph.queue_missing_artifacts_for_embedding();
     }
-    let effective_batch_size = effective_batch_size(request.batch_size, deadline.is_some());
+    let effective_batch_size = effective_batch_size(
+        request.batch_size,
+        request.cap_batch_size && deadline.is_some(),
+    );
 
     // Embed entities with per-batch progress
     let embed_start = std::time::Instant::now();
@@ -455,6 +471,11 @@ mod tests {
     #[test]
     fn effective_batch_size_caps_bounded_requests_to_default() {
         assert_eq!(effective_batch_size(512, true), DEFAULT_BATCH_SIZE);
+    }
+
+    #[test]
+    fn effective_batch_size_honors_uncapped_internal_bounded_requests() {
+        assert_eq!(effective_batch_size(512, false), 512);
     }
 
     #[test]
