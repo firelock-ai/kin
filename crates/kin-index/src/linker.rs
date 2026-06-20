@@ -564,8 +564,10 @@ fn link_cross_file_against_entities_serial(
     universe_entities: &[Entity],
 ) -> Vec<Relation> {
     let ctx = build_link_context(files, universe_entities);
-    let per_file_relations: Vec<Vec<Relation>> =
-        files.iter().map(|file| resolve_one_file(file, &ctx)).collect();
+    let per_file_relations: Vec<Vec<Relation>> = files
+        .iter()
+        .map(|file| resolve_one_file(file, &ctx))
+        .collect();
     merge_resolved(per_file_relations, files, &ctx)
 }
 
@@ -1841,7 +1843,10 @@ mod tests {
             // Same-file resolution.
             FileParseData {
                 file_path: "src/a.ts".to_string(),
-                entities: vec![make_entity("funcA", "src/a.ts"), make_entity("helperA", "src/a.ts")],
+                entities: vec![
+                    make_entity("funcA", "src/a.ts"),
+                    make_entity("helperA", "src/a.ts"),
+                ],
                 relations: vec![calls("funcA", "helperA")],
                 imports: vec![],
             },
