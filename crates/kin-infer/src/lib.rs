@@ -252,9 +252,24 @@ fn reshape_on_gpu() -> bool {
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    static POOLED_OUTPUT_TEST_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_pooled_output_test_override(enabled: Option<bool>) {
+    POOLED_OUTPUT_TEST_OVERRIDE.with(|override_value| override_value.set(enabled));
+}
+
 /// Whether the batched embed path may return pooled embeddings directly from the
 /// accelerator instead of reading the full hidden matrix back to the host.
 fn pooled_output_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = POOLED_OUTPUT_TEST_OVERRIDE.with(|override_value| override_value.get()) {
+        return enabled;
+    }
+
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -2131,6 +2146,12 @@ impl BertModel {
             return Ok(vec![]);
         }
         if batch_size == 1 {
+            if let Some(results) = self.try_forward_batched_pooled(token_ids, attention_masks)? {
+                #[cfg(all(feature = "metal", target_os = "macos"))]
+                crate::metal_backend::record_forward_calls(1);
+                ensure_finite_embeddings(&results)?;
+                return Ok(results);
+            }
             return self.forward(token_ids, attention_masks);
         }
 
@@ -2171,6 +2192,11 @@ impl BertModel {
         let Some(gpu) = self.gpu.as_ref() else {
             return Ok(None);
         };
+        if self.weights.layers.iter().any(|layer| {
+            layer.rel_pos_embeddings.is_some() || layer.relative_attention_bias.is_some()
+        }) {
+            return Ok(None);
+        }
 
         let batch_size = token_ids.len();
         let h = self.config.hidden_size;
@@ -4514,6 +4540,153 @@ pub fn init_performance_threads() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct PooledOnlyGpu {
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct PooledOutputOverrideGuard;
+
+    impl PooledOutputOverrideGuard {
+        fn enabled() -> Self {
+            set_pooled_output_test_override(Some(true));
+            Self
+        }
+    }
+
+    impl Drop for PooledOutputOverrideGuard {
+        fn drop(&mut self) {
+            set_pooled_output_test_override(None);
+        }
+    }
+
+    impl PooledOnlyGpu {
+        fn unexpected<T>(op: &str) -> Result<T, InferError> {
+            Err(InferError::Internal(format!(
+                "unexpected mock GPU call: {op}"
+            )))
+        }
+    }
+
+    impl gpu::GpuCompute for PooledOnlyGpu {
+        fn matmul(
+            &self,
+            _a: &[f32],
+            _b: &[f32],
+            _m: usize,
+            _n: usize,
+            _k: usize,
+        ) -> Result<Vec<f32>, InferError> {
+            Self::unexpected("matmul")
+        }
+
+        fn batched_matmul(
+            &self,
+            _q: &[f32],
+            _k: &[f32],
+            _num_heads: usize,
+            _seq_len: usize,
+            _head_dim: usize,
+        ) -> Result<Vec<f32>, InferError> {
+            Self::unexpected("batched_matmul")
+        }
+
+        fn batched_attn_values(
+            &self,
+            _scores: &[f32],
+            _v: &[f32],
+            _num_heads: usize,
+            _seq_len: usize,
+            _head_dim: usize,
+        ) -> Result<Vec<f32>, InferError> {
+            Self::unexpected("batched_attn_values")
+        }
+
+        fn softmax(&self, _data: &mut [f32], _rows: usize, _cols: usize) -> Result<(), InferError> {
+            Self::unexpected("softmax")
+        }
+
+        fn layer_norm(
+            &self,
+            _data: &mut [f32],
+            _gamma: &[f32],
+            _beta: &[f32],
+            _rows: usize,
+            _cols: usize,
+            _eps: f32,
+        ) -> Result<(), InferError> {
+            Self::unexpected("layer_norm")
+        }
+
+        fn rms_norm(
+            &self,
+            _data: &mut [f32],
+            _weight: &[f32],
+            _rows: usize,
+            _cols: usize,
+            _eps: f32,
+        ) -> Result<(), InferError> {
+            Self::unexpected("rms_norm")
+        }
+
+        fn gelu(&self, _data: &mut [f32]) -> Result<(), InferError> {
+            Self::unexpected("gelu")
+        }
+
+        fn silu(&self, _data: &mut [f32]) -> Result<(), InferError> {
+            Self::unexpected("silu")
+        }
+
+        fn elementwise_mul(&self, _a: &mut [f32], _b: &[f32]) -> Result<(), InferError> {
+            Self::unexpected("elementwise_mul")
+        }
+
+        fn rope(
+            &self,
+            _data: &mut [f32],
+            _cos_table: &[f32],
+            _sin_table: &[f32],
+            _seq_offset: usize,
+            _seq_len: usize,
+            _head_dim: usize,
+            _total_dim: usize,
+        ) -> Result<(), InferError> {
+            Self::unexpected("rope")
+        }
+
+        fn forward_layers_batched_pooled(
+            &self,
+            hidden: &[f32],
+            masks: &[u32],
+            layers: &[gpu::LayerTensors],
+            config: &gpu::LayerConfig,
+            _rope_cos: &[f32],
+            _rope_sin: &[f32],
+            pooling: gpu::PoolingMode,
+        ) -> Result<Option<Vec<f32>>, InferError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(config.batch_size, 1);
+            assert_eq!(config.max_len, 2);
+            assert_eq!(config.hidden_size, 2);
+            assert_eq!(hidden.len(), 4);
+            assert_eq!(masks, &[1, 1]);
+            assert!(layers.is_empty());
+            assert_eq!(pooling, gpu::PoolingMode::Mean);
+            Ok(Some(vec![3.0, 4.0]))
+        }
+
+        fn backend(&self) -> gpu::GpuBackend {
+            gpu::GpuBackend::Metal
+        }
+
+        fn device_name(&self) -> &str {
+            "pooled-only-test"
+        }
+    }
 
     #[test]
     fn effective_max_seq_len_prefers_trained_range() {
@@ -5358,6 +5531,87 @@ mod tests {
             rope_sin: None,
             gpu: None,
         }
+    }
+
+    fn mock_embedding_model_with_gpu(
+        layers: Vec<TransformerLayerWeights>,
+        gpu: Box<dyn gpu::GpuCompute>,
+    ) -> BertModel {
+        let layer_count = layers.len();
+        let json = format!(
+            r#"{{ "n_embd": 2, "n_layer": {layer_count}, "n_head": 1, "n_inner": 2,
+                  "n_positions": 16, "vocab_size": 4 }}"#
+        );
+        let config: BertConfig = serde_json::from_str(&json).expect("parse config");
+        let weights = ModelWeights {
+            word_embeddings: Array2::zeros((config.vocab_size, config.hidden_size)),
+            position_embeddings: None,
+            token_type_embeddings: None,
+            embed_ln_weight: None,
+            embed_ln_bias: None,
+            embed_projection: None,
+            layers,
+            final_norm_weight: None,
+            final_norm_bias: None,
+            lm_head_weight: None,
+            lm_head_bias: None,
+            classifier: None,
+        };
+        BertModel {
+            config,
+            weights,
+            head_dim: 2,
+            kv_head_dim: 2,
+            rope_cos: None,
+            rope_sin: None,
+            gpu: Some(gpu),
+        }
+    }
+
+    #[test]
+    fn forward_batched_single_entity_uses_pooled_output_when_enabled() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = mock_embedding_model_with_gpu(
+            vec![],
+            Box::new(PooledOnlyGpu {
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        let _override = PooledOutputOverrideGuard::enabled();
+        let result = model
+            .forward_batched(&[vec![1, 2]], &[vec![1, 1]])
+            .expect("forward_batched");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], vec![0.6, 0.8]);
+    }
+
+    #[test]
+    fn pooled_output_declines_relative_attention_layers() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut layer = mock_layer(
+            2,
+            2,
+            Some(Array2::zeros((2, 2))),
+            Some(Array2::zeros((2, 2))),
+        );
+        layer.relative_attention_bias = Some(Array2::zeros((1, 1)));
+        let model = mock_embedding_model_with_gpu(
+            vec![layer],
+            Box::new(PooledOnlyGpu {
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        let _override = PooledOutputOverrideGuard::enabled();
+        let result = model
+            .try_forward_batched_pooled(&[vec![1, 2]], &[vec![1, 1]])
+            .expect("try pooled");
+
+        assert!(result.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
