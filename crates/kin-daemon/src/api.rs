@@ -1847,9 +1847,7 @@ async fn command_resources(
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn metal_profile_runtime() -> Option<kin_cli::commands::resources::MetalProfileRuntime> {
-    if std::env::var_os("KIN_INFER_METAL_PROFILE").is_none() {
-        return None;
-    }
+    std::env::var_os("KIN_INFER_METAL_PROFILE")?;
     let forward_calls = kin_infer::metal_backend::profile_forward_calls();
     let gpu_phase_nanos = kin_infer::metal_backend::profile_gpu_phase_nanos()
         .into_iter()
@@ -1861,13 +1859,14 @@ fn metal_profile_runtime() -> Option<kin_cli::commands::resources::MetalProfileR
         )
         .collect::<Vec<_>>();
     let gpu_total_nanos = gpu_phase_nanos.iter().map(|phase| phase.nanos).sum();
+    let host_blocked_nanos = kin_infer::metal_backend::profile_host_blocked_nanos();
     Some(kin_cli::commands::resources::MetalProfileRuntime {
         submissions: kin_infer::metal_backend::profile_submissions(),
         round_trips: kin_infer::metal_backend::profile_round_trips(),
         forward_calls,
-        host_blocked_nanos: kin_infer::metal_backend::profile_host_blocked_nanos(),
+        host_blocked_nanos,
         host_blocked_nanos_per_forward: (forward_calls > 0)
-            .then(|| kin_infer::metal_backend::profile_host_blocked_nanos() / forward_calls),
+            .then_some(host_blocked_nanos / forward_calls),
         gpu_phase_nanos,
         gpu_total_nanos,
     })
