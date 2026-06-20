@@ -1688,7 +1688,7 @@ impl BertModel {
         // per-layer host round-trip. Falls back to the per-layer loop below when
         // the backend declines (CPU/CUDA) or a per-layer divergence dump is asked.
         let mut layers_resident = false;
-        if !resident_stack_disabled() && !dump_layer_enabled() {
+        if self.should_try_resident_stack() {
             if let Some(gpu) = self.gpu.as_ref() {
                 let rope_cos_slice = if self.weights.position_embeddings.is_none() {
                     self.rope_cos
@@ -2192,9 +2192,7 @@ impl BertModel {
         let Some(gpu) = self.gpu.as_ref() else {
             return Ok(None);
         };
-        if self.weights.layers.iter().any(|layer| {
-            layer.rel_pos_embeddings.is_some() || layer.relative_attention_bias.is_some()
-        }) {
+        if self.has_relative_attention_layers() {
             return Ok(None);
         }
 
@@ -2424,6 +2422,16 @@ impl BertModel {
         }
         ensure_finite_embeddings(&results)?;
         Ok(results)
+    }
+
+    fn should_try_resident_stack(&self) -> bool {
+        !resident_stack_disabled() && !dump_layer_enabled() && !self.has_relative_attention_layers()
+    }
+
+    fn has_relative_attention_layers(&self) -> bool {
+        self.weights.layers.iter().any(|layer| {
+            layer.rel_pos_embeddings.is_some() || layer.relative_attention_bias.is_some()
+        })
     }
 
     /// Batched cross-encoder forward pass. Extracts the `[CLS]` token (index 0) from each
@@ -5612,6 +5620,16 @@ mod tests {
 
         assert!(result.is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn relative_attention_layers_decline_resident_stack() {
+        let mut layer = mock_layer(4, 4, Some(Array2::zeros((4, 4))), None);
+        layer.relative_attention_bias = Some(Array2::zeros((1, 1)));
+        let model = mock_encoder(layer);
+
+        assert!(model.has_relative_attention_layers());
+        assert!(!model.should_try_resident_stack());
     }
 
     #[test]
