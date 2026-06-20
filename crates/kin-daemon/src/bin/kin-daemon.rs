@@ -371,6 +371,10 @@ async fn async_main() -> i32 {
         }
     };
 
+    let embed_pipeline_overlap = kin_cli::commands::resources::embed_pipeline_overlap_default(
+        env::var("KIN_RESOURCE_PROFILE").ok().as_deref(),
+    );
+
     let config = DaemonConfig {
         api_port: args.port,
         lsp_enabled: !env_flag("KIN_DAEMON_DISABLE_LSP"),
@@ -382,6 +386,7 @@ async fn async_main() -> i32 {
             }
         },
         embed_batch_size,
+        embed_pipeline_overlap,
         ..DaemonConfig::default()
     };
 
