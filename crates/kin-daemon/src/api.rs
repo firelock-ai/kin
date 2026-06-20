@@ -3296,26 +3296,9 @@ async fn embed(
             .save_snapshot()
             .map_err(|error| format!("embed pre-persist save failed: {error:#}"))?;
 
-        // Persist the kvec sidecar after every batch so a long embed survives a
-        // mid-run kill/OOM with the completed vectors intact, instead of losing
-        // all progress when only the final save_snapshot would have run. Each
-        // flush takes persist_lock so it never interleaves with the background
-        // persistence loop or idle-shutdown flush.
         let persist_state = Arc::clone(&state_for_embed);
-        let persist_batch = || -> Result<(), kin_db::KinDbError> {
-            let _persist = persist_state.persist_lock.lock().map_err(|_| {
-                kin_db::KinDbError::ConcurrentAccessError("persist lock poisoned".to_string())
-            })?;
-            // Stamp the sidecar with this daemon build's identity so vectors
-            // written by one embedder stack are never silently trusted by
-            // another.
-            let embedder_identity = kin_buildinfo::sha_with_dirty(kin_buildinfo::get());
-            kin_db::SnapshotManager::save_vector_index_for_graph(
-                persist_state.layout.kindb_snapshot_path(),
-                persist_state.graph.as_ref(),
-                Some(embedder_identity.as_str()),
-            )
-        };
+        let persist_batch =
+            || -> Result<(), kin_db::KinDbError> { persist_foreground_embed_batch(&persist_state) };
 
         // Rebuild migration: drop any loaded vector index (which may be sized to
         // an older model's dimension, e.g. a 384-dim index that rejects the
@@ -3364,6 +3347,12 @@ async fn embed(
     .map_err(internal_error)?
     .map_err(internal_error)?;
     Ok(Json(result))
+}
+
+fn persist_foreground_embed_batch(state: &DaemonState) -> Result<(), kin_db::KinDbError> {
+    state.flush_embed_progress().map(|_| ()).map_err(|error| {
+        kin_db::KinDbError::StorageError(format!("embed progress flush failed: {error:#}"))
+    })
 }
 
 /// POST /blame — render entity blame from daemon-owned graph state.
@@ -8115,6 +8104,30 @@ mod tests {
             .lines
             .iter()
             .any(|line| line.contains("No retrievable graph objects found")));
+    }
+
+    #[test]
+    fn foreground_embed_batch_flush_defers_sidecar_while_queue_pending() {
+        let state = test_state();
+        state
+            .graph
+            .upsert_entity(&test_entity("needs_embedding", "src/lib.py"))
+            .unwrap();
+        state.save_snapshot().unwrap();
+
+        let vector_path = kin_cli::backend::vector_index_path(&state.layout);
+        let vectors = kin_db::VectorIndex::new(4).unwrap();
+        vectors.save(&vector_path).unwrap();
+        state.graph.load_vector_index(&vector_path).unwrap();
+        state.graph.queue_missing_for_embedding();
+        assert!(state.graph.pending_embeddings() > 0);
+
+        std::fs::remove_file(&vector_path).unwrap();
+        persist_foreground_embed_batch(state.as_ref()).unwrap();
+        assert!(
+            !vector_path.exists(),
+            "foreground per-batch flush must defer the sidecar while work is pending"
+        );
     }
 
     #[tokio::test]
