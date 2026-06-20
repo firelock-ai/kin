@@ -2670,16 +2670,23 @@ fn steel_mma_name(base: &str) -> &str {
     }
 }
 
-impl GpuCompute for MetalCompute {
-    fn forward_layer_batched(
+impl MetalCompute {
+    /// Encode one transformer layer's three command buffers against the resident
+    /// `current_hidden` residual buffer. Does not upload the input or read the
+    /// output back: the caller owns `current_hidden` and keeps it on-device across
+    /// layers. Only the final layer (`is_last`) blocks the host; earlier layers
+    /// commit asynchronously so the GPU stays fed across the whole stack.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_layer_resident(
         &self,
-        hidden: &[f32],
+        current_hidden: &PooledBuffer,
         masks: &[u32],
         weights: &LayerTensors,
         config: &LayerConfig,
         rope_cos: &[f32],
         rope_sin: &[f32],
-    ) -> Result<Option<Vec<f32>>, InferError> {
+        is_last: bool,
+    ) -> Result<(), InferError> {
         autoreleasepool(|_| {
             let kv_heads = if let Some(k) = weights.k_weight {
                 k.len() / (config.hidden_size * config.head_dim)
@@ -2691,7 +2698,7 @@ impl GpuCompute for MetalCompute {
                 config.num_heads
             };
 
-            let _span = tracing::info_span!("kin_infer.metal.forward_layer_batched").entered();
+            let _span = tracing::info_span!("kin_infer.metal.encode_layer_resident").entered();
 
             let batch_size = config.batch_size;
             let max_len = config.max_len;
@@ -2702,8 +2709,6 @@ impl GpuCompute for MetalCompute {
             let inter = config.inter_size;
             let q_dim = heads * head_dim;
             let kv_dim = kv_heads * head_dim;
-
-            let current_hidden = self.buf_slice_pooled(hidden)?;
 
             // ---------------------------------------------------------
             // Command Buffer 1: Norm 1 + QKV Projections
@@ -3583,12 +3588,82 @@ impl GpuCompute for MetalCompute {
             }
             retains3.push(buf_ffn_out);
 
-            self.commit_wait(cmd3);
-
-            let out = Self::read_buf(current_hidden.buffer(), total_rows * h);
-            Ok(Some(out))
+            if is_last {
+                self.commit_wait(cmd3);
+            } else {
+                self.commit_bounded(cmd3, retains3);
+            }
+            Ok(())
         })
     }
+}
+
+impl GpuCompute for MetalCompute {
+    fn forward_layer_batched(
+        &self,
+        hidden: &[f32],
+        masks: &[u32],
+        weights: &LayerTensors,
+        config: &LayerConfig,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> Result<Option<Vec<f32>>, InferError> {
+        let total_rows = config.batch_size * config.max_len;
+        let h = config.hidden_size;
+        let current_hidden = self.buf_slice_pooled(hidden)?;
+        self.encode_layer_resident(
+            &current_hidden,
+            masks,
+            weights,
+            config,
+            rope_cos,
+            rope_sin,
+            true,
+        )?;
+        Ok(Some(Self::read_buf(
+            current_hidden.buffer(),
+            total_rows * h,
+        )))
+    }
+
+    fn forward_layers_batched(
+        &self,
+        hidden: &[f32],
+        masks: &[u32],
+        layers: &[LayerTensors],
+        config: &LayerConfig,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+    ) -> Result<Option<Vec<f32>>, InferError> {
+        if layers.is_empty() {
+            return Ok(None);
+        }
+        let _span = tracing::info_span!(
+            "kin_infer.metal.forward_layers_batched",
+            layers = layers.len()
+        )
+        .entered();
+        let total_rows = config.batch_size * config.max_len;
+        let h = config.hidden_size;
+        let current_hidden = self.buf_slice_pooled(hidden)?;
+        let last = layers.len() - 1;
+        for (i, weights) in layers.iter().enumerate() {
+            self.encode_layer_resident(
+                &current_hidden,
+                masks,
+                weights,
+                config,
+                rope_cos,
+                rope_sin,
+                i == last,
+            )?;
+        }
+        Ok(Some(Self::read_buf(
+            current_hidden.buffer(),
+            total_rows * h,
+        )))
+    }
+
     fn matmul(
         &self,
         a: &[f32],

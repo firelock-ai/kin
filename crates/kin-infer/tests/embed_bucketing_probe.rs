@@ -126,8 +126,20 @@ fn embed_length_bucketing_ab() {
         return;
     }
 
-    let cfg_json = fs::read_to_string(dir.join("config.json")).expect("read config.json");
-    let config: BertConfig = serde_json::from_str(&cfg_json).expect("parse config.json");
+    let cfg_json = match fs::read_to_string(dir.join("config.json")) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SKIP: cannot read config.json ({e})");
+            return;
+        }
+    };
+    let config: BertConfig = match serde_json::from_str(&cfg_json) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SKIP: config.json not a loadable BertConfig ({e})");
+            return;
+        }
+    };
     let model = BertModel::load(&dir.join("model.safetensors"), config).expect("load model");
     eprintln!("backend={}", model.backend());
 
