@@ -5825,6 +5825,15 @@ pub fn discover_devices() -> Vec<GpuDeviceInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
+
+    static PROFILE_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn profile_test_lock() -> StdMutexGuard<'static, ()> {
+        PROFILE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn get_metal() -> Option<MetalCompute> {
         MetalCompute::try_new()
@@ -5856,6 +5865,7 @@ mod tests {
 
     #[test]
     fn test_profile_round_trip_counter_contract() {
+        let _lock = profile_test_lock();
         reset_profile();
         record_forward_calls(2);
         if profile_enabled() {
@@ -6956,6 +6966,7 @@ mod tests {
 
     #[test]
     fn test_metal_pooled_stack_uses_single_submission_when_profiled() {
+        let _lock = profile_test_lock();
         reset_profile();
         if !profile_enabled() {
             return;
@@ -7072,6 +7083,7 @@ mod tests {
 
     #[test]
     fn test_metal_segmented_pooled_stack_uses_one_submission_per_segment_when_profiled() {
+        let _lock = profile_test_lock();
         reset_profile();
         if !profile_enabled() {
             return;
@@ -7189,6 +7201,7 @@ mod tests {
 
     #[test]
     fn test_metal_segmented_resident_stack_uses_one_submission_per_segment_when_profiled() {
+        let _lock = profile_test_lock();
         reset_profile();
         if !profile_enabled() {
             return;
