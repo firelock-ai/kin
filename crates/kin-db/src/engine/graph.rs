@@ -48,6 +48,158 @@ fn default_embedding_batch_size() -> usize {
         })
 }
 
+/// Bounded look-ahead between the drain+prep producer and the forward (GPU)
+/// stage: at most this many prepared batches may sit in flight, capping host
+/// scratch memory while still letting prep run ahead of inference.
+#[cfg(all(feature = "embeddings", feature = "vector"))]
+const EMBED_PIPELINE_PREP_CAPACITY: usize = 2;
+
+/// Bounded look-ahead between the forward stage and the persist consumer.
+#[cfg(all(feature = "embeddings", feature = "vector"))]
+const EMBED_PIPELINE_RESULT_CAPACITY: usize = 2;
+
+/// Whether the staged embed pipeline should overlap prep/forward/persist instead
+/// of running them strictly back to back.
+///
+/// Opt-in by design: the citable proof profile keeps the serial path so the
+/// persisted vector order is byte-for-byte the established order. An explicit
+/// `KIN_EMBED_PIPELINED` value overrides in either direction (`1`/`true`/`on`
+/// forces pipelined, `0`/`false`/`off` forces serial); absent that, the pipeline
+/// turns on only under the throughput resource profile.
+#[cfg(all(feature = "embeddings", feature = "vector"))]
+fn embed_pipeline_enabled() -> bool {
+    if let Ok(raw) = std::env::var("KIN_EMBED_PIPELINED") {
+        let value = raw.trim();
+        if value.eq_ignore_ascii_case("1")
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("on")
+        {
+            return true;
+        }
+        if value.eq_ignore_ascii_case("0")
+            || value.eq_ignore_ascii_case("false")
+            || value.eq_ignore_ascii_case("off")
+        {
+            return false;
+        }
+    }
+    crate::embed::resource_profile_is_throughput()
+}
+
+/// Drive the three embed stages — drain+prep, forward, persist — as a bounded
+/// producer→consumer pipeline so prep for batch N+2 and persist for batch N
+/// overlap the GPU forward for batch N+1.
+///
+/// Determinism is preserved end to end: `drain_prep` is the single serial
+/// producer (the established `EmbedSortKey` ordering authority), and both stage
+/// channels are FIFO with exactly one consumer each, so persist observes batches
+/// — and the keys within each batch — in precisely the drained order. The forward
+/// stage runs one batch at a time (a single consumer), so GPU concurrency is
+/// unchanged; only the CPU prep/persist stages overlap inference.
+///
+/// The first error from any stage is captured and returned; channel disconnection
+/// then tears the remaining stages down without deadlock — when a consumer drops
+/// its receiver, the upstream `send` fails rather than blocking.
+#[cfg(all(feature = "embeddings", feature = "vector"))]
+fn drive_embed_pipeline<P, F, G>(
+    prep_capacity: usize,
+    result_capacity: usize,
+    drain_prep: P,
+    forward: F,
+    persist: G,
+) -> Result<usize, KinDbError>
+where
+    P: FnMut() -> Result<Option<PreparedEmbedBatch>, KinDbError> + Send,
+    F: Fn(
+            PreparedEmbedBatch,
+        )
+            -> Result<(PreparedEmbedBatch, Vec<(RetrievalKey, Vec<f32>)>), KinDbError>
+        + Send,
+    G: FnMut(PreparedEmbedBatch, Vec<(RetrievalKey, Vec<f32>)>) -> Result<usize, KinDbError>,
+{
+    use std::sync::mpsc::sync_channel;
+
+    let (prep_tx, prep_rx) = sync_channel::<PreparedEmbedBatch>(prep_capacity);
+    let (result_tx, result_rx) =
+        sync_channel::<(PreparedEmbedBatch, Vec<(RetrievalKey, Vec<f32>)>)>(result_capacity);
+    let first_error: parking_lot::Mutex<Option<KinDbError>> = parking_lot::Mutex::new(None);
+    let error_ref = &first_error;
+
+    let total = std::thread::scope(move |scope| -> usize {
+        // DRAIN + PREP: the single serial producer. Dropping `prep_tx` when this
+        // thread ends tells the forward stage that no more batches will arrive.
+        scope.spawn(move || {
+            let mut drain_prep = drain_prep;
+            let prep_tx = prep_tx;
+            loop {
+                match drain_prep() {
+                    Ok(Some(prepared)) => {
+                        if prep_tx.send(prepared).is_err() {
+                            break; // forward stage gone; stop producing.
+                        }
+                    }
+                    Ok(None) => break, // queue drained.
+                    Err(error) => {
+                        let mut slot = error_ref.lock();
+                        if slot.is_none() {
+                            *slot = Some(error);
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
+        // FORWARD: one batch at a time. Holds no graph lock; carries `prepared`
+        // through so persist writes in the exact drained key order.
+        scope.spawn(move || {
+            let result_tx = result_tx;
+            while let Ok(prepared) = prep_rx.recv() {
+                match forward(prepared) {
+                    Ok(pair) => {
+                        if result_tx.send(pair).is_err() {
+                            break; // persist consumer gone; stop forwarding.
+                        }
+                    }
+                    Err(error) => {
+                        let mut slot = error_ref.lock();
+                        if slot.is_none() {
+                            *slot = Some(error);
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
+        // PERSIST: runs on this scope thread, consuming results in FIFO order.
+        // The `while let` ends when the forward stage disconnects the channel.
+        let mut persist = persist;
+        let mut total = 0usize;
+        while let Ok((prepared, embedded)) = result_rx.recv() {
+            match persist(prepared, embedded) {
+                Ok(count) => total += count,
+                Err(error) => {
+                    let mut slot = error_ref.lock();
+                    if slot.is_none() {
+                        *slot = Some(error);
+                    }
+                    break;
+                }
+            }
+        }
+        // Drop the receiver so a forward thread parked on a full result channel
+        // unblocks, letting the scope join every stage without deadlocking.
+        drop(result_rx);
+        total
+    });
+
+    if let Some(error) = first_error.into_inner() {
+        return Err(error);
+    }
+    Ok(total)
+}
+
 const TEXT_INDEX_IMPORT_SOURCE_WEIGHT: f32 = 1.4;
 const TEXT_INDEX_NEIGHBOR_NAME_WEIGHT: f32 = 1.0;
 #[cfg(all(feature = "embeddings", feature = "vector"))]
@@ -3810,6 +3962,9 @@ impl InMemoryGraph {
             batch_size = batch_size
         )
         .entered();
+        if embed_pipeline_enabled() {
+            return self.process_all_pending_embeddings_pipelined(batch_size);
+        }
         let mut total = 0usize;
         let initial_pending = self.pending_embeddings();
         let start_time = std::time::Instant::now();
@@ -3837,6 +3992,87 @@ impl InMemoryGraph {
         if initial_pending > 0 {
             eprintln!();
         }
+        Ok(total)
+    }
+
+    /// Pipelined variant of [`InMemoryGraph::process_all_pending_embeddings`]:
+    /// overlaps the drain+prep, forward, and persist stages on a bounded
+    /// producer→consumer so the GPU forward for batch N+1 runs while the CPU preps
+    /// batch N+2 and persists batch N.
+    ///
+    /// Opt-in via [`embed_pipeline_enabled`]; the serial path remains the default
+    /// proof path. Output is byte-equivalent to the serial path (same drained
+    /// batch sequence, same in-batch key order) modulo the pre-existing Metal
+    /// float jitter, so the citable embed order is preserved.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    pub fn process_all_pending_embeddings_pipelined(
+        &self,
+        batch_size: usize,
+    ) -> Result<usize, KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.process_all_pending_embeddings_pipelined",
+            batch_size = batch_size
+        )
+        .entered();
+
+        let batch_size = batch_size.max(1);
+        let initial_pending = self.pending_embeddings();
+        let start_time = std::time::Instant::now();
+        let mut running_total = 0usize;
+
+        let total = drive_embed_pipeline(
+            EMBED_PIPELINE_PREP_CAPACITY,
+            EMBED_PIPELINE_RESULT_CAPACITY,
+            // DRAIN + PREP — the single serial ordering authority. Returns `None`
+            // once a drain yields no embeddable work, exactly where the serial loop
+            // stops on a zero-progress batch.
+            || {
+                let prepared = self.prepare_pending_embedding_batch(batch_size);
+                if prepared.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(prepared))
+                }
+            },
+            // FORWARD — one batch at a time on the GPU; carries `prepared` forward
+            // so persist writes in the exact drained key order.
+            |prepared| {
+                let embedded = self.embed_prepared_batch(&prepared)?;
+                Ok((prepared, embedded))
+            },
+            // PERSIST — preserves key order. The per-batch prune is suppressed
+            // (`prune_on_empty = false`): the drain thread empties the queue while
+            // batches are still in flight, so the serial path's "prune when the
+            // queue is empty" gate would otherwise fire on every batch. The single
+            // end-of-run prune below reproduces the serial path's one reconcile.
+            |prepared, embedded| {
+                let count = self.persist_embedded_batch_inner(embedded, &prepared, false)?;
+                running_total += count;
+                if initial_pending > 0 {
+                    let percent = (running_total * 100) / initial_pending;
+                    eprint!(
+                        "\r  Embedding Entities: [{}/{}] {}% | {:.1}s",
+                        running_total,
+                        initial_pending,
+                        percent,
+                        start_time.elapsed().as_secs_f64()
+                    );
+                }
+                Ok(count)
+            },
+        )?;
+
+        if initial_pending > 0 {
+            eprintln!();
+        }
+
+        // Single end-of-drain reconcile, mirroring the serial path's one prune when
+        // the queue empties. Gated on the queue being empty so an error-requeued
+        // remainder is never pruned against a partially embedded index.
+        if total > 0 && self.embedding_queue.lock().is_empty() {
+            self.prune_orphaned_vectors();
+        }
+
         Ok(total)
     }
 
@@ -4039,6 +4275,24 @@ impl InMemoryGraph {
         embedded: Vec<(RetrievalKey, Vec<f32>)>,
         prepared: &PreparedEmbedBatch,
     ) -> Result<usize, KinDbError> {
+        self.persist_embedded_batch_inner(embedded, prepared, true)
+    }
+
+    /// Persist worker shared by the serial and pipelined paths.
+    ///
+    /// `prune_on_empty` controls the live-retire reconcile. The serial path passes
+    /// `true`: it persists each batch only after draining the next, so the prune
+    /// fires exactly once, on the batch that empties the queue. The pipelined path
+    /// passes `false` because its drain thread empties the queue while batches are
+    /// still in flight — firing the gate on every persist — and instead prunes
+    /// once after the whole run drains.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn persist_embedded_batch_inner(
+        &self,
+        embedded: Vec<(RetrievalKey, Vec<f32>)>,
+        prepared: &PreparedEmbedBatch,
+        prune_on_empty: bool,
+    ) -> Result<usize, KinDbError> {
         if embedded.is_empty() {
             return Ok(0);
         }
@@ -4064,7 +4318,7 @@ impl InMemoryGraph {
         // superseded generation is retired now, instead of accumulating until the
         // next daemon boot's load-time reclaim. Gated on the queue being empty so
         // a multi-batch backfill prunes once at the end rather than per batch.
-        if count > 0 && self.embedding_queue.lock().is_empty() {
+        if prune_on_empty && count > 0 && self.embedding_queue.lock().is_empty() {
             self.prune_orphaned_vectors();
         }
 
@@ -12285,6 +12539,98 @@ mod tests {
             Some(&EmbedRecency::ChangedThisSync)
         );
         assert_eq!(queue.items.get(&defaulted), Some(&EmbedRecency::Backfill));
+    }
+
+    /// The pipelined embed driver must persist exactly the serial path's
+    /// (key, vector) sequence — same order, same values. A deterministic stub
+    /// embedder (the vector is a pure function of the input text) lets this run on
+    /// CPU with no GPU and no real model: any reordering or duplication introduced
+    /// by the bounded producer→consumer pipeline shows up as a sequence mismatch.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
+    fn pipelined_embed_preserves_serial_persist_order() {
+        // Deterministic per-text vector — no randomness, no model.
+        fn stub_vector(text: &str) -> Vec<f32> {
+            let mut acc = 0u32;
+            for byte in text.bytes() {
+                acc = acc.wrapping_mul(31).wrapping_add(byte as u32);
+            }
+            let base = acc as f32;
+            vec![base, base + 1.0, base + 2.0, base + 3.0]
+        }
+
+        fn make_batch(ids: &[u128]) -> PreparedEmbedBatch {
+            let keys: Vec<RetrievalKey> = ids
+                .iter()
+                .map(|n| RetrievalKey::Entity(EntityId(uuid::Uuid::from_u128(*n))))
+                .collect();
+            let texts: Vec<String> = ids.iter().map(|n| format!("entity-text-{n}")).collect();
+            let recency = keys.iter().map(|k| (*k, EmbedRecency::Backfill)).collect();
+            PreparedEmbedBatch {
+                keys,
+                texts,
+                recency,
+            }
+        }
+
+        // `fn` item (not a closure) so the same forward stage feeds both the serial
+        // reference loop and the pipelined driver, which consumes it by value.
+        fn forward(
+            prepared: PreparedEmbedBatch,
+        ) -> Result<(PreparedEmbedBatch, Vec<(RetrievalKey, Vec<f32>)>), KinDbError> {
+            let embedded: Vec<(RetrievalKey, Vec<f32>)> = prepared
+                .keys
+                .iter()
+                .zip(prepared.texts.iter())
+                .map(|(key, text)| (*key, stub_vector(text)))
+                .collect();
+            Ok((prepared, embedded))
+        }
+
+        // Many batches of varying size so the bounded channels fill and the three
+        // stages genuinely overlap across threads.
+        let batch_id_lists: Vec<Vec<u128>> = (0..64u128)
+            .map(|b| {
+                let size = (b % 5) + 1;
+                (0..size).map(|i| b * 100 + i + 1).collect()
+            })
+            .collect();
+
+        // Serial reference: identical stub stages run strictly in sequence.
+        let mut serial_order: Vec<(RetrievalKey, Vec<f32>)> = Vec::new();
+        for ids in &batch_id_lists {
+            let (_prepared, embedded) = forward(make_batch(ids)).unwrap();
+            serial_order.extend(embedded);
+        }
+
+        // Pipelined: the real driver under test, same stub stages.
+        let pipelined_order: std::sync::Mutex<Vec<(RetrievalKey, Vec<f32>)>> =
+            std::sync::Mutex::new(Vec::new());
+        let mut remaining = batch_id_lists.clone().into_iter();
+        let total = drive_embed_pipeline(
+            EMBED_PIPELINE_PREP_CAPACITY,
+            EMBED_PIPELINE_RESULT_CAPACITY,
+            move || Ok(remaining.next().map(|ids| make_batch(&ids))),
+            forward,
+            |_prepared, embedded: Vec<(RetrievalKey, Vec<f32>)>| {
+                let count = embedded.len();
+                pipelined_order.lock().unwrap().extend(embedded);
+                Ok(count)
+            },
+        )
+        .unwrap();
+
+        let pipelined_order = pipelined_order.into_inner().unwrap();
+        assert!(!serial_order.is_empty());
+        assert_eq!(
+            total,
+            serial_order.len(),
+            "pipeline must persist every prepared item exactly once"
+        );
+        assert_eq!(
+            serial_order, pipelined_order,
+            "pipelined persist order and values must equal the serial reference"
+        );
     }
 
     /// CPU microbench for the embed hot-path changes. Ignored by default;
