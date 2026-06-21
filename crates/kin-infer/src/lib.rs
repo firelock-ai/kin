@@ -23,7 +23,7 @@ pub mod resource;
 pub mod watchdog;
 
 use half::{bf16, f16};
-use ndarray::{s, Array1, Array2};
+use ndarray::{s, Array1, Array2, ArrayView2};
 use safetensors::{Dtype, SafeTensors};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -2067,12 +2067,13 @@ impl BertModel {
             let _pool_span =
                 tracing::info_span!("kin_infer.model.forward.pool_and_normalize").entered();
             let pooled = if self.config.uses_cls_pooling() {
-                cls_pool(&hidden)
+                cls_pool(hidden.view())
             } else {
-                mean_pool(&hidden, mask)
+                mean_pool(hidden.view(), mask)
             };
-            let normalized = l2_normalize(&pooled);
-            results.push(normalized.to_vec());
+            results.push(l2_normalize_to_vec(
+                pooled.as_slice().expect("pooled embedding is contiguous"),
+            ));
         }
 
         ensure_finite_embeddings(&results)?;
@@ -3073,10 +3074,7 @@ impl BertModel {
                 flat.len()
             )));
         }
-        let pooled = flat
-            .chunks_exact(h)
-            .map(|row| l2_normalize(&Array1::from_vec(row.to_vec())).to_vec())
-            .collect();
+        let pooled = flat.chunks_exact(h).map(l2_normalize_to_vec).collect();
         let reason = if use_segmented {
             PooledOutputDecisionReason::UsedSegmented
         } else {
@@ -3105,18 +3103,15 @@ impl BertModel {
         let cls_pooling = self.config.uses_cls_pooling();
         for b in 0..batch_size {
             let base = b * max_len;
-            let h_b = hidden
-                .slice(ndarray::s![base..base + max_len, ..])
-                .to_owned();
+            let h_b = hidden.slice(ndarray::s![base..base + max_len, ..]);
             let pooled = if cls_pooling {
-                cls_pool(&h_b)
+                cls_pool(h_b)
             } else {
-                mean_pool(
-                    &h_b,
-                    &masks[b].iter().map(|&m| m as u32).collect::<Vec<_>>(),
-                )
+                mean_pool(h_b, &masks[b])
             };
-            results.push(l2_normalize(&pooled).to_vec());
+            results.push(l2_normalize_to_vec(
+                pooled.as_slice().expect("pooled embedding is contiguous"),
+            ));
         }
         results
     }
@@ -5187,12 +5182,40 @@ fn softmax_rows(x: &mut Array2<f32>) {
     }
 }
 
-fn mean_pool(hidden: &Array2<f32>, mask: &[u32]) -> Array1<f32> {
+/// Attention-mask element: a nonzero value marks a real (non-padding) token
+/// that contributes to mean pooling. Implemented for the `u32` masks the public
+/// forward path carries and the `u8` masks `encode_batched` packs, so `mean_pool`
+/// can borrow either width directly instead of widening into a transient copy.
+trait MaskBit: Copy {
+    fn is_token(self) -> bool;
+}
+
+impl MaskBit for u8 {
+    #[inline]
+    fn is_token(self) -> bool {
+        self != 0
+    }
+}
+
+impl MaskBit for u32 {
+    #[inline]
+    fn is_token(self) -> bool {
+        self != 0
+    }
+}
+
+/// Mask-aware mean pooling over a sequence's hidden states.
+///
+/// Takes a borrowed `ArrayView2` so a caller holding a sub-slice of a larger
+/// batched activation block can pool in place without copying the rows out. The
+/// accumulation order (real tokens in row order, element-wise) is unchanged, so
+/// the result is bit-identical to pooling an owned copy.
+fn mean_pool<M: MaskBit>(hidden: ArrayView2<f32>, mask: &[M]) -> Array1<f32> {
     let h = hidden.ncols();
     let mut sum = Array1::<f32>::zeros(h);
     let mut count = 0.0f32;
     for (i, &m) in mask.iter().enumerate() {
-        if m != 0 {
+        if m.is_token() {
             sum += &hidden.row(i);
             count += 1.0;
         }
@@ -5205,19 +5228,26 @@ fn mean_pool(hidden: &Array2<f32>, mask: &[u32]) -> Array1<f32> {
 
 /// CLS pooling: the first-token ([CLS]) hidden state. Used by nomic_bert /
 /// SweRank-style sentence encoders whose pooling layer selects the CLS token.
-fn cls_pool(hidden: &Array2<f32>) -> Array1<f32> {
+fn cls_pool(hidden: ArrayView2<f32>) -> Array1<f32> {
     if hidden.nrows() == 0 {
         return Array1::<f32>::zeros(hidden.ncols());
     }
     hidden.row(0).to_owned()
 }
 
-fn l2_normalize(v: &Array1<f32>) -> Array1<f32> {
+/// L2-normalize into a freshly allocated `Vec<f32>` in a single pass.
+///
+/// Equivalent to normalizing the slice (each element divided by its L2 norm, or
+/// copied unchanged when the norm underflows `1e-12`) and collecting the result,
+/// but writes the output vector once instead of materializing an intermediate
+/// `Array1`. The norm and per-element divisions are computed identically to the
+/// previous `Array1`-based path, so values are bit-identical.
+fn l2_normalize_to_vec(v: &[f32]) -> Vec<f32> {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 1e-12 {
-        v / norm
+        v.iter().map(|x| x / norm).collect()
     } else {
-        v.clone()
+        v.to_vec()
     }
 }
 
@@ -5225,7 +5255,8 @@ fn l2_normalize(v: &Array1<f32>) -> Array1<f32> {
 /// value (NaN or ±Inf), so a corrupt vector can never silently reach the vector
 /// index. Backend-agnostic and O(batch × dim) — negligible against the forward
 /// pass — it catches a non-finite produced anywhere upstream at the kin-infer
-/// output boundary instead of letting `l2_normalize` pass it through unchanged.
+/// output boundary instead of letting `l2_normalize_to_vec` pass it through
+/// unchanged.
 fn ensure_finite_embeddings(rows: &[Vec<f32>]) -> Result<(), InferError> {
     for (i, row) in rows.iter().enumerate() {
         if let Some(j) = row.iter().position(|x| !x.is_finite()) {
@@ -6277,8 +6308,7 @@ mod tests {
 
     #[test]
     fn test_l2_normalize() {
-        let v = Array1::from(vec![3.0, 4.0]);
-        let n = l2_normalize(&v);
+        let n = l2_normalize_to_vec(&[3.0, 4.0]);
         let norm: f32 = n.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-5);
         assert!((n[0] - 0.6).abs() < 1e-5);
@@ -6311,8 +6341,8 @@ mod tests {
     #[test]
     fn test_mean_pool_with_mask() {
         let hidden = Array2::from_shape_vec((3, 2), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        let mask = vec![1, 1, 0];
-        let pooled = mean_pool(&hidden, &mask);
+        let mask: Vec<u32> = vec![1, 1, 0];
+        let pooled = mean_pool(hidden.view(), &mask);
         assert!((pooled[0] - 2.0).abs() < 1e-5);
         assert!((pooled[1] - 3.0).abs() < 1e-5);
     }
