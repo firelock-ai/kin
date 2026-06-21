@@ -1351,6 +1351,13 @@ impl BertModel {
         #[cfg(all(feature = "metal", target_os = "macos"))]
         crate::metal_backend::record_forward_calls(batch_size);
 
+        if batch_size == 1 {
+            if let Some(results) = self.try_forward_batched_pooled(token_ids, attention_masks)? {
+                ensure_finite_embeddings(&results)?;
+                return Ok(results);
+            }
+        }
+
         for b in 0..batch_size {
             let ids = &token_ids[b];
             let mask = &attention_masks[b];
@@ -2146,12 +2153,6 @@ impl BertModel {
             return Ok(vec![]);
         }
         if batch_size == 1 {
-            if let Some(results) = self.try_forward_batched_pooled(token_ids, attention_masks)? {
-                #[cfg(all(feature = "metal", target_os = "macos"))]
-                crate::metal_backend::record_forward_calls(1);
-                ensure_finite_embeddings(&results)?;
-                return Ok(results);
-            }
             return self.forward(token_ids, attention_masks);
         }
 
@@ -5608,6 +5609,26 @@ mod tests {
         let result = model
             .forward_batched(&[vec![1, 2]], &[vec![1, 1]])
             .expect("forward_batched");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], vec![0.6, 0.8]);
+    }
+
+    #[test]
+    fn forward_single_entity_uses_pooled_output_when_enabled() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = mock_embedding_model_with_gpu(
+            vec![],
+            Box::new(PooledOnlyGpu {
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        let _override = PooledOutputOverrideGuard::enabled();
+        let result = model
+            .forward(&[vec![1, 2]], &[vec![1, 1]])
+            .expect("forward");
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(result.len(), 1);

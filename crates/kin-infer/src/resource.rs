@@ -3,8 +3,8 @@
 
 //! Shared resource plan — inspect-only host/accelerator/memory detection plus
 //! per-profile budgets. Stable JSON (`kin.resource_plan.v1`) consumed across the
-//! ecosystem. This module describes resources and recommends budgets; it wires
-//! nothing and changes no runtime behavior.
+//! ecosystem. Runtime embedding code also reads the profile-resolved kernel plan
+//! from this module so CLI/daemon behavior matches the reported plan.
 
 use serde::{Deserialize, Serialize};
 
@@ -202,11 +202,12 @@ pub struct EmbeddingPlan {
 /// All-off (the [`Default`]) is the proven fp32 single-buffer 32x32-MMA path with
 /// the host-side attention reshape — bit-identical across runs and the only shape
 /// the proof profile ever uses. Profiles currently keep the alternate,
-/// parity-cleared kernels off until they beat the baseline. kin-infer's Metal
+/// parity-cleared kernels off until they beat the baseline, except for
+/// scheduling/readback levers that preserve embedding values. kin-infer's Metal
 /// backend resolves these into its per-process kernel gates; a `KIN_INFER_*` env
 /// override still wins per lever so each can be A/B-measured in isolation.
-/// `flash_attention` and `pooled_output` remain default-off until runtime
-/// support exists, is parity-cleared, and measures as a win.
+/// `flash_attention` remains default-off until runtime support exists, is
+/// parity-cleared, and measures as a win.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct GpuKernelPlan {
     /// fp16-operand MMA GEMM (`KIN_INFER_GEMM_FP16`).
@@ -230,16 +231,15 @@ pub struct GpuKernelPlan {
 }
 
 impl GpuKernelPlan {
-    /// Kernel selection for `profile` on `backend`. Every alternate Metal
-    /// GEMM/attention kernel is currently OFF for all profiles: each one is
-    /// parity-clean (bit-identical, finite) but measures throughput-neutral to
-    /// regressive against the baseline simdgroup MMA on Apple silicon, so the
-    /// throughput profile stays on the proven path rather than shipping a
-    /// regression. This is the per-profile seam to flip a field on once a kernel
-    /// actually beats the baseline; the matching `KIN_INFER_*` env override stays
-    /// available for A/B-measuring any of them in isolation.
-    pub fn resolve(_profile: Profile, _backend: AcceleratorBackend) -> GpuKernelPlan {
-        GpuKernelPlan::default()
+    /// Kernel selection for `profile` on `backend`. Proof stays on the
+    /// historical bit-identical path. Throughput may use parity-cleared kernels
+    /// that improve scheduling/readback without changing embedding values.
+    pub fn resolve(profile: Profile, backend: AcceleratorBackend) -> GpuKernelPlan {
+        let mut plan = GpuKernelPlan::default();
+        if matches!(profile, Profile::Throughput) && matches!(backend, AcceleratorBackend::Metal) {
+            plan.pooled_output = true;
+        }
+        plan
     }
 }
 
@@ -729,15 +729,17 @@ mod tests {
         assert_eq!(plan.host.reserve_logical_cores, 1);
         assert_eq!(plan.bench.explore_fast_jobs, Some(16));
         assert_eq!(plan.bench.artifact_mode, ArtifactMode::NonCitableExplore);
-        // The alternate Metal kernels measure throughput-neutral-to-regressive vs
-        // the baseline MMA, so even throughput keeps them off (proven path).
-        assert_eq!(plan.embedding.gpu_kernels, GpuKernelPlan::default());
+        assert_eq!(
+            plan.embedding.gpu_kernels,
+            GpuKernelPlan {
+                pooled_output: true,
+                ..GpuKernelPlan::default()
+            }
+        );
     }
 
     #[test]
-    fn gpu_kernel_plan_stays_off_for_every_profile() {
-        // No alternate kernel is a measured throughput win, so the plan resolves
-        // off for every profile/backend; a winning kernel is flipped on here.
+    fn gpu_kernel_plan_enables_pooled_output_only_for_throughput_metal() {
         for profile in [
             Profile::Proof,
             Profile::Interactive,
@@ -749,11 +751,17 @@ mod tests {
                 AcceleratorBackend::Cuda,
                 AcceleratorBackend::Cpu,
             ] {
-                assert_eq!(
-                    GpuKernelPlan::resolve(profile, backend),
-                    GpuKernelPlan::default(),
-                    "{profile:?}/{backend:?} must keep alternate kernels off"
-                );
+                let expected = if matches!(profile, Profile::Throughput)
+                    && matches!(backend, AcceleratorBackend::Metal)
+                {
+                    GpuKernelPlan {
+                        pooled_output: true,
+                        ..GpuKernelPlan::default()
+                    }
+                } else {
+                    GpuKernelPlan::default()
+                };
+                assert_eq!(GpuKernelPlan::resolve(profile, backend), expected);
             }
         }
     }
