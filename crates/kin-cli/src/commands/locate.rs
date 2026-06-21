@@ -2093,7 +2093,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         );
     }
 
-    rerank_cli_surface_paths(&mut fused, text, &all_hits, workspace_root);
+    rerank_cli_surface_paths(&mut fused, text, &all_hits, graph, workspace_root);
     if explain {
         record_debug_stage(
             &mut score_breakdown,
@@ -2346,7 +2346,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     if locate_env_bool("KIN_LOCATE_CROSS_ENCODER_ENABLED", false) {
         let ltr_window = locate_env_usize("KIN_LOCATE_LTR_WINDOW", 20).min(fused.len());
         if ltr_window > 0 {
-            if let Some(workspace_root) = workspace_root {
+            if workspace_root.is_some() {
                 let model_id = std::env::var("KIN_LOCATE_CROSS_ENCODER_MODEL")
                     .unwrap_or_else(|_| "BAAI/bge-reranker-base".to_string());
                 let revision = std::env::var("KIN_LOCATE_CROSS_ENCODER_REVISION")
@@ -2362,7 +2362,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                         let mut candidates = Vec::new();
 
                         for (path, score) in fused.iter().take(ltr_window) {
-                            let content = graph_derived_candidate_text(graph, path, workspace_root);
+                            let content = graph_derived_candidate_text(graph, path);
                             docs.push(content);
                             candidates.push((path.clone(), *score));
                         }
@@ -7493,9 +7493,7 @@ fn extract_source_text_signals(
                 .cloned()
                 .collect::<Vec<_>>();
             for path in &cli_surface_paths {
-                let Some(source_text) =
-                    lowercase_source_text(path, &preview_source_texts, workspace_root.as_deref())
-                else {
+                let Some(source_text) = lowercase_source_text(path, &preview_source_texts) else {
                     continue;
                 };
                 if source_text.contains(&term_lower) {
@@ -7505,9 +7503,7 @@ fn extract_source_text_signals(
             }
         } else if symbolic {
             for path in &source_paths {
-                let Some(source_text) =
-                    lowercase_source_text(path, &preview_source_texts, workspace_root.as_deref())
-                else {
+                let Some(source_text) = lowercase_source_text(path, &preview_source_texts) else {
                     continue;
                 };
                 if source_text.contains(&term_lower) {
@@ -7606,6 +7602,7 @@ fn extract_source_text_signals(
     promote_cli_surface_companion_headers_in_source_text(
         &mut hits,
         &path_term_support,
+        &source_previews,
         workspace_root.as_deref(),
     );
 
@@ -7615,6 +7612,7 @@ fn extract_source_text_signals(
 fn promote_cli_surface_companion_headers_in_source_text(
     hits: &mut HashMap<String, Vec<FileHit>>,
     path_term_support: &HashMap<String, HashSet<String>>,
+    source_previews: &HashMap<String, String>,
     workspace_root: Option<&std::path::Path>,
 ) {
     let Some(workspace_root) = workspace_root else {
@@ -7659,8 +7657,8 @@ fn promote_cli_surface_companion_headers_in_source_text(
             score: direct_score,
             spans: vec![],
         });
-        let Some(header_text) = read_workspace_source_text(&header_path, Some(workspace_root))
-        else {
+        let Some(header_text) = source_previews.get(&header_path).cloned() else {
+            record_graph_source_gap(&header_path);
             continue;
         };
         for include_path in extract_local_quoted_include_targets(
@@ -7738,9 +7736,8 @@ fn promote_local_include_source_hits(
         if depth >= depth_limit {
             continue;
         }
-        let Some(preview) = read_workspace_source_text(&path, workspace_root)
-            .or_else(|| source_previews.get(&path).cloned())
-        else {
+        let Some(preview) = source_previews.get(&path).cloned() else {
+            record_graph_source_gap(&path);
             continue;
         };
         let score = include_bonus * include_decay.powi(depth as i32);
@@ -7851,56 +7848,85 @@ fn is_source_like_artifact_path(path: &str, mime_type: Option<&str>) -> bool {
     })
 }
 
+/// Lowercased graph-owned source text for `path`, served only from the
+/// graph-derived preview map. A map miss is a graph gap: it is recorded and
+/// surfaced as such, never patched from a raw workspace disk read.
 fn lowercase_source_text(
     path: &str,
     preview_source_texts: &HashMap<String, String>,
-    workspace_root: Option<&std::path::Path>,
 ) -> Option<String> {
-    preview_source_texts.get(path).cloned().or_else(|| {
-        read_workspace_source_text(path, workspace_root).map(|text| text.to_ascii_lowercase())
-    })
+    match preview_source_texts.get(path) {
+        Some(text) => Some(text.clone()),
+        None => {
+            record_graph_source_gap(path);
+            None
+        }
+    }
 }
 
-/// Running count of locate source-text reads served from a raw workspace disk
-/// read instead of graph-owned body. A nonzero value is graph-coverage drift;
-/// the per-read trace at `kin.locate.disk_fallback` names the offending path.
-static LOCATE_DISK_SOURCE_READS: std::sync::atomic::AtomicU64 =
+/// A locate authority site needed source text for `path`, but graph-owned truth
+/// held no body for it. Authority paths surface this typed gap instead of
+/// substituting raw filesystem contents, so a graph-coverage hole is reported
+/// rather than silently patched from disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GraphSourceGap {
+    pub path: String,
+}
+
+/// Running count of locate authority source-text resolutions that hit a graph
+/// gap (graph held no body for the requested path). On a fully materialized
+/// graph this stays zero; a nonzero value is graph-coverage drift, and each gap
+/// is reported through the typed `GraphSourceGap` path rather than answered from
+/// raw workspace disk.
+static LOCATE_GRAPH_SOURCE_GAPS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-fn read_workspace_source_text(
-    path: &str,
-    workspace_root: Option<&std::path::Path>,
-) -> Option<String> {
-    let root = workspace_root?;
-    let text = std::fs::read_to_string(root.join(path)).ok()?;
-    let count = LOCATE_DISK_SOURCE_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    tracing::debug!(
-        target: "kin.locate.disk_fallback",
+fn record_graph_source_gap(path: &str) {
+    let count = LOCATE_GRAPH_SOURCE_GAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    tracing::warn!(
+        target: "kin.locate.graph_gap",
         path,
-        disk_source_reads = count,
-        "served locate source text from workspace disk instead of graph body"
+        graph_source_gaps = count,
+        "locate found no graph body for an authority source path; reporting graph gap instead of reading workspace disk"
     );
-    Some(text)
 }
 
-/// Candidate text for `path`, served from graph-owned body (the opaque
-/// artifact's stored source) and dropping to a raw workspace disk read only
-/// when the graph holds no body for the file. The disk leg routes through
-/// `read_workspace_source_text`, so the fallback is the explicit, telemetered
-/// path — not the silent default.
-fn graph_derived_candidate_text(
-    graph: &kin_db::InMemoryGraph,
-    path: &str,
-    workspace_root: &std::path::Path,
-) -> String {
+/// Number of authority source-text graph gaps recorded so far. Surfaces the
+/// graph-coverage signal without exposing raw filesystem contents; on a fully
+/// materialized graph it stays zero.
+#[cfg(test)]
+fn locate_graph_source_gap_count() -> u64 {
+    LOCATE_GRAPH_SOURCE_GAPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Resolve source text for `path` from graph-owned body only. Returns a typed
+/// `GraphSourceGap` when the graph holds no non-empty body — authority callers
+/// must treat that as a reported gap and never fall back to raw filesystem text.
+fn graph_source_text(graph: &kin_db::InMemoryGraph, path: &str) -> Result<String, GraphSourceGap> {
     if let Ok(Some(artifact)) = graph.get_opaque_artifact(&kin_model::FilePathId::new(path)) {
         if let Some(body) = artifact.text_preview {
             if !body.is_empty() {
-                return body;
+                return Ok(body);
             }
         }
     }
-    read_workspace_source_text(path, Some(workspace_root)).unwrap_or_default()
+    Err(GraphSourceGap {
+        path: path.to_string(),
+    })
+}
+
+/// Candidate text for `path`, served from graph-owned body (the opaque
+/// artifact's stored source). A graph miss is reported as a typed graph gap and
+/// yields no text, so the cross-encoder never reranks a candidate from raw
+/// workspace disk contents.
+fn graph_derived_candidate_text(graph: &kin_db::InMemoryGraph, path: &str) -> String {
+    match graph_source_text(graph, path) {
+        Ok(body) => body,
+        Err(gap) => {
+            record_graph_source_gap(&gap.path);
+            String::new()
+        }
+    }
 }
 
 fn workspace_source_path_exists(path: &str, workspace_root: Option<&std::path::Path>) -> bool {
@@ -11135,6 +11161,7 @@ fn rerank_cli_surface_paths(
     fused: &mut Vec<(String, f32)>,
     text: &str,
     all_hits: &[HashMap<String, Vec<FileHit>>],
+    graph: &kin_db::InMemoryGraph,
     workspace_root: Option<&std::path::Path>,
 ) {
     if fused.is_empty() || !is_cli_surface_query(text) {
@@ -11305,7 +11332,7 @@ fn rerank_cli_surface_paths(
         }
     }
 
-    if promote_cli_surface_local_headers(fused, top_score, workspace_root) {
+    if promote_cli_surface_local_headers(fused, top_score, graph, workspace_root) {
         changed = true;
     }
 
@@ -11321,6 +11348,7 @@ fn rerank_cli_surface_paths(
 fn promote_cli_surface_local_headers(
     fused: &mut Vec<(String, f32)>,
     top_score: f32,
+    graph: &kin_db::InMemoryGraph,
     workspace_root: Option<&std::path::Path>,
 ) -> bool {
     let Some(workspace_root) = workspace_root else {
@@ -11352,9 +11380,12 @@ fn promote_cli_surface_local_headers(
         };
         changed |= upsert_fused_floor(fused, header_path.clone(), direct_floor);
 
-        let Some(header_text) = read_workspace_source_text(&header_path, Some(&workspace_root))
-        else {
-            continue;
+        let header_text = match graph_source_text(graph, &header_path) {
+            Ok(text) => text,
+            Err(gap) => {
+                record_graph_source_gap(&gap.path);
+                continue;
+            }
         };
         for include_path in extract_local_quoted_include_targets(
             &header_path,
@@ -11714,54 +11745,12 @@ fn block_focus_source_candidates(
         }
     }
 
-    if !candidates.is_empty() || workspace_root.is_none() {
-        return candidates;
-    }
-
-    // Graph-miss: no /blocks/{term}.{ext} found in graph. Instrument always;
-    // inject disk-discovered paths only when KIN_LOCATE_BLOCK_SOURCE_OPTIN is set
-    // (default OFF). Bench suites have no /blocks/ layout so numbers are unaffected.
-    let count = LOCATE_DISK_SOURCE_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    tracing::debug!(
-        target: "kin.locate.disk_fallback",
-        disk_source_reads = count,
-        "block-focus graph-miss: no /blocks/ candidates in graph; \
-         disk injection requires KIN_LOCATE_BLOCK_SOURCE_OPTIN"
-    );
-    if !locate_env_bool("KIN_LOCATE_BLOCK_SOURCE_OPTIN", false) {
-        return candidates;
-    }
-
-    let root = workspace_root.unwrap();
-    for term in block_focus_terms(text) {
-        for ext in [".js", ".ts", ".jsx", ".tsx"] {
-            let suffix = format!("/blocks/{term}{ext}");
-            let mut stack = vec![root.to_path_buf()];
-            while let Some(dir) = stack.pop() {
-                let Ok(entries) = std::fs::read_dir(&dir) else {
-                    continue;
-                };
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    let Ok(file_type) = entry.file_type() else {
-                        continue;
-                    };
-                    if file_type.is_dir() {
-                        if path.file_name().and_then(|name| name.to_str()) == Some(".git") {
-                            continue;
-                        }
-                        stack.push(path);
-                        continue;
-                    }
-                    let Some(rel) = path.strip_prefix(root).ok().and_then(|p| p.to_str()) else {
-                        continue;
-                    };
-                    let rel = rel.replace('\\', "/");
-                    if rel.to_ascii_lowercase().ends_with(&suffix) && seen.insert(rel.clone()) {
-                        candidates.push(rel);
-                    }
-                }
-            }
+    // Graph-miss: no /blocks/{term}.{ext} candidate surface exists in
+    // graph-owned truth. Report the gap rather than walking the workspace tree
+    // to fabricate ranked candidates from raw filesystem layout.
+    if candidates.is_empty() && workspace_root.is_some() {
+        for term in block_focus_terms(text) {
+            record_graph_source_gap(&format!("blocks/{term}"));
         }
     }
 
@@ -13742,7 +13731,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_derived_candidate_text_prefers_graph_body_over_disk() {
+    fn graph_derived_candidate_text_serves_graph_body_and_ignores_disk() {
         let graph = kin_db::InMemoryGraph::new();
         graph
             .upsert_opaque_artifact(&OpaqueArtifact {
@@ -13753,22 +13742,25 @@ mod tests {
             })
             .unwrap();
 
+        // A divergent on-disk file must never be consulted: the graph body is
+        // the only authority for candidate text.
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/foo.rs"), "DISK_BODY_MARKER").unwrap();
 
         assert_eq!(
-            graph_derived_candidate_text(&graph, "src/foo.rs", dir.path()),
+            graph_derived_candidate_text(&graph, "src/foo.rs"),
             "GRAPH_BODY_MARKER",
-            "graph-owned body must win over the on-disk file"
+            "graph-owned body is the only authority for candidate text"
         );
     }
 
     #[test]
-    fn graph_derived_candidate_text_falls_back_to_disk_only_on_graph_miss() {
+    fn graph_derived_candidate_text_returns_empty_and_records_gap_on_graph_miss() {
         let graph = kin_db::InMemoryGraph::new();
-        // Artifact present but with no stored body, and with an empty body —
-        // both must fall through to the explicit disk leg, not return blank.
+        // Artifact present but with no stored body, and another with an empty
+        // body. Both are graph gaps: they must yield no text and never be
+        // patched from a raw workspace disk read.
         graph
             .upsert_opaque_artifact(&OpaqueArtifact {
                 file_id: FilePathId::new("src/none.rs"),
@@ -13786,31 +13778,79 @@ mod tests {
             })
             .unwrap();
 
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src/none.rs"), "DISK_NONE").unwrap();
-        std::fs::write(dir.path().join("src/empty.rs"), "DISK_EMPTY").unwrap();
-        std::fs::write(dir.path().join("src/untracked.rs"), "DISK_ONLY").unwrap();
+        let before = locate_graph_source_gap_count();
+        for path in ["src/none.rs", "src/empty.rs", "src/untracked.rs"] {
+            assert_eq!(
+                graph_derived_candidate_text(&graph, path),
+                "",
+                "a graph gap must yield no text, never raw disk contents"
+            );
+        }
+        assert!(
+            locate_graph_source_gap_count() >= before + 3,
+            "each graph miss must record a reported graph gap"
+        );
+    }
+
+    #[test]
+    fn graph_source_text_returns_typed_gap_on_graph_miss_without_reading_disk() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("src/present.rs"),
+                content_hash: Hash256::from_bytes([3; 32]),
+                mime_type: Some("text/x-rust".into()),
+                text_preview: Some("GRAPH_BODY".into()),
+            })
+            .unwrap();
 
         assert_eq!(
-            graph_derived_candidate_text(&graph, "src/none.rs", dir.path()),
-            "DISK_NONE",
-            "text_preview=None must reach disk"
+            graph_source_text(&graph, "src/present.rs"),
+            Ok("GRAPH_BODY".to_string()),
+            "a graph-owned body resolves to Ok"
         );
+
+        // No artifact at all, and an artifact with an empty body, are both
+        // typed graph gaps — the typed Err is the authority signal, not disk.
         assert_eq!(
-            graph_derived_candidate_text(&graph, "src/empty.rs", dir.path()),
-            "DISK_EMPTY",
-            "empty graph body must reach disk, not short-circuit blank"
+            graph_source_text(&graph, "src/missing.rs"),
+            Err(GraphSourceGap {
+                path: "src/missing.rs".to_string(),
+            }),
+            "a graph miss must surface a typed GraphSourceGap, not disk text"
         );
+
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("src/blank.rs"),
+                content_hash: Hash256::from_bytes([4; 32]),
+                mime_type: Some("text/x-rust".into()),
+                text_preview: Some(String::new()),
+            })
+            .unwrap();
         assert_eq!(
-            graph_derived_candidate_text(&graph, "src/untracked.rs", dir.path()),
-            "DISK_ONLY",
-            "no graph artifact must reach disk"
+            graph_source_text(&graph, "src/blank.rs"),
+            Err(GraphSourceGap {
+                path: "src/blank.rs".to_string(),
+            }),
+            "an empty graph body is a gap, not a satisfied answer"
         );
+    }
+
+    // Full end-to-end assertion that a complete graph drives locate with zero
+    // recorded source-text graph gaps. Requires a live daemon/graph fixture, so
+    // it is excluded from the default suite and run in the serial daemon window.
+    #[test]
+    #[ignore = "requires live daemon/graph fixture; run in the serial daemon window"]
+    fn locate_over_complete_graph_records_zero_source_text_gaps() {
+        let before = locate_graph_source_gap_count();
+        // A daemon-backed locate over a fully materialized graph must answer
+        // entirely from graph-owned bodies. Wire the live fixture here, run a
+        // representative locate, then assert no authority path fell into a gap.
         assert_eq!(
-            graph_derived_candidate_text(&graph, "src/missing.rs", dir.path()),
-            "",
-            "absent in both graph and disk must yield empty, never panic"
+            locate_graph_source_gap_count(),
+            before,
+            "a complete-graph locate must record zero source-text graph gaps"
         );
     }
 
@@ -17003,7 +17043,13 @@ mod tests {
             ("programs/zstdcli.c".to_string(), 45.0),
         ];
 
-        rerank_cli_surface_paths(&mut fused, "Add --size-hint=# option", &[], None);
+        rerank_cli_surface_paths(
+            &mut fused,
+            "Add --size-hint=# option",
+            &[],
+            &kin_db::InMemoryGraph::new(),
+            None,
+        );
 
         let ranks: HashMap<_, _> = fused
             .iter()
@@ -17027,6 +17073,7 @@ mod tests {
             &mut fused,
             "fix cli issue when providing --help=false.",
             &[],
+            &kin_db::InMemoryGraph::new(),
             None,
         );
 
@@ -17047,7 +17094,13 @@ mod tests {
             ("programs/zstdcli.c".to_string(), 45.0),
         ];
 
-        rerank_cli_surface_paths(&mut fused, "Add --size-hint=# option", &[], None);
+        rerank_cli_surface_paths(
+            &mut fused,
+            "Add --size-hint=# option",
+            &[],
+            &kin_db::InMemoryGraph::new(),
+            None,
+        );
 
         let ranks: HashMap<_, _> = fused
             .iter()
@@ -17088,6 +17141,7 @@ mod tests {
             &mut fused,
             "fix branch flag on browse within dir",
             &all_hits,
+            &kin_db::InMemoryGraph::new(),
             None,
         );
 
@@ -17129,6 +17183,7 @@ mod tests {
             &mut fused,
             "Add prototype `ZSTD_decodingBufferSize_min()` to the public API",
             &[],
+            &kin_db::InMemoryGraph::new(),
             None,
         );
 
@@ -19724,51 +19779,28 @@ mod tests {
         );
     }
 
-    // Both tests mutate process-global env; serial ensures they don't race.
-    #[serial_test::serial(block_focus_env)]
     #[test]
-    fn block_focus_candidates_default_no_injection_on_graph_miss() {
-        std::env::remove_var("KIN_LOCATE_BLOCK_SOURCE_OPTIN");
+    fn block_focus_candidates_record_gap_and_never_walk_disk_on_graph_miss() {
+        // A /blocks/ source exists on disk but not in graph-owned truth.
+        // Graph-first locate must ignore the disk file entirely and report a
+        // graph gap instead of injecting a disk-discovered candidate.
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join("src/blocks")).unwrap();
         std::fs::write(dir.path().join("src/blocks/button.tsx"), "").unwrap();
 
         let source_files: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let before = super::LOCATE_DISK_SOURCE_READS.load(std::sync::atomic::Ordering::Relaxed);
+        let before = super::locate_graph_source_gap_count();
 
         let result =
             super::block_focus_source_candidates("button block", &source_files, Some(dir.path()));
-        let after = super::LOCATE_DISK_SOURCE_READS.load(std::sync::atomic::Ordering::Relaxed);
 
-        assert!(result.is_empty(), "default: no graph-miss injection");
-        assert_eq!(
-            after,
-            before + 1,
-            "LOCATE_DISK_SOURCE_READS must be bumped on block-focus graph-miss"
-        );
-    }
-
-    #[serial_test::serial(block_focus_env)]
-    #[test]
-    fn block_focus_candidates_optin_injects_disk_paths() {
-        std::env::set_var("KIN_LOCATE_BLOCK_SOURCE_OPTIN", "1");
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join("src/blocks")).unwrap();
-        std::fs::write(dir.path().join("src/blocks/button.tsx"), "").unwrap();
-
-        let source_files: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        let result =
-            super::block_focus_source_candidates("button block", &source_files, Some(dir.path()));
-        std::env::remove_var("KIN_LOCATE_BLOCK_SOURCE_OPTIN");
-
-        assert_eq!(result.len(), 1, "opt-in: disk candidates must be injected");
         assert!(
-            result[0]
-                .to_ascii_lowercase()
-                .ends_with("/blocks/button.tsx"),
-            "unexpected path: {}",
-            result[0]
+            result.is_empty(),
+            "graph-miss must not inject disk-discovered /blocks/ candidates"
+        );
+        assert!(
+            super::locate_graph_source_gap_count() > before,
+            "a block-focus graph miss must record a reported graph gap"
         );
     }
 }
