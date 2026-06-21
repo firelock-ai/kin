@@ -1820,6 +1820,21 @@ type InflightGate = Arc<(Mutex<u32>, Condvar)>;
 /// memory on unified-memory Macs.
 const DEFAULT_RESIDENT_STACK_BUDGET_DIVISOR: u64 = 2;
 
+/// Share of physical RAM (`hw.memsize`) the resident stack may reserve for
+/// GPU-resident command-buffer transients. On unified memory the cached weights,
+/// host activation buffers, the BufferPool free-list, and the rest of the daemon
+/// process all draw from this same DRAM, so the working-set figure alone (which
+/// reports the GPU's share, not what is left after the process is already
+/// resident) over-budgets. Capping against true physical RAM keeps the standing
+/// in-flight footprint below the OS jetsam ceiling; over-budget segments fall to
+/// the bounded per-layer / op-by-op path instead of allocating unbounded.
+const RESIDENT_STACK_HW_MEMSIZE_PERCENT: u64 = 25;
+
+/// Absolute ceiling on the resident-stack transient budget regardless of how
+/// large the machine is. A single in-flight segment never needs tens of GB of
+/// transients; anything beyond this should segment or drop to the per-layer path.
+const RESIDENT_STACK_ABS_CEILING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
 /// Shared byte gate for resident stack command buffers. This is deliberately a
 /// no-wait gate: stack paths can return `Ok(None)` and let the caller use the
 /// proven fallback path instead of parking after allocating large MTLBuffers.
@@ -1876,11 +1891,52 @@ fn resolve_resident_stack_budget(device: &Device) -> usize {
     }
 
     let recommended = device.recommended_max_working_set_size();
-    if recommended == 0 {
-        return usize::MAX;
-    }
-    (recommended / DEFAULT_RESIDENT_STACK_BUDGET_DIVISOR) as usize
+    let system_total = crate::resource::detect_memory().system_total_bytes;
+    resident_stack_budget_bytes(recommended, system_total)
 }
+
+/// Pure budget arithmetic (no device / no env), so the formula is unit-testable.
+///
+/// The budget is the smallest of three ceilings:
+/// 1. a share of Metal's recommended working set (the GPU's reported headroom),
+/// 2. a share of true physical RAM (`hw.memsize`) — the unified-memory ceiling
+///    that actually bounds the process before the OS kills it, and
+/// 3. an absolute ceiling, so even very large machines never let a single
+///    in-flight segment's transients balloon unbounded.
+///
+/// A `recommended` of 0 means the working-set term is unknown; the physical-RAM
+/// and absolute ceilings still apply. When physical RAM is also unknown the
+/// remaining ceilings still bound the budget.
+fn resident_stack_budget_bytes(recommended: u64, system_total_bytes: Option<u64>) -> usize {
+    let working_set_term = if recommended == 0 {
+        u64::MAX
+    } else {
+        recommended / DEFAULT_RESIDENT_STACK_BUDGET_DIVISOR
+    };
+    let hw_term = system_total_bytes
+        .map(|total| total.saturating_mul(RESIDENT_STACK_HW_MEMSIZE_PERCENT) / 100)
+        .unwrap_or(u64::MAX);
+    working_set_term
+        .min(hw_term)
+        .min(RESIDENT_STACK_ABS_CEILING_BYTES) as usize
+}
+
+/// Default ceiling on total bytes the BufferPool free-list may hold. The free
+/// list is a recycling cache, not a reservation: anything it drops is simply
+/// re-allocated on the next acquire of that size-class. Without a ceiling the
+/// list grows monotonically to the run's peak high-water (one retained
+/// `StorageModeShared` buffer per size-class ever touched at peak concurrency),
+/// which on unified memory is permanent physical RAM. Capping it bounds the
+/// standing footprint while keeping the hot recycling path intact for the common
+/// (small, repeated) size-classes.
+const DEFAULT_BUFFER_POOL_CAP_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+
+/// Per-buffer high-water: buffers whose size-class exceeds this are never pooled.
+/// The largest pooled allocations are the O(seq²) attention-score buffers, which
+/// are the least likely to be re-hit at the exact same class and the most
+/// expensive to strand. Dropping them frees the unified allocation immediately;
+/// the next same-shaped forward simply re-allocates.
+const DEFAULT_BUFFER_POOL_PER_BUFFER_CAP_BYTES: u64 = 256 * 1024 * 1024;
 
 /// A size-classed free-list of `StorageModeShared` buffers. Recycling a buffer
 /// back onto the list avoids the per-op `new_buffer` churn that otherwise mints
@@ -1888,9 +1944,53 @@ fn resolve_resident_stack_budget(device: &Device) -> usize {
 /// the list once the GPU is done with them (recycling is tied to the completion
 /// handler that owns the `PooledBuffer`, never to Rust scope exit while the
 /// buffer may still be GPU-resident).
+///
+/// The free-list is trimmed: a buffer is recycled only while doing so keeps the
+/// pooled total under `cap_bytes` and the buffer itself is under
+/// `per_buffer_cap_bytes`; otherwise it is dropped so Metal frees the unified
+/// allocation. Trimming never changes which buffer a computation uses — a dropped
+/// buffer is re-allocated on the next acquire of that class — so it preserves the
+/// determinism guarantees the acquire path documents.
 struct BufferPool {
     device: Device,
     free: Mutex<HashMap<usize, Vec<Buffer>>>,
+    /// Total bytes (by size-class) currently held on the free-list. Maintained
+    /// under the same lock as `free` so the pair stays consistent.
+    pooled_bytes: Mutex<usize>,
+    /// Ceiling on `pooled_bytes`; recycling that would exceed it drops instead.
+    cap_bytes: usize,
+    /// Per-buffer high-water; a size-class above this is never pooled.
+    per_buffer_cap_bytes: usize,
+}
+
+/// Decide whether a buffer of `class` bytes should be recycled onto the free-list
+/// given the bytes already pooled. Pure (no lock, no device) so the trim policy
+/// is unit-testable. Drops (returns `false`) when the buffer is larger than the
+/// per-buffer high-water, or when adding it would push the pooled total over the
+/// cap.
+#[inline]
+fn buffer_pool_should_recycle(
+    class: usize,
+    pooled_bytes: usize,
+    cap_bytes: usize,
+    per_buffer_cap_bytes: usize,
+) -> bool {
+    if class > per_buffer_cap_bytes {
+        return false;
+    }
+    match pooled_bytes.checked_add(class) {
+        Some(next) => next <= cap_bytes,
+        None => false,
+    }
+}
+
+/// Resolve the BufferPool total-bytes cap, honoring `KIN_INFER_METAL_POOL_CAP_BYTES`.
+fn resolve_buffer_pool_cap_bytes() -> usize {
+    std::env::var("KIN_INFER_METAL_POOL_CAP_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(DEFAULT_BUFFER_POOL_CAP_BYTES as usize)
 }
 
 /// Round a byte count up to its allocation size-class. Powers of two up to 64KB,
@@ -2115,7 +2215,23 @@ impl BufferPool {
         Self {
             device,
             free: Mutex::new(HashMap::new()),
+            pooled_bytes: Mutex::new(0),
+            cap_bytes: resolve_buffer_pool_cap_bytes(),
+            per_buffer_cap_bytes: DEFAULT_BUFFER_POOL_PER_BUFFER_CAP_BYTES as usize,
         }
+    }
+
+    /// Pop a recycled buffer of `class` off the free-list, decrementing the
+    /// pooled-bytes accounting in lockstep. Returns `None` if none is pooled.
+    /// Holds both locks (free, then pooled_bytes — the same order `recycle`
+    /// uses) so the pop and the byte decrement are atomic with respect to a
+    /// concurrent recycle.
+    fn take_pooled(&self, class: usize) -> Option<Buffer> {
+        let mut free = self.free.lock();
+        let mut pooled = self.pooled_bytes.lock();
+        let buf = free.get_mut(&class).and_then(|v| v.pop())?;
+        *pooled = pooled.saturating_sub(class);
+        Some(buf)
     }
 
     /// Acquire a buffer of at least `bytes`, zero-filled. Pops a recycled buffer
@@ -2129,7 +2245,7 @@ impl BufferPool {
     /// that relies on the zero fill.
     fn acquire_zeroed(self: &Arc<Self>, bytes: usize) -> Result<PooledBuffer, InferError> {
         let class = size_class(bytes);
-        let buf = self.free.lock().get_mut(&class).and_then(|v| v.pop());
+        let buf = self.take_pooled(class);
         let buf = match buf {
             Some(buf) => buf,
             None => try_new_buffer(&self.device, class as u64).ok_or_else(|| {
@@ -2151,7 +2267,7 @@ impl BufferPool {
     fn acquire_with(self: &Arc<Self>, data: &[f32]) -> Result<PooledBuffer, InferError> {
         let bytes = std::mem::size_of_val(data);
         let class = size_class(bytes);
-        let buf = self.free.lock().get_mut(&class).and_then(|v| v.pop());
+        let buf = self.take_pooled(class);
         let buf = match buf {
             Some(buf) => buf,
             None => try_new_buffer(&self.device, class as u64).ok_or_else(|| {
@@ -2182,7 +2298,7 @@ impl BufferPool {
     /// was written by the producing kernel first.
     fn acquire_uninit(self: &Arc<Self>, bytes: usize) -> Result<PooledBuffer, InferError> {
         let class = size_class(bytes);
-        let buf = self.free.lock().get_mut(&class).and_then(|v| v.pop());
+        let buf = self.take_pooled(class);
         let buf = match buf {
             Some(buf) => buf,
             None => try_new_buffer(&self.device, class as u64).ok_or_else(|| {
@@ -2205,7 +2321,21 @@ impl BufferPool {
         if no_pool_reuse() {
             return;
         }
-        self.free.lock().entry(class).or_default().push(buf);
+        // Hold both locks (free, then pooled_bytes) so the decision and the
+        // accounting cannot race a concurrent acquire/recycle. Dropping `buf`
+        // here (by not pushing it) lets Metal free the unified allocation.
+        let mut free = self.free.lock();
+        let mut pooled = self.pooled_bytes.lock();
+        if !buffer_pool_should_recycle(class, *pooled, self.cap_bytes, self.per_buffer_cap_bytes) {
+            return;
+        }
+        free.entry(class).or_default().push(buf);
+        *pooled = pooled.saturating_add(class);
+    }
+
+    #[cfg(test)]
+    fn pooled_bytes_for_test(&self) -> usize {
+        *self.pooled_bytes.lock()
     }
 }
 
@@ -2574,6 +2704,15 @@ impl MetalCompute {
             );
         }
         reservation
+    }
+
+    /// Replace the resident-stack memory budget on this live instance. Test-only
+    /// (no env races): models the tiny-`KIN_INFER_METAL_RESIDENT_BUDGET_BYTES`
+    /// case so the resident segment reservation declines and the caller takes the
+    /// bounded per-layer / op-by-op fallback path.
+    #[cfg(test)]
+    fn set_resident_budget_for_test(&mut self, budget_bytes: usize) {
+        self.resident_stack_memory = ResidentStackMemoryGate::new(budget_bytes);
     }
 
     /// Create a Metal buffer from a slice and copy data in.
@@ -6111,6 +6250,115 @@ mod tests {
     }
 
     #[test]
+    fn resident_stack_budget_caps_against_hw_memsize_and_absolute_ceiling() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let pct = RESIDENT_STACK_HW_MEMSIZE_PERCENT;
+        let ceiling = RESIDENT_STACK_ABS_CEILING_BYTES as usize;
+
+        // Large unified Mac: working-set/2 (48G) and hw% (32G) both exceed the
+        // absolute ceiling, so the budget is the ceiling — not the loose ~48G.
+        let big = resident_stack_budget_bytes(96 * GIB, Some(128 * GIB));
+        assert_eq!(big, ceiling);
+        assert!(big < (96 * GIB / DEFAULT_RESIDENT_STACK_BUDGET_DIVISOR) as usize);
+
+        // Small Mac where the hw% term is the binding ceiling (below both the
+        // working-set term and the absolute ceiling).
+        let small = resident_stack_budget_bytes(11 * GIB, Some(16 * GIB));
+        let expected_hw = (16 * GIB).saturating_mul(pct) / 100;
+        assert_eq!(small as u64, expected_hw);
+        assert!(small < ceiling);
+
+        // Working-set unknown (recommended == 0): hw% / absolute ceiling still bound.
+        let no_ws = resident_stack_budget_bytes(0, Some(64 * GIB));
+        let hw_64 = ((64 * GIB).saturating_mul(pct) / 100).min(RESIDENT_STACK_ABS_CEILING_BYTES);
+        assert_eq!(no_ws as u64, hw_64);
+
+        // Physical RAM unknown: working-set term and absolute ceiling still bound.
+        let no_hw = resident_stack_budget_bytes(96 * GIB, None);
+        assert_eq!(no_hw, ceiling);
+
+        // Both unknown: only the absolute ceiling remains.
+        let neither = resident_stack_budget_bytes(0, None);
+        assert_eq!(neither, ceiling);
+    }
+
+    #[test]
+    fn buffer_pool_should_recycle_trims_at_caps() {
+        let cap = 1_000usize;
+        let per_buffer = 400usize;
+
+        // Fits: under per-buffer cap and pooled total stays under the cap.
+        assert!(buffer_pool_should_recycle(300, 0, cap, per_buffer));
+        assert!(buffer_pool_should_recycle(300, 700, cap, per_buffer));
+
+        // Per-buffer high-water: a single oversized buffer is never pooled, even
+        // into an empty list.
+        assert!(!buffer_pool_should_recycle(401, 0, cap, per_buffer));
+
+        // Total cap: recycling would push pooled bytes over the cap -> drop.
+        assert!(!buffer_pool_should_recycle(300, 800, cap, per_buffer));
+
+        // Exactly at the cap boundary still recycles.
+        assert!(buffer_pool_should_recycle(200, 800, cap, per_buffer));
+
+        // Overflow-safe: a class near usize::MAX never panics, just drops.
+        assert!(!buffer_pool_should_recycle(usize::MAX, 1, cap, per_buffer));
+    }
+
+    #[test]
+    fn buffer_pool_free_list_never_exceeds_cap_under_large_recycle_churn() {
+        let Some(metal) = get_metal() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        // Small caps so the churn provably exceeds them: 1 MiB total, 256 KiB per
+        // buffer. Each acquire of >256 KiB must never be pooled; smaller buffers
+        // are pooled only while the running total stays <= 1 MiB.
+        let pool = Arc::new(BufferPool {
+            device: metal.device.clone(),
+            free: Mutex::new(HashMap::new()),
+            pooled_bytes: Mutex::new(0),
+            cap_bytes: 1024 * 1024,
+            per_buffer_cap_bytes: 256 * 1024,
+        });
+
+        // Many large acquire/recycle cycles. Each PooledBuffer drops at end of
+        // its loop turn (no GPU work committed), exercising the recycle trim.
+        for i in 0..256 {
+            // Alternate a small class (pools) and a large class (always dropped).
+            let small = pool
+                .acquire_uninit(64 * 1024 + (i % 4) * 1024)
+                .expect("small acquire");
+            let large = pool
+                .acquire_uninit(512 * 1024 + (i % 8) * 1024)
+                .expect("large acquire");
+            assert!(
+                pool.pooled_bytes_for_test() <= pool.cap_bytes,
+                "pooled bytes exceeded cap mid-churn"
+            );
+            drop(small);
+            drop(large);
+            assert!(
+                pool.pooled_bytes_for_test() <= pool.cap_bytes,
+                "pooled bytes exceeded cap after recycle"
+            );
+        }
+
+        // Final invariant: the free-list never grew past the cap.
+        assert!(pool.pooled_bytes_for_test() <= pool.cap_bytes);
+
+        // And the accounting matches the actual buffers held on the free-list.
+        let free = pool.free.lock();
+        let actual: usize = free.iter().map(|(class, v)| class * v.len()).sum();
+        assert_eq!(actual, pool.pooled_bytes_for_test());
+        // No oversized class was ever pooled.
+        assert!(
+            free.keys().all(|&class| class <= pool.per_buffer_cap_bytes),
+            "an oversized buffer was pooled"
+        );
+    }
+
+    #[test]
     fn resident_segment_estimate_scales_with_layers_and_attention_area() {
         let h = 8usize;
         let heads = 2usize;
@@ -6174,6 +6422,120 @@ mod tests {
 
     fn get_metal() -> Option<MetalCompute> {
         MetalCompute::try_new()
+    }
+
+    /// An over-budget resident segment declines (returns `None`, which routes the
+    /// lib.rs caller to the bounded per-layer fallback at lib.rs:2426), while the
+    /// smaller per-layer path under the same tight budget still succeeds and
+    /// produces the SAME finite output as the unconstrained resident path. This is
+    /// the safety property the governor relies on: shrinking the budget degrades
+    /// gracefully without OOM and without changing numerics.
+    #[test]
+    fn tiny_resident_budget_forces_per_layer_fallback_with_correct_output() {
+        let Some(mut metal) = get_metal() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+
+        let batch_size = 2usize;
+        let max_len = 16usize;
+        let hidden = 64usize;
+        let num_heads = 4usize;
+        let head_dim = 16usize;
+        let inter = 128usize;
+        let total_rows = batch_size * max_len;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_heads * head_dim;
+
+        let mk = |n: usize, salt: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i as f32) * 0.7 + salt).sin() * 0.05)
+                .collect()
+        };
+
+        let norm1_weight = vec![1.0f32; hidden];
+        let norm1_bias = vec![0.0f32; hidden];
+        let norm2_weight = vec![1.0f32; hidden];
+        let norm2_bias = vec![0.0f32; hidden];
+        let qkv_weight = mk((q_dim + 2 * kv_dim) * hidden, 1.0);
+        let attn_out_weight = mk(hidden * (num_heads * head_dim), 2.0);
+        let ffn_up_weight = mk(inter * hidden, 3.0);
+        let ffn_down_weight = mk(hidden * inter, 4.0);
+
+        let weights = crate::gpu::LayerTensors {
+            norm1_weight: &norm1_weight,
+            norm1_bias: Some(&norm1_bias),
+            qkv_weight: Some(&qkv_weight),
+            attn_out_weight: &attn_out_weight,
+            norm2_weight: &norm2_weight,
+            norm2_bias: Some(&norm2_bias),
+            ffn_up_weight: Some(&ffn_up_weight),
+            ffn_down_weight: &ffn_down_weight,
+            ..crate::gpu::LayerTensors::default()
+        };
+
+        let config = crate::gpu::LayerConfig {
+            batch_size,
+            max_len,
+            hidden_size: hidden,
+            num_heads,
+            head_dim,
+            inter_size: inter,
+            eps: 1e-5,
+            rms_eps: 1e-6,
+            use_rms: false,
+            pre_ln: false,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            alibi_slopes: None,
+        };
+
+        let hidden_in = mk(total_rows * hidden, 0.0);
+        let masks = vec![1u32; total_rows];
+        let two_layers = [weights.clone(), weights.clone()];
+
+        // Reference: unconstrained resident path over the 2-layer stack.
+        let reference = metal
+            .forward_layers_batched(&hidden_in, &masks, &two_layers, &config, &[], &[])
+            .expect("reference forward_layers_batched errored")
+            .expect("reference resident path unexpectedly declined");
+        assert_eq!(reference.len(), total_rows * hidden);
+        assert!(reference.iter().all(|x| x.is_finite()));
+
+        // Budget that admits ONE layer's transients but not the whole 2-layer
+        // segment: the per-layer path fits, the whole-stack segment does not.
+        let one_layer_estimate =
+            estimate_resident_segment_bytes(std::slice::from_ref(&weights), &config, None, false);
+        let two_layer_estimate = estimate_resident_segment_bytes(&two_layers, &config, None, false);
+        assert!(two_layer_estimate > one_layer_estimate);
+        metal.set_resident_budget_for_test(one_layer_estimate);
+
+        // The whole-stack resident segment now declines (this is the `None` that
+        // makes lib.rs fall to the per-layer loop).
+        let declined = metal
+            .forward_layers_batched(&hidden_in, &masks, &two_layers, &config, &[], &[])
+            .expect("forward_layers_batched errored under tight budget");
+        assert!(
+            declined.is_none(),
+            "over-budget resident segment should decline, not allocate unbounded"
+        );
+
+        // The per-layer fallback rung still runs under the same tight budget, layer
+        // by layer, and reproduces the reference output bit-for-bit (same kernels,
+        // same inputs — only the command-buffer granularity changed).
+        let mut hidden_state = hidden_in.clone();
+        for _ in 0..two_layers.len() {
+            hidden_state = metal
+                .forward_layer_batched(&hidden_state, &masks, &weights, &config, &[], &[])
+                .expect("per-layer fallback errored")
+                .expect("per-layer fallback declined under one-layer budget");
+        }
+        assert_eq!(hidden_state.len(), total_rows * hidden);
+        assert!(hidden_state.iter().all(|x| x.is_finite()));
+        let max_diff = max_abs_diff(&reference, &hidden_state);
+        assert!(
+            max_diff == 0.0,
+            "per-layer fallback diverged from resident path: max_abs_diff {max_diff}"
+        );
     }
 
     #[test]
