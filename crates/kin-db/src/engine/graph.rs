@@ -1407,6 +1407,13 @@ pub struct InMemoryGraph {
     /// (re)build, entity removal) that still demand a full index↔truth scan.
     #[cfg(feature = "vector")]
     vector_reconcile: parking_lot::Mutex<VectorReconcileState>,
+    /// Per-stage wall-clock + call-count timing for the embed hot path (drain,
+    /// prep, forward, persist, prune). The staged embed methods record into this;
+    /// a completed embed run logs its delta at `info` and operator tooling can
+    /// read a snapshot via [`InMemoryGraph::embed_stage_timings_snapshot`]. See
+    /// [`crate::embed::EmbedStageTimings`].
+    #[cfg(feature = "vector")]
+    embed_stage_timings: crate::embed::EmbedStageTimings,
     /// Per-graph count of deferred Merkle refreshes that actually ran.
     /// Used by tests to prove that burst mutations collapse into one batch
     /// reconciliation. A per-instance counter avoids interference from other
@@ -1513,6 +1520,8 @@ impl InMemoryGraph {
             artifact_embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
             #[cfg(feature = "vector")]
             vector_reconcile: parking_lot::Mutex::new(VectorReconcileState::default()),
+            #[cfg(feature = "vector")]
+            embed_stage_timings: crate::embed::EmbedStageTimings::default(),
             #[cfg(test)]
             merkle_flush_count: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -1919,6 +1928,8 @@ impl InMemoryGraph {
             artifact_embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
             #[cfg(feature = "vector")]
             vector_reconcile: parking_lot::Mutex::new(VectorReconcileState::default()),
+            #[cfg(feature = "vector")]
+            embed_stage_timings: crate::embed::EmbedStageTimings::default(),
             #[cfg(test)]
             merkle_flush_count: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -2142,6 +2153,8 @@ impl InMemoryGraph {
             artifact_embedding_queue: parking_lot::Mutex::new(RecencyQueue::default()),
             #[cfg(feature = "vector")]
             vector_reconcile: parking_lot::Mutex::new(VectorReconcileState::default()),
+            #[cfg(feature = "vector")]
+            embed_stage_timings: crate::embed::EmbedStageTimings::default(),
             #[cfg(test)]
             merkle_flush_count: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -3903,6 +3916,9 @@ impl InMemoryGraph {
     /// determinism bug.
     #[cfg(feature = "vector")]
     fn drain_embedding_batch(&self, batch_size: usize) -> Vec<(RetrievalKey, EmbedRecency)> {
+        let _drain_timer = self
+            .embed_stage_timings
+            .scope(crate::embed::EmbedStage::Drain);
         let batch_size = batch_size.max(1);
         let drained = {
             let mut queue = self.embedding_queue.lock();
@@ -4002,6 +4018,7 @@ impl InMemoryGraph {
         if embed_pipeline_enabled() {
             return self.process_all_pending_embeddings_pipelined(batch_size);
         }
+        let timing_base = self.embed_stage_timings.snapshot();
         let mut total = 0usize;
         let initial_pending = self.pending_embeddings();
         let start_time = std::time::Instant::now();
@@ -4029,6 +4046,10 @@ impl InMemoryGraph {
         if initial_pending > 0 {
             eprintln!();
         }
+        self.embed_stage_timings
+            .snapshot()
+            .since(&timing_base)
+            .log_summary("serial");
         Ok(total)
     }
 
@@ -4056,6 +4077,7 @@ impl InMemoryGraph {
         let initial_pending = self.pending_embeddings();
         let start_time = std::time::Instant::now();
         let mut running_total = 0usize;
+        let timing_base = self.embed_stage_timings.snapshot();
 
         let total = drive_embed_pipeline(
             EMBED_PIPELINE_PREP_CAPACITY,
@@ -4113,12 +4135,25 @@ impl InMemoryGraph {
             self.prune_orphaned_vectors();
         }
 
+        self.embed_stage_timings
+            .snapshot()
+            .since(&timing_base)
+            .log_summary("pipelined");
         Ok(total)
     }
 
     #[cfg(not(all(feature = "embeddings", feature = "vector")))]
     pub fn process_all_pending_embeddings(&self, _batch_size: usize) -> Result<usize, KinDbError> {
         Ok(0)
+    }
+
+    /// A point-in-time snapshot of this graph's cumulative embed-stage timings
+    /// (drain / prep / forward / persist / prune wall time + call counts). Cheap
+    /// — it reads ten relaxed atomics — so operator tooling (e.g. `kin resources
+    /// inspect`) can poll it without perturbing the embed hot path.
+    #[cfg(feature = "vector")]
+    pub fn embed_stage_timings_snapshot(&self) -> crate::embed::EmbedStageSnapshot {
+        self.embed_stage_timings.snapshot()
     }
 
     /// Drain the current pending artifact embedding queue in batches.
@@ -4207,6 +4242,11 @@ impl InMemoryGraph {
 
         let batch_size = batch_size.max(1);
         let batch = self.drain_embedding_batch(batch_size);
+        // Time only the text-format work; the drain above is timed inside
+        // `drain_embedding_batch`, so the two stages never double-count.
+        let _prep_timer = self
+            .embed_stage_timings
+            .scope(crate::embed::EmbedStage::Prep);
         let recency: hashbrown::HashMap<RetrievalKey, EmbedRecency> =
             batch.iter().copied().collect();
 
@@ -4290,7 +4330,12 @@ impl InMemoryGraph {
             return Err(err);
         }
 
-        let vectors = match embedder.embed_batch(&prepared.texts) {
+        let forward_result = self
+            .embed_stage_timings
+            .time(crate::embed::EmbedStage::Forward, || {
+                embedder.embed_batch(&prepared.texts)
+            });
+        let vectors = match forward_result {
             Ok(vectors) => vectors,
             Err(err) => {
                 self.requeue_embedding_keys(prepared.keys.iter().copied(), &prepared.recency);
@@ -4347,7 +4392,12 @@ impl InMemoryGraph {
         };
 
         let count = embedded.len();
-        if let Err(err) = vi.upsert_retrievable_batch(embedded) {
+        let persist_result = self
+            .embed_stage_timings
+            .time(crate::embed::EmbedStage::Persist, || {
+                vi.upsert_retrievable_batch(embedded)
+            });
+        if let Err(err) = persist_result {
             self.requeue_embedding_keys(keys.iter().copied(), &prepared.recency);
             return Err(err);
         }
@@ -4551,6 +4601,9 @@ impl InMemoryGraph {
     #[cfg(feature = "vector")]
     pub fn prune_orphaned_vectors(&self) -> usize {
         let _span = tracing::info_span!("kindb.prune_orphaned_vectors").entered();
+        let _prune_timer = self
+            .embed_stage_timings
+            .scope(crate::embed::EmbedStage::Prune);
 
         let vi = match self.vector_index.lock().clone() {
             Some(vi) => vi,
@@ -12579,6 +12632,42 @@ mod tests {
             Some(&EmbedRecency::ChangedThisSync)
         );
         assert_eq!(queue.items.get(&defaulted), Some(&EmbedRecency::Backfill));
+    }
+
+    /// `prepare_pending_embedding_batch` must record exactly one drain and one
+    /// prep against the stage-timing accumulator (the two never double-count),
+    /// and must leave the GPU/index stages untouched on the CPU-only prep path.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
+    fn embed_stage_timing_records_drain_and_prep_once_per_prepare() {
+        use crate::embed::EmbedStage;
+
+        let g = InMemoryGraph::new();
+        for i in 0..5u128 {
+            let e = test_entity_with_id(0x300 + i, "e");
+            g.upsert_entity(&e).unwrap();
+        }
+
+        let base = g.embed_stage_timings_snapshot();
+        let prepared = g.prepare_pending_embedding_batch(3);
+        assert!(!prepared.is_empty(), "upserts must have queued embed work");
+
+        let delta = g.embed_stage_timings_snapshot().since(&base);
+        assert_eq!(
+            delta.stage(EmbedStage::Drain).calls,
+            1,
+            "one prepare drains exactly once"
+        );
+        assert_eq!(
+            delta.stage(EmbedStage::Prep).calls,
+            1,
+            "one prepare formats exactly once"
+        );
+        // The forward/persist/prune stages need the embedder + index and must not
+        // be touched by the CPU-only prep path.
+        assert_eq!(delta.stage(EmbedStage::Forward).calls, 0);
+        assert_eq!(delta.stage(EmbedStage::Persist).calls, 0);
+        assert_eq!(delta.stage(EmbedStage::Prune).calls, 0);
     }
 
     /// The pipelined embed driver must persist exactly the serial path's

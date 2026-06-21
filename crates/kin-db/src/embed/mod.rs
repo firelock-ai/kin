@@ -42,6 +42,222 @@ use kin_model::{
     ArtifactKind, Entity, EntityKind, OpaqueArtifact, ShallowTrackedFile, StructuredArtifact,
 };
 
+// ---------------------------------------------------------------------------
+// Embed stage timing
+// ---------------------------------------------------------------------------
+
+/// The stages of the entity embed hot path, in pipeline order.
+///
+/// The forward stage is GPU-bound; drain, prep, persist, and prune run on the
+/// CPU around it. [`EmbedStageTimings`] accumulates per-stage wall time and call
+/// counts so a `RUST_LOG=kin_db=info` embed run reports where CPU time actually
+/// goes — without per-batch span spam — and so a snapshot can be surfaced through
+/// operator tooling (e.g. `kin resources inspect`).
+#[cfg(feature = "vector")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbedStage {
+    /// Drain + deterministic priority selection of the next batch from the queue.
+    Drain,
+    /// Format each drained entity's embed text under the graph read lock.
+    Prep,
+    /// Run model inference for the prepared batch (the GPU forward).
+    Forward,
+    /// Upsert embedded vectors into the index.
+    Persist,
+    /// Reconcile the index against graph truth (orphaned-vector eviction).
+    Prune,
+}
+
+#[cfg(feature = "vector")]
+impl EmbedStage {
+    /// Every stage, in pipeline order. Array indices match [`EmbedStage::index`].
+    pub const ALL: [EmbedStage; 5] = [
+        EmbedStage::Drain,
+        EmbedStage::Prep,
+        EmbedStage::Forward,
+        EmbedStage::Persist,
+        EmbedStage::Prune,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            EmbedStage::Drain => 0,
+            EmbedStage::Prep => 1,
+            EmbedStage::Forward => 2,
+            EmbedStage::Persist => 3,
+            EmbedStage::Prune => 4,
+        }
+    }
+
+    /// Short lower-case label used in log lines and inspect output.
+    pub const fn label(self) -> &'static str {
+        match self {
+            EmbedStage::Drain => "drain",
+            EmbedStage::Prep => "prep",
+            EmbedStage::Forward => "forward",
+            EmbedStage::Persist => "persist",
+            EmbedStage::Prune => "prune",
+        }
+    }
+}
+
+/// Per-stage wall-clock + call-count accumulator for the embed hot path. One
+/// instance lives on each `InMemoryGraph`; the staged embed methods record into
+/// it. Recording a stage is two `Instant` reads plus two relaxed atomic adds —
+/// negligible against a ~128-entity batch — so it is always on.
+#[cfg(feature = "vector")]
+pub struct EmbedStageTimings {
+    nanos: [std::sync::atomic::AtomicU64; 5],
+    calls: [std::sync::atomic::AtomicU64; 5],
+}
+
+#[cfg(feature = "vector")]
+impl Default for EmbedStageTimings {
+    fn default() -> Self {
+        Self {
+            nanos: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            calls: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+}
+
+#[cfg(feature = "vector")]
+impl EmbedStageTimings {
+    /// Record one stage observation.
+    pub fn record(&self, stage: EmbedStage, elapsed: std::time::Duration) {
+        let i = stage.index();
+        // Saturate rather than wrap; nanos for any realistic embed run stay far
+        // below u64::MAX (~584 years).
+        let add = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+        self.nanos[i].fetch_add(add, std::sync::atomic::Ordering::Relaxed);
+        self.calls[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Time `body`, record its wall time against `stage`, and return its value.
+    pub fn time<T>(&self, stage: EmbedStage, body: impl FnOnce() -> T) -> T {
+        let start = std::time::Instant::now();
+        let out = body();
+        self.record(stage, start.elapsed());
+        out
+    }
+
+    /// Start a scoped timer that records `stage` when dropped — for stages whose
+    /// function returns from several places.
+    pub fn scope(&self, stage: EmbedStage) -> EmbedStageScope<'_> {
+        EmbedStageScope {
+            timings: self,
+            stage,
+            start: std::time::Instant::now(),
+        }
+    }
+
+    /// Take a point-in-time snapshot of the cumulative totals.
+    pub fn snapshot(&self) -> EmbedStageSnapshot {
+        let mut stages = [EmbedStageCount::default(); 5];
+        for (i, slot) in stages.iter_mut().enumerate() {
+            *slot = EmbedStageCount {
+                nanos: self.nanos[i].load(std::sync::atomic::Ordering::Relaxed),
+                calls: self.calls[i].load(std::sync::atomic::Ordering::Relaxed),
+            };
+        }
+        EmbedStageSnapshot { stages }
+    }
+}
+
+/// RAII guard recording its stage's elapsed time when dropped.
+#[cfg(feature = "vector")]
+pub struct EmbedStageScope<'a> {
+    timings: &'a EmbedStageTimings,
+    stage: EmbedStage,
+    start: std::time::Instant,
+}
+
+#[cfg(feature = "vector")]
+impl Drop for EmbedStageScope<'_> {
+    fn drop(&mut self) {
+        self.timings.record(self.stage, self.start.elapsed());
+    }
+}
+
+/// Cumulative wall time + call count for a single stage.
+#[cfg(feature = "vector")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EmbedStageCount {
+    /// Total nanoseconds spent in the stage.
+    pub nanos: u64,
+    /// Number of times the stage ran.
+    pub calls: u64,
+}
+
+/// An immutable snapshot of [`EmbedStageTimings`], indexed by [`EmbedStage`].
+#[cfg(feature = "vector")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EmbedStageSnapshot {
+    stages: [EmbedStageCount; 5],
+}
+
+#[cfg(feature = "vector")]
+impl EmbedStageSnapshot {
+    /// Per-stage totals accrued between `base` and `self` — one run's slice of a
+    /// cumulative per-graph accumulator. Saturating so a reset base never
+    /// underflows.
+    pub fn since(&self, base: &EmbedStageSnapshot) -> EmbedStageSnapshot {
+        let mut stages = [EmbedStageCount::default(); 5];
+        for (i, slot) in stages.iter_mut().enumerate() {
+            *slot = EmbedStageCount {
+                nanos: self.stages[i].nanos.saturating_sub(base.stages[i].nanos),
+                calls: self.stages[i].calls.saturating_sub(base.stages[i].calls),
+            };
+        }
+        EmbedStageSnapshot { stages }
+    }
+
+    /// The cumulative total for one stage.
+    pub fn stage(&self, stage: EmbedStage) -> EmbedStageCount {
+        self.stages[stage.index()]
+    }
+
+    /// Total wall time across all stages.
+    pub fn total_nanos(&self) -> u64 {
+        self.stages.iter().map(|s| s.nanos).sum()
+    }
+
+    /// Whether any stage ran at all.
+    pub fn is_empty(&self) -> bool {
+        self.stages.iter().all(|s| s.calls == 0)
+    }
+
+    /// Emit a single `info`-level line summarizing every stage. `context` labels
+    /// the run (e.g. "serial" / "pipelined"). No-op when nothing ran.
+    pub fn log_summary(&self, context: &str) {
+        if self.is_empty() {
+            return;
+        }
+        let ms = |n: u64| n as f64 / 1.0e6;
+        let drain = self.stage(EmbedStage::Drain);
+        let prep = self.stage(EmbedStage::Prep);
+        let forward = self.stage(EmbedStage::Forward);
+        let persist = self.stage(EmbedStage::Persist);
+        let prune = self.stage(EmbedStage::Prune);
+        tracing::info!(
+            target: "kin_db",
+            "embed stage timing [{context}] total={:.1}ms | drain={:.1}ms/{} prep={:.1}ms/{} \
+             forward={:.1}ms/{} persist={:.1}ms/{} prune={:.1}ms/{}",
+            ms(self.total_nanos()),
+            ms(drain.nanos),
+            drain.calls,
+            ms(prep.nanos),
+            prep.calls,
+            ms(forward.nanos),
+            forward.calls,
+            ms(persist.nanos),
+            persist.calls,
+            ms(prune.nanos),
+            prune.calls,
+        );
+    }
+}
+
 /// Parse a HuggingFace `config.json` into the target config type, dropping a
 /// serde-alias key whenever its canonical counterpart is also present. Some
 /// published configs (nomic-bert) ship both `layer_norm_eps` and
@@ -2680,93 +2896,136 @@ pub fn format_graph_entity_text(entity: &Entity) -> String {
     format_graph_entity_text_with_context(entity, &[])
 }
 
-/// Bound a single embed-text field to `max_chars`, on a UTF-8 char boundary.
+/// Append `text` to `out`, bounded to `max_chars` on a UTF-8 char boundary.
 /// Right-truncation keeps the front of the field, which for docstrings is the
 /// summary line and first paragraph (the discriminating signal); the trailing
 /// boilerplate that is dropped carries little retrieval value but heavy cost.
-fn bounded_embed_field(text: &str, max_chars: usize) -> String {
+///
+/// Writes straight into the embed-text buffer instead of allocating an
+/// intermediate `String` for every capped field.
+fn push_bounded_embed_field(out: &mut String, text: &str, max_chars: usize) {
     if text.chars().count() <= max_chars {
-        text.to_string()
+        out.push_str(text);
     } else {
-        text.chars().take(max_chars).collect()
+        out.extend(text.chars().take(max_chars));
     }
+}
+
+/// Allocating twin of [`push_bounded_embed_field`], kept for the unit tests that
+/// assert the truncation contract directly.
+#[cfg(test)]
+fn bounded_embed_field(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    push_bounded_embed_field(&mut out, text, max_chars);
+    out
 }
 
 /// Build the text representation for a persisted graph entity with additional
 /// graph-derived neighborhood context lines.
+///
+/// The fields are emitted in a fixed order and joined with `\n`. Output is built
+/// directly into one pre-sized `String` — no intermediate `Vec<String>` and no
+/// per-field clones — so the common entity formats in a single allocation. The
+/// byte layout is identical to the prior `parts.join("\n")` form; embed
+/// determinism depends on that, so it is locked by
+/// `format_graph_entity_text_byte_identical_to_joined_parts`.
 pub fn format_graph_entity_text_with_context(entity: &Entity, context_lines: &[String]) -> String {
-    let mut parts = Vec::with_capacity(8 + context_lines.len());
+    let kind_label = entity_kind_label(entity.kind);
 
-    parts.push(entity_kind_label(entity.kind).to_string());
-
-    if let Some(file_origin) = &entity.file_origin {
+    let file_origin = entity.file_origin.as_ref().map(|origin| origin.0.as_str());
+    if let Some(path) = file_origin {
         // Machine-absolute paths must never enter embed text — they bake
         // machine-specific prefixes into vectors, breaking cross-host
         // reproducibility. The parser layer is responsible for storing
         // repo-relative paths; this guard catches regressions at the embed
         // boundary where the damage would be silent.
         debug_assert!(
-            !file_origin.0.starts_with('/'),
-            "absolute path in embed text: '{}' — store repo-relative paths only",
-            file_origin.0
+            !path.starts_with('/'),
+            "absolute path in embed text: '{path}' — store repo-relative paths only"
         );
-        if file_origin.0.starts_with('/') {
+        if path.starts_with('/') {
             tracing::warn!(
-                path = %file_origin.0,
+                path = %path,
                 "machine-absolute path detected in embedding input (entity file_origin); \
                  vectors may not be reproducible across machines — store repo-relative paths"
             );
         }
-        parts.push(file_origin.0.clone());
+    }
+
+    let doc_summary = entity
+        .doc_summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty());
+    let metadata_field = |key: &str| {
+        entity
+            .metadata
+            .extra
+            .get(key)
+            .and_then(|value| value.as_str())
+            .filter(|text| !text.is_empty())
+    };
+    let body_preview = metadata_field(EMBEDDING_BODY_PREVIEW_KEY);
+    let file_import_context = metadata_field(FILE_IMPORT_CONTEXT_KEY);
+    let file_surface_context = metadata_field(FILE_SURFACE_CONTEXT_KEY);
+
+    // Pre-size for every field that will be emitted (each preceded by one
+    // `\n` joiner), so the buffer is allocated once. The doc-summary estimate
+    // uses its untruncated byte length — a harmless slight over-reserve when the
+    // field is capped.
+    let mut capacity = kind_label.len();
+    if let Some(path) = file_origin {
+        capacity += 1 + path.len();
     }
     if !entity.name.is_empty() {
-        parts.push(entity.name.clone());
+        capacity += 1 + entity.name.len();
     }
     if !entity.signature.is_empty() {
-        parts.push(entity.signature.clone());
+        capacity += 1 + entity.signature.len();
     }
-    if let Some(doc_summary) = entity.doc_summary.as_deref() {
-        let doc_summary = doc_summary.trim();
-        if !doc_summary.is_empty() {
-            parts.push(bounded_embed_field(
-                doc_summary,
-                EMBED_DOC_SUMMARY_MAX_CHARS,
-            ));
-        }
+    if let Some(summary) = doc_summary {
+        capacity += 1 + summary.len();
     }
-    if let Some(body_preview) = entity
-        .metadata
-        .extra
-        .get(EMBEDDING_BODY_PREVIEW_KEY)
-        .and_then(|value| value.as_str())
+    for field in [body_preview, file_import_context, file_surface_context]
+        .into_iter()
+        .flatten()
     {
-        if !body_preview.is_empty() {
-            parts.push(body_preview.to_string());
-        }
+        capacity += 1 + field.len();
     }
-    if let Some(file_import_context) = entity
-        .metadata
-        .extra
-        .get(FILE_IMPORT_CONTEXT_KEY)
-        .and_then(|value| value.as_str())
-    {
-        if !file_import_context.is_empty() {
-            parts.push(file_import_context.to_string());
-        }
+    for line in context_lines {
+        capacity += 1 + line.len();
     }
-    if let Some(file_surface_context) = entity
-        .metadata
-        .extra
-        .get(FILE_SURFACE_CONTEXT_KEY)
-        .and_then(|value| value.as_str())
-    {
-        if !file_surface_context.is_empty() {
-            parts.push(file_surface_context.to_string());
-        }
-    }
-    parts.extend(context_lines.iter().cloned());
 
-    parts.join("\n")
+    let mut out = String::with_capacity(capacity);
+    out.push_str(kind_label);
+    if let Some(path) = file_origin {
+        out.push('\n');
+        out.push_str(path);
+    }
+    if !entity.name.is_empty() {
+        out.push('\n');
+        out.push_str(&entity.name);
+    }
+    if !entity.signature.is_empty() {
+        out.push('\n');
+        out.push_str(&entity.signature);
+    }
+    if let Some(summary) = doc_summary {
+        out.push('\n');
+        push_bounded_embed_field(&mut out, summary, EMBED_DOC_SUMMARY_MAX_CHARS);
+    }
+    for field in [body_preview, file_import_context, file_surface_context]
+        .into_iter()
+        .flatten()
+    {
+        out.push('\n');
+        out.push_str(field);
+    }
+    for line in context_lines {
+        out.push('\n');
+        out.push_str(line);
+    }
+    out
 }
 
 /// Build the text representation for a structured artifact.
@@ -3244,6 +3503,163 @@ mod tests {
         assert!(formatted.contains("load_registry"));
         assert!(formatted.contains("calls parse_manifest"));
         assert!(formatted.contains("import_source serde_json"));
+    }
+
+    #[test]
+    fn format_graph_entity_text_byte_identical_to_joined_parts() {
+        // The direct-build rewrite of `format_graph_entity_text_with_context`
+        // must be byte-for-byte identical to the prior `Vec<String>` +
+        // `join("\n")` construction, or persisted embed vectors would shift.
+        // This reproduces that prior algorithm and asserts equality across the
+        // field-presence and truncation permutations the embed path exercises.
+        fn joined_reference(entity: &Entity, context_lines: &[String]) -> String {
+            fn bounded(text: &str, max_chars: usize) -> String {
+                if text.chars().count() <= max_chars {
+                    text.to_string()
+                } else {
+                    text.chars().take(max_chars).collect()
+                }
+            }
+            let mut parts: Vec<String> = Vec::new();
+            parts.push(entity_kind_label(entity.kind).to_string());
+            if let Some(file_origin) = &entity.file_origin {
+                parts.push(file_origin.0.clone());
+            }
+            if !entity.name.is_empty() {
+                parts.push(entity.name.clone());
+            }
+            if !entity.signature.is_empty() {
+                parts.push(entity.signature.clone());
+            }
+            if let Some(doc_summary) = entity.doc_summary.as_deref() {
+                let doc_summary = doc_summary.trim();
+                if !doc_summary.is_empty() {
+                    parts.push(bounded(doc_summary, EMBED_DOC_SUMMARY_MAX_CHARS));
+                }
+            }
+            for key in [
+                EMBEDDING_BODY_PREVIEW_KEY,
+                FILE_IMPORT_CONTEXT_KEY,
+                FILE_SURFACE_CONTEXT_KEY,
+            ] {
+                if let Some(text) = entity.metadata.extra.get(key).and_then(|v| v.as_str()) {
+                    if !text.is_empty() {
+                        parts.push(text.to_string());
+                    }
+                }
+            }
+            parts.extend(context_lines.iter().cloned());
+            parts.join("\n")
+        }
+
+        let sample_entity = || Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: "load_registry".into(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256([0; 32]),
+                signature_hash: Hash256([0; 32]),
+                behavior_hash: Hash256([0; 32]),
+                stability_score: 1.0,
+            },
+            // Repo-relative path: the new formatter's absolute-path guard must
+            // stay a no-op so its push matches the reference exactly.
+            file_origin: Some(FilePathId::new("src/registry.rs")),
+            span: None,
+            signature: "fn load_registry() -> Registry".into(),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: Some("Load the registry".into()),
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        };
+
+        // Case 1: every field populated, including all three metadata contexts.
+        let mut full = sample_entity();
+        full.metadata.extra.insert(
+            EMBEDDING_BODY_PREVIEW_KEY.into(),
+            serde_json::Value::String("fn load_registry() -> Registry { .. }".into()),
+        );
+        full.metadata.extra.insert(
+            FILE_IMPORT_CONTEXT_KEY.into(),
+            serde_json::Value::String("module serde names Deserialize".into()),
+        );
+        full.metadata.extra.insert(
+            FILE_SURFACE_CONTEXT_KEY.into(),
+            serde_json::Value::String("surface registry".into()),
+        );
+
+        // Case 2: doc summary far over the cap → ASCII truncation path.
+        let mut capped = sample_entity();
+        capped.doc_summary = Some("word ".repeat(EMBED_DOC_SUMMARY_MAX_CHARS));
+
+        // Case 3: minimal — no file, empty name + signature, no doc/metadata.
+        let mut minimal = sample_entity();
+        minimal.file_origin = None;
+        minimal.name = String::new();
+        minimal.signature = String::new();
+        minimal.doc_summary = None;
+
+        // Case 4: multibyte doc summary truncation on a char boundary.
+        let mut multibyte = sample_entity();
+        multibyte.doc_summary = Some("é".repeat(EMBED_DOC_SUMMARY_MAX_CHARS + 50));
+
+        let cases: Vec<(Entity, Vec<String>)> = vec![
+            (
+                full,
+                vec!["calls parse_manifest".into(), "import_source serde".into()],
+            ),
+            (capped, Vec::new()),
+            (minimal, Vec::new()),
+            (multibyte, vec!["neighbor load_other".into()]),
+        ];
+
+        for (entity, ctx) in cases {
+            assert_eq!(
+                format_graph_entity_text_with_context(&entity, &ctx),
+                joined_reference(&entity, &ctx),
+                "direct-build embed text diverged from the joined-parts reference",
+            );
+        }
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn embed_stage_timings_accumulate_and_delta() {
+        let timings = EmbedStageTimings::default();
+        let base = timings.snapshot();
+        assert!(base.is_empty(), "a fresh accumulator records nothing");
+
+        timings.record(EmbedStage::Drain, std::time::Duration::from_millis(2));
+        timings.record(EmbedStage::Drain, std::time::Duration::from_millis(3));
+        let out = timings.time(EmbedStage::Prep, || 7);
+        assert_eq!(out, 7, "time() returns the closure's value");
+        {
+            // A scoped timer counts as one call even at ~zero duration.
+            let _scope = timings.scope(EmbedStage::Forward);
+        }
+
+        let snap = timings.snapshot();
+        assert_eq!(snap.stage(EmbedStage::Drain).calls, 2);
+        assert_eq!(snap.stage(EmbedStage::Drain).nanos, 5_000_000);
+        assert_eq!(snap.stage(EmbedStage::Prep).calls, 1);
+        assert_eq!(snap.stage(EmbedStage::Forward).calls, 1);
+        assert_eq!(snap.stage(EmbedStage::Persist).calls, 0);
+        assert_eq!(snap.stage(EmbedStage::Prune).calls, 0);
+        assert!(!snap.is_empty());
+        assert!(snap.total_nanos() >= 5_000_000);
+
+        let delta = snap.since(&base);
+        assert_eq!(delta.stage(EmbedStage::Drain).calls, 2);
+        assert_eq!(delta.stage(EmbedStage::Drain).nanos, 5_000_000);
+        // A later baseline yields a zero (saturating, never underflowing) delta.
+        assert!(snap.since(&snap).is_empty());
+        // Smoke: summarizing must not panic with no subscriber installed.
+        delta.log_summary("unit");
     }
 
     #[test]
