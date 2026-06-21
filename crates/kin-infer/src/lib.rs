@@ -719,22 +719,46 @@ struct ResidentStackCaps {
 }
 
 impl ResidentStackCaps {
-    fn normalized(self) -> Self {
-        let segmented_max_seq = self.segmented_max_seq.max(1);
+    fn normalized_against(self, pooled: PooledOutputCaps) -> Self {
+        let pooled = pooled.normalized();
+        let segmented_max_seq = self.segmented_max_seq.max(1).min(pooled.segmented_max_seq);
         Self {
-            max_batch_size: self.max_batch_size.max(1),
-            max_seq: self.max_seq.max(1).min(segmented_max_seq),
+            max_batch_size: self.max_batch_size.max(1).min(pooled.max_batch_size),
+            max_seq: self
+                .max_seq
+                .max(1)
+                .min(pooled.max_seq)
+                .min(segmented_max_seq),
             segmented_max_seq,
-            segment_layers: self.segment_layers.max(1),
+            segment_layers: self.segment_layers.max(1).min(pooled.segment_layers),
         }
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static RESIDENT_STACK_CAPS_TEST_OVERRIDE: std::cell::Cell<Option<ResidentStackCaps>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_resident_stack_caps_test_override(caps: Option<ResidentStackCaps>) {
+    RESIDENT_STACK_CAPS_TEST_OVERRIDE.with(|override_value| override_value.set(caps));
+}
+
+/// Resident-stack overrides may tighten the pooled guardrails, but never loosen
+/// them; otherwise long sequences can slip back into one all-layer command buffer.
 fn resident_stack_caps() -> ResidentStackCaps {
+    let pooled = pooled_output_caps();
+    #[cfg(test)]
+    if let Some(caps) =
+        RESIDENT_STACK_CAPS_TEST_OVERRIDE.with(|override_value| override_value.get())
+    {
+        return caps.normalized_against(pooled);
+    }
+
     use std::sync::OnceLock;
     static CAPS: OnceLock<ResidentStackCaps> = OnceLock::new();
     *CAPS.get_or_init(|| {
-        let pooled = pooled_output_caps();
         ResidentStackCaps {
             max_batch_size: env_usize_or(
                 "KIN_INFER_RESIDENT_MAX_BATCH_SIZE",
@@ -750,7 +774,7 @@ fn resident_stack_caps() -> ResidentStackCaps {
                 pooled.segment_layers,
             ),
         }
-        .normalized()
+        .normalized_against(pooled)
     })
 }
 
@@ -5336,6 +5360,7 @@ mod tests {
 
     struct PooledOutputOverrideGuard;
     struct PooledOutputCapsOverrideGuard;
+    struct ResidentStackCapsOverrideGuard;
     static POOLED_OUTPUT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn pooled_output_test_lock() -> MutexGuard<'static, ()> {
@@ -5367,6 +5392,19 @@ mod tests {
     impl Drop for PooledOutputCapsOverrideGuard {
         fn drop(&mut self) {
             set_pooled_output_caps_test_override(None);
+        }
+    }
+
+    impl ResidentStackCapsOverrideGuard {
+        fn set(caps: ResidentStackCaps) -> Self {
+            set_resident_stack_caps_test_override(Some(caps));
+            Self
+        }
+    }
+
+    impl Drop for ResidentStackCapsOverrideGuard {
+        fn drop(&mut self) {
+            set_resident_stack_caps_test_override(None);
         }
     }
 
@@ -6915,6 +6953,69 @@ mod tests {
         assert_eq!(resident_segmented_calls.load(Ordering::SeqCst), 1);
         let stats = resident_stack_runtime_stats();
         assert!(stats.used_segmented >= 1);
+        assert_eq!(stats.segment_layers, POOLED_OUTPUT_DEFAULT_SEGMENT_LAYERS);
+    }
+
+    #[test]
+    fn resident_stack_caps_cannot_loosen_pooled_caps() {
+        let _lock = pooled_output_test_lock();
+        reset_resident_stack_runtime_stats();
+        let _pooled_caps = PooledOutputCapsOverrideGuard::set(PooledOutputCaps {
+            max_batch_size: POOLED_OUTPUT_DEFAULT_MAX_BATCH_SIZE,
+            max_seq: 4,
+            segmented_max_seq: 8,
+            segment_layers: POOLED_OUTPUT_DEFAULT_SEGMENT_LAYERS,
+        });
+        let _resident_caps = ResidentStackCapsOverrideGuard::set(ResidentStackCaps {
+            max_batch_size: POOLED_OUTPUT_DEFAULT_MAX_BATCH_SIZE * 2,
+            max_seq: 4096,
+            segmented_max_seq: 4096,
+            segment_layers: SEGMENT_LAYERS_ENV_MAX,
+        });
+        let pooled_calls = Arc::new(AtomicUsize::new(0));
+        let resident_unbounded_calls = Arc::new(AtomicUsize::new(0));
+        let resident_segmented_calls = Arc::new(AtomicUsize::new(0));
+        let layers = (0..5)
+            .map(|_| {
+                mock_layer(
+                    2,
+                    2,
+                    Some(Array2::zeros((2, 2))),
+                    Some(Array2::zeros((2, 2))),
+                )
+            })
+            .collect();
+        let len = 5;
+        let model = mock_embedding_model_with_gpu(
+            layers,
+            Box::new(PooledOnlyGpu::resident_segmented(
+                Arc::clone(&pooled_calls),
+                Arc::clone(&resident_unbounded_calls),
+                Arc::clone(&resident_segmented_calls),
+                len,
+                5,
+            )),
+        );
+
+        let ids = vec![1u32; len];
+        let mask = vec![1u32; len];
+        let (_hidden, _masks, max_len) = model
+            .encode_batched(&[ids], &[mask])
+            .expect("encode_batched");
+
+        assert_eq!(max_len, len);
+        assert_eq!(pooled_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(resident_unbounded_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(resident_segmented_calls.load(Ordering::SeqCst), 1);
+        let stats = resident_stack_runtime_stats();
+        assert_eq!(
+            stats.last_reason,
+            ResidentStackDecisionReason::UsedSegmented
+        );
+        assert_eq!(stats.last_segment_count, 3);
+        assert_eq!(stats.max_batch_size, POOLED_OUTPUT_DEFAULT_MAX_BATCH_SIZE);
+        assert_eq!(stats.max_seq, 4);
+        assert_eq!(stats.segmented_max_seq, 8);
         assert_eq!(stats.segment_layers, POOLED_OUTPUT_DEFAULT_SEGMENT_LAYERS);
     }
 
