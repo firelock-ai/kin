@@ -457,9 +457,9 @@ fn unified_throughput_scale(system_total_bytes: Option<u64>) -> usize {
 /// memory tier so larger parts pipeline more work without starving submission.
 fn unified_inflight(system_total_bytes: Option<u64>) -> usize {
     match system_total_bytes {
-        Some(b) if b >= 96 * GIB => 4,
-        Some(b) if b >= 32 * GIB => 3,
-        _ => 2,
+        Some(b) if b >= 96 * GIB => 2, // Cap at 2 to prevent unified-memory thrashing
+        Some(b) if b >= 32 * GIB => 2,
+        _ => 1,
     }
 }
 
@@ -549,7 +549,10 @@ impl ResourcePlan {
                     // also have proportionally more GPU cores.
                     let scale = unified_throughput_scale(memory.system_total_bytes);
                     embedding.max_batch_tokens = 65_536 * scale;
-                    embedding.max_attention_area = proof_attention_area.map(|a| a * scale as u64);
+                    // Cap attention area scale to 2 to prevent extreme O(L^2) memory footprint
+                    let area_scale = scale.min(2);
+                    embedding.max_attention_area =
+                        proof_attention_area.map(|a| a * area_scale as u64);
                     accel.max_inflight_command_buffers =
                         unified_inflight(memory.system_total_bytes);
                 } else {
@@ -720,9 +723,10 @@ mod tests {
         let plan = ResourcePlan::for_profile(Profile::Throughput, &host, &accel, &mem);
 
         // 128 GiB unified -> top tier (4x) over the historical 8.38M / 65536 base.
-        assert_eq!(plan.embedding.max_attention_area, Some(33_554_432));
+        // Cap attention area scale to 2x (16_777_216) and inflight command buffers to 2 to prevent memory pressure crashes.
+        assert_eq!(plan.embedding.max_attention_area, Some(16_777_216));
         assert_eq!(plan.embedding.max_batch_tokens, 262_144);
-        assert_eq!(plan.accelerator.max_inflight_command_buffers, 4);
+        assert_eq!(plan.accelerator.max_inflight_command_buffers, 2);
         assert_eq!(plan.embedding.max_entities_per_graph_chunk, 512);
         assert_eq!(plan.embedding.hybrid_mode, HybridMode::Balanced);
         assert_eq!(plan.host.rayon_threads, 17);
@@ -825,9 +829,9 @@ mod tests {
             &accel,
             &mem_with(Some(64 * GIB)),
         );
-        assert_eq!(plan.embedding.max_attention_area, Some(25_165_824));
+        assert_eq!(plan.embedding.max_attention_area, Some(16_777_216));
         assert_eq!(plan.embedding.max_batch_tokens, 196_608);
-        assert_eq!(plan.accelerator.max_inflight_command_buffers, 3);
+        assert_eq!(plan.accelerator.max_inflight_command_buffers, 2);
 
         let plan = ResourcePlan::for_profile(
             Profile::Throughput,
@@ -837,7 +841,7 @@ mod tests {
         );
         assert_eq!(plan.embedding.max_attention_area, Some(16_777_216));
         assert_eq!(plan.embedding.max_batch_tokens, 131_072);
-        assert_eq!(plan.accelerator.max_inflight_command_buffers, 3);
+        assert_eq!(plan.accelerator.max_inflight_command_buffers, 2);
     }
 
     #[test]
@@ -849,7 +853,7 @@ mod tests {
         // Smallest tier (1x): unchanged from the pre-scaling throughput budgets.
         assert_eq!(plan.embedding.max_attention_area, Some(8_388_608));
         assert_eq!(plan.embedding.max_batch_tokens, 65_536);
-        assert_eq!(plan.accelerator.max_inflight_command_buffers, 2);
+        assert_eq!(plan.accelerator.max_inflight_command_buffers, 1);
         assert_eq!(plan.embedding.hybrid_mode, HybridMode::Off);
     }
 

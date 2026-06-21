@@ -1814,6 +1814,74 @@ fn resolve_max_inflight_inner(override_raw: Option<&str>, profile_raw: Option<&s
 /// the submitter.
 type InflightGate = Arc<(Mutex<u32>, Condvar)>;
 
+/// Default share of Metal's recommended working set the resident stack may
+/// reserve for command-buffer-owned transients. The remaining headroom covers
+/// cached weights, host allocations, Metal driver overhead, and other process
+/// memory on unified-memory Macs.
+const DEFAULT_RESIDENT_STACK_BUDGET_DIVISOR: u64 = 2;
+
+/// Shared byte gate for resident stack command buffers. This is deliberately a
+/// no-wait gate: stack paths can return `Ok(None)` and let the caller use the
+/// proven fallback path instead of parking after allocating large MTLBuffers.
+#[derive(Clone)]
+struct ResidentStackMemoryGate {
+    budget_bytes: usize,
+    active_bytes: Arc<Mutex<usize>>,
+}
+
+struct ResidentStackReservation {
+    active_bytes: Arc<Mutex<usize>>,
+    bytes: usize,
+}
+
+impl ResidentStackMemoryGate {
+    fn new(budget_bytes: usize) -> Self {
+        Self {
+            budget_bytes,
+            active_bytes: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    fn try_reserve(&self, bytes: usize) -> Option<ResidentStackReservation> {
+        if bytes > self.budget_bytes {
+            return None;
+        }
+        let mut active = self.active_bytes.lock();
+        let next = active.checked_add(bytes)?;
+        if next > self.budget_bytes {
+            return None;
+        }
+        *active = next;
+        Some(ResidentStackReservation {
+            active_bytes: Arc::clone(&self.active_bytes),
+            bytes,
+        })
+    }
+}
+
+impl Drop for ResidentStackReservation {
+    fn drop(&mut self) {
+        let mut active = self.active_bytes.lock();
+        *active = active.saturating_sub(self.bytes);
+    }
+}
+
+fn resolve_resident_stack_budget(device: &Device) -> usize {
+    if let Some(bytes) = std::env::var("KIN_INFER_METAL_RESIDENT_BUDGET_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|bytes| *bytes > 0)
+    {
+        return bytes;
+    }
+
+    let recommended = device.recommended_max_working_set_size();
+    if recommended == 0 {
+        return usize::MAX;
+    }
+    (recommended / DEFAULT_RESIDENT_STACK_BUDGET_DIVISOR) as usize
+}
+
 /// A size-classed free-list of `StorageModeShared` buffers. Recycling a buffer
 /// back onto the list avoids the per-op `new_buffer` churn that otherwise mints
 /// a fresh MTLBuffer for every activation/output tensor. Buffers only return to
@@ -1837,6 +1905,143 @@ fn size_class(bytes: usize) -> usize {
     } else {
         bytes.div_ceil(CHUNK) * CHUNK
     }
+}
+
+#[inline]
+fn estimate_size_class(bytes: usize) -> usize {
+    let bytes = bytes.max(1);
+    const CHUNK: usize = 64 * 1024;
+    if bytes <= CHUNK {
+        bytes.checked_next_power_of_two().unwrap_or(usize::MAX)
+    } else {
+        bytes
+            .checked_add(CHUNK - 1)
+            .map(|rounded| (rounded / CHUNK) * CHUNK)
+            .unwrap_or(usize::MAX)
+    }
+}
+
+#[inline]
+fn estimate_pooled_f32_bytes(count: usize) -> usize {
+    estimate_size_class(count.saturating_mul(std::mem::size_of::<f32>()))
+}
+
+#[inline]
+fn estimate_raw_bytes(count: usize, elem_bytes: usize) -> usize {
+    count.saturating_mul(elem_bytes)
+}
+
+fn estimate_layer_kv_heads(weights: &LayerTensors<'_>, config: &LayerConfig<'_>) -> usize {
+    if let Some(k) = weights.k_weight {
+        k.len() / (config.hidden_size * config.head_dim).max(1)
+    } else if let Some(qkv) = weights.qkv_weight {
+        let total_qkv_dim = qkv.len() / config.hidden_size.max(1);
+        let q_dim = config.num_heads * config.head_dim;
+        total_qkv_dim.saturating_sub(q_dim) / (2 * config.head_dim).max(1)
+    } else {
+        config.num_heads
+    }
+}
+
+fn estimate_embedding_prelude_bytes(
+    embedding: Option<&EmbeddingPrelude<'_>>,
+    config: &LayerConfig<'_>,
+) -> usize {
+    let total_rows = config.batch_size.saturating_mul(config.max_len);
+    let hidden = total_rows.saturating_mul(config.hidden_size);
+    match embedding {
+        Some(embedding) if embedding.projection.is_some() => {
+            estimate_pooled_f32_bytes(total_rows.saturating_mul(embedding.input_dim))
+                .saturating_add(estimate_pooled_f32_bytes(hidden))
+        }
+        _ => estimate_pooled_f32_bytes(hidden),
+    }
+}
+
+fn estimate_layer_resident_bytes(weights: &LayerTensors<'_>, config: &LayerConfig<'_>) -> usize {
+    let batch_size = config.batch_size;
+    let max_len = config.max_len;
+    let total_rows = batch_size.saturating_mul(max_len);
+    let h = config.hidden_size;
+    let heads = config.num_heads;
+    let head_dim = config.head_dim;
+    let inter = config.inter_size;
+    let kv_heads = estimate_layer_kv_heads(weights, config);
+    let q_dim = heads.saturating_mul(head_dim);
+    let kv_dim = kv_heads.saturating_mul(head_dim);
+    let hidden_elems = total_rows.saturating_mul(h);
+    let q_elems = total_rows.saturating_mul(q_dim);
+    let kv_elems = total_rows.saturating_mul(kv_dim);
+    let q_heads = batch_size.saturating_mul(heads);
+
+    let mut bytes = 0usize;
+    if config.pre_ln {
+        bytes = bytes.saturating_add(estimate_pooled_f32_bytes(hidden_elems));
+    }
+
+    bytes = bytes
+        .saturating_add(estimate_pooled_f32_bytes(q_elems))
+        .saturating_add(estimate_pooled_f32_bytes(kv_elems))
+        .saturating_add(estimate_pooled_f32_bytes(kv_elems));
+
+    if weights.qkv_weight.is_some() {
+        let total_qkv = q_dim.saturating_add(kv_dim.saturating_mul(2));
+        bytes = bytes.saturating_add(estimate_pooled_f32_bytes(
+            total_rows.saturating_mul(total_qkv),
+        ));
+    }
+
+    bytes = bytes
+        .saturating_add(estimate_pooled_f32_bytes(q_elems))
+        .saturating_add(estimate_pooled_f32_bytes(q_elems))
+        .saturating_add(estimate_pooled_f32_bytes(q_elems))
+        .saturating_add(estimate_pooled_f32_bytes(
+            q_heads.saturating_mul(max_len).saturating_mul(max_len),
+        ))
+        .saturating_add(estimate_raw_bytes(total_rows, std::mem::size_of::<u32>()))
+        .saturating_add(estimate_pooled_f32_bytes(1))
+        .saturating_add(estimate_pooled_f32_bytes(q_elems))
+        .saturating_add(estimate_pooled_f32_bytes(q_elems))
+        .saturating_add(estimate_pooled_f32_bytes(hidden_elems));
+
+    if config.pre_ln {
+        bytes = bytes.saturating_add(estimate_pooled_f32_bytes(hidden_elems));
+    }
+
+    bytes = bytes.saturating_add(estimate_pooled_f32_bytes(hidden_elems));
+    if weights.ffn_gate_weight.is_some() {
+        bytes = bytes
+            .saturating_add(estimate_pooled_f32_bytes(
+                total_rows.saturating_mul(inter).saturating_mul(2),
+            ))
+            .saturating_add(estimate_pooled_f32_bytes(total_rows.saturating_mul(inter)));
+    } else {
+        bytes = bytes.saturating_add(estimate_pooled_f32_bytes(total_rows.saturating_mul(inter)));
+    }
+    bytes
+}
+
+fn estimate_resident_segment_bytes(
+    layers: &[LayerTensors<'_>],
+    config: &LayerConfig<'_>,
+    embedding: Option<&EmbeddingPrelude<'_>>,
+    include_pooling: bool,
+) -> usize {
+    let mut bytes = estimate_embedding_prelude_bytes(embedding, config);
+    for weights in layers {
+        bytes = bytes.saturating_add(estimate_layer_resident_bytes(weights, config));
+    }
+    if include_pooling {
+        bytes = bytes
+            .saturating_add(estimate_pooled_f32_bytes(
+                config.batch_size.saturating_mul(config.hidden_size),
+            ))
+            .saturating_add(estimate_raw_bytes(
+                config.batch_size.saturating_mul(config.max_len),
+                std::mem::size_of::<u32>(),
+            ));
+    }
+    bytes
 }
 
 /// Diagnostic gate (`KIN_INFER_NO_POOL_REUSE`): when ON, the pool never recycles
@@ -2053,6 +2258,8 @@ pub struct MetalCompute {
     max_inflight: u32,
     /// Size-classed activation/output buffer pool.
     pool: Arc<BufferPool>,
+    /// Byte budget for resident stack command buffers before they allocate.
+    resident_stack_memory: ResidentStackMemoryGate,
 }
 
 impl MetalCompute {
@@ -2336,6 +2543,8 @@ impl MetalCompute {
         C7_FLASH_ATTENTION_AVAILABLE.store(c7_flash_attention_available, Ordering::Relaxed);
 
         let pool = Arc::new(BufferPool::new(device.clone()));
+        let resident_stack_memory =
+            ResidentStackMemoryGate::new(resolve_resident_stack_budget(&device));
         Some(Self {
             device,
             queue,
@@ -2346,7 +2555,25 @@ impl MetalCompute {
             inflight: Arc::new((Mutex::new(0), Condvar::new())),
             max_inflight: resolve_max_inflight(),
             pool,
+            resident_stack_memory,
         })
+    }
+
+    fn try_reserve_resident_segment(
+        &self,
+        bytes: usize,
+        path: &'static str,
+    ) -> Option<ResidentStackReservation> {
+        let reservation = self.resident_stack_memory.try_reserve(bytes);
+        if reservation.is_none() {
+            tracing::debug!(
+                path,
+                bytes,
+                budget_bytes = self.resident_stack_memory.budget_bytes,
+                "kin_infer.metal.resident_stack: declining resident path before command buffer allocation"
+            );
+        }
+        reservation
     }
 
     /// Create a Metal buffer from a slice and copy data in.
@@ -3992,6 +4219,13 @@ impl GpuCompute for MetalCompute {
     ) -> Result<Option<Vec<f32>>, InferError> {
         let total_rows = config.batch_size * config.max_len;
         let h = config.hidden_size;
+        let estimated_bytes =
+            estimate_resident_segment_bytes(std::slice::from_ref(weights), config, None, false);
+        let Some(_resident_reservation) =
+            self.try_reserve_resident_segment(estimated_bytes, "forward_layer_batched")
+        else {
+            return Ok(None);
+        };
         let out = autoreleasepool(|_| -> Result<Vec<f32>, InferError> {
             let current_hidden = self.buf_slice_pooled(hidden)?;
             let cmd = self.queue.new_command_buffer();
@@ -4031,6 +4265,12 @@ impl GpuCompute for MetalCompute {
         .entered();
         let total_rows = config.batch_size * config.max_len;
         let h = config.hidden_size;
+        let estimated_bytes = estimate_resident_segment_bytes(layers, config, None, false);
+        let Some(_resident_reservation) =
+            self.try_reserve_resident_segment(estimated_bytes, "forward_layers_batched")
+        else {
+            return Ok(None);
+        };
         let out = autoreleasepool(|_| -> Result<Vec<f32>, InferError> {
             let current_hidden = self.buf_slice_pooled(hidden)?;
             let cmd = self.queue.new_command_buffer();
@@ -4079,9 +4319,16 @@ impl GpuCompute for MetalCompute {
         .entered();
         let total_rows = config.batch_size * config.max_len;
         let h = config.hidden_size;
-        let out = autoreleasepool(|_| -> Result<Vec<f32>, InferError> {
+        let out = autoreleasepool(|_| -> Result<Option<Vec<f32>>, InferError> {
             let mut current_hidden = None;
             for (segment_index, chunk) in layers.chunks(segment_layers).enumerate() {
+                let estimated_bytes = estimate_resident_segment_bytes(chunk, config, None, false);
+                let Some(_resident_reservation) = self.try_reserve_resident_segment(
+                    estimated_bytes,
+                    "forward_layers_batched_segmented",
+                ) else {
+                    return Ok(None);
+                };
                 let hidden_buf = if segment_index == 0 {
                     self.buf_slice_pooled(hidden)?
                 } else {
@@ -4109,7 +4356,7 @@ impl GpuCompute for MetalCompute {
 
                 let is_last = segment_index + 1 == segment_count;
                 if is_last {
-                    return Ok(Self::read_buf(hidden_buf.buffer(), total_rows * h));
+                    return Ok(Some(Self::read_buf(hidden_buf.buffer(), total_rows * h)));
                 }
                 current_hidden = Some(hidden_buf);
             }
@@ -4118,7 +4365,7 @@ impl GpuCompute for MetalCompute {
                 "segmented resident Metal path completed no segments".into(),
             ))
         })?;
-        Ok(Some(out))
+        Ok(out)
     }
 
     fn forward_layers_batched_pooled(
@@ -4141,6 +4388,13 @@ impl GpuCompute for MetalCompute {
         )
         .entered();
         let h = config.hidden_size;
+        let estimated_bytes =
+            estimate_resident_segment_bytes(layers, config, Some(embedding), true);
+        let Some(_resident_reservation) =
+            self.try_reserve_resident_segment(estimated_bytes, "forward_layers_batched_pooled")
+        else {
+            return Ok(None);
+        };
         let out = autoreleasepool(|_| -> Result<Vec<f32>, InferError> {
             let cmd = self.queue.new_command_buffer();
             let mut retains = Vec::new();
@@ -4195,9 +4449,19 @@ impl GpuCompute for MetalCompute {
         )
         .entered();
         let h = config.hidden_size;
-        let out = autoreleasepool(|_| -> Result<Vec<f32>, InferError> {
+        let out = autoreleasepool(|_| -> Result<Option<Vec<f32>>, InferError> {
             let mut current_hidden = None;
             for (segment_index, chunk) in layers.chunks(segment_layers).enumerate() {
+                let is_last = segment_index + 1 == segment_count;
+                let segment_embedding = (segment_index == 0).then_some(embedding);
+                let estimated_bytes =
+                    estimate_resident_segment_bytes(chunk, config, segment_embedding, is_last);
+                let Some(_resident_reservation) = self.try_reserve_resident_segment(
+                    estimated_bytes,
+                    "forward_layers_batched_pooled_segmented",
+                ) else {
+                    return Ok(None);
+                };
                 let cmd = self.queue.new_command_buffer();
                 let mut retains = Vec::new();
                 let hidden_buf = if segment_index == 0 {
@@ -4229,12 +4493,11 @@ impl GpuCompute for MetalCompute {
                     )?;
                 }
 
-                let is_last = segment_index + 1 == segment_count;
                 if is_last {
                     let pooled =
                         self.encode_pool_rows_into(cmd, &hidden_buf, masks, config, pooling)?;
                     self.commit_wait(cmd);
-                    return Ok(Self::read_buf(pooled.buffer(), config.batch_size * h));
+                    return Ok(Some(Self::read_buf(pooled.buffer(), config.batch_size * h)));
                 }
 
                 self.commit_wait(cmd);
@@ -4245,7 +4508,7 @@ impl GpuCompute for MetalCompute {
                 "segmented pooled Metal path completed no segments".into(),
             ))
         })?;
-        Ok(Some(out))
+        Ok(out)
     }
 
     fn matmul(
@@ -5833,6 +6096,80 @@ mod tests {
         PROFILE_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn resident_stack_memory_gate_reserves_declines_and_releases() {
+        let gate = ResidentStackMemoryGate::new(100);
+
+        let first = gate.try_reserve(60).expect("first reservation fits");
+        assert!(gate.try_reserve(41).is_none());
+        assert!(gate.try_reserve(101).is_none());
+
+        drop(first);
+        assert!(gate.try_reserve(100).is_some());
+    }
+
+    #[test]
+    fn resident_segment_estimate_scales_with_layers_and_attention_area() {
+        let h = 8usize;
+        let heads = 2usize;
+        let head_dim = 4usize;
+        let inter = 16usize;
+        let q_dim = heads * head_dim;
+        let kv_dim = q_dim;
+
+        let norm1_weight = vec![1.0; h];
+        let norm1_bias = vec![0.0; h];
+        let qkv_weight = vec![0.0; (q_dim + 2 * kv_dim) * h];
+        let attn_out_weight = vec![0.0; h * q_dim];
+        let norm2_weight = vec![1.0; h];
+        let norm2_bias = vec![0.0; h];
+        let ffn_up_weight = vec![0.0; inter * h];
+        let ffn_down_weight = vec![0.0; h * inter];
+        let weights = LayerTensors {
+            norm1_weight: &norm1_weight,
+            norm1_bias: Some(&norm1_bias),
+            qkv_weight: Some(&qkv_weight),
+            attn_out_weight: &attn_out_weight,
+            norm2_weight: &norm2_weight,
+            norm2_bias: Some(&norm2_bias),
+            ffn_up_weight: Some(&ffn_up_weight),
+            ffn_down_weight: &ffn_down_weight,
+            ..LayerTensors::default()
+        };
+        let config = LayerConfig {
+            batch_size: 2,
+            max_len: 8,
+            hidden_size: h,
+            num_heads: heads,
+            head_dim,
+            inter_size: inter,
+            eps: 1e-5,
+            rms_eps: 1e-6,
+            use_rms: false,
+            pre_ln: true,
+            scale: 1.0,
+            alibi_slopes: None,
+        };
+
+        let one_layer =
+            estimate_resident_segment_bytes(std::slice::from_ref(&weights), &config, None, false);
+        let two_layers = estimate_resident_segment_bytes(
+            &[weights.clone(), weights.clone()],
+            &config,
+            None,
+            false,
+        );
+        assert!(two_layers > one_layer);
+
+        let longer = LayerConfig {
+            max_len: config.max_len * 2,
+            ..config
+        };
+        let longer_layer =
+            estimate_resident_segment_bytes(std::slice::from_ref(&weights), &longer, None, false);
+        assert!(longer_layer > one_layer);
     }
 
     fn get_metal() -> Option<MetalCompute> {
