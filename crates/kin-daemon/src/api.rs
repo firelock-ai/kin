@@ -1833,6 +1833,7 @@ async fn command_resources(
         embeddings_indexed: embed_status.indexed,
         embeddings_pending: embed_status.pending,
         embeddings_total: embed_status.total,
+        hybrid_metrics: hybrid_metrics_runtime(),
         metal_profile: metal_profile_runtime(),
     };
 
@@ -1843,6 +1844,28 @@ async fn command_resources(
     )
     .map_err(internal_error)?;
     Ok(Json(response))
+}
+
+fn hybrid_metrics_runtime() -> kin_cli::commands::resources::HybridMetricsRuntime {
+    #[cfg(feature = "embeddings")]
+    {
+        let stats = kin_db::embed::hybrid_metrics::snapshot();
+        return kin_cli::commands::resources::HybridMetricsRuntime {
+            gpu_entities: stats.gpu_entities,
+            gpu_tokens: stats.gpu_tokens,
+            cpu_twin_entities: stats.cpu_twin_entities,
+            cpu_twin_tokens: stats.cpu_twin_tokens,
+            hybrid_batches: stats.hybrid_batches,
+            single_side_batches: stats.single_side_batches,
+            twin_unavailable_batches: stats.twin_unavailable_batches,
+            cpu_parallel_batches: stats.cpu_parallel_batches,
+        };
+    }
+
+    #[cfg(not(feature = "embeddings"))]
+    {
+        kin_cli::commands::resources::HybridMetricsRuntime::default()
+    }
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
