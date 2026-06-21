@@ -1,0 +1,65 @@
+{
+  "allowlist": [
+    {
+      "file": "crates/kin-cli/src/commands/checkout.rs",
+      "reason": "IO Boundary: materializes file state during checkout and reads files for status/reconcile bounds"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/commit.rs",
+      "reason": "IO Boundary: reads local workspace files to build gitignore, hashes, and commit metadata"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/init.rs",
+      "reason": "IO Ingestion: imports files from disk to build the initial semantic graph"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/reconcile.rs",
+      "reason": "IO Boundary: writes/projects graph modifications back to filesystem"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/stash.rs",
+      "reason": "IO Boundary: stashes and restores uncommitted file changes"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/session_workspace.rs",
+      "reason": "IO Boundary: syncs workspace by reading and writing files"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/native_sync.rs",
+      "reason": "IO Boundary: reads/writes sync files between local and remote state"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/open.rs",
+      "reason": "IO Boundary: materializes session folder and reads/writes files"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/shell.rs",
+      "reason": "IO Boundary: bootstraps session shell workspace files"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/secret.rs",
+      "reason": "IO Boundary: reads authentication/tokens from stdin or config file"
+    },
+    {
+      "file": "crates/kin-cli/src/commands/locate_debug.rs",
+      "reason": "Debug Command: reads benchmark/test inputs from disk"
+    },
+    {
+      "file": "crates/kin-cli/src/backend.rs",
+      "reason": "Direct Snapshot direct-reads (offline bootstrap fallback)"
+    },
+    {
+      "file": "crates/kin-cli/src/capability.rs",
+      "reason": "Hardware check: reads /proc/meminfo for system stats"
+    },
+    {
+      "file": "crates/kin-mcp/src/daemon_delegate.rs",
+      "reason": "Auth: reads token from local daemon token file"
+    },
+    {
+      "file": "crates/kin-core/src/text_refs.rs",
+      "reason": "TRANSITIONAL: Direct filesystem read for text references. Needs migration to graph-derived source.",
+      "status": "transitional"
+    }
+  ]
+}
