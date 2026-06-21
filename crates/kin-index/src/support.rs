@@ -9,12 +9,14 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use rayon::prelude::*;
+
 use crate::classifier::{FileClassification, FileClassifier};
 use crate::error::IndexError;
 use kin_model::ArtifactKind;
 
 /// Aggregated coverage report over a directory tree.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct CoverageReport {
     pub entity_source_count: usize,
     pub entity_source_extensions: HashMap<String, usize>,
@@ -34,68 +36,107 @@ pub struct CoverageReport {
 /// Walk `root` and classify every file, returning a [`CoverageReport`].
 pub fn compute_coverage_report(root: &Path) -> crate::Result<CoverageReport> {
     let files = collect_all_files(root)?;
+
+    // Each file is classified independently — the work includes reading file
+    // content to detect imports, which is I/O-bound and otherwise pins a single
+    // core on large trees. Classify in parallel, then fold the per-file outcomes
+    // into the report serially in input order so the result is identical to a
+    // sequential walk (counts are commutative, but ordered merge keeps the
+    // report byte-stable regardless of scheduling).
+    let outcomes: Vec<FileCoverage> = files
+        .par_iter()
+        .map(|file_path| classify_file_coverage(file_path))
+        .collect();
+
     let mut report = CoverageReport::default();
+    for outcome in outcomes {
+        report.absorb(outcome);
+    }
 
-    for file_path in &files {
-        report.total_files += 1;
+    Ok(report)
+}
 
-        let classification = FileClassifier::classify(file_path);
-        let ext = file_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_string();
+/// Classification outcome for a single file, computed without touching the
+/// shared report so the per-file pass can run in parallel.
+enum FileCoverage {
+    EntitySource { ext: String, has_imports: bool },
+    ShallowSyntax { language_hint: String },
+    StructuredArtifact { kind_name: String },
+    OpaqueArtifact { key: String },
+}
 
-        match classification {
-            FileClassification::EntitySource => {
-                report.entity_source_count += 1;
-                *report
-                    .entity_source_extensions
-                    .entry(ext.clone())
-                    .or_insert(0) += 1;
+/// Classify one file into its coverage bucket. Pure with respect to the report:
+/// performs only file reads and classification, returning the outcome to merge.
+fn classify_file_coverage(file_path: &Path) -> FileCoverage {
+    let classification = FileClassifier::classify(file_path);
+    let ext = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_string();
 
-                // Sub-classify into C5 (cross-file) vs C4 (intra-file)
-                // based on whether the file contains import statements.
-                let has_imports = std::fs::read_to_string(file_path)
-                    .map(|content| file_has_imports(&ext, &content))
-                    .unwrap_or(false);
+    match classification {
+        FileClassification::EntitySource => {
+            // Sub-classify into C5 (cross-file) vs C4 (intra-file) based on
+            // whether the file contains import statements.
+            let has_imports = std::fs::read_to_string(file_path)
+                .map(|content| file_has_imports(&ext, &content))
+                .unwrap_or(false);
+            FileCoverage::EntitySource { ext, has_imports }
+        }
+        FileClassification::ShallowSyntax { language_hint } => {
+            FileCoverage::ShallowSyntax { language_hint }
+        }
+        FileClassification::StructuredArtifact(kind) => FileCoverage::StructuredArtifact {
+            kind_name: artifact_kind_name(kind),
+        },
+        FileClassification::OpaqueArtifact { .. } => {
+            let key = if ext.is_empty() {
+                "(no ext)".to_string()
+            } else {
+                ext
+            };
+            FileCoverage::OpaqueArtifact { key }
+        }
+    }
+}
 
+impl CoverageReport {
+    /// Fold a single file's classification outcome into the running totals.
+    fn absorb(&mut self, outcome: FileCoverage) {
+        self.total_files += 1;
+        match outcome {
+            FileCoverage::EntitySource { ext, has_imports } => {
+                self.entity_source_count += 1;
+                *self.entity_source_extensions.entry(ext.clone()).or_insert(0) += 1;
                 if has_imports {
-                    report.c5_cross_file_count += 1;
-                    *report.c5_languages.entry(ext).or_insert(0) += 1;
+                    self.c5_cross_file_count += 1;
+                    *self.c5_languages.entry(ext).or_insert(0) += 1;
                 } else {
-                    report.c4_intra_file_count += 1;
-                    *report.c4_languages.entry(ext).or_insert(0) += 1;
+                    self.c4_intra_file_count += 1;
+                    *self.c4_languages.entry(ext).or_insert(0) += 1;
                 }
             }
-            FileClassification::ShallowSyntax { language_hint } => {
-                report.shallow_syntax_count += 1;
-                *report
+            FileCoverage::ShallowSyntax { language_hint } => {
+                self.shallow_syntax_count += 1;
+                *self
                     .shallow_syntax_languages
                     .entry(language_hint)
                     .or_insert(0) += 1;
             }
-            FileClassification::StructuredArtifact(kind) => {
-                report.structured_artifact_count += 1;
-                let kind_name = artifact_kind_name(kind);
-                *report
+            FileCoverage::StructuredArtifact { kind_name } => {
+                self.structured_artifact_count += 1;
+                *self
                     .structured_artifacts_by_kind
                     .entry(kind_name)
                     .or_insert(0) += 1;
             }
-            FileClassification::OpaqueArtifact { .. } => {
-                report.opaque_artifact_count += 1;
-                let key = if ext.is_empty() {
-                    "(no ext)".to_string()
-                } else {
-                    ext
-                };
-                *report.opaque_extensions.entry(key).or_insert(0) += 1;
+            FileCoverage::OpaqueArtifact { key } => {
+                self.opaque_artifact_count += 1;
+                *self.opaque_extensions.entry(key).or_insert(0) += 1;
             }
         }
     }
-
-    Ok(report)
 }
 
 impl CoverageReport {
@@ -520,5 +561,70 @@ mod tests {
             report.c5_cross_file_count + report.c4_intra_file_count,
             report.entity_source_count,
         );
+    }
+
+    /// Serial counterpart of [`compute_coverage_report`], retained as the
+    /// byte-identical reference for the parallel classification pass.
+    fn compute_coverage_report_serial(root: &Path) -> crate::Result<CoverageReport> {
+        let files = collect_all_files(root)?;
+        let mut report = CoverageReport::default();
+        for file_path in &files {
+            report.absorb(classify_file_coverage(file_path));
+        }
+        Ok(report)
+    }
+
+    #[test]
+    fn coverage_report_parallel_matches_serial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Spread real work across every classification bucket and enough files
+        // that the parallel pass actually splits, so any ordering or
+        // double-counting hazard would surface.
+        for i in 0..40 {
+            let dir = root.join(format!("pkg{}", i % 5));
+            fs::create_dir_all(&dir).unwrap();
+
+            // Entity sources: alternate import / no-import so C4 vs C5 both fill.
+            fs::write(
+                dir.join(format!("mod{i}.rs")),
+                if i % 2 == 0 {
+                    "use std::fmt;\nfn run() {}"
+                } else {
+                    "fn run() {}"
+                },
+            )
+            .unwrap();
+            fs::write(
+                dir.join(format!("app{i}.ts")),
+                if i % 3 == 0 {
+                    "import { x } from './x'\nexport const y = 1"
+                } else {
+                    "export const y = 1"
+                },
+            )
+            .unwrap();
+
+            // Structured artifacts.
+            fs::write(dir.join(format!("Dockerfile{i}")), "FROM alpine").unwrap();
+            fs::write(dir.join(format!("pkg{i}.json")), "{}").unwrap();
+
+            // Opaque artifacts (one with an extension, one without).
+            fs::write(dir.join(format!("notes{i}.md")), "# notes").unwrap();
+            fs::write(dir.join(format!("DATA{i}")), [0u8; 4]).unwrap();
+        }
+
+        let parallel = compute_coverage_report(root).unwrap();
+        let serial = compute_coverage_report_serial(root).unwrap();
+        assert_eq!(
+            parallel, serial,
+            "parallel coverage report must equal the serial reference"
+        );
+
+        // Re-running the parallel path must also be stable.
+        let parallel_again = compute_coverage_report(root).unwrap();
+        assert_eq!(parallel, parallel_again);
+        assert!(parallel.total_files >= 240);
     }
 }
