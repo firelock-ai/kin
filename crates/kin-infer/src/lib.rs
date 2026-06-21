@@ -287,6 +287,7 @@ const POOLED_OUTPUT_DEFAULT_MAX_BATCH_SIZE: usize = 256;
 const POOLED_OUTPUT_DEFAULT_MAX_SEQ: usize = 512;
 const POOLED_OUTPUT_DEFAULT_SEGMENTED_MAX_SEQ: usize = 2048;
 const POOLED_OUTPUT_DEFAULT_SEGMENT_LAYERS: usize = 2;
+const SEGMENT_LAYERS_ENV_MAX: usize = 8;
 
 static POOLED_OUTPUT_USED: AtomicU64 = AtomicU64::new(0);
 static POOLED_OUTPUT_USED_SEGMENTED: AtomicU64 = AtomicU64::new(0);
@@ -456,7 +457,8 @@ fn pooled_output_caps() -> PooledOutputCaps {
 }
 
 fn env_segment_layers_or(name: &str, default: usize) -> usize {
-    env_usize_or(name, default.max(1)).max(1)
+    let max = SEGMENT_LAYERS_ENV_MAX.max(1);
+    env_usize_or(name, default.max(1).min(max)).clamp(1, max)
 }
 
 fn env_usize_or(name: &str, default: usize) -> usize {
@@ -6610,6 +6612,12 @@ mod tests {
         const VALID_ENV: &str = "KIN_INFER_TEST_SEGMENT_LAYERS_VALID";
         const DEFAULT_ZERO_ENV: &str = "KIN_INFER_TEST_SEGMENT_LAYERS_DEFAULT_ZERO";
 
+        std::env::remove_var(DEFAULT_ZERO_ENV);
+        assert_eq!(
+            env_segment_layers_or(DEFAULT_ZERO_ENV, POOLED_OUTPUT_DEFAULT_SEGMENT_LAYERS),
+            POOLED_OUTPUT_DEFAULT_SEGMENT_LAYERS
+        );
+
         std::env::set_var(ZERO_ENV, "0");
         assert_eq!(env_segment_layers_or(ZERO_ENV, 2), 2);
         std::env::remove_var(ZERO_ENV);
@@ -6624,6 +6632,23 @@ mod tests {
             3usize.div_ceil(env_segment_layers_or(DEFAULT_ZERO_ENV, 0)),
             3
         );
+    }
+
+    #[test]
+    fn segment_layer_env_caps_oversized_values() {
+        const MAX_ENV: &str = "KIN_INFER_TEST_SEGMENT_LAYERS_MAX";
+        const OVERSIZED_ENV: &str = "KIN_INFER_TEST_SEGMENT_LAYERS_OVERSIZED";
+
+        std::env::set_var(MAX_ENV, SEGMENT_LAYERS_ENV_MAX.to_string());
+        assert_eq!(env_segment_layers_or(MAX_ENV, 2), SEGMENT_LAYERS_ENV_MAX);
+        std::env::remove_var(MAX_ENV);
+
+        std::env::set_var(OVERSIZED_ENV, (SEGMENT_LAYERS_ENV_MAX + 100).to_string());
+        assert_eq!(
+            env_segment_layers_or(OVERSIZED_ENV, 2),
+            SEGMENT_LAYERS_ENV_MAX
+        );
+        std::env::remove_var(OVERSIZED_ENV);
     }
 
     #[test]
