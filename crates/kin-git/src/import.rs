@@ -9,6 +9,7 @@ use kin_model::{
     ArtifactDelta, ArtifactDeltaKind, AuthorId, BranchName, FilePathId, Hash256, SemanticChange,
     SemanticChangeId, Timestamp,
 };
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
@@ -196,9 +197,78 @@ fn import_full(
         blobs = blob_store.is_some()
     )
     .entered();
-    let mut changes = Vec::new();
 
     // Walk commits in topological order (parents before children).
+    let walk = repo
+        .rev_walk([head_id])
+        .sorting(gix::revision::walk::Sorting::ByCommitTime(
+            Default::default(),
+        ))
+        .all()
+        .map_err(|e| GitError::Git(e.to_string()))?;
+
+    // Phase 1: collect OIDs in walk order (cheap sequential walk), honoring
+    // max_commits. The order here is the authority for the final output order.
+    let oids: Vec<gix::ObjectId> = {
+        let _span = tracing::info_span!("kin.git.import_full.collect_oids").entered();
+        let iter = walk.map(|r| {
+            r.map(|info| info.id().detach())
+                .map_err(|e| GitError::Git(e.to_string()))
+        });
+        if max_commits > 0 {
+            iter.take(max_commits).collect::<Result<Vec<_>>>()?
+        } else {
+            iter.collect::<Result<Vec<_>>>()?
+        }
+    };
+
+    // Phase 2: map each commit to an ImportedChange in parallel. Each commit's
+    // mapping is independent (deterministic change_id from its OID, parents from
+    // its parent OIDs, all fields derived purely from the commit); the only
+    // shared side-effect is the content-addressed blob_store.write, which is
+    // thread-safe and idempotent by hash. rayon's indexed `par_iter().collect()`
+    // preserves `oids` order, so the result is byte-identical to a serial walk.
+    let mut changes: Vec<ImportedChange> = {
+        let _span =
+            tracing::info_span!("kin.git.import_full.map_commits", commits = oids.len()).entered();
+        let thread_safe = repo.clone().into_sync();
+        oids.par_iter()
+            .map(|oid| {
+                let local = thread_safe.to_thread_local();
+                let commit = local
+                    .find_object(*oid)
+                    .map_err(|e| GitError::Git(e.to_string()))?
+                    .into_commit();
+                let is_root = commit.parent_ids().count() == 0;
+                let change = commit_to_change(&local, &commit, genesis_id, is_root, blob_store)?;
+                let oid_str = oid.to_string();
+                debug!(git_oid = %oid_str, kin_id = %change.id, parents = change.parents.len(), "imported commit");
+                Ok(ImportedChange {
+                    change,
+                    git_oid: oid_str,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    // Reverse so oldest commit is first (topological order).
+    changes.reverse();
+
+    info!(count = changes.len(), "full history import complete");
+    Ok(changes)
+}
+
+/// Serial counterpart of [`import_full`], retained as the byte-identical
+/// reference for the parallel commit-mapping path.
+#[cfg(test)]
+fn import_full_serial(
+    repo: &gix::Repository,
+    head_id: gix::ObjectId,
+    genesis_id: SemanticChangeId,
+    max_commits: usize,
+    blob_store: Option<&BlobStore>,
+) -> Result<Vec<ImportedChange>> {
+    let mut changes = Vec::new();
     let walk = repo
         .rev_walk([head_id])
         .sorting(gix::revision::walk::Sorting::ByCommitTime(
@@ -219,23 +289,17 @@ fn import_full(
         let change = commit_to_change(repo, &commit, genesis_id, is_root, blob_store)?;
         let oid_str = info.id.to_string();
 
-        debug!(git_oid = %oid_str, kin_id = %change.id, parents = change.parents.len(), "imported commit");
-
         changes.push(ImportedChange {
             change,
             git_oid: oid_str,
         });
 
         if max_commits > 0 && changes.len() >= max_commits {
-            info!(count = changes.len(), "reached max_commits limit");
             break;
         }
     }
 
-    // Reverse so oldest commit is first (topological order).
     changes.reverse();
-
-    info!(count = changes.len(), "full history import complete");
     Ok(changes)
 }
 
@@ -622,5 +686,149 @@ mod tests {
 
         assert_eq!(imported.len(), 1);
         assert_eq!(imported[0].git_oid, first_oid);
+    }
+
+    /// Build a git repo with `num_commits` commits, each touching a couple of
+    /// files, using a deterministic xorshift selection (no wall-clock / RNG) so
+    /// the history is reproducible. Returns the repo's tempdir.
+    fn build_test_repo(num_commits: usize, num_files: usize) -> Option<tempfile::TempDir> {
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo(dir.path()) {
+            return None;
+        }
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+
+        let mut state: u64 = 0xC0FFEE | 1;
+        let mut next = || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545F4914F6CDD1D)
+        };
+
+        for c in 0..num_commits {
+            // Touch two adjacent files, content keyed on the commit index so each
+            // commit produces a distinct tree (and distinct blobs).
+            let base = (next() as usize) % num_files;
+            for k in 0..2 {
+                let f = (base + k) % num_files;
+                let path = dir.path().join("src").join(format!("f{f}.rs"));
+                std::fs::write(&path, format!("// f{f} rev {c}\nfn f{f}_{c}() {{}}\n")).unwrap();
+            }
+            let _ = Command::new("git")
+                .args(["add", "."])
+                .current_dir(dir.path())
+                .output();
+            let _ = Command::new("git")
+                .args(["commit", "-m", &format!("commit {c}")])
+                .current_dir(dir.path())
+                .output();
+        }
+        Some(dir)
+    }
+
+    /// Determinism gate: the parallel commit-mapping path must produce a
+    /// byte-identical `Vec<ImportedChange>` to the serial reference — same order,
+    /// same change_id / parents / artifact_deltas / message / timestamp per
+    /// element — and re-running the parallel path must be byte-stable. This is
+    /// the proof that parallelizing the import preserves the citable graph.
+    #[test]
+    fn parallel_import_is_byte_identical_to_serial() {
+        let Some(dir) = build_test_repo(40, 6) else {
+            eprintln!("git not available, skipping parallel/serial equality test");
+            return;
+        };
+
+        let repo = open_repo(dir.path()).expect("open repo");
+        let head_id = repo
+            .head_ref()
+            .expect("head_ref")
+            .expect("non-empty repo")
+            .id()
+            .detach();
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x44; 32]));
+
+        // Separate blob stores so the comparison isolates the mapping, not store
+        // state, and so neither run's writes mask the other's.
+        let store_par = BlobStore::new(dir.path().join("blobs-par")).unwrap();
+        let store_ser = BlobStore::new(dir.path().join("blobs-ser")).unwrap();
+
+        let parallel = import_full(&repo, head_id, genesis_id, 0, Some(&store_par))
+            .expect("parallel import should succeed");
+        let serial = import_full_serial(&repo, head_id, genesis_id, 0, Some(&store_ser))
+            .expect("serial import should succeed");
+
+        assert!(!parallel.is_empty(), "import should yield changes");
+        assert_eq!(
+            parallel.len(),
+            serial.len(),
+            "parallel and serial must import the same number of commits"
+        );
+        // Debug formatting captures every field (id, parents, timestamp, author,
+        // message, artifact_deltas, git_oid); equal Debug strings ⇒ byte-identical
+        // ImportedChange vectors in identical order.
+        assert_eq!(
+            format!("{parallel:?}"),
+            format!("{serial:?}"),
+            "parallel import must produce byte-identical changes to the serial path"
+        );
+
+        // Re-running the parallel path must also be byte-stable.
+        let store_par2 = BlobStore::new(dir.path().join("blobs-par2")).unwrap();
+        let parallel_again = import_full(&repo, head_id, genesis_id, 0, Some(&store_par2))
+            .expect("second parallel import should succeed");
+        assert_eq!(
+            format!("{parallel:?}"),
+            format!("{parallel_again:?}"),
+            "parallel import must be byte-stable across runs"
+        );
+
+        // The byte-identical guarantee must also hold under max_commits truncation.
+        let store_a = BlobStore::new(dir.path().join("blobs-a")).unwrap();
+        let store_b = BlobStore::new(dir.path().join("blobs-b")).unwrap();
+        let par_limited = import_full(&repo, head_id, genesis_id, 10, Some(&store_a)).unwrap();
+        let ser_limited =
+            import_full_serial(&repo, head_id, genesis_id, 10, Some(&store_b)).unwrap();
+        assert_eq!(par_limited.len(), 10);
+        assert_eq!(format!("{par_limited:?}"), format!("{ser_limited:?}"));
+    }
+
+    /// Manual timing harness comparing serial vs parallel import over a ~50-commit
+    /// temp repo. Ignored by default — run with
+    /// `cargo test -p kin-git parallel_import_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing harness; run explicitly with --ignored --nocapture"]
+    fn parallel_import_timing() {
+        let num_commits = 50;
+        let Some(dir) = build_test_repo(num_commits, 12) else {
+            eprintln!("git not available, skipping timing harness");
+            return;
+        };
+        let repo = open_repo(dir.path()).expect("open repo");
+        let head_id = repo
+            .head_ref()
+            .expect("head_ref")
+            .expect("non-empty repo")
+            .id()
+            .detach();
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x55; 32]));
+
+        let store_ser = BlobStore::new(dir.path().join("blobs-t-ser")).unwrap();
+        let t0 = std::time::Instant::now();
+        let serial = import_full_serial(&repo, head_id, genesis_id, 0, Some(&store_ser)).unwrap();
+        let serial_ms = t0.elapsed().as_micros() as f64 / 1000.0;
+
+        let store_par = BlobStore::new(dir.path().join("blobs-t-par")).unwrap();
+        let t1 = std::time::Instant::now();
+        let parallel = import_full(&repo, head_id, genesis_id, 0, Some(&store_par)).unwrap();
+        let parallel_ms = t1.elapsed().as_micros() as f64 / 1000.0;
+
+        eprintln!(
+            "[import-timing] commits={} serial={serial_ms:.2}ms parallel={parallel_ms:.2}ms \
+             speedup={:.2}x",
+            serial.len(),
+            serial_ms / parallel_ms.max(0.0001)
+        );
+        assert_eq!(parallel.len(), serial.len());
     }
 }
