@@ -3201,6 +3201,11 @@ impl BertModel {
         if resident_stack_disabled() {
             return Some(ResidentStackDecisionReason::Disabled);
         }
+        // Proof runs the bit-identical per-layer path; the whole-stack GPU-resident
+        // pass is a throughput-only optimization.
+        if matches!(crate::resource::Profile::from_env(), crate::resource::Profile::Proof) {
+            return Some(ResidentStackDecisionReason::Disabled);
+        }
         if dump_layer_enabled() {
             return Some(ResidentStackDecisionReason::LayerDumpEnabled);
         }
@@ -5366,7 +5371,26 @@ mod tests {
     fn pooled_output_test_lock() -> MutexGuard<'static, ()> {
         POOLED_OUTPUT_TEST_LOCK
             .lock()
-            .expect("pooled output test lock")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct ResourceProfileEnvGuard(Option<String>);
+
+    impl ResourceProfileEnvGuard {
+        fn set(value: &str) -> Self {
+            let prev = std::env::var("KIN_RESOURCE_PROFILE").ok();
+            std::env::set_var("KIN_RESOURCE_PROFILE", value);
+            Self(prev)
+        }
+    }
+
+    impl Drop for ResourceProfileEnvGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("KIN_RESOURCE_PROFILE", value),
+                None => std::env::remove_var("KIN_RESOURCE_PROFILE"),
+            }
+        }
     }
 
     impl PooledOutputOverrideGuard {
@@ -6913,6 +6937,7 @@ mod tests {
     #[test]
     fn encode_batched_segments_long_resident_stack_instead_of_unbounded_stack() {
         let _lock = pooled_output_test_lock();
+        let _profile = ResourceProfileEnvGuard::set("interactive");
         reset_resident_stack_runtime_stats();
         let pooled_calls = Arc::new(AtomicUsize::new(0));
         let resident_unbounded_calls = Arc::new(AtomicUsize::new(0));
@@ -6959,6 +6984,7 @@ mod tests {
     #[test]
     fn resident_stack_caps_cannot_loosen_pooled_caps() {
         let _lock = pooled_output_test_lock();
+        let _profile = ResourceProfileEnvGuard::set("interactive");
         reset_resident_stack_runtime_stats();
         let _pooled_caps = PooledOutputCapsOverrideGuard::set(PooledOutputCaps {
             max_batch_size: POOLED_OUTPUT_DEFAULT_MAX_BATCH_SIZE,
@@ -7022,6 +7048,7 @@ mod tests {
     #[test]
     fn resident_stack_records_backend_unsupported_when_segmented_backend_declines() {
         let _lock = pooled_output_test_lock();
+        let _profile = ResourceProfileEnvGuard::set("interactive");
         reset_resident_stack_runtime_stats();
         let pooled_calls = Arc::new(AtomicUsize::new(0));
         let resident_unbounded_calls = Arc::new(AtomicUsize::new(0));
