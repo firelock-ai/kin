@@ -13,7 +13,7 @@ use crate::gpu::{
 };
 use crate::InferError;
 use metal::{
-    Buffer, CommandBuffer, CommandBufferRef, CommandQueue, CompileOptions, ComputePipelineState, Device,
+    Buffer, CommandBufferRef, CommandQueue, CompileOptions, ComputePipelineState, Device,
     MTLLanguageVersion, MTLResourceOptions, MTLSize,
 };
 use objc2::rc::autoreleasepool;
@@ -3434,9 +3434,9 @@ impl MetalCompute {
             config.eps
         })?;
 
-        let mut step = |cmd_in: &'a CommandBufferRef,
-                        phase: Phase,
-                        f: &mut dyn FnMut(&CommandBufferRef) -> Result<(), InferError>|
+        let step = |cmd_in: &'a CommandBufferRef,
+                    phase: Phase,
+                    f: &mut dyn FnMut(&CommandBufferRef) -> Result<(), InferError>|
          -> Result<&'a CommandBufferRef, InferError> {
             if profile_enabled() {
                 let mut err = Ok(());
