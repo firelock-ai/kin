@@ -28,6 +28,7 @@ use safetensors::{Dtype, SafeTensors};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -276,6 +277,244 @@ fn pooled_output_enabled() -> bool {
         crate::resource::env_flag_override("KIN_INFER_POOLED_OUTPUT")
             .unwrap_or_else(|| crate::resource::active_gpu_kernel_plan().pooled_output)
     })
+}
+
+/// Conservative guardrail for the whole-stack pooled-output Metal path. The path
+/// encodes every transformer layer plus final pooling into one command buffer, so
+/// long sequences are capped until the long-sequence Metal hang is disproven.
+const POOLED_OUTPUT_DEFAULT_MAX_BATCH_SIZE: usize = 256;
+const POOLED_OUTPUT_DEFAULT_MAX_SEQ: usize = 512;
+
+static POOLED_OUTPUT_USED: AtomicU64 = AtomicU64::new(0);
+static POOLED_OUTPUT_DECLINED: AtomicU64 = AtomicU64::new(0);
+static POOLED_OUTPUT_DECLINED_DISABLED: AtomicU64 = AtomicU64::new(0);
+static POOLED_OUTPUT_DECLINED_RESIDENT_DISABLED: AtomicU64 = AtomicU64::new(0);
+static POOLED_OUTPUT_DECLINED_DUMP_LAYER: AtomicU64 = AtomicU64::new(0);
+static POOLED_OUTPUT_DECLINED_NO_GPU: AtomicU64 = AtomicU64::new(0);
+static POOLED_OUTPUT_DECLINED_RELATIVE_ATTENTION: AtomicU64 = AtomicU64::new(0);
+static POOLED_OUTPUT_DECLINED_BATCH_TOO_LARGE: AtomicU64 = AtomicU64::new(0);
+static POOLED_OUTPUT_DECLINED_SEQUENCE_TOO_LONG: AtomicU64 = AtomicU64::new(0);
+static POOLED_OUTPUT_DECLINED_BACKEND_UNSUPPORTED: AtomicU64 = AtomicU64::new(0);
+static POOLED_OUTPUT_LAST_REASON: AtomicU64 = AtomicU64::new(0);
+static POOLED_OUTPUT_LAST_BATCH_SIZE: AtomicU64 = AtomicU64::new(0);
+static POOLED_OUTPUT_LAST_MAX_SEQ: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PooledOutputDecisionReason {
+    None,
+    Used,
+    Disabled,
+    ResidentStackDisabled,
+    LayerDumpEnabled,
+    NoGpu,
+    RelativeAttention,
+    BatchTooLarge,
+    SequenceTooLong,
+    BackendUnsupported,
+}
+
+impl PooledOutputDecisionReason {
+    fn code(self) -> u64 {
+        match self {
+            Self::None => 0,
+            Self::Used => 1,
+            Self::Disabled => 2,
+            Self::ResidentStackDisabled => 3,
+            Self::LayerDumpEnabled => 4,
+            Self::NoGpu => 5,
+            Self::RelativeAttention => 6,
+            Self::BatchTooLarge => 7,
+            Self::SequenceTooLong => 8,
+            Self::BackendUnsupported => 9,
+        }
+    }
+
+    fn from_code(code: u64) -> Self {
+        match code {
+            1 => Self::Used,
+            2 => Self::Disabled,
+            3 => Self::ResidentStackDisabled,
+            4 => Self::LayerDumpEnabled,
+            5 => Self::NoGpu,
+            6 => Self::RelativeAttention,
+            7 => Self::BatchTooLarge,
+            8 => Self::SequenceTooLong,
+            9 => Self::BackendUnsupported,
+            _ => Self::None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Used => "used",
+            Self::Disabled => "disabled",
+            Self::ResidentStackDisabled => "resident_stack_disabled",
+            Self::LayerDumpEnabled => "layer_dump_enabled",
+            Self::NoGpu => "no_gpu",
+            Self::RelativeAttention => "relative_attention",
+            Self::BatchTooLarge => "batch_too_large",
+            Self::SequenceTooLong => "sequence_too_long",
+            Self::BackendUnsupported => "backend_unsupported",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PooledOutputRuntimeStats {
+    pub used: u64,
+    pub declined: u64,
+    pub declined_disabled: u64,
+    pub declined_resident_stack_disabled: u64,
+    pub declined_layer_dump_enabled: u64,
+    pub declined_no_gpu: u64,
+    pub declined_relative_attention: u64,
+    pub declined_batch_too_large: u64,
+    pub declined_sequence_too_long: u64,
+    pub declined_backend_unsupported: u64,
+    pub last_reason: PooledOutputDecisionReason,
+    pub last_batch_size: u64,
+    pub last_max_seq: u64,
+    pub max_batch_size: usize,
+    pub max_seq: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PooledOutputCaps {
+    max_batch_size: usize,
+    max_seq: usize,
+}
+
+fn pooled_output_caps() -> PooledOutputCaps {
+    use std::sync::OnceLock;
+    static CAPS: OnceLock<PooledOutputCaps> = OnceLock::new();
+    *CAPS.get_or_init(|| PooledOutputCaps {
+        max_batch_size: env_usize_or(
+            "KIN_INFER_POOLED_MAX_BATCH_SIZE",
+            POOLED_OUTPUT_DEFAULT_MAX_BATCH_SIZE,
+        ),
+        max_seq: env_usize_or("KIN_INFER_POOLED_MAX_SEQ", POOLED_OUTPUT_DEFAULT_MAX_SEQ),
+    })
+}
+
+fn env_usize_or(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn pooled_output_stderr_log_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("KIN_INFER_POOLED_OUTPUT_LOG").is_some())
+}
+
+fn pooled_output_decline_counter(reason: PooledOutputDecisionReason) -> Option<&'static AtomicU64> {
+    match reason {
+        PooledOutputDecisionReason::Disabled => Some(&POOLED_OUTPUT_DECLINED_DISABLED),
+        PooledOutputDecisionReason::ResidentStackDisabled => {
+            Some(&POOLED_OUTPUT_DECLINED_RESIDENT_DISABLED)
+        }
+        PooledOutputDecisionReason::LayerDumpEnabled => Some(&POOLED_OUTPUT_DECLINED_DUMP_LAYER),
+        PooledOutputDecisionReason::NoGpu => Some(&POOLED_OUTPUT_DECLINED_NO_GPU),
+        PooledOutputDecisionReason::RelativeAttention => {
+            Some(&POOLED_OUTPUT_DECLINED_RELATIVE_ATTENTION)
+        }
+        PooledOutputDecisionReason::BatchTooLarge => Some(&POOLED_OUTPUT_DECLINED_BATCH_TOO_LARGE),
+        PooledOutputDecisionReason::SequenceTooLong => {
+            Some(&POOLED_OUTPUT_DECLINED_SEQUENCE_TOO_LONG)
+        }
+        PooledOutputDecisionReason::BackendUnsupported => {
+            Some(&POOLED_OUTPUT_DECLINED_BACKEND_UNSUPPORTED)
+        }
+        PooledOutputDecisionReason::None | PooledOutputDecisionReason::Used => None,
+    }
+}
+
+fn record_pooled_output_decision(
+    reason: PooledOutputDecisionReason,
+    batch_size: usize,
+    max_seq: usize,
+) {
+    POOLED_OUTPUT_LAST_REASON.store(reason.code(), Ordering::Relaxed);
+    POOLED_OUTPUT_LAST_BATCH_SIZE.store(batch_size as u64, Ordering::Relaxed);
+    POOLED_OUTPUT_LAST_MAX_SEQ.store(max_seq as u64, Ordering::Relaxed);
+
+    let used = matches!(reason, PooledOutputDecisionReason::Used);
+    if used {
+        POOLED_OUTPUT_USED.fetch_add(1, Ordering::Relaxed);
+    } else if let Some(counter) = pooled_output_decline_counter(reason) {
+        POOLED_OUTPUT_DECLINED.fetch_add(1, Ordering::Relaxed);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let caps = pooled_output_caps();
+    tracing::info!(
+        target: "kin_infer::pooled_output",
+        used = used,
+        reason = reason.as_str(),
+        batch_size = batch_size,
+        max_seq = max_seq,
+        max_batch_size = caps.max_batch_size,
+        max_seq_cap = caps.max_seq,
+        "kin_infer.pooled_output.decision"
+    );
+    if pooled_output_stderr_log_enabled() {
+        eprintln!(
+            "kin_infer.pooled_output decision={} used={} batch_size={} max_seq={} max_batch_size={} max_seq_cap={}",
+            reason.as_str(),
+            used,
+            batch_size,
+            max_seq,
+            caps.max_batch_size,
+            caps.max_seq
+        );
+    }
+}
+
+pub fn pooled_output_runtime_stats() -> PooledOutputRuntimeStats {
+    let caps = pooled_output_caps();
+    PooledOutputRuntimeStats {
+        used: POOLED_OUTPUT_USED.load(Ordering::Relaxed),
+        declined: POOLED_OUTPUT_DECLINED.load(Ordering::Relaxed),
+        declined_disabled: POOLED_OUTPUT_DECLINED_DISABLED.load(Ordering::Relaxed),
+        declined_resident_stack_disabled: POOLED_OUTPUT_DECLINED_RESIDENT_DISABLED
+            .load(Ordering::Relaxed),
+        declined_layer_dump_enabled: POOLED_OUTPUT_DECLINED_DUMP_LAYER.load(Ordering::Relaxed),
+        declined_no_gpu: POOLED_OUTPUT_DECLINED_NO_GPU.load(Ordering::Relaxed),
+        declined_relative_attention: POOLED_OUTPUT_DECLINED_RELATIVE_ATTENTION
+            .load(Ordering::Relaxed),
+        declined_batch_too_large: POOLED_OUTPUT_DECLINED_BATCH_TOO_LARGE.load(Ordering::Relaxed),
+        declined_sequence_too_long: POOLED_OUTPUT_DECLINED_SEQUENCE_TOO_LONG
+            .load(Ordering::Relaxed),
+        declined_backend_unsupported: POOLED_OUTPUT_DECLINED_BACKEND_UNSUPPORTED
+            .load(Ordering::Relaxed),
+        last_reason: PooledOutputDecisionReason::from_code(
+            POOLED_OUTPUT_LAST_REASON.load(Ordering::Relaxed),
+        ),
+        last_batch_size: POOLED_OUTPUT_LAST_BATCH_SIZE.load(Ordering::Relaxed),
+        last_max_seq: POOLED_OUTPUT_LAST_MAX_SEQ.load(Ordering::Relaxed),
+        max_batch_size: caps.max_batch_size,
+        max_seq: caps.max_seq,
+    }
+}
+
+pub fn reset_pooled_output_runtime_stats() {
+    POOLED_OUTPUT_USED.store(0, Ordering::Relaxed);
+    POOLED_OUTPUT_DECLINED.store(0, Ordering::Relaxed);
+    POOLED_OUTPUT_DECLINED_DISABLED.store(0, Ordering::Relaxed);
+    POOLED_OUTPUT_DECLINED_RESIDENT_DISABLED.store(0, Ordering::Relaxed);
+    POOLED_OUTPUT_DECLINED_DUMP_LAYER.store(0, Ordering::Relaxed);
+    POOLED_OUTPUT_DECLINED_NO_GPU.store(0, Ordering::Relaxed);
+    POOLED_OUTPUT_DECLINED_RELATIVE_ATTENTION.store(0, Ordering::Relaxed);
+    POOLED_OUTPUT_DECLINED_BATCH_TOO_LARGE.store(0, Ordering::Relaxed);
+    POOLED_OUTPUT_DECLINED_SEQUENCE_TOO_LONG.store(0, Ordering::Relaxed);
+    POOLED_OUTPUT_DECLINED_BACKEND_UNSUPPORTED.store(0, Ordering::Relaxed);
+    POOLED_OUTPUT_LAST_REASON.store(PooledOutputDecisionReason::None.code(), Ordering::Relaxed);
+    POOLED_OUTPUT_LAST_BATCH_SIZE.store(0, Ordering::Relaxed);
+    POOLED_OUTPUT_LAST_MAX_SEQ.store(0, Ordering::Relaxed);
 }
 
 /// Length-bucketing gate for `forward_batched`. When ON, mixed-length batches are
@@ -2187,20 +2426,65 @@ impl BertModel {
         token_ids: &[Vec<u32>],
         attention_masks: &[Vec<u32>],
     ) -> Result<Option<Vec<Vec<f32>>>, InferError> {
-        if !pooled_output_enabled() || resident_stack_disabled() || dump_layer_enabled() {
+        let batch_size = token_ids.len();
+        let max_len = token_ids.iter().map(|t| t.len()).max().unwrap_or(0);
+
+        if !pooled_output_enabled() {
+            record_pooled_output_decision(
+                PooledOutputDecisionReason::Disabled,
+                batch_size,
+                max_len,
+            );
+            return Ok(None);
+        }
+        if resident_stack_disabled() {
+            record_pooled_output_decision(
+                PooledOutputDecisionReason::ResidentStackDisabled,
+                batch_size,
+                max_len,
+            );
+            return Ok(None);
+        }
+        if dump_layer_enabled() {
+            record_pooled_output_decision(
+                PooledOutputDecisionReason::LayerDumpEnabled,
+                batch_size,
+                max_len,
+            );
             return Ok(None);
         }
         let Some(gpu) = self.gpu.as_ref() else {
+            record_pooled_output_decision(PooledOutputDecisionReason::NoGpu, batch_size, max_len);
             return Ok(None);
         };
         if self.has_relative_attention_layers() {
+            record_pooled_output_decision(
+                PooledOutputDecisionReason::RelativeAttention,
+                batch_size,
+                max_len,
+            );
+            return Ok(None);
+        }
+        let caps = pooled_output_caps();
+        if batch_size > caps.max_batch_size {
+            record_pooled_output_decision(
+                PooledOutputDecisionReason::BatchTooLarge,
+                batch_size,
+                max_len,
+            );
+            return Ok(None);
+        }
+        if max_len > caps.max_seq {
+            record_pooled_output_decision(
+                PooledOutputDecisionReason::SequenceTooLong,
+                batch_size,
+                max_len,
+            );
             return Ok(None);
         }
 
-        let batch_size = token_ids.len();
         let h = self.config.hidden_size;
         let embed_dim = self.config.embedding_size.unwrap_or(h);
-        let max_len = token_ids.iter().map(|t| t.len()).max().unwrap_or(0);
         let total_rows = batch_size * max_len;
 
         let mut hidden = Array2::<f32>::zeros((total_rows, embed_dim));
@@ -2320,6 +2604,11 @@ impl BertModel {
             pooling,
         )?
         else {
+            record_pooled_output_decision(
+                PooledOutputDecisionReason::BackendUnsupported,
+                batch_size,
+                max_len,
+            );
             return Ok(None);
         };
 
@@ -2329,11 +2618,12 @@ impl BertModel {
                 flat.len()
             )));
         }
-        Ok(Some(
-            flat.chunks_exact(h)
-                .map(|row| l2_normalize(&Array1::from_vec(row.to_vec())).to_vec())
-                .collect(),
-        ))
+        let pooled = flat
+            .chunks_exact(h)
+            .map(|row| l2_normalize(&Array1::from_vec(row.to_vec())).to_vec())
+            .collect();
+        record_pooled_output_decision(PooledOutputDecisionReason::Used, batch_size, max_len);
+        Ok(Some(pooled))
     }
 
     /// Per-input mean/CLS pooling + L2 normalize over an encoded batch.
@@ -4564,7 +4854,7 @@ mod tests {
     use super::*;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex, MutexGuard,
     };
 
     struct PooledOnlyGpu {
@@ -4572,6 +4862,13 @@ mod tests {
     }
 
     struct PooledOutputOverrideGuard;
+    static POOLED_OUTPUT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn pooled_output_test_lock() -> MutexGuard<'static, ()> {
+        POOLED_OUTPUT_TEST_LOCK
+            .lock()
+            .expect("pooled output test lock")
+    }
 
     impl PooledOutputOverrideGuard {
         fn enabled() -> Self {
@@ -5597,6 +5894,8 @@ mod tests {
 
     #[test]
     fn forward_batched_single_entity_uses_pooled_output_when_enabled() {
+        let _lock = pooled_output_test_lock();
+        reset_pooled_output_runtime_stats();
         let calls = Arc::new(AtomicUsize::new(0));
         let model = mock_embedding_model_with_gpu(
             vec![],
@@ -5613,10 +5912,18 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], vec![0.6, 0.8]);
+        let stats = pooled_output_runtime_stats();
+        assert_eq!(stats.used, 1);
+        assert_eq!(stats.declined, 0);
+        assert_eq!(stats.last_reason, PooledOutputDecisionReason::Used);
+        assert_eq!(stats.last_batch_size, 1);
+        assert_eq!(stats.last_max_seq, 2);
     }
 
     #[test]
     fn forward_single_entity_uses_pooled_output_when_enabled() {
+        let _lock = pooled_output_test_lock();
+        reset_pooled_output_runtime_stats();
         let calls = Arc::new(AtomicUsize::new(0));
         let model = mock_embedding_model_with_gpu(
             vec![],
@@ -5633,10 +5940,18 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], vec![0.6, 0.8]);
+        let stats = pooled_output_runtime_stats();
+        assert_eq!(stats.used, 1);
+        assert_eq!(stats.declined, 0);
+        assert_eq!(stats.last_reason, PooledOutputDecisionReason::Used);
+        assert_eq!(stats.last_batch_size, 1);
+        assert_eq!(stats.last_max_seq, 2);
     }
 
     #[test]
     fn pooled_output_declines_relative_attention_layers() {
+        let _lock = pooled_output_test_lock();
+        reset_pooled_output_runtime_stats();
         let calls = Arc::new(AtomicUsize::new(0));
         let mut layer = mock_layer(
             2,
@@ -5659,6 +5974,51 @@ mod tests {
 
         assert!(result.is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let stats = pooled_output_runtime_stats();
+        assert_eq!(stats.used, 0);
+        assert_eq!(stats.declined, 1);
+        assert_eq!(stats.declined_relative_attention, 1);
+        assert_eq!(
+            stats.last_reason,
+            PooledOutputDecisionReason::RelativeAttention
+        );
+        assert_eq!(stats.last_batch_size, 1);
+        assert_eq!(stats.last_max_seq, 2);
+    }
+
+    #[test]
+    fn pooled_output_declines_sequences_over_default_cap() {
+        let _lock = pooled_output_test_lock();
+        reset_pooled_output_runtime_stats();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = mock_embedding_model_with_gpu(
+            vec![],
+            Box::new(PooledOnlyGpu {
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        let _override = PooledOutputOverrideGuard::enabled();
+        let len = POOLED_OUTPUT_DEFAULT_MAX_SEQ + 1;
+        let ids = vec![1u32; len];
+        let mask = vec![1u32; len];
+        let result = model
+            .try_forward_batched_pooled(&[ids], &[mask])
+            .expect("try pooled");
+
+        assert!(result.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let stats = pooled_output_runtime_stats();
+        assert_eq!(stats.used, 0);
+        assert_eq!(stats.declined, 1);
+        assert_eq!(stats.declined_sequence_too_long, 1);
+        assert_eq!(
+            stats.last_reason,
+            PooledOutputDecisionReason::SequenceTooLong
+        );
+        assert_eq!(stats.last_batch_size, 1);
+        assert_eq!(stats.last_max_seq, len as u64);
+        assert_eq!(stats.max_seq, POOLED_OUTPUT_DEFAULT_MAX_SEQ);
     }
 
     #[test]
