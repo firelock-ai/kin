@@ -532,6 +532,11 @@ fn merge_resolved(
     // Import/include syntax belongs to the file/module surface. Do not anchor it
     // to an arbitrary "first entity" in the file; that makes the graph lie about
     // which symbol owns the dependency and drops files with no parsed entities.
+    //
+    // Edge construction resolves each import's module path (which can scan the
+    // whole `known_files` set), so per-file candidates are built in parallel and
+    // collected in input order. The cross-file dedup then runs serially over that
+    // ordered set, so the appended edges — and their order — match a serial pass.
     let mut seen_artifact: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
     {
         let _span = tracing::info_span!(
@@ -539,15 +544,22 @@ fn merge_resolved(
             files = files.len()
         )
         .entered();
-        for file in files {
-            for imp in &file.imports {
-                if let Some(rel) =
-                    make_artifact_import_relation(&file.file_path, imp, &ctx.known_files)
-                {
-                    let key = (rel.src, rel.dst, rel.kind);
-                    if seen_artifact.insert(key) {
-                        resolved.push(rel);
-                    }
+        let per_file_artifact: Vec<Vec<Relation>> = files
+            .par_iter()
+            .map(|file| {
+                file.imports
+                    .iter()
+                    .filter_map(|imp| {
+                        make_artifact_import_relation(&file.file_path, imp, &ctx.known_files)
+                    })
+                    .collect()
+            })
+            .collect();
+        for file_relations in per_file_artifact {
+            for rel in file_relations {
+                let key = (rel.src, rel.dst, rel.kind);
+                if seen_artifact.insert(key) {
+                    resolved.push(rel);
                 }
             }
         }
@@ -571,7 +583,10 @@ fn link_cross_file_against_entities_serial(
     merge_resolved(per_file_relations, files, &ctx)
 }
 
-fn build_include_graph<S>(
+/// Serial counterpart of [`build_include_graph`], retained as the byte-identical
+/// reference for the parallel include-graph construction.
+#[cfg(test)]
+fn build_include_graph_serial<S>(
     files: &[FileParseData],
     known_files: &HashSet<S>,
 ) -> HashMap<String, Vec<String>>
@@ -593,6 +608,85 @@ where
                     .push(resolved_path);
             }
         }
+    }
+    for targets in include_graph.values_mut() {
+        targets.sort();
+        targets.dedup();
+    }
+    include_graph
+}
+
+/// Serial counterpart of the artifact-edge construction in [`merge_resolved`],
+/// retained as the byte-identical reference for the parallel edge pass.
+#[cfg(test)]
+fn merge_resolved_serial(
+    per_file_relations: Vec<Vec<Relation>>,
+    files: &[FileParseData],
+    ctx: &LinkContext<'_>,
+) -> Vec<Relation> {
+    let mut resolved = Vec::new();
+    let mut seen: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
+    for file_relations in per_file_relations {
+        for rel in file_relations {
+            if seen.insert((rel.src, rel.dst, rel.kind)) {
+                resolved.push(rel);
+            }
+        }
+    }
+    let mut seen_artifact: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
+    for file in files {
+        for imp in &file.imports {
+            if let Some(rel) = make_artifact_import_relation(&file.file_path, imp, &ctx.known_files)
+            {
+                let key = (rel.src, rel.dst, rel.kind);
+                if seen_artifact.insert(key) {
+                    resolved.push(rel);
+                }
+            }
+        }
+    }
+    resolved
+}
+
+fn build_include_graph<S>(
+    files: &[FileParseData],
+    known_files: &HashSet<S>,
+) -> HashMap<String, Vec<String>>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq + Sync,
+{
+    // Each file's include targets are resolved independently, and module-path
+    // resolution can scan the entire `known_files` set, so this is the heavy
+    // part of include-graph construction. Resolve per file in parallel, collect
+    // in input order, then fold into the map serially so the result is identical
+    // to a sequential pass (entries are keyed by file path; the final per-target
+    // sort/dedup makes within-entry order independent of scheduling anyway).
+    let per_file: Vec<(String, Vec<String>)> = files
+        .par_iter()
+        .filter_map(|file| {
+            let mut targets = Vec::new();
+            for import in &file.imports {
+                let Some(resolved_path) =
+                    resolve_module_path(&file.file_path, &import.module_path, known_files)
+                else {
+                    continue;
+                };
+                if is_include_like_path(&import.module_path) || is_include_like_path(&resolved_path)
+                {
+                    targets.push(resolved_path);
+                }
+            }
+            if targets.is_empty() {
+                None
+            } else {
+                Some((file.file_path.clone(), targets))
+            }
+        })
+        .collect();
+
+    let mut include_graph: HashMap<String, Vec<String>> = HashMap::new();
+    for (file_path, targets) in per_file {
+        include_graph.entry(file_path).or_default().extend(targets);
     }
     for targets in include_graph.values_mut() {
         targets.sort();
@@ -1912,6 +2006,126 @@ mod tests {
         // Re-running the parallel path must also be byte-stable.
         let parallel_again = link_cross_file_against_entities(&files, &universe);
         assert_eq!(format!("{parallel:?}"), format!("{parallel_again:?}"));
+    }
+
+    #[test]
+    fn build_include_graph_parallel_matches_serial() {
+        let header = |path: &str| FileParseData {
+            file_path: path.to_string(),
+            entities: vec![],
+            relations: vec![],
+            imports: vec![],
+        };
+        let header_import = |module: &str| FileImport {
+            module_path: module.to_string(),
+            specifiers: vec![],
+        };
+
+        let mut files = vec![
+            header("include/json/macros.hpp"),
+            header("include/json/extra.hpp"),
+            // Resolves to a real file but is not include-like (exercises the
+            // "resolved but filtered out" branch).
+            header("src/other.ts"),
+        ];
+        // Many includers so the parallel resolve spreads real work; module-path
+        // resolution scans known_files, which is the cost being parallelized.
+        for i in 0..24 {
+            files.push(FileParseData {
+                file_path: format!("src/app{i}.cpp"),
+                entities: vec![],
+                relations: vec![],
+                imports: vec![
+                    header_import("json/macros.hpp"),
+                    header_import("json/extra.hpp"),
+                    header_import("./other"),
+                ],
+            });
+        }
+
+        let known_files: HashSet<&str> = files.iter().map(|f| f.file_path.as_str()).collect();
+
+        let parallel = build_include_graph(&files, &known_files);
+        let serial = build_include_graph_serial(&files, &known_files);
+        assert_eq!(
+            parallel, serial,
+            "parallel include graph must equal the serial reference"
+        );
+        assert!(
+            !parallel.is_empty(),
+            "expected include edges to be produced"
+        );
+    }
+
+    #[test]
+    fn artifact_import_edges_parallel_match_serial() {
+        let import = |module: &str, name: &str| FileImport {
+            module_path: module.to_string(),
+            specifiers: vec![kin_parser::ImportedName {
+                local_name: name.to_string(),
+                original_name: None,
+                is_default: false,
+            }],
+        };
+
+        let mut files = vec![
+            FileParseData {
+                file_path: "src/a.ts".to_string(),
+                entities: vec![make_entity("handler", "src/a.ts")],
+                relations: vec![],
+                imports: vec![import("./b/util", "util")],
+            },
+            FileParseData {
+                file_path: "src/b/util.ts".to_string(),
+                entities: vec![make_entity("util", "src/b/util.ts")],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+        // Pad so the parallel artifact-edge pass spreads across files; each edge
+        // resolves a module path (the parallelized cost).
+        for i in 0..24 {
+            let path = format!("src/pad/m{i}.ts");
+            let dep = format!("src/pad/dep{i}.ts");
+            files.push(FileParseData {
+                file_path: path.clone(),
+                entities: vec![make_entity("m", &path)],
+                relations: vec![],
+                imports: vec![import(&format!("./dep{i}"), "d")],
+            });
+            files.push(FileParseData {
+                file_path: dep.clone(),
+                entities: vec![make_entity("d", &dep)],
+                relations: vec![],
+                imports: vec![],
+            });
+        }
+
+        let universe: Vec<Entity> = files
+            .iter()
+            .flat_map(|f| f.entities.iter().cloned())
+            .collect();
+        let ctx = build_link_context(&files, &universe);
+
+        // resolve_one_file is deterministic, so building the per-file relations
+        // twice yields identical inputs for the two merge paths.
+        let pfr_parallel: Vec<Vec<Relation>> =
+            files.iter().map(|f| resolve_one_file(f, &ctx)).collect();
+        let pfr_serial: Vec<Vec<Relation>> =
+            files.iter().map(|f| resolve_one_file(f, &ctx)).collect();
+
+        let parallel = merge_resolved(pfr_parallel, &files, &ctx);
+        let serial = merge_resolved_serial(pfr_serial, &files, &ctx);
+
+        assert_eq!(
+            format!("{parallel:?}"),
+            format!("{serial:?}"),
+            "parallel artifact-edge construction must be byte-identical to serial"
+        );
+        assert!(
+            parallel.iter().any(|r| r.kind == RelationKind::Imports),
+            "expected artifact-level import edges"
+        );
     }
 
     #[test]
