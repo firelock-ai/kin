@@ -3203,7 +3203,10 @@ impl BertModel {
         }
         // Proof runs the bit-identical per-layer path; the whole-stack GPU-resident
         // pass is a throughput-only optimization.
-        if matches!(crate::resource::Profile::from_env(), crate::resource::Profile::Proof) {
+        if matches!(
+            crate::resource::Profile::from_env(),
+            crate::resource::Profile::Proof
+        ) {
             return Some(ResidentStackDecisionReason::Disabled);
         }
         if dump_layer_enabled() {
