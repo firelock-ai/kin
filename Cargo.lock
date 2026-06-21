@@ -3140,9 +3140,9 @@ dependencies = [
 
 [[package]]
 name = "kin-infer"
-version = "0.2.16"
+version = "0.2.18"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "6b5fd6498434f7ef0259c8c0c85fabc11a9cac3f6316c41f73fa454e09ec4eba"
+checksum = "789cc700fd97ee1ea403529e827cf4cc972f67670d15c5df59348559edb70aea"
 dependencies = [
  "block",
  "half",
