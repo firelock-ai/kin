@@ -56,15 +56,16 @@ pub enum EntityKind {
     Macro,
 }
 
-/// Kin's identity moat. Survives renames, moves, formatting.
+/// Content-based fingerprint of an entity, used to detect what changed
+/// between revisions (structure, signature, and exact contents).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SemanticFingerprint {
     pub algorithm: FingerprintAlgorithm,
-    /// Normalized AST shape hash.
+    /// Hash of the normalized AST/source structure (insensitive to comments and whitespace).
     pub ast_hash: Hash256,
-    /// Parameter/return contract hash.
+    /// Hash of the entity's signature line / declaration shape.
     pub signature_hash: Hash256,
-    /// Control flow + side effects hash.
+    /// Hash of the entity's full source text (changes on any body edit).
     pub behavior_hash: Hash256,
     /// Confidence in fingerprint stability (0.0 - 1.0).
     pub stability_score: f32,
