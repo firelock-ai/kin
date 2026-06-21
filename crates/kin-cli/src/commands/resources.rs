@@ -25,8 +25,22 @@ pub struct EmbedRuntimeState {
     pub embeddings_indexed: usize,
     pub embeddings_pending: usize,
     pub embeddings_total: usize,
+    #[serde(default)]
+    pub hybrid_metrics: HybridMetricsRuntime,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metal_profile: Option<MetalProfileRuntime>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HybridMetricsRuntime {
+    pub gpu_entities: u64,
+    pub gpu_tokens: u64,
+    pub cpu_twin_entities: u64,
+    pub cpu_twin_tokens: u64,
+    pub hybrid_batches: u64,
+    pub single_side_batches: u64,
+    pub twin_unavailable_batches: u64,
+    pub cpu_parallel_batches: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,6 +303,39 @@ mod tests {
         assert_eq!(value["embed_runtime"]["embeddings_indexed"], 3);
         assert_eq!(value["embed_runtime"]["embeddings_pending"], 7);
         assert_eq!(value["embed_runtime"]["embeddings_total"], 10);
+        assert_eq!(value["embed_runtime"]["hybrid_metrics"]["gpu_entities"], 0);
+    }
+
+    #[test]
+    fn json_response_carries_hybrid_metrics() {
+        let embed = EmbedRuntimeState {
+            hybrid_metrics: HybridMetricsRuntime {
+                gpu_entities: 40,
+                gpu_tokens: 20_000,
+                cpu_twin_entities: 12,
+                cpu_twin_tokens: 1_200,
+                hybrid_batches: 3,
+                single_side_batches: 2,
+                twin_unavailable_batches: 1,
+                cpu_parallel_batches: 4,
+            },
+            ..EmbedRuntimeState::default()
+        };
+        let response =
+            build_command_resources_response(sample_plan(Profile::Throughput), embed, true)
+                .unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_str(&response.json.expect("json requested")).unwrap();
+        let metrics = &value["embed_runtime"]["hybrid_metrics"];
+        assert_eq!(metrics["gpu_entities"], 40);
+        assert_eq!(metrics["gpu_tokens"], 20_000);
+        assert_eq!(metrics["cpu_twin_entities"], 12);
+        assert_eq!(metrics["cpu_twin_tokens"], 1_200);
+        assert_eq!(metrics["hybrid_batches"], 3);
+        assert_eq!(metrics["single_side_batches"], 2);
+        assert_eq!(metrics["twin_unavailable_batches"], 1);
+        assert_eq!(metrics["cpu_parallel_batches"], 4);
     }
 
     #[test]
