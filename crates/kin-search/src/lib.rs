@@ -564,6 +564,13 @@ fn kinseg_sibling_files(storage_path: &Path) -> Vec<PathBuf> {
 /// ```
 pub fn tokenize(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
+    // Mirrors the contents of `tokens` so the per-segment whole-segment token can
+    // be de-duplicated against the whole output in O(1) instead of re-scanning the
+    // growing `tokens` vector (which is quadratic in the token count on long
+    // inputs). camelCase parts are still emitted unconditionally — only the
+    // whole-segment token is gated — so the resulting sequence is byte-for-byte
+    // identical to the former linear `tokens.contains` dedup.
+    let mut seen: HashSet<String> = HashSet::new();
 
     // Split on non-alphanumeric characters first
     for segment in text.split(|c: char| !c.is_alphanumeric()) {
@@ -581,6 +588,7 @@ pub fn tokenize(text: &str) -> Vec<String> {
             {
                 let lower = current.to_lowercase();
                 if !lower.is_empty() {
+                    seen.insert(lower.clone());
                     tokens.push(lower);
                 }
                 current.clear();
@@ -590,13 +598,16 @@ pub fn tokenize(text: &str) -> Vec<String> {
         if !current.is_empty() {
             let lower = current.to_lowercase();
             if !lower.is_empty() {
+                seen.insert(lower.clone());
                 tokens.push(lower);
             }
         }
 
-        // Also add the whole segment as a token (lowercased) for exact matching
+        // Also add the whole segment as a token (lowercased) for exact matching.
+        // `seen.insert` reports whether it was absent, reproducing the former
+        // `!tokens.contains(&full)` guard against every token emitted so far.
         let full = segment.to_lowercase();
-        if full.len() > 1 && !tokens.contains(&full) {
+        if full.len() > 1 && seen.insert(full.clone()) {
             tokens.push(full);
         }
     }
@@ -2167,6 +2178,91 @@ mod tests {
         assert!(tokens.contains(&"ascii".to_string()));
         assert!(tokens.contains(&"html".to_string()));
         assert!(tokens.contains(&"py".to_string()));
+    }
+
+    /// Reference tokenizer using the original linear `tokens.contains` dedup. The
+    /// production [`tokenize`] replaces that O(n^2) per-segment scan with an O(1)
+    /// `seen` set and must reproduce this output token-for-token, order included.
+    fn tokenize_linear_scan_ref(text: &str) -> Vec<String> {
+        let mut tokens: Vec<String> = Vec::new();
+        for segment in text.split(|c: char| !c.is_alphanumeric()) {
+            if segment.is_empty() {
+                continue;
+            }
+            let mut current = String::new();
+            let chars: Vec<char> = segment.chars().collect();
+            for i in 0..chars.len() {
+                if i > 0
+                    && chars[i].is_uppercase()
+                    && chars[i - 1].is_lowercase()
+                    && !current.is_empty()
+                {
+                    let lower = current.to_lowercase();
+                    if !lower.is_empty() {
+                        tokens.push(lower);
+                    }
+                    current.clear();
+                }
+                current.push(chars[i]);
+            }
+            if !current.is_empty() {
+                let lower = current.to_lowercase();
+                if !lower.is_empty() {
+                    tokens.push(lower);
+                }
+            }
+            let full = segment.to_lowercase();
+            if full.len() > 1 && !tokens.contains(&full) {
+                tokens.push(full);
+            }
+        }
+        tokens
+    }
+
+    #[test]
+    fn tokenize_dedup_matches_linear_scan() {
+        let long_mixed = "segABCdefGHIjkl ".repeat(64);
+        let long_repeat = "repeat ".repeat(512);
+        let cases: &[&str] = &[
+            "",
+            "x",
+            "ab",
+            "parse",
+            "parseTableFromHtml",
+            "parse_table_html",
+            "src/io/ascii/html.py",
+            "foo foo foo",
+            "foobar fooBar",
+            "fooBar foobar",
+            "renderWidget widgetFactory render render",
+            "caféMenu CaféMenu café_menu",
+            "ALLCAPS allCaps all_caps ALLCAPS",
+            "a ab abc abcd abcde",
+            "one_two_three_four_five_six_seven",
+            &long_mixed,
+            &long_repeat,
+        ];
+        for case in cases {
+            assert_eq!(
+                tokenize(case),
+                tokenize_linear_scan_ref(case),
+                "tokenize diverged from linear-scan reference for {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tokenize_dedup_drops_full_segment_already_emitted() {
+        // A single-word segment's whole-segment token equals its only camelCase
+        // part, so it is emitted exactly once.
+        assert_eq!(tokenize("parse"), vec!["parse".to_string()]);
+        // A multi-word segment whose lowercased whole form already appeared as an
+        // earlier token is de-duplicated — `foobar` is not repeated — while the
+        // first-occurrence order of every distinct token is preserved.
+        assert_eq!(
+            tokenize("foobar fooBar"),
+            vec!["foobar".to_string(), "foo".to_string(), "bar".to_string()]
+        );
     }
 
     #[test]
