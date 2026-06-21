@@ -908,12 +908,12 @@ impl BertEmbedder {
                 .map_err(|e| KinDbError::IndexError(format!("tokenization failed: {e}")))?
         };
 
-        // Extract token ids + masks in parallel, then length-sort so the budget
-        // packs same-length entities together. The parallel collect preserves
-        // input order and the sort is stable, so equal-length entities keep their
-        // ascending original index — ordering is identical to the prior serial
-        // extraction.
-        let mut order: Vec<(usize, Vec<u32>, Vec<u32>)> = encodings
+        // Extract token ids + masks in parallel, then trim tokenizer right-padding
+        // and length-sort so the budget packs by real tokenized length. The
+        // parallel collect preserves input order and the sort is stable, so
+        // equal-length entities keep their ascending original index — ordering is
+        // identical to the prior serial extraction.
+        let order: Vec<(usize, Vec<u32>, Vec<u32>)> = encodings
             .into_par_iter()
             .enumerate()
             .map(|(idx, encoding)| {
@@ -924,21 +924,7 @@ impl BertEmbedder {
                 )
             })
             .collect();
-        order.sort_by_key(|(_, ids, _)| ids.len());
-
-        // Move (not clone) the sorted tuples into parallel arrays. Holding ids and
-        // masks contiguously lets every GPU dispatch borrow a sub-range directly,
-        // so the hot loop never re-clones token buffers per sub-batch.
-        let mut batch = EncodedBatch {
-            idx: Vec::with_capacity(order.len()),
-            ids: Vec::with_capacity(order.len()),
-            masks: Vec::with_capacity(order.len()),
-        };
-        for (idx, ids, mask) in order {
-            batch.idx.push(idx);
-            batch.ids.push(ids);
-            batch.masks.push(mask);
-        }
+        let batch = encoded_batch_from_tokenized(order);
 
         let budget = BatchBudget::from_env(self.model.backend());
 
@@ -2300,6 +2286,46 @@ impl EncodedBatch {
     }
 }
 
+#[cfg(feature = "embeddings")]
+fn trim_tokenized_right_padding(ids: &mut Vec<u32>, mask: &mut Vec<u32>) {
+    let requested_keep = mask
+        .iter()
+        .rposition(|&value| value != 0)
+        .map(|idx| idx + 1)
+        .unwrap_or(1);
+    let max_keep = ids.len().min(mask.len());
+    let keep = if max_keep == 0 {
+        0
+    } else {
+        requested_keep.min(max_keep).max(1)
+    };
+    ids.truncate(keep);
+    mask.truncate(keep);
+}
+
+#[cfg(feature = "embeddings")]
+fn encoded_batch_from_tokenized(mut order: Vec<(usize, Vec<u32>, Vec<u32>)>) -> EncodedBatch {
+    for (_, ids, mask) in &mut order {
+        trim_tokenized_right_padding(ids, mask);
+    }
+    order.sort_by_key(|(_, ids, _)| ids.len());
+
+    // Move (not clone) the sorted tuples into parallel arrays. Holding ids and
+    // masks contiguously lets every GPU dispatch borrow a sub-range directly,
+    // so the hot loop never re-clones token buffers per sub-batch.
+    let mut batch = EncodedBatch {
+        idx: Vec::with_capacity(order.len()),
+        ids: Vec::with_capacity(order.len()),
+        masks: Vec::with_capacity(order.len()),
+    };
+    for (idx, ids, mask) in order {
+        batch.idx.push(idx);
+        batch.ids.push(ids);
+        batch.masks.push(mask);
+    }
+    batch
+}
+
 /// Borrowed view over a contiguous run of an [`EncodedBatch`]. `Copy` so the two
 /// hybrid arms can each capture a disjoint view inside `rayon::join` without
 /// cloning the underlying token buffers.
@@ -3304,6 +3330,85 @@ mod tests {
             "over-budget lone entity admitted; next not packed with it"
         );
         assert_eq!(longest, 2048);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn tokenized_padding_trim_removes_only_right_padding() {
+        let mut ids = vec![101, 201, 0, 301, 0, 0];
+        let mut mask = vec![1, 1, 0, 1, 0, 0];
+        trim_tokenized_right_padding(&mut ids, &mut mask);
+        assert_eq!(ids, vec![101, 201, 0, 301]);
+        assert_eq!(mask, vec![1, 1, 0, 1]);
+
+        let mut all_padding_ids = vec![0, 0, 0];
+        let mut all_padding_mask = vec![0, 0, 0];
+        trim_tokenized_right_padding(&mut all_padding_ids, &mut all_padding_mask);
+        assert_eq!(
+            all_padding_ids,
+            vec![0],
+            "an all-padding row still keeps one token"
+        );
+        assert_eq!(
+            all_padding_mask,
+            vec![0],
+            "an all-padding row still keeps one mask entry"
+        );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn encoded_batch_sorts_and_budgets_by_unpadded_lengths() {
+        fn padded_row(real_len: usize, padded_len: usize) -> (Vec<u32>, Vec<u32>) {
+            let mut ids: Vec<u32> = (0..padded_len).map(|i| i as u32).collect();
+            let mut mask = vec![0u32; padded_len];
+            for value in mask.iter_mut().take(real_len) {
+                *value = 1;
+            }
+            ids.truncate(padded_len);
+            (ids, mask)
+        }
+
+        let padded_len = 2048;
+        let tokenized = vec![
+            {
+                let (ids, mask) = padded_row(8, padded_len);
+                (0usize, ids, mask)
+            },
+            {
+                let (ids, mask) = padded_row(3, padded_len);
+                (1usize, ids, mask)
+            },
+            {
+                let (ids, mask) = padded_row(4, padded_len);
+                (2usize, ids, mask)
+            },
+        ];
+        assert!(tokenized
+            .iter()
+            .all(|(_, ids, mask)| ids.len() == padded_len && mask.len() == padded_len));
+
+        let batch = encoded_batch_from_tokenized(tokenized);
+        assert_eq!(batch.idx, vec![1, 2, 0]);
+        assert_eq!(
+            batch.ids.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![3, 4, 8]
+        );
+        assert_eq!(
+            batch.masks.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![3, 4, 8]
+        );
+
+        let budget = BatchBudget {
+            max_tokens: 24,
+            max_attention_area: usize::MAX,
+        };
+        let (end, longest) = budget.next_batch(&batch.ids, 0);
+        assert_eq!(
+            (end, longest),
+            (3, 8),
+            "unpadded lengths should pack the whole mixed-length batch"
+        );
     }
 
     #[cfg(feature = "embeddings")]
