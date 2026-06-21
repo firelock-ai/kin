@@ -389,7 +389,8 @@ const METAL_MAX_BATCH_TOKENS: usize = 16_384;
 // pack fewer-per-dispatch, short entities still pack many. 8_388_608 = 2 × 2048²
 // (two entities at the EMBED_MAX_SEQ_LEN cap) — the largest worst-case dispatch
 // verified to survive the watchdog live on a long-body repo; 4 × that died.
-// Tune via KIN_EMBED_MAX_ATTENTION_AREA.
+// KIN_EMBED_MAX_ATTENTION_AREA may lower this cap, but must not raise the
+// Metal hard guard until the inference engine has a real allocator-level bound.
 #[cfg(feature = "embeddings")]
 const METAL_MAX_ATTENTION_AREA: usize = 8_388_608;
 #[cfg(feature = "embeddings")]
@@ -1118,64 +1119,100 @@ impl BertEmbedder {
         let count = token_ids.len();
         let (vectors, forward_model): (Vec<Vec<f32>>, &BertModel) = match backend_choice {
             EmbedBackendChoice::Metal { reason } => {
-                tracing::info!(
-                    target: "kindb.embed.dispatch",
-                    batch_size = count,
-                    max_seq = longest,
-                    backend = "metal",
-                    reason = reason,
-                    "embed_dispatch"
-                );
-                let _span = tracing::info_span!(
-                    "kindb.embedder.forward_batch",
-                    batch = count,
-                    longest = longest
-                )
-                .entered();
-                let metal_forward = if metal_oom_injection_armed() {
-                    Err(kin_infer::InferError::OutOfMemory(
-                        "synthetic Metal OOM (KIN_EMBED_TEST_FORCE_METAL_OOM)".to_string(),
-                    ))
-                } else {
-                    self.model.forward_batched(token_ids, attention_masks)
-                };
-                let vectors = match metal_forward {
-                    Ok(v) => v,
-                    Err(kin_infer::InferError::OutOfMemory(msg)) => {
-                        // Metal ran out of device memory mid-forward. Rather than
-                        // failing the index, degrade this batch to the CPU twin and
-                        // retry once.
-                        tracing::warn!(
-                            target: "kindb.embed.dispatch",
-                            error = %msg,
-                            batch_size = count,
-                            max_seq = longest,
-                            "metal embed out-of-memory; retrying batch on CPU"
-                        );
-                        let cpu_model = match self.cpu_model() {
-                            Ok(m) => Some(m),
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "cpu_model unavailable after metal OOM; retrying on primary model"
-                                );
-                                None
-                            }
-                        };
-                        let model = cpu_model.unwrap_or(&self.model);
+                if let Some((attention_area, attention_area_cap)) =
+                    metal_hard_guard_rejection(count, longest)
+                {
+                    let guard_reason = match reason {
+                        "env_forced" => "env_forced_memory_guard",
+                        "hybrid_metal" => "hybrid_metal_memory_guard",
+                        "hybrid_serial_primary" => "hybrid_serial_memory_guard",
+                        _ => "metal_memory_guard_cpu",
+                    };
+                    tracing::warn!(
+                        target: "kindb.embed.dispatch",
+                        batch_size = count,
+                        max_seq = longest,
+                        attention_area = attention_area,
+                        attention_area_cap = attention_area_cap,
+                        backend = "cpu",
+                        reason = guard_reason,
+                        "embed_metal_memory_guard"
+                    );
+                    let model = self.cpu_model().map_err(|e| {
+                        KinDbError::IndexError(format!(
+                            "Metal memory guard declined unsafe batch \
+                             (batch_size={count}, max_seq={longest}, \
+                             attention_area={attention_area}, cap={attention_area_cap}) \
+                             but CPU twin is unavailable: {e}"
+                        ))
+                    })?;
+                    let vectors =
                         model
                             .forward_batched(token_ids, attention_masks)
                             .map_err(|e| {
                                 KinDbError::IndexError(format!(
-                                    "inference failed (cpu retry after metal OOM): {e}"
+                                    "inference failed (CPU retry after Metal memory guard): {e}"
                                 ))
-                            })?
-                    }
-                    Err(e) => {
-                        return Err(KinDbError::IndexError(format!("inference failed: {e}")));
-                    }
-                };
-                (vectors, &self.model)
+                            })?;
+                    (vectors, model)
+                } else {
+                    tracing::info!(
+                        target: "kindb.embed.dispatch",
+                        batch_size = count,
+                        max_seq = longest,
+                        backend = "metal",
+                        reason = reason,
+                        "embed_dispatch"
+                    );
+                    let _span = tracing::info_span!(
+                        "kindb.embedder.forward_batch",
+                        batch = count,
+                        longest = longest
+                    )
+                    .entered();
+                    let metal_forward = if metal_oom_injection_armed() {
+                        Err(kin_infer::InferError::OutOfMemory(
+                            "synthetic Metal OOM (KIN_EMBED_TEST_FORCE_METAL_OOM)".to_string(),
+                        ))
+                    } else {
+                        self.model.forward_batched(token_ids, attention_masks)
+                    };
+                    let vectors = match metal_forward {
+                        Ok(v) => v,
+                        Err(kin_infer::InferError::OutOfMemory(msg)) => {
+                            // Metal ran out of device memory mid-forward. Rather
+                            // than failing the index, degrade this batch to the CPU
+                            // twin and retry once. If the twin is unavailable, fail
+                            // loud instead of submitting the same unsafe batch back
+                            // to the primary Metal model.
+                            tracing::warn!(
+                                target: "kindb.embed.dispatch",
+                                error = %msg,
+                                batch_size = count,
+                                max_seq = longest,
+                                "metal embed out-of-memory; retrying batch on CPU"
+                            );
+                            let model = self.cpu_model().map_err(|e| {
+                                KinDbError::IndexError(format!(
+                                    "Metal OOM for batch \
+                                     (batch_size={count}, max_seq={longest}) \
+                                     and CPU twin is unavailable: {e}"
+                                ))
+                            })?;
+                            model
+                                .forward_batched(token_ids, attention_masks)
+                                .map_err(|e| {
+                                    KinDbError::IndexError(format!(
+                                        "inference failed (CPU retry after Metal OOM): {e}"
+                                    ))
+                                })?
+                        }
+                        Err(e) => {
+                            return Err(KinDbError::IndexError(format!("inference failed: {e}")));
+                        }
+                    };
+                    (vectors, &self.model)
+                }
             }
             EmbedBackendChoice::Cpu { reason } => {
                 tracing::info!(
@@ -1996,6 +2033,29 @@ fn default_max_attention_area(backend: GpuBackend) -> usize {
     }
 }
 
+#[cfg(feature = "embeddings")]
+fn cap_attention_area_for_backend(backend: GpuBackend, area: usize) -> usize {
+    match backend {
+        GpuBackend::Metal => area.min(METAL_MAX_ATTENTION_AREA),
+        GpuBackend::Cuda | GpuBackend::Cpu => area,
+    }
+}
+
+#[cfg(feature = "embeddings")]
+fn metal_attention_area(count: usize, max_seq: usize) -> usize {
+    max_seq
+        .max(1)
+        .saturating_mul(max_seq.max(1))
+        .saturating_mul(count.max(1))
+}
+
+#[cfg(feature = "embeddings")]
+fn metal_hard_guard_rejection(count: usize, max_seq: usize) -> Option<(usize, usize)> {
+    let area = metal_attention_area(count, max_seq);
+    let cap = METAL_MAX_ATTENTION_AREA;
+    (area > cap).then_some((area, cap))
+}
+
 /// True only when `KIN_RESOURCE_PROFILE` is explicitly set to `throughput`.
 /// Read live (never cached) so behavior tracks the current environment.
 #[cfg(feature = "embeddings")]
@@ -2105,9 +2165,10 @@ impl BatchBudget {
                 default_max_attention_area(backend),
             )
         };
+        let requested_area = env_usize("KIN_EMBED_MAX_ATTENTION_AREA", default_area);
         Self {
             max_tokens: env_usize("KIN_EMBED_MAX_BATCH_TOKENS", default_tokens),
-            max_attention_area: env_usize("KIN_EMBED_MAX_ATTENTION_AREA", default_area),
+            max_attention_area: cap_attention_area_for_backend(backend, requested_area),
         }
     }
 
@@ -3300,6 +3361,20 @@ mod tests {
 
     #[cfg(feature = "embeddings")]
     #[test]
+    fn metal_hard_guard_rejects_crash_shape() {
+        let safe = metal_hard_guard_rejection(2, EMBED_MAX_SEQ_LEN);
+        assert_eq!(safe, None, "2 x 2048^2 is the verified safe Metal hard cap");
+
+        let unsafe_shape = metal_hard_guard_rejection(8, EMBED_MAX_SEQ_LEN);
+        assert_eq!(
+            unsafe_shape,
+            Some((33_554_432, METAL_MAX_ATTENTION_AREA)),
+            "the 8 x 2048 smoke-crash shape must be declined before Metal allocation"
+        );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
     fn batch_budget_token_cap_bounds_short_entity_dispatch() {
         // Area unbounded so ONLY the token cap binds: short entities still pack many,
         // exactly as before the area guard existed (no common-case regression).
@@ -3487,7 +3562,6 @@ mod tests {
         let budget = BatchBudget::from_env(GpuBackend::Metal);
         assert_eq!(budget.max_tokens, METAL_MAX_BATCH_TOKENS);
         assert_eq!(budget.max_tokens, 16_384);
-        assert_eq!(budget.max_attention_area, METAL_MAX_ATTENTION_AREA);
         assert_eq!(budget.max_attention_area, 8_388_608);
     }
 
@@ -3510,8 +3584,13 @@ mod tests {
         let expected_area = plan
             .max_attention_area
             .map(|area| area as usize)
-            .unwrap_or(usize::MAX);
+            .unwrap_or(usize::MAX)
+            .min(METAL_MAX_ATTENTION_AREA);
         assert_eq!(budget.max_attention_area, expected_area);
+        assert_eq!(
+            budget.max_attention_area, METAL_MAX_ATTENTION_AREA,
+            "throughput may lift token budget, but Metal attention area stays at the verified hard cap"
+        );
     }
 
     #[cfg(feature = "embeddings")]
@@ -3528,8 +3607,30 @@ mod tests {
         let expected_area = plan
             .max_attention_area
             .map(|area| area as usize)
-            .unwrap_or(usize::MAX);
+            .unwrap_or(usize::MAX)
+            .min(METAL_MAX_ATTENTION_AREA);
         assert_eq!(budget.max_attention_area, expected_area);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn metal_attention_area_env_override_cannot_raise_hard_cap() {
+        let _env = ResourceEnvGuard::acquire();
+        std::env::set_var("KIN_RESOURCE_PROFILE", "throughput");
+        std::env::set_var("KIN_EMBED_MAX_ATTENTION_AREA", "33554432");
+
+        let budget = BatchBudget::from_env(GpuBackend::Metal);
+        assert_eq!(
+            budget.max_attention_area, METAL_MAX_ATTENTION_AREA,
+            "env override cannot raise Metal above the verified hard guard"
+        );
+
+        std::env::set_var("KIN_EMBED_MAX_ATTENTION_AREA", "4194304");
+        let tightened = BatchBudget::from_env(GpuBackend::Metal);
+        assert_eq!(
+            tightened.max_attention_area, 4_194_304,
+            "env override may still lower Metal's hard guard"
+        );
     }
 
     #[cfg(feature = "embeddings")]
