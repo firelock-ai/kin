@@ -108,7 +108,10 @@ impl CoverageReport {
         match outcome {
             FileCoverage::EntitySource { ext, has_imports } => {
                 self.entity_source_count += 1;
-                *self.entity_source_extensions.entry(ext.clone()).or_insert(0) += 1;
+                *self
+                    .entity_source_extensions
+                    .entry(ext.clone())
+                    .or_insert(0) += 1;
                 if has_imports {
                     self.c5_cross_file_count += 1;
                     *self.c5_languages.entry(ext).or_insert(0) += 1;
