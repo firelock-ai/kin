@@ -2165,6 +2165,23 @@ impl BatchBudget {
 #[cfg(feature = "embeddings")]
 const EMBED_CPU_SEQ_THRESHOLD: usize = EMBED_MAX_SEQ_LEN;
 
+/// Default Balanced-hybrid CPU lane cutoff. Tokenized entities at or below this
+/// length are cheap enough for the CPU twin; heavier under-cap entities stay on
+/// Metal. Tune with `KIN_EMBED_HYBRID_CPU_MAX_SEQ_LEN`.
+#[cfg(feature = "embeddings")]
+const BALANCED_CPU_MAX_SEQ_LEN: usize = 256;
+
+#[cfg(feature = "embeddings")]
+fn balanced_cpu_max_seq_len() -> usize {
+    std::env::var("KIN_EMBED_HYBRID_CPU_MAX_SEQ_LEN")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(BALANCED_CPU_MAX_SEQ_LEN)
+        .min(EMBED_MAX_SEQ_LEN.saturating_sub(1))
+        .max(1)
+}
+
 /// When auto dispatch resolves, should it prefer CPU unconditionally?
 ///
 /// The Metal BERT NaN was root-caused to GELU's tanh argument overflowing
@@ -2326,27 +2343,23 @@ impl<'a> EncodedSlice<'a> {
 /// Split a length-sorted batch into a Metal (GPU) subset and a CPU-twin subset
 /// for the Balanced hybrid mode.
 ///
-/// Entities longer than `EMBED_CPU_SEQ_THRESHOLD` always run on the CPU twin (the
-/// batched Metal attention path is reserved for shorter sequences). The SHORT
-/// entities are then split so the two arms finish at roughly the same time: the
-/// GPU clears work `gpu_tput_ratio`× faster per unit, while the CPU arm also
-/// carries all the long entities. Balancing GPU time `metal / ratio` against CPU
-/// time `(short - metal) + long` gives
+/// Tokenized entities at or below `KIN_EMBED_HYBRID_CPU_MAX_SEQ_LEN` are
+/// CPU-eligible because they are cheap enough for the CPU twin. Heavier
+/// under-`EMBED_MAX_SEQ_LEN` entities stay on the GPU, where Metal's batch
+/// throughput is strongest. The CPU-eligible entities are then split so the two
+/// arms finish at roughly the same time: the GPU clears work `gpu_tput_ratio`×
+/// faster per unit while also carrying the heavier entities. Balancing GPU time
+/// `(heavy + eligible - cpu) / ratio` against CPU time `cpu` gives
 ///
 /// ```text
-/// metal = ratio · (short + long) / (ratio + 1)
+/// cpu = (eligible + heavy) / (ratio + 1)
 /// ```
 ///
-/// clamped to `[0, short]`. When long work dominates this clamps to "all short on
-/// the GPU" (the CPU twin is already saturated by the long entities); with no long
-/// work it reduces to the GPU taking `ratio / (ratio + 1)` of the short work.
-/// Either way both arms get a real share, so the CPU cores never sit idle while
-/// the GPU runs. Note the `+ long` term: the long entities load the CPU side, so
-/// they must raise the GPU's share of the short work, not reduce it — a `− long`
-/// form would drive the target negative on long-heavy corpora and empty the GPU
-/// subset.
+/// clamped to `[0, eligible]`. When heavy work dominates this gives the CPU twin
+/// all cheap entities while the GPU carries the expensive ones; with no heavy
+/// work it reduces to the CPU taking `1 / (ratio + 1)` of uniform short work.
 ///
-/// `min_cpu_probe` forces the twin at least that many of the SHORTEST entities
+/// `min_cpu_probe` forces the twin at least that many of the shortest entities
 /// even when the ratio would give it none — used by the adaptive probe to take a
 /// fresh throughput measurement (shortest entities minimize the probe's cost).
 #[cfg(feature = "embeddings")]
@@ -2355,81 +2368,100 @@ fn balanced_partition(
     gpu_tput_ratio: f64,
     min_cpu_probe: usize,
 ) -> (EncodedBatch, EncodedBatch) {
-    let ceiling_split = batch
+    balanced_partition_with_cpu_max_seq_len(
+        batch,
+        gpu_tput_ratio,
+        min_cpu_probe,
+        balanced_cpu_max_seq_len(),
+    )
+}
+
+#[cfg(feature = "embeddings")]
+fn balanced_partition_with_cpu_max_seq_len(
+    batch: EncodedSlice<'_>,
+    gpu_tput_ratio: f64,
+    min_cpu_probe: usize,
+    cpu_max_seq_len: usize,
+) -> (EncodedBatch, EncodedBatch) {
+    let cpu_max_seq_len = cpu_max_seq_len
+        .min(EMBED_MAX_SEQ_LEN.saturating_sub(1))
+        .max(1);
+    let cpu_candidate_split = batch
         .ids
-        .partition_point(|ids| ids.len() <= EMBED_CPU_SEQ_THRESHOLD);
+        .partition_point(|ids| ids.len() <= cpu_max_seq_len);
 
     let work = |ids: &[u32]| ids.len().max(1) as f64;
-    let w_short: f64 = batch.ids[..ceiling_split].iter().map(|ids| work(ids)).sum();
-    let w_long: f64 = batch.ids[ceiling_split..].iter().map(|ids| work(ids)).sum();
+    let w_cpu_candidates: f64 = batch.ids[..cpu_candidate_split]
+        .iter()
+        .map(|ids| work(ids))
+        .sum();
+    let w_gpu_forced: f64 = batch.ids[cpu_candidate_split..]
+        .iter()
+        .map(|ids| work(ids))
+        .sum();
 
-    let target_metal =
-        ((gpu_tput_ratio * (w_short + w_long)) / (gpu_tput_ratio + 1.0)).clamp(0.0, w_short);
+    let target_cpu =
+        ((w_cpu_candidates + w_gpu_forced) / (gpu_tput_ratio + 1.0)).clamp(0.0, w_cpu_candidates);
 
-    // Fill the GPU side from the longest short entities down; the tie-break on
+    // Fill the CPU side from the shortest eligible entities up; the tie-break on
     // original index keeps the selection deterministic regardless of sort impl.
-    let mut order: Vec<usize> = (0..ceiling_split).collect();
+    let mut order: Vec<usize> = (0..cpu_candidate_split).collect();
     order.sort_by(|&a, &b| {
-        batch.ids[b]
+        batch.ids[a]
             .len()
-            .cmp(&batch.ids[a].len())
+            .cmp(&batch.ids[b].len())
             .then(batch.idx[a].cmp(&batch.idx[b]))
     });
 
-    let mut to_metal = vec![false; ceiling_split];
-    let mut metal_work = 0.0;
-    let mut metal_count = 0usize;
+    let mut to_cpu = vec![false; batch.len()];
+    let mut cpu_work = 0.0;
+    let mut cpu_count = 0usize;
     for pos in order {
         let w = work(&batch.ids[pos]);
-        if target_metal > 0.0 && (metal_work + w <= target_metal || metal_count == 0) {
-            metal_work += w;
-            metal_count += 1;
-            to_metal[pos] = true;
+        if target_cpu > 0.0 && (cpu_work + w <= target_cpu || cpu_count == 0) {
+            cpu_work += w;
+            cpu_count += 1;
+            to_cpu[pos] = true;
         }
     }
 
     // Adaptive probe: ensure the twin gets at least `min_cpu_probe` entities by
-    // moving the shortest GPU-assigned ones over (the batch is length-sorted
-    // ascending, so low positions are shortest = cheapest to run on the CPU).
+    // moving the shortest GPU-assigned entities over (the batch is length-sorted
+    // ascending, so low positions are cheapest to run on the CPU).
     if min_cpu_probe > 0 {
-        let mut cpu_count = batch.len() - metal_count;
-        for on_metal in to_metal.iter_mut() {
+        for on_cpu in to_cpu.iter_mut() {
             if cpu_count >= min_cpu_probe {
                 break;
             }
-            if *on_metal {
-                *on_metal = false;
-                metal_count -= 1;
+            if !*on_cpu {
+                *on_cpu = true;
                 cpu_count += 1;
             }
         }
     }
 
+    let metal_count = batch.len() - cpu_count;
     let mut metal = EncodedBatch {
         idx: Vec::with_capacity(metal_count),
         ids: Vec::with_capacity(metal_count),
         masks: Vec::with_capacity(metal_count),
     };
-    let cpu_cap = batch.len() - metal_count;
     let mut cpu = EncodedBatch {
-        idx: Vec::with_capacity(cpu_cap),
-        ids: Vec::with_capacity(cpu_cap),
-        masks: Vec::with_capacity(cpu_cap),
+        idx: Vec::with_capacity(cpu_count),
+        ids: Vec::with_capacity(cpu_count),
+        masks: Vec::with_capacity(cpu_count),
     };
     let push_into = |dst: &mut EncodedBatch, pos: usize| {
         dst.idx.push(batch.idx[pos]);
         dst.ids.push(batch.ids[pos].clone());
         dst.masks.push(batch.masks[pos].clone());
     };
-    for (pos, &on_metal) in to_metal.iter().enumerate() {
-        if on_metal {
-            push_into(&mut metal, pos);
-        } else {
+    for (pos, &on_cpu) in to_cpu.iter().enumerate() {
+        if on_cpu {
             push_into(&mut cpu, pos);
+        } else {
+            push_into(&mut metal, pos);
         }
-    }
-    for pos in ceiling_split..batch.len() {
-        push_into(&mut cpu, pos);
     }
 
     (metal, cpu)
@@ -3292,6 +3324,7 @@ mod tests {
         max_area: Option<String>,
         hybrid: Option<String>,
         hybrid_ratio: Option<String>,
+        hybrid_cpu_max_seq_len: Option<String>,
         backend: Option<String>,
     }
 
@@ -3308,6 +3341,7 @@ mod tests {
                 max_area: std::env::var("KIN_EMBED_MAX_ATTENTION_AREA").ok(),
                 hybrid: std::env::var("KIN_EMBED_HYBRID").ok(),
                 hybrid_ratio: std::env::var("KIN_EMBED_HYBRID_GPU_TPUT_RATIO").ok(),
+                hybrid_cpu_max_seq_len: std::env::var("KIN_EMBED_HYBRID_CPU_MAX_SEQ_LEN").ok(),
                 backend: std::env::var("KIN_EMBED_BACKEND").ok(),
             };
             std::env::remove_var("KIN_RESOURCE_PROFILE");
@@ -3315,6 +3349,7 @@ mod tests {
             std::env::remove_var("KIN_EMBED_MAX_ATTENTION_AREA");
             std::env::remove_var("KIN_EMBED_HYBRID");
             std::env::remove_var("KIN_EMBED_HYBRID_GPU_TPUT_RATIO");
+            std::env::remove_var("KIN_EMBED_HYBRID_CPU_MAX_SEQ_LEN");
             std::env::remove_var("KIN_EMBED_BACKEND");
             guard
         }
@@ -3332,6 +3367,10 @@ mod tests {
             restore("KIN_EMBED_MAX_ATTENTION_AREA", &self.max_area);
             restore("KIN_EMBED_HYBRID", &self.hybrid);
             restore("KIN_EMBED_HYBRID_GPU_TPUT_RATIO", &self.hybrid_ratio);
+            restore(
+                "KIN_EMBED_HYBRID_CPU_MAX_SEQ_LEN",
+                &self.hybrid_cpu_max_seq_len,
+            );
             restore("KIN_EMBED_BACKEND", &self.backend);
         }
     }
@@ -3498,6 +3537,23 @@ mod tests {
         assert_eq!(hybrid_mode(GpuBackend::Metal), HybridMode::Off);
     }
 
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn balanced_cpu_max_seq_len_env_is_narrow_and_below_token_cap() {
+        let _env = ResourceEnvGuard::acquire();
+        assert_eq!(balanced_cpu_max_seq_len(), BALANCED_CPU_MAX_SEQ_LEN);
+        assert!(balanced_cpu_max_seq_len() < EMBED_MAX_SEQ_LEN);
+
+        std::env::set_var("KIN_EMBED_HYBRID_CPU_MAX_SEQ_LEN", "384");
+        assert_eq!(balanced_cpu_max_seq_len(), 384);
+
+        std::env::set_var("KIN_EMBED_HYBRID_CPU_MAX_SEQ_LEN", "999999");
+        assert_eq!(balanced_cpu_max_seq_len(), EMBED_MAX_SEQ_LEN - 1);
+
+        std::env::set_var("KIN_EMBED_HYBRID_CPU_MAX_SEQ_LEN", "0");
+        assert_eq!(balanced_cpu_max_seq_len(), BALANCED_CPU_MAX_SEQ_LEN);
+    }
+
     /// Build a length-sorted `EncodedBatch` from a list of input lengths, exactly
     /// as `embed_uncached_batch` does: `idx[k]` is the original (pre-sort) input
     /// position of the k-th shortest entity.
@@ -3530,70 +3586,71 @@ mod tests {
         );
     }
 
-    // On a realistic mix of many short entities plus a few long ones, both the
-    // GPU arm and the CPU twin must each receive a real share — neither side may
-    // come back empty (an empty GPU subset would route everything back to the GPU
-    // and leave the CPU cores idle).
+    // On a realistic post-tokenization mix of many cheap entities plus under-cap
+    // heavy ones, both the GPU arm and CPU twin must receive a real share.
     #[cfg(feature = "embeddings")]
     #[test]
     fn balanced_partition_engages_both_arms_on_real_mix() {
-        let mut lengths: Vec<usize> = (0..200).map(|_| 128).collect();
-        lengths.extend((0..20).map(|_| EMBED_CPU_SEQ_THRESHOLD + 200)); // > threshold
+        let mut lengths: Vec<usize> = (0..160).map(|i| 64 + (i % 4) * 32).collect();
+        lengths.extend((0..40).map(|i| 512 + (i % 5) * 192));
         let batch = encoded_batch_from_lengths(&lengths);
-        let (metal, cpu) = balanced_partition(batch.as_slice(), 4.0, 0);
+        let (metal, cpu) = balanced_partition_with_cpu_max_seq_len(batch.as_slice(), 4.0, 0, 256);
 
         assert!(
             metal.len() > 0,
             "GPU arm must get a real share of the batch"
         );
         assert!(cpu.len() > 0, "CPU twin must get a real share of the batch");
+        assert!(
+            cpu.ids.iter().all(|ids| ids.len() <= 256),
+            "CPU twin should receive cheap entities"
+        );
+        assert!(
+            metal.ids.iter().any(|ids| ids.len() > 256),
+            "GPU arm should carry heavier under-cap entities"
+        );
         covers_all_indices(&metal, &cpu, lengths.len());
     }
 
-    // When long work dominates, the target clamps to "all short on the GPU" while
-    // the CPU twin carries the long entities — both arms busy, none idle.
+    // When under-cap heavy work dominates, the CPU twin takes all cheap entities
+    // while the GPU carries the heavier tokenized entities.
     #[cfg(feature = "embeddings")]
     #[test]
-    fn balanced_partition_long_heavy_keeps_gpu_busy() {
-        let mut lengths: Vec<usize> = (0..10).map(|_| 200).collect(); // short
-        lengths.extend((0..10).map(|_| EMBED_CPU_SEQ_THRESHOLD + 200)); // long, heavy
+    fn balanced_partition_heavy_under_cap_keeps_gpu_busy() {
+        let mut lengths: Vec<usize> = (0..10).map(|_| 128).collect();
+        lengths.extend((0..10).map(|_| 1200));
         let batch = encoded_batch_from_lengths(&lengths);
-        let (metal, cpu) = balanced_partition(batch.as_slice(), 4.0, 0);
+        let (metal, cpu) = balanced_partition_with_cpu_max_seq_len(batch.as_slice(), 4.0, 0, 256);
 
         assert_eq!(
             metal.len(),
             10,
-            "every short entity should land on the GPU arm"
+            "every heavy entity should land on the GPU arm"
         );
         assert!(
-            metal
-                .ids
-                .iter()
-                .all(|ids| ids.len() <= EMBED_CPU_SEQ_THRESHOLD),
-            "GPU arm must hold only short (<= threshold) sequences"
+            metal.ids.iter().all(|ids| ids.len() > 256),
+            "GPU arm must hold the heavier under-cap sequences"
         );
         assert_eq!(
             cpu.len(),
             10,
-            "every long entity should land on the CPU arm"
+            "every cheap entity should land on the CPU arm"
         );
         assert!(
-            cpu.ids
-                .iter()
-                .all(|ids| ids.len() > EMBED_CPU_SEQ_THRESHOLD),
-            "CPU arm must hold the long sequences"
+            cpu.ids.iter().all(|ids| ids.len() <= 256),
+            "CPU twin must hold the cheap sequences"
         );
         covers_all_indices(&metal, &cpu, lengths.len());
     }
 
-    // With no long entities the split reduces to the GPU taking ratio/(ratio+1) of
-    // the (uniform) short work — ~80% at the default 4× ratio, ~20% to the CPU.
+    // With no heavy entities the split reduces to the GPU taking ratio/(ratio+1)
+    // of uniform cheap work — ~80% at the default 4× ratio, ~20% to the CPU.
     #[cfg(feature = "embeddings")]
     #[test]
     fn balanced_partition_no_long_splits_short_by_ratio() {
         let lengths: Vec<usize> = (0..100).map(|_| 100).collect();
         let batch = encoded_batch_from_lengths(&lengths);
-        let (metal, cpu) = balanced_partition(batch.as_slice(), 4.0, 0);
+        let (metal, cpu) = balanced_partition_with_cpu_max_seq_len(batch.as_slice(), 4.0, 0, 256);
 
         assert!(metal.len() > 0 && cpu.len() > 0, "both arms must run");
         let metal_frac = metal.len() as f64 / lengths.len() as f64;
@@ -3614,17 +3671,17 @@ mod tests {
     fn balanced_partition_is_deterministic_and_order_stable() {
         let mut lengths = Vec::new();
         for i in 0..300usize {
-            // Deterministic pseudo-mix of short and over-the-ceiling sequences.
+            // Deterministic pseudo-mix of cheap and heavier under-cap sequences.
             let len = if i % 7 == 0 {
-                EMBED_CPU_SEQ_THRESHOLD + 50 + (i % 5) * 200
+                512 + (i % 5) * 200
             } else {
                 50 + (i % 31)
             };
             lengths.push(len);
         }
         let batch = encoded_batch_from_lengths(&lengths);
-        let (m1, c1) = balanced_partition(batch.as_slice(), 3.5, 0);
-        let (m2, c2) = balanced_partition(batch.as_slice(), 3.5, 0);
+        let (m1, c1) = balanced_partition_with_cpu_max_seq_len(batch.as_slice(), 3.5, 0, 256);
+        let (m2, c2) = balanced_partition_with_cpu_max_seq_len(batch.as_slice(), 3.5, 0, 256);
         assert_eq!(m1.idx, m2.idx, "GPU assignment must be deterministic");
         assert_eq!(c1.idx, c2.idx, "CPU assignment must be deterministic");
         covers_all_indices(&m1, &c1, lengths.len());
@@ -3673,14 +3730,15 @@ mod tests {
         let lengths: Vec<usize> = (0..40).map(|i| 100 + i).collect();
         let batch = encoded_batch_from_lengths(&lengths);
         // Without a probe, a near-infinite ratio sends ~everything to the GPU.
-        let (_, cpu_no_probe) = balanced_partition(batch.as_slice(), 1.0e6, 0);
+        let (_, cpu_no_probe) =
+            balanced_partition_with_cpu_max_seq_len(batch.as_slice(), 1.0e6, 0, 256);
         assert!(
             cpu_no_probe.len() <= 1,
             "high ratio with no probe → ~GPU-only, got {}",
             cpu_no_probe.len()
         );
         // With a probe of 2, the twin gets at least its minimum share.
-        let (metal, cpu) = balanced_partition(batch.as_slice(), 1.0e6, 2);
+        let (metal, cpu) = balanced_partition_with_cpu_max_seq_len(batch.as_slice(), 1.0e6, 2, 256);
         assert!(
             cpu.len() >= 2,
             "probe must hand the twin its minimum share, got {}",
