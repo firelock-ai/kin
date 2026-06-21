@@ -101,45 +101,62 @@ fn embed_pipeline_enabled() -> bool {
 /// then tears the remaining stages down without deadlock — when a consumer drops
 /// its receiver, the upstream `send` fails rather than blocking.
 #[cfg(all(feature = "embeddings", feature = "vector"))]
-fn drive_embed_pipeline<P, F, G>(
+fn drive_embed_pipeline<P, F, G, H>(
     prep_capacity: usize,
     result_capacity: usize,
     drain_prep: P,
     forward: F,
     persist: G,
+    abandon: H,
 ) -> Result<usize, KinDbError>
 where
     P: FnMut() -> Result<Option<PreparedEmbedBatch>, KinDbError> + Send,
     F: Fn(
             PreparedEmbedBatch,
-        )
-            -> Result<(PreparedEmbedBatch, Vec<(RetrievalKey, Vec<f32>)>), KinDbError>
+        ) -> Result<(PreparedEmbedBatch, Vec<(RetrievalKey, Vec<f32>)>), KinDbError>
         + Send,
     G: FnMut(PreparedEmbedBatch, Vec<(RetrievalKey, Vec<f32>)>) -> Result<usize, KinDbError>,
+    H: Fn(PreparedEmbedBatch) + Send + Sync,
 {
-    use std::sync::mpsc::sync_channel;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::sync_channel,
+        Arc,
+    };
 
     let (prep_tx, prep_rx) = sync_channel::<PreparedEmbedBatch>(prep_capacity);
     let (result_tx, result_rx) =
         sync_channel::<(PreparedEmbedBatch, Vec<(RetrievalKey, Vec<f32>)>)>(result_capacity);
     let first_error: parking_lot::Mutex<Option<KinDbError>> = parking_lot::Mutex::new(None);
     let error_ref = &first_error;
+    let abandon_ref = &abandon;
+    let aborting = Arc::new(AtomicBool::new(false));
 
     let total = std::thread::scope(move |scope| -> usize {
         // DRAIN + PREP: the single serial producer. Dropping `prep_tx` when this
         // thread ends tells the forward stage that no more batches will arrive.
+        let drain_aborting = Arc::clone(&aborting);
         scope.spawn(move || {
             let mut drain_prep = drain_prep;
             let prep_tx = prep_tx;
             loop {
+                if drain_aborting.load(Ordering::Acquire) {
+                    break;
+                }
                 match drain_prep() {
                     Ok(Some(prepared)) => {
-                        if prep_tx.send(prepared).is_err() {
+                        if drain_aborting.load(Ordering::Acquire) {
+                            abandon_ref(prepared);
+                            break;
+                        }
+                        if let Err(err) = prep_tx.send(prepared) {
+                            abandon_ref(err.0);
                             break; // forward stage gone; stop producing.
                         }
                     }
                     Ok(None) => break, // queue drained.
                     Err(error) => {
+                        drain_aborting.store(true, Ordering::Release);
                         let mut slot = error_ref.lock();
                         if slot.is_none() {
                             *slot = Some(error);
@@ -152,22 +169,36 @@ where
 
         // FORWARD: one batch at a time. Holds no graph lock; carries `prepared`
         // through so persist writes in the exact drained key order.
+        let forward_aborting = Arc::clone(&aborting);
         scope.spawn(move || {
             let result_tx = result_tx;
             while let Ok(prepared) = prep_rx.recv() {
+                if forward_aborting.load(Ordering::Acquire) {
+                    abandon_ref(prepared);
+                    continue;
+                }
                 match forward(prepared) {
                     Ok(pair) => {
-                        if result_tx.send(pair).is_err() {
+                        if let Err(err) = result_tx.send(pair) {
+                            forward_aborting.store(true, Ordering::Release);
+                            let (prepared, _embedded) = err.0;
+                            abandon_ref(prepared);
                             break; // persist consumer gone; stop forwarding.
                         }
                     }
                     Err(error) => {
+                        forward_aborting.store(true, Ordering::Release);
                         let mut slot = error_ref.lock();
                         if slot.is_none() {
                             *slot = Some(error);
                         }
                         break;
                     }
+                }
+            }
+            if forward_aborting.load(Ordering::Acquire) {
+                while let Ok(prepared) = prep_rx.recv() {
+                    abandon_ref(prepared);
                 }
             }
         });
@@ -180,12 +211,18 @@ where
             match persist(prepared, embedded) {
                 Ok(count) => total += count,
                 Err(error) => {
+                    aborting.store(true, Ordering::Release);
                     let mut slot = error_ref.lock();
                     if slot.is_none() {
                         *slot = Some(error);
                     }
                     break;
                 }
+            }
+        }
+        if aborting.load(Ordering::Acquire) {
+            while let Ok((prepared, _embedded)) = result_rx.recv() {
+                abandon_ref(prepared);
             }
         }
         // Drop the receiver so a forward thread parked on a full result channel
@@ -4059,6 +4096,9 @@ impl InMemoryGraph {
                     );
                 }
                 Ok(count)
+            },
+            |prepared| {
+                self.requeue_embedding_keys(prepared.recency.keys().copied(), &prepared.recency);
             },
         )?;
 
@@ -12617,6 +12657,7 @@ mod tests {
                 pipelined_order.lock().unwrap().extend(embedded);
                 Ok(count)
             },
+            |_prepared| {},
         )
         .unwrap();
 
@@ -12630,6 +12671,73 @@ mod tests {
         assert_eq!(
             serial_order, pipelined_order,
             "pipelined persist order and values must equal the serial reference"
+        );
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
+    fn pipelined_embed_abandons_every_drained_batch_on_persist_error() {
+        let created = std::sync::Mutex::new(Vec::<RetrievalKey>::new());
+        let abandoned = std::sync::Mutex::new(Vec::<RetrievalKey>::new());
+        let mut remaining = (0..8u128).map(|n| vec![n + 1]);
+
+        let err = drive_embed_pipeline(
+            EMBED_PIPELINE_PREP_CAPACITY,
+            EMBED_PIPELINE_RESULT_CAPACITY,
+            || {
+                let Some(ids) = remaining.next() else {
+                    return Ok(None);
+                };
+                let prepared = {
+                    let keys: Vec<RetrievalKey> = ids
+                        .iter()
+                        .map(|n| RetrievalKey::Entity(EntityId(uuid::Uuid::from_u128(*n))))
+                        .collect();
+                    created.lock().unwrap().extend(keys.iter().copied());
+                    let recency = keys.iter().map(|k| (*k, EmbedRecency::Backfill)).collect();
+                    PreparedEmbedBatch {
+                        texts: keys.iter().map(|k| format!("{k:?}")).collect(),
+                        keys,
+                        recency,
+                    }
+                };
+                Ok(Some(prepared))
+            },
+            |prepared| {
+                let embedded = prepared
+                    .keys
+                    .iter()
+                    .map(|key| (*key, vec![1.0, 2.0, 3.0, 4.0]))
+                    .collect();
+                Ok((prepared, embedded))
+            },
+            |prepared, _embedded| {
+                abandoned
+                    .lock()
+                    .unwrap()
+                    .extend(prepared.recency.keys().copied());
+                Err(KinDbError::StorageError("persist failed".into()))
+            },
+            |prepared| {
+                abandoned
+                    .lock()
+                    .unwrap()
+                    .extend(prepared.recency.keys().copied());
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{err}").contains("persist failed"),
+            "the original persist error should be returned"
+        );
+        let mut created = created.into_inner().unwrap();
+        let mut abandoned = abandoned.into_inner().unwrap();
+        created.sort();
+        abandoned.sort();
+        assert_eq!(
+            created, abandoned,
+            "every drained prepared batch must be abandoned for requeue on pipeline failure"
         );
     }
 
