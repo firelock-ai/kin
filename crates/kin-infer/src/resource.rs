@@ -267,6 +267,130 @@ pub struct WatchdogPlan {
 }
 
 // ---------------------------------------------------------------------------
+// Metal resident-stack governor (canonical formula + caps)
+// ---------------------------------------------------------------------------
+
+/// Default share of Metal's recommended working set the resident stack may
+/// reserve for command-buffer-owned transients. The remaining headroom covers
+/// cached weights, host allocations, Metal driver overhead, and other process
+/// memory on unified-memory Macs.
+pub(crate) const DEFAULT_RESIDENT_STACK_BUDGET_DIVISOR: u64 = 2;
+
+/// Share of physical RAM (`hw.memsize`) the resident stack may reserve for
+/// GPU-resident command-buffer transients. On unified memory the cached weights,
+/// host activation buffers, the BufferPool free-list, and the rest of the daemon
+/// process all draw from this same DRAM, so the working-set figure alone (which
+/// reports the GPU's share, not what is left after the process is already
+/// resident) over-budgets. Capping against true physical RAM keeps the standing
+/// in-flight footprint below the OS jetsam ceiling; over-budget segments fall to
+/// the bounded per-layer / op-by-op path instead of allocating unbounded.
+pub(crate) const RESIDENT_STACK_HW_MEMSIZE_PERCENT: u64 = 25;
+
+/// Absolute ceiling on the resident-stack transient budget regardless of how
+/// large the machine is. A single in-flight segment never needs tens of GB of
+/// transients; anything beyond this should segment or drop to the per-layer path.
+pub(crate) const RESIDENT_STACK_ABS_CEILING_BYTES: u64 = 8 * GIB;
+
+/// Default ceiling on total bytes the Metal BufferPool free-list may hold. The
+/// free list is a recycling cache, not a reservation: anything it drops is simply
+/// re-allocated on the next acquire of that size-class. Without a ceiling the
+/// list grows monotonically to the run's peak high-water, which on unified memory
+/// is permanent physical RAM. Capping it bounds the standing footprint while
+/// keeping the hot recycling path intact for the common (small, repeated) classes.
+pub(crate) const DEFAULT_BUFFER_POOL_CAP_BYTES: u64 = 3 * GIB;
+
+/// Per-buffer high-water: pooled buffers whose size-class exceeds this are never
+/// recycled. The largest pooled allocations are the O(seq²) attention-score
+/// buffers, the least likely to be re-hit at the exact same class and the most
+/// expensive to strand; dropping them frees the unified allocation immediately.
+pub(crate) const DEFAULT_BUFFER_POOL_PER_BUFFER_CAP_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Pure resident-stack budget arithmetic (no device / no env), the single
+/// canonical copy of the formula. The Metal backend resolves the live device's
+/// `recommended_max_working_set_size()` and physical RAM and calls this; the
+/// inspect-only [`MetalGovernorPlan`] derives from the same two inputs, so the
+/// reported budget and the runtime budget can never diverge.
+///
+/// The budget is the smallest of three ceilings:
+/// 1. a share of Metal's recommended working set (the GPU's reported headroom),
+/// 2. a share of true physical RAM (`hw.memsize`) — the unified-memory ceiling
+///    that actually bounds the process before the OS kills it, and
+/// 3. an absolute ceiling, so even very large machines never let a single
+///    in-flight segment's transients balloon unbounded.
+///
+/// A `recommended` of 0 means the working-set term is unknown; the physical-RAM
+/// and absolute ceilings still apply. When physical RAM is also unknown the
+/// remaining ceilings still bound the budget.
+pub(crate) fn resident_stack_budget_bytes(
+    recommended: u64,
+    system_total_bytes: Option<u64>,
+) -> u64 {
+    let working_set_term = if recommended == 0 {
+        u64::MAX
+    } else {
+        recommended / DEFAULT_RESIDENT_STACK_BUDGET_DIVISOR
+    };
+    let hw_term = system_total_bytes
+        .map(|total| total.saturating_mul(RESIDENT_STACK_HW_MEMSIZE_PERCENT) / 100)
+        .unwrap_or(u64::MAX);
+    working_set_term
+        .min(hw_term)
+        .min(RESIDENT_STACK_ABS_CEILING_BYTES)
+}
+
+/// Inspect-only view of the Metal resident-stack governor's hardware-derived
+/// caps. Reported in [`ResourcePlan`] (and therefore in
+/// `kin resources inspect --json`) so the "actual values used" — the resolved
+/// resident-stack byte budget plus the BufferPool ceilings — are visible without
+/// reading the GPU at runtime. The documented constants the formula keys off
+/// (the working-set divisor, the physical-RAM percent, and the absolute ceiling)
+/// are reported alongside so the derivation is auditable from the plan alone.
+///
+/// This is observability only: it derives from the SAME
+/// `(recommended_working_set, system_total)` inputs the live governor uses and
+/// does not change any runtime memory bound. Env overrides
+/// (`KIN_INFER_METAL_RESIDENT_BUDGET_BYTES`, `KIN_INFER_METAL_POOL_CAP_BYTES`)
+/// are deliberately not folded in here — this reports the hardware-derived
+/// defaults, not the per-process override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetalGovernorPlan {
+    /// Resolved resident-stack transient byte budget (the smallest of the three
+    /// ceilings below), from the same formula the backend resolves at startup.
+    pub resident_stack_budget_bytes: u64,
+    /// Default ceiling on total bytes the BufferPool free-list may hold.
+    pub buffer_pool_cap_bytes: u64,
+    /// Per-buffer high-water above which a size-class is never pooled.
+    pub buffer_pool_per_buffer_cap_bytes: u64,
+    /// Divisor applied to Metal's recommended working set for the GPU-headroom
+    /// ceiling (term 1 of the budget formula).
+    pub resident_stack_budget_divisor: u64,
+    /// Percent of physical RAM (`hw.memsize`) for the unified-memory ceiling
+    /// (term 2 of the budget formula).
+    pub resident_stack_hw_memsize_percent: u64,
+    /// Absolute ceiling on the resident-stack transient budget (term 3).
+    pub resident_stack_abs_ceiling_bytes: u64,
+}
+
+impl MetalGovernorPlan {
+    /// Derive the governor caps from the same `(recommended_working_set,
+    /// system_total)` inputs the live Metal backend resolves. Pure: no device,
+    /// no env, no runtime effect.
+    pub fn derive(recommended_working_set_bytes: u64, system_total_bytes: Option<u64>) -> Self {
+        MetalGovernorPlan {
+            resident_stack_budget_bytes: resident_stack_budget_bytes(
+                recommended_working_set_bytes,
+                system_total_bytes,
+            ),
+            buffer_pool_cap_bytes: DEFAULT_BUFFER_POOL_CAP_BYTES,
+            buffer_pool_per_buffer_cap_bytes: DEFAULT_BUFFER_POOL_PER_BUFFER_CAP_BYTES,
+            resident_stack_budget_divisor: DEFAULT_RESIDENT_STACK_BUDGET_DIVISOR,
+            resident_stack_hw_memsize_percent: RESIDENT_STACK_HW_MEMSIZE_PERCENT,
+            resident_stack_abs_ceiling_bytes: RESIDENT_STACK_ABS_CEILING_BYTES,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Plan
 // ---------------------------------------------------------------------------
 
@@ -286,6 +410,21 @@ pub struct ResourcePlan {
     pub locate_search: LocateSearchPlan,
     pub bench: BenchPlan,
     pub watchdog: WatchdogPlan,
+    /// Inspect-only Metal resident-stack governor caps, derived from the same
+    /// `(recommended_working_set, system_total)` inputs the live backend uses.
+    /// Observability only — reported here so `kin resources inspect --json`
+    /// surfaces the resolved resident-stack budget and BufferPool ceilings.
+    #[serde(default = "MetalGovernorPlan::derive_default")]
+    pub metal_governor: MetalGovernorPlan,
+}
+
+impl MetalGovernorPlan {
+    /// Serde fallback for plans deserialized from an older schema that predates
+    /// `metal_governor`: derive from no hardware inputs (both ceilings unknown),
+    /// which collapses to the absolute ceiling and the default pool caps.
+    fn derive_default() -> MetalGovernorPlan {
+        MetalGovernorPlan::derive(0, None)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -585,6 +724,15 @@ impl ResourcePlan {
             }
         }
 
+        // Inspect-only governor caps from the same inputs the live Metal backend
+        // resolves: the GPU's recommended working set and true physical RAM. The
+        // formula tolerates unknown (0 / None) inputs, so non-Metal backends
+        // report the absolute-ceiling default without any runtime effect.
+        let metal_governor = MetalGovernorPlan::derive(
+            accel.recommended_working_set_bytes.unwrap_or(0),
+            memory.system_total_bytes,
+        );
+
         ResourcePlan {
             schema_version: SchemaVersion,
             profile,
@@ -596,6 +744,7 @@ impl ResourcePlan {
             locate_search,
             bench,
             watchdog,
+            metal_governor,
         }
     }
 }
@@ -974,5 +1123,77 @@ mod tests {
     #[test]
     fn detect_proof_does_not_panic() {
         let _ = ResourcePlan::detect(Profile::Proof);
+    }
+
+    #[test]
+    fn metal_governor_plan_reports_resolved_caps_and_constants() {
+        // 64 GiB recommended working set, 128 GiB physical RAM: both the
+        // working-set term (32G) and the hw% term (32G) exceed the absolute
+        // ceiling, so the resolved budget is the ceiling.
+        let gov = MetalGovernorPlan::derive(64 * GIB, Some(128 * GIB));
+        assert_eq!(
+            gov.resident_stack_budget_bytes,
+            RESIDENT_STACK_ABS_CEILING_BYTES
+        );
+        // Reported caps mirror the canonical constants.
+        assert_eq!(gov.buffer_pool_cap_bytes, DEFAULT_BUFFER_POOL_CAP_BYTES);
+        assert_eq!(
+            gov.buffer_pool_per_buffer_cap_bytes,
+            DEFAULT_BUFFER_POOL_PER_BUFFER_CAP_BYTES
+        );
+        assert_eq!(
+            gov.resident_stack_budget_divisor,
+            DEFAULT_RESIDENT_STACK_BUDGET_DIVISOR
+        );
+        assert_eq!(
+            gov.resident_stack_hw_memsize_percent,
+            RESIDENT_STACK_HW_MEMSIZE_PERCENT
+        );
+        assert_eq!(
+            gov.resident_stack_abs_ceiling_bytes,
+            RESIDENT_STACK_ABS_CEILING_BYTES
+        );
+    }
+
+    #[test]
+    fn metal_governor_plan_binds_on_hw_percent_for_small_machine() {
+        // 11 GiB working set / 16 GiB RAM: hw% (4 GiB) is the binding ceiling,
+        // below both the working-set term (5.5 GiB) and the absolute ceiling.
+        let gov = MetalGovernorPlan::derive(11 * GIB, Some(16 * GIB));
+        let expected_hw = (16 * GIB).saturating_mul(RESIDENT_STACK_HW_MEMSIZE_PERCENT) / 100;
+        assert_eq!(gov.resident_stack_budget_bytes, expected_hw);
+        assert!(gov.resident_stack_budget_bytes < RESIDENT_STACK_ABS_CEILING_BYTES);
+    }
+
+    #[test]
+    fn for_profile_populates_metal_governor_from_inputs() {
+        let host = host_with(18);
+        let accel = metal_accel(); // recommended_working_set_bytes = 64 GiB
+        let mem = mem_with(Some(128 * GIB));
+        let plan = ResourcePlan::for_profile(Profile::Proof, &host, &accel, &mem);
+        let expected = MetalGovernorPlan::derive(
+            accel.recommended_working_set_bytes.unwrap_or(0),
+            mem.system_total_bytes,
+        );
+        assert_eq!(plan.metal_governor, expected);
+    }
+
+    #[test]
+    fn metal_governor_deserializes_missing_field_as_default() {
+        let host = host_with(18);
+        let accel = metal_accel();
+        let mem = mem_with(Some(128 * GIB));
+        let plan = ResourcePlan::for_profile(Profile::Proof, &host, &accel, &mem);
+        let mut value = serde_json::to_value(&plan).unwrap();
+        value.as_object_mut().unwrap().remove("metal_governor");
+
+        let back: ResourcePlan = serde_json::from_value(value).unwrap();
+        // An older plan with no governor field falls back to the no-hardware
+        // derivation (absolute ceiling + default pool caps).
+        assert_eq!(back.metal_governor, MetalGovernorPlan::derive(0, None));
+        assert_eq!(
+            back.metal_governor.resident_stack_budget_bytes,
+            RESIDENT_STACK_ABS_CEILING_BYTES
+        );
     }
 }

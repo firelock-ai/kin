@@ -1814,27 +1814,6 @@ fn resolve_max_inflight_inner(override_raw: Option<&str>, profile_raw: Option<&s
 /// the submitter.
 type InflightGate = Arc<(Mutex<u32>, Condvar)>;
 
-/// Default share of Metal's recommended working set the resident stack may
-/// reserve for command-buffer-owned transients. The remaining headroom covers
-/// cached weights, host allocations, Metal driver overhead, and other process
-/// memory on unified-memory Macs.
-const DEFAULT_RESIDENT_STACK_BUDGET_DIVISOR: u64 = 2;
-
-/// Share of physical RAM (`hw.memsize`) the resident stack may reserve for
-/// GPU-resident command-buffer transients. On unified memory the cached weights,
-/// host activation buffers, the BufferPool free-list, and the rest of the daemon
-/// process all draw from this same DRAM, so the working-set figure alone (which
-/// reports the GPU's share, not what is left after the process is already
-/// resident) over-budgets. Capping against true physical RAM keeps the standing
-/// in-flight footprint below the OS jetsam ceiling; over-budget segments fall to
-/// the bounded per-layer / op-by-op path instead of allocating unbounded.
-const RESIDENT_STACK_HW_MEMSIZE_PERCENT: u64 = 25;
-
-/// Absolute ceiling on the resident-stack transient budget regardless of how
-/// large the machine is. A single in-flight segment never needs tens of GB of
-/// transients; anything beyond this should segment or drop to the per-layer path.
-const RESIDENT_STACK_ABS_CEILING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-
 /// Shared byte gate for resident stack command buffers. This is deliberately a
 /// no-wait gate: stack paths can return `Ok(None)` and let the caller use the
 /// proven fallback path instead of parking after allocating large MTLBuffers.
@@ -1892,51 +1871,10 @@ fn resolve_resident_stack_budget(device: &Device) -> usize {
 
     let recommended = device.recommended_max_working_set_size();
     let system_total = crate::resource::detect_memory().system_total_bytes;
-    resident_stack_budget_bytes(recommended, system_total)
+    // Single canonical copy of the formula lives in `resource`, so the runtime
+    // budget and the inspect-only `MetalGovernorPlan` can never diverge.
+    crate::resource::resident_stack_budget_bytes(recommended, system_total) as usize
 }
-
-/// Pure budget arithmetic (no device / no env), so the formula is unit-testable.
-///
-/// The budget is the smallest of three ceilings:
-/// 1. a share of Metal's recommended working set (the GPU's reported headroom),
-/// 2. a share of true physical RAM (`hw.memsize`) — the unified-memory ceiling
-///    that actually bounds the process before the OS kills it, and
-/// 3. an absolute ceiling, so even very large machines never let a single
-///    in-flight segment's transients balloon unbounded.
-///
-/// A `recommended` of 0 means the working-set term is unknown; the physical-RAM
-/// and absolute ceilings still apply. When physical RAM is also unknown the
-/// remaining ceilings still bound the budget.
-fn resident_stack_budget_bytes(recommended: u64, system_total_bytes: Option<u64>) -> usize {
-    let working_set_term = if recommended == 0 {
-        u64::MAX
-    } else {
-        recommended / DEFAULT_RESIDENT_STACK_BUDGET_DIVISOR
-    };
-    let hw_term = system_total_bytes
-        .map(|total| total.saturating_mul(RESIDENT_STACK_HW_MEMSIZE_PERCENT) / 100)
-        .unwrap_or(u64::MAX);
-    working_set_term
-        .min(hw_term)
-        .min(RESIDENT_STACK_ABS_CEILING_BYTES) as usize
-}
-
-/// Default ceiling on total bytes the BufferPool free-list may hold. The free
-/// list is a recycling cache, not a reservation: anything it drops is simply
-/// re-allocated on the next acquire of that size-class. Without a ceiling the
-/// list grows monotonically to the run's peak high-water (one retained
-/// `StorageModeShared` buffer per size-class ever touched at peak concurrency),
-/// which on unified memory is permanent physical RAM. Capping it bounds the
-/// standing footprint while keeping the hot recycling path intact for the common
-/// (small, repeated) size-classes.
-const DEFAULT_BUFFER_POOL_CAP_BYTES: u64 = 3 * 1024 * 1024 * 1024;
-
-/// Per-buffer high-water: buffers whose size-class exceeds this are never pooled.
-/// The largest pooled allocations are the O(seq²) attention-score buffers, which
-/// are the least likely to be re-hit at the exact same class and the most
-/// expensive to strand. Dropping them frees the unified allocation immediately;
-/// the next same-shaped forward simply re-allocates.
-const DEFAULT_BUFFER_POOL_PER_BUFFER_CAP_BYTES: u64 = 256 * 1024 * 1024;
 
 /// A size-classed free-list of `StorageModeShared` buffers. Recycling a buffer
 /// back onto the list avoids the per-op `new_buffer` churn that otherwise mints
@@ -1990,7 +1928,7 @@ fn resolve_buffer_pool_cap_bytes() -> usize {
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|bytes| *bytes > 0)
-        .unwrap_or(DEFAULT_BUFFER_POOL_CAP_BYTES as usize)
+        .unwrap_or(crate::resource::DEFAULT_BUFFER_POOL_CAP_BYTES as usize)
 }
 
 /// Round a byte count up to its allocation size-class. Powers of two up to 64KB,
@@ -2217,7 +2155,8 @@ impl BufferPool {
             free: Mutex::new(HashMap::new()),
             pooled_bytes: Mutex::new(0),
             cap_bytes: resolve_buffer_pool_cap_bytes(),
-            per_buffer_cap_bytes: DEFAULT_BUFFER_POOL_PER_BUFFER_CAP_BYTES as usize,
+            per_buffer_cap_bytes: crate::resource::DEFAULT_BUFFER_POOL_PER_BUFFER_CAP_BYTES
+                as usize,
         }
     }
 
@@ -2675,6 +2614,22 @@ impl MetalCompute {
         let pool = Arc::new(BufferPool::new(device.clone()));
         let resident_stack_memory =
             ResidentStackMemoryGate::new(resolve_resident_stack_budget(&device));
+        let max_inflight = resolve_max_inflight();
+
+        // The hardware-derived governor caps actually in force for this process,
+        // logged once so the resolved resident budget, pool ceilings, and
+        // in-flight depth are visible in runtime logs (mirrors what
+        // `kin resources inspect --json` reports via ResourcePlan).
+        tracing::info!(
+            target: "kin.resource",
+            device = %device_name,
+            resident_stack_budget_bytes = resident_stack_memory.budget_bytes,
+            buffer_pool_cap_bytes = pool.cap_bytes,
+            buffer_pool_per_buffer_cap_bytes = pool.per_buffer_cap_bytes,
+            max_inflight_command_buffers = max_inflight,
+            "metal resident-stack governor resolved"
+        );
+
         Some(Self {
             device,
             queue,
@@ -2683,7 +2638,7 @@ impl MetalCompute {
             weight_cache: Mutex::new(HashMap::new()),
             concat_cache: Mutex::new(HashMap::new()),
             inflight: Arc::new((Mutex::new(0), Condvar::new())),
-            max_inflight: resolve_max_inflight(),
+            max_inflight,
             pool,
             resident_stack_memory,
         })
@@ -6251,27 +6206,31 @@ mod tests {
 
     #[test]
     fn resident_stack_budget_caps_against_hw_memsize_and_absolute_ceiling() {
+        use crate::resource::{
+            resident_stack_budget_bytes, DEFAULT_RESIDENT_STACK_BUDGET_DIVISOR,
+            RESIDENT_STACK_ABS_CEILING_BYTES, RESIDENT_STACK_HW_MEMSIZE_PERCENT,
+        };
         const GIB: u64 = 1024 * 1024 * 1024;
         let pct = RESIDENT_STACK_HW_MEMSIZE_PERCENT;
-        let ceiling = RESIDENT_STACK_ABS_CEILING_BYTES as usize;
+        let ceiling = RESIDENT_STACK_ABS_CEILING_BYTES;
 
         // Large unified Mac: working-set/2 (48G) and hw% (32G) both exceed the
         // absolute ceiling, so the budget is the ceiling — not the loose ~48G.
         let big = resident_stack_budget_bytes(96 * GIB, Some(128 * GIB));
         assert_eq!(big, ceiling);
-        assert!(big < (96 * GIB / DEFAULT_RESIDENT_STACK_BUDGET_DIVISOR) as usize);
+        assert!(big < 96 * GIB / DEFAULT_RESIDENT_STACK_BUDGET_DIVISOR);
 
         // Small Mac where the hw% term is the binding ceiling (below both the
         // working-set term and the absolute ceiling).
         let small = resident_stack_budget_bytes(11 * GIB, Some(16 * GIB));
         let expected_hw = (16 * GIB).saturating_mul(pct) / 100;
-        assert_eq!(small as u64, expected_hw);
+        assert_eq!(small, expected_hw);
         assert!(small < ceiling);
 
         // Working-set unknown (recommended == 0): hw% / absolute ceiling still bound.
         let no_ws = resident_stack_budget_bytes(0, Some(64 * GIB));
         let hw_64 = ((64 * GIB).saturating_mul(pct) / 100).min(RESIDENT_STACK_ABS_CEILING_BYTES);
-        assert_eq!(no_ws as u64, hw_64);
+        assert_eq!(no_ws, hw_64);
 
         // Physical RAM unknown: working-set term and absolute ceiling still bound.
         let no_hw = resident_stack_budget_bytes(96 * GIB, None);
@@ -6280,6 +6239,60 @@ mod tests {
         // Both unknown: only the absolute ceiling remains.
         let neither = resident_stack_budget_bytes(0, None);
         assert_eq!(neither, ceiling);
+    }
+
+    // The inspect-only MetalGovernorPlan must report exactly what the live Metal
+    // backend resolves for the same hardware inputs — no divergence. The backend
+    // resident budget goes through `crate::resource::resident_stack_budget_bytes`
+    // (via `resolve_resident_stack_budget`) and the BufferPool ceilings come from
+    // `crate::resource::DEFAULT_BUFFER_POOL_*`, so these assert the two never drift.
+    #[test]
+    fn metal_governor_plan_matches_backend_resolution() {
+        use crate::resource::MetalGovernorPlan;
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        // Resident budget: the plan's value equals the backend formula's, byte for
+        // byte, across the same input regimes the backend can hit at startup.
+        for (recommended, system_total) in [
+            (96 * GIB, Some(128 * GIB)), // absolute-ceiling regime
+            (11 * GIB, Some(16 * GIB)),  // hw% binding regime
+            (0, Some(64 * GIB)),         // working-set unknown
+            (96 * GIB, None),            // physical RAM unknown
+            (0, None),                   // both unknown
+        ] {
+            let plan = MetalGovernorPlan::derive(recommended, system_total);
+            let backend_budget =
+                crate::resource::resident_stack_budget_bytes(recommended, system_total);
+            assert_eq!(
+                plan.resident_stack_budget_bytes, backend_budget,
+                "resident budget diverged for ({recommended}, {system_total:?})"
+            );
+            // `resolve_resident_stack_budget` returns the same value cast to usize.
+            assert_eq!(
+                plan.resident_stack_budget_bytes as usize,
+                backend_budget as usize
+            );
+        }
+
+        // BufferPool ceilings: the plan reports exactly the constants the live
+        // pool is constructed with. Take the profile lock and assert the default
+        // (no-override) path so the env-derived cap equals the documented default.
+        let _guard = profile_test_lock();
+        let plan = MetalGovernorPlan::derive(64 * GIB, Some(128 * GIB));
+        if std::env::var_os("KIN_INFER_METAL_POOL_CAP_BYTES").is_none() {
+            assert_eq!(
+                resolve_buffer_pool_cap_bytes() as u64,
+                plan.buffer_pool_cap_bytes
+            );
+        }
+        assert_eq!(
+            crate::resource::DEFAULT_BUFFER_POOL_CAP_BYTES,
+            plan.buffer_pool_cap_bytes
+        );
+        assert_eq!(
+            crate::resource::DEFAULT_BUFFER_POOL_PER_BUFFER_CAP_BYTES,
+            plan.buffer_pool_per_buffer_cap_bytes
+        );
     }
 
     #[test]
