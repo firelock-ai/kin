@@ -454,7 +454,7 @@ pub(crate) fn render_comparison_tables() -> String {
     out.push_str("| Instead of | Use | Why |\n");
     out.push_str("|------------|-----|-----|\n");
     out.push_str("| Reading 5 files to find callers | `kin context <entity>` | Token-budgeted pack: focal entity + callers + dependencies |\n");
-    out.push_str("| `cat src/foo.rs` (whole file) | `kin search foo` then read only the pointed-to file | 84% fewer tokens on average |\n");
+    out.push_str("| `cat src/foo.rs` (whole file) | `kin search foo` then read only the pointed-to file | Surfaces the exact definition, so you read one location instead of the whole file |\n");
     out.push_str("| Guessing which files matter | `kin support` | Coverage report showing all indexed entities, languages, relations |\n");
     out.push('\n');
 
@@ -543,9 +543,10 @@ fn render_kin_first_section(target_path: &str) -> String {
     }
 
     out.push_str("### Key Principle\n\n");
-    out.push_str("**Search semantically first, read files second.** Kin search returns 4-22x\n");
-    out.push_str("less noise than grep and context packs use 84% fewer tokens than reading\n");
-    out.push_str("all matching files. Only fall back to raw file reads when Kin doesn't have\n");
+    out.push_str("**Search semantically first, read files second.** Kin search returns ranked\n");
+    out.push_str("entity definitions with file:line instead of raw text matches, and context\n");
+    out.push_str("packs assemble a focal entity with its callers and dependencies instead of\n");
+    out.push_str("reading whole files. Only fall back to raw file reads when Kin doesn't have\n");
     out.push_str("what you need.\n");
     out.push('\n');
 
