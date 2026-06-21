@@ -1445,18 +1445,45 @@ fn load_classifier_head(
     Ok(None)
 }
 
-/// Memory-maps a safetensors file for zero-copy deserialization.
+/// Safetensors weight bytes: a memory map when the platform/filesystem supports
+/// it, or a heap copy read from the file as a fallback. Both variants deref to
+/// the same `&[u8]`, so `SafeTensors::deserialize` and every parsed tensor are
+/// identical regardless of which path produced the bytes.
+enum WeightBytes {
+    Mmap(memmap2::Mmap),
+    Owned(Vec<u8>),
+}
+
+impl std::ops::Deref for WeightBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            WeightBytes::Mmap(mmap) => mmap,
+            WeightBytes::Owned(bytes) => bytes,
+        }
+    }
+}
+
+/// Loads a safetensors file as a byte buffer for zero-copy deserialization.
 ///
-/// The mapping exposes the same bytes as reading the file into a `Vec<u8>`, so
-/// parsed tensors and downstream embeddings are unchanged; it only avoids the
-/// up-front heap copy of the full weight file.
-fn load_safetensors_mmap(weights_path: &Path) -> Result<memmap2::Mmap, InferError> {
+/// Prefers a memory map, which avoids the up-front heap copy of the
+/// multi-hundred-MB weight file at load time. If the map call fails — e.g. a
+/// filesystem or sandbox that disallows `mmap` — it falls back to reading the
+/// file into a heap buffer. Either path exposes the same bytes as
+/// `std::fs::read`, so parsed tensors and downstream embeddings are unchanged.
+fn load_weight_bytes(weights_path: &Path) -> Result<WeightBytes, InferError> {
     let file = std::fs::File::open(weights_path)
         .map_err(|e| InferError::ModelError(format!("failed to open weights: {e}")))?;
-    unsafe {
-        memmap2::MmapOptions::new()
-            .map(&file)
-            .map_err(|e| InferError::ModelError(format!("failed to mmap weights: {e}")))
+    // Safety: the file is opened read-only and the returned `WeightBytes` owns
+    // the mapping for as long as the bytes are borrowed.
+    match unsafe { memmap2::MmapOptions::new().map(&file) } {
+        Ok(mmap) => Ok(WeightBytes::Mmap(mmap)),
+        Err(_) => {
+            let bytes = std::fs::read(weights_path)
+                .map_err(|e| InferError::ModelError(format!("failed to read weights: {e}")))?;
+            Ok(WeightBytes::Owned(bytes))
+        }
     }
 }
 
@@ -1496,8 +1523,8 @@ impl BertModel {
             architecture = ?config.architecture()
         )
         .entered();
-        let mmap = load_safetensors_mmap(weights_path)?;
-        let tensors = SafeTensors::deserialize(&mmap)
+        let weights = load_weight_bytes(weights_path)?;
+        let tensors = SafeTensors::deserialize(&weights)
             .map_err(|e| InferError::ModelError(format!("failed to parse safetensors: {e}")))?;
         Self::load_from_tensors(&tensors, config)
     }
@@ -7345,16 +7372,28 @@ mod tests {
         }
 
         let via_fs = std::fs::read(&path).expect("fs read");
-        let mmap = load_safetensors_mmap(&path).expect("mmap load");
+        let weights = load_weight_bytes(&path).expect("weight load");
 
         assert_eq!(
             &via_fs[..],
-            &mmap[..],
-            "mmap bytes must match fs::read bytes"
+            &weights[..],
+            "loaded bytes must match fs::read bytes"
         );
-        assert_eq!(&bytes[..], &mmap[..], "mmap bytes must match written bytes");
+        assert_eq!(
+            &bytes[..],
+            &weights[..],
+            "loaded bytes must match written bytes"
+        );
 
-        drop(mmap);
+        // The heap fallback must expose byte-identical contents to the mmap path.
+        let fallback = WeightBytes::Owned(via_fs.clone());
+        assert_eq!(
+            &fallback[..],
+            &weights[..],
+            "fallback bytes must match primary load path"
+        );
+
+        drop(weights);
         let _ = std::fs::remove_file(&path);
     }
 }
