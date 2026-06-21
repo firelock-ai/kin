@@ -69,14 +69,38 @@ fn embed_one(model: &BertModel, ids: &[u32], mask: &[u32]) -> Vec<f32> {
 fn print_pooled_output_stats(label: &str) {
     let stats = kin_infer::pooled_output_runtime_stats();
     eprintln!(
-        "{label} pooled_output: used={} declined={} last_reason={} batch_size={} max_seq={} cap_batch={} cap_seq={} declined_sequence_too_long={} declined_backend_unsupported={}",
+        "{label} pooled_output: used={} used_segmented={} declined={} last_reason={} batch_size={} max_seq={} segment_count={} cap_batch={} cap_seq={} cap_segmented_seq={} segment_layers={} declined_sequence_too_long={} declined_backend_unsupported={}",
         stats.used,
+        stats.used_segmented,
         stats.declined,
         stats.last_reason.as_str(),
         stats.last_batch_size,
         stats.last_max_seq,
+        stats.last_segment_count,
         stats.max_batch_size,
         stats.max_seq,
+        stats.segmented_max_seq,
+        stats.segment_layers,
+        stats.declined_sequence_too_long,
+        stats.declined_backend_unsupported,
+    );
+}
+
+fn print_resident_stack_stats(label: &str) {
+    let stats = kin_infer::resident_stack_runtime_stats();
+    eprintln!(
+        "{label} resident_stack: used={} used_segmented={} declined={} last_reason={} batch_size={} max_seq={} segment_count={} cap_batch={} cap_seq={} cap_segmented_seq={} segment_layers={} declined_sequence_too_long={} declined_backend_unsupported={}",
+        stats.used,
+        stats.used_segmented,
+        stats.declined,
+        stats.last_reason.as_str(),
+        stats.last_batch_size,
+        stats.last_max_seq,
+        stats.last_segment_count,
+        stats.max_batch_size,
+        stats.max_seq,
+        stats.segmented_max_seq,
+        stats.segment_layers,
         stats.declined_sequence_too_long,
         stats.declined_backend_unsupported,
     );
@@ -220,6 +244,7 @@ fn metal_embed_forward_profile() {
     // measure wall-clock and stall.
     metal_backend::reset_profile();
     kin_infer::reset_pooled_output_runtime_stats();
+    kin_infer::reset_resident_stack_runtime_stats();
     let start = Instant::now();
     let mut checksum = 0.0f64;
     for (ids, mask) in &corpus {
@@ -259,6 +284,7 @@ fn metal_embed_forward_profile() {
         "forward_calls={forward_calls}  GPU submissions={submissions} ({subs_per_fwd:.1}/forward)  round_trips={round_trips} ({trips_per_fwd:.1}/forward)"
     );
     print_pooled_output_stats("single-forward corpus");
+    print_resident_stack_stats("single-forward corpus");
 
     if submissions == 0 {
         eprintln!(
@@ -343,6 +369,7 @@ fn metal_embed_forward_profile() {
     let _ = model.forward_batched(&bt, &bm).expect("warm batched"); // warm
     metal_backend::reset_profile();
     kin_infer::reset_pooled_output_runtime_stats();
+    kin_infer::reset_resident_stack_runtime_stats();
     let t_b = Instant::now();
     let _ = model.forward_batched(&bt, &bm).expect("batched fwd");
     let bw = t_b.elapsed().as_secs_f64();
@@ -363,6 +390,7 @@ fn metal_embed_forward_profile() {
         host_blocked_b as f64 / fwd_b as f64,
     );
     print_pooled_output_stats("daemon-batched");
+    print_resident_stack_stats("daemon-batched");
     eprintln!(
         "host-wall phase split: matmul {:.0}% / attention {:.0}% / norm-softmax {:.0}% / activation {:.0}% / copy-readback {:.0}%",
         mm as f64 / tot * 100.0,
@@ -425,6 +453,7 @@ fn metal_embed_forward_profile() {
     );
     metal_backend::reset_profile();
     kin_infer::reset_pooled_output_runtime_stats();
+    kin_infer::reset_resident_stack_runtime_stats();
     let t_l = Instant::now();
     let long_out = model.forward_batched(&lt, &lm).expect("long batched fwd");
     let lw = t_l.elapsed().as_secs_f64();
@@ -439,6 +468,7 @@ fn metal_embed_forward_profile() {
         long_n as f64 / lw.max(1e-9),
     );
     print_pooled_output_stats("long-batched");
+    print_resident_stack_stats("long-batched");
     if long_gpu_tot > 0 {
         let denom = long_gpu_tot as f64;
         let dist = long_gpu

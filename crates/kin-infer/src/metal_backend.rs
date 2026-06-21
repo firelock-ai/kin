@@ -3946,6 +3946,38 @@ impl MetalCompute {
 
         Ok(())
     }
+
+    fn encode_pool_rows_into(
+        &self,
+        cmd: &CommandBufferRef,
+        current_hidden: &PooledBuffer,
+        masks: &[u32],
+        config: &LayerConfig,
+        pooling: PoolingMode,
+    ) -> Result<PooledBuffer, InferError> {
+        let h = config.hidden_size;
+        let pooled = self.pool.acquire_uninit(config.batch_size * h * 4)?;
+        let mask_buf = self.buf_u32_slice(masks)?;
+        let buf_max_len = self.buf_u32(config.max_len as u32)?;
+        let buf_h = self.buf_u32(h as u32)?;
+        let buf_cls_pooling = self.buf_u32(matches!(pooling, PoolingMode::Cls) as u32)?;
+
+        let pipeline = &self.pipelines["pool_rows"];
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(pipeline);
+        enc.set_buffer(0, Some(current_hidden.buffer()), 0);
+        enc.set_buffer(1, Some(&mask_buf), 0);
+        enc.set_buffer(2, Some(pooled.buffer()), 0);
+        enc.set_buffer(3, Some(&buf_max_len), 0);
+        enc.set_buffer(4, Some(&buf_h), 0);
+        enc.set_buffer(5, Some(&buf_cls_pooling), 0);
+        let tw = pipeline.thread_execution_width().max(1);
+        let threads = MTLSize::new(config.batch_size as u64 * tw, 1, 1);
+        let tg = MTLSize::new(tw, 1, 1);
+        enc.dispatch_threads(threads, tg);
+        enc.end_encoding();
+        Ok(pooled)
+    }
 }
 
 impl GpuCompute for MetalCompute {
@@ -4021,6 +4053,74 @@ impl GpuCompute for MetalCompute {
         Ok(Some(out))
     }
 
+    fn forward_layers_batched_segmented(
+        &self,
+        hidden: &[f32],
+        masks: &[u32],
+        layers: &[LayerTensors],
+        config: &LayerConfig,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+        segment_layers: usize,
+    ) -> Result<Option<Vec<f32>>, InferError> {
+        if layers.is_empty() {
+            return Ok(None);
+        }
+        let segment_layers = segment_layers.max(1);
+        let segment_count = layers.len().div_ceil(segment_layers);
+        let _span = tracing::info_span!(
+            "kin_infer.metal.forward_layers_batched_segmented",
+            layers = layers.len(),
+            segment_layers = segment_layers,
+            segment_count = segment_count,
+            batch_size = config.batch_size,
+            max_seq = config.max_len,
+        )
+        .entered();
+        let total_rows = config.batch_size * config.max_len;
+        let h = config.hidden_size;
+        let out = autoreleasepool(|_| -> Result<Vec<f32>, InferError> {
+            let mut current_hidden = None;
+            for (segment_index, chunk) in layers.chunks(segment_layers).enumerate() {
+                let hidden_buf = if segment_index == 0 {
+                    self.buf_slice_pooled(hidden)?
+                } else {
+                    current_hidden.take().ok_or_else(|| {
+                        InferError::Internal(
+                            "segmented resident Metal path lost current hidden buffer".into(),
+                        )
+                    })?
+                };
+                let cmd = self.queue.new_command_buffer();
+                let mut retains = Vec::new();
+                for weights in chunk {
+                    self.encode_layer_resident_into(
+                        cmd,
+                        &hidden_buf,
+                        masks,
+                        weights,
+                        config,
+                        rope_cos,
+                        rope_sin,
+                        &mut retains,
+                    )?;
+                }
+                self.commit_wait(cmd);
+
+                let is_last = segment_index + 1 == segment_count;
+                if is_last {
+                    return Ok(Self::read_buf(hidden_buf.buffer(), total_rows * h));
+                }
+                current_hidden = Some(hidden_buf);
+            }
+
+            Err(InferError::Internal(
+                "segmented resident Metal path completed no segments".into(),
+            ))
+        })?;
+        Ok(Some(out))
+    }
+
     fn forward_layers_batched_pooled(
         &self,
         hidden: &[f32],
@@ -4059,29 +4159,91 @@ impl GpuCompute for MetalCompute {
                 )?;
             }
 
-            let pooled = self.pool.acquire_uninit(config.batch_size * h * 4)?;
-            let mask_buf = self.buf_u32_slice(masks)?;
-            let buf_max_len = self.buf_u32(config.max_len as u32)?;
-            let buf_h = self.buf_u32(h as u32)?;
-            let buf_cls_pooling = self.buf_u32(matches!(pooling, PoolingMode::Cls) as u32)?;
-
-            let pipeline = &self.pipelines["pool_rows"];
-            let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(pipeline);
-            enc.set_buffer(0, Some(current_hidden.buffer()), 0);
-            enc.set_buffer(1, Some(&mask_buf), 0);
-            enc.set_buffer(2, Some(pooled.buffer()), 0);
-            enc.set_buffer(3, Some(&buf_max_len), 0);
-            enc.set_buffer(4, Some(&buf_h), 0);
-            enc.set_buffer(5, Some(&buf_cls_pooling), 0);
-            let tw = pipeline.thread_execution_width().max(1);
-            let threads = MTLSize::new(config.batch_size as u64 * tw, 1, 1);
-            let tg = MTLSize::new(tw, 1, 1);
-            enc.dispatch_threads(threads, tg);
-            enc.end_encoding();
+            let pooled =
+                self.encode_pool_rows_into(cmd, &current_hidden, masks, config, pooling)?;
             self.commit_wait(cmd);
 
             Ok(Self::read_buf(pooled.buffer(), config.batch_size * h))
+        })?;
+        Ok(Some(out))
+    }
+
+    fn forward_layers_batched_pooled_segmented(
+        &self,
+        hidden: &[f32],
+        masks: &[u32],
+        layers: &[LayerTensors],
+        config: &LayerConfig,
+        embedding: &EmbeddingPrelude<'_>,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+        pooling: PoolingMode,
+        segment_layers: usize,
+    ) -> Result<Option<Vec<f32>>, InferError> {
+        if layers.is_empty() {
+            return Ok(None);
+        }
+        let segment_layers = segment_layers.max(1);
+        let segment_count = layers.len().div_ceil(segment_layers);
+        let _span = tracing::info_span!(
+            "kin_infer.metal.forward_layers_batched_pooled_segmented",
+            layers = layers.len(),
+            segment_layers = segment_layers,
+            segment_count = segment_count,
+            batch_size = config.batch_size,
+            max_seq = config.max_len,
+        )
+        .entered();
+        let h = config.hidden_size;
+        let out = autoreleasepool(|_| -> Result<Vec<f32>, InferError> {
+            let mut current_hidden = None;
+            for (segment_index, chunk) in layers.chunks(segment_layers).enumerate() {
+                let cmd = self.queue.new_command_buffer();
+                let mut retains = Vec::new();
+                let hidden_buf = if segment_index == 0 {
+                    self.encode_embedding_prelude_into(
+                        cmd,
+                        hidden,
+                        embedding,
+                        config,
+                        &mut retains,
+                    )?
+                } else {
+                    current_hidden.take().ok_or_else(|| {
+                        InferError::Internal(
+                            "segmented pooled Metal path lost current hidden buffer".into(),
+                        )
+                    })?
+                };
+
+                for weights in chunk {
+                    self.encode_layer_resident_into(
+                        cmd,
+                        &hidden_buf,
+                        masks,
+                        weights,
+                        config,
+                        rope_cos,
+                        rope_sin,
+                        &mut retains,
+                    )?;
+                }
+
+                let is_last = segment_index + 1 == segment_count;
+                if is_last {
+                    let pooled =
+                        self.encode_pool_rows_into(cmd, &hidden_buf, masks, config, pooling)?;
+                    self.commit_wait(cmd);
+                    return Ok(Self::read_buf(pooled.buffer(), config.batch_size * h));
+                }
+
+                self.commit_wait(cmd);
+                current_hidden = Some(hidden_buf);
+            }
+
+            Err(InferError::Internal(
+                "segmented pooled Metal path completed no segments".into(),
+            ))
         })?;
         Ok(Some(out))
     }
@@ -6905,6 +7067,221 @@ mod tests {
             profile_round_trips(),
             1,
             "pooled resident stack should wait once at final readback"
+        );
+    }
+
+    #[test]
+    fn test_metal_segmented_pooled_stack_uses_one_submission_per_segment_when_profiled() {
+        reset_profile();
+        if !profile_enabled() {
+            return;
+        }
+        let Some(metal) = get_metal() else { return };
+
+        let batch_size = 1usize;
+        let max_len = 3usize;
+        let hidden = 32usize;
+        let num_heads = 1usize;
+        let head_dim = 32usize;
+        let inter = 64usize;
+        let total_rows = batch_size * max_len;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_heads * head_dim;
+
+        let mk = |n: usize, salt: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i as f32) * 0.17 + salt).sin() * 0.03)
+                .collect()
+        };
+
+        let norm1_weight = vec![1.0f32; hidden];
+        let norm1_bias = vec![0.0f32; hidden];
+        let norm2_weight = vec![1.0f32; hidden];
+        let norm2_bias = vec![0.0f32; hidden];
+        let embed_norm_weight = vec![1.0f32; hidden];
+        let embed_norm_bias = vec![0.0f32; hidden];
+        let qkv_weight = mk((q_dim + 2 * kv_dim) * hidden, 1.0);
+        let attn_out_weight = mk(hidden * q_dim, 2.0);
+        let ffn_up_weight = mk(inter * hidden, 3.0);
+        let ffn_down_weight = mk(hidden * inter, 4.0);
+
+        let weights = crate::gpu::LayerTensors {
+            norm1_weight: &norm1_weight,
+            norm1_bias: Some(&norm1_bias),
+            qkv_weight: Some(&qkv_weight),
+            qkv_bias: None,
+            q_weight: None,
+            q_bias: None,
+            k_weight: None,
+            k_bias: None,
+            v_weight: None,
+            v_bias: None,
+            q_ln_weight: None,
+            q_ln_bias: None,
+            k_ln_weight: None,
+            k_ln_bias: None,
+            attn_out_weight: &attn_out_weight,
+            attn_out_bias: None,
+            norm2_weight: &norm2_weight,
+            norm2_bias: Some(&norm2_bias),
+            ffn_gate_weight: None,
+            ffn_up_weight: Some(&ffn_up_weight),
+            ffn_up_bias: None,
+            ffn_down_weight: &ffn_down_weight,
+            ffn_down_bias: None,
+            ffn_up_gated_weight: None,
+            relative_attention_bias: None,
+            rel_pos_embeddings: None,
+        };
+        let layers = [weights.clone(), weights];
+
+        let config = crate::gpu::LayerConfig {
+            batch_size,
+            max_len,
+            hidden_size: hidden,
+            num_heads,
+            head_dim,
+            inter_size: inter,
+            eps: 1e-5,
+            rms_eps: 1e-6,
+            use_rms: false,
+            pre_ln: false,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            alibi_slopes: None,
+        };
+        let embedding = crate::gpu::EmbeddingPrelude {
+            input_dim: hidden,
+            projection: None,
+            norm_weight: Some(&embed_norm_weight),
+            norm_bias: Some(&embed_norm_bias),
+            eps: 1e-5,
+        };
+
+        let hidden_in = mk(total_rows * hidden, 0.0);
+        let masks = vec![1u32; total_rows];
+        let out = metal
+            .forward_layers_batched_pooled_segmented(
+                &hidden_in,
+                &masks,
+                &layers,
+                &config,
+                &embedding,
+                &[],
+                &[],
+                crate::gpu::PoolingMode::Mean,
+                1,
+            )
+            .expect("forward_layers_batched_pooled_segmented errored")
+            .expect("metal backend returned None for segmented pooled stack");
+
+        assert_eq!(out.len(), batch_size * hidden);
+        assert_eq!(
+            profile_submissions(),
+            2,
+            "segmented pooled stack should submit one command buffer per segment"
+        );
+        assert_eq!(
+            profile_round_trips(),
+            2,
+            "segmented pooled stack should wait once per segment"
+        );
+    }
+
+    #[test]
+    fn test_metal_segmented_resident_stack_uses_one_submission_per_segment_when_profiled() {
+        reset_profile();
+        if !profile_enabled() {
+            return;
+        }
+        let Some(metal) = get_metal() else { return };
+
+        let batch_size = 1usize;
+        let max_len = 3usize;
+        let hidden = 32usize;
+        let num_heads = 1usize;
+        let head_dim = 32usize;
+        let inter = 64usize;
+        let total_rows = batch_size * max_len;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_heads * head_dim;
+
+        let mk = |n: usize, salt: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i as f32) * 0.19 + salt).sin() * 0.03)
+                .collect()
+        };
+
+        let norm1_weight = vec![1.0f32; hidden];
+        let norm1_bias = vec![0.0f32; hidden];
+        let norm2_weight = vec![1.0f32; hidden];
+        let norm2_bias = vec![0.0f32; hidden];
+        let qkv_weight = mk((q_dim + 2 * kv_dim) * hidden, 1.0);
+        let attn_out_weight = mk(hidden * q_dim, 2.0);
+        let ffn_up_weight = mk(inter * hidden, 3.0);
+        let ffn_down_weight = mk(hidden * inter, 4.0);
+
+        let weights = crate::gpu::LayerTensors {
+            norm1_weight: &norm1_weight,
+            norm1_bias: Some(&norm1_bias),
+            qkv_weight: Some(&qkv_weight),
+            qkv_bias: None,
+            q_weight: None,
+            q_bias: None,
+            k_weight: None,
+            k_bias: None,
+            v_weight: None,
+            v_bias: None,
+            q_ln_weight: None,
+            q_ln_bias: None,
+            k_ln_weight: None,
+            k_ln_bias: None,
+            attn_out_weight: &attn_out_weight,
+            attn_out_bias: None,
+            norm2_weight: &norm2_weight,
+            norm2_bias: Some(&norm2_bias),
+            ffn_gate_weight: None,
+            ffn_up_weight: Some(&ffn_up_weight),
+            ffn_up_bias: None,
+            ffn_down_weight: &ffn_down_weight,
+            ffn_down_bias: None,
+            ffn_up_gated_weight: None,
+            relative_attention_bias: None,
+            rel_pos_embeddings: None,
+        };
+        let layers = [weights.clone(), weights];
+
+        let config = crate::gpu::LayerConfig {
+            batch_size,
+            max_len,
+            hidden_size: hidden,
+            num_heads,
+            head_dim,
+            inter_size: inter,
+            eps: 1e-5,
+            rms_eps: 1e-6,
+            use_rms: false,
+            pre_ln: false,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            alibi_slopes: None,
+        };
+
+        let hidden_in = mk(total_rows * hidden, 0.0);
+        let masks = vec![1u32; total_rows];
+        let out = metal
+            .forward_layers_batched_segmented(&hidden_in, &masks, &layers, &config, &[], &[], 1)
+            .expect("forward_layers_batched_segmented errored")
+            .expect("metal backend returned None for segmented resident stack");
+
+        assert_eq!(out.len(), total_rows * hidden);
+        assert_eq!(
+            profile_submissions(),
+            2,
+            "segmented resident stack should submit one command buffer per segment"
+        );
+        assert_eq!(
+            profile_round_trips(),
+            2,
+            "segmented resident stack should wait once per segment"
         );
     }
 

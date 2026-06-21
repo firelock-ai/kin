@@ -698,6 +698,26 @@ pub trait GpuCompute: Send + Sync {
         Ok(None)
     }
 
+    /// Segmented variant of [`GpuCompute::forward_layers_batched`].
+    ///
+    /// Backends that support bounded resident execution can run at most
+    /// `segment_layers` transformer layers per command buffer while carrying the
+    /// hidden state across segments on device. Unsupported backends must decline
+    /// so callers fall back to the proven per-layer path.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layers_batched_segmented(
+        &self,
+        _hidden: &[f32],
+        _masks: &[u32],
+        _layers: &[LayerTensors],
+        _config: &LayerConfig,
+        _rope_cos: &[f32],
+        _rope_sin: &[f32],
+        _segment_layers: usize,
+    ) -> Result<Option<Vec<f32>>, InferError> {
+        Ok(None)
+    }
+
     /// Evaluates the full transformer stack and returns only final pooled
     /// embeddings `[batch_size, hidden_size]`.
     ///
@@ -715,6 +735,28 @@ pub trait GpuCompute: Send + Sync {
         _rope_cos: &[f32],
         _rope_sin: &[f32],
         _pooling: PoolingMode,
+    ) -> Result<Option<Vec<f32>>, InferError> {
+        Ok(None)
+    }
+
+    /// Segmented variant of [`GpuCompute::forward_layers_batched_pooled`].
+    ///
+    /// Backends that need bounded command-buffer residency can execute at most
+    /// `segment_layers` transformer layers per command buffer, carrying the final
+    /// hidden buffer across segments on-device and pooling after the last segment.
+    /// Unsupported backends keep returning `Ok(None)` via the unsegmented default.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layers_batched_pooled_segmented(
+        &self,
+        _hidden: &[f32],
+        _masks: &[u32],
+        _layers: &[LayerTensors],
+        _config: &LayerConfig,
+        _embedding: &EmbeddingPrelude<'_>,
+        _rope_cos: &[f32],
+        _rope_sin: &[f32],
+        _pooling: PoolingMode,
+        _segment_layers: usize,
     ) -> Result<Option<Vec<f32>>, InferError> {
         Ok(None)
     }

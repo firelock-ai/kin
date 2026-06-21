@@ -280,12 +280,16 @@ fn pooled_output_enabled() -> bool {
 }
 
 /// Conservative guardrail for the whole-stack pooled-output Metal path. The path
-/// encodes every transformer layer plus final pooling into one command buffer, so
-/// long sequences are capped until the long-sequence Metal hang is disproven.
+/// encodes every transformer layer plus final pooling into one command buffer up
+/// to `POOLED_OUTPUT_DEFAULT_MAX_SEQ`. Longer sequences may use the segmented
+/// resident path, which caps each command buffer to a small layer group.
 const POOLED_OUTPUT_DEFAULT_MAX_BATCH_SIZE: usize = 256;
 const POOLED_OUTPUT_DEFAULT_MAX_SEQ: usize = 512;
+const POOLED_OUTPUT_DEFAULT_SEGMENTED_MAX_SEQ: usize = 2048;
+const POOLED_OUTPUT_DEFAULT_SEGMENT_LAYERS: usize = 2;
 
 static POOLED_OUTPUT_USED: AtomicU64 = AtomicU64::new(0);
+static POOLED_OUTPUT_USED_SEGMENTED: AtomicU64 = AtomicU64::new(0);
 static POOLED_OUTPUT_DECLINED: AtomicU64 = AtomicU64::new(0);
 static POOLED_OUTPUT_DECLINED_DISABLED: AtomicU64 = AtomicU64::new(0);
 static POOLED_OUTPUT_DECLINED_RESIDENT_DISABLED: AtomicU64 = AtomicU64::new(0);
@@ -298,11 +302,13 @@ static POOLED_OUTPUT_DECLINED_BACKEND_UNSUPPORTED: AtomicU64 = AtomicU64::new(0)
 static POOLED_OUTPUT_LAST_REASON: AtomicU64 = AtomicU64::new(0);
 static POOLED_OUTPUT_LAST_BATCH_SIZE: AtomicU64 = AtomicU64::new(0);
 static POOLED_OUTPUT_LAST_MAX_SEQ: AtomicU64 = AtomicU64::new(0);
+static POOLED_OUTPUT_LAST_SEGMENT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PooledOutputDecisionReason {
     None,
     Used,
+    UsedSegmented,
     Disabled,
     ResidentStackDisabled,
     LayerDumpEnabled,
@@ -318,6 +324,7 @@ impl PooledOutputDecisionReason {
         match self {
             Self::None => 0,
             Self::Used => 1,
+            Self::UsedSegmented => 10,
             Self::Disabled => 2,
             Self::ResidentStackDisabled => 3,
             Self::LayerDumpEnabled => 4,
@@ -332,6 +339,7 @@ impl PooledOutputDecisionReason {
     fn from_code(code: u64) -> Self {
         match code {
             1 => Self::Used,
+            10 => Self::UsedSegmented,
             2 => Self::Disabled,
             3 => Self::ResidentStackDisabled,
             4 => Self::LayerDumpEnabled,
@@ -348,6 +356,7 @@ impl PooledOutputDecisionReason {
         match self {
             Self::None => "none",
             Self::Used => "used",
+            Self::UsedSegmented => "used_segmented",
             Self::Disabled => "disabled",
             Self::ResidentStackDisabled => "resident_stack_disabled",
             Self::LayerDumpEnabled => "layer_dump_enabled",
@@ -358,11 +367,16 @@ impl PooledOutputDecisionReason {
             Self::BackendUnsupported => "backend_unsupported",
         }
     }
+
+    fn is_used(self) -> bool {
+        matches!(self, Self::Used | Self::UsedSegmented)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PooledOutputRuntimeStats {
     pub used: u64,
+    pub used_segmented: u64,
     pub declined: u64,
     pub declined_disabled: u64,
     pub declined_resident_stack_disabled: u64,
@@ -375,26 +389,74 @@ pub struct PooledOutputRuntimeStats {
     pub last_reason: PooledOutputDecisionReason,
     pub last_batch_size: u64,
     pub last_max_seq: u64,
+    pub last_segment_count: u64,
     pub max_batch_size: usize,
     pub max_seq: usize,
+    pub segmented_max_seq: usize,
+    pub segment_layers: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct PooledOutputCaps {
     max_batch_size: usize,
     max_seq: usize,
+    segmented_max_seq: usize,
+    segment_layers: usize,
+}
+
+impl PooledOutputCaps {
+    fn normalized(self) -> Self {
+        let segmented_max_seq = self.segmented_max_seq.max(1);
+        Self {
+            max_batch_size: self.max_batch_size.max(1),
+            max_seq: self.max_seq.max(1).min(segmented_max_seq),
+            segmented_max_seq,
+            segment_layers: self.segment_layers.max(1),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static POOLED_OUTPUT_CAPS_TEST_OVERRIDE: std::cell::Cell<Option<PooledOutputCaps>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_pooled_output_caps_test_override(caps: Option<PooledOutputCaps>) {
+    POOLED_OUTPUT_CAPS_TEST_OVERRIDE.with(|override_value| override_value.set(caps));
 }
 
 fn pooled_output_caps() -> PooledOutputCaps {
+    #[cfg(test)]
+    if let Some(caps) = POOLED_OUTPUT_CAPS_TEST_OVERRIDE.with(|override_value| override_value.get())
+    {
+        return caps.normalized();
+    }
+
     use std::sync::OnceLock;
     static CAPS: OnceLock<PooledOutputCaps> = OnceLock::new();
-    *CAPS.get_or_init(|| PooledOutputCaps {
-        max_batch_size: env_usize_or(
-            "KIN_INFER_POOLED_MAX_BATCH_SIZE",
-            POOLED_OUTPUT_DEFAULT_MAX_BATCH_SIZE,
-        ),
-        max_seq: env_usize_or("KIN_INFER_POOLED_MAX_SEQ", POOLED_OUTPUT_DEFAULT_MAX_SEQ),
+    *CAPS.get_or_init(|| {
+        PooledOutputCaps {
+            max_batch_size: env_usize_or(
+                "KIN_INFER_POOLED_MAX_BATCH_SIZE",
+                POOLED_OUTPUT_DEFAULT_MAX_BATCH_SIZE,
+            ),
+            max_seq: env_usize_or("KIN_INFER_POOLED_MAX_SEQ", POOLED_OUTPUT_DEFAULT_MAX_SEQ),
+            segmented_max_seq: env_usize_or(
+                "KIN_INFER_POOLED_SEGMENTED_MAX_SEQ",
+                POOLED_OUTPUT_DEFAULT_SEGMENTED_MAX_SEQ,
+            ),
+            segment_layers: env_segment_layers_or(
+                "KIN_INFER_POOLED_SEGMENT_LAYERS",
+                POOLED_OUTPUT_DEFAULT_SEGMENT_LAYERS,
+            ),
+        }
+        .normalized()
     })
+}
+
+fn env_segment_layers_or(name: &str, default: usize) -> usize {
+    env_usize_or(name, default.max(1)).max(1)
 }
 
 fn env_usize_or(name: &str, default: usize) -> usize {
@@ -429,7 +491,9 @@ fn pooled_output_decline_counter(reason: PooledOutputDecisionReason) -> Option<&
         PooledOutputDecisionReason::BackendUnsupported => {
             Some(&POOLED_OUTPUT_DECLINED_BACKEND_UNSUPPORTED)
         }
-        PooledOutputDecisionReason::None | PooledOutputDecisionReason::Used => None,
+        PooledOutputDecisionReason::None
+        | PooledOutputDecisionReason::Used
+        | PooledOutputDecisionReason::UsedSegmented => None,
     }
 }
 
@@ -438,13 +502,26 @@ fn record_pooled_output_decision(
     batch_size: usize,
     max_seq: usize,
 ) {
+    record_pooled_output_decision_with_segments(reason, batch_size, max_seq, 0);
+}
+
+fn record_pooled_output_decision_with_segments(
+    reason: PooledOutputDecisionReason,
+    batch_size: usize,
+    max_seq: usize,
+    segment_count: usize,
+) {
     POOLED_OUTPUT_LAST_REASON.store(reason.code(), Ordering::Relaxed);
     POOLED_OUTPUT_LAST_BATCH_SIZE.store(batch_size as u64, Ordering::Relaxed);
     POOLED_OUTPUT_LAST_MAX_SEQ.store(max_seq as u64, Ordering::Relaxed);
+    POOLED_OUTPUT_LAST_SEGMENT_COUNT.store(segment_count as u64, Ordering::Relaxed);
 
-    let used = matches!(reason, PooledOutputDecisionReason::Used);
+    let used = reason.is_used();
     if used {
         POOLED_OUTPUT_USED.fetch_add(1, Ordering::Relaxed);
+        if matches!(reason, PooledOutputDecisionReason::UsedSegmented) {
+            POOLED_OUTPUT_USED_SEGMENTED.fetch_add(1, Ordering::Relaxed);
+        }
     } else if let Some(counter) = pooled_output_decline_counter(reason) {
         POOLED_OUTPUT_DECLINED.fetch_add(1, Ordering::Relaxed);
         counter.fetch_add(1, Ordering::Relaxed);
@@ -457,19 +534,25 @@ fn record_pooled_output_decision(
         reason = reason.as_str(),
         batch_size = batch_size,
         max_seq = max_seq,
+        segment_count = segment_count,
         max_batch_size = caps.max_batch_size,
         max_seq_cap = caps.max_seq,
+        segmented_max_seq_cap = caps.segmented_max_seq,
+        segment_layers_cap = caps.segment_layers,
         "kin_infer.pooled_output.decision"
     );
     if pooled_output_stderr_log_enabled() {
         eprintln!(
-            "kin_infer.pooled_output decision={} used={} batch_size={} max_seq={} max_batch_size={} max_seq_cap={}",
+            "kin_infer.pooled_output decision={} used={} batch_size={} max_seq={} segment_count={} max_batch_size={} max_seq_cap={} segmented_max_seq_cap={} segment_layers_cap={}",
             reason.as_str(),
             used,
             batch_size,
             max_seq,
+            segment_count,
             caps.max_batch_size,
-            caps.max_seq
+            caps.max_seq,
+            caps.segmented_max_seq,
+            caps.segment_layers
         );
     }
 }
@@ -478,6 +561,7 @@ pub fn pooled_output_runtime_stats() -> PooledOutputRuntimeStats {
     let caps = pooled_output_caps();
     PooledOutputRuntimeStats {
         used: POOLED_OUTPUT_USED.load(Ordering::Relaxed),
+        used_segmented: POOLED_OUTPUT_USED_SEGMENTED.load(Ordering::Relaxed),
         declined: POOLED_OUTPUT_DECLINED.load(Ordering::Relaxed),
         declined_disabled: POOLED_OUTPUT_DECLINED_DISABLED.load(Ordering::Relaxed),
         declined_resident_stack_disabled: POOLED_OUTPUT_DECLINED_RESIDENT_DISABLED
@@ -496,13 +580,17 @@ pub fn pooled_output_runtime_stats() -> PooledOutputRuntimeStats {
         ),
         last_batch_size: POOLED_OUTPUT_LAST_BATCH_SIZE.load(Ordering::Relaxed),
         last_max_seq: POOLED_OUTPUT_LAST_MAX_SEQ.load(Ordering::Relaxed),
+        last_segment_count: POOLED_OUTPUT_LAST_SEGMENT_COUNT.load(Ordering::Relaxed),
         max_batch_size: caps.max_batch_size,
         max_seq: caps.max_seq,
+        segmented_max_seq: caps.segmented_max_seq,
+        segment_layers: caps.segment_layers,
     }
 }
 
 pub fn reset_pooled_output_runtime_stats() {
     POOLED_OUTPUT_USED.store(0, Ordering::Relaxed);
+    POOLED_OUTPUT_USED_SEGMENTED.store(0, Ordering::Relaxed);
     POOLED_OUTPUT_DECLINED.store(0, Ordering::Relaxed);
     POOLED_OUTPUT_DECLINED_DISABLED.store(0, Ordering::Relaxed);
     POOLED_OUTPUT_DECLINED_RESIDENT_DISABLED.store(0, Ordering::Relaxed);
@@ -515,6 +603,282 @@ pub fn reset_pooled_output_runtime_stats() {
     POOLED_OUTPUT_LAST_REASON.store(PooledOutputDecisionReason::None.code(), Ordering::Relaxed);
     POOLED_OUTPUT_LAST_BATCH_SIZE.store(0, Ordering::Relaxed);
     POOLED_OUTPUT_LAST_MAX_SEQ.store(0, Ordering::Relaxed);
+    POOLED_OUTPUT_LAST_SEGMENT_COUNT.store(0, Ordering::Relaxed);
+}
+
+static RESIDENT_STACK_USED: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_STACK_USED_SEGMENTED: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_STACK_DECLINED: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_STACK_DECLINED_DISABLED: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_STACK_DECLINED_DUMP_LAYER: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_STACK_DECLINED_NO_GPU: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_STACK_DECLINED_RELATIVE_ATTENTION: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_STACK_DECLINED_BATCH_TOO_LARGE: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_STACK_DECLINED_SEQUENCE_TOO_LONG: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_STACK_DECLINED_BACKEND_UNSUPPORTED: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_STACK_LAST_REASON: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_STACK_LAST_BATCH_SIZE: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_STACK_LAST_MAX_SEQ: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_STACK_LAST_SEGMENT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResidentStackDecisionReason {
+    None,
+    Used,
+    UsedSegmented,
+    Disabled,
+    LayerDumpEnabled,
+    NoGpu,
+    RelativeAttention,
+    BatchTooLarge,
+    SequenceTooLong,
+    BackendUnsupported,
+}
+
+impl ResidentStackDecisionReason {
+    fn code(self) -> u64 {
+        match self {
+            Self::None => 0,
+            Self::Used => 1,
+            Self::UsedSegmented => 2,
+            Self::Disabled => 3,
+            Self::LayerDumpEnabled => 4,
+            Self::NoGpu => 5,
+            Self::RelativeAttention => 6,
+            Self::BatchTooLarge => 7,
+            Self::SequenceTooLong => 8,
+            Self::BackendUnsupported => 9,
+        }
+    }
+
+    fn from_code(code: u64) -> Self {
+        match code {
+            1 => Self::Used,
+            2 => Self::UsedSegmented,
+            3 => Self::Disabled,
+            4 => Self::LayerDumpEnabled,
+            5 => Self::NoGpu,
+            6 => Self::RelativeAttention,
+            7 => Self::BatchTooLarge,
+            8 => Self::SequenceTooLong,
+            9 => Self::BackendUnsupported,
+            _ => Self::None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Used => "used",
+            Self::UsedSegmented => "used_segmented",
+            Self::Disabled => "disabled",
+            Self::LayerDumpEnabled => "layer_dump_enabled",
+            Self::NoGpu => "no_gpu",
+            Self::RelativeAttention => "relative_attention",
+            Self::BatchTooLarge => "batch_too_large",
+            Self::SequenceTooLong => "sequence_too_long",
+            Self::BackendUnsupported => "backend_unsupported",
+        }
+    }
+
+    fn is_used(self) -> bool {
+        matches!(self, Self::Used | Self::UsedSegmented)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidentStackRuntimeStats {
+    pub used: u64,
+    pub used_segmented: u64,
+    pub declined: u64,
+    pub declined_disabled: u64,
+    pub declined_layer_dump_enabled: u64,
+    pub declined_no_gpu: u64,
+    pub declined_relative_attention: u64,
+    pub declined_batch_too_large: u64,
+    pub declined_sequence_too_long: u64,
+    pub declined_backend_unsupported: u64,
+    pub last_reason: ResidentStackDecisionReason,
+    pub last_batch_size: u64,
+    pub last_max_seq: u64,
+    pub last_segment_count: u64,
+    pub max_batch_size: usize,
+    pub max_seq: usize,
+    pub segmented_max_seq: usize,
+    pub segment_layers: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResidentStackCaps {
+    max_batch_size: usize,
+    max_seq: usize,
+    segmented_max_seq: usize,
+    segment_layers: usize,
+}
+
+impl ResidentStackCaps {
+    fn normalized(self) -> Self {
+        let segmented_max_seq = self.segmented_max_seq.max(1);
+        Self {
+            max_batch_size: self.max_batch_size.max(1),
+            max_seq: self.max_seq.max(1).min(segmented_max_seq),
+            segmented_max_seq,
+            segment_layers: self.segment_layers.max(1),
+        }
+    }
+}
+
+fn resident_stack_caps() -> ResidentStackCaps {
+    use std::sync::OnceLock;
+    static CAPS: OnceLock<ResidentStackCaps> = OnceLock::new();
+    *CAPS.get_or_init(|| {
+        let pooled = pooled_output_caps();
+        ResidentStackCaps {
+            max_batch_size: env_usize_or(
+                "KIN_INFER_RESIDENT_MAX_BATCH_SIZE",
+                pooled.max_batch_size,
+            ),
+            max_seq: env_usize_or("KIN_INFER_RESIDENT_MAX_SEQ", pooled.max_seq),
+            segmented_max_seq: env_usize_or(
+                "KIN_INFER_RESIDENT_SEGMENTED_MAX_SEQ",
+                pooled.segmented_max_seq,
+            ),
+            segment_layers: env_segment_layers_or(
+                "KIN_INFER_RESIDENT_SEGMENT_LAYERS",
+                pooled.segment_layers,
+            ),
+        }
+        .normalized()
+    })
+}
+
+fn resident_stack_stderr_log_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("KIN_INFER_RESIDENT_STACK_LOG").is_some())
+}
+
+fn resident_stack_decline_counter(
+    reason: ResidentStackDecisionReason,
+) -> Option<&'static AtomicU64> {
+    match reason {
+        ResidentStackDecisionReason::Disabled => Some(&RESIDENT_STACK_DECLINED_DISABLED),
+        ResidentStackDecisionReason::LayerDumpEnabled => Some(&RESIDENT_STACK_DECLINED_DUMP_LAYER),
+        ResidentStackDecisionReason::NoGpu => Some(&RESIDENT_STACK_DECLINED_NO_GPU),
+        ResidentStackDecisionReason::RelativeAttention => {
+            Some(&RESIDENT_STACK_DECLINED_RELATIVE_ATTENTION)
+        }
+        ResidentStackDecisionReason::BatchTooLarge => {
+            Some(&RESIDENT_STACK_DECLINED_BATCH_TOO_LARGE)
+        }
+        ResidentStackDecisionReason::SequenceTooLong => {
+            Some(&RESIDENT_STACK_DECLINED_SEQUENCE_TOO_LONG)
+        }
+        ResidentStackDecisionReason::BackendUnsupported => {
+            Some(&RESIDENT_STACK_DECLINED_BACKEND_UNSUPPORTED)
+        }
+        ResidentStackDecisionReason::None
+        | ResidentStackDecisionReason::Used
+        | ResidentStackDecisionReason::UsedSegmented => None,
+    }
+}
+
+fn record_resident_stack_decision(
+    reason: ResidentStackDecisionReason,
+    batch_size: usize,
+    max_seq: usize,
+    segment_count: usize,
+) {
+    RESIDENT_STACK_LAST_REASON.store(reason.code(), Ordering::Relaxed);
+    RESIDENT_STACK_LAST_BATCH_SIZE.store(batch_size as u64, Ordering::Relaxed);
+    RESIDENT_STACK_LAST_MAX_SEQ.store(max_seq as u64, Ordering::Relaxed);
+    RESIDENT_STACK_LAST_SEGMENT_COUNT.store(segment_count as u64, Ordering::Relaxed);
+
+    let used = reason.is_used();
+    if used {
+        RESIDENT_STACK_USED.fetch_add(1, Ordering::Relaxed);
+        if matches!(reason, ResidentStackDecisionReason::UsedSegmented) {
+            RESIDENT_STACK_USED_SEGMENTED.fetch_add(1, Ordering::Relaxed);
+        }
+    } else if let Some(counter) = resident_stack_decline_counter(reason) {
+        RESIDENT_STACK_DECLINED.fetch_add(1, Ordering::Relaxed);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let caps = resident_stack_caps();
+    tracing::info!(
+        target: "kin_infer::resident_stack",
+        used = used,
+        reason = reason.as_str(),
+        batch_size = batch_size,
+        max_seq = max_seq,
+        segment_count = segment_count,
+        max_batch_size = caps.max_batch_size,
+        max_seq_cap = caps.max_seq,
+        segmented_max_seq_cap = caps.segmented_max_seq,
+        segment_layers_cap = caps.segment_layers,
+        "kin_infer.resident_stack.decision"
+    );
+    if resident_stack_stderr_log_enabled() {
+        eprintln!(
+            "kin_infer.resident_stack decision={} used={} batch_size={} max_seq={} segment_count={} max_batch_size={} max_seq_cap={} segmented_max_seq_cap={} segment_layers_cap={}",
+            reason.as_str(),
+            used,
+            batch_size,
+            max_seq,
+            segment_count,
+            caps.max_batch_size,
+            caps.max_seq,
+            caps.segmented_max_seq,
+            caps.segment_layers
+        );
+    }
+}
+
+pub fn resident_stack_runtime_stats() -> ResidentStackRuntimeStats {
+    let caps = resident_stack_caps();
+    ResidentStackRuntimeStats {
+        used: RESIDENT_STACK_USED.load(Ordering::Relaxed),
+        used_segmented: RESIDENT_STACK_USED_SEGMENTED.load(Ordering::Relaxed),
+        declined: RESIDENT_STACK_DECLINED.load(Ordering::Relaxed),
+        declined_disabled: RESIDENT_STACK_DECLINED_DISABLED.load(Ordering::Relaxed),
+        declined_layer_dump_enabled: RESIDENT_STACK_DECLINED_DUMP_LAYER.load(Ordering::Relaxed),
+        declined_no_gpu: RESIDENT_STACK_DECLINED_NO_GPU.load(Ordering::Relaxed),
+        declined_relative_attention: RESIDENT_STACK_DECLINED_RELATIVE_ATTENTION
+            .load(Ordering::Relaxed),
+        declined_batch_too_large: RESIDENT_STACK_DECLINED_BATCH_TOO_LARGE.load(Ordering::Relaxed),
+        declined_sequence_too_long: RESIDENT_STACK_DECLINED_SEQUENCE_TOO_LONG
+            .load(Ordering::Relaxed),
+        declined_backend_unsupported: RESIDENT_STACK_DECLINED_BACKEND_UNSUPPORTED
+            .load(Ordering::Relaxed),
+        last_reason: ResidentStackDecisionReason::from_code(
+            RESIDENT_STACK_LAST_REASON.load(Ordering::Relaxed),
+        ),
+        last_batch_size: RESIDENT_STACK_LAST_BATCH_SIZE.load(Ordering::Relaxed),
+        last_max_seq: RESIDENT_STACK_LAST_MAX_SEQ.load(Ordering::Relaxed),
+        last_segment_count: RESIDENT_STACK_LAST_SEGMENT_COUNT.load(Ordering::Relaxed),
+        max_batch_size: caps.max_batch_size,
+        max_seq: caps.max_seq,
+        segmented_max_seq: caps.segmented_max_seq,
+        segment_layers: caps.segment_layers,
+    }
+}
+
+pub fn reset_resident_stack_runtime_stats() {
+    RESIDENT_STACK_USED.store(0, Ordering::Relaxed);
+    RESIDENT_STACK_USED_SEGMENTED.store(0, Ordering::Relaxed);
+    RESIDENT_STACK_DECLINED.store(0, Ordering::Relaxed);
+    RESIDENT_STACK_DECLINED_DISABLED.store(0, Ordering::Relaxed);
+    RESIDENT_STACK_DECLINED_DUMP_LAYER.store(0, Ordering::Relaxed);
+    RESIDENT_STACK_DECLINED_NO_GPU.store(0, Ordering::Relaxed);
+    RESIDENT_STACK_DECLINED_RELATIVE_ATTENTION.store(0, Ordering::Relaxed);
+    RESIDENT_STACK_DECLINED_BATCH_TOO_LARGE.store(0, Ordering::Relaxed);
+    RESIDENT_STACK_DECLINED_SEQUENCE_TOO_LONG.store(0, Ordering::Relaxed);
+    RESIDENT_STACK_DECLINED_BACKEND_UNSUPPORTED.store(0, Ordering::Relaxed);
+    RESIDENT_STACK_LAST_REASON.store(ResidentStackDecisionReason::None.code(), Ordering::Relaxed);
+    RESIDENT_STACK_LAST_BATCH_SIZE.store(0, Ordering::Relaxed);
+    RESIDENT_STACK_LAST_MAX_SEQ.store(0, Ordering::Relaxed);
+    RESIDENT_STACK_LAST_SEGMENT_COUNT.store(0, Ordering::Relaxed);
 }
 
 /// Length-bucketing gate for `forward_batched`. When ON, mixed-length batches are
@@ -1929,65 +2293,108 @@ impl BertModel {
         let all_heads = batch_size * num_heads;
         let zero_bias = Array1::zeros(h);
 
-        // Whole-stack GPU-resident pass: hold the residual activations on-device
-        // across every transformer layer and read them back once, instead of the
-        // per-layer host round-trip. Falls back to the per-layer loop below when
-        // the backend declines (CPU/CUDA) or a per-layer divergence dump is asked.
+        // Whole-stack GPU-resident pass: for short sequences, hold residual
+        // activations across every layer and read them back once. For longer
+        // allowed sequences, run bounded layer chunks so no single command buffer
+        // owns the whole stack. Falls back to the per-layer loop when caps or the
+        // backend decline.
         let mut layers_resident = false;
-        if self.should_try_resident_stack() {
-            if let Some(gpu) = self.gpu.as_ref() {
-                let rope_cos_slice = if self.weights.position_embeddings.is_none() {
-                    self.rope_cos
-                        .as_ref()
-                        .and_then(|x| x.as_slice())
-                        .unwrap_or(&[])
-                } else {
-                    &[]
-                };
-                let rope_sin_slice = if self.weights.position_embeddings.is_none() {
-                    self.rope_sin
-                        .as_ref()
-                        .and_then(|x| x.as_slice())
-                        .unwrap_or(&[])
-                } else {
-                    &[]
-                };
-                let layer_config = crate::gpu::LayerConfig {
-                    batch_size,
-                    max_len,
-                    hidden_size: h,
-                    num_heads,
-                    head_dim,
-                    inter_size: self.config.intermediate_size,
-                    eps,
-                    rms_eps,
-                    use_rms,
-                    pre_ln,
-                    scale,
-                    alibi_slopes: alibi_slopes.as_deref(),
-                };
-                let layer_tensors: Vec<crate::gpu::LayerTensors> =
-                    (0..self.config.num_hidden_layers)
-                        .map(|i| self.layer_tensors(&self.weights.layers[i % num_groups]))
-                        .collect();
-                if let Some(out) = gpu.forward_layers_batched(
-                    hidden
-                        .as_slice()
-                        .expect("activation buffer is row-major contiguous"),
+        if let Some(reason) = self.resident_stack_decline_reason(batch_size, max_len) {
+            record_resident_stack_decision(reason, batch_size, max_len, 0);
+        } else if let Some(gpu) = self.gpu.as_ref() {
+            let caps = resident_stack_caps();
+            let use_segmented = max_len > caps.max_seq;
+            let rope_cos_slice = if self.weights.position_embeddings.is_none() {
+                self.rope_cos
+                    .as_ref()
+                    .and_then(|x| x.as_slice())
+                    .unwrap_or(&[])
+            } else {
+                &[]
+            };
+            let rope_sin_slice = if self.weights.position_embeddings.is_none() {
+                self.rope_sin
+                    .as_ref()
+                    .and_then(|x| x.as_slice())
+                    .unwrap_or(&[])
+            } else {
+                &[]
+            };
+            let layer_config = crate::gpu::LayerConfig {
+                batch_size,
+                max_len,
+                hidden_size: h,
+                num_heads,
+                head_dim,
+                inter_size: self.config.intermediate_size,
+                eps,
+                rms_eps,
+                use_rms,
+                pre_ln,
+                scale,
+                alibi_slopes: alibi_slopes.as_deref(),
+            };
+            let layer_tensors: Vec<crate::gpu::LayerTensors> = (0..self.config.num_hidden_layers)
+                .map(|i| self.layer_tensors(&self.weights.layers[i % num_groups]))
+                .collect();
+            let segment_count = if use_segmented {
+                layer_tensors.len().div_ceil(caps.segment_layers).max(1)
+            } else {
+                1
+            };
+            let hidden_flat = hidden
+                .as_slice()
+                .expect("activation buffer is row-major contiguous");
+            let maybe_out = if use_segmented {
+                gpu.forward_layers_batched_segmented(
+                    hidden_flat,
                     &flat_masks,
                     &layer_tensors,
                     &layer_config,
                     rope_cos_slice,
                     rope_sin_slice,
-                )? {
-                    hidden = Array2::from_shape_vec((total_rows, h), out).map_err(|e| {
-                        InferError::Internal(format!(
-                            "fused stack output not {total_rows}x{h}: {e}"
-                        ))
-                    })?;
-                    layers_resident = true;
-                }
+                    caps.segment_layers,
+                )?
+            } else {
+                gpu.forward_layers_batched(
+                    hidden_flat,
+                    &flat_masks,
+                    &layer_tensors,
+                    &layer_config,
+                    rope_cos_slice,
+                    rope_sin_slice,
+                )?
+            };
+            if let Some(out) = maybe_out {
+                hidden = Array2::from_shape_vec((total_rows, h), out).map_err(|e| {
+                    InferError::Internal(format!("fused stack output not {total_rows}x{h}: {e}"))
+                })?;
+                layers_resident = true;
+                record_resident_stack_decision(
+                    if use_segmented {
+                        ResidentStackDecisionReason::UsedSegmented
+                    } else {
+                        ResidentStackDecisionReason::Used
+                    },
+                    batch_size,
+                    max_len,
+                    segment_count,
+                );
+            } else {
+                record_resident_stack_decision(
+                    ResidentStackDecisionReason::BackendUnsupported,
+                    batch_size,
+                    max_len,
+                    0,
+                );
             }
+        } else {
+            record_resident_stack_decision(
+                ResidentStackDecisionReason::NoGpu,
+                batch_size,
+                max_len,
+                0,
+            );
         }
 
         let layer_range = if layers_resident {
@@ -2474,7 +2881,7 @@ impl BertModel {
             );
             return Ok(None);
         }
-        if max_len > caps.max_seq {
+        if max_len > caps.segmented_max_seq {
             record_pooled_output_decision(
                 PooledOutputDecisionReason::SequenceTooLong,
                 batch_size,
@@ -2482,6 +2889,7 @@ impl BertModel {
             );
             return Ok(None);
         }
+        let use_segmented = max_len > caps.max_seq;
 
         let h = self.config.hidden_size;
         let embed_dim = self.config.embedding_size.unwrap_or(h);
@@ -2591,19 +2999,40 @@ impl BertModel {
             eps,
         };
 
-        let Some(flat) = gpu.forward_layers_batched_pooled(
-            hidden
-                .as_slice()
-                .expect("activation buffer is row-major contiguous"),
-            &flat_masks,
-            &layer_tensors,
-            &layer_config,
-            &embedding,
-            rope_cos_slice,
-            rope_sin_slice,
-            pooling,
-        )?
-        else {
+        let segment_count = if use_segmented {
+            layer_tensors.len().div_ceil(caps.segment_layers).max(1)
+        } else {
+            1
+        };
+        let hidden_flat = hidden
+            .as_slice()
+            .expect("activation buffer is row-major contiguous");
+        let maybe_flat = if use_segmented {
+            gpu.forward_layers_batched_pooled_segmented(
+                hidden_flat,
+                &flat_masks,
+                &layer_tensors,
+                &layer_config,
+                &embedding,
+                rope_cos_slice,
+                rope_sin_slice,
+                pooling,
+                caps.segment_layers,
+            )?
+        } else {
+            gpu.forward_layers_batched_pooled(
+                hidden_flat,
+                &flat_masks,
+                &layer_tensors,
+                &layer_config,
+                &embedding,
+                rope_cos_slice,
+                rope_sin_slice,
+                pooling,
+            )?
+        };
+
+        let Some(flat) = maybe_flat else {
             record_pooled_output_decision(
                 PooledOutputDecisionReason::BackendUnsupported,
                 batch_size,
@@ -2622,7 +3051,12 @@ impl BertModel {
             .chunks_exact(h)
             .map(|row| l2_normalize(&Array1::from_vec(row.to_vec())).to_vec())
             .collect();
-        record_pooled_output_decision(PooledOutputDecisionReason::Used, batch_size, max_len);
+        let reason = if use_segmented {
+            PooledOutputDecisionReason::UsedSegmented
+        } else {
+            PooledOutputDecisionReason::Used
+        };
+        record_pooled_output_decision_with_segments(reason, batch_size, max_len, segment_count);
         Ok(Some(pooled))
     }
 
@@ -2728,8 +3162,36 @@ impl BertModel {
         Ok(results)
     }
 
+    #[cfg(test)]
     fn should_try_resident_stack(&self) -> bool {
         !resident_stack_disabled() && !dump_layer_enabled() && !self.has_relative_attention_layers()
+    }
+
+    fn resident_stack_decline_reason(
+        &self,
+        batch_size: usize,
+        max_len: usize,
+    ) -> Option<ResidentStackDecisionReason> {
+        if resident_stack_disabled() {
+            return Some(ResidentStackDecisionReason::Disabled);
+        }
+        if dump_layer_enabled() {
+            return Some(ResidentStackDecisionReason::LayerDumpEnabled);
+        }
+        if self.gpu.is_none() {
+            return Some(ResidentStackDecisionReason::NoGpu);
+        }
+        if self.has_relative_attention_layers() {
+            return Some(ResidentStackDecisionReason::RelativeAttention);
+        }
+        let caps = resident_stack_caps();
+        if batch_size > caps.max_batch_size {
+            return Some(ResidentStackDecisionReason::BatchTooLarge);
+        }
+        if max_len > caps.segmented_max_seq {
+            return Some(ResidentStackDecisionReason::SequenceTooLong);
+        }
+        None
     }
 
     fn has_relative_attention_layers(&self) -> bool {
@@ -4859,9 +5321,19 @@ mod tests {
 
     struct PooledOnlyGpu {
         calls: Arc<AtomicUsize>,
+        segmented_calls: Option<Arc<AtomicUsize>>,
+        expected_max_len: usize,
+        expected_layers: usize,
+        resident_unbounded_calls: Option<Arc<AtomicUsize>>,
+        resident_segmented_calls: Option<Arc<AtomicUsize>>,
+        expected_resident_max_len: usize,
+        expected_resident_layers: usize,
+        decline_pooled_segmented: bool,
+        decline_resident_segmented: bool,
     }
 
     struct PooledOutputOverrideGuard;
+    struct PooledOutputCapsOverrideGuard;
     static POOLED_OUTPUT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn pooled_output_test_lock() -> MutexGuard<'static, ()> {
@@ -4883,7 +5355,117 @@ mod tests {
         }
     }
 
+    impl PooledOutputCapsOverrideGuard {
+        fn set(caps: PooledOutputCaps) -> Self {
+            set_pooled_output_caps_test_override(Some(caps));
+            Self
+        }
+    }
+
+    impl Drop for PooledOutputCapsOverrideGuard {
+        fn drop(&mut self) {
+            set_pooled_output_caps_test_override(None);
+        }
+    }
+
     impl PooledOnlyGpu {
+        fn standard(calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                calls,
+                segmented_calls: None,
+                expected_max_len: 2,
+                expected_layers: 0,
+                resident_unbounded_calls: None,
+                resident_segmented_calls: None,
+                expected_resident_max_len: 0,
+                expected_resident_layers: 0,
+                decline_pooled_segmented: false,
+                decline_resident_segmented: false,
+            }
+        }
+
+        fn segmented(
+            calls: Arc<AtomicUsize>,
+            segmented_calls: Arc<AtomicUsize>,
+            expected_max_len: usize,
+            expected_layers: usize,
+        ) -> Self {
+            Self {
+                calls,
+                segmented_calls: Some(segmented_calls),
+                expected_max_len,
+                expected_layers,
+                resident_unbounded_calls: None,
+                resident_segmented_calls: None,
+                expected_resident_max_len: 0,
+                expected_resident_layers: 0,
+                decline_pooled_segmented: false,
+                decline_resident_segmented: false,
+            }
+        }
+
+        fn pooled_segmented_decline(
+            calls: Arc<AtomicUsize>,
+            segmented_calls: Arc<AtomicUsize>,
+            expected_max_len: usize,
+            expected_layers: usize,
+        ) -> Self {
+            Self {
+                calls,
+                segmented_calls: Some(segmented_calls),
+                expected_max_len,
+                expected_layers,
+                resident_unbounded_calls: None,
+                resident_segmented_calls: None,
+                expected_resident_max_len: 0,
+                expected_resident_layers: 0,
+                decline_pooled_segmented: true,
+                decline_resident_segmented: false,
+            }
+        }
+
+        fn resident_segmented(
+            calls: Arc<AtomicUsize>,
+            resident_unbounded_calls: Arc<AtomicUsize>,
+            resident_segmented_calls: Arc<AtomicUsize>,
+            expected_resident_max_len: usize,
+            expected_resident_layers: usize,
+        ) -> Self {
+            Self {
+                calls,
+                segmented_calls: None,
+                expected_max_len: 2,
+                expected_layers: 0,
+                resident_unbounded_calls: Some(resident_unbounded_calls),
+                resident_segmented_calls: Some(resident_segmented_calls),
+                expected_resident_max_len,
+                expected_resident_layers,
+                decline_pooled_segmented: false,
+                decline_resident_segmented: false,
+            }
+        }
+
+        fn resident_segmented_decline(
+            calls: Arc<AtomicUsize>,
+            resident_unbounded_calls: Arc<AtomicUsize>,
+            resident_segmented_calls: Arc<AtomicUsize>,
+            expected_resident_max_len: usize,
+            expected_resident_layers: usize,
+        ) -> Self {
+            Self {
+                calls,
+                segmented_calls: None,
+                expected_max_len: 2,
+                expected_layers: 0,
+                resident_unbounded_calls: Some(resident_unbounded_calls),
+                resident_segmented_calls: Some(resident_segmented_calls),
+                expected_resident_max_len,
+                expected_resident_layers,
+                decline_pooled_segmented: false,
+                decline_resident_segmented: true,
+            }
+        }
+
         fn unexpected<T>(op: &str) -> Result<T, InferError> {
             Err(InferError::Internal(format!(
                 "unexpected mock GPU call: {op}"
@@ -4990,16 +5572,94 @@ mod tests {
         ) -> Result<Option<Vec<f32>>, InferError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             assert_eq!(config.batch_size, 1);
-            assert_eq!(config.max_len, 2);
+            assert_eq!(config.max_len, self.expected_max_len);
             assert_eq!(config.hidden_size, 2);
-            assert_eq!(hidden.len(), 4);
-            assert_eq!(masks, &[1, 1]);
-            assert!(layers.is_empty());
+            assert_eq!(hidden.len(), config.max_len * 2);
+            assert_eq!(masks, vec![1u32; config.max_len]);
+            assert_eq!(layers.len(), self.expected_layers);
             assert_eq!(embedding.input_dim, 2);
             assert!(embedding.projection.is_none());
             assert!(embedding.norm_weight.is_none());
             assert!(embedding.norm_bias.is_none());
             assert_eq!(pooling, gpu::PoolingMode::Mean);
+            Ok(Some(vec![3.0, 4.0]))
+        }
+
+        fn forward_layers_batched(
+            &self,
+            _hidden: &[f32],
+            _masks: &[u32],
+            _layers: &[gpu::LayerTensors],
+            _config: &gpu::LayerConfig,
+            _rope_cos: &[f32],
+            _rope_sin: &[f32],
+        ) -> Result<Option<Vec<f32>>, InferError> {
+            if let Some(calls) = self.resident_unbounded_calls.as_ref() {
+                calls.fetch_add(1, Ordering::SeqCst);
+            }
+            Self::unexpected("forward_layers_batched")
+        }
+
+        fn forward_layers_batched_segmented(
+            &self,
+            hidden: &[f32],
+            masks: &[u32],
+            layers: &[gpu::LayerTensors],
+            config: &gpu::LayerConfig,
+            _rope_cos: &[f32],
+            _rope_sin: &[f32],
+            segment_layers: usize,
+        ) -> Result<Option<Vec<f32>>, InferError> {
+            let Some(calls) = self.resident_segmented_calls.as_ref() else {
+                return Self::unexpected("forward_layers_batched_segmented");
+            };
+            calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(config.max_len, self.expected_resident_max_len);
+            assert_eq!(layers.len(), self.expected_resident_layers);
+            assert_eq!(
+                hidden.len(),
+                config.batch_size * config.max_len * config.hidden_size
+            );
+            assert_eq!(masks, vec![1u32; config.batch_size * config.max_len]);
+            assert_eq!(segment_layers, POOLED_OUTPUT_DEFAULT_SEGMENT_LAYERS);
+            if self.decline_resident_segmented {
+                return Ok(None);
+            }
+            Ok(Some(hidden.to_vec()))
+        }
+
+        fn forward_layers_batched_pooled_segmented(
+            &self,
+            hidden: &[f32],
+            masks: &[u32],
+            layers: &[gpu::LayerTensors],
+            config: &gpu::LayerConfig,
+            embedding: &gpu::EmbeddingPrelude<'_>,
+            _rope_cos: &[f32],
+            _rope_sin: &[f32],
+            pooling: gpu::PoolingMode,
+            segment_layers: usize,
+        ) -> Result<Option<Vec<f32>>, InferError> {
+            let Some(segmented_calls) = self.segmented_calls.as_ref() else {
+                return Self::unexpected("forward_layers_batched_pooled_segmented");
+            };
+            segmented_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(self.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(config.batch_size, 1);
+            assert_eq!(config.max_len, self.expected_max_len);
+            assert_eq!(config.hidden_size, 2);
+            assert_eq!(hidden.len(), config.max_len * 2);
+            assert_eq!(masks, vec![1u32; config.max_len]);
+            assert_eq!(layers.len(), self.expected_layers);
+            assert_eq!(segment_layers, POOLED_OUTPUT_DEFAULT_SEGMENT_LAYERS);
+            assert_eq!(embedding.input_dim, 2);
+            assert!(embedding.projection.is_none());
+            assert!(embedding.norm_weight.is_none());
+            assert!(embedding.norm_bias.is_none());
+            assert_eq!(pooling, gpu::PoolingMode::Mean);
+            if self.decline_pooled_segmented {
+                return Ok(None);
+            }
             Ok(Some(vec![3.0, 4.0]))
         }
 
@@ -5899,9 +6559,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let model = mock_embedding_model_with_gpu(
             vec![],
-            Box::new(PooledOnlyGpu {
-                calls: Arc::clone(&calls),
-            }),
+            Box::new(PooledOnlyGpu::standard(Arc::clone(&calls))),
         );
 
         let _override = PooledOutputOverrideGuard::enabled();
@@ -5927,9 +6585,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let model = mock_embedding_model_with_gpu(
             vec![],
-            Box::new(PooledOnlyGpu {
-                calls: Arc::clone(&calls),
-            }),
+            Box::new(PooledOnlyGpu::standard(Arc::clone(&calls))),
         );
 
         let _override = PooledOutputOverrideGuard::enabled();
@@ -5949,6 +6605,28 @@ mod tests {
     }
 
     #[test]
+    fn segment_layer_env_zero_falls_back_before_div_ceil() {
+        const ZERO_ENV: &str = "KIN_INFER_TEST_SEGMENT_LAYERS_ZERO";
+        const VALID_ENV: &str = "KIN_INFER_TEST_SEGMENT_LAYERS_VALID";
+        const DEFAULT_ZERO_ENV: &str = "KIN_INFER_TEST_SEGMENT_LAYERS_DEFAULT_ZERO";
+
+        std::env::set_var(ZERO_ENV, "0");
+        assert_eq!(env_segment_layers_or(ZERO_ENV, 2), 2);
+        std::env::remove_var(ZERO_ENV);
+
+        std::env::set_var(VALID_ENV, "5");
+        assert_eq!(env_segment_layers_or(VALID_ENV, 2), 5);
+        std::env::remove_var(VALID_ENV);
+
+        std::env::remove_var(DEFAULT_ZERO_ENV);
+        assert_eq!(env_segment_layers_or(DEFAULT_ZERO_ENV, 0), 1);
+        assert_eq!(
+            3usize.div_ceil(env_segment_layers_or(DEFAULT_ZERO_ENV, 0)),
+            3
+        );
+    }
+
+    #[test]
     fn pooled_output_declines_relative_attention_layers() {
         let _lock = pooled_output_test_lock();
         reset_pooled_output_runtime_stats();
@@ -5962,9 +6640,7 @@ mod tests {
         layer.relative_attention_bias = Some(Array2::zeros((1, 1)));
         let model = mock_embedding_model_with_gpu(
             vec![layer],
-            Box::new(PooledOnlyGpu {
-                calls: Arc::clone(&calls),
-            }),
+            Box::new(PooledOnlyGpu::standard(Arc::clone(&calls))),
         );
 
         let _override = PooledOutputOverrideGuard::enabled();
@@ -5987,19 +6663,163 @@ mod tests {
     }
 
     #[test]
-    fn pooled_output_declines_sequences_over_default_cap() {
+    fn pooled_output_declines_over_segmented_cap_even_when_unbounded_cap_is_raised() {
+        let _lock = pooled_output_test_lock();
+        reset_pooled_output_runtime_stats();
+        let _caps = PooledOutputCapsOverrideGuard::set(PooledOutputCaps {
+            max_batch_size: POOLED_OUTPUT_DEFAULT_MAX_BATCH_SIZE,
+            max_seq: 4096,
+            segmented_max_seq: 2048,
+            segment_layers: POOLED_OUTPUT_DEFAULT_SEGMENT_LAYERS,
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let segmented_calls = Arc::new(AtomicUsize::new(0));
+        let model = mock_embedding_model_with_gpu(
+            vec![],
+            Box::new(PooledOnlyGpu::pooled_segmented_decline(
+                Arc::clone(&calls),
+                Arc::clone(&segmented_calls),
+                3000,
+                0,
+            )),
+        );
+
+        let _override = PooledOutputOverrideGuard::enabled();
+        let ids = vec![1u32; 3000];
+        let mask = vec![1u32; 3000];
+        let result = model
+            .try_forward_batched_pooled(&[ids], &[mask])
+            .expect("try pooled");
+
+        assert!(result.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(segmented_calls.load(Ordering::SeqCst), 0);
+        let stats = pooled_output_runtime_stats();
+        assert_eq!(
+            stats.last_reason,
+            PooledOutputDecisionReason::SequenceTooLong
+        );
+        assert_eq!(stats.last_max_seq, 3000);
+        assert_eq!(stats.max_seq, 2048);
+        assert_eq!(stats.segmented_max_seq, 2048);
+        assert_eq!(stats.last_segment_count, 0);
+    }
+
+    #[test]
+    fn pooled_output_records_backend_unsupported_when_segmented_backend_declines() {
+        let _lock = pooled_output_test_lock();
+        reset_pooled_output_runtime_stats();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let segmented_calls = Arc::new(AtomicUsize::new(0));
+        let layers = (0..5)
+            .map(|_| {
+                mock_layer(
+                    2,
+                    2,
+                    Some(Array2::zeros((2, 2))),
+                    Some(Array2::zeros((2, 2))),
+                )
+            })
+            .collect();
+        let len = POOLED_OUTPUT_DEFAULT_MAX_SEQ + 1;
+        let model = mock_embedding_model_with_gpu(
+            layers,
+            Box::new(PooledOnlyGpu::pooled_segmented_decline(
+                Arc::clone(&calls),
+                Arc::clone(&segmented_calls),
+                len,
+                5,
+            )),
+        );
+
+        let _override = PooledOutputOverrideGuard::enabled();
+        let ids = vec![1u32; len];
+        let mask = vec![1u32; len];
+        let result = model
+            .try_forward_batched_pooled(&[ids], &[mask])
+            .expect("try pooled");
+
+        assert!(result.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(segmented_calls.load(Ordering::SeqCst), 1);
+        let stats = pooled_output_runtime_stats();
+        assert_eq!(
+            stats.last_reason,
+            PooledOutputDecisionReason::BackendUnsupported
+        );
+        assert_eq!(stats.used_segmented, 0);
+        assert_eq!(stats.last_segment_count, 0);
+    }
+
+    #[test]
+    fn pooled_output_segments_sequences_over_default_cap() {
+        let _lock = pooled_output_test_lock();
+        reset_pooled_output_runtime_stats();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let segmented_calls = Arc::new(AtomicUsize::new(0));
+        let layers = (0..5)
+            .map(|_| {
+                mock_layer(
+                    2,
+                    2,
+                    Some(Array2::zeros((2, 2))),
+                    Some(Array2::zeros((2, 2))),
+                )
+            })
+            .collect();
+        let len = POOLED_OUTPUT_DEFAULT_MAX_SEQ + 1;
+        let model = mock_embedding_model_with_gpu(
+            layers,
+            Box::new(PooledOnlyGpu::segmented(
+                Arc::clone(&calls),
+                Arc::clone(&segmented_calls),
+                len,
+                5,
+            )),
+        );
+
+        let _override = PooledOutputOverrideGuard::enabled();
+        let ids = vec![1u32; len];
+        let mask = vec![1u32; len];
+        let result = model
+            .try_forward_batched_pooled(&[ids], &[mask])
+            .expect("try pooled");
+
+        assert_eq!(result, Some(vec![vec![0.6, 0.8]]));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(segmented_calls.load(Ordering::SeqCst), 1);
+        let stats = pooled_output_runtime_stats();
+        assert!(stats.used >= 1);
+        assert!(stats.used_segmented >= 1);
+        assert_eq!(stats.last_reason, PooledOutputDecisionReason::UsedSegmented);
+        assert_eq!(stats.last_batch_size, 1);
+        assert_eq!(stats.last_max_seq, len as u64);
+        assert_eq!(stats.last_segment_count, 3);
+        assert_eq!(stats.max_seq, POOLED_OUTPUT_DEFAULT_MAX_SEQ);
+        assert_eq!(
+            stats.segmented_max_seq,
+            POOLED_OUTPUT_DEFAULT_SEGMENTED_MAX_SEQ
+        );
+        assert_eq!(stats.segment_layers, POOLED_OUTPUT_DEFAULT_SEGMENT_LAYERS);
+    }
+
+    #[test]
+    fn pooled_output_declines_sequences_over_segmented_cap() {
         let _lock = pooled_output_test_lock();
         reset_pooled_output_runtime_stats();
         let calls = Arc::new(AtomicUsize::new(0));
         let model = mock_embedding_model_with_gpu(
-            vec![],
-            Box::new(PooledOnlyGpu {
-                calls: Arc::clone(&calls),
-            }),
+            vec![mock_layer(
+                2,
+                2,
+                Some(Array2::zeros((2, 2))),
+                Some(Array2::zeros((2, 2))),
+            )],
+            Box::new(PooledOnlyGpu::standard(Arc::clone(&calls))),
         );
 
         let _override = PooledOutputOverrideGuard::enabled();
-        let len = POOLED_OUTPUT_DEFAULT_MAX_SEQ + 1;
+        let len = POOLED_OUTPUT_DEFAULT_SEGMENTED_MAX_SEQ + 1;
         let ids = vec![1u32; len];
         let mask = vec![1u32; len];
         let result = model
@@ -6010,6 +6830,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let stats = pooled_output_runtime_stats();
         assert_eq!(stats.used, 0);
+        assert_eq!(stats.used_segmented, 0);
         assert_eq!(stats.declined, 1);
         assert_eq!(stats.declined_sequence_too_long, 1);
         assert_eq!(
@@ -6018,7 +6839,96 @@ mod tests {
         );
         assert_eq!(stats.last_batch_size, 1);
         assert_eq!(stats.last_max_seq, len as u64);
+        assert_eq!(stats.last_segment_count, 0);
         assert_eq!(stats.max_seq, POOLED_OUTPUT_DEFAULT_MAX_SEQ);
+        assert_eq!(
+            stats.segmented_max_seq,
+            POOLED_OUTPUT_DEFAULT_SEGMENTED_MAX_SEQ
+        );
+    }
+
+    #[test]
+    fn encode_batched_segments_long_resident_stack_instead_of_unbounded_stack() {
+        let _lock = pooled_output_test_lock();
+        reset_resident_stack_runtime_stats();
+        let pooled_calls = Arc::new(AtomicUsize::new(0));
+        let resident_unbounded_calls = Arc::new(AtomicUsize::new(0));
+        let resident_segmented_calls = Arc::new(AtomicUsize::new(0));
+        let layers = (0..5)
+            .map(|_| {
+                mock_layer(
+                    2,
+                    2,
+                    Some(Array2::zeros((2, 2))),
+                    Some(Array2::zeros((2, 2))),
+                )
+            })
+            .collect();
+        let len = POOLED_OUTPUT_DEFAULT_MAX_SEQ + 1;
+        let model = mock_embedding_model_with_gpu(
+            layers,
+            Box::new(PooledOnlyGpu::resident_segmented(
+                Arc::clone(&pooled_calls),
+                Arc::clone(&resident_unbounded_calls),
+                Arc::clone(&resident_segmented_calls),
+                len,
+                5,
+            )),
+        );
+
+        let ids = vec![1u32; len];
+        let mask = vec![1u32; len];
+        let (hidden, masks, max_len) = model
+            .encode_batched(&[ids], &[mask])
+            .expect("encode_batched");
+
+        assert_eq!(max_len, len);
+        assert_eq!(hidden.shape(), &[len, 2]);
+        assert_eq!(masks, vec![vec![1u8; len]]);
+        assert_eq!(pooled_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(resident_unbounded_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(resident_segmented_calls.load(Ordering::SeqCst), 1);
+        let stats = resident_stack_runtime_stats();
+        assert!(stats.used_segmented >= 1);
+        assert_eq!(stats.segment_layers, POOLED_OUTPUT_DEFAULT_SEGMENT_LAYERS);
+    }
+
+    #[test]
+    fn resident_stack_records_backend_unsupported_when_segmented_backend_declines() {
+        let _lock = pooled_output_test_lock();
+        reset_resident_stack_runtime_stats();
+        let pooled_calls = Arc::new(AtomicUsize::new(0));
+        let resident_unbounded_calls = Arc::new(AtomicUsize::new(0));
+        let resident_segmented_calls = Arc::new(AtomicUsize::new(0));
+        let len = POOLED_OUTPUT_DEFAULT_MAX_SEQ + 1;
+        let model = mock_embedding_model_with_gpu(
+            vec![],
+            Box::new(PooledOnlyGpu::resident_segmented_decline(
+                Arc::clone(&pooled_calls),
+                Arc::clone(&resident_unbounded_calls),
+                Arc::clone(&resident_segmented_calls),
+                len,
+                0,
+            )),
+        );
+
+        let ids = vec![1u32; len];
+        let mask = vec![1u32; len];
+        let (_hidden, _masks, max_len) = model
+            .encode_batched(&[ids], &[mask])
+            .expect("encode_batched");
+
+        assert_eq!(max_len, len);
+        assert_eq!(pooled_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(resident_unbounded_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(resident_segmented_calls.load(Ordering::SeqCst), 1);
+        let stats = resident_stack_runtime_stats();
+        assert_eq!(
+            stats.last_reason,
+            ResidentStackDecisionReason::BackendUnsupported
+        );
+        assert_eq!(stats.used_segmented, 0);
+        assert_eq!(stats.last_segment_count, 0);
     }
 
     #[test]
