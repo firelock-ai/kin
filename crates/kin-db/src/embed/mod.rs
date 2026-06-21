@@ -2025,19 +2025,21 @@ fn default_max_batch_tokens(backend: GpuBackend) -> usize {
 fn default_max_attention_area(backend: GpuBackend) -> usize {
     match backend {
         GpuBackend::Metal => METAL_MAX_ATTENTION_AREA,
-        // CUDA (flash-attention, large VRAM) and CPU (host RAM, no GPU watchdog)
-        // are not bounded by the macOS GPU attention ceiling; leave the area
-        // effectively unbounded so their dispatch sizing stays governed by the
-        // token budget exactly as before this guard was introduced.
-        GpuBackend::Cuda | GpuBackend::Cpu => usize::MAX,
+        // CUDA (flash-attention, large VRAM) is not bounded by the host attention
+        // ceiling. CPU IS bounded by the same area ceiling: host attention scratch
+        // is count*seq^2*heads bytes, and the hybrid CPU twin runs many sub-batches
+        // concurrently (rayon), so an unbounded CPU area lets parallel host
+        // allocations OOM-kill the daemon on high-RAM machines.
+        GpuBackend::Cuda => usize::MAX,
+        GpuBackend::Cpu => METAL_MAX_ATTENTION_AREA,
     }
 }
 
 #[cfg(feature = "embeddings")]
 fn cap_attention_area_for_backend(backend: GpuBackend, area: usize) -> usize {
     match backend {
-        GpuBackend::Metal => area.min(METAL_MAX_ATTENTION_AREA),
-        GpuBackend::Cuda | GpuBackend::Cpu => area,
+        GpuBackend::Metal | GpuBackend::Cpu => area.min(METAL_MAX_ATTENTION_AREA),
+        GpuBackend::Cuda => area,
     }
 }
 
@@ -3331,9 +3333,13 @@ mod tests {
             default_max_attention_area(GpuBackend::Metal),
             METAL_MAX_ATTENTION_AREA
         );
-        // CUDA/CPU are not bound by the macOS GPU attention ceiling.
+        // CUDA (large VRAM, flash-attention) stays unbounded; CPU is bounded by the
+        // same area ceiling so the parallel host attention scratch can't OOM the daemon.
         assert_eq!(default_max_attention_area(GpuBackend::Cuda), usize::MAX);
-        assert_eq!(default_max_attention_area(GpuBackend::Cpu), usize::MAX);
+        assert_eq!(
+            default_max_attention_area(GpuBackend::Cpu),
+            METAL_MAX_ATTENTION_AREA
+        );
     }
 
     #[cfg(feature = "embeddings")]
