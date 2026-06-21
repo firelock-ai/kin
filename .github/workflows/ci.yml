@@ -186,7 +186,9 @@ jobs:
             ${{ runner.os }}-cargo-tarpaulin-
 
       - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
 
       - name: Run coverage
         run: |
