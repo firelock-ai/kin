@@ -1861,4 +1861,176 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(manifest).unwrap()).unwrap();
         assert!(manifest_json["file_count"].as_u64().unwrap() > 0);
     }
+
+    fn init_git_repo_with_files(root: &Path, branch: &str, files: &[(&str, &str)]) -> bool {
+        for (rel_path, contents) in files {
+            if let Some(parent) = Path::new(rel_path).parent() {
+                std::fs::create_dir_all(root.join(parent)).unwrap();
+            }
+            std::fs::write(root.join(rel_path), contents).unwrap();
+        }
+
+        let git_init = std::process::Command::new("git")
+            .args(["init", "-b", branch])
+            .current_dir(root)
+            .output();
+        match git_init {
+            Ok(output) if output.status.success() => {}
+            _ => return false,
+        }
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(root)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(root)
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(root)
+            .output();
+        let commit = std::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(root)
+            .output();
+        matches!(commit, Ok(output) if output.status.success())
+    }
+
+    const DETERMINISM_FIXTURE: &[(&str, &str)] = &[
+        (
+            "src/lib.rs",
+            "pub mod helper;\n\npub fn entry() -> i32 {\n    helper::value() + 1\n}\n\npub struct Widget {\n    pub id: u32,\n}\n\nimpl Widget {\n    pub fn new(id: u32) -> Self {\n        Self { id }\n    }\n}\n",
+        ),
+        (
+            "src/helper.rs",
+            "pub fn value() -> i32 {\n    41\n}\n\npub fn doubled() -> i32 {\n    value() * 2\n}\n",
+        ),
+    ];
+
+    /// Canonicalize the persisted semantic graph into a stable string plus the
+    /// content-addressed Merkle root, for byte-identity comparison.
+    ///
+    /// Every entity field that carries semantic truth is included. Metadata is
+    /// serialized in sorted-key order so `HashMap` iteration order cannot perturb
+    /// the projection. The kin-db `recompute_root_hash` is the canonical,
+    /// order-independent graph root (it sorts entity and subgraph hashes), unlike
+    /// the continuously-maintained live root which is history-sensitive.
+    fn canonical_graph_fingerprint(snapshot_path: &Path) -> (String, [u8; 32]) {
+        use kin_model::EntityStore;
+
+        let snapshot = open_snapshot_retrying(snapshot_path).unwrap();
+        let graph = snapshot.graph();
+
+        let mut entities = graph.list_all_entities().unwrap();
+        entities.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let mut lines: Vec<String> = Vec::new();
+        for e in &entities {
+            let mut meta: Vec<(String, String)> = e
+                .metadata
+                .extra
+                .iter()
+                .map(|(k, v)| (k.clone(), v.to_string()))
+                .collect();
+            meta.sort();
+            lines.push(format!(
+                "ENT id={:?} kind={:?} name={} lang={:?} sig={} vis={:?} role={:?} file={:?} span={:?} fp_ast={} fp_sig={} fp_beh={} doc={:?} created_in={:?} lineage={:?} superseded={:?} meta={:?}",
+                e.id, e.kind, e.name, e.language, e.signature, e.visibility, e.role,
+                e.file_origin, e.span,
+                e.fingerprint.ast_hash, e.fingerprint.signature_hash, e.fingerprint.behavior_hash,
+                e.doc_summary, e.created_in, e.lineage_parent, e.superseded_by, meta
+            ));
+        }
+
+        let mut rel_lines: Vec<String> = entities
+            .iter()
+            .flat_map(|e| graph.get_all_relations_for_entity(&e.id).unwrap())
+            .map(|r| format!("{r:?}"))
+            .collect();
+        rel_lines.sort();
+        rel_lines.dedup();
+
+        lines.sort();
+        lines.extend(rel_lines);
+        let root = graph.recompute_root_hash();
+        (lines.join("\n"), root)
+    }
+
+    /// Determinism gate: a migration's persisted graph must be byte-identical
+    /// across repeated runs.
+    ///
+    /// Source files are parsed exactly once during migration — only the persist
+    /// pass (`persist_semantic_index`) parses them, and it is the sole writer of
+    /// entities and relations to the graph. This gate locks that the persisted
+    /// graph is fully determined by that single pass and nothing perturbs it
+    /// between runs.
+    ///
+    /// This gate migrates the same fixture twice into the same fixed path
+    /// (re-importing from scratch each time) and asserts the persisted graph is
+    /// byte-identical across both runs — identical content-addressed root hash and
+    /// identical entity/relation projection — and that the reported counts are
+    /// both correct and stable. Holding the source path fixed is required because
+    /// entity IDs and file-surface-context metadata are derived from the absolute
+    /// source path; a fresh random tempdir per run would perturb those fields
+    /// independently of any parsing change.
+    #[test]
+    fn migrate_persisted_graph_is_byte_identical_across_runs() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().join("repo");
+
+        let migrate_once = || -> (MigrationResult, String, [u8; 32]) {
+            let _ = std::fs::remove_dir_all(root.join(".git"));
+            let _ = std::fs::remove_dir_all(root.join(".kin"));
+            std::fs::create_dir_all(&root).unwrap();
+            assert!(
+                init_git_repo_with_files(&root, "main", DETERMINISM_FIXTURE),
+                "git fixture setup must succeed"
+            );
+
+            let plan = MigrationPlan {
+                source: root.clone(),
+                target: root.clone(),
+                strategy: MigrationStrategy::Shallow,
+                branch: Some("main".into()),
+                max_commits: 0,
+                source_files: vec![
+                    std::path::PathBuf::from("src/lib.rs"),
+                    std::path::PathBuf::from("src/helper.rs"),
+                ],
+            };
+
+            let result = execute_migration_persisted(&plan).unwrap();
+            let layout = kin_core::KinLayout::new(root.join(".kin"));
+            let (dump, hash) = canonical_graph_fingerprint(&layout.kindb_snapshot_path());
+            (result, dump, hash)
+        };
+
+        let (result_a, dump_a, hash_a) = migrate_once();
+        let (result_b, dump_b, hash_b) = migrate_once();
+
+        // Reported counts are correct for the fixture (six entities: module
+        // `helper`, fns `entry`/`value`/`doubled`, struct `Widget`, method
+        // `Widget::new`; four relations: two `Contains`, two `Calls`).
+        assert_eq!(result_a.files_indexed, 2, "files_indexed");
+        assert_eq!(result_a.entities_extracted, 6, "entities_extracted");
+        assert_eq!(result_a.relations_extracted, 4, "relations_extracted");
+
+        // Counts are stable run-to-run.
+        assert_eq!(result_a.files_indexed, result_b.files_indexed);
+        assert_eq!(result_a.entities_extracted, result_b.entities_extracted);
+        assert_eq!(result_a.relations_extracted, result_b.relations_extracted);
+
+        // The persisted graph is byte-identical across runs: same content-addressed
+        // root hash and same full entity/relation projection.
+        assert_eq!(
+            hash_a, hash_b,
+            "persisted graph root hash diverged across identical migrations"
+        );
+        pretty_assertions::assert_eq!(
+            dump_a,
+            dump_b,
+            "persisted entity/relation set diverged across identical migrations"
+        );
+    }
 }
