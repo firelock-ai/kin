@@ -1788,7 +1788,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19753d40da53d0ec41604750eeb969097a90fb2d7f7992730d904541c04e2c19"
 dependencies = [
  "bstr",
- "hashbrown 0.17.1",
+ "hashbrown 0.16.1",
 ]
 
 [[package]]
@@ -3140,9 +3140,9 @@ dependencies = [
 
 [[package]]
 name = "kin-infer"
-version = "0.2.21"
+version = "0.2.22"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "baeffb366f46272bd7fef899155db9893b445061d03ecb560f200f110765b5c4"
+checksum = "f2433d2cbb7ca7ad8448cfedf8c3699ca991a00ce72113623440640ec44ade7f"
 dependencies = [
  "block",
  "half",
