@@ -2,64 +2,95 @@
   "allowlist": [
     {
       "file": "crates/kin-cli/src/commands/checkout.rs",
-      "reason": "IO Boundary: materializes file state during checkout and reads files for status/reconcile bounds"
+      "reason": "IO Boundary: materializes file state during checkout and reads files for status/reconcile bounds",
+      "owner": "kin-cli",
+      "expiration": "2026-12-31"
     },
     {
       "file": "crates/kin-cli/src/commands/commit.rs",
-      "reason": "IO Boundary: reads local workspace files to build gitignore, hashes, and commit metadata"
+      "reason": "IO Boundary: reads local workspace files to build gitignore, hashes, and commit metadata",
+      "owner": "kin-cli",
+      "expiration": "2026-12-31"
     },
     {
       "file": "crates/kin-cli/src/commands/init.rs",
-      "reason": "IO Ingestion: imports files from disk to build the initial semantic graph"
+      "reason": "IO Ingestion: imports files from disk to build the initial semantic graph",
+      "owner": "kin-cli",
+      "expiration": "2026-12-31"
     },
     {
       "file": "crates/kin-cli/src/commands/reconcile.rs",
-      "reason": "IO Boundary: writes/projects graph modifications back to filesystem"
+      "reason": "IO Boundary: writes/projects graph modifications back to filesystem",
+      "owner": "kin-cli",
+      "expiration": "2026-12-31"
     },
     {
       "file": "crates/kin-cli/src/commands/stash.rs",
-      "reason": "IO Boundary: stashes and restores uncommitted file changes"
+      "reason": "IO Boundary: stashes and restores uncommitted file changes",
+      "owner": "kin-cli",
+      "expiration": "2026-12-31"
     },
     {
       "file": "crates/kin-cli/src/commands/session_workspace.rs",
-      "reason": "IO Boundary: syncs workspace by reading and writing files"
+      "reason": "IO Boundary: syncs workspace by reading and writing files",
+      "owner": "kin-cli",
+      "expiration": "2026-12-31"
     },
     {
       "file": "crates/kin-cli/src/commands/native_sync.rs",
-      "reason": "IO Boundary: reads/writes sync files between local and remote state"
+      "reason": "IO Boundary: reads/writes sync files between local and remote state",
+      "owner": "kin-cli",
+      "expiration": "2026-12-31"
     },
     {
       "file": "crates/kin-cli/src/commands/open.rs",
-      "reason": "IO Boundary: materializes session folder and reads/writes files"
+      "reason": "IO Boundary: materializes session folder and reads/writes files",
+      "owner": "kin-cli",
+      "expiration": "2026-12-31"
     },
     {
       "file": "crates/kin-cli/src/commands/shell.rs",
-      "reason": "IO Boundary: bootstraps session shell workspace files"
+      "reason": "IO Boundary: bootstraps session shell workspace files",
+      "owner": "kin-cli",
+      "expiration": "2026-12-31"
     },
     {
       "file": "crates/kin-cli/src/commands/secret.rs",
-      "reason": "IO Boundary: reads authentication/tokens from stdin or config file"
+      "reason": "IO Boundary: reads authentication/tokens from stdin or config file",
+      "owner": "kin-cli",
+      "expiration": "2026-12-31"
     },
     {
       "file": "crates/kin-cli/src/commands/locate_debug.rs",
-      "reason": "Debug Command: reads benchmark/test inputs from disk"
+      "reason": "Debug Command: reads benchmark/test inputs from disk",
+      "owner": "kin-cli",
+      "expiration": "2026-12-31"
     },
     {
       "file": "crates/kin-cli/src/backend.rs",
-      "reason": "Direct Snapshot direct-reads (offline bootstrap fallback)"
+      "reason": "Direct Snapshot direct-reads (offline bootstrap fallback)",
+      "owner": "kin-cli",
+      "expiration": "2026-12-31"
     },
     {
       "file": "crates/kin-cli/src/capability.rs",
-      "reason": "Hardware check: reads /proc/meminfo for system stats"
+      "reason": "Hardware check: reads /proc/meminfo for system stats",
+      "owner": "kin-cli",
+      "expiration": "2026-12-31"
     },
     {
       "file": "crates/kin-mcp/src/daemon_delegate.rs",
-      "reason": "Auth: reads token from local daemon token file"
+      "reason": "Auth: reads token from local daemon token file",
+      "owner": "kin-mcp",
+      "expiration": "2026-12-31"
     },
     {
       "file": "crates/kin-core/src/text_refs.rs",
       "reason": "TRANSITIONAL: Direct filesystem read for text references. Needs migration to graph-derived source.",
-      "status": "transitional"
+      "owner": "kin-core",
+      "status": "transitional",
+      "removal_target": "Replace direct text-reference reads with graph-derived source projection.",
+      "expiration": "2026-09-30"
     }
   ]
 }
