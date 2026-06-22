@@ -24,5 +24,6 @@ hex = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+kin-spine = { workspace = true }
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
