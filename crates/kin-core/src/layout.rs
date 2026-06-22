@@ -31,15 +31,40 @@ impl KinLayout {
     /// holds `registry.toml` but never a `manifest.json`. Discovery skips it so
     /// running outside any repo does not resolve to the home directory and spawn
     /// a daemon that fails `resolve_repo_id` against a non-existent manifest.
+    ///
+    /// Discovery also refuses to bind a parent store across a nested-repository
+    /// boundary: if the walk passes a directory that is itself a repository root
+    /// (it has a `.git`) without its own `.kin/`, then a `.kin/` found higher up
+    /// belongs to a different repository and is not bound — the nested repo is
+    /// reported as having no store rather than silently sharing the parent's
+    /// graph (the failure mode behind the parent-store poisoning incident). Set
+    /// `KIN_ALLOW_PARENT_STORE=1` to opt back into binding the parent store.
     pub fn discover(start: &Path) -> Option<Self> {
         if std::env::var("KIN_DAEMON_URL").is_ok() {
             return Some(Self::new(start.join(".kin")));
         }
         let mut current = start.to_path_buf();
+        let mut crossed_boundary: Option<PathBuf> = None;
         loop {
             let candidate = current.join(".kin");
             if candidate.is_dir() && !is_global_home_kin_dir(&candidate) {
+                if let Some(boundary) = &crossed_boundary {
+                    if std::env::var("KIN_ALLOW_PARENT_STORE").is_err() {
+                        eprintln!(
+                            "kin: refusing to bind the parent store at {} across the repository \
+                             boundary at {} (the nested repository has no .kin/ of its own). Run \
+                             `kin init` here to create its own store, or set \
+                             KIN_ALLOW_PARENT_STORE=1 to bind the parent store explicitly.",
+                            candidate.display(),
+                            boundary.display(),
+                        );
+                        return None;
+                    }
+                }
                 return Some(Self::new(candidate));
+            }
+            if crossed_boundary.is_none() && current.join(".git").exists() {
+                crossed_boundary = Some(current.clone());
             }
             if !current.pop() {
                 return None;
@@ -369,6 +394,29 @@ mod tests {
     fn discover_returns_none_when_missing() {
         let dir = tempfile::tempdir().unwrap();
         assert!(KinLayout::discover(dir.path()).is_none());
+    }
+
+    #[test]
+    fn discover_refuses_parent_store_across_nested_repo_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".kin")).unwrap();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir_all(nested.join(".git")).unwrap();
+        let deep = nested.join("src");
+        std::fs::create_dir_all(&deep).unwrap();
+
+        assert!(
+            KinLayout::discover(&deep).is_none(),
+            "must refuse to bind a parent .kin across a nested-repo (.git) boundary"
+        );
+
+        std::fs::create_dir(nested.join(".kin")).unwrap();
+        let found = KinLayout::discover(&deep).unwrap();
+        assert_eq!(
+            found.root(),
+            nested.join(".kin"),
+            "a nested repo with its own .kin binds that store, not the parent"
+        );
     }
 
     #[test]
