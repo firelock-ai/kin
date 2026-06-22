@@ -2039,22 +2039,24 @@ mod tests {
     #[serial_test::serial]
     fn spine_init_materializes_cross_repo_edges() {
         use kin_db::{InMemoryGraph, SnapshotManager};
-        use kin_model::{GraphNodeId, Relation, RelationId, RelationKind, RelationOrigin};
+        use kin_model::{
+            GraphNodeId, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin,
+        };
 
         // A sibling repo whose persisted graph exposes the entity the primary
         // repo references across the repo boundary. The spine resolves a
-        // cross-repo reference by matching the reference's graph-node label
-        // against an indexed entity name, so the sibling entity is named to
-        // match the label the primary's relation carries.
+        // cross-repo reference by matching the imported-symbol evidence on the
+        // primary's relation against an indexed entity name, so the sibling
+        // entity is named with the real symbol the reference imports.
         let sibling_id = "sibling-lib";
         let external_id = kin_model::EntityId::new();
-        let reference_label = format!("{}", GraphNodeId::Entity(external_id));
+        let imported_symbol = "remote_call";
 
         let sibling_dir = tempfile::tempdir().unwrap();
         let sibling_init = kin_core::init(sibling_dir.path()).unwrap();
         let sibling_graph = InMemoryGraph::new();
         sibling_graph
-            .batch_upsert_entities(&[test_entity(&reference_label, "src/lib.rs")])
+            .batch_upsert_entities(&[test_entity(imported_symbol, "src/lib.rs")])
             .unwrap();
         SnapshotManager::save_graph(sibling_init.layout.kindb_snapshot_path(), &sibling_graph)
             .unwrap();
@@ -2080,7 +2082,10 @@ mod tests {
                 origin: RelationOrigin::Parsed,
                 created_in: None,
                 import_source: Some(sibling_id.to_string()),
-                evidence: vec![],
+                evidence: vec![RelationEvidence {
+                    token: Some(imported_symbol.to_string()),
+                    ..RelationEvidence::default()
+                }],
             })
             .unwrap();
 
