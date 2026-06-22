@@ -27,6 +27,32 @@ pub struct FederatedNode {
     pub depth: u32,
 }
 
+/// Build a federated node, populating name/kind/file from the spine index.
+///
+/// When the entity is present in the index its real metadata is used. When it
+/// is absent the metadata fields are left empty/None rather than fabricated — an
+/// unresolved cross-repo node is marked by its missing metadata, never by a
+/// guessed label.
+fn resolve_node(
+    index: &SpineIndex,
+    repo_id: &str,
+    entity_id: &EntityId,
+    depth: u32,
+) -> FederatedNode {
+    let meta = index.lookup_by_id(repo_id, entity_id);
+    FederatedNode {
+        repo_id: repo_id.to_string(),
+        entity_id: *entity_id,
+        name: meta.as_ref().map(|e| e.name.clone()).unwrap_or_default(),
+        kind: meta
+            .as_ref()
+            .map(|e| format!("{:?}", e.kind))
+            .unwrap_or_default(),
+        file_path: meta.as_ref().and_then(|e| e.file_path.clone()),
+        depth,
+    }
+}
+
 /// An edge in the federated impact subgraph.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FederatedEdge {
@@ -80,21 +106,7 @@ pub fn federated_impact(
     repos.insert(start_repo.to_string());
 
     // Look up start entity metadata from the index
-    let start_meta = index.lookup_by_id(start_repo, start_entity);
-    nodes.push(FederatedNode {
-        repo_id: start_repo.to_string(),
-        entity_id: *start_entity,
-        name: start_meta
-            .as_ref()
-            .map(|e| e.name.clone())
-            .unwrap_or_default(),
-        kind: start_meta
-            .as_ref()
-            .map(|e| format!("{:?}", e.kind))
-            .unwrap_or_default(),
-        file_path: start_meta.as_ref().and_then(|e| e.file_path.clone()),
-        depth: 0,
-    });
+    nodes.push(resolve_node(index, start_repo, start_entity, 0));
 
     while let Some((repo_id, entity_id, depth)) = queue.pop_front() {
         if depth >= max_depth {
@@ -120,14 +132,7 @@ pub fn federated_impact(
 
             repos.insert(target_repo.clone());
 
-            nodes.push(FederatedNode {
-                repo_id: target_repo.clone(),
-                entity_id: *target_entity,
-                name: String::new(), // Resolved later from index
-                kind: String::new(),
-                file_path: None,
-                depth: depth + 1,
-            });
+            nodes.push(resolve_node(index, target_repo, target_entity, depth + 1));
 
             edges.push(FederatedEdge {
                 src_repo: repo_id.clone(),
@@ -229,6 +234,49 @@ mod tests {
         assert_eq!(result.nodes[0].name, "query_entities");
         assert!(!result.nodes[0].kind.is_empty());
         assert_eq!(result.nodes[0].file_path.as_deref(), Some("src/lib.rs"));
+    }
+
+    #[test]
+    fn federated_impact_nodes_carry_resolved_metadata() {
+        // Non-start (cross-repo) impact nodes must carry the real entity
+        // name/kind/file resolved from the index — not empty placeholders.
+        let index = SpineIndex::new();
+
+        let a = test_entry("kin-db", "query_entities");
+        let b = test_entry("kin", "run_search");
+
+        index.register_repo("kin-db", vec![a.clone()], "h1");
+        index.register_repo("kin", vec![b.clone()], "h2");
+
+        // kin → kin-db (kin's run_search imports kin-db's query_entities)
+        index.add_cross_repo_edge(CrossRepoEdge {
+            src_repo: "kin".to_string(),
+            src_entity: b.entity_id,
+            dst_repo: "kin-db".to_string(),
+            dst_entity: a.entity_id,
+            confidence: 0.9,
+        });
+
+        // Impact of changing query_entities: run_search (in kin) is affected.
+        let result = federated_impact(&index, "kin-db", &a.entity_id, 5);
+
+        // Find the non-start node (the cross-repo dependent) and assert it
+        // carries real metadata rather than the old empty placeholders.
+        let dependent = result
+            .nodes
+            .iter()
+            .find(|n| n.entity_id == b.entity_id)
+            .expect("run_search should appear as an impacted node");
+
+        assert_eq!(dependent.repo_id, "kin");
+        assert_eq!(dependent.name, "run_search");
+        assert!(
+            !dependent.kind.is_empty(),
+            "kind must be resolved, not empty"
+        );
+        assert_eq!(dependent.kind, "Function");
+        assert_eq!(dependent.file_path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(dependent.depth, 1);
     }
 
     #[test]
