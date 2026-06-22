@@ -2988,12 +2988,6 @@ async fn locate(
         state.graph.embedding_status().indexed,
         state.graph.compute_root_hash()
     );
-    let kvec_meta_path = state.layout.kindb_dir().join("graph.kvec.meta.json");
-    if let Ok(content) = std::fs::read_to_string(kvec_meta_path) {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-            tracing::info!(">>> LOCATE: kvec hash={:?}", json.get("graph_root_hash"));
-        }
-    }
 
     let result = if let Some(reference) = req.reference.as_deref() {
         // Explicit --ref always takes precedence over session scope.
