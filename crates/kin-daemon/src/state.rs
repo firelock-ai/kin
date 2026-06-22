@@ -774,6 +774,11 @@ impl DaemonState {
         let _ = self.spine.get_or_init(|| {
             let backend: Arc<dyn kin_spine::SpineBackend> = self.create_spine_backend();
 
+            // Per-repo (id, entities, relations) captured during registration and
+            // replayed into cross-repo edge resolution once every repo is indexed.
+            let mut repo_relations: Vec<(String, Vec<kin_model::Entity>, Vec<kin_model::Relation>)> =
+                Vec::new();
+
             // Register the primary (this daemon's) repo.
             let repo_id = self
                 .layout
@@ -803,6 +808,8 @@ impl DaemonState {
                     entities = entities.len(),
                     "registered primary repo in spine"
                 );
+                let relations = Self::collect_spine_relations(self.graph.as_ref(), &entities);
+                repo_relations.push((repo_id.to_string(), entities, relations));
             }
 
             // Register sibling repos from the global registry.
@@ -859,13 +866,26 @@ impl DaemonState {
                                 let count = entries.len();
                                 backend.register_repo(&sibling_id, entries, "");
                                 info!(repo_id = %sibling_id, entities = count, "registered sibling in spine");
+                                let relations =
+                                    Self::collect_spine_relations(&sibling_graph, &entities);
+                                repo_relations.push((sibling_id.clone(), entities, relations));
                             }
                         }
                     }
                 }
             }
 
-            info!("spine index initialized");
+            // With every reachable repo indexed, resolve unresolved imports into
+            // cross-repo reference edges so federated impact/xref can traverse them.
+            let registry_ids: Vec<String> = backend.registered_repo_ids().into_iter().collect();
+            for (rid, entities, relations) in &repo_relations {
+                backend.refresh_cross_repo_edges(rid, entities, relations, &registry_ids);
+            }
+
+            info!(
+                cross_repo_edges = backend.edge_count(),
+                "spine index initialized"
+            );
             backend
         });
     }
@@ -892,6 +912,28 @@ impl DaemonState {
 
         info!("using in-memory spine backend (local dev mode)");
         Arc::new(kin_spine::InMemorySpineBackend::new())
+    }
+
+    /// Collect the entity-level reference edges the spine uses to resolve
+    /// cross-repo imports. Only `Calls`/`References` edges carry the
+    /// `import_source` the cross-repo resolver keys on, so the scan is limited
+    /// to those kinds. Edges are read per source entity (outgoing only), so each
+    /// relation is yielded exactly once.
+    fn collect_spine_relations(
+        graph: &kin_db::InMemoryGraph,
+        entities: &[kin_model::Entity],
+    ) -> Vec<kin_model::Relation> {
+        let kinds = [
+            kin_model::RelationKind::Calls,
+            kin_model::RelationKind::References,
+        ];
+        let mut relations = Vec::new();
+        for entity in entities {
+            if let Ok(rels) = graph.get_relations(&entity.id, &kinds) {
+                relations.extend(rels);
+            }
+        }
+        relations
     }
 
     /// Load a repo's graph from the storage backend (synchronous).
@@ -1990,6 +2032,101 @@ mod tests {
         assert_eq!(
             state.graph.get_file_hash(&file_id.0),
             Some(kin_blobs::digest_bytes(&content))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn spine_init_materializes_cross_repo_edges() {
+        use kin_db::{InMemoryGraph, SnapshotManager};
+        use kin_model::{GraphNodeId, Relation, RelationId, RelationKind, RelationOrigin};
+
+        // A sibling repo whose persisted graph exposes the entity the primary
+        // repo references across the repo boundary. The spine resolves a
+        // cross-repo reference by matching the reference's graph-node label
+        // against an indexed entity name, so the sibling entity is named to
+        // match the label the primary's relation carries.
+        let sibling_id = "sibling-lib";
+        let external_id = kin_model::EntityId::new();
+        let reference_label = format!("{}", GraphNodeId::Entity(external_id));
+
+        let sibling_dir = tempfile::tempdir().unwrap();
+        let sibling_init = kin_core::init(sibling_dir.path()).unwrap();
+        let sibling_graph = InMemoryGraph::new();
+        sibling_graph
+            .batch_upsert_entities(&[test_entity(&reference_label, "src/lib.rs")])
+            .unwrap();
+        SnapshotManager::save_graph(sibling_init.layout.kindb_snapshot_path(), &sibling_graph)
+            .unwrap();
+
+        // The primary repo: a caller entity plus an unresolved cross-repo call
+        // tagged with the sibling repo as its import source.
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+        let state = test_state(primary_init.layout, primary_dir.path());
+        let caller = test_entity("caller", "src/main.rs");
+        state
+            .graph
+            .batch_upsert_entities(&[caller.clone()])
+            .unwrap();
+        state
+            .graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Calls,
+                src: GraphNodeId::Entity(caller.id),
+                dst: GraphNodeId::Entity(external_id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: Some(sibling_id.to_string()),
+                evidence: vec![],
+            })
+            .unwrap();
+
+        // Point the global registry at a temp file naming only the sibling so
+        // init discovers and indexes it alongside the primary.
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        kin_core::registry::KinRegistry {
+            repos: vec![kin_core::registry::RegisteredRepo {
+                id: sibling_id.to_string(),
+                path: sibling_dir.path().to_path_buf(),
+                entities: 1,
+                last_commit: String::new(),
+                dependencies: vec![],
+            }],
+        }
+        .save_to(&registry_path)
+        .unwrap();
+
+        let prev_registry = std::env::var_os("KIN_REGISTRY_PATH");
+        let prev_disable = std::env::var_os("KIN_DISABLE_SPINE");
+        std::env::set_var("KIN_REGISTRY_PATH", &registry_path);
+        std::env::remove_var("KIN_DISABLE_SPINE");
+
+        let (repo_count, edge_count) = {
+            let spine = state.ensure_spine().expect("spine must be enabled");
+            (spine.repo_count(), spine.edge_count())
+        };
+
+        // Restore the process-global env before asserting so a failure can never
+        // leak the override into other tests.
+        match prev_registry {
+            Some(v) => std::env::set_var("KIN_REGISTRY_PATH", v),
+            None => std::env::remove_var("KIN_REGISTRY_PATH"),
+        }
+        if let Some(v) = prev_disable {
+            std::env::set_var("KIN_DISABLE_SPINE", v);
+        }
+
+        assert!(
+            repo_count >= 2,
+            "primary and sibling repos must both be indexed (got {repo_count})"
+        );
+        assert!(
+            edge_count > 0,
+            "cross-repo edges must materialize after spine init (got {edge_count})"
         );
     }
 
