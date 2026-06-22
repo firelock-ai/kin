@@ -9025,6 +9025,147 @@ mod tests {
         assert!(json["results"].as_array().unwrap().is_empty());
     }
 
+    fn spine_test_fingerprint() -> kin_model::SemanticFingerprint {
+        let zero = kin_model::Hash256::from_bytes([0u8; 32]);
+        kin_model::SemanticFingerprint {
+            algorithm: kin_model::FingerprintAlgorithm::V1TreeSitter,
+            ast_hash: zero,
+            signature_hash: zero,
+            behavior_hash: zero,
+            stability_score: 1.0,
+        }
+    }
+
+    fn parse_consumer_source(file_path: &str, source: &str) -> kin_index::FileParseData {
+        let registry = kin_parser::AdapterRegistry::new();
+        let ext = std::path::Path::new(file_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .expect("file extension");
+        let adapter = registry
+            .get_by_extension(ext)
+            .expect("language adapter for extension");
+        let language = adapter.language_id();
+        let file_id = FilePathId::new(file_path);
+        let bytes = source.as_bytes();
+        let tree = adapter.parse(bytes).expect("parse");
+        let output = adapter.extract(&tree, bytes, &file_id).expect("extract");
+        let entities = output
+            .entities
+            .into_iter()
+            .map(|e| e.into_entity_with_source(language, &file_id, Some(bytes)))
+            .collect();
+        kin_index::FileParseData {
+            file_path: file_path.to_string(),
+            entities,
+            relations: output.relations,
+            imports: output.imports,
+        }
+    }
+
+    /// The daemon's /spine/xref and /spine/impact serve real cross-repo edges
+    /// materialized from a parsed + linked fixture through the production refresh
+    /// path, and fail loud rather than return an empty impact.
+    #[tokio::test]
+    async fn spine_impact_and_xref_serve_real_cross_repo_fixture() {
+        let do_work_id = EntityId::new();
+        let provider_entry = kin_spine::EntityEntry {
+            repo_id: "provider".to_string(),
+            entity_id: do_work_id,
+            name: "do_work".to_string(),
+            kind: kin_model::EntityKind::Function,
+            signature: "fn do_work()".to_string(),
+            fingerprint: spine_test_fingerprint(),
+            file_path: Some("src/lib.rs".to_string()),
+            role: Some(kin_model::EntityRole::Source),
+        };
+
+        let consumer = parse_consumer_source(
+            "src/app.rs",
+            "use provider::do_work;\n\npub fn run_task() {\n    do_work();\n}\n",
+        );
+        let consumer_entities = consumer.entities.clone();
+        let consumer_relations = kin_index::link_cross_file(&[consumer]);
+        let run_task_id = consumer_entities
+            .iter()
+            .find(|e| e.name == "run_task")
+            .expect("run_task entity present")
+            .id;
+
+        let state = test_state();
+        let spine = state.ensure_spine().expect("spine enabled in test");
+        spine.register_repo("provider", vec![provider_entry], "");
+        spine.refresh_cross_repo_edges(
+            "consumer",
+            &consumer_entities,
+            &consumer_relations,
+            &["provider".to_string()],
+        );
+        assert!(
+            spine.edge_count() >= 1,
+            "fixture must materialize a cross-repo edge (parse -> link -> spine)"
+        );
+
+        let app = router(state);
+
+        let xref = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/spine/xref?repo=consumer&entity={}",
+                    run_task_id.0
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(xref.status(), StatusCode::OK);
+        let xbody: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(xref.into_body(), 65536).await.unwrap())
+                .unwrap();
+        let edges = xbody["edges"]
+            .as_array()
+            .expect("edges array in /spine/xref");
+        assert!(
+            !edges.is_empty(),
+            "/spine/xref must return the cross-repo edge, not an empty list"
+        );
+        assert!(
+            edges.iter().any(|e| e["dst_repo"] == "provider"),
+            "the cross-repo edge must resolve to the provider repo, got {edges:?}"
+        );
+
+        let impact = app
+            .oneshot(
+                Request::get(format!(
+                    "/spine/impact?repo=provider&entity={}&depth=5",
+                    do_work_id.0
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(impact.status(), StatusCode::OK);
+        let ibody: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(impact.into_body(), 65536)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let repos: Vec<&str> = ibody["repos_involved"]
+            .as_array()
+            .expect("repos_involved array in /spine/impact")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            repos.contains(&"consumer"),
+            "federated impact of do_work must include the consumer repo (blast radius), got {repos:?}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Scope parsing
     // -----------------------------------------------------------------------
