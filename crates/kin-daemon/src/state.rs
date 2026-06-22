@@ -2067,7 +2067,7 @@ mod tests {
         let caller = test_entity("caller", "src/main.rs");
         state
             .graph
-            .batch_upsert_entities(&[caller.clone()])
+            .batch_upsert_entities(std::slice::from_ref(&caller))
             .unwrap();
         state
             .graph
