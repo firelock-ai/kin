@@ -272,9 +272,49 @@ pub fn materialize_edges(
     count
 }
 
+/// Derive the real imported symbol name for a cross-repo reference from the
+/// relation's parser/linker evidence.
+///
+/// The graph node label (`entity:<id>`) is never a real symbol, so seeding
+/// resolution from it only ever matches a sibling entity by accident. A
+/// cross-repo reference can resolve meaningfully only when the relation carries
+/// the lexical symbol that was actually called or imported. Returns `None` when
+/// no usable symbol token is present; callers must treat that as an unresolved
+/// reference rather than fabricate a name.
+fn derive_imported_symbol(rel: &Relation) -> Option<String> {
+    rel.evidence
+        .iter()
+        .find_map(|ev| ev.token.as_deref().and_then(symbol_leaf))
+}
+
+/// Reduce a (possibly qualified) evidence token to its leaf identifier, e.g.
+/// `kin_db::InMemoryGraph` → `InMemoryGraph`, `requests.get` → `get`.
+///
+/// Returns `None` for tokens whose leaf is not a plain identifier (include
+/// directives, macro text, punctuation), so non-symbol evidence is rejected
+/// instead of producing a garbage name that could mis-resolve.
+fn symbol_leaf(token: &str) -> Option<String> {
+    let leaf = token
+        .rsplit(|c| c == '.' || c == ':')
+        .next()
+        .unwrap_or(token)
+        .trim();
+    if !leaf.is_empty() && leaf.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        Some(leaf.to_string())
+    } else {
+        None
+    }
+}
+
 /// Walk a repo's entity relations looking for Calls/References where:
 /// - The dst entity doesn't exist in the local entity set (external reference)
 /// - `import_source` is set on the relation
+/// - The relation carries a real imported-symbol token in its evidence
+///
+/// The imported symbol name is taken from the relation's parser/linker evidence
+/// (the symbol actually called/imported), never from the graph node label. When
+/// no symbol evidence is present the reference is left unresolved rather than
+/// emitting a wrong edge.
 ///
 /// Produces `Vec<UnresolvedImport>` that feeds into `resolve_imports()`.
 pub fn collect_unresolved_imports(
@@ -318,10 +358,18 @@ pub fn collect_unresolved_imports(
             None => continue,
         };
 
+        // The real imported symbol comes from parser/linker evidence on the
+        // relation. Without it we cannot pick a specific target entity, so we
+        // leave the reference unresolved rather than seed resolution from the
+        // graph node label (which only ever matched by accident).
+        let Some(imported_name) = derive_imported_symbol(rel) else {
+            continue;
+        };
+
         imports.push(UnresolvedImport {
             source_repo: repo_id.to_string(),
             source_entity: src_entity_id,
-            imported_name: format!("{}", rel.dst), // entity name unknown, use graph node label
+            imported_name,
             imported_kind: None,
             candidate_repos: registry_repo_ids
                 .iter()
@@ -613,8 +661,8 @@ mod tests {
     #[test]
     fn collect_unresolved_finds_external_refs_with_import_source() {
         use kin_model::{
-            EntityMetadata, EntityRole, GraphNodeId, LanguageId, RelationId, RelationOrigin,
-            Visibility,
+            EntityMetadata, EntityRole, GraphNodeId, LanguageId, RelationEvidence, RelationId,
+            RelationOrigin, Visibility,
         };
 
         let local_entity_id = EntityId::new();
@@ -639,7 +687,8 @@ mod tests {
         }];
 
         let relations = vec![
-            // Calls edge to external entity with import_source
+            // Calls edge to external entity with import_source and a real
+            // imported-symbol token in its evidence.
             Relation {
                 id: RelationId::new(),
                 kind: RelationKind::Calls,
@@ -649,7 +698,11 @@ mod tests {
                 origin: RelationOrigin::Parsed,
                 created_in: None,
                 import_source: Some("requests".to_string()),
-                evidence: vec![],
+                evidence: vec![RelationEvidence {
+                    token: Some("requests.get".to_string()),
+                    parser_rule: Some("call_expression".to_string()),
+                    ..RelationEvidence::default()
+                }],
             },
             // Contains edge (should be ignored — not Calls/References)
             Relation {
@@ -691,6 +744,9 @@ mod tests {
             "should find exactly one unresolved import (Calls with import_source)"
         );
         assert_eq!(unresolved[0].import_source.as_deref(), Some("requests"));
+        // The imported name is the real symbol from the relation's evidence
+        // token (leaf of `requests.get`), never the graph node label.
+        assert_eq!(unresolved[0].imported_name, "get");
         assert_eq!(unresolved[0].source_repo, "my-app");
         assert_eq!(unresolved[0].source_entity, local_entity_id);
         // candidate_repos should exclude the source repo
@@ -700,5 +756,250 @@ mod tests {
         assert!(unresolved[0]
             .candidate_repos
             .contains(&"requests".to_string()));
+    }
+
+    /// Build a local source entity for collection tests.
+    fn local_entity(id: EntityId, name: &str, language: kin_model::LanguageId) -> Entity {
+        use kin_model::{EntityMetadata, EntityRole, Visibility};
+        Entity {
+            id,
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language,
+            fingerprint: test_fp(),
+            file_origin: None,
+            span: None,
+            signature: format!("fn {name}()"),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    /// Build a Calls relation to an external entity, optionally carrying an
+    /// imported-symbol token in its evidence.
+    fn external_call(
+        src: EntityId,
+        dst: EntityId,
+        import_source: Option<&str>,
+        token: Option<&str>,
+    ) -> Relation {
+        use kin_model::{GraphNodeId, RelationEvidence, RelationId, RelationOrigin};
+        Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: import_source.map(|s| s.to_string()),
+            evidence: token
+                .map(|t| {
+                    vec![RelationEvidence {
+                        token: Some(t.to_string()),
+                        ..RelationEvidence::default()
+                    }]
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn symbol_leaf_keeps_simple_identifier() {
+        assert_eq!(
+            symbol_leaf("InMemoryGraph").as_deref(),
+            Some("InMemoryGraph")
+        );
+        assert_eq!(symbol_leaf("get").as_deref(), Some("get"));
+    }
+
+    #[test]
+    fn symbol_leaf_strips_module_qualifier() {
+        assert_eq!(
+            symbol_leaf("kin_db::InMemoryGraph").as_deref(),
+            Some("InMemoryGraph")
+        );
+        assert_eq!(symbol_leaf("requests.get").as_deref(), Some("get"));
+        assert_eq!(
+            symbol_leaf("util.finalizeIssue").as_deref(),
+            Some("finalizeIssue")
+        );
+    }
+
+    #[test]
+    fn symbol_leaf_rejects_non_symbol_tokens() {
+        // Include directives, quoted paths and empties are not symbols and must
+        // not become a fabricated imported name.
+        assert_eq!(symbol_leaf("#include \"app.hpp\""), None);
+        assert_eq!(symbol_leaf(""), None);
+        assert_eq!(symbol_leaf("::"), None);
+    }
+
+    #[test]
+    fn collect_derives_real_symbol_from_qualified_token() {
+        let caller = EntityId::new();
+        let external = EntityId::new();
+        let entities = vec![local_entity(
+            caller,
+            "use_graph",
+            kin_model::LanguageId::Rust,
+        )];
+        let relations = vec![external_call(
+            caller,
+            external,
+            Some("kin_db"),
+            Some("kin_db::InMemoryGraph"),
+        )];
+
+        let unresolved = collect_unresolved_imports(
+            &entities,
+            &relations,
+            "kin",
+            &["kin".to_string(), "kin-db".to_string()],
+        );
+
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].imported_name, "InMemoryGraph");
+        assert_eq!(unresolved[0].import_source.as_deref(), Some("kin_db"));
+    }
+
+    #[test]
+    fn collect_skips_external_ref_without_symbol_evidence() {
+        // import_source is set, but the relation carries no symbol token. We must
+        // NOT fall back to the graph node label (which would resolve only by
+        // accident) — the reference stays unresolved.
+        let caller = EntityId::new();
+        let external = EntityId::new();
+        let entities = vec![local_entity(
+            caller,
+            "use_graph",
+            kin_model::LanguageId::Rust,
+        )];
+        let relations = vec![external_call(caller, external, Some("kin_db"), None)];
+
+        let unresolved = collect_unresolved_imports(
+            &entities,
+            &relations,
+            "kin",
+            &["kin".to_string(), "kin-db".to_string()],
+        );
+
+        assert!(
+            unresolved.is_empty(),
+            "a reference without symbol evidence must be left unresolved, got {unresolved:?}"
+        );
+    }
+
+    #[test]
+    fn disambiguates_same_symbol_across_repos_via_import_source() {
+        // Two repos both export `Config`. The reference's import_source names
+        // one of them, so the resolver must pick that repo deterministically —
+        // never a coin-flip across the two equally-named entities.
+        let index = SpineIndex::new();
+        index.register_repo(
+            "repo-a",
+            vec![test_entry("repo-a", "Config", EntityKind::Class)],
+            "hash-a",
+        );
+        index.register_repo(
+            "repo-b",
+            vec![test_entry("repo-b", "Config", EntityKind::Class)],
+            "hash-b",
+        );
+
+        let caller = EntityId::new();
+        let external = EntityId::new();
+        let entities = vec![local_entity(caller, "build", kin_model::LanguageId::Python)];
+        let relations = vec![external_call(
+            caller,
+            external,
+            Some("repo-a"),
+            Some("Config"),
+        )];
+
+        let unresolved = collect_unresolved_imports(
+            &entities,
+            &relations,
+            "app",
+            &[
+                "app".to_string(),
+                "repo-a".to_string(),
+                "repo-b".to_string(),
+            ],
+        );
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].imported_name, "Config");
+
+        let results = resolve_imports(&index, &unresolved);
+        match &results[0].1 {
+            ResolveResult::Resolved {
+                target_repo,
+                confidence,
+                ..
+            } => {
+                assert_eq!(target_repo, "repo-a", "must pick the import_source repo");
+                assert!(*confidence >= 0.95);
+            }
+            other => panic!("expected Resolved to repo-a, got {other:?}"),
+        }
+
+        let edge_count = materialize_edges(&index, &unresolved, &results);
+        assert_eq!(edge_count, 1);
+    }
+
+    #[test]
+    fn same_symbol_without_repo_hint_is_deterministically_ambiguous() {
+        // Same two `Config`-exporting repos, but the import_source matches no
+        // registered repo and there is no fingerprint. The resolver must mark
+        // the reference ambiguous against BOTH candidates (a deterministic
+        // result) rather than silently committing to one.
+        let index = SpineIndex::new();
+        index.register_repo(
+            "repo-a",
+            vec![test_entry("repo-a", "Config", EntityKind::Class)],
+            "hash-a",
+        );
+        index.register_repo(
+            "repo-b",
+            vec![test_entry("repo-b", "Config", EntityKind::Class)],
+            "hash-b",
+        );
+
+        let caller = EntityId::new();
+        let external = EntityId::new();
+        let entities = vec![local_entity(caller, "build", kin_model::LanguageId::Python)];
+        let relations = vec![external_call(
+            caller,
+            external,
+            Some("unknown-module"),
+            Some("Config"),
+        )];
+
+        let unresolved = collect_unresolved_imports(
+            &entities,
+            &relations,
+            "app",
+            &[
+                "app".to_string(),
+                "repo-a".to_string(),
+                "repo-b".to_string(),
+            ],
+        );
+        assert_eq!(unresolved.len(), 1);
+
+        let results = resolve_imports(&index, &unresolved);
+        match &results[0].1 {
+            ResolveResult::Ambiguous { candidates } => {
+                assert_eq!(candidates.len(), 2);
+                let repos: HashSet<&str> = candidates.iter().map(|c| c.0.as_str()).collect();
+                assert!(repos.contains("repo-a") && repos.contains("repo-b"));
+            }
+            other => panic!("expected deterministic Ambiguous over both repos, got {other:?}"),
+        }
     }
 }
