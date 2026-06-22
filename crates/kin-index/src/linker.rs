@@ -498,12 +498,14 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
         }
 
         // (d) Cross-repo external reference: the target is not in this repo's
-        // parse universe, but the parser recorded the module it was imported
-        // from. Preserve it as an inferred edge carrying the imported symbol and
-        // source so the spine cross-repo resolver can match it against a sibling
-        // repo. Drops to the unresolved log below when no import source/symbol
-        // is available.
-        if let Some(external) = make_external_reference_relation(rel, src_id) {
+        // parse universe, but the parser recorded an external module it was
+        // imported from. Preserve it as an inferred edge carrying the imported
+        // symbol and source so the spine cross-repo resolver can match it
+        // against a sibling repo. Drops to the unresolved log below when no
+        // external import source/symbol is available.
+        if let Some(external) =
+            make_external_reference_relation(rel, src_id, &file.file_path, &ctx.known_files)
+        {
             if let GraphNodeId::Entity(dst_id) = external.dst {
                 if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
                     resolved.push(external);
@@ -841,7 +843,7 @@ const EXTERNAL_REFERENCE_KIND_TAG: &str = "ExternalReference";
 
 /// Emit a cross-repo reference edge for a Calls/References relation that could
 /// not be resolved to any local entity but carries a parser-provided import
-/// source.
+/// source from a module that lives outside this repo.
 ///
 /// The destination is a deterministic placeholder entity derived from the import
 /// source and the called/imported symbol. It is intentionally absent from this
@@ -851,7 +853,20 @@ const EXTERNAL_REFERENCE_KIND_TAG: &str = "ExternalReference";
 /// against a sibling repo. When the parser supplied no import source or no
 /// symbol, no edge is emitted — the reference stays honestly unresolved rather
 /// than fabricated.
-fn make_external_reference_relation(rel: &ExtractedRelation, src: EntityId) -> Option<Relation> {
+///
+/// An import whose module path resolves to a file in this repo is a local
+/// import, not a cross-repo reference: a symbol that fails local resolution
+/// there (e.g. a moved or deleted local definition) must not be mis-attributed
+/// as an external edge. Only module sources that do not resolve locally qualify.
+fn make_external_reference_relation<S>(
+    rel: &ExtractedRelation,
+    src: EntityId,
+    importer_file: &str,
+    known_files: &HashSet<S>,
+) -> Option<Relation>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
     if rel.kind != RelationKind::Calls && rel.kind != RelationKind::References {
         return None;
     }
@@ -862,6 +877,9 @@ fn make_external_reference_relation(rel: &ExtractedRelation, src: EntityId) -> O
         .filter(|s| !s.is_empty())?;
     let symbol = rel.dst_name.trim();
     if symbol.is_empty() {
+        return None;
+    }
+    if resolve_module_path(importer_file, import_source, known_files).is_some() {
         return None;
     }
 
@@ -1728,10 +1746,13 @@ pub fn link_cross_file_incremental(
             }
 
             // (d) Cross-repo external reference: preserve an unresolved
-            // import-bearing reference as an inferred edge carrying the imported
-            // symbol and source, so the spine cross-repo resolver can match it
-            // against a sibling repo. See `make_external_reference_relation`.
-            if let Some(external) = make_external_reference_relation(rel, src_id) {
+            // reference to an external module as an inferred edge carrying the
+            // imported symbol and source, so the spine cross-repo resolver can
+            // match it against a sibling repo. See
+            // `make_external_reference_relation`.
+            if let Some(external) =
+                make_external_reference_relation(rel, src_id, &file.file_path, &linker.known_files)
+            {
                 if let GraphNodeId::Entity(dst_id) = external.dst {
                     if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
                         resolved.push(external);
@@ -3070,6 +3091,50 @@ void f();
         assert_eq!(
             first[0].dst, second[0].dst,
             "external target id is stable across link runs"
+        );
+    }
+
+    #[test]
+    fn external_reference_skipped_for_local_module_import() {
+        // The import source resolves to a file in this repo, so a symbol that
+        // fails local resolution (e.g. a moved or deleted local definition) is a
+        // broken local import, not a cross-repo reference. No external edge may
+        // be fabricated for it.
+        let handler = make_entity("handler", "src/routes/api.ts");
+        // tools.ts still exists in the repo but no longer defines `executeTool`.
+        let surviving = make_entity("VERSION", "src/utils/tools.ts");
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/routes/api.ts".to_string(),
+                entities: vec![handler.clone()],
+                relations: vec![ExtractedRelation {
+                    kind: RelationKind::Calls,
+                    src_name: "handler".to_string(),
+                    dst_name: "executeTool".to_string(),
+                    import_source: Some("../utils/tools".to_string()),
+                }],
+                imports: vec![FileImport {
+                    module_path: "../utils/tools".to_string(),
+                    specifiers: vec![kin_parser::ImportedName {
+                        local_name: "executeTool".to_string(),
+                        original_name: None,
+                        is_default: false,
+                    }],
+                }],
+            },
+            FileParseData {
+                file_path: "src/utils/tools.ts".to_string(),
+                entities: vec![surviving],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        assert!(
+            result.iter().all(|r| r.kind != RelationKind::Calls),
+            "a broken local import must not be emitted as a cross-repo edge"
         );
     }
 }
