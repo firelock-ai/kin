@@ -166,6 +166,20 @@ impl SpineIndex {
             .collect()
     }
 
+    /// Get all cross-repo edges whose source repo is `repo_id`.
+    ///
+    /// `refresh_cross_repo_edges` replaces a repo's edges by source repo, so this
+    /// returns the exact set a persistence layer must mirror after a refresh.
+    pub fn cross_repo_edges_from(&self, repo_id: &str) -> Vec<CrossRepoEdge> {
+        let inner = self.inner.read();
+        inner
+            .cross_repo_edges
+            .iter()
+            .filter(|e| e.src_repo == repo_id)
+            .cloned()
+            .collect()
+    }
+
     /// Add a cross-repo edge to the index.
     pub fn add_cross_repo_edge(&self, edge: CrossRepoEdge) {
         let mut inner = self.inner.write();

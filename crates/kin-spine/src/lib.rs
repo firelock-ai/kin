@@ -13,18 +13,20 @@
 
 pub mod backend;
 pub mod federation;
-#[cfg(feature = "firestore")]
 pub mod firestore;
 pub mod index;
 pub mod routing;
+pub mod store;
 pub mod xref;
 
 pub use backend::{InMemorySpineBackend, SpineBackend, SpineError};
 pub use federation::{federated_impact, FederatedEdge, FederatedImpact, FederatedNode};
-#[cfg(feature = "firestore")]
 pub use firestore::FirestoreSpineBackend;
+#[cfg(feature = "firestore")]
+pub use firestore::FirestoreStore;
 pub use index::{CrossRepoEdge, EntityEntry, SpineIndex};
 pub use routing::{RepoEndpoint, RoutingTable};
+pub use store::{LoadedRepo, SpineStore};
 pub use xref::{
     collect_unresolved_imports, materialize_edges, resolve_imports, ResolveResult, UnresolvedImport,
 };
