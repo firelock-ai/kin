@@ -1837,9 +1837,11 @@ async fn command_resources(
         metal_profile: metal_profile_runtime(),
     };
 
+    let actual = kin_cli::commands::resources::ActualResources::capture();
     let response = kin_cli::commands::resources::build_command_resources_response(
         plan,
         embed_runtime,
+        actual,
         request.json,
     )
     .map_err(internal_error)?;
