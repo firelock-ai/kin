@@ -74,4 +74,5 @@ kin-infer = { version = ">=0.2.1", registry = "kin", features = ["metal"] }
 kin-git = { workspace = true }
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
+serial_test = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
