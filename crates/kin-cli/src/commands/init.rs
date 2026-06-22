@@ -593,7 +593,14 @@ pub async fn run(
         // Include artifact_deltas for every file so that the VFS tree
         // (built from the change DAG) knows which files exist.
         let branch_name = kin_core::read_current_branch(&layout)?;
-        let change_id = compute_init_change_id(&genesis_id);
+        let change_id = compute_init_change_id(
+            &genesis_id,
+            &compute_artifact_fingerprint(
+                indexable_files
+                    .iter()
+                    .map(|f| (f.rel_path.as_str(), &f.hash)),
+            ),
+        );
 
         // Ensure every tracked file has its blob in the store.
         // The warm-cache path may skip unchanged files, leaving blobs missing.
@@ -3356,15 +3363,41 @@ fn ensure_graph_surface_materialized(
     Ok(())
 }
 
-/// Compute a unique change ID for the init auto-parse commit.
-fn compute_init_change_id(parent: &SemanticChangeId) -> SemanticChangeId {
+/// Deterministic digest of the (path, content-hash) set, independent of
+/// wall-clock time, machine path, and walk order. The path length prefix keeps
+/// the digest unambiguous across path boundaries.
+fn compute_artifact_fingerprint<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a [u8; 32])>,
+) -> [u8; 32] {
+    let mut entries: Vec<(&str, &[u8; 32])> = entries.into_iter().collect();
+    entries.sort_unstable();
+    let mut hasher = Sha256::new();
+    hasher.update(b"kin-init-artifacts-v1:");
+    for (path, hash) in entries {
+        hasher.update((path.len() as u64).to_le_bytes());
+        hasher.update(path.as_bytes());
+        hasher.update(hash);
+    }
+    let result = hasher.finalize();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&result);
+    bytes
+}
+
+/// Deterministic change ID for the init auto-parse commit: a pure function of
+/// the parent change and the artifact content fingerprint, so two independent
+/// preps of the same graph produce the same ID.
+fn compute_init_change_id(
+    parent: &SemanticChangeId,
+    artifact_fingerprint: &[u8; 32],
+) -> SemanticChangeId {
     let mut hasher = Sha256::new();
     hasher.update(b"kin-change-v1:");
     hasher.update(b"kin init: auto-parse");
     hasher.update(b":");
     hasher.update(parent.0.as_bytes());
     hasher.update(b":");
-    hasher.update(chrono::Utc::now().to_rfc3339().as_bytes());
+    hasher.update(artifact_fingerprint);
     let result = hasher.finalize();
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(&result);
@@ -3424,6 +3457,37 @@ mod tests {
         let full = git_history_import_options("full").unwrap();
         assert_eq!(full.max_commits, 0);
         assert!(!full.shallow);
+    }
+
+    #[test]
+    fn init_change_id_is_content_addressed_not_wall_clock() {
+        let parent = SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32]));
+        let a: [u8; 32] = [0xaa; 32];
+        let b: [u8; 32] = [0xbb; 32];
+        let fingerprint = compute_artifact_fingerprint([("src/a.rs", &a), ("src/b.rs", &b)]);
+
+        let id1 = compute_init_change_id(&parent, &fingerprint);
+        let id2 = compute_init_change_id(&parent, &fingerprint);
+        assert_eq!(
+            id1.to_string(),
+            id2.to_string(),
+            "same parent + content must yield an identical change id (no wall-clock)"
+        );
+
+        assert_eq!(
+            fingerprint,
+            compute_artifact_fingerprint([("src/b.rs", &b), ("src/a.rs", &a)]),
+            "fingerprint must be independent of walk order"
+        );
+
+        let c: [u8; 32] = [0xcc; 32];
+        let id3 =
+            compute_init_change_id(&parent, &compute_artifact_fingerprint([("src/a.rs", &c)]));
+        assert_ne!(
+            id1.to_string(),
+            id3.to_string(),
+            "different artifact content must yield a different change id"
+        );
     }
 
     fn with_env_var<T>(name: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
