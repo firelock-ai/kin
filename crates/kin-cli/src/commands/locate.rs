@@ -13837,16 +13837,66 @@ mod tests {
         );
     }
 
-    // Full end-to-end assertion that a complete graph drives locate with zero
-    // recorded source-text graph gaps. Requires a live daemon/graph fixture, so
-    // it is excluded from the default suite and run in the serial daemon window.
+    // Full end-to-end assertion that a graph with complete source-body coverage
+    // drives locate with zero recorded source-text graph gaps. Every entity
+    // carries its graph-owned body (an opaque artifact with non-empty text), the
+    // shape a daemon holds for a fully indexed repo, so locate's authority path
+    // resolves all source text from graph truth and never falls back to a raw
+    // workspace disk read. `LOCATE_GRAPH_SOURCE_GAPS` is the source-body coverage
+    // signal — a nonzero value would mean the authority path hit a graph gap and
+    // would otherwise have needed disk.
     #[test]
-    #[ignore = "requires live daemon/graph fixture; run in the serial daemon window"]
+    #[serial_test::serial]
     fn locate_over_complete_graph_records_zero_source_text_gaps() {
+        let graph = kin_db::InMemoryGraph::new();
+        let entities = [
+            test_entity("parse_config", "src/config.rs", 1, 40),
+            test_entity("load_settings", "src/settings.rs", 1, 30),
+        ];
+        for entity in &entities {
+            graph.upsert_entity(entity).unwrap();
+        }
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("src/config.rs"),
+                content_hash: Hash256::from_bytes([21; 32]),
+                mime_type: Some("text/x-rust".into()),
+                text_preview: Some(
+                    "fn parse_config() reads and parses the configuration settings".into(),
+                ),
+            })
+            .unwrap();
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("src/settings.rs"),
+                content_hash: Hash256::from_bytes([22; 32]),
+                mime_type: Some("text/x-rust".into()),
+                text_preview: Some(
+                    "fn load_settings() loads settings from the parsed configuration".into(),
+                ),
+            })
+            .unwrap();
+        graph.flush_text_index().unwrap();
+
         let before = locate_graph_source_gap_count();
-        // A daemon-backed locate over a fully materialized graph must answer
-        // entirely from graph-owned bodies. Wire the live fixture here, run a
-        // representative locate, then assert no authority path fell into a gap.
+
+        // `workspace_root = None` is a scoped-session daemon locate: the
+        // workspace is off-limits, so every source-text resolution must be
+        // satisfied from graph-owned bodies or reported as a gap.
+        let result = run_with_graph_capture_in_workspace(
+            &graph,
+            None,
+            "where is parse_config defined",
+            true,
+            10,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            !result.files.is_empty(),
+            "complete-graph locate should return graph-derived results"
+        );
         assert_eq!(
             locate_graph_source_gap_count(),
             before,
