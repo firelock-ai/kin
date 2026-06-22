@@ -2312,14 +2312,14 @@ pub struct MetalCompute {
     queue: CommandQueue,
     pipelines: HashMap<&'static str, ComputePipelineState>,
     device_name: String,
-    /// Cache weight buffers on GPU keyed by (data_ptr, len). Weight matrices
-    /// are the same across all forward passes, so allocating once and reusing
-    /// eliminates ~100GB of redundant copies for a typical embedding run.
-    weight_cache: Mutex<HashMap<(usize, usize), Buffer>>,
+    /// Cache weight buffers on GPU keyed by (data_ptr, len, first_element_bits, last_element_bits).
+    /// Weight matrices are the same across all forward passes, so allocating once and
+    /// reusing eliminates ~100GB of redundant copies for a typical embedding run.
+    weight_cache: Mutex<HashMap<(usize, usize, u32, u32), Buffer>>,
     /// Cache row-concatenated weight buffers (e.g. q|k|v, gate|up) keyed by the
-    /// component weights' stable (ptr, len) pairs, so the fat GEMM uploads the
-    /// concatenation once and reuses it across every forward pass.
-    concat_cache: Mutex<HashMap<Vec<(usize, usize)>, Buffer>>,
+    /// component weights' stable (ptr, len, first_bits, last_bits) tuples, so the
+    /// fat GEMM uploads the concatenation once and reuses it across every forward pass.
+    concat_cache: Mutex<HashMap<Vec<(usize, usize, u32, u32)>, Buffer>>,
     /// Bounded in-flight depth gate shared with completion handlers.
     inflight: InflightGate,
     /// Maximum committed-but-incomplete command buffers, resolved once at
@@ -2729,10 +2729,12 @@ impl MetalCompute {
     }
 
     /// Get or create a cached buffer for persistent data (weight matrices).
-    /// Keyed by (pointer, len) — weight Array2 data pointers are stable
-    /// across forward passes, so this hits on every call after the first.
+    /// Keyed by (pointer, len, first_bits, last_bits) — weight Array2 data pointers
+    /// are stable across forward passes, so this hits on every call after the first.
     fn buf_cached(&self, data: &[f32]) -> Result<Buffer, InferError> {
-        let key = (data.as_ptr() as usize, data.len());
+        let first_bits = data.first().map(|x| x.to_bits()).unwrap_or(0);
+        let last_bits = data.last().map(|x| x.to_bits()).unwrap_or(0);
+        let key = (data.as_ptr() as usize, data.len(), first_bits, last_bits);
         let mut cache = self.weight_cache.lock();
         if let Some(buf) = cache.get(&key) {
             return Ok(buf.clone());
@@ -2745,12 +2747,17 @@ impl MetalCompute {
     /// Get or create a cached GPU buffer holding `weights` concatenated
     /// row-major in order. The weight Array2 data pointers are stable across
     /// forward passes, so the concatenation — built once — is keyed by the
-    /// component (ptr, len) pairs and reused on every subsequent call. Used to
-    /// fold the q/k/v (and gate/up) projections into one fat GEMM.
+    /// component (ptr, len, first_bits, last_bits) tuples and reused on every
+    /// subsequent call. Used to fold the q/k/v (and gate/up) projections into
+    /// one fat GEMM.
     fn buf_cached_concat(&self, weights: &[&[f32]]) -> Result<Buffer, InferError> {
-        let key: Vec<(usize, usize)> = weights
+        let key: Vec<(usize, usize, u32, u32)> = weights
             .iter()
-            .map(|w| (w.as_ptr() as usize, w.len()))
+            .map(|w| {
+                let first_bits = w.first().map(|x| x.to_bits()).unwrap_or(0);
+                let last_bits = w.last().map(|x| x.to_bits()).unwrap_or(0);
+                (w.as_ptr() as usize, w.len(), first_bits, last_bits)
+            })
             .collect();
         let mut cache = self.concat_cache.lock();
         if let Some(buf) = cache.get(&key) {
