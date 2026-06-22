@@ -84,6 +84,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
+      - name: Check Zero File-Search Invariant
+        run: python3 scripts/verify-zero-file-search.py
+
       # TEMPORARY debt allow-list — burn down per crates/kin-cli/docs/kin-cli-clippy-triage.md
       # + release-ops task; no additions without lead sign-off.
       # Enumerated from `cargo clippy --all-targets --all-features` on main against
