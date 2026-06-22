@@ -2319,6 +2319,7 @@ pub struct MetalCompute {
     /// Cache row-concatenated weight buffers (e.g. q|k|v, gate|up) keyed by the
     /// component weights' stable (ptr, len, first_bits, last_bits) tuples, so the
     /// fat GEMM uploads the concatenation once and reuses it across every forward pass.
+    #[allow(clippy::type_complexity)]
     concat_cache: Mutex<HashMap<Vec<(usize, usize, u32, u32)>, Buffer>>,
     /// Bounded in-flight depth gate shared with completion handlers.
     inflight: InflightGate,
