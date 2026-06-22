@@ -497,6 +497,21 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
             continue;
         }
 
+        // (d) Cross-repo external reference: the target is not in this repo's
+        // parse universe, but the parser recorded the module it was imported
+        // from. Preserve it as an inferred edge carrying the imported symbol and
+        // source so the spine cross-repo resolver can match it against a sibling
+        // repo. Drops to the unresolved log below when no import source/symbol
+        // is available.
+        if let Some(external) = make_external_reference_relation(rel, src_id) {
+            if let GraphNodeId::Entity(dst_id) = external.dst {
+                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                    resolved.push(external);
+                }
+            }
+            continue;
+        }
+
         debug!(
             src = %rel.src_name,
             dst = %rel.dst_name,
@@ -811,6 +826,64 @@ fn make_relation(kind: RelationKind, src: EntityId, dst: EntityId, confidence: f
         import_source: None,
         evidence: Vec::new(),
     }
+}
+
+/// Confidence assigned to an unresolved cross-repo reference edge. The target
+/// entity lives in another repository and is absent from this repo's parse
+/// universe, so the edge is inferred until the spine cross-repo resolver matches
+/// it against a registered sibling repo.
+const EXTERNAL_REFERENCE_CONFIDENCE: f32 = 0.2;
+
+/// Synthetic tag used to derive a deterministic, repo-stable id for an external
+/// (cross-repo) reference target. It is never a real `EntityKind`, so the
+/// derived id can never collide with a locally indexed entity.
+const EXTERNAL_REFERENCE_KIND_TAG: &str = "ExternalReference";
+
+/// Emit a cross-repo reference edge for a Calls/References relation that could
+/// not be resolved to any local entity but carries a parser-provided import
+/// source.
+///
+/// The destination is a deterministic placeholder entity derived from the import
+/// source and the called/imported symbol. It is intentionally absent from this
+/// repo's entity set, which is exactly the signal the spine cross-repo resolver
+/// keys on. The relation carries the lexical symbol as `evidence.token` and the
+/// module hint as `import_source`, the two facts the resolver needs to match it
+/// against a sibling repo. When the parser supplied no import source or no
+/// symbol, no edge is emitted — the reference stays honestly unresolved rather
+/// than fabricated.
+fn make_external_reference_relation(rel: &ExtractedRelation, src: EntityId) -> Option<Relation> {
+    if rel.kind != RelationKind::Calls && rel.kind != RelationKind::References {
+        return None;
+    }
+    let import_source = rel
+        .import_source
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let symbol = rel.dst_name.trim();
+    if symbol.is_empty() {
+        return None;
+    }
+
+    let dst = EntityId::from_content(import_source, symbol, EXTERNAL_REFERENCE_KIND_TAG, 0);
+    let id = stable_relation_id(&src, &dst, &rel.kind);
+
+    Some(Relation {
+        id,
+        kind: rel.kind,
+        src: GraphNodeId::Entity(src),
+        dst: GraphNodeId::Entity(dst),
+        confidence: EXTERNAL_REFERENCE_CONFIDENCE,
+        origin: RelationOrigin::Inferred,
+        created_in: None,
+        import_source: Some(import_source.to_string()),
+        evidence: vec![RelationEvidence {
+            token: Some(symbol.to_string()),
+            parser_rule: Some("external_import_reference".to_string()),
+            source_path: Some(import_source.to_string()),
+            ..RelationEvidence::default()
+        }],
+    })
 }
 
 // Graph-less caller: the cross-file linker pipeline builds these artifact
@@ -1650,7 +1723,21 @@ pub fn link_cross_file_incremental(
                     if add_deduped(&mut seen, src_id, *dst_id, rel.kind) {
                         resolved.push(make_relation(rel.kind, src_id, *dst_id, 0.7));
                     }
+                    continue;
                 }
+            }
+
+            // (d) Cross-repo external reference: preserve an unresolved
+            // import-bearing reference as an inferred edge carrying the imported
+            // symbol and source, so the spine cross-repo resolver can match it
+            // against a sibling repo. See `make_external_reference_relation`.
+            if let Some(external) = make_external_reference_relation(rel, src_id) {
+                if let GraphNodeId::Entity(dst_id) = external.dst {
+                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                        resolved.push(external);
+                    }
+                }
+                continue;
             }
         }
     }
@@ -2879,5 +2966,110 @@ void f();
         assert_eq!(result[0].kind, RelationKind::Calls);
         assert_eq!(result[0].src, GraphNodeId::Entity(e1.id));
         assert_eq!(result[0].dst, GraphNodeId::Entity(e2.id));
+    }
+
+    #[test]
+    fn external_reference_carries_symbol_and_import_source() {
+        // A call to a symbol that lives in another repo: the target is absent
+        // from this repo's parse universe, but the parser recorded the module it
+        // was imported from. The linker must preserve it as a cross-repo edge
+        // carrying the lexical symbol (evidence.token) and the module hint
+        // (import_source) — exactly what the spine resolver keys on.
+        let caller = make_entity("run_task", "src/app.rs");
+
+        let files = vec![FileParseData {
+            file_path: "src/app.rs".to_string(),
+            entities: vec![caller.clone()],
+            relations: vec![ExtractedRelation {
+                kind: RelationKind::Calls,
+                src_name: "run_task".to_string(),
+                dst_name: "InMemoryGraph".to_string(),
+                import_source: Some("kin_db".to_string()),
+            }],
+            imports: vec![],
+        }];
+
+        let result = link_cross_file(&files);
+        assert_eq!(result.len(), 1, "one cross-repo reference edge expected");
+        let edge = &result[0];
+        assert_eq!(edge.kind, RelationKind::Calls);
+        assert_eq!(edge.src, GraphNodeId::Entity(caller.id));
+        // The destination is an external placeholder, never a local entity.
+        assert_ne!(edge.dst, GraphNodeId::Entity(caller.id));
+        assert_eq!(edge.import_source.as_deref(), Some("kin_db"));
+        assert_eq!(edge.origin, RelationOrigin::Inferred);
+        let token = edge
+            .evidence
+            .iter()
+            .find_map(|ev| ev.token.as_deref())
+            .expect("evidence token present");
+        assert_eq!(token, "InMemoryGraph");
+    }
+
+    #[test]
+    fn external_reference_not_emitted_without_import_source() {
+        // No import source from the parser means we cannot honestly attribute
+        // the reference to any repo — it must stay unresolved, not fabricated.
+        let caller = make_entity("run_task", "src/app.rs");
+
+        let files = vec![FileParseData {
+            file_path: "src/app.rs".to_string(),
+            entities: vec![caller.clone()],
+            relations: vec![ExtractedRelation {
+                kind: RelationKind::Calls,
+                src_name: "run_task".to_string(),
+                dst_name: "InMemoryGraph".to_string(),
+                import_source: None,
+            }],
+            imports: vec![],
+        }];
+
+        let result = link_cross_file(&files);
+        assert!(
+            result.is_empty(),
+            "no edge should be fabricated without an import source"
+        );
+    }
+
+    #[test]
+    fn external_reference_is_deterministic_and_deduped() {
+        // Two call sites to the same external symbol collapse to one stable edge,
+        // and the derived target id is identical across independent link runs.
+        let caller = make_entity("run_task", "src/app.rs");
+        let other = make_entity("run_again", "src/app.rs");
+
+        let build = |entities: Vec<Entity>| FileParseData {
+            file_path: "src/app.rs".to_string(),
+            entities,
+            relations: vec![
+                ExtractedRelation {
+                    kind: RelationKind::Calls,
+                    src_name: "run_task".to_string(),
+                    dst_name: "InMemoryGraph".to_string(),
+                    import_source: Some("kin_db".to_string()),
+                },
+                ExtractedRelation {
+                    kind: RelationKind::Calls,
+                    src_name: "run_again".to_string(),
+                    dst_name: "InMemoryGraph".to_string(),
+                    import_source: Some("kin_db".to_string()),
+                },
+            ],
+            imports: vec![],
+        };
+
+        let first = link_cross_file(&[build(vec![caller.clone(), other.clone()])]);
+        // Two distinct sources, same external target → two edges sharing one dst.
+        assert_eq!(first.len(), 2);
+        let dst_a = first[0].dst;
+        let dst_b = first[1].dst;
+        assert_eq!(dst_a, dst_b, "same symbol/source → same external target id");
+
+        let second = link_cross_file(&[build(vec![caller, other])]);
+        assert_eq!(second.len(), 2);
+        assert_eq!(
+            first[0].dst, second[0].dst,
+            "external target id is stable across link runs"
+        );
     }
 }
