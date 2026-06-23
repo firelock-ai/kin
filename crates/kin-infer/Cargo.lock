@@ -440,7 +440,7 @@ dependencies = [
 
 [[package]]
 name = "kin-infer"
-version = "0.2.31"
+version = "0.2.32"
 dependencies = [
  "block",
  "half",

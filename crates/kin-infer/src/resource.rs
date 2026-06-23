@@ -245,6 +245,107 @@ impl GpuKernelPlan {
         }
         plan
     }
+
+    /// The selected value of a single lever in this plan.
+    pub fn get(&self, kernel: GpuKernel) -> bool {
+        match kernel {
+            GpuKernel::GemmFp16 => self.gemm_fp16,
+            GpuKernel::Steel => self.steel,
+            GpuKernel::MmaWide => self.mma_wide,
+            GpuKernel::ReshapeGpu => self.reshape_gpu,
+            GpuKernel::FlashAttention => self.flash_attention,
+            GpuKernel::PooledOutput => self.pooled_output,
+        }
+    }
+
+    fn field_mut(&mut self, kernel: GpuKernel) -> &mut bool {
+        match kernel {
+            GpuKernel::GemmFp16 => &mut self.gemm_fp16,
+            GpuKernel::Steel => &mut self.steel,
+            GpuKernel::MmaWide => &mut self.mma_wide,
+            GpuKernel::ReshapeGpu => &mut self.reshape_gpu,
+            GpuKernel::FlashAttention => &mut self.flash_attention,
+            GpuKernel::PooledOutput => &mut self.pooled_output,
+        }
+    }
+
+    /// Apply per-lever overrides to this derived plan. `lookup` returns
+    /// `Some(true)`/`Some(false)` to force a lever on/off, or `None` to keep the
+    /// profile/backend-derived value. Precedence: an explicit override always
+    /// wins over the derived default — the single canonical copy of the rule
+    /// each Metal-backend call site applies today by hand. Used by
+    /// [`resolved_gpu_kernel_plan`] with the `KIN_INFER_*` env overrides as the
+    /// lookup.
+    pub fn with_overrides(mut self, lookup: impl Fn(GpuKernel) -> Option<bool>) -> GpuKernelPlan {
+        for kernel in GpuKernel::ALL {
+            if let Some(forced) = lookup(kernel) {
+                *self.field_mut(kernel) = forced;
+            }
+        }
+        self
+    }
+}
+
+/// Per-lever selector for the [`GpuKernelPlan`] kernel families. Each variant
+/// maps to one plan field and to the canonical `KIN_INFER_*` environment
+/// override that forces that lever on or off independent of the
+/// profile/backend-derived default. This is the single source of truth for
+/// those override names: the embedding forward path resolves a lever through
+/// [`resolved_gpu_kernel`] (or the whole plan through
+/// [`resolved_gpu_kernel_plan`]) instead of naming the variable at each call
+/// site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GpuKernel {
+    GemmFp16,
+    Steel,
+    MmaWide,
+    ReshapeGpu,
+    FlashAttention,
+    PooledOutput,
+}
+
+impl GpuKernel {
+    /// Every per-lever kernel knob, in declaration order. Plan-wide resolution
+    /// iterates this so a new lever is overridable as soon as it is listed here.
+    pub const ALL: [GpuKernel; 6] = [
+        GpuKernel::GemmFp16,
+        GpuKernel::Steel,
+        GpuKernel::MmaWide,
+        GpuKernel::ReshapeGpu,
+        GpuKernel::FlashAttention,
+        GpuKernel::PooledOutput,
+    ];
+
+    /// Canonical `KIN_INFER_*` environment variable that overrides this lever in
+    /// either direction (parsed via [`env_flag_override`]).
+    pub fn env_var(self) -> &'static str {
+        match self {
+            GpuKernel::GemmFp16 => "KIN_INFER_GEMM_FP16",
+            GpuKernel::Steel => "KIN_INFER_STEEL",
+            GpuKernel::MmaWide => "KIN_INFER_MMA_WIDE",
+            GpuKernel::ReshapeGpu => "KIN_INFER_RESHAPE_GPU",
+            GpuKernel::FlashAttention => "KIN_INFER_FLASH_ATTENTION",
+            GpuKernel::PooledOutput => "KIN_INFER_POOLED_OUTPUT",
+        }
+    }
+}
+
+/// The fully-resolved GPU kernel plan for the active embedding process: the
+/// profile/backend-derived plan ([`active_gpu_kernel_plan`]) with every
+/// `KIN_INFER_*` env override applied, an explicit override winning over the
+/// derived default. This is the selection the Metal forward path actually gates
+/// on; exposing it in one place lets callers report the resolved value without
+/// recomputing the precedence per lever.
+pub fn resolved_gpu_kernel_plan() -> GpuKernelPlan {
+    active_gpu_kernel_plan().with_overrides(|kernel| env_flag_override(kernel.env_var()))
+}
+
+/// The resolved value of a single GPU kernel lever: its `KIN_INFER_*` env
+/// override if set, otherwise the profile/backend-derived default. Matches the
+/// corresponding field of [`resolved_gpu_kernel_plan`]; provided for a caller
+/// that needs only one lever and should not resolve the whole plan.
+pub fn resolved_gpu_kernel(kernel: GpuKernel) -> bool {
+    env_flag_override(kernel.env_var()).unwrap_or_else(|| active_gpu_kernel_plan().get(kernel))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -971,6 +1072,98 @@ mod tests {
     #[test]
     fn env_flag_override_parses_both_directions() {
         assert_eq!(env_flag_override("KIN_INFER_NONEXISTENT_FLAG_XYZ"), None);
+    }
+
+    #[test]
+    fn gpu_kernel_env_var_names_are_canonical() {
+        assert_eq!(GpuKernel::GemmFp16.env_var(), "KIN_INFER_GEMM_FP16");
+        assert_eq!(GpuKernel::Steel.env_var(), "KIN_INFER_STEEL");
+        assert_eq!(GpuKernel::MmaWide.env_var(), "KIN_INFER_MMA_WIDE");
+        assert_eq!(GpuKernel::ReshapeGpu.env_var(), "KIN_INFER_RESHAPE_GPU");
+        assert_eq!(
+            GpuKernel::FlashAttention.env_var(),
+            "KIN_INFER_FLASH_ATTENTION"
+        );
+        assert_eq!(GpuKernel::PooledOutput.env_var(), "KIN_INFER_POOLED_OUTPUT");
+    }
+
+    #[test]
+    fn gpu_kernel_all_lists_each_lever_once() {
+        assert_eq!(GpuKernel::ALL.len(), 6);
+        let mut seen = std::collections::HashSet::new();
+        for kernel in GpuKernel::ALL {
+            assert!(
+                seen.insert(kernel.env_var()),
+                "duplicate lever {kernel:?} in GpuKernel::ALL"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_kernel_get_reads_matching_field() {
+        let plan = GpuKernelPlan {
+            gemm_fp16: true,
+            steel: false,
+            mma_wide: true,
+            reshape_gpu: false,
+            flash_attention: true,
+            pooled_output: false,
+        };
+        assert!(plan.get(GpuKernel::GemmFp16));
+        assert!(!plan.get(GpuKernel::Steel));
+        assert!(plan.get(GpuKernel::MmaWide));
+        assert!(!plan.get(GpuKernel::ReshapeGpu));
+        assert!(plan.get(GpuKernel::FlashAttention));
+        assert!(!plan.get(GpuKernel::PooledOutput));
+    }
+
+    #[test]
+    fn with_overrides_none_keeps_derived_default() {
+        // No override for any lever: the derived plan passes through unchanged.
+        let derived = GpuKernelPlan::resolve(Profile::Throughput, AcceleratorBackend::Metal);
+        assert!(derived.pooled_output); // throughput/Metal derives this on
+        assert_eq!(derived.with_overrides(|_| None), derived);
+    }
+
+    #[test]
+    fn with_overrides_explicit_value_wins_over_derived() {
+        // An explicit override beats the derived default in both directions.
+        let derived = GpuKernelPlan::resolve(Profile::Throughput, AcceleratorBackend::Metal);
+        assert!(derived.pooled_output);
+        assert!(!derived.gemm_fp16);
+
+        let resolved = derived.with_overrides(|kernel| match kernel {
+            GpuKernel::PooledOutput => Some(false), // force off over a derived on
+            GpuKernel::GemmFp16 => Some(true),      // force on over a derived off
+            _ => None,
+        });
+        assert!(!resolved.pooled_output);
+        assert!(resolved.gemm_fp16);
+        // Levers without an override keep the derived default: steel is derived
+        // on for throughput/Metal, flash_attention derived off.
+        assert!(resolved.steel);
+        assert!(!resolved.flash_attention);
+    }
+
+    #[test]
+    fn with_overrides_applies_every_lever() {
+        // A force value for every lever yields a uniform plan regardless of base.
+        let all_on = GpuKernelPlan::default().with_overrides(|_| Some(true));
+        for kernel in GpuKernel::ALL {
+            assert!(all_on.get(kernel), "{kernel:?} not forced on");
+        }
+        let all_off = GpuKernelPlan {
+            gemm_fp16: true,
+            steel: true,
+            mma_wide: true,
+            reshape_gpu: true,
+            flash_attention: true,
+            pooled_output: true,
+        }
+        .with_overrides(|_| Some(false));
+        for kernel in GpuKernel::ALL {
+            assert!(!all_off.get(kernel), "{kernel:?} not forced off");
+        }
     }
 
     #[test]
