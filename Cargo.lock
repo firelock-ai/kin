@@ -3003,6 +3003,7 @@ dependencies = [
  "kin-db",
  "kin-model",
  "pretty_assertions",
+ "rayon",
  "serde",
  "serde_json",
  "tempfile",
