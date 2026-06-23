@@ -564,15 +564,24 @@ pub fn compute_subgraph_hash_generic(
         let _ = ehash; // used below
 
         if let Some(rel_ids) = source.hash_outgoing(&eid) {
+            // Discover destinations in a deterministic (id-sorted) order. The
+            // adjacency slice order is not guaranteed across runs, and the DFS
+            // discovery order decides which edge of a cycle becomes the
+            // ZERO_HASH back-edge — so an unsorted push would make cyclic
+            // subgraph hashes (and thus the graph root) depend on adjacency
+            // insertion order rather than on graph content alone.
+            let mut next: Vec<EntityId> = Vec::new();
             for rel_id in rel_ids {
                 if let Some(relation) = source.hash_relation(rel_id) {
                     if let GraphNodeId::Entity(dst_eid) = &relation.dst {
                         if !cache.contains_key(dst_eid) {
-                            visit_stack.push(*dst_eid);
+                            next.push(*dst_eid);
                         }
                     }
                 }
             }
+            next.sort_unstable_by_key(|e| *e.0.as_bytes());
+            visit_stack.extend(next);
         }
     }
 
@@ -1175,6 +1184,40 @@ mod tests {
         let h2 = compute_graph_root_hash(&snap2);
 
         assert_eq!(h1, h2, "root hash should stay stable for cyclic graphs");
+    }
+
+    #[test]
+    fn graph_root_hash_is_independent_of_adjacency_order_with_branching_cycle() {
+        // e1 points to BOTH members of a cycle (e2 <-> e3). The DFS discovery
+        // order of e2 vs e3 — and therefore which edge becomes the ZERO_HASH
+        // back-edge — must depend only on graph content, never on e1's
+        // adjacency (outgoing edge) order. Fixed ids make the fixture
+        // order-sensitive deterministically.
+        let mut e1 = test_entity("alpha");
+        let mut e2 = test_entity("beta");
+        let mut e3 = test_entity("gamma");
+        e1.id = EntityId(uuid::Uuid::from_u128(1));
+        e2.id = EntityId(uuid::Uuid::from_u128(2));
+        e3.id = EntityId(uuid::Uuid::from_u128(3));
+
+        let r_a = test_relation(e1.id, e2.id, RelationKind::Calls);
+        let r_b = test_relation(e1.id, e3.id, RelationKind::Calls);
+        let r_c = test_relation(e2.id, e3.id, RelationKind::Calls);
+        let r_d = test_relation(e3.id, e2.id, RelationKind::Calls);
+
+        let ents = vec![e1, e2, e3];
+        // snap1 discovers e1's out-edges as [e2, e3]; snap2 as [e3, e2].
+        let snap1 = build_snapshot(
+            ents.clone(),
+            vec![r_a.clone(), r_b.clone(), r_c.clone(), r_d.clone()],
+        );
+        let snap2 = build_snapshot(ents, vec![r_b, r_a, r_c, r_d]);
+
+        assert_eq!(
+            compute_graph_root_hash(&snap1),
+            compute_graph_root_hash(&snap2),
+            "graph root must not depend on adjacency (outgoing edge) order"
+        );
     }
 
     #[test]
