@@ -3,6 +3,31 @@
   "organization": "firelock-ai",
   "status": "current",
   "description": "Current Kin ecosystem topology and repo ownership map.",
+  "naming": {
+    "summary": "Firelock (the company) builds Kin (the semantic repo and collaboration substrate). KinLab is the hosted collaboration product; @kinlab is the shared package and registry scope.",
+    "product": {
+      "name": "Kin",
+      "descriptor": "The semantic repo and collaboration substrate — the system of record for software work.",
+      "github": "https://github.com/firelock-ai/kin"
+    },
+    "company": {
+      "name": "Firelock",
+      "legalEntity": "Firelock, LLC",
+      "alsoKnownAs": ["Firelock AI"],
+      "githubOrg": "firelock-ai"
+    },
+    "hostedProduct": {
+      "name": "KinLab",
+      "descriptor": "The hosted collaboration and control-plane product.",
+      "domain": "kinlab.ai",
+      "install": "get.kinlab.dev"
+    },
+    "packageScope": {
+      "name": "@kinlab",
+      "npm": "@kinlab (for example, @kinlab/kin-mcp)",
+      "cargoRegistry": "sparse+https://kinlab.ai/registry/cargo/"
+    }
+  },
   "repos": [
     {
       "name": "kin-db",
