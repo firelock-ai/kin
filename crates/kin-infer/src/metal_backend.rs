@@ -5160,10 +5160,11 @@ impl GpuCompute for MetalCompute {
         )
         .entered();
 
-        // Identical to `fused_ffn_swiglu` up to the down-projection, then the
-        // residual add and LayerNorm are appended to the SAME command buffer so
-        // the FFN output never round-trips to host memory un-normed — the post-LN
-        // norm2 boundary folds into the FFN's existing single submission.
+        // gate/up projection, SwiGLU, down projection, residual add, and LayerNorm
+        // each read the previous stage's output, so each runs in its own command
+        // buffer and completes before the next reads it. Chaining the stages in one
+        // command buffer left each output visible to its dependent read only by
+        // timing, which produced nondeterministic bytes for non-tile-aligned rows.
         let buf_x = self.buf_slice_pooled(x)?;
         let buf_wgateup = self.buf_cached_concat(&[w_gate, w_up])?;
         let buf_wdown = self.buf_cached(w_down)?;
@@ -5188,9 +5189,8 @@ impl GpuCompute for MetalCompute {
         let down_mma = use_mma(rows, hidden, inter);
 
         let out = autoreleasepool(|_| {
-            let cmd = self.queue.new_command_buffer();
-
             // gateup = x @ [w_gate|w_up]^T -> [rows, 2*inter]
+            let cmd = self.queue.new_command_buffer();
             if gateup_mma {
                 self.encode_mma(
                     cmd,
@@ -5222,8 +5222,10 @@ impl GpuCompute for MetalCompute {
                     rows,
                 );
             }
+            time_phase(Phase::Matmul, || self.commit_wait(cmd));
 
             // act = silu(gate) * up -> [rows, inter]
+            let cmd = self.queue.new_command_buffer();
             {
                 let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(swi);
@@ -5238,8 +5240,10 @@ impl GpuCompute for MetalCompute {
                 );
                 enc.end_encoding();
             }
+            time_phase(Phase::Activation, || self.commit_wait(cmd));
 
             // out = act @ w_down^T -> [rows, hidden]
+            let cmd = self.queue.new_command_buffer();
             if down_mma {
                 self.encode_mma(
                     cmd,
@@ -5271,8 +5275,10 @@ impl GpuCompute for MetalCompute {
                     rows,
                 );
             }
+            time_phase(Phase::Matmul, || self.commit_wait(cmd));
 
             // out += residual (resident)
+            let cmd = self.queue.new_command_buffer();
             {
                 let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(add);
@@ -5286,8 +5292,10 @@ impl GpuCompute for MetalCompute {
                 );
                 enc.end_encoding();
             }
+            time_phase(Phase::Activation, || self.commit_wait(cmd));
 
             // out = layer_norm(out, gamma, beta, eps) (in-place)
+            let cmd = self.queue.new_command_buffer();
             {
                 let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(ln);
@@ -5301,10 +5309,8 @@ impl GpuCompute for MetalCompute {
                 enc.dispatch_threads(MTLSize::new(rows_u * tw, 1, 1), MTLSize::new(tw, 1, 1));
                 enc.end_encoding();
             }
+            time_phase(Phase::Norm, || self.commit_wait(cmd));
 
-            time_phase(Phase::Matmul, || {
-                self.commit_wait(cmd);
-            });
             Self::read_buf(buf_out.buffer(), rows * hidden)
         });
         Self::count_nonfinite(
@@ -5334,11 +5340,12 @@ impl GpuCompute for MetalCompute {
         )
         .entered();
 
-        // x uploaded once; weight/gamma/beta hit the persistent cache. The
-        // projection output stays resident, the residual is added on-device, and
-        // the LayerNorm runs in-place on the same buffer — one command buffer, one
-        // readback. The proj buffer is a pooled transient that recycles after the
-        // readback below.
+        // x uploaded once; weight/gamma/beta hit the persistent cache. The residual
+        // add and LayerNorm read the projection in place, so each stage runs in its
+        // own command buffer and completes before the next reads its output. A single
+        // command buffer chaining all three left the matmul output visible to the
+        // dependent reads only by timing, which produced nondeterministic bytes for
+        // non-tile-aligned row counts. The proj buffer is a pooled transient.
         let buf_x = self.buf_slice_pooled(x)?;
         let buf_w = self.buf_cached(weight)?;
         let buf_residual = self.buf_slice_pooled(residual)?;
@@ -5357,9 +5364,8 @@ impl GpuCompute for MetalCompute {
         let proj_mma = use_mma(rows, hidden, cols);
 
         let out = autoreleasepool(|_| {
-            let cmd = self.queue.new_command_buffer();
-
             // proj = x @ weight^T -> [rows, hidden]  (M=rows, N=hidden, K=cols)
+            let cmd = self.queue.new_command_buffer();
             if proj_mma {
                 self.encode_mma(
                     cmd,
@@ -5391,8 +5397,10 @@ impl GpuCompute for MetalCompute {
                     rows,
                 );
             }
+            time_phase(Phase::Matmul, || self.commit_wait(cmd));
 
             // proj += residual (in-place on the resident projection buffer)
+            let cmd = self.queue.new_command_buffer();
             {
                 let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(add);
@@ -5406,8 +5414,10 @@ impl GpuCompute for MetalCompute {
                 );
                 enc.end_encoding();
             }
+            time_phase(Phase::Activation, || self.commit_wait(cmd));
 
             // out = layer_norm(proj, gamma, beta, eps) (in-place)
+            let cmd = self.queue.new_command_buffer();
             {
                 let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(ln);
@@ -5421,10 +5431,8 @@ impl GpuCompute for MetalCompute {
                 enc.dispatch_threads(MTLSize::new(rows_u * tw, 1, 1), MTLSize::new(tw, 1, 1));
                 enc.end_encoding();
             }
+            time_phase(Phase::Norm, || self.commit_wait(cmd));
 
-            time_phase(Phase::Matmul, || {
-                self.commit_wait(cmd);
-            });
             Self::read_buf(buf_proj.buffer(), rows * hidden)
         });
         Self::count_nonfinite(

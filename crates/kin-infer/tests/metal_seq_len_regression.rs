@@ -365,6 +365,127 @@ fn metal_fused_linear_add_norm_matches_per_op() {
     }
 }
 
+/// Byte-determinism guard for `fused_linear_add_norm` (FIR-1141 parity baseline).
+/// The residual add and LayerNorm read the projection in place; running the
+/// dependent stages in one command buffer made each read see the prior output
+/// only by timing, so identical input embedded to different bytes run-to-run for
+/// non-tile-aligned row counts. Re-running the same fixed input must be
+/// byte-identical and match the per-op oracle.
+#[test]
+fn metal_fused_linear_add_norm_is_byte_deterministic() {
+    let Some(metal) = MetalCompute::try_new() else {
+        eprintln!("Metal device not available, skipping");
+        return;
+    };
+    // The historically nondeterministic ragged-small shape first, plus a ragged
+    // and an aligned shape.
+    let cases = [
+        (37usize, 384usize, 384usize),
+        (100, 768, 768),
+        (64, 768, 768),
+    ];
+    const REPEATS: usize = 16;
+    for &(rows, cols, hidden) in &cases {
+        let x: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i as i32 % 257 - 128) as f32) * 0.01)
+            .collect();
+        let w: Vec<f32> = (0..hidden * cols)
+            .map(|i| ((i as i32 % 263 - 131) as f32) * 0.01)
+            .collect();
+        let residual: Vec<f32> = (0..rows * hidden)
+            .map(|i| ((i as i32 % 251 - 125) as f32) * 0.02)
+            .collect();
+        let gamma: Vec<f32> = (0..hidden).map(|i| 1.0 + (i as f32) * 1e-4).collect();
+        let beta: Vec<f32> = (0..hidden).map(|i| (i as f32) * 1e-4 - 0.05).collect();
+        let eps = 1e-12f32;
+
+        let first = metal
+            .fused_linear_add_norm(&x, &w, &residual, &gamma, &beta, rows, cols, hidden, eps)
+            .unwrap();
+        assert_eq!(count_nonfinite(&first), 0, "non-finite at rows={rows}");
+
+        // Per-op oracle (matmul -> host add -> layer_norm), the numerical reference.
+        let mut oracle = metal.matmul(&x, &w, rows, hidden, cols).unwrap();
+        for (s, r) in oracle.iter_mut().zip(residual.iter()) {
+            *s += *r;
+        }
+        metal
+            .layer_norm(&mut oracle, &gamma, &beta, rows, hidden, eps)
+            .unwrap();
+        assert!(
+            max_abs_err(&first, &oracle) < 1e-4,
+            "fused vs per-op rows={rows}: drift"
+        );
+
+        // The pool recycles buffers between calls, perturbing state; every run
+        // must reproduce the first byte-for-byte.
+        for rep in 0..REPEATS {
+            let again = metal
+                .fused_linear_add_norm(&x, &w, &residual, &gamma, &beta, rows, cols, hidden, eps)
+                .unwrap();
+            assert!(
+                again == first,
+                "fused_linear_add_norm not byte-deterministic at rows={rows} (repeat {rep})"
+            );
+        }
+        eprintln!("byte-deterministic OK rows={rows} cols={cols} hidden={hidden} x{REPEATS}");
+    }
+}
+
+/// Byte-determinism guard for `fused_ffn_swiglu_add_norm` (same in-place
+/// stage-chaining fix as `fused_linear_add_norm`). Correctness is covered by
+/// `metal_fused_ffn_swiglu_add_norm_matches_per_op`; this pins run-to-run bytes.
+#[test]
+fn metal_fused_ffn_swiglu_add_norm_is_byte_deterministic() {
+    let Some(metal) = MetalCompute::try_new() else {
+        eprintln!("Metal device not available, skipping");
+        return;
+    };
+    let cases = [(37usize, 768usize, 3072usize), (64, 768, 3072)];
+    const REPEATS: usize = 8;
+    for &(rows, hidden, inter) in &cases {
+        let x: Vec<f32> = (0..rows * hidden)
+            .map(|i| ((i as i32 % 257 - 128) as f32) * 0.01)
+            .collect();
+        let w_gate: Vec<f32> = (0..inter * hidden)
+            .map(|i| ((i as i32 % 263 - 131) as f32) * 0.01)
+            .collect();
+        let w_up: Vec<f32> = (0..inter * hidden)
+            .map(|i| ((i as i32 % 269 - 134) as f32) * 0.01)
+            .collect();
+        let w_down: Vec<f32> = (0..hidden * inter)
+            .map(|i| ((i as i32 % 271 - 135) as f32) * 0.01)
+            .collect();
+        let residual: Vec<f32> = (0..rows * hidden)
+            .map(|i| ((i as i32 % 251 - 125) as f32) * 0.02)
+            .collect();
+        let gamma: Vec<f32> = (0..hidden).map(|i| 1.0 + (i as f32) * 1e-4).collect();
+        let beta: Vec<f32> = (0..hidden).map(|i| (i as f32) * 1e-4 - 0.05).collect();
+        let eps = 1e-12f32;
+
+        let first = metal
+            .fused_ffn_swiglu_add_norm(
+                &x, &w_gate, &w_up, &w_down, &residual, &gamma, &beta, rows, hidden, inter, eps,
+            )
+            .unwrap();
+        assert_eq!(count_nonfinite(&first), 0, "non-finite at rows={rows}");
+        for rep in 0..REPEATS {
+            let again = metal
+                .fused_ffn_swiglu_add_norm(
+                    &x, &w_gate, &w_up, &w_down, &residual, &gamma, &beta, rows, hidden, inter, eps,
+                )
+                .unwrap();
+            assert!(
+                again == first,
+                "fused_ffn_swiglu_add_norm not byte-deterministic at rows={rows} (repeat {rep})"
+            );
+        }
+        eprintln!(
+            "byte-deterministic OK (ffn) rows={rows} hidden={hidden} inter={inter} x{REPEATS}"
+        );
+    }
+}
+
 /// Parity for the post-LN FFN residency fold `fused_ffn_swiglu_add_norm`.
 ///
 /// The fold appends the residual add and norm2 to the FFN's own command buffer,
