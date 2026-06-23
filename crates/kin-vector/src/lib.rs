@@ -399,6 +399,23 @@ pub struct HnswNode {
     pub level: usize,
 }
 
+/// Serialize an `id -> internal index` map in canonical ascending-index order so
+/// the persisted index is byte-identical across builds. A `HashMap`'s native
+/// iteration order is process-randomized; the internal index is a bijection over
+/// live entries, so ordering by it is total and deterministic.
+fn serialize_id_to_idx_canonical<S, Id>(
+    map: &HashMap<Id, usize>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+    Id: VectorId,
+{
+    let mut entries: Vec<(&Id, &usize)> = map.iter().collect();
+    entries.sort_unstable_by_key(|&(_, idx)| *idx);
+    serializer.collect_map(entries)
+}
+
 /// Internal mutable state of the HNSW graph.
 #[derive(Serialize, Deserialize)]
 #[serde(bound(serialize = "Id: VectorId", deserialize = "Id: VectorId"))]
@@ -410,6 +427,11 @@ pub struct HnswGraph<Id: VectorId = DefaultId> {
     pub max_level: usize,
     pub dimensions: usize,
     /// Bi-directional mapping Id <-> internal index.
+    ///
+    /// Serialized in canonical ascending-index order so the persisted bytes are
+    /// byte-identical across builds; a `HashMap`'s native iteration order is
+    /// process-randomized and would otherwise leak into the saved index.
+    #[serde(serialize_with = "serialize_id_to_idx_canonical")]
     pub id_to_idx: HashMap<Id, usize>,
     pub idx_to_id: Vec<Id>,
     /// Indices that were removed and can be reused.
@@ -3382,5 +3404,52 @@ mod tests {
         let graph = try_load_snapshot::<DefaultId>(&bytes).unwrap();
         assert_eq!(graph.dimensions, 8);
         assert_eq!(graph.descriptor, IndexDescriptor::default());
+    }
+
+    /// Citable-bar guarantee (strict byte-determinism of the persisted index):
+    /// the SERIALIZED bytes of `save` must be identical across repeated parallel
+    /// batch builds of the same input/config, and independent of caller input
+    /// order. The existing fingerprint tests pin the in-memory topology; this pins
+    /// the persisted bytes the parity proof actually compares, catching any
+    /// non-canonical serialization (e.g. a `HashMap`'s iteration order) the
+    /// topology fingerprint cannot see. `n` spans several doubling chunks so the
+    /// real parallel planning path runs.
+    #[test]
+    fn saved_index_bytes_are_identical_across_repeated_parallel_builds() {
+        let n: u64 = 800;
+        let dim = 24;
+        let forward: Vec<(u64, Vec<f32>)> = (0..n).map(|k| (k, batch_test_vec(k, dim))).collect();
+
+        let build_and_save_bytes = |items: Vec<(u64, Vec<f32>)>| -> Vec<u8> {
+            let idx = VectorIndex::<u64>::new(dim).unwrap();
+            idx.upsert_batch(items).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("idx.hnsw");
+            idx.save(&path).unwrap();
+            std::fs::read(&path).unwrap()
+        };
+
+        let reference = build_and_save_bytes(forward.clone());
+
+        // Repeated identical-input parallel builds must serialize byte-identically.
+        for rep in 0..12 {
+            assert_eq!(
+                build_and_save_bytes(forward.clone()),
+                reference,
+                "saved index bytes diverged on identical-input parallel build rep {rep}"
+            );
+        }
+
+        // Caller input order must not change the saved bytes either.
+        let mut shuffled = forward.clone();
+        let len = shuffled.len();
+        for i in 0..len / 2 {
+            shuffled.swap(i, len - 1 - i);
+        }
+        assert_eq!(
+            build_and_save_bytes(shuffled),
+            reference,
+            "saved index bytes depended on caller input order"
+        );
     }
 }
