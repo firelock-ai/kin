@@ -241,6 +241,7 @@ impl GpuKernelPlan {
         let mut plan = GpuKernelPlan::default();
         if matches!(profile, Profile::Throughput) && matches!(backend, AcceleratorBackend::Metal) {
             plan.pooled_output = true;
+            plan.steel = true;
         }
         plan
     }
@@ -889,13 +890,14 @@ mod tests {
             plan.embedding.gpu_kernels,
             GpuKernelPlan {
                 pooled_output: true,
+                steel: true,
                 ..GpuKernelPlan::default()
             }
         );
     }
 
     #[test]
-    fn gpu_kernel_plan_enables_pooled_output_only_for_throughput_metal() {
+    fn gpu_kernel_plan_enables_throughput_metal_kernels() {
         for profile in [
             Profile::Proof,
             Profile::Interactive,
@@ -912,6 +914,7 @@ mod tests {
                 {
                     GpuKernelPlan {
                         pooled_output: true,
+                        steel: true,
                         ..GpuKernelPlan::default()
                     }
                 } else {
