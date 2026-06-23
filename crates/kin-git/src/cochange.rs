@@ -25,6 +25,24 @@ fn cochange_env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Select up to `max_commits` commit ids by a deterministic total order
+/// (commit time descending, then id ascending).
+///
+/// A `ByCommitTime` walk orders commits by time but leaves the order among
+/// equal-timestamp commits unspecified and process-dependent, so truncating the
+/// raw walk with `take(max_commits)` can select a different boundary set on each
+/// run. That shifts per-pair co-change counts — and therefore the `confidence`
+/// folded into each relation's content hash — making the mined graph
+/// non-deterministic. Sorting by the id tie-break before truncating makes the
+/// selected set independent of the walk's emission order.
+fn select_commit_oids<Id: Ord>(mut timed: Vec<(i64, Id)>, max_commits: usize) -> Vec<Id> {
+    timed.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    if max_commits > 0 {
+        timed.truncate(max_commits);
+    }
+    timed.into_iter().map(|(_, id)| id).collect()
+}
+
 pub fn mine_from_change_dag<G>(graph: &G, changes: &[SemanticChange]) -> Result<Vec<Relation>>
 where
     G: EntityStore + Sync,
@@ -100,18 +118,17 @@ where
         .all()
         .map_err(|e| GitError::Git(e.to_string()))?;
 
-    // Phase 1: Collect OIDs (cheap sequential walk) — propagate walk errors
+    // Phase 1: Collect (commit time, OID) for the full walk, then truncate to
+    // max_commits under a deterministic total order — see `select_commit_oids`.
     let oids: Vec<gix::ObjectId> = {
         let _span = tracing::info_span!("kin.git.cochange.collect_oids").entered();
-        let iter = walk.map(|r| {
-            r.map(|info| info.id().detach())
-                .map_err(|e| GitError::Git(e.to_string()))
-        });
-        if max_commits > 0 {
-            iter.take(max_commits).collect::<Result<Vec<_>>>()?
-        } else {
-            iter.collect::<Result<Vec<_>>>()?
-        }
+        let timed: Vec<(i64, gix::ObjectId)> = walk
+            .map(|r| {
+                r.map(|info| (info.commit_time.unwrap_or(0), info.id().detach()))
+                    .map_err(|e| GitError::Git(e.to_string()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        select_commit_oids(timed, max_commits)
     };
 
     // Phase 2: Parallel tree diffs — propagate object/diff errors
@@ -407,6 +424,58 @@ mod tests {
         Visibility,
     };
     use std::process::Command;
+
+    #[test]
+    fn select_commit_oids_is_input_order_independent_at_tie_boundary() {
+        // A commit-time tie (t=100) straddles the max_commits cutoff. The
+        // selected set must depend only on (time desc, id asc), never on the
+        // walk's (process-dependent) emission order for the tied commits.
+        let base: Vec<(i64, u32)> = vec![
+            (300, 0x10),
+            (200, 0x20),
+            (100, 0x05),
+            (100, 0x03),
+            (100, 0x09),
+            (50, 0x40),
+        ];
+        let max = 4;
+        let expected = select_commit_oids(base.clone(), max);
+        // Top two by time, then the two smallest ids within the t=100 tie group.
+        assert_eq!(expected, vec![0x10u32, 0x20, 0x03, 0x05]);
+
+        let shuffles: Vec<Vec<(i64, u32)>> = vec![
+            base.iter().rev().copied().collect(),
+            vec![
+                (100, 0x09),
+                (300, 0x10),
+                (100, 0x03),
+                (50, 0x40),
+                (200, 0x20),
+                (100, 0x05),
+            ],
+            vec![
+                (100, 0x05),
+                (100, 0x03),
+                (100, 0x09),
+                (200, 0x20),
+                (300, 0x10),
+                (50, 0x40),
+            ],
+        ];
+        for s in shuffles {
+            assert_eq!(
+                select_commit_oids(s, max),
+                expected,
+                "truncated commit set must be independent of walk emission order"
+            );
+        }
+
+        // max_commits == 0 keeps all commits, still in deterministic total order.
+        assert_eq!(
+            select_commit_oids(base, 0),
+            vec![0x10u32, 0x20, 0x03, 0x05, 0x09, 0x40]
+        );
+    }
 
     fn test_entity(name: &str, path: &str, line: u32) -> kin_model::Entity {
         kin_model::Entity {
@@ -829,8 +898,13 @@ mod tests {
             .current_dir(dir.path())
             .output()
             .unwrap();
+        // Distinct, increasing commit dates so the recency window is decided by
+        // commit time (the realistic case for sequential commits) rather than by
+        // the tie-break that only applies to equal-timestamp commits.
         Command::new("git")
             .args(["commit", "-m", "initial"])
+            .env("GIT_AUTHOR_DATE", "2021-01-01T00:00:00 +0000")
+            .env("GIT_COMMITTER_DATE", "2021-01-01T00:00:00 +0000")
             .current_dir(dir.path())
             .output()
             .unwrap();
@@ -843,6 +917,8 @@ mod tests {
             .unwrap();
         Command::new("git")
             .args(["commit", "-m", "middle"])
+            .env("GIT_AUTHOR_DATE", "2021-01-02T00:00:00 +0000")
+            .env("GIT_COMMITTER_DATE", "2021-01-02T00:00:00 +0000")
             .current_dir(dir.path())
             .output()
             .unwrap();
@@ -860,6 +936,8 @@ mod tests {
             .unwrap();
         Command::new("git")
             .args(["commit", "-m", "latest"])
+            .env("GIT_AUTHOR_DATE", "2021-01-03T00:00:00 +0000")
+            .env("GIT_COMMITTER_DATE", "2021-01-03T00:00:00 +0000")
             .current_dir(dir.path())
             .output()
             .unwrap();
