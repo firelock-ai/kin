@@ -898,8 +898,13 @@ mod tests {
             .current_dir(dir.path())
             .output()
             .unwrap();
+        // Distinct, increasing commit dates so the recency window is decided by
+        // commit time (the realistic case for sequential commits) rather than by
+        // the tie-break that only applies to equal-timestamp commits.
         Command::new("git")
             .args(["commit", "-m", "initial"])
+            .env("GIT_AUTHOR_DATE", "2021-01-01T00:00:00 +0000")
+            .env("GIT_COMMITTER_DATE", "2021-01-01T00:00:00 +0000")
             .current_dir(dir.path())
             .output()
             .unwrap();
@@ -912,6 +917,8 @@ mod tests {
             .unwrap();
         Command::new("git")
             .args(["commit", "-m", "middle"])
+            .env("GIT_AUTHOR_DATE", "2021-01-02T00:00:00 +0000")
+            .env("GIT_COMMITTER_DATE", "2021-01-02T00:00:00 +0000")
             .current_dir(dir.path())
             .output()
             .unwrap();
@@ -929,6 +936,8 @@ mod tests {
             .unwrap();
         Command::new("git")
             .args(["commit", "-m", "latest"])
+            .env("GIT_AUTHOR_DATE", "2021-01-03T00:00:00 +0000")
+            .env("GIT_COMMITTER_DATE", "2021-01-03T00:00:00 +0000")
             .current_dir(dir.path())
             .output()
             .unwrap();
