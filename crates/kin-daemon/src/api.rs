@@ -6097,7 +6097,14 @@ async fn spine_impact(
     let entity_id = parse_entity_id_hex(&params.entity)?;
     let impact = spine.federated_impact(&params.repo, &entity_id, params.depth);
 
-    Ok(Json(impact))
+    let mut body = serde_json::to_value(&impact).map_err(internal_error)?;
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "version".to_string(),
+            json!(kin_spine::SPINE_PAYLOAD_VERSION),
+        );
+    }
+    Ok(Json(body))
 }
 
 /// GET /spine/xref?repo=A&entity=X — cross-repo edges for an entity.
@@ -6115,7 +6122,9 @@ async fn spine_xref(
     let entity_id = parse_entity_id_hex(&params.entity)?;
     let edges = spine.cross_repo_edges_for(&params.repo, &entity_id);
 
-    Ok(Json(json!({ "edges": edges })))
+    Ok(Json(
+        json!({ "version": kin_spine::SPINE_PAYLOAD_VERSION, "edges": edges }),
+    ))
 }
 
 /// POST /lsp/sweep — trigger a full LSP cold sweep of all entities.
@@ -9137,6 +9146,11 @@ mod tests {
             edges.iter().any(|e| e["dst_repo"] == "provider"),
             "the cross-repo edge must resolve to the provider repo, got {edges:?}"
         );
+        assert_eq!(
+            xbody["version"],
+            serde_json::json!(kin_spine::SPINE_PAYLOAD_VERSION),
+            "/spine/xref payload must carry the spine wire-format version"
+        );
 
         let impact = app
             .oneshot(
@@ -9165,6 +9179,11 @@ mod tests {
         assert!(
             repos.contains(&"consumer"),
             "federated impact of do_work must include the consumer repo (blast radius), got {repos:?}"
+        );
+        assert_eq!(
+            ibody["version"],
+            serde_json::json!(kin_spine::SPINE_PAYLOAD_VERSION),
+            "/spine/impact payload must carry the spine wire-format version"
         );
     }
 

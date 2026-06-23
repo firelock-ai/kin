@@ -19,6 +19,11 @@ pub mod routing;
 pub mod store;
 pub mod xref;
 
+/// Wire-format version of the spine HTTP payloads (`/spine/impact`, `/spine/xref`).
+/// Stamped on every response so consumers (CLI, MCP, KinLab control-plane) can
+/// detect payload-shape changes and adapt. Bump on any breaking field change.
+pub const SPINE_PAYLOAD_VERSION: u32 = 1;
+
 pub use backend::{InMemorySpineBackend, SpineBackend, SpineError};
 pub use federation::{federated_impact, FederatedEdge, FederatedImpact, FederatedNode};
 pub use firestore::FirestoreSpineBackend;
