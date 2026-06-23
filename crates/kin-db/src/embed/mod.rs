@@ -343,6 +343,7 @@ pub mod hybrid_metrics {
     static SINGLE_SIDE_BATCHES: AtomicU64 = AtomicU64::new(0);
     static TWIN_UNAVAILABLE_BATCHES: AtomicU64 = AtomicU64::new(0);
     static CPU_PARALLEL_BATCHES: AtomicU64 = AtomicU64::new(0);
+    static SEQFLOOR_DEGENERATE_BATCHES: AtomicU64 = AtomicU64::new(0);
 
     /// A point-in-time read of the hybrid dispatch counters.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -365,6 +366,13 @@ pub mod hybrid_metrics {
         /// CPU subsets embedded with their sub-batches spread concurrently across
         /// cores — non-zero proves the idle cores ran in parallel.
         pub cpu_parallel_batches: u64,
+        /// SeqFloor batches whose sequence-length split was structurally
+        /// degenerate (no entity exceeded the truncation cap, so the criterion
+        /// could route nothing to the CPU twin). Non-zero proves the dispatcher
+        /// recognized the degenerate split and deferred to the adaptive
+        /// throughput decision rather than silently collapsing to a single GPU
+        /// arm.
+        pub seqfloor_degenerate_batches: u64,
     }
 
     pub(crate) fn record_gpu(entities: u64, tokens: u64) {
@@ -393,6 +401,10 @@ pub mod hybrid_metrics {
         CPU_PARALLEL_BATCHES.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_seqfloor_degenerate_batch() {
+        SEQFLOOR_DEGENERATE_BATCHES.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Read the current counters.
     pub fn snapshot() -> HybridDispatchStats {
         HybridDispatchStats {
@@ -404,6 +416,7 @@ pub mod hybrid_metrics {
             single_side_batches: SINGLE_SIDE_BATCHES.load(Ordering::Relaxed),
             twin_unavailable_batches: TWIN_UNAVAILABLE_BATCHES.load(Ordering::Relaxed),
             cpu_parallel_batches: CPU_PARALLEL_BATCHES.load(Ordering::Relaxed),
+            seqfloor_degenerate_batches: SEQFLOOR_DEGENERATE_BATCHES.load(Ordering::Relaxed),
         }
     }
 
@@ -418,6 +431,7 @@ pub mod hybrid_metrics {
             &SINGLE_SIDE_BATCHES,
             &TWIN_UNAVAILABLE_BATCHES,
             &CPU_PARALLEL_BATCHES,
+            &SEQFLOOR_DEGENERATE_BATCHES,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -1164,78 +1178,108 @@ impl BertEmbedder {
     ) -> Result<Vec<Vec<f32>>, KinDbError> {
         let placed = match mode {
             HybridMode::Off => unreachable!("embed_hybrid is only called for enabled modes"),
-            HybridMode::SeqFloor => {
-                let split = batch
-                    .ids
-                    .partition_point(|ids| ids.len() <= EMBED_CPU_SEQ_THRESHOLD);
-                let (short, long) = batch.as_slice().split_at(split);
-                self.dispatch_concurrent(short, long, dimensions, budget, false)?
-            }
-            HybridMode::Balanced { gpu_tput_ratio } => {
-                // An explicit env ratio pins a balanced split; otherwise the plan
-                // is adaptive — GPU-only unless a probe shows the twin keeps up.
-                let (plan, adaptive) = match gpu_tput_ratio {
-                    Some(fixed) => (
-                        adaptive_split::SplitPlan::Balanced {
-                            ratio: fixed,
-                            min_cpu_probe: 0,
-                        },
-                        false,
-                    ),
-                    None => (adaptive_split::plan(), true),
-                };
-                match plan {
-                    adaptive_split::SplitPlan::GpuOnly => {
-                        // The twin is not pulling its weight at this sequence
-                        // length: embed the whole batch on the GPU and record the
-                        // decision rather than fake-balancing a dragging split.
-                        let entities = batch.len() as u64;
-                        let tokens: u64 = batch.ids.iter().map(|ids| ids.len() as u64).sum();
-                        hybrid_metrics::record_single_side_batch();
-                        hybrid_metrics::record_gpu(entities, tokens);
-                        tracing::info!(
-                            target: "kindb.embed.dispatch",
-                            routing = "gpu_only_adaptive",
-                            gpu_entities = entities,
-                            gpu_tokens = tokens,
-                            cpu_twin_used = false,
-                            "embed_hybrid_dispatch"
-                        );
-                        self.process_encoded_subset(batch.as_slice(), dimensions, budget, None)?
-                    }
-                    adaptive_split::SplitPlan::Balanced {
-                        ratio,
-                        min_cpu_probe,
-                    } => {
-                        let (metal_subset, cpu_subset) =
-                            balanced_partition(batch.as_slice(), ratio, min_cpu_probe);
-                        let metal_tokens: usize =
-                            metal_subset.ids.iter().map(|ids| ids.len()).sum();
-                        let cpu_tokens: usize = cpu_subset.ids.iter().map(|ids| ids.len()).sum();
-                        tracing::info!(
-                            target: "kindb.embed.dispatch",
-                            metal_entities = metal_subset.len(),
-                            cpu_entities = cpu_subset.len(),
-                            metal_tokens = metal_tokens,
-                            cpu_tokens = cpu_tokens,
-                            gpu_tput_ratio = ratio,
-                            adaptive = adaptive,
-                            cpu_threads = rayon::current_num_threads(),
-                            "embed_hybrid_balance"
-                        );
-                        self.dispatch_concurrent(
-                            metal_subset.as_slice(),
-                            cpu_subset.as_slice(),
-                            dimensions,
-                            budget,
-                            adaptive,
-                        )?
-                    }
+            HybridMode::SeqFloor => match plan_seqfloor_route(&batch.ids) {
+                SeqFloorRoute::SplitByLength { cpu_from } => {
+                    // A sequence longer than the truncation cap is present: keep
+                    // the over-cap entities on the CPU twin and the rest on the GPU.
+                    let (short, long) = batch.as_slice().split_at(cpu_from);
+                    self.dispatch_concurrent(short, long, dimensions, budget, false)?
                 }
-            }
+                SeqFloorRoute::Degenerate => {
+                    // Every entity sits at or under the truncation cap, so the
+                    // sequence-length criterion can route nothing to the CPU twin.
+                    // Record the degenerate split explicitly and make a real
+                    // per-batch decision with the adaptive throughput split, which
+                    // engages the twin with non-zero work when it measurably keeps
+                    // up and records an explicit GPU-only ("hybrid not beneficial")
+                    // decision when it does not — instead of silently collapsing to
+                    // a single GPU arm that looks like a balanced hybrid.
+                    hybrid_metrics::record_seqfloor_degenerate_batch();
+                    self.dispatch_adaptive_balanced(batch.as_slice(), dimensions, budget, None)?
+                }
+            },
+            HybridMode::Balanced { gpu_tput_ratio } => self.dispatch_adaptive_balanced(
+                batch.as_slice(),
+                dimensions,
+                budget,
+                gpu_tput_ratio,
+            )?,
         };
 
         scatter_placed(placed, total)
+    }
+
+    /// Dispatch a batch through the adaptive throughput split.
+    ///
+    /// An explicit `gpu_tput_ratio` pins a fixed balanced split; otherwise the
+    /// plan is adaptive — GPU-only unless a probe shows the CPU twin keeps up.
+    /// Either way the per-batch decision is recorded through `hybrid_metrics` (a
+    /// GPU-only decision bumps `single_side_batches` and the GPU counters; a real
+    /// split bumps `hybrid_batches` and the CPU-twin counters), so the routing is
+    /// provable after the fact rather than silently collapsing to one arm.
+    fn dispatch_adaptive_balanced(
+        &self,
+        batch: EncodedSlice<'_>,
+        dimensions: usize,
+        budget: BatchBudget,
+        gpu_tput_ratio: Option<f64>,
+    ) -> Result<Vec<(usize, Vec<f32>)>, KinDbError> {
+        let (plan, adaptive) = match gpu_tput_ratio {
+            Some(fixed) => (
+                adaptive_split::SplitPlan::Balanced {
+                    ratio: fixed,
+                    min_cpu_probe: 0,
+                },
+                false,
+            ),
+            None => (adaptive_split::plan(), true),
+        };
+        match plan {
+            adaptive_split::SplitPlan::GpuOnly => {
+                // The twin is not pulling its weight at this sequence length: embed
+                // the whole batch on the GPU and record the decision rather than
+                // fake-balancing a dragging split.
+                let entities = batch.len() as u64;
+                let tokens: u64 = batch.ids.iter().map(|ids| ids.len() as u64).sum();
+                hybrid_metrics::record_single_side_batch();
+                hybrid_metrics::record_gpu(entities, tokens);
+                tracing::info!(
+                    target: "kindb.embed.dispatch",
+                    routing = "gpu_only_adaptive",
+                    gpu_entities = entities,
+                    gpu_tokens = tokens,
+                    cpu_twin_used = false,
+                    "embed_hybrid_dispatch"
+                );
+                self.process_encoded_subset(batch, dimensions, budget, None)
+            }
+            adaptive_split::SplitPlan::Balanced {
+                ratio,
+                min_cpu_probe,
+            } => {
+                let (metal_subset, cpu_subset) = balanced_partition(batch, ratio, min_cpu_probe);
+                let metal_tokens: usize = metal_subset.ids.iter().map(|ids| ids.len()).sum();
+                let cpu_tokens: usize = cpu_subset.ids.iter().map(|ids| ids.len()).sum();
+                tracing::info!(
+                    target: "kindb.embed.dispatch",
+                    metal_entities = metal_subset.len(),
+                    cpu_entities = cpu_subset.len(),
+                    metal_tokens = metal_tokens,
+                    cpu_tokens = cpu_tokens,
+                    gpu_tput_ratio = ratio,
+                    adaptive = adaptive,
+                    cpu_threads = rayon::current_num_threads(),
+                    "embed_hybrid_balance"
+                );
+                self.dispatch_concurrent(
+                    metal_subset.as_slice(),
+                    cpu_subset.as_slice(),
+                    dimensions,
+                    budget,
+                    adaptive,
+                )
+            }
+        }
     }
 
     fn process_encoded_subset(
@@ -2429,6 +2473,44 @@ impl BatchBudget {
 /// any future sequence longer than the cap.
 #[cfg(feature = "embeddings")]
 const EMBED_CPU_SEQ_THRESHOLD: usize = EMBED_MAX_SEQ_LEN;
+
+/// The pre-inference routing decision for one SeqFloor-profile batch.
+///
+/// `EMBED_CPU_SEQ_THRESHOLD` equals the tokenizer's hard truncation cap
+/// (`EMBED_MAX_SEQ_LEN`), so no tokenized entity can exceed it. The
+/// sequence-length split therefore routes every real batch entirely to the GPU
+/// arm and nothing to the CPU twin — the `> threshold` partition is always empty.
+/// Running such a batch through the raw `split_at` collapses it to a single
+/// GPU-only arm with no record of WHY the twin never engaged, so it is
+/// indistinguishable from a balanced hybrid that legitimately chose the GPU. This
+/// decision makes the degeneracy explicit instead.
+#[cfg(feature = "embeddings")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeqFloorRoute {
+    /// At least one entity exceeds the truncation cap, so the sequence-length
+    /// split routes real work to the CPU twin. `cpu_from` is the first index of
+    /// the CPU (over-cap) side within the length-sorted batch. This remains a
+    /// defensive guard for any future sequence longer than the cap.
+    SplitByLength { cpu_from: usize },
+    /// No entity exceeds the cap: the sequence-length criterion can never move
+    /// work to the CPU twin. Defer the per-batch GPU/CPU decision to the adaptive
+    /// throughput split instead of silently collapsing to a single GPU arm.
+    Degenerate,
+}
+
+/// Decide how a SeqFloor batch routes, purely from tokenized lengths.
+///
+/// Pure and side-effect-free (no timing, no global state) so the routing
+/// decision is deterministic and unit-testable without a GPU or daemon.
+#[cfg(feature = "embeddings")]
+fn plan_seqfloor_route(ids: &[Vec<u32>]) -> SeqFloorRoute {
+    let cpu_from = ids.partition_point(|entity| entity.len() <= EMBED_CPU_SEQ_THRESHOLD);
+    if !ids.is_empty() && cpu_from >= ids.len() {
+        SeqFloorRoute::Degenerate
+    } else {
+        SeqFloorRoute::SplitByLength { cpu_from }
+    }
+}
 
 /// Default Balanced-hybrid CPU lane cutoff. Tokenized entities at or below this
 /// length are cheap enough for the CPU twin; heavier under-cap entities stay on
@@ -3916,6 +3998,11 @@ mod tests {
     #[cfg(feature = "embeddings")]
     static ADAPTIVE_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Serializes the tests that read/reset the process-global `hybrid_metrics`
+    /// counters so a parallel reset can't clobber another test's assertion.
+    #[cfg(feature = "embeddings")]
+    static HYBRID_METRICS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Serializes process-env access for the resource-profile tests and snapshots
     /// the relevant vars, restoring them on drop so the suite never leaks state.
     #[cfg(feature = "embeddings")]
@@ -4443,6 +4530,89 @@ mod tests {
             .ids
             .iter()
             .all(|ids| ids.len() > EMBED_CPU_SEQ_THRESHOLD));
+    }
+
+    #[cfg(feature = "embeddings")]
+    fn ids_of_lengths(lengths: &[usize]) -> Vec<Vec<u32>> {
+        lengths.iter().map(|&len| vec![0u32; len]).collect()
+    }
+
+    // Every tokenized entity is truncated to `EMBED_MAX_SEQ_LEN`, which equals
+    // `EMBED_CPU_SEQ_THRESHOLD`, so a real post-tokenization batch never has an
+    // over-cap entity: the sequence-length split is structurally degenerate and
+    // the route reports it as such rather than masquerading as a balanced hybrid.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn plan_seqfloor_route_is_degenerate_when_all_under_cap() {
+        let ids = ids_of_lengths(&(0..32).map(|i| 64 + i).collect::<Vec<_>>());
+        assert_eq!(plan_seqfloor_route(&ids), SeqFloorRoute::Degenerate);
+        // The boundary length (exactly at the cap) is still CPU-ineligible by the
+        // `<= threshold` test, so a full-cap batch is degenerate too.
+        let at_cap = ids_of_lengths(&[EMBED_CPU_SEQ_THRESHOLD; 4]);
+        assert_eq!(plan_seqfloor_route(&at_cap), SeqFloorRoute::Degenerate);
+    }
+
+    // The defensive `> threshold` arm: if a future sequence ever exceeds the cap,
+    // the route splits at the first over-cap (length-sorted) entity so the long
+    // tail rides the CPU twin and the short head stays on the GPU.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn plan_seqfloor_route_splits_when_over_cap_present() {
+        let mut lengths: Vec<usize> = (0..10).map(|i| 100 + i).collect();
+        lengths.extend((0..5).map(|i| EMBED_CPU_SEQ_THRESHOLD + 1 + i));
+        let ids = ids_of_lengths(&lengths);
+        match plan_seqfloor_route(&ids) {
+            SeqFloorRoute::SplitByLength { cpu_from } => {
+                assert_eq!(cpu_from, 10, "split begins at the first over-cap entity");
+                assert!(ids[..cpu_from]
+                    .iter()
+                    .all(|e| e.len() <= EMBED_CPU_SEQ_THRESHOLD));
+                assert!(ids[cpu_from..]
+                    .iter()
+                    .all(|e| e.len() > EMBED_CPU_SEQ_THRESHOLD));
+            }
+            other => panic!("expected SplitByLength, got {other:?}"),
+        }
+    }
+
+    // An empty batch is not "degenerate" (there is no work and nothing to record);
+    // it takes the cheap split-at-zero path so no degenerate counter is bumped.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn plan_seqfloor_route_empty_batch_is_not_degenerate() {
+        let ids: Vec<Vec<u32>> = Vec::new();
+        assert_eq!(
+            plan_seqfloor_route(&ids),
+            SeqFloorRoute::SplitByLength { cpu_from: 0 }
+        );
+    }
+
+    // The route is a pure function of the lengths: the same batch always decides
+    // the same way, with no timing or global-state dependence.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn plan_seqfloor_route_is_deterministic() {
+        let mut lengths: Vec<usize> = (0..20).map(|i| 80 + i).collect();
+        lengths.extend((0..3).map(|i| EMBED_CPU_SEQ_THRESHOLD + 1 + i));
+        let ids = ids_of_lengths(&lengths);
+        assert_eq!(plan_seqfloor_route(&ids), plan_seqfloor_route(&ids));
+    }
+
+    // The degenerate-split counter is observable: it starts at zero, records each
+    // degenerate SeqFloor batch, and clears on reset.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn seqfloor_degenerate_metric_records_and_resets() {
+        let _guard = HYBRID_METRICS_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        hybrid_metrics::reset();
+        assert_eq!(hybrid_metrics::snapshot().seqfloor_degenerate_batches, 0);
+        hybrid_metrics::record_seqfloor_degenerate_batch();
+        hybrid_metrics::record_seqfloor_degenerate_batch();
+        assert_eq!(hybrid_metrics::snapshot().seqfloor_degenerate_batches, 2);
+        hybrid_metrics::reset();
+        assert_eq!(hybrid_metrics::snapshot().seqfloor_degenerate_batches, 0);
     }
 
     #[cfg(feature = "embeddings")]
