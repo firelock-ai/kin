@@ -1166,6 +1166,10 @@ impl GpuCompute for CpuCompute {
         if should_parallelize(rows * cols) {
             data.par_chunks_mut(cols).for_each(|row| {
                 let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                if !max.is_finite() {
+                    row.iter_mut().for_each(|v| *v = 0.0);
+                    return;
+                }
                 let mut sum = 0.0f32;
                 for v in row.iter_mut() {
                     *v = (*v - max).exp();
@@ -1181,6 +1185,10 @@ impl GpuCompute for CpuCompute {
             for r in 0..rows {
                 let row = &mut data[r * cols..(r + 1) * cols];
                 let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                if !max.is_finite() {
+                    row.iter_mut().for_each(|v| *v = 0.0);
+                    continue;
+                }
                 let mut sum = 0.0f32;
                 for v in row.iter_mut() {
                     *v = (*v - max).exp();

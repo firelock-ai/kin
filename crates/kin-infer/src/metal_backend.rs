@@ -1004,6 +1004,15 @@ kernel void softmax_rows(
     }
     max_val = simd_max(max_val);
 
+    // Fully-masked row (every score is -inf): emit zeros instead of computing
+    // exp(-inf - -inf) = NaN, which the sum>0 guard below cannot scrub.
+    if (!isfinite(max_val)) {
+        for (uint j = tiitg; j < cols; j += tptg) {
+            data[row_offset + j] = 0.0;
+        }
+        return;
+    }
+
     // Exp and sum
     float sum = 0.0;
     for (uint j = tiitg; j < cols; j += tptg) {
