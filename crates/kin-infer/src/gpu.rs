@@ -6,6 +6,7 @@
 //! No external ML frameworks. Direct platform API calls behind feature flags.
 //! Device discovery is automatic; callers get the best available backend.
 
+use std::ffi::OsStr;
 use std::fmt;
 
 use rayon::prelude::*;
@@ -768,19 +769,44 @@ pub trait GpuCompute: Send + Sync {
     fn device_name(&self) -> &str;
 }
 
-/// Create the best available compute backend.
+/// Create the best available compute backend, honoring the
+/// `KIN_INFER_FORCE_CPU` environment override.
 ///
-/// Respects `KIN_INFER_FORCE_CPU=1` as a short-circuit escape hatch: when set,
-/// skips GPU discovery and returns `CpuCompute` regardless of feature flags.
-/// Callers that need to force CPU for a specific `BertModel` construction
-/// (e.g. kin-db's embedding dispatcher falling back around broken Metal
-/// attention at long sequences) can set this env var around the `load()`
-/// call and unset it afterward.
+/// When `KIN_INFER_FORCE_CPU` is set to any non-empty value other than `0`, GPU
+/// discovery is skipped and `CpuCompute` is returned regardless of feature
+/// flags. Otherwise the normal Metal > CUDA > CPU auto ladder runs.
+///
+/// Callers that need to force CPU for a specific `BertModel` construction should
+/// prefer the non-env [`create_compute_forcing_cpu`] (or
+/// [`crate::BertModel::load_with_backend`]) over mutating the process
+/// environment around a `load()` call.
 pub fn create_compute() -> Box<dyn GpuCompute> {
-    if std::env::var_os("KIN_INFER_FORCE_CPU")
+    create_compute_forcing_cpu(force_cpu_from_env())
+}
+
+/// Whether `KIN_INFER_FORCE_CPU` requests the CPU backend: a present, non-empty
+/// value other than `0`.
+pub fn force_cpu_from_env() -> bool {
+    force_cpu_requested(std::env::var_os("KIN_INFER_FORCE_CPU").as_deref())
+}
+
+/// Pure predicate behind [`force_cpu_from_env`], split out so the env semantics
+/// are unit-testable without mutating the process environment.
+fn force_cpu_requested(force_cpu_var: Option<&OsStr>) -> bool {
+    force_cpu_var
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false)
-    {
+}
+
+/// Create a compute backend with explicit per-load CPU selection, ignoring
+/// `KIN_INFER_FORCE_CPU`.
+///
+/// When `force_cpu` is true, `CpuCompute` is returned unconditionally; when
+/// false, the normal Metal > CUDA > CPU auto ladder runs. This is the non-env
+/// counterpart to [`create_compute`]: a caller can force CPU for a single model
+/// build without touching the process environment.
+pub fn create_compute_forcing_cpu(force_cpu: bool) -> Box<dyn GpuCompute> {
+    if force_cpu {
         return Box::new(CpuCompute);
     }
 
@@ -1411,6 +1437,35 @@ mod tests {
             );
             assert_eq!(select_cpu_backend(Some("pure-rust")), CpuBackend::PureRust);
         }
+    }
+
+    #[test]
+    fn force_cpu_requested_parses_env_values() {
+        // A present, non-empty value other than "0" requests CPU; everything
+        // else (absent, empty, "0") does not.
+        assert!(force_cpu_requested(Some(OsStr::new("1"))));
+        assert!(force_cpu_requested(Some(OsStr::new("true"))));
+        assert!(!force_cpu_requested(Some(OsStr::new("0"))));
+        assert!(!force_cpu_requested(Some(OsStr::new(""))));
+        assert!(!force_cpu_requested(None));
+    }
+
+    #[test]
+    fn create_compute_forcing_cpu_true_is_cpu_regardless_of_env() {
+        // The forced path branches solely on its argument — it never reads
+        // KIN_INFER_FORCE_CPU (env parsing lives entirely in force_cpu_requested,
+        // covered above) — so it yields CPU whatever the environment says.
+        assert_eq!(create_compute_forcing_cpu(true).backend(), GpuBackend::Cpu);
+    }
+
+    #[test]
+    fn create_compute_forcing_cpu_false_uses_auto_ladder() {
+        // force_cpu=false runs the same Metal > CUDA > CPU discovery ladder that
+        // backs best_device(): CPU on a CPU-only build, the accelerator otherwise.
+        assert_eq!(
+            create_compute_forcing_cpu(false).backend(),
+            best_device().backend
+        );
     }
 
     #[test]

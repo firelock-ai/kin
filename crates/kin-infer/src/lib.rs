@@ -1513,25 +1513,45 @@ pub fn load_sharded_index(index_path: &Path) -> Result<HashMap<String, String>, 
 
 impl BertModel {
     /// Load a model from a safetensors file + config.
+    ///
+    /// Honors the `KIN_INFER_FORCE_CPU` environment override. To choose the
+    /// backend per load without touching the environment, use
+    /// [`BertModel::load_with_backend`].
     pub fn load(weights_path: &Path, config: BertConfig) -> Result<Self, InferError> {
+        Self::load_with_backend(weights_path, config, gpu::force_cpu_from_env())
+    }
+
+    /// Load a model, selecting the compute backend explicitly.
+    ///
+    /// When `force_cpu` is true the CPU backend is used regardless of available
+    /// accelerators or `KIN_INFER_FORCE_CPU`; when false the normal
+    /// Metal > CUDA > CPU auto ladder runs (also ignoring the env override).
+    /// This is the per-load, non-env counterpart to [`BertModel::load`].
+    pub fn load_with_backend(
+        weights_path: &Path,
+        config: BertConfig,
+        force_cpu: bool,
+    ) -> Result<Self, InferError> {
         let _span = tracing::info_span!(
             "kin_infer.model.load",
             weights_path = %weights_path.display(),
             hidden_size = config.hidden_size,
             layers = config.num_hidden_layers,
             heads = config.num_attention_heads,
-            architecture = ?config.architecture()
+            architecture = ?config.architecture(),
+            force_cpu
         )
         .entered();
         let weights = load_weight_bytes(weights_path)?;
         let tensors = SafeTensors::deserialize(&weights)
             .map_err(|e| InferError::ModelError(format!("failed to parse safetensors: {e}")))?;
-        Self::load_from_tensors(&tensors, config)
+        Self::load_from_tensors(&tensors, config, force_cpu)
     }
 
     fn load_from_tensors(
         tensors: &SafeTensors,
         mut config: BertConfig,
+        force_cpu: bool,
     ) -> Result<Self, InferError> {
         let _names: Vec<_> = tensors.names().into_iter().collect();
 
@@ -1940,8 +1960,8 @@ impl BertModel {
             (None, None)
         };
 
-        // Auto-detect best GPU backend (Metal > CUDA > CPU)
-        let gpu_compute = gpu::create_compute();
+        // Select the compute backend: forced CPU, or the Metal > CUDA > CPU ladder.
+        let gpu_compute = gpu::create_compute_forcing_cpu(force_cpu);
 
         Ok(Self {
             weights: ModelWeights {
