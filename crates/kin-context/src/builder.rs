@@ -9,6 +9,7 @@ use kin_model::{
     EntityRole, FilePathId, GraphNodeId, GraphStore, IntentSummary, ProjectionLevel, RetrievalKey,
     TokenBudget, TrafficEntry, TrafficProximity, WorkItem, WorkItemEntry, WorkScope,
 };
+use rayon::prelude::*;
 use tracing::debug;
 
 use crate::error::{ContextError, Result};
@@ -225,6 +226,109 @@ impl Default for ContextOptions {
 }
 
 /// Build a context pack centered on a focal entity.
+/// Subgraph size at or above which the per-entity projection/token work is
+/// precomputed in parallel. Below it, rayon's fan-out overhead outweighs the
+/// gain, so the sequential path runs. Either path produces identical output.
+const PARALLEL_ASSEMBLY_MIN_ENTITIES: usize = 64;
+
+/// Which pack section a non-focal subgraph entity projects into.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AssemblySection {
+    Test,
+    Contract,
+    DirectDep,
+    Transitive,
+}
+
+/// A classified, projected subgraph entity that has not yet been admitted under
+/// the token budget. Computing one is a pure function of the entity, the
+/// options, and the precomputed relation sets — independent across entities, so
+/// the projection pass is safe to parallelize. The budget admission that
+/// consumes these stays sequential and order-preserving, so the assembled pack
+/// is byte-identical regardless of how the projections were computed.
+struct AssemblyCandidate {
+    entity_id: EntityId,
+    section: AssemblySection,
+    projection_level: ProjectionLevel,
+    content: String,
+    tokens: usize,
+}
+
+/// Classify and project a single non-focal subgraph entity. Returns `None` when
+/// the entity contributes no section (a transitive candidate that is not on a
+/// real dependency edge or is below the relevance floor). Pure / side-effect-free.
+fn classify_subgraph_entity(
+    entity: &Entity,
+    is_direct: bool,
+    on_dependency_edge: bool,
+    weight: f64,
+    opts: &ContextOptions,
+) -> Option<AssemblyCandidate> {
+    let with_gemini_prefix = |content: String| -> String {
+        if opts.assistant_hint == Some(AssistantHint::GeminiCli) {
+            if let Some(ref origin) = entity.file_origin {
+                return format!("// file: {}\n{}", origin, content);
+            }
+        }
+        content
+    };
+
+    if entity.role == EntityRole::Test && opts.include_tests {
+        let content = with_gemini_prefix(project_signature_only(entity));
+        let tokens = estimate_tokens(&content);
+        return Some(AssemblyCandidate {
+            entity_id: entity.id,
+            section: AssemblySection::Test,
+            projection_level: ProjectionLevel::SignatureOnly,
+            content,
+            tokens,
+        });
+    }
+
+    if matches!(
+        entity.kind,
+        EntityKind::ApiEndpoint | EntityKind::EventContract | EntityKind::Schema
+    ) && opts.include_contracts
+    {
+        let content = with_gemini_prefix(project_signature_only(entity));
+        let tokens = estimate_tokens(&content);
+        return Some(AssemblyCandidate {
+            entity_id: entity.id,
+            section: AssemblySection::Contract,
+            projection_level: ProjectionLevel::SignatureOnly,
+            content,
+            tokens,
+        });
+    }
+
+    if is_direct {
+        let content = with_gemini_prefix(project_signature_only(entity));
+        let tokens = estimate_tokens(&content);
+        return Some(AssemblyCandidate {
+            entity_id: entity.id,
+            section: AssemblySection::DirectDep,
+            projection_level: ProjectionLevel::SignatureOnly,
+            content,
+            tokens,
+        });
+    }
+
+    // Transitive fill must ride a real dependency edge and clear the relevance
+    // floor; otherwise same-file/co-change plumbing pads the pack.
+    if !on_dependency_edge || weight < TRANSITIVE_RELEVANCE_FLOOR {
+        return None;
+    }
+    let content = with_gemini_prefix(project_name_and_kind(entity));
+    let tokens = estimate_tokens(&content);
+    Some(AssemblyCandidate {
+        entity_id: entity.id,
+        section: AssemblySection::Transitive,
+        projection_level: ProjectionLevel::NameAndKind,
+        content,
+        tokens,
+    })
+}
+
 pub fn build_context_pack<G>(
     graph: &G,
     focal_id: &EntityId,
@@ -384,102 +488,77 @@ where
     };
     let mut transitive_tokens = 0;
 
-    for (eid, entity) in &sorted_entities {
-        let eid = *eid;
-
-        let is_direct = direct_dep_ids.contains(eid);
-
-        // Tests
-        if entity.role == EntityRole::Test && opts.include_tests {
-            let mut content = project_signature_only(entity);
-            if opts.assistant_hint == Some(AssistantHint::GeminiCli) {
-                if let Some(ref origin) = entity.file_origin {
-                    content = format!("// file: {}\n{}", origin, content);
-                }
-            }
-            let tokens = estimate_tokens(&content);
-            if total_tokens + tokens <= budget_max {
-                total_tokens += tokens;
-                test_entries.push(ContextEntry {
-                    entity_id: entity.id,
-                    projection_level: ProjectionLevel::SignatureOnly,
-                    content,
-                });
-            }
-            continue;
-        }
-
-        // Contracts
-        if matches!(
-            entity.kind,
-            EntityKind::ApiEndpoint | EntityKind::EventContract | EntityKind::Schema
-        ) && opts.include_contracts
-        {
-            let mut content = project_signature_only(entity);
-            if opts.assistant_hint == Some(AssistantHint::GeminiCli) {
-                if let Some(ref origin) = entity.file_origin {
-                    content = format!("// file: {}\n{}", origin, content);
-                }
-            }
-            let tokens = estimate_tokens(&content);
-            if total_tokens + tokens <= budget_max {
-                total_tokens += tokens;
-                contract_entries.push(ContextEntry {
-                    entity_id: entity.id,
-                    projection_level: ProjectionLevel::SignatureOnly,
-                    content,
-                });
-            }
-            continue;
-        }
-
-        // Direct deps: signature level
-        if is_direct {
-            let mut content = project_signature_only(entity);
-            if opts.assistant_hint == Some(AssistantHint::GeminiCli) {
-                if let Some(ref origin) = entity.file_origin {
-                    content = format!("// file: {}\n{}", origin, content);
-                }
-            }
-            let tokens = estimate_tokens(&content);
-            if total_tokens + tokens <= budget_max {
-                total_tokens += tokens;
-                dep_entries.push(ContextEntry {
-                    entity_id: entity.id,
-                    projection_level: ProjectionLevel::SignatureOnly,
-                    content,
-                });
-            }
+    // Project each subgraph entity into its section in parallel (pure and
+    // independent per entity), then admit candidates under the token budget
+    // sequentially in the unchanged sorted order. The budget fold is identical,
+    // so the assembled pack is byte-for-byte the same as the sequential path.
+    let classify = |&(eid, entity): &(&EntityId, &Entity)| -> Option<AssemblyCandidate> {
+        classify_subgraph_entity(
+            entity,
+            direct_dep_ids.contains(eid),
+            dependency_entities.contains(eid),
+            weight_map.get(eid).copied().unwrap_or(0.0),
+            opts,
+        )
+    };
+    let candidates: Vec<Option<AssemblyCandidate>> =
+        if sorted_entities.len() >= PARALLEL_ASSEMBLY_MIN_ENTITIES {
+            sorted_entities.par_iter().map(classify).collect()
         } else {
-            // Transitive fill must be reached via a real dependency edge, not pure
-            // structural containment and not git co-change — otherwise the budget
-            // pads with same-file/same-crate plumbing or co-change history noise
-            // Direct deps bypass this (handled above).
-            if !dependency_entities.contains(eid) {
-                continue;
-            }
-            let weight = weight_map.get(eid).copied().unwrap_or(0.0);
-            if weight < TRANSITIVE_RELEVANCE_FLOOR {
-                continue;
-            }
-            // Transitive deps: name and kind level
-            let mut content = project_name_and_kind(entity);
-            if opts.assistant_hint == Some(AssistantHint::GeminiCli) {
-                if let Some(ref origin) = entity.file_origin {
-                    content = format!("// file: {}\n{}", origin, content);
+            sorted_entities.iter().map(classify).collect()
+        };
+
+    for candidate in candidates.into_iter().flatten() {
+        let AssemblyCandidate {
+            entity_id,
+            section,
+            projection_level,
+            content,
+            tokens,
+        } = candidate;
+        match section {
+            AssemblySection::Test => {
+                if total_tokens + tokens <= budget_max {
+                    total_tokens += tokens;
+                    test_entries.push(ContextEntry {
+                        entity_id,
+                        projection_level,
+                        content,
+                    });
                 }
             }
-            let tokens = estimate_tokens(&content);
-            if total_tokens + tokens <= budget_max
-                && transitive_tokens + tokens <= transitive_budget
-            {
-                total_tokens += tokens;
-                transitive_tokens += tokens;
-                transitive_entries.push(ContextEntry {
-                    entity_id: entity.id,
-                    projection_level: ProjectionLevel::NameAndKind,
-                    content,
-                });
+            AssemblySection::Contract => {
+                if total_tokens + tokens <= budget_max {
+                    total_tokens += tokens;
+                    contract_entries.push(ContextEntry {
+                        entity_id,
+                        projection_level,
+                        content,
+                    });
+                }
+            }
+            AssemblySection::DirectDep => {
+                if total_tokens + tokens <= budget_max {
+                    total_tokens += tokens;
+                    dep_entries.push(ContextEntry {
+                        entity_id,
+                        projection_level,
+                        content,
+                    });
+                }
+            }
+            AssemblySection::Transitive => {
+                if total_tokens + tokens <= budget_max
+                    && transitive_tokens + tokens <= transitive_budget
+                {
+                    total_tokens += tokens;
+                    transitive_tokens += tokens;
+                    transitive_entries.push(ContextEntry {
+                        entity_id,
+                        projection_level,
+                        content,
+                    });
+                }
             }
         }
     }
@@ -1048,6 +1127,106 @@ mod tests {
         let mut entity = make_entity(name, kind);
         entity.file_origin = Some(FilePathId::new(file_path));
         entity
+    }
+
+    #[test]
+    fn classify_subgraph_entity_sections_match_intent() {
+        let opts = ContextOptions {
+            include_tests: true,
+            include_contracts: true,
+            ..ContextOptions::default()
+        };
+
+        let mut test_e = make_entity("a_test", EntityKind::Function);
+        test_e.role = EntityRole::Test;
+        assert_eq!(
+            classify_subgraph_entity(&test_e, true, true, 9.0, &opts).map(|c| c.section),
+            Some(AssemblySection::Test),
+            "test role takes precedence even when also a direct dep"
+        );
+
+        let contract = make_entity("an_endpoint", EntityKind::ApiEndpoint);
+        assert_eq!(
+            classify_subgraph_entity(&contract, false, false, 0.0, &opts).map(|c| c.section),
+            Some(AssemblySection::Contract)
+        );
+
+        let direct = make_entity("a_callee", EntityKind::Function);
+        assert_eq!(
+            classify_subgraph_entity(&direct, true, true, 5.0, &opts).map(|c| c.section),
+            Some(AssemblySection::DirectDep)
+        );
+
+        let transitive = make_entity("a_transitive", EntityKind::Function);
+        assert_eq!(
+            classify_subgraph_entity(&transitive, false, true, TRANSITIVE_RELEVANCE_FLOOR, &opts)
+                .map(|c| c.section),
+            Some(AssemblySection::Transitive)
+        );
+        // Not on a dependency edge → no candidate.
+        assert!(classify_subgraph_entity(&transitive, false, false, 9.0, &opts).is_none());
+        // Below the relevance floor → no candidate.
+        assert!(classify_subgraph_entity(
+            &transitive,
+            false,
+            true,
+            TRANSITIVE_RELEVANCE_FLOOR - 0.5,
+            &opts
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn parallel_assembly_admits_a_stable_set() {
+        use kin_model::relation::{Relation, RelationKind, RelationOrigin};
+        let store = kin_db::InMemoryGraph::new();
+        let focal = make_entity("focal", EntityKind::Function);
+        store.upsert_entity(&focal).unwrap();
+        // Above PARALLEL_ASSEMBLY_MIN_ENTITIES so the parallel projection path runs.
+        let n = PARALLEL_ASSEMBLY_MIN_ENTITIES + 24;
+        for i in 0..n {
+            let dep = make_entity(&format!("dep_{i}"), EntityKind::Function);
+            store.upsert_entity(&dep).unwrap();
+            store
+                .upsert_relation(&Relation {
+                    id: kin_model::ids::RelationId::new(),
+                    kind: RelationKind::Calls,
+                    src: GraphNodeId::Entity(focal.id),
+                    dst: GraphNodeId::Entity(dep.id),
+                    confidence: 1.0,
+                    origin: RelationOrigin::Parsed,
+                    created_in: None,
+                    import_source: None,
+                    evidence: Vec::new(),
+                })
+                .unwrap();
+        }
+        // Generous budget so every dep is admitted; the admitted set is then a
+        // pure function of content, independent of the (pre-existing) tie-order.
+        let opts = ContextOptions {
+            budget: TokenBudget::Large32k,
+            ..ContextOptions::default()
+        };
+        let admitted = |p: &ContextPack| {
+            let mut ids: Vec<_> = p
+                .dependency_signatures
+                .iter()
+                .map(|e| e.entity_id)
+                .collect();
+            ids.sort();
+            ids
+        };
+        let a = build_context_pack(&store, &focal.id, &opts).unwrap();
+        let b = build_context_pack(&store, &focal.id, &opts).unwrap();
+        assert!(
+            !a.dependency_signatures.is_empty(),
+            "parallel path should admit direct deps"
+        );
+        assert_eq!(
+            admitted(&a),
+            admitted(&b),
+            "parallel context-pack assembly must admit a stable set"
+        );
     }
 
     fn make_artifact_work_item(title: &str, file_path: &FilePathId) -> WorkItem {
