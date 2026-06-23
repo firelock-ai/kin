@@ -5545,6 +5545,8 @@ impl EntityStore for InMemoryGraph {
             }
         }
 
+        // Canonical, insertion-order-independent ordering.
+        result.sort_unstable_by_key(|r| r.id.0);
         Ok(result)
     }
 
@@ -5576,6 +5578,8 @@ impl EntityStore for InMemoryGraph {
             }
         }
 
+        // Canonical, insertion-order-independent ordering.
+        result.sort_unstable_by_key(|r| r.id.0);
         Ok(result)
     }
 
@@ -13358,5 +13362,168 @@ mod tests {
         );
         assert!(matches!(out2, VectorIndexLoad::Loaded(1)));
         assert!(graph.vector_index.lock().is_some());
+    }
+
+    // ----------------------------------------------------------------------
+    // FIR-1141: baseline graph determinism. Root hash and traversal output must
+    // not depend on relation insertion order, must survive save/reopen, and (for
+    // the parity baseline) must be content-determined rather than dependent on the
+    // random entity/relation ids assigned at ingest. The fixture has a
+    // multi-outgoing hub and a 2-cycle, which is where the sorted cycle-break in
+    // MerkleCache::from_source is load-bearing.
+    // ----------------------------------------------------------------------
+
+    // hub --Calls--> {a,b,c,d} (multi-outgoing); a <-> b (2-cycle); c -> d -> e.
+    fn fir1141_fixture() -> (Vec<Entity>, Vec<Relation>) {
+        let hub = test_entity("hub", "src/hub.rs");
+        let a = test_entity("alpha", "src/a.rs");
+        let b = test_entity("beta", "src/b.rs");
+        let c = test_entity("gamma", "src/c.rs");
+        let d = test_entity("delta", "src/d.rs");
+        let e = test_entity("epsilon", "src/e.rs");
+        let rels = vec![
+            test_relation(hub.id, a.id, RelationKind::Calls),
+            test_relation(hub.id, b.id, RelationKind::Calls),
+            test_relation(hub.id, c.id, RelationKind::Calls),
+            test_relation(hub.id, d.id, RelationKind::Calls),
+            test_relation(a.id, b.id, RelationKind::Calls),
+            test_relation(b.id, a.id, RelationKind::Calls),
+            test_relation(c.id, d.id, RelationKind::Calls),
+            test_relation(d.id, e.id, RelationKind::Calls),
+        ];
+        (vec![hub, a, b, c, d, e], rels)
+    }
+
+    fn fir1141_build(ents: &[Entity], rels: &[Relation], order: &[usize]) -> InMemoryGraph {
+        let g = InMemoryGraph::new();
+        for e in ents {
+            g.upsert_entity(e).unwrap();
+        }
+        for &i in order {
+            g.upsert_relation(&rels[i]).unwrap();
+        }
+        g
+    }
+
+    const FIR1141_SHUFFLE: [usize; 8] = [7, 5, 2, 4, 0, 6, 3, 1];
+
+    #[test]
+    fn fir1141_root_hash_independent_of_relation_insertion_order() {
+        let (ents, rels) = fir1141_fixture();
+        let fwd: Vec<usize> = (0..rels.len()).collect();
+        let g1 = fir1141_build(&ents, &rels, &fwd);
+        let g2 = fir1141_build(&ents, &rels, &FIR1141_SHUFFLE);
+        assert_eq!(
+            g1.compute_root_hash(),
+            g2.compute_root_hash(),
+            "root must be independent of relation insertion order (multi-outgoing + cycle)"
+        );
+        assert_eq!(
+            g1.compute_root_hash(),
+            compute_graph_root_hash(&g1.to_snapshot()),
+            "deferred InMemoryGraph root must equal the from_snapshot root"
+        );
+    }
+
+    // Content-derived ids mirror production ingest (kin-parser `EntityId::from_content`
+    // + kin-index `stable_relation_id`): identical source yields identical ids, which
+    // is what makes the id-ordered cycle-break in MerkleCache::from_source stable.
+    fn fir1141_fixture_content_derived() -> (Vec<Entity>, Vec<Relation>) {
+        let (mut ents, _) = fir1141_fixture();
+        for e in &mut ents {
+            let file = e
+                .file_origin
+                .as_ref()
+                .map(|f| f.0.clone())
+                .unwrap_or_default();
+            e.id = EntityId::from_content(&file, &e.name, &format!("{:?}", e.kind), 0);
+        }
+        let ids: Vec<EntityId> = ents.iter().map(|e| e.id).collect();
+        let mk = |s: EntityId, d: EntityId| -> Relation {
+            let mut r = test_relation(s, d, RelationKind::Calls);
+            r.id = RelationId::from_content(&s.0.to_string(), &d.0.to_string(), "Calls");
+            r
+        };
+        // hub->{a,b,c,d}; a<->b (cycle); c->d->e.
+        let rels = vec![
+            mk(ids[0], ids[1]),
+            mk(ids[0], ids[2]),
+            mk(ids[0], ids[3]),
+            mk(ids[0], ids[4]),
+            mk(ids[1], ids[2]),
+            mk(ids[2], ids[1]),
+            mk(ids[3], ids[4]),
+            mk(ids[4], ids[5]),
+        ];
+        (ents, rels)
+    }
+
+    #[test]
+    fn fir1141_cyclic_root_is_stable_under_content_derived_ids() {
+        // Production assigns content-derived ids, so two independent builds of the
+        // same source yield identical ids and — despite the 2-cycle — an identical
+        // root. This is why the graph/Merkle root is deterministic in production and
+        // is ruled out as the parity-citable nondeterminism source. (The cycle-break
+        // is id-ordered, so this stability is contingent on content-derived ids.)
+        let fwd: Vec<usize> = (0..8).collect();
+        let (e1, r1) = fir1141_fixture_content_derived();
+        let (e2, r2) = fir1141_fixture_content_derived();
+        let g1 = fir1141_build(&e1, &r1, &fwd);
+        let g2 = fir1141_build(&e2, &r2, &fwd);
+        assert_eq!(
+            g1.compute_root_hash(),
+            g2.compute_root_hash(),
+            "with content-derived ids, the cyclic-graph root must be stable across builds"
+        );
+    }
+
+    #[test]
+    fn fir1141_root_hash_stable_across_save_reopen() {
+        let (ents, rels) = fir1141_fixture();
+        let fwd: Vec<usize> = (0..rels.len()).collect();
+        let g = fir1141_build(&ents, &rels, &fwd);
+        let before = g.compute_root_hash();
+        let reopened = InMemoryGraph::from_snapshot(g.to_snapshot());
+        assert_eq!(
+            before,
+            reopened.compute_root_hash(),
+            "root must survive to_snapshot -> from_snapshot"
+        );
+    }
+
+    #[test]
+    fn fir1141_relation_and_neighborhood_ordering_independent_of_insertion_order() {
+        let (ents, rels) = fir1141_fixture();
+        let hub = ents[0].id;
+        let fwd: Vec<usize> = (0..rels.len()).collect();
+        let g1 = fir1141_build(&ents, &rels, &fwd);
+        let g2 = fir1141_build(&ents, &rels, &FIR1141_SHUFFLE);
+
+        let rel_ids = |g: &InMemoryGraph| -> Vec<RelationId> {
+            g.get_all_relations_for_entity(&hub)
+                .unwrap()
+                .iter()
+                .map(|r| r.id)
+                .collect()
+        };
+        assert_eq!(
+            rel_ids(&g1),
+            rel_ids(&g2),
+            "get_all_relations_for_entity order must not depend on insertion order"
+        );
+
+        let sg1 = g1.get_dependency_neighborhood(&hub, 3).unwrap();
+        let sg2 = g2.get_dependency_neighborhood(&hub, 3).unwrap();
+        assert_eq!(
+            sg1.nodes, sg2.nodes,
+            "neighborhood node order must not depend on insertion order"
+        );
+        let nrel =
+            |sg: &SubGraph| -> Vec<RelationId> { sg.relations.iter().map(|r| r.id).collect() };
+        assert_eq!(
+            nrel(&sg1),
+            nrel(&sg2),
+            "neighborhood relation order must not depend on insertion order"
+        );
     }
 }

@@ -52,15 +52,21 @@ pub fn bfs_neighborhood(
         }
     }
 
-    // Convert to std HashMap for SubGraph
+    // Canonical output order so callers see a deterministic neighborhood
+    // regardless of relation insertion / hash-map iteration order. The graph root
+    // is computed separately (sorted-hash fold), so this ordering does not affect it.
+    let mut nodes: Vec<GraphNodeId> = result_entities
+        .keys()
+        .copied()
+        .map(GraphNodeId::Entity)
+        .collect();
+    nodes.sort_unstable_by_key(|n| n.to_string());
+    let mut relations = result_relations;
+    relations.sort_unstable_by_key(|r| r.id.0);
     SubGraph {
-        nodes: result_entities
-            .keys()
-            .copied()
-            .map(GraphNodeId::Entity)
-            .collect(),
+        nodes,
         entities: result_entities.into_iter().collect(),
-        relations: result_relations,
+        relations,
     }
 }
 
@@ -133,14 +139,18 @@ pub fn expand_neighborhood(
         }
     }
 
+    let mut nodes: Vec<GraphNodeId> = result_entities
+        .keys()
+        .copied()
+        .map(GraphNodeId::Entity)
+        .collect();
+    nodes.sort_unstable_by_key(|n| n.to_string());
+    let mut relations = result_relations;
+    relations.sort_unstable_by_key(|r| r.id.0);
     SubGraph {
-        nodes: result_entities
-            .keys()
-            .copied()
-            .map(GraphNodeId::Entity)
-            .collect(),
+        nodes,
         entities: result_entities.into_iter().collect(),
-        relations: result_relations,
+        relations,
     }
 }
 
