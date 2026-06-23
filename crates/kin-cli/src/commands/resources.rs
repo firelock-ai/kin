@@ -61,10 +61,62 @@ pub struct MetalPhaseRuntime {
     pub nanos: u64,
 }
 
+/// Actual host resource values observed at runtime, captured in the daemon
+/// process so an inspector can compare what is really in use against the plan's
+/// recommended (PLANNED) budgets. Capturing these is read-only observation: it
+/// never configures a pool, sets an env var, or otherwise changes runtime
+/// behavior, and it is sourced from host runtime APIs only (no kin-infer state).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActualResources {
+    /// Size of the process-global Rayon thread pool actually in use.
+    pub rayon_global_threads: usize,
+    /// OS-visible parallelism (`std::thread::available_parallelism`); 0 if it
+    /// could not be determined.
+    pub available_parallelism: usize,
+    /// Active `KIN_RESOURCE_PROFILE` env value, if set and non-empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_profile_env: Option<String>,
+    /// Active `RAYON_NUM_THREADS` override, if set and non-empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rayon_num_threads_env: Option<String>,
+    /// Active `TOKENIZERS_PARALLELISM` value, if set and non-empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokenizers_parallelism_env: Option<String>,
+}
+
+impl ActualResources {
+    /// Capture the actual host resource state from the current process. Must be
+    /// called from the daemon/runtime process so `rayon_global_threads` reflects
+    /// the pool that actually runs ingest/embed work rather than a transient CLI
+    /// process pool.
+    pub fn capture() -> Self {
+        ActualResources {
+            rayon_global_threads: rayon::current_num_threads(),
+            available_parallelism: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(0),
+            resource_profile_env: non_empty_env("KIN_RESOURCE_PROFILE"),
+            rayon_num_threads_env: non_empty_env("RAYON_NUM_THREADS"),
+            tokenizers_parallelism_env: non_empty_env("TOKENIZERS_PARALLELISM"),
+        }
+    }
+}
+
+/// Read an environment variable, returning `Some(trimmed)` only when it is set
+/// and non-empty after trimming.
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandResourcesResponse {
     pub plan: ResourcePlan,
     pub embed_runtime: EmbedRuntimeState,
+    #[serde(default)]
+    pub actual: ActualResources,
     #[serde(default)]
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -79,6 +131,7 @@ struct ResourcesJson<'a> {
     #[serde(flatten)]
     plan: &'a ResourcePlan,
     embed_runtime: &'a EmbedRuntimeState,
+    actual: &'a ActualResources,
 }
 
 /// Parse a CLI/request profile name. Absent input defaults to `Interactive`;
@@ -107,9 +160,13 @@ fn profile_label(profile: Profile) -> &'static str {
     }
 }
 
-fn render_lines(plan: &ResourcePlan, embed: &EmbedRuntimeState) -> Vec<String> {
+fn render_lines(
+    plan: &ResourcePlan,
+    embed: &EmbedRuntimeState,
+    actual: &ActualResources,
+) -> Vec<String> {
     let accel = format!("{:?}", plan.accelerator.backend).to_ascii_lowercase();
-    vec![
+    let mut lines = vec![
         format!("Profile: {}", profile_label(plan.profile)),
         format!(
             "Host: {} ({} logical cores, {} rayon threads, {} reserved)",
@@ -117,6 +174,10 @@ fn render_lines(plan: &ResourcePlan, embed: &EmbedRuntimeState) -> Vec<String> {
             plan.host.logical_cores,
             plan.host.rayon_threads,
             plan.host.reserve_logical_cores
+        ),
+        format!(
+            "Rayon pool: {} planned, {} actual global threads ({} cores available)",
+            plan.host.rayon_threads, actual.rayon_global_threads, actual.available_parallelism
         ),
         format!(
             "Accelerator: {accel} (unified memory: {})",
@@ -142,7 +203,26 @@ fn render_lines(plan: &ResourcePlan, embed: &EmbedRuntimeState) -> Vec<String> {
                 "idle"
             }
         ),
+    ];
+
+    let overrides = [
+        ("KIN_RESOURCE_PROFILE", &actual.resource_profile_env),
+        ("RAYON_NUM_THREADS", &actual.rayon_num_threads_env),
+        ("TOKENIZERS_PARALLELISM", &actual.tokenizers_parallelism_env),
     ]
+    .into_iter()
+    .filter_map(|(key, value)| value.as_ref().map(|value| format!("{key}={value}")))
+    .collect::<Vec<_>>();
+    lines.push(format!(
+        "Env overrides: {}",
+        if overrides.is_empty() {
+            "none".to_string()
+        } else {
+            overrides.join(", ")
+        }
+    ));
+
+    lines
 }
 
 /// Build the inspect response from a detected plan plus live daemon embedding
@@ -150,9 +230,10 @@ fn render_lines(plan: &ResourcePlan, embed: &EmbedRuntimeState) -> Vec<String> {
 pub fn build_command_resources_response(
     plan: ResourcePlan,
     embed_runtime: EmbedRuntimeState,
+    actual: ActualResources,
     json: bool,
 ) -> Result<CommandResourcesResponse> {
-    let text = render_lines(&plan, &embed_runtime)
+    let text = render_lines(&plan, &embed_runtime, &actual)
         .into_iter()
         .map(|line| format!("{line}\n"))
         .collect::<String>();
@@ -160,6 +241,7 @@ pub fn build_command_resources_response(
         Some(serde_json::to_string(&ResourcesJson {
             plan: &plan,
             embed_runtime: &embed_runtime,
+            actual: &actual,
         })?)
     } else {
         None
@@ -167,6 +249,7 @@ pub fn build_command_resources_response(
     Ok(CommandResourcesResponse {
         plan,
         embed_runtime,
+        actual,
         text,
         json,
     })
@@ -290,9 +373,20 @@ mod tests {
             embeddings_total: 10,
             ..EmbedRuntimeState::default()
         };
-        let response =
-            build_command_resources_response(sample_plan(Profile::Interactive), embed, true)
-                .unwrap();
+        let actual = ActualResources {
+            rayon_global_threads: 6,
+            available_parallelism: 8,
+            resource_profile_env: Some("throughput".to_string()),
+            tokenizers_parallelism_env: Some("false".to_string()),
+            ..ActualResources::default()
+        };
+        let response = build_command_resources_response(
+            sample_plan(Profile::Interactive),
+            embed,
+            actual,
+            true,
+        )
+        .unwrap();
 
         let value: serde_json::Value =
             serde_json::from_str(&response.json.expect("json requested")).unwrap();
@@ -304,6 +398,12 @@ mod tests {
         assert_eq!(value["embed_runtime"]["embeddings_pending"], 7);
         assert_eq!(value["embed_runtime"]["embeddings_total"], 10);
         assert_eq!(value["embed_runtime"]["hybrid_metrics"]["gpu_entities"], 0);
+        assert_eq!(value["actual"]["rayon_global_threads"], 6);
+        assert_eq!(value["actual"]["available_parallelism"], 8);
+        assert_eq!(value["actual"]["resource_profile_env"], "throughput");
+        assert_eq!(value["actual"]["tokenizers_parallelism_env"], "false");
+        // Unset env overrides are omitted from the JSON surface.
+        assert!(value["actual"]["rayon_num_threads_env"].is_null());
     }
 
     #[test]
@@ -321,9 +421,13 @@ mod tests {
             },
             ..EmbedRuntimeState::default()
         };
-        let response =
-            build_command_resources_response(sample_plan(Profile::Throughput), embed, true)
-                .unwrap();
+        let response = build_command_resources_response(
+            sample_plan(Profile::Throughput),
+            embed,
+            ActualResources::default(),
+            true,
+        )
+        .unwrap();
 
         let value: serde_json::Value =
             serde_json::from_str(&response.json.expect("json requested")).unwrap();
@@ -355,9 +459,13 @@ mod tests {
             }),
             ..EmbedRuntimeState::default()
         };
-        let response =
-            build_command_resources_response(sample_plan(Profile::Throughput), embed, true)
-                .unwrap();
+        let response = build_command_resources_response(
+            sample_plan(Profile::Throughput),
+            embed,
+            ActualResources::default(),
+            true,
+        )
+        .unwrap();
 
         let value: serde_json::Value =
             serde_json::from_str(&response.json.expect("json requested")).unwrap();
@@ -377,12 +485,54 @@ mod tests {
         let response = build_command_resources_response(
             sample_plan(Profile::Proof),
             EmbedRuntimeState::default(),
+            ActualResources::default(),
             false,
         )
         .unwrap();
         assert!(response.json.is_none());
         assert!(response.text.contains("Profile: proof"));
         assert!(response.text.contains("Embed coverage:"));
+    }
+
+    #[test]
+    fn human_text_reports_planned_vs_actual_and_env_overrides() {
+        let actual = ActualResources {
+            rayon_global_threads: 6,
+            available_parallelism: 8,
+            rayon_num_threads_env: Some("6".to_string()),
+            tokenizers_parallelism_env: Some("false".to_string()),
+            ..ActualResources::default()
+        };
+        let response = build_command_resources_response(
+            sample_plan(Profile::Interactive),
+            EmbedRuntimeState::default(),
+            actual,
+            false,
+        )
+        .unwrap();
+        let planned = response.plan.host.rayon_threads;
+        let expected =
+            format!("Rayon pool: {planned} planned, 6 actual global threads (8 cores available)");
+        assert!(
+            response.text.contains(&expected),
+            "missing planned-vs-actual line; text was:\n{}",
+            response.text
+        );
+        assert!(response
+            .text
+            .contains("Env overrides: RAYON_NUM_THREADS=6, TOKENIZERS_PARALLELISM=false"));
+    }
+
+    #[test]
+    fn human_text_reports_no_env_overrides_when_unset() {
+        let response = build_command_resources_response(
+            sample_plan(Profile::Interactive),
+            EmbedRuntimeState::default(),
+            ActualResources::default(),
+            false,
+        )
+        .unwrap();
+        assert!(response.text.contains("Env overrides: none"));
     }
 
     #[test]
