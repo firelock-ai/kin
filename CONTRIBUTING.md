@@ -46,6 +46,22 @@ Common types are `feat`, `fix`, `docs`, `test`, `refactor`, `perf`, and
 `search`, `release`, and so on). Write the summary in the imperative mood and
 keep it focused on what changed and why.
 
+## Branch Naming and Commit Hygiene
+
+Public Git history is part of the product, so keep it clean and reviewable:
+
+- **Keep branch names topical, not tracker-coded.** Prefer short, descriptive
+  names like `fix/locate-tie-breaks` or `docs/contributing-hygiene`. Avoid
+  embedding internal issue or tracker IDs in a branch name — a squash merge
+  copies the branch name into the public commit subject, so anything in the
+  branch name lands in history verbatim.
+- **Write durable subjects and bodies.** Commit messages should describe the
+  technical change and why it was made. Keep internal tracker IDs, session
+  identifiers, and automated authorship trailers out of public commit
+  metadata; link that context from the pull request instead.
+- **Don't bypass the hooks.** Repository hooks normalize commit metadata for
+  consistency — don't skip them with `--no-verify`.
+
 ## Pull Requests
 
 - **Keep PRs scoped.** Stage only the files your change actually needs.
