@@ -285,42 +285,28 @@ fn parse_model_config<T: serde::de::DeserializeOwned>(data: &str) -> serde_json:
     serde_json::from_value(value)
 }
 
-/// Serializes every kin-db `BertModel` load so the CPU-twin's force-CPU toggle is
-/// never observable to a concurrent load.
-#[cfg(feature = "embeddings")]
-static MODEL_LOAD_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Load a `BertModel`, optionally pinned to the CPU backend.
 ///
-/// kin-infer selects its compute backend at load time inside
-/// `gpu::create_compute`, whose only CPU override is the process-global
-/// `KIN_INFER_FORCE_CPU` env var. Toggling that var directly is a data race: a
-/// concurrent load on another thread would observe the transient value and pick
-/// the wrong backend. This serializes all kin-db loads under one lock and only
-/// flips the var inside the lock, so the override is never visible outside the
-/// single load it is meant for. (A non-env backend parameter on the kin-infer
-/// load API would remove the toggle entirely; until that exists, this keeps the
-/// override race-free.)
+/// The compute backend is passed explicitly to kin-infer via
+/// `BertModel::load_with_backend`. The effective backend is CPU when either the
+/// caller's `force_cpu` argument is set or the process-global
+/// `KIN_INFER_FORCE_CPU` env override is active (`gpu::force_cpu_from_env`);
+/// otherwise the normal Metal > CUDA > CPU auto ladder runs. This preserves the
+/// env-honoring semantics of `BertModel::load` (which a forced-CPU determinism
+/// proof relies on) while selecting per-load: the load never mutates the
+/// environment, so a concurrent load can no longer observe a transient toggle
+/// and pick the wrong backend.
 #[cfg(feature = "embeddings")]
 fn load_bert_model(
     weights_path: &Path,
     config: BertConfig,
     force_cpu: bool,
 ) -> Result<BertModel, kin_infer::InferError> {
-    let _guard = MODEL_LOAD_GUARD
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    if !force_cpu {
-        return BertModel::load(weights_path, config);
-    }
-    let prev = std::env::var_os("KIN_INFER_FORCE_CPU");
-    std::env::set_var("KIN_INFER_FORCE_CPU", "1");
-    let result = BertModel::load(weights_path, config);
-    match prev {
-        Some(value) => std::env::set_var("KIN_INFER_FORCE_CPU", value),
-        None => std::env::remove_var("KIN_INFER_FORCE_CPU"),
-    }
-    result
+    BertModel::load_with_backend(
+        weights_path,
+        config,
+        force_cpu || kin_infer::gpu::force_cpu_from_env(),
+    )
 }
 
 /// Process-global counters that record how the throughput-profile hybrid split
@@ -1716,9 +1702,10 @@ impl BertEmbedder {
     /// Lazily construct (or return) the CPU-only BertModel twin.
     ///
     /// Construction goes through `load_bert_model(.., force_cpu = true)`, which
-    /// pins this one load to `CpuCompute` under a serialized, scoped backend
-    /// toggle so the primary (GPU) model and any concurrent load are unaffected.
-    /// The twin runs the CPU arm of the throughput-profile hybrid split.
+    /// pins this one load to `CpuCompute` via an explicit kin-infer backend
+    /// argument, so the primary (GPU) model and any concurrent load are
+    /// unaffected. The twin runs the CPU arm of the throughput-profile hybrid
+    /// split.
     #[cfg(feature = "embeddings")]
     fn cpu_model(&self) -> Result<&BertModel, KinDbError> {
         if let Some(model) = self.cpu_model.get() {
@@ -1741,9 +1728,9 @@ impl BertEmbedder {
                 KinDbError::IndexError(format!("cpu twin config parse failed: {e}"))
             })?;
 
-            // Pin this single load to the CPU backend. The force-CPU toggle is
-            // serialized and scoped inside load_bert_model, so the primary (GPU)
-            // model and any concurrent load never observe it.
+            // Pin this single load to the CPU backend. load_bert_model passes
+            // the backend explicitly to kin-infer, so the primary (GPU) model
+            // and any concurrent load are unaffected.
             let cpu_model = load_bert_model(&source.weights_path, config, true).map_err(|e| {
                 KinDbError::IndexError(format!("failed to load CPU BERT twin: {e}"))
             })?;
