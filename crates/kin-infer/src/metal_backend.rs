@@ -259,10 +259,8 @@ fn use_fp16_mma(m: usize, n: usize, k: usize) -> bool {
 }
 
 /// Whether the C7 flash-attention path is selected. Default OFF: selected only
-/// by the resource plan or `KIN_INFER_FLASH_ATTENTION=1`, and currently used
-/// solely to attempt optional pipeline registration during Metal construction.
-/// No runtime attention dispatch is routed through C7 until kernels are added
-/// and parity-cleared.
+/// by the resource plan or `KIN_INFER_FLASH_ATTENTION=1`. Runtime dispatch still
+/// requires the optional C7 library to compile and the shape gate to pass.
 fn c7_flash_attention_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -277,6 +275,57 @@ fn c7_flash_attention_enabled() -> bool {
 /// C7 is disabled, absent, or rejected by the Metal toolchain.
 static C7_FLASH_ATTENTION_AVAILABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Route only conservative shapes through the optional C7 fused-attention path.
+/// The first C7 cut is default-off and parity-first: it supports the public
+/// head-major batched attention layout and grouped masks, while ALiBi and
+/// resident-stack routing stay on the proven baseline until direct parity clears.
+#[inline]
+fn c7_flash_attention_shape_supported(
+    num_groups: usize,
+    seq_len: usize,
+    head_dim: usize,
+    heads_per_group: usize,
+    has_alibi: bool,
+    scale: f32,
+    masks: &[u32],
+) -> bool {
+    num_groups > 0
+        && seq_len > 0
+        && head_dim > 0
+        && heads_per_group > 0
+        && !has_alibi
+        && scale.is_finite()
+        && (64..=1024).contains(&seq_len)
+        && matches!(head_dim, 32 | 64)
+        && num_groups.checked_mul(seq_len) == Some(masks.len())
+        && masks
+            .chunks(seq_len)
+            .all(|group_mask| group_mask.iter().any(|&keep| keep != 0))
+}
+
+#[inline]
+fn use_c7_flash_attention(
+    num_groups: usize,
+    seq_len: usize,
+    head_dim: usize,
+    heads_per_group: usize,
+    has_alibi: bool,
+    scale: f32,
+    masks: &[u32],
+) -> bool {
+    c7_flash_attention_enabled()
+        && C7_FLASH_ATTENTION_AVAILABLE.load(Ordering::Relaxed)
+        && c7_flash_attention_shape_supported(
+            num_groups,
+            seq_len,
+            head_dim,
+            heads_per_group,
+            has_alibi,
+            scale,
+            masks,
+        )
+}
 
 /// Whether the steel double-buffered K-loop MMA path is selected. The steel
 /// kernels overlap the next K-tile's global load with the current tile's MMA
@@ -1737,15 +1786,97 @@ kernel void batched_matmul_ab_simdgroup_fp16(
 // ---------------------------------------------------------------------------
 // Kept separate from the baseline Metal shader library for the same reason as
 // the fp16 MMA library: an experimental C7 compile/pipeline failure must only
-// disable C7, never Metal itself. The kernel list intentionally starts empty;
-// adding a real C7 shader later is a small registration change instead of a
-// control-flow change.
+// disable C7, never Metal itself. Adding more C7 shaders later should be a
+// small registration change instead of a control-flow change.
 const C7_FLASH_ATTENTION_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
+
+// One 32-lane simdgroup per (row, head): fuses QK, scale/mask, online softmax,
+// and SV without materializing the O(seq^2) score buffer. The launch is
+// conservative/default-off; ALiBi and resident-stack routing remain on the
+// baseline path until direct parity clears.
+constant uint C7_THREADS = 32;
+constant uint C7_MAX_HEAD_DIM = 64;
+
+kernel void c7_flash_attention_batched(
+    device const float* q           [[buffer(0)]],
+    device const float* k           [[buffer(1)]],
+    device const float* v           [[buffer(2)]],
+    device float* out               [[buffer(3)]],
+    device const uint* mask         [[buffer(4)]],
+    constant uint& seq_len          [[buffer(5)]],
+    constant uint& head_dim         [[buffer(6)]],
+    constant float& scale           [[buffer(7)]],
+    constant uint& heads_per_group  [[buffer(8)]],
+    uint3 tgid                      [[threadgroup_position_in_grid]],
+    uint tid                        [[thread_index_in_threadgroup]]
+) {
+    uint row = tgid.x;
+    uint head = tgid.y;
+    if (tid >= C7_THREADS) return;
+    if (row >= seq_len || heads_per_group == 0 || head_dim > C7_MAX_HEAD_DIM) return;
+
+    uint group = head / heads_per_group;
+    uint head_base = head * seq_len * head_dim;
+    uint mask_base = group * seq_len;
+    uint q_row = head_base + row * head_dim;
+
+    threadgroup float partials[C7_THREADS][C7_MAX_HEAD_DIM];
+
+    for (uint d = 0; d < C7_MAX_HEAD_DIM; d++) {
+        if (d < head_dim) {
+            partials[tid][d] = 0.0;
+        }
+    }
+
+    float max_val = -INFINITY;
+    for (uint col = tid; col < seq_len; col += C7_THREADS) {
+        if (mask[mask_base + col] == 0) {
+            continue;
+        }
+        float score = 0.0;
+        uint k_off = head_base + col * head_dim;
+        for (uint inner = 0; inner < head_dim; inner++) {
+            score += q[q_row + inner] * k[k_off + inner];
+        }
+        score *= scale;
+        max_val = max(max_val, score);
+    }
+    max_val = simd_max(max_val);
+
+    float local_sum = 0.0;
+    for (uint col = tid; col < seq_len; col += C7_THREADS) {
+        if (mask[mask_base + col] == 0) {
+            continue;
+        }
+        float score = 0.0;
+        uint k_off = head_base + col * head_dim;
+        for (uint inner = 0; inner < head_dim; inner++) {
+            score += q[q_row + inner] * k[k_off + inner];
+        }
+        score *= scale;
+        float weight = exp(score - max_val);
+        local_sum += weight;
+        for (uint d = 0; d < head_dim; d++) {
+            partials[tid][d] += weight * v[head_base + col * head_dim + d];
+        }
+    }
+
+    float denom = simd_sum(local_sum);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint d = tid; d < head_dim; d += C7_THREADS) {
+        float numer = 0.0;
+        for (uint lane = 0; lane < C7_THREADS; lane++) {
+            numer += partials[lane][d];
+        }
+        out[q_row + d] = denom > 0.0 ? numer / denom : 0.0;
+    }
+}
 "#;
 
-const C7_FLASH_ATTENTION_KERNEL_NAMES: &[&str] = &[];
+const C7_FLASH_ATTENTION_KERNEL_NAMES: &[&str] = &["c7_flash_attention_batched"];
 
 // ---------------------------------------------------------------------------
 // Bounded in-flight submission
@@ -2564,11 +2695,10 @@ impl MetalCompute {
         FP16_MMA_AVAILABLE.store(fp16_mma_available, Ordering::Relaxed);
 
         // C7 flash-attention — OPTIONAL, compiled as a SEPARATE library only
-        // when opt-in enabled. The skeleton currently registers no kernels, so
-        // C7 availability remains false and all runtime attention calls continue
-        // through the baseline Metal path. Future C7 kernels can be added to
-        // C7_FLASH_ATTENTION_KERNEL_NAMES without making the main library depend
-        // on them.
+        // when opt-in enabled. C7 availability remains false if compilation or
+        // pipeline creation fails, and runtime attention calls continue through
+        // the baseline Metal path unless registration succeeds and the shape
+        // gate passes.
         let mut c7_flash_attention_available = false;
         if c7_flash_attention_enabled() {
             match device.new_library_with_source(C7_FLASH_ATTENTION_SHADER_SOURCE, &opts) {
@@ -5815,17 +5945,78 @@ impl GpuCompute for MetalCompute {
         let buf_q = self.buf_slice_pooled(q)?;
         let buf_k = self.buf_slice_pooled(k)?;
         let buf_v = self.buf_slice_pooled(v)?;
-        let buf_scores = self.buf_zeros_pooled(total_heads * seq_len * seq_len)?;
         let buf_out = self.buf_zeros_pooled(total_heads * seq_len * head_dim)?;
         let buf_seq = self.buf_u32(seq_len as u32)?;
         let buf_dim = self.buf_u32(head_dim as u32)?;
         let buf_scale = self.buf_f32(scale)?;
         let has_alibi = !alibi_slopes.is_empty();
+        let buf_masks = self.buf_u32_slice(masks)?;
+        let buf_heads_per_group = self.buf_u32(heads_per_group as u32)?;
+
+        if let Some(c7_pipeline) = self
+            .pipelines
+            .get("c7_flash_attention_batched")
+            .filter(|pipeline| pipeline.thread_execution_width() == 32)
+            .filter(|_| {
+                use_c7_flash_attention(
+                    num_groups,
+                    seq_len,
+                    head_dim,
+                    heads_per_group,
+                    has_alibi,
+                    scale,
+                    masks,
+                )
+            })
+        {
+            let out = autoreleasepool(|_| -> Result<Vec<f32>, InferError> {
+                let cmd = self.queue.new_command_buffer();
+                {
+                    let _op_span = tracing::info_span!(
+                        "kin_infer.metal.fused_attention_batched.c7_flash_attention"
+                    )
+                    .entered();
+                    let enc = cmd.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(c7_pipeline);
+                    enc.set_buffer(0, Some(buf_q.buffer()), 0);
+                    enc.set_buffer(1, Some(buf_k.buffer()), 0);
+                    enc.set_buffer(2, Some(buf_v.buffer()), 0);
+                    enc.set_buffer(3, Some(buf_out.buffer()), 0);
+                    enc.set_buffer(4, Some(&buf_masks), 0);
+                    enc.set_buffer(5, Some(&buf_seq), 0);
+                    enc.set_buffer(6, Some(&buf_dim), 0);
+                    enc.set_buffer(7, Some(&buf_scale), 0);
+                    enc.set_buffer(8, Some(&buf_heads_per_group), 0);
+                    let groups = MTLSize::new(seq_len as u64, total_heads as u64, 1);
+                    let tg = MTLSize::new(32, 1, 1);
+                    enc.dispatch_thread_groups(groups, tg);
+                    enc.end_encoding();
+                }
+                {
+                    let _commit_span = tracing::info_span!(
+                        "kin_infer.metal.fused_attention_batched.c7_commit_wait"
+                    )
+                    .entered();
+                    time_phase(Phase::Attention, || {
+                        self.commit_wait(cmd);
+                    });
+                }
+                Ok(Self::read_buf(
+                    buf_out.buffer(),
+                    total_heads * seq_len * head_dim,
+                ))
+            })?;
+            Self::count_nonfinite(
+                &format!("c7_flash_attention_batched seq_len={seq_len} total_heads={total_heads}"),
+                &out,
+            );
+            return Ok(out);
+        }
+
         let alibi_ref = if has_alibi { alibi_slopes } else { &[0.0f32] };
         let pooled_alibi = self.buf_slice_pooled(alibi_ref)?;
-        let buf_masks = self.buf_u32_slice(masks)?;
         let buf_has_alibi = self.buf_u32(has_alibi as u32)?;
-        let buf_heads_per_group = self.buf_u32(heads_per_group as u32)?;
+        let buf_scores = self.buf_zeros_pooled(total_heads * seq_len * seq_len)?;
 
         // All four ops + commit + readback inside one autorelease pool: the
         // command buffer and its encoders are autoreleased (+0) and would
@@ -6971,6 +7162,201 @@ mod tests {
         assert!(
             max_err < 5e-3,
             "fused_attention_batched max err: {}",
+            max_err
+        );
+    }
+
+    #[test]
+    fn test_metal_c7_flash_attention_shape_gate_without_device() {
+        let num_groups = 2;
+        let heads_per_group = 2;
+        let seq_len = 64;
+        let head_dim = 64;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let masks = vec![1u32; num_groups * seq_len];
+
+        assert!(c7_flash_attention_shape_supported(
+            num_groups,
+            seq_len,
+            head_dim,
+            heads_per_group,
+            false,
+            scale,
+            &masks,
+        ));
+        assert!(!c7_flash_attention_shape_supported(
+            num_groups,
+            seq_len,
+            head_dim,
+            heads_per_group,
+            true,
+            scale,
+            &masks,
+        ));
+        assert!(!c7_flash_attention_shape_supported(
+            num_groups,
+            seq_len,
+            head_dim,
+            heads_per_group,
+            false,
+            f32::NAN,
+            &masks,
+        ));
+        assert!(!c7_flash_attention_shape_supported(
+            num_groups,
+            seq_len,
+            16,
+            heads_per_group,
+            false,
+            scale,
+            &masks,
+        ));
+        assert!(!c7_flash_attention_shape_supported(
+            num_groups,
+            32,
+            head_dim,
+            heads_per_group,
+            false,
+            scale,
+            &masks[..num_groups * 32],
+        ));
+
+        let short_masks = &masks[..masks.len() - 1];
+        assert!(!c7_flash_attention_shape_supported(
+            num_groups,
+            seq_len,
+            head_dim,
+            heads_per_group,
+            false,
+            scale,
+            short_masks,
+        ));
+
+        let mut all_zero_group = masks.clone();
+        all_zero_group[..seq_len].fill(0);
+        assert!(!c7_flash_attention_shape_supported(
+            num_groups,
+            seq_len,
+            head_dim,
+            heads_per_group,
+            false,
+            scale,
+            &all_zero_group,
+        ));
+    }
+
+    #[test]
+    fn test_metal_c7_flash_attention_default_off_shape_gate() {
+        if c7_flash_attention_enabled() {
+            return;
+        }
+        let seq_len = 64;
+        let masks = vec![1u32; seq_len];
+
+        assert!(c7_flash_attention_shape_supported(
+            1,
+            seq_len,
+            64,
+            1,
+            false,
+            1.0 / 8.0,
+            &masks,
+        ));
+        assert!(!use_c7_flash_attention(
+            1,
+            seq_len,
+            64,
+            1,
+            false,
+            1.0 / 8.0,
+            &masks,
+        ));
+    }
+
+    #[test]
+    fn test_metal_c7_flash_attention_batched_matches_cpu() {
+        if !c7_flash_attention_enabled() {
+            return;
+        }
+        let Some(metal) = get_metal() else { return };
+        assert!(
+            C7_FLASH_ATTENTION_AVAILABLE.load(Ordering::Relaxed),
+            "C7 flash-attention was requested but the optional Metal pipeline did not compile"
+        );
+        let cpu = crate::gpu::CpuCompute;
+
+        let num_groups = 2;
+        let heads_per_group = 2;
+        let seq_len = 64;
+        let head_dim = 64;
+        let total_heads = num_groups * heads_per_group;
+        let elems = total_heads * seq_len * head_dim;
+
+        let q: Vec<f32> = (0..elems)
+            .map(|i| ((i % 97) as f32 - 48.0) * 0.013)
+            .collect();
+        let k: Vec<f32> = (0..elems)
+            .map(|i| ((i % 83) as f32 - 41.0) * 0.011)
+            .collect();
+        let v: Vec<f32> = (0..elems)
+            .map(|i| ((i % 79) as f32 - 39.0) * 0.007)
+            .collect();
+        let masks: Vec<u32> = (0..num_groups * seq_len)
+            .map(|i| if i % 11 == 0 { 0 } else { 1 })
+            .collect();
+        let alibi = Vec::new();
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        assert_eq!(
+            metal
+                .pipelines
+                .get("c7_flash_attention_batched")
+                .map(|p| p.thread_execution_width()),
+            Some(32),
+        );
+        assert!(use_c7_flash_attention(
+            num_groups,
+            seq_len,
+            head_dim,
+            heads_per_group,
+            false,
+            scale,
+            &masks,
+        ));
+
+        let out_metal = metal
+            .fused_attention_batched(
+                &q,
+                &k,
+                &v,
+                num_groups,
+                heads_per_group,
+                seq_len,
+                head_dim,
+                scale,
+                &alibi,
+                &masks,
+            )
+            .unwrap();
+        let out_cpu = cpu
+            .fused_attention_batched(
+                &q,
+                &k,
+                &v,
+                num_groups,
+                heads_per_group,
+                seq_len,
+                head_dim,
+                scale,
+                &alibi,
+                &masks,
+            )
+            .unwrap();
+
+        assert_eq!(out_metal.len(), elems);
+        let max_err = max_abs_diff(&out_metal, &out_cpu);
+        assert!(
+            max_err < 5e-4,
+            "C7 flash_attention_batched max err: {}",
             max_err
         );
     }

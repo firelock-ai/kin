@@ -206,7 +206,10 @@ pub struct EmbeddingPlan {
 /// scheduling/readback levers that preserve embedding values. kin-infer's Metal
 /// backend resolves these into its per-process kernel gates; a `KIN_INFER_*` env
 /// override still wins per lever so each can be A/B-measured in isolation.
-/// `flash_attention` remains default-off until runtime support exists, is
+/// `flash_attention` selects the optional C7 fused-attention family when the
+/// backend has compiled it; it remains default-off until parity and throughput
+/// are proven on the same corpus.
+/// `pooled_output` also remains default-off until runtime support exists, is
 /// parity-cleared, and measures as a win.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct GpuKernelPlan {
@@ -222,7 +225,7 @@ pub struct GpuKernelPlan {
     /// On-device head-major attention reshape (`KIN_INFER_RESHAPE_GPU`).
     #[serde(default)]
     pub reshape_gpu: bool,
-    /// Future fused flash-attention kernel family. Schema support only.
+    /// Optional fused flash-attention kernel family (`KIN_INFER_FLASH_ATTENTION`).
     #[serde(default)]
     pub flash_attention: bool,
     /// Final pooled-output readback instead of full hidden-state readback.
