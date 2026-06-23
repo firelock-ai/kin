@@ -2859,13 +2859,28 @@ impl MetalCompute {
         .ok_or_else(|| InferError::OutOfMemory("metal scalar f32 buffer alloc failed".into()))
     }
 
-    /// Get or create a cached buffer for persistent data (weight matrices).
-    /// Keyed by (pointer, len, first_bits, last_bits) — weight Array2 data pointers
-    /// are stable across forward passes, so this hits on every call after the first.
-    fn buf_cached(&self, data: &[f32]) -> Result<Buffer, InferError> {
+    /// Cache key for a weight buffer: pointer, length, and the first/last element
+    /// bit patterns. Folding in the content bits means a reused allocation (same
+    /// pointer and length, different contents) no longer collides with a stale
+    /// cached buffer, while stable weights still hit on every call after the first.
+    fn weight_cache_key(data: &[f32]) -> (usize, usize, u32, u32) {
         let first_bits = data.first().map(|x| x.to_bits()).unwrap_or(0);
         let last_bits = data.last().map(|x| x.to_bits()).unwrap_or(0);
-        let key = (data.as_ptr() as usize, data.len(), first_bits, last_bits);
+        (data.as_ptr() as usize, data.len(), first_bits, last_bits)
+    }
+
+    /// Cache key for a row-concatenated weight buffer: the per-component
+    /// [`Self::weight_cache_key`] in order, so any component's content change
+    /// changes the key.
+    fn concat_cache_key(weights: &[&[f32]]) -> Vec<(usize, usize, u32, u32)> {
+        weights.iter().map(|w| Self::weight_cache_key(w)).collect()
+    }
+
+    /// Get or create a cached buffer for persistent data (weight matrices).
+    /// Keyed by [`Self::weight_cache_key`] — weight Array2 data pointers are stable
+    /// across forward passes, so this hits on every call after the first.
+    fn buf_cached(&self, data: &[f32]) -> Result<Buffer, InferError> {
+        let key = Self::weight_cache_key(data);
         let mut cache = self.weight_cache.lock();
         if let Some(buf) = cache.get(&key) {
             return Ok(buf.clone());
@@ -2882,14 +2897,7 @@ impl MetalCompute {
     /// subsequent call. Used to fold the q/k/v (and gate/up) projections into
     /// one fat GEMM.
     fn buf_cached_concat(&self, weights: &[&[f32]]) -> Result<Buffer, InferError> {
-        let key: Vec<(usize, usize, u32, u32)> = weights
-            .iter()
-            .map(|w| {
-                let first_bits = w.first().map(|x| x.to_bits()).unwrap_or(0);
-                let last_bits = w.last().map(|x| x.to_bits()).unwrap_or(0);
-                (w.as_ptr() as usize, w.len(), first_bits, last_bits)
-            })
-            .collect();
+        let key = Self::concat_cache_key(weights);
         let mut cache = self.concat_cache.lock();
         if let Some(buf) = cache.get(&key) {
             return Ok(buf.clone());
