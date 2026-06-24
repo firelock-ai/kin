@@ -15,8 +15,7 @@ pub async fn run_status() -> Result<()> {
 
     let env_val = std::env::var("KIN_LOCATE_TELEMETRY").ok();
     let consent_marker = consent_path.exists();
-    let enabled =
-        super::locate_telemetry::telemetry_enabled(env_val.as_deref(), consent_marker);
+    let enabled = super::locate_telemetry::telemetry_enabled(env_val.as_deref(), consent_marker);
 
     println!("Telemetry status: {}", if enabled { "ON" } else { "OFF" });
     println!();
@@ -28,10 +27,7 @@ pub async fn run_status() -> Result<()> {
     if consent_marker {
         println!("  Consent marker present: {}", consent_path.display());
     } else {
-        println!(
-            "  No consent marker at {}",
-            consent_path.display()
-        );
+        println!("  No consent marker at {}", consent_path.display());
     }
 
     if spool_dir.is_dir() {
@@ -51,9 +47,7 @@ pub async fn run_status() -> Result<()> {
     println!("  - timestamp, max_files requested");
     println!("  - NOT: file contents, entity payloads, diff data");
     println!();
-    println!(
-        "Run `kin telemetry consent`  to opt in."
-    );
+    println!("Run `kin telemetry consent`  to opt in.");
     println!("Run `kin telemetry revoke`   to revoke consent.");
     println!("Run `kin telemetry purge`    to delete all spool files.");
     println!("See PRIVACY.md for the full privacy policy.");
@@ -69,8 +63,12 @@ pub async fn run_consent() -> Result<()> {
     let consent_path = consent_marker_path(kin_root);
     let spool_dir = telemetry_dir(kin_root);
 
-    std::fs::create_dir_all(&spool_dir)
-        .with_context(|| format!("could not create telemetry directory {}", spool_dir.display()))?;
+    std::fs::create_dir_all(&spool_dir).with_context(|| {
+        format!(
+            "could not create telemetry directory {}",
+            spool_dir.display()
+        )
+    })?;
     std::fs::write(&consent_path, "")
         .with_context(|| format!("could not write consent marker {}", consent_path.display()))?;
 
