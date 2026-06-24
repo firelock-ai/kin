@@ -9,13 +9,30 @@ use std::path::Path;
 
 /// Remove Kin metadata (and optionally revert working files).
 ///
-/// DEFAULT (safe): stops the daemon and removes .kin/ graph + metadata.
-/// Working files are left exactly as they are.
+/// This is the "you can always leave" exit. It is deliberately conservative
+/// about what it touches.
 ///
-/// WITH --revert-files (DESTRUCTIVE): additionally overwrites every working
-/// file with the pre-init snapshot copy.  Requires typing "revert" to confirm
-/// (or --yes for non-interactive use).  A backup of current files is written
-/// to `.kin-backup-eject-<timestamp>/` in the project root before any mutation.
+/// DEFAULT (safe): stops the daemon and removes `.kin/` (the graph and all Kin
+/// metadata). Working files are left exactly as they are — nothing is restored
+/// or rewritten.
+///
+/// WITH `--revert-files` (DESTRUCTIVE): additionally overwrites every working
+/// file that Kin snapshotted at init time with its pre-init copy from
+/// `.kin/snapshot/`, returning those files to their byte-for-byte pre-Kin state.
+/// Requires typing "revert" to confirm (or `--yes` for non-interactive use). A
+/// backup of the current versions is written to `.kin-backup-eject-<timestamp>/`
+/// in the project root before any mutation.
+///
+/// What eject never touches:
+/// - `.git/` and Git history. Kin records the Git HEAD in the snapshot manifest
+///   as a reference marker only; commits, branches, and refs are left exactly as
+///   Git wrote them, because Git history was never Kin's to restore.
+/// - Files created after init that were never in the snapshot. `--revert-files`
+///   only overwrites snapshotted paths; it does not delete other working files.
+///
+/// `--revert-files` verifies snapshot integrity before mutating anything: if the
+/// snapshot is incomplete relative to its manifest, it fails loudly and changes
+/// nothing rather than restoring a partial tree and then deleting the graph.
 pub async fn run(revert_files: bool, yes: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let layout =
@@ -52,6 +69,20 @@ fn run_with_layout(layout: &KinLayout, revert_files: bool, yes: bool) -> Result<
     };
 
     let file_count = manifest["file_count"].as_u64().unwrap_or(0);
+
+    // Verify the snapshot is complete BEFORE mutating anything. A partial or
+    // corrupt snapshot must fail loudly with zero side effects rather than
+    // silently restoring fewer files than promised and then deleting the graph.
+    let present = count_snapshot_files(&snapshot_dir)?;
+    if present != file_count {
+        bail!(
+            "Snapshot integrity check failed: manifest declares {file_count} file(s) but {present} \
+             are present in {}. Refusing to revert from an incomplete snapshot — no working files \
+             were changed and Kin metadata was left intact. Run `kin eject` without --revert-files \
+             to remove Kin while leaving working files untouched.",
+            snapshot_dir.display()
+        );
+    }
 
     // Require typed confirmation unless --yes.
     if !yes {
@@ -200,6 +231,42 @@ fn restore_files(
         }
     }
     Ok(())
+}
+
+// ── Integrity helpers ─────────────────────────────────────────────────────────
+
+/// Count the files present in the snapshot tree, excluding the top-level
+/// `manifest.json` metadata file. Mirrors the traversal used by [`restore_files`]
+/// so the integrity check counts exactly the set of files a restore would copy.
+fn count_snapshot_files(snapshot_dir: &Path) -> Result<u64> {
+    fn walk(snapshot_root: &Path, current: &Path, count: &mut u64) -> Result<()> {
+        for entry in fs::read_dir(current)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            // Skip the manifest itself — it is metadata, not a restored file.
+            if path
+                .file_name()
+                .map(|f| f == "manifest.json")
+                .unwrap_or(false)
+                && path.parent() == Some(snapshot_root)
+            {
+                continue;
+            }
+
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                walk(snapshot_root, &path, count)?;
+            } else if ft.is_file() {
+                *count += 1;
+            }
+        }
+        Ok(())
+    }
+
+    let mut count = 0;
+    walk(snapshot_dir, snapshot_dir, &mut count)?;
+    Ok(count)
 }
 
 // ── Daemon helpers ────────────────────────────────────────────────────────────
@@ -393,6 +460,53 @@ mod tests {
             fs::read_to_string(backup_dir.join("src/main.rs")).unwrap(),
             "fn current() {}",
             "backup must contain the pre-mutation src/main.rs"
+        );
+    }
+
+    /// A partial/corrupt snapshot (fewer files than the manifest declares) must
+    /// fail loudly and make NO changes: the working tree is untouched, `.kin/`
+    /// remains, and no backup directory is created.
+    #[test]
+    fn revert_fails_loud_on_incomplete_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        setup_fake_repo(root);
+
+        // Current working files differ from the snapshot.
+        fs::write(root.join("README.md"), "current content").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn current() {}").unwrap();
+
+        // Corrupt the snapshot: drop one file the manifest still counts.
+        fs::remove_file(root.join(".kin/snapshot/src/main.rs")).unwrap();
+
+        let layout = KinLayout::discover(root).unwrap();
+        let err = run_with_layout(&layout, true, true)
+            .expect_err("revert must fail on an incomplete snapshot");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("integrity") && msg.contains("incomplete snapshot"),
+            "error must explain the integrity failure, got: {msg}"
+        );
+
+        // No partial application: .kin/ intact, working files untouched, no backup.
+        assert!(
+            root.join(".kin").exists(),
+            ".kin/ must be preserved when the snapshot is incomplete"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("README.md")).unwrap(),
+            "current content",
+            "working files must be untouched when failing fast"
+        );
+        let created_backup = fs::read_dir(root).unwrap().filter_map(|e| e.ok()).any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".kin-backup-eject-")
+        });
+        assert!(
+            !created_backup,
+            "no backup dir must be created when failing fast"
         );
     }
 

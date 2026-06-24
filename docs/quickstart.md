@@ -386,7 +386,14 @@ normal use. The escape hatches:
 Kin is ejectable — there is no data lock-in:
 
 ```sh
-kin eject [--force]
+kin eject                 # remove Kin; leave working files exactly as they are
+kin eject --revert-files  # also restore files to their byte-for-byte pre-init state
 ```
 
-This removes Kin and restores files to their pre-init state.
+The default `kin eject` stops the daemon and deletes `.kin/` (the graph and all
+Kin metadata), leaving your working files untouched. Adding `--revert-files`
+additionally overwrites every file Kin snapshotted at init time with its pre-init
+copy, after writing a backup of the current versions to
+`.kin-backup-eject-<timestamp>/`; if that snapshot is incomplete it fails without
+changing anything. Either way, `.git` and your Git history are never touched —
+Kin never owned them.
