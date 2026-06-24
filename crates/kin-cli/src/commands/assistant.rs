@@ -384,12 +384,21 @@ pub async fn prompt(assistant: String, mode: String) -> Result<()> {
     Ok(())
 }
 
-/// Build a RepoSummary from the current graph state.
-fn build_repo_summary(_layout: &kin_core::KinLayout) -> Result<RepoSummary> {
+/// Build a RepoSummary from the persisted graph snapshot.
+///
+/// Returns an empty summary if no snapshot exists yet (freshly-inited repos).
+fn build_repo_summary(layout: &kin_core::KinLayout) -> Result<RepoSummary> {
     use kin_model::{EntityFilter, WorkFilter};
     use std::collections::HashMap;
 
-    let graph = kin_db::InMemoryGraph::new();
+    let snapshot_path = layout.kindb_snapshot_path();
+    if !snapshot_path.exists() {
+        return Ok(RepoSummary::default());
+    }
+
+    let snap = kin_db::SnapshotManager::open_read_only(snapshot_path)
+        .map_err(|e| anyhow::anyhow!("failed to open graph snapshot: {e}"))?;
+    let graph = snap.graph();
 
     let entities = graph.query_entities(&EntityFilter::default())?;
     let mut language_breakdown = HashMap::new();
