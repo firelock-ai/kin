@@ -149,7 +149,7 @@ process** and runs with that process's privileges. Two consequences follow:
   more-privileged process.
 
 The daemon-side counterpart of projection — materializing graph-owned files into
-a workspace for a session or an exec request — runs within the same same-user
+a workspace for a session or an exec request — runs within the same-user
 daemon trust boundary described above.
 
 ## Blob-Store Integrity
