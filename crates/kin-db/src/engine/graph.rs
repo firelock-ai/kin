@@ -13365,7 +13365,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------
-    // FIR-1141: baseline graph determinism. Root hash and traversal output must
+    // Baseline graph determinism. Root hash and traversal output must
     // not depend on relation insertion order, must survive save/reopen, and (for
     // the parity baseline) must be content-determined rather than dependent on the
     // random entity/relation ids assigned at ingest. The fixture has a
@@ -13374,7 +13374,7 @@ mod tests {
     // ----------------------------------------------------------------------
 
     // hub --Calls--> {a,b,c,d} (multi-outgoing); a <-> b (2-cycle); c -> d -> e.
-    fn fir1141_fixture() -> (Vec<Entity>, Vec<Relation>) {
+    fn determinism_fixture() -> (Vec<Entity>, Vec<Relation>) {
         let hub = test_entity("hub", "src/hub.rs");
         let a = test_entity("alpha", "src/a.rs");
         let b = test_entity("beta", "src/b.rs");
@@ -13394,7 +13394,7 @@ mod tests {
         (vec![hub, a, b, c, d, e], rels)
     }
 
-    fn fir1141_build(ents: &[Entity], rels: &[Relation], order: &[usize]) -> InMemoryGraph {
+    fn determinism_build(ents: &[Entity], rels: &[Relation], order: &[usize]) -> InMemoryGraph {
         let g = InMemoryGraph::new();
         for e in ents {
             g.upsert_entity(e).unwrap();
@@ -13405,14 +13405,14 @@ mod tests {
         g
     }
 
-    const FIR1141_SHUFFLE: [usize; 8] = [7, 5, 2, 4, 0, 6, 3, 1];
+    const DETERMINISM_SHUFFLE: [usize; 8] = [7, 5, 2, 4, 0, 6, 3, 1];
 
     #[test]
-    fn fir1141_root_hash_independent_of_relation_insertion_order() {
-        let (ents, rels) = fir1141_fixture();
+    fn determinism_root_hash_independent_of_relation_insertion_order() {
+        let (ents, rels) = determinism_fixture();
         let fwd: Vec<usize> = (0..rels.len()).collect();
-        let g1 = fir1141_build(&ents, &rels, &fwd);
-        let g2 = fir1141_build(&ents, &rels, &FIR1141_SHUFFLE);
+        let g1 = determinism_build(&ents, &rels, &fwd);
+        let g2 = determinism_build(&ents, &rels, &DETERMINISM_SHUFFLE);
         assert_eq!(
             g1.compute_root_hash(),
             g2.compute_root_hash(),
@@ -13428,8 +13428,8 @@ mod tests {
     // Content-derived ids mirror production ingest (kin-parser `EntityId::from_content`
     // + kin-index `stable_relation_id`): identical source yields identical ids, which
     // is what makes the id-ordered cycle-break in MerkleCache::from_source stable.
-    fn fir1141_fixture_content_derived() -> (Vec<Entity>, Vec<Relation>) {
-        let (mut ents, _) = fir1141_fixture();
+    fn determinism_fixture_content_derived() -> (Vec<Entity>, Vec<Relation>) {
+        let (mut ents, _) = determinism_fixture();
         for e in &mut ents {
             let file = e
                 .file_origin
@@ -13459,17 +13459,17 @@ mod tests {
     }
 
     #[test]
-    fn fir1141_cyclic_root_is_stable_under_content_derived_ids() {
+    fn determinism_cyclic_root_is_stable_under_content_derived_ids() {
         // Production assigns content-derived ids, so two independent builds of the
         // same source yield identical ids and — despite the 2-cycle — an identical
         // root. This is why the graph/Merkle root is deterministic in production and
         // is ruled out as the parity-citable nondeterminism source. (The cycle-break
         // is id-ordered, so this stability is contingent on content-derived ids.)
         let fwd: Vec<usize> = (0..8).collect();
-        let (e1, r1) = fir1141_fixture_content_derived();
-        let (e2, r2) = fir1141_fixture_content_derived();
-        let g1 = fir1141_build(&e1, &r1, &fwd);
-        let g2 = fir1141_build(&e2, &r2, &fwd);
+        let (e1, r1) = determinism_fixture_content_derived();
+        let (e2, r2) = determinism_fixture_content_derived();
+        let g1 = determinism_build(&e1, &r1, &fwd);
+        let g2 = determinism_build(&e2, &r2, &fwd);
         assert_eq!(
             g1.compute_root_hash(),
             g2.compute_root_hash(),
@@ -13478,10 +13478,10 @@ mod tests {
     }
 
     #[test]
-    fn fir1141_root_hash_stable_across_save_reopen() {
-        let (ents, rels) = fir1141_fixture();
+    fn determinism_root_hash_stable_across_save_reopen() {
+        let (ents, rels) = determinism_fixture();
         let fwd: Vec<usize> = (0..rels.len()).collect();
-        let g = fir1141_build(&ents, &rels, &fwd);
+        let g = determinism_build(&ents, &rels, &fwd);
         let before = g.compute_root_hash();
         let reopened = InMemoryGraph::from_snapshot(g.to_snapshot());
         assert_eq!(
@@ -13492,12 +13492,12 @@ mod tests {
     }
 
     #[test]
-    fn fir1141_relation_and_neighborhood_ordering_independent_of_insertion_order() {
-        let (ents, rels) = fir1141_fixture();
+    fn determinism_relation_and_neighborhood_ordering_independent_of_insertion_order() {
+        let (ents, rels) = determinism_fixture();
         let hub = ents[0].id;
         let fwd: Vec<usize> = (0..rels.len()).collect();
-        let g1 = fir1141_build(&ents, &rels, &fwd);
-        let g2 = fir1141_build(&ents, &rels, &FIR1141_SHUFFLE);
+        let g1 = determinism_build(&ents, &rels, &fwd);
+        let g2 = determinism_build(&ents, &rels, &DETERMINISM_SHUFFLE);
 
         let rel_ids = |g: &InMemoryGraph| -> Vec<RelationId> {
             g.get_all_relations_for_entity(&hub)
