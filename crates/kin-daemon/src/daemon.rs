@@ -64,6 +64,38 @@ fn next_embed_error_backoff(current: Option<Duration>, base: Duration, max: Dura
     current.unwrap_or(base).saturating_mul(2).min(max)
 }
 
+/// Poll `workspace/symbol` with an empty query until the LSP server responds
+/// or the deadline is reached. Language servers like rust-analyzer and pyright
+/// continue background indexing after the `initialize` handshake; this probe
+/// detects when they are actually ready to serve symbol queries.
+///
+/// Falls back to a best-effort fixed delay if the server does not respond to
+/// `workspace/symbol` (e.g., server does not declare the capability).
+async fn wait_for_lsp_index(server: &kin_lsp::lifecycle::LspServer, max: Duration) {
+    const POLL_INTERVAL: Duration = Duration::from_millis(500);
+    if !server.has_references() && !server.has_definition() {
+        tokio::time::sleep(max.min(Duration::from_secs(5))).await;
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + max;
+    loop {
+        let probe = server
+            .client
+            .request(
+                "workspace/symbol",
+                serde_json::json!({ "query": "" }),
+            )
+            .await;
+        if probe.is_ok() {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// Await an in-flight embed-progress flush, logging any persistence or task
 /// failure. Awaiting before the next flush is scheduled is what serializes
 /// successive flushes: at most one persist runs at a time, so two flushes can
@@ -1187,9 +1219,8 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                                 .await
                                 {
                                     Ok(server) => {
-                                        info!(language = %lang, "LSP server started, waiting for indexing...");
-                                        tokio::time::sleep(std::time::Duration::from_secs(25))
-                                            .await;
+                                        info!(language = %lang, "LSP server started, polling for readiness...");
+                                        wait_for_lsp_index(&server, Duration::from_secs(60)).await;
                                         info!(language = %lang, "LSP server ready");
                                         servers.insert(lang, server);
 
@@ -1473,9 +1504,8 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                                     .await
                                     {
                                         Ok(server) => {
-                                            info!(language = %lang, "LSP server started for sweep, waiting for indexing...");
-                                            tokio::time::sleep(std::time::Duration::from_secs(25))
-                                                .await;
+                                            info!(language = %lang, "LSP server started for sweep, polling for readiness...");
+                                            wait_for_lsp_index(&server, Duration::from_secs(60)).await;
                                             info!(language = %lang, "LSP server ready");
                                             servers.insert(lang, server);
                                         }

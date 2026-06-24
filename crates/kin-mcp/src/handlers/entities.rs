@@ -297,9 +297,6 @@ pub fn handle_get_context_pack<G: GraphStore>(
                 obj["stale"] = serde_json::json!(is_stale);
                 obj["source"] = serde_json::json!(source);
                 obj["body"] = serde_json::json!(body.unwrap_or_else(|| entry.content.clone()));
-            } else {
-                obj["stale"] = serde_json::json!(false);
-                obj["source"] = serde_json::json!("unknown");
             }
             obj
         } else {
