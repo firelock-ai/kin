@@ -50,7 +50,6 @@ jobs:
             target: x86_64-apple-darwin
             artifact: kin-macos-x86_64
             shim_name: libkin_vfs_shim.dylib
-            experimental: true
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: kin-macos-aarch64
@@ -80,6 +79,18 @@ jobs:
         with:
           repository: firelock-ai/kin-vfs
           path: kin-vfs
+
+      - name: Cache Cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            kin-vfs/target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
 
       - name: Checkout kin-db (for Windows vector-free build)
         if: ${{ matrix.skip_vector }}
