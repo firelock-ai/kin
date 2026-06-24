@@ -50,6 +50,7 @@ jobs:
             target: x86_64-apple-darwin
             artifact: kin-macos-x86_64
             shim_name: libkin_vfs_shim.dylib
+            experimental: true
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: kin-macos-aarch64
