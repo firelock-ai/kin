@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+#
+# DCO sign-off check. Every commit on a human-authored PR must carry a
+# "Signed-off-by: Name <email>" trailer (added with `git commit -s`).
+# Bot accounts (dependabot, github-actions) are exempt.
+
+name: DCO
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  dco:
+    name: DCO sign-off
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check DCO or bot exemption
+        env:
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Bot accounts are exempt from the DCO sign-off requirement.
+          case "$PR_AUTHOR" in
+            "dependabot[bot]"|"github-actions[bot]")
+              echo "DCO check skipped: $PR_AUTHOR is an exempt bot account"
+              exit 0
+              ;;
+          esac
+
+          # Count commits whose message does not contain a Signed-off-by trailer.
+          # jq does the pattern match entirely inside the API response — commit
+          # messages are never interpolated into the shell command, avoiding
+          # injection from untrusted PR content.
+          UNSIGNED=$(gh api \
+            "repos/${REPO}/pulls/${PR_NUMBER}/commits" \
+            --jq '[.[] | select(
+              .commit.message | test("Signed-off-by: .+ <.+@.+>"; "im") | not
+            )] | length')
+
+          if [[ "$UNSIGNED" -gt 0 ]]; then
+            echo "::error title=DCO sign-off required::${UNSIGNED} commit(s) are missing a Signed-off-by trailer."
+            echo ""
+            echo "Add -s to each commit that needs it:"
+            echo "  git commit -s --amend              # amend only the last commit"
+            echo "  git rebase --signoff HEAD~N        # add sign-off to last N commits"
+            echo ""
+            echo "Full instructions: https://github.com/firelock-ai/kin/blob/main/CONTRIBUTING.md#dco-sign-off"
+            exit 1
+          fi
+
+          echo "DCO check passed: all commits carry a Signed-off-by trailer"

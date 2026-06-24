@@ -12,11 +12,19 @@ Use GitHub's private vulnerability reporting on this repository:
 3. Include a description, affected versions, reproduction steps, and the
    impact you observed.
 
-We aim to acknowledge new reports within a few business days and will keep
-you informed as we investigate. Please give us a reasonable opportunity to
-release a fix before any public disclosure.
-
 There is no paid bug-bounty program at this time.
+
+## Response SLA
+
+| Stage | Target |
+| ----- | ------ |
+| Acknowledgement | 48 hours of receipt |
+| Initial assessment | 5 business days |
+| Fix or mitigation | 90 days (critical), 180 days (high/medium) |
+| Coordinated disclosure | After fix ships; we contact the reporter before going public |
+
+We will keep you informed as we investigate. If 90 days pass without a
+fix, we will discuss an extension or limited disclosure with you.
 
 ## Supported Versions
 
@@ -40,3 +48,29 @@ projections, and the bundled crates and packages under `crates/` and
 `packages/`. Other Kin ecosystem repositories (for example `kin-db`,
 `kin-vfs`, `kinlab`) carry their own security policies; report issues
 against the repository where the affected code lives.
+
+## High-Risk Features
+
+### POST /commands/exec
+
+`POST /commands/exec` lets the daemon materialize a graph workspace and
+execute an arbitrary shell command (`sh -c`) inside it. This is a
+high-risk capability.
+
+**Decision: disabled by default, explicit opt-in required.**
+
+The endpoint returns `403 Forbidden` unless the operator sets
+`KIN_DAEMON_ALLOW_EXEC=1` in the daemon environment. The daemon only
+listens on loopback (`127.0.0.1`) and validates the `Host` header and an
+auth token for non-loopback callers; even so, shell execution is off
+unless you consciously enable it.
+
+Enable only in controlled, local development environments where you trust
+all processes on the machine. Do not expose the daemon to untrusted
+networks with this flag set.
+
+### kin-vfs LD_PRELOAD / DYLD_INSERT_LIBRARIES shim
+
+`kin-vfs` intercepts libc calls at runtime. Only install and use it from
+the official signed release binaries. Verify the installer checksum
+before running `kin setup`.

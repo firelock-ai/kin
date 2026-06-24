@@ -74,6 +74,7 @@ pub mod spec;
 pub mod stash;
 pub mod status;
 pub mod support;
+pub mod telemetry;
 pub mod trace;
 pub mod trace_data_flow;
 pub mod traffic;
