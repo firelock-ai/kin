@@ -479,10 +479,17 @@ fn archive_corrupt_index(storage_path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Build a typed [`SearchError::CorruptIndex`], archiving the bad file first so
-/// the corrupt bytes are preserved as evidence and a clean reopen is possible.
-fn corrupt_index_error(storage_path: &Path, reason: String) -> SearchError {
-    let archived = archive_corrupt_index(storage_path);
+/// Build a typed [`SearchError::CorruptIndex`].
+///
+/// When `archive` is true, moves the corrupt file aside first so the bytes
+/// are preserved as evidence and a clean reopen is possible. Pass `false` when
+/// opening in read-only mode — the caller must not rename files on disk.
+fn corrupt_index_error(storage_path: &Path, reason: String, archive: bool) -> SearchError {
+    let archived = if archive {
+        archive_corrupt_index(storage_path)
+    } else {
+        None
+    };
     SearchError::CorruptIndex {
         path: storage_path.to_path_buf(),
         archived,
@@ -1543,7 +1550,7 @@ where
         // segmented index opened with the flag off still loads (and the next
         // monolithic commit retires it), and vice-versa.
         if manifest_path(&storage_path).exists() {
-            let loaded = Self::load_segmented(&storage_path)?;
+            let loaded = Self::load_segmented(&storage_path, persist_changes)?;
             *index.index.write() = loaded.index;
             index.index_epoch.fetch_add(1, Ordering::Relaxed);
             *index.docs.write() = loaded.docs;
@@ -1555,7 +1562,7 @@ where
             seg.baseline_gens = Some(loaded.baseline_gens);
             seg.segment_docs = Some(loaded.segment_docs);
             seg.dirty = SegmentDirty::Tracked(HashSet::new());
-        } else if let Some(persisted) = Self::load_persisted(&storage_path)? {
+        } else if let Some(persisted) = Self::load_persisted(&storage_path, persist_changes)? {
             *index.index.write() = persisted.index;
             index.index_epoch.fetch_add(1, Ordering::Relaxed);
             *index.docs.write() = persisted.docs;
@@ -1569,7 +1576,10 @@ where
         Ok(index)
     }
 
-    fn load_persisted(storage_path: &Path) -> Result<Option<PersistedIndex<Id>>, SearchError> {
+    fn load_persisted(
+        storage_path: &Path,
+        archive_corrupt: bool,
+    ) -> Result<Option<PersistedIndex<Id>>, SearchError> {
         if !storage_path.exists() {
             return Ok(None);
         }
@@ -1597,6 +1607,7 @@ where
             return Err(corrupt_index_error(
                 storage_path,
                 format!("truncated ({} bytes)", bytes.len()),
+                archive_corrupt,
             ));
         }
         let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
@@ -1615,6 +1626,7 @@ where
                     return Err(corrupt_index_error(
                         storage_path,
                         format!("undecodable (declared v{version}): {err}"),
+                        archive_corrupt,
                     ));
                 }
             };
@@ -1625,6 +1637,7 @@ where
                         "declared version {version} but decoded version {}",
                         persisted.version
                     ),
+                    archive_corrupt,
                 ));
             }
             Ok(Some(persisted))
@@ -1637,6 +1650,7 @@ where
                     return Err(corrupt_index_error(
                         storage_path,
                         format!("undecodable (declared v1): {err}"),
+                        archive_corrupt,
                     ));
                 }
             };
@@ -1644,6 +1658,7 @@ where
                 return Err(corrupt_index_error(
                     storage_path,
                     format!("declared version 1 but decoded version {}", v1.version),
+                    archive_corrupt,
                 ));
             }
             tracing::info!(
@@ -1667,6 +1682,7 @@ where
             Err(corrupt_index_error(
                 storage_path,
                 format!("unsupported version {version}"),
+                archive_corrupt,
             ))
         }
     }
@@ -1963,7 +1979,10 @@ where
     /// missing/undecodable manifest or segment, or any cross-segment duplicate
     /// doc id, is reported as a typed [`SearchError::CorruptIndex`] (the manifest
     /// is archived) so the consumer rebuilds rather than serving a partial index.
-    fn load_segmented(storage_path: &Path) -> Result<LoadedSegmented<Id>, SearchError> {
+    fn load_segmented(
+        storage_path: &Path,
+        archive_corrupt: bool,
+    ) -> Result<LoadedSegmented<Id>, SearchError> {
         let m_path = manifest_path(storage_path);
         let bytes = std::fs::read(&m_path).map_err(|err| {
             SearchError::IndexError(format!(
@@ -1975,6 +1994,7 @@ where
             return Err(corrupt_index_error(
                 &m_path,
                 format!("truncated manifest ({} bytes)", bytes.len()),
+                archive_corrupt,
             ));
         }
         let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
@@ -1982,10 +2002,16 @@ where
             return Err(corrupt_index_error(
                 &m_path,
                 format!("unsupported segmented manifest version {version}"),
+                archive_corrupt,
             ));
         }
-        let manifest: SegmentManifest = bincode::deserialize(&bytes)
-            .map_err(|err| corrupt_index_error(&m_path, format!("undecodable manifest: {err}")))?;
+        let manifest: SegmentManifest = bincode::deserialize(&bytes).map_err(|err| {
+            corrupt_index_error(
+                &m_path,
+                format!("undecodable manifest: {err}"),
+                archive_corrupt,
+            )
+        })?;
         if manifest.version != SEGMENTED_FORMAT_VERSION {
             return Err(corrupt_index_error(
                 &m_path,
@@ -1993,6 +2019,7 @@ where
                     "declared version {version} but decoded version {}",
                     manifest.version
                 ),
+                archive_corrupt,
             ));
         }
         if manifest.segment_gens.len() != manifest.segment_count {
@@ -2003,6 +2030,7 @@ where
                     manifest.segment_count,
                     manifest.segment_gens.len()
                 ),
+                archive_corrupt,
             ));
         }
 
@@ -2021,10 +2049,15 @@ where
                 corrupt_index_error(
                     &m_path,
                     format!("missing/unreadable segment {s} gen {gen}: {err}"),
+                    archive_corrupt,
                 )
             })?;
             let seg_data: SegmentData<Id> = bincode::deserialize(&seg_bytes).map_err(|err| {
-                corrupt_index_error(&m_path, format!("undecodable segment {s} gen {gen}: {err}"))
+                corrupt_index_error(
+                    &m_path,
+                    format!("undecodable segment {s} gen {gen}: {err}"),
+                    archive_corrupt,
+                )
             })?;
 
             // Merge this segment's postings. Doc sets are disjoint across
@@ -2039,6 +2072,7 @@ where
                         return Err(corrupt_index_error(
                             &m_path,
                             format!("duplicate doc id in postings (segment {s})"),
+                            archive_corrupt,
                         ));
                     }
                     entry.occurrences += occ;
@@ -2050,6 +2084,7 @@ where
                     return Err(corrupt_index_error(
                         &m_path,
                         format!("duplicate doc id across segments (segment {s})"),
+                        archive_corrupt,
                     ));
                 }
             }
@@ -2064,6 +2099,7 @@ where
                     "segment sums ({doc_count} docs / {total_doc_length} len) disagree with manifest ({} / {})",
                     manifest.doc_count, manifest.total_doc_length
                 ),
+                archive_corrupt,
             ));
         }
 
