@@ -1,0 +1,195 @@
+# Threat Model: Daemon and Filesystem Projection
+
+This document describes the security model of the parts of Kin that run as
+long-lived local processes or interpose on the operating system: the **Kin
+daemon** (its control API and the command-execution endpoint) and the
+**filesystem projection** that serves graph-backed content to ordinary tools. It
+describes behavior as it exists today, including the cases where a protection is
+provisioned but not enforced by default. Where a boundary is owned by another
+repository in the ecosystem, that is called out so the authority for the
+implementation is unambiguous.
+
+For how to report a suspected vulnerability, see [SECURITY.md](../../SECURITY.md).
+
+## Scope and Trust Model
+
+Kin's baseline trust boundary is the **local operating-system user account**. Kin
+trusts the user it runs as, the integrity of that user's filesystem, and the
+OS-level isolation between users and between a user's processes and other users'
+processes. A repository's graph, indexes, blobs, and configuration live under the
+repository's `.kin/` directory and are protected by ordinary filesystem
+permissions.
+
+The following are therefore **in scope** for this document:
+
+- the daemon's network exposure, request authentication, and cross-origin
+  defenses;
+- the daemon's command-execution capability and the conditions under which it
+  can run a shell;
+- the trust boundary of the filesystem projection (library interposition);
+- the integrity properties of the content-addressed blob store.
+
+The following are **out of scope** here:
+
+- hosted services such as KinLab, which run under their own operational security
+  model;
+- an attacker who already has code execution as the same OS user (that is inside
+  the trust boundary — see [Residual Risks](#residual-risks-and-hardening) for
+  the partial defenses that still apply);
+- physical access and full-disk compromise.
+
+## The Kin Daemon
+
+The daemon exposes an HTTP control API used by the CLI, the MCP server, and
+editor integrations. Three layers defend it: where it binds, a cross-origin
+guard, and an optional bearer token.
+
+### Network binding
+
+By default the daemon binds to loopback (`127.0.0.1`) and is reachable only from
+the local host. Binding to a non-loopback address is **refused** unless an
+authentication token is configured: the listener setup returns an error
+(`KIN_DAEMON_AUTH_TOKEN is required when binding to a non-loopback host`) when
+the resolved bind address is not a loopback address and no token is present. This
+prevents accidentally exposing an unauthenticated daemon off-host.
+
+### Cross-origin and DNS-rebinding guard
+
+A Host/Origin validation layer runs on **every** request, including the public
+package-registry routes. It enforces an allowlist of Host values
+(`localhost`, `127.0.0.1`, `::1`, and the configured bind host) and rejects
+anything else. A request that omits the `Host` header is rejected on sensitive
+routes; only the public liveness routes (`/health`, `/ready`, `/readiness`,
+`/spine/health`) remain reachable without a Host so that health-probe tooling is
+unaffected.
+
+This is the primary defense against a browser-driven DNS-rebinding attack: a web
+page cannot rebind a name to `127.0.0.1` and drive the loopback daemon, because
+the rebound request still carries the attacker's Host value and is rejected by
+the allowlist. This guard is always active, independent of whether bearer
+authentication is enabled.
+
+### Request authentication (bearer token)
+
+The daemon supports a per-install bearer token. On first run it auto-provisions a
+random token at `.kin/daemon.token` with owner-only permissions (`0600` on
+Unix); local clients read the same file and present it as
+`Authorization: Bearer <token>`. The authentication middleware is scoped to the
+daemon's own control routes — the package-registry routes (cargo/npm/oci/go) stay
+public so that build tooling, which does not send credentials on reads, can fetch
+from a token-protected daemon.
+
+Enforcement of the per-install token is **opt-in** and **off by default**:
+
+- With no configuration, the token file is provisioned (so clients can adopt it)
+  but the daemon does **not** require it. In this default state the daemon relies
+  on the loopback bind, the Host/Origin guard, and OS-level filesystem and
+  process isolation rather than on bearer authentication.
+- Setting `KIN_DAEMON_REQUIRE_TOKEN` to a truthy value makes the daemon enforce
+  the per-install token, returning `401` to requests that do not present it.
+- Setting `KIN_DAEMON_AUTH_TOKEN` to an explicit value always takes precedence
+  and is always enforced; this is also the token required to bind a non-loopback
+  address.
+
+### Resulting trust boundary
+
+In its default configuration the daemon's effective trust boundary is **any
+process running as the same OS user**: such a process can reach the loopback
+daemon and can read the `0600` token file. Cross-user access is blocked by file
+permissions, and remote/browser access is blocked by the loopback bind and the
+Host/Origin guard. Operators on shared or multi-tenant hosts should raise this
+boundary explicitly (see [Residual Risks](#residual-risks-and-hardening)).
+
+## Command Execution (`POST /commands/exec`)
+
+The daemon can run a shell command inside a graph-materialized workspace via the
+`POST /commands/exec` endpoint. This is the highest-risk capability the daemon
+exposes: if an unauthorized caller can reach the loopback daemon, an enabled exec
+endpoint is local remote-code-execution. It is therefore **disabled by default**
+and gated behind an explicit opt-in.
+
+The handler applies two checks before doing any work:
+
+1. If the daemon is not fully initialized, it returns `503 Service Unavailable`.
+2. If the exec capability is not enabled, it returns `403 Forbidden` with a
+   message instructing the operator to set `KIN_DAEMON_ALLOW_EXEC=1` to opt in.
+
+The capability is enabled only when `KIN_DAEMON_ALLOW_EXEC` is set to a truthy
+value (`1`, `true`, `yes`, or `on`); it is disabled in every other case,
+including when the variable is unset. When enabled, the request runs the supplied
+command through the system shell (`sh -c` on Unix) inside a per-request workspace
+materialized from the graph.
+
+**Operator guidance.** Leave exec disabled unless a specific workflow requires
+it. When it must be enabled, pair it with `KIN_DAEMON_REQUIRE_TOKEN` so the
+endpoint is also behind bearer authentication, and never enable exec on a daemon
+bound to a non-loopback address that local-network peers can reach.
+
+## Filesystem Projection (Library Interposition)
+
+Kin's transparent filesystem projection (the `kin-vfs` repository) serves
+graph-backed content to unmodified tools by interposing on libc file calls using
+the dynamic loader's preload mechanism (`LD_PRELOAD` on Linux,
+`DYLD_INSERT_LIBRARIES` on macOS). The projection's implementation and its
+detailed security properties are owned by `kin-vfs`; this section states the
+trust boundary as it pertains to running Kin.
+
+The interposition library is loaded **into the address space of the target
+process** and runs with that process's privileges. Two consequences follow:
+
+- **The shim is as trusted as the program it is injected into.** Because it
+  intercepts that process's file I/O, a user enabling projection for a tool is
+  extending that tool's trust to the projection library. Install the shim only
+  from a trusted build, exactly as you would any other code you run.
+- **Projection is per-user and per-process.** It is configured through the
+  environment of the processes a user launches; it does not grant cross-user
+  access and does not run with elevated privilege of its own. Consistent with the
+  platform loaders, preload-based interposition is ignored by the OS for
+  privileged (for example setuid) binaries, so it cannot be used to inject into a
+  more-privileged process.
+
+The daemon-side counterpart of projection — materializing graph-owned files into
+a workspace for a session or an exec request — runs within the same-user
+daemon trust boundary described above.
+
+## Blob-Store Integrity
+
+Kin stores file and artifact content in a content-addressed blob store (the
+`kin-blobs` substrate). A blob's identity **is** the SHA-256 hash of its
+contents: blobs are keyed and read by that hash, and workspace snapshots derive a
+content hash over their materialized contents. Package artifacts served by the
+bundled registries (cargo/npm/oci) likewise carry SHA-256 digests.
+
+Content-addressing gives integrity by construction: changing a single byte of a
+blob changes its address, so stored content cannot be silently substituted under
+an existing key without producing a hash collision. Where a consumer re-derives
+or verifies the address on read, tampering is detectable rather than transparent.
+The storage substrate that performs reads and any read-time verification is
+`kin-blobs`; this repository consumes it and relies on those integrity
+properties.
+
+An attacker with write access to a repository's `.kin/` directory could modify
+stored blobs or graph state — but such an attacker already holds same-user
+filesystem access, which is inside the trust boundary. Content-addressing limits
+that actor to detectable substitution rather than silent tampering wherever
+addresses are re-verified.
+
+## Residual Risks and Hardening
+
+- **Shared and multi-tenant hosts.** The default same-user trust boundary means
+  any process running as your user can reach the loopback daemon. On hosts where
+  that is not an acceptable assumption, enable `KIN_DAEMON_REQUIRE_TOKEN` (or set
+  an explicit `KIN_DAEMON_AUTH_TOKEN`) and keep `KIN_DAEMON_ALLOW_EXEC` unset.
+- **Provisioned-but-unenforced token.** Because the per-install token is
+  provisioned but not enforced by default, do not assume bearer authentication is
+  active unless one of the enforcement variables above is set.
+- **Off-host exposure.** Binding the daemon to a non-loopback address requires a
+  token, but exposing it to a network still widens the attack surface
+  considerably; treat it as a deliberate, audited deployment choice and never
+  combine it with command execution.
+
+## Reporting
+
+Report suspected vulnerabilities privately through the process described in
+[SECURITY.md](../../SECURITY.md). Do not open a public issue for a suspected
+vulnerability.
