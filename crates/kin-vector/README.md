@@ -23,15 +23,17 @@ bit-identical to the frozen benchmark baseline on every target.
 
 ## Key types
 
-- `HnswIndex<Id>` — the index, generic over the key type via `VectorId`.
-  Supports `insert`, `search`, `delete`, persistence (`save`/`load`), and
-  merge from a delta set.
+- `VectorIndex<Id>` — the index, generic over the key type via `VectorId`
+  (defaults to `DefaultId`). Supports `upsert` / `upsert_batch`,
+  `search_similar` / `search_similar_filtered`, `remove`, and on-disk
+  persistence (`save` / `load` / `load_checked`).
 - `VectorId` trait — implement for custom key types; blanket impls provided for
   `u64`, `u32`, and `uuid::Uuid`.
 - `DefaultId` — UUID-based default key type.
 - `VectorError` — typed errors including `ModelMismatch` (refuses to load an
   index built with a different embedding model).
-- `VecDelta` — incremental index mutation for snapshot-based sync.
+- `IndexDescriptor` — stamps the embedding model and graph-snapshot root an
+  index was built against; `verify_compatible` enforces it on load.
 
 ## License
 
