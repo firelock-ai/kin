@@ -89,6 +89,32 @@ async fn wait_for_serving(port: u16) {
     }
 }
 
+async fn wait_for_path(path: &Path, what: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if path.exists() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("{what}: {} never appeared", path.display());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_path_removed(path: &Path, what: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !path.exists() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("{what}: {} was never removed", path.display());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn create_branch(port: u16, name: &str) {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{port}/graph/branches");
@@ -152,13 +178,19 @@ async fn daemon_exits_after_idle_timeout_and_removes_endpoint_files() {
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
 
+    // A generous idle window (rather than a few seconds) keeps the daemon alive
+    // long enough to deterministically observe the endpoint files on a loaded CI
+    // runner before the idle timer fires and removes them.
+    let idle_timeout = Duration::from_secs(15);
+    let idle_secs = idle_timeout.as_secs().to_string();
+
     let port = free_port();
     let mut child = spawn_daemon_with_env(
         repo.path(),
         port,
         &[
             ("KIN_DAEMON_DISABLE_LSP", "1"),
-            ("KIN_DAEMON_IDLE_TIMEOUT_SECS", "5"),
+            ("KIN_DAEMON_IDLE_TIMEOUT_SECS", idle_secs.as_str()),
         ],
     );
 
@@ -166,10 +198,26 @@ async fn daemon_exits_after_idle_timeout_and_removes_endpoint_files() {
 
     let daemon_port = repo.path().join(".kin/daemon.port");
     let daemon_pid = repo.path().join(".kin/daemon.pid");
-    assert!(daemon_port.exists(), "daemon did not write port file");
-    assert!(daemon_pid.exists(), "daemon did not write pid file");
+    // Poll for the endpoint files instead of asserting they are present the
+    // instant the socket accepts: observing them can lag the socket becoming
+    // connectable on a loaded runner, and they must still be there before the
+    // idle timer removes them.
+    wait_for_path(
+        &daemon_port,
+        "daemon did not write port file",
+        Duration::from_secs(10),
+    )
+    .await;
+    wait_for_path(
+        &daemon_pid,
+        "daemon did not write pid file",
+        Duration::from_secs(10),
+    )
+    .await;
 
-    let exit = match tokio::time::timeout(Duration::from_secs(15), child.wait()).await {
+    // Wait for the idle timer to fire and the process to exit. The budget is far
+    // larger than the idle window so a slow runner's shutdown still fits.
+    let exit = match tokio::time::timeout(Duration::from_secs(90), child.wait()).await {
         Ok(result) => result.expect("kin-daemon wait failed"),
         Err(_) => {
             let _ = child.start_kill();
@@ -177,8 +225,21 @@ async fn daemon_exits_after_idle_timeout_and_removes_endpoint_files() {
         }
     };
     assert!(exit.success(), "idle shutdown should be graceful: {exit}");
-    assert!(!daemon_port.exists(), "idle daemon left daemon.port behind");
-    assert!(!daemon_pid.exists(), "idle daemon left daemon.pid behind");
+
+    // Graceful shutdown removes the endpoint files before the process exits; poll
+    // for their removal to tolerate any cleanup-vs-exit ordering gap.
+    wait_for_path_removed(
+        &daemon_port,
+        "idle daemon left daemon.port behind",
+        Duration::from_secs(10),
+    )
+    .await;
+    wait_for_path_removed(
+        &daemon_pid,
+        "idle daemon left daemon.pid behind",
+        Duration::from_secs(10),
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

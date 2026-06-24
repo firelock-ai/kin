@@ -111,3 +111,18 @@ pub use state::{ChangeType, DaemonEvent, DaemonState, LspEnrichmentMessage, LspE
 
 /// Re-export kin_spine so consumers (MCP server, API) can use it via kin_daemon.
 pub use kin_spine;
+
+/// Process-global serialization for tests that mutate shared `KIN_*` environment
+/// variables.
+///
+/// `std::env::set_var`/`remove_var` mutate one process-wide table that is not
+/// synchronized against concurrent reads on other test threads, and several
+/// `KIN_*` variables (notably `KIN_REGISTRY_PATH`) are read by code under test in
+/// more than one module. A single shared lock keeps every env-mutating test in
+/// this binary inside one serialization domain so their opposite expectations
+/// can never race the parallel test runner.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}

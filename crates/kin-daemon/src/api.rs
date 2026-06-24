@@ -7660,8 +7660,7 @@ mod tests {
     /// `KIN_DAEMON_AUTH_TOKEN`, `KIN_DAEMON_REQUIRE_TOKEN`) so their
     /// opposite expectations never race under the parallel test runner.
     fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        crate::test_env_lock()
     }
 
     #[tokio::test]
