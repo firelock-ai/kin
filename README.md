@@ -9,7 +9,7 @@ In Kin, the graph is the source of authority. The filesystem is a derived projec
 - **Semantic VCS**: Version control at the level of entities and relations instead of lines and files.
 - **AI-native context packs**: Build structured context packs containing a target entity plus its caller/callee neighborhood in a single call (`kin context`).
 - **Trace & dataflow**: Trace call chains and dataflow dependencies in one step instead of looping over file reads (`kin trace`, `kin trace-data-flow`).
-- **Ejectable brownfield compatibility**: Works alongside Git and traditional toolchains. `kin eject` removes Kin and restores files to their pre-init state, so there is no data lock-in.
+- **Ejectable brownfield compatibility**: Works alongside Git and traditional toolchains. `kin eject` removes Kin and leaves your working files untouched; `kin eject --revert-files` additionally restores files to their byte-for-byte pre-init state. Git history is never touched, so there is no data lock-in.
 
 ---
 
@@ -168,9 +168,13 @@ check table and what to do for each state.
   ```sh
   kin locate "<problem text>" [--explain]
   ```
-- **Eject and restore files**:
+- **Remove Kin (working files untouched)**:
   ```sh
-  kin eject [--force]
+  kin eject
+  ```
+- **Remove Kin and restore files to their pre-init state**:
+  ```sh
+  kin eject --revert-files
   ```
 
 ---
