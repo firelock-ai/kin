@@ -139,9 +139,18 @@ impl<Id: DocId> Postings<Id> {
         }
     }
 
-    /// Total postings (token occurrences across all docs); the BM25 df proxy.
+    /// Total postings (token occurrences across all docs).
+    ///
+    /// Used as a work-size estimate for the parallel-vs-serial scoring threshold.
+    /// NOT used as the BM25 document-frequency; use `by_doc.len()` for that.
     fn len(&self) -> usize {
         self.occurrences
+    }
+
+    /// Number of distinct documents containing this token — the correct BM25
+    /// document-frequency value for IDF computation.
+    fn doc_count(&self) -> usize {
+        self.by_doc.len()
     }
 
     fn is_empty(&self) -> bool {
@@ -869,7 +878,7 @@ impl<Id: DocId> TextIndex<Id> {
         let mut min_df: Option<usize> = None;
         for tok in tokenize(term) {
             if let Some(postings) = index.get(&tok) {
-                let df = postings.len();
+                let df = postings.doc_count();
                 min_df = Some(min_df.map_or(df, |m| m.min(df)));
             }
         }
@@ -1375,7 +1384,7 @@ impl<Id: DocId> TextIndex<Id> {
         };
 
         let idf_of = |postings: &Postings<Id>| -> f32 {
-            let df = postings.len() as f32;
+            let df = postings.doc_count() as f32;
             // BM25 IDF: log((N - df + 0.5) / (df + 0.5) + 1)
             ((n - df + 0.5) / (df + 0.5) + 1.0).ln().max(0.0)
         };
@@ -2538,6 +2547,49 @@ mod tests {
         );
     }
 
+    /// BM25 IDF uses the number of *unique documents* containing a token, not the
+    /// total occurrence count.  When one document repeats a token many times the
+    /// occurrence count diverges from the unique-doc count; `doc_frequency` must
+    /// report unique-doc count and IDF must be computed from that.
+    #[test]
+    fn bm25_df_counts_unique_documents_not_occurrences() {
+        let idx = TextIndex::<TestId>::new();
+        let single_doc = next_id();
+        // Index one document with "sparseToken" appearing 10 times (via 10 fields).
+        let fields: Vec<(&str, f32)> = vec![
+            ("sparseToken", 1.0),
+            ("sparseToken", 1.0),
+            ("sparseToken", 1.0),
+            ("sparseToken", 1.0),
+            ("sparseToken", 1.0),
+            ("sparseToken", 1.0),
+            ("sparseToken", 1.0),
+            ("sparseToken", 1.0),
+            ("sparseToken", 1.0),
+            ("sparseToken", 1.0),
+        ];
+        idx.upsert(single_doc, &fields).unwrap();
+        idx.commit().unwrap();
+
+        let df = idx.doc_frequency("sparseToken");
+        assert_eq!(
+            df, 1,
+            "doc_frequency must count distinct documents (1), not total occurrences (10)"
+        );
+
+        // IDF-derived ranking: add a second document with the token once; both
+        // docs should score the same since IDF is identical for them.
+        let second_doc = next_id();
+        idx.upsert(second_doc, &[("sparseToken", 1.0)]).unwrap();
+        idx.commit().unwrap();
+
+        let df2 = idx.doc_frequency("sparseToken");
+        assert_eq!(
+            df2, 2,
+            "df must be 2 after two distinct documents contain the token"
+        );
+    }
+
     /// A format-v1 index on disk (flat `Vec` posting lists) must load, migrate
     /// forward, and keep serving searches; the next commit re-persists as v2.
     #[test]
@@ -3579,7 +3631,7 @@ mod tests {
         let mut scores: HashMap<TestId, f32> = HashMap::new();
         for qt in &query_tokens {
             if let Some(postings) = index.get(qt) {
-                let df = postings.len() as f32;
+                let df = postings.doc_count() as f32;
                 let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln().max(0.0);
                 for (eid, weight) in postings.iter() {
                     let dl = docs.get(eid).map(|d| d.doc_length as f32).unwrap_or(avgdl);
@@ -3601,7 +3653,7 @@ mod tests {
                 matched.sort_unstable();
                 for t in matched {
                     let postings = &index[t];
-                    let df = postings.len() as f32;
+                    let df = postings.doc_count() as f32;
                     let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln().max(0.0);
                     for (eid, weight) in postings.iter() {
                         let dl = docs.get(eid).map(|d| d.doc_length as f32).unwrap_or(avgdl);
