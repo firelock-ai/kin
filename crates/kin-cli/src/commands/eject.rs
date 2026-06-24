@@ -6,6 +6,7 @@ use kin_core::KinLayout;
 use std::fs;
 use std::io::BufRead;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 /// Remove Kin metadata (and optionally revert working files).
 ///
@@ -258,20 +259,27 @@ fn count_snapshot_files(snapshot_root: &Path, current: &Path) -> Result<u64> {
 // ── Daemon helpers ────────────────────────────────────────────────────────────
 
 /// Best-effort attempt to stop running Kin daemons.
+///
+/// Sends SIGTERM to each daemon and then polls until the PID file disappears
+/// (or a 5-second timeout expires). This prevents a race where a daemon still
+/// mid-shutdown recreates `.kin/` endpoint files after `remove_dir_all` runs.
 fn stop_daemons(kin_root: &Path) {
-    // Try PID file for kin-daemon.
-    kill_pid_file(&kin_root.join("daemon.pid"));
-    // Try PID file for kin-vfs-daemon.
-    kill_pid_file(&kin_root.join("vfs.pid"));
+    kill_pid_file_and_wait(&kin_root.join("daemon.pid"));
+    kill_pid_file_and_wait(&kin_root.join("vfs.pid"));
 }
 
-fn kill_pid_file(path: &Path) {
+fn kill_pid_file_and_wait(path: &Path) {
     if let Ok(content) = fs::read_to_string(path) {
         if let Ok(pid) = content.trim().parse::<u32>() {
-            // SIGTERM via `kill` command — best effort, ignore errors.
             let _ = std::process::Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
                 .output();
+            // Poll until the PID file disappears — the daemon removes it as
+            // part of shutdown — bounded to 5 seconds.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while path.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
     }
 }
