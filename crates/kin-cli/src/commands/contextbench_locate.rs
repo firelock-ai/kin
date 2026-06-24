@@ -312,9 +312,22 @@ fn select_query(task: &Value) -> Result<(&'static str, String)> {
             let trimmed = text.trim();
             if !trimmed.is_empty() {
                 // test_patch hints leak ContextBench gold (the patch's own test files) and are
-                // forbidden for submission; default OFF, opt-in only via KIN_CONTEXTBENCH_TEST_HINTS=1
-                // for internal upper-bound experiments.
+                // forbidden for submission. Default OFF; enabling requires a double opt-in
+                // (KIN_CONTEXTBENCH_TEST_HINTS=1 + KIN_CONTEXTBENCH_ALLOW_NONCITABLE=1) so a
+                // citable/submission run can never silently contaminate the query, and it warns.
                 let query = if std::env::var("KIN_CONTEXTBENCH_TEST_HINTS").as_deref() == Ok("1") {
+                    if std::env::var("KIN_CONTEXTBENCH_ALLOW_NONCITABLE").as_deref() != Ok("1") {
+                        bail!(
+                            "KIN_CONTEXTBENCH_TEST_HINTS=1 leaks ContextBench gold (the task's own \
+                             test-patch file paths and test names) into the query and is forbidden \
+                             for submission/citable runs. To run a deliberately NON-CITABLE internal \
+                             upper-bound experiment, also set KIN_CONTEXTBENCH_ALLOW_NONCITABLE=1."
+                        );
+                    }
+                    eprintln!(
+                        "WARNING: KIN_CONTEXTBENCH_TEST_HINTS=1: query augmented with gold \
+                         test-patch hints; this run is NON-CITABLE (upper-bound experiment only)."
+                    );
                     augment_query_with_test_patch(trimmed, task)
                 } else {
                     trimmed.to_string()
