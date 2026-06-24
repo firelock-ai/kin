@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 //
-// Requirement (3) of the SIMD distance lane: run the HNSW determinism conviction
+// Requirement (3) of the SIMD distance lane: run the HNSW determinism guard
 // UNDER the SIMD distance path. Compiled only with `--features simd` on aarch64.
 //
 // This is a separate test binary so the `KIN_VECTOR_SIMD` env gate (sampled once
 // per process via OnceLock in the lib) is set cleanly before the first distance
 // call — no interleaving with the default-path unit tests. It mirrors the
-// in-crate conviction `interleaved_reembed_history_does_not_change_results`, but
+// in-crate test `interleaved_reembed_history_does_not_change_results`, but
 // over the public API and with the NEON kernel active, proving the SIMD distance
 // keeps kNN bit-stable across rebuilds and in-place re-embeds.
 
@@ -67,7 +67,7 @@ fn hnsw_determinism_holds_under_simd_distance() {
     }
 
     // (b) Re-embed the same keys IN PLACE (same order) a varying number of times,
-    // mirroring the in-crate conviction test — must not change results under SIMD.
+    // mirroring the in-crate test — must not change results under SIMD.
     let c = VectorIndex::<u64>::new(dim).unwrap();
     for (step, &k) in order.iter().enumerate() {
         c.upsert(k, &vec_for(k, dim)).unwrap();

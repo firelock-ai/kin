@@ -2125,7 +2125,7 @@ mod tests {
         }
     }
 
-    /// The key conviction test for the HNSW-determinism fix.
+    /// The core regression test for the HNSW-determinism fix.
     ///
     /// Two indices reach the SAME final content, but index B gets there via a
     /// DIFFERENT remove/insert *interleaving*: every few keys it re-embeds
