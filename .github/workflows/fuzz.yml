@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+# Bounded fuzzing of the tree-sitter parsing and language-adapter surface.
+#
+# The fuzz targets live in `fuzz/` and feed arbitrary bytes into kin-parser's
+# source-ingesting entry points:
+#   - parse_adapter: every built-in LanguageAdapter's parse + extract path.
+#   - parse_shallow: the C2 shallow parse path (parse_shallow_file).
+# The invariant under test is that the parser is total on arbitrary input -- it
+# returns a value or a handled error and never panics, crashes, or hits UB.
+#
+# Triggers:
+#   - pull_request touching the parser crate or the harness: a short smoke per
+#     target keeps regressions out of `main` without slowing every PR.
+#   - schedule (weekly): a longer bounded campaign for drift detection.
+#   - workflow_dispatch: on-demand runs.
+#
+# Every run has a hard `-max_total_time` wall-clock cap plus a per-input
+# `-timeout`, so neither a single pathological input nor the campaign as a whole
+# can hang the runner.
+
+name: Fuzz
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/kin-parser/**"
+      - "fuzz/**"
+      - ".github/workflows/fuzz.yml"
+  schedule:
+    # Mondays 06:00 UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: cargo-fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - parse_adapter
+          - parse_shallow
+    steps:
+      - uses: actions/checkout@v6
+
+      # kin-model resolves from the Kin sparse registry ([registries.kin]). The
+      # fuzz crate is detached from the kin workspace, but Cargo still discovers
+      # the tracked .cargo/config.toml by walking up from fuzz/, so the registry
+      # is configured exactly as for a normal kin build.
+      - name: Verify kin cargo registry config
+        run: |
+          test -f .cargo/config.toml
+          grep -q '^\[registries\.kin\]' .cargo/config.toml
+
+      # cargo-fuzz requires nightly (libFuzzer + -Zsanitizer).
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry and fuzz build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target
+          key: ${{ runner.os }}-parser-fuzz-${{ hashFiles('fuzz/Cargo.toml', 'crates/kin-parser/**') }}
+          restore-keys: |
+            ${{ runner.os }}-parser-fuzz-
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Build fuzz target
+        run: cargo +nightly fuzz build ${{ matrix.target }}
+
+      # Bounded campaign: 300s/target on the weekly schedule, 60s on PRs/dispatch.
+      # `-timeout` caps any single input; `-rss_limit_mb` guards against a runaway
+      # allocation aborting the runner. EVENT_NAME / TARGET are mapped through env
+      # (not interpolated into the shell) per GitHub Actions injection-hardening
+      # guidance.
+      - name: Run bounded fuzz campaign
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          DURATION=60
+          if [ "$EVENT_NAME" = "schedule" ]; then DURATION=300; fi
+          cargo +nightly fuzz run "$TARGET" -- \
+            -max_total_time="$DURATION" -timeout=25 -rss_limit_mb=2048
+
+      - name: Upload crash artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
