@@ -9308,9 +9308,7 @@ mod tests {
             .await
             .expect("CLI get_spine_xref call")
             .expect("CLI get_spine_xref returns edges");
-        let cli_xref_to_provider = cli_xref
-            .iter()
-            .any(|e| e.dst_repo.to_string() == "provider");
+        let cli_xref_to_provider = cli_xref.iter().any(|e| e.dst_repo == "provider");
         assert!(
             cli_xref_to_provider,
             "kin xref CLI must resolve consumer->provider: {cli_xref:?}"
