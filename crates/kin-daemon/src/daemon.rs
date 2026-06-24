@@ -81,10 +81,7 @@ async fn wait_for_lsp_index(server: &kin_lsp::lifecycle::LspServer, max: Duratio
     loop {
         let probe = server
             .client
-            .request(
-                "workspace/symbol",
-                serde_json::json!({ "query": "" }),
-            )
+            .request("workspace/symbol", serde_json::json!({ "query": "" }))
             .await;
         if probe.is_ok() {
             return;
@@ -1505,7 +1502,8 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
                                     {
                                         Ok(server) => {
                                             info!(language = %lang, "LSP server started for sweep, polling for readiness...");
-                                            wait_for_lsp_index(&server, Duration::from_secs(60)).await;
+                                            wait_for_lsp_index(&server, Duration::from_secs(60))
+                                                .await;
                                             info!(language = %lang, "LSP server ready");
                                             servers.insert(lang, server);
                                         }
