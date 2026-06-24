@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-06-24
+
+Corrective release adding Intel Mac (`x86_64`) to the public install matrix.
+
+### Fixed
+
+- The `kin-vfs` native shim now builds on `x86_64-apple-darwin`. Xcode 16's SDK declares `stat64`/`lstat64`/`fstat64` with a distinct `struct stat64`, which conflicted with the manual forward-declarations needed on `arm64`; these are now guarded by `#ifndef __x86_64__`. The `kin-macos-x86_64` archive is now produced and is no longer experimental.
+
 ## [0.2.1] - 2026-06-16
 
 Corrective public install release for first-run setup.
