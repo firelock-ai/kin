@@ -383,10 +383,31 @@ normal use. The escape hatches:
 
 ## 10. Removing Kin
 
-Kin is ejectable — there is no data lock-in:
+Kin is ejectable — there is no data lock-in. There are two modes, and they
+do different things:
 
 ```sh
-kin eject [--force]
+kin eject                 # safe default
 ```
 
-This removes Kin and restores files to their pre-init state.
+Stops the Kin daemon and removes the `.kin/` directory (the graph and all Kin
+metadata). **Your working files are left exactly as they are** — whatever is on
+disk right now stays on disk. This is the everyday "walk away with my files"
+path.
+
+```sh
+kin eject --revert-files  # destructive: restore the pre-init snapshot
+```
+
+Additionally overwrites every working file with the copy Kin snapshotted at
+`kin init`, discarding changes made since. It asks you to type `revert` to
+confirm (use `--yes` to skip the prompt in scripts), and it writes a timestamped
+backup of your current files to `.kin-backup-eject-<timestamp>/` first, so
+nothing is lost. If the snapshot is missing or incomplete, eject refuses and
+touches nothing rather than half-restoring.
+
+**What eject never touches: `.git`.** Kin snapshots your *working tree* at init
+(excluding `.git`, `.kin*`, and ignored paths) and restores those files only. It
+never reads, rewrites, or restores Git history — your commit history is owned by
+Git the entire time. After eject, the directory is a plain Git repository with
+its history intact; `git log`, `git status`, and `git fsck` all work unchanged.
