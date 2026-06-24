@@ -9187,6 +9187,186 @@ mod tests {
         );
     }
 
+    /// One gate proving the cross-repo blast radius is consistent across every
+    /// kin-side surface that consumes the spine — the daemon HTTP API, the
+    /// `kin xref`/`kin impact` CLI client code, and the MCP impact_analysis
+    /// client code — over a single real parsed+linked fixture served by a real
+    /// daemon socket.
+    ///
+    /// Each surface runs its OWN production client (not a re-implementation):
+    /// the daemon HTTP contract via reqwest (the same one KinLab's fetch path
+    /// uses), `kin_cli::backend::get_spine_{xref,impact}` (what `kin xref` /
+    /// `kin impact` call), and `kin_mcp::handlers::common::fetch_spine_{xref,
+    /// impact_typed}` (what MCP impact_analysis calls). All three resolve the
+    /// daemon through `KIN_DAEMON_URL`, so they hit this in-process daemon.
+    ///
+    /// The hosted KinLab surface and cloud/Firestore restart-hydration are out
+    /// of scope here and tracked in FIR-1082.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spine_blast_radius_is_consistent_across_daemon_cli_and_mcp() {
+        use kin_cli::backend::{get_spine_impact, get_spine_xref};
+        use kin_mcp::handlers::common::{fetch_spine_impact_typed, fetch_spine_xref};
+
+        // Fixture: provider exports do_work; consumer imports and calls it.
+        let do_work_id = EntityId::new();
+        let provider_entry = kin_spine::EntityEntry {
+            repo_id: "provider".to_string(),
+            entity_id: do_work_id,
+            name: "do_work".to_string(),
+            kind: kin_model::EntityKind::Function,
+            signature: "fn do_work()".to_string(),
+            fingerprint: spine_test_fingerprint(),
+            file_path: Some("src/lib.rs".to_string()),
+            role: Some(kin_model::EntityRole::Source),
+        };
+        let consumer = parse_consumer_source(
+            "src/app.rs",
+            "use provider::do_work;\n\npub fn run_task() {\n    do_work();\n}\n",
+        );
+        let consumer_entities = consumer.entities.clone();
+        let consumer_relations = kin_index::link_cross_file(&[consumer]);
+        let run_task_id = consumer_entities
+            .iter()
+            .find(|e| e.name == "run_task")
+            .expect("run_task entity present")
+            .id;
+
+        let state = test_state();
+        let layout = state.layout.clone();
+        {
+            let spine = state.ensure_spine().expect("spine enabled in test");
+            spine.register_repo("provider", vec![provider_entry], "");
+            spine.refresh_cross_repo_edges(
+                "consumer",
+                &consumer_entities,
+                &consumer_relations,
+                &["provider".to_string()],
+            );
+            assert!(
+                spine.edge_count() >= 1,
+                "fixture must materialize a cross-repo edge (parse -> link -> spine)"
+            );
+        }
+
+        // Serve the real daemon router on an ephemeral loopback socket.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router(state)).await;
+        });
+        let base = format!("http://{addr}");
+        std::env::set_var("KIN_DAEMON_URL", &base);
+
+        let run_task_str = run_task_id.to_string();
+        let do_work_str = do_work_id.to_string();
+
+        // ── Surface 1: daemon HTTP (also the KinLab fetch contract). ──
+        let http = reqwest::Client::new();
+        let http_xref: serde_json::Value = http
+            .get(format!("{base}/v1/spine/xref"))
+            .query(&[("repo", "consumer"), ("entity", run_task_str.as_str())])
+            .send()
+            .await
+            .expect("daemon xref request")
+            .json()
+            .await
+            .expect("daemon xref json");
+        let daemon_xref_to_provider = http_xref["edges"]
+            .as_array()
+            .map(|edges| edges.iter().any(|e| e["dst_repo"] == "provider"))
+            .unwrap_or(false);
+        assert!(
+            daemon_xref_to_provider,
+            "daemon /v1/spine/xref must resolve the consumer->provider edge: {http_xref}"
+        );
+
+        let http_impact: serde_json::Value = http
+            .get(format!("{base}/v1/spine/impact"))
+            .query(&[
+                ("repo", "provider"),
+                ("entity", do_work_str.as_str()),
+                ("depth", "5"),
+            ])
+            .send()
+            .await
+            .expect("daemon impact request")
+            .json()
+            .await
+            .expect("daemon impact json");
+        let daemon_impact_hits_consumer = http_impact["repos_involved"]
+            .as_array()
+            .map(|repos| repos.iter().any(|r| r == "consumer"))
+            .unwrap_or(false);
+        assert!(
+            daemon_impact_hits_consumer,
+            "daemon /v1/spine/impact blast radius must include consumer: {http_impact}"
+        );
+
+        // ── Surface 2: the `kin xref` / `kin impact` CLI client code. ──
+        let cli_xref = get_spine_xref(&layout, "consumer", &run_task_id)
+            .await
+            .expect("CLI get_spine_xref call")
+            .expect("CLI get_spine_xref returns edges");
+        let cli_xref_to_provider = cli_xref
+            .iter()
+            .any(|e| e.dst_repo.to_string() == "provider");
+        assert!(
+            cli_xref_to_provider,
+            "kin xref CLI must resolve consumer->provider: {cli_xref:?}"
+        );
+
+        let cli_impact = get_spine_impact(&layout, "provider", &do_work_id, 5)
+            .await
+            .expect("CLI get_spine_impact call")
+            .expect("CLI get_spine_impact returns impact");
+        let cli_impact_hits_consumer = cli_impact.repos_involved.iter().any(|r| r == "consumer");
+        assert!(
+            cli_impact_hits_consumer,
+            "kin impact CLI blast radius must include consumer: {:?}",
+            cli_impact.repos_involved
+        );
+
+        // ── Surface 3: the MCP impact_analysis client code. ──
+        let mcp_xref = fetch_spine_xref("consumer", &run_task_id)
+            .await
+            .expect("MCP fetch_spine_xref call")
+            .expect("MCP fetch_spine_xref returns edges");
+        let mcp_xref_to_provider = mcp_xref["edges"]
+            .as_array()
+            .map(|edges| edges.iter().any(|e| e["dst_repo"] == "provider"))
+            .unwrap_or(false);
+        assert!(
+            mcp_xref_to_provider,
+            "MCP fetch_spine_xref must resolve consumer->provider: {mcp_xref}"
+        );
+
+        let mcp_impact = fetch_spine_impact_typed("provider", &do_work_id, 5)
+            .await
+            .expect("MCP fetch_spine_impact_typed call")
+            .expect("MCP fetch_spine_impact_typed returns impact");
+        let mcp_impact_hits_consumer = mcp_impact.repos_involved.iter().any(|r| r == "consumer");
+        assert!(
+            mcp_impact_hits_consumer,
+            "MCP impact blast radius must include consumer: {:?}",
+            mcp_impact.repos_involved
+        );
+
+        // ── Consistency: all three surfaces agree on the cross-repo result. ──
+        assert_eq!(
+            cli_impact.repos_involved.iter().any(|r| r == "consumer"),
+            mcp_impact.repos_involved.iter().any(|r| r == "consumer"),
+            "CLI and MCP must agree on the impacted repo set"
+        );
+        assert!(
+            daemon_xref_to_provider && cli_xref_to_provider && mcp_xref_to_provider,
+            "daemon, CLI, and MCP must all resolve the same consumer->provider xref"
+        );
+
+        std::env::remove_var("KIN_DAEMON_URL");
+        server.abort();
+    }
+
     // -----------------------------------------------------------------------
     // Scope parsing
     // -----------------------------------------------------------------------
