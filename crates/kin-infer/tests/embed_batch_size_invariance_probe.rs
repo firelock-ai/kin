@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 //
-// CONVICTION HARNESS — batch-size / batch-composition invariance of a single
-// entity's embedding (the LAST variance in the freeze stack).
+// Batch-size / batch-composition invariance of a single entity's embedding —
+// a remaining source of run-to-run embedding variance.
 //
 // The concat-cache fix (commit 58a38f0, guard `batched_cold_matches_single_forward`)
 // made the batched embedder invariant to PADDING layout. This probe tests the next

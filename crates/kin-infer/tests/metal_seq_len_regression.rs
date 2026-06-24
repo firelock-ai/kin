@@ -365,7 +365,7 @@ fn metal_fused_linear_add_norm_matches_per_op() {
     }
 }
 
-/// Byte-determinism guard for `fused_linear_add_norm` (FIR-1141 parity baseline).
+/// Byte-determinism guard for `fused_linear_add_norm` (parity baseline).
 /// The residual add and LayerNorm read the projection in place; running the
 /// dependent stages in one command buffer made each read see the prior output
 /// only by timing, so identical input embedded to different bytes run-to-run for

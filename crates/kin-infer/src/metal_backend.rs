@@ -367,7 +367,7 @@ pub fn profile_stall_nanos() -> u64 {
     STALL_NANOS.load(Ordering::Relaxed)
 }
 
-/// Alias for the total host-blocked time reported by FIR-1128 profile output.
+/// Alias for the total host-blocked time reported in the Metal profile output.
 pub fn profile_host_blocked_nanos() -> u64 {
     STALL_NANOS.load(Ordering::Relaxed)
 }
