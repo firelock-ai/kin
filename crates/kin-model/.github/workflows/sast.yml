@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: SAST
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Verify kin cargo registry config
+        # cargo-deny resolves the full dependency graph via `cargo metadata`.
+        # The tracked .cargo/config.toml defines the Kin registry alias and the
+        # public Git [patch.kin] pins that redirect the kin-* crates to immutable
+        # commits, so the graph resolves without registry credentials.
+        run: |
+          test -f .cargo/config.toml
+          grep -q '^\[registries\.kin\]' .cargo/config.toml
+
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          rust-version: stable
