@@ -550,6 +550,11 @@ enum Command {
         #[arg(long)]
         scope: Option<String>,
     },
+    /// Manage local telemetry consent and the spool
+    Telemetry {
+        #[command(subcommand)]
+        action: TelemetryAction,
+    },
     /// Show graph observability
     Support {
         /// Output machine-readable JSON for editor integrations
@@ -1475,6 +1480,18 @@ enum VerifyAction {
 }
 
 #[derive(Subcommand)]
+enum TelemetryAction {
+    /// Show consent status and spool statistics
+    Status,
+    /// Record consent to local telemetry collection
+    Consent,
+    /// Revoke telemetry consent
+    Revoke,
+    /// Delete all spooled telemetry data
+    Purge,
+}
+
+#[derive(Subcommand)]
 enum ApprovalsAction {
     /// Show approvals for a change
     Show {
@@ -2157,6 +2174,12 @@ fn main() -> Result<()> {
                     strategy,
                     scope,
                 } => commands::exec::run_full(command, keep, strategy, scope).await,
+                Command::Telemetry { action } => match action {
+                    TelemetryAction::Status => commands::telemetry::run_status().await,
+                    TelemetryAction::Consent => commands::telemetry::run_consent().await,
+                    TelemetryAction::Revoke => commands::telemetry::run_revoke().await,
+                    TelemetryAction::Purge => commands::telemetry::run_purge().await,
+                },
                 Command::Support { json } => commands::support::run(json).await,
                 Command::BenchMeta {
                     json,

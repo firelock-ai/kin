@@ -39,6 +39,7 @@ pub mod locate;
 pub mod locate_debug;
 pub mod locate_telemetry;
 pub mod log;
+pub mod telemetry;
 pub mod mcp;
 pub mod merge;
 pub mod migrate;
