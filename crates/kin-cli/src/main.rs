@@ -95,6 +95,10 @@ enum Command {
     /// file with the pre-init snapshot copy, destroying any uncommitted changes.
     /// Requires typing "revert" to confirm unless --yes is also given.
     /// A backup of current files is created before any mutation.
+    ///
+    /// Eject never touches .git: Kin only restores files it snapshotted at init,
+    /// and Git history is left intact. After eject the directory is a plain Git
+    /// repository again.
     Eject {
         /// DESTRUCTIVE: overwrite working files with the pre-init snapshot and
         /// delete the Kin graph. Requires typing "revert" to confirm (or --yes).
