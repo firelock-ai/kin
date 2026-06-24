@@ -173,10 +173,11 @@
       ]
     },
     {
-      "name": "planning",
-      "layer": "strategy",
-      "role": "ordered-program-authority",
-      "dependsOn": []
+      "name": "kin-actions",
+      "layer": "infrastructure",
+      "role": "shared-ci-and-release-workflows",
+      "dependsOn": [],
+      "note": "Reusable GitHub Actions workflows for CI and release pipelines. Infrastructure/CI-only — not a product surface."
     },
     {
       "name": "experimental/kin-kernel",
