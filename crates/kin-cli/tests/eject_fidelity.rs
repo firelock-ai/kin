@@ -254,6 +254,22 @@ fn write_proof(name: &str, value: &serde_json::Value) {
     }
 }
 
+/// Wait until the repo's daemon has fully idle-exited (its endpoint files are
+/// gone). `kin eject` only sends a best-effort SIGTERM and does not wait, so a
+/// still-live daemon from a preceding `kin commit` could recreate `.kin/` right
+/// after eject removes the directory. Quiescing first makes the eject assertion
+/// deterministic — the same wait the daemon-autostart locate test relies on.
+fn wait_for_daemon_gone(repo: &Path) {
+    let pid = repo.join(".kin/daemon.pid");
+    let port = repo.join(".kin/daemon.port");
+    for _ in 0..150 {
+        if !pid.exists() && !port.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// `kin eject --revert-files` restores the working tree byte-for-byte to its
 /// pre-init state, leaves `.git`/Git history untouched, and the restored tree
 /// still builds and tests green under a plain toolchain.
@@ -289,6 +305,10 @@ fn eject_revert_files_is_byte_faithful_and_leaves_git_intact() {
         LIB_V1.as_bytes(),
         "edit must be present before eject",
     );
+
+    // Quiesce the commit's daemon before leaving, so its endpoint files cannot
+    // reappear under .kin/ after eject removes the directory.
+    wait_for_daemon_gone(&repo);
 
     // Leave.
     run_kin(&repo, &["eject", "--revert-files", "--yes"]);
