@@ -3195,12 +3195,110 @@ fn disabled_error() -> KinDbError {
     )
 }
 
+/// Capacity of the in-memory LRU in front of the on-disk embedding vector
+/// cache: ~1024 vectors (≈3 MB at 768-dim f32) bounds resident memory while
+/// keeping the hot working set warm.
+#[cfg(feature = "embeddings")]
+const EMBED_MEMORY_CACHE_CAPACITY: usize = 1024;
+
+/// Bounded least-recently-used cache for embedding vectors held in memory in
+/// front of the on-disk vector cache. When full, it evicts only the single
+/// least-recently-used entry, keeping the hottest working set resident.
+///
+/// It governs only which vectors are resident in RAM, never the bytes returned:
+/// a value served from this cache is byte-for-byte identical to what the
+/// on-disk read would return, so embedding determinism and cache provenance are
+/// unchanged. Recency uses a monotonic counter; eviction scans for the minimum,
+/// which is cheap because the cache is small and eviction is rare relative to
+/// embedding cost.
+#[cfg(feature = "embeddings")]
+#[derive(Debug)]
+struct VectorLruCache {
+    capacity: usize,
+    tick: u64,
+    entries: std::collections::HashMap<String, LruEntry>,
+}
+
+#[cfg(feature = "embeddings")]
+#[derive(Debug)]
+struct LruEntry {
+    vector: Vec<f32>,
+    last_used: u64,
+}
+
+#[cfg(feature = "embeddings")]
+impl VectorLruCache {
+    fn with_capacity(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            capacity,
+            tick: 0,
+            entries: std::collections::HashMap::with_capacity(capacity),
+        }
+    }
+
+    fn next_tick(&mut self) -> u64 {
+        self.tick = self.tick.wrapping_add(1);
+        self.tick
+    }
+
+    /// Return a clone of the cached vector and mark it most-recently-used.
+    fn get(&mut self, key: &str) -> Option<Vec<f32>> {
+        let tick = self.next_tick();
+        let entry = self.entries.get_mut(key)?;
+        entry.last_used = tick;
+        Some(entry.vector.clone())
+    }
+
+    /// Insert or refresh `key`, evicting the least-recently-used entry first
+    /// when a new key would exceed capacity.
+    fn put(&mut self, key: &str, vector: Vec<f32>) {
+        let tick = self.next_tick();
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.vector = vector;
+            entry.last_used = tick;
+            return;
+        }
+        if self.entries.len() >= self.capacity {
+            self.evict_least_recently_used();
+        }
+        self.entries.insert(
+            key.to_string(),
+            LruEntry {
+                vector,
+                last_used: tick,
+            },
+        );
+    }
+
+    fn evict_least_recently_used(&mut self) {
+        if let Some(victim) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(key, _)| key.clone())
+        {
+            self.entries.remove(&victim);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+}
+
 #[cfg(feature = "embeddings")]
 #[derive(Debug, Clone)]
 struct EmbeddingCache {
     root: PathBuf,
     dimensions: usize,
-    memory_cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<f32>>>>,
+    memory_cache: std::sync::Arc<std::sync::Mutex<VectorLruCache>>,
 }
 
 #[cfg(feature = "embeddings")]
@@ -3230,7 +3328,7 @@ impl EmbeddingCache {
             root,
             dimensions,
             memory_cache: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
+                VectorLruCache::with_capacity(EMBED_MEMORY_CACHE_CAPACITY),
             )),
         })
     }
@@ -3243,15 +3341,11 @@ impl EmbeddingCache {
 
     fn get_by_key(&self, key: &str) -> Option<Vec<f32>> {
         if let Some(cached) = self.memory_cache.lock().unwrap().get(key) {
-            return Some(cached.clone());
+            return Some(cached);
         }
 
         if let Some(vector) = read_cached_vector(&self.path_for_key(key), self.dimensions) {
-            let mut cache = self.memory_cache.lock().unwrap();
-            if cache.len() > 8192 {
-                cache.clear();
-            }
-            cache.insert(key.to_string(), vector.clone());
+            self.memory_cache.lock().unwrap().put(key, vector.clone());
             Some(vector)
         } else {
             None
@@ -3275,10 +3369,7 @@ impl EmbeddingCache {
 
         {
             let mut cache = self.memory_cache.lock().unwrap();
-            if cache.len() > 8192 {
-                cache.clear();
-            }
-            cache.insert(key.to_string(), vector.to_vec());
+            cache.put(key, vector.to_vec());
         }
 
         let _ = write_cached_vector(&self.path_for_key(key), vector);
@@ -4794,5 +4885,81 @@ mod tests {
         };
         // The debug_assert! inside format_graph_entity_text_with_context fires here.
         let _ = format_graph_entity_text(&entity);
+    }
+
+    #[test]
+    #[cfg(feature = "embeddings")]
+    fn vector_lru_hit_and_miss() {
+        let mut lru = VectorLruCache::with_capacity(4);
+        assert_eq!(lru.get("absent"), None);
+        lru.put("k", vec![0.5, 0.25]);
+        assert_eq!(lru.get("k"), Some(vec![0.5, 0.25]));
+        assert_eq!(lru.len(), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "embeddings")]
+    fn vector_lru_evicts_least_recently_used() {
+        let mut lru = VectorLruCache::with_capacity(2);
+        lru.put("a", vec![1.0]);
+        lru.put("b", vec![2.0]);
+        // Touch "a" so "b" becomes the least-recently-used entry.
+        assert_eq!(lru.get("a"), Some(vec![1.0]));
+        // Inserting a third key over capacity must evict "b" only.
+        lru.put("c", vec![3.0]);
+        assert_eq!(lru.len(), 2);
+        assert!(lru.contains_key("a"));
+        assert!(lru.contains_key("c"));
+        assert!(!lru.contains_key("b"));
+        assert_eq!(lru.get("b"), None);
+    }
+
+    #[test]
+    #[cfg(feature = "embeddings")]
+    fn vector_lru_refresh_existing_does_not_evict() {
+        let mut lru = VectorLruCache::with_capacity(2);
+        lru.put("a", vec![1.0]);
+        lru.put("b", vec![2.0]);
+        // Updating an existing key is not a new insertion — nothing is evicted.
+        lru.put("a", vec![9.0]);
+        assert_eq!(lru.len(), 2);
+        assert_eq!(lru.get("a"), Some(vec![9.0]));
+        assert!(lru.contains_key("b"));
+    }
+
+    /// A vector served from the in-memory LRU must be byte-for-byte identical to
+    /// what a direct on-disk read returns — the LRU only changes residency, not
+    /// the answer, so embed determinism and cache provenance are preserved.
+    #[test]
+    #[cfg(feature = "embeddings")]
+    fn lru_served_vector_equals_disk_read() {
+        let tmp =
+            std::env::temp_dir().join(format!("kin-db-embed-lru-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let dims = 4;
+
+        let writer = EmbeddingCache::new_in(tmp.clone(), "lru-equality".to_string(), dims)
+            .expect("cache root");
+        let key = writer.key_for_text("function\nsrc/lib.rs\nload_registry");
+        let vector = vec![0.5_f32, -0.25, 0.125, 0.0625];
+        writer.put_by_key(&key, &vector);
+
+        // Direct disk read of the persisted vector.
+        let from_disk = read_cached_vector(&writer.path_for_key(&key), dims).expect("on-disk hit");
+
+        // A fresh cache over the same root starts with an empty LRU, so the
+        // first read is served from disk (and populates the LRU); the second is
+        // served from the LRU. Both must equal the disk bytes.
+        let reader = EmbeddingCache::new_in(tmp.clone(), "lru-equality".to_string(), dims)
+            .expect("cache root");
+        let served_from_disk = reader.get_by_key(&key).expect("disk-backed hit");
+        let served_from_lru = reader.get_by_key(&key).expect("memory hit");
+
+        assert_eq!(from_disk, vector);
+        assert_eq!(served_from_disk, vector);
+        assert_eq!(served_from_lru, vector);
+        assert_eq!(served_from_lru, from_disk);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
