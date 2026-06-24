@@ -1,31 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
-#
-# =============================================================================
-#  DRAFT FORMULA — NOT YET INSTALLABLE
-# -----------------------------------------------------------------------------
-#  The `sha256` values below are PLACEHOLDERS, not real checksums. This formula
-#  is committed so the packaging shape is reviewable, but it will NOT install
-#  until a real tagged release exists and these are filled in.
-#
-#  Before publishing this to a Homebrew tap you MUST:
-#    1. Tag and publish a release (see .github/workflows/release.yml). Each
-#       release uploads `<asset>.tar.gz` and a matching `<asset>.tar.gz.sha256`.
-#    2. Set `version` below to that release tag, WITHOUT the leading "v"
-#       (e.g. tag v0.1.0-alpha.1  ->  version "0.1.0-alpha.1").
-#    3. Replace each placeholder `sha256` with the real hash, e.g.:
-#         curl -fsSL \
-#           https://github.com/firelock-ai/kin/releases/download/v0.1.0-alpha.1/kin-macos-aarch64.tar.gz.sha256
-#
-#  Do NOT paste a zero/dummy 64-hex hash to make `brew` proceed — that would
-#  silently install an unverified binary. A real release is the only fix; until
-#  then the obviously-non-hex placeholders below make `brew` fail fast on
-#  purpose.
-# =============================================================================
 class Kin < Formula
   desc "Semantic system of record for software work"
   homepage "https://github.com/firelock-ai/kin"
-  version "0.1.0-alpha.1" # TODO: set to the real released tag (no leading "v")
+  version "0.2.2"
   license "Apache-2.0"
 
   # macOS-only for now. The release also publishes Linux tarballs
@@ -35,13 +13,11 @@ class Kin < Formula
   on_macos do
     on_arm do
       url "https://github.com/firelock-ai/kin/releases/download/v#{version}/kin-macos-aarch64.tar.gz"
-      # TODO: real hash from kin-macos-aarch64.tar.gz.sha256
-      sha256 "REPLACE_WITH_RELEASE_SHA256_kin_macos_aarch64"
+      sha256 "7a222f929ce0984e5a4478cf4db9a4b53726b6fc62c25ae01f16adf5b40ccfe2"
     end
     on_intel do
       url "https://github.com/firelock-ai/kin/releases/download/v#{version}/kin-macos-x86_64.tar.gz"
-      # TODO: real hash from kin-macos-x86_64.tar.gz.sha256
-      sha256 "REPLACE_WITH_RELEASE_SHA256_kin_macos_x86_64"
+      sha256 "621230294d298b17f482daabe3f0b7fce4fc92f28b3b0e41ebebff9e2c77acff"
     end
   end
 
