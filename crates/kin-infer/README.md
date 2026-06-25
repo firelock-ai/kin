@@ -1,6 +1,6 @@
 # kin-infer
 
-Universal transformer inference engine for the Kin stack.
+> Inference and embedding substrate.
 
 `kin-infer` runs encoder and decoder transformer models entirely in Rust, with
 GPU acceleration and no external ML framework dependency (no PyTorch, no ONNX,
@@ -9,6 +9,18 @@ no TensorFlow). Custom compute shaders and kernels drive the GPU backends.
 It is the inference primitive in the open Kin local substrate. `kin-db`
 consumes it to embed source entities on-device. Kin uses it to power
 deterministic, citable embedding inference over local code corpora.
+
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/firelock-ai/kin)
+
+## What is Kin?
+
+Kin is the semantic system of record for AI-native software — your code as a graph of
+entities, relations, and intents, not a pile of files and diffs. AI agents and humans
+navigate it semantically, with provenance, review, and governance built in. It coexists
+with Git and projects graph truth back to a normal filesystem, so any tool works unchanged.
+
+Start at **[firelock-ai/kin](https://github.com/firelock-ai/kin)** · **[kinlab.ai](https://kinlab.ai)**
 
 ## Build
 
@@ -54,4 +66,4 @@ With no GPU feature flag, the engine runs on CPU with SIMD acceleration.
 
 ## License
 
-Apache-2.0. Part of the open Kin local substrate.
+[Apache-2.0](LICENSE).
