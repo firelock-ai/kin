@@ -9,7 +9,13 @@ use std::collections::HashSet;
 /// Starts a transport-only MCP server. Graph-backed tools are executed by the
 /// repo daemon resolved through the supervisor route; MCP never loads or serves
 /// a local graph snapshot in product mode.
-pub async fn start() -> Result<()> {
+pub async fn start(global: bool) -> Result<()> {
+    if global {
+        anyhow::bail!(
+            "`kin mcp start --global` (multi-repo registry mode) is not yet implemented.\n\
+             Omit --global to start in single-repo mode, or set KIN_DAEMON_URL to a running daemon."
+        );
+    }
     let daemon_url = if let Ok(url) = std::env::var("KIN_DAEMON_URL") {
         url
     } else {
@@ -66,7 +72,7 @@ fn build_mcp_start_config() -> kin_mcp::McpServerConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_mcp_start_config, session_authority_notice};
+    use super::{build_mcp_start_config, session_authority_notice, start};
 
     #[test]
     fn daemon_available_notice_mentions_daemon_authority() {
@@ -83,5 +89,13 @@ mod tests {
             kin_mcp::SessionAuthorityMode::DaemonRequired
         );
         assert!(config.snapshot_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn global_flag_returns_clear_error() {
+        let err = start(true).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not yet implemented"), "unexpected message: {msg}");
+        assert!(msg.contains("--global"), "missing flag hint: {msg}");
     }
 }

@@ -2099,7 +2099,7 @@ fn main() -> Result<()> {
                     }
                 },
                 Command::Mcp { action } => match action {
-                    McpAction::Start { global: _ } => commands::mcp::start().await,
+                    McpAction::Start { global } => commands::mcp::start(global).await,
                 },
                 Command::Auth { action } => match action {
                     AuthAction::Login {

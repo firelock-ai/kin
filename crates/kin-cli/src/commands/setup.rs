@@ -752,22 +752,22 @@ fn detect_ai_assistants() -> Vec<AiAssistant> {
     ]
 }
 
-/// Read a JSON file, or return an empty object if it doesn't exist / is invalid.
-fn read_json_file(path: &PathBuf) -> serde_json::Value {
-    if path.exists() {
-        if let Ok(content) = fs::read_to_string(path) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                return val;
-            }
-        }
-    }
-    serde_json::json!({})
-}
-
 /// Merge the "kin" MCP server entry into an existing JSON config file.
 /// Creates the file if it doesn't exist.
 fn merge_mcp_config(path: &PathBuf) -> Result<()> {
-    let mut root = read_json_file(path);
+    let mut root: serde_json::Value = if path.exists() {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        serde_json::from_str(&content).with_context(|| {
+            format!(
+                "existing file {} is not valid JSON — refusing to overwrite it. \
+                 Fix or remove the file and try again.",
+                path.display()
+            )
+        })?
+    } else {
+        serde_json::json!({})
+    };
 
     // Ensure root is an object
     if !root.is_object() {
@@ -913,7 +913,12 @@ fn has_kin_mcp_config(path: &PathBuf) -> bool {
     if !path.exists() {
         return false;
     }
-    let root = read_json_file(path);
+    let Ok(content) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
     root.get("mcpServers").and_then(|s| s.get("kin")).is_some()
 }
 
@@ -1748,5 +1753,47 @@ mod tests {
         o.auto_daemon = true;
         let plan = build_plan(SetupIntent::Editor, &o, &assistants, "zsh", false).unwrap();
         assert!(plan.auto_daemon);
+    }
+
+    #[test]
+    fn merge_mcp_config_refuses_to_overwrite_corrupt_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, b"this is not json {{{").unwrap();
+
+        let original = std::fs::read(&path).unwrap();
+        let err = merge_mcp_config(&path).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("not valid JSON"),
+            "expected 'not valid JSON' in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("refusing to overwrite"),
+            "expected 'refusing to overwrite' in error, got: {msg}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "corrupt file must not be modified"
+        );
+    }
+
+    #[test]
+    fn merge_mcp_config_merges_into_valid_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"existingKey": true}"#).unwrap();
+
+        merge_mcp_config(&path).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(val["existingKey"], true, "existing keys must be preserved");
+        assert!(
+            val["mcpServers"]["kin"].is_object(),
+            "kin entry must be added"
+        );
     }
 }
