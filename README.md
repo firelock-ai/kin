@@ -54,7 +54,7 @@ Configure the installer with environment variables:
 ### Runtime configuration
 
 The Kin daemon is the canonical authority for graph truth. Commands that analyze the
-graph in-process (`kin merge`, `kin release`, `kin semver`, `kin rollback`, `kin git export`)
+graph in-process (`kin merge`, `kin tag`, `kin semver`, `kin rollback`, `kin git export`)
 read from the daemon and auto-start it as needed — no configuration required for normal use.
 
 - `KIN_NO_DAEMON`: Set to `1` to disable daemon auto-start. The CLI will only use an
