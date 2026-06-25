@@ -22,15 +22,27 @@ pub struct WeightConfig {
     pub proof_bias: f32,
 }
 
+/// Read a non-negative finite `f32` override from the environment, falling back to
+/// `default` when the variable is unset or unparseable. Keeps the unset path
+/// byte-identical to the hardcoded defaults so ranking is unchanged unless an
+/// operator opts in.
+fn rank_env_f32(name: &str, default: f32) -> f32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(default)
+}
+
 impl Default for WeightConfig {
     fn default() -> Self {
         Self {
-            lexical: 0.30,
-            semantic: 0.28,
-            graph: 0.18,
-            proof: 0.16,
-            provenance: 0.08,
-            proof_bias: 1.35,
+            lexical: rank_env_f32("KIN_RANK_LEXICAL", 0.30),
+            semantic: rank_env_f32("KIN_RANK_SEMANTIC", 0.28),
+            graph: rank_env_f32("KIN_RANK_GRAPH", 0.18),
+            proof: rank_env_f32("KIN_RANK_PROOF", 0.16),
+            provenance: rank_env_f32("KIN_RANK_PROVENANCE", 0.08),
+            proof_bias: rank_env_f32("KIN_RANK_PROOF_BIAS", 1.35),
         }
     }
 }

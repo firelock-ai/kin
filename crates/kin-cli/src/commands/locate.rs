@@ -515,6 +515,27 @@ fn locate_env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+/// Parse a comma-separated list of signal-list indices from the environment into a
+/// set, falling back to `default` when the variable is unset or yields no valid
+/// entries. Whitespace and empty fields are ignored; non-numeric fields make the
+/// whole override fall back so a typo cannot silently drop graph signals.
+fn locate_env_usize_set(name: &str, default: &[usize]) -> HashSet<usize> {
+    if let Ok(value) = std::env::var(name) {
+        let parsed: Option<HashSet<usize>> = value
+            .split(',')
+            .map(str::trim)
+            .filter(|field| !field.is_empty())
+            .map(|field| field.parse::<usize>().ok())
+            .collect();
+        if let Some(set) = parsed {
+            if !set.is_empty() {
+                return set;
+            }
+        }
+    }
+    default.iter().copied().collect()
+}
+
 /// Single source for the entity-resolve strength floor (read by both the
 /// strong-resolve support cap and resolve-boundary compression).
 fn resolve_strength_floor() -> f32 {
@@ -1441,6 +1462,11 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         ScoringTrack::BroadBlend
     };
 
+    // RRF rank-saturation constant `k` in `w / (k + rank + 1)`. Default 60.0 (classic
+    // RRF); larger compresses rank differences, smaller sharpens top ranks. Shared by
+    // every track's fusion below so a sweep moves them together.
+    let rrf_k = locate_env_f32("KIN_LOCATE_RRF_K", 60.0);
+
     // Entity-granular fusion experiment (default OFF; byte-identical when unset).
     // When KIN_LOCATE_ENTITY_FUSION=1, fuse at ENTITY granularity (entity-derived
     // signals keyed by entity id, the rest by path) and PROJECT to files at the
@@ -1473,7 +1499,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 }
                 reciprocal_rank_fusion_weighted(
                     &ranked_lists,
-                    60.0,
+                    rrf_k,
                     &rrf_rank_lift_weights(ranked_lists.len()),
                     &[],
                 )
@@ -1508,7 +1534,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                     }
                     reciprocal_rank_fusion_weighted(
                         &ranked_lists,
-                        60.0,
+                        rrf_k,
                         &rrf_rank_lift_weights(ranked_lists.len()),
                         &entity_dom_weights,
                     )
@@ -1548,7 +1574,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                         .filter(|(idx, _)| *idx != 7)
                         .map(|(_, list)| list.clone())
                         .collect::<Vec<_>>();
-                    let other_fused = reciprocal_rank_fusion(&other_ranked_lists, 60.0);
+                    let other_fused = reciprocal_rank_fusion(&other_ranked_lists, rrf_k);
                     let other_max = other_fused
                         .first()
                         .map(|(_, s)| *s)
@@ -1568,7 +1594,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 // Boost multihop and imports, suppress test/snippet noise.
                 reciprocal_rank_fusion_weighted(
                     &ranked_lists,
-                    60.0,
+                    rrf_k,
                     &rrf_rank_lift_weights(ranked_lists.len()),
                     &[],
                 )
@@ -1589,7 +1615,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 }
                 reciprocal_rank_fusion_weighted(
                     &ranked_lists,
-                    60.0,
+                    rrf_k,
                     &rrf_rank_lift_weights(ranked_lists.len()),
                     &[],
                 )
@@ -9409,7 +9435,8 @@ fn entity_granular_fused_files(
         };
         keyed_lists.push(keyed);
     }
-    let fused_entities = reciprocal_rank_fusion_entities(&keyed_lists, 60.0);
+    let rrf_k = locate_env_f32("KIN_LOCATE_RRF_K", 60.0);
+    let fused_entities = reciprocal_rank_fusion_entities(&keyed_lists, rrf_k);
     // Project entity ranking → files: each file takes its best entity's score.
     let mut best_per_file: HashMap<String, f32> = HashMap::new();
     for (_, path, score) in &fused_entities {
@@ -9786,8 +9813,10 @@ fn reciprocal_rank_fusion_weighted(
     let mut signal_counts: FxHashMap<String, usize> = FxHashMap::default();
 
     // Track which graph-structural signal indices each file appears in.
-    // multihop=1, tests=2, imports=4, cochange=6.
-    let graph_signal_indices: HashSet<usize> = [1, 2, 4, 6].iter().copied().collect();
+    // multihop=1, tests=2, imports=4, cochange=6 (override:
+    // KIN_LOCATE_GRAPH_SIGNAL_INDICES as a comma-separated list).
+    let graph_signal_indices: HashSet<usize> =
+        locate_env_usize_set("KIN_LOCATE_GRAPH_SIGNAL_INDICES", &[1, 2, 4, 6]);
     let mut graph_signal_counts: FxHashMap<String, usize> = FxHashMap::default();
 
     for (list_idx, list) in ranked_lists.iter().enumerate() {
