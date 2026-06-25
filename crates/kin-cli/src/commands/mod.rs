@@ -57,6 +57,7 @@ pub mod refs;
 pub mod registry;
 pub mod release;
 pub mod release_cmd;
+pub mod release_orch;
 pub mod remote;
 pub mod rename;
 pub mod resolve;

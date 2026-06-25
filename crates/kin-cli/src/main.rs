@@ -617,9 +617,13 @@ enum Command {
     },
     /// Analyze semver impact of changes
     Semver,
-    /// Create a release snapshot
-    #[command(visible_alias = "tag")]
+    /// Cross-repo release orchestration and per-repo release snapshots
     Release {
+        #[command(subcommand)]
+        action: ReleaseAction,
+    },
+    /// Create a release snapshot (alias of `kin release snapshot`)
+    Tag {
         /// Release tag
         tag: String,
         /// Block release if entities lack linked passing tests
@@ -1578,6 +1582,59 @@ enum PipelineAction {
     },
 }
 
+/// Deliberate, bottom-up cross-repo release orchestration (the in-binary port
+/// of the umbrella `bin/kin-release`), plus the per-repo graph release snapshot.
+///
+/// `plan`/`apply`/`intent` read registry truth + the local sibling manifests and
+/// drive the bottom-up front (primitives -> kin-model -> kin-db -> kin -> bench/
+/// vfs/lsp) deliberately. They never publish — publishing stays in CI behind the
+/// version gate. `snapshot` is the original `kin release <tag>` graph snapshot.
+#[derive(Subcommand)]
+enum ReleaseAction {
+    /// Read-only bottom-up release plan: which crates need publishing and which
+    /// downstream pins lag a published crate.
+    Plan {
+        /// Skip registry queries; show local versions + pins only.
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Propagate a published crate version into downstream Cargo.toml pins
+    /// (registry = "kin"). Edits manifests locally; never commits/pushes/publishes.
+    Apply {
+        /// The registry crate whose pin to bump (e.g. kin-db).
+        crate_name: String,
+        /// The version to pin (e.g. 0.2.24).
+        version: String,
+        /// Repos to update (default: every consumer repo).
+        repos: Vec<String>,
+        /// Do not refresh Cargo.lock with `cargo update --precise` after editing.
+        #[arg(long)]
+        no_lock: bool,
+    },
+    /// Release-intent gate for one repo (exit 0 = release intended / nothing to
+    /// do, non-zero = staged but out of sync). For `kin`, runs the canonical
+    /// scripts/release-intent.mjs gate.
+    Intent {
+        /// Repo to gate (e.g. kin, kin-db).
+        repo: String,
+    },
+    /// Create a release snapshot of the current entity graph state (the original
+    /// `kin release <tag>` behavior; also available as `kin tag <tag>`).
+    Snapshot {
+        /// Release tag
+        tag: String,
+        /// Block release if entities lack linked passing tests
+        #[arg(long)]
+        require_proof: bool,
+        /// Block release if unapproved agent changes exist
+        #[arg(long)]
+        require_approval: bool,
+        /// Force release even with low coverage
+        #[arg(long)]
+        force: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum HostedReleaseAction {
     /// Create a hosted release
@@ -2233,7 +2290,33 @@ fn main() -> Result<()> {
                     commands::security::run_with_options(propagate).await
                 }
                 Command::Semver => commands::release::semver().await,
-                Command::Release {
+                Command::Release { action } => match action {
+                    ReleaseAction::Plan { offline } => commands::release_orch::plan(offline).await,
+                    ReleaseAction::Apply {
+                        crate_name,
+                        version,
+                        repos,
+                        no_lock,
+                    } => commands::release_orch::apply(crate_name, version, repos, !no_lock).await,
+                    ReleaseAction::Intent { repo } => commands::release_orch::intent(repo).await,
+                    ReleaseAction::Snapshot {
+                        tag,
+                        require_proof,
+                        require_approval,
+                        force,
+                    } => {
+                        commands::release::release_with_options(
+                            tag,
+                            commands::release::ReleaseOptions {
+                                force,
+                                require_proof,
+                                require_approval,
+                            },
+                        )
+                        .await
+                    }
+                },
+                Command::Tag {
                     tag,
                     require_proof,
                     require_approval,
