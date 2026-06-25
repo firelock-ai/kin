@@ -377,16 +377,31 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Publish npm package (Trusted Publishing via OIDC)
+        id: npm_pub
         run: |
           PKG=$(node -p "require('./packages/kin-mcp/package.json').name")
           VER=$(node -p "require('./packages/kin-mcp/package.json').version")
+          echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
           if npm view "${PKG}@${VER}" version >/dev/null 2>&1; then
             echo "${PKG}@${VER} already published — skipping (idempotent recut)."
+            echo "published=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           npm publish ./packages/kin-mcp --access public --tag "${NPM_DIST_TAG}"
+          echo "published=true" >> "$GITHUB_OUTPUT"
         env:
           NPM_DIST_TAG: ${{ steps.dist-tag.outputs.tag }}
+
+      - name: Notify Discord (npm publish)
+        if: steps.npm_pub.outputs.published == 'true' && env.DISCORD_WEBHOOK_URL != ''
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          PKG: ${{ steps.npm_pub.outputs.pkg }}
+          VER: ${{ steps.npm_pub.outputs.ver }}
+        run: |
+          jq -nc --arg c "📦 \`${PKG}@${VER}\` published to **npm**." '{content:$c}' \
+            | curl -fsS -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
 
   publish_boundary_contracts:
     name: Publish boundary contracts to KinLab
@@ -407,11 +422,22 @@ jobs:
         run: |
           if [ -z "${KINLAB_NPM_TOKEN:-}" ]; then
             echo "KINLAB_NPM_TOKEN is not configured; skipping KinLab registry publish"
+            echo "published=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           node ./scripts/publish-boundary-contracts.mjs
+          echo "published=true" >> "$GITHUB_OUTPUT"
         env:
           TAG_NAME: ${{ github.ref_name }}
           KINLAB_NPM_TOKEN: ${{ secrets.KINLAB_NPM_TOKEN }}
           KINLAB_NPM_REGISTRY_URL: ${{ vars.KINLAB_NPM_REGISTRY_URL }}
           KINLAB_NPM_DIST_TAG: ${{ contains(github.ref_name, '-alpha') && 'alpha' || contains(github.ref_name, '-beta') && 'beta' || contains(github.ref_name, '-rc') && 'rc' || 'latest' }}
+
+      - name: Notify Discord (KinLab registry publish)
+        if: steps.publish-boundary.outputs.published == 'true' && env.DISCORD_WEBHOOK_URL != ''
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          REF: ${{ github.ref_name }}
+        run: |
+          jq -nc --arg c "📦 \`@kin/boundary-contracts\` ${REF} published to the **KinLab registry**." '{content:$c}' \
+            | curl -fsS -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
