@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-06-24
+
+Signed release. The macOS binaries are now code-signed with a Developer ID certificate and notarized by Apple.
+
+### Changed
+
+- The `kin-macos-x86_64` and `kin-macos-aarch64` archives are now code-signed (Developer ID Application) and notarized, so they launch without a Gatekeeper warning on first run.
+
 ## [0.2.2] - 2026-06-24
 
 Corrective release adding Intel Mac (`x86_64`) to the public install matrix.
