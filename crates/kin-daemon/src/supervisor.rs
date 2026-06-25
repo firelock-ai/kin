@@ -410,9 +410,10 @@ pub async fn repo_daemon_registration_loop(
 // `KIN_DAEMON_*` env vars for `KIN_SUPERVISOR_*` and the `daemon.token` file for
 // `supervisor.token`, so the two surfaces stay symmetric.
 
-/// `.kin/supervisor.token` — auto-provisioned per-install loopback token.
-fn supervisor_token_path() -> PathBuf {
-    supervisor_dir().join(SUPERVISOR_TOKEN_FILE)
+/// `.kin/supervisor.token` — auto-provisioned per-install loopback token, under
+/// the given supervisor directory.
+fn supervisor_token_path(dir: &Path) -> PathBuf {
+    dir.join(SUPERVISOR_TOKEN_FILE)
 }
 
 /// Strip an optional `:port` suffix from a Host/authority value, correctly
@@ -600,8 +601,8 @@ fn auth_token_from_env() -> Option<String> {
 
 /// Load the per-install supervisor loopback token, generating and persisting one
 /// (mode 0600 on unix) on first run. Mirrors `api::ensure_loopback_token`.
-fn ensure_loopback_token() -> std::io::Result<String> {
-    let path = supervisor_token_path();
+fn ensure_loopback_token(dir: &Path) -> std::io::Result<String> {
+    let path = supervisor_token_path(dir);
     if let Ok(existing) = std::fs::read_to_string(&path) {
         let trimmed = existing.trim().to_string();
         if !trimmed.is_empty() {
@@ -640,11 +641,11 @@ fn loopback_token_enforced() -> bool {
 /// loopback token is auto-provisioned under `.kin/` (so local clients can adopt
 /// it) but only returned for enforcement when `KIN_SUPERVISOR_REQUIRE_TOKEN`
 /// is set. Mirrors `api::resolve_serve_auth_token`.
-fn resolve_serve_auth_token() -> Option<String> {
+fn resolve_serve_auth_token(dir: &Path) -> Option<String> {
     if let Some(env_token) = auth_token_from_env() {
         return Some(env_token);
     }
-    match ensure_loopback_token() {
+    match ensure_loopback_token(dir) {
         Ok(token) => loopback_token_enforced().then_some(token),
         Err(error) => {
             warn!(
@@ -888,7 +889,7 @@ pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::i
     // which rejects a non-loopback daemon bind that has no auth token. The
     // Host/Origin guard is always active; the token is the second layer for
     // non-browser local/LAN callers.
-    let auth_token = resolve_serve_auth_token();
+    let auth_token = resolve_serve_auth_token(&supervisor_dir());
     if !addr.ip().is_loopback() && auth_token.is_none() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -2498,21 +2499,11 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    /// Serialize tests that mutate process-global `KIN_SUPERVISOR_*` /
-    /// `KIN_REGISTRY_PATH` env so they cannot race. Mirrors `api::env_test_lock`.
+    /// Serialize tests that mutate process-global `KIN_SUPERVISOR_*` env so they
+    /// cannot race. Shares one lock with every other env-mutating test in this
+    /// binary (see `crate::test_env_lock`).
     fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Point `supervisor_dir()` (via `KIN_REGISTRY_PATH`) at a unique temp dir so
-    /// `supervisor.token` provisioning is hermetic. Returns the `.kin` dir.
-    fn isolate_supervisor_dir() -> PathBuf {
-        let root = std::env::temp_dir().join(format!("kin-supervisor-test-{}", Uuid::new_v4()));
-        let kin_dir = root.join(".kin");
-        std::fs::create_dir_all(&kin_dir).unwrap();
-        std::env::set_var("KIN_REGISTRY_PATH", kin_dir.join("registry.toml"));
-        kin_dir
+        crate::test_env_lock()
     }
 
     #[tokio::test]
@@ -2726,19 +2717,25 @@ mod tests {
         let _env = env_test_lock();
         std::env::remove_var("KIN_SUPERVISOR_AUTH_TOKEN");
         std::env::remove_var("KIN_SUPERVISOR_REQUIRE_TOKEN");
-        let _kin_dir = isolate_supervisor_dir();
+
+        // Hermetic per-test supervisor directory, passed explicitly to the token
+        // helpers so the assertions never depend on the process-global
+        // `KIN_REGISTRY_PATH` (which other tests in this binary mutate
+        // concurrently). Mirrors `api::resolve_serve_auth_token_gates_enforcement`.
+        let dir = std::env::temp_dir().join(format!("kin-supervisor-token-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
 
         // First provisioning persists a token; re-provisioning returns the SAME
         // token (mode 0600 on unix).
-        let token = ensure_loopback_token().unwrap();
+        let token = ensure_loopback_token(&dir).unwrap();
         assert!(!token.is_empty());
-        assert_eq!(ensure_loopback_token().unwrap(), token);
-        let on_disk = std::fs::read_to_string(supervisor_token_path()).unwrap();
+        assert_eq!(ensure_loopback_token(&dir).unwrap(), token);
+        let on_disk = std::fs::read_to_string(supervisor_token_path(&dir)).unwrap();
         assert_eq!(on_disk.trim(), token);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(supervisor_token_path())
+            let mode = std::fs::metadata(supervisor_token_path(&dir))
                 .unwrap()
                 .permissions()
                 .mode();
@@ -2747,21 +2744,23 @@ mod tests {
 
         // Default: enforcement OFF — the file is provisioned but not required, so
         // existing unauthenticated local clients keep working.
-        assert!(resolve_serve_auth_token().is_none());
+        assert!(resolve_serve_auth_token(&dir).is_none());
 
         // Opt-in via KIN_SUPERVISOR_REQUIRE_TOKEN returns the provisioned token.
         std::env::set_var("KIN_SUPERVISOR_REQUIRE_TOKEN", "1");
-        assert_eq!(resolve_serve_auth_token().as_deref(), Some(token.as_str()));
+        assert_eq!(
+            resolve_serve_auth_token(&dir).as_deref(),
+            Some(token.as_str())
+        );
 
         // An explicit KIN_SUPERVISOR_AUTH_TOKEN override always wins.
         std::env::set_var("KIN_SUPERVISOR_AUTH_TOKEN", "explicit-override");
         assert_eq!(
-            resolve_serve_auth_token().as_deref(),
+            resolve_serve_auth_token(&dir).as_deref(),
             Some("explicit-override")
         );
 
         std::env::remove_var("KIN_SUPERVISOR_AUTH_TOKEN");
         std::env::remove_var("KIN_SUPERVISOR_REQUIRE_TOKEN");
-        std::env::remove_var("KIN_REGISTRY_PATH");
     }
 }
