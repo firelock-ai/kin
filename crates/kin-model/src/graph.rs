@@ -209,27 +209,36 @@ pub trait EntityStore: Send + Sync {
         Ok(())
     }
 
-    /// Atomically replace all relations of a given kind with a new set.
-    /// Default impl falls back to remove_relations_batch + upsert_relations_batch.
+    /// Replace all relations of a given kind with a new set.
+    ///
+    /// The default implementation is **not atomic**: it removes existing
+    /// relations then upserts the new set as two separate operations. If the
+    /// upsert fails after the remove has committed, a best-effort rollback is
+    /// attempted; if the rollback also fails, the relations of that kind are
+    /// left absent. Implementors that need true atomicity must override this
+    /// method and wrap both operations in a single database transaction.
     fn replace_relations_of_kind(
         &self,
         kind: RelationKind,
         new_relations: Vec<Relation>,
     ) -> std::result::Result<(), Self::Error> {
-        // Default: scan all entities for relations of this kind, remove, then insert
-        let existing: Vec<RelationId> = self
+        let existing: Vec<Relation> = self
             .query_entities(&EntityFilter::default())?
             .iter()
             .flat_map(|e| self.get_all_relations_for_entity(&e.id).unwrap_or_default())
             .filter(|r| r.kind == kind)
-            .map(|r| r.id)
             .collect();
-        let refs: Vec<_> = existing.iter().collect();
-        if !refs.is_empty() {
-            self.remove_relations_batch(&refs)?;
+        let existing_ids: Vec<_> = existing.iter().map(|r| &r.id).collect();
+        if !existing_ids.is_empty() {
+            self.remove_relations_batch(&existing_ids)?;
         }
-        if !new_relations.is_empty() {
-            self.upsert_relations_batch(&new_relations)?;
+        if let Err(upsert_err) = self.upsert_relations_batch(&new_relations) {
+            // Best-effort rollback: attempt to restore the removed relations.
+            // Ignore the rollback error and return the original upsert error.
+            if !existing.is_empty() {
+                let _ = self.upsert_relations_batch(&existing);
+            }
+            return Err(upsert_err);
         }
         Ok(())
     }
