@@ -120,6 +120,22 @@ impl BlobStore {
     /// after `rename` could leave a zero-length or torn object that the content
     /// address now vouches for — and because [`write`](Self::write) dedup-skips
     /// on existence, that corrupt object would be trusted forever.
+    ///
+    /// # Self-healing precondition for write-only callers
+    ///
+    /// If a corrupt blob is already present at its content-addressed path,
+    /// `write` will skip writing and return `Ok(hash)` — the corrupt file stays
+    /// trusted by dedup. The self-healing path is:
+    ///
+    /// 1. Call [`read`](Self::read): it detects the mismatch, quarantines the
+    ///    corrupt file (freeing the path), and returns [`BlobError::HashMismatch`].
+    /// 2. Call `write` again: dedup now sees no existing file and writes correctly.
+    ///
+    /// Callers that never call `read` on a written blob (bulk importers, etc.)
+    /// will not trigger quarantine and a corrupt file can persist indefinitely.
+    /// The safe pattern for resilient importers is to `write` then immediately
+    /// `read`-verify, or to call [`read`](Self::read) instead of relying on dedup
+    /// to detect prior corruption.
     pub fn write(&self, data: &[u8]) -> Result<Hash256> {
         let _span = tracing::info_span!("kin_blobs.write", bytes = data.len()).entered();
         let hash = digest(data);
@@ -194,6 +210,15 @@ impl BlobStore {
     /// has already been established — never as the general-purpose read.
     ///
     /// Returns [`BlobError::NotFound`] if the blob does not exist.
+    ///
+    /// # Warning: bypasses the quarantine-trigger
+    ///
+    /// Unlike [`read`](Self::read), this method does not hash-verify the content
+    /// and therefore never detects corruption or triggers quarantine. If this is
+    /// the only read path for a given blob, a corrupt file will never be
+    /// quarantined and a subsequent `write` of the correct bytes will continue to
+    /// dedup-skip past the corrupt file. Prefer `read` for correctness;
+    /// reserve `read_unverified` for hot paths where prior verification is proven.
     pub fn read_unverified(&self, hash: &Hash256) -> Result<Vec<u8>> {
         let blob_path = self.blob_path(hash);
         fs::read(&blob_path).map_err(|e| {
@@ -1272,5 +1297,63 @@ mod tests {
         // Its shard directory still exists.
         let keep_shard = on_disk_path(&store, &keep).parent().unwrap().to_path_buf();
         assert!(keep_shard.is_dir());
+    }
+
+    // -----------------------------------------------------------------------
+    // Self-healing precondition tests (FIR-1161)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn write_dedup_skips_corrupt_blob_until_read_quarantines() {
+        let (_dir, store) = make_store();
+
+        // Write correct content; compute the hash it should live under.
+        let correct = b"correct content";
+        let hash = store.write(correct).unwrap();
+
+        // Corrupt the on-disk file directly (simulating bit-rot).
+        let blob_path = on_disk_path(&store, &hash);
+        fs::write(&blob_path, b"corrupted!").unwrap();
+
+        // A second write of the correct bytes dedup-skips: the corrupt file
+        // stays trusted because write() only checks existence, not content.
+        let hash2 = store.write(correct).unwrap();
+        assert_eq!(hash, hash2);
+        assert_eq!(fs::read(&blob_path).unwrap(), b"corrupted!");
+
+        // read() detects the mismatch and quarantines the corrupt object.
+        let err = store.read(&hash).unwrap_err();
+        assert!(matches!(err, BlobError::HashMismatch { .. }));
+        // After quarantine the path is freed, so write() now heals the store.
+        let hash3 = store.write(correct).unwrap();
+        assert_eq!(hash, hash3);
+        assert_eq!(store.read(&hash).unwrap(), correct);
+    }
+
+    #[test]
+    fn gc_live_set_covers_all_written_blobs() {
+        let (_dir, store) = make_store();
+
+        let hashes: Vec<Hash256> = [b"alpha" as &[u8], b"beta", b"gamma"]
+            .iter()
+            .map(|d| store.write(d).unwrap())
+            .collect();
+
+        // A correct live-set containing every written blob must retain all of them.
+        let live: std::collections::HashSet<Hash256> = hashes.iter().copied().collect();
+        let report = store.gc(&live).unwrap();
+        assert_eq!(report.reclaimed, 0, "complete live set must retain every blob");
+        for h in &hashes {
+            assert!(store.exists(h).unwrap(), "blob {h} must survive GC");
+        }
+
+        // A live-set that omits one blob must reclaim exactly that one.
+        let mut partial = live.clone();
+        partial.remove(&hashes[1]);
+        let report2 = store.gc(&partial).unwrap();
+        assert_eq!(report2.reclaimed, 1);
+        assert!(!store.exists(&hashes[1]).unwrap());
+        assert!(store.exists(&hashes[0]).unwrap());
+        assert!(store.exists(&hashes[2]).unwrap());
     }
 }
