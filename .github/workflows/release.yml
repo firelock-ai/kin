@@ -478,9 +478,17 @@ jobs:
             echo "KIN_CI_BOT_TOKEN not configured; the tap self-updates on its 6h schedule"
             exit 0
           fi
-          curl -fsS -X POST \
+          # Convenience dispatch: the tap also self-updates on its 6h schedule, so a
+          # failure here (e.g. a token without homebrew-kin access) warns rather than
+          # failing an already-published release.
+          code=$(curl -sS -o /tmp/tap-dispatch.out -w '%{http_code}' -X POST \
             -H "Authorization: Bearer ${TAP_DISPATCH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/firelock-ai/homebrew-kin/dispatches \
-            -d '{"event_type":"kin-release"}'
-          echo "Dispatched kin-release to firelock-ai/homebrew-kin"
+            -d '{"event_type":"kin-release"}' || echo "000")
+          if [ "$code" = "204" ]; then
+            echo "Dispatched kin-release to firelock-ai/homebrew-kin"
+          else
+            echo "::warning::Homebrew tap dispatch returned HTTP ${code}; the tap self-updates on its 6h schedule, not failing the release."
+            cat /tmp/tap-dispatch.out 2>/dev/null || true
+          fi
