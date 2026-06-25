@@ -90,14 +90,16 @@ jobs:
                  cp llms.txt "gs://${BUCKET}/llms.txt"
           echo "sha256=${HASH}" >> "$GITHUB_OUTPUT"
 
-      - name: Invalidate CDN cache
+      - name: Invalidate CDN cache (best-effort)
         run: |
-          gcloud compute url-maps invalidate-cdn-cache "${URL_MAP}" \
-            --path="/install" --async --quiet
-          gcloud compute url-maps invalidate-cdn-cache "${URL_MAP}" \
-            --path="/install.ps1" --async --quiet
-          gcloud compute url-maps invalidate-cdn-cache "${URL_MAP}" \
-            --path="/llms.txt" --async --quiet
+          # Uploads set Cache-Control:no-cache, max-age=0, so the CDN revalidates
+          # on every request and this explicit purge is belt-and-suspenders. It
+          # needs roles/compute.loadBalancerAdmin on the WIF service account; if
+          # that is not granted, warn but never fail the publish — content is fresh.
+          for p in /install /install.ps1 /llms.txt; do
+            gcloud compute url-maps invalidate-cdn-cache "${URL_MAP}" --path="$p" --async --quiet \
+              || echo "::warning::CDN invalidation for ${p} skipped (WIF SA missing compute.urlMaps.invalidateCache; no-cache headers keep content fresh)"
+          done
 
       - name: Summary
         run: |
