@@ -95,7 +95,10 @@ mod tests {
     async fn global_flag_returns_clear_error() {
         let err = start(true).await.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("not yet implemented"), "unexpected message: {msg}");
+        assert!(
+            msg.contains("not yet implemented"),
+            "unexpected message: {msg}"
+        );
         assert!(msg.contains("--global"), "missing flag hint: {msg}");
     }
 }
