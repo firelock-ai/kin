@@ -2695,12 +2695,12 @@ impl InMemoryGraph {
         };
         let t_serialize = t2.elapsed();
 
-        eprintln!(
-            "[save-timer] lock={:.1}ms  root_hash={:.1}ms  serialize={:.1}ms  bytes={}",
-            t_lock.as_secs_f64() * 1000.0,
-            t_hash.as_secs_f64() * 1000.0,
-            t_serialize.as_secs_f64() * 1000.0,
-            bytes.len(),
+        tracing::debug!(
+            lock_ms = t_lock.as_secs_f64() * 1000.0,
+            root_hash_ms = t_hash.as_secs_f64() * 1000.0,
+            serialize_ms = t_serialize.as_secs_f64() * 1000.0,
+            bytes = bytes.len(),
+            "kindb.save_timer"
         );
 
         Ok((bytes, graph_root_hash))
