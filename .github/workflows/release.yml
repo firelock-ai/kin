@@ -232,7 +232,7 @@ jobs:
             --apple-id "$APPLE_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
-            --wait
+            --wait --timeout 30m
           # NOTE: a bare CLI binary (and a .tar.gz) cannot be stapled — `xcrun
           # stapler` only supports .app bundles, .dmg, .pkg, and .xip. The
           # notarization ticket is stored on Apple's servers and validated
