@@ -12,7 +12,9 @@
 //! apply` / `kin release intent`). It reads registry truth plus the local
 //! sibling manifests and answers, in one bottom-up view
 //!
-//!     primitives -> kin-model -> kin-db -> kin -> kin-bench/kin-vfs/kin-lsp
+//! ```text
+//! primitives -> kin-model -> kin-db -> kin -> kin-bench/kin-vfs/kin-lsp
+//! ```
 //!
 //!   - which registry crates have a local version ahead of what is published
 //!     (a publish is pending),
