@@ -6,12 +6,21 @@
 //! These tests exercise the full spine stack: SpineIndex registration,
 //! cross-repo edge resolution, federated BFS traversal, and routing.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::Mutex;
 
-use kin_model::{EntityId, EntityKind, FingerprintAlgorithm, Hash256, SemanticFingerprint};
+use kin_model::{
+    Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, GraphNodeId,
+    Hash256, LanguageId, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin,
+    SemanticFingerprint, Visibility,
+};
+use kin_spine::backend::SpineBackend;
 use kin_spine::federation::federated_impact;
 use kin_spine::index::{CrossRepoEdge, EntityEntry, SpineIndex};
 use kin_spine::routing::{RepoEndpoint, RoutingTable};
+use kin_spine::{FirestoreSpineBackend, LoadedRepo, SpineError, SpineStore};
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -539,4 +548,288 @@ fn multiple_entities_per_repo_with_mixed_kinds() {
     // "parse" with no kind filter returns both Function and Method
     let parses = index.resolve("parse", None, None);
     assert_eq!(parses.len(), 2);
+}
+
+// ── Hosted-shaped multi-repo xref (no local disk, no network) ──────────
+//
+// The hosted daemon runs one repo per pod and owns no local sibling
+// checkouts: the cross-repo index has to come from the durable spine store,
+// not from on-disk sibling `.kndb` graphs. These tests stand up the exact
+// store-backed backend a cloud pod builds (`FirestoreSpineBackend` over a
+// `SpineStore`), hydrate it from a store seeded by a separate writer, drive
+// the cross-repo edge refresh over the primary repo's relations, and assert
+// the per-entity edge contract that backs `GET /spine/xref` returns
+// non-empty cross-repo edges. The store seam is in-memory here so the whole
+// pipeline runs with no Firestore and no filesystem siblings.
+
+/// In-memory [`SpineStore`] standing in for Firestore: same replace-by-repo
+/// semantics, no network, no disk. Shared between a writer backend (the
+/// ingestion side) and a reader backend (the freshly started pod) via `Arc`.
+#[derive(Default)]
+struct HostedFakeStore {
+    /// (root_hash, entries) keyed by repo_id.
+    repos: Mutex<HashMap<String, (String, Vec<EntityEntry>)>>,
+    edges: Mutex<Vec<CrossRepoEdge>>,
+}
+
+impl SpineStore for HostedFakeStore {
+    fn load_repos(&self) -> Result<Vec<LoadedRepo>, SpineError> {
+        Ok(self
+            .repos
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(repo_id, (root_hash, entries))| LoadedRepo {
+                repo_id: repo_id.clone(),
+                root_hash: root_hash.clone(),
+                entries: entries.clone(),
+            })
+            .collect())
+    }
+
+    fn load_edges(&self) -> Result<Vec<CrossRepoEdge>, SpineError> {
+        Ok(self.edges.lock().unwrap().clone())
+    }
+
+    fn write_entity(&self, entry: &EntityEntry, root_hash: &str) -> Result<(), SpineError> {
+        let mut repos = self.repos.lock().unwrap();
+        let bucket = repos
+            .entry(entry.repo_id.clone())
+            .or_insert_with(|| (root_hash.to_string(), Vec::new()));
+        bucket.0 = root_hash.to_string();
+        bucket.1.push(entry.clone());
+        Ok(())
+    }
+
+    fn delete_repo_entities(&self, repo_id: &str) -> Result<(), SpineError> {
+        self.repos.lock().unwrap().remove(repo_id);
+        Ok(())
+    }
+
+    fn write_edge(&self, edge: &CrossRepoEdge) -> Result<(), SpineError> {
+        self.edges.lock().unwrap().push(edge.clone());
+        Ok(())
+    }
+
+    fn delete_repo_edges(&self, repo_id: &str) -> Result<(), SpineError> {
+        self.edges.lock().unwrap().retain(|e| e.src_repo != repo_id);
+        Ok(())
+    }
+}
+
+/// A source-side function entity (the caller that references a sibling repo).
+fn source_entity(id: EntityId, name: &str, language: LanguageId) -> Entity {
+    Entity {
+        id,
+        kind: EntityKind::Function,
+        name: name.to_string(),
+        language,
+        fingerprint: make_fp(1),
+        file_origin: None,
+        span: None,
+        signature: format!("fn {name}()"),
+        visibility: Visibility::Public,
+        role: EntityRole::Source,
+        doc_summary: None,
+        metadata: EntityMetadata::default(),
+        lineage_parent: None,
+        created_in: None,
+        superseded_by: None,
+    }
+}
+
+/// A `Calls`/`References` relation from a local entity to an out-of-repo
+/// target, carrying the `import_source` module and the imported-symbol token
+/// the cross-repo resolver keys on. `dst` is a fresh id deliberately absent
+/// from the local entity set so the reference is treated as external.
+fn cross_repo_call(
+    src: EntityId,
+    import_source: &str,
+    symbol_token: &str,
+    kind: RelationKind,
+) -> Relation {
+    Relation {
+        id: RelationId::new(),
+        kind,
+        src: GraphNodeId::Entity(src),
+        dst: GraphNodeId::Entity(EntityId::new()),
+        confidence: 1.0,
+        origin: RelationOrigin::Parsed,
+        created_in: None,
+        import_source: Some(import_source.to_string()),
+        evidence: vec![RelationEvidence {
+            token: Some(symbol_token.to_string()),
+            ..RelationEvidence::default()
+        }],
+    }
+}
+
+// ── Test 15: hosted pod serves non-empty /spine/xref from the store ────
+//
+// This is the cross-repo demo blocker in miniature: a single-repo pod with
+// no on-disk siblings must still answer cross-repo xref. It proves the spine
+// pipeline (store hydrate → cross-repo edge refresh → per-entity edge read)
+// produces non-empty edges purely from store-resident sibling metadata.
+
+#[test]
+fn hosted_pod_serves_non_empty_xref_from_store_only() {
+    // Shared durable store standing in for Firestore — no disk, no network.
+    let store = Arc::new(HostedFakeStore::default());
+
+    // ── Ingestion side ────────────────────────────────────────────────
+    // Two repos land in the store the way cloud ingestion would: the sibling
+    // `kin-db` (which exports `InMemoryGraph`) and the primary `kin`. The
+    // sibling is registered through a *separate* backend instance to model a
+    // different ingestion actor; only its metadata reaches the store, never a
+    // local `.kndb`.
+    let graph_entity = entry("kin-db", "InMemoryGraph", EntityKind::Class, 7);
+    {
+        let ingest = FirestoreSpineBackend::with_store(store.clone());
+        ingest_repo(&ingest, "kin-db", vec![graph_entity.clone()], "db-hash");
+    }
+
+    // ── Pod startup side (the bug surface) ────────────────────────────
+    // A freshly started pod builds the same store-backed backend the cloud
+    // path constructs and hydrates its cache from the store — the cache is
+    // empty until then because the pod has no local siblings.
+    let pod = FirestoreSpineBackend::with_store(store.clone());
+    assert_eq!(
+        pod.entity_count(),
+        0,
+        "pod cache must be empty before hydrate (no local-disk siblings)"
+    );
+    pod.hydrate().expect("hydrate cache from store");
+    assert_eq!(
+        pod.repo_count(),
+        1,
+        "the sibling repo is visible purely from the store after hydrate"
+    );
+
+    // The pod registers its own primary repo and refreshes cross-repo edges,
+    // exactly as the daemon spine init does. The primary `kin` has a function
+    // that calls `kin_db::InMemoryGraph`; the relation carries the
+    // `import_source` and the imported symbol, so the resolver can bind it to
+    // the store-resident `kin-db` entity.
+    let caller = EntityId::new();
+    let primary_entities = vec![source_entity(caller, "open_graph", LanguageId::Rust)];
+    let primary_entries = vec![EntityEntry {
+        repo_id: "kin".to_string(),
+        entity_id: caller,
+        name: "open_graph".to_string(),
+        kind: EntityKind::Function,
+        signature: "fn open_graph()".to_string(),
+        fingerprint: make_fp(1),
+        file_path: Some("src/graph.rs".to_string()),
+        role: Some(EntityRole::Source),
+    }];
+    pod.register_repo("kin", primary_entries, "kin-hash");
+
+    let relations = vec![cross_repo_call(
+        caller,
+        "kin_db",
+        "kin_db::InMemoryGraph",
+        RelationKind::Calls,
+    )];
+    let registry: Vec<String> = pod.registered_repo_ids().into_iter().collect();
+    pod.refresh_cross_repo_edges("kin", &primary_entities, &relations, &registry);
+
+    // ── The contract the demo needs: non-empty cross-repo xref ────────
+    // This is exactly what `GET /spine/xref?repo=kin&entity=<caller>` reads.
+    assert!(
+        pod.edge_count() >= 1,
+        "spine must hold at least one cross-repo edge after refresh, got {}",
+        pod.edge_count()
+    );
+    let xref = pod.cross_repo_edges_for("kin", &caller);
+    assert!(
+        !xref.is_empty(),
+        "/spine/xref for the primary caller must be non-empty with store-only siblings"
+    );
+    let edge = &xref[0];
+    assert_eq!(edge.src_repo, "kin");
+    assert_eq!(edge.dst_repo, "kin-db", "edge must cross into the sibling repo");
+    assert_eq!(
+        edge.dst_entity, graph_entity.entity_id,
+        "edge must bind to the store-resident sibling entity, not a local guess"
+    );
+
+    // The same edge is reachable from the sibling side, and federated impact
+    // crosses the boundary — the cross-repo reachability the demo shows.
+    let from_db = pod.cross_repo_edges_for("kin-db", &graph_entity.entity_id);
+    assert_eq!(from_db.len(), 1, "edge is bidirectional from the dst side");
+    let impact = pod.federated_impact("kin-db", &graph_entity.entity_id, 5);
+    assert!(
+        impact.repos_involved.contains(&"kin".to_string()),
+        "changing the sibling entity must impact the primary repo across the boundary"
+    );
+}
+
+// ── Test 16: edges survive a cold pod restart (store is the source) ────
+//
+// A second pod that only ever hydrates from the store — never touching the
+// primary repo's relations — must still see the materialized cross-repo
+// edges, because `refresh_cross_repo_edges` write-through persisted them.
+// This proves the edge state is owned by the store, not by an ephemeral
+// in-pod refresh.
+
+#[test]
+fn cross_repo_edges_survive_cold_pod_restart_via_store() {
+    let store = Arc::new(HostedFakeStore::default());
+
+    let graph_entity = entry("kin-db", "InMemoryGraph", EntityKind::Class, 7);
+    let caller = EntityId::new();
+
+    // First pod: ingest sibling, register primary, refresh edges (all
+    // write-through to the store).
+    {
+        let pod = FirestoreSpineBackend::with_store(store.clone());
+        ingest_repo(&pod, "kin-db", vec![graph_entity.clone()], "db-hash");
+
+        let primary_entries = vec![EntityEntry {
+            repo_id: "kin".to_string(),
+            entity_id: caller,
+            name: "open_graph".to_string(),
+            kind: EntityKind::Function,
+            signature: "fn open_graph()".to_string(),
+            fingerprint: make_fp(1),
+            file_path: Some("src/graph.rs".to_string()),
+            role: Some(EntityRole::Source),
+        }];
+        let primary_entities = vec![source_entity(caller, "open_graph", LanguageId::Rust)];
+        pod.register_repo("kin", primary_entries, "kin-hash");
+
+        let relations = vec![cross_repo_call(
+            caller,
+            "kin_db",
+            "kin_db::InMemoryGraph",
+            RelationKind::Calls,
+        )];
+        let registry: Vec<String> = pod.registered_repo_ids().into_iter().collect();
+        pod.refresh_cross_repo_edges("kin", &primary_entities, &relations, &registry);
+        assert_eq!(pod.edge_count(), 1);
+    }
+
+    // Second (cold) pod: hydrate only — no access to the primary's relations.
+    let cold = FirestoreSpineBackend::with_store(store.clone());
+    cold.hydrate().expect("cold hydrate");
+
+    assert_eq!(
+        cold.edge_count(),
+        1,
+        "materialized cross-repo edge must rehydrate from the store on a cold pod"
+    );
+    let xref = cold.cross_repo_edges_for("kin", &caller);
+    assert_eq!(xref.len(), 1, "/spine/xref non-empty on a pod that only hydrated");
+    assert_eq!(xref[0].dst_repo, "kin-db");
+}
+
+/// Register a repo's entity metadata through the store-backed backend,
+/// mirroring the metadata write the daemon performs when it indexes a repo.
+fn ingest_repo(
+    backend: &FirestoreSpineBackend,
+    repo_id: &str,
+    entries: Vec<EntityEntry>,
+    root_hash: &str,
+) {
+    backend.register_repo(repo_id, entries, root_hash);
 }

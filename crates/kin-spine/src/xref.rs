@@ -295,7 +295,7 @@ fn derive_imported_symbol(rel: &Relation) -> Option<String> {
 /// instead of producing a garbage name that could mis-resolve.
 fn symbol_leaf(token: &str) -> Option<String> {
     let leaf = token
-        .rsplit(|c| c == '.' || c == ':')
+        .rsplit(['.', ':'])
         .next()
         .unwrap_or(token)
         .trim();
