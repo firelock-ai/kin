@@ -524,6 +524,10 @@ mod tests {
                     .args(["config", "user.name", "Test"])
                     .current_dir(dir)
                     .output();
+                let _ = Command::new("git")
+                    .args(["config", "gc.auto", "0"])
+                    .current_dir(dir)
+                    .output();
                 true
             }
             _ => false,
