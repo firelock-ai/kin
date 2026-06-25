@@ -9200,7 +9200,7 @@ mod tests {
     /// daemon through `KIN_DAEMON_URL`, so they hit this in-process daemon.
     ///
     /// The hosted KinLab surface and cloud/Firestore restart-hydration are out
-    /// of scope here and tracked in FIR-1082.
+    /// of scope for this in-process daemon test.
     #[tokio::test]
     #[serial_test::serial]
     async fn spine_blast_radius_is_consistent_across_daemon_cli_and_mcp() {
