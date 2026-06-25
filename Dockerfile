@@ -14,6 +14,10 @@ WORKDIR /build/kin
 # registry that kin-* crates resolve from (the Git [patch.kin] pins were dropped
 # at the registry cutover — kin no longer depends on GitHub for crate deps).
 RUN test -f .cargo/config.toml && grep -q '^\[registries\.kin\]' .cargo/config.toml
+# The kin sparse registry can return a brief 502 during a deploy/cold start.
+# Cargo's default of 3 retries can be exhausted inside such a window and fail
+# the whole build; raise the retry budget so a transient blip is ridden out.
+ENV CARGO_NET_RETRY=10
 # kin-daemon needs --features gcs for GCS StorageBackend in cloud deployment.
 RUN cargo build --release --features gcs --bin kin-daemon --bin kin
 
