@@ -1,5 +1,10 @@
 # Kin — The Semantic System of Record for Software Work
 
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Install](https://img.shields.io/badge/install-get.kinlab.dev-6E56CF.svg)](https://get.kinlab.dev/install)
+[![Homebrew](https://img.shields.io/badge/brew-firelock--ai%2Fkin-orange.svg)](https://github.com/firelock-ai/homebrew-kin)
+[![kinlab.ai](https://img.shields.io/badge/hosted-kinlab.ai-111111.svg)](https://kinlab.ai)
+
 Kin is a semantic, graph-first repository and collaboration substrate for AI-native software development. Unlike traditional file-first, diff-first systems (like Git), Kin represents software as a semantic graph of entities (functions, methods, classes, structs, traits, enums, interfaces, types, constants) and relations (calls, imports, references, inheritance).
 
 In Kin, the graph is the source of authority. The filesystem is a derived projection over that graph truth, made transparently available to existing editors and compilers through the `kin-vfs` virtual filesystem.
@@ -198,3 +203,21 @@ quickstart. For the full tool surface, see [docs/mcp-tools.md](docs/mcp-tools.md
 ## Architecture & Thesis
 
 To understand the philosophy behind Kin, see the [thesis document](docs/thesis.md).
+
+---
+
+## The Kin ecosystem
+
+Kin is one system with a few clear surfaces:
+
+- **[kin](https://github.com/firelock-ai/kin)** — the semantic system of record (this repo): CLI, daemon, MCP server, projections, reconcile, review, provenance.
+- **[kin-vfs](https://github.com/firelock-ai/kin-vfs)** — the transparent virtual filesystem that serves graph-backed files to any tool, unchanged.
+- **[kin-editor](https://github.com/firelock-ai/kin-editor)** — the VS Code extension: entity explorer, semantic search, trace, rename/review.
+- **[kin-db](https://github.com/firelock-ai/kin-db)** — the semantic engine: graph storage, snapshots, indexing, text + vector search.
+- **[kinlab.ai](https://kinlab.ai)** — the hosted collaboration and control-plane layer.
+
+Supporting substrate: [kin-blobs](https://github.com/firelock-ai/kin-blobs) · [kin-search](https://github.com/firelock-ai/kin-search) · [kin-vector](https://github.com/firelock-ai/kin-vector) · [kin-infer](https://github.com/firelock-ai/kin-infer) · [kin-lsp](https://github.com/firelock-ai/kin-lsp) · [kin-model](https://github.com/firelock-ai/kin-model).
+
+## License
+
+Kin is licensed under [Apache-2.0](LICENSE).
