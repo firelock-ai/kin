@@ -10,6 +10,8 @@ repository in the ecosystem, that is called out so the authority for the
 implementation is unambiguous.
 
 For how to report a suspected vulnerability, see [SECURITY.md](../../SECURITY.md).
+For the trust chain a downloaded release carries and how it is verified on
+install, see [signing-and-update-trust.md](./signing-and-update-trust.md).
 
 ## Scope and Trust Model
 
@@ -132,7 +134,9 @@ graph-backed content to unmodified tools by interposing on libc file calls using
 the dynamic loader's preload mechanism (`LD_PRELOAD` on Linux,
 `DYLD_INSERT_LIBRARIES` on macOS). The projection's implementation and its
 detailed security properties are owned by `kin-vfs`; this section states the
-trust boundary as it pertains to running Kin.
+trust boundary as it pertains to running Kin. For the shim's re-entrancy and
+signal-safety handling specifically, see the `kin-vfs` note
+`docs/security/shim-reentrancy-and-signal-safety.md`.
 
 The interposition library is loaded **into the address space of the target
 process** and runs with that process's privileges. Two consequences follow:
