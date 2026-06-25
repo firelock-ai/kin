@@ -248,14 +248,35 @@ fn mma_fp16_enabled() -> bool {
 static FP16_MMA_AVAILABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Whether the fp16-operand WIDE (64x64) projection-GEMM pipeline compiled
+/// (Lever #5 phase 2). Gated separately from [`FP16_MMA_AVAILABLE`] so a
+/// composed-tile pipeline failure only disables the composed path; the proven
+/// 32x32 fp16 MMA stays available.
+static WIDE_FP16_MMA_AVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Route a GEMM to the fp16-operand MMA tile only when it is opt-in enabled, the
-/// fp16 pipelines compiled, AND the standard MMA gate already passes. The fp16
-/// variants are 32x32 (the wider tile composes with fp16 only in Lever #5 phase
-/// 2), so when both `KIN_INFER_GEMM_FP16` and `KIN_INFER_MMA_WIDE` are set the
-/// fp16 32x32 path takes precedence — they are alternative experiments for now.
+/// fp16 pipelines compiled, AND the standard MMA gate already passes. The base
+/// fp16 variants are 32x32; the fp16 + 64x64 composition (Lever #5 phase 2) is
+/// preferred for the projection GEMM via [`use_fp16_wide_mma`] when both flags
+/// are set, and this 32x32 path is the fallback for the remaining shapes.
 #[inline]
 fn use_fp16_mma(m: usize, n: usize, k: usize) -> bool {
     mma_fp16_enabled() && FP16_MMA_AVAILABLE.load(Ordering::Relaxed) && use_mma(m, n, k)
+}
+
+/// Route the projection GEMM to the fp16-operand 64x64 tile only when BOTH fp16
+/// and wide are opt-in enabled, the composed pipeline compiled, the standard MMA
+/// gate passes, AND the output fills the 64x64 tile. fp32 accumulate is unchanged
+/// (same parity invariant as the fp32 wide and 32x32 fp16 paths).
+#[inline]
+fn use_fp16_wide_mma(m: usize, n: usize, k: usize) -> bool {
+    mma_fp16_enabled()
+        && mma_wide_enabled()
+        && WIDE_FP16_MMA_AVAILABLE.load(Ordering::Relaxed)
+        && use_mma(m, n, k)
+        && m >= 64
+        && n >= 64
 }
 
 /// Whether the C7 flash-attention path is selected. Default OFF: selected only
@@ -1640,7 +1661,7 @@ constant uint MMA_BK = 16, MMA_F = 8;
 
 // 32x32 tile, 4 simdgroups / 128 threads — same geometry as the fp32
 // `block_mma`; the only differences are the half stage/operands (see header).
-template <bool TRANSB>
+template <bool TRANSB, uint BM = 32, uint BN = 32>
 static inline void block_mma_fp16(
     device const float* A,
     device const float* B,
@@ -1651,9 +1672,15 @@ static inline void block_mma_fp16(
     threadgroup half (*Bs)[MMA_BK],
     threadgroup float (*store_tile)[MMA_F][MMA_F])
 {
-    constexpr uint BM = 32, BN = 32, BK = 16, WM = 2, WN = 2, F = 8;
+    constexpr uint BK = 16, WM = 2, WN = 2, F = 8;
     constexpr uint TM = BM / (F * WM);
     constexpr uint TN = BN / (F * WN);
+    // The WMxWN simdgroups tile a TMxTN grid of FxF fragments, covering exactly
+    // F*WM*TM by F*WN*TN. Require that to equal BMxBN so a tile that is not a
+    // whole multiple of F*WM / F*WN fails to build instead of staging only part
+    // of the output (the half-MMA-at-64x64 hazard).
+    static_assert(F * WM * TM == BM && F * WN * TN == BN,
+                  "block_mma_fp16: BM/BN must be whole multiples of F*WM / F*WN");
 
     const uint sm = sgid / WN;
     const uint sn = sgid % WN;
@@ -1787,6 +1814,37 @@ kernel void batched_matmul_ab_simdgroup_fp16(
     threadgroup half Bs[32][MMA_BK];
     threadgroup float store_tile[2 * 2][MMA_F][MMA_F];
     block_mma_fp16<false>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, tpsg, As, Bs, store_tile);
+}
+
+// fp16 operands in the wider 64x64 tile (Lever #5 phase 2): composes the half
+// stage/issue of block_mma_fp16 with the 64x64 blocking of the proven fp32 wide
+// kernel. fp32 accumulate is unchanged. Same 128-thread / 4-simdgroup geometry;
+// only the projection GEMM (M/N/K) is composed here — the batched attention
+// shapes stay on the 32x32 fp16 path.
+kernel void matmul_transb_simdgroup_fp16_wide(
+    device const float* A   [[buffer(0)]],
+    device const float* B   [[buffer(1)]],
+    device float*       C   [[buffer(2)]],
+    constant uint& M        [[buffer(3)]],
+    constant uint& N        [[buffer(4)]],
+    constant uint& K        [[buffer(5)]],
+    uint3 tgid              [[threadgroup_position_in_grid]],
+    uint  sgid             [[simdgroup_index_in_threadgroup]],
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
+{
+    threadgroup half As[64][MMA_BK];
+    threadgroup half Bs[64][MMA_BK];
+    threadgroup float store_tile[2 * 2][MMA_F][MMA_F];
+    // block_mma_fp16<true,64,64> blocks over a 64x64 output, so the A/B stage must
+    // hold 64 rows; a 32-row stage would leave half the tile unstaged (the prior
+    // half-MMA-at-64x64 parity bug). Couple the stage size to the 64 tile at
+    // compile time so the two can never drift apart.
+    static_assert(sizeof(As) / sizeof(As[0]) == 64,
+                  "fp16 wide: As must stage 64 M-rows for the 64x64 tile");
+    static_assert(sizeof(Bs) / sizeof(Bs[0]) == 64,
+                  "fp16 wide: Bs must stage 64 N-rows for the 64x64 tile");
+    block_mma_fp16<true, 64, 64>(A, B, C, M, N, K, tgid, sgid, lane, tpsg, As, Bs, store_tile);
 }
 "#;
 
@@ -2664,6 +2722,7 @@ impl MetalCompute {
         // kernels; any failure (compile, lookup, or pipeline) leaves
         // FP16_MMA_AVAILABLE false and every GEMM uses the fp32 MMA.
         let mut fp16_mma_available = false;
+        let mut fp16_wide_mma_available = false;
         if mma_available && mma_fp16_enabled() {
             match device.new_library_with_source(FP16_SHADER_SOURCE, &opts) {
                 Ok(fp16_library) => {
@@ -2692,6 +2751,27 @@ impl MetalCompute {
                         }
                     }
                     fp16_mma_available = ok;
+                    // Lever #5 phase 2: the composed fp16 + 64x64 projection GEMM,
+                    // registered only if the base fp16 kernels built. A failure here
+                    // disables only the composed path, never the proven 32x32 fp16 MMA.
+                    if ok {
+                        let wide = "matmul_transb_simdgroup_fp16_wide";
+                        match fp16_library
+                            .get_function(wide, None)
+                            .and_then(|func| device.new_compute_pipeline_state_with_function(&func))
+                        {
+                            Ok(pipeline) => {
+                                pipelines.insert(wide, pipeline);
+                                fp16_wide_mma_available = true;
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "kin-infer: Metal fp16+wide MMA kernel {wide} unavailable \
+                                     ({err}); fp16+wide disabled (32x32 fp16 stays enabled)"
+                                );
+                            }
+                        }
+                    }
                 }
                 Err(err) => {
                     eprintln!(
@@ -2702,6 +2782,7 @@ impl MetalCompute {
             }
         }
         FP16_MMA_AVAILABLE.store(fp16_mma_available, Ordering::Relaxed);
+        WIDE_FP16_MMA_AVAILABLE.store(fp16_wide_mma_available, Ordering::Relaxed);
 
         // C7 flash-attention — OPTIONAL, compiled as a SEPARATE library only
         // when opt-in enabled. C7 availability remains false if compilation or
@@ -3314,21 +3395,29 @@ impl MetalCompute {
         k: usize,
         depth: usize,
     ) {
-        let (pipeline, block) = if use_fp16_mma(m, n, k) {
-            // fp16 operands, fp32 accumulate (32x32 tile). Takes precedence over
-            // the wider tile — they don't compose until Lever #5 phase 2.
-            (&self.pipelines[fp16_mma_name(base_name)], 32usize)
-        } else if use_wide_mma(m, n, k) {
-            (&self.pipelines[wide_mma_name(base_name)], 64usize)
-        } else if use_steel(m, n, k) {
-            // Steel double-buffered K-loop, same proven 32x32 tile/grid as the
-            // single-buffer MMA — only the K-loop staging differs (fp32 accumulate
-            // unchanged). Distinct experiment from fp16/wide; routed when only
-            // KIN_INFER_STEEL is set.
-            (&self.pipelines[steel_mma_name(base_name)], 32usize)
-        } else {
-            (&self.pipelines[base_name], 32usize)
-        };
+        let (pipeline, block) =
+            if use_fp16_wide_mma(m, n, k) && base_name == "matmul_transb_simdgroup" {
+                // fp16 operands in the 64x64 tile (Lever #5 phase 2), projection GEMM
+                // only; fp32 accumulate unchanged. Highest precedence when both flags
+                // are set and the shape fills 64x64.
+                (
+                    &self.pipelines["matmul_transb_simdgroup_fp16_wide"],
+                    64usize,
+                )
+            } else if use_fp16_mma(m, n, k) {
+                // fp16 operands, fp32 accumulate (32x32 tile).
+                (&self.pipelines[fp16_mma_name(base_name)], 32usize)
+            } else if use_wide_mma(m, n, k) {
+                (&self.pipelines[wide_mma_name(base_name)], 64usize)
+            } else if use_steel(m, n, k) {
+                // Steel double-buffered K-loop, same proven 32x32 tile/grid as the
+                // single-buffer MMA — only the K-loop staging differs (fp32 accumulate
+                // unchanged). Distinct experiment from fp16/wide; routed when only
+                // KIN_INFER_STEEL is set.
+                (&self.pipelines[steel_mma_name(base_name)], 32usize)
+            } else {
+                (&self.pipelines[base_name], 32usize)
+            };
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(pipeline);
         for (i, buf) in bufs.iter().enumerate() {
@@ -7934,6 +8023,81 @@ mod tests {
             max_err < 5e-2,
             "fp16 MMA vs CPU matmul max err: {}",
             max_err
+        );
+    }
+
+    #[test]
+    fn test_metal_fp16_wide_mma_close_to_cpu() {
+        // Lever #5 phase 2: the composed fp16 + 64x64 projection GEMM must compute
+        // the right GEMM to within fp16 precision. Direct-dispatch the `*_fp16_wide`
+        // kernel on a shape that fills the 64x64 tile with a ragged remainder, and
+        // compare to the CPU fp32 reference. Skips unless the composed pipeline
+        // built (needs the fp16 library, i.e. KIN_INFER_GEMM_FP16 at construction).
+        let Some(metal) = get_metal() else { return };
+        if !WIDE_FP16_MMA_AVAILABLE.load(Ordering::Relaxed) {
+            return;
+        }
+        let cpu = crate::gpu::CpuCompute;
+
+        let (m, n, k) = (80usize, 96usize, 64usize);
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 89) as f32 - 44.0) * 0.01)
+            .collect();
+        let b: Vec<f32> = (0..n * k)
+            .map(|i| ((i % 73) as f32 - 36.0) * 0.01)
+            .collect();
+
+        let buf_a = metal.buf_slice_pooled(&a).unwrap();
+        let buf_b = metal.buf_cached(&b).unwrap();
+        let buf_c = metal.buf_zeros_pooled(m * n).unwrap();
+        let buf_m = metal.buf_u32(m as u32).unwrap();
+        let buf_n = metal.buf_u32(n as u32).unwrap();
+        let buf_k = metal.buf_u32(k as u32).unwrap();
+        let bufs = [
+            buf_a.buffer(),
+            &buf_b,
+            buf_c.buffer(),
+            &buf_m,
+            &buf_n,
+            &buf_k,
+        ];
+        autoreleasepool(|_| {
+            let cmd = metal.queue.new_command_buffer();
+            let pipeline = &metal.pipelines["matmul_transb_simdgroup_fp16_wide"];
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(pipeline);
+            for (i, bb) in bufs.iter().enumerate() {
+                enc.set_buffer(i as u64, Some(*bb), 0);
+            }
+            let groups = MTLSize::new(n.div_ceil(64) as u64, m.div_ceil(64) as u64, 1);
+            enc.dispatch_thread_groups(groups, MTLSize::new(128, 1, 1));
+            enc.end_encoding();
+            metal.commit_wait(cmd);
+        });
+        let out = MetalCompute::read_buf(buf_c.buffer(), m * n);
+        let cpu_out = cpu.matmul(&a, &b, m, n, k).unwrap();
+
+        assert_eq!(out.len(), m * n);
+        assert!(
+            out.iter().all(|x| x.is_finite()),
+            "fp16+wide MMA produced non-finite output"
+        );
+        // Mixed absolute/relative tolerance: |x-y| <= atol + rtol*max(|x|,|y|).
+        // fp16 operands over a K=64 contraction give ~rtol relative error, but
+        // sign-cancelling near-zero C entries have a tiny denominator under a pure
+        // relative metric and would read as spurious parity failures; the absolute
+        // floor (atol) absorbs those. `worst` is the largest amount any element
+        // exceeds its bound — <= 0 means every element is within tolerance.
+        let atol = 2e-3f32;
+        let rtol = 5e-2f32;
+        let worst: f32 = out
+            .iter()
+            .zip(cpu_out.iter())
+            .map(|(x, y)| (x - y).abs() - (atol + rtol * x.abs().max(y.abs())))
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            worst <= 0.0,
+            "fp16+wide MMA vs CPU exceeds mixed abs/rel tol (atol={atol}, rtol={rtol}): worst excess {worst}"
         );
     }
 
