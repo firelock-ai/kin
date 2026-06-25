@@ -801,12 +801,14 @@ impl DaemonState {
                 Vec::new();
 
             // Register the primary (this daemon's) repo.
-            let repo_id = self
+            let default_repo = self
                 .layout
-                .root()
+                .working_dir()
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("default");
+            let repo_id_str = std::env::var("KIN_PRIMARY_REPO_ID").unwrap_or_else(|_| default_repo.to_string());
+            let repo_id = repo_id_str.as_str();
 
             if let Ok(entities) = self.graph.list_all_entities() {
                 let entries = Self::entities_to_spine_entries(repo_id, &entities);
