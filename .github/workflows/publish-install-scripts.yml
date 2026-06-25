@@ -21,6 +21,7 @@ on:
     paths:
       - scripts/install.sh
       - scripts/install.ps1
+      - llms.txt
   release:
     types: [published]
   workflow_dispatch:
@@ -44,6 +45,7 @@ jobs:
     outputs:
       sha256_sh: ${{ steps.upload_sh.outputs.sha256 }}
       sha256_ps1: ${{ steps.upload_ps1.outputs.sha256 }}
+      sha256_llms: ${{ steps.upload_llms.outputs.sha256 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -79,12 +81,23 @@ jobs:
           echo "sha256=${HASH}" >> "$GITHUB_OUTPUT"
           echo "generation=${GEN}" >> "$GITHUB_OUTPUT"
 
+      - name: Upload llms.txt
+        id: upload_llms
+        run: |
+          HASH=$(sha256sum llms.txt | awk '{print $1}')
+          gsutil -h "Cache-Control:no-cache, max-age=0" \
+                 -h "Content-Type:text/markdown; charset=utf-8" \
+                 cp llms.txt "gs://${BUCKET}/llms.txt"
+          echo "sha256=${HASH}" >> "$GITHUB_OUTPUT"
+
       - name: Invalidate CDN cache
         run: |
           gcloud compute url-maps invalidate-cdn-cache "${URL_MAP}" \
             --path="/install" --async --quiet
           gcloud compute url-maps invalidate-cdn-cache "${URL_MAP}" \
             --path="/install.ps1" --async --quiet
+          gcloud compute url-maps invalidate-cdn-cache "${URL_MAP}" \
+            --path="/llms.txt" --async --quiet
 
       - name: Summary
         run: |
@@ -125,3 +138,15 @@ jobs:
             exit 1
           fi
           echo "install.ps1 OK: sha256=${SERVED}"
+
+      - name: Verify llms.txt checksum at get.kinlab.dev
+        env:
+          EXPECTED: ${{ needs.publish.outputs.sha256_llms }}
+        run: |
+          curl -fsSL https://get.kinlab.dev/llms.txt -o /tmp/llms.txt
+          SERVED=$(sha256sum /tmp/llms.txt | awk '{print $1}')
+          if [ "$EXPECTED" != "$SERVED" ]; then
+            echo "::error::llms.txt checksum mismatch: expected=${EXPECTED} served=${SERVED}"
+            exit 1
+          fi
+          echo "llms.txt OK: sha256=${SERVED}"

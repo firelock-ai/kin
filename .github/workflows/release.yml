@@ -441,3 +441,23 @@ jobs:
         run: |
           jq -nc --arg c "📦 \`@kin/boundary-contracts\` ${REF} published to the **KinLab registry**." '{content:$c}' \
             | curl -fsS -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
+
+  bump_homebrew:
+    name: Trigger Homebrew formula bump
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch update to the homebrew-kin tap
+        env:
+          TAP_DISPATCH_TOKEN: ${{ secrets.KIN_CI_BOT_TOKEN }}
+        run: |
+          if [ -z "${TAP_DISPATCH_TOKEN:-}" ]; then
+            echo "KIN_CI_BOT_TOKEN not configured; the tap self-updates on its 6h schedule"
+            exit 0
+          fi
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${TAP_DISPATCH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/firelock-ai/homebrew-kin/dispatches \
+            -d '{"event_type":"kin-release"}'
+          echo "Dispatched kin-release to firelock-ai/homebrew-kin"
