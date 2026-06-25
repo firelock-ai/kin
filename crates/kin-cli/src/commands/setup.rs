@@ -1520,10 +1520,27 @@ fn print_human_report(report: &crate::commands::health::HealthReport) {
         }
     }
     println!();
+    let summary = report.summary();
+    println!(
+        "Summary: {} passed, {} need attention, {} not applicable.",
+        style(summary.passed).green(),
+        if summary.attention > 0 {
+            style(summary.attention).red()
+        } else {
+            style(summary.attention).dim()
+        },
+        style(summary.skipped).dim(),
+    );
     if report.healthy {
-        println!("All checks passed.");
+        println!(
+            "{} First-run ready — no component is missing or misconfigured.",
+            style("✓").green()
+        );
     } else {
-        println!("Some checks need attention. Run `kin doctor --fix` to apply safe repairs.");
+        println!(
+            "{} Some checks need attention. Run `kin doctor --fix` to apply safe repairs.",
+            style("✗").red()
+        );
     }
 }
 
@@ -1531,11 +1548,15 @@ fn print_human_report(report: &crate::commands::health::HealthReport) {
 // `kin setup doctor`
 // ---------------------------------------------------------------------------
 
-pub async fn doctor(fix: bool) -> Result<()> {
+pub async fn doctor(fix: bool, json: bool) -> Result<()> {
     let report = crate::commands::health::run_health_checks().await;
 
     if !fix {
-        print_human_report(&report);
+        if json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            print_human_report(&report);
+        }
         return Ok(());
     }
 
@@ -1570,6 +1591,20 @@ pub async fn doctor(fix: bool) -> Result<()> {
         }
     }
 
+    // Start the repo daemon if we're inside a Kin repo and it isn't running.
+    let daemon_needs_fix = report.checks.iter().any(|c| {
+        c.id == "daemon_running"
+            && c.fixable
+            && !matches!(c.status, crate::commands::health::HealthStatus::Healthy)
+    });
+    if daemon_needs_fix {
+        match start_repo_daemon().await {
+            Ok(Some(url)) => applied.push(format!("started kin-daemon ({url})")),
+            Ok(None) => {}
+            Err(e) => println!("  {} kin-daemon start failed: {e}", style("✗").red()),
+        }
+    }
+
     // Ensure the config directory scaffold exists (idempotent).
     if let Ok(kin_home) = kin_dir() {
         let config_dir = kin_home.join("config");
@@ -1594,9 +1629,13 @@ pub async fn doctor(fix: bool) -> Result<()> {
     println!();
 
     // Re-run the checks to report the post-fix state.
+    let after = crate::commands::health::run_health_checks().await;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&after)?);
+        return Ok(());
+    }
     println!("Re-running checks...");
     println!();
-    let after = crate::commands::health::run_health_checks().await;
     print_human_report(&after);
 
     let still_manual: Vec<&crate::commands::health::HealthCheck> = after
@@ -1618,6 +1657,20 @@ pub async fn doctor(fix: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Start the daemon for the repo containing the current directory, if any.
+///
+/// Returns `Ok(Some(url))` when a daemon is now reachable, `Ok(None)` when the
+/// current directory is not inside a Kin repository (nothing to start), or an
+/// error if the daemon could not be started.
+async fn start_repo_daemon() -> Result<Option<String>> {
+    let cwd = env::current_dir().unwrap_or_default();
+    let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
+        return Ok(None);
+    };
+    let url = crate::daemon_client::ensure_daemon_running(layout.root()).await?;
+    Ok(Some(url))
 }
 
 /// Scan all registered repos for stale daemon PID/port files and clean them up.
