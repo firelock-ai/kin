@@ -215,6 +215,27 @@ impl TemporalScope {
     }
 }
 
+/// Outcome of ingesting one repo's graph into the spine from durable storage.
+///
+/// Returned by [`DaemonState::ingest_repo_into_spine`] and surfaced by the
+/// `POST /spine/repos/{repo_id}/ingest` route so the hosted control plane can
+/// gate the cross-repo org graph on real, graph-derived counts.
+#[derive(Debug, Clone)]
+pub struct SpineIngestOutcome {
+    /// The repo that was ingested.
+    pub repo_id: String,
+    /// Graph root hash of the ingested snapshot (cache-coherence key).
+    pub root_hash: String,
+    /// Entities registered into the spine for this repo.
+    pub entity_count: usize,
+    /// `Calls`/`References` relations scanned for cross-repo candidates.
+    pub relation_count: usize,
+    /// Relations the cross-repo resolver can bind into xref edges (out-of-repo
+    /// target carrying an `import_source` + imported-symbol token). The org
+    /// graph's real cross-repo edges come from these.
+    pub resolvable_relations: usize,
+}
+
 /// Shared daemon state. All mutable state is behind RwLock for
 /// concurrent access from the reconciliation loop and API handlers.
 pub struct DaemonState {
@@ -788,19 +809,7 @@ impl DaemonState {
                 .unwrap_or("default");
 
             if let Ok(entities) = self.graph.list_all_entities() {
-                let entries: Vec<kin_spine::EntityEntry> = entities
-                    .iter()
-                    .map(|e| kin_spine::EntityEntry {
-                        repo_id: repo_id.to_string(),
-                        entity_id: e.id,
-                        name: e.name.clone(),
-                        kind: e.kind,
-                        signature: e.signature.clone(),
-                        fingerprint: e.fingerprint.clone(),
-                        file_path: e.file_origin.as_ref().map(|f| f.0.clone()),
-                        role: Some(e.role),
-                    })
-                    .collect();
+                let entries = Self::entities_to_spine_entries(repo_id, &entities);
                 let root_hash = hex::encode(self.graph.compute_root_hash());
                 backend.register_repo(repo_id, entries, &root_hash);
                 info!(
@@ -850,19 +859,8 @@ impl DaemonState {
                     if let Ok(h) = handle {
                         if let Ok(Some(sibling_graph)) = h.join() {
                             if let Ok(entities) = sibling_graph.list_all_entities() {
-                                let entries: Vec<kin_spine::EntityEntry> = entities
-                                    .iter()
-                                    .map(|e| kin_spine::EntityEntry {
-                                        repo_id: sibling_id.clone(),
-                                        entity_id: e.id,
-                                        name: e.name.clone(),
-                                        kind: e.kind,
-                                        signature: e.signature.clone(),
-                                        fingerprint: e.fingerprint.clone(),
-                                        file_path: e.file_origin.as_ref().map(|f| f.0.clone()),
-                                        role: Some(e.role),
-                                    })
-                                    .collect();
+                                let entries =
+                                    Self::entities_to_spine_entries(&sibling_id, &entities);
                                 let count = entries.len();
                                 backend.register_repo(&sibling_id, entries, "");
                                 info!(repo_id = %sibling_id, entities = count, "registered sibling in spine");
@@ -934,6 +932,113 @@ impl DaemonState {
             }
         }
         relations
+    }
+
+    /// Project a repo's graph entities into the metadata-only `EntityEntry`
+    /// rows the spine indexes. The spine never stores entity bodies — just
+    /// enough (name, kind, signature, fingerprint, role) to resolve cross-repo
+    /// references — so this is the single mapping used by both the local
+    /// sibling-scan path and the cloud ingest path.
+    fn entities_to_spine_entries(
+        repo_id: &str,
+        entities: &[kin_model::Entity],
+    ) -> Vec<kin_spine::EntityEntry> {
+        entities
+            .iter()
+            .map(|e| kin_spine::EntityEntry {
+                repo_id: repo_id.to_string(),
+                entity_id: e.id,
+                name: e.name.clone(),
+                kind: e.kind,
+                signature: e.signature.clone(),
+                fingerprint: e.fingerprint.clone(),
+                file_path: e.file_origin.as_ref().map(|f| f.0.clone()),
+                role: Some(e.role),
+            })
+            .collect()
+    }
+
+    /// Ingest a repo's graph into the spine from durable storage — the
+    /// production multi-repo write path.
+    ///
+    /// Unlike `initialize_spine_lazy`, which only discovers siblings from the
+    /// local `registry.toml` + on-disk `.kndb` files (absent in a hosted pod),
+    /// this loads the named repo's graph through the configured
+    /// [`StorageBackend`](kin_db::StorageBackend) — the GCS blob store in
+    /// cloud — and registers its entity metadata (write-through to the durable
+    /// spine store). This is what lets a single-repo pod build a spine holding
+    /// ≥2 repos so `/spine/xref` returns non-empty cross-repo edges.
+    ///
+    /// `refresh_cross_repo_edges`: when `true` (the cross-repo anchor, e.g.
+    /// `kin`), re-resolve this repo's unresolved imports against the now
+    /// multi-repo spine and materialize the cross-repo edges. Sibling repos are
+    /// ingested with `false` (metadata only); the anchor pass binds the edges.
+    ///
+    /// `get_repo_graph` enforces the `allowed_repo_ids` (`KIN_REPO_IDS`) gate and
+    /// caches the loaded graph, so repeated ingests of the same repo reuse it.
+    pub async fn ingest_repo_into_spine(
+        &self,
+        repo_id: &str,
+        refresh_cross_repo_edges: bool,
+    ) -> Result<SpineIngestOutcome> {
+        let Some(spine) = self.ensure_spine() else {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                "spine disabled via KIN_DISABLE_SPINE".to_string(),
+            )));
+        };
+
+        // Load the repo's graph from durable storage (GCS in cloud). This is the
+        // blob-store read boundary that replaces the local-disk `.kndb` lookup.
+        let graph = self.get_repo_graph(repo_id).await?;
+
+        let entities = graph
+            .list_all_entities()
+            .map_err(|e| DaemonError::Graph(kin_db::KinDbError::StorageError(e.to_string())))?;
+
+        let entries = Self::entities_to_spine_entries(repo_id, &entities);
+        let entity_count = entries.len();
+        let root_hash = hex::encode(graph.compute_root_hash());
+
+        // Write-through: register this repo's metadata into the spine store so a
+        // freshly started (stateless) pod can hydrate it and resolve against it.
+        spine.register_repo(repo_id, entries, &root_hash);
+
+        let relations = Self::collect_spine_relations(graph.as_ref(), &entities);
+        let relation_count = relations.len();
+
+        // Count the relations the resolver can actually bind into cross-repo
+        // edges, against the spine's current registered-repo set. This is the
+        // honest "can this materialize edges" signal the control plane gates on
+        // — it is derived from graph truth, never a heuristic.
+        let registry_ids: Vec<String> = spine.registered_repo_ids().into_iter().collect();
+        let resolvable_relations =
+            kin_spine::collect_unresolved_imports(&entities, &relations, repo_id, &registry_ids)
+                .len();
+
+        if refresh_cross_repo_edges {
+            // Re-resolve this repo's imports now that the sibling metadata is in
+            // the spine, materializing (and write-through persisting) the
+            // cross-repo edges that back `/spine/xref`.
+            spine.refresh_cross_repo_edges(repo_id, &entities, &relations, &registry_ids);
+        }
+
+        info!(
+            repo_id,
+            entities = entity_count,
+            relations = relation_count,
+            resolvable_relations,
+            refreshed = refresh_cross_repo_edges,
+            cross_repo_edges = spine.edge_count(),
+            "ingested repo into spine from storage"
+        );
+
+        Ok(SpineIngestOutcome {
+            repo_id: repo_id.to_string(),
+            root_hash,
+            entity_count,
+            relation_count,
+            resolvable_relations,
+        })
     }
 
     /// Load a repo's graph from the storage backend (synchronous).
@@ -2132,6 +2237,168 @@ mod tests {
         assert!(
             edge_count > 0,
             "cross-repo edges must materialize after spine init (got {edge_count})"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ingest_repo_into_spine_serves_non_empty_xref_from_storage_only() {
+        // Hosted org-graph demo in miniature, against the PRODUCTION ingest
+        // write path. A hosted pod runs one repo and owns no local sibling
+        // checkouts and no `registry.toml`: the cross-repo index must be built
+        // by loading sibling graphs from the durable StorageBackend (GCS in
+        // cloud, a `LocalFileBackend` rooted at `v2/` here — the same
+        // `v2/<repo>/graph.kndb` layout) via `ingest_repo_into_spine`, NOT from
+        // on-disk `.kndb` siblings the way `initialize_spine_lazy` does.
+        //
+        // Two repos land in storage the way cloud ingestion sees them: the
+        // sibling `kin-db` (which exports `InMemoryGraph`) and the primary
+        // `kin`, whose caller references `kin_db::InMemoryGraph` across the repo
+        // boundary. After ingesting both, `/spine/xref` for the primary caller
+        // must return a non-empty cross-repo edge bound to the store-resident
+        // sibling entity.
+        use kin_db::{InMemoryGraph, LocalFileBackend, StorageBackend, GENERATION_INIT};
+        use kin_model::{
+            GraphNodeId, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin,
+        };
+
+        let sibling_id = "kin-db";
+        let primary_id = "kin";
+        let imported_symbol = "InMemoryGraph";
+
+        // The durable store, standing in for the GCS bucket (no local-disk
+        // siblings, no registry).
+        let storage = tempfile::tempdir().unwrap();
+        let v2_root = storage.path().join("v2");
+
+        // ── Ingestion source: seed the sibling graph into storage ─────────
+        // Only the sibling's serialized graph reaches storage — never a local
+        // `.kndb` next to the pod's repo.
+        let sibling_entity = test_entity(imported_symbol, "src/lib.rs");
+        let sibling_graph = InMemoryGraph::new();
+        sibling_graph
+            .batch_upsert_entities(std::slice::from_ref(&sibling_entity))
+            .unwrap();
+        {
+            let seed_backend = LocalFileBackend::new(&v2_root);
+            let bytes = sibling_graph.to_snapshot().to_bytes().unwrap();
+            seed_backend
+                .save_snapshot(sibling_id, &bytes, GENERATION_INIT)
+                .unwrap();
+        }
+
+        // ── The hosted pod: serves `kin`, knows `kin`+`kin-db` via KIN_REPO_IDS
+        // The pod is opened over the same storage backend; `allowed_repo_ids`
+        // mirrors `KIN_REPO_IDS=kin,kin-db` so the daemon may load the sibling
+        // graph from storage on demand.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let allowed: HashSet<String> = [primary_id.to_string(), sibling_id.to_string()]
+            .into_iter()
+            .collect();
+        let state = DaemonState::open_with_backend(
+            init.layout,
+            Box::new(LocalFileBackend::new(&v2_root)),
+            primary_id,
+            Some(allowed),
+        )
+        .unwrap();
+
+        // Build the primary repo's served graph: a caller plus an unresolved
+        // cross-repo `Calls` to `kin_db::InMemoryGraph`, carrying the
+        // `import_source` and the imported-symbol token the resolver binds on.
+        let caller = test_entity("open_graph", "src/graph.rs");
+        state
+            .graph
+            .batch_upsert_entities(std::slice::from_ref(&caller))
+            .unwrap();
+        state
+            .graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Calls,
+                src: GraphNodeId::Entity(caller.id),
+                dst: GraphNodeId::Entity(kin_model::EntityId::new()),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: Some(sibling_id.to_string()),
+                evidence: vec![RelationEvidence {
+                    token: Some(format!("kin_db::{imported_symbol}")),
+                    ..RelationEvidence::default()
+                }],
+            })
+            .unwrap();
+
+        // Spine must be enabled for this test regardless of ambient env.
+        let prev_disable = std::env::var_os("KIN_DISABLE_SPINE");
+        std::env::remove_var("KIN_DISABLE_SPINE");
+
+        // ── Drive the production ingest route logic ───────────────────────
+        // Sibling first (metadata only), then the anchor with edge refresh —
+        // exactly the order the control-plane orchestrator POSTs.
+        let sibling_outcome = state
+            .ingest_repo_into_spine(sibling_id, false)
+            .await
+            .expect("sibling ingest from storage");
+        let primary_outcome = state
+            .ingest_repo_into_spine(primary_id, true)
+            .await
+            .expect("primary ingest + cross-repo edge refresh");
+
+        // Restore env before asserting so a failure cannot leak the override.
+        if let Some(v) = prev_disable {
+            std::env::set_var("KIN_DISABLE_SPINE", v);
+        }
+
+        // The sibling was loaded purely from storage (it has no local `.kndb`).
+        assert_eq!(
+            sibling_outcome.entity_count, 1,
+            "sibling entity metadata must load from the storage backend"
+        );
+        // The anchor reports a resolvable relation — the honest "this can
+        // materialize a cross-repo edge" signal the control plane gates on.
+        assert_eq!(
+            primary_outcome.resolvable_relations, 1,
+            "the primary's cross-repo call must be classified resolvable"
+        );
+
+        let spine = state.spine().expect("spine initialized by ingest");
+        assert!(
+            spine.repo_count() >= 2,
+            "primary and sibling must both be registered (got {})",
+            spine.repo_count()
+        );
+
+        // ── The contract the demo needs: non-empty cross-repo xref ────────
+        // This is exactly what `GET /spine/xref?repo=kin&entity=<caller>` reads.
+        assert!(
+            spine.edge_count() >= 1,
+            "spine must hold a cross-repo edge after ingest (got {})",
+            spine.edge_count()
+        );
+        let xref = spine.cross_repo_edges_for(primary_id, &caller.id);
+        assert!(
+            !xref.is_empty(),
+            "/spine/xref for the primary caller must be non-empty with storage-only siblings"
+        );
+        let edge = &xref[0];
+        assert_eq!(edge.src_repo, primary_id);
+        assert_eq!(
+            edge.dst_repo, sibling_id,
+            "edge must cross into the sibling repo loaded from storage"
+        );
+        assert_eq!(
+            edge.dst_entity, sibling_entity.id,
+            "edge must bind to the storage-resident sibling entity, not a local guess"
+        );
+
+        // The boundary is crossable from the sibling side too — the federated
+        // reachability the org graph renders.
+        let impact = spine.federated_impact(sibling_id, &sibling_entity.id, 5);
+        assert!(
+            impact.repos_involved.contains(&primary_id.to_string()),
+            "changing the sibling entity must impact the primary repo across the boundary"
         );
     }
 

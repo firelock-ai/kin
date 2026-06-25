@@ -816,6 +816,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/spine/resolve", get(spine_resolve))
         .route("/spine/impact", get(spine_impact))
         .route("/spine/xref", get(spine_xref))
+        .route("/spine/repos/{repo_id}/ingest", post(spine_ingest_repo))
         // LSP enrichment — trigger a full cold sweep
         .route("/lsp/sweep", post(lsp_sweep))
 }
@@ -6127,6 +6128,70 @@ async fn spine_xref(
     ))
 }
 
+/// Body for `POST /spine/repos/{repo_id}/ingest`.
+///
+/// The control-plane import orchestrator (kinlab) POSTs this per cataloged repo
+/// to drive the daemon's graph-authority ingest path. `repo` is informational
+/// (the path `repo_id` is authoritative); `refresh_cross_repo_edges` is set for
+/// the cross-repo anchor so the resolver runs once the spine is multi-repo.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SpineIngestBody {
+    /// Repo name as the orchestrator knows it (informational; path wins).
+    #[serde(default)]
+    repo: Option<String>,
+    /// Materialize cross-repo edges for this repo after registering it. Set by
+    /// the orchestrator for the anchor repo (e.g. `kin`).
+    #[serde(default)]
+    refresh_cross_repo_edges: bool,
+}
+
+/// `POST /spine/repos/{repo_id}/ingest` — load a repo's graph from durable
+/// storage (GCS in cloud) into the spine store.
+///
+/// This is the production multi-repo write path: it lets a single-repo hosted
+/// pod build a spine holding ≥2 repos so `GET /spine/xref` returns non-empty
+/// cross-repo edges. The daemon answers purely from graph-owned truth — it
+/// loads the named repo's graph through the configured `StorageBackend`,
+/// registers its entity metadata (write-through to the durable spine store),
+/// and — for the anchor — materializes the cross-repo edges.
+///
+/// Reports graph-derived counts the control plane gates the org graph on,
+/// including `resolvableRelationCount` (relations that can actually bind into
+/// cross-repo edges). Field names are camelCase to match the orchestrator's
+/// `DaemonIngestResponse`.
+async fn spine_ingest_repo(
+    Path(repo_id): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+    body: Option<Json<SpineIngestBody>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let Json(body) = body.unwrap_or_default();
+
+    // The path `repo_id` is authoritative; reject a body `repo` that disagrees
+    // so an orchestrator wiring bug can't ingest the wrong repo silently.
+    if let Some(repo) = body.repo.as_deref() {
+        if !repo.is_empty() && repo != repo_id {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("body repo {repo:?} does not match path repo_id {repo_id:?}"),
+            ));
+        }
+    }
+
+    let outcome = state
+        .ingest_repo_into_spine(&repo_id, body.refresh_cross_repo_edges)
+        .await
+        .map_err(internal_error)?;
+
+    Ok(Json(json!({
+        "repoId": outcome.repo_id,
+        "rootHash": outcome.root_hash,
+        "entityCount": outcome.entity_count,
+        "relationCount": outcome.relation_count,
+        "resolvableRelationCount": outcome.resolvable_relations,
+    })))
+}
+
 /// POST /lsp/sweep — trigger a full LSP cold sweep of all entities.
 async fn lsp_sweep(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     state.queue_lsp_sweep();
@@ -9183,6 +9248,76 @@ mod tests {
             ibody["version"],
             serde_json::json!(kin_spine::SPINE_PAYLOAD_VERSION),
             "/spine/impact payload must carry the spine wire-format version"
+        );
+    }
+
+    #[tokio::test]
+    async fn spine_ingest_route_rejects_body_repo_mismatch() {
+        // The path `repo_id` is authoritative. A body `repo` that disagrees is
+        // an orchestrator wiring bug and must be refused before any ingest, so
+        // a mis-wired client can never load the wrong repo into the spine.
+        let state = test_state();
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::post("/spine/repos/kin/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "repo": "kin-db",
+                            "refreshCrossRepoEdges": true,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "a body repo that disagrees with the path repo_id must be rejected"
+        );
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            body.contains("does not match"),
+            "rejection must explain the path/body mismatch, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spine_ingest_route_requires_a_storage_backend() {
+        // Without a configured StorageBackend (the local single-repo daemon),
+        // the multi-repo ingest path has nowhere to load a repo's graph from and
+        // must fail loud rather than silently serve an empty cross-repo graph.
+        // The hosted pod always runs with a backend; this guards the misconfig.
+        let state = test_state();
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::post("/spine/repos/kin/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({ "repo": "kin" })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ingest without a storage backend must surface an error, not a 200"
         );
     }
 
