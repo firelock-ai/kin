@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-06-25
+
+Portable Linux release. The Linux binaries are now statically linked against musl with rustls, removing the OpenSSL and glibc-version runtime dependencies, so `kin` and `kin-daemon` run on any Linux distribution including Alpine/musl and older glibc systems.
+
+### Changed
+- Linux release binaries switched from glibc dynamic linking to static musl, and from native-tls/OpenSSL to rustls. The binaries no longer require libssl/libcrypto at runtime or a minimum glibc version.
+
 ## [0.2.3] - 2026-06-24
 
 Signed release. The macOS binaries are now code-signed with a Developer ID certificate and notarized by Apple.
