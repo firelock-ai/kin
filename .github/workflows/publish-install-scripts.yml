@@ -1,0 +1,127 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Publish Install Scripts
+
+# Upload scripts/install.sh and scripts/install.ps1 to gs://kinlab-dev-install/
+# so https://get.kinlab.dev/install and /install.ps1 always match HEAD.
+#
+# Triggers:
+#   - Push to main when either install script changes.
+#   - GitHub Release published (re-upload on every release regardless of script diff).
+#   - Manual dispatch (break-glass recovery).
+#
+# Required secrets: WIF_PROVIDER, WIF_SERVICE_ACCOUNT (same WIF binding as daemon-image.yml).
+# The service account must have roles/storage.objectAdmin on kinlab-dev-install
+# and roles/compute.loadBalancerAdmin to run CDN cache invalidations.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - scripts/install.sh
+      - scripts/install.ps1
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish-install-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BUCKET: kinlab-dev-install
+  URL_MAP: kinlab-dev-install-urlmap
+
+jobs:
+  publish:
+    name: Upload to GCS + invalidate CDN
+    runs-on: ubuntu-latest
+    outputs:
+      sha256_sh: ${{ steps.upload_sh.outputs.sha256 }}
+      sha256_ps1: ${{ steps.upload_ps1.outputs.sha256 }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Authenticate to Google Cloud (keyless WIF)
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Upload install.sh
+        id: upload_sh
+        run: |
+          HASH=$(sha256sum scripts/install.sh | awk '{print $1}')
+          gsutil -h "Cache-Control:no-cache, max-age=0" \
+                 -h "Content-Type:text/x-shellscript" \
+                 cp scripts/install.sh "gs://${BUCKET}/install"
+          GEN=$(gsutil stat "gs://${BUCKET}/install" | awk '/Generation:/ {print $2}')
+          echo "sha256=${HASH}" >> "$GITHUB_OUTPUT"
+          echo "generation=${GEN}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload install.ps1
+        id: upload_ps1
+        run: |
+          HASH=$(sha256sum scripts/install.ps1 | awk '{print $1}')
+          gsutil -h "Cache-Control:no-cache, max-age=0" \
+                 -h "Content-Type:text/plain" \
+                 cp scripts/install.ps1 "gs://${BUCKET}/install.ps1"
+          GEN=$(gsutil stat "gs://${BUCKET}/install.ps1" | awk '/Generation:/ {print $2}')
+          echo "sha256=${HASH}" >> "$GITHUB_OUTPUT"
+          echo "generation=${GEN}" >> "$GITHUB_OUTPUT"
+
+      - name: Invalidate CDN cache
+        run: |
+          gcloud compute url-maps invalidate-cdn-cache "${URL_MAP}" \
+            --path="/install" --async --quiet
+          gcloud compute url-maps invalidate-cdn-cache "${URL_MAP}" \
+            --path="/install.ps1" --async --quiet
+
+      - name: Summary
+        run: |
+          {
+            echo "### Install script publish"
+            echo "| Script | SHA-256 | GCS generation |"
+            echo "|--------|---------|----------------|"
+            echo "| \`install.sh\` | \`${{ steps.upload_sh.outputs.sha256 }}\` | \`${{ steps.upload_sh.outputs.generation }}\` |"
+            echo "| \`install.ps1\` | \`${{ steps.upload_ps1.outputs.sha256 }}\` | \`${{ steps.upload_ps1.outputs.generation }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  verify:
+    name: Verify served content
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Verify install.sh checksum at get.kinlab.dev
+        run: |
+          EXPECTED="${{ needs.publish.outputs.sha256_sh }}"
+          curl -fsSL https://get.kinlab.dev/install -o /tmp/install.sh
+          SERVED=$(sha256sum /tmp/install.sh | awk '{print $1}')
+          if [ "$EXPECTED" != "$SERVED" ]; then
+            echo "::error::install.sh checksum mismatch: expected=${EXPECTED} served=${SERVED}"
+            exit 1
+          fi
+          echo "install.sh OK: sha256=${SERVED}"
+
+      - name: Verify install.ps1 checksum at get.kinlab.dev
+        run: |
+          EXPECTED="${{ needs.publish.outputs.sha256_ps1 }}"
+          curl -fsSL https://get.kinlab.dev/install.ps1 -o /tmp/install.ps1
+          SERVED=$(sha256sum /tmp/install.ps1 | awk '{print $1}')
+          if [ "$EXPECTED" != "$SERVED" ]; then
+            echo "::error::install.ps1 checksum mismatch: expected=${EXPECTED} served=${SERVED}"
+            exit 1
+          fi
+          echo "install.ps1 OK: sha256=${SERVED}"
