@@ -1,6 +1,6 @@
 # kin-vector
 
-Pure-Rust HNSW approximate nearest-neighbor search for the Kin stack.
+> Vector / ANN substrate for semantic retrieval.
 
 `kin-vector` implements a Hierarchical Navigable Small World (HNSW) index for
 embedding-based retrieval. It is compiled directly into the binary — no C++
@@ -9,6 +9,18 @@ FFI, no platform-specific build scripts, no external ANN library dependency.
 It is a low-level retrieval primitive in the open Kin local substrate.
 `kin-db` consumes it for vector-side retrieval; Kin's ranking and
 proof-weighting policy lives above this crate, not inside it.
+
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/firelock-ai/kin)
+
+## What is Kin?
+
+Kin is the semantic system of record for AI-native software — your code as a graph of
+entities, relations, and intents, not a pile of files and diffs. AI agents and humans
+navigate it semantically, with provenance, review, and governance built in. It coexists
+with Git and projects graph truth back to a normal filesystem, so any tool works unchanged.
+
+Start at **[firelock-ai/kin](https://github.com/firelock-ai/kin)** · **[kinlab.ai](https://kinlab.ai)**
 
 ## Build
 
@@ -37,4 +49,4 @@ bit-identical to the frozen benchmark baseline on every target.
 
 ## License
 
-Apache-2.0. Part of the open Kin local substrate.
+[Apache-2.0](LICENSE).
