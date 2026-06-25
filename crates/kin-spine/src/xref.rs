@@ -294,11 +294,7 @@ fn derive_imported_symbol(rel: &Relation) -> Option<String> {
 /// directives, macro text, punctuation), so non-symbol evidence is rejected
 /// instead of producing a garbage name that could mis-resolve.
 fn symbol_leaf(token: &str) -> Option<String> {
-    let leaf = token
-        .rsplit(['.', ':'])
-        .next()
-        .unwrap_or(token)
-        .trim();
+    let leaf = token.rsplit(['.', ':']).next().unwrap_or(token).trim();
     if !leaf.is_empty() && leaf.chars().all(|c| c.is_alphanumeric() || c == '_') {
         Some(leaf.to_string())
     } else {
