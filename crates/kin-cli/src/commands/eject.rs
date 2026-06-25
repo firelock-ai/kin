@@ -16,6 +16,16 @@ use std::path::Path;
 /// file with the pre-init snapshot copy.  Requires typing "revert" to confirm
 /// (or --yes for non-interactive use).  A backup of current files is written
 /// to `.kin-backup-eject-<timestamp>/` in the project root before any mutation.
+///
+/// Scope guarantee — what eject does NOT touch:
+/// - `.git/` and Git history are never read, rewritten, or restored by Kin.
+///   Kin snapshots the *working tree* at init (excluding `.git`, `.kin*`, and
+///   ignored paths); eject restores those files only.  Commit history is and
+///   always was owned by Git, so after eject the repository is a plain Git repo
+///   with its history intact.
+/// - --revert-files refuses to run against a truncated/partial snapshot: it
+///   verifies the snapshot file count against the manifest first and bails
+///   before any mutation, so a corrupt snapshot never silently strands files.
 pub async fn run(revert_files: bool, yes: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let layout =
@@ -52,6 +62,20 @@ fn run_with_layout(layout: &KinLayout, revert_files: bool, yes: bool) -> Result<
     };
 
     let file_count = manifest["file_count"].as_u64().unwrap_or(0);
+
+    // Verify the snapshot is complete BEFORE touching any working file. A
+    // truncated or partially-deleted snapshot must fail loudly here — never
+    // half-restore and then delete .kin/, which would silently strand files at
+    // their post-init content with no path back to pre-init state.
+    let snapshot_file_count = count_snapshot_files(&snapshot_dir, &snapshot_dir)?;
+    if snapshot_file_count != file_count {
+        bail!(
+            "Snapshot is incomplete: manifest records {file_count} file(s) but the snapshot \
+             directory contains {snapshot_file_count}. Refusing to revert from a partial \
+             snapshot — your working files have NOT been touched. Run without --revert-files \
+             to remove Kin while leaving every working file exactly as it is."
+        );
+    }
 
     // Require typed confirmation unless --yes.
     if !yes {
@@ -200,6 +224,35 @@ fn restore_files(
         }
     }
     Ok(())
+}
+
+/// Count the user files present in the snapshot, mirroring `restore_files`'
+/// walk (the top-level `manifest.json` is metadata and is not counted). Used to
+/// detect a truncated or partially-deleted snapshot before any destructive
+/// restore begins.
+fn count_snapshot_files(snapshot_root: &Path, current: &Path) -> Result<u64> {
+    let mut count = 0u64;
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path
+            .file_name()
+            .map(|f| f == "manifest.json")
+            .unwrap_or(false)
+            && path.parent() == Some(snapshot_root)
+        {
+            continue;
+        }
+
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            count += count_snapshot_files(snapshot_root, &path)?;
+        } else if ft.is_file() {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 // ── Daemon helpers ────────────────────────────────────────────────────────────
@@ -393,6 +446,55 @@ mod tests {
             fs::read_to_string(backup_dir.join("src/main.rs")).unwrap(),
             "fn current() {}",
             "backup must contain the pre-mutation src/main.rs"
+        );
+    }
+
+    /// A truncated snapshot (manifest count > files present) must fail loudly
+    /// BEFORE any mutation: .kin/ stays, working files are untouched, and no
+    /// backup is created.
+    #[test]
+    fn revert_files_fails_loud_on_partial_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        setup_fake_repo(root);
+
+        // Post-init working content the user would lose if we half-reverted.
+        fs::write(root.join("README.md"), "current content").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn current() {}").unwrap();
+
+        // Truncate the snapshot: manifest still claims 2 files but one is gone.
+        fs::remove_file(root.join(".kin/snapshot/src/main.rs")).unwrap();
+
+        let layout = KinLayout::discover(root).unwrap();
+        let result = run_with_layout(&layout, true, true);
+
+        assert!(result.is_err(), "partial snapshot must fail loudly");
+        assert!(
+            root.join(".kin").exists(),
+            ".kin/ must remain after a refused revert"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("README.md")).unwrap(),
+            "current content",
+            "working files must be untouched after a refused revert"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("src/main.rs")).unwrap(),
+            "fn current() {}"
+        );
+        let backups = fs::read_dir(root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".kin-backup-eject-")
+            })
+            .count();
+        assert_eq!(
+            backups, 0,
+            "no backup should be created when revert is refused pre-mutation"
         );
     }
 
