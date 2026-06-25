@@ -1770,10 +1770,24 @@ impl<Id: VectorId> VectorIndex<Id> {
         atomic_save_bytes(path, &bytes, "vector index")
     }
 
-    /// Load a previously saved HNSW index from disk.
+    /// Load a previously saved HNSW index from disk (dimension check only).
     ///
-    /// Returns a new `VectorIndex` with the loaded index data.
-    /// The `dimensions` parameter is used to validate the loaded data matches.
+    /// # Deprecation
+    ///
+    /// Prefer [`VectorIndex::load_checked`] whenever the index was built by a
+    /// specific embedding model. `load` checks only that the stored dimension
+    /// matches `dimensions`; it does **not** verify model identity or graph
+    /// provenance. Two embedding models can share the same dimension while
+    /// producing incompatible vector spaces, so a model swap can load
+    /// silently-wrong neighbors without any error. `load_checked` adds the
+    /// provenance check and returns [`VectorError::ModelMismatch`] in that case.
+    ///
+    /// Use `load` only when no `IndexDescriptor` is available (e.g. loading an
+    /// index for inspection without the original model context).
+    #[deprecated(
+        note = "Use `load_checked` instead; `load` only verifies dimensions and will \
+                silently return wrong neighbors after a same-dimension model swap."
+    )]
     pub fn load(path: &Path, dimensions: usize) -> Result<Self, VectorError> {
         let _span = tracing::info_span!(
             "kin_vector.load",
@@ -1795,17 +1809,28 @@ impl<Id: VectorId> VectorIndex<Id> {
     /// caller's `expected` self-description (model identity + graph provenance),
     /// in addition to vector dimensionality.
     ///
-    /// Use this instead of [`VectorIndex::load`] whenever the index was built by
-    /// a specific embedding model: it returns [`VectorError::ModelMismatch`] when
-    /// a same-dimension model swap (or graph-root change) would otherwise load
-    /// silently-wrong vectors. Only the fields the caller pins on `expected` are
-    /// enforced (see [`IndexDescriptor::verify_compatible`]).
+    /// Returns [`VectorError::ModelMismatch`] when a same-dimension model swap
+    /// (or graph-root change) would otherwise load silently-wrong vectors. Only
+    /// the fields the caller pins on `expected` are enforced (see
+    /// [`IndexDescriptor::verify_compatible`]).
     pub fn load_checked(
         path: &Path,
         dimensions: usize,
         expected: &IndexDescriptor,
     ) -> Result<Self, VectorError> {
-        let vi = Self::load(path, dimensions)?;
+        let _span = tracing::info_span!(
+            "kin_vector.load_checked",
+            path = %path.display(),
+            dimensions = dimensions
+        )
+        .entered();
+        let vi = Self::load_from_disk(path)?;
+        let loaded_dims = vi.dimensions();
+        if loaded_dims != dimensions {
+            return Err(VectorError::IndexError(format!(
+                "loaded vector index has dimensions {loaded_dims}, expected {dimensions}",
+            )));
+        }
         vi.descriptor().verify_compatible(expected)?;
         Ok(vi)
     }
@@ -2610,7 +2635,7 @@ mod tests {
         };
         vi.save(&path).unwrap();
 
-        let loaded = VectorIndex::<u64>::load(&path, 2).unwrap();
+        let loaded = VectorIndex::<u64>::load_from_disk(&path).unwrap();
         assert_eq!(loaded.graph.read().nodes[0].level, forced_hi_level);
         assert_ne!(forced_hi_level, hnsw_level_for_key(&k_hi));
         assert_eq!(loaded.len(), 2);
@@ -2640,7 +2665,7 @@ mod tests {
         }
         idx.save(&path).unwrap();
 
-        let loaded = VectorIndex::<u64>::load(&path, 4).unwrap();
+        let loaded = VectorIndex::<u64>::load_from_disk(&path).unwrap();
         for i in 40..50u64 {
             loaded.upsert(i, &mk(i)).unwrap();
         }
@@ -2760,7 +2785,7 @@ mod tests {
         idx.upsert(e3, &[0.9, 0.1, 0.0, 0.0]).unwrap();
         idx.save(&path).unwrap();
 
-        let loaded = VectorIndex::<DefaultId>::load(&path, 4).unwrap();
+        let loaded = VectorIndex::<DefaultId>::load_from_disk(&path).unwrap();
         let results = loaded.search_similar(&[1.0, 0.0, 0.0, 0.0], 2).unwrap();
 
         assert_eq!(results.len(), 2);
@@ -2779,7 +2804,7 @@ mod tests {
 
         fs::write(&path, b"corrupted hnsw index").unwrap();
 
-        let error = VectorIndex::<DefaultId>::load(&path, 4).unwrap_err();
+        let error = VectorIndex::<DefaultId>::load_from_disk(&path).unwrap_err();
         assert!(
             error.to_string().contains("failed to deserialize")
                 || error.to_string().contains("recovery"),
@@ -2805,7 +2830,7 @@ mod tests {
         idx.upsert(e2, &[0.9, 0.1, 0.0, 0.0]).unwrap();
         idx.save(&path).unwrap();
 
-        let loaded = VectorIndex::<DefaultId>::load(&path, 4).unwrap();
+        let loaded = VectorIndex::<DefaultId>::load_from_disk(&path).unwrap();
         let results = loaded.search_similar(&[1.0, 0.0, 0.0, 0.0], 2).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, e1);
@@ -2829,7 +2854,7 @@ mod tests {
         write_bytes_recovery_candidate(&path, &bytes, "vector index").unwrap();
         fs::remove_file(&path).unwrap();
 
-        let loaded = VectorIndex::<DefaultId>::load(&path, 4).unwrap();
+        let loaded = VectorIndex::<DefaultId>::load_from_disk(&path).unwrap();
         let results = loaded.search_similar(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, entity_id);
@@ -2854,7 +2879,7 @@ mod tests {
         write_bytes_recovery_candidate(&path, &bytes, "vector index").unwrap();
         fs::write(&path, b"corrupted hnsw index").unwrap();
 
-        let loaded = VectorIndex::<DefaultId>::load(&path, 4).unwrap();
+        let loaded = VectorIndex::<DefaultId>::load_from_disk(&path).unwrap();
         let results = loaded.search_similar(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, entity_id);
@@ -2901,7 +2926,7 @@ mod tests {
 
         fs::rename(&path, &tmp_path).unwrap();
 
-        let error = VectorIndex::<DefaultId>::load(&path, 4).unwrap_err();
+        let error = VectorIndex::<DefaultId>::load_from_disk(&path).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -2929,7 +2954,7 @@ mod tests {
         marker.byte_len += 1;
         fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
 
-        let error = VectorIndex::<DefaultId>::load(&path, 4).unwrap_err();
+        let error = VectorIndex::<DefaultId>::load_from_disk(&path).unwrap_err();
         assert!(
             error.to_string().contains("does not match marker"),
             "unexpected error: {error}"
@@ -3275,6 +3300,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn load_checked_rejects_same_dimension_model_swap() {
         // The core bug: identical dimension (4) but a different embedding model.
         // A dimension-only check would pass and return silently-wrong neighbors.
