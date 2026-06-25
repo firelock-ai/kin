@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+# Fuzz harness for the tree-sitter parsing and language-adapter surface.
+#
+# These targets feed arbitrary bytes into kin-parser's two source-ingesting
+# entry points -- the full LanguageAdapter parse + extract path (every built-in
+# grammar) and the C2 shallow parse path -- asserting the parser is total on
+# arbitrary input: it returns a value or a handled error and never panics,
+# crashes, or hits undefined behavior.
+#
+# This package declares its own (empty) [workspace] table so it is detached from
+# the parent kin workspace and is built only by the Fuzz CI workflow, never by
+# the standard `cargo build --workspace` / clippy gate. kin-parser is pulled in
+# by path; its `workspace = true` dependency inheritance still resolves from the
+# kin workspace root, so kin-model resolves from the Kin registry exactly as in a
+# normal kin build (Cargo discovers the tracked .cargo/config.toml by walking up
+# from this directory).
+
+[package]
+name = "kin-parser-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+kin-parser = { path = "../crates/kin-parser" }
+kin-model = { version = "0.2.1", registry = "kin" }
+
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "parse_adapter"
+path = "fuzz_targets/parse_adapter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_shallow"
+path = "fuzz_targets/parse_shallow.rs"
+test = false
+doc = false
+bench = false
