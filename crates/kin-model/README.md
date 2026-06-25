@@ -1,5 +1,7 @@
 # kin-model
 
+> Canonical types and domain models for Kin's semantic VCS.
+
 `kin-model` contains the canonical shared types for Kin's semantic repository
 substrate.
 
@@ -14,6 +16,18 @@ engine, CLI, daemon, MCP server, projection layer, and supporting crates:
 This crate is intentionally small and dependency-light. It is the schema and
 domain boundary for the open local substrate, not the hosted KinLab control
 plane.
+
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/firelock-ai/kin)
+
+## What is Kin?
+
+Kin is the semantic system of record for AI-native software — your code as a graph of
+entities, relations, and intents, not a pile of files and diffs. AI agents and humans
+navigate it semantically, with provenance, review, and governance built in. It coexists
+with Git and projects graph truth back to a normal filesystem, so any tool works unchanged.
+
+Start at **[firelock-ai/kin](https://github.com/firelock-ai/kin)** · **[kinlab.ai](https://kinlab.ai)**
 
 ## Versioning & release policy
 
@@ -53,3 +67,7 @@ fails CI when `src/` changes without a version move.
 
 These three scripts (version-bump gate, downstream-pin compatibility, fresh-cache
 consumer smoke) run in CI; see `.github/workflows/`.
+
+## License
+
+[Apache-2.0](LICENSE).
