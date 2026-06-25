@@ -802,6 +802,9 @@ enum Command {
         /// Apply safe automatic repairs (shell hook, MCP configs, config dirs)
         #[arg(long, default_value_t = false)]
         fix: bool,
+        /// Emit the machine-readable health report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// First-time setup and health checks for the Kin system
     Setup {
@@ -822,6 +825,9 @@ enum Command {
         /// Run non-interactively using defaults or provided flags
         #[arg(long, global = true)]
         no_interactive: bool,
+        /// Skip the wizard and only run the first-run health check
+        #[arg(long, default_value_t = false)]
+        check: bool,
     },
     /// Manage secrets (org and repo level)
     Secret {
@@ -1523,6 +1529,9 @@ enum SetupAction {
         /// Apply safe automatic repairs (shell hook, MCP configs, config dirs)
         #[arg(long, default_value_t = false)]
         fix: bool,
+        /// Emit the machine-readable health report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -2509,7 +2518,7 @@ fn main() -> Result<()> {
                     Some(RegistryAction::Clean) => commands::registry::clean().await,
                     None => commands::registry::list().await,
                 },
-                Command::Doctor { fix } => commands::setup::doctor(fix).await,
+                Command::Doctor { fix, json } => commands::setup::doctor(fix, json).await,
                 Command::Setup {
                     action,
                     intent,
@@ -2517,9 +2526,15 @@ fn main() -> Result<()> {
                     shell,
                     auto_daemon,
                     no_interactive,
+                    check,
                 } => match action {
                     Some(SetupAction::Status { json }) => commands::setup::status(json).await,
-                    Some(SetupAction::Doctor { fix }) => commands::setup::doctor(fix).await,
+                    Some(SetupAction::Doctor { fix, json }) => {
+                        commands::setup::doctor(fix, json).await
+                    }
+                    // `kin setup --check` is shorthand for the first-run health
+                    // check without running the wizard.
+                    None if check => commands::setup::doctor(false, false).await,
                     None => {
                         commands::setup::run_wizard(commands::setup::WizardOptions {
                             mode,

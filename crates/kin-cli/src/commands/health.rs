@@ -81,6 +81,39 @@ fn is_failing(status: &HealthStatus) -> bool {
     matches!(status, HealthStatus::Missing | HealthStatus::Misconfigured)
 }
 
+/// A pass/attention/skip tally over a set of checks, used for the one-line
+/// readiness summary printed by `kin doctor` and `kin setup status`.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct HealthSummary {
+    /// Checks that are Healthy.
+    pub passed: usize,
+    /// Checks that need attention (Missing, Misconfigured, or Stale).
+    pub attention: usize,
+    /// Checks that do not apply on this platform / context (Unsupported).
+    pub skipped: usize,
+}
+
+impl HealthReport {
+    /// Tally checks into pass / needs-attention / not-applicable buckets.
+    pub fn summary(&self) -> HealthSummary {
+        let mut summary = HealthSummary {
+            passed: 0,
+            attention: 0,
+            skipped: 0,
+        };
+        for check in &self.checks {
+            match check.status {
+                HealthStatus::Healthy => summary.passed += 1,
+                HealthStatus::Unsupported => summary.skipped += 1,
+                HealthStatus::Missing | HealthStatus::Misconfigured | HealthStatus::Stale => {
+                    summary.attention += 1
+                }
+            }
+        }
+        summary
+    }
+}
+
 /// Run every health check and assemble the report.
 ///
 /// This is the single source of truth consumed by the CLI, editor, and
@@ -90,6 +123,7 @@ pub async fn run_health_checks() -> HealthReport {
     let mut checks = vec![
         check_kin_binary(),
         check_kin_daemon_binary(),
+        check_daemon_running().await,
         check_vfs_projection(),
         check_repo_init(),
         check_shell_path(),
@@ -166,6 +200,50 @@ fn check_kin_daemon_binary() -> HealthCheck {
             "not found beside the kin binary or on PATH",
         )
         .with_manual_fix("reinstall Kin so kin-daemon is installed alongside kin"),
+    }
+}
+
+/// Probe whether the daemon is actually *running* (reachable) for the current
+/// repository — distinct from [`check_kin_daemon_binary`], which only confirms
+/// the binary is installed.
+///
+/// Outside a Kin repository there is no repo-scoped daemon to probe, so this is
+/// reported as Unsupported rather than a failure. Inside a repo, a daemon that
+/// is not reachable is reported as Stale (recoverable): any `kin` command in the
+/// repo auto-starts it, so it is not a hard first-run blocker.
+async fn check_daemon_running() -> HealthCheck {
+    let cwd = env::current_dir().unwrap_or_default();
+    let layout = match kin_core::KinLayout::discover(&cwd) {
+        Some(l) => l,
+        None => {
+            return HealthCheck::new(
+                "daemon_running",
+                "kin-daemon running",
+                HealthStatus::Unsupported,
+                "n/a — not in a Kin repository (the daemon is repo-scoped)",
+            )
+            .with_manual_fix(
+                "cd into a Kin repository, then run any `kin` command to start its daemon",
+            );
+        }
+    };
+
+    let repo = layout.working_dir().display().to_string();
+    match crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await {
+        Some(url) => HealthCheck::new(
+            "daemon_running",
+            "kin-daemon running",
+            HealthStatus::Healthy,
+            format!("daemon reachable for {repo} ({url})"),
+        ),
+        None => HealthCheck::new(
+            "daemon_running",
+            "kin-daemon running",
+            HealthStatus::Stale,
+            format!("no daemon reachable for {repo} — it auto-starts on first use"),
+        )
+        .fixable()
+        .with_manual_fix("run any `kin` command in the repo to auto-start the daemon"),
     }
 }
 
@@ -573,10 +651,83 @@ mod tests {
         assert!(!report.checks.is_empty());
         let json = serde_json::to_string(&report).expect("report serializes");
         assert!(json.contains("\"kin_binary\""));
+        assert!(json.contains("\"kin_daemon_binary\""));
+        assert!(json.contains("\"daemon_running\""));
         assert!(json.contains("\"vfs_projection\""));
         assert!(json.contains("\"shell_path\""));
         assert!(json.contains("\"platform\""));
         assert!(json.contains("\"healthy\""));
+    }
+
+    fn check_with(id: &str, status: HealthStatus) -> HealthCheck {
+        HealthCheck::new(id, id, status, "")
+    }
+
+    #[test]
+    fn summary_tallies_pass_attention_skip_buckets() {
+        let report = HealthReport {
+            platform: "test".to_string(),
+            checks: vec![
+                check_with("a", HealthStatus::Healthy),
+                check_with("b", HealthStatus::Healthy),
+                check_with("c", HealthStatus::Missing),
+                check_with("d", HealthStatus::Misconfigured),
+                check_with("e", HealthStatus::Stale),
+                check_with("f", HealthStatus::Unsupported),
+            ],
+            healthy: false,
+        };
+        let summary = report.summary();
+        assert_eq!(summary.passed, 2, "two Healthy checks pass");
+        assert_eq!(
+            summary.attention, 3,
+            "Missing + Misconfigured + Stale need attention"
+        );
+        assert_eq!(summary.skipped, 1, "Unsupported is not applicable");
+    }
+
+    #[test]
+    fn summary_buckets_sum_to_total_checks() {
+        let report = HealthReport {
+            platform: "test".to_string(),
+            checks: vec![
+                check_with("a", HealthStatus::Healthy),
+                check_with("b", HealthStatus::Stale),
+                check_with("c", HealthStatus::Unsupported),
+            ],
+            healthy: false,
+        };
+        let summary = report.summary();
+        assert_eq!(
+            summary.passed + summary.attention + summary.skipped,
+            report.checks.len(),
+            "every check lands in exactly one bucket"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_running_check_is_present_and_never_hard_fails() {
+        // The daemon-running probe is recoverable by construction: Healthy when
+        // reachable, Stale when not started (auto-starts on use), Unsupported
+        // outside a repo. It must never report Missing/Misconfigured, which
+        // would make first-run readiness look broken when it is merely idle.
+        // This holds regardless of the test's working directory, so no global
+        // cwd mutation (which would race other tests) is needed.
+        let daemon = check_daemon_running().await;
+        assert_eq!(daemon.id, "daemon_running");
+        assert!(
+            !is_failing(&daemon.status),
+            "daemon-running must not hard-fail; got {:?}",
+            daemon.status
+        );
+        // When the daemon is not Healthy (Stale/Unsupported), there is always a
+        // remediation hint so the user knows what to do.
+        if !matches!(daemon.status, HealthStatus::Healthy) {
+            assert!(
+                daemon.manual_fix.is_some(),
+                "non-healthy daemon-running must offer a remediation hint"
+            );
+        }
     }
 
     #[test]
