@@ -747,7 +747,10 @@ fn hosted_pod_serves_non_empty_xref_from_store_only() {
     );
     let edge = &xref[0];
     assert_eq!(edge.src_repo, "kin");
-    assert_eq!(edge.dst_repo, "kin-db", "edge must cross into the sibling repo");
+    assert_eq!(
+        edge.dst_repo, "kin-db",
+        "edge must cross into the sibling repo"
+    );
     assert_eq!(
         edge.dst_entity, graph_entity.entity_id,
         "edge must bind to the store-resident sibling entity, not a local guess"
@@ -819,7 +822,11 @@ fn cross_repo_edges_survive_cold_pod_restart_via_store() {
         "materialized cross-repo edge must rehydrate from the store on a cold pod"
     );
     let xref = cold.cross_repo_edges_for("kin", &caller);
-    assert_eq!(xref.len(), 1, "/spine/xref non-empty on a pod that only hydrated");
+    assert_eq!(
+        xref.len(),
+        1,
+        "/spine/xref non-empty on a pod that only hydrated"
+    );
     assert_eq!(xref[0].dst_repo, "kin-db");
 }
 
