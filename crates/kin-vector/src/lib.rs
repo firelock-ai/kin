@@ -1518,6 +1518,19 @@ impl<Id: VectorId> VectorIndex<Id> {
         self.len() == 0
     }
 
+    /// Fraction of allocated slots that hold deleted (not yet reclaimed) nodes.
+    ///
+    /// Returns `0.0` when the index is empty or there are no pending deletes.
+    /// After `compact()` this is always `0.0`.
+    pub fn deleted_fraction(&self) -> f32 {
+        let graph = self.graph.read();
+        let total = graph.nodes.len();
+        if total == 0 {
+            return 0.0;
+        }
+        graph.free_list.len() as f32 / total as f32
+    }
+
     /// Whether the index already contains an embedding for the given entity.
     pub fn contains(&self, entity_id: &Id) -> bool {
         self.graph.read().id_to_idx.contains_key(entity_id)
@@ -1667,6 +1680,22 @@ impl<Id: VectorId> VectorIndex<Id> {
     /// Rebuilds the graph from scratch in canonical insertion order to ensure deterministic serialization.
     pub fn ensure_canonical_order(&self) -> Result<(), VectorError> {
         let mut graph = self.graph.write();
+        graph.ensure_canonical_order()
+    }
+
+    /// Compact the index by rebuilding the HNSW graph from live nodes only.
+    ///
+    /// Soft-deletes remove nodes and their incident edges but leave the
+    /// surrounding graph structure unchanged.  After a high-delete-rate
+    /// reconcile the surviving nodes can end up with fewer cross-cluster
+    /// connections than they would have in a freshly built graph, which
+    /// degrades ANN recall.  `compact()` forces a full rebuild, restoring
+    /// connectivity among the live nodes at the cost of an O(n log n) pass.
+    ///
+    /// After the call `deleted_fraction()` returns `0.0`.
+    pub fn compact(&self) -> Result<(), VectorError> {
+        let mut graph = self.graph.write();
+        graph.canonical_order_dirty = true;
         graph.ensure_canonical_order()
     }
 
@@ -3476,6 +3505,112 @@ mod tests {
             build_and_save_bytes(shuffled),
             reference,
             "saved index bytes depended on caller input order"
+        );
+    }
+
+    /// Recall metric: for each query, compute the true k-NN by brute force over
+    /// `candidates`, then measure what fraction the ANN result captures.
+    fn recall_at_k(
+        idx: &VectorIndex<u64>,
+        queries: &[(u64, Vec<f32>)],
+        candidates: &[(u64, Vec<f32>)],
+        k: usize,
+    ) -> f32 {
+        let mut total = 0usize;
+        let mut hits = 0usize;
+        for (qid, qvec) in queries {
+            let ann: std::collections::HashSet<u64> = idx
+                .search_similar(qvec, k)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            let mut dists: Vec<(u64, f32)> = candidates
+                .iter()
+                .filter(|(id, _)| *id != *qid)
+                .map(|(id, v)| {
+                    let d: f32 = v.iter().zip(qvec).map(|(a, b)| (a - b) * (a - b)).sum();
+                    (*id, d)
+                })
+                .collect();
+            dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            dists.truncate(k);
+            hits += dists.iter().filter(|(id, _)| ann.contains(id)).count();
+            total += dists.len();
+        }
+        if total == 0 {
+            1.0
+        } else {
+            hits as f32 / total as f32
+        }
+    }
+
+    /// compact() rebuilds the HNSW graph from live nodes only, restoring
+    /// cross-cluster connectivity that soft-deletes fragment.
+    ///
+    /// After a 50% bulk delete:
+    ///   - deleted_fraction() reflects the pending deletes
+    ///   - compact() must not degrade recall vs the post-delete baseline
+    ///   - after compact(), deleted_fraction() is 0.0
+    #[test]
+    fn compact_restores_recall_after_bulk_deletes() {
+        let n: u64 = 300;
+        let dim = 16;
+        let k = 10;
+        let vectors: Vec<(u64, Vec<f32>)> = (0..n).map(|i| (i, batch_test_vec(i, dim))).collect();
+
+        let idx = VectorIndex::<u64>::new(dim).unwrap();
+        idx.upsert_batch(vectors.clone()).unwrap();
+
+        // The odd-indexed vectors are our query / survivor set.
+        let survivors: Vec<(u64, Vec<f32>)> = vectors
+            .iter()
+            .filter(|(id, _)| id % 2 == 1)
+            .cloned()
+            .collect();
+
+        // Sanity: baseline recall with the full index is reasonable.
+        let baseline = recall_at_k(&idx, &survivors, &vectors, k);
+        assert!(
+            baseline > 0.7,
+            "baseline recall {baseline:.3} unexpectedly low before any deletion"
+        );
+
+        // Delete all even-indexed vectors (≈50 % of the index).
+        for (id, _) in vectors.iter().filter(|(id, _)| id % 2 == 0) {
+            idx.remove(id).unwrap();
+        }
+
+        let frac = idx.deleted_fraction();
+        assert!(
+            frac > 0.4 && frac < 0.6,
+            "expected ~50 % deleted slots, got {frac:.3}"
+        );
+
+        // Recall over surviving vectors against the surviving candidate set.
+        let recall_pre = recall_at_k(&idx, &survivors, &survivors, k);
+
+        // compact() rebuilds from live nodes, clearing the free-list.
+        idx.compact().unwrap();
+        assert_eq!(
+            idx.deleted_fraction(),
+            0.0,
+            "after compact, free_list must be empty"
+        );
+        assert_eq!(
+            idx.len(),
+            survivors.len(),
+            "live count unchanged by compact"
+        );
+
+        let recall_post = recall_at_k(&idx, &survivors, &survivors, k);
+        assert!(
+            recall_post >= recall_pre,
+            "compact must not degrade recall: pre={recall_pre:.3} post={recall_post:.3}"
+        );
+        assert!(
+            recall_post > 0.6,
+            "post-compact recall {recall_post:.3} should be reasonable"
         );
     }
 }
