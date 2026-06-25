@@ -67,8 +67,8 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:${{ github.sha }}
             ${{ env.IMAGE }}:latest
-            ghcr.io/firelock-ai/kin-daemon:${{ github.sha }}
-            ghcr.io/firelock-ai/kin-daemon:latest
+            ghcr.io/firelock-ai/kin:${{ github.sha }}
+            ghcr.io/firelock-ai/kin:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -77,6 +77,6 @@ jobs:
           {
             echo "Pushed \`${IMAGE}:${GITHUB_SHA}\`"
             echo "Pushed \`${IMAGE}:latest\`"
-            echo "Pushed \`ghcr.io/firelock-ai/kin-daemon:${GITHUB_SHA}\` (public)"
-            echo "Pushed \`ghcr.io/firelock-ai/kin-daemon:latest\` (public)"
+            echo "Pushed \`ghcr.io/firelock-ai/kin:${GITHUB_SHA}\` (public)"
+            echo "Pushed \`ghcr.io/firelock-ai/kin:latest\` (public)"
           } >> "$GITHUB_STEP_SUMMARY"
