@@ -38,12 +38,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux core binaries (kin, kin-daemon) target musl and link static by
+          # default, so a single artifact runs on any Linux distro: musl (Alpine)
+          # and glibc (Ubuntu/Debian/RHEL) alike, with no OpenSSL or glibc version
+          # coupling. The VFS leg builds against gnu (vfs_target) because an
+          # LD_PRELOAD shim is intrinsically libc-specific (see the VFS steps).
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
+            vfs_target: x86_64-unknown-linux-gnu
             artifact: kin-linux-x86_64
             shim_name: libkin_vfs_shim.so
           - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
+            vfs_target: aarch64-unknown-linux-gnu
             artifact: kin-linux-aarch64
             shim_name: libkin_vfs_shim.so
           - os: macos-latest
@@ -68,7 +75,16 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@1.96.0
         with:
-          targets: ${{ matrix.target }}
+          # On the Linux legs the core (kin, kin-daemon) targets musl and the VFS
+          # leg targets gnu (vfs_target), so both targets must be installed.
+          targets: ${{ matrix.target }}${{ matrix.vfs_target && format(' {0}', matrix.vfs_target) || '' }}
+
+      # musl-static C dependencies (ring, oniguruma, sqlite, tree-sitter) need a
+      # musl-targeting C compiler; musl-tools provides musl-gcc. Only the Linux
+      # musl legs require it.
+      - name: Install musl C toolchain (Linux musl)
+        if: ${{ contains(matrix.target, '-linux-musl') }}
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Install cross (ARM64)
         if: matrix.cross
@@ -144,10 +160,14 @@ jobs:
         working-directory: kin-vfs
         shell: bash
         run: |
-          cargo build --release --target "$TARGET" -p kin-vfs-cli
-          cargo build --release --target "$TARGET" -p kin-vfs-shim
+          # The VFS shim is an LD_PRELOAD libc interceptor and is therefore
+          # libc-specific: on Linux it builds against gnu (VFS_TARGET) so it can
+          # preload into the host distro's glibc programs. macOS/Windows have no
+          # vfs_target, so VFS_TARGET falls back to the core target there.
+          cargo build --release --target "$VFS_TARGET" -p kin-vfs-cli
+          cargo build --release --target "$VFS_TARGET" -p kin-vfs-shim
         env:
-          TARGET: ${{ matrix.target }}
+          VFS_TARGET: ${{ matrix.vfs_target || matrix.target }}
 
       - name: Build kin-vfs (cross)
         if: ${{ matrix.cross }}
@@ -232,8 +252,10 @@ jobs:
           # archive lets `kin init` succeed but then `kin status`/`kin search`
           # fail with no daemon on PATH, so a missing daemon must fail the build.
           cp "target/${TARGET}/release/kin-daemon" "$ARTIFACT/"
-          cp "kin-vfs/target/${TARGET}/release/kin-vfs" "$ARTIFACT/" 2>/dev/null || true
-          cp "kin-vfs/target/${TARGET}/release/${SHIM_NAME}" "$ARTIFACT/" 2>/dev/null || true
+          # kin-vfs (cli + shim) is built under VFS_TARGET, which on Linux is the
+          # gnu triple (the shim is libc-specific) and elsewhere equals TARGET.
+          cp "kin-vfs/target/${VFS_TARGET}/release/kin-vfs" "$ARTIFACT/" 2>/dev/null || true
+          cp "kin-vfs/target/${VFS_TARGET}/release/${SHIM_NAME}" "$ARTIFACT/" 2>/dev/null || true
           tar czf "${ARTIFACT}.tar.gz" "$ARTIFACT"
           # Assert the published archive actually contains kin-daemon so
           # a daemon-less build can never be released green.
@@ -244,6 +266,7 @@ jobs:
           shasum -a 256 "${ARTIFACT}.tar.gz" > "${ARTIFACT}.tar.gz.sha256"
         env:
           TARGET: ${{ matrix.target }}
+          VFS_TARGET: ${{ matrix.vfs_target || matrix.target }}
           ARTIFACT: ${{ matrix.artifact }}
           SHIM_NAME: ${{ matrix.shim_name }}
 
