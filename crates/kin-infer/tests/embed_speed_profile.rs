@@ -283,6 +283,18 @@ fn metal_embed_forward_profile() {
     eprintln!(
         "forward_calls={forward_calls}  GPU submissions={submissions} ({subs_per_fwd:.1}/forward)  round_trips={round_trips} ({trips_per_fwd:.1}/forward)"
     );
+    // In-process GPU utilization, computed from Metal's own per-command-buffer
+    // GPUStartTime/GPUEndTime (not an external ioreg sampler). aggregate = total
+    // GPU-busy / wall; median = median of the per-50ms-window busy fractions
+    // (resists a front/tail-loaded burst). Reads 0 unless KIN_INFER_METAL_PROFILE
+    // is set. The >=80% saturation target keys on these.
+    let gpu_busy_ns = metal_backend::profile_gpu_busy_nanos();
+    let gpu_util_pct = metal_backend::profile_gpu_util_pct();
+    let gpu_util_median = metal_backend::profile_gpu_util_median_pct();
+    eprintln!(
+        "GPU-util = {gpu_util_pct:.1}% aggregate, {gpu_util_median:.1}% median-per-window  (GPU-busy {:.3}s of {wall_s:.3}s wall)",
+        gpu_busy_ns as f64 / 1e9
+    );
     print_pooled_output_stats("single-forward corpus");
     print_resident_stack_stats("single-forward corpus");
 

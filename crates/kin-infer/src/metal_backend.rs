@@ -60,12 +60,114 @@ static GPU_NORM_NANOS: AtomicU64 = AtomicU64::new(0);
 static GPU_ACTIVATION_NANOS: AtomicU64 = AtomicU64::new(0);
 static GPU_COPY_NANOS: AtomicU64 = AtomicU64::new(0);
 
+// In-process GPU utilization. `GPU_BUSY_NANOS` accumulates every command
+// buffer's on-GPU execution window (`GPUStartTime`/`GPUEndTime`) across BOTH the
+// synchronous `commit_wait` path AND the async `commit_bounded` completion
+// handler — so deferred-readback pipelined submissions, which never block the
+// host, still contribute their GPU-busy time. Divided by the wall-clock since
+// `reset_profile` (the `UtilSampler.anchor` below), this is a graph-native,
+// in-process util% — the trustworthy alternative to the harness's external
+// `ioreg` "Device Utilization %" sampler. Only written when `profile_enabled()`;
+// relaxed atomics + a lock taken only on the completion boundary, zero cost off.
+static GPU_BUSY_NANOS: AtomicU64 = AtomicU64::new(0);
+
+// Fixed-window utilization bucketer for the MEDIAN util%, mirroring the external
+// sampler (which medians fixed-interval samples rather than reporting one global
+// ratio). Each command buffer's GPU-busy window is attributed — split across
+// boundaries — into `UTIL_WINDOW_NANOS`-wide wall-clock buckets measured from the
+// reset anchor; `profile_gpu_util_median_pct` then medians the per-bucket
+// busy-fraction. A median resists a single front/tail-loaded burst skewing the
+// aggregate ratio. Guarded by the same `profile_enabled()` gate.
+const UTIL_WINDOW_NANOS: u64 = 50_000_000; // 50ms sampling window
+
 thread_local! {
     // The phase whose GPU command buffers should be attributed at the next
     // commit/wait boundary. Set by `time_phase` for the duration of its closure
     // (save/restore so nested phases compose), read by `commit_wait`. Only
     // touched when `profile_enabled()`.
     static CURRENT_PHASE: std::cell::Cell<Option<Phase>> = const { std::cell::Cell::new(None) };
+}
+
+/// Wall-clock + per-window state for in-process GPU-util sampling. Kept behind a
+/// single `Mutex` because `Instant` and the per-window busy-ns vector are not
+/// atomics; only touched on `reset_profile` and on each command-buffer completion
+/// boundary, and only when `profile_enabled()`, so the lock is never on a hot
+/// per-element path.
+struct UtilSampler {
+    /// Wall-clock origin set by the last `reset_profile`. `None` until the first
+    /// reset, in which case util% reads as 0 (no timed region established).
+    anchor: Option<std::time::Instant>,
+    /// GPU-busy nanoseconds accumulated per fixed `UTIL_WINDOW_NANOS` wall window,
+    /// indexed by window number measured from `anchor`. Grown sparsely as buffers
+    /// complete; a window with no GPU work stays implicitly 0.
+    windows: Vec<u64>,
+}
+
+impl UtilSampler {
+    const fn new() -> Self {
+        UtilSampler {
+            anchor: None,
+            windows: Vec::new(),
+        }
+    }
+
+    /// Attribute a command buffer's GPU-busy window `[start_ns, end_ns)` (both
+    /// measured from `anchor`) across the fixed wall-clock buckets it overlaps, so
+    /// a buffer that straddles a window boundary contributes to each window in
+    /// proportion to its overlap — the same accounting a fixed-interval external
+    /// sampler would produce. No-op if no anchor is set or the window is empty.
+    fn attribute(&mut self, start_ns: u64, busy_ns: u64) {
+        if self.anchor.is_none() || busy_ns == 0 {
+            return;
+        }
+        let end_ns = start_ns.saturating_add(busy_ns);
+        let mut cursor = start_ns;
+        while cursor < end_ns {
+            let window_idx = (cursor / UTIL_WINDOW_NANOS) as usize;
+            let window_end = (window_idx as u64 + 1) * UTIL_WINDOW_NANOS;
+            let slice_end = end_ns.min(window_end);
+            let slice = slice_end - cursor;
+            if window_idx >= self.windows.len() {
+                self.windows.resize(window_idx + 1, 0);
+            }
+            self.windows[window_idx] = self.windows[window_idx].saturating_add(slice);
+            cursor = slice_end;
+        }
+    }
+}
+
+fn util_sampler() -> &'static Mutex<UtilSampler> {
+    use std::sync::OnceLock;
+    static SAMPLER: OnceLock<Mutex<UtilSampler>> = OnceLock::new();
+    SAMPLER.get_or_init(|| Mutex::new(UtilSampler::new()))
+}
+
+/// Record a completed command buffer's GPU-busy time into the total
+/// [`GPU_BUSY_NANOS`] accumulator and the fixed-window median sampler. Called
+/// from both the synchronous (`commit_wait`) and asynchronous (`commit_bounded`
+/// completion handler) boundaries so the pipelined, deferred-readback path is
+/// counted too. The window position uses the host monotonic clock (`now -
+/// anchor`) — the same timebase as the reset anchor — rather than the GPU's
+/// separate `GPUStartTime` clock, so the busy window is placed where the host
+/// observed it complete (accurate well within a 50ms window). No-op when
+/// profiling is off or the GPU window is degenerate.
+#[inline]
+fn record_gpu_busy(cmd: &CommandBufferRef) {
+    if !profile_enabled() {
+        return;
+    }
+    let busy_ns = cmd_gpu_nanos(cmd);
+    if busy_ns == 0 {
+        return;
+    }
+    GPU_BUSY_NANOS.fetch_add(busy_ns, Ordering::Relaxed);
+    let mut sampler = util_sampler().lock();
+    if let Some(anchor) = sampler.anchor {
+        // Place the busy window so it ENDS at the observed completion instant.
+        let end_ns = anchor.elapsed().as_nanos() as u64;
+        let start_ns = end_ns.saturating_sub(busy_ns);
+        sampler.attribute(start_ns, busy_ns);
+    }
 }
 
 /// Kernel-class buckets for per-phase profiling.
@@ -449,6 +551,80 @@ pub fn profile_gpu_phase_nanos() -> Vec<(&'static str, u64)> {
     ]
 }
 
+/// Total nanoseconds the GPU spent EXECUTING command buffers since the last
+/// `reset_profile`, summed from every buffer's `GPUStartTime`/`GPUEndTime` across
+/// both the synchronous and deferred-readback submission paths. Only meaningful
+/// when `KIN_INFER_METAL_PROFILE` is set. The numerator of the in-process util%.
+pub fn profile_gpu_busy_nanos() -> u64 {
+    GPU_BUSY_NANOS.load(Ordering::Relaxed)
+}
+
+/// Wall-clock nanoseconds elapsed since the last `reset_profile`, measured on the
+/// host monotonic clock (the same anchor the util windows use). 0 until the first
+/// reset establishes a timed region. The denominator of the aggregate util%.
+pub fn profile_wall_nanos() -> u64 {
+    util_sampler()
+        .lock()
+        .anchor
+        .map(|a| a.elapsed().as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// In-process GPU utilization since the last `reset_profile`, as a percentage in
+/// `[0, 100]`: total GPU-busy time / wall-clock time. This is the graph-native,
+/// in-process answer to "is the GPU saturated" — computed from Metal's own
+/// per-command-buffer execution timestamps rather than the harness's external
+/// `ioreg` "Device Utilization %" sampler. Pipelined, deferred-readback
+/// submissions are included (they are attributed in the completion handler), so a
+/// well-pipelined forward that keeps several command buffers in flight reads near
+/// 100% even though no single host thread is ever blocked on the GPU. Returns 0.0
+/// when profiling is off or no timed region has run. Clamped to 100 because the
+/// busy windows of concurrently in-flight buffers can overlap in wall time.
+pub fn profile_gpu_util_pct() -> f64 {
+    let busy = GPU_BUSY_NANOS.load(Ordering::Relaxed);
+    let wall = profile_wall_nanos();
+    if wall == 0 {
+        return 0.0;
+    }
+    (busy as f64 / wall as f64 * 100.0).min(100.0)
+}
+
+/// Median per-window GPU utilization (%) since the last `reset_profile`, the
+/// in-process analog of the external sampler's median-of-fixed-interval-samples.
+/// Each `UTIL_WINDOW_NANOS`-wide wall window from the reset anchor up to now
+/// (including trailing windows with no GPU work, counted as 0%) yields one
+/// busy-fraction sample; the median of those samples is returned, clamped to
+/// `[0, 100]`. A median resists a single front- or tail-loaded burst inflating
+/// the aggregate ratio, so it is the honest "sustained saturation" number the
+/// ≥80% gate wants. Returns 0.0 when profiling is off or no window has elapsed.
+pub fn profile_gpu_util_median_pct() -> f64 {
+    let sampler = util_sampler().lock();
+    let Some(anchor) = sampler.anchor else {
+        return 0.0;
+    };
+    // Number of fully- or partially-elapsed windows in the timed region, so a run
+    // that idled the GPU late still contributes those windows as 0% samples.
+    let elapsed_ns = anchor.elapsed().as_nanos() as u64;
+    let window_count = (elapsed_ns / UTIL_WINDOW_NANOS + 1) as usize;
+    if window_count == 0 {
+        return 0.0;
+    }
+    let mut samples: Vec<f64> = (0..window_count)
+        .map(|i| {
+            let busy = sampler.windows.get(i).copied().unwrap_or(0);
+            (busy as f64 / UTIL_WINDOW_NANOS as f64 * 100.0).min(100.0)
+        })
+        .collect();
+    drop(sampler);
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = samples.len() / 2;
+    if samples.len().is_multiple_of(2) {
+        (samples[mid - 1] + samples[mid]) / 2.0
+    } else {
+        samples[mid]
+    }
+}
+
 /// Zero the host-stall and per-phase accumulators. Call before a timed region.
 pub fn reset_profile() {
     STALL_NANOS.store(0, Ordering::Relaxed);
@@ -465,6 +641,14 @@ pub fn reset_profile() {
     GPU_NORM_NANOS.store(0, Ordering::Relaxed);
     GPU_ACTIVATION_NANOS.store(0, Ordering::Relaxed);
     GPU_COPY_NANOS.store(0, Ordering::Relaxed);
+    // In-process util%: zero the busy accumulator, drop prior windows, and start
+    // the wall-clock anchor NOW so util% covers exactly the upcoming timed region.
+    GPU_BUSY_NANOS.store(0, Ordering::Relaxed);
+    {
+        let mut sampler = util_sampler().lock();
+        sampler.windows.clear();
+        sampler.anchor = Some(std::time::Instant::now());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3116,6 +3300,12 @@ impl MetalCompute {
                     "kin_infer.metal.commit_bounded: command buffer completed in Error state"
                 );
             }
+            // Count this buffer's on-GPU window toward the in-process util%. The
+            // handler fires after completion, so `GPUStartTime`/`GPUEndTime` are
+            // valid — this is the ONLY place the deferred-readback path can be
+            // attributed (the host never waits on it). Gated inside
+            // `record_gpu_busy` so it is a no-op when profiling is off.
+            record_gpu_busy(cb);
             // Recycle retained buffers (drop returns them to the pool) before
             // releasing the in-flight slot.
             retain.lock().take();
@@ -3155,6 +3345,11 @@ impl MetalCompute {
                     .gpu_counter()
                     .fetch_add(cmd_gpu_nanos(cmd), Ordering::Relaxed);
             }
+            // NB: the total/windowed GPU-busy for the in-process util% is recorded
+            // by the `commit_bounded` completion handler (invoked above), which
+            // fires for THIS buffer too — recording it again here would
+            // double-count. The per-phase attribution stays here because it needs
+            // the committing thread's `time_phase` thread-local.
         }
     }
 
@@ -6555,6 +6750,61 @@ mod tests {
         PROFILE_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn util_sampler_attributes_busy_span_across_windows() {
+        // A busy span that straddles a window boundary is split proportionally
+        // into each window it overlaps — the same accounting a fixed-interval
+        // sampler would produce. Window 0 is [0, W); the span [W/2, W + W/4)
+        // contributes W/2 to window 0 and W/4 to window 1.
+        let w = UTIL_WINDOW_NANOS;
+        let mut sampler = UtilSampler::new();
+        sampler.anchor = Some(std::time::Instant::now());
+        sampler.attribute(w / 2, w / 2 + w / 4);
+        assert_eq!(sampler.windows.len(), 2);
+        assert_eq!(sampler.windows[0], w / 2);
+        assert_eq!(sampler.windows[1], w / 4);
+    }
+
+    #[test]
+    fn util_sampler_no_op_without_anchor() {
+        // Before any reset establishes an anchor, attribution records nothing —
+        // util% reads as "no timed region" rather than a bogus fraction.
+        let mut sampler = UtilSampler::new();
+        sampler.attribute(0, UTIL_WINDOW_NANOS);
+        assert!(sampler.windows.is_empty());
+    }
+
+    #[test]
+    fn util_median_counts_trailing_idle_windows_as_zero() {
+        // Two fully-busy windows followed by two idle windows must median to a
+        // value reflecting the late stall — not stay pinned at 100% — so the
+        // median is the honest "sustained saturation" number. Sampling under the
+        // process-wide profile lock since the util sampler is global state.
+        let _guard = profile_test_lock();
+        let w = UTIL_WINDOW_NANOS;
+        {
+            let mut sampler = util_sampler().lock();
+            sampler.windows.clear();
+            // Backdate the anchor by ~4 windows so `profile_gpu_util_median_pct`
+            // sees four elapsed windows, the last two of which have no GPU work.
+            sampler.anchor = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_nanos(4 * w + w / 2));
+            sampler.windows = vec![w, w, 0, 0]; // 100%, 100%, 0%, 0%
+        }
+        let median = profile_gpu_util_median_pct();
+        // Median of [100, 100, 0, 0, 0] (>=5 windows incl. the current partial) is
+        // 0; of an even count it averages the two middles. Either way the trailing
+        // idle drags it well below 100 — the property under test.
+        assert!(
+            median < 60.0,
+            "median util% should reflect trailing idle, got {median}"
+        );
+        // Leave global state clean for other tests.
+        let mut sampler = util_sampler().lock();
+        sampler.windows.clear();
+        sampler.anchor = None;
     }
 
     #[test]

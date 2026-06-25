@@ -242,6 +242,21 @@ impl GpuKernelPlan {
         if matches!(profile, Profile::Throughput) && matches!(backend, AcceleratorBackend::Metal) {
             plan.pooled_output = true;
             plan.steel = true;
+            // The wider 64x64 MMA register tile. Numerically identical to the
+            // 32x32 MMA (same fp32 `simdgroup_float8x8` accumulate, same
+            // per-fragment 8-wide reduction order — only the output blocking
+            // changes), so embedding values are preserved by construction, the
+            // same parity class as `steel` above. The shared `encode_mma` dispatch
+            // routes the resident batched stack through this gate too, raising
+            // arithmetic intensity on the matmul-dominant resident path. Stays off
+            // under proof (bit-identical) and is overridable per lever via
+            // `KIN_INFER_MMA_WIDE`.
+            plan.mma_wide = true;
+            // `flash_attention` stays off here on purpose. The fused online-softmax
+            // kernel changes the attention reduction order — its matches-CPU test
+            // is tolerance-based (5e-4), not bit-identical — unlike steel/wide
+            // which are identical by construction, so it can perturb embedding
+            // values. It remains opt-in via `KIN_INFER_FLASH_ATTENTION=1`.
         }
         plan
     }
@@ -992,6 +1007,7 @@ mod tests {
             GpuKernelPlan {
                 pooled_output: true,
                 steel: true,
+                mma_wide: true,
                 ..GpuKernelPlan::default()
             }
         );
@@ -1016,6 +1032,7 @@ mod tests {
                     GpuKernelPlan {
                         pooled_output: true,
                         steel: true,
+                        mma_wide: true,
                         ..GpuKernelPlan::default()
                     }
                 } else {
