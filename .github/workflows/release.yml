@@ -7,6 +7,15 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      notarize_on_linux:
+        description: >-
+          Notarize the macOS binaries from a Linux runner via rcodesign instead
+          of running xcrun notarytool on the macOS build runner. Leave unchecked
+          to use the native macOS notarytool path (the proven default).
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -15,8 +24,38 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Resolve a single effective "notarize on Linux" flag for the whole run. The
+  # macOS legs still build + codesign natively; only the Apple Notary submission
+  # moves to a 1x Linux runner (macOS minutes bill 10x) when this is on.
+  #
+  # Source of truth, in order:
+  #   1. the workflow_dispatch boolean input (for one-off validation runs)
+  #   2. the repository variable NOTARIZE_ON_LINUX == 'true' (the persistent
+  #      cutover switch — flip it once the Linux leg is proven green)
+  # When neither is set, notarization stays on macOS notarytool (the fallback).
+  config:
+    name: Resolve release config
+    runs-on: ubuntu-latest
+    outputs:
+      notarize_on_linux: ${{ steps.flags.outputs.notarize_on_linux }}
+    steps:
+      - name: Resolve notarize backend
+        id: flags
+        env:
+          DISPATCH_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.notarize_on_linux || '' }}
+          REPO_VAR: ${{ vars.NOTARIZE_ON_LINUX }}
+        run: |
+          if [ "$DISPATCH_INPUT" = "true" ] || [ "$REPO_VAR" = "true" ]; then
+            echo "notarize_on_linux=true" >> "$GITHUB_OUTPUT"
+            echo "Notarization backend: rcodesign on Linux"
+          else
+            echo "notarize_on_linux=false" >> "$GITHUB_OUTPUT"
+            echo "Notarization backend: xcrun notarytool on macOS (default)"
+          fi
+
   build:
     name: Build (${{ matrix.artifact }})
+    needs: config
     runs-on: ${{ matrix.os }}
     # Windows is a work-in-progress release target while the vector-free
     # dependency path is hardened. It must not block the macOS/Linux release:
@@ -34,6 +73,11 @@ jobs:
       APPLE_ID: ${{ secrets.APPLE_ID }}
       APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      # When true, the macOS leg codesigns and uploads the signed-but-unnotarized
+      # zip, and the separate notarize_linux job submits it to Apple Notary via
+      # rcodesign. When false (default), the macOS leg notarizes inline with
+      # xcrun notarytool — the proven fallback path.
+      NOTARIZE_ON_LINUX: ${{ needs.config.outputs.notarize_on_linux }}
     strategy:
       fail-fast: false
       matrix:
@@ -215,10 +259,16 @@ jobs:
           TARGET: ${{ matrix.target }}
           SHIM_NAME: ${{ matrix.shim_name }}
 
-      - name: Notarize macOS binaries
+      # Zip the signed Mach-O binaries for notarization. Apple Notary accepts a
+      # zip of standalone executables/dylibs (the same input notarytool takes);
+      # bare binaries cannot be stapled, so the ticket lives on Apple's servers
+      # and is validated online by Gatekeeper on first run regardless of which
+      # tool submits the zip. Built once here and reused by whichever backend
+      # notarizes (macOS notarytool inline, or rcodesign on the Linux job).
+      - name: Stage signed binaries for notarization (macOS)
         if: ${{ runner.os == 'macOS' && env.MACOS_CERTIFICATE != '' && env.APPLE_ID != '' }}
         run: |
-          NOTARIZE_ZIP="$RUNNER_TEMP/${ARTIFACT}-notarize.zip"
+          NOTARIZE_ZIP="${ARTIFACT}-notarize.zip"
           FILES=()
           for f in \
             "target/${TARGET}/release/kin" \
@@ -228,7 +278,18 @@ jobs:
             [ -f "$f" ] && FILES+=("$f")
           done
           zip -j "$NOTARIZE_ZIP" "${FILES[@]}"
-          xcrun notarytool submit "$NOTARIZE_ZIP" \
+        env:
+          TARGET: ${{ matrix.target }}
+          SHIM_NAME: ${{ matrix.shim_name }}
+          ARTIFACT: ${{ matrix.artifact }}
+
+      # Fallback / default backend: notarize inline on the macOS runner. Runs
+      # only when the Linux backend is NOT selected, so flipping NOTARIZE_ON_LINUX
+      # cleanly swaps backends without ever double-submitting.
+      - name: Notarize macOS binaries (notarytool)
+        if: ${{ runner.os == 'macOS' && env.MACOS_CERTIFICATE != '' && env.APPLE_ID != '' && env.NOTARIZE_ON_LINUX != 'true' }}
+        run: |
+          xcrun notarytool submit "${ARTIFACT}-notarize.zip" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
@@ -239,9 +300,19 @@ jobs:
           # online by Gatekeeper on first run. If a .dmg/.pkg installer is added
           # later, run `xcrun stapler staple <installer>` here.
         env:
-          TARGET: ${{ matrix.target }}
-          SHIM_NAME: ${{ matrix.shim_name }}
           ARTIFACT: ${{ matrix.artifact }}
+
+      # Linux backend: hand the signed zip to the notarize_linux job, which
+      # submits it to Apple Notary via rcodesign on a (10x cheaper) Linux runner.
+      # The zip is short-lived job-internal plumbing, not a published artifact.
+      - name: Upload signed binaries for Linux notarization
+        if: ${{ runner.os == 'macOS' && env.MACOS_CERTIFICATE != '' && env.APPLE_ID != '' && env.NOTARIZE_ON_LINUX == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}-notarize-zip
+          path: ${{ matrix.artifact }}-notarize.zip
+          retention-days: 1
+          if-no-files-found: error
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -304,9 +375,90 @@ jobs:
             ${{ matrix.artifact }}.zip
             ${{ matrix.artifact }}.zip.sha256
 
+  # Notarize the macOS binaries from a Linux runner via rcodesign (the
+  # apple-codesign Rust tool). Runs ONLY when NOTARIZE_ON_LINUX is selected; the
+  # build job has already codesigned natively on macOS and uploaded the signed
+  # zips. rcodesign calls the same Apple Notary API as notarytool and accepts the
+  # same zip of standalone Mach-O binaries, so the resulting ticket (server-side,
+  # keyed by code-signature hash) covers the identical binaries already packaged
+  # into the published .tar.gz — the published artifacts are unchanged. This job
+  # is a gate: if notarization fails, the release fails.
+  notarize_linux:
+    name: Notarize macOS binaries (Linux / rcodesign)
+    needs: [config, build]
+    if: ${{ needs.config.outputs.notarize_on_linux == 'true' }}
+    runs-on: ubuntu-latest
+    env:
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+      # Pin rcodesign so a release never depends on a moving upstream binary.
+      RCODESIGN_VERSION: "0.29.0"
+      RCODESIGN_SHA256: "dbe85cedd8ee4217b64e9a0e4c2aef92ab8bcaaa41f20bde99781ff02e600002"
+    steps:
+      - name: Download signed notarization zips
+        uses: actions/download-artifact@v8
+        with:
+          pattern: "*-notarize-zip"
+          merge-multiple: true
+
+      - name: Install rcodesign (pinned, checksum-verified)
+        run: |
+          asset="apple-codesign-${RCODESIGN_VERSION}-x86_64-unknown-linux-musl"
+          url="https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F${RCODESIGN_VERSION}/${asset}.tar.gz"
+          curl -fsSL -o rcodesign.tar.gz "$url"
+          echo "${RCODESIGN_SHA256}  rcodesign.tar.gz" | sha256sum -c -
+          tar xzf rcodesign.tar.gz
+          install -m 0755 "${asset}/rcodesign" /usr/local/bin/rcodesign
+          rcodesign --version
+
+      - name: Notarize signed binaries via rcodesign
+        if: ${{ env.APPLE_API_ISSUER_ID != '' && env.APPLE_API_KEY_ID != '' && env.APPLE_API_PRIVATE_KEY != '' }}
+        run: |
+          # Reconstruct the App Store Connect API .p8 and fold it (with the
+          # issuer + key id) into the single unified key JSON rcodesign expects.
+          umask 077
+          KEY_DIR="$RUNNER_TEMP/asc-key"
+          mkdir -p "$KEY_DIR"
+          P8_PATH="$KEY_DIR/AuthKey.p8"
+          KEY_JSON="$KEY_DIR/api-key.json"
+          printf '%s' "$APPLE_API_PRIVATE_KEY" | base64 --decode > "$P8_PATH"
+          rcodesign encode-app-store-connect-api-key \
+            -o "$KEY_JSON" \
+            "$APPLE_API_ISSUER_ID" \
+            "$APPLE_API_KEY_ID" \
+            "$P8_PATH"
+
+          # One signed zip per macOS leg. --wait blocks on Apple Notary;
+          # --max-wait-seconds 1800 mirrors the macOS notarytool 30m cap so a
+          # stalled Apple queue fails fast (and a re-run picks up the result).
+          # Bare binaries are not stapled (the ticket validates online), exactly
+          # as the macOS notarytool path does.
+          shopt -s nullglob
+          zips=(*-notarize.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "::error::no signed notarization zips were downloaded — nothing to notarize"
+            exit 1
+          fi
+          for zip in "${zips[@]}"; do
+            echo "Submitting $zip to Apple Notary via rcodesign"
+            rcodesign notary-submit \
+              --api-key-file "$KEY_JSON" \
+              --wait \
+              --max-wait-seconds 1800 \
+              "$zip"
+          done
+
+          rm -f "$P8_PATH" "$KEY_JSON"
+
   publish:
     name: Publish Release
-    needs: build
+    needs: [build, notarize_linux]
+    # notarize_linux is skipped on the default (macOS notarytool) path; publish
+    # must still run then, but must NOT run if notarization actually failed or
+    # was cancelled. `always() && !failure() && !cancelled()` lets a skipped
+    # dependency through while still gating on a real Linux-notarize failure.
+    if: ${{ always() && !failure() && !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
