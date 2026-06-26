@@ -123,6 +123,71 @@ pub struct LocateSymbol {
     /// from the vector pool. Recorded under --explain only; never affects rank.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cosine: Option<f32>,
+    /// Bounded inline source snippet: the symbol's signature plus the first
+    /// several body lines, projected from graph-owned content (the same
+    /// content-addressed, hash-verified body `get_entity_source` and
+    /// `semantic_locate` serve), capped for density. Lets an agent act on the
+    /// first `locate` without a follow-up file read. Populated only on the
+    /// structured/agent JSON surface when snippets are requested; `None`
+    /// otherwise or on a graph gap. Never read from the working tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+}
+
+/// Controls the bounded inline snippet attached to located symbols. Disabled by
+/// default so non-agent and in-process callers (and human CLI output) are
+/// byte-identical; the structured/agent JSON path (`kin locate --json`, the
+/// daemon `/locate` result) turns it on. Caps default to the shared
+/// retrieval-snippet bound used by every agent surface (locate symbols and
+/// `semantic_locate` hits alike) and are env-overridable.
+#[derive(Clone, Copy, Debug)]
+pub struct SnippetOptions {
+    /// Whether to project snippets at all.
+    pub enabled: bool,
+    /// Max snippet lines per symbol (signature + first body lines).
+    pub max_lines: usize,
+    /// Hard char cap per snippet.
+    pub max_chars: usize,
+    /// Max definition symbols per file that receive a snippet (top-ranked
+    /// first); the rest keep coordinates only, so the payload stays dense.
+    pub max_symbols_per_file: usize,
+}
+
+/// Default count of top definition symbols per file that receive a snippet.
+const DEFAULT_SNIPPET_SYMBOLS: usize = 4;
+
+impl Default for SnippetOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_lines: kin_mcp::handlers::common::RETRIEVAL_SNIPPET_MAX_LINES,
+            max_chars: kin_mcp::handlers::common::RETRIEVAL_SNIPPET_MAX_CHARS,
+            max_symbols_per_file: DEFAULT_SNIPPET_SYMBOLS,
+        }
+    }
+}
+
+impl SnippetOptions {
+    /// Enabled options. `max_lines` honors an explicit per-request override,
+    /// else `KIN_LOCATE_SNIPPET_LINES`, else the shared default; the char and
+    /// per-file-symbol caps honor `KIN_LOCATE_SNIPPET_CHARS` /
+    /// `KIN_LOCATE_SNIPPET_SYMBOLS`.
+    pub fn enabled(max_lines: Option<usize>) -> Self {
+        let base = Self::default();
+        let lines = max_lines
+            .unwrap_or_else(|| locate_env_usize("KIN_LOCATE_SNIPPET_LINES", base.max_lines))
+            .clamp(1, 200);
+        Self {
+            enabled: true,
+            max_lines: lines,
+            max_chars: locate_env_usize("KIN_LOCATE_SNIPPET_CHARS", base.max_chars).clamp(1, 8000),
+            max_symbols_per_file: locate_env_usize(
+                "KIN_LOCATE_SNIPPET_SYMBOLS",
+                base.max_symbols_per_file,
+            )
+            .clamp(1, 50),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -778,6 +843,7 @@ pub async fn run(
     max_files: usize,
     max_files_explicit: bool,
     reference: Option<String>,
+    snippets: bool,
 ) -> Result<()> {
     let _span = tracing::info_span!(
         "kin.locate",
@@ -787,7 +853,15 @@ pub async fn run(
         max_files = max_files
     )
     .entered();
-    let result = capture(text, explain, max_files, max_files_explicit, reference).await?;
+    let result = capture(
+        text,
+        explain,
+        max_files,
+        max_files_explicit,
+        reference,
+        snippets,
+    )
+    .await?;
     output_result(&result, json);
     Ok(())
 }
@@ -798,6 +872,7 @@ pub async fn capture(
     max_files: usize,
     max_files_explicit: bool,
     reference: Option<String>,
+    snippets: bool,
 ) -> Result<LocateResult> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
@@ -814,6 +889,7 @@ pub async fn capture(
         max_files,
         max_files_explicit,
         reference,
+        snippets,
     )
     .await?;
     record_locate_telemetry(&layout, text, max_files, &result);
@@ -896,6 +972,7 @@ async fn try_locate_via_daemon(
     max_files: usize,
     max_files_explicit: bool,
     reference: Option<String>,
+    snippets: bool,
 ) -> Result<LocateResult> {
     let daemon_url = std::env::var("KIN_DAEMON_URL")
         .ok()
@@ -912,6 +989,8 @@ async fn try_locate_via_daemon(
         max_files,
         max_files_explicit,
         reference,
+        snippets,
+        snippet_lines: None,
     };
     client
         .locate(&request)
@@ -994,6 +1073,7 @@ pub fn run_with_graph_capture_with_priority_files(
         max_files_explicit,
         extra_priority_files,
         None,
+        SnippetOptions::default(),
     )
 }
 
@@ -1006,6 +1086,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     max_files_explicit: bool,
     extra_priority_files: Vec<(String, f32)>,
     vector_source: Option<&kin_db::InMemoryGraph>,
+    snippet_opts: SnippetOptions,
 ) -> Result<LocateResult> {
     let _span = tracing::info_span!(
         "kin.locate.run_with_graph",
@@ -2652,7 +2733,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         );
     }
 
-    Ok(build_result(
+    let mut result = build_result(
         &results,
         &all_hits,
         &projection_explain,
@@ -2663,7 +2744,12 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         debug_info,
         explain,
     )
-    .with_semantic_coverage(semantic_coverage))
+    .with_semantic_coverage(semantic_coverage);
+    // Project bounded inline snippets from graph-owned content (no extra IO on
+    // the working tree). No-op unless requested; the early budget-exhausted
+    // return above carries no symbols, so it needs no snippets.
+    attach_snippets(&mut result, graph, &snippet_opts);
+    Ok(result)
 }
 
 pub fn run_with_graph_capture_at_ref(
@@ -2676,6 +2762,7 @@ pub fn run_with_graph_capture_at_ref(
     explain: bool,
     max_files: usize,
     max_files_explicit: bool,
+    snippet_opts: SnippetOptions,
 ) -> Result<LocateResult> {
     let changes = kin_core::collect_changes_at_ref(graph, head)
         .map_err(|err| anyhow::anyhow!(err.to_string()))?;
@@ -2710,6 +2797,7 @@ pub fn run_with_graph_capture_at_ref(
         max_files_explicit,
         extra_priority_files,
         Some(graph),
+        snippet_opts,
     )
 }
 
@@ -8917,6 +9005,7 @@ fn resolve_entities_to_files(
                     } else {
                         None
                     },
+                    snippet: None,
                 };
                 file_symbols.entry(path.clone()).or_default().push(symbol);
                 if explain {
@@ -12956,6 +13045,7 @@ fn rank_enriched_symbols(
                 definition: true,
                 origin: String::new(),
                 cosine: None,
+                snippet: None,
             }
         })
         .collect();
@@ -13073,6 +13163,7 @@ fn apply_query_relevance(
             definition: true,
             origin: String::new(),
             cosine: None,
+            snippet: None,
         });
     }
     existing
@@ -13287,6 +13378,7 @@ fn rank_body_relevant_symbols(
             definition: true,
             origin: String::new(),
             cosine: None,
+            snippet: None,
         })
         .collect()
 }
@@ -13619,6 +13711,83 @@ fn collect_explain_for_file(
     } else {
         vec![format!("matched signals: {}", signals.join(", "))]
     }
+}
+
+/// Attach a bounded inline snippet to the top definition symbols of every
+/// located file. The body is projected from graph-owned content through the
+/// shared [`kin_mcp::handlers::common::read_entity_source_excerpt_detailed`]
+/// projection (content-addressed, hash-verified — the same bytes
+/// `get_entity_source` and `semantic_locate` serve), so there is no working-tree
+/// read: a graph/blob miss simply leaves the symbol as coordinates-only.
+///
+/// Additive: symbol set, ordering, and scores are untouched (the ContextBench
+/// scorer derives its predicted symbol set from `symbols[].name`, which is
+/// unchanged), so retrieval scoring and proof are unaffected. A no-op unless
+/// `opts.enabled`.
+pub fn attach_snippets(
+    result: &mut LocateResult,
+    graph: &kin_db::InMemoryGraph,
+    opts: &SnippetOptions,
+) {
+    if !opts.enabled {
+        return;
+    }
+    for file in result.files.iter_mut() {
+        if file.symbols.is_empty() {
+            continue;
+        }
+        let filter = EntityFilter {
+            file_path: Some(kin_model::FilePathId::new(&file.path)),
+            ..Default::default()
+        };
+        let Ok(entities) = graph.query_entities(&filter) else {
+            continue;
+        };
+        if entities.is_empty() {
+            continue;
+        }
+        let mut filled = 0usize;
+        for sym in file.symbols.iter_mut() {
+            if filled >= opts.max_symbols_per_file {
+                break;
+            }
+            // References/re-exports have no body to surface; only definitions.
+            if !sym.definition {
+                continue;
+            }
+            let Some(entity) = match_symbol_entity(&entities, sym) else {
+                continue;
+            };
+            if let Some(snippet) = kin_mcp::handlers::common::read_entity_source_excerpt_detailed(
+                graph,
+                entity,
+                opts.max_lines,
+                opts.max_chars,
+            ) {
+                sym.snippet = Some(snippet);
+                filled += 1;
+            }
+        }
+    }
+}
+
+/// Resolve a located symbol to its graph entity by name, disambiguating by start
+/// line when the symbol carries a span (so same-name overloads map to the right
+/// definition). Falls back to a name-only match when spans are absent.
+fn match_symbol_entity<'a>(
+    entities: &'a [kin_model::Entity],
+    sym: &LocateSymbol,
+) -> Option<&'a kin_model::Entity> {
+    let start_line = sym.span.map(|s| s[0]);
+    entities
+        .iter()
+        .find(|e| {
+            e.name == sym.name
+                && start_line
+                    .zip(e.span.as_ref())
+                    .is_some_and(|(sl, es)| es.start_line == sl)
+        })
+        .or_else(|| entities.iter().find(|e| e.name == sym.name))
 }
 
 fn build_result(
@@ -14567,6 +14736,7 @@ mod tests {
             definition: true,
             origin: String::new(),
             cosine: None,
+            snippet: None,
         };
         let json = serde_json::to_string(&symbol).unwrap();
         assert!(
@@ -14597,6 +14767,7 @@ mod tests {
             definition,
             origin: String::new(),
             cosine: None,
+            snippet: None,
         }
     }
 
@@ -19401,6 +19572,7 @@ mod tests {
             false,
             10,
             true,
+            SnippetOptions::default(),
         )
         .unwrap();
         assert_eq!(
@@ -19423,6 +19595,7 @@ mod tests {
             false,
             10,
             true,
+            SnippetOptions::default(),
         )
         .unwrap();
         assert!(

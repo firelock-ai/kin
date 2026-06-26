@@ -247,6 +247,15 @@ enum Command {
         /// and semantic changes as `kin:<id>`, `change:<id>`, or bare change IDs.
         #[arg(long = "ref", value_name = "REF")]
         reference: Option<String>,
+        /// Attach a bounded inline source snippet (signature + first body lines)
+        /// to each top definition symbol. Default ON for `--json` (the agent
+        /// surface), so an agent can act on the first locate without a follow-up
+        /// read; force it on for any output with this flag.
+        #[arg(long)]
+        snippets: bool,
+        /// Suppress inline snippets even on the `--json` surface.
+        #[arg(long = "no-snippets", conflicts_with = "snippets")]
+        no_snippets: bool,
     },
     /// Debug locate results: show per-signal breakdown, rank gold files,
     /// and diagnose why targets were missed.
@@ -1845,7 +1854,14 @@ fn main() -> Result<()> {
                     gold,
                     max_files,
                     reference,
+                    snippets,
+                    no_snippets,
                 } => {
+                    // Inline snippets default ON for the structured/agent `--json`
+                    // surface (so an agent gets code on the first locate);
+                    // --diagnose stays lean unless --snippets is explicit;
+                    // --no-snippets always wins.
+                    let want_snippets = !no_snippets && (snippets || (json && !diagnose));
                     // --diagnose implies --json --explain
                     let json = json || diagnose;
                     let explain = explain || diagnose;
@@ -1871,6 +1887,7 @@ fn main() -> Result<()> {
                             max_files_val,
                             max_files_explicit,
                             reference,
+                            want_snippets,
                         )
                         .await?;
 
@@ -1994,6 +2011,7 @@ fn main() -> Result<()> {
                             max_files_val,
                             max_files_explicit,
                             reference,
+                            want_snippets,
                         )
                         .await
                     }
