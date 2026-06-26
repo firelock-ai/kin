@@ -9,7 +9,7 @@ use crate::ids::{ContractId, EntityId, FilePathId, IntentId, SessionId};
 use crate::timestamp::Timestamp;
 
 /// How the agent session connects to Kin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum SessionTransport {
     /// MCP (Model Context Protocol) connection.
     Mcp,
@@ -22,7 +22,7 @@ pub enum SessionTransport {
 }
 
 /// Capabilities declared by the agent session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionCapabilities {
     /// Agent can read files.
     pub can_read: bool,
@@ -52,7 +52,7 @@ impl Default for SessionCapabilities {
 }
 
 /// A registered agent session (transient, not part of semantic history).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentSession {
     pub session_id: SessionId,
     /// Vendor identifier: "claude-code", "codex", "gemini-cli", etc.
@@ -74,7 +74,7 @@ pub struct AgentSession {
 }
 
 /// Lock strength for an intent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum LockType {
     /// Advisory lock: other agents see a warning but can proceed.
     Soft,
@@ -83,7 +83,7 @@ pub enum LockType {
 }
 
 /// What an intent targets.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum IntentScope {
     /// An entity in the semantic graph.
     Entity(EntityId),
@@ -97,7 +97,7 @@ pub enum IntentScope {
 ///
 /// Intents represent what an agent plans to modify, enabling collision
 /// detection before conflicting writes occur.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Intent {
     pub intent_id: IntentId,
     /// Session that owns this intent.
@@ -115,7 +115,7 @@ pub struct Intent {
 }
 
 /// Classification of an intent conflict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum IntentConflict {
     /// Two hard locks on the same scope.
     HardCollision,
@@ -126,7 +126,7 @@ pub enum IntentConflict {
 }
 
 /// Summary of an intent for display in traffic reports.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct IntentSummary {
     pub intent_id: IntentId,
     pub session_id: SessionId,
@@ -150,7 +150,7 @@ impl IntentSummary {
 ///
 /// Shows what agents are actively working on or near a given
 /// entity/contract/file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TrafficReport {
     /// The scope being queried.
     pub target: IntentScope,
@@ -161,7 +161,7 @@ pub struct TrafficReport {
 }
 
 /// Events emitted by the coordination system.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum CoordinationEvent {
     /// A new session was registered.
     SessionRegistered {

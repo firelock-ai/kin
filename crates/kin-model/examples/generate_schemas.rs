@@ -66,6 +66,22 @@ fn main() {
             "RiskLevel",
             serde_json::to_string_pretty(&schema_for!(kin_model::RiskLevel)).unwrap(),
         ),
+        (
+            "intent",
+            serde_json::to_string_pretty(&schema_for!(kin_model::Intent)).unwrap(),
+        ),
+        (
+            "TrafficReport",
+            serde_json::to_string_pretty(&schema_for!(kin_model::TrafficReport)).unwrap(),
+        ),
+        (
+            "IntentSummary",
+            serde_json::to_string_pretty(&schema_for!(kin_model::IntentSummary)).unwrap(),
+        ),
+        (
+            "AgentSession",
+            serde_json::to_string_pretty(&schema_for!(kin_model::AgentSession)).unwrap(),
+        ),
     ];
 
     for (name, schema) in &schemas {
