@@ -1037,6 +1037,32 @@ pub fn read_entity_source_excerpt_detailed<G: GraphStore>(
     None
 }
 
+/// Caps for the inline snippet surfaced on a retrieval hit (`kin locate --json`
+/// symbols, `semantic_locate` entity results): a signature plus the first
+/// several body lines — dense enough for an agent to act on without a follow-up
+/// read, but far tighter than the full-body excerpt
+/// ([`MCP_SOURCE_MAX_LINES`]/[`MCP_SOURCE_MAX_CHARS`]) `get_entity_source` and
+/// `get_context_pack` serve. One bound shared by every agent surface so the
+/// snippet is identical wherever it appears.
+pub const RETRIEVAL_SNIPPET_MAX_LINES: usize = 12;
+pub const RETRIEVAL_SNIPPET_MAX_CHARS: usize = 800;
+
+/// Graph-native bounded snippet for an entity. Delegates to the same
+/// content-addressed, hash-verified body projection
+/// ([`read_entity_source_excerpt_detailed`]) that backs `get_entity_source` and
+/// `get_context_pack`, capped to
+/// [`RETRIEVAL_SNIPPET_MAX_LINES`]/[`RETRIEVAL_SNIPPET_MAX_CHARS`] for inline use
+/// on retrieval hits. Returns `None` on a graph/blob miss so callers surface the
+/// coordinates without a snippet rather than reading the working tree.
+pub fn read_bounded_entity_snippet<G: GraphStore>(store: &G, entity: &Entity) -> Option<String> {
+    read_entity_source_excerpt_detailed(
+        store,
+        entity,
+        RETRIEVAL_SNIPPET_MAX_LINES,
+        RETRIEVAL_SNIPPET_MAX_CHARS,
+    )
+}
+
 pub fn excerpt_from_span_bytes(
     bytes: &[u8],
     span: &SourceSpan,

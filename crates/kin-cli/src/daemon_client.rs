@@ -125,6 +125,16 @@ pub struct LocateRequest {
     pub max_files_explicit: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reference: Option<String>,
+    /// When true, the daemon attaches a bounded inline source snippet to each
+    /// top definition symbol of every located file (the structured/agent JSON
+    /// surface). Defaults to false so existing clients and human output are
+    /// unchanged.
+    #[serde(default)]
+    pub snippets: bool,
+    /// Optional override for the snippet line budget (`KIN_LOCATE_SNIPPET_LINES`
+    /// otherwise). Only meaningful when `snippets` is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet_lines: Option<usize>,
 }
 
 /// Resolve the bearer token the daemon expects on non-public routes.

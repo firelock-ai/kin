@@ -2990,6 +2990,15 @@ async fn locate(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let session_id = extract_session_id_from_headers(&headers)?;
 
+    // Resolve the bounded-snippet projection for this request. Off by default
+    // (CLI human path, legacy clients); the agent JSON surface sets it so each
+    // located definition symbol carries inline code from graph-owned content.
+    let snippet_opts = if req.snippets {
+        kin_cli::commands::locate::SnippetOptions::enabled(req.snippet_lines)
+    } else {
+        kin_cli::commands::locate::SnippetOptions::default()
+    };
+
     tracing::info!(
         ">>> LOCATE: state.graph.embedding_status().indexed={}, graph root hash={:?}",
         state.graph.embedding_status().indexed,
@@ -3020,6 +3029,7 @@ async fn locate(
             req.explain,
             req.max_files,
             req.max_files_explicit,
+            snippet_opts,
         )
     } else {
         // Use scoped graph if session has a temporal scope, otherwise HEAD.
@@ -3068,6 +3078,7 @@ async fn locate(
             req.max_files_explicit,
             extra_priority_files,
             vector_source,
+            snippet_opts,
         )
     }
     .map_err(internal_error)?;
@@ -3875,10 +3886,15 @@ fn terminal_transaction_id(
 /// Build the `semantic_locate` response from the daemon's real vector index.
 ///
 /// Contract (shared verbatim with the MCP server): args
-/// `{query, limit?=20, granularity?="entity"|"file"}`; response object with a
-/// ranked `results: [{entity_id, name, file, score}]` array plus a
+/// `{query, limit?=20, granularity?="entity"|"file", include_snippet?=true}`;
+/// response object with a ranked
+/// `results: [{entity_id, name, file, score, snippet?}]` array plus a
 /// `semantic_coverage` float (`indexed / total`). `score` is cosine similarity
 /// (`1.0 - distance`), higher is better; results are already rank-ordered.
+/// `snippet` is a bounded inline body excerpt (entity granularity only),
+/// projected from graph-owned content via the same body projection
+/// `get_entity_source` uses, so one `semantic_locate` is act-on-able without a
+/// follow-up read; omitted on a graph gap or when `include_snippet` is false.
 fn build_semantic_locate_result(
     graph: &kin_db::InMemoryGraph,
     arguments: &HashMap<String, serde_json::Value>,
@@ -3900,6 +3916,15 @@ fn build_semantic_locate_result(
         .and_then(serde_json::Value::as_str)
         .map(|value| value.eq_ignore_ascii_case("file"))
         .unwrap_or(false);
+    // Inline a bounded code snippet on each entity hit by default, so a single
+    // `semantic_locate` is act-on-able without a follow-up `get_entity_source`.
+    // Suppressible via `include_snippet: false`; never applies to file
+    // granularity (a file hit has no single entity body).
+    let include_snippet = arguments
+        .get("include_snippet")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+        && !file_granularity;
 
     // Coverage is reported, never gated: a partially-embedded graph still
     // returns whatever the index can answer (graceful degradation per R5).
@@ -3974,13 +3999,30 @@ fn build_semantic_locate_result(
             continue;
         }
 
+        // Project the bounded snippet only for kept entity hits (top `limit`),
+        // from graph-owned content — no working-tree read; a graph gap yields no
+        // snippet rather than a fallback.
+        let snippet = if include_snippet {
+            if let kin_db::ResolvedRetrievalItem::Entity(entity) = &item {
+                kin_mcp::handlers::common::read_bounded_entity_snippet(graph, entity)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let score = 1.0_f32 - distance;
-        results.push(json!({
+        let mut hit = json!({
             "entity_id": entity_id,
             "name": name,
             "file": file,
             "score": score,
-        }));
+        });
+        if let Some(snippet) = snippet {
+            hit["snippet"] = json!(snippet);
+        }
+        results.push(hit);
     }
 
     let payload = json!({
