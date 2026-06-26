@@ -25,7 +25,7 @@ jobs:
     # (readiness gates on initialization, not embedding coverage).
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.96.0
