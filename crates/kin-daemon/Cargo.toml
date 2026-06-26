@@ -59,7 +59,7 @@ zip = { workspace = true }
 reqwest = { workspace = true }
 which = "7"
 fs2 = { workspace = true }
-sysinfo = "0.38"
+sysinfo = "0.39"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
