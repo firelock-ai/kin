@@ -236,6 +236,21 @@ pub struct SpineIngestOutcome {
     pub resolvable_relations: usize,
 }
 
+/// Outcome of refreshing cross-repo edges across every registered repo.
+///
+/// Returned by [`DaemonState::refresh_all_cross_repo_edges`] and surfaced by the
+/// `POST /spine/refresh-cross-repo-edges` route. The hosted import orchestrator
+/// runs this final pass once every repo is registered so cross-repo edges
+/// emanate from every repo (kin-db→kin-search, kin-model→kin-vector, …), not
+/// only the anchor.
+#[derive(Debug, Clone)]
+pub struct SpineRefreshOutcome {
+    /// Repos whose outgoing cross-repo edges were re-resolved.
+    pub repos_refreshed: usize,
+    /// Total cross-repo edges in the spine after the refresh pass.
+    pub cross_repo_edges: usize,
+}
+
 /// Shared daemon state. All mutable state is behind RwLock for
 /// concurrent access from the reconciliation loop and API handlers.
 pub struct DaemonState {
@@ -1040,6 +1055,64 @@ impl DaemonState {
             entity_count,
             relation_count,
             resolvable_relations,
+        })
+    }
+
+    /// Refresh cross-repo edges for EVERY registered repo, mirroring the local
+    /// [`Self::initialize_spine_lazy`] "register all, then resolve all" pass.
+    ///
+    /// The per-repo ingest path only materializes the anchor repo's edges, so a
+    /// repo ingested before its dependency was registered never forms its
+    /// outgoing edges. This final pass — run by the hosted orchestrator once
+    /// every repo is registered — loads each registered repo's graph from
+    /// durable storage (the blob store, never on-disk siblings) and re-resolves
+    /// its imports against the now-complete spine. It is idempotent: each repo's
+    /// existing edges are removed and re-materialized.
+    pub async fn refresh_all_cross_repo_edges(&self) -> Result<SpineRefreshOutcome> {
+        let Some(spine) = self.ensure_spine() else {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                "spine disabled via KIN_DISABLE_SPINE".to_string(),
+            )));
+        };
+
+        // Resolve against the full registered-repo set, sorted for a
+        // deterministic pass order.
+        let mut registry_ids: Vec<String> = spine.registered_repo_ids().into_iter().collect();
+        registry_ids.sort();
+
+        let mut repos_refreshed = 0usize;
+        for repo_id in &registry_ids {
+            // Load this repo's graph from durable storage (cached after the first
+            // load). Skip a repo this pod cannot load rather than aborting the
+            // whole pass — the others still refresh.
+            let graph = match self.get_repo_graph(repo_id).await {
+                Ok(graph) => graph,
+                Err(e) => {
+                    warn!(repo_id, error = %e, "skipping cross-repo refresh: graph load failed");
+                    continue;
+                }
+            };
+            let entities = match graph.list_all_entities() {
+                Ok(entities) => entities,
+                Err(e) => {
+                    warn!(repo_id, error = %e, "skipping cross-repo refresh: entity listing failed");
+                    continue;
+                }
+            };
+            let relations = Self::collect_spine_relations(graph.as_ref(), &entities);
+            spine.refresh_cross_repo_edges(repo_id, &entities, &relations, &registry_ids);
+            repos_refreshed += 1;
+        }
+
+        info!(
+            repos_refreshed,
+            cross_repo_edges = spine.edge_count(),
+            "refreshed cross-repo edges across all registered repos"
+        );
+
+        Ok(SpineRefreshOutcome {
+            repos_refreshed,
+            cross_repo_edges: spine.edge_count(),
         })
     }
 
