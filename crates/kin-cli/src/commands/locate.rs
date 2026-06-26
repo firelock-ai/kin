@@ -3725,7 +3725,14 @@ fn extract_priority_file_traces(
         // Only inject non-entity files when explicitly named in the query.
         // Descriptor-based fuzzy matching was too loose — a 4-letter word overlap
         // caused build artifacts (ChangeLog, Makefile, etc.) to outscore real source.
-        if explicitly_named {
+        // Skip test paths and VCS/fixture internals: neither `is_test_path` nor
+        // `is_vendored_path` catches `git/fixtures/simple.git/*` or `**/fixtures/*`,
+        // so a git fixture named "HEAD"/"config"/"main" force-injected at flat
+        // priority over the true edit sites. These are never real edit targets.
+        if explicitly_named
+            && !is_test_path(&tracked.path)
+            && !is_fixture_or_vcs_internal_path(&tracked.path)
+        {
             note_priority_reason(
                 &mut file_scores,
                 tracked.path.clone(),
@@ -3776,6 +3783,9 @@ fn extract_priority_file_traces(
             .iter()
             .filter_map(|tracked| {
                 if is_test_path(&tracked.path) && !allow_test_artifact_priority {
+                    return None;
+                }
+                if is_fixture_or_vcs_internal_path(&tracked.path) {
                     return None;
                 }
                 if require_named_test_artifacts && !is_named_test_artifact_path(&tracked.path) {
@@ -12341,6 +12351,16 @@ fn is_vendored_path(path: &str) -> bool {
         || lower.contains("/dependencies/")
         || lower.starts_with("deps/")
         || lower.contains("/deps/")
+}
+
+/// Test fixtures and VCS internals (`git/fixtures/simple.git/HEAD`, `**/fixtures/*`)
+/// are never real edit targets, but their basenames ("HEAD"/"config"/"main") are
+/// generic enough to match query text and force-inject at flat priority over the
+/// true edit sites. Neither `is_test_path` nor `is_vendored_path` catches them, so
+/// the explicit-name and term-match priority injectors guard against them here.
+fn is_fixture_or_vcs_internal_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.starts_with("fixtures/") || lower.contains("/fixtures/") || lower.contains(".git/")
 }
 
 fn resolve_path_in_graph(graph: &kin_db::InMemoryGraph, partial_path: &str) -> Option<String> {
