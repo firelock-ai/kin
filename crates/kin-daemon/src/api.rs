@@ -817,6 +817,10 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/spine/impact", get(spine_impact))
         .route("/spine/xref", get(spine_xref))
         .route("/spine/repos/{repo_id}/ingest", post(spine_ingest_repo))
+        .route(
+            "/spine/refresh-cross-repo-edges",
+            post(spine_refresh_cross_repo_edges),
+        )
         // LSP enrichment — trigger a full cold sweep
         .route("/lsp/sweep", post(lsp_sweep))
 }
@@ -6192,6 +6196,28 @@ async fn spine_ingest_repo(
     })))
 }
 
+/// `POST /spine/refresh-cross-repo-edges` — re-resolve cross-repo edges for
+/// every registered repo.
+///
+/// The control-plane import orchestrator calls this once, after all repos are
+/// ingested, so cross-repo edges emanate from every repo (mirroring the local
+/// daemon's multi-anchor pass) rather than only the anchor. Loads each repo's
+/// graph from durable storage and re-materializes its outgoing edges; the
+/// operation is idempotent. Field names are camelCase to match the orchestrator.
+async fn spine_refresh_cross_repo_edges(
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let outcome = state
+        .refresh_all_cross_repo_edges()
+        .await
+        .map_err(internal_error)?;
+
+    Ok(Json(json!({
+        "reposRefreshed": outcome.repos_refreshed,
+        "crossRepoEdges": outcome.cross_repo_edges,
+    })))
+}
+
 /// POST /lsp/sweep — trigger a full LSP cold sweep of all entities.
 async fn lsp_sweep(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     state.queue_lsp_sweep();
@@ -9319,6 +9345,50 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR,
             "ingest without a storage backend must surface an error, not a 200"
         );
+    }
+
+    #[tokio::test]
+    async fn spine_refresh_cross_repo_edges_route_is_wired_and_degrades_gracefully() {
+        // The hosted orchestrator calls this final pass after every repo is
+        // ingested so edges emanate from every repo, not just the anchor. Without
+        // a storage backend (the local single-repo daemon) no repo graph can be
+        // loaded, so the pass refreshes nothing — but it must still answer 200
+        // with the camelCase contract the orchestrator reads, never a 500/panic.
+        let state = test_state();
+        let spine = state.ensure_spine().expect("spine enabled in test");
+        // Register two repos' metadata so the pass has a non-empty repo set to
+        // iterate over (their graphs are unavailable without a backend).
+        spine.register_repo("kin", vec![], "");
+        spine.register_repo("kin-db", vec![], "");
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::post("/spine/refresh-cross-repo-edges")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            body.get("reposRefreshed").is_some(),
+            "response must carry reposRefreshed, got {body}"
+        );
+        assert!(
+            body.get("crossRepoEdges").is_some(),
+            "response must carry crossRepoEdges, got {body}"
+        );
+        // No backend → no repo graph loadable → nothing refreshed, but a clean
+        // 200 rather than a hard failure.
+        assert_eq!(body["reposRefreshed"], serde_json::json!(0));
     }
 
     /// One gate proving the cross-repo blast radius is consistent across every

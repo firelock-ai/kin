@@ -80,57 +80,85 @@ pub fn resolve_imports(
     results
 }
 
+/// Normalize a crate name or repo id for cross-repo matching: trim, lowercase,
+/// and fold underscores to hyphens. Rust crate names are written with `_`
+/// (`kin_db`) while repo ids are hyphenated (`kin-db`), so the two compare equal
+/// only after folding.
+fn normalize_repo_token(token: &str) -> String {
+    token.trim().to_lowercase().replace('_', "-")
+}
+
+/// Extract the leading crate/package segment from an import source path. Rust
+/// paths separate with `::` (`kin_db::graph` → `kin_db`) and dotted-module
+/// languages with `.` (`os.path` → `os`); that leading segment is the crate or
+/// top-level package identifying the owning repo.
+fn import_source_root(source: &str) -> &str {
+    let trimmed = source.trim();
+    let crate_seg = trimmed.split("::").next().unwrap_or(trimmed);
+    crate_seg.split('.').next().unwrap_or(crate_seg).trim()
+}
+
 /// Resolve a single import using the 3-tier strategy.
 fn resolve_single(
     index: &SpineIndex,
     import: &UnresolvedImport,
     registered_repos: &HashSet<String>,
 ) -> ResolveResult {
-    // Tier 1: import_source directly matches a registry repo name
+    // The import_source names the crate/package the referenced symbol came
+    // from. Match its root segment against registered repo ids, folding the Rust
+    // crate-name / repo-id spelling gap (`kin_db` ↔ `kin-db`) so real cross-repo
+    // imports bind at Tier 1 instead of collapsing into name-only Tier 3
+    // collisions.
     if let Some(ref source) = import.import_source {
-        if registered_repos.contains(source.as_str()) {
+        let normalized_source = normalize_repo_token(import_source_root(source));
+
+        // Tier 1: the import's crate/package root names a registered repo.
+        if let Some(matched_repo) = registered_repos
+            .iter()
+            .find(|r| normalize_repo_token(r.as_str()) == normalized_source)
+        {
             let matches = index.resolve(
                 &import.imported_name,
                 import.imported_kind,
                 import.reference_fingerprint.as_ref(),
             );
-            let in_source: Vec<&EntityEntry> =
-                matches.iter().filter(|e| e.repo_id == *source).collect();
+            let in_source: Vec<&EntityEntry> = matches
+                .iter()
+                .filter(|e| e.repo_id == *matched_repo)
+                .collect();
 
-            match in_source.len() {
-                0 => {} // Fall through to tier 2/3
-                1 => {
-                    return ResolveResult::Resolved {
-                        target_repo: in_source[0].repo_id.clone(),
-                        target_entity: in_source[0].entity_id,
-                        confidence: 0.95,
-                    };
-                }
-                _ => {
-                    // Multiple in that repo — still high confidence, return best match
-                    let candidates: Vec<(String, EntityId, f32)> = in_source
+            // The import names one specific repo, so resolve only there. A
+            // symbol absent from that repo is a graph gap, not grounds to bind an
+            // unrelated repo by name collision.
+            return match in_source.len() {
+                0 => ResolveResult::NotFound,
+                1 => ResolveResult::Resolved {
+                    target_repo: in_source[0].repo_id.clone(),
+                    target_entity: in_source[0].entity_id,
+                    confidence: 0.95,
+                },
+                _ => ResolveResult::Ambiguous {
+                    candidates: in_source
                         .iter()
                         .map(|e| (e.repo_id.clone(), e.entity_id, 0.95))
-                        .collect();
-                    return ResolveResult::Ambiguous { candidates };
-                }
-            }
+                        .collect(),
+                },
+            };
         }
 
-        // Tier 2: import_source set but doesn't match a repo directly —
-        // use it to filter candidate_repos (repos whose name contains the source)
-        let source_lower = source.to_lowercase();
+        // Tier 2: import_source set but names no registered repo directly —
+        // use its normalized root to narrow candidate_repos by containment.
         let filtered_candidates: Vec<String> = if import.candidate_repos.is_empty() {
             registered_repos
                 .iter()
-                .filter(|r| r.to_lowercase().contains(&source_lower))
+                .filter(|r| normalize_repo_token(r.as_str()).contains(&normalized_source))
                 .cloned()
                 .collect()
         } else {
             import
                 .candidate_repos
                 .iter()
-                .filter(|r| r.to_lowercase().contains(&source_lower))
+                .filter(|r| normalize_repo_token(r.as_str()).contains(&normalized_source))
                 .cloned()
                 .collect()
         };
@@ -997,5 +1025,126 @@ mod tests {
             }
             other => panic!("expected deterministic Ambiguous over both repos, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn normalize_and_root_fold_crate_spelling() {
+        assert_eq!(normalize_repo_token("kin_db"), "kin-db");
+        assert_eq!(normalize_repo_token("Kin_DB"), "kin-db");
+        assert_eq!(normalize_repo_token("kin-db"), "kin-db");
+        assert_eq!(import_source_root("kin_db"), "kin_db");
+        assert_eq!(import_source_root("kin_db::graph::Inner"), "kin_db");
+        assert_eq!(import_source_root("os.path"), "os");
+        assert_eq!(import_source_root("requests"), "requests");
+    }
+
+    #[test]
+    fn rust_crate_underscore_binds_to_hyphenated_repo() {
+        // The Rust parser emits import_source as the crate's module path with an
+        // underscore (`kin_db`), while the repo is registered hyphenated
+        // (`kin-db`). Tier 1 must fold the spelling and bind at 0.95 instead of
+        // dropping to a name-only collision match.
+        let index = SpineIndex::new();
+        index.register_repo(
+            "kin-db",
+            vec![test_entry("kin-db", "InMemoryGraph", EntityKind::Class)],
+            "hash-db",
+        );
+
+        let imports = vec![UnresolvedImport {
+            source_repo: "kin".to_string(),
+            source_entity: EntityId::new(),
+            imported_name: "InMemoryGraph".to_string(),
+            imported_kind: Some(EntityKind::Class),
+            candidate_repos: vec!["kin-db".to_string()],
+            language: Some("rust".to_string()),
+            reference_fingerprint: None,
+            import_source: Some("kin_db".to_string()),
+        }];
+
+        let results = resolve_imports(&index, &imports);
+        match &results[0].1 {
+            ResolveResult::Resolved {
+                target_repo,
+                confidence,
+                ..
+            } => {
+                assert_eq!(target_repo, "kin-db");
+                assert!(
+                    *confidence >= 0.95,
+                    "underscore→hyphen crate match must bind at Tier 1 (0.95), got {confidence}"
+                );
+            }
+            other => panic!("expected Tier-1 Resolved to kin-db, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_segment_module_path_binds_to_crate_repo() {
+        // `use kin_db::graph::InMemoryGraph` yields import_source `kin_db::graph`.
+        // Only the crate root (`kin_db`) identifies the repo, so the resolver
+        // must bind it to `kin-db` rather than miss on the full module path.
+        let index = SpineIndex::new();
+        index.register_repo(
+            "kin-db",
+            vec![test_entry("kin-db", "InMemoryGraph", EntityKind::Class)],
+            "hash-db",
+        );
+
+        let imports = vec![UnresolvedImport {
+            source_repo: "kin".to_string(),
+            source_entity: EntityId::new(),
+            imported_name: "InMemoryGraph".to_string(),
+            imported_kind: Some(EntityKind::Class),
+            candidate_repos: vec!["kin-db".to_string()],
+            language: Some("rust".to_string()),
+            reference_fingerprint: None,
+            import_source: Some("kin_db::graph".to_string()),
+        }];
+
+        let results = resolve_imports(&index, &imports);
+        match &results[0].1 {
+            ResolveResult::Resolved { target_repo, .. } => {
+                assert_eq!(target_repo, "kin-db");
+            }
+            other => panic!("expected Resolved to kin-db from crate root, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn named_repo_miss_does_not_bind_collision_repo() {
+        // `use kin_db::SomeType` where SomeType is NOT in kin-db but a same-named
+        // entity exists in an unrelated repo (kin-vfs). The import names kin-db,
+        // so a miss there must report NotFound — never bind the bogus kin→kin-vfs
+        // collision edge the hosted org graph was showing.
+        let index = SpineIndex::new();
+        index.register_repo(
+            "kin-db",
+            vec![test_entry("kin-db", "InMemoryGraph", EntityKind::Class)],
+            "hash-db",
+        );
+        index.register_repo(
+            "kin-vfs",
+            vec![test_entry("kin-vfs", "SomeType", EntityKind::Class)],
+            "hash-vfs",
+        );
+
+        let imports = vec![UnresolvedImport {
+            source_repo: "kin".to_string(),
+            source_entity: EntityId::new(),
+            imported_name: "SomeType".to_string(),
+            imported_kind: Some(EntityKind::Class),
+            candidate_repos: vec!["kin-db".to_string(), "kin-vfs".to_string()],
+            language: Some("rust".to_string()),
+            reference_fingerprint: None,
+            import_source: Some("kin_db".to_string()),
+        }];
+
+        let results = resolve_imports(&index, &imports);
+        assert!(
+            matches!(results[0].1, ResolveResult::NotFound),
+            "import naming kin_db must not bind a kin-vfs name collision, got {:?}",
+            results[0].1
+        );
     }
 }
