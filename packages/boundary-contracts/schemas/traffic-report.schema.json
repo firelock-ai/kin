@@ -11,14 +11,14 @@
         "type": "object",
         "required": ["target", "active_intents", "downstream_warnings"],
         "properties": {
-          "target": { "$ref": "kin://contracts/intent#/$defs/IntentScope" },
+          "target": { "$ref": "kin://contracts/intent-scope" },
           "active_intents": {
             "type": "array",
-            "items": { "$ref": "kin://contracts/intent#/$defs/IntentSummary" }
+            "items": { "$ref": "kin://contracts/intent-summary" }
           },
           "downstream_warnings": {
             "type": "array",
-            "items": { "$ref": "kin://contracts/intent#/$defs/IntentSummary" }
+            "items": { "$ref": "kin://contracts/intent-summary" }
           }
         }
       }

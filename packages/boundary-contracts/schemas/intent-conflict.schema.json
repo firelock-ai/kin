@@ -15,7 +15,7 @@
     },
     "blocking_intents": {
       "type": "array",
-      "items": { "$ref": "kin://contracts/intent#/$defs/IntentSummary" }
+      "items": { "$ref": "kin://contracts/intent-summary" }
     },
     "message": {
       "type": "string",

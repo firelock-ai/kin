@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kin://contracts/intent-scope",
+  "type": "object",
+  "description": "Tagged union: exactly one of entity_id, contract_id, or artifact_path must be set.",
+  "oneOf": [
+    {
+      "required": ["type", "entity_id"],
+      "properties": {
+        "type": { "type": "string", "const": "Entity" },
+        "entity_id": { "type": "string" }
+      }
+    },
+    {
+      "required": ["type", "contract_id"],
+      "properties": {
+        "type": { "type": "string", "const": "Contract" },
+        "contract_id": { "type": "string" }
+      }
+    },
+    {
+      "required": ["type", "artifact_path"],
+      "properties": {
+        "type": { "type": "string", "const": "Artifact" },
+        "artifact_path": { "type": "string" }
+      }
+    }
+  ]
+}

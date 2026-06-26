@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kin://contracts/intent-summary",
+  "type": "object",
+  "required": ["intent_id", "session_id", "vendor", "task_description", "lock_type", "registered_at"],
+  "properties": {
+    "intent_id": { "type": "string" },
+    "session_id": { "type": "string" },
+    "vendor": { "type": "string" },
+    "task_description": { "type": "string" },
+    "lock_type": { "$ref": "kin://contracts/lock-type" },
+    "registered_at": { "type": "string", "description": "ISO 8601 UTC timestamp" }
+  }
+}
