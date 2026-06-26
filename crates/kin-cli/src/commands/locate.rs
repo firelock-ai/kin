@@ -2372,7 +2372,14 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     if locate_env_bool("KIN_LOCATE_CROSS_ENCODER_ENABLED", false) {
         let ltr_window = locate_env_usize("KIN_LOCATE_LTR_WINDOW", 20).min(fused.len());
         if ltr_window > 0 {
-            if workspace_root.is_some() {
+            // Gate the cross-encoder rerank on graph presence, not a live
+            // workspace root. The candidate text is built entirely from
+            // `graph_derived_candidate_text` (graph-owned artifact bodies), so the
+            // reranker only needs the graph's retrievable artifacts to score
+            // against. Scoped sessions run with `workspace_root = None` while
+            // keeping a populated graph, so the gate must key on the graph to stay
+            // effective in that mode.
+            if cross_encoder_has_graph_candidates(graph) {
                 let model_id = std::env::var("KIN_LOCATE_CROSS_ENCODER_MODEL")
                     .unwrap_or_else(|_| "BAAI/bge-reranker-base".to_string());
                 let revision = std::env::var("KIN_LOCATE_CROSS_ENCODER_REVISION")
@@ -2474,7 +2481,8 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 }
             } else {
                 tracing::warn!(
-                    "skipping cross-encoder rerank because no live workspace root is available"
+                    "skipping cross-encoder rerank because the graph has no entities \
+                     to derive candidate text from"
                 );
             }
         }
@@ -7953,6 +7961,19 @@ fn graph_derived_candidate_text(graph: &kin_db::InMemoryGraph, path: &str) -> St
             String::new()
         }
     }
+}
+
+/// Whether the cross-encoder rerank stage has graph truth to rerank against.
+///
+/// The reranker scores `graph_derived_candidate_text`, whose bodies are resolved
+/// from graph-owned artifacts (`get_opaque_artifact`), so its only data
+/// precondition is that the graph holds those retrievable artifacts. It is
+/// deliberately independent of any live `workspace_root`: scoped sessions run
+/// with `workspace_root = None` while keeping a populated graph, and the
+/// candidate text is graph-owned, so keying the gate on the graph keeps the
+/// reranker effective in scoped mode.
+fn cross_encoder_has_graph_candidates(graph: &kin_db::InMemoryGraph) -> bool {
+    graph.artifact_count() > 0
 }
 
 fn workspace_source_path_exists(path: &str, workspace_root: Option<&std::path::Path>) -> bool {
@@ -13781,6 +13802,38 @@ mod tests {
             graph_derived_candidate_text(&graph, "src/foo.rs"),
             "GRAPH_BODY_MARKER",
             "graph-owned body is the only authority for candidate text"
+        );
+    }
+
+    #[test]
+    fn cross_encoder_gate_keys_on_graph_presence_not_workspace_root() {
+        // In scoped eval the daemon runs with `workspace_root = None` while still
+        // passing a populated scoped graph. The cross-encoder scores
+        // graph-derived candidate text, so the rerank gate must fire on graph
+        // presence alone — an absent workspace root must not disable it.
+        let scoped_graph = kin_db::InMemoryGraph::new();
+        scoped_graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new("src/scoped.rs"),
+                content_hash: Hash256::from_bytes([13; 32]),
+                mime_type: Some("text/x-rust".into()),
+                text_preview: Some("SCOPED_GRAPH_BODY".into()),
+            })
+            .unwrap();
+        assert!(scoped_graph.artifact_count() > 0);
+        assert!(
+            cross_encoder_has_graph_candidates(&scoped_graph),
+            "a populated scoped graph must enable the cross-encoder even when \
+             workspace_root is None"
+        );
+
+        // An empty graph offers no candidate text to rerank, so the gate stays
+        // closed and the stage is skipped — never a raw-disk fallback.
+        let empty_graph = kin_db::InMemoryGraph::new();
+        assert_eq!(empty_graph.artifact_count(), 0);
+        assert!(
+            !cross_encoder_has_graph_candidates(&empty_graph),
+            "an empty graph has no candidate text, so the rerank gate stays closed"
         );
     }
 
