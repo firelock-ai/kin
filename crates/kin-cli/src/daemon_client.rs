@@ -135,6 +135,17 @@ pub struct LocateRequest {
     /// otherwise). Only meaningful when `snippets` is true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snippet_lines: Option<usize>,
+    /// Opaque paging cursor (`<key>.<page>`) from a prior locate's `next_cursor`.
+    /// When set and the daemon still holds the matching ranking, the next page of
+    /// ENTITIES is sliced from cache with NO retrieval re-run; on a cache miss or
+    /// a graph-version change the daemon transparently re-runs retrieval and
+    /// returns page 0. Absent for a first/fresh query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// Entities per page for the graph-native `entities` surface
+    /// (`KIN_LOCATE_ENTITY_CAP` otherwise). Only affects entity paging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<usize>,
 }
 
 /// Resolve the bearer token the daemon expects on non-public routes.

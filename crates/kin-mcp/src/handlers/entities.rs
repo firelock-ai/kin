@@ -478,6 +478,9 @@ pub async fn handle_find_references<G: GraphStore>(
                 if edge["to_repo_id"] == repo_id && edge["repo_id"] != repo_id {
                     // This is an external caller pointing at us.
                     rows.push(ReferenceRow {
+                        // Federated xref: the caller lives in another repo, so
+                        // there is no local entity id or graph-owned body here.
+                        entity_id: None,
                         name: edge["from_name"].as_str().unwrap_or("unknown").to_string(),
                         kind: edge["kind"].as_str().map(|s| s.to_string()),
                         file_path: Some(format!(
@@ -487,6 +490,7 @@ pub async fn handle_find_references<G: GraphStore>(
                         )),
                         start_line: None,
                         signature: None,
+                        snippet: None,
                         relation_kinds: vec![RelationKind::References], // Spine edges are generic xrefs
                     });
                 }
@@ -498,11 +502,19 @@ pub async fn handle_find_references<G: GraphStore>(
         .into_iter()
         .map(|row| {
             serde_json::json!({
+                // `entity_id` is the keystone: it lets the agent drill this
+                // reference straight to the caller's body
+                // (`get_entity_source`/`get_context_pack`) with no name
+                // re-resolution and no filesystem fallback. `snippet` carries the
+                // caller's bounded body inline so the common drill needs no
+                // second round-trip.
+                "entity_id": row.entity_id,
                 "name": row.name,
                 "kind": row.kind,
                 "file_path": row.file_path,
                 "start_line": row.start_line,
                 "signature": row.signature,
+                "snippet": row.snippet,
                 "relation_kinds": row.relation_kinds.into_iter().map(relation_kind_name).collect::<Vec<_>>(),
             })
         })
@@ -1877,6 +1889,12 @@ mod tests {
         assert_eq!(refs[0]["name"], "caller");
         assert_eq!(refs[0]["file_path"], "src/a.rs");
         assert_eq!(refs[0]["kind"], "Function");
+        // The keystone: each reference carries the caller's graph entity_id so an
+        // agent can drill straight to its body with no name re-resolution.
+        assert_eq!(refs[0]["entity_id"], caller_id.to_string());
+        // `snippet` is always present in the shape (null here: the fixture has no
+        // blob-backed body to project).
+        assert!(refs[0].as_object().unwrap().contains_key("snippet"));
     }
 
     #[tokio::test]

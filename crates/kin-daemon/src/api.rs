@@ -8,7 +8,10 @@ use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use crate::state::{DaemonEvent, DaemonState, ProjectionChangedSet};
+use crate::state::{
+    CachedLocateRanking, CachedSemanticPage, DaemonEvent, DaemonState, ProjectionChangedSet,
+    LOCATE_RANKING_CACHE_CAP,
+};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -2999,13 +3002,63 @@ async fn locate(
         kin_cli::commands::locate::SnippetOptions::default()
     };
 
+    // Graph version stamps the paging cursor: any mutation bumps `vfs_version`,
+    // so a stale cursor can never page a ranking built against different truth.
+    let graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+    let page_size = req
+        .page_size
+        .filter(|n| *n > 0)
+        .unwrap_or_else(kin_cli::commands::locate::entity_page_size);
+
+    // Paging fast path: a valid cursor whose ranking is still cached at the
+    // current graph version is windowed straight from cache — NO retrieval.
+    if let Some(cursor_token) = req.cursor.as_deref() {
+        if let Some(parsed) = kin_cli::commands::locate::LocateCursor::decode(cursor_token) {
+            let cached = {
+                let cache = state.locate_rankings.lock().unwrap();
+                cache
+                    .get(&parsed.key)
+                    .filter(|entry| entry.graph_version == graph_version)
+                    .map(|entry| entry.entities.clone())
+            };
+            if let Some(entities) = cached {
+                let mut result = kin_cli::commands::locate::LocateResult {
+                    entities,
+                    ..Default::default()
+                };
+                kin_cli::commands::locate::apply_entity_page(
+                    &mut result,
+                    &parsed.key,
+                    parsed.page,
+                    page_size,
+                );
+                return Ok(Json(result));
+            }
+        }
+        // Cache miss / stale / undecodable cursor: fall through to a fresh run
+        // (returns page 0) rather than silently failing the page.
+    }
+
+    // Scope token for the cursor key (explicit ref, else the session's temporal
+    // scope) so cursors never collide across refs/scopes for the same query.
+    let scope_token: Option<String> = if let Some(reference) = req.reference.as_ref() {
+        Some(reference.clone())
+    } else if let Some(sid) = session_id.as_ref() {
+        state
+            .get_session_scope(sid)
+            .await
+            .map(|(ref_str, _, _, _)| ref_str)
+    } else {
+        None
+    };
+
     tracing::info!(
         ">>> LOCATE: state.graph.embedding_status().indexed={}, graph root hash={:?}",
         state.graph.embedding_status().indexed,
         state.graph.compute_root_hash()
     );
 
-    let result = if let Some(reference) = req.reference.as_deref() {
+    let mut result = if let Some(reference) = req.reference.as_deref() {
         // Explicit --ref always takes precedence over session scope.
         let resolved = kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate_with_report(
             state.graph.as_ref(),
@@ -3082,7 +3135,47 @@ async fn locate(
         )
     }
     .map_err(internal_error)?;
+
+    // Cache the full entity ranking and window page 0 so a follow-up `--next`
+    // pages it from cache without re-running retrieval. Keyed by
+    // (query, ref/scope, graph-version) so any edit invalidates the page.
+    let key = kin_cli::commands::locate::locate_cursor_key(
+        &req.text,
+        scope_token.as_deref(),
+        graph_version,
+    );
+    cache_locate_ranking(&state, &key, &result.entities, graph_version);
+    kin_cli::commands::locate::apply_entity_page(&mut result, &key, 0, page_size);
     Ok(Json(result))
+}
+
+/// Insert a full locate ranking into the paging cache, evicting the oldest entry
+/// when the cache is at capacity (a fresh key past the cap). The cache is bounded
+/// to [`LOCATE_RANKING_CACHE_CAP`], so the linear eviction scan stays cheap.
+fn cache_locate_ranking(
+    state: &DaemonState,
+    key: &str,
+    entities: &[kin_cli::commands::locate::LocateEntity],
+    graph_version: u64,
+) {
+    let mut cache = state.locate_rankings.lock().unwrap();
+    if cache.len() >= LOCATE_RANKING_CACHE_CAP && !cache.contains_key(key) {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.created)
+            .map(|(k, _)| k.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(
+        key.to_string(),
+        CachedLocateRanking {
+            entities: entities.to_vec(),
+            graph_version,
+            created: std::time::Instant::now(),
+        },
+    );
 }
 
 /// POST /search — run CLI search against daemon-owned graph state.
@@ -3895,12 +3988,80 @@ fn terminal_transaction_id(
 /// projected from graph-owned content via the same body projection
 /// `get_entity_source` uses, so one `semantic_locate` is act-on-able without a
 /// follow-up read; omitted on a graph gap or when `include_snippet` is false.
+/// Max entity pages retained for a single `semantic_locate` ranking. Bounds the
+/// per-query snippet/projection work while still letting a cursor walk well past
+/// the first page.
+const SEMANTIC_LOCATE_MAX_PAGES: usize = 5;
+
+/// Window a full ranked row list to page `page` of `page_size`, returning the
+/// slice, the total, and whether more rows remain. Pure paging arithmetic shared
+/// by the fresh and cached `semantic_locate` paths.
+fn window_semantic_rows(
+    rows: &[serde_json::Value],
+    page: usize,
+    page_size: usize,
+) -> (Vec<serde_json::Value>, usize, bool) {
+    let page_size = page_size.max(1);
+    let total = rows.len();
+    let start = page.saturating_mul(page_size);
+    let end = start.saturating_add(page_size).min(total);
+    let window = if start < total {
+        rows[start..end].to_vec()
+    } else {
+        Vec::new()
+    };
+    (window, total, end < total)
+}
+
+/// Serialize a windowed `semantic_locate` page into the tool result payload.
+fn semantic_locate_payload(
+    query: &str,
+    file_granularity: bool,
+    semantic_coverage: f32,
+    key: &str,
+    page: usize,
+    page_size: usize,
+    rows: &[serde_json::Value],
+) -> kin_mcp::ToolCallResult {
+    let (window, total, has_more) = window_semantic_rows(rows, page, page_size);
+    let next_cursor = has_more.then(|| {
+        kin_cli::commands::locate::LocateCursor {
+            key: key.to_string(),
+            page: page + 1,
+        }
+        .encode()
+    });
+    let payload = json!({
+        "query": query,
+        "granularity": if file_granularity { "file" } else { "entity" },
+        "semantic_coverage": semantic_coverage,
+        "page": page,
+        "total_ranked": total,
+        "next_cursor": next_cursor,
+        "results": window,
+    });
+    match serde_json::to_string_pretty(&payload) {
+        Ok(text) => kin_mcp::ToolCallResult::text(text),
+        Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
+    }
+}
+
 fn build_semantic_locate_result(
+    state: &DaemonState,
     graph: &kin_db::InMemoryGraph,
     arguments: &HashMap<String, serde_json::Value>,
 ) -> kin_mcp::ToolCallResult {
     let query = match arguments.get("query").and_then(serde_json::Value::as_str) {
         Some(value) if !value.trim().is_empty() => value.to_string(),
+        // A paging request carries the query in its cached ranking, so an empty
+        // query is allowed only when a cursor is present.
+        _ if arguments
+            .get("cursor")
+            .and_then(serde_json::Value::as_str)
+            .is_some() =>
+        {
+            String::new()
+        }
         _ => {
             return kin_mcp::ToolCallResult::error("missing required parameter: query".to_string());
         }
@@ -3911,6 +4072,13 @@ fn build_semantic_locate_result(
         .map(|value| value as usize)
         .filter(|value| *value > 0)
         .unwrap_or(20);
+    // Entities per page: `page_size` if given, else the historical `limit`.
+    let page_size = arguments
+        .get("page_size")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value as usize)
+        .filter(|value| *value > 0)
+        .unwrap_or(limit);
     let file_granularity = arguments
         .get("granularity")
         .and_then(serde_json::Value::as_str)
@@ -3926,6 +4094,9 @@ fn build_semantic_locate_result(
         .unwrap_or(true)
         && !file_granularity;
 
+    let graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+    let granularity_token = format!("sem:{}", if file_granularity { "file" } else { "entity" });
+
     // Coverage is reported, never gated: a partially-embedded graph still
     // returns whatever the index can answer (graceful degradation per R5).
     let status = graph.embedding_status();
@@ -3935,13 +4106,39 @@ fn build_semantic_locate_result(
         status.indexed as f32 / status.total as f32
     };
 
-    // Over-fetch so post-resolution dedupe can still fill `limit`: by file for
+    // Paging fast path: a valid cursor whose ranking is still cached at the
+    // current graph version is windowed straight from cache — no re-search.
+    if let Some(cursor_token) = arguments.get("cursor").and_then(serde_json::Value::as_str) {
+        if let Some(parsed) = kin_cli::commands::locate::LocateCursor::decode(cursor_token) {
+            let cached = {
+                let cache = state.semantic_locate_pages.lock().unwrap();
+                cache
+                    .get(&parsed.key)
+                    .filter(|entry| entry.graph_version == graph_version)
+                    .map(|entry| entry.rows.clone())
+            };
+            if let Some(rows) = cached {
+                return semantic_locate_payload(
+                    &query,
+                    file_granularity,
+                    semantic_coverage,
+                    &parsed.key,
+                    parsed.page,
+                    page_size,
+                    &rows,
+                );
+            }
+        }
+        // Cache miss / stale cursor: fall through to a fresh search (page 0).
+    }
+
+    // Over-fetch so post-resolution dedupe can still fill the page: by file for
     // file granularity, by resolved entity for entity granularity.
     // Every entity carries both an `Entity(E)` and an `EntityRevision(head)`
     // vector in the index, both resolving to the same entity, so without the
     // entity dedup below each entity would appear ~twice and effective recall@k
     // would halve.
-    let fetch_limit = limit.saturating_mul(8).max(limit);
+    let fetch_limit = page_size.saturating_mul(8).max(page_size);
 
     let raw = match graph.semantic_search(&query, fetch_limit) {
         Ok(hits) => hits,
@@ -3950,21 +4147,29 @@ fn build_semantic_locate_result(
         }
     };
 
-    let mut results = Vec::with_capacity(limit);
+    // Build the full (bounded) ranking once; page 0 is returned and the rest is
+    // cached for `--next`. Cap the retained ranking so per-query projection work
+    // stays bounded regardless of how deep the over-fetch ran.
+    let max_rows = page_size.saturating_mul(SEMANTIC_LOCATE_MAX_PAGES);
+    let mut rows: Vec<serde_json::Value> = Vec::with_capacity(page_size);
     let mut seen_files: HashSet<String> = HashSet::new();
     let mut seen_entities: HashSet<String> = HashSet::new();
     for (key, distance) in raw {
-        if results.len() >= limit {
+        if rows.len() >= max_rows {
             break;
         }
         let Some(item) = graph.resolve_retrieval_key(&key) else {
             continue;
         };
-        let (entity_id, name, file) = match &item {
+        // Entity-centric projection: the ENTITY (kind + name + signature) is the
+        // result; the file is demoted to provenance.
+        let (entity_id, name, file, kind, signature) = match &item {
             kin_db::ResolvedRetrievalItem::Entity(entity) => (
                 entity.id.to_string(),
                 entity.name.clone(),
                 entity.file_origin.as_ref().map(|origin| origin.0.clone()),
+                Some(format!("{:?}", entity.kind).to_lowercase()),
+                Some(entity.signature.clone()).filter(|sig| !sig.is_empty()),
             ),
             other => {
                 let file = other.file_path().map(|path| path.0.clone());
@@ -3978,7 +4183,7 @@ fn build_semantic_locate_result(
                     .unwrap_or_default()
                     .to_string();
                 let id = file.clone().unwrap_or_else(|| name.clone());
-                (id, name, file)
+                (id, name, file, None, None)
             }
         };
 
@@ -3999,9 +4204,8 @@ fn build_semantic_locate_result(
             continue;
         }
 
-        // Project the bounded snippet only for kept entity hits (top `limit`),
-        // from graph-owned content — no working-tree read; a graph gap yields no
-        // snippet rather than a fallback.
+        // Project the bounded snippet from graph-owned content — no working-tree
+        // read; a graph gap yields no snippet rather than a fallback.
         let snippet = if include_snippet {
             if let kin_db::ResolvedRetrievalItem::Entity(entity) = &item {
                 kin_mcp::handlers::common::read_bounded_entity_snippet(graph, entity)
@@ -4015,27 +4219,54 @@ fn build_semantic_locate_result(
         let score = 1.0_f32 - distance;
         let mut hit = json!({
             "entity_id": entity_id,
+            "kind": kind,
             "name": name,
-            "file": file,
+            "signature": signature,
             "score": score,
+            "provenance": { "file": file },
         });
         if let Some(snippet) = snippet {
             hit["snippet"] = json!(snippet);
         }
-        results.push(hit);
+        rows.push(hit);
     }
 
-    let payload = json!({
-        "query": query,
-        "granularity": if file_granularity { "file" } else { "entity" },
-        "semantic_coverage": semantic_coverage,
-        "results": results,
-    });
-
-    match serde_json::to_string_pretty(&payload) {
-        Ok(text) => kin_mcp::ToolCallResult::text(text),
-        Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
+    // Cache the full ranking under the paging key, then return page 0.
+    let key = kin_cli::commands::locate::locate_cursor_key(
+        &query,
+        Some(granularity_token.as_str()),
+        graph_version,
+    );
+    {
+        let mut cache = state.semantic_locate_pages.lock().unwrap();
+        if cache.len() >= LOCATE_RANKING_CACHE_CAP && !cache.contains_key(&key) {
+            if let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.created)
+                .map(|(k, _)| k.clone())
+            {
+                cache.remove(&oldest);
+            }
+        }
+        cache.insert(
+            key.clone(),
+            CachedSemanticPage {
+                rows: rows.clone(),
+                graph_version,
+                created: std::time::Instant::now(),
+            },
+        );
     }
+
+    semantic_locate_payload(
+        &query,
+        file_granularity,
+        semantic_coverage,
+        &key,
+        0,
+        page_size,
+        &rows,
+    )
 }
 
 async fn mcp_tools_call(
@@ -4211,6 +4442,7 @@ async fn mcp_tools_call(
     // embedding coverage (graceful degradation per R5).
     if request.name == "semantic_locate" {
         return Ok(Json(build_semantic_locate_result(
+            &state,
             graph.as_ref(),
             &request.arguments,
         )));

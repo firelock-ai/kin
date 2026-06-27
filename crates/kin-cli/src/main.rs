@@ -256,6 +256,19 @@ enum Command {
         /// Suppress inline snippets even on the `--json` surface.
         #[arg(long = "no-snippets", conflicts_with = "snippets")]
         no_snippets: bool,
+        /// Fetch the NEXT page of ranked entities from the previous query,
+        /// reading the cursor persisted in `.kin/locate-cursor`. No retrieval
+        /// re-run; pages the daemon's cached ranking. Query text is not required.
+        #[arg(long, conflicts_with = "cursor")]
+        next: bool,
+        /// Fetch a specific entity page using an explicit cursor token (from a
+        /// prior result's `next_cursor`). Lower-level alternative to `--next`.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Entities per page for the graph-native `entities` surface
+        /// (`KIN_LOCATE_ENTITY_CAP` otherwise).
+        #[arg(long)]
+        page_size: Option<usize>,
     },
     /// Debug locate results: show per-signal breakdown, rank gold files,
     /// and diagnose why targets were missed.
@@ -1856,6 +1869,9 @@ fn main() -> Result<()> {
                     reference,
                     snippets,
                     no_snippets,
+                    next,
+                    cursor,
+                    page_size,
                 } => {
                     // Inline snippets default ON for the structured/agent `--json`
                     // surface (so an agent gets code on the first locate);
@@ -1867,6 +1883,20 @@ fn main() -> Result<()> {
                     let explain = explain || diagnose;
                     let max_files_explicit = max_files.is_some();
                     let max_files_val = max_files.unwrap_or(10);
+                    // Resolve the paging cursor: --next reads the persisted cursor
+                    // from the prior page; --cursor takes an explicit token.
+                    let paging_cursor = if next {
+                        Some(commands::locate::read_persisted_locate_cursor()?)
+                    } else {
+                        cursor
+                    };
+                    let paging = commands::locate::LocatePaging {
+                        cursor: paging_cursor,
+                        page_size,
+                    };
+                    // On a paging request the query text is carried by the cursor
+                    // (the daemon holds the cached ranking), so it is optional.
+                    let paging_active = paging.cursor.is_some();
                     let problem_text = if stdin {
                         let mut buf = String::new();
                         std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
@@ -1875,6 +1905,10 @@ fn main() -> Result<()> {
                         std::fs::read_to_string(&path)?
                     } else if let Some(t) = text {
                         t
+                    } else if paging_active {
+                        // --next / --cursor without inline text: the daemon pages
+                        // its cached ranking; text is only a cache-miss fallback.
+                        String::new()
                     } else {
                         anyhow::bail!("provide problem text, --file, or --stdin");
                     };
@@ -1888,6 +1922,7 @@ fn main() -> Result<()> {
                             max_files_explicit,
                             reference,
                             want_snippets,
+                            paging,
                         )
                         .await?;
 
@@ -2012,6 +2047,7 @@ fn main() -> Result<()> {
                             max_files_explicit,
                             reference,
                             want_snippets,
+                            paging,
                         )
                         .await
                     }

@@ -154,6 +154,7 @@ pub async fn run(task_file: PathBuf, json: bool, debug: bool) -> Result<()> {
         max_files_explicit,
         None,
         false,
+        crate::commands::locate::LocatePaging::default(),
     )
     .await?;
 

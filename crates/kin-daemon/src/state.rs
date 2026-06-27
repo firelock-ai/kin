@@ -383,7 +383,38 @@ pub struct DaemonState {
     /// separate HTTP calls) must live here to survive between calls; sessions and
     /// intents persist through the graph, but transactions have no graph backing.
     pub mcp_transactions: Mutex<HashMap<String, kin_mcp::McpTransaction>>,
+    /// Cached locate entity-rankings keyed by paging-cursor key, so `kin locate
+    /// --next` (and `semantic_locate` cursors) page a held ranking without
+    /// re-running retrieval. Bounded by [`LOCATE_RANKING_CACHE_CAP`].
+    pub locate_rankings: Mutex<HashMap<String, CachedLocateRanking>>,
+    /// Cached `semantic_locate` result pages keyed by paging-cursor key.
+    pub semantic_locate_pages: Mutex<HashMap<String, CachedSemanticPage>>,
 }
+
+/// Cached full locate entity-ranking for cursor paging. The daemon caches the
+/// FULL ranked entity list once per (query, ref/scope, graph-version) so a
+/// follow-up page (`kin locate --next`) windows the next slice with no retrieval
+/// re-run. `graph_version` is checked on lookup so a stale page (the graph moved
+/// under the cursor) is rejected rather than served.
+pub struct CachedLocateRanking {
+    pub entities: Vec<kin_cli::commands::locate::LocateEntity>,
+    pub graph_version: u64,
+    pub created: Instant,
+}
+
+/// Cached full `semantic_locate` result rows for cursor paging — the entity-
+/// granularity analogue of [`CachedLocateRanking`], holding the already-projected
+/// per-entity JSON rows so a follow-up page is a pure window.
+pub struct CachedSemanticPage {
+    pub rows: Vec<serde_json::Value>,
+    pub graph_version: u64,
+    pub created: Instant,
+}
+
+/// Soft cap on distinct rankings retained for paging; the oldest is evicted past
+/// this bound. Paging is a short-lived read-after-read, so a small cache covers
+/// the realistic concurrent-cursor count without unbounded growth.
+pub const LOCATE_RANKING_CACHE_CAP: usize = 64;
 
 /// Minimum baseline count before an anti-wipe guard can fire. Below this, the
 /// set is small enough that a collapse is not catastrophic (and fresh-init /
@@ -628,6 +659,8 @@ impl DaemonState {
             mass_deletion_blocked: AtomicBool::new(false),
             embed_worker_failed: AtomicBool::new(false),
             mcp_transactions: Mutex::new(HashMap::new()),
+            locate_rankings: Mutex::new(HashMap::new()),
+            semantic_locate_pages: Mutex::new(HashMap::new()),
         };
         // Restore in-flight MCP transactions persisted before a restart
         // so staged-but-uncommitted work is not silently dropped across a daemon
@@ -763,6 +796,8 @@ impl DaemonState {
             mass_deletion_blocked: AtomicBool::new(false),
             embed_worker_failed: AtomicBool::new(false),
             mcp_transactions: Mutex::new(HashMap::new()),
+            locate_rankings: Mutex::new(HashMap::new()),
+            semantic_locate_pages: Mutex::new(HashMap::new()),
         };
 
         // Restore in-flight MCP transactions persisted before a restart.
@@ -2035,6 +2070,8 @@ mod tests {
             mass_deletion_blocked: AtomicBool::new(false),
             embed_worker_failed: AtomicBool::new(false),
             mcp_transactions: Mutex::new(HashMap::new()),
+            locate_rankings: Mutex::new(HashMap::new()),
+            semantic_locate_pages: Mutex::new(HashMap::new()),
         }
     }
 
