@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use kin_cli::commands::sync::SyncSummary;
 use kin_index::{FileEvent, FileWatcher};
 use kin_reconcile::apply_overlay_to_graph;
 use tracing::{debug, error, info, warn};
@@ -472,12 +473,19 @@ fn should_block_mass_deletion(removed: u64, total_graph_files: u64, allow_overri
     crate::state::graph_collapse_is_wipe(surviving, total_graph_files)
 }
 
+/// Reconcile the working tree into the graph: a deterministic disk-vs-graph
+/// content-hash diff that adds/modifies/deletes entities to match what is on
+/// disk. Runs at daemon startup, in the commit pipeline, and on demand via the
+/// `/sync` route (the `kin sync` primitive). Unchanged entities keep their
+/// vectors; changed entities are queued for the next embed pass. Returns a
+/// [`SyncSummary`] of the applied diff.
 #[tracing::instrument(skip(state))]
-pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
+pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<SyncSummary> {
+    let mut summary = SyncSummary::default();
     let working_dir = state.layout.working_dir();
     if is_bare_repository(working_dir) {
         debug!(working_dir = %working_dir.display(), "working directory is a bare Git repository; skipping filesystem sync");
-        return Ok(());
+        return Ok(summary);
     }
 
     let extensions = kin_index::watcher::supported_extensions();
@@ -589,7 +597,8 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
     }
 
     if events.is_empty() {
-        return Ok(());
+        summary.embed_queued = state.graph.pending_embeddings();
+        return Ok(summary);
     }
 
     info!(
@@ -653,6 +662,26 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
                         }
                     }
 
+                    // Tally the applied entity-level delta for the sync summary.
+                    match &outcome {
+                        ReconcileOutcome::Updated {
+                            added,
+                            modified,
+                            removed,
+                            ..
+                        } => {
+                            summary.entities_added += added.len();
+                            summary.entities_modified += modified.len();
+                            summary.entities_deleted += removed.len();
+                            summary.files_changed += 1;
+                        }
+                        ReconcileOutcome::FileRemoved { removed, .. } => {
+                            summary.entities_deleted += removed.len();
+                            summary.files_changed += 1;
+                        }
+                        _ => {}
+                    }
+
                     graph_changed = true;
                 }
             }
@@ -678,5 +707,10 @@ pub async fn sync_filesystem_with_graph(state: &DaemonState) -> Result<()> {
         }
     }
 
-    Ok(())
+    summary.reconciled = graph_changed;
+    // The mutation path auto-queued every changed entity (`ChangedThisSync`);
+    // report the resulting pending-embedding count so a caller can confirm the
+    // subsequent `kin embed` pass touches only the diff, not the whole repo.
+    summary.embed_queued = state.graph.pending_embeddings();
+    Ok(summary)
 }

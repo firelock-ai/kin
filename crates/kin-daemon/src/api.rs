@@ -808,6 +808,9 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/vfs/file-changed", post(vfs_file_changed))
         .route("/vfs/write-notify", post(vfs_write_notify))
         .route("/vfs/subscribe", get(vfs_subscribe))
+        // Working-tree reconcile — diff the on-disk tree against the graph after a
+        // bulk change such as `git checkout` (the `kin sync` primitive).
+        .route("/sync", post(sync_filesystem))
         // Archive endpoints — downloadable source archives
         // Axum doesn't allow parameters and literals in the same segment,
         // so we use /archive/tar/{ref} and /archive/zip/{ref} instead.
@@ -3708,6 +3711,37 @@ async fn reconcile(
         .map_err(internal_error)?
         .map_err(internal_error)?
     };
+    Ok(Json(summary))
+}
+
+/// POST /sync — reconcile the daemon's working tree into the graph.
+///
+/// Runs the same deterministic disk-vs-graph content-hash diff that fires at
+/// daemon startup (`sync_filesystem_with_graph`): it adds/modifies/deletes graph
+/// entities to match the on-disk working tree after a bulk change such as a
+/// `git checkout`. The vector index is left frozen — changed entities are queued
+/// (`ChangedThisSync`) for the next embed pass while unchanged entities keep
+/// their existing vectors. Returns a [`kin_cli::commands::sync::SyncSummary`]
+/// describing the applied diff.
+///
+/// The request body is an explicit `{}` and is intentionally ignored: the sync
+/// target is always the daemon's own working tree.
+async fn sync_filesystem(
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+
+    let summary = crate::loop_runner::sync_filesystem_with_graph(&state)
+        .await
+        .map_err(internal_error)?;
     Ok(Json(summary))
 }
 
@@ -7788,6 +7822,62 @@ mod tests {
             }
             other => panic!("expected entity record, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn sync_endpoint_reconciles_working_tree_and_returns_summary() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let working_dir = state.layout.working_dir().to_path_buf();
+        std::fs::create_dir_all(working_dir.join("src")).unwrap();
+        std::fs::write(
+            working_dir.join("src/lib.rs"),
+            "pub fn greet() -> u32 {\n    1\n}\n",
+        )
+        .unwrap();
+
+        let app = router(Arc::clone(&state));
+        let response = app
+            .oneshot(
+                Request::post("/sync")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let summary: kin_cli::commands::sync::SyncSummary =
+            serde_json::from_slice(&body).unwrap();
+
+        assert!(
+            summary.reconciled,
+            "writing a new source file should reconcile the graph: {summary:?}"
+        );
+        assert_eq!(summary.files_changed, 1, "exactly one file changed: {summary:?}");
+        assert!(
+            summary.entities_added >= 1,
+            "greet() should be added as an entity: {summary:?}"
+        );
+        assert_eq!(summary.entities_deleted, 0, "{summary:?}");
+        // The reconcile auto-queues the changed entities for embedding; the
+        // summary's embed_queued mirrors the live pending-embedding count (the
+        // diff a subsequent `kin embed` pass will drain — never the whole repo).
+        assert_eq!(
+            summary.embed_queued,
+            state.graph.pending_embeddings(),
+            "embed_queued must equal the live pending-embedding count: {summary:?}"
+        );
+        assert!(
+            summary.embed_queued >= 1,
+            "changed entities must be queued for embedding: {summary:?}"
+        );
     }
 
     #[tokio::test]

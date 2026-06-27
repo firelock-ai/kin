@@ -781,6 +781,17 @@ enum Command {
         #[arg(long)]
         cleanup: bool,
     },
+    /// Reconcile the working tree into the graph after a bulk change (e.g. `git checkout`)
+    ///
+    /// Runs the deterministic disk-vs-graph content-hash diff: adds/modifies/
+    /// deletes graph entities to match the on-disk working tree, reusing the
+    /// existing vectors for unchanged entities and queueing only the changed
+    /// ones for embedding. Run `kin embed` afterwards to embed the queued diff.
+    Sync {
+        /// Output the reconcile summary as JSON instead of a one-line report.
+        #[arg(long)]
+        json: bool,
+    },
     /// Open an interactive shell in a materialized session workspace
     Shell {
         /// Materialization strategy
@@ -2527,6 +2538,7 @@ fn main() -> Result<()> {
                 Command::Reconcile { session, cleanup } => {
                     commands::reconcile::run(session, cleanup).await
                 }
+                Command::Sync { json } => commands::sync::run(json).await,
                 Command::With {
                     assistant,
                     passive_guidance,

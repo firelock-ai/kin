@@ -592,6 +592,30 @@ impl DaemonClient {
             .context("parse daemon reconcile response")?)
     }
 
+    /// Reconcile the daemon's working tree into the graph (`POST /sync`).
+    ///
+    /// Runs the deterministic disk-vs-graph content-hash diff, reusing vectors
+    /// for unchanged entities and queueing only the changed ones for embedding.
+    pub async fn sync(
+        &self,
+        request: &crate::commands::sync::SyncRequest,
+    ) -> Result<crate::commands::sync::SyncSummary> {
+        let resp = self
+            .send(
+                self.client
+                    .post(format!("{}/sync", self.base_url))
+                    .json(request),
+                "send daemon sync request",
+            )
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon sync error (HTTP {}): {}", status, body);
+        }
+        Ok(resp.json().await.context("parse daemon sync response")?)
+    }
+
     pub async fn command_status(
         &self,
         request: &crate::commands::status::CommandStatusRequest,
