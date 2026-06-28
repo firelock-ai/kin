@@ -445,7 +445,9 @@ where
                         )
                 })
                 .collect::<Vec<_>>();
-            entities.sort_by_key(|entity| same_file_neighbor_rank(&focal, entity));
+            // (rank, entity id): the id tie-break makes equal-rank same-file neighbours
+            // deterministically ordered instead of inheriting query/HashMap order.
+            entities.sort_by_key(|entity| (same_file_neighbor_rank(&focal, entity), entity.id));
             entities
         } else {
             Vec::new()
@@ -473,7 +475,14 @@ where
     sorted_entities.sort_by(|(a_id, _), (b_id, _)| {
         let wa = weight_map.get(a_id).copied().unwrap_or(0.0);
         let wb = weight_map.get(b_id).copied().unwrap_or(0.0);
-        wb.partial_cmp(&wa).unwrap_or(std::cmp::Ordering::Equal)
+        // Deterministic TOTAL order: relation weight desc, then entity id. Without the
+        // id tie-break, equal-weight entities retained their HashMap iteration order
+        // (nondeterministic per process), so get_context_pack's "related entities" list
+        // — which the agent reads — differed run-to-run and made multi-turn trajectories
+        // diverge. The id tie-break makes the pack byte-identical for identical truth.
+        wb.partial_cmp(&wa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a_id.cmp(b_id))
     });
 
     let mut dep_entries = Vec::new();
