@@ -55,6 +55,7 @@ pub fn handle_semantic_search<G: GraphStore>(
             total_matches,
             truncated: total_matches > limited.len(),
             results: limited,
+            fallback: None,
         })
         .map_err(McpError::Json)?
     } else {
@@ -69,6 +70,7 @@ pub fn handle_semantic_search<G: GraphStore>(
             total_matches,
             truncated: total_matches > limited.len(),
             results: limited,
+            fallback: None,
         })
         .map_err(McpError::Json)?
     };

@@ -1550,6 +1550,12 @@ pub struct SemanticSearchResponse {
     pub total_matches: usize,
     pub truncated: bool,
     pub results: Vec<SemanticSearchResult>,
+    /// Set when the name/kind/language metadata filter returned nothing and the
+    /// results were instead produced by the vector pipeline (a concept-query
+    /// fallback). `"vector"` marks that substitution; `None` on the normal
+    /// name-pattern path. Additive — absent from the wire when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1587,6 +1593,12 @@ pub struct CompactSearchResponse {
     pub total_matches: usize,
     pub truncated: bool,
     pub results: Vec<CompactSearchResult>,
+    /// Set when the name/kind/language metadata filter returned nothing and the
+    /// results were instead produced by the vector pipeline (a concept-query
+    /// fallback). `"vector"` marks that substitution; `None` on the normal
+    /// name-pattern path. Additive — absent from the wire when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

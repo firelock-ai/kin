@@ -4303,6 +4303,125 @@ fn build_semantic_locate_result(
     )
 }
 
+/// `semantic_search` with a vector fallback.
+///
+/// The base behavior is a name/kind/language metadata filter over graph entities
+/// — an exact-ish declaration lookup. When that filter returns zero matches
+/// (commonly because the caller issued a *concept* query, the shape
+/// `semantic_locate` expects), fall back to the daemon's real vector pipeline
+/// (`graph.semantic_search`, the same HNSW path `semantic_locate` uses) for the
+/// same query so a behavioral query still returns relevant declarations instead
+/// of an empty set. The fallback response is tagged `fallback: "vector"` so the
+/// substitution is visible. When the metadata filter DOES hit, behavior — and the
+/// wire shape — is unchanged (no fallback, no tag).
+fn build_semantic_search_result(
+    graph: &kin_db::InMemoryGraph,
+    arguments: &HashMap<String, serde_json::Value>,
+) -> kin_mcp::ToolCallResult {
+    let (query, limit, filter) =
+        match kin_mcp::handlers::common::build_semantic_search_request(arguments) {
+            Ok(parts) => parts,
+            Err(error) => return kin_mcp::ToolCallResult::error(error.to_string()),
+        };
+    let compact = kin_mcp::handlers::common::get_optional_bool(arguments, "compact", true);
+
+    let entities = match graph.query_entities(&filter) {
+        Ok(entities) => entities,
+        Err(error) => return kin_mcp::ToolCallResult::error(error.to_string()),
+    };
+
+    // Name-pattern hit: preserve the exact existing behavior (no fallback tag).
+    if !entities.is_empty() {
+        return render_semantic_search_response(query, limit, compact, entities, None);
+    }
+
+    // Zero metadata matches: fall back to vector search for the same query.
+    tracing::info!(
+        query = %query,
+        "semantic_search metadata filter returned 0; falling back to vector search"
+    );
+    let fetch_limit = limit.saturating_mul(8).max(limit);
+    let raw = match graph.semantic_search(&query, fetch_limit) {
+        Ok(hits) => hits,
+        Err(error) => {
+            // Vector path unavailable (e.g. nothing embedded): return the honest,
+            // well-formed empty metadata result rather than a hard error.
+            tracing::warn!(error = %error, "semantic_search vector fallback unavailable");
+            return render_semantic_search_response(query, limit, compact, Vec::new(), None);
+        }
+    };
+
+    // Resolve vector hits to entities, collapsing the two index vectors per entity
+    // (`Entity` + `EntityRevision`, both resolving to the same entity) into one
+    // result. `raw` is rank-ordered by distance, so the first occurrence wins.
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut fallback_entities: Vec<kin_model::entity::Entity> = Vec::new();
+    for (key, _distance) in raw {
+        if fallback_entities.len() >= limit {
+            break;
+        }
+        let Some(kin_db::ResolvedRetrievalItem::Entity(entity)) = graph.resolve_retrieval_key(&key)
+        else {
+            continue;
+        };
+        if !seen.insert(entity.id.to_string()) {
+            continue;
+        }
+        fallback_entities.push(entity);
+    }
+
+    render_semantic_search_response(query, limit, compact, fallback_entities, Some("vector"))
+}
+
+/// Serialize a `semantic_search` page into the tool result, honoring the
+/// `compact` shape and an optional `fallback` tag. `entities` may exceed `limit`
+/// (the name-pattern path passes the full match set so `truncated`/`total_matches`
+/// stay accurate); the fallback path passes a pre-capped, rank-ordered set.
+fn render_semantic_search_response(
+    query: String,
+    limit: usize,
+    compact: bool,
+    entities: Vec<kin_model::entity::Entity>,
+    fallback: Option<&'static str>,
+) -> kin_mcp::ToolCallResult {
+    let total_matches = entities.len();
+    let serialized = if compact {
+        let results: Vec<_> = entities
+            .into_iter()
+            .take(limit)
+            .map(kin_mcp::handlers::common::CompactSearchResult::from)
+            .collect();
+        let truncated = total_matches > results.len();
+        serde_json::to_string_pretty(&kin_mcp::handlers::common::CompactSearchResponse {
+            query,
+            limit,
+            total_matches,
+            truncated,
+            results,
+            fallback: fallback.map(str::to_string),
+        })
+    } else {
+        let results: Vec<_> = entities
+            .into_iter()
+            .take(limit)
+            .map(kin_mcp::handlers::common::SemanticSearchResult::from)
+            .collect();
+        let truncated = total_matches > results.len();
+        serde_json::to_string_pretty(&kin_mcp::handlers::common::SemanticSearchResponse {
+            query,
+            limit,
+            total_matches,
+            truncated,
+            results,
+            fallback: fallback.map(str::to_string),
+        })
+    };
+    match serialized {
+        Ok(text) => kin_mcp::ToolCallResult::text(text),
+        Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
+    }
+}
+
 async fn mcp_tools_call(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
@@ -4477,6 +4596,21 @@ async fn mcp_tools_call(
     if request.name == "semantic_locate" {
         return Ok(Json(build_semantic_locate_result(
             &state,
+            graph.as_ref(),
+            &request.arguments,
+        )));
+    }
+
+    // `semantic_search`: a name/kind/language metadata filter with a vector
+    // fallback. When the metadata filter returns zero matches — typically because
+    // the caller issued a *concept* query (the shape `semantic_locate` expects) —
+    // fall back to the daemon's real vector pipeline (`graph.semantic_search`, the
+    // same HNSW path R14 uses) so a behavioral query still returns relevant
+    // declarations instead of an empty set. Exact-name lookups keep hitting the
+    // metadata filter unchanged. The generic GraphStore handler in kin-mcp cannot
+    // reach the vector index, so the fallback is routed here like `semantic_locate`.
+    if request.name == "semantic_search" {
+        return Ok(Json(build_semantic_search_result(
             graph.as_ref(),
             &request.arguments,
         )));
