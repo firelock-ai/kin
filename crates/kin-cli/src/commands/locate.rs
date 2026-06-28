@@ -34,7 +34,7 @@ type ResolveEntitiesOutput = (
 pub struct LocateResult {
     /// Graph-native PRIMARY result: the top-confidence semantic ENTITIES
     /// (function/method/type …) the query is about — each with its kind, name,
-    /// signature, bounded body, and the file demoted to mere provenance. This is
+    /// signature, a bounded snippet, and the file demoted to mere provenance. This is
     /// the entity-centric surface an agent reasons over; `files` below is kept for
     /// back-compat and file-level provenance. Populated on the agent/JSON surface
     /// (when snippet projection is requested); empty on the human/in-process path,
@@ -164,9 +164,10 @@ fn is_zero_usize(value: &usize) -> bool {
 /// A single ranked graph ENTITY surfaced by `kin locate` — the graph-native unit
 /// of the result. Unlike [`LocateSymbol`] (a file-attributed symbol), a
 /// `LocateEntity` is self-describing and act-on-able: it carries the entity's
-/// stable graph id, declared signature, and bounded body, with the file demoted
-/// to [`LocateProvenance`]. An agent can declare it, read its body, or drill its
-/// references straight from this record — no path typing, no follow-up file read.
+/// stable graph id, declared signature, and a bounded snippet, with the file
+/// demoted to [`LocateProvenance`]. An agent can declare it, read its snippet (or
+/// pull the full body via `get_entity_source`), or drill its references straight
+/// from this record — no path typing, no follow-up file read.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LocateEntity {
     /// Stable graph entity id. The handle for every follow-up graph query
@@ -188,13 +189,16 @@ pub struct LocateEntity {
     /// 1-based inclusive line span of the entity, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<[u32; 2]>,
-    /// The entity's BOUNDED body — the answer itself — projected from the same
+    /// Bounded inline source SNIPPET — a teaser, not the full body: the entity's
+    /// signature plus the first few lines, projected from the same
     /// content-addressed, hash-verified graph body that backs `get_entity_source`
-    /// (never a working-tree read). Capped for density; when the full body
-    /// exceeds the cap a trailing note points at `get_entity_source <entity_id>`
-    /// for the remainder. `None` on a graph/blob miss (coordinates only).
+    /// (never a working-tree read), capped to the shared retrieval-snippet bound
+    /// every agent surface uses (`semantic_locate`, located symbols). The full
+    /// body is fetched on demand via `get_entity_source <entity_id>`; keeping the
+    /// discovery surface to a snippet is what keeps locate/search token-lean.
+    /// `None` on a graph/blob miss (coordinates only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub body: Option<String>,
+    pub snippet: Option<String>,
     /// Where this entity lives. The file is provenance, not the result.
     pub provenance: LocateProvenance,
 }
@@ -13957,46 +13961,15 @@ fn match_symbol_entity<'a>(
         .or_else(|| entities.iter().find(|e| e.name == sym.name))
 }
 
-/// Project an entity's BOUNDED body from graph-owned content, appending a
-/// truncation note (pointing at `get_entity_source <id>` for the remainder) when
-/// the entity spans more source lines than the cap surfaced. Same
-/// content-addressed, hash-verified projection
-/// ([`kin_mcp::handlers::common::read_entity_source_excerpt_detailed`]) every
-/// agent surface uses — never a working-tree read; a graph/blob miss yields
-/// `None` (coordinates only).
-fn bounded_entity_body_with_note(
-    graph: &kin_db::InMemoryGraph,
-    entity: &kin_model::Entity,
-    max_lines: usize,
-    max_chars: usize,
-) -> Option<String> {
-    let body = kin_mcp::handlers::common::read_entity_source_excerpt_detailed(
-        graph, entity, max_lines, max_chars,
-    )?;
-    if let Some(span) = entity.span.as_ref() {
-        let total_lines = (span.end_line.saturating_sub(span.start_line) as usize).saturating_add(1);
-        let shown = body.lines().count();
-        if total_lines > shown {
-            let remaining = total_lines - shown;
-            return Some(format!(
-                "{body}\n… (+{remaining} more line{} — get_entity_source {} for the full body)",
-                if remaining == 1 { "" } else { "s" },
-                entity.id
-            ));
-        }
-    }
-    Some(body)
-}
-
 /// Re-project the file-attributed ranked symbols already built into `result`
 /// (`build_result` + `attach_snippets`) into the graph-native PRIMARY surface:
 /// a single GLOBALLY-ranked list of [`LocateEntity`] (kind + name + signature +
-/// bounded body, file demoted to provenance), stored on `result.entities`.
+/// bounded snippet, file demoted to provenance), stored on `result.entities`.
 ///
 /// This is a thin RE-PROJECTION, not new retrieval: it reuses the tuned file/
-/// symbol ranking and the graph-owned body projection. For each ranked file it
+/// symbol ranking and the graph-owned snippet projection. For each ranked file it
 /// resolves every emitted symbol to its graph entity ([`match_symbol_entity`]),
-/// fills the stable `entity_id` + declared `signature` + bounded `body`, then
+/// fills the stable `entity_id` + declared `signature` + bounded `snippet`, then
 /// global-ranks (definition-before-reference, score desc, file-rank, name) and
 /// de-duplicates by `entity_id`. The FULL ranking is written to `result.entities`
 /// (and `total_ranked`); the daemon then caches it and windows a single page via
@@ -14035,10 +14008,14 @@ pub fn build_entity_view(
             if !seen.insert(entity_id.clone()) {
                 continue;
             }
-            // Bodies belong to definitions; references/re-exports stay
+            // Snippets belong to definitions; references/re-exports stay
             // coordinates-only (the symbol already reused its snippet, if any).
-            let body = if sym.definition {
-                bounded_entity_body_with_note(graph, entity, opts.max_lines, opts.max_chars)
+            // Project the SHORT shared retrieval snippet (signature + first lines)
+            // — a teaser, not the full body — so the discovery surface stays
+            // token-lean; the full body is fetched on demand via
+            // `get_entity_source`. Same projection `semantic_locate` hits use.
+            let snippet = if sym.definition {
+                kin_mcp::handlers::common::read_bounded_entity_snippet(graph, entity)
                     .or_else(|| sym.snippet.clone())
             } else {
                 None
@@ -14058,7 +14035,7 @@ pub fn build_entity_view(
                     score: sym.score,
                     definition: sym.definition,
                     span: sym.span,
-                    body,
+                    snippet,
                     provenance: LocateProvenance {
                         file: file_origin,
                         origin: sym.origin.clone(),
@@ -14325,7 +14302,7 @@ mod tests {
             score,
             definition,
             span: Some([10, 20]),
-            body: Some(format!("fn {name}() {{ /* … */ }}")),
+            snippet: Some(format!("fn {name}() {{ /* … */ }}")),
             provenance: LocateProvenance {
                 file: Some(format!("src/{name}.rs")),
                 origin: "vector".to_string(),
@@ -14356,7 +14333,7 @@ mod tests {
         assert_eq!(e["kind"], "function");
         assert_eq!(e["name"], "parse_config");
         assert_eq!(e["signature"], "fn parse_config()");
-        assert!(e["body"].as_str().unwrap().contains("parse_config"));
+        assert!(e["snippet"].as_str().unwrap().contains("parse_config"));
         // File is provenance, never a top-level field on the entity.
         assert_eq!(e["provenance"]["file"], "src/parse_config.rs");
         assert!(e.get("file").is_none());
