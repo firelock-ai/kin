@@ -14065,18 +14065,21 @@ pub fn build_entity_view(
     result.total_ranked = result.entities.len();
 }
 
-/// Stable, opaque key for a locate ranking, scoped to the query, the ref/scope it
-/// ran against, and the graph version. Embedding the graph version means any
-/// edit (a `vfs_version` bump) yields a different key, so a stale cursor can
-/// never page a ranking built against different graph truth.
-pub fn locate_cursor_key(text: &str, reference: Option<&str>, graph_version: u64) -> String {
+/// Stable, opaque key for a locate ranking, identifying the QUERY: the query text
+/// plus the ref/scope (or granularity) it ran against. Deliberately carries NO graph
+/// version: a version stamp here is redundant — staleness is already enforced on the
+/// cache ENTRY (`entry.graph_version == current`), so a mutation invalidates the page
+/// regardless. Earlier this key embedded `vfs_version` (a build-nondeterministic
+/// counter) and then its content-hash replacement (which still includes worktree-
+/// absolute paths); either way a build-dependent value leaked into the agent-visible
+/// cursor token and made multi-turn agent trajectories diverge run-to-run on identical
+/// rankings. Keying on the query alone is deterministic and path-independent.
+pub fn locate_cursor_key(text: &str, reference: Option<&str>) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = FxHasher::default();
     text.hash(&mut hasher);
     0xff_u8.hash(&mut hasher); // field separator
     reference.unwrap_or("").hash(&mut hasher);
-    0xff_u8.hash(&mut hasher);
-    graph_version.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
@@ -14427,17 +14430,16 @@ mod tests {
     }
 
     #[test]
-    fn locate_cursor_key_is_deterministic_and_version_scoped() {
-        let a = locate_cursor_key("find the parser", Some("HEAD"), 42);
-        let b = locate_cursor_key("find the parser", Some("HEAD"), 42);
+    fn locate_cursor_key_is_deterministic_and_query_scoped() {
+        // The key depends ONLY on query + ref/scope — no graph version — so it is
+        // identical run-to-run (deterministic cursor). Staleness is enforced on the
+        // cache entry, not the key.
+        let a = locate_cursor_key("find the parser", Some("HEAD"));
+        let b = locate_cursor_key("find the parser", Some("HEAD"));
         assert_eq!(a, b, "same inputs must yield the same key");
-        // A graph edit bumps the version → a different key, so a stale cursor can
-        // never page a ranking built against different graph truth.
-        let c = locate_cursor_key("find the parser", Some("HEAD"), 43);
-        assert_ne!(a, c);
         // Query and ref are part of the identity.
-        assert_ne!(a, locate_cursor_key("other query", Some("HEAD"), 42));
-        assert_ne!(a, locate_cursor_key("find the parser", Some("main"), 42));
+        assert_ne!(a, locate_cursor_key("other query", Some("HEAD")));
+        assert_ne!(a, locate_cursor_key("find the parser", Some("main")));
     }
 
     #[test]

@@ -3140,12 +3140,13 @@ async fn locate(
     .map_err(internal_error)?;
 
     // Cache the full entity ranking and window page 0 so a follow-up `--next`
-    // pages it from cache without re-running retrieval. Keyed by
-    // (query, ref/scope, graph-version) so any edit invalidates the page.
+    // pages it from cache without re-running retrieval. The cursor KEY identifies the
+    // QUERY only (no graph version), so the agent-visible cursor token is deterministic
+    // run-to-run. Staleness is enforced on the cache ENTRY below (`graph_version`): a
+    // mutation bumps it -> the entry mismatches -> fresh search.
     let key = kin_cli::commands::locate::locate_cursor_key(
         &req.text,
         scope_token.as_deref(),
-        graph_version,
     );
     cache_locate_ranking(&state, &key, &result.entities, graph_version);
     kin_cli::commands::locate::apply_entity_page(&mut result, &key, 0, page_size);
@@ -4265,11 +4266,14 @@ fn build_semantic_locate_result(
         rows.push(hit);
     }
 
-    // Cache the full ranking under the paging key, then return page 0.
+    // Cache the full ranking under the paging key, then return page 0. The cursor KEY
+    // identifies the QUERY only (no graph version) so it is deterministic run-to-run —
+    // this is the agent-facing path, where a volatile cursor made multi-turn
+    // trajectories diverge. The cache ENTRY keeps `graph_version` for intra-daemon
+    // staleness (a mutation invalidates the entry -> fresh search).
     let key = kin_cli::commands::locate::locate_cursor_key(
         &query,
         Some(granularity_token.as_str()),
-        graph_version,
     );
     {
         let mut cache = state.semantic_locate_pages.lock().unwrap();
