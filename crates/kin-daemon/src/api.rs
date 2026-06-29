@@ -4491,15 +4491,24 @@ async fn mcp_tools_call(
             graph.as_ref(),
             entity_id,
         ) {
-            Ok(response) => match response.source {
-                Some(source) => match serde_json::to_string_pretty(&source) {
-                    Ok(json) => kin_mcp::ToolCallResult::text(json),
-                    Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
-                },
-                None => kin_mcp::ToolCallResult::error(
-                    "graph source response missing source".to_string(),
-                ),
-            },
+            Ok(response) => {
+                // Surface the resolver's own error first: a missing/invalid entity_id
+                // yields error: Some("no entity found matching ...") with source: None.
+                // Checking source first mislabels "not found" as the confusing "missing
+                // source", which makes agents retry a dead id in a loop.
+                if let Some(err_msg) = response.error {
+                    kin_mcp::ToolCallResult::error(err_msg)
+                } else if let Some(source) = response.source {
+                    match serde_json::to_string_pretty(&source) {
+                        Ok(json) => kin_mcp::ToolCallResult::text(json),
+                        Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
+                    }
+                } else {
+                    kin_mcp::ToolCallResult::error(
+                        "graph source response missing source".to_string(),
+                    )
+                }
+            }
             Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
         };
         return Ok(Json(result));
