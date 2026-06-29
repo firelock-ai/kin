@@ -4198,13 +4198,17 @@ fn build_semantic_locate_result(
         };
         // Entity-centric projection: the ENTITY (kind + name + signature) is the
         // result; the file is demoted to provenance.
-        let (entity_id, name, file, kind, signature) = match &item {
+        let (entity_id, name, file, kind, signature, span) = match &item {
             kin_db::ResolvedRetrievalItem::Entity(entity) => (
                 entity.id.to_string(),
                 entity.name.clone(),
                 entity.file_origin.as_ref().map(|origin| origin.0.clone()),
                 Some(format!("{:?}", entity.kind).to_lowercase()),
                 Some(entity.signature.clone()).filter(|sig| !sig.is_empty()),
+                entity
+                    .span
+                    .as_ref()
+                    .map(|span| (span.start_line, span.end_line)),
             ),
             other => {
                 let file = other.file_path().map(|path| path.0.clone());
@@ -4218,7 +4222,7 @@ fn build_semantic_locate_result(
                     .unwrap_or_default()
                     .to_string();
                 let id = file.clone().unwrap_or_else(|| name.clone());
-                (id, name, file, None, None)
+                (id, name, file, None, None, None)
             }
         };
 
@@ -4252,13 +4256,26 @@ fn build_semantic_locate_result(
         };
 
         let score = 1.0_f32 - distance;
+        // Provenance carries the entity's source location: the file plus, when the
+        // graph knows it, the 1-based inclusive line span. The agent-facing benchmark
+        // records this span as OBSERVED structural-credit provenance, so it must never
+        // re-derive a span by re-parsing the file from a symbol name. Absent a span
+        // (relation-only / pathless hits) provenance stays file-only.
+        let provenance = match span {
+            Some((start_line, end_line)) => json!({
+                "file": file,
+                "start_line": start_line,
+                "end_line": end_line,
+            }),
+            None => json!({ "file": file }),
+        };
         let mut hit = json!({
             "entity_id": entity_id,
             "kind": kind,
             "name": name,
             "signature": signature,
             "score": score,
-            "provenance": { "file": file },
+            "provenance": provenance,
         });
         if let Some(snippet) = snippet {
             hit["snippet"] = json!(snippet);
