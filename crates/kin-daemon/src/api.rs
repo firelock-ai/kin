@@ -9385,7 +9385,12 @@ mod tests {
         // Each refresh registers the repo's own entities as resolution targets so
         // the next hop can bind to them — the behavior this gate proves. Refresh
         // in dependency order so each hop's targets are present.
-        spine.refresh_cross_repo_edges("consumer", &consumer_entities, &consumer_relations, &registry);
+        spine.refresh_cross_repo_edges(
+            "consumer",
+            &consumer_entities,
+            &consumer_relations,
+            &registry,
+        );
         spine.refresh_cross_repo_edges(
             "consumer2",
             &consumer2_entities,
@@ -9418,7 +9423,9 @@ mod tests {
         let xbody: serde_json::Value =
             serde_json::from_slice(&axum::body::to_bytes(xref.into_body(), 65536).await.unwrap())
                 .unwrap();
-        let edges = xbody["edges"].as_array().expect("edges array in /spine/xref");
+        let edges = xbody["edges"]
+            .as_array()
+            .expect("edges array in /spine/xref");
         assert!(
             edges.iter().any(|e| e["dst_repo"] == "consumer"),
             "2-hop: downstream must resolve a cross-repo edge into consumer, got {edges:?}"

@@ -243,7 +243,11 @@ impl SpineIndex {
         // target. Idempotent with the ingest-time register_repo: re-registration
         // replaces this repo's rows and preserves its existing root hash.
         let root_hash = self.root_hash(repo_id).unwrap_or_default();
-        self.register_repo(repo_id, entries_from_entities(repo_id, entities), &root_hash);
+        self.register_repo(
+            repo_id,
+            entries_from_entities(repo_id, entities),
+            &root_hash,
+        );
 
         // Remove existing edges from this repo
         {
