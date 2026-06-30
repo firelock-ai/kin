@@ -9550,10 +9550,13 @@ mod tests {
         );
 
         // ── Surface 2: the `kin xref` / `kin impact` CLI client code. ──
-        let cli_xref = get_spine_xref(&layout, "consumer", &run_task_id)
+        let cli_xref = match get_spine_xref(&layout, "consumer", &run_task_id)
             .await
             .expect("CLI get_spine_xref call")
-            .expect("CLI get_spine_xref returns edges");
+        {
+            kin_spine::SpineQuery::Found(edges) => edges,
+            other => panic!("CLI get_spine_xref expected Found, got {other:?}"),
+        };
         let cli_xref_to_provider = cli_xref.iter().any(|e| e.dst_repo == "provider");
         assert!(
             cli_xref_to_provider,
@@ -9572,10 +9575,10 @@ mod tests {
         );
 
         // ── Surface 3: the MCP impact_analysis client code. ──
-        let mcp_xref = fetch_spine_xref("consumer", &run_task_id)
-            .await
-            .expect("MCP fetch_spine_xref call")
-            .expect("MCP fetch_spine_xref returns edges");
+        let mcp_xref = match fetch_spine_xref("consumer", &run_task_id).await {
+            kin_spine::SpineQuery::Found(body) => body,
+            other => panic!("MCP fetch_spine_xref expected Found, got {other:?}"),
+        };
         let mcp_xref_to_provider = mcp_xref["edges"]
             .as_array()
             .map(|edges| edges.iter().any(|e| e["dst_repo"] == "provider"))
@@ -9585,10 +9588,10 @@ mod tests {
             "MCP fetch_spine_xref must resolve consumer->provider: {mcp_xref}"
         );
 
-        let mcp_impact = fetch_spine_impact_typed("provider", &do_work_id, 5)
-            .await
-            .expect("MCP fetch_spine_impact_typed call")
-            .expect("MCP fetch_spine_impact_typed returns impact");
+        let mcp_impact = match fetch_spine_impact_typed("provider", &do_work_id, 5).await {
+            kin_spine::SpineQuery::Found(impact) => impact,
+            other => panic!("MCP fetch_spine_impact_typed expected Found, got {other:?}"),
+        };
         let mcp_impact_hits_consumer = mcp_impact.repos_involved.iter().any(|r| r == "consumer");
         assert!(
             mcp_impact_hits_consumer,
