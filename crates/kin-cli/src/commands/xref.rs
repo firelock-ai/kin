@@ -92,7 +92,9 @@ pub async fn build_xref_response(
         }
         // No daemon endpoint configured in this context.
         Ok(::kin_spine::SpineQuery::NotConfigured) => {
-            lines.push("  Cross-repo spine not configured (no daemon endpoint available).".to_string());
+            lines.push(
+                "  Cross-repo spine not configured (no daemon endpoint available).".to_string(),
+            );
         }
         Err(e) => {
             lines.push(format!("  Failed to query spine: {}", e));
