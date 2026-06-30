@@ -830,6 +830,129 @@ fn cross_repo_edges_survive_cold_pod_restart_via_store() {
     assert_eq!(xref[0].dst_repo, "kin-db");
 }
 
+// ── Test 17: transitive (2-hop) + multi-consumer edges form through
+// refresh_cross_repo_edges alone, without a separate register_repo ─────────
+//
+// Chain: prov ← consumer ← downstream, plus a second consumer2 ← prov. Each
+// repo is ONLY ever passed to refresh_cross_repo_edges (never an explicit
+// register_repo), exactly as a direct/store refresh does. The downstream→
+// consumer edge can only materialize if consumer's own entities became
+// name-resolution targets during consumer's refresh — the behavior this fix
+// adds. Before it, consumer indexed as an impact node but not a resolution
+// target, so the 2nd hop never resolved.
+#[test]
+fn transitive_and_multi_consumer_edges_via_refresh_only() {
+    let index = SpineIndex::new();
+    let registry: Vec<String> = vec![
+        "prov".to_string(),
+        "consumer".to_string(),
+        "consumer2".to_string(),
+        "downstream".to_string(),
+    ];
+
+    // prov exports `target_fn` (a leaf; no outgoing imports).
+    let target = source_entity(EntityId::new(), "target_fn", LanguageId::Rust);
+    index.refresh_cross_repo_edges("prov", std::slice::from_ref(&target), &[], &registry);
+
+    // consumer imports prov::target_fn via its own `run_task`.
+    let run_task = source_entity(EntityId::new(), "run_task", LanguageId::Rust);
+    let consumer_rels = vec![cross_repo_call(
+        run_task.id,
+        "prov",
+        "prov::target_fn",
+        RelationKind::Calls,
+    )];
+    index.refresh_cross_repo_edges(
+        "consumer",
+        std::slice::from_ref(&run_task),
+        &consumer_rels,
+        &registry,
+    );
+
+    // consumer2 also imports prov::target_fn (the multi-consumer case).
+    let other_task = source_entity(EntityId::new(), "other_task", LanguageId::Rust);
+    let consumer2_rels = vec![cross_repo_call(
+        other_task.id,
+        "prov",
+        "prov::target_fn",
+        RelationKind::Calls,
+    )];
+    index.refresh_cross_repo_edges(
+        "consumer2",
+        std::slice::from_ref(&other_task),
+        &consumer2_rels,
+        &registry,
+    );
+
+    // downstream imports consumer::run_task — the 2nd hop.
+    let down_fn = source_entity(EntityId::new(), "orchestrate", LanguageId::Rust);
+    let downstream_rels = vec![cross_repo_call(
+        down_fn.id,
+        "consumer",
+        "consumer::run_task",
+        RelationKind::Calls,
+    )];
+    index.refresh_cross_repo_edges(
+        "downstream",
+        std::slice::from_ref(&down_fn),
+        &downstream_rels,
+        &registry,
+    );
+
+    // 1-hop (unchanged): consumer → prov outgoing edge bound to prov's entity.
+    let consumer_out: Vec<_> = index
+        .cross_repo_edges_for("consumer", &run_task.id)
+        .into_iter()
+        .filter(|e| e.src_repo == "consumer")
+        .collect();
+    assert_eq!(
+        consumer_out.len(),
+        1,
+        "consumer must have exactly one outgoing 1-hop edge"
+    );
+    assert_eq!(consumer_out[0].dst_repo, "prov");
+    assert_eq!(consumer_out[0].dst_entity, target.id);
+
+    // 2-hop (the fix): downstream → consumer outgoing edge. ABSENT without
+    // registering consumer's entities during its own refresh.
+    let downstream_out: Vec<_> = index
+        .cross_repo_edges_for("downstream", &down_fn.id)
+        .into_iter()
+        .filter(|e| e.src_repo == "downstream")
+        .collect();
+    assert_eq!(
+        downstream_out.len(),
+        1,
+        "downstream must resolve the 2nd hop into consumer (transitive edge)"
+    );
+    assert_eq!(downstream_out[0].dst_repo, "consumer");
+    assert_eq!(downstream_out[0].dst_entity, run_task.id);
+
+    // multi-consumer: prov's target_fn has incoming edges from both consumers.
+    let into_prov: Vec<_> = index
+        .cross_repo_edges_for("prov", &target.id)
+        .into_iter()
+        .filter(|e| e.dst_repo == "prov")
+        .collect();
+    let mut src_repos: Vec<String> = into_prov.iter().map(|e| e.src_repo.clone()).collect();
+    src_repos.sort();
+    assert_eq!(
+        src_repos,
+        vec!["consumer".to_string(), "consumer2".to_string()],
+        "prov's exported entity must show both consumers as incoming edges"
+    );
+
+    // Registering each repo's own entities during refresh must not create
+    // self-edges (src_repo == dst_repo).
+    assert!(
+        index
+            .cross_repo_edges_for("prov", &target.id)
+            .iter()
+            .all(|e| e.src_repo != e.dst_repo),
+        "refresh must not introduce self-edges"
+    );
+}
+
 /// Register a repo's entity metadata through the store-backed backend,
 /// mirroring the metadata write the daemon performs when it indexes a repo.
 fn ingest_repo(

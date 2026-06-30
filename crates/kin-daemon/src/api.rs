@@ -9319,6 +9319,157 @@ mod tests {
         );
     }
 
+    /// The daemon's /spine endpoints serve a TRANSITIVE (2-hop) blast radius and
+    /// MULTI-CONSUMER edges through the production refresh path: provider <-
+    /// consumer <- downstream, plus a second consumer of provider. This is the
+    /// FIR-1149 transitive/multi-consumer gate on top of the 1-hop fixture; it
+    /// depends on refresh registering each repo's own entities so the next hop
+    /// can resolve them.
+    #[tokio::test]
+    async fn spine_serves_transitive_2hop_and_multi_consumer_blast_radius() {
+        let do_work_id = EntityId::new();
+        let provider_entry = kin_spine::EntityEntry {
+            repo_id: "provider".to_string(),
+            entity_id: do_work_id,
+            name: "do_work".to_string(),
+            kind: kin_model::EntityKind::Function,
+            signature: "fn do_work()".to_string(),
+            fingerprint: spine_test_fingerprint(),
+            file_path: Some("src/lib.rs".to_string()),
+            role: Some(kin_model::EntityRole::Source),
+        };
+
+        // consumer: imports provider::do_work via run_task (the 1st hop).
+        let consumer = parse_consumer_source(
+            "src/app.rs",
+            "use provider::do_work;\n\npub fn run_task() {\n    do_work();\n}\n",
+        );
+        let consumer_entities = consumer.entities.clone();
+        let consumer_relations = kin_index::link_cross_file(&[consumer]);
+        let run_task_id = consumer_entities
+            .iter()
+            .find(|e| e.name == "run_task")
+            .expect("run_task entity present")
+            .id;
+
+        // consumer2: a SECOND consumer of provider::do_work (multi-consumer).
+        let consumer2 = parse_consumer_source(
+            "src/other.rs",
+            "use provider::do_work;\n\npub fn other_task() {\n    do_work();\n}\n",
+        );
+        let consumer2_entities = consumer2.entities.clone();
+        let consumer2_relations = kin_index::link_cross_file(&[consumer2]);
+
+        // downstream: imports consumer::run_task (the 2nd hop).
+        let downstream = parse_consumer_source(
+            "src/top.rs",
+            "use consumer::run_task;\n\npub fn orchestrate() {\n    run_task();\n}\n",
+        );
+        let downstream_entities = downstream.entities.clone();
+        let downstream_relations = kin_index::link_cross_file(&[downstream]);
+        let orchestrate_id = downstream_entities
+            .iter()
+            .find(|e| e.name == "orchestrate")
+            .expect("orchestrate entity present")
+            .id;
+
+        let state = test_state();
+        let spine = state.ensure_spine().expect("spine enabled in test");
+        let registry = [
+            "provider".to_string(),
+            "consumer".to_string(),
+            "consumer2".to_string(),
+            "downstream".to_string(),
+        ];
+        spine.register_repo("provider", vec![provider_entry], "");
+        // Each refresh registers the repo's own entities as resolution targets so
+        // the next hop can bind to them — the behavior this gate proves. Refresh
+        // in dependency order so each hop's targets are present.
+        spine.refresh_cross_repo_edges(
+            "consumer",
+            &consumer_entities,
+            &consumer_relations,
+            &registry,
+        );
+        spine.refresh_cross_repo_edges(
+            "consumer2",
+            &consumer2_entities,
+            &consumer2_relations,
+            &registry,
+        );
+        spine.refresh_cross_repo_edges(
+            "downstream",
+            &downstream_entities,
+            &downstream_relations,
+            &registry,
+        );
+
+        let app = router(state);
+
+        // 2-hop: /spine/xref for downstream's orchestrate resolves into consumer.
+        let xref = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/spine/xref?repo=downstream&entity={}",
+                    orchestrate_id.0
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(xref.status(), StatusCode::OK);
+        let xbody: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(xref.into_body(), 65536).await.unwrap())
+                .unwrap();
+        let edges = xbody["edges"]
+            .as_array()
+            .expect("edges array in /spine/xref");
+        assert!(
+            edges.iter().any(|e| e["dst_repo"] == "consumer"),
+            "2-hop: downstream must resolve a cross-repo edge into consumer, got {edges:?}"
+        );
+
+        // Multi-consumer + transitive: federated impact of provider::do_work
+        // includes BOTH consumers AND the transitive downstream repo.
+        let impact = app
+            .oneshot(
+                Request::get(format!(
+                    "/spine/impact?repo=provider&entity={}&depth=5",
+                    do_work_id.0
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(impact.status(), StatusCode::OK);
+        let ibody: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(impact.into_body(), 65536)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let repos: Vec<&str> = ibody["repos_involved"]
+            .as_array()
+            .expect("repos_involved array in /spine/impact")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            repos.contains(&"consumer") && repos.contains(&"consumer2"),
+            "multi-consumer: both consumers must appear in provider's blast radius, got {repos:?}"
+        );
+        assert!(
+            repos.contains(&"downstream"),
+            "transitive: the 2-hop downstream repo must appear in provider's blast radius, got {repos:?}"
+        );
+        // Bind the 1st-hop id so the helper is exercised end-to-end (and the
+        // unused-variable lint stays quiet) — run_task anchors the chain.
+        let _ = run_task_id;
+    }
+
     #[tokio::test]
     async fn spine_ingest_route_rejects_body_repo_mismatch() {
         // The path `repo_id` is authoritative. A body `repo` that disagrees is

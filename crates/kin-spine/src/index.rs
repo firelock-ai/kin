@@ -235,6 +235,20 @@ impl SpineIndex {
     ) {
         use crate::xref::{collect_unresolved_imports, materialize_edges, resolve_imports};
 
+        // Register this repo's own entities as resolution targets first, so a
+        // downstream repo importing THIS repo's symbols can resolve them — the
+        // basis for transitive (2-hop) and multi-consumer cross-repo edges. A
+        // repo that only ever has its edges refreshed (the direct/store path)
+        // would otherwise index as an impact node but never as a name-resolution
+        // target. Idempotent with the ingest-time register_repo: re-registration
+        // replaces this repo's rows and preserves its existing root hash.
+        let root_hash = self.root_hash(repo_id).unwrap_or_default();
+        self.register_repo(
+            repo_id,
+            entries_from_entities(repo_id, entities),
+            &root_hash,
+        );
+
         // Remove existing edges from this repo
         {
             let mut inner = self.inner.write();
@@ -250,6 +264,26 @@ impl SpineIndex {
         let resolutions = resolve_imports(self, &unresolved);
         materialize_edges(self, &unresolved, &resolutions);
     }
+}
+
+/// Project a repo's graph entities into the metadata-only [`EntityEntry`] rows
+/// the index resolves against — the same mapping the daemon uses when it
+/// registers a repo. Bodies are never stored; just name/kind/signature/
+/// fingerprint/role, enough for cross-repo resolution.
+fn entries_from_entities(repo_id: &str, entities: &[Entity]) -> Vec<EntityEntry> {
+    entities
+        .iter()
+        .map(|e| EntityEntry {
+            repo_id: repo_id.to_string(),
+            entity_id: e.id,
+            name: e.name.clone(),
+            kind: e.kind,
+            signature: e.signature.clone(),
+            fingerprint: e.fingerprint.clone(),
+            file_path: e.file_origin.as_ref().map(|f| f.0.clone()),
+            role: Some(e.role),
+        })
+        .collect()
 }
 
 /// Score how well two fingerprints match (0.0 = no match, 3.0 = exact match).
