@@ -15,6 +15,7 @@ pub mod backend;
 pub mod federation;
 pub mod firestore;
 pub mod index;
+pub mod query;
 pub mod routing;
 pub mod store;
 pub mod xref;
@@ -30,6 +31,7 @@ pub use firestore::FirestoreSpineBackend;
 #[cfg(feature = "firestore")]
 pub use firestore::FirestoreStore;
 pub use index::{CrossRepoEdge, EntityEntry, SpineIndex};
+pub use query::{classify_spine_probe, SpineProbe, SpineQuery};
 pub use routing::{RepoEndpoint, RoutingTable};
 pub use store::{LoadedRepo, SpineStore};
 pub use xref::{

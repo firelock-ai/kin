@@ -79,20 +79,39 @@ pub async fn handle_impact_analysis<G: GraphStore>(
     let repo_id = std::env::var("KIN_REPO_ID").unwrap_or_else(|_| "unknown".into());
     let changed_ids = diff.changed_entity_ids();
     let mut cross_repo_nodes: Vec<kin_spine::FederatedNode> = Vec::new();
+    let mut spine_unavailable: Option<String> = None;
 
     for eid in &changed_ids {
-        if let Ok(Some(federated)) = fetch_spine_impact_typed(&repo_id, eid, depth).await {
-            for node in federated.nodes {
-                if node.repo_id != repo_id {
-                    cross_repo_nodes.push(node);
+        match fetch_spine_impact_typed(&repo_id, eid, depth).await {
+            kin_spine::SpineQuery::Found(federated) => {
+                for node in federated.nodes {
+                    if node.repo_id != repo_id {
+                        cross_repo_nodes.push(node);
+                    }
                 }
             }
+            // Configured but a query failed — record the first reason so the
+            // result reports the gap rather than silently omitting cross-repo
+            // impact (which would read as "analyzed, none").
+            kin_spine::SpineQuery::Unavailable(reason) => {
+                spine_unavailable.get_or_insert(reason);
+            }
+            // No spine in this context (local-only MCP server): a quiet absence
+            // of cross-repo impact is correct, so stay non-noisy.
+            kin_spine::SpineQuery::NotConfigured => {}
         }
     }
 
     if !cross_repo_nodes.is_empty() {
         result["cross_repo_impact"] =
             serde_json::to_value(&cross_repo_nodes).map_err(McpError::Json)?;
+    }
+    if let Some(reason) = spine_unavailable {
+        // Additive, failure-only field: present only when the spine was
+        // expected but unreachable, so an empty/absent cross_repo_impact is
+        // never mistaken for a healthy "no cross-repo impact" result.
+        result["cross_repo_impact_status"] =
+            serde_json::json!(format!("spine_unavailable: {reason}"));
     }
 
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;

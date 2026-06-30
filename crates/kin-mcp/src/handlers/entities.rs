@@ -472,26 +472,35 @@ pub async fn handle_find_references<G: GraphStore>(
 
     // ── Federated Xrefs via Spine ─────────────────────────────────────
     let repo_id = std::env::var("KIN_REPO_ID").unwrap_or_else(|_| "unknown".into());
-    if let Ok(Some(body)) = fetch_spine_xref(&repo_id, &target.id).await {
-        if let Some(edges) = body.get("edges").and_then(|v| v.as_array()) {
-            for edge in edges {
-                if edge["to_repo_id"] == repo_id && edge["repo_id"] != repo_id {
-                    // This is an external caller pointing at us.
-                    rows.push(ReferenceRow {
-                        name: edge["from_name"].as_str().unwrap_or("unknown").to_string(),
-                        kind: edge["kind"].as_str().map(|s| s.to_string()),
-                        file_path: Some(format!(
-                            "[{}] {}",
-                            edge["repo_id"].as_str().unwrap_or("?"),
-                            edge["from_name"].as_str().unwrap_or("?")
-                        )),
-                        start_line: None,
-                        signature: None,
-                        relation_kinds: vec![RelationKind::References], // Spine edges are generic xrefs
-                    });
+    match fetch_spine_xref(&repo_id, &target.id).await {
+        kin_spine::SpineQuery::Found(body) => {
+            if let Some(edges) = body.get("edges").and_then(|v| v.as_array()) {
+                for edge in edges {
+                    if edge["to_repo_id"] == repo_id && edge["repo_id"] != repo_id {
+                        // This is an external caller pointing at us.
+                        rows.push(ReferenceRow {
+                            name: edge["from_name"].as_str().unwrap_or("unknown").to_string(),
+                            kind: edge["kind"].as_str().map(|s| s.to_string()),
+                            file_path: Some(format!(
+                                "[{}] {}",
+                                edge["repo_id"].as_str().unwrap_or("?"),
+                                edge["from_name"].as_str().unwrap_or("?")
+                            )),
+                            start_line: None,
+                            signature: None,
+                            relation_kinds: vec![RelationKind::References], // Spine edges are generic xrefs
+                        });
+                    }
                 }
             }
         }
+        // Spine configured but unreachable: surface as a warning rather than
+        // silently dropping cross-repo references (which would read as "none").
+        kin_spine::SpineQuery::Unavailable(reason) => {
+            tracing::warn!(reason = %reason, "cross-repo spine unavailable for references enrichment");
+        }
+        // Local-only (no spine configured): quiet — cross-repo refs don't apply.
+        kin_spine::SpineQuery::NotConfigured => {}
     }
 
     let references = rows
