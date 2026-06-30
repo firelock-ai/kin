@@ -477,14 +477,22 @@ pub async fn get_spine_impact(
 }
 
 /// Query the daemon for cross-repo edges (xrefs) for a specific entity.
+///
+/// Returns a [`kin_spine::SpineQuery`] so the caller can tell apart a spine
+/// that is not configured (no daemon endpoint), one that is configured but
+/// unreachable/non-2xx (e.g. `503` when the spine is disabled), and a healthy
+/// answer that is genuinely empty — instead of collapsing the failure into a
+/// silent "no references" result.
 pub async fn get_spine_xref(
     layout: &kin_core::KinLayout,
     repo_id: &str,
     entity_id: &kin_model::EntityId,
-) -> anyhow::Result<Option<Vec<::kin_spine::CrossRepoEdge>>> {
-    let daemon_url = crate::daemon_client::resolve_daemon_url(layout)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Kin daemon is required for spine xref queries"))?;
+) -> anyhow::Result<::kin_spine::SpineQuery<Vec<::kin_spine::CrossRepoEdge>>> {
+    use ::kin_spine::{classify_spine_probe, SpineProbe, SpineQuery};
+
+    let Some(daemon_url) = crate::daemon_client::resolve_daemon_url(layout).await? else {
+        return Ok(SpineQuery::NotConfigured);
+    };
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
@@ -496,15 +504,20 @@ pub async fn get_spine_xref(
         ))
         .query(&[("repo", repo_id), ("entity", &entity_id.to_string())])
         .send()
-        .await?;
+        .await;
+    let status = resp.as_ref().ok().map(|r| r.status().as_u16());
 
-    if !resp.status().is_success() {
-        return Ok(None);
+    match classify_spine_probe(true, status) {
+        SpineProbe::Healthy => {
+            let body: serde_json::Value = resp?.json().await?;
+            let edges = serde_json::from_value(body["edges"].clone())?;
+            Ok(SpineQuery::Found(edges))
+        }
+        SpineProbe::Unavailable(reason) => Ok(SpineQuery::Unavailable(reason)),
+        SpineProbe::NotConfigured => Ok(SpineQuery::Unavailable(
+            "spine endpoint unexpectedly unconfigured".to_string(),
+        )),
     }
-
-    let body: serde_json::Value = resp.json().await?;
-    let edges = serde_json::from_value(body["edges"].clone())?;
-    Ok(Some(edges))
 }
 
 #[cfg(test)]

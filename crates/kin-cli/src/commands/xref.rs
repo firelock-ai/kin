@@ -70,7 +70,7 @@ pub async fn build_xref_response(
     let repo_id = crate::commands::remote::resolve_repo_id(layout)?;
 
     match crate::backend::get_spine_xref(layout, &repo_id, &target.id).await {
-        Ok(Some(edges)) if !edges.is_empty() => {
+        Ok(::kin_spine::SpineQuery::Found(edges)) if !edges.is_empty() => {
             lines.push(format!("  Found {} cross-repo edges:", edges.len()));
             for edge in edges {
                 lines.push(format!(
@@ -79,8 +79,22 @@ pub async fn build_xref_response(
                 ));
             }
         }
-        Ok(_) => {
+        // Healthy spine, genuinely no edges — an explicit, trustworthy empty.
+        Ok(::kin_spine::SpineQuery::Found(_)) => {
             lines.push("  No cross-repo references found in the spine.".to_string());
+        }
+        // Spine configured but unreachable/disabled (e.g. HTTP 503) — say so
+        // instead of implying an empty result.
+        Ok(::kin_spine::SpineQuery::Unavailable(reason)) => {
+            lines.push(format!(
+                "  Cross-repo spine unavailable ({reason}) — this is not the same as 'no references found'."
+            ));
+        }
+        // No daemon endpoint configured in this context.
+        Ok(::kin_spine::SpineQuery::NotConfigured) => {
+            lines.push(
+                "  Cross-repo spine not configured (no daemon endpoint available).".to_string(),
+            );
         }
         Err(e) => {
             lines.push(format!("  Failed to query spine: {}", e));

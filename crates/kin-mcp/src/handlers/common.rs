@@ -20,6 +20,7 @@ thread_local! {
 }
 
 use crate::error::{McpError, Result};
+use kin_spine::{classify_spine_probe, SpineProbe, SpineQuery};
 
 // ── Parameter extraction helpers ──
 
@@ -183,18 +184,27 @@ pub async fn fetch_spine_impact(
 }
 
 /// Query the daemon for federated impact analysis, returning the typed struct.
+///
+/// Returns a [`SpineQuery`] so callers can distinguish a spine that is simply
+/// not configured (local-only — quiet) from one that is configured but
+/// unavailable (surface it) and a healthy, possibly-empty answer.
 pub async fn fetch_spine_impact_typed(
     repo_id: &str,
     entity_id: &EntityId,
     depth: u32,
-) -> Result<Option<kin_spine::FederatedImpact>> {
-    let daemon_url = daemon_url_from_env()?;
-    let client = reqwest::Client::builder()
+) -> SpineQuery<kin_spine::FederatedImpact> {
+    let Ok(daemon_url) = daemon_url_from_env() else {
+        return SpineQuery::NotConfigured;
+    };
+    let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .map_err(|e| McpError::Other(format!("failed to build reqwest client: {}", e)))?;
+    {
+        Ok(client) => client,
+        Err(e) => return SpineQuery::Unavailable(format!("failed to build reqwest client: {e}")),
+    };
 
-    let resp = client
+    let resp = match client
         .get(format!(
             "{}/v1/spine/impact",
             daemon_url.trim_end_matches('/')
@@ -206,31 +216,42 @@ pub async fn fetch_spine_impact_typed(
         ])
         .send()
         .await
-        .map_err(|e| McpError::Other(format!("failed to send spine request: {}", e)))?;
+    {
+        Ok(resp) => resp,
+        Err(e) => return SpineQuery::Unavailable(format!("spine request failed: {e}")),
+    };
 
-    if !resp.status().is_success() {
-        return Ok(None);
+    match classify_spine_probe(true, Some(resp.status().as_u16())) {
+        SpineProbe::Healthy => match resp.json::<kin_spine::FederatedImpact>().await {
+            Ok(impact) => SpineQuery::Found(impact),
+            Err(e) => SpineQuery::Unavailable(format!("malformed spine impact response: {e}")),
+        },
+        SpineProbe::Unavailable(reason) => SpineQuery::Unavailable(reason),
+        SpineProbe::NotConfigured => {
+            SpineQuery::Unavailable("spine endpoint unexpectedly unconfigured".to_string())
+        }
     }
-
-    let impact = resp
-        .json::<kin_spine::FederatedImpact>()
-        .await
-        .map_err(|e| McpError::Other(format!("failed to parse spine impact response: {}", e)))?;
-    Ok(Some(impact))
 }
 
 /// Query the daemon for cross-repo edges (xrefs) for a specific entity.
+///
+/// See [`fetch_spine_impact_typed`] for the [`SpineQuery`] three-state contract.
 pub async fn fetch_spine_xref(
     repo_id: &str,
     entity_id: &EntityId,
-) -> Result<Option<serde_json::Value>> {
-    let daemon_url = daemon_url_from_env()?;
-    let client = reqwest::Client::builder()
+) -> SpineQuery<serde_json::Value> {
+    let Ok(daemon_url) = daemon_url_from_env() else {
+        return SpineQuery::NotConfigured;
+    };
+    let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .map_err(|e| McpError::Other(format!("failed to build reqwest client: {}", e)))?;
+    {
+        Ok(client) => client,
+        Err(e) => return SpineQuery::Unavailable(format!("failed to build reqwest client: {e}")),
+    };
 
-    let resp = client
+    let resp = match client
         .get(format!(
             "{}/v1/spine/xref",
             daemon_url.trim_end_matches('/')
@@ -238,17 +259,21 @@ pub async fn fetch_spine_xref(
         .query(&[("repo", repo_id), ("entity", &entity_id.to_string())])
         .send()
         .await
-        .map_err(|e| McpError::Other(format!("failed to send spine request: {}", e)))?;
+    {
+        Ok(resp) => resp,
+        Err(e) => return SpineQuery::Unavailable(format!("spine request failed: {e}")),
+    };
 
-    if !resp.status().is_success() {
-        return Ok(None);
+    match classify_spine_probe(true, Some(resp.status().as_u16())) {
+        SpineProbe::Healthy => match resp.json::<serde_json::Value>().await {
+            Ok(body) => SpineQuery::Found(body),
+            Err(e) => SpineQuery::Unavailable(format!("malformed spine response: {e}")),
+        },
+        SpineProbe::Unavailable(reason) => SpineQuery::Unavailable(reason),
+        SpineProbe::NotConfigured => {
+            SpineQuery::Unavailable("spine endpoint unexpectedly unconfigured".to_string())
+        }
     }
-
-    let body = resp
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|e| McpError::Other(format!("failed to parse spine response: {}", e)))?;
-    Ok(Some(body))
 }
 
 // ── Entity selection and ranking ──
