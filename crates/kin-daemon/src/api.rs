@@ -3879,6 +3879,81 @@ fn terminal_transaction_id(
         .map(str::to_string)
 }
 
+// Opt-in re-rank of the `semantic_locate` cosine result set. Default OFF so the
+// shipped ranking is unchanged until a paired benchmark validates the effect and
+// flips the default; set KIN_SEMLOC_RERANK=1 to enable. Weights are env-tunable.
+// The full graph-native `kin locate` pipeline already applies richer role/exact
+// ranking; this brings the lighter cosine surface (the agent's `semantic_locate`)
+// toward the same shape without re-running that pipeline.
+fn semloc_rerank_enabled() -> bool {
+    matches!(
+        std::env::var("KIN_SEMLOC_RERANK").ok().as_deref(),
+        Some("1") | Some("true") | Some("on") | Some("yes")
+    )
+}
+
+fn semloc_env_f32(key: &str, default: f32) -> f32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// True when the query is itself about test/spec/fixture code, in which case
+/// test-role entities must NOT be demoted (they may be the edit target).
+fn semloc_query_is_test_related(query: &str) -> bool {
+    let q = query.to_ascii_lowercase();
+    q.contains("test") || q.contains("spec") || q.contains("fixture")
+}
+
+/// True when `name` appears as a literal token of `query` (case-insensitive),
+/// including the last dotted segment of a qualified name (e.g. query
+/// "constant.Raspbian" matches entity "Raspbian"). Tokens split on non-[a-z0-9_].
+fn semloc_query_has_exact_token(query: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let target = name.to_ascii_lowercase();
+    let last = target.rsplit('.').next().unwrap_or(&target).to_string();
+    query
+        .to_ascii_lowercase()
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|t| !t.is_empty())
+        .any(|tok| tok == target || tok == last)
+}
+
+/// Re-rank PRIORITY for one cosine hit (LOWER = better rank). Pure: no graph.
+///   Lever A — role-aware demotion: Generated/Vendored/Docs always pushed back;
+///     Test pushed back only when the query is not test-related.
+///   Lever B — exact-name boost: a literal symbol/path-token query match floats up.
+/// The displayed cosine score is unchanged; only the ORDER is affected. The demote
+/// penalty dominates the exact bonus, so an exact-name match in a demoted role does
+/// not jump ahead of real source.
+fn semloc_rerank_priority(
+    role: Option<kin_model::EntityRole>,
+    name: &str,
+    query: &str,
+    is_test_query: bool,
+    cosine_distance: f32,
+) -> f32 {
+    use kin_model::EntityRole;
+    let demote = semloc_env_f32("KIN_SEMLOC_DEMOTE", 10.0);
+    let bonus = semloc_env_f32("KIN_SEMLOC_EXACT_BONUS", 1.0);
+    let mut p = cosine_distance;
+    let is_demotable = match role {
+        Some(EntityRole::Generated) | Some(EntityRole::Vendored) | Some(EntityRole::Docs) => true,
+        Some(EntityRole::Test) => !is_test_query,
+        _ => false, // Source / External / unknown: never demoted
+    };
+    if is_demotable {
+        p += demote;
+    }
+    if semloc_query_has_exact_token(query, name) {
+        p -= bonus;
+    }
+    p
+}
+
 /// POST /mcp/tools/call — execute an MCP tool against daemon-owned graph state.
 ///
 /// MCP stdio processes are transport shims only. They forward graph-backed
@@ -3948,6 +4023,41 @@ fn build_semantic_locate_result(
         Err(error) => {
             return kin_mcp::ToolCallResult::error(format!("semantic search failed: {error}"));
         }
+    };
+
+    // Opt-in (KIN_SEMLOC_RERANK=1): role-aware demotion + exact-name boost over the
+    // cosine hit set ONLY. Resolve once for scoring, then stable-sort by priority with
+    // the original cosine order as the deterministic tiebreak (no nondeterminism).
+    let raw = if semloc_rerank_enabled() {
+        let is_test_q = semloc_query_is_test_related(&query);
+        let mut scored: Vec<_> = raw
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (key, distance))| {
+                let prio = match graph.resolve_retrieval_key(&key) {
+                    Some(kin_db::ResolvedRetrievalItem::Entity(entity)) => semloc_rerank_priority(
+                        Some(entity.role),
+                        &entity.name,
+                        &query,
+                        is_test_q,
+                        distance,
+                    ),
+                    _ => semloc_rerank_priority(None, "", &query, is_test_q, distance),
+                };
+                (prio, idx, key, distance)
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.cmp(&b.1))
+        });
+        scored
+            .into_iter()
+            .map(|(_, _, key, distance)| (key, distance))
+            .collect()
+    } else {
+        raw
     };
 
     let mut results = Vec::with_capacity(limit);
@@ -6754,6 +6864,110 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+
+    #[test]
+    fn semloc_rerank_priority_demotes_and_boosts() {
+        use kin_model::EntityRole;
+        let q = "raspbian package detection";
+        // Equal cosine distance: a Source entity outranks (lower priority than) a
+        // Test/Docs/Generated/Vendored entity when the query is not test-related.
+        let src = semloc_rerank_priority(Some(EntityRole::Source), "Detector", q, false, 0.30);
+        for role in [
+            EntityRole::Test,
+            EntityRole::Docs,
+            EntityRole::Generated,
+            EntityRole::Vendored,
+        ] {
+            let demoted = semloc_rerank_priority(Some(role), "Detector", q, false, 0.30);
+            assert!(
+                demoted > src,
+                "{role:?} must be demoted below Source at equal cosine"
+            );
+        }
+        // External / unknown role are NOT demoted.
+        assert!(
+            (semloc_rerank_priority(Some(EntityRole::External), "X", q, false, 0.30) - 0.30).abs()
+                < 1e-6
+        );
+        assert!((semloc_rerank_priority(None, "X", q, false, 0.30) - 0.30).abs() < 1e-6);
+    }
+
+    #[test]
+    fn semloc_rerank_test_role_kept_for_test_query() {
+        use kin_model::EntityRole;
+        // When the query IS test-related, a Test-role entity is not demoted.
+        let p = semloc_rerank_priority(
+            Some(EntityRole::Test),
+            "X",
+            "fix the parser test",
+            true,
+            0.40,
+        );
+        assert!(
+            (p - 0.40).abs() < 1e-6,
+            "test-role must survive a test query"
+        );
+    }
+
+    #[test]
+    fn semloc_rerank_exact_name_boost_and_dominance() {
+        use kin_model::EntityRole;
+        // Lever B: exact token match floats a Source entity up (lower priority).
+        let exact = semloc_rerank_priority(
+            Some(EntityRole::Source),
+            "Raspbian",
+            "constant.Raspbian",
+            false,
+            0.50,
+        );
+        let fuzzy = semloc_rerank_priority(
+            Some(EntityRole::Source),
+            "RaspbianHelper",
+            "constant.Raspbian",
+            false,
+            0.50,
+        );
+        assert!(
+            exact < fuzzy,
+            "exact name token must outrank a fuzzy namesake"
+        );
+        // Demotion dominates the exact bonus: an exact match in a demoted role does
+        // not jump ahead of a non-exact Source entity at the same cosine.
+        let exact_test = semloc_rerank_priority(
+            Some(EntityRole::Generated),
+            "Raspbian",
+            "constant.Raspbian",
+            false,
+            0.50,
+        );
+        let plain_src = semloc_rerank_priority(
+            Some(EntityRole::Source),
+            "Other",
+            "constant.Raspbian",
+            false,
+            0.50,
+        );
+        assert!(
+            exact_test > plain_src,
+            "demote must dominate the exact bonus"
+        );
+    }
+
+    #[test]
+    fn semloc_query_token_matching() {
+        assert!(semloc_query_has_exact_token(
+            "constant.Raspbian",
+            "Raspbian"
+        ));
+        assert!(semloc_query_has_exact_token(
+            "RemoveRaspbianPackFromResult here",
+            "RemoveRaspbianPackFromResult"
+        ));
+        assert!(!semloc_query_has_exact_token("scan results", "Detector"));
+        assert!(!semloc_query_has_exact_token("anything", ""));
+        assert!(semloc_query_is_test_related("the wav2vec feature test"));
+        assert!(!semloc_query_is_test_related("css scoping selector"));
+    }
     use axum::routing::get as axum_get;
     use kin_model::{
         AgentSession, AnnotationFilter, ArtifactDelta, ArtifactDeltaKind, AuthorId, Branch,
