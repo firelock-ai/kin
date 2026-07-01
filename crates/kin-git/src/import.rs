@@ -232,6 +232,22 @@ fn import_full(
         let _span =
             tracing::info_span!("kin.git.import_full.map_commits", commits = oids.len()).entered();
         let thread_safe = repo.clone().into_sync();
+
+        // Force every pack index to load once here, on the walking thread,
+        // before the workers fan out. gitoxide loads pack indices lazily on
+        // first access; when many rayon workers take that first look
+        // concurrently through their own thread-local handles, a worker can
+        // transiently observe a present object as missing while another worker
+        // is still initializing the shared index slot. Loading all indices up
+        // front on a single thread closes that window for the commit lookup
+        // and every nested tree/blob lookup below. A genuinely absent object
+        // still fails loud in the worker.
+        thread_safe
+            .to_thread_local()
+            .objects
+            .packed_object_count()
+            .map_err(|e| GitError::Git(e.to_string()))?;
+
         oids.par_iter()
             .map(|oid| {
                 let local = thread_safe.to_thread_local();

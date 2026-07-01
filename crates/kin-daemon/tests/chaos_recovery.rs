@@ -18,6 +18,29 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// Readiness budget for a daemon to come up. Generous enough that two CI runs
+/// sharing a runner (a push build and a pull_request build on the same commit)
+/// can both bring a daemon up under load without a false timeout. A daemon that
+/// dies during startup is detected eagerly via its child handle, so this budget
+/// only ever bounds a slow-but-live startup, never a dead one.
+const READINESS_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Capped exponential backoff for readiness polling: responsive at first, then
+/// it stops hammering a saturated runner once the wait stretches out.
+fn backoff_after(current: Duration) -> Duration {
+    (current * 2).min(Duration::from_millis(1000))
+}
+
+/// Fail loudly the instant a daemon child exits before it is ready instead of
+/// polling a dead process until the readiness deadline. This turns a bind
+/// collision or a startup crash into an immediate, legible failure rather than
+/// a multi-minute "never became healthy" hang.
+fn assert_child_alive(child: &mut Child, port: u16, what: &str) {
+    if let Ok(Some(status)) = child.try_wait() {
+        panic!("daemon on port {port} exited before it became {what}: {status}");
+    }
+}
+
 fn init_repo(root: &Path) {
     kin_core::init(root).unwrap();
 }
@@ -41,10 +64,11 @@ fn spawn_daemon_with_env(repo_root: &Path, port: u16, envs: &[(&str, &str)]) -> 
     cmd.spawn().expect("failed to spawn kin-daemon")
 }
 
-async fn wait_for_health(port: u16) -> HealthResponse {
+async fn wait_for_health(child: &mut Child, port: u16) -> HealthResponse {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{port}/health");
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + READINESS_TIMEOUT;
+    let mut backoff = Duration::from_millis(50);
 
     loop {
         if let Ok(response) = client.get(&url).send().await {
@@ -56,17 +80,20 @@ async fn wait_for_health(port: u16) -> HealthResponse {
             }
         }
 
+        assert_child_alive(child, port, "healthy");
         if Instant::now() >= deadline {
             panic!("daemon on port {port} never became healthy");
         }
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(backoff).await;
+        backoff = backoff_after(backoff);
     }
 }
 
-async fn wait_for_serving(port: u16) {
+async fn wait_for_serving(child: &mut Child, port: u16) {
     let addr = format!("127.0.0.1:{port}");
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + READINESS_TIMEOUT;
+    let mut backoff = Duration::from_millis(50);
     let mut observations = Vec::new();
 
     loop {
@@ -77,6 +104,7 @@ async fn wait_for_serving(port: u16) {
             }
         }
 
+        assert_child_alive(child, port, "reachable");
         if Instant::now() >= deadline {
             let last_observation = observations
                 .last()
@@ -85,7 +113,8 @@ async fn wait_for_serving(port: u16) {
             panic!("daemon on port {port} never served health: {last_observation}");
         }
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(backoff).await;
+        backoff = backoff_after(backoff);
     }
 }
 
@@ -118,7 +147,8 @@ async fn wait_for_path_removed(path: &Path, what: &str, timeout: Duration) {
 async fn create_branch(port: u16, name: &str) {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{port}/graph/branches");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut backoff = Duration::from_millis(50);
 
     loop {
         let result = client
@@ -136,7 +166,8 @@ async fn create_branch(port: u16, name: &str) {
         if Instant::now() >= deadline {
             result.expect("create branch request failed");
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(backoff).await;
+        backoff = backoff_after(backoff);
     }
 }
 
@@ -148,7 +179,7 @@ async fn daemon_recovers_after_process_kill_and_restart() {
     let port = free_port();
     let mut child = spawn_daemon(repo.path(), port);
 
-    let first = wait_for_health(port).await;
+    let first = wait_for_health(&mut child, port).await;
     assert_eq!(first.status, "ok");
     assert!(first.uptime_seconds < 20);
 
@@ -163,7 +194,7 @@ async fn daemon_recovers_after_process_kill_and_restart() {
     );
 
     let mut restarted = spawn_daemon(repo.path(), port);
-    let second = wait_for_health(port).await;
+    let second = wait_for_health(&mut restarted, port).await;
     assert_eq!(second.status, "ok");
     assert!(second.uptime_seconds < 20);
 
@@ -194,7 +225,7 @@ async fn daemon_exits_after_idle_timeout_and_removes_endpoint_files() {
         ],
     );
 
-    wait_for_serving(port).await;
+    wait_for_serving(&mut child, port).await;
 
     let daemon_port = repo.path().join(".kin/daemon.port");
     let daemon_pid = repo.path().join(".kin/daemon.pid");
@@ -257,7 +288,7 @@ async fn daemon_exits_after_dirty_repo_control_dir_is_removed() {
         ],
     );
 
-    wait_for_serving(port).await;
+    wait_for_serving(&mut child, port).await;
     create_branch(port, "dirty-before-delete").await;
 
     std::fs::remove_dir_all(repo.path().join(".kin")).unwrap();
