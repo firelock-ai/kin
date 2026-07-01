@@ -3031,58 +3031,89 @@ async fn locate(
             req.max_files_explicit,
             snippet_opts,
         )
+        .map_err(|error| error.to_string())
     } else {
         // Use scoped graph if session has a temporal scope, otherwise HEAD.
         let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-
-        // When a session scope is active, discover historical test artifact
-        // priority files to match the ref-scoped path's behavior.
-        let scope_ref_string = if let Some(sid) = session_id.as_ref() {
-            state
-                .get_session_scope(sid)
-                .await
-                .map(|(ref_str, _, _, _)| ref_str)
-        } else {
-            None
-        };
-        let extra_priority_files = scope_ref_string
-            .as_deref()
-            .map(|ref_str| {
-                kin_cli::commands::locate::discover_historical_test_artifact_priority_files(
-                    &state.layout,
-                    ref_str,
-                    &req.text,
-                )
-            })
-            .unwrap_or_default();
-
-        // Always pass the HEAD graph as vector source for embedding signals.
-        // For scoped sessions, the scoped graph has no vector index — HEAD
-        // vectors are queried and post-filtered to the scoped entity set.
-        // For unscoped queries, the HEAD graph IS the primary graph, so
-        // vector_source provides the same index — but extract_embedding_signals
-        // only uses vector_source when the primary graph has no embeddings,
-        // so there's no double-query.
-        let vector_source = Some(state.graph.as_ref());
-        let workspace_root = if scope_ref_string.is_some() {
-            None
-        } else {
-            Some(kin_core::source_dir(&state.layout))
-        };
-        kin_cli::commands::locate::run_with_graph_capture_with_priority_files_and_vector_source(
+        run_fused_locate_for_state(
+            &state,
+            session_id.as_ref(),
             graph.as_ref(),
-            workspace_root.as_deref(),
             &req.text,
             req.explain,
             req.max_files,
             req.max_files_explicit,
-            extra_priority_files,
-            vector_source,
             snippet_opts,
         )
+        .await
     }
     .map_err(internal_error)?;
     Ok(Json(result))
+}
+
+/// Run the fused locate pipeline against daemon state for a non-ref query,
+/// exactly as `POST /locate` serves it: session temporal scope honored,
+/// historical test-artifact priority files discovered for scoped sessions,
+/// and the HEAD graph passed as vector source. Shared by the `/locate`
+/// endpoint and the fused `semantic_locate` MCP arm so the two agent-facing
+/// retrieval surfaces cannot drift apart.
+#[allow(clippy::too_many_arguments)]
+async fn run_fused_locate_for_state(
+    state: &Arc<DaemonState>,
+    session_id: Option<&SessionId>,
+    graph: &kin_db::InMemoryGraph,
+    text: &str,
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+    snippet_opts: kin_cli::commands::locate::SnippetOptions,
+) -> Result<kin_cli::commands::locate::LocateResult, String> {
+    // When a session scope is active, discover historical test artifact
+    // priority files to match the ref-scoped path's behavior.
+    let scope_ref_string = if let Some(sid) = session_id {
+        state
+            .get_session_scope(sid)
+            .await
+            .map(|(ref_str, _, _, _)| ref_str)
+    } else {
+        None
+    };
+    let extra_priority_files = scope_ref_string
+        .as_deref()
+        .map(|ref_str| {
+            kin_cli::commands::locate::discover_historical_test_artifact_priority_files(
+                &state.layout,
+                ref_str,
+                text,
+            )
+        })
+        .unwrap_or_default();
+
+    // Always pass the HEAD graph as vector source for embedding signals.
+    // For scoped sessions, the scoped graph has no vector index — HEAD
+    // vectors are queried and post-filtered to the scoped entity set.
+    // For unscoped queries, the HEAD graph IS the primary graph, so
+    // vector_source provides the same index — but extract_embedding_signals
+    // only uses vector_source when the primary graph has no embeddings,
+    // so there's no double-query.
+    let vector_source = Some(state.graph.as_ref());
+    let workspace_root = if scope_ref_string.is_some() {
+        None
+    } else {
+        Some(kin_core::source_dir(&state.layout))
+    };
+    kin_cli::commands::locate::run_with_graph_capture_with_priority_files_and_vector_source(
+        graph,
+        workspace_root.as_deref(),
+        text,
+        explain,
+        max_files,
+        max_files_explicit,
+        extra_priority_files,
+        vector_source,
+        snippet_opts,
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// POST /search — run CLI search against daemon-owned graph state.
@@ -4138,9 +4169,216 @@ fn build_semantic_locate_result(
     let payload = json!({
         "query": query,
         "granularity": if file_granularity { "file" } else { "entity" },
+        "routing": "cosine-v0",
         "semantic_coverage": semantic_coverage,
         "results": results,
     });
+
+    match serde_json::to_string_pretty(&payload) {
+        Ok(text) => kin_mcp::ToolCallResult::text(text),
+        Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
+    }
+}
+
+/// Resolve the graph entity behind one fused-locate symbol so a
+/// `semantic_locate` hit stays act-on-able (`get_entity_source(entity_id)`)
+/// without a name search round-trip. Matches by file + exact name, breaking
+/// ties by span start; graph-owned truth only.
+fn resolve_symbol_entity_id(
+    graph: &kin_db::InMemoryGraph,
+    file_path: &str,
+    symbol: &kin_cli::commands::locate::LocateSymbol,
+) -> Option<String> {
+    let filter = kin_model::EntityFilter {
+        file_path: Some(kin_model::FilePathId::new(file_path)),
+        ..Default::default()
+    };
+    let entities = graph.query_entities(&filter).ok()?;
+    let mut candidates: Vec<_> = entities
+        .into_iter()
+        .filter(|entity| entity.name == symbol.name)
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    if let Some(span) = symbol.span {
+        candidates.sort_by_key(|entity| {
+            let start = entity
+                .span
+                .as_ref()
+                .map(|entity_span| entity_span.start_line)
+                .unwrap_or(u32::MAX);
+            start.abs_diff(span[0])
+        });
+    }
+    candidates.first().map(|entity| entity.id.to_string())
+}
+
+/// Build the `semantic_locate` response from the full fused locate pipeline
+/// (the same multi-signal fusion + rerank `POST /locate` serves) instead of
+/// the single-vector cosine ranking. Selected by the retrieval quality
+/// profile (`KIN_PROFILE`) or an explicit per-call `pipeline` argument.
+///
+/// Contract: args `{query, limit?=20, granularity?="entity"|"file",
+/// include_snippet?=true, explain?=false, pipeline?}`. Response keeps the
+/// legacy shape — ranked `results` array plus a `semantic_coverage` float —
+/// and adds per-hit line spans/kind/definition, a structured
+/// `semantic_coverage_detail`, the `degradations` array, and
+/// `routing: "fused-v1"` so a caller can tell which pipeline answered.
+async fn build_fused_semantic_locate_result(
+    state: &Arc<DaemonState>,
+    session_id: Option<&SessionId>,
+    graph: &kin_db::InMemoryGraph,
+    arguments: &HashMap<String, serde_json::Value>,
+) -> kin_mcp::ToolCallResult {
+    let query = match arguments.get("query").and_then(serde_json::Value::as_str) {
+        Some(value) if !value.trim().is_empty() => value.to_string(),
+        _ => {
+            return kin_mcp::ToolCallResult::error("missing required parameter: query".to_string());
+        }
+    };
+    let limit = arguments
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value as usize)
+        .filter(|value| *value > 0)
+        .unwrap_or(20);
+    let file_granularity = arguments
+        .get("granularity")
+        .and_then(serde_json::Value::as_str)
+        .map(|value| value.eq_ignore_ascii_case("file"))
+        .unwrap_or(false);
+    let include_snippet = arguments
+        .get("include_snippet")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+        && !file_granularity;
+    let explain = arguments
+        .get("explain")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    let snippet_opts = if include_snippet {
+        kin_cli::commands::locate::SnippetOptions::enabled(None)
+    } else {
+        kin_cli::commands::locate::SnippetOptions::default()
+    };
+
+    // The agent asked for `limit` ranked hits; give the fused pipeline the
+    // same number of file slots EXPLICITLY so the adaptive cap cannot shrink
+    // the pool below what the caller asked to see (entity hits flatten from
+    // the file ranking in file-major order).
+    let locate_result = match run_fused_locate_for_state(
+        state,
+        session_id,
+        graph,
+        &query,
+        explain,
+        limit,
+        true,
+        snippet_opts,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return kin_mcp::ToolCallResult::error(format!("fused locate failed: {error}"));
+        }
+    };
+
+    let coverage_fraction = locate_result
+        .semantic_coverage
+        .as_ref()
+        .map(|coverage| {
+            if coverage.total == 0 {
+                0.0_f32
+            } else {
+                coverage.indexed as f32 / coverage.total as f32
+            }
+        })
+        .unwrap_or(0.0);
+
+    let mut results = Vec::with_capacity(limit);
+    let mut seen_entities: HashSet<String> = HashSet::new();
+    'files: for file_entry in &locate_result.files {
+        if file_granularity {
+            let name = FsPath::new(&file_entry.path)
+                .file_name()
+                .and_then(|component| component.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let mut hit = json!({
+                "entity_id": file_entry.path,
+                "name": name,
+                "file": file_entry.path,
+                "score": file_entry.score,
+            });
+            if !file_entry.spans.is_empty() {
+                hit["spans"] = json!(file_entry.spans);
+            }
+            if !file_entry.signals.is_empty() {
+                hit["signals"] = json!(file_entry.signals);
+            }
+            results.push(hit);
+            if results.len() >= limit {
+                break 'files;
+            }
+            continue;
+        }
+        for symbol in &file_entry.symbols {
+            let Some(entity_id) = resolve_symbol_entity_id(graph, &file_entry.path, symbol) else {
+                // A symbol Kin cannot re-attach to a graph entity is not
+                // act-on-able over MCP (no source read without an id); skip it
+                // rather than emit a dead hit.
+                continue;
+            };
+            if !seen_entities.insert(entity_id.clone()) {
+                continue;
+            }
+            let mut hit = json!({
+                "entity_id": entity_id,
+                "name": symbol.name,
+                "file": file_entry.path,
+                "score": symbol.score,
+                "file_score": file_entry.score,
+                "kind": symbol.kind,
+                "definition": symbol.definition,
+            });
+            if let Some(span) = symbol.span {
+                hit["start_line"] = json!(span[0]);
+                hit["end_line"] = json!(span[1]);
+            }
+            if let Some(snippet) = symbol.snippet.as_ref() {
+                hit["snippet"] = json!(snippet);
+            }
+            if !file_entry.signals.is_empty() {
+                hit["signals"] = json!(file_entry.signals);
+            }
+            results.push(hit);
+            if results.len() >= limit {
+                break 'files;
+            }
+        }
+    }
+
+    let mut payload = json!({
+        "query": query,
+        "granularity": if file_granularity { "file" } else { "entity" },
+        "routing": "fused-v1",
+        "semantic_coverage": coverage_fraction,
+        "results": results,
+    });
+    if let Some(coverage) = locate_result.semantic_coverage.as_ref() {
+        payload["semantic_coverage_detail"] = json!(coverage);
+    }
+    if !locate_result.degradations.is_empty() {
+        payload["degradations"] = json!(locate_result.degradations);
+    }
+    if explain {
+        if let Some(debug) = locate_result.debug.as_ref() {
+            payload["debug"] = json!(debug);
+        }
+    }
 
     match serde_json::to_string_pretty(&payload) {
         Ok(text) => kin_mcp::ToolCallResult::text(text),
@@ -4314,12 +4552,43 @@ async fn mcp_tools_call(
         return Ok(Json(result));
     }
 
-    // R14 — `semantic_locate`: route to the daemon's REAL vector pipeline
-    // (`graph.semantic_search`, the same HNSW path `kin search --semantic`
-    // uses) instead of the metadata-filter handler. Returns partial results
-    // plus a `semantic_coverage` field rather than hard-gating on full
-    // embedding coverage (graceful degradation per R5).
+    // R14 — `semantic_locate`: serve the agent's primary retrieval tool from
+    // the daemon's real pipelines. Under the accuracy profile (default) this
+    // is the SAME fused multi-signal ranking `POST /locate` serves — vector,
+    // lexical, and graph fusion with role-aware ranking — so the MCP surface
+    // is no longer a weaker single-vector shadow of the product ranker. The
+    // legacy cosine ranking stays reachable via `KIN_PROFILE=compat-v0` or a
+    // per-call `pipeline: "cosine"` argument for A/B comparison. Both paths
+    // return partial results plus `semantic_coverage` rather than hard-gating
+    // on full embedding coverage (graceful degradation per R5).
     if request.name == "semantic_locate" {
+        let pipeline_override = request
+            .arguments
+            .get("pipeline")
+            .and_then(serde_json::Value::as_str);
+        let use_fused = match pipeline_override {
+            Some(value) if value.eq_ignore_ascii_case("fused") => true,
+            Some(value) if value.eq_ignore_ascii_case("cosine") => false,
+            Some(other) => {
+                return Ok(Json(kin_mcp::ToolCallResult::error(format!(
+                    "invalid pipeline '{other}': expected \"fused\" or \"cosine\""
+                ))));
+            }
+            None => {
+                kin_cli::retrieval_profile::RetrievalProfile::from_env().semantic_locate_fused()
+            }
+        };
+        if use_fused {
+            return Ok(Json(
+                build_fused_semantic_locate_result(
+                    &state,
+                    session_id.as_ref(),
+                    graph.as_ref(),
+                    &request.arguments,
+                )
+                .await,
+            ));
+        }
         return Ok(Json(build_semantic_locate_result(
             graph.as_ref(),
             &request.arguments,
@@ -10879,6 +11148,204 @@ mod tests {
             .unwrap();
         let bad_result: kin_mcp::ToolCallResult = serde_json::from_slice(&bad_body).unwrap();
         assert_eq!(bad_result.is_error, Some(true));
+    }
+
+    /// Call `semantic_locate` over the MCP dispatch route and return the
+    /// parsed JSON payload (must not be a tool error).
+    async fn call_semantic_locate(app: Router, arguments: serde_json::Value) -> serde_json::Value {
+        let response = app
+            .oneshot(
+                Request::post("/mcp/tools/call")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "name": "semantic_locate", "arguments": arguments }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let result: kin_mcp::ToolCallResult = serde_json::from_slice(&body).unwrap();
+        assert_ne!(result.is_error, Some(true), "tool call errored: {result:?}");
+        let text = match result.content.first().unwrap() {
+            kin_mcp::ContentBlock::Text { text } => text,
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    // FIR parity gate: the MCP `semantic_locate` fused arm must serve the SAME
+    // ranking as `POST /locate` — same pipeline, same order — so the agent
+    // surface is the product ranker, not a weaker shadow of it.
+    #[tokio::test]
+    async fn mcp_semantic_locate_fused_matches_locate_endpoint_ranking() {
+        let state = test_state();
+        state
+            .graph
+            .upsert_entity(&test_entity("parse_config", "src/config.py"))
+            .unwrap();
+        state
+            .graph
+            .upsert_entity(&test_entity("render_output", "src/render.py"))
+            .unwrap();
+        state
+            .graph
+            .upsert_entity(&test_entity("parse_config_helper", "src/config_util.py"))
+            .unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+
+        let locate_response = app
+            .clone()
+            .oneshot(
+                Request::post("/locate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&kin_cli::daemon_client::LocateRequest {
+                            text: "parse config".to_string(),
+                            explain: false,
+                            max_files: 10,
+                            max_files_explicit: true,
+                            reference: None,
+                            snippets: false,
+                            snippet_lines: None,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(locate_response.status(), StatusCode::OK);
+        let locate_body = axum::body::to_bytes(locate_response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let locate_result: kin_cli::commands::locate::LocateResult =
+            serde_json::from_slice(&locate_body).unwrap();
+        let locate_files: Vec<String> = locate_result
+            .files
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect();
+        assert!(
+            !locate_files.is_empty(),
+            "locate endpoint should rank at least one file"
+        );
+
+        let payload = call_semantic_locate(
+            app,
+            json!({
+                "query": "parse config",
+                "granularity": "file",
+                "limit": 10,
+                "pipeline": "fused"
+            }),
+        )
+        .await;
+        assert_eq!(payload["routing"], "fused-v1");
+        let mcp_files: Vec<String> = payload["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["file"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            mcp_files, locate_files,
+            "fused semantic_locate must serve the same file ranking as POST /locate"
+        );
+    }
+
+    // Entity-granularity fused hits must stay act-on-able: a real entity_id
+    // (resolvable for get_entity_source), the file, a line span, and the
+    // ranked score — matching the agent output contract.
+    #[tokio::test]
+    async fn mcp_semantic_locate_fused_entity_hits_are_act_on_able() {
+        let state = test_state();
+        let entity = test_entity("parse_config", "src/config.py");
+        let expected_id = entity.id.to_string();
+        state.graph.upsert_entity(&entity).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+
+        let payload = call_semantic_locate(
+            app,
+            json!({
+                "query": "parse config",
+                "limit": 5,
+                "pipeline": "fused"
+            }),
+        )
+        .await;
+        assert_eq!(payload["routing"], "fused-v1");
+        assert_eq!(payload["granularity"], "entity");
+        assert!(
+            payload.get("semantic_coverage").is_some(),
+            "fused payload keeps the legacy semantic_coverage float"
+        );
+        let results = payload["results"].as_array().unwrap();
+        assert!(!results.is_empty(), "expected at least one entity hit");
+        let hit = &results[0];
+        assert_eq!(hit["entity_id"], expected_id);
+        assert_eq!(hit["name"], "parse_config");
+        assert_eq!(hit["file"], "src/config.py");
+        let start_line = hit["start_line"].as_u64().unwrap();
+        let end_line = hit["end_line"].as_u64().unwrap();
+        assert!(
+            start_line >= 1 && end_line >= start_line,
+            "1-based inclusive line span expected, got {start_line}..{end_line}"
+        );
+        assert!(hit["score"].as_f64().is_some());
+        assert!(hit["kind"].as_str().is_some());
+    }
+
+    // The legacy cosine ranking stays reachable per-call, independent of the
+    // daemon's profile — the A/B lever for benchmarks and the compat escape.
+    #[tokio::test]
+    async fn mcp_semantic_locate_pipeline_cosine_override_serves_legacy() {
+        let state = test_state();
+        state
+            .graph
+            .upsert_entity(&test_entity("handler", "src/lib.py"))
+            .unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+
+        let payload = call_semantic_locate(
+            app.clone(),
+            json!({ "query": "handler", "pipeline": "cosine" }),
+        )
+        .await;
+        assert_eq!(payload["routing"], "cosine-v0");
+
+        // Unknown pipeline values fail loud, not silently defaulted.
+        let response = app
+            .oneshot(
+                Request::post("/mcp/tools/call")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "semantic_locate",
+                            "arguments": { "query": "handler", "pipeline": "warp" }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let result: kin_mcp::ToolCallResult = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result.is_error, Some(true));
     }
 
     // ---------------------------------------------------------------
