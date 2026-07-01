@@ -170,6 +170,23 @@ Inspect changes at the level of entities rather than raw lines:
 kin diff
 ```
 
+### Run your normal tools
+
+Ordinary project commands run through a graph-backed **session workspace** — the
+venv-like execution contract, so you never need to know which files are
+materialized before running the repo:
+
+```sh
+kin exec -- npm test          # one-shot command (alias: kin run)
+kin shell                     # interactive shell in a session workspace
+kin with --session claude -- "fix the failing test"   # agent inside a session
+```
+
+On success the session reconciles back into the graph (generated dirs like
+`node_modules/` are skipped by policy); on failure the workspace is preserved
+with recovery commands. See [Session Runtime](session-runtime.md) for the full
+contract, closeout flags, and Docker/Compose caveats.
+
 ---
 
 ## 6. Semantic exploration and retrieval
@@ -230,7 +247,7 @@ The wizard writes this entry to each client:
   "mcpServers": {
     "kin": {
       "command": "kin",
-      "args": ["mcp", "start", "--global"],
+      "args": ["mcp", "start"],
       "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
     }
   }
@@ -324,7 +341,7 @@ server to your client's config by hand. Match the wizard exactly — including t
   "mcpServers": {
     "kin": {
       "command": "kin",
-      "args": ["mcp", "start", "--global"],
+      "args": ["mcp", "start"],
       "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
     }
   }
@@ -342,7 +359,11 @@ Config file locations the wizard targets (and `kin setup status` inspects):
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` |
 
 `kin mcp start` launches the MCP **stdio** server. You normally do not run this by hand —
-your AI client launches it as a subprocess via the config above.
+your AI client launches it as a subprocess via the config above. The server binds
+per invocation: it uses `KIN_DAEMON_URL` when set (agent sessions launched with
+`kin with --session` pin it), and otherwise resolves the repository by walking up
+from the working directory — so each agent session talks to the daemon of the
+repository it is actually working in.
 
 ### npm wrapper (`@kinlab/kin-mcp`)
 

@@ -679,6 +679,11 @@ fn prompt_yn(prompt: &str, default_yes: bool, interactive: bool) -> bool {
 /// Prefers an absolute path to the `kin` binary (resolved from the current
 /// executable) so the entry works in agent processes that do not inherit the
 /// user's PATH.
+///
+/// The entry starts the MCP server in single-repo mode: `kin mcp start`
+/// resolves the repo from the agent's working directory (or from
+/// `KIN_DAEMON_URL` when a session launch pinned one), so each agent session
+/// binds to the daemon of the repository it is actually working in.
 fn kin_mcp_entry() -> serde_json::Value {
     // Try to resolve an absolute path from the running executable.  The
     // installed binary lives alongside the other kin-* binaries, so
@@ -692,7 +697,7 @@ fn kin_mcp_entry() -> serde_json::Value {
     };
     serde_json::json!({
         "command": command,
-        "args": ["mcp", "start", "--global"],
+        "args": ["mcp", "start"],
         "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
     })
 }

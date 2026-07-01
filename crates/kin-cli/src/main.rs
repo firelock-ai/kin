@@ -549,13 +549,18 @@ enum Command {
         #[command(subcommand)]
         action: VerifyAction,
     },
-    /// Execute a command in a materialized workspace
+    /// Run a command in a graph-backed session workspace
+    #[command(visible_alias = "run")]
     Exec {
-        /// Command to execute
-        command: String,
-        /// Keep the workspace after execution
+        /// Command to run (put kin flags before it: `kin exec --keep -- npm test`)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+        /// Keep the session workspace after the run and defer reconcile
         #[arg(long)]
         keep: bool,
+        /// Discard all workspace changes after the run (no reconcile)
+        #[arg(long, conflicts_with = "keep")]
+        discard: bool,
         /// Materialization strategy
         #[arg(long)]
         strategy: Option<String>,
@@ -747,6 +752,11 @@ enum Command {
     With {
         /// Assistant to launch: claude, codex, gemini
         assistant: String,
+        /// Launch inside a graph-backed session workspace: the assistant starts
+        /// with its cwd in the session, receives session/daemon env, and its
+        /// changes reconcile into the graph on a successful exit
+        #[arg(long)]
+        session: bool,
         /// Pass the raw task only; keep AGENTS/bootstrap docs on disk but do not inject prompt guidance
         #[arg(long)]
         passive_guidance: bool,
@@ -2259,9 +2269,10 @@ fn main() -> Result<()> {
                 Command::Exec {
                     command,
                     keep,
+                    discard,
                     strategy,
                     scope,
-                } => commands::exec::run_full(command, keep, strategy, scope).await,
+                } => commands::exec::run_full(command, keep, discard, strategy, scope).await,
                 Command::Telemetry { action } => match action {
                     TelemetryAction::Status => commands::telemetry::run_status().await,
                     TelemetryAction::Consent => commands::telemetry::run_consent().await,
@@ -2493,6 +2504,7 @@ fn main() -> Result<()> {
                 }
                 Command::With {
                     assistant,
+                    session,
                     passive_guidance,
                     restrict_discovery,
                     restrict_filesystem,
@@ -2501,6 +2513,7 @@ fn main() -> Result<()> {
                     commands::with::run(
                         assistant,
                         task,
+                        session,
                         passive_guidance,
                         restrict_discovery,
                         restrict_filesystem,
