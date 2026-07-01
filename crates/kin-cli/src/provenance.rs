@@ -60,7 +60,7 @@ where
     Ok(event.event_id)
 }
 
-fn current_actor_label() -> String {
+pub(crate) fn current_actor_label() -> String {
     std::env::var("KIN_ACTOR")
         .ok()
         .filter(|value| !value.trim().is_empty())

@@ -1125,6 +1125,32 @@ enum IntentAction {
 
 #[derive(Subcommand)]
 enum ReviewAction {
+    /// Shadow-mode merge gate: evaluate a PR-shaped change and emit a
+    /// report-only verdict with blast radius, repair context, and audit
+    /// evidence. Never blocks and never mutates graph state.
+    Shadow {
+        /// Change range as <base>..<head>. Refs accept branch names,
+        /// semantic change IDs, and imported Git commit SHAs.
+        range: Option<String>,
+        /// Base ref (alternative to the positional range)
+        #[arg(long)]
+        base: Option<String>,
+        /// Head ref (alternative to the positional range)
+        #[arg(long)]
+        head: Option<String>,
+        /// Change title for the report (e.g. PR title)
+        #[arg(long)]
+        title: Option<String>,
+        /// Source URL for the report (e.g. PR URL)
+        #[arg(long = "source-url")]
+        source_url: Option<String>,
+        /// Change author identity for the report
+        #[arg(long)]
+        author: Option<String>,
+        /// Emit the report as machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Create a new review
     Create {
         /// Review title
@@ -2082,6 +2108,37 @@ fn main() -> Result<()> {
                 } => {
                     if let Some(review_action) = action {
                         match review_action {
+                            ReviewAction::Shadow {
+                                range,
+                                base,
+                                head,
+                                title,
+                                source_url,
+                                author,
+                                json,
+                            } => {
+                                let (base, head) = match (range, base, head) {
+                                    (Some(range), None, None) => match range.split_once("..") {
+                                        Some((base, head))
+                                            if !base.is_empty() && !head.is_empty() =>
+                                        {
+                                            (base.to_string(), head.to_string())
+                                        }
+                                        _ => anyhow::bail!(
+                                            "invalid range '{}': expected <base>..<head>",
+                                            range
+                                        ),
+                                    },
+                                    (None, Some(base), Some(head)) => (base, head),
+                                    _ => anyhow::bail!(
+                                        "provide a <base>..<head> range or both --base and --head"
+                                    ),
+                                };
+                                commands::review::shadow_report(
+                                    base, head, title, source_url, author, json,
+                                )
+                                .await
+                            }
                             ReviewAction::Create {
                                 title,
                                 base,
@@ -2655,6 +2712,14 @@ mod tests {
 
     #[test]
     fn cli_definition_is_valid() {
-        Cli::command().debug_assert();
+        // clap's debug_assert recurses over the full command tree, which has
+        // outgrown the default 2 MiB test-thread stack; give it a dedicated
+        // thread with room to validate every subcommand.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| Cli::command().debug_assert())
+            .expect("spawn cli validation thread")
+            .join()
+            .expect("cli definition validation must succeed");
     }
 }

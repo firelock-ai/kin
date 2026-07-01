@@ -22,7 +22,8 @@ const schemaFiles = {
   scmResourceGroups: 'scm-resource-groups.schema.json',
   intent: 'intent.schema.json',
   intentConflict: 'intent-conflict.schema.json',
-  trafficReport: 'traffic-report.schema.json'
+  trafficReport: 'traffic-report.schema.json',
+  shadowGateReport: 'shadow-gate-report.schema.json'
 };
 
 const schemaIdMap = {

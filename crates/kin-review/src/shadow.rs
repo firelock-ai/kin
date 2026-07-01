@@ -1,0 +1,1276 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
+//! Shadow-mode merge-gate report.
+//!
+//! Packages one PR-shaped change evaluation into a single payload: what
+//! changed at the entity level, the graph-proven blast radius, the policy
+//! verdict the gate would have issued, the context a reviewer or agent needs
+//! to repair findings, and the audit evidence for the evaluation itself.
+//!
+//! Shadow mode is report-only. It never blocks and never mutates graph
+//! state; a blocking verdict is reported as `would_block`.
+//!
+//! Every section is graph-derived. When the graph cannot prove something —
+//! files with no captured entities, entities without spans, an empty impact
+//! signal, cross-repo federation not evaluated — the report carries an
+//! explicit entry in `evidence_gaps` instead of passing silently.
+
+use std::collections::BTreeSet;
+
+use kin_model::entity::Entity;
+use kin_model::graph::GraphStore;
+use kin_model::ids::SemanticChangeId;
+use kin_model::timestamp::Timestamp;
+use serde::{Deserialize, Serialize};
+
+use crate::diff::EntityChangeKind;
+use crate::gate::{derive_decision, GateStatus, ReviewFinding, ReviewSignalKind};
+use crate::inline::InlineCommentKind;
+use crate::review::{Review, SemanticReview};
+use crate::ReviewError;
+
+/// Version of the shadow gate report payload schema. Mirrored by
+/// `packages/boundary-contracts/schemas/shadow-gate-report.schema.json`.
+pub const SHADOW_GATE_REPORT_SCHEMA_VERSION: u32 = 1;
+
+/// Enforcement label carried by every shadow report.
+pub const SHADOW_ENFORCEMENT_REPORT_ONLY: &str = "report_only";
+
+/// Inputs for one shadow gate evaluation.
+#[derive(Debug, Clone)]
+pub struct ShadowRequest {
+    /// Base ref exactly as supplied by the caller.
+    pub base_ref: String,
+    /// Head ref exactly as supplied by the caller.
+    pub head_ref: String,
+    /// Resolved base change.
+    pub resolved_base: SemanticChangeId,
+    /// Resolved head change.
+    pub resolved_head: SemanticChangeId,
+    /// Optional change title (e.g. PR title).
+    pub title: Option<String>,
+    /// Optional source URL (e.g. PR URL).
+    pub source_url: Option<String>,
+    /// Optional change author identity.
+    pub author: Option<String>,
+    /// Identity running the evaluation (for audit evidence).
+    pub actor: String,
+}
+
+/// Echo of the evaluated input, with resolution results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowInputEcho {
+    pub base_ref: String,
+    pub head_ref: String,
+    pub resolved_base: String,
+    pub resolved_head: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+}
+
+/// One directly changed entity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowChangedEntity {
+    pub entity_id: String,
+    pub name: String,
+    pub kind: String,
+    /// "added" | "modified" | "removed"
+    pub change: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u32>,
+    pub signature_changed: bool,
+    pub visibility_changed: bool,
+}
+
+/// One entity reached by blast-radius traversal, with the graph relationship
+/// bucket that proves why it is affected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowAffectedEntity {
+    pub entity_id: String,
+    pub name: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Relationship bucket: "calls" | "depends_on" | "consumes_contract" | "tests"
+    pub via: String,
+}
+
+/// Open work item scoped to a changed entity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowWorkItem {
+    pub work_id: String,
+    pub title: String,
+    pub status: String,
+}
+
+/// Cross-repo federation section. v1 reports single-repo blast radius only
+/// and labels the cross-repo section explicitly instead of implying coverage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowCrossRepo {
+    /// "not_evaluated" | "unavailable" | "available"
+    pub status: String,
+    pub detail: String,
+    pub nodes: Vec<ShadowCrossRepoNode>,
+}
+
+/// One cross-repo node (populated only when `status` is "available").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowCrossRepoNode {
+    pub repo_id: String,
+    pub entity_id: String,
+    pub name: String,
+}
+
+/// Graph-proven blast radius for the changed entities.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowBlastRadius {
+    pub callers: Vec<ShadowAffectedEntity>,
+    pub dependents: Vec<ShadowAffectedEntity>,
+    pub contract_consumers: Vec<ShadowAffectedEntity>,
+    pub tests: Vec<ShadowAffectedEntity>,
+    pub open_work_items: Vec<ShadowWorkItem>,
+    pub total_affected: usize,
+    pub cross_repo: ShadowCrossRepo,
+}
+
+/// Gate status a shadow evaluation reports (never enforces).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowGateVerdict {
+    Pass,
+    NeedsAttention,
+    WouldBlock,
+}
+
+/// One policy finding, anchored to source where the graph has a span.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowPolicyFinding {
+    /// Machine-readable kind, e.g. "breaking", "coverage_gap".
+    pub kind: String,
+    /// "error" | "warning" | "info"
+    pub severity: String,
+    /// Whether this finding would block in enforcing mode.
+    pub blocking: bool,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+}
+
+/// The verdict the gate would have issued, plus its inputs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowPolicyResult {
+    /// Always "report_only" in shadow mode.
+    pub enforcement: String,
+    pub verdict: ShadowGateVerdict,
+    /// Overall risk from the risk assessment: "low" | "medium" | "high" | "critical".
+    pub risk_level: String,
+    pub blocking_count: usize,
+    pub attention_count: usize,
+    pub summary: String,
+    pub findings: Vec<ShadowPolicyFinding>,
+}
+
+/// What a reviewer or agent needs to address one finding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowRepairItem {
+    pub finding: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    /// Graph-known tests covering the changed entities ("name (file)").
+    pub covering_tests: Vec<String>,
+    /// Graph-known callers/consumers to check ("name (file)").
+    pub affected_consumers: Vec<String>,
+    pub guidance: String,
+}
+
+/// Explicit statement that the graph could not prove something.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowEvidenceGap {
+    /// "artifact_only_change" | "missing_span" | "actor_attribution_unavailable"
+    /// | "impact_signal_absent" | "cross_repo_not_evaluated"
+    pub kind: String,
+    pub subject: String,
+    pub detail: String,
+}
+
+/// Actor attribution for one changed entity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowAttribution {
+    pub entity_id: String,
+    pub actor_kind: String,
+}
+
+/// One recorded approval on the head change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowApproval {
+    pub approver: String,
+    pub decision: String,
+    pub reason: String,
+}
+
+/// Who/what/when evidence for the evaluation itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowAuditEvidence {
+    pub generated_at: Timestamp,
+    pub actor: String,
+    /// "human" | "assistant" | "service"
+    pub actor_kind: String,
+    pub tool: String,
+    pub tool_version: String,
+    pub base_change: String,
+    pub head_change: String,
+    pub changes_in_range: usize,
+    pub entity_attribution: Vec<ShadowAttribution>,
+    pub head_approvals: Vec<ShadowApproval>,
+}
+
+/// The complete shadow-mode merge-gate report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowGateReport {
+    pub schema_version: u32,
+    /// Always "shadow".
+    pub mode: String,
+    pub input: ShadowInputEcho,
+    pub changed_entities: Vec<ShadowChangedEntity>,
+    pub blast_radius: ShadowBlastRadius,
+    pub policy: ShadowPolicyResult,
+    pub repair_context: Vec<ShadowRepairItem>,
+    pub evidence_gaps: Vec<ShadowEvidenceGap>,
+    pub audit: ShadowAuditEvidence,
+}
+
+/// Build a shadow-mode merge-gate report for a resolved base..head range.
+///
+/// Read-only: consumes graph truth, produces a report, records nothing.
+pub fn build_shadow_report<G: GraphStore>(
+    store: &G,
+    request: &ShadowRequest,
+) -> Result<ShadowGateReport, ReviewError> {
+    let review =
+        SemanticReview::create_review(&request.resolved_base, &request.resolved_head, store)?;
+
+    let changes = store
+        .get_changes_since(&request.resolved_base, &request.resolved_head)
+        .map_err(ReviewError::graph)?;
+
+    let changed_entities = collect_changed_entities(&review);
+    let blast_radius = collect_blast_radius(&review);
+    let evidence_gaps = collect_evidence_gaps(&review, &changes, &changed_entities);
+    let policy = derive_policy(&review, &evidence_gaps);
+    let repair_context = collect_repair_context(&policy.findings, &review);
+    let audit = collect_audit_evidence(store, request, &review, changes.len())?;
+
+    Ok(ShadowGateReport {
+        schema_version: SHADOW_GATE_REPORT_SCHEMA_VERSION,
+        mode: "shadow".to_string(),
+        input: ShadowInputEcho {
+            base_ref: request.base_ref.clone(),
+            head_ref: request.head_ref.clone(),
+            resolved_base: request.resolved_base.to_string(),
+            resolved_head: request.resolved_head.to_string(),
+            title: request.title.clone(),
+            source_url: request.source_url.clone(),
+            author: request.author.clone(),
+        },
+        changed_entities,
+        blast_radius,
+        policy,
+        repair_context,
+        evidence_gaps,
+        audit,
+    })
+}
+
+fn entity_location(entity: &Entity) -> (Option<String>, Option<u32>, Option<u32>) {
+    match &entity.span {
+        Some(span) => (
+            Some(span.file.to_string()),
+            Some(span.start_line),
+            Some(span.end_line),
+        ),
+        None => (
+            entity.file_origin.as_ref().map(|file| file.to_string()),
+            None,
+            None,
+        ),
+    }
+}
+
+fn collect_changed_entities(review: &Review) -> Vec<ShadowChangedEntity> {
+    let mut changed = Vec::new();
+    for change in &review.diff.entity_changes {
+        match &change.kind {
+            EntityChangeKind::Added(entity) => {
+                let (file, start_line, end_line) = entity_location(entity);
+                changed.push(ShadowChangedEntity {
+                    entity_id: entity.id.to_string(),
+                    name: entity.name.clone(),
+                    kind: format!("{:?}", entity.kind),
+                    change: "added".to_string(),
+                    file,
+                    start_line,
+                    end_line,
+                    signature_changed: false,
+                    visibility_changed: false,
+                });
+            }
+            EntityChangeKind::Modified { old, new } => {
+                let (file, start_line, end_line) = entity_location(new);
+                changed.push(ShadowChangedEntity {
+                    entity_id: new.id.to_string(),
+                    name: new.name.clone(),
+                    kind: format!("{:?}", new.kind),
+                    change: "modified".to_string(),
+                    file,
+                    start_line,
+                    end_line,
+                    signature_changed: old.signature != new.signature,
+                    visibility_changed: old.visibility != new.visibility,
+                });
+            }
+            EntityChangeKind::Removed(id) => {
+                changed.push(ShadowChangedEntity {
+                    entity_id: id.to_string(),
+                    name: id.to_string(),
+                    kind: "unknown".to_string(),
+                    change: "removed".to_string(),
+                    file: None,
+                    start_line: None,
+                    end_line: None,
+                    signature_changed: false,
+                    visibility_changed: false,
+                });
+            }
+        }
+    }
+    changed.sort_by(|a, b| {
+        a.file
+            .cmp(&b.file)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.entity_id.cmp(&b.entity_id))
+    });
+    changed
+}
+
+fn affected_from(entities: &[Entity], via: &str) -> Vec<ShadowAffectedEntity> {
+    let mut affected: Vec<ShadowAffectedEntity> = entities
+        .iter()
+        .map(|entity| {
+            let (file, _, _) = entity_location(entity);
+            ShadowAffectedEntity {
+                entity_id: entity.id.to_string(),
+                name: entity.name.clone(),
+                kind: format!("{:?}", entity.kind),
+                file,
+                via: via.to_string(),
+            }
+        })
+        .collect();
+    affected.sort_by(|a, b| {
+        a.file
+            .cmp(&b.file)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.entity_id.cmp(&b.entity_id))
+    });
+    affected
+}
+
+fn collect_blast_radius(review: &Review) -> ShadowBlastRadius {
+    let impact = &review.impact;
+    let mut open_work_items: Vec<ShadowWorkItem> = impact
+        .affected_work_items
+        .iter()
+        .map(|item| ShadowWorkItem {
+            work_id: item.work_id.to_string(),
+            title: item.title.clone(),
+            status: format!("{:?}", item.status),
+        })
+        .collect();
+    open_work_items.sort_by(|a, b| a.work_id.cmp(&b.work_id));
+
+    ShadowBlastRadius {
+        callers: affected_from(&impact.affected_callers, "calls"),
+        dependents: affected_from(&impact.affected_dependents, "depends_on"),
+        contract_consumers: affected_from(&impact.affected_contract_consumers, "consumes_contract"),
+        tests: affected_from(&impact.affected_tests, "tests"),
+        open_work_items,
+        total_affected: impact.total_affected(),
+        cross_repo: ShadowCrossRepo {
+            status: "not_evaluated".to_string(),
+            detail: "cross-repo federation is not evaluated by shadow report v1; blast radius \
+                     covers this repository only"
+                .to_string(),
+            nodes: Vec::new(),
+        },
+    }
+}
+
+fn finding_kind_label(kind: InlineCommentKind) -> &'static str {
+    match kind {
+        InlineCommentKind::Breaking => "breaking",
+        InlineCommentKind::CoverageGap => "coverage_gap",
+        InlineCommentKind::ContractViolation => "contract_violation",
+        InlineCommentKind::SignatureChange => "signature_change",
+        InlineCommentKind::VisibilityChange => "visibility_change",
+        InlineCommentKind::Added => "entity_added",
+        InlineCommentKind::Removed => "entity_removed",
+        InlineCommentKind::Renamed => "entity_renamed",
+        InlineCommentKind::AgentUnreviewed => "agent_unreviewed",
+    }
+}
+
+fn finding_severity(kind: InlineCommentKind) -> &'static str {
+    match kind {
+        InlineCommentKind::Breaking | InlineCommentKind::ContractViolation => "error",
+        InlineCommentKind::CoverageGap
+        | InlineCommentKind::SignatureChange
+        | InlineCommentKind::VisibilityChange
+        | InlineCommentKind::Renamed
+        | InlineCommentKind::AgentUnreviewed => "warning",
+        InlineCommentKind::Added | InlineCommentKind::Removed => "info",
+    }
+}
+
+fn is_blocking(kind: InlineCommentKind) -> bool {
+    matches!(
+        kind,
+        InlineCommentKind::Breaking | InlineCommentKind::ContractViolation
+    )
+}
+
+/// Evidence-gap kinds that describe a deficit in what the graph could prove
+/// about THIS change. A gate cannot certify `pass` over them. Structural v1
+/// limits (cross-repo not evaluated, attribution unavailable) do not demote
+/// the verdict — they are constant framing, reported but not change-specific.
+fn gap_blocks_pass(kind: &str) -> bool {
+    matches!(
+        kind,
+        "artifact_only_change" | "missing_span" | "impact_signal_absent"
+    )
+}
+
+fn derive_policy(review: &Review, evidence_gaps: &[ShadowEvidenceGap]) -> ShadowPolicyResult {
+    let mut findings: Vec<ShadowPolicyFinding> = review
+        .inline_comments
+        .iter()
+        .map(|comment| ShadowPolicyFinding {
+            kind: finding_kind_label(comment.kind).to_string(),
+            severity: finding_severity(comment.kind).to_string(),
+            blocking: is_blocking(comment.kind),
+            message: comment.message.clone(),
+            file: Some(comment.file.clone()),
+            line: Some(comment.start_line),
+        })
+        .collect();
+
+    // Gate rule: a contract-surface change (signature/visibility/removal) with
+    // ANY graph-known downstream entity is a blocking downstream risk. The
+    // impact walker buckets incoming consumers under `dependents`, which the
+    // inline `Breaking` rule does not consult, so the gate consults the full
+    // affected set here.
+    let downstream_count = review.impact.affected_callers.len()
+        + review.impact.affected_dependents.len()
+        + review.impact.affected_contract_consumers.len();
+    if downstream_count > 0 {
+        for change in &review.diff.entity_changes {
+            let (name, location, surface_changed) = match &change.kind {
+                EntityChangeKind::Modified { old, new } => (
+                    new.name.clone(),
+                    new.span
+                        .as_ref()
+                        .map(|span| (span.file.to_string(), span.start_line)),
+                    old.signature != new.signature || old.visibility != new.visibility,
+                ),
+                EntityChangeKind::Removed(id) => (id.to_string(), None, true),
+                EntityChangeKind::Added(_) => continue,
+            };
+            if !surface_changed {
+                continue;
+            }
+            let already_blocking = findings.iter().any(|finding| {
+                finding.blocking
+                    && finding.file == location.as_ref().map(|(file, _)| file.clone())
+                    && finding.line == location.as_ref().map(|(_, line)| *line)
+            });
+            if already_blocking {
+                continue;
+            }
+            findings.push(ShadowPolicyFinding {
+                kind: "downstream_risk".to_string(),
+                severity: "error".to_string(),
+                blocking: true,
+                message: format!(
+                    "Contract surface of `{}` changed with {} graph-known downstream entity(ies)",
+                    name, downstream_count
+                ),
+                file: location.as_ref().map(|(file, _)| file.clone()),
+                line: location.as_ref().map(|(_, line)| *line),
+            });
+        }
+    }
+
+    // Informational findings (entity added/removed) describe the diff, not a
+    // gate signal; they are reported but do not feed the verdict.
+    let gate_findings: Vec<ReviewFinding> = findings
+        .iter()
+        .filter(|finding| finding.severity != "info")
+        .map(|finding| ReviewFinding {
+            kind: match finding.kind.as_str() {
+                "contract_violation" | "agent_unreviewed" => ReviewSignalKind::PolicyViolation,
+                "coverage_gap" => ReviewSignalKind::CoverageGap,
+                _ => ReviewSignalKind::DownstreamRisk,
+            },
+            title: finding.message.clone(),
+            blocking: finding.blocking,
+        })
+        .collect();
+
+    let decision = derive_decision(&gate_findings, 0);
+    let mut verdict = match decision.status {
+        GateStatus::Pass => ShadowGateVerdict::Pass,
+        GateStatus::NeedsAttention => ShadowGateVerdict::NeedsAttention,
+        GateStatus::Blocked => ShadowGateVerdict::WouldBlock,
+    };
+
+    // Missing evidence is never a pass: when the graph could not prove parts
+    // of this change, the gate reports needs_attention instead of certifying
+    // a clean result it did not actually verify.
+    let pass_blocking_gaps = evidence_gaps
+        .iter()
+        .filter(|gap| gap_blocks_pass(&gap.kind))
+        .count();
+    if verdict == ShadowGateVerdict::Pass && pass_blocking_gaps > 0 {
+        verdict = ShadowGateVerdict::NeedsAttention;
+    }
+
+    let risk_level = format!("{:?}", review.risk.overall_risk).to_lowercase();
+    let summary = match verdict {
+        ShadowGateVerdict::Pass => "no gate signals; would pass".to_string(),
+        ShadowGateVerdict::NeedsAttention if decision.attention_count == 0 => format!(
+            "{} evidence gap(s) prevent certifying a pass; evidence missing is not evidence of \
+             safety",
+            pass_blocking_gaps
+        ),
+        ShadowGateVerdict::NeedsAttention => format!(
+            "{} attention signal(s); would pass with attention",
+            decision.attention_count
+        ),
+        ShadowGateVerdict::WouldBlock => format!(
+            "{} blocking finding(s), {} attention signal(s); would block in enforcing mode",
+            decision.blocking_count, decision.attention_count
+        ),
+    };
+
+    ShadowPolicyResult {
+        enforcement: SHADOW_ENFORCEMENT_REPORT_ONLY.to_string(),
+        verdict,
+        risk_level,
+        blocking_count: decision.blocking_count,
+        attention_count: decision.attention_count,
+        summary,
+        findings,
+    }
+}
+
+fn repair_guidance(kind: &str) -> &'static str {
+    match kind {
+        "breaking" => {
+            "Update the listed consumers to the new contract or restore compatibility, then run \
+             the covering tests."
+        }
+        "contract_violation" => {
+            "The contract has graph-known consumers; version the contract or migrate every \
+             consumer in the same change."
+        }
+        "coverage_gap" => {
+            "No graph-known test covers this entity; add or link a test so the gate has proof."
+        }
+        "signature_change" => {
+            "Verify every listed caller against the new signature before merging."
+        }
+        "visibility_change" => {
+            "Confirm the visibility change is intentional; listed dependents may lose access."
+        }
+        "agent_unreviewed" => {
+            "Record a human review decision for the agent-authored change before enforcing."
+        }
+        "entity_renamed" => "Confirm references were updated for the rename.",
+        "downstream_risk" => {
+            "The contract surface changed with graph-known downstream entities; verify each \
+             listed dependent and consumer, then run the covering tests."
+        }
+        _ => "Review the change against the listed blast radius.",
+    }
+}
+
+fn collect_repair_context(
+    findings: &[ShadowPolicyFinding],
+    review: &Review,
+) -> Vec<ShadowRepairItem> {
+    let mut covering_tests: Vec<String> = review
+        .impact
+        .affected_tests
+        .iter()
+        .map(|test| {
+            let (file, _, _) = entity_location(test);
+            match file {
+                Some(file) => format!("{} ({})", test.name, file),
+                None => test.name.clone(),
+            }
+        })
+        .collect();
+    covering_tests.sort();
+    covering_tests.dedup();
+
+    let mut affected_consumers: Vec<String> = review
+        .impact
+        .affected_callers
+        .iter()
+        .chain(review.impact.affected_contract_consumers.iter())
+        .map(|consumer| {
+            let (file, _, _) = entity_location(consumer);
+            match file {
+                Some(file) => format!("{} ({})", consumer.name, file),
+                None => consumer.name.clone(),
+            }
+        })
+        .collect();
+    affected_consumers.sort();
+    affected_consumers.dedup();
+
+    findings
+        .iter()
+        .filter(|finding| finding.severity != "info")
+        .map(|finding| ShadowRepairItem {
+            finding: finding.message.clone(),
+            kind: finding.kind.clone(),
+            file: finding.file.clone(),
+            line: finding.line,
+            covering_tests: covering_tests.clone(),
+            affected_consumers: affected_consumers.clone(),
+            guidance: repair_guidance(&finding.kind).to_string(),
+        })
+        .collect()
+}
+
+fn collect_evidence_gaps(
+    review: &Review,
+    changes: &[kin_model::change::SemanticChange],
+    changed_entities: &[ShadowChangedEntity],
+) -> Vec<ShadowEvidenceGap> {
+    let mut gaps = Vec::new();
+
+    // Files whose changes were recorded only as raw artifacts: the graph has
+    // no entities for them, so they are invisible to blast radius and policy.
+    let entity_files: BTreeSet<String> = changed_entities
+        .iter()
+        .filter_map(|entity| entity.file.clone())
+        .collect();
+    let mut artifact_only: BTreeSet<String> = BTreeSet::new();
+    for change in changes {
+        for delta in &change.artifact_deltas {
+            let file = delta.file_id.to_string();
+            if !entity_files.contains(&file) {
+                artifact_only.insert(file);
+            }
+        }
+    }
+    for file in artifact_only {
+        gaps.push(ShadowEvidenceGap {
+            kind: "artifact_only_change".to_string(),
+            subject: file,
+            detail: "file changed but no semantic entities were captured for it (unsupported \
+                     language or unparsed artifact); its impact is NOT included in the blast \
+                     radius or policy result"
+                .to_string(),
+        });
+    }
+
+    // Changed entities without a source span cannot anchor line-level findings.
+    for entity in changed_entities {
+        if entity.change != "removed" && entity.start_line.is_none() {
+            gaps.push(ShadowEvidenceGap {
+                kind: "missing_span".to_string(),
+                subject: entity.name.clone(),
+                detail: "changed entity has no source span in the graph; line-anchored findings \
+                         and inline evidence are unavailable for it"
+                    .to_string(),
+            });
+        }
+    }
+
+    // An empty impact signal is only trustworthy when relation data exists.
+    // Distinguishing "genuinely isolated" from "relations never ingested"
+    // requires coverage state the report does not have, so say so.
+    if !changed_entities.is_empty() && review.impact.is_empty() {
+        gaps.push(ShadowEvidenceGap {
+            kind: "impact_signal_absent".to_string(),
+            subject: "blast_radius".to_string(),
+            detail: "no graph relations connect the changed entities to any caller, dependent, \
+                     contract consumer, or test; verify relation ingestion completed for this \
+                     repository before treating the empty blast radius as proof of isolation"
+                .to_string(),
+        });
+    }
+
+    // Actor attribution requires recorded audit events; absence is a gap, not
+    // a claim that no agent was involved.
+    if review.impact.actor_attribution.is_empty() && !changed_entities.is_empty() {
+        gaps.push(ShadowEvidenceGap {
+            kind: "actor_attribution_unavailable".to_string(),
+            subject: "audit.entity_attribution".to_string(),
+            detail: "no recorded audit events attribute the changed entities to an actor; \
+                     author identity comes from change metadata only"
+                .to_string(),
+        });
+    }
+
+    gaps.push(ShadowEvidenceGap {
+        kind: "cross_repo_not_evaluated".to_string(),
+        subject: "blast_radius.cross_repo".to_string(),
+        detail: "cross-repo federation is not evaluated by shadow report v1; consumers in other \
+                 repositories are not represented in this report"
+            .to_string(),
+    });
+
+    gaps
+}
+
+fn actor_kind_label(actor: &str) -> &'static str {
+    let lowered = actor.to_ascii_lowercase();
+    if lowered.contains("codex")
+        || lowered.contains("assistant")
+        || lowered.contains("claude")
+        || lowered.contains("gemini")
+        || lowered.contains("agent")
+    {
+        "assistant"
+    } else if lowered.contains("service") || lowered.contains("daemon") {
+        "service"
+    } else {
+        "human"
+    }
+}
+
+fn collect_audit_evidence<G: GraphStore>(
+    store: &G,
+    request: &ShadowRequest,
+    review: &Review,
+    changes_in_range: usize,
+) -> Result<ShadowAuditEvidence, ReviewError> {
+    let mut entity_attribution: Vec<ShadowAttribution> = review
+        .impact
+        .actor_attribution
+        .iter()
+        .map(|(entity_id, kind)| ShadowAttribution {
+            entity_id: entity_id.to_string(),
+            actor_kind: format!("{:?}", kind).to_lowercase(),
+        })
+        .collect();
+    entity_attribution.sort_by(|a, b| a.entity_id.cmp(&b.entity_id));
+
+    let mut head_approvals: Vec<ShadowApproval> = store
+        .get_approvals_for_change(&request.resolved_head)
+        .map_err(ReviewError::graph)?
+        .iter()
+        .map(|approval| ShadowApproval {
+            approver: approval.approver.to_string(),
+            decision: approval.decision.to_string(),
+            reason: approval.reason.clone(),
+        })
+        .collect();
+    head_approvals.sort_by(|a, b| a.approver.cmp(&b.approver));
+
+    Ok(ShadowAuditEvidence {
+        generated_at: Timestamp::now(),
+        actor: request.actor.clone(),
+        actor_kind: actor_kind_label(&request.actor).to_string(),
+        tool: "kin-review".to_string(),
+        tool_version: env!("CARGO_PKG_VERSION").to_string(),
+        base_change: request.resolved_base.to_string(),
+        head_change: request.resolved_head.to_string(),
+        changes_in_range,
+        entity_attribution,
+        head_approvals,
+    })
+}
+
+/// Render a shadow gate report for humans.
+pub fn format_shadow_report(report: &ShadowGateReport) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "Shadow Merge Gate Report (report-only; never blocks)");
+    let _ = writeln!(
+        out,
+        "  Range: {} .. {}",
+        report.input.base_ref, report.input.head_ref
+    );
+    if let Some(title) = &report.input.title {
+        let _ = writeln!(out, "  Title: {}", title);
+    }
+    if let Some(source_url) = &report.input.source_url {
+        let _ = writeln!(out, "  Source: {}", source_url);
+    }
+
+    let verdict = match report.policy.verdict {
+        ShadowGateVerdict::Pass => "PASS",
+        ShadowGateVerdict::NeedsAttention => "NEEDS ATTENTION",
+        ShadowGateVerdict::WouldBlock => "WOULD BLOCK",
+    };
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "Verdict: {} (risk: {}) — {}",
+        verdict, report.policy.risk_level, report.policy.summary
+    );
+
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Changed entities ({}):", report.changed_entities.len());
+    for entity in &report.changed_entities {
+        let location = match (&entity.file, entity.start_line) {
+            (Some(file), Some(line)) => format!(" [{}:{}]", file, line),
+            (Some(file), None) => format!(" [{}]", file),
+            _ => String::new(),
+        };
+        let _ = writeln!(
+            out,
+            "  {} {} ({}){}",
+            match entity.change.as_str() {
+                "added" => "+",
+                "removed" => "-",
+                _ => "~",
+            },
+            entity.name,
+            entity.kind,
+            location
+        );
+    }
+
+    let radius = &report.blast_radius;
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "Blast radius ({} affected; this repository):",
+        radius.total_affected
+    );
+    for (label, entries) in [
+        ("callers", &radius.callers),
+        ("dependents", &radius.dependents),
+        ("contract consumers", &radius.contract_consumers),
+        ("tests", &radius.tests),
+    ] {
+        if !entries.is_empty() {
+            let _ = writeln!(out, "  {} ({}):", label, entries.len());
+            for entry in entries {
+                let location = entry
+                    .file
+                    .as_ref()
+                    .map(|file| format!(" [{}]", file))
+                    .unwrap_or_default();
+                let _ = writeln!(out, "    {}{}", entry.name, location);
+            }
+        }
+    }
+    if !radius.open_work_items.is_empty() {
+        let _ = writeln!(out, "  open work items ({}):", radius.open_work_items.len());
+        for item in &radius.open_work_items {
+            let _ = writeln!(out, "    {} [{}]", item.title, item.status);
+        }
+    }
+    let _ = writeln!(
+        out,
+        "  cross-repo: {} — {}",
+        radius.cross_repo.status, radius.cross_repo.detail
+    );
+
+    if !report.policy.findings.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Findings ({}):", report.policy.findings.len());
+        for finding in &report.policy.findings {
+            let location = match (&finding.file, finding.line) {
+                (Some(file), Some(line)) => format!(" [{}:{}]", file, line),
+                (Some(file), None) => format!(" [{}]", file),
+                _ => String::new(),
+            };
+            let _ = writeln!(
+                out,
+                "  [{}]{} {}{}",
+                finding.severity,
+                if finding.blocking { " [blocking]" } else { "" },
+                finding.message,
+                location
+            );
+        }
+    }
+
+    if !report.repair_context.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Repair context:");
+        for item in &report.repair_context {
+            let _ = writeln!(out, "  - {}", item.finding);
+            let _ = writeln!(out, "    {}", item.guidance);
+            if !item.covering_tests.is_empty() {
+                let _ = writeln!(out, "    tests: {}", item.covering_tests.join(", "));
+            }
+            if !item.affected_consumers.is_empty() {
+                let _ = writeln!(out, "    consumers: {}", item.affected_consumers.join(", "));
+            }
+        }
+    }
+
+    if !report.evidence_gaps.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Evidence gaps ({}):", report.evidence_gaps.len());
+        for gap in &report.evidence_gaps {
+            let _ = writeln!(out, "  [{}] {}: {}", gap.kind, gap.subject, gap.detail);
+        }
+    }
+
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "Audit: generated {} by {} ({}) via {} {} over {} change(s) [{} -> {}]",
+        report.audit.generated_at,
+        report.audit.actor,
+        report.audit.actor_kind,
+        report.audit.tool,
+        report.audit.tool_version,
+        report.audit.changes_in_range,
+        report.audit.base_change,
+        report.audit.head_change
+    );
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kin_db::InMemoryGraph;
+    use kin_model::change::{ArtifactDelta, ArtifactDeltaKind, EntityDelta, SemanticChange};
+    use kin_model::entity::{
+        Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint,
+        SourceSpan, Visibility,
+    };
+    use kin_model::graph::{ChangeStore, EntityStore};
+    use kin_model::ids::*;
+    use kin_model::relation::{GraphNodeId, Relation, RelationKind, RelationOrigin};
+    use kin_model::timestamp::Timestamp;
+
+    fn entity_with_span(name: &str, file: &str, start_line: u32, role: EntityRole) -> Entity {
+        let file_id = FilePathId::new(file);
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([0; 32]),
+                behavior_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(file_id.clone()),
+            span: Some(SourceSpan {
+                file: file_id,
+                start_byte: 0,
+                end_byte: 10,
+                start_line,
+                start_col: 0,
+                end_line: start_line + 2,
+                end_col: 1,
+            }),
+            signature: format!("fn {}()", name),
+            visibility: Visibility::Public,
+            role,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn change_id(byte: u8) -> SemanticChangeId {
+        SemanticChangeId::from_hash(Hash256::from_bytes([byte; 32]))
+    }
+
+    fn change_with_deltas(
+        id: SemanticChangeId,
+        parents: Vec<SemanticChangeId>,
+        entity_deltas: Vec<EntityDelta>,
+        artifact_deltas: Vec<ArtifactDelta>,
+    ) -> SemanticChange {
+        SemanticChange {
+            id,
+            parents,
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test-author"),
+            message: "test change".into(),
+            entity_deltas,
+            relation_deltas: vec![],
+            artifact_deltas,
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        }
+    }
+
+    fn relation(src: &Entity, dst: &Entity, kind: RelationKind) -> Relation {
+        Relation {
+            id: RelationId::new(),
+            kind,
+            src: GraphNodeId::Entity(src.id),
+            dst: GraphNodeId::Entity(dst.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: vec![],
+        }
+    }
+
+    fn request(base: SemanticChangeId, head: SemanticChangeId) -> ShadowRequest {
+        ShadowRequest {
+            base_ref: "main".into(),
+            head_ref: "feature/change".into(),
+            resolved_base: base,
+            resolved_head: head,
+            title: Some("test PR".into()),
+            source_url: None,
+            author: Some("agent-bot".into()),
+            actor: "test-runner".into(),
+        }
+    }
+
+    /// Graph with: base change adding `target` + `caller` + `test`, head
+    /// change modifying `target`'s signature. Caller and test are wired to
+    /// `target` via graph relations.
+    fn signature_change_graph() -> (InMemoryGraph, SemanticChangeId, SemanticChangeId) {
+        let graph = InMemoryGraph::new();
+
+        let target_v1 = entity_with_span("compute_total", "src/billing.rs", 10, EntityRole::Source);
+        let mut target_v2 = target_v1.clone();
+        target_v2.signature = "fn compute_total(currency: &str)".into();
+
+        let caller = entity_with_span("render_invoice", "src/invoice.rs", 5, EntityRole::Source);
+        let test = entity_with_span(
+            "test_compute_total",
+            "tests/billing.rs",
+            3,
+            EntityRole::Test,
+        );
+
+        graph.upsert_entity(&target_v2).unwrap();
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&test).unwrap();
+        graph
+            .upsert_relation(&relation(&caller, &target_v2, RelationKind::Calls))
+            .unwrap();
+        graph
+            .upsert_relation(&relation(&test, &target_v2, RelationKind::Tests))
+            .unwrap();
+
+        let base_id = change_id(1);
+        let head_id = change_id(2);
+        let base = change_with_deltas(
+            base_id,
+            vec![],
+            vec![
+                EntityDelta::Added(target_v1.clone()),
+                EntityDelta::Added(caller),
+                EntityDelta::Added(test),
+            ],
+            vec![],
+        );
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![EntityDelta::Modified {
+                old: target_v1,
+                new: target_v2,
+            }],
+            vec![],
+        );
+        graph.create_change(&base).unwrap();
+        graph.create_change(&head).unwrap();
+
+        (graph, base_id, head_id)
+    }
+
+    #[test]
+    fn report_carries_blast_radius_verdict_and_audit() {
+        let (graph, base_id, head_id) = signature_change_graph();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+
+        assert_eq!(report.schema_version, SHADOW_GATE_REPORT_SCHEMA_VERSION);
+        assert_eq!(report.mode, "shadow");
+        assert_eq!(report.policy.enforcement, SHADOW_ENFORCEMENT_REPORT_ONLY);
+
+        assert_eq!(report.changed_entities.len(), 1);
+        assert_eq!(report.changed_entities[0].name, "compute_total");
+        assert_eq!(report.changed_entities[0].change, "modified");
+        assert!(report.changed_entities[0].signature_changed);
+
+        // The impact walker reaches incoming consumers through the
+        // incoming-edge downstream traversal, bucketing them as dependents.
+        assert!(report
+            .blast_radius
+            .dependents
+            .iter()
+            .any(|dependent| dependent.name == "render_invoice"));
+        assert!(report
+            .blast_radius
+            .tests
+            .iter()
+            .any(|test| test.name == "test_compute_total"));
+        assert!(report.blast_radius.total_affected >= 2);
+
+        // Signature change with graph-known downstream entities -> would block.
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::WouldBlock);
+        assert!(report.policy.blocking_count >= 1);
+        assert!(report
+            .policy
+            .findings
+            .iter()
+            .any(|finding| finding.blocking && finding.kind == "downstream_risk"));
+
+        // Repair context points at the covering test.
+        assert!(!report.repair_context.is_empty());
+        assert!(report.repair_context.iter().any(|item| item
+            .covering_tests
+            .iter()
+            .any(|test| test.contains("test_compute_total"))));
+
+        // Audit evidence identifies range, actor, and tool.
+        assert_eq!(report.audit.base_change, base_id.to_string());
+        assert_eq!(report.audit.head_change, head_id.to_string());
+        assert_eq!(report.audit.changes_in_range, 1);
+        assert_eq!(report.audit.actor, "test-runner");
+        assert_eq!(report.audit.tool, "kin-review");
+        assert!(!report.audit.tool_version.is_empty());
+
+        // Cross-repo is labeled, never silently green.
+        assert_eq!(report.blast_radius.cross_repo.status, "not_evaluated");
+        assert!(report
+            .evidence_gaps
+            .iter()
+            .any(|gap| gap.kind == "cross_repo_not_evaluated"));
+    }
+
+    #[test]
+    fn artifact_only_change_is_an_explicit_evidence_gap() {
+        let graph = InMemoryGraph::new();
+        let entity = entity_with_span("helper", "src/lib.rs", 1, EntityRole::Source);
+        graph.upsert_entity(&entity).unwrap();
+
+        let base_id = change_id(3);
+        let head_id = change_id(4);
+        let base = change_with_deltas(
+            base_id,
+            vec![],
+            vec![EntityDelta::Added(entity.clone())],
+            vec![],
+        );
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![EntityDelta::Modified {
+                old: entity.clone(),
+                new: entity,
+            }],
+            vec![ArtifactDelta {
+                file_id: FilePathId::new("config/policy.yaml"),
+                kind: ArtifactDeltaKind::Modified,
+                old_hash: Some(Hash256::from_bytes([7; 32])),
+                new_hash: Some(Hash256::from_bytes([8; 32])),
+            }],
+        );
+        graph.create_change(&base).unwrap();
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+
+        let artifact_gap = report
+            .evidence_gaps
+            .iter()
+            .find(|gap| gap.kind == "artifact_only_change")
+            .expect("artifact-only change must surface as an evidence gap");
+        assert_eq!(artifact_gap.subject, "config/policy.yaml");
+
+        // No relations exist -> empty impact must be flagged, not passed.
+        assert!(report
+            .evidence_gaps
+            .iter()
+            .any(|gap| gap.kind == "impact_signal_absent"));
+        assert!(report
+            .evidence_gaps
+            .iter()
+            .any(|gap| gap.kind == "actor_attribution_unavailable"));
+
+        // Missing evidence must never certify a pass.
+        assert_ne!(report.policy.verdict, ShadowGateVerdict::Pass);
+    }
+
+    #[test]
+    fn empty_range_fails_loud() {
+        let graph = InMemoryGraph::new();
+        let base_id = change_id(5);
+        let base = change_with_deltas(base_id, vec![], vec![], vec![]);
+        graph.create_change(&base).unwrap();
+
+        let result = build_shadow_report(&graph, &request(base_id, base_id));
+        assert!(
+            result.is_err(),
+            "empty base..head range must error, not report"
+        );
+    }
+
+    #[test]
+    fn report_json_is_deterministic_modulo_timestamp() {
+        let (graph, base_id, head_id) = signature_change_graph();
+
+        let strip = |report: ShadowGateReport| {
+            let mut value = serde_json::to_value(&report).unwrap();
+            value["audit"]["generated_at"] = serde_json::json!(null);
+            value
+        };
+
+        let first = strip(build_shadow_report(&graph, &request(base_id, head_id)).unwrap());
+        let second = strip(build_shadow_report(&graph, &request(base_id, head_id)).unwrap());
+        assert_eq!(first, second, "shadow report must be deterministic");
+    }
+
+    #[test]
+    fn human_rendering_carries_all_sections() {
+        let (graph, base_id, head_id) = signature_change_graph();
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+
+        let text = format_shadow_report(&report);
+        assert!(text.contains("Shadow Merge Gate Report"));
+        assert!(text.contains("report-only"));
+        assert!(text.contains("WOULD BLOCK"));
+        assert!(text.contains("Blast radius"));
+        assert!(text.contains("Evidence gaps"));
+        assert!(text.contains("Audit:"));
+    }
+}

@@ -3237,6 +3237,7 @@ dependencies = [
  "kin-context",
  "kin-core",
  "kin-db",
+ "kin-git",
  "kin-model",
  "kin-parser",
  "kin-ranking",

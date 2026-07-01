@@ -53,6 +53,7 @@ pub async fn handle_tool_call<G: GraphStore>(
         "semantic_diff" => review::handle_semantic_diff(arguments, store),
         "impact_analysis" => review::handle_impact_analysis(arguments, store, sessions).await,
         "semantic_review" => review::handle_semantic_review(arguments, store, sessions),
+        "shadow_gate_report" => review::handle_shadow_gate_report(arguments, store),
         "entity_history" => review::handle_entity_history(arguments, store),
         // Sessions
         "register_session" => sessions::handle_register_session(arguments, sessions),
