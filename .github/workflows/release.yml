@@ -510,6 +510,10 @@ jobs:
   publish_npm:
     name: Publish npm Wrapper
     needs: publish
+    # publish uses always() to survive a skipped notarize_linux (the default
+    # macOS-notarytool path); mirror that guard here or GitHub transitively skips
+    # this job whenever notarize_linux is skipped.
+    if: ${{ always() && !failure() && !cancelled() }}
     runs-on: ubuntu-latest
     # Trusted Publishing (OIDC): npm authenticates this workflow via a short-lived
     # OIDC token instead of a long-lived NPM_TOKEN secret — no token to leak or
@@ -581,6 +585,9 @@ jobs:
   publish_boundary_contracts:
     name: Publish boundary contracts to KinLab
     needs: publish
+    # Mirror publish's always() guard so a skipped notarize_linux does not
+    # transitively skip this job.
+    if: ${{ always() && !failure() && !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -620,6 +627,9 @@ jobs:
   bump_homebrew:
     name: Trigger Homebrew formula bump
     needs: publish
+    # Mirror publish's always() guard so a skipped notarize_linux does not
+    # transitively skip this job.
+    if: ${{ always() && !failure() && !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - name: Dispatch update to the homebrew-kin tap
