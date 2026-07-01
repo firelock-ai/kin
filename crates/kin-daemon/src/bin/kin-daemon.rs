@@ -288,6 +288,10 @@ fn main() {
 async fn async_main() -> i32 {
     tracing_subscriber::fmt::init();
 
+    // Resident serving daemon: profile-driven retrieval defaults that assume
+    // model residency (cross-encoder rerank) may apply in this process.
+    kin_cli::retrieval_profile::mark_daemon_serving();
+
     let program = env::args()
         .next()
         .unwrap_or_else(|| "kin-daemon".to_string());

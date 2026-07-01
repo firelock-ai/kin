@@ -132,6 +132,7 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_editor());
     checks.push(check_kinlab_connect());
     checks.push(check_semantic_query_readiness().await);
+    checks.push(check_retrieval_profile());
 
     let healthy = !checks.iter().any(|c| is_failing(&c.status));
 
@@ -641,6 +642,61 @@ async fn check_semantic_query_readiness() -> HealthCheck {
     }
 }
 
+/// Report the active retrieval quality profile and the effective lever set,
+/// so an operator can see at a glance whether they are getting full
+/// retrieval capability — and why not, when a lever is off.
+fn check_retrieval_profile() -> HealthCheck {
+    let profile = crate::retrieval_profile::RetrievalProfile::from_env();
+    let ce_model = env::var("KIN_LOCATE_CROSS_ENCODER_MODEL")
+        .unwrap_or_else(|_| "BAAI/bge-reranker-base".to_string());
+    let ce_cached = crate::retrieval_profile::cross_encoder_model_cached(&ce_model);
+    // Report the daemon-serving default (the state queries actually run
+    // under), not this one-shot CLI process's own gate.
+    let ce_active = env::var("KIN_LOCATE_CROSS_ENCODER_ENABLED")
+        .map(|value| {
+            matches!(
+                value.as_str(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(
+            matches!(
+                profile,
+                crate::retrieval_profile::RetrievalProfile::AccuracyV1
+            ) && ce_cached,
+        );
+    let detail =
+        format!(
+        "profile {} — semantic_locate routing: {}; entity fusion: {}; lexical parity floor: {}; \
+         cross-encoder rerank: {} (model {} {})",
+        profile.name(),
+        if profile.semantic_locate_fused() {
+            "fused locate pipeline"
+        } else {
+            "cosine-only (compat)"
+        },
+        if profile.entity_fusion_default() { "on" } else { "off" },
+        if profile.lexical_floor_readmit_default() { "on" } else { "off" },
+        if ce_active { "on (budget-gated)" } else { "off" },
+        ce_model,
+        if ce_cached { "cached" } else { "not cached" },
+    );
+    let check = HealthCheck::new(
+        "retrieval_profile",
+        "Retrieval quality profile",
+        HealthStatus::Healthy,
+        detail,
+    );
+    if !ce_cached {
+        check.with_manual_fix(
+            "to enable the reranker, prefetch its model once with \
+             KIN_LOCATE_CROSS_ENCODER_ENABLED=1 (downloads on first use)",
+        )
+    } else {
+        check
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,6 +713,7 @@ mod tests {
         assert!(json.contains("\"shell_path\""));
         assert!(json.contains("\"platform\""));
         assert!(json.contains("\"healthy\""));
+        assert!(json.contains("\"retrieval_profile\""));
     }
 
     fn check_with(id: &str, status: HealthStatus) -> HealthCheck {
