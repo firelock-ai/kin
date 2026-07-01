@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-07-01
+
+Cross-repo intelligence, more informative retrieval surfaces, and a guided first-run experience.
+
+### Added
+
+- Guided first-run setup: `kin` detects whether the daemon is running and walks through initial configuration, with a scriptable `kin doctor` for health checks.
+- `kin locate` and the agent retrieval surfaces now return inline, bounded source snippets alongside each result, so callers see the relevant code without a second fetch.
+- Cross-repo spine now resolves transitive (2-hop) and multi-consumer blast radius: a repository's entities are registered as resolution targets on every refresh, so impact and cross-references span the full dependency chain rather than stopping at direct neighbours.
+- The daemon can ingest multi-repo graphs into the spine directly from durable storage.
+- `kin release`: a cross-repo release orchestrator (`plan`, `apply`, `intent`, `snapshot`) for bottom-up version and dependency-pin management.
+- `@kin/boundary-contracts` gains intent-scope, intent-summary, and lock-type schemas.
+- Opt-in `semantic_locate` re-ranking (role demotion + exact-name boost), off by default.
+
+### Changed
+
+- Cross-repo spine queries now distinguish "spine configured but unavailable" from "genuinely no cross-repo impact" instead of silently collapsing both into an empty result; the gap is observable across the CLI, MCP, and hosted gateways.
+- Locate ranking constants are environment-overridable for tuning.
+
+### Fixed
+
+- Locate priority injectors no longer surface fixture or VCS-internal paths.
+- Cross-repo imports bind by normalized crate root and refresh across every repository.
+- The cross-encoder re-rank gates on graph presence rather than workspace-root presence.
+- The daemon honours `KIN_PRIMARY_REPO_ID` when selecting the primary repository.
+
 ## [0.2.4] - 2026-06-25
 
 Portable Linux release. The Linux binaries are now statically linked against musl with rustls, removing the OpenSSL and glibc-version runtime dependencies, so `kin` and `kin-daemon` run on any Linux distribution including Alpine/musl and older glibc systems.
