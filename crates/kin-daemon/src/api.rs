@@ -4148,6 +4148,34 @@ fn build_semantic_locate_result(
     }
 }
 
+/// Map a resolved [`kin_cli::commands::graph::EntitySourceOutcome`] to an MCP
+/// tool result.
+///
+/// The three application outcomes are surfaced distinctly so an agent can act on
+/// each: a not-found ID and a sourceless-but-valid entity each carry their own
+/// explanatory error — reported ahead of any generic missing-source text — while
+/// a found entity serializes to its source record. Genuine read failures (`Err`)
+/// surface their message verbatim. Generic over the error type so the daemon
+/// need not name the caller's error crate.
+fn entity_source_tool_result<E: std::fmt::Display>(
+    outcome: Result<kin_cli::commands::graph::EntitySourceOutcome, E>,
+) -> kin_mcp::ToolCallResult {
+    use kin_cli::commands::graph::EntitySourceOutcome;
+    match outcome {
+        Ok(EntitySourceOutcome::Found(source)) => match serde_json::to_string_pretty(&source) {
+            Ok(json) => kin_mcp::ToolCallResult::text(json),
+            Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
+        },
+        // The ID does not resolve — non-retryable. Surfaced verbatim so the agent
+        // stops retrying and probing the ID (this case previously masqueraded as
+        // "graph source response missing source").
+        Ok(EntitySourceOutcome::NotFound(message)) => kin_mcp::ToolCallResult::error(message),
+        // A real entity with no attached source body — distinct from not-found.
+        Ok(EntitySourceOutcome::NoSource(message)) => kin_mcp::ToolCallResult::error(message),
+        Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
+    }
+}
+
 async fn mcp_tools_call(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
@@ -4191,22 +4219,12 @@ async fn mcp_tools_call(
                 "missing required parameter: entity_id".to_string(),
             )));
         };
-        let result = match kin_cli::commands::graph::build_graph_source_response(
-            &state.layout,
-            graph.as_ref(),
-            entity_id,
-        ) {
-            Ok(response) => match response.source {
-                Some(source) => match serde_json::to_string_pretty(&source) {
-                    Ok(json) => kin_mcp::ToolCallResult::text(json),
-                    Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
-                },
-                None => kin_mcp::ToolCallResult::error(
-                    "graph source response missing source".to_string(),
-                ),
-            },
-            Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
-        };
+        let result =
+            entity_source_tool_result(kin_cli::commands::graph::build_entity_source_outcome(
+                &state.layout,
+                graph.as_ref(),
+                entity_id,
+            ));
         return Ok(Json(result));
     }
 
@@ -6890,6 +6908,86 @@ mod tests {
                 < 1e-6
         );
         assert!((semloc_rerank_priority(None, "X", q, false, 0.30) - 0.30).abs() < 1e-6);
+    }
+
+    fn tool_result_json(result: &kin_mcp::ToolCallResult) -> serde_json::Value {
+        serde_json::to_value(result).unwrap()
+    }
+
+    #[test]
+    fn entity_source_tool_result_not_found_surfaces_error_not_missing_source() {
+        use kin_cli::commands::graph::EntitySourceOutcome;
+        // The case that previously rendered as "graph source response missing
+        // source": a not-found ID must surface its own error verbatim.
+        let message = "no entity exists with ID 'abc'. This entity ID is invalid or stale.";
+        let result = entity_source_tool_result(Ok::<_, String>(EntitySourceOutcome::NotFound(
+            message.into(),
+        )));
+
+        let json = tool_result_json(&result);
+        assert_eq!(json["isError"], serde_json::json!(true));
+        let text = json["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, message);
+        assert!(!text.contains("missing source"), "{text}");
+    }
+
+    #[test]
+    fn entity_source_tool_result_no_source_is_distinct_from_not_found() {
+        use kin_cli::commands::graph::EntitySourceOutcome;
+        let not_found =
+            entity_source_tool_result(Ok::<_, String>(EntitySourceOutcome::NotFound("NF".into())));
+        let no_source =
+            entity_source_tool_result(Ok::<_, String>(EntitySourceOutcome::NoSource("NS".into())));
+
+        let nf = tool_result_json(&not_found);
+        let ns = tool_result_json(&no_source);
+        assert_eq!(nf["isError"], serde_json::json!(true));
+        assert_eq!(ns["isError"], serde_json::json!(true));
+        let nf_text = nf["content"][0]["text"].as_str().unwrap();
+        let ns_text = ns["content"][0]["text"].as_str().unwrap();
+        assert_eq!(nf_text, "NF");
+        assert_eq!(ns_text, "NS");
+        assert_ne!(nf_text, ns_text);
+    }
+
+    #[test]
+    fn entity_source_tool_result_found_serializes_record_without_error_flag() {
+        use kin_cli::commands::graph::{EntitySourceOutcome, GraphSourceRecord};
+        let record = GraphSourceRecord {
+            id: "id-1".into(),
+            name: "target".into(),
+            kind: "Function".into(),
+            language: "rust".into(),
+            file_path: "src/lib.rs".into(),
+            start_line: 1,
+            end_line: 3,
+            start_byte: 0,
+            end_byte: 14,
+            signature: "fn target()".into(),
+            body: "fn target() {}".into(),
+        };
+        let result = entity_source_tool_result(Ok::<_, String>(EntitySourceOutcome::Found(record)));
+
+        let json = tool_result_json(&result);
+        // A success result omits the isError flag entirely.
+        assert!(json.get("isError").is_none());
+        let text = json["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"body\": \"fn target() {}\""), "{text}");
+    }
+
+    #[test]
+    fn entity_source_tool_result_genuine_error_surfaces_message() {
+        use kin_cli::commands::graph::EntitySourceOutcome;
+        let result = entity_source_tool_result(Err::<EntitySourceOutcome, _>(
+            "graph blob for file 'src/lib.rs' is unavailable".to_string(),
+        ));
+        let json = tool_result_json(&result);
+        assert_eq!(json["isError"], serde_json::json!(true));
+        let text = json["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("graph blob for file 'src/lib.rs' is unavailable"),
+            "{text}"
+        );
     }
 
     #[test]

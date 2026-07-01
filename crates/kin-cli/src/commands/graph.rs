@@ -45,6 +45,28 @@ pub struct GraphSourceRecord {
     pub body: String,
 }
 
+/// The three distinguishable results of resolving an entity's source for
+/// `get_entity_source` / `get_entity_body`.
+///
+/// Callers (agents especially) must be able to tell these apart: a source they
+/// can act on, an ID that does not exist (retrying it is pointless), and a real
+/// entity that simply has no source body attached to graph truth. Collapsing
+/// the latter two into one opaque "missing source" message makes agents retry
+/// invented or stale IDs and probe adjacent ones, which burns their tool-call
+/// budget for no gain.
+#[derive(Debug, Clone)]
+pub enum EntitySourceOutcome {
+    /// The entity resolved and its source body was read from graph-owned truth.
+    Found(GraphSourceRecord),
+    /// The query resolved to no entity. Non-retryable: the ID is invalid or
+    /// stale. The string is an agent-facing explanation.
+    NotFound(String),
+    /// The entity resolved but has no source body in graph truth (no file
+    /// origin or no source span). Distinct from [`EntitySourceOutcome::NotFound`]
+    /// — the ID is valid, there is simply nothing to return.
+    NoSource(String),
+}
+
 /// `kin graph status` — quick health check of the semantic graph.
 pub async fn status() -> Result<()> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
@@ -563,43 +585,118 @@ fn graph_entity_not_found_lines(name: &str) -> Vec<String> {
     ]
 }
 
+/// Resolve an entity's source into a typed [`EntitySourceOutcome`].
+///
+/// This is the taxonomy authority for `get_entity_source` / `get_entity_body`:
+/// it separates a non-existent/stale ID (`NotFound`, non-retryable) from a real
+/// entity that has no source body (`NoSource`) from a genuine read/extraction
+/// failure (`Err`, e.g. an out-of-bounds span or an unavailable blob). The
+/// daemon MCP path consumes this directly so those cases surface distinctly to
+/// agents instead of collapsing into one opaque message.
+pub fn build_entity_source_outcome(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    entity_query: &str,
+) -> Result<EntitySourceOutcome> {
+    let entity = match resolve_source_entity(graph, entity_query)? {
+        Some(e) => e,
+        None => {
+            return Ok(EntitySourceOutcome::NotFound(
+                entity_source_not_found_message(entity_query),
+            ));
+        }
+    };
+
+    // A structurally sourceless entity (no file origin or no span) is a valid ID
+    // with nothing to return — reported as `NoSource`, not as the genuine
+    // extraction error below (which signals corrupt spans or unavailable blobs).
+    if entity.file_origin.is_none() {
+        return Ok(EntitySourceOutcome::NoSource(entity_no_source_message(
+            &entity,
+            "the entity has no file origin",
+        )));
+    }
+    if entity.span.is_none() {
+        return Ok(EntitySourceOutcome::NoSource(entity_no_source_message(
+            &entity,
+            "the entity has no source span",
+        )));
+    }
+
+    let record = graph_source_record(layout, graph, &entity)?;
+    Ok(EntitySourceOutcome::Found(record))
+}
+
 pub fn build_graph_source_response(
     layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,
     entity_query: &str,
 ) -> Result<GraphCommandResponse> {
-    let entity = match resolve_source_entity(graph, entity_query)? {
-        Some(e) => e,
-        None => {
-            return Ok(GraphCommandResponse {
-                lines: graph_entity_not_found_lines(entity_query),
-                error: Some(format!("no entity found matching '{}'", entity_query)),
-                source: None,
-            });
+    match build_entity_source_outcome(layout, graph, entity_query)? {
+        EntitySourceOutcome::Found(record) => {
+            let mut lines = vec![
+                format!(
+                    "Entity source for '{}' -> {} ({})",
+                    entity_query, record.name, record.kind
+                ),
+                format!("ID: {}", record.id),
+                format!("File: {}", record.file_path),
+                format!("Lines: {}-{}", record.start_line, record.end_line),
+            ];
+            if !record.signature.is_empty() {
+                lines.push(format!("Signature: {}", record.signature));
+            }
+            lines.push("--- Source ---".to_string());
+            lines.push(record.body.clone());
+
+            Ok(GraphCommandResponse {
+                lines,
+                error: None,
+                source: Some(record),
+            })
         }
-    };
-    let record = graph_source_record(layout, graph, &entity)?;
-
-    let mut lines = vec![
-        format!(
-            "Entity source for '{}' -> {} ({})",
-            entity_query, record.name, record.kind
-        ),
-        format!("ID: {}", record.id),
-        format!("File: {}", record.file_path),
-        format!("Lines: {}-{}", record.start_line, record.end_line),
-    ];
-    if !record.signature.is_empty() {
-        lines.push(format!("Signature: {}", record.signature));
+        EntitySourceOutcome::NotFound(message) => Ok(GraphCommandResponse {
+            lines: graph_entity_not_found_lines(entity_query),
+            error: Some(message),
+            source: None,
+        }),
+        // A valid entity with no retrievable source is an error for the text/`?`
+        // command paths (the CLI `kin graph source` and `trace_data_flow`, which
+        // drops the step). The MCP path keeps the two apart via the typed outcome.
+        EntitySourceOutcome::NoSource(message) => Err(anyhow::anyhow!(message)),
     }
-    lines.push("--- Source ---".to_string());
-    lines.push(record.body.clone());
+}
 
-    Ok(GraphCommandResponse {
-        lines,
-        error: None,
-        source: Some(record),
-    })
+/// Agent-facing message for a `get_entity_source` query that resolved to no
+/// entity. When the query is a UUID — the shape MCP agents pass — the wording
+/// states plainly that the ID does not exist so the agent stops retrying it and
+/// probing adjacent IDs; for a name query it points at the discovery tools.
+fn entity_source_not_found_message(entity_query: &str) -> String {
+    let trimmed = entity_query.trim();
+    if uuid::Uuid::parse_str(trimmed).is_ok() {
+        format!(
+            "no entity exists with ID '{trimmed}'. This entity ID is invalid or stale — it is \
+             not present in the graph, so retrying the same ID will not succeed. Use \
+             semantic_locate or semantic_search to obtain a current entity ID."
+        )
+    } else {
+        format!(
+            "no entity found matching '{trimmed}'. Use semantic_search or semantic_locate to \
+             find the entity, then call get_entity_source with the ID it returns."
+        )
+    }
+}
+
+/// Agent-facing message for a real entity that has no source body to return.
+/// Explicitly affirms the ID is valid so the agent does not treat it as a
+/// missing/stale ID and retry or probe around it.
+fn entity_no_source_message(entity: &Entity, reason: &str) -> String {
+    format!(
+        "entity '{}' ({}) exists in the graph but has no retrievable source: {reason}. The \
+         entity ID is valid — this is not a missing or stale ID — there is simply no source \
+         body attached to return.",
+        entity.name, entity.id
+    )
 }
 
 fn resolve_source_entity(
@@ -957,5 +1054,103 @@ mod tests {
             err.contains("source body cannot be read from daemon-backed graph"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn entity_source_outcome_found_returns_record() {
+        let source = "fn before() {}\nfn target() {\n    2 + 2\n}\nfn after() {}\n";
+        let body = "fn target() {\n    2 + 2\n}";
+        let start = source.find(body).unwrap();
+        let end = start + body.len();
+        let fixture = graph_source_fixture(Some(source.as_bytes()));
+
+        let entity = source_entity("target", fixture.file_id.clone(), start, end);
+        let id = entity.id;
+        fixture.graph.upsert_entity(&entity).unwrap();
+
+        match build_entity_source_outcome(&fixture.layout, &fixture.graph, &id.to_string()).unwrap()
+        {
+            EntitySourceOutcome::Found(record) => assert_eq!(record.body, body),
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn entity_source_outcome_not_found_for_invented_uuid() {
+        let fixture = graph_source_fixture(Some(b"fn x() {}\n"));
+        let invented = uuid::Uuid::new_v4();
+
+        match build_entity_source_outcome(&fixture.layout, &fixture.graph, &invented.to_string())
+            .unwrap()
+        {
+            EntitySourceOutcome::NotFound(message) => {
+                assert!(message.contains(&invented.to_string()), "{message}");
+                // Non-retryable signal for the agent.
+                assert!(message.contains("invalid or stale"), "{message}");
+                assert!(message.contains("will not succeed"), "{message}");
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn entity_source_outcome_no_source_for_spanless_entity() {
+        let fixture = graph_source_fixture(Some(b"fn x() {}\n"));
+        let mut entity = source_entity("target", fixture.file_id.clone(), 0, 8);
+        // A valid, resolvable entity that simply carries no source span.
+        entity.span = None;
+        let id = entity.id;
+        fixture.graph.upsert_entity(&entity).unwrap();
+
+        match build_entity_source_outcome(&fixture.layout, &fixture.graph, &id.to_string()).unwrap()
+        {
+            EntitySourceOutcome::NoSource(message) => {
+                assert!(message.contains("target"), "{message}");
+                assert!(message.contains("no source span"), "{message}");
+                assert!(message.contains("ID is valid"), "{message}");
+            }
+            other => panic!("expected NoSource, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn not_found_and_no_source_messages_are_distinguishable() {
+        let fixture = graph_source_fixture(Some(b"fn x() {}\n"));
+
+        let invented = uuid::Uuid::new_v4();
+        let not_found =
+            build_entity_source_outcome(&fixture.layout, &fixture.graph, &invented.to_string())
+                .unwrap();
+
+        let mut spanless = source_entity("target", fixture.file_id.clone(), 0, 8);
+        spanless.span = None;
+        let spanless_id = spanless.id;
+        fixture.graph.upsert_entity(&spanless).unwrap();
+        let no_source =
+            build_entity_source_outcome(&fixture.layout, &fixture.graph, &spanless_id.to_string())
+                .unwrap();
+
+        let (nf, ns) = match (not_found, no_source) {
+            (EntitySourceOutcome::NotFound(nf), EntitySourceOutcome::NoSource(ns)) => (nf, ns),
+            other => panic!("unexpected taxonomy: {other:?}"),
+        };
+        assert_ne!(nf, ns);
+    }
+
+    #[test]
+    fn graph_source_response_not_found_sets_error_and_leaves_source_none() {
+        // Regression guard for the precedence bug: a not-found query must set the
+        // structured `error` field (surfaced ahead of any missing-source text)
+        // and leave `source` empty.
+        let fixture = graph_source_fixture(Some(b"fn x() {}\n"));
+        let invented = uuid::Uuid::new_v4();
+
+        let response =
+            build_graph_source_response(&fixture.layout, &fixture.graph, &invented.to_string())
+                .unwrap();
+
+        assert!(response.source.is_none());
+        let error = response.error.expect("not-found must populate error");
+        assert!(error.contains(&invented.to_string()), "{error}");
     }
 }
