@@ -296,7 +296,8 @@ fn check_vfs_projection() -> HealthCheck {
                 lib_path.display()
             ),
         )
-        .with_manual_fix(format!("rm {} && kin setup", lib_path.display()))
+        .fixable()
+        .with_manual_fix("run `kin doctor --fix` to reinstall the shim (or reinstall kin if no local copy remains)")
     } else {
         HealthCheck::new(
             "vfs_projection",
@@ -304,7 +305,10 @@ fn check_vfs_projection() -> HealthCheck {
             HealthStatus::Missing,
             format!("shim not installed at {}", lib_path.display()),
         )
-        .with_manual_fix("run `kin setup` (builds/copies the VFS shim into ~/.kin/lib)")
+        .fixable()
+        .with_manual_fix(
+            "run `kin doctor --fix` (or `kin setup`) to install the VFS shim into ~/.kin/lib",
+        )
     }
 }
 
