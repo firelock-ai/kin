@@ -465,6 +465,25 @@ mod tests {
     }
 
     #[test]
+    fn bare_fmt_init_default_drops_info() {
+        // Root-cause proof. `tracing_subscriber::fmt::init()` filters through
+        // `EnvFilter::from_default_env()`, whose builder default directive is
+        // ERROR; with RUST_LOG unset it admits only ERROR, so every info-level
+        // lifecycle log is dropped — the reason supervisor.log / daemon.log
+        // stayed empty on a fresh install. Reproduce that filter deterministically
+        // (explicit empty RUST_LOG) and confirm it excludes info, unlike the
+        // daemon's explicit `info` default.
+        let bare = EnvFilter::builder()
+            .with_default_directive(LevelFilter::ERROR.into())
+            .parse_lossy("");
+        assert_eq!(bare.max_level_hint(), Some(LevelFilter::ERROR));
+        assert_eq!(
+            EnvFilter::new(DEFAULT_LOG_DIRECTIVE).max_level_hint(),
+            Some(LevelFilter::INFO)
+        );
+    }
+
+    #[test]
     fn info_events_reach_the_log_writer_under_default_filter() {
         // Build the subscriber exactly as the daemon does for the RUST_LOG-unset
         // case and confirm a lifecycle info event actually lands in the writer —
