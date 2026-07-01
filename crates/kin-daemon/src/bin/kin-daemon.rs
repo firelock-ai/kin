@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use kin_core::KinLayout;
 use kin_daemon::{run, DaemonConfig, DaemonState};
+use tracing_subscriber::EnvFilter;
 
 /// Storage mode for graph snapshots.
 #[derive(Debug, Clone, PartialEq)]
@@ -285,8 +286,32 @@ fn main() {
     process::exit(exit_code);
 }
 
+/// Default tracing directive when `RUST_LOG` is unset.
+///
+/// `info` so first-run daemon and supervisor lifecycle logs actually land in the
+/// daemon/supervisor log files. A bare `tracing_subscriber::fmt::init()` derives
+/// its default from `RUST_LOG` and admits no info-level events when it is unset,
+/// which left the log files empty and first-run failures undiagnosable.
+const DEFAULT_LOG_DIRECTIVE: &str = "info";
+
+/// Tracing filter for the daemon/supervisor process: honor `RUST_LOG` when set,
+/// otherwise fall back to [`DEFAULT_LOG_DIRECTIVE`].
+fn daemon_env_filter() -> EnvFilter {
+    if env::var_os("RUST_LOG").is_some() {
+        EnvFilter::from_default_env()
+    } else {
+        EnvFilter::new(DEFAULT_LOG_DIRECTIVE)
+    }
+}
+
+fn init_tracing() {
+    tracing_subscriber::fmt()
+        .with_env_filter(daemon_env_filter())
+        .init();
+}
+
 async fn async_main() -> i32 {
-    tracing_subscriber::fmt::init();
+    init_tracing();
 
     let program = env::args()
         .next()
@@ -395,4 +420,89 @@ async fn async_main() -> i32 {
         return 1;
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing::level_filters::LevelFilter;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// A `MakeWriter` that appends everything the subscriber emits into a shared
+    /// buffer — stands in for the daemon/supervisor log file the spawn code wires
+    /// the process's stdout/stderr to.
+    #[derive(Clone)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for SharedBuf {
+        type Writer = SharedBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn default_directive_admits_info() {
+        // The regression: a bare `fmt::init()` starves info-level logs when
+        // RUST_LOG is unset. The daemon default must admit info.
+        let filter = EnvFilter::new(DEFAULT_LOG_DIRECTIVE);
+        assert_eq!(filter.max_level_hint(), Some(LevelFilter::INFO));
+    }
+
+    #[test]
+    fn bare_fmt_init_default_drops_info() {
+        // Root-cause proof. `tracing_subscriber::fmt::init()` filters through
+        // `EnvFilter::from_default_env()`, whose builder default directive is
+        // ERROR; with RUST_LOG unset it admits only ERROR, so every info-level
+        // lifecycle log is dropped — the reason supervisor.log / daemon.log
+        // stayed empty on a fresh install. Reproduce that filter deterministically
+        // (explicit empty RUST_LOG) and confirm it excludes info, unlike the
+        // daemon's explicit `info` default.
+        let bare = EnvFilter::builder()
+            .with_default_directive(LevelFilter::ERROR.into())
+            .parse_lossy("");
+        assert_eq!(bare.max_level_hint(), Some(LevelFilter::ERROR));
+        assert_eq!(
+            EnvFilter::new(DEFAULT_LOG_DIRECTIVE).max_level_hint(),
+            Some(LevelFilter::INFO)
+        );
+    }
+
+    #[test]
+    fn info_events_reach_the_log_writer_under_default_filter() {
+        // Build the subscriber exactly as the daemon does for the RUST_LOG-unset
+        // case and confirm a lifecycle info event actually lands in the writer —
+        // i.e. the log file receives content on startup.
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new(DEFAULT_LOG_DIRECTIVE))
+            .with_writer(SharedBuf(Arc::clone(&buf)))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(port = 4219, "daemon is up and ready");
+        });
+
+        let logged = String::from_utf8(buf.lock().expect("log buffer poisoned").clone())
+            .expect("log output is valid UTF-8");
+        assert!(
+            logged.contains("daemon is up and ready"),
+            "expected info lifecycle log in the writer, got: {logged:?}"
+        );
+    }
 }
