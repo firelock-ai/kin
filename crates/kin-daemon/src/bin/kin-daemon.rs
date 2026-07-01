@@ -313,6 +313,14 @@ fn init_tracing() {
 async fn async_main() -> i32 {
     init_tracing();
 
+    // Validate the KIN_* environment surface at startup: unknown names and
+    // out-of-range values are surfaced loudly; an invalid correctness-relevant
+    // value refuses to boot. Governed by KIN_ENV_VALIDATION (off/warn/strict).
+    if let Err(err) = kin_core::env_registry::enforce_startup_env() {
+        eprintln!("kin-daemon: {err}");
+        return 2;
+    }
+
     let program = env::args()
         .next()
         .unwrap_or_else(|| "kin-daemon".to_string());
