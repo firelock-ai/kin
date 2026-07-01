@@ -68,7 +68,7 @@ info "Platform: $OS ($ARCH)"
 
 PREVIOUS_VERSION=""
 if [ -x "$KIN_BIN/kin" ]; then
-    PREVIOUS_VERSION=$("$KIN_BIN/kin" --version 2>/dev/null | awk '{print $NF}')
+    PREVIOUS_VERSION=$("$KIN_BIN/kin" --version 2>/dev/null | awk '{print $2}')
     if [ -n "$PREVIOUS_VERSION" ]; then
         info "Existing install found: kin $PREVIOUS_VERSION (will be replaced)"
     else
@@ -254,7 +254,7 @@ esac
 export PATH="$KIN_BIN:$PATH"
 
 if has_cmd "$KIN_BIN/kin"; then
-    INSTALLED_VERSION=$("$KIN_BIN/kin" --version 2>/dev/null | awk '{print $NF}')
+    INSTALLED_VERSION=$("$KIN_BIN/kin" --version 2>/dev/null | awk '{print $2}')
     if [ -n "$PREVIOUS_VERSION" ] && [ -n "$INSTALLED_VERSION" ] && [ "$PREVIOUS_VERSION" != "$INSTALLED_VERSION" ]; then
         ok "kin upgraded: $PREVIOUS_VERSION → $INSTALLED_VERSION"
     else
@@ -282,12 +282,15 @@ else
     if [ -t 0 ]; then
         # Already in a TTY — run directly
         "$KIN_BIN/kin" setup
-    elif [ -e /dev/tty ] && { : < /dev/tty; } 2>/dev/null; then
+    elif [ -e /dev/tty ] && ( : < /dev/tty ) 2>/dev/null; then
         # Piped but a usable controlling TTY is available — read keyboard input
-        # from it. The `: < /dev/tty` probe confirms the device can actually be
-        # OPENED — on CI/Docker /dev/tty often exists but has no controlling
+        # from it. The `( : < /dev/tty )` probe confirms the device can actually
+        # be OPENED — on CI/Docker /dev/tty often exists but has no controlling
         # terminal, so opening it errors ("cannot open /dev/tty") and the bare
-        # `[ -e /dev/tty ]` check is not enough.
+        # `[ -e /dev/tty ]` check is not enough. The probe runs in a SUBSHELL:
+        # a redirection failure on the `:` special built-in exits its shell, so
+        # in a bare brace group it would terminate the whole non-interactive
+        # installer (POSIX dash) before the fallback below can run.
         "$KIN_BIN/kin" setup < /dev/tty
     else
         # No usable TTY (CI, Docker, piped without a controlling terminal) —
