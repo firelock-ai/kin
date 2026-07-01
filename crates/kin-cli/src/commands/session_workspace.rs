@@ -116,12 +116,16 @@ pub fn materialize_session_workspace(
         .transpose()
         .map_err(|error| anyhow::anyhow!("{}", error))?;
     let session_dir = std::path::PathBuf::from(&request.session_dir);
+    // `entity:`/`artifact:` scopes resolve against graph truth here, so every
+    // session surface (shell, exec, open) shares one scope vocabulary and an
+    // unresolvable scope fails loud instead of silently widening.
+    let scope = super::exec::resolve_materialization_scope(graph, request.scope.clone())?;
     let workspace = create_session_workspace_from_graph(
         layout,
         graph,
         &session_dir,
         strategy,
-        request.scope.as_deref(),
+        scope.as_deref(),
     )?;
 
     Ok(SessionWorkspaceResponse {

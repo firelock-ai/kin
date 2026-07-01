@@ -42,7 +42,6 @@ pub async fn finalize_open_session_with_writer<W: Write>(
     finalize_session(layout, session_dir, writer, SessionCloseoutStyle::Open).await
 }
 
-#[cfg(test)]
 pub async fn finalize_shell_session_with_writer<W: Write>(
     layout: &kin_core::KinLayout,
     session_dir: &Path,

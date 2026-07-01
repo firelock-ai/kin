@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Session runtime for ordinary tools: `kin exec -- <cmd>` (new alias `kin run`) runs commands in a graph-backed session workspace, reconciles on success, and preserves the workspace with recovery commands on failure; `--keep` defers reconcile and `--discard` skips it.
+- Agent session launches: `kin with --session <assistant> -- <task>` starts the assistant inside a session workspace with its cwd, file shims, session identity (`KIN_SESSION`, `KIN_SESSION_ID`, `KIN_SESSION_DIR`), and daemon binding (`KIN_DAEMON_URL`, `KIN_REPO_ID`) pointed at the same repository — MCP tools spawned by the assistant bind to the same daemon and session.
+- External-tool detection now covers package managers (`npm`, `npx`, `pnpm`, `pnpx`, `yarn`, `bun`, `bunx`, `corepack`), which widen scoped execution to a full workspace under the default policy.
+- `kin doctor` gains a session-runtime check that teaches the `kin exec` / `kin shell` / `kin with --session` path and reports leftover session workspaces with recovery commands.
+- Session workspace materialization resolves `entity:`/`artifact:` scopes against graph truth for every session surface, failing loudly on unknown entities instead of silently widening.
+- New [Session Runtime](docs/session-runtime.md) guide: execution contract, closeout flags, generated-file policy, and Docker/Compose caveats.
+
+### Changed
+
+- `kin exec` executes commands locally in the materialized session workspace instead of requiring the daemon's gated remote-exec capability; the daemon endpoint remains opt-in via `KIN_DAEMON_ALLOW_EXEC`.
+
+### Fixed
+
+- `kin setup` and `kin doctor --fix` now write MCP client entries that start (`kin mcp start`); the previously written `--global` mode was refused at startup, leaving agents with a dead kin MCP server. `kin doctor` flags the retired entries and `--fix` repairs them.
+
 ## [0.2.5] - 2026-07-01
 
 Cross-repo intelligence, more informative retrieval surfaces, and a guided first-run experience.
