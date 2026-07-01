@@ -28,7 +28,11 @@ jobs:
           grep -q '^\[registries\.kin\]' .cargo/config.toml
           if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed — kin-* resolve from the Kin registry"; exit 1; fi
 
+      - name: Read pinned toolchain channel
+        id: toolchain
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
       - name: Run cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          rust-version: stable
+          rust-version: ${{ steps.toolchain.outputs.channel }}
