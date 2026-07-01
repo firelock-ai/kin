@@ -380,31 +380,36 @@ struct LocateBudget {
 
 impl LocateBudget {
     fn new() -> Self {
-        let total = locate_env_f32("KIN_LOCATE_TOTAL_TIMEOUT_SECS", 90.0) as f64;
+        // Timeout/budget knobs: `0` means unbounded (disable the budget) rather
+        // than a real 0 s deadline that would skip every phase and gut retrieval.
+        // The unbounded sentinel (`f64::INFINITY`) flows harmlessly through the
+        // `elapsed > total_secs` / `remaining_total` comparisons below.
+        use kin_core::env_registry::env_secs_bound_f64 as secs_budget;
+        let total = secs_budget("KIN_LOCATE_TOTAL_TIMEOUT_SECS", 90.0);
         let mut phase_budgets = HashMap::new();
         phase_budgets.insert(
             "entity_discovery",
-            locate_env_f32("KIN_LOCATE_PHASE_ENTITY_DISCOVERY_SECS", 20.0) as f64,
+            secs_budget("KIN_LOCATE_PHASE_ENTITY_DISCOVERY_SECS", 20.0),
         );
         phase_budgets.insert(
             "entity_resolution",
-            locate_env_f32("KIN_LOCATE_PHASE_ENTITY_RESOLUTION_SECS", 20.0) as f64,
+            secs_budget("KIN_LOCATE_PHASE_ENTITY_RESOLUTION_SECS", 20.0),
         );
         phase_budgets.insert(
             "multihop",
-            locate_env_f32("KIN_LOCATE_PHASE_MULTIHOP_SECS", 20.0) as f64,
+            secs_budget("KIN_LOCATE_PHASE_MULTIHOP_SECS", 20.0),
         );
         phase_budgets.insert(
             "text_search",
-            locate_env_f32("KIN_LOCATE_PHASE_TEXT_SEARCH_SECS", 10.0) as f64,
+            secs_budget("KIN_LOCATE_PHASE_TEXT_SEARCH_SECS", 10.0),
         );
         phase_budgets.insert(
             "source_text",
-            locate_env_f32("KIN_LOCATE_PHASE_SOURCE_TEXT_SECS", 10.0) as f64,
+            secs_budget("KIN_LOCATE_PHASE_SOURCE_TEXT_SECS", 10.0),
         );
         phase_budgets.insert(
             "scoring",
-            locate_env_f32("KIN_LOCATE_PHASE_SCORING_SECS", 10.0) as f64,
+            secs_budget("KIN_LOCATE_PHASE_SCORING_SECS", 10.0),
         );
         Self {
             start: std::time::Instant::now(),
@@ -2484,8 +2489,14 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                         let doc_refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
                         if let Ok(scores) = encoder.rerank(text, &doc_refs) {
                             let elapsed_ms = rerank_started.elapsed().as_millis();
-                            let budget_ms =
-                                locate_env_usize("KIN_LOCATE_RERANK_LATENCY_BUDGET_MS", 0) as u128;
+                            // `0` means unbounded (no latency gate), matching
+                            // `rerank_within_budget`'s 0-is-off contract — never a
+                            // 0 ms budget that gates every rerank.
+                            let budget_ms = kin_core::env_registry::env_ms_bound(
+                                "KIN_LOCATE_RERANK_LATENCY_BUDGET_MS",
+                                kin_core::env_registry::MsBound::Unbounded,
+                            )
+                            .as_millis_u128();
                             if rerank_within_budget(elapsed_ms, budget_ms) {
                                 // additive, promotion-only blend.
                                 // Legacy (default) OVERWRITES the fused score with the raw
@@ -6834,10 +6845,14 @@ fn extract_multihop_signals(
         "KIN_LOCATE_MULTIHOP_FRONTIER_LIMIT",
         profile.multihop_frontier_limit(),
     );
-    let timeout = std::time::Duration::from_millis(locate_env_usize(
+    // `0` means unbounded (disable the bound), never an instant zero-length
+    // timeout that would gut multihop retrieval. BFS is still bounded by
+    // `max_depth`/`frontier_limit`, so unbounded here cannot run away.
+    let timeout = kin_core::env_registry::env_ms_bound(
         "KIN_LOCATE_MULTIHOP_TIMEOUT_MS",
-        profile.multihop_timeout_ms() as usize,
-    ) as u64);
+        kin_core::env_registry::MsBound::Limited(profile.multihop_timeout_ms()),
+    )
+    .as_duration();
     let bfs_start = std::time::Instant::now();
 
     let mut seed_scores: HashMap<String, f32> = HashMap::new();

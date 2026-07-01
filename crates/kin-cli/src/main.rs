@@ -1737,6 +1737,15 @@ fn main() -> Result<()> {
             .init();
     }
 
+    // Validate the KIN_* environment surface once logging is live. Unknown names
+    // (likely typos) and out-of-range values are surfaced loudly instead of
+    // silently no-op'ing; an invalid correctness-relevant value refuses to run
+    // rather than mis-behaving. Governed by KIN_ENV_VALIDATION (off/warn/strict).
+    if let Err(err) = kin_core::env_registry::enforce_startup_env() {
+        eprintln!("kin: {err}");
+        std::process::exit(2);
+    }
+
     let root_span = tracing::info_span!(
         "kin.command",
         command = %command_name,
