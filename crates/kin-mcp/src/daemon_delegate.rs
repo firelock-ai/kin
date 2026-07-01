@@ -16,7 +16,7 @@ use std::time::Duration;
 use kin_model::session::SessionCapabilities;
 use tracing::debug;
 
-use crate::types::ToolCallResult;
+use crate::types::{ContentBlock, ToolCallResult};
 
 /// Cached daemon HTTP client. We only cache positive connectivity so that a
 /// daemon that comes online after MCP startup can still take authority.
@@ -166,6 +166,158 @@ fn optional_u32(args: &HashMap<String, serde_json::Value>, key: &str) -> Option<
     args.get(key)
         .and_then(|value| value.as_u64())
         .map(|value| value as u32)
+}
+
+// ── get_entity_source failure memo ──────────────────────────────────────
+//
+// `get_entity_source` / `get_entity_body` are pure functions of (entity_id,
+// graph generation): for a given graph, an ID either resolves to a body or it
+// does not. The observed agent-loop failure mode is calling the tool on a
+// hallucinated, invented, or stale ID, getting a failure, and then retrying the
+// same ID (or probing adjacent ones), which burns tool-call budget. Memoizing
+// the failure lets an identical repeated call short-circuit locally instead of
+// paying another daemon round-trip.
+//
+// The memo is bounded and keyed by (session, entity_id), and is dropped whenever
+// the graph generation marker advances — a re-index can resurrect a previously
+// absent ID, so a stale negative must not outlive the graph it described.
+
+/// Maximum number of remembered failures across all sessions. Bounds memory for
+/// long-lived agent sessions; eviction is oldest-first.
+const ENTITY_SOURCE_MEMO_CAP: usize = 512;
+
+/// Bounded per-session memo of `get_entity_source` failures, valid for a single
+/// graph generation.
+struct EntitySourceFailureMemo {
+    generation: u64,
+    entries: HashMap<(String, String), String>,
+    order: std::collections::VecDeque<(String, String)>,
+}
+
+impl EntitySourceFailureMemo {
+    fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            entries: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Drop every entry and rebind to `generation`.
+    fn reset(&mut self, generation: u64) {
+        self.generation = generation;
+        self.entries.clear();
+        self.order.clear();
+    }
+
+    /// Cached failure message for `key` at `generation`, if any. A generation
+    /// change invalidates the whole memo before the lookup.
+    fn get(&mut self, generation: u64, key: &(String, String)) -> Option<String> {
+        if generation != self.generation {
+            self.reset(generation);
+            return None;
+        }
+        self.entries.get(key).cloned()
+    }
+
+    /// Remember `message` as the failure for `key` at `generation`. First write
+    /// for a key wins; the oldest entry is evicted once the cap is reached.
+    fn insert(&mut self, generation: u64, key: (String, String), message: String) {
+        if generation != self.generation {
+            self.reset(generation);
+        }
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        if self.entries.len() >= ENTITY_SOURCE_MEMO_CAP {
+            if let Some(evicted) = self.order.pop_front() {
+                self.entries.remove(&evicted);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(key, message);
+    }
+}
+
+static ENTITY_SOURCE_MEMO: OnceLock<std::sync::Mutex<EntitySourceFailureMemo>> = OnceLock::new();
+
+fn entity_source_memo() -> &'static std::sync::Mutex<EntitySourceFailureMemo> {
+    ENTITY_SOURCE_MEMO.get_or_init(|| std::sync::Mutex::new(EntitySourceFailureMemo::new(0)))
+}
+
+/// Session identity for the memo key. Mirrors [`with_session_header`]: an
+/// explicit `session_id` argument wins, else `KIN_SESSION_ID`, else a shared
+/// process-global bucket (the common single-session MCP process case).
+fn session_key(arguments: &HashMap<String, serde_json::Value>) -> String {
+    if let Some(session_id) = optional_string(arguments, "session_id") {
+        return session_id.to_string();
+    }
+    if let Ok(session_id) = std::env::var("KIN_SESSION_ID") {
+        let trimmed = session_id.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    String::new()
+}
+
+/// Current graph generation from the local marker the daemon maintains at
+/// `<kin_dir>/kindb/generation`. Read directly off disk (no daemon round-trip);
+/// a missing or unreadable marker reads as generation 0, which still gives a
+/// stable within-session memo, just without cross-generation invalidation.
+fn current_graph_generation() -> u64 {
+    let Some(kin_dir) = discover_kin_dir() else {
+        return 0;
+    };
+    std::fs::read_to_string(kin_dir.join("kindb").join("generation"))
+        .ok()
+        .and_then(|contents| contents.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Extract a cacheable failure message from a forwarded tool result. Only
+/// error results are cacheable — a success or a non-result is never memoized.
+fn cacheable_failure_message(result: Option<&ToolCallResult>) -> Option<String> {
+    let result = result?;
+    if result.is_error != Some(true) {
+        return None;
+    }
+    result.content.first().map(|block| match block {
+        ContentBlock::Text { text } => text.clone(),
+    })
+}
+
+/// Forward `get_entity_source` / `get_entity_body` through the failure memo.
+///
+/// On a cache hit the remembered failure is returned without contacting the
+/// daemon; otherwise the call is forwarded and a resulting failure is recorded
+/// for the current graph generation. Calls without a concrete `entity_id` are
+/// forwarded unmemoized (there is nothing stable to key on).
+async fn forward_entity_source_memoized(
+    name: &str,
+    arguments: &HashMap<String, serde_json::Value>,
+) -> Result<Option<ToolCallResult>, String> {
+    let Some(entity_id) = optional_string(arguments, "entity_id").map(str::to_string) else {
+        return forward_mcp_tool_call(name, arguments).await;
+    };
+    let key = (session_key(arguments), entity_id);
+    let generation = current_graph_generation();
+
+    if let Ok(mut memo) = entity_source_memo().lock() {
+        if let Some(cached) = memo.get(generation, &key) {
+            debug!(tool = name, "get_entity_source failure served from memo");
+            return Ok(Some(ToolCallResult::error(cached)));
+        }
+    }
+
+    let result = forward_mcp_tool_call(name, arguments).await?;
+
+    if let Some(message) = cacheable_failure_message(result.as_ref()) {
+        if let Ok(mut memo) = entity_source_memo().lock() {
+            memo.insert(generation, key, message);
+        }
+    }
+    Ok(result)
 }
 
 fn parse_capabilities(args: &HashMap<String, serde_json::Value>) -> SessionCapabilities {
@@ -604,6 +756,12 @@ pub async fn forward_tool_call(
             Ok(()) => forward_mcp_tool_call(name, arguments).await,
             Err(message) => Ok(Some(ToolCallResult::error(message))),
         },
+        // Short-circuit repeated failures for an identical entity ID within a
+        // session so a hallucinated/stale ID does not burn a daemon round-trip
+        // on every retry.
+        "get_entity_source" | "get_entity_body" => {
+            forward_entity_source_memoized(name, arguments).await
+        }
         _ => forward_mcp_tool_call(name, arguments).await,
     }
 }
@@ -1291,5 +1449,85 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("transaction_id".into(), serde_json::json!("tx-1"));
         assert!(validate_stage_arguments(&args).is_ok());
+    }
+
+    #[test]
+    fn entity_source_failure_memo_hit_then_generation_invalidates() {
+        let mut memo = EntitySourceFailureMemo::new(1);
+        let key = ("session-a".to_string(), "entity-1".to_string());
+
+        // Cold: nothing remembered yet.
+        assert!(memo.get(1, &key).is_none());
+
+        // Record a failure, then the identical (session, id) lookup is a HIT.
+        memo.insert(
+            1,
+            key.clone(),
+            "no entity exists with ID 'entity-1'".to_string(),
+        );
+        assert_eq!(
+            memo.get(1, &key).as_deref(),
+            Some("no entity exists with ID 'entity-1'"),
+        );
+
+        // A different id in the same session is unaffected.
+        let other = ("session-a".to_string(), "entity-2".to_string());
+        assert!(memo.get(1, &other).is_none());
+
+        // A graph-generation bump drops the negative — a re-index may resurrect
+        // the id, so the stale failure must not be served.
+        assert!(memo.get(2, &key).is_none());
+    }
+
+    #[test]
+    fn entity_source_memo_first_write_wins() {
+        let mut memo = EntitySourceFailureMemo::new(0);
+        let key = ("s".to_string(), "id".to_string());
+        memo.insert(0, key.clone(), "first".to_string());
+        memo.insert(0, key.clone(), "second".to_string());
+        assert_eq!(memo.get(0, &key).as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn entity_source_memo_is_bounded_with_oldest_first_eviction() {
+        let mut memo = EntitySourceFailureMemo::new(0);
+        for i in 0..(ENTITY_SOURCE_MEMO_CAP + 5) {
+            memo.insert(0, ("s".to_string(), format!("id-{i}")), format!("fail-{i}"));
+        }
+        assert_eq!(memo.entries.len(), ENTITY_SOURCE_MEMO_CAP);
+        // The five oldest were evicted; the newest survive.
+        for i in 0..5 {
+            assert!(memo.get(0, &("s".to_string(), format!("id-{i}"))).is_none());
+        }
+        let newest = ENTITY_SOURCE_MEMO_CAP + 4;
+        assert_eq!(
+            memo.get(0, &("s".to_string(), format!("id-{newest}")))
+                .as_deref(),
+            Some(format!("fail-{newest}").as_str()),
+        );
+    }
+
+    #[test]
+    fn only_error_results_are_cacheable() {
+        let err = ToolCallResult::error("boom".to_string());
+        assert_eq!(
+            cacheable_failure_message(Some(&err)).as_deref(),
+            Some("boom")
+        );
+
+        let ok = ToolCallResult::text("{}".to_string());
+        assert!(cacheable_failure_message(Some(&ok)).is_none());
+
+        assert!(cacheable_failure_message(None).is_none());
+    }
+
+    #[test]
+    fn session_key_prefers_explicit_argument() {
+        let mut args = HashMap::new();
+        args.insert(
+            "session_id".to_string(),
+            serde_json::json!("explicit-session"),
+        );
+        assert_eq!(session_key(&args), "explicit-session");
     }
 }
