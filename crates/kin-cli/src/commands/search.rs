@@ -120,6 +120,10 @@ struct SearchJsonEntity {
     name: String,
     file: String,
     line: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_line: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    score: Option<f32>,
     signature: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<String>,
@@ -763,6 +767,8 @@ fn daemon_record_to_json(record: &DaemonSearchRecord) -> SearchJsonRecord {
             name: entity.name.clone(),
             file: entity.file.clone().unwrap_or_default(),
             line: entity.start_line.unwrap_or(1),
+            end_line: entity.end_line,
+            score: entity.score,
             signature: entity.signature.clone(),
             body: entity.body.clone(),
         }),
@@ -1359,6 +1365,36 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    #[test]
+    fn search_json_entity_carries_score_and_span() {
+        use super::{
+            daemon_record_to_json, DaemonSearchEntityRecord, DaemonSearchRecord, SearchJsonRecord,
+        };
+        let rec = DaemonSearchRecord::Entity(DaemonSearchEntityRecord {
+            id: "e1".into(),
+            name: "handler".into(),
+            kind: "function".into(),
+            language: "rust".into(),
+            file: Some("src/handler.rs".into()),
+            start_line: Some(10),
+            end_line: Some(20),
+            start_byte: None,
+            end_byte: None,
+            signature: Some("fn handler()".into()),
+            score: Some(0.87),
+            body: None,
+            body_omitted_line_count: 0,
+        });
+        let SearchJsonRecord::Entity(entity) = daemon_record_to_json(&rec) else {
+            panic!("expected entity record");
+        };
+        let json = serde_json::to_value(&entity).expect("serialize");
+        // Agent surfaces must carry the span end and confidence, not just the start line.
+        assert_eq!(json["line"].as_u64(), Some(10));
+        assert_eq!(json["end_line"].as_u64(), Some(20));
+        assert!((json["score"].as_f64().unwrap() - 0.87).abs() < 1e-6);
     }
 
     #[test]
