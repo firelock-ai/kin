@@ -512,16 +512,32 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
 
     let state = Arc::new(state);
 
-    // Write the port file so CLI processes can discover and auto-connect. Each
-    // repo gets its own daemon on its own port — the port file enables per-repo
-    // isolation (critical for benchmark worktrees). The PID file was written
-    // earlier, immediately after acquiring the singleton lock.
-    crate::lifecycle::write_port_file(state.layout.root(), config.api_port);
+    // Bind the API listener up front so the daemon owns port selection. With
+    // config.api_port == 0 the OS assigns a free ephemeral port; we then publish
+    // the *actual* bound port via the port file. Binding here — before the port
+    // file is written and before the slower graph/LSP startup — closes the
+    // reserve-release-rebind race (find_free_port TOCTOU) where a launcher picked
+    // a port, dropped it, and a sibling process stole it before the daemon bound.
+    let (api_listener, bound_port) = match api::bind_api_listener(&state, config.api_port) {
+        Ok(bound) => bound,
+        Err(error) => {
+            // We hold the singleton lock and already wrote daemon.pid; drop the
+            // pid file so a failed bind never strands a stale endpoint record.
+            crate::lifecycle::remove_pid_file(state.layout.root());
+            return Err(DaemonError::Io(error));
+        }
+    };
+
+    // Publish the actual bound port so CLI processes can discover and auto-connect.
+    // Each repo gets its own daemon on its own port — the port file enables
+    // per-repo isolation (critical for benchmark worktrees). The PID file was
+    // written earlier, immediately after acquiring the singleton lock.
+    crate::lifecycle::write_port_file(state.layout.root(), bound_port);
 
     // Shutdown signal: when set to true, all loops exit.
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
-    info!(port = config.api_port, "starting kin daemon");
+    info!(port = bound_port, "starting kin daemon");
 
     let idle_state = Arc::clone(&state);
     let idle_timeout = config.idle_timeout;
@@ -576,20 +592,18 @@ pub async fn run(mut state: DaemonState, config: DaemonConfig) -> Result<()> {
             async move { loop_runner::run_loop(loop_state, loop_config, loop_cancel).await },
         );
 
-    // Spawn the API server.
+    // Spawn the API server on the pre-bound listener.
     let api_state = Arc::clone(&state);
-    let api_port = config.api_port;
     let api_cancel = cancel_rx.clone();
-    let api_handle =
-        tokio::spawn(
-            async move { api::serve_with_shutdown(api_state, api_port, api_cancel).await },
-        );
+    let api_handle = tokio::spawn(async move {
+        api::serve_bound_with_shutdown(api_state, api_listener, api_cancel).await
+    });
 
     // Register this repo-scoped graph daemon with the lightweight central
     // supervisor when one is available. The supervisor owns process/routing
     // metadata only; this daemon remains graph-authoritative for its repo.
     let supervisor_state = Arc::clone(&state);
-    let supervisor_port = config.api_port;
+    let supervisor_port = bound_port;
     let supervisor_cancel = cancel_rx.clone();
     let supervisor_handle = tokio::spawn(async move {
         crate::supervisor::repo_daemon_registration_loop(

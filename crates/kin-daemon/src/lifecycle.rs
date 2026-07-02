@@ -160,9 +160,16 @@ pub fn write_pid_file(kin_root: &Path) {
     }
 }
 
-/// Write port file so the CLI knows where to connect.
+/// Write the port file so the CLI knows where to connect.
+///
+/// Written atomically (temp + rename) so a CLI polling the port file during the
+/// daemon→CLI port handshake never parses a torn or partial value.
 pub fn write_port_file(kin_root: &Path, port: u16) {
-    let _ = std::fs::write(kin_root.join("daemon.port"), port.to_string());
+    let tmp = kin_root.join("daemon.port.tmp");
+    let dst = kin_root.join("daemon.port");
+    if std::fs::write(&tmp, port.to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, &dst);
+    }
 }
 
 /// Read port from `.kin/daemon.port`.
@@ -548,6 +555,38 @@ pub enum AutoStartError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Port-file handshake ────────────────────────────────────────────────
+    //
+    // The daemon publishes its real bound port here for the CLI handshake, so
+    // read_port_file must recover exactly what write_port_file wrote, overwrite
+    // must replace cleanly, and the atomic temp artifact must never linger for a
+    // polling reader to trip over.
+
+    #[test]
+    fn port_file_round_trips_atomically() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+
+        assert_eq!(
+            read_port_file(root),
+            None,
+            "no port file before first write"
+        );
+
+        write_port_file(root, 51234);
+        assert_eq!(read_port_file(root), Some(51234));
+
+        // Overwrite (temp + rename) must replace the previous value cleanly.
+        write_port_file(root, 6001);
+        assert_eq!(read_port_file(root), Some(6001));
+
+        // The atomic-write temp file must not be left behind.
+        assert!(
+            !root.join("daemon.port.tmp").exists(),
+            "atomic write must not leave a .tmp artifact"
+        );
+    }
 
     // ── Idle-timeout env resolution ────────────────────────────────────────
     //

@@ -1280,13 +1280,6 @@ pub fn daemon_is_up(kin_root: &Path) -> Option<u16> {
     }
 }
 
-fn find_free_port() -> Option<u16> {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .ok()
-        .and_then(|l| l.local_addr().ok())
-        .map(|a| a.port())
-}
-
 fn daemon_binary_supports_supervisor(path: &Path) -> bool {
     let output = match Command::new(path).arg("--help").output() {
         Ok(output) => output,
@@ -1732,14 +1725,12 @@ async fn validate_daemon_endpoint(
 async fn wait_for_daemon_ready(
     kin_root: &Path,
     child: &mut Child,
-    port: u16,
     deadline: Instant,
     log_offset: u64,
 ) -> Result<String> {
     let timeout = deadline.saturating_duration_since(Instant::now());
     let client = daemon_health_client();
-    let base_url = format!("http://127.0.0.1:{port}");
-    let mut last_error = String::from("daemon did not bind");
+    let mut last_error = String::from("daemon did not report its port");
 
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait().context("check daemon child status")? {
@@ -1748,6 +1739,16 @@ async fn wait_for_daemon_ready(
                 daemon_log_tail_since(kin_root, log_offset)
             );
         }
+
+        // The daemon binds :0 and writes its actual bound port to the port file
+        // once it is listening. Read it each poll until it appears — the port
+        // file is the daemon→CLI handshake that lets the daemon own port
+        // selection, eliminating the reserve-release-rebind race.
+        let Some(port) = read_port_file(kin_root) else {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        };
+        let base_url = format!("http://127.0.0.1:{port}");
 
         if is_port_open(port) {
             match client.get(format!("{base_url}/readiness")).send().await {
@@ -1879,20 +1880,27 @@ fn open_supervisor_log() -> Result<File> {
         .with_context(|| format!("open supervisor log at {}", log_path.display()))
 }
 
-async fn wait_for_supervisor_ready(
-    child: &mut Child,
-    port: u16,
-    deadline: Instant,
-) -> Result<String> {
+async fn wait_for_supervisor_ready(child: &mut Child, deadline: Instant) -> Result<String> {
     let timeout = deadline.saturating_duration_since(Instant::now());
     let client = daemon_health_client();
-    let base_url = format!("http://127.0.0.1:{port}");
-    let mut last_error = String::from("supervisor did not bind");
+    let mut last_error = String::from("supervisor did not report its port");
 
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait().context("check supervisor child status")? {
             bail!("supervisor exited during startup with status {status}");
         }
+
+        // The supervisor binds :0 and writes its real bound port to its port
+        // file once listening. Read it each poll until it appears — the port
+        // file is the supervisor→CLI handshake.
+        let Some(port) = std::fs::read_to_string(supervisor_port_path())
+            .ok()
+            .and_then(|value| value.trim().parse::<u16>().ok())
+        else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
+        let base_url = format!("http://127.0.0.1:{port}");
 
         if is_port_open(port) {
             match client.get(format!("{base_url}/health")).send().await {
@@ -1938,11 +1946,15 @@ pub async fn ensure_supervisor_running() -> Result<String> {
     }
 
     let daemon_bin = find_daemon_binary()?;
-    let port = find_free_port().unwrap_or(4218);
-    info!(binary = %daemon_bin.display(), port, "starting supervisor");
+    // The supervisor binds :0 and reports its real bound port via its endpoint
+    // files; passing 0 (rather than a reserved port) removes the same
+    // reserve-release-rebind race the repo-daemon path had. Clear stale endpoint
+    // files so wait_for_supervisor_ready reads only this spawn's port.
+    remove_stale_supervisor_files();
+    info!(binary = %daemon_bin.display(), "starting supervisor (OS-assigned port)");
 
     let mut cmd = std::process::Command::new(&daemon_bin);
-    cmd.args(["--supervisor", "--port", &port.to_string()]);
+    cmd.args(["--supervisor", "--port", "0"]);
     let log = open_supervisor_log()?;
     let stderr = log
         .try_clone()
@@ -1969,8 +1981,8 @@ pub async fn ensure_supervisor_running() -> Result<String> {
 
     let mut child = cmd.spawn().context("spawn kin supervisor")?;
     let deadline = Instant::now() + Duration::from_secs(daemon_ready_timeout_secs());
-    let base_url = wait_for_supervisor_ready(&mut child, port, deadline).await?;
-    info!(port, "supervisor is up and ready");
+    let base_url = wait_for_supervisor_ready(&mut child, deadline).await?;
+    info!(supervisor = %base_url, "supervisor is up and ready");
     Ok(base_url)
 }
 
@@ -2235,17 +2247,18 @@ pub async fn ensure_daemon_running_with_idle_timeout(
     let working_dir = kin_root
         .parent()
         .ok_or_else(|| anyhow!("invalid .kin layout: no parent"))?;
-    let port = find_free_port().unwrap_or(4219);
 
-    info!(binary = %daemon_bin.display(), repo = %working_dir.display(), port, "starting daemon");
+    // The daemon owns port selection: it binds :0 and reports the real bound
+    // port via the port file. Passing 0 (rather than a port we reserve here)
+    // eliminates the reserve-release-rebind race where a sibling process steals
+    // the port between our probe and the daemon's bind. Clear any stale port
+    // file first so wait_for_daemon_ready only reads the port this spawn writes.
+    let _ = std::fs::remove_file(kin_root.join("daemon.port"));
+
+    info!(binary = %daemon_bin.display(), repo = %working_dir.display(), "starting daemon (OS-assigned port)");
 
     let mut cmd = std::process::Command::new(&daemon_bin);
-    cmd.args([
-        "--repo",
-        &working_dir.display().to_string(),
-        "--port",
-        &port.to_string(),
-    ]);
+    cmd.args(["--repo", &working_dir.display().to_string(), "--port", "0"]);
     let log_offset = daemon_log_len(kin_root);
     let log = open_daemon_log(kin_root)?;
     let stderr = log
@@ -2276,9 +2289,9 @@ pub async fn ensure_daemon_running_with_idle_timeout(
 
     let timeout_secs = daemon_ready_timeout_secs();
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    let base_url = wait_for_daemon_ready(kin_root, &mut child, port, deadline, log_offset).await?;
+    let base_url = wait_for_daemon_ready(kin_root, &mut child, deadline, log_offset).await?;
     register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url).await?;
-    info!(port, "daemon is up and ready");
+    info!(daemon = %base_url, "daemon is up and ready");
     Ok(base_url)
 }
 

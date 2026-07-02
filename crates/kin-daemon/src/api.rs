@@ -6985,16 +6985,40 @@ pub async fn serve(state: Arc<DaemonState>, port: u16) -> std::io::Result<()> {
     serve_with_shutdown(state, port, shutdown_rx).await
 }
 
-/// Start the API server on the given port and stop when shutdown is signaled.
-pub async fn serve_with_shutdown(
-    state: Arc<DaemonState>,
+/// Bind the daemon API listener and report the concrete port it is bound to.
+///
+/// Passing `port == 0` binds an OS-assigned ephemeral port; the returned value
+/// is the real port the daemon must advertise. This is the primitive behind the
+/// daemon-owned port handshake: the daemon binds (optionally `:0`) and then
+/// publishes the actual bound port via `.kin/daemon.port`, instead of a launcher
+/// reserving a port and releasing it before the daemon re-binds — a window a
+/// racing process can steal (the `find_free_port` TOCTOU).
+pub fn bind_api_listener(
+    state: &DaemonState,
     port: u16,
+) -> std::io::Result<(tokio::net::TcpListener, u16)> {
+    let bind_host = bind_host_from_env();
+    let auth_present = resolve_serve_auth_token(&state.layout).is_some();
+    let listener = bind_listener(&bind_host, port, auth_present)?;
+    let bound_port = listener.local_addr()?.port();
+    Ok((listener, bound_port))
+}
+
+/// Serve the daemon API on an already-bound listener until shutdown is signaled.
+///
+/// Pairs with [`bind_api_listener`]: the daemon binds first — so it can publish
+/// the real bound port before the slower graph/LSP startup — then serves here.
+pub async fn serve_bound_with_shutdown(
+    state: Arc<DaemonState>,
+    listener: tokio::net::TcpListener,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
-    let bind_host = bind_host_from_env();
     let auth_token = resolve_serve_auth_token(&state.layout);
-    let app = router_with_auth(state, auth_token.clone());
-    let listener = bind_listener(&bind_host, port, auth_token.is_some())?;
+    let app = router_with_auth(state, auth_token);
+    let port = listener
+        .local_addr()
+        .map(|addr| addr.port())
+        .unwrap_or_default();
 
     info!(port, "daemon API server listening");
 
@@ -7007,6 +7031,16 @@ pub async fn serve_with_shutdown(
             }
         })
         .await
+}
+
+/// Start the API server on the given port and stop when shutdown is signaled.
+pub async fn serve_with_shutdown(
+    state: Arc<DaemonState>,
+    port: u16,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    let (listener, _bound_port) = bind_api_listener(&state, port)?;
+    serve_bound_with_shutdown(state, listener, shutdown_rx).await
 }
 
 fn resolve_bind_host(bind_host: Option<String>) -> String {
@@ -7383,6 +7417,33 @@ mod tests {
             .save(&layout.manifest_path())
             .unwrap();
         Arc::new(DaemonState::open(layout).unwrap())
+    }
+
+    #[tokio::test]
+    async fn bind_api_listener_reports_real_ephemeral_port() {
+        // Runs under a Tokio runtime because binding a tokio TcpListener needs
+        // the reactor — exactly how the daemon calls this at startup.
+        // The daemon-owned port handshake: binding :0 must yield a concrete,
+        // live ephemeral port (never 0), and two independent :0 binds must land
+        // on different ports — proving the OS assigns the port and nothing is
+        // reserved ahead of the bind. This is what lets the daemon pick its own
+        // port and report it, instead of a launcher reserving-and-releasing a
+        // port a peer can steal before the daemon binds.
+        let state = test_state();
+
+        let (listener_a, port_a) = bind_api_listener(&state, 0).expect("bind :0");
+        assert_ne!(port_a, 0, "bind_api_listener must report a real bound port");
+        assert_eq!(
+            port_a,
+            listener_a.local_addr().unwrap().port(),
+            "reported port must equal the listener's actual bound port"
+        );
+
+        let (_listener_b, port_b) = bind_api_listener(&state, 0).expect("second bind :0");
+        assert_ne!(
+            port_a, port_b,
+            "two :0 binds must get distinct ports (no fixed-port reservation)"
+        );
     }
 
     #[test]
