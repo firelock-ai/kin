@@ -2244,9 +2244,20 @@ fn try_warm_init_from_cache(
     let Some(cache_dir) = init_cache_repo_path(dir) else {
         return Ok(None);
     };
-    let Some(cache_graph_path) = resolve_warm_cache_graph_path(dir, &cache_dir)? else {
-        return Ok(None);
-    };
+    // A HEAD recorded in the manifest resolves to a trusted bundle. An
+    // unrecorded HEAD may still share semantic truth with a cached bundle (a
+    // sibling clone, a no-op commit, or a doc-only change); adopt that
+    // content-addressed candidate only speculatively, and confirm below that no
+    // entity-source file diverged before grafting so a divergent HEAD still
+    // cold-inits.
+    let (cache_graph_path, speculative_candidate) =
+        match resolve_warm_cache_graph_path(dir, &cache_dir)? {
+            Some(path) => (path, false),
+            None => match resolve_warm_cache_content_candidate(dir, &cache_dir)? {
+                Some(path) => (path, true),
+                None => return Ok(None),
+            },
+        };
     if !cache_graph_path.exists() {
         return Ok(None);
     }
@@ -2277,6 +2288,29 @@ fn try_warm_init_from_cache(
         diff.modified_files.len(),
         diff.removed_files.len()
     );
+
+    // A speculative candidate (the current HEAD is not recorded in the manifest)
+    // may only be grafted when the working tree's parsed semantic truth matches
+    // it. An added, modified, or removed entity-source or shallow-syntax file
+    // diverges that truth, so reject to a cold init rather than graft a foreign
+    // semantic base onto an unrecorded HEAD. Artifact and opaque deltas (docs,
+    // configs, manifests) carry no entity truth and stay reusable.
+    if speculative_candidate {
+        let semantic_source_diverged = diff
+            .added_files
+            .iter()
+            .chain(diff.modified_files.iter())
+            .chain(diff.removed_files.iter())
+            .any(|path| {
+                matches!(
+                    FileClassifier::classify(Path::new(path)),
+                    FileClassification::EntitySource | FileClassification::ShallowSyntax { .. }
+                )
+            });
+        if semantic_source_diverged {
+            return Ok(None);
+        }
+    }
 
     let delta = if diff.is_empty() {
         wphase!("apply_delta (skipped — no changes)");
@@ -3208,6 +3242,41 @@ fn resolve_warm_cache_graph_path_for_head(
         }
     }
 
+    Ok(None)
+}
+
+/// Resolve a *content-addressed* warm-cache bundle candidate for a working tree
+/// whose current HEAD is not recorded in the manifest.
+///
+/// The trusted head-scoped resolver rejects an unrecorded HEAD so it never
+/// grafts a foreign or last-published state. That correctly refuses divergent
+/// truth, but it also refuses the legitimate case where a different HEAD carries
+/// *identical* graph truth — a sibling clone, a fresh checkout, or a commit that
+/// changes no indexed file. Because a bundle is addressed by its graph root
+/// hash, identical file content always maps to the same bundle, so such a tree
+/// can safely reuse the last-published state.
+///
+/// This returns only a CANDIDATE: the caller MUST confirm no entity-source file
+/// diverged (a semantic-truth-preserving diff) before grafting. An entity-level
+/// divergence falls back to a cold init instead of adopting the candidate,
+/// preserving the reject-don't-adopt guarantee against publish-order
+/// contamination while still reusing shared semantic truth across doc- or
+/// config-only changes.
+fn resolve_warm_cache_content_candidate(dir: &Path, cache_dir: &Path) -> Result<Option<PathBuf>> {
+    let manifest_path = warm_cache_manifest_path(cache_dir);
+    let Some(manifest) = read_warm_cache_manifest(&manifest_path)? else {
+        return Ok(None);
+    };
+    if !warm_cache_manifest_is_valid(dir, &manifest) {
+        return Ok(None);
+    }
+    let Some(bundle_id) = manifest.current_bundle_id.as_deref() else {
+        return Ok(None);
+    };
+    let bundle_graph_path = warm_cache_bundle_graph_path(cache_dir, bundle_id);
+    if bundle_graph_path.exists() && warm_cache_ready_marker_path(cache_dir, bundle_id).exists() {
+        return Ok(Some(bundle_graph_path));
+    }
     Ok(None)
 }
 
@@ -5034,6 +5103,80 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some(warm_cache_bundle_graph_path(cache_dir.path(), &bundle_b).as_path()),
+        );
+    }
+
+    #[test]
+    fn warm_cache_content_candidate_offers_ready_last_bundle_head_agnostically() {
+        // The speculative content candidate recovers reuse for an unrecorded
+        // HEAD that still shares semantic truth (a sibling clone or a doc-only
+        // change). It offers the last-published bundle head-agnostically; the
+        // caller diff-gates it on entity-source divergence, so the candidate
+        // itself only needs to exist and be marked ready.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        // No manifest yet: nothing to offer.
+        assert!(
+            resolve_warm_cache_content_candidate(repo_dir.path(), cache_dir.path())
+                .unwrap()
+                .is_none(),
+            "no manifest means no candidate",
+        );
+
+        let bundle_id = "content-bundle".to_string();
+        let manifest = WarmCacheRepoManifest {
+            schema: INIT_WARM_CACHE_SCHEMA_VERSION.to_string(),
+            pipeline_epoch: INIT_WARM_CACHE_PIPELINE_EPOCH.to_string(),
+            repo_identity: repo_cache_identity(repo_dir.path()),
+            current_bundle_id: Some(bundle_id.clone()),
+            // A different HEAD is the only one recorded; the candidate must not
+            // depend on the current tree's HEAD being present.
+            heads: BTreeMap::from([("recorded_head".to_string(), bundle_id.clone())]),
+            bundles: BTreeMap::from([(
+                bundle_id.clone(),
+                WarmCacheBundleManifestEntry {
+                    graph_root_hash: bundle_id.clone(),
+                    entity_count: 1,
+                    relation_count: 1,
+                    indexed_files: 1,
+                    published_at: chrono::Utc::now().to_rfc3339(),
+                },
+            )]),
+            ..Default::default()
+        };
+        fs::write(
+            warm_cache_manifest_path(cache_dir.path()),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(cache_dir.path().join("bundles").join(&bundle_id)).unwrap();
+        fs::write(
+            warm_cache_bundle_graph_path(cache_dir.path(), &bundle_id),
+            b"graph",
+        )
+        .unwrap();
+
+        // Bundle present but not yet marked ready: still nothing to offer.
+        assert!(
+            resolve_warm_cache_content_candidate(repo_dir.path(), cache_dir.path())
+                .unwrap()
+                .is_none(),
+            "an unready bundle is not a candidate",
+        );
+
+        fs::write(
+            warm_cache_ready_marker_path(cache_dir.path(), &bundle_id),
+            b"ready",
+        )
+        .unwrap();
+
+        // Ready last-published bundle: offered regardless of the current HEAD.
+        assert_eq!(
+            resolve_warm_cache_content_candidate(repo_dir.path(), cache_dir.path())
+                .unwrap()
+                .as_deref(),
+            Some(warm_cache_bundle_graph_path(cache_dir.path(), &bundle_id).as_path()),
         );
     }
 
