@@ -90,8 +90,7 @@ impl UpdateConfig {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).context("failed to create ~/.kin")?;
         }
-        let contents =
-            toml::to_string_pretty(self).context("failed to serialize update config")?;
+        let contents = toml::to_string_pretty(self).context("failed to serialize update config")?;
         std::fs::write(&path, contents)
             .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(())
@@ -441,7 +440,10 @@ fn split_version(v: &str) -> (Vec<u64>, Option<Vec<String>>) {
         Some((core, pre)) => (core, Some(pre)),
         None => (v, None),
     };
-    let core_nums = core.split('.').map(|s| s.parse::<u64>().unwrap_or(0)).collect();
+    let core_nums = core
+        .split('.')
+        .map(|s| s.parse::<u64>().unwrap_or(0))
+        .collect();
     let pre_ids = pre.map(|p| p.split('.').map(str::to_string).collect());
     (core_nums, pre_ids)
 }
@@ -694,7 +696,7 @@ mod tests {
         };
 
         let picked = select_alpha(vec![
-            mk("v0.2.6", false),        // stable, must be ignored
+            mk("v0.2.6", false), // stable, must be ignored
             mk("v0.2.7-alpha.1", true),
             mk("v0.2.7-alpha.3", true), // newest pre-release
             mk("v0.2.7-alpha.2", true),
