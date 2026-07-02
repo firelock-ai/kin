@@ -22,6 +22,11 @@ embeddings = [
     "dep:reqwest",
 ]
 metal = ["embeddings", "kin-infer/metal"]
+# Apple Accelerate BLAS for the CPU embedding path (the hybrid CPU twin). Off by
+# default and independent of `metal`, so a throughput build can enable both to run
+# the GPU arm on Metal and the CPU arm on BLAS; proof builds leave it off and keep
+# the deterministic pure-Rust CPU matmul.
+accelerate = ["embeddings", "kin-infer/accelerate"]
 archive = ["rkyv"]
 gcs = ["object_store/gcp", "tokio", "bytes"]
 sql = ["rusqlite"]
