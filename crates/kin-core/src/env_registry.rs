@@ -155,7 +155,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "bypass the embedding-coverage correctness gate" },
     EnvVarSpec { name: "KIN_STRICT_BUILD_MATCH", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "require a strict historical build match when resolving a ref view" },
     EnvVarSpec { name: "KIN_ALLOW_MASS_DELETION", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "permit reconcile to apply mass deletions (data-destructive)" },
-    EnvVarSpec { name: "KIN_WRITE_VETO", kind: Kind::OneOf(&["enforce", "off"]), default: "off", sensitivity: Sensitivity::Correctness, summary: "write-veto mode; 'enforce' rejects writes into foreign-held scopes" },
+    EnvVarSpec { name: "KIN_WRITE_VETO", kind: Kind::OneOf(&["warn", "enforce", "off"]), default: "warn", sensitivity: Sensitivity::Correctness, summary: "write-veto mode: 'warn' (default) annotates would-be vetoes into foreign-held scopes, 'enforce' rejects them with a 409, 'off' disables" },
     EnvVarSpec { name: "KIN_DAEMON_LOCATE_ONLY", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "daemon serves locate-only from a snapshot, changing what it answers" },
     EnvVarSpec { name: "KIN_DAEMON_DISABLE_LSP", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "disable LSP enrichment in the daemon, reducing relation coverage" },
     EnvVarSpec { name: "KIN_COCHANGE_MAX_FAN_OUT", kind: Kind::Usize, default: "15", sensitivity: Sensitivity::Correctness, summary: "cap on co-change fan-out per entity (co-change ranking signal)" },
