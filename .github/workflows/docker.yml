@@ -94,7 +94,12 @@ jobs:
           echo "::group::Unwritable workspace — loud fatal, no bare mkdir death"
           # KIN_WORKSPACE_DIR=/workspace is an unwritable image-root path with no
           # mount: the entrypoint must print an actionable fatal and exit 1.
-          out_bad="$(docker run --rm -e KIN_WORKSPACE_DIR=/workspace "$IMAGE" 2>&1)"; code_bad=$?
+          # Expected-failure capture: suspend errexit so the nonzero exit lands
+          # in code_bad instead of aborting the step at the assignment.
+          set +e
+          out_bad="$(docker run --rm -e KIN_WORKSPACE_DIR=/workspace "$IMAGE" 2>&1)"
+          code_bad=$?
+          set -e
           echo "$out_bad"
           if [ "$code_bad" -ne 1 ]; then echo "::error::unwritable workspace should exit 1 (got $code_bad)"; exit 1; fi
           if ! printf '%s\n' "$out_bad" | grep -q "FATAL: workspace '/workspace' is not writable"; then echo "::error::missing actionable fatal naming the dir"; exit 1; fi
