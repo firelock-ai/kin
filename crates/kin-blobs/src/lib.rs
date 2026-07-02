@@ -1342,7 +1342,10 @@ mod tests {
         // A correct live-set containing every written blob must retain all of them.
         let live: std::collections::HashSet<Hash256> = hashes.iter().copied().collect();
         let report = store.gc(&live).unwrap();
-        assert_eq!(report.reclaimed, 0, "complete live set must retain every blob");
+        assert_eq!(
+            report.reclaimed, 0,
+            "complete live set must retain every blob"
+        );
         for h in &hashes {
             assert!(store.exists(h).unwrap(), "blob {h} must survive GC");
         }
