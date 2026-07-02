@@ -206,6 +206,29 @@ impl IndexPipeline {
             incremental = old_tree.is_some() && edit_hint.is_some()
         )
         .entered();
+        let file_id = FilePathId::new(path.display().to_string());
+        let (indexed, tree) =
+            self.index_file_hint_with_id(path, blob_store, &file_id, old_tree, edit_hint)?;
+        Ok((indexed.indexed_file, tree))
+    }
+
+    /// Index a file for incremental reconcile using an explicit logical
+    /// `file_id` for all content-addressed identity, while reading source from
+    /// `path` on disk.
+    ///
+    /// This is the single source of truth for the incremental parse/extract
+    /// path. Because `EntityId` and `RelationId` are derived from the supplied
+    /// `file_id`, absolute-path and normalized (relative) callers produce
+    /// identical entity and relation IDs for identical content — the graph-first
+    /// content-addressed contract that keeps init and reconcile in agreement.
+    fn index_file_hint_with_id(
+        &self,
+        path: &Path,
+        blob_store: &BlobStore,
+        file_id: &FilePathId,
+        old_tree: Option<&tree_sitter::Tree>,
+        edit_hint: Option<&kin_parser::EditHint>,
+    ) -> Result<(IndexedFileWithTests, tree_sitter::Tree)> {
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -223,7 +246,6 @@ impl IndexPipeline {
         let blob_hash = blob_store.write(&source)?;
         debug!(path = %path.display(), hash = %blob_hash, "stored source blob");
 
-        let file_id = FilePathId::new(path.display().to_string());
         let language = adapter.language_id();
 
         // Parse: incremental when hints are available, full otherwise
@@ -240,29 +262,35 @@ impl IndexPipeline {
             }
             _ => adapter.parse(&source)?,
         };
-        let output = adapter.extract(&tree, &source, &file_id)?;
+        let output = adapter.extract(&tree, &source, file_id)?;
+        let kin_parser::ParseOutput {
+            entities: extracted_entities,
+            relations: extracted_relations,
+            imports,
+            tests,
+            parse_state,
+        } = output;
 
         // Convert extracted entities to model entities
         let role = classify_file_role(&file_id.0);
-        let mut entities: Vec<Entity> = output
-            .entities
+        let mut entities: Vec<Entity> = extracted_entities
             .into_iter()
             .map(|e| {
-                let mut ent = e.into_entity_with_source(language, &file_id, Some(&source));
+                let mut ent = e.into_entity_with_source(language, file_id, Some(&source));
                 ent.role = role;
                 ent
             })
             .collect();
-        attach_file_context_metadata(&mut entities, &file_id, &output.imports);
+        attach_file_context_metadata(&mut entities, file_id, &imports);
 
         // Resolve extracted relations to model relations using entity name mapping
-        let (relations, unresolved_relations) = resolve_relations(&output.relations, &entities);
+        let (relations, unresolved_relations) = resolve_relations(&extracted_relations, &entities);
         let file_layout = build_layout(
-            &file_id,
+            file_id,
             &entities,
             source.len(),
             &[],
-            ParseCompleteness::from_parse_state(&output.parse_state),
+            ParseCompleteness::from_parse_state(&parse_state),
         );
 
         debug!(
@@ -275,17 +303,20 @@ impl IndexPipeline {
         );
 
         Ok((
-            IndexedFile {
-                file_id,
-                language,
-                entities,
-                relations,
-                unresolved_relations,
-                file_layout,
-                extracted_relations: output.relations,
-                imports: output.imports,
-                parse_state: output.parse_state,
-                blob_hash,
+            IndexedFileWithTests {
+                indexed_file: IndexedFile {
+                    file_id: file_id.clone(),
+                    language,
+                    entities,
+                    relations,
+                    unresolved_relations,
+                    file_layout,
+                    extracted_relations,
+                    imports,
+                    parse_state,
+                    blob_hash,
+                },
+                tests,
             },
             tree,
         ))
@@ -305,104 +336,16 @@ impl IndexPipeline {
             incremental = old_tree.is_some() && edit_hint.is_some()
         )
         .entered();
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .ok_or_else(|| IndexError::UnsupportedFile(path.display().to_string()))?;
-
-        let adapter = self
-            .registry
-            .get_by_extension(ext)
-            .ok_or_else(|| IndexError::UnsupportedFile(ext.to_string()))?;
-
-        let source =
-            std::fs::read(path).map_err(|e| IndexError::io(path.display().to_string(), e))?;
-
-        // Store the raw source as a blob
-        let blob_hash = blob_store.write(&source)?;
-        debug!(path = %path.display(), hash = %blob_hash, "stored source blob");
-
         let file_id = FilePathId::new(path.display().to_string());
-        let language = adapter.language_id();
-
-        // Parse: incremental when hints are available, full otherwise
-        let tree = match (old_tree, edit_hint) {
-            (Some(old), Some(hint)) => {
-                debug!(
-                    path = %path.display(),
-                    start = hint.start_byte,
-                    old_end = hint.old_end_byte,
-                    new_end = hint.new_end_byte,
-                    "incremental parse"
-                );
-                adapter.parse_incremental(&source, old, hint)?
-            }
-            _ => adapter.parse(&source)?,
-        };
-        let output = adapter.extract(&tree, &source, &file_id)?;
-        let kin_parser::ParseOutput {
-            entities: extracted_entities,
-            relations: extracted_relations,
-            imports,
-            tests,
-            parse_state,
-        } = output;
-
-        // Convert extracted entities to model entities
-        let role = classify_file_role(&file_id.0);
-        let mut entities: Vec<Entity> = extracted_entities
-            .into_iter()
-            .map(|e| {
-                let mut ent = e.into_entity_with_source(language, &file_id, Some(&source));
-                ent.role = role;
-                ent
-            })
-            .collect();
-        attach_file_context_metadata(&mut entities, &file_id, &imports);
-
-        // Resolve extracted relations to model relations using entity name mapping
-        let (relations, unresolved_relations) = resolve_relations(&extracted_relations, &entities);
-        let file_layout = build_layout(
-            &file_id,
-            &entities,
-            source.len(),
-            &[],
-            ParseCompleteness::from_parse_state(&parse_state),
-        );
-
-        debug!(
-            path = %path.display(),
-            entities = entities.len(),
-            resolved_relations = relations.len(),
-            unresolved_relations = unresolved_relations.len(),
-            incremental = old_tree.is_some(),
-            "indexed file"
-        );
-
-        Ok((
-            IndexedFileWithTests {
-                indexed_file: IndexedFile {
-                    file_id,
-                    language,
-                    entities,
-                    relations,
-                    unresolved_relations,
-                    file_layout,
-                    extracted_relations,
-                    imports,
-                    parse_state,
-                    blob_hash,
-                },
-                tests,
-            },
-            tree,
-        ))
+        self.index_file_hint_with_id(path, blob_store, &file_id, old_tree, edit_hint)
     }
 
     /// Index a file with hint, normalizing its `FilePathId` relative to the given root.
     ///
-    /// Same as `index_file_with_hint` but strips the `root` prefix from the
-    /// file path for a stable cross-platform `FilePathId`.
+    /// Same as `index_file_with_hint` but derives all identity from the
+    /// root-relative path. `EntityId` and `RelationId` are computed from the
+    /// normalized path, so a repo indexed at different absolute locations yields
+    /// identical IDs and reconcile agrees with init.
     pub fn index_file_relative_with_hint(
         &self,
         path: &Path,
@@ -411,21 +354,13 @@ impl IndexPipeline {
         old_tree: Option<&tree_sitter::Tree>,
         edit_hint: Option<&kin_parser::EditHint>,
     ) -> Result<(IndexedFile, tree_sitter::Tree)> {
-        let (mut indexed, tree) =
-            self.index_file_with_hint(path, blob_store, old_tree, edit_hint)?;
-        let normalized = normalize_file_path_id(path, root);
-        indexed.file_id = normalized.clone();
-        indexed.file_layout.file_id = normalized.clone();
-        for entity in &mut indexed.entities {
-            entity.file_origin = Some(normalized.clone());
-            if let Some(ref mut span) = entity.span {
-                span.file = normalized.clone();
-            }
-        }
-        Ok((indexed, tree))
+        let file_id = normalize_file_path_id(path, root);
+        let (indexed, tree) =
+            self.index_file_hint_with_id(path, blob_store, &file_id, old_tree, edit_hint)?;
+        Ok((indexed.indexed_file, tree))
     }
 
-    /// Index a file with hint, normalizing its `FilePathId` relative to the given root
+    /// Index a file with hint, deriving identity from the root-relative path
     /// while retaining parser-emitted tests.
     pub fn index_file_relative_with_hint_with_tests(
         &self,
@@ -435,26 +370,18 @@ impl IndexPipeline {
         old_tree: Option<&tree_sitter::Tree>,
         edit_hint: Option<&kin_parser::EditHint>,
     ) -> Result<(IndexedFileWithTests, tree_sitter::Tree)> {
-        let (mut indexed, tree) =
-            self.index_file_with_hint_with_tests(path, blob_store, old_tree, edit_hint)?;
-        let normalized = normalize_file_path_id(path, root);
-        indexed.indexed_file.file_id = normalized.clone();
-        indexed.indexed_file.file_layout.file_id = normalized.clone();
-        for entity in &mut indexed.indexed_file.entities {
-            entity.file_origin = Some(normalized.clone());
-            if let Some(ref mut span) = entity.span {
-                span.file = normalized.clone();
-            }
-        }
-        Ok((indexed, tree))
+        let file_id = normalize_file_path_id(path, root);
+        self.index_file_hint_with_id(path, blob_store, &file_id, old_tree, edit_hint)
     }
 
-    /// Index a file, normalizing its `FilePathId` relative to the given root.
+    /// Index a file, deriving all identity from the root-relative path.
     ///
-    /// This strips the `root` prefix from the file path and normalizes path
-    /// separators to forward slashes, producing a stable cross-platform
-    /// `FilePathId` regardless of whether the caller passes an absolute or
-    /// relative path.
+    /// The `root` prefix is stripped and path separators normalized to forward
+    /// slashes, producing a stable cross-platform `FilePathId` regardless of
+    /// whether the caller passes an absolute or relative path. Entity and
+    /// relation IDs are content-addressed from this normalized path, so the same
+    /// repo content produces identical IDs across machines and across the
+    /// init/reconcile paths.
     pub fn index_file_relative(
         &self,
         path: &Path,
@@ -467,22 +394,13 @@ impl IndexPipeline {
             root = %root.display()
         )
         .entered();
-        let mut indexed = self.index_file(path, blob_store)?;
-        let normalized = normalize_file_path_id(path, root);
-        // Re-assign file_id and file_origin on all entities.
-        indexed.file_id = normalized.clone();
-        indexed.file_layout.file_id = normalized.clone();
-        for entity in &mut indexed.entities {
-            entity.file_origin = Some(normalized.clone());
-            if let Some(ref mut span) = entity.span {
-                span.file = normalized.clone();
-            }
-        }
-        Ok(indexed)
+        Ok(self
+            .index_file_relative_with_tests(path, blob_store, root)?
+            .indexed_file)
     }
 
-    /// Index a file, normalizing its `FilePathId` relative to the given root and
-    /// retaining parser-emitted tests.
+    /// Index a file, deriving identity from the root-relative path and retaining
+    /// parser-emitted tests.
     pub fn index_file_relative_with_tests(
         &self,
         path: &Path,
@@ -495,17 +413,12 @@ impl IndexPipeline {
             root = %root.display()
         )
         .entered();
-        let mut indexed = self.index_file_with_tests(path, blob_store)?;
-        let normalized = normalize_file_path_id(path, root);
-        indexed.indexed_file.file_id = normalized.clone();
-        indexed.indexed_file.file_layout.file_id = normalized.clone();
-        for entity in &mut indexed.indexed_file.entities {
-            entity.file_origin = Some(normalized.clone());
-            if let Some(ref mut span) = entity.span {
-                span.file = normalized.clone();
-            }
-        }
-        Ok(indexed)
+        let source =
+            std::fs::read(path).map_err(|e| IndexError::io(path.display().to_string(), e))?;
+        let blob_hash = blob_store.write(&source)?;
+        debug!(path = %path.display(), hash = %blob_hash, "stored source blob");
+        let file_id = normalize_file_path_id(path, root);
+        self.index_file_content_with_tests(&file_id, &source, blob_hash)
     }
 
     /// Index any file by classifying it first, then routing to the right handler.
@@ -979,5 +892,203 @@ mod tests {
         assert_eq!(classify_file_role("docs/guide.md"), EntityRole::Docs);
         assert_eq!(classify_file_role("README.md"), EntityRole::Docs);
         assert_eq!(classify_file_role("doc/api.rst"), EntityRole::Docs);
+    }
+
+    // Relative indexing must derive entity/relation identity from the
+    // root-relative path, never the machine-absolute path, so that the init and
+    // reconcile paths agree and identical content produces identical IDs across
+    // machines and checkout locations.
+
+    const REL_RUST_SRC: &[u8] = b"pub struct Point { x: f64, y: f64 }\n\
+impl Point { pub fn origin() -> Point { Point { x: 0.0, y: 0.0 } } }\n\
+pub fn add(a: i32, b: i32) -> i32 { a + b }\n";
+
+    fn write_repo_file(root: &Path, rel: &str, content: &[u8]) -> std::path::PathBuf {
+        let abs = root.join(rel);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&abs, content).unwrap();
+        abs
+    }
+
+    fn entity_id_set(indexed: &IndexedFile) -> std::collections::HashSet<kin_model::EntityId> {
+        indexed.entities.iter().map(|e| e.id).collect()
+    }
+
+    fn relation_id_set(indexed: &IndexedFile) -> std::collections::HashSet<kin_model::RelationId> {
+        indexed.relations.iter().map(|r| r.id).collect()
+    }
+
+    #[test]
+    fn relative_index_derives_entity_ids_from_relative_path_not_absolute() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let blob_store = BlobStore::new(root.join("blobs")).unwrap();
+        let pipeline = IndexPipeline::new();
+
+        let abs = write_repo_file(root, "src/geo/point.rs", REL_RUST_SRC);
+        let indexed = pipeline
+            .index_file_relative(&abs, &blob_store, root)
+            .unwrap();
+
+        assert_eq!(indexed.file_id.0, "src/geo/point.rs");
+
+        let mut checked = 0;
+        for entity in &indexed.entities {
+            let Some(span) = entity.span.as_ref() else {
+                continue;
+            };
+            let relative = kin_model::EntityId::from_content(
+                "src/geo/point.rs",
+                &entity.name,
+                &format!("{:?}", entity.kind),
+                span.start_line,
+            );
+            let absolute = kin_model::EntityId::from_content(
+                &abs.display().to_string(),
+                &entity.name,
+                &format!("{:?}", entity.kind),
+                span.start_line,
+            );
+            assert_eq!(
+                entity.id, relative,
+                "entity {} is not addressed by its relative path",
+                entity.name
+            );
+            assert_ne!(
+                entity.id, absolute,
+                "entity {} still bakes the machine-absolute path",
+                entity.name
+            );
+            assert_eq!(entity.file_origin.as_ref().unwrap().0, "src/geo/point.rs");
+            checked += 1;
+        }
+        assert!(checked >= 2, "expected at least two spanned entities");
+    }
+
+    #[test]
+    fn relative_index_is_invariant_across_absolute_roots() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let blob_a = BlobStore::new(dir_a.path().join("blobs")).unwrap();
+        let blob_b = BlobStore::new(dir_b.path().join("blobs")).unwrap();
+        let pipeline = IndexPipeline::new();
+
+        let abs_a = write_repo_file(dir_a.path(), "src/foo.rs", REL_RUST_SRC);
+        let abs_b = write_repo_file(dir_b.path(), "src/foo.rs", REL_RUST_SRC);
+
+        let a = pipeline
+            .index_file_relative(&abs_a, &blob_a, dir_a.path())
+            .unwrap();
+        let b = pipeline
+            .index_file_relative(&abs_b, &blob_b, dir_b.path())
+            .unwrap();
+
+        assert!(!a.entities.is_empty());
+        assert_eq!(
+            entity_id_set(&a),
+            entity_id_set(&b),
+            "entity IDs must not depend on the absolute checkout location"
+        );
+        assert_eq!(
+            relation_id_set(&a),
+            relation_id_set(&b),
+            "relation IDs must not depend on the absolute checkout location"
+        );
+    }
+
+    #[test]
+    fn reconcile_relative_matches_init_content_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let blob_store = BlobStore::new(root.join("blobs")).unwrap();
+        let pipeline = IndexPipeline::new();
+
+        let abs = write_repo_file(root, "src/foo.rs", REL_RUST_SRC);
+
+        // reconcile path: absolute path on disk, normalized against the root.
+        let reconcile = pipeline
+            .index_file_relative(&abs, &blob_store, root)
+            .unwrap();
+
+        // init path: already-loaded content addressed by the relative file_id.
+        let content = std::fs::read(&abs).unwrap();
+        let blob_hash = blob_store.write(&content).unwrap();
+        let init = pipeline
+            .index_file_content_with_tests(&FilePathId::new("src/foo.rs"), &content, blob_hash)
+            .unwrap()
+            .indexed_file;
+
+        assert_eq!(
+            entity_id_set(&reconcile),
+            entity_id_set(&init),
+            "reconcile must produce the same entity IDs as init"
+        );
+        assert_eq!(
+            relation_id_set(&reconcile),
+            relation_id_set(&init),
+            "reconcile must produce the same relation IDs as init"
+        );
+    }
+
+    #[test]
+    fn relative_index_relations_reference_local_entities() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let blob_store = BlobStore::new(root.join("blobs")).unwrap();
+        let pipeline = IndexPipeline::new();
+
+        let abs = write_repo_file(root, "src/foo.rs", REL_RUST_SRC);
+        let indexed = pipeline
+            .index_file_relative(&abs, &blob_store, root)
+            .unwrap();
+
+        let ids = entity_id_set(&indexed);
+        for rel in &indexed.relations {
+            if let kin_model::GraphNodeId::Entity(src) = &rel.src {
+                assert!(
+                    ids.contains(src),
+                    "relation src {src:?} is not a local entity"
+                );
+            }
+            if let kin_model::GraphNodeId::Entity(dst) = &rel.dst {
+                assert!(
+                    ids.contains(dst),
+                    "relation dst {dst:?} is not a local entity"
+                );
+            }
+        }
+        for unresolved in &indexed.unresolved_relations {
+            assert!(
+                ids.contains(&unresolved.src_entity_id),
+                "unresolved relation src {:?} is not a local entity",
+                unresolved.src_entity_id
+            );
+        }
+    }
+
+    #[test]
+    fn relative_hint_index_matches_non_hint_relative_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let blob_store = BlobStore::new(root.join("blobs")).unwrap();
+        let pipeline = IndexPipeline::new();
+
+        let abs = write_repo_file(root, "src/foo.rs", REL_RUST_SRC);
+
+        let full = pipeline
+            .index_file_relative(&abs, &blob_store, root)
+            .unwrap();
+        let (hinted, _tree) = pipeline
+            .index_file_relative_with_hint(&abs, &blob_store, root, None, None)
+            .unwrap();
+
+        assert_eq!(hinted.file_id.0, "src/foo.rs");
+        assert_eq!(
+            entity_id_set(&full),
+            entity_id_set(&hinted),
+            "incremental and full relative indexing must agree on entity IDs"
+        );
     }
 }
