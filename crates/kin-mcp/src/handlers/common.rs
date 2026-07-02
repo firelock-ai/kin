@@ -1462,8 +1462,9 @@ pub fn parse_capabilities(args: &HashMap<String, serde_json::Value>) -> SessionC
 pub fn build_semantic_search_request(
     args: &HashMap<String, serde_json::Value>,
 ) -> Result<(String, usize, EntityFilter)> {
+    const MAX_LIMIT: usize = 200;
     let query = get_string_param(args, "query")?;
-    let limit = get_optional_u64(args, "limit", 20) as usize;
+    let limit = (get_optional_u64(args, "limit", 20) as usize).clamp(1, MAX_LIMIT);
 
     let kind_str = args.get("kind").and_then(|v| v.as_str());
     let kind_filter = kind_str.and_then(parse_kind_filter);
