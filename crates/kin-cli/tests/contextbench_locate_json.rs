@@ -75,21 +75,41 @@ fn contextbench_locate_keeps_query_selection_and_normalization_inside_kin() {
     )
     .expect("write task file");
 
-    let locate = Command::new(env!("CARGO_BIN_EXE_kin"))
-        .args([
-            "contextbench-locate",
-            "--json",
-            "--task-file",
-            task_file.to_str().expect("task path"),
-        ])
-        .env("KIN_DAEMON_BIN", common::fresh_daemon_bin())
-        .env("KIN_DAEMON_DISABLE_LSP", "1")
-        .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1")
-        .env("KIN_DAEMON_READY_TIMEOUT_SECS", "30")
-        .env("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", "1")
-        .current_dir(repo.path())
-        .output()
-        .expect("run kin contextbench-locate");
+    // The daemon autostart reserves a free TCP port, releases it, then rebinds
+    // it when spawning kin-daemon, so under parallel test load another process
+    // can claim the port in the gap and the daemon exits during startup. Each
+    // attempt rebinds a fresh port, so a bounded retry clears that transient
+    // startup race without masking a genuine failure.
+    let daemon_bin = common::fresh_daemon_bin();
+    let mut locate = None;
+    for attempt in 1..=8u64 {
+        let out = Command::new(env!("CARGO_BIN_EXE_kin"))
+            .args([
+                "contextbench-locate",
+                "--json",
+                "--task-file",
+                task_file.to_str().expect("task path"),
+            ])
+            .env("KIN_DAEMON_BIN", &daemon_bin)
+            .env("KIN_DAEMON_DISABLE_LSP", "1")
+            .env("KIN_DAEMON_IDLE_TIMEOUT_SECS", "1")
+            .env("KIN_DAEMON_READY_TIMEOUT_SECS", "30")
+            .env("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", "1")
+            .current_dir(repo.path())
+            .output()
+            .expect("run kin contextbench-locate");
+        if out.status.success() {
+            locate = Some(out);
+            break;
+        }
+        eprintln!(
+            "contextbench-locate attempt {attempt}/8 failed, retrying: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        locate = Some(out);
+        std::thread::sleep(std::time::Duration::from_millis(200 * attempt));
+    }
+    let locate = locate.expect("contextbench-locate produced output");
     let payload = parse_json_output(&locate, "kin contextbench-locate --json");
 
     assert_eq!(payload["schema"], "kin.contextbench-locate.v1");
