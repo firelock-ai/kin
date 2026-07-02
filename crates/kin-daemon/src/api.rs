@@ -10295,10 +10295,13 @@ mod tests {
             "kin xref CLI must resolve consumer->provider: {cli_xref:?}"
         );
 
-        let cli_impact = get_spine_impact(&layout, "provider", &do_work_id, 5)
+        let cli_impact = match get_spine_impact(&layout, "provider", &do_work_id, 5)
             .await
             .expect("CLI get_spine_impact call")
-            .expect("CLI get_spine_impact returns impact");
+        {
+            kin_spine::SpineQuery::Found(impact) => impact,
+            other => panic!("CLI get_spine_impact expected Found, got {other:?}"),
+        };
         let cli_impact_hits_consumer = cli_impact.repos_involved.iter().any(|r| r == "consumer");
         assert!(
             cli_impact_hits_consumer,
@@ -10341,6 +10344,76 @@ mod tests {
             daemon_xref_to_provider && cli_xref_to_provider && mcp_xref_to_provider,
             "daemon, CLI, and MCP must all resolve the same consumer->provider xref"
         );
+
+        std::env::remove_var("KIN_DAEMON_URL");
+        server.abort();
+    }
+
+    /// Fail-loud contract: when a spine endpoint IS configured but the daemon
+    /// answers non-2xx (e.g. `503` because the spine is disabled), every client
+    /// surface must report the gap as `SpineQuery::Unavailable` — never collapse
+    /// it into a silent empty result (the old `Ok(None)` swallow) nor a quiet
+    /// `NotConfigured`. This is the cross-repo analogue of the graph-first
+    /// "fail loud or report the gap" rule, enforced across CLI and MCP.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spine_clients_surface_unavailable_on_non_success_status() {
+        use kin_cli::backend::{get_spine_impact, get_spine_xref};
+        use kin_mcp::handlers::common::{fetch_spine_impact_typed, fetch_spine_xref};
+
+        // A stand-in daemon that answers every route 503. No real graph and no
+        // autostart — the clients reach it purely through KIN_DAEMON_URL.
+        async fn always_unavailable() -> StatusCode {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, Router::new().fallback(always_unavailable)).await;
+        });
+        std::env::set_var("KIN_DAEMON_URL", format!("http://{addr}"));
+
+        let layout = test_state().layout.clone();
+        let repo = "consumer";
+        let entity = EntityId::new();
+
+        // ── CLI xref: configured-but-failing must be Unavailable, naming 503. ──
+        match get_spine_xref(&layout, repo, &entity)
+            .await
+            .expect("CLI get_spine_xref call")
+        {
+            kin_spine::SpineQuery::Unavailable(reason) => {
+                assert!(
+                    reason.contains("503"),
+                    "reason must name the status: {reason}"
+                );
+            }
+            other => panic!("CLI xref must be Unavailable on 503, got {other:?}"),
+        }
+
+        // ── CLI impact: the surface migrated off the Ok(None) swallow. ──
+        match get_spine_impact(&layout, repo, &entity, 5)
+            .await
+            .expect("CLI get_spine_impact call")
+        {
+            kin_spine::SpineQuery::Unavailable(reason) => {
+                assert!(
+                    reason.contains("503"),
+                    "reason must name the status: {reason}"
+                );
+            }
+            other => panic!("CLI impact must be Unavailable on 503, got {other:?}"),
+        }
+
+        // ── MCP xref + impact: same fail-loud contract. ──
+        match fetch_spine_xref(repo, &entity).await {
+            kin_spine::SpineQuery::Unavailable(_) => {}
+            other => panic!("MCP xref must be Unavailable on 503, got {other:?}"),
+        }
+        match fetch_spine_impact_typed(repo, &entity, 5).await {
+            kin_spine::SpineQuery::Unavailable(_) => {}
+            other => panic!("MCP impact must be Unavailable on 503, got {other:?}"),
+        }
 
         std::env::remove_var("KIN_DAEMON_URL");
         server.abort();
