@@ -163,7 +163,72 @@ fn extract_java_node(
                 }
             }
         }
+        "record_declaration" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = name_node.utf8_text(source).unwrap_or("").to_string();
+                let vis = detect_java_visibility(node, source);
+                // A record is modeled as a Class; its components live in the
+                // signature via node_signature (the record header line).
+                entities.push(ExtractedEntity {
+                    kind: EntityKind::Class,
+                    name: name.clone(),
+                    signature: node_signature(node, source),
+                    visibility: vis,
+                    doc_summary: extract_preceding_comment(node, source),
+                    fingerprint: compute_fingerprint(node, source),
+                    span: span_from_node(node, file_id),
+                });
+
+                // Records cannot extend a superclass, but they may implement interfaces.
+                if let Some(ifaces) = node.child_by_field_name("interfaces") {
+                    let mut iface_cursor = ifaces.walk();
+                    for iface in ifaces.children(&mut iface_cursor) {
+                        if iface.is_named() {
+                            let iface_name = iface.utf8_text(source).unwrap_or("").to_string();
+                            if !iface_name.is_empty() {
+                                relations.push(ExtractedRelation {
+                                    kind: kin_model::RelationKind::Implements,
+                                    src_name: name.clone(),
+                                    dst_name: iface_name,
+                                    import_source: None,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Recurse into the record body, mirroring the class arm's member handling.
+                if let Some(body) = node.child_by_field_name("body") {
+                    let mut body_cursor = body.walk();
+                    for member in body.children(&mut body_cursor) {
+                        extract_java_node(
+                            &member,
+                            source,
+                            file_id,
+                            Some(&name),
+                            entities,
+                            relations,
+                        );
+                    }
+                }
+            }
+        }
         "interface_declaration" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = name_node.utf8_text(source).unwrap_or("").to_string();
+                entities.push(ExtractedEntity {
+                    kind: EntityKind::Interface,
+                    name,
+                    signature: node_signature(node, source),
+                    visibility: detect_java_visibility(node, source),
+                    doc_summary: extract_preceding_comment(node, source),
+                    fingerprint: compute_fingerprint(node, source),
+                    span: span_from_node(node, file_id),
+                });
+            }
+        }
+        // An annotation type (`@interface`) is modeled as an Interface.
+        "annotation_type_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
                 entities.push(ExtractedEntity {
@@ -677,5 +742,69 @@ public class Service {
             .filter(|r| r.kind == kin_model::RelationKind::Contains && r.src_name == "Color")
             .collect();
         assert_eq!(contains.len(), 3);
+    }
+
+    #[test]
+    fn parse_java_record() {
+        let adapter = JavaAdapter;
+        let source =
+            b"public record Point(int x, int y) implements Comparable { public int sum() { return x + y; } }";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("Point.java");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let classes: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Class)
+            .collect();
+        assert_eq!(classes.len(), 1);
+        assert_eq!(classes[0].name, "Point");
+        // Record components are carried in the signature.
+        assert!(
+            classes[0].signature.contains("(int x, int y)"),
+            "record signature should include components, got {:?}",
+            classes[0].signature
+        );
+
+        // Body members are extracted and Contained, mirroring the class arm.
+        let methods: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Method)
+            .collect();
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0].name, "Point.sum");
+        assert!(output
+            .relations
+            .iter()
+            .any(|r| r.kind == kin_model::RelationKind::Contains
+                && r.src_name == "Point"
+                && r.dst_name == "Point.sum"));
+
+        // Implemented interfaces become Implements relations.
+        assert!(output
+            .relations
+            .iter()
+            .any(|r| r.kind == kin_model::RelationKind::Implements
+                && r.src_name == "Point"
+                && r.dst_name == "Comparable"));
+    }
+
+    #[test]
+    fn parse_java_annotation_type() {
+        let adapter = JavaAdapter;
+        let source = b"public @interface Marker { String value(); }";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("Marker.java");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let ifaces: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Interface)
+            .collect();
+        assert_eq!(ifaces.len(), 1);
+        assert_eq!(ifaces[0].name, "Marker");
+        assert_eq!(ifaces[0].visibility, Visibility::Public);
     }
 }

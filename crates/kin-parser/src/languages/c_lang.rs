@@ -129,6 +129,23 @@ fn extract_c_node(
                 }
             }
         }
+        // A union is modeled as a Class, mirroring struct handling.
+        "union_specifier" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = name_node.utf8_text(source).unwrap_or("").to_string();
+                if !name.is_empty() {
+                    entities.push(ExtractedEntity {
+                        kind: EntityKind::Class,
+                        name,
+                        signature: node_signature(node, source),
+                        visibility: Visibility::Public,
+                        doc_summary: extract_preceding_comment(node, source),
+                        fingerprint: compute_fingerprint(node, source),
+                        span: span_from_node(node, file_id),
+                    });
+                }
+            }
+        }
         "enum_specifier" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
@@ -246,6 +263,25 @@ fn extract_declaration(
     // Check for struct_specifier inside the declaration
     if let Some(struct_node) = find_child_of_kind(node, "struct_specifier") {
         if let Some(name_node) = struct_node.child_by_field_name("name") {
+            let name = name_node.utf8_text(source).unwrap_or("").to_string();
+            if !name.is_empty() {
+                entities.push(ExtractedEntity {
+                    kind: EntityKind::Class,
+                    name,
+                    signature: node_signature(node, source),
+                    visibility: Visibility::Public,
+                    doc_summary: extract_preceding_comment(node, source),
+                    fingerprint: compute_fingerprint(node, source),
+                    span: span_from_node(node, file_id),
+                });
+                return;
+            }
+        }
+    }
+
+    // Check for union_specifier inside the declaration (mirrors struct handling)
+    if let Some(union_node) = find_child_of_kind(node, "union_specifier") {
+        if let Some(name_node) = union_node.child_by_field_name("name") {
             let name = name_node.utf8_text(source).unwrap_or("").to_string();
             if !name.is_empty() {
                 entities.push(ExtractedEntity {
@@ -871,6 +907,39 @@ int compute(Point p) { return internal_helper() + p.x; }
         for call in &calls {
             assert_eq!(call.src_name, "my_func");
         }
+    }
+
+    #[test]
+    fn extract_union() {
+        let adapter = CAdapter;
+        let source = b"union Value { int i; float f; };";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.c");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let unions: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Class)
+            .collect();
+        assert_eq!(unions.len(), 1);
+        assert_eq!(unions[0].name, "Value");
+        assert_eq!(unions[0].visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn extract_union_declared_with_variable() {
+        let adapter = CAdapter;
+        let source = b"union Data { int i; float f; } shared;";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.c");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let unions: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Class)
+            .collect();
+        assert_eq!(unions.len(), 1);
+        assert_eq!(unions[0].name, "Data");
     }
 }
 

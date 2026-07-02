@@ -196,6 +196,10 @@ fn extract_cpp_node(
         "struct_specifier" => {
             extract_class_or_struct(node, source, file_id, true, entities, relations);
         }
+        // A union is modeled as a Class; its members default to public like a struct.
+        "union_specifier" => {
+            extract_class_or_struct(node, source, file_id, true, entities, relations);
+        }
         "enum_specifier" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = name_node.utf8_text(source).unwrap_or("").to_string();
@@ -298,6 +302,7 @@ fn extract_cpp_node(
                 match child.kind() {
                     "class_specifier"
                     | "struct_specifier"
+                    | "union_specifier"
                     | "function_definition"
                     | "declaration" => {
                         extract_cpp_node(
@@ -1549,6 +1554,60 @@ namespace ns {
         for call in &calls {
             assert_eq!(call.src_name, "MyClass::my_method");
         }
+    }
+
+    #[test]
+    fn extract_union() {
+        let adapter = CppAdapter;
+        let source = b"union Value { int i; float f; };";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("value.cpp");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let unions: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Class)
+            .collect();
+        assert_eq!(unions.len(), 1);
+        assert_eq!(unions[0].name, "Value");
+    }
+
+    #[test]
+    fn extract_union_with_method() {
+        let adapter = CppAdapter;
+        let source = br#"
+union Tagged {
+    int as_int() { return 0; }
+};
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("tagged.cpp");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let unions: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Class)
+            .collect();
+        assert_eq!(unions.len(), 1);
+        assert_eq!(unions[0].name, "Tagged");
+
+        let methods: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Method)
+            .collect();
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0].name, "Tagged::as_int");
+        // Union members default to public, mirroring struct.
+        assert_eq!(methods[0].visibility, Visibility::Public);
+
+        assert!(output
+            .relations
+            .iter()
+            .any(|r| r.kind == kin_model::RelationKind::Contains
+                && r.src_name == "Tagged"
+                && r.dst_name == "Tagged::as_int"));
     }
 }
 
