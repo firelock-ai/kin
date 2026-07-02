@@ -5,6 +5,11 @@
 Universal transformer inference engine in pure Rust. Custom GPU compute shaders, no external ML frameworks.
 
 ## Build
+
+GPU or Metal test runs must first acquire the umbrella GPU lane with
+`bin/kin-lane acquire gpu <lane> --pid <pid>` from the ecosystem root. Do not run
+GPU tests in parallel with proof or benchmark work.
+
 ```bash
 cargo build                          # CPU only
 cargo build --features metal         # macOS: Apple Metal GPU
