@@ -220,8 +220,8 @@ fn build_file_import_context(imports: &[FileImport]) -> Option<String> {
         let mut names = Vec::new();
         let mut name_seen = std::collections::HashSet::new();
         for spec in import.specifiers.iter().take(8) {
-            for candidate in std::iter::once(spec.local_name.as_str())
-                .chain(spec.original_name.as_deref().into_iter())
+            for candidate in
+                std::iter::once(spec.local_name.as_str()).chain(spec.original_name.as_deref())
             {
                 for form in expanded_search_forms(candidate) {
                     if name_seen.insert(form.clone()) {
