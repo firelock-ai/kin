@@ -36,6 +36,7 @@ pub mod import;
 pub mod init;
 pub mod intent;
 pub mod locate;
+pub mod locate_cursor;
 pub mod locate_debug;
 pub mod locate_telemetry;
 pub mod log;

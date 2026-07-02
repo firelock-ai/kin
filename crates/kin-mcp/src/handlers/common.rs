@@ -855,11 +855,22 @@ pub fn push_indented_body(
 
 #[derive(Debug, Clone)]
 pub struct ReferenceRow {
+    /// Graph entity id of the referencing (caller) entity, when it is a
+    /// graph-owned local entity. Lets an agent drill a reference straight to the
+    /// caller's body (`get_entity_source`/`get_context_pack`) without re-resolving
+    /// the caller by name — the keystone of the no-filesystem reference→body
+    /// chain. `None` for federated spine xrefs (no local entity).
+    pub entity_id: Option<String>,
     pub name: String,
     pub kind: Option<String>,
     pub file_path: Option<String>,
     pub start_line: Option<u32>,
     pub signature: Option<String>,
+    /// Bounded inline body excerpt of the referencing entity, projected from the
+    /// same content-addressed, hash-verified graph body that backs
+    /// `get_entity_source` (never a working-tree read). `None` on a graph/blob
+    /// miss or for pathless/federated rows.
+    pub snippet: Option<String>,
     pub relation_kinds: Vec<RelationKind>,
 }
 
@@ -891,11 +902,16 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
         let file_path = entity.file_origin.as_ref().map(|path| path.0.clone());
         let key = reference_row_key(file_path.as_deref(), &entity.name);
         let entry = grouped.entry(key).or_insert_with(|| ReferenceRow {
+            entity_id: Some(source_entity_id.to_string()),
             name: entity.name.clone(),
             kind: Some(format!("{:?}", entity.kind)),
             file_path: file_path.clone(),
             start_line: entity.span.as_ref().map(|span| span.start_line),
             signature: Some(entity.signature.clone()),
+            // Project the caller's bounded body once, where the entity is in
+            // hand, so `find_references` hands back act-on-able code per caller
+            // without a follow-up id→body round-trip.
+            snippet: read_bounded_entity_snippet(store, &entity),
             relation_kinds: Vec::new(),
         });
         if entry.file_path.is_none() {

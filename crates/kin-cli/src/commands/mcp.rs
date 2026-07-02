@@ -41,6 +41,10 @@ pub async fn start(global: bool) -> Result<()> {
         match std::env::var("KIN_MCP_TOOL_PROFILE").ok().as_deref() {
             Some("agent-default") => Some(kin_mcp::agent_default_tool_names()),
             Some("benchmark") => Some(kin_mcp::benchmark_tool_names()),
+            // Read-only graph-native ContextBench belt: no write-side session/
+            // transaction tools and no filesystem tools (none exist) — the
+            // purely graph-native arm.
+            Some("context-bench") => Some(kin_mcp::context_bench_tool_names()),
             _ => None,
         };
     if let Some(names) = profile_tools {
