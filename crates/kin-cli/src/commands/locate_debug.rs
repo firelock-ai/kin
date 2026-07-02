@@ -70,6 +70,8 @@ pub struct DebugInfoReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scoring_track: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fast_path: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped_signals: Vec<String>,
@@ -280,6 +282,7 @@ fn build_report(query: &str, gold_files: &[String], result: &LocateResult) -> De
 
     let debug_info = result.debug.as_ref().map(|d| DebugInfoReport {
         scoring_track: d.scoring_track.clone(),
+        retrieval_profile: d.retrieval_profile.clone(),
         fast_path: d.fast_path.clone(),
         skipped_signals: d.skipped_signals.clone(),
         query_terms: d.query_terms.clone(),
@@ -331,6 +334,9 @@ fn print_human_report(report: &DebugReport) {
     if let Some(ref info) = report.debug_info {
         if let Some(ref track) = info.scoring_track {
             println!("Track:    {}", track);
+        }
+        if let Some(ref profile) = info.retrieval_profile {
+            println!("Profile:  {}", profile);
         }
         if let Some(ref fp) = info.fast_path {
             println!("Fast path: {}", fp);

@@ -220,6 +220,12 @@ impl SnippetOptions {
 pub struct LocateDebugInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scoring_track: Option<String>,
+    /// Active retrieval quality profile (name + version, e.g. `compat-v0` /
+    /// `accuracy-v1`) resolved from `KIN_PROFILE` for this query, so every
+    /// `--explain` result is attributable to the serving profile that produced
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub traceback_top: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1963,6 +1969,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         let resolve_identity = entity_resolve_identity(&all_entity_seeds, graph)?;
         Some(LocateDebugInfo {
             scoring_track: Some(format!("{track:?}")),
+            retrieval_profile: Some(quality.name().to_string()),
             traceback_top: Some(traceback_top),
             resolve_top: Some(resolve_top),
             resolve_gap: Some(resolve_gap),
@@ -15318,6 +15325,26 @@ mod tests {
         let json = serde_json::to_string(&tagged).unwrap();
         assert!(json.contains("\"origin\":\"vector\""));
         assert!(json.contains("\"cosine\":0.87"));
+    }
+
+    #[test]
+    fn locate_debug_info_serializes_retrieval_profile_and_omits_when_unset() {
+        let with_profile = LocateDebugInfo {
+            retrieval_profile: Some("compat-v0".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&with_profile).unwrap();
+        assert!(
+            json.contains("\"retrieval_profile\":\"compat-v0\""),
+            "--explain debug must carry the active profile name+version: {json}"
+        );
+
+        let unset = LocateDebugInfo::default();
+        let json = serde_json::to_string(&unset).unwrap();
+        assert!(
+            !json.contains("retrieval_profile"),
+            "retrieval_profile is omitted from output when unset: {json}"
+        );
     }
 
     fn sym(name: &str, score: f32, definition: bool) -> LocateSymbol {
