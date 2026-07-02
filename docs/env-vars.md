@@ -47,7 +47,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_ORIGINAL_PATH` | path | *(unset)* | operational | caller's original PATH preserved across a with/exec shim |
 | `KIN_PLUGIN_DIR` | path | *(unset)* | operational | plugin directory override |
 | `KIN_PRIMARY_REPO_ID` | string | *(unset)* | operational | primary repo id for a multi-repo daemon |
-| `KIN_PROFILE` | string | accuracy-v1 | correctness | retrieval quality profile: accuracy-v1 (default) or compat-v0 (legacy ranking behavior); proof runs pin this explicitly |
+| `KIN_PROFILE` | string | compat-v0 | correctness | retrieval quality profile: compat-v0 (default, pre-profile behavior) or accuracy-v1 (opt-in candidate pending A/B-tuned graduation); proof runs pin this explicitly |
 | `KIN_REGEN_ENV_DOC` | string | *(unset)* | diagnostic | dev/test tooling: set to regenerate docs/env-vars.md from the registry |
 | `KIN_REMOTE_URL` | url | *(unset)* | operational | native remote endpoint URL |
 | `KIN_REPO_ID` | string | *(unset)* | operational | active repo id override |

@@ -10,15 +10,19 @@
 //! lever exports, and so future lever flips land as a new version rather than
 //! silently changing what an existing pin means.
 //!
-//! - `accuracy-v1` (default): the measured-accuracy serving shape. The MCP
+//! - `compat-v0` (default): byte-identical to the pre-profile serving
+//!   behavior. The MCP `semantic_locate` tool keeps the single-vector cosine
+//!   ranking, and every lever keeps its historical default. It is the default
+//!   because a paired A/B on the frozen multi-file diagnostic measured the
+//!   accuracy-v1 candidate REGRESSING the CLI agent arm on every localization
+//!   metric; accuracy-v1 stays opt-in until its levers are tuned and graduate
+//!   on measurement.
+//! - `accuracy-v1` (opt-in): the candidate serving shape. The MCP
 //!   `semantic_locate` tool routes through the full fused locate pipeline,
 //!   entity-granularity fusion and the lexical parity floor are on, the
 //!   cross-encoder reranker runs in promotion-only blend mode under a latency
 //!   budget when its model is already cached locally, and the embedding
 //!   seed floor actually rejects near-orthogonal noise.
-//! - `compat-v0`: byte-identical to the pre-profile serving behavior. The MCP
-//!   `semantic_locate` tool keeps the single-vector cosine ranking, and every
-//!   lever keeps its historical default.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -174,7 +178,7 @@ impl RetrievalProfile {
 
 impl Default for RetrievalProfile {
     fn default() -> Self {
-        Self::AccuracyV1
+        Self::CompatV0
     }
 }
 
@@ -217,7 +221,7 @@ mod tests {
     #[serial_test::serial]
     fn profile_resolves_from_env_with_aliases_and_default() {
         std::env::remove_var("KIN_PROFILE");
-        assert_eq!(RetrievalProfile::from_env(), RetrievalProfile::AccuracyV1);
+        assert_eq!(RetrievalProfile::from_env(), RetrievalProfile::CompatV0);
 
         std::env::set_var("KIN_PROFILE", "compat-v0");
         assert_eq!(RetrievalProfile::from_env(), RetrievalProfile::CompatV0);
@@ -228,9 +232,9 @@ mod tests {
         std::env::set_var("KIN_PROFILE", "ACCURACY-V1");
         assert_eq!(RetrievalProfile::from_env(), RetrievalProfile::AccuracyV1);
 
-        // Unknown values must not silently select compat behavior.
+        // Unknown values must not silently select a different serving shape.
         std::env::set_var("KIN_PROFILE", "warp-speed");
-        assert_eq!(RetrievalProfile::from_env(), RetrievalProfile::AccuracyV1);
+        assert_eq!(RetrievalProfile::from_env(), RetrievalProfile::CompatV0);
 
         std::env::remove_var("KIN_PROFILE");
     }

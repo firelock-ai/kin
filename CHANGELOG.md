@@ -13,6 +13,8 @@ Session-aware runtime, a shadow-mode merge gate, a hardened first-run installer,
 
 ### Added
 
+- Retrieval quality profiles (`KIN_PROFILE`): `compat-v0` (default, the pre-profile serving behavior) and `accuracy-v1` (opt-in candidate: fused `semantic_locate` serving, entity-granularity fusion, lexical parity floor, promotion-only cross-encoder blend). Both ship structured `degradations[]` reporting and a per-stage prune ledger for miss forensics; the candidate graduates to default only on measured wins.
+- Go interface methods are extracted as first-class graph entities, closing a symbol-recall gap on Go codebases.
 - Session runtime for ordinary tools: `kin exec -- <cmd>` (new alias `kin run`) runs commands in a graph-backed session workspace, reconciles on success, and preserves the workspace with recovery commands on failure; `--keep` defers reconcile and `--discard` skips it.
 - Agent session launches: `kin with --session <assistant> -- <task>` starts the assistant inside a session workspace with its cwd, file shims, session identity (`KIN_SESSION`, `KIN_SESSION_ID`, `KIN_SESSION_DIR`), and daemon binding (`KIN_DAEMON_URL`, `KIN_REPO_ID`) pointed at the same repository — MCP tools spawned by the assistant bind to the same daemon and session.
 - External-tool detection now covers package managers (`npm`, `npx`, `pnpm`, `pnpx`, `yarn`, `bun`, `bunx`, `corepack`), which widen scoped execution to a full workspace under the default policy.
@@ -35,6 +37,7 @@ Session-aware runtime, a shadow-mode merge gate, a hardened first-run installer,
 - `get_entity_source` distinguishes "entity not found" from "entity found but has no source" instead of collapsing both into one error.
 - Release builds no longer self-report a spurious `-dirty` version suffix: the in-tree CI checkouts of `kin-vfs`/`kin-db` are ignored, so a clean tagged tree stamps a clean version.
 - Unified `sha1`/`sha2` on `digest` 0.11 to repair a registry checksum break, and refreshed pinned dependencies (`anyhow`, `uuid`, `tree-sitter-rust`, `notify`, `sysinfo`).
+- `kin-daemon --compat-json` emits its payload before logging or env validation can write to stdout, so a `KIN_*` override warning can no longer corrupt the CLI's daemon-compat probe into a spurious "daemon stale" failure; a regression test guards the probe's stdout purity.
 
 ## [0.2.5] - 2026-07-01
 
