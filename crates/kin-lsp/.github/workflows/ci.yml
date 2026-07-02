@@ -54,27 +54,3 @@ jobs:
 
       - name: Test
         run: cargo test
-
-  notify-downstream:
-    name: Notify Downstream Repos
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    needs: [check]
-    runs-on: ubuntu-latest
-    env:
-      DISPATCH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
-    steps:
-      - name: Trigger kin CI
-        # Skip cleanly when DISPATCH_TOKEN is not provisioned so the job stays
-        # green instead of failing on a missing secret (secrets can't be read
-        # in a job-level `if:`, so the guard lives on the step). kin consumes
-        # kin-lsp directly, so it is the downstream to rebuild on a change here.
-        if: env.DISPATCH_TOKEN != ''
-        uses: peter-evans/repository-dispatch@v3
-        with:
-          # Requires a PAT with repo scope stored as the DISPATCH_TOKEN secret.
-          # Create at: GitHub > Settings > Developer settings > Personal access tokens
-          # Then add to: kin-lsp repo > Settings > Secrets > Actions > DISPATCH_TOKEN
-          token: ${{ secrets.DISPATCH_TOKEN }}
-          repository: firelock-ai/kin
-          event-type: dependency-updated
-          client-payload: '{"source": "kin-lsp", "sha": "${{ github.sha }}"}'
