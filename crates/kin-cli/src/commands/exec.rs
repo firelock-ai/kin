@@ -729,6 +729,7 @@ mod tests {
         std::fs::write(repo.path().join("package.json"), "{\"name\":\"app\"}\n").unwrap();
         std::fs::create_dir_all(&session_dir).unwrap();
         std::fs::write(session_dir.join("package.json"), "{\"name\":\"app\"}\n").unwrap();
+        crate::commands::session_base::record_materialized_base(&session_dir, None).unwrap();
 
         // Fake npm: emits a lockfile plus a node_modules tree, like a real install.
         let mut env = stub_tool(
@@ -819,6 +820,7 @@ mod tests {
             "services:\n  app:\n    image: alpine\n",
         )
         .unwrap();
+        crate::commands::session_base::record_materialized_base(&session_dir, None).unwrap();
 
         // Fake docker: validates that the compose file is visible from the
         // workspace cwd, like `docker compose config` would.

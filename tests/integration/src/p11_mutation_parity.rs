@@ -15,6 +15,23 @@ use kin_runtime::workspace::{MaterializeStrategy, MaterializedWorkspace};
 
 use crate::helpers::*;
 
+/// Record a base manifest for a hand-built session workspace, modeling the base
+/// a real materialization captures: a snapshot of the source tree at the moment
+/// the workspace was materialized. With the source unchanged afterward,
+/// change-set reconcile reduces to the workspace's own edits, so these
+/// end-to-end mutation-parity assertions hold exactly as before.
+fn record_session_base(layout: &kin_core::KinLayout, session_dir: &std::path::Path) {
+    let files = kin_cli::commands::session_base::hash_dir(&kin_core::source_dir(layout)).unwrap();
+    kin_cli::commands::session_base::write_base(
+        session_dir,
+        &kin_cli::commands::session_base::SessionBase {
+            base_head: None,
+            files,
+        },
+    )
+    .unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // 42. Edit source file, re-index, verify entity updated in graph
 // ---------------------------------------------------------------------------
@@ -294,6 +311,7 @@ async fn test_session_reconcile_adds_doc_file() {
         "# Session-created Doc\n\nThis file should survive reconcile.\n",
     )
     .unwrap();
+    record_session_base(&layout, &session_dir);
 
     let summary = reconcile_session_dir(&layout, &session_dir).await.unwrap();
     assert_eq!(summary.change_count, 1);
@@ -333,6 +351,7 @@ async fn test_session_reconcile_deletes_doc_file() {
     )
     .unwrap();
     std::fs::create_dir_all(&session_dir).unwrap();
+    record_session_base(&layout, &session_dir);
 
     let summary = reconcile_session_dir(&layout, &session_dir).await.unwrap();
     assert_eq!(summary.change_count, 1);
@@ -386,6 +405,7 @@ async fn test_session_reconcile_renames_source_file() {
         "pub fn renamed_from_session() -> &'static str { \"ok\" }\n",
     )
     .unwrap();
+    record_session_base(&layout, &session_dir);
 
     let summary = reconcile_session_dir(&layout, &session_dir).await.unwrap();
     assert_eq!(summary.change_count, 2);
@@ -478,6 +498,7 @@ async fn test_session_reconcile_rejects_broken_source_edit_without_copying_back(
         "pub fn stable_reconcile_target( {\n",
     )
     .unwrap();
+    record_session_base(&layout, &session_dir);
 
     let err = reconcile_session_dir(&layout, &session_dir)
         .await
@@ -545,6 +566,7 @@ async fn test_session_reconcile_ignores_generated_artifacts() {
     )
     .unwrap();
     std::fs::write(session_dir.join("build/report.txt"), "generated report").unwrap();
+    record_session_base(&layout, &session_dir);
 
     let summary = reconcile_session_dir(&layout, &session_dir).await.unwrap();
     assert_eq!(summary.change_count, 1);
@@ -668,6 +690,7 @@ async fn test_session_edit_test_fix_reconcile_loop() {
         passing.status.success(),
         "repo-local check should pass after the session fix"
     );
+    record_session_base(&layout, &session_dir);
 
     let summary = reconcile_session_dir(&layout, &session_dir).await.unwrap();
     assert_eq!(summary.change_count, 1);
@@ -741,6 +764,7 @@ async fn test_session_round_trip() {
         "pub fn mode_value() -> &'static str {\n    \"after\"\n}\n",
     )
     .unwrap();
+    record_session_base(&layout, &session_dir);
 
     let summary = reconcile_session_dir(&layout, &session_dir).await.unwrap();
     assert_eq!(summary.change_count, 1);

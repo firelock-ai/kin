@@ -69,6 +69,7 @@ pub mod scope;
 pub mod search;
 pub mod secret;
 pub mod security;
+pub mod session_base;
 pub mod session_closeout;
 pub mod session_workspace;
 pub mod setup;
