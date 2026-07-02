@@ -953,6 +953,104 @@ fn transitive_and_multi_consumer_edges_via_refresh_only() {
     );
 }
 
+// ── Test 18: refresh alone registers the repo as a resolution target ────────
+//
+// Regression guard for the register-on-refresh weld: refresh_cross_repo_edges
+// must register a repo's own entities, not just index its imports. Before it, a
+// repo indexed as an impact node but never became a name-resolution target, so
+// the registry the cross-repo traversal consults came up empty. This asserts the
+// weld directly — a repo that is ONLY ever passed to refresh_cross_repo_edges
+// (never an explicit register_repo) must afterward be both present in
+// registered_repo_ids() and resolvable by name.
+#[test]
+fn refresh_alone_registers_repo_as_resolution_target() {
+    let index = SpineIndex::new();
+    let leaf = source_entity(EntityId::new(), "open_graph", LanguageId::Rust);
+
+    index.refresh_cross_repo_edges("libgraph", std::slice::from_ref(&leaf), &[], &[]);
+
+    assert!(
+        index.registered_repo_ids().contains("libgraph"),
+        "refresh must register the repo in the registry the traversal consults"
+    );
+    let resolved = index.resolve("open_graph", Some(EntityKind::Function), None);
+    assert!(
+        resolved.iter().any(|e| e.repo_id == "libgraph"),
+        "the refreshed repo's own entities must become name-resolution targets"
+    );
+}
+
+// ── Test 19: a 2-hop chain resolves regardless of refresh order ─────────────
+//
+// The production daemon registers every sibling's metadata first, then refreshes
+// each repo's edges. This mirrors that shape: with all repos pre-registered, a
+// leaf ← mid ← top chain resolves even when edges are materialized in
+// dependent-first (adversarial) order — proving the fix does not depend on a
+// lucky dependency-ordered refresh, only on every repo being a resolution target
+// before edges are bound.
+#[test]
+fn two_hop_resolves_independent_of_refresh_order_when_prewired() {
+    let registry: Vec<String> = vec!["leaf".to_string(), "mid".to_string(), "top".to_string()];
+
+    let leaf_fn = source_entity(EntityId::new(), "leaf_fn", LanguageId::Rust);
+    let mid_fn = source_entity(EntityId::new(), "mid_fn", LanguageId::Rust);
+    let top_fn = source_entity(EntityId::new(), "top_fn", LanguageId::Rust);
+
+    // mid calls leaf::leaf_fn (2nd hop); top calls mid::mid_fn (1st hop).
+    let mid_rels = vec![cross_repo_call(
+        mid_fn.id,
+        "leaf",
+        "leaf::leaf_fn",
+        RelationKind::Calls,
+    )];
+    let top_rels = vec![cross_repo_call(
+        top_fn.id,
+        "mid",
+        "mid::mid_fn",
+        RelationKind::Calls,
+    )];
+
+    let index = SpineIndex::new();
+
+    // Pass 1 — register every repo's entities (edges deferred: empty relations),
+    // exactly as the daemon registers all siblings before resolving any edges.
+    index.refresh_cross_repo_edges("leaf", std::slice::from_ref(&leaf_fn), &[], &registry);
+    index.refresh_cross_repo_edges("mid", std::slice::from_ref(&mid_fn), &[], &registry);
+    index.refresh_cross_repo_edges("top", std::slice::from_ref(&top_fn), &[], &registry);
+
+    // Pass 2 — materialize edges in DEPENDENT-FIRST (adversarial) order.
+    index.refresh_cross_repo_edges("top", std::slice::from_ref(&top_fn), &top_rels, &registry);
+    index.refresh_cross_repo_edges("mid", std::slice::from_ref(&mid_fn), &mid_rels, &registry);
+
+    // 1st hop: top → mid, bound to mid's registered entity.
+    let top_out: Vec<_> = index
+        .cross_repo_edges_for("top", &top_fn.id)
+        .into_iter()
+        .filter(|e| e.src_repo == "top")
+        .collect();
+    assert_eq!(top_out.len(), 1, "top must resolve its edge into mid");
+    assert_eq!(top_out[0].dst_repo, "mid");
+    assert_eq!(top_out[0].dst_entity, mid_fn.id);
+
+    // 2nd hop: mid → leaf, bound to leaf's registered entity.
+    let mid_out: Vec<_> = index
+        .cross_repo_edges_for("mid", &mid_fn.id)
+        .into_iter()
+        .filter(|e| e.src_repo == "mid")
+        .collect();
+    assert_eq!(mid_out.len(), 1, "mid must resolve the 2nd hop into leaf");
+    assert_eq!(mid_out[0].dst_repo, "leaf");
+    assert_eq!(mid_out[0].dst_entity, leaf_fn.id);
+
+    // End to end: changing leaf_fn impacts top across both hops.
+    let impact = federated_impact(&index, "leaf", &leaf_fn.id, 5);
+    assert!(
+        impact.repos_involved.contains(&"top".to_string()),
+        "transitive blast radius from leaf must reach top, got {:?}",
+        impact.repos_involved
+    );
+}
+
 /// Register a repo's entity metadata through the store-backed backend,
 /// mirroring the metadata write the daemon performs when it indexes a repo.
 fn ingest_repo(

@@ -146,43 +146,6 @@ fn daemon_url_from_env() -> Result<String> {
         })
 }
 
-/// Query the daemon for federated impact analysis across the spine.
-pub async fn fetch_spine_impact(
-    repo_id: &str,
-    entity_id: &EntityId,
-    depth: u32,
-) -> Result<Option<serde_json::Value>> {
-    let daemon_url = daemon_url_from_env()?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| McpError::Other(format!("failed to build reqwest client: {}", e)))?;
-
-    let resp = client
-        .get(format!(
-            "{}/v1/spine/impact",
-            daemon_url.trim_end_matches('/')
-        ))
-        .query(&[
-            ("repo", repo_id),
-            ("entity", &entity_id.to_string()),
-            ("depth", &depth.to_string()),
-        ])
-        .send()
-        .await
-        .map_err(|e| McpError::Other(format!("failed to send spine request: {}", e)))?;
-
-    if !resp.status().is_success() {
-        return Ok(None);
-    }
-
-    let impact = resp
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|e| McpError::Other(format!("failed to parse spine response: {}", e)))?;
-    Ok(Some(impact))
-}
-
 /// Query the daemon for federated impact analysis, returning the typed struct.
 ///
 /// Returns a [`SpineQuery`] so callers can distinguish a spine that is simply

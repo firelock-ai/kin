@@ -442,15 +442,23 @@ pub async fn require_daemon_graph_mutations(
 // ── Spine Federation Helpers ──────────────────────────────────────────────
 
 /// Query the daemon for federated impact analysis across the spine.
+///
+/// Returns a [`kin_spine::SpineQuery`] so the caller can tell apart a spine
+/// that is not configured (no daemon endpoint), one that is configured but
+/// unreachable/non-2xx (e.g. `503` when the spine is disabled), and a healthy
+/// answer that is genuinely empty — instead of collapsing a transport/HTTP
+/// failure into a silent "no impact" result. Mirrors [`get_spine_xref`].
 pub async fn get_spine_impact(
     layout: &kin_core::KinLayout,
     repo_id: &str,
     entity_id: &kin_model::EntityId,
     depth: u32,
-) -> anyhow::Result<Option<::kin_spine::FederatedImpact>> {
-    let daemon_url = crate::daemon_client::resolve_daemon_url(layout)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Kin daemon is required for spine impact queries"))?;
+) -> anyhow::Result<::kin_spine::SpineQuery<::kin_spine::FederatedImpact>> {
+    use ::kin_spine::{classify_spine_probe, SpineProbe, SpineQuery};
+
+    let Some(daemon_url) = crate::daemon_client::resolve_daemon_url(layout).await? else {
+        return Ok(SpineQuery::NotConfigured);
+    };
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
@@ -466,14 +474,19 @@ pub async fn get_spine_impact(
             ("depth", &depth.to_string()),
         ])
         .send()
-        .await?;
+        .await;
+    let status = resp.as_ref().ok().map(|r| r.status().as_u16());
 
-    if !resp.status().is_success() {
-        return Ok(None);
+    match classify_spine_probe(true, status) {
+        SpineProbe::Healthy => {
+            let impact = resp?.json::<::kin_spine::FederatedImpact>().await?;
+            Ok(SpineQuery::Found(impact))
+        }
+        SpineProbe::Unavailable(reason) => Ok(SpineQuery::Unavailable(reason)),
+        SpineProbe::NotConfigured => Ok(SpineQuery::Unavailable(
+            "spine endpoint unexpectedly unconfigured".to_string(),
+        )),
     }
-
-    let impact = resp.json::<::kin_spine::FederatedImpact>().await?;
-    Ok(Some(impact))
 }
 
 /// Query the daemon for cross-repo edges (xrefs) for a specific entity.
