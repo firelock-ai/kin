@@ -556,6 +556,34 @@ pub enum AutoStartError {
 mod tests {
     use super::*;
 
+    // ── Port-file handshake ────────────────────────────────────────────────
+    //
+    // The daemon publishes its real bound port here for the CLI handshake, so
+    // read_port_file must recover exactly what write_port_file wrote, overwrite
+    // must replace cleanly, and the atomic temp artifact must never linger for a
+    // polling reader to trip over.
+
+    #[test]
+    fn port_file_round_trips_atomically() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+
+        assert_eq!(read_port_file(root), None, "no port file before first write");
+
+        write_port_file(root, 51234);
+        assert_eq!(read_port_file(root), Some(51234));
+
+        // Overwrite (temp + rename) must replace the previous value cleanly.
+        write_port_file(root, 6001);
+        assert_eq!(read_port_file(root), Some(6001));
+
+        // The atomic-write temp file must not be left behind.
+        assert!(
+            !root.join("daemon.port.tmp").exists(),
+            "atomic write must not leave a .tmp artifact"
+        );
+    }
+
     // ── Idle-timeout env resolution ────────────────────────────────────────
     //
     // These lock the scoped-timeout contract: user env wins over everything,

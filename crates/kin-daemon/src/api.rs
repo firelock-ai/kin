@@ -7419,6 +7419,33 @@ mod tests {
         Arc::new(DaemonState::open(layout).unwrap())
     }
 
+    #[tokio::test]
+    async fn bind_api_listener_reports_real_ephemeral_port() {
+        // Runs under a Tokio runtime because binding a tokio TcpListener needs
+        // the reactor — exactly how the daemon calls this at startup.
+        // The daemon-owned port handshake: binding :0 must yield a concrete,
+        // live ephemeral port (never 0), and two independent :0 binds must land
+        // on different ports — proving the OS assigns the port and nothing is
+        // reserved ahead of the bind. This is what lets the daemon pick its own
+        // port and report it, instead of a launcher reserving-and-releasing a
+        // port a peer can steal before the daemon binds.
+        let state = test_state();
+
+        let (listener_a, port_a) = bind_api_listener(&state, 0).expect("bind :0");
+        assert_ne!(port_a, 0, "bind_api_listener must report a real bound port");
+        assert_eq!(
+            port_a,
+            listener_a.local_addr().unwrap().port(),
+            "reported port must equal the listener's actual bound port"
+        );
+
+        let (_listener_b, port_b) = bind_api_listener(&state, 0).expect("second bind :0");
+        assert_ne!(
+            port_a, port_b,
+            "two :0 binds must get distinct ports (no fixed-port reservation)"
+        );
+    }
+
     #[test]
     fn scope_build_timeout_defaults_and_rejects_invalid_values() {
         assert_eq!(resolve_scope_build_timeout(None), Duration::from_secs(870));
