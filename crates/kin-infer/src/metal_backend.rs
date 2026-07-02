@@ -13,13 +13,15 @@ use crate::gpu::{
 };
 use crate::InferError;
 use metal::{
-    Buffer, CommandBufferRef, CommandQueue, CompileOptions, ComputePipelineState, Device,
-    MTLLanguageVersion, MTLResourceOptions, MTLSize,
+    Buffer, CommandBufferRef, CommandQueue, CompileOptions, ComputePassDescriptor,
+    ComputePipelineState, CounterSampleBuffer, CounterSampleBufferDescriptor, Device,
+    MTLCounterSamplingPoint, MTLLanguageVersion, MTLResourceOptions, MTLSize, MTLStorageMode,
+    NSUInteger,
 };
 use objc2::rc::autoreleasepool;
 use parking_lot::{Condvar, Mutex};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -168,6 +170,141 @@ fn record_gpu_busy(cmd: &CommandBufferRef) {
         let start_ns = end_ns.saturating_sub(busy_ns);
         sampler.attribute(start_ns, busy_ns);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Non-invasive per-phase GPU timestamp sampling (opt-in, profiling only)
+// ---------------------------------------------------------------------------
+//
+// Under `KIN_INFER_METAL_PROFILE` the resident/pooled forward keeps the WHOLE
+// layer stack in ONE command buffer (production submission cadence) and brackets
+// each phase with two empty marker compute encoders that sample the GPU
+// timestamp counter at their stage boundary. After the buffer completes,
+// `resolve_phase_samples` reads the counter range and attributes each phase's
+// GPU-execution delta to its bucket — so per-phase GPU timing survives WITHOUT
+// the per-stage commit+wait round-trips that used to serialize the host and make
+// the saturation harness measure host overhead it introduced itself. All of this
+// is gated on stage-boundary counter-sampling support and degrades to
+// unattributed (per-phase GPU ns stay 0) when unavailable; the cadence,
+// host-blocked, and util% numbers are production-accurate either way.
+
+/// Counter-sample capacity (timestamps) per finalized command buffer. One
+/// forward (or one segment) brackets each phase with two samples, so 1024 covers
+/// 128 layers — far past any real model — before sampling is skipped.
+const PHASE_SAMPLE_CAPACITY: u64 = 1024;
+
+/// `MTLCounterDontSample`: the sentinel that tells a sample-buffer attachment to
+/// skip one boundary. Each marker samples only its start-of-encoder index.
+const COUNTER_DONT_SAMPLE: NSUInteger = NSUInteger::MAX;
+
+/// Next free index into the counter sample buffer for the in-progress command
+/// buffer. Advanced by `sample_phase_marker`, reset to 0 once the buffer is
+/// resolved (`resolve_phase_samples`) and by `reset_profile`. Only touched when
+/// profiling AND counter sampling are active.
+static NEXT_SAMPLE_INDEX: AtomicU64 = AtomicU64::new(0);
+
+// GPU-clock anchor for the tick->ns correlation, captured lazily on the first
+// resolve after a reset. The host reference is the util sampler's `Instant`, so
+// no mach-timebase / CFTimeInterval unit assumption is baked in.
+static GPU_ANCHOR_SET: AtomicBool = AtomicBool::new(false);
+static GPU_ANCHOR_TICKS: AtomicU64 = AtomicU64::new(0);
+static GPU_ANCHOR_ELAPSED_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Per-phase GPU samples for the in-progress command buffer: `(phase,
+/// start_sample_index, end_sample_index)`, pushed by the profiled `step` and
+/// drained by `resolve_phase_samples`. Behind a `Mutex` (single global, touched
+/// only at phase boundaries under profiling) for the same reason as the util
+/// sampler — it holds a non-atomic `Vec`.
+fn phase_samples() -> &'static Mutex<Vec<(Phase, u64, u64)>> {
+    use std::sync::OnceLock;
+    static SAMPLES: OnceLock<Mutex<Vec<(Phase, u64, u64)>>> = OnceLock::new();
+    SAMPLES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Resolve `count` timestamps (GPU ticks) from a counter sample buffer's range
+/// `[0, count)`. `metal` 0.29 wraps sample-buffer creation but NOT
+/// `resolveCounterRange:`, so message the live object directly — the same objc2
+/// path `cmd_gpu_nanos` uses. `MTLCounterResultTimestamp` is a single `u64`, so
+/// the returned `NSData` is a packed `[u64]`. Returns `None` if the resolve
+/// yields nil or short data (e.g. the device dropped samples).
+fn resolve_counter_timestamps(sample_buffer: &CounterSampleBuffer, count: u64) -> Option<Vec<u64>> {
+    use metal::foreign_types::ForeignType;
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    // objc2's `msg_send!` requires arguments to implement `objc2::Encode`; metal's
+    // `NSRange` targets the legacy `objc` runtime and does not, so pass an
+    // equivalent two-`NSUInteger` struct. The call ABI is the `repr(C)` layout
+    // (two u64s on LP64), byte-identical to `NSRange`.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CounterResolveRange {
+        location: NSUInteger,
+        length: NSUInteger,
+    }
+    unsafe impl objc2::Encode for CounterResolveRange {
+        const ENCODING: objc2::Encoding = objc2::Encoding::Struct(
+            "_NSRange",
+            &[
+                <NSUInteger as objc2::Encode>::ENCODING,
+                <NSUInteger as objc2::Encode>::ENCODING,
+            ],
+        );
+    }
+
+    if count == 0 {
+        return None;
+    }
+    let buf = sample_buffer.as_ptr() as *const AnyObject;
+    if buf.is_null() {
+        return None;
+    }
+    let range = CounterResolveRange {
+        location: 0,
+        length: count as NSUInteger,
+    };
+    unsafe {
+        let buf = &*buf;
+        let data: *mut AnyObject = msg_send![buf, resolveCounterRange: range];
+        if data.is_null() {
+            return None;
+        }
+        let data = &*data;
+        let bytes: *const u8 = msg_send![data, bytes];
+        let len: NSUInteger = msg_send![data, length];
+        let len = len as usize;
+        if bytes.is_null() || len < std::mem::size_of::<u64>() {
+            return None;
+        }
+        let n = len / std::mem::size_of::<u64>();
+        let ptr = bytes as *const u64;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            out.push(ptr.add(i).read_unaligned());
+        }
+        Some(out)
+    }
+}
+
+/// Nanoseconds per GPU timestamp tick, from the counter clock's reset anchor to
+/// now. Apple's counter timestamps share the `sampleTimestamps:gpuTimestamp:`
+/// GPU clock, so the slope over a wide interval converts a tick delta to ns
+/// without assuming the tick unit. Falls back to 1.0 (treat ticks as ns, the
+/// Apple-Silicon common case) until a usable interval exists.
+fn gpu_tick_to_ns_scale(device: &Device) -> f64 {
+    if !GPU_ANCHOR_SET.load(Ordering::Relaxed) {
+        return 1.0;
+    }
+    let anchor_ticks = GPU_ANCHOR_TICKS.load(Ordering::Relaxed);
+    let anchor_ns = GPU_ANCHOR_ELAPSED_NS.load(Ordering::Relaxed);
+    let now_ns = profile_wall_nanos();
+    let (mut cpu_now, mut gpu_now) = (0u64, 0u64);
+    device.sample_timestamps(&mut cpu_now, &mut gpu_now);
+    let _ = cpu_now;
+    if gpu_now <= anchor_ticks || now_ns <= anchor_ns {
+        return 1.0;
+    }
+    (now_ns - anchor_ns) as f64 / (gpu_now - anchor_ticks) as f64
 }
 
 /// Kernel-class buckets for per-phase profiling.
@@ -641,6 +778,14 @@ pub fn reset_profile() {
     GPU_NORM_NANOS.store(0, Ordering::Relaxed);
     GPU_ACTIVATION_NANOS.store(0, Ordering::Relaxed);
     GPU_COPY_NANOS.store(0, Ordering::Relaxed);
+    // Per-phase GPU timestamp sampling: drop pending samples, rewind the sample
+    // index, and clear the tick->ns correlation anchor (re-captured lazily on the
+    // first resolve of the upcoming timed region).
+    NEXT_SAMPLE_INDEX.store(0, Ordering::Relaxed);
+    GPU_ANCHOR_SET.store(false, Ordering::Relaxed);
+    GPU_ANCHOR_TICKS.store(0, Ordering::Relaxed);
+    GPU_ANCHOR_ELAPSED_NS.store(0, Ordering::Relaxed);
+    phase_samples().lock().clear();
     // In-process util%: zero the busy accumulator, drop prior windows, and start
     // the wall-clock anchor NOW so util% covers exactly the upcoming timed region.
     GPU_BUSY_NANOS.store(0, Ordering::Relaxed);
@@ -2689,6 +2834,61 @@ impl Drop for PooledBuffer {
 // Metal compute context
 // ---------------------------------------------------------------------------
 
+/// Counter sample buffer + capacity for non-invasive per-phase GPU timestamp
+/// sampling under `KIN_INFER_METAL_PROFILE`. Only built when profiling is on AND
+/// the device supports stage-boundary counter sampling, so production never
+/// allocates it. `CounterSampleBuffer` is `Send + Sync` (metal's
+/// `foreign_obj_type!`), so `MetalCompute` stays auto-`Send + Sync`.
+struct PhaseTimestampSampler {
+    sample_buffer: CounterSampleBuffer,
+    capacity: u64,
+}
+
+/// Build the per-phase GPU timestamp sampler, or `None` when it should stay off:
+/// outside profiling, when opted out, when the device cannot sample at stage
+/// boundaries, or when the sample buffer cannot be allocated. In every `None`
+/// case per-phase GPU timing degrades to unattributed while the cadence and
+/// util% numbers stay production-accurate.
+fn build_phase_timestamp_sampler(device: &Device) -> Option<PhaseTimestampSampler> {
+    // Production (profiling off) never allocates — only the opt-in profiling
+    // process does, and an explicit opt-out keeps the cadence fix while dropping
+    // just the counter sampling.
+    std::env::var_os("KIN_INFER_METAL_PROFILE")?;
+    if std::env::var("KIN_INFER_METAL_PHASE_COUNTERS").as_deref() == Ok("0") {
+        return None;
+    }
+    if !device.supports_counter_sampling(MTLCounterSamplingPoint::AtStageBoundary) {
+        eprintln!(
+            "kin-infer: Metal device does not support stage-boundary counter sampling; \
+             per-phase GPU timing disabled (cadence/util numbers stay production-accurate)"
+        );
+        return None;
+    }
+    // The common timestamp counter set is named "timestamp"
+    // (`MTLCommonCounterSetTimestamp`).
+    let counter_set = device
+        .counter_sets()
+        .into_iter()
+        .find(|set| set.name() == "timestamp")?;
+    let descriptor = CounterSampleBufferDescriptor::new();
+    descriptor.set_counter_set(&counter_set);
+    descriptor.set_sample_count(PHASE_SAMPLE_CAPACITY);
+    descriptor.set_storage_mode(MTLStorageMode::Shared);
+    match device.new_counter_sample_buffer_with_descriptor(&descriptor) {
+        Ok(sample_buffer) => Some(PhaseTimestampSampler {
+            sample_buffer,
+            capacity: PHASE_SAMPLE_CAPACITY,
+        }),
+        Err(err) => {
+            eprintln!(
+                "kin-infer: Metal counter sample buffer allocation failed ({err}); \
+                 per-phase GPU timing disabled"
+            );
+            None
+        }
+    }
+}
+
 pub struct MetalCompute {
     device: Device,
     queue: CommandQueue,
@@ -2712,6 +2912,10 @@ pub struct MetalCompute {
     pool: Arc<BufferPool>,
     /// Byte budget for resident stack command buffers before they allocate.
     resident_stack_memory: ResidentStackMemoryGate,
+    /// Non-invasive per-phase GPU timestamp sampler; `None` outside profiling or
+    /// when the device lacks stage-boundary counter sampling. Never touched on
+    /// the production (profiling-off) path.
+    phase_timestamp_sampler: Option<PhaseTimestampSampler>,
 }
 
 impl MetalCompute {
@@ -3020,6 +3224,7 @@ impl MetalCompute {
         let resident_stack_memory =
             ResidentStackMemoryGate::new(resolve_resident_stack_budget(&device));
         let max_inflight = resolve_max_inflight();
+        let phase_timestamp_sampler = build_phase_timestamp_sampler(&device);
 
         // The hardware-derived governor caps actually in force for this process,
         // logged once so the resolved resident budget, pool ceilings, and
@@ -3046,6 +3251,7 @@ impl MetalCompute {
             max_inflight,
             pool,
             resident_stack_memory,
+            phase_timestamp_sampler,
         })
     }
 
@@ -3348,9 +3554,83 @@ impl MetalCompute {
             // NB: the total/windowed GPU-busy for the in-process util% is recorded
             // by the `commit_bounded` completion handler (invoked above), which
             // fires for THIS buffer too — recording it again here would
-            // double-count. The per-phase attribution stays here because it needs
-            // the committing thread's `time_phase` thread-local.
+            // double-count. The per-op per-phase attribution stays here because it
+            // needs the committing thread's `time_phase` thread-local; the
+            // resident/pooled path attributes per-phase from counter samples
+            // instead (see `resolve_phase_samples`).
         }
+        // Attribute any per-phase GPU timestamp markers carried by THIS
+        // now-completed command buffer (the resident/pooled forward brackets each
+        // phase with two markers). A no-op for per-op buffers that carry no
+        // markers and when profiling is off, so every finalized buffer that did
+        // carry markers is resolved exactly once, right after its completion wait.
+        self.resolve_phase_samples();
+    }
+
+    /// Emit an empty marker compute encoder that samples the GPU timestamp
+    /// counter at its stage boundary, returning the sample index (or `None` when
+    /// counter sampling is unavailable or this command buffer is out of
+    /// capacity). Profiling only; never called on the production path. The marker
+    /// runs no dispatches, so it changes no data — it only fixes a point on the
+    /// GPU timeline inside the single resident command buffer.
+    fn sample_phase_marker(&self, cmd: &CommandBufferRef) -> Option<u64> {
+        let sampler = self.phase_timestamp_sampler.as_ref()?;
+        let idx = NEXT_SAMPLE_INDEX.fetch_add(1, Ordering::Relaxed);
+        if idx >= sampler.capacity {
+            return None;
+        }
+        let descriptor = ComputePassDescriptor::new();
+        let attachment = descriptor.sample_buffer_attachments().object_at(0)?;
+        attachment.set_sample_buffer(&sampler.sample_buffer);
+        attachment.set_start_of_encoder_sample_index(idx as NSUInteger);
+        attachment.set_end_of_encoder_sample_index(COUNTER_DONT_SAMPLE);
+        let encoder = cmd.compute_command_encoder_with_descriptor(descriptor);
+        encoder.end_encoding();
+        Some(idx)
+    }
+
+    /// Resolve the per-phase GPU timestamp markers sampled into the now-completed
+    /// command buffer and attribute each phase's `[start, end]` tick delta (scaled
+    /// to ns) to its GPU bucket, then rewind for the next buffer. A no-op when
+    /// profiling is off, when no markers were sampled (per-op buffers), or when
+    /// counter sampling is unavailable — leaving per-phase GPU ns unattributed
+    /// while the cadence and util% numbers stay production-accurate.
+    fn resolve_phase_samples(&self) {
+        if !profile_enabled() {
+            return;
+        }
+        let count = NEXT_SAMPLE_INDEX.swap(0, Ordering::Relaxed);
+        if count == 0 {
+            return;
+        }
+        let mut pending = phase_samples().lock();
+        let Some(sampler) = self.phase_timestamp_sampler.as_ref() else {
+            pending.clear();
+            return;
+        };
+        // Anchor the GPU clock for the tick->ns correlation the first time we
+        // resolve after a reset; the host reference is the util sampler's Instant.
+        if !GPU_ANCHOR_SET.swap(true, Ordering::Relaxed) {
+            let (mut cpu, mut gpu) = (0u64, 0u64);
+            self.device.sample_timestamps(&mut cpu, &mut gpu);
+            let _ = cpu;
+            GPU_ANCHOR_TICKS.store(gpu, Ordering::Relaxed);
+            GPU_ANCHOR_ELAPSED_NS.store(profile_wall_nanos(), Ordering::Relaxed);
+        }
+        let n = count.min(sampler.capacity);
+        let Some(ticks) = resolve_counter_timestamps(&sampler.sample_buffer, n) else {
+            pending.clear();
+            return;
+        };
+        let scale = gpu_tick_to_ns_scale(&self.device);
+        for &(phase, start, end) in pending.iter() {
+            let (s, e) = (start as usize, end as usize);
+            if s < ticks.len() && e < ticks.len() && ticks[e] > ticks[s] {
+                let ns = ((ticks[e] - ticks[s]) as f64 * scale) as u64;
+                phase.gpu_counter().fetch_add(ns, Ordering::Relaxed);
+            }
+        }
+        pending.clear();
     }
 
     /// Dispatch a 1D compute kernel.
@@ -3889,13 +4169,23 @@ impl MetalCompute {
                     f: &mut dyn FnMut(&CommandBufferRef) -> Result<(), InferError>|
          -> Result<&'a CommandBufferRef, InferError> {
             if profile_enabled() {
-                let mut err = Ok(());
-                time_phase(phase, || {
-                    err = f(cmd_in);
-                    self.commit_wait(cmd_in);
-                });
-                err?;
-                Ok(self.queue.new_command_buffer())
+                // Profiled submission cadence == production: encode every stage
+                // into the SAME command buffer (no per-stage commit+wait, which
+                // would serialize the host and make the saturation harness measure
+                // round-trips it introduced itself). Bracket the stage with two
+                // GPU-timestamp markers so per-phase GPU time is attributed from
+                // the counter buffer after the single submission completes (see
+                // `resolve_phase_samples`). `time_phase` still records per-phase
+                // host *encode* wall-clock. Returns `cmd_in` — exactly like the
+                // production branch below.
+                let start_sample = self.sample_phase_marker(cmd_in);
+                let result = time_phase(phase, || f(cmd_in));
+                let end_sample = self.sample_phase_marker(cmd_in);
+                result?;
+                if let (Some(start), Some(end)) = (start_sample, end_sample) {
+                    phase_samples().lock().push((phase, start, end));
+                }
+                Ok(cmd_in)
             } else {
                 f(cmd_in)?;
                 Ok(cmd_in)
@@ -8679,13 +8969,14 @@ mod tests {
         assert_eq!(out.len(), batch_size * hidden);
         assert_eq!(
             profile_submissions(),
-            5,
-            "pooled resident stack should submit 5 command buffers when profiled"
+            1,
+            "pooled resident stack should submit 1 command buffer when profiled \
+             (production cadence; per-stage commits were a measurement artifact)"
         );
         assert_eq!(
             profile_round_trips(),
-            5,
-            "pooled resident stack should wait 5 times when profiled"
+            1,
+            "pooled resident stack should wait once when profiled (production cadence)"
         );
     }
 
@@ -8797,13 +9088,14 @@ mod tests {
         assert_eq!(out.len(), batch_size * hidden);
         assert_eq!(
             profile_submissions(),
-            10,
-            "segmented pooled stack should submit 10 command buffers when profiled"
+            2,
+            "segmented pooled stack should submit 2 command buffers (one per segment) \
+             when profiled (production cadence)"
         );
         assert_eq!(
             profile_round_trips(),
-            10,
-            "segmented pooled stack should wait 10 times when profiled"
+            2,
+            "segmented pooled stack should wait twice (one per segment) when profiled"
         );
     }
 
@@ -8896,13 +9188,14 @@ mod tests {
         assert_eq!(out.len(), total_rows * hidden);
         assert_eq!(
             profile_submissions(),
-            10,
-            "segmented resident stack should submit 10 command buffers when profiled"
+            2,
+            "segmented resident stack should submit 2 command buffers (one per segment) \
+             when profiled (production cadence)"
         );
         assert_eq!(
             profile_round_trips(),
-            10,
-            "segmented resident stack should wait 10 times when profiled"
+            2,
+            "segmented resident stack should wait twice (one per segment) when profiled"
         );
     }
 
