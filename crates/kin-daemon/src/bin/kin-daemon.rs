@@ -311,16 +311,6 @@ fn init_tracing() {
 }
 
 async fn async_main() -> i32 {
-    init_tracing();
-
-    // Validate the KIN_* environment surface at startup: unknown names and
-    // out-of-range values are surfaced loudly; an invalid correctness-relevant
-    // value refuses to boot. Governed by KIN_ENV_VALIDATION (off/warn/strict).
-    if let Err(err) = kin_core::env_registry::enforce_startup_env() {
-        eprintln!("kin-daemon: {err}");
-        return 2;
-    }
-
     let program = env::args()
         .next()
         .unwrap_or_else(|| "kin-daemon".to_string());
@@ -333,6 +323,12 @@ async fn async_main() -> i32 {
         }
     };
 
+    // The CLI's daemon-compat probe runs `kin-daemon --compat-json` and parses
+    // this process's stdout as JSON. Emit that payload before installing the
+    // tracing subscriber (whose default writer is stdout) or running startup env
+    // validation, so no log line — e.g. a KIN_* override warning — can precede
+    // the JSON and be misread as a stale/incompatible daemon. A compat probe is
+    // a pure metadata query needing neither logging nor env enforcement.
     if args.compat_json {
         println!(
             "{}",
@@ -343,6 +339,16 @@ async fn async_main() -> i32 {
             })
         );
         return 0;
+    }
+
+    init_tracing();
+
+    // Validate the KIN_* environment surface at startup: unknown names and
+    // out-of-range values are surfaced loudly; an invalid correctness-relevant
+    // value refuses to boot. Governed by KIN_ENV_VALIDATION (off/warn/strict).
+    if let Err(err) = kin_core::env_registry::enforce_startup_env() {
+        eprintln!("kin-daemon: {err}");
+        return 2;
     }
 
     if args.supervisor {
