@@ -2258,12 +2258,7 @@ pub async fn ensure_daemon_running_with_idle_timeout(
     info!(binary = %daemon_bin.display(), repo = %working_dir.display(), "starting daemon (OS-assigned port)");
 
     let mut cmd = std::process::Command::new(&daemon_bin);
-    cmd.args([
-        "--repo",
-        &working_dir.display().to_string(),
-        "--port",
-        "0",
-    ]);
+    cmd.args(["--repo", &working_dir.display().to_string(), "--port", "0"]);
     let log_offset = daemon_log_len(kin_root);
     let log = open_daemon_log(kin_root)?;
     let stderr = log

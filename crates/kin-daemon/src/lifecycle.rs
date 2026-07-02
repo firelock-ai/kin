@@ -568,7 +568,11 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let root = dir.path();
 
-        assert_eq!(read_port_file(root), None, "no port file before first write");
+        assert_eq!(
+            read_port_file(root),
+            None,
+            "no port file before first write"
+        );
 
         write_port_file(root, 51234);
         assert_eq!(read_port_file(root), Some(51234));
