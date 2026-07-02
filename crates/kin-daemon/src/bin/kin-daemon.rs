@@ -328,9 +328,12 @@ async fn async_main() -> i32 {
         }
     };
 
-    // Answer the compat probe before logging or env validation can write
-    // anything: its stdout must stay pure JSON, and a probe must succeed even
-    // in an environment the registry would refuse to boot with.
+    // The CLI's daemon-compat probe runs `kin-daemon --compat-json` and parses
+    // this process's stdout as JSON. Emit that payload before installing the
+    // tracing subscriber (whose default writer is stdout) or running startup env
+    // validation, so no log line — e.g. a KIN_* override warning — can precede
+    // the JSON and be misread as a stale/incompatible daemon. A compat probe is
+    // a pure metadata query needing neither logging nor env enforcement.
     if args.compat_json {
         println!(
             "{}",
