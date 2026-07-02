@@ -21,6 +21,7 @@ pub mod contextbench_locate;
 pub mod dead_code;
 pub mod deps;
 pub mod diff;
+pub mod doctor_drift;
 pub mod eject;
 pub mod embed;
 pub mod exec;

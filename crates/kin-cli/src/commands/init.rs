@@ -3317,6 +3317,21 @@ fn collect_source_files_recursive(root: &Path, dir: &Path, files: &mut Vec<PathB
     Ok(())
 }
 
+/// Enumerate the on-disk source files under `source_root` and pair each
+/// repo-relative path with its content hash, using the exact enumeration and
+/// hashing the indexer uses. Sharing this path with indexing guarantees the
+/// hashes are directly comparable to graph truth, so a drift check can never
+/// report a false mismatch caused by hashing a file differently than it was
+/// indexed.
+pub(crate) fn collect_on_disk_file_hashes(source_root: &Path) -> Result<Vec<(String, [u8; 32])>> {
+    let all_files = collect_source_files(source_root)?;
+    let indexable = collect_indexable_files(source_root, &all_files)?;
+    Ok(indexable
+        .into_iter()
+        .map(|file| (file.rel_path, file.hash))
+        .collect())
+}
+
 fn count_supported_source_inputs(indexable_files: &[IndexableFile]) -> (usize, usize) {
     let mut entity_source_count = 0usize;
     let mut shallow_source_count = 0usize;

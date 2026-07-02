@@ -841,6 +841,14 @@ enum Command {
         /// Emit the machine-readable health report as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Check for graph⇄file drift: on-disk source files that no longer match
+        /// graph truth (edited out of band, deleted, or added)
+        #[arg(long, default_value_t = false)]
+        drift: bool,
+        /// Restore drifted and missing files from graph truth. Implies --drift;
+        /// explicit invocation only — never runs automatically
+        #[arg(long, default_value_t = false)]
+        heal: bool,
     },
     /// First-time setup and health checks for the Kin system
     Setup {
@@ -2658,7 +2666,20 @@ fn main() -> Result<()> {
                     Some(RegistryAction::Clean) => commands::registry::clean().await,
                     None => commands::registry::list().await,
                 },
-                Command::Doctor { fix, json } => commands::setup::doctor(fix, json).await,
+                Command::Doctor {
+                    fix,
+                    json,
+                    drift,
+                    heal,
+                } => {
+                    // `--drift`/`--heal` run the graph⇄file drift tripwire; bare
+                    // `kin doctor` stays the first-run config health check.
+                    if drift || heal {
+                        commands::doctor_drift::run(heal, json).await
+                    } else {
+                        commands::setup::doctor(fix, json).await
+                    }
+                }
                 Command::Setup {
                     action,
                     intent,
