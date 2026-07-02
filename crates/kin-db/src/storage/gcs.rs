@@ -19,7 +19,7 @@ use std::sync::OnceLock;
 
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
 use parking_lot::Mutex;
 
 use crate::error::KinDbError;

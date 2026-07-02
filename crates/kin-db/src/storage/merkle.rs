@@ -942,7 +942,7 @@ pub fn remove_entity_hash(entity_id: &EntityId, hash_map: &mut HashMap<EntityId,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use rand::{rngs::StdRng, RngExt, SeedableRng};
 
     fn test_entity(name: &str) -> Entity {
         Entity {
@@ -1439,8 +1439,8 @@ mod tests {
             ));
         }
         for _ in 0..18 {
-            let src_index = rng.gen_range(0..entities.len());
-            let dst_index = rng.gen_range(0..entities.len());
+            let src_index = rng.random_range(0..entities.len());
+            let dst_index = rng.random_range(0..entities.len());
             if src_index != dst_index {
                 relations.push(test_relation(
                     entities[src_index].id,
@@ -1456,16 +1456,16 @@ mod tests {
 
         for step in 0..80 {
             let mut seeds = Vec::new();
-            let op = match rng.gen_range(0..4) {
+            let op = match rng.random_range(0..4) {
                 0 if !entities.is_empty() => {
-                    let index = rng.gen_range(0..entities.len());
+                    let index = rng.random_range(0..entities.len());
                     entities[index].name = format!("entity_{index}_mutated_{step}");
                     entities[index].signature = format!("fn entity_{index}_mutated_{step}()");
                     seeds.push(entities[index].id);
                     format!("mutate entity index {index}")
                 }
                 1 if entities.len() > 3 => {
-                    let index = rng.gen_range(0..entities.len());
+                    let index = rng.random_range(0..entities.len());
                     let removed = entities.remove(index);
                     for relation in &relations {
                         if relation.src.as_entity() == Some(removed.id)
@@ -1484,8 +1484,8 @@ mod tests {
                     format!("delete entity index {index}")
                 }
                 2 if entities.len() > 1 => {
-                    let src_index = rng.gen_range(0..entities.len());
-                    let mut dst_index = rng.gen_range(0..entities.len());
+                    let src_index = rng.random_range(0..entities.len());
+                    let mut dst_index = rng.random_range(0..entities.len());
                     if src_index == dst_index {
                         dst_index = (dst_index + 1) % entities.len();
                     }
@@ -1503,7 +1503,7 @@ mod tests {
                     format!("add relation {src_index}->{dst_index}")
                 }
                 _ if !relations.is_empty() => {
-                    let index = rng.gen_range(0..relations.len());
+                    let index = rng.random_range(0..relations.len());
                     let relation = relations.remove(index);
                     seeds.extend(relation.src.as_entity());
                     seeds.extend(relation.dst.as_entity());
