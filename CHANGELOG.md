@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-07-02
+
+Determinism hardened end to end — real-inference byte-identity, deterministic history import, change-set session reconcile — plus the Accelerate compute default and wider parser fidelity.
+
+### Added
+
+- Apple Accelerate is the compiled CPU-BLAS default for `kin` and `kin-daemon` (`metal`+`accelerate` features). Proof and freeze paths stay pinned to the deterministic pure-Rust backend via `KIN_INFER_CPU_BACKEND=pure-rust`; the gate re-proved bit-identical embeddings across five independent cache-cold runs on the new default.
+- Behavior-environment divergence warnings: the daemon's `/health` reports its effective behavior-relevant environment, and env-sensitive commands warn per diverging variable (value on each side plus the remedy) when the invoking shell's `KIN_*` levers differ from the running daemon's. `KIN_STRICT_BEHAVIOR_ENV=1` escalates the warning to an error.
+- The environment registry now covers downstream sibling-crate levers (CPU backend, occupancy dispatch, embed backend/hybrid family, embed cache, VFS bypass, container workspace/storage selectors) with honest classification — live levers are no longer mislabeled as unrecognized typos — and a completeness test keeps kin's own env reads registered.
+- MCP `semantic_locate` hits on the default profile carry `start_line`/`end_line` from the entity span, and `semantic_search` clamps caller-supplied limits to the shared maximum.
+- Parser fidelity: Rust `macro_rules!` definitions extract as first-class `Macro` entities (`#[macro_export]`-aware visibility), C and C++ `union` declarations extract as entities in both adapters, and Java `record` / `@interface` declarations extract as classes and interfaces respectively.
+- Update channels for `kin update` and a `kin doctor --drift` surface for projection-drift inspection.
+- Entity re-key and port-handshake hardening in the daemon; write-veto warnings on protected paths; `--explain` output carries the active retrieval profile; entity-centric locate output improvements.
+
+### Changed
+
+- Session-workspace reconcile is change-set based: materialization records the workspace's base (projected graph head plus per-file content hashes), and reconcile replays only the workspace's own delta. Files the workspace never touched are left untouched when the source has advanced; both-moved divergence fails loudly naming each conflicting file — newer source truth is never silently overwritten. Legacy workspaces without a recorded base apply pure additions only.
+- Git history import selects and orders commits by a content-total order at commit-time ties, so two preps of identical history produce identical change partitions and revision ids (the long-standing cross-prep retrieval-variance root).
+- Container entrypoint resolves a writable workspace identically in both storage modes (`KIN_WORKSPACE_DIR` override, `/tmp/kin-workspace` default backed by an emptyDir), materializes a complete repository layout, and owns the authoritative `--repo` argument; unwritable resolution fails with one actionable diagnostic. The docker workflow gains a creds-free entrypoint smoke covering both modes.
+- `quick-xml` is pinned under the dependency deny policy.
+
+### Fixed
+
+- The stale-kept-workspace data-loss edge on `kin exec` / `kin run` / `kin shell` / `kin with --session` closeout (see the reconcile change above).
+- Object lookups during parallel history import retry once before failing loud, closing a transient loose-object miss window under concurrency.
+- Multi-commit test fixtures across the workspace carry explicit increasing timestamps, removing wall-clock dependence from order-sensitive suites.
+
 ## [0.2.6] - 2026-07-01
 
 Session-aware runtime, a shadow-mode merge gate, a hardened first-run installer, and a central environment registry.
