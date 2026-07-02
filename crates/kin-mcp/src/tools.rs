@@ -35,6 +35,21 @@ pub fn tool_definitions() -> ToolsListResult {
                             "enum": ["file", "entity"],
                             "description": "Rank entities ('entity', default) or roll up to files ('file')",
                             "default": "entity"
+                        },
+                        "include_snippet": {
+                            "type": "boolean",
+                            "description": "Attach a bounded inline source snippet to each entity hit",
+                            "default": true
+                        },
+                        "pipeline": {
+                            "type": "string",
+                            "enum": ["fused", "cosine"],
+                            "description": "Force a retrieval pipeline for this call: 'fused' (full multi-signal locate ranking) or 'cosine' (legacy single-vector). Defaults to the daemon's KIN_PROFILE."
+                        },
+                        "explain": {
+                            "type": "boolean",
+                            "description": "Include the fused pipeline's debug object (per-stage scores and the prune ledger). Fused pipeline only.",
+                            "default": false
                         }
                     },
                     "required": ["query"]

@@ -165,7 +165,12 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     // These route through the shared zero-safe bound helpers, so `0` disables the
     // bound rather than firing an instant zero-length timeout that guts retrieval.
     EnvVarSpec { name: "KIN_LOCATE_MULTIHOP_TIMEOUT_MS", kind: Kind::MsBound, default: "profile-dependent (200/500/1000 ms)", sensitivity: Sensitivity::Correctness, summary: "multihop BFS timeout; 0 disables the bound (still capped by depth/frontier)" },
-    EnvVarSpec { name: "KIN_LOCATE_RERANK_LATENCY_BUDGET_MS", kind: Kind::MsBound, default: "0", sensitivity: Sensitivity::Correctness, summary: "cross-encoder rerank latency budget; 0 disables the latency gate" },
+    EnvVarSpec { name: "KIN_LOCATE_RERANK_LATENCY_BUDGET_MS", kind: Kind::MsBound, default: "profile-dependent (1500 ms accuracy / 0 compat)", sensitivity: Sensitivity::Correctness, summary: "cross-encoder rerank latency budget; 0 disables the latency gate" },
+
+    // ---- retrieval quality profile and its profile-gated levers ---------------
+    // KIN_PROFILE selects the versioned retrieval profile; the levers below
+    // default per-profile and an explicit value always wins over the profile.
+    EnvVarSpec { name: "KIN_PROFILE", kind: Kind::Str, default: "accuracy-v1", sensitivity: Sensitivity::Correctness, summary: "retrieval quality profile: accuracy-v1 (default) or compat-v0 (legacy ranking behavior); proof runs pin this explicitly" },
     EnvVarSpec { name: "KIN_LOCATE_TOTAL_TIMEOUT_SECS", kind: Kind::SecsBound, default: "90", sensitivity: Sensitivity::Correctness, summary: "total locate pipeline budget in seconds; 0 disables it (unbounded)" },
     EnvVarSpec { name: "KIN_LOCATE_PHASE_ENTITY_DISCOVERY_SECS", kind: Kind::SecsBound, default: "20", sensitivity: Sensitivity::Correctness, summary: "locate phase budget: entity discovery; 0 = unbounded" },
     EnvVarSpec { name: "KIN_LOCATE_PHASE_ENTITY_RESOLUTION_SECS", kind: Kind::SecsBound, default: "20", sensitivity: Sensitivity::Correctness, summary: "locate phase budget: entity resolution; 0 = unbounded" },

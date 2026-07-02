@@ -305,8 +305,13 @@ fn daemon_env_filter() -> EnvFilter {
 }
 
 fn init_tracing() {
+    // Logs go to stderr: stdout is a protocol surface (`--compat-json` emits
+    // machine-read JSON there), and any log line on stdout corrupts it —
+    // an env-registry override warning printed before the compat payload
+    // makes the CLI's compat probe report the daemon binary as stale.
     tracing_subscriber::fmt()
         .with_env_filter(daemon_env_filter())
+        .with_writer(std::io::stderr)
         .init();
 }
 
@@ -350,6 +355,10 @@ async fn async_main() -> i32 {
         eprintln!("kin-daemon: {err}");
         return 2;
     }
+
+    // Resident serving daemon: profile-driven retrieval defaults that assume
+    // model residency (cross-encoder rerank) may apply in this process.
+    kin_cli::retrieval_profile::mark_daemon_serving();
 
     if args.supervisor {
         let idle_timeout = match supervisor_idle_timeout_from_env() {
