@@ -30,8 +30,30 @@ type ResolveEntitiesOutput = (
 // JSON output types
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 pub struct LocateResult {
+    /// Graph-native PRIMARY result: the top-confidence semantic ENTITIES
+    /// (function/method/type …) the query is about — each with its kind, name,
+    /// signature, bounded body, and the file demoted to mere provenance. This is
+    /// the entity-centric surface an agent reasons over; `files` below is kept for
+    /// back-compat and file-level provenance. Populated on the agent/JSON surface
+    /// (when snippet projection is requested); empty on the human/in-process path,
+    /// where it is omitted from output. Capped to one page (see `next_cursor`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<LocateEntity>,
+    /// Opaque cursor for the NEXT page of ranked entities. Present iff the full
+    /// ranking holds more entities than this page. Re-issue the query with this
+    /// cursor (`kin locate --next`, or the `cursor` arg) to fetch the next page
+    /// from the daemon's cached ranking — no retrieval re-run. `None` on the last
+    /// page or when paging is not active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// 0-based index of the entity page in `entities`.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub page: usize,
+    /// Total entities in the full ranking behind this paged view.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub total_ranked: usize,
     pub files: Vec<LocateFileEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug: Option<LocateDebugInfo>,
@@ -158,6 +180,79 @@ pub struct LocateSymbol {
     /// otherwise or on a graph gap. Never read from the working tree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
+}
+
+/// `serde` skip predicate: omit a `usize` field when it is `0`.
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
+/// A single ranked graph ENTITY surfaced by `kin locate` — the graph-native unit
+/// of the result. Unlike [`LocateSymbol`] (a file-attributed symbol), a
+/// `LocateEntity` is self-describing and act-on-able: it carries the entity's
+/// stable graph id, declared signature, and bounded body, with the file demoted
+/// to [`LocateProvenance`]. An agent can declare it, read its body, or drill its
+/// references straight from this record — no path typing, no follow-up file read.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LocateEntity {
+    /// Stable graph entity id. The handle for every follow-up graph query
+    /// (`get_entity_source`, `get_context_pack`, `find_references`, `declare`).
+    pub entity_id: String,
+    /// Entity kind (function, method, class, …), lowercased.
+    pub kind: String,
+    /// Entity name (the symbol identifier).
+    pub name: String,
+    /// Declared signature (params/return contract) from graph truth. Empty when
+    /// the graph carries none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signature: String,
+    /// Composite resolution score; higher means more confident.
+    pub score: f32,
+    /// True when Kin resolved this entity as a definition (has a body) rather than
+    /// a bare reference/re-export.
+    pub definition: bool,
+    /// 1-based inclusive line span of the entity, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<[u32; 2]>,
+    /// The entity's BOUNDED body — the answer itself — projected from the same
+    /// content-addressed, hash-verified graph body that backs `get_entity_source`
+    /// (never a working-tree read). Capped for density; when the full body
+    /// exceeds the cap a trailing note points at `get_entity_source <entity_id>`
+    /// for the remainder. `None` on a graph/blob miss (coordinates only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// Where this entity lives. The file is provenance, not the result.
+    pub provenance: LocateProvenance,
+}
+
+/// Provenance for a [`LocateEntity`]: the file (and resolution origin) the entity
+/// was materialized from. The file is metadata about the entity, never the unit
+/// the agent acts on.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LocateProvenance {
+    /// File the entity is defined in (graph `file_origin`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Resolution origin ("text", "vector", or empty) — which seed pool surfaced
+    /// the entity. Populated under --explain.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin: String,
+    /// Raw embedding cosine of the seed that surfaced this entity, when from the
+    /// vector pool. Recorded under --explain only; never affects rank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cosine: Option<f32>,
+}
+
+/// Default count of top ranked entities returned per `kin locate` page. Kept
+/// small (top-few high-confidence) so the agent sees the answer, not a file
+/// listing; the rest of the ranking is reachable via `next_cursor`. Tunable via
+/// `KIN_LOCATE_ENTITY_CAP`.
+pub const DEFAULT_ENTITY_PAGE_SIZE: usize = 6;
+
+/// Effective entities-per-page from `KIN_LOCATE_ENTITY_CAP`
+/// (default [`DEFAULT_ENTITY_PAGE_SIZE`]; clamped to at least 1).
+pub fn entity_page_size() -> usize {
+    locate_env_usize("KIN_LOCATE_ENTITY_CAP", DEFAULT_ENTITY_PAGE_SIZE).max(1)
 }
 
 /// Controls the bounded inline snippet attached to located symbols. Disabled by
@@ -965,6 +1060,15 @@ fn source_file_paths(graph: &kin_db::InMemoryGraph) -> HashSet<String> {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Paging inputs for a locate request: an opaque `cursor` from a prior result's
+/// `next_cursor`, and an optional `page_size` override for the entity surface.
+/// Defaults to no paging (first page, env-default page size).
+#[derive(Debug, Clone, Default)]
+pub struct LocatePaging {
+    pub cursor: Option<String>,
+    pub page_size: Option<usize>,
+}
+
 pub async fn run(
     text: &str,
     json: bool,
@@ -973,6 +1077,7 @@ pub async fn run(
     max_files_explicit: bool,
     reference: Option<String>,
     snippets: bool,
+    paging: LocatePaging,
 ) -> Result<()> {
     let _span = tracing::info_span!(
         "kin.locate",
@@ -989,8 +1094,12 @@ pub async fn run(
         max_files_explicit,
         reference,
         snippets,
+        paging,
     )
     .await?;
+    // Persist the paging cursor so `kin locate --next` can fetch the next page
+    // without the caller re-supplying the query. Best-effort; never fatal.
+    super::locate_cursor::persist_locate_cursor(result.next_cursor.as_deref());
     output_result(&result, json);
     Ok(())
 }
@@ -1002,6 +1111,7 @@ pub async fn capture(
     max_files_explicit: bool,
     reference: Option<String>,
     snippets: bool,
+    paging: LocatePaging,
 ) -> Result<LocateResult> {
     let layout = kin_core::KinLayout::discover(&std::env::current_dir()?)
         .ok_or_else(|| anyhow::anyhow!("not a Kin repository (no .kin/ found)"))?;
@@ -1019,6 +1129,7 @@ pub async fn capture(
         max_files_explicit,
         reference,
         snippets,
+        paging,
     )
     .await?;
     record_locate_telemetry(&layout, text, max_files, &result);
@@ -1102,6 +1213,7 @@ async fn try_locate_via_daemon(
     max_files_explicit: bool,
     reference: Option<String>,
     snippets: bool,
+    paging: LocatePaging,
 ) -> Result<LocateResult> {
     let daemon_url = std::env::var("KIN_DAEMON_URL")
         .ok()
@@ -1120,6 +1232,8 @@ async fn try_locate_via_daemon(
         reference,
         snippets,
         snippet_lines: None,
+        cursor: paging.cursor,
+        page_size: paging.page_size,
     };
     client
         .locate(&request)
@@ -3099,6 +3213,11 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // the working tree). No-op unless requested; the early budget-exhausted
     // return above carries no symbols, so it needs no snippets.
     attach_snippets(&mut result, graph, &snippet_opts);
+    // Re-project the ranked symbols into the graph-native PRIMARY surface: a
+    // single globally-ranked entity list (file demoted to provenance). Reuses the
+    // snippet projection's bounds; the daemon caches the full ranking and windows
+    // one page. No-op unless the agent/JSON surface requested snippets.
+    build_entity_view(&mut result, graph, &snippet_opts);
     Ok(result)
 }
 
@@ -14319,6 +14438,212 @@ fn match_symbol_entity<'a>(
         .or_else(|| entities.iter().find(|e| e.name == sym.name))
 }
 
+/// Project an entity's BOUNDED body from graph-owned content, appending a
+/// truncation note (pointing at `get_entity_source <id>` for the remainder) when
+/// the entity spans more source lines than the cap surfaced. Same
+/// content-addressed, hash-verified projection
+/// ([`kin_mcp::handlers::common::read_entity_source_excerpt_detailed`]) every
+/// agent surface uses — never a working-tree read; a graph/blob miss yields
+/// `None` (coordinates only).
+fn bounded_entity_body_with_note(
+    graph: &kin_db::InMemoryGraph,
+    entity: &kin_model::Entity,
+    max_lines: usize,
+    max_chars: usize,
+) -> Option<String> {
+    let body = kin_mcp::handlers::common::read_entity_source_excerpt_detailed(
+        graph, entity, max_lines, max_chars,
+    )?;
+    if let Some(span) = entity.span.as_ref() {
+        let total_lines =
+            (span.end_line.saturating_sub(span.start_line) as usize).saturating_add(1);
+        let shown = body.lines().count();
+        if total_lines > shown {
+            let remaining = total_lines - shown;
+            return Some(format!(
+                "{body}\n… (+{remaining} more line{} — get_entity_source {} for the full body)",
+                if remaining == 1 { "" } else { "s" },
+                entity.id
+            ));
+        }
+    }
+    Some(body)
+}
+
+/// Re-project the file-attributed ranked symbols already built into `result`
+/// (`build_result` + `attach_snippets`) into the graph-native PRIMARY surface:
+/// a single GLOBALLY-ranked list of [`LocateEntity`] (kind + name + signature +
+/// bounded body, file demoted to provenance), stored on `result.entities`.
+///
+/// This is a thin RE-PROJECTION, not new retrieval: it reuses the tuned file/
+/// symbol ranking and the graph-owned body projection. For each ranked file it
+/// resolves every emitted symbol to its graph entity ([`match_symbol_entity`]),
+/// fills the stable `entity_id` + declared `signature` + bounded `body`, then
+/// global-ranks (definition-before-reference, score desc, file-rank, name) and
+/// de-duplicates by `entity_id`. The FULL ranking is written to `result.entities`
+/// (and `total_ranked`); the daemon then caches it and windows a single page via
+/// [`apply_entity_page`]. No filesystem read. A no-op unless `opts.enabled`
+/// (the agent/JSON surface), so the human/in-process path is unchanged.
+pub fn build_entity_view(
+    result: &mut LocateResult,
+    graph: &kin_db::InMemoryGraph,
+    opts: &SnippetOptions,
+) {
+    if !opts.enabled {
+        return;
+    }
+    // (file_rank, LocateEntity) so global ranking can tie-break on file order.
+    let mut ranked: Vec<(usize, LocateEntity)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for (file_rank, file) in result.files.iter().enumerate() {
+        if file.symbols.is_empty() {
+            continue;
+        }
+        let filter = EntityFilter {
+            file_path: Some(kin_model::FilePathId::new(&file.path)),
+            ..Default::default()
+        };
+        let Ok(entities) = graph.query_entities(&filter) else {
+            continue;
+        };
+        if entities.is_empty() {
+            continue;
+        }
+        for sym in &file.symbols {
+            let Some(entity) = match_symbol_entity(&entities, sym) else {
+                continue;
+            };
+            let entity_id = entity.id.to_string();
+            if !seen.insert(entity_id.clone()) {
+                continue;
+            }
+            // Bodies belong to definitions; references/re-exports stay
+            // coordinates-only (the symbol already reused its snippet, if any).
+            let body = if sym.definition {
+                bounded_entity_body_with_note(graph, entity, opts.max_lines, opts.max_chars)
+                    .or_else(|| sym.snippet.clone())
+            } else {
+                None
+            };
+            let file_origin = entity
+                .file_origin
+                .as_ref()
+                .map(|origin| origin.0.clone())
+                .or_else(|| Some(file.path.clone()));
+            ranked.push((
+                file_rank,
+                LocateEntity {
+                    entity_id,
+                    kind: format!("{:?}", entity.kind).to_lowercase(),
+                    name: entity.name.clone(),
+                    signature: entity.signature.clone(),
+                    score: sym.score,
+                    definition: sym.definition,
+                    span: sym.span,
+                    body,
+                    provenance: LocateProvenance {
+                        file: file_origin,
+                        origin: sym.origin.clone(),
+                        cosine: sym.cosine,
+                    },
+                },
+            ));
+        }
+    }
+
+    // Global rank: definitions first, then composite score desc, then the file's
+    // own rank, then name/id for a total deterministic order.
+    ranked.sort_by(|(a_rank, a), (b_rank, b)| {
+        b.definition
+            .cmp(&a.definition)
+            .then_with(|| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a_rank.cmp(b_rank))
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.entity_id.cmp(&b.entity_id))
+    });
+
+    result.entities = ranked.into_iter().map(|(_, entity)| entity).collect();
+    result.total_ranked = result.entities.len();
+}
+
+/// Stable, opaque key for a locate ranking, scoped to the query, the ref/scope it
+/// ran against, and the graph version. Embedding the graph version means any
+/// edit (a `vfs_version` bump) yields a different key, so a stale cursor can
+/// never page a ranking built against different graph truth.
+pub fn locate_cursor_key(text: &str, reference: Option<&str>, graph_version: u64) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = FxHasher::default();
+    text.hash(&mut hasher);
+    0xff_u8.hash(&mut hasher); // field separator
+    reference.unwrap_or("").hash(&mut hasher);
+    0xff_u8.hash(&mut hasher);
+    graph_version.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// A locate paging cursor: the ranking key plus the page to fetch. Serialized as
+/// `<key>.<page>` (the key is hex, so the last `.` cleanly separates the page).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocateCursor {
+    pub key: String,
+    pub page: usize,
+}
+
+impl LocateCursor {
+    pub fn encode(&self) -> String {
+        format!("{}.{}", self.key, self.page)
+    }
+
+    pub fn decode(token: &str) -> Option<LocateCursor> {
+        let (key, page) = token.trim().rsplit_once('.')?;
+        if key.is_empty() {
+            return None;
+        }
+        let page = page.parse::<usize>().ok()?;
+        Some(LocateCursor {
+            key: key.to_string(),
+            page,
+        })
+    }
+}
+
+/// Window the full ranked `result.entities` down to a single page and set the
+/// paging fields. Pure: the daemon caches the full ranking under `cursor_key`,
+/// then calls this to emit page `page` of `page_size` and a `next_cursor` when
+/// more entities remain — so `--next` pages from cache without re-running
+/// retrieval.
+pub fn apply_entity_page(
+    result: &mut LocateResult,
+    cursor_key: &str,
+    page: usize,
+    page_size: usize,
+) {
+    let page_size = page_size.max(1);
+    let total = result.entities.len();
+    result.total_ranked = total;
+    let start = page.saturating_mul(page_size);
+    let end = start.saturating_add(page_size).min(total);
+    let window = if start < total {
+        result.entities[start..end].to_vec()
+    } else {
+        Vec::new()
+    };
+    let has_more = end < total;
+    result.entities = window;
+    result.page = page;
+    result.next_cursor = has_more.then(|| {
+        LocateCursor {
+            key: cursor_key.to_string(),
+            page: page + 1,
+        }
+        .encode()
+    });
+}
+
 fn build_result(
     results: &[(String, f32)],
     all_hits: &[HashMap<String, Vec<FileHit>>],
@@ -14401,7 +14726,7 @@ fn build_result(
         files,
         debug,
         semantic_coverage: None,
-        degradations: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -14501,6 +14826,186 @@ mod tests {
             score,
             spans: vec![],
         }]
+    }
+
+    // ── Graph-native entity surface + cursor paging (static shape) ──
+
+    fn mk_locate_entity(name: &str, score: f32, definition: bool) -> LocateEntity {
+        LocateEntity {
+            entity_id: format!("id-{name}"),
+            kind: "function".to_string(),
+            name: name.to_string(),
+            signature: format!("fn {name}()"),
+            score,
+            definition,
+            span: Some([10, 20]),
+            body: Some(format!("fn {name}() {{ /* … */ }}")),
+            provenance: LocateProvenance {
+                file: Some(format!("src/{name}.rs")),
+                origin: "vector".to_string(),
+                cosine: Some(0.5),
+            },
+        }
+    }
+
+    fn ranking(n: usize) -> Vec<LocateEntity> {
+        (0..n)
+            .map(|i| mk_locate_entity(&format!("e{i}"), 1.0 - i as f32 * 0.01, true))
+            .collect()
+    }
+
+    #[test]
+    fn locate_entity_serializes_entity_centric_with_file_as_provenance() {
+        let result = LocateResult {
+            entities: vec![mk_locate_entity("parse_config", 0.9, true)],
+            total_ranked: 1,
+            page: 0,
+            files: Vec::new(),
+            ..Default::default()
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        let e = &v["entities"][0];
+        assert_eq!(e["entity_id"], "id-parse_config");
+        assert_eq!(e["kind"], "function");
+        assert_eq!(e["name"], "parse_config");
+        assert_eq!(e["signature"], "fn parse_config()");
+        assert!(e["body"].as_str().unwrap().contains("parse_config"));
+        // File is provenance, never a top-level field on the entity.
+        assert_eq!(e["provenance"]["file"], "src/parse_config.rs");
+        assert!(e.get("file").is_none());
+        assert_eq!(v["total_ranked"], 1);
+        // Empty file list + zero/None paging fields are omitted from the wire.
+        assert!(v.get("files").is_some()); // files is always serialized
+        assert!(v.get("next_cursor").is_none());
+        assert!(v.get("page").is_none()); // page == 0 is skipped
+    }
+
+    #[test]
+    fn empty_entities_are_omitted_from_serialized_output() {
+        let result = LocateResult {
+            files: Vec::new(),
+            ..Default::default()
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        // Human/in-process path: no entity surface leaks into the JSON.
+        assert!(v.get("entities").is_none());
+        assert!(v.get("total_ranked").is_none());
+    }
+
+    #[test]
+    fn apply_entity_page_windows_first_page_and_emits_next_cursor() {
+        let mut result = LocateResult {
+            entities: ranking(20),
+            ..Default::default()
+        };
+        apply_entity_page(&mut result, "abc123", 0, 6);
+        assert_eq!(result.entities.len(), 6);
+        assert_eq!(result.page, 0);
+        assert_eq!(result.total_ranked, 20);
+        // First page holds the top-ranked entity; more remain → next_cursor set.
+        assert_eq!(result.entities[0].name, "e0");
+        assert_eq!(result.next_cursor.as_deref(), Some("abc123.1"));
+    }
+
+    #[test]
+    fn apply_entity_page_last_page_has_no_next_cursor() {
+        let mut result = LocateResult {
+            entities: ranking(10),
+            ..Default::default()
+        };
+        // page 1 of size 6 over 10 entities → 4 remaining, then done.
+        apply_entity_page(&mut result, "k", 1, 6);
+        assert_eq!(result.entities.len(), 4);
+        assert_eq!(result.page, 1);
+        assert_eq!(result.total_ranked, 10);
+        assert_eq!(result.entities[0].name, "e6");
+        assert!(result.next_cursor.is_none());
+    }
+
+    #[test]
+    fn apply_entity_page_past_end_is_empty_window() {
+        let mut result = LocateResult {
+            entities: ranking(5),
+            ..Default::default()
+        };
+        apply_entity_page(&mut result, "k", 9, 6);
+        assert!(result.entities.is_empty());
+        assert_eq!(result.total_ranked, 5);
+        assert!(result.next_cursor.is_none());
+    }
+
+    #[test]
+    fn apply_entity_page_clamps_zero_page_size() {
+        let mut result = LocateResult {
+            entities: ranking(3),
+            ..Default::default()
+        };
+        // page_size 0 must clamp to 1, not divide-by-zero or return everything.
+        apply_entity_page(&mut result, "k", 0, 0);
+        assert_eq!(result.entities.len(), 1);
+        assert_eq!(result.next_cursor.as_deref(), Some("k.1"));
+    }
+
+    #[test]
+    fn locate_cursor_round_trips_and_rejects_garbage() {
+        let cursor = LocateCursor {
+            key: "deadbeefcafef00d".to_string(),
+            page: 7,
+        };
+        let token = cursor.encode();
+        assert_eq!(token, "deadbeefcafef00d.7");
+        assert_eq!(LocateCursor::decode(&token), Some(cursor));
+        // Garbage / non-numeric page / empty key → None (never a silent page 0).
+        assert!(LocateCursor::decode("nodelimiter").is_none());
+        assert!(LocateCursor::decode("key.notanumber").is_none());
+        assert!(LocateCursor::decode(".5").is_none());
+    }
+
+    #[test]
+    fn locate_cursor_key_is_deterministic_and_version_scoped() {
+        let a = locate_cursor_key("find the parser", Some("HEAD"), 42);
+        let b = locate_cursor_key("find the parser", Some("HEAD"), 42);
+        assert_eq!(a, b, "same inputs must yield the same key");
+        // A graph edit bumps the version → a different key, so a stale cursor can
+        // never page a ranking built against different graph truth.
+        let c = locate_cursor_key("find the parser", Some("HEAD"), 43);
+        assert_ne!(a, c);
+        // Query and ref are part of the identity.
+        assert_ne!(a, locate_cursor_key("other query", Some("HEAD"), 42));
+        assert_ne!(a, locate_cursor_key("find the parser", Some("main"), 42));
+    }
+
+    #[test]
+    fn build_entity_view_is_noop_when_snippets_disabled() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut result = LocateResult {
+            files: vec![LocateFileEntry {
+                path: "src/a.rs".to_string(),
+                score: 1.0,
+                signals: vec![],
+                spans: vec![],
+                symbols: vec![],
+                explain: vec![],
+                provenance: None,
+                signal_scores: None,
+                score_breakdown: None,
+            }],
+            ..Default::default()
+        };
+        build_entity_view(&mut result, &graph, &SnippetOptions::default());
+        assert!(
+            result.entities.is_empty(),
+            "disabled snippet opts must leave the entity surface untouched"
+        );
+    }
+
+    #[test]
+    fn entity_page_size_honors_env_override() {
+        // Default when unset; floor of 1 when set to 0.
+        std::env::remove_var("KIN_LOCATE_ENTITY_CAP");
+        assert_eq!(entity_page_size(), DEFAULT_ENTITY_PAGE_SIZE);
     }
 
     #[test]
@@ -20617,7 +21122,7 @@ mod tests {
             }],
             debug: None,
             semantic_coverage: None,
-            degradations: Vec::new(),
+            ..Default::default()
         }
     }
 

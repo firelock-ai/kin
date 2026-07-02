@@ -28,8 +28,10 @@ pub fn tool_definitions() -> ToolsListResult {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "Natural-language description of the code to find" },
-                        "limit": { "type": "integer", "description": "Max ranked results to return", "default": 20 },
+                        "query": { "type": "string", "description": "Natural-language description of the code to find. Optional when paging with `cursor`." },
+                        "limit": { "type": "integer", "description": "Max ranked entities per page (page size). Default 20.", "default": 20 },
+                        "page_size": { "type": "integer", "description": "Entities per page; overrides `limit` for paging when set." },
+                        "cursor": { "type": "string", "description": "Opaque cursor from a prior result's `next_cursor`: returns the NEXT page of ranked entities from the cached ranking with no re-search. Omit for a fresh query." },
                         "granularity": {
                             "type": "string",
                             "enum": ["file", "entity"],
@@ -947,6 +949,31 @@ pub fn agent_default_tool_names() -> &'static [&'static str] {
     ]
 }
 
+/// Tool names for the READ-ONLY graph-native ContextBench profile.
+///
+/// This is the belt the graph-native benchmark agent arm drives: purely
+/// graph-native retrieval/read tools and NO write-side session/transaction tools
+/// (which `agent_default_tool_names` carries) and NO filesystem tools (there are
+/// none to expose — the entire MCP surface is graph-backed). It includes
+/// `semantic_locate` (entity-centric + paged), which `benchmark_tool_names`
+/// omits, so the agent can do natural-language entity retrieval, drill via
+/// `find_references`/`trace_data_flow`/`graph_neighborhood`, and read bodies via
+/// `get_entity_source`/`get_context_pack` — all without ever touching a file.
+pub fn context_bench_tool_names() -> &'static [&'static str] {
+    &[
+        "kin_graph_status",
+        "semantic_locate",
+        "semantic_search",
+        "get_entity",
+        "get_entity_source",
+        "get_entity_body",
+        "get_context_pack",
+        "trace_data_flow",
+        "find_references",
+        "graph_neighborhood",
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1041,6 +1068,46 @@ mod tests {
             profile.len(),
             "every profile tool should be listable"
         );
+    }
+
+    #[test]
+    fn context_bench_profile_is_read_only_and_graph_native() {
+        let list = tool_definitions();
+        let all: std::collections::HashSet<&str> =
+            list.tools.iter().map(|t| t.name.as_str()).collect();
+        let profile = context_bench_tool_names();
+
+        // Every belt tool is a real, listable graph tool.
+        for name in profile {
+            assert!(
+                all.contains(name),
+                "context-bench tool '{name}' is not in tool_definitions()"
+            );
+        }
+        // It carries semantic_locate (the entity-centric NL retrieval surface)
+        // which the benchmark profile omits.
+        assert!(profile.contains(&"semantic_locate"));
+        assert!(!benchmark_tool_names().contains(&"semantic_locate"));
+
+        // READ-ONLY: no write-side session/transaction/intent tools.
+        for forbidden in profile {
+            assert!(
+                !forbidden.starts_with("kin_session_")
+                    && !forbidden.starts_with("kin_transaction_")
+                    && !forbidden.contains("intent")
+                    && !forbidden.starts_with("register_"),
+                "context-bench must be read-only; found write-side tool '{forbidden}'"
+            );
+        }
+
+        // GRAPH-NATIVE: not a single filesystem tool name in the belt (there are
+        // none to expose — the whole MCP surface is graph-backed).
+        for fs in ["cat", "ls", "grep", "find", "read_file", "open_file"] {
+            assert!(
+                !profile.contains(&fs),
+                "context-bench belt must have zero filesystem tools; found '{fs}'"
+            );
+        }
     }
 
     #[test]

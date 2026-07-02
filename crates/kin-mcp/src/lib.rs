@@ -24,7 +24,9 @@ pub use server::{
 pub use session::{
     AssistantSession, McpMutationOperation, McpMutationPayload, McpTransaction, SessionRegistry,
 };
-pub use tools::{agent_default_tool_names, benchmark_tool_names, tool_definitions};
+pub use tools::{
+    agent_default_tool_names, benchmark_tool_names, context_bench_tool_names, tool_definitions,
+};
 pub use types::{
     ContentBlock, JsonRpcRequest, JsonRpcResponse, ToolCallParams, ToolCallResult, ToolDefinition,
 };

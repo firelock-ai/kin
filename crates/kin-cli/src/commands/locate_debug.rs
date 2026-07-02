@@ -496,8 +496,16 @@ pub async fn run(
     }
 
     // 2. Run locate with explain=true and wider max_files
-    let result =
-        crate::commands::locate::capture(&query_text, true, max_files, true, None, false).await?;
+    let result = crate::commands::locate::capture(
+        &query_text,
+        true,
+        max_files,
+        true,
+        None,
+        false,
+        crate::commands::locate::LocatePaging::default(),
+    )
+    .await?;
 
     // 3. Build the report
     let mut report = build_report(&query_text, &gold_files, &result);
