@@ -67,7 +67,7 @@ libc = "0.2"
 # macOS-only: re-enable the Metal embedding backend (kin-db/metal -> kin-infer/metal).
 # Additive via feature unification; absent on Linux so the Linux build stays green.
 [target.'cfg(target_os = "macos")'.dependencies]
-kin-db = { workspace = true, features = ["metal"] }
+kin-db = { workspace = true, features = ["metal", "accelerate"] }
 kin-infer = { version = ">=0.2.1", registry = "kin", features = ["metal"] }
 
 [dev-dependencies]

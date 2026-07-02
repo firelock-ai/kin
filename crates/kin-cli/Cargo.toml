@@ -95,5 +95,5 @@ libc = "0.2"
 # Feature unification is additive, so on macOS kin-db is built with metal; on Linux this
 # block is absent and metal is never requested, keeping the Linux build green.
 [target.'cfg(target_os = "macos")'.dependencies]
-kin-db = { workspace = true, features = ["metal"] }
+kin-db = { workspace = true, features = ["metal", "accelerate"] }
 kin-infer = { version = ">=0.2.1", registry = "kin", features = ["metal"] }
