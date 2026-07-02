@@ -99,12 +99,16 @@ fn locate_json_keeps_tracing_warnings_off_stdout() {
 
     let stdout = String::from_utf8_lossy(&locate.stdout);
 
+    // The whole stdout stream must be ONE JSON document: a tracing warning
+    // interleaved before/inside/after it fails the parse. Degraded-state facts
+    // are allowed on stdout only as structured fields of that document
+    // (`semantic_coverage`, `degradations`), never as free-text lines.
     assert!(
-        !stdout.contains("vector index") && !stdout.contains("stale"),
-        "warning leaked to stdout: {stdout}"
+        stdout.trim_start().starts_with('{'),
+        "stdout must begin with the JSON document, got: {stdout}"
     );
     serde_json::from_slice::<serde_json::Value>(&locate.stdout)
-        .expect("locate --json stdout should remain parseable");
+        .expect("locate --json stdout should remain parseable (no interleaved log lines)");
 }
 
 #[test]

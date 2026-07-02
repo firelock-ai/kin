@@ -8,3 +8,4 @@ pub mod daemon_client;
 pub mod profile;
 pub mod progress;
 pub mod provenance;
+pub mod retrieval_profile;

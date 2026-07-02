@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (371 total, 283 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (372 total, 284 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -47,6 +47,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_ORIGINAL_PATH` | path | *(unset)* | operational | caller's original PATH preserved across a with/exec shim |
 | `KIN_PLUGIN_DIR` | path | *(unset)* | operational | plugin directory override |
 | `KIN_PRIMARY_REPO_ID` | string | *(unset)* | operational | primary repo id for a multi-repo daemon |
+| `KIN_PROFILE` | string | accuracy-v1 | correctness | retrieval quality profile: accuracy-v1 (default) or compat-v0 (legacy ranking behavior); proof runs pin this explicitly |
 | `KIN_REGEN_ENV_DOC` | string | *(unset)* | diagnostic | dev/test tooling: set to regenerate docs/env-vars.md from the registry |
 | `KIN_REMOTE_URL` | url | *(unset)* | operational | native remote endpoint URL |
 | `KIN_REPO_ID` | string | *(unset)* | operational | active repo id override |
@@ -218,7 +219,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_COMPANION_ENTITY_LIMIT` | usize | 24 | correctness | locate tuning knob: companion entity limit |
 | `KIN_LOCATE_CONTRIB_PATH_PENALTY` | float>=0 | 0.2 | correctness | locate tuning knob: contrib path penalty |
 | `KIN_LOCATE_CORROBORATED_RESOLVE_FLOOR_PCT` | float>=0 | 0.05 | correctness | locate tuning knob: corroborated resolve floor pct |
-| `KIN_LOCATE_CROSS_ENCODER_ENABLED` | bool | false | correctness | locate tuning knob: cross encoder enabled |
+| `KIN_LOCATE_CROSS_ENCODER_ENABLED` | bool | quality.cross_encoder_default(ce_model_cached | correctness | locate tuning knob: cross encoder enabled |
 | `KIN_LOCATE_CROSS_ENCODER_MODEL` | string | *(unset)* | correctness | override the cross-encoder rerank model id |
 | `KIN_LOCATE_CROSS_ENCODER_REVISION` | string | *(unset)* | correctness | override the cross-encoder rerank model revision |
 | `KIN_LOCATE_CURATED_TERM_LIMIT` | usize | 6 | correctness | locate tuning knob: curated term limit |
@@ -248,7 +249,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_DIRECT_DOMINANCE_TAIL_PENALTY` | float>=0 | 0.35 | correctness | locate tuning knob: direct dominance tail penalty |
 | `KIN_LOCATE_DIR_MATCH_FILE_LIMIT` | usize | 20 | correctness | locate tuning knob: dir match file limit |
 | `KIN_LOCATE_DOCS_PATH_PENALTY` | float>=0 | 0.01 | correctness | locate tuning knob: docs path penalty |
-| `KIN_LOCATE_EMBEDDING_MIN_SIMILARITY` | float>=0 | 0.25 | correctness | locate tuning knob: embedding min similarity |
+| `KIN_LOCATE_EMBEDDING_MIN_SIMILARITY` | float>=0 | context-dependent | correctness | locate tuning knob: embedding min similarity |
 | `KIN_LOCATE_EMBED_FLOOR_EXEMPT_TOPK` | usize | 5 | correctness | locate tuning knob: embed floor exempt topk |
 | `KIN_LOCATE_EMIT_INNER_METHODS` | bool | false | correctness | locate tuning knob: emit inner methods |
 | `KIN_LOCATE_ENRICH_EMPTY_FILES` | bool | true | correctness | locate tuning knob: enrich empty files |
@@ -261,7 +262,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_ENTITY_DOMINANT_RESOLVE_MIN` | float>=0 | 20.0 | correctness | locate tuning knob: entity dominant resolve min |
 | `KIN_LOCATE_ENTITY_DOMINANT_RESOLVE_WEIGHT` | float>=0 | 8.0 | correctness | locate tuning knob: entity dominant resolve weight |
 | `KIN_LOCATE_ENTITY_DOMINANT_RRF_THRESHOLD` | usize | 3 | correctness | locate tuning knob: entity dominant rrf threshold |
-| `KIN_LOCATE_ENTITY_FUSION` | bool | false | correctness | locate tuning knob: entity fusion |
+| `KIN_LOCATE_ENTITY_FUSION` | bool | context-dependent | correctness | locate tuning knob: entity fusion |
 | `KIN_LOCATE_EXPLAIN_DEF_FLOOR_PCT` | float>=0 | 0.0 | correctness | locate tuning knob: explain def floor pct |
 | `KIN_LOCATE_EXPLAIN_DEF_TOPK` | usize | 0 | correctness | locate tuning knob: explain def topk |
 | `KIN_LOCATE_EXPLICIT_PHASE_MISMATCH_PENALTY` | float>=0 | 0.22 | correctness | locate tuning knob: explicit phase mismatch penalty |
@@ -285,7 +286,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_LEXICAL_FLOOR_LIFT` | float>=0 | 1.05 | correctness | locate tuning knob: lexical floor lift |
 | `KIN_LOCATE_LEXICAL_FLOOR_LIFT_PRESENT` | bool | true | correctness | locate tuning knob: lexical floor lift present |
 | `KIN_LOCATE_LEXICAL_FLOOR_QUALITY` | float>=0 | 3.0 | correctness | locate tuning knob: lexical floor quality |
-| `KIN_LOCATE_LEXICAL_FLOOR_READMIT` | bool | false | correctness | locate tuning knob: lexical floor readmit |
+| `KIN_LOCATE_LEXICAL_FLOOR_READMIT` | bool | context-dependent | correctness | locate tuning knob: lexical floor readmit |
 | `KIN_LOCATE_LEXICAL_FLOOR_STRONG_STRENGTH` | float>=0 | 1.0 | correctness | locate tuning knob: lexical floor strong strength |
 | `KIN_LOCATE_LEXICAL_FLOOR_TEXT_HITS` | usize | 40 | correctness | locate tuning knob: lexical floor text hits |
 | `KIN_LOCATE_LEXICAL_FLOOR_TIEBREAK` | float>=0 | 0.05 | correctness | locate tuning knob: lexical floor tiebreak |
@@ -354,9 +355,9 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_PUBLIC_API_IMPL_PENALTY` | float>=0 | 0.3 | correctness | locate tuning knob: public api impl penalty |
 | `KIN_LOCATE_QUERY_PRIORITY_RETAIN_LIMIT` | usize | 3 | correctness | locate tuning knob: query priority retain limit |
 | `KIN_LOCATE_QUERY_TEST_ARTIFACT_LIMIT` | usize | 3 | correctness | locate tuning knob: query test artifact limit |
-| `KIN_LOCATE_RERANK_BLEND` | bool | false | correctness | locate tuning knob: rerank blend |
+| `KIN_LOCATE_RERANK_BLEND` | bool | context-dependent | correctness | locate tuning knob: rerank blend |
 | `KIN_LOCATE_RERANK_BLEND_WEIGHT` | float>=0 | 0.04 | correctness | locate tuning knob: rerank blend weight |
-| `KIN_LOCATE_RERANK_LATENCY_BUDGET_MS` | ms bound (0=unbounded) | 0 | correctness | cross-encoder rerank latency budget; 0 disables the latency gate |
+| `KIN_LOCATE_RERANK_LATENCY_BUDGET_MS` | ms bound (0=unbounded) | profile-dependent (1500 ms accuracy / 0 compat) | correctness | cross-encoder rerank latency budget; 0 disables the latency gate |
 | `KIN_LOCATE_RERANK_MIN_SPREAD` | float>=0 | 0.10 | correctness | locate tuning knob: rerank min spread |
 | `KIN_LOCATE_RESOLVE_ARTIFACT_FRONTIER` | usize | 32 | correctness | locate tuning knob: resolve artifact frontier |
 | `KIN_LOCATE_RESOLVE_ARTIFACT_HOPS` | usize | 2 | correctness | locate tuning knob: resolve artifact hops |

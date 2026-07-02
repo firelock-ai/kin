@@ -77,23 +77,26 @@ pub fn handle_semantic_search<G: GraphStore>(
 }
 
 pub const SEMANTIC_LOCATE_DESC: &str = "\
-Rank the code most relevant to a natural-language query by embedding similarity against \
-Kin's real vector index — a graph-native semantic ranking, not a name/metadata filter. \
-This is the tool to reach for when you are looking for \"where is the code that does X\" \
-and you only have a description of the behavior, not an exact symbol name. Unlike \
-semantic_search (which matches declarations by name/kind/language and ignores the query \
-for ranking), semantic_locate embeds your query and scores entities by cosine similarity \
-against the graph's HNSW index, returning a ranked list with relevance scores. It is a \
-single-vector ranking: it does NOT add the lexical and graph-structure fusion or the \
-cross-encoder reranking that the full `kin locate` CLI pipeline layers on top, so for the \
-product's best-ranked retrieval prefer `kin locate`. Set granularity to \"entity\" \
+Rank the code most relevant to a natural-language query using Kin's full fused retrieval \
+pipeline — the same multi-signal ranking `kin locate` serves: vector similarity, lexical \
+search, and graph-structure signals fused with role-aware ranking, exact-name promotion, \
+and (when its model is available) cross-encoder reranking. This is the tool to reach for \
+when you are looking for \"where is the code that does X\" and you only have a \
+description of the behavior, not an exact symbol name. Unlike semantic_search (which \
+matches declarations by name/kind/language and ignores the query for ranking), \
+semantic_locate ranks by query relevance and returns act-on-able hits: entity_id, file, \
+line span, kind, score, and a bounded inline snippet. Set granularity to \"entity\" \
 (default) for ranked declarations or \"file\" to roll results up to the most relevant \
-files. The response also reports semantic_coverage — the fraction of the graph that has \
-embeddings indexed — so you can tell whether a thin result set means \"not relevant\" or \
-\"not yet embedded\". Requires the Kin daemon: vector search runs against the daemon's \
-live graph and HNSW index, so this tool returns an error in offline/no-daemon mode. On an \
-empty result the additive `negative` object's `safe_to_conclude_absent` flag distinguishes \
-an authoritative \"no match\" from \"not yet embedded\".";
+files. The `routing` field reports which pipeline answered (`fused-v1` by default; \
+`cosine-v0` when KIN_PROFILE=compat-v0 or `pipeline: \"cosine\"` selects the legacy \
+single-vector ranking). The response also reports semantic_coverage — the fraction of \
+the graph that has embeddings indexed — plus a `degradations` array naming any \
+retrieval capability that could not fully run (empty vector index, reranker model not \
+cached, …), so a thin result set is attributable instead of silent. Requires the Kin \
+daemon: retrieval runs against the daemon's live graph, so this tool returns an error \
+in offline/no-daemon mode. On an empty result the additive `negative` object's \
+`safe_to_conclude_absent` flag distinguishes an authoritative \"no match\" from \"not \
+yet embedded\".";
 
 /// Offline/generic dispatch arm for `semantic_locate`.
 ///

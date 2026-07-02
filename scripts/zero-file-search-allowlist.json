@@ -91,6 +91,12 @@
       "status": "transitional",
       "removal_target": "Replace direct text-reference reads with graph-derived source projection.",
       "expiration": "2026-09-30"
+    },
+    {
+      "file": "crates/kin-cli/src/retrieval_profile.rs",
+      "reason": "Config/capability IO: probes the local model cache directory for reranker availability; never reads repo content and is not a semantic answer path",
+      "owner": "kin-cli",
+      "expiration": "2026-12-31"
     }
   ]
 }

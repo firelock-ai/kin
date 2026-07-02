@@ -42,6 +42,32 @@ pub struct LocateResult {
     /// erroring out. Always populated by the daemon/in-process locate path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_coverage: Option<SemanticCoverage>,
+    /// Structured record of every retrieval capability that was unavailable or
+    /// cut short for THIS query (vector arm failed, reranker model missing,
+    /// rerank over latency budget, …). Empty when the full pipeline ran. This
+    /// is the machine-readable no-silent-degradation contract: a caller can
+    /// tell a strong answer from a degraded one without parsing logs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degradations: Vec<RetrievalDegradation>,
+}
+
+/// One retrieval capability that did not fully run for a query, with the
+/// reason and the operator remediation. Serialized on `LocateResult` and on
+/// the agent-facing `semantic_locate` payload; also logged at WARN by the
+/// daemon so degraded serving is visible on both sides of the boundary.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct RetrievalDegradation {
+    /// Which capability degraded: `vector_index`, `cross_encoder`, ….
+    pub component: String,
+    /// Stable machine-readable cause (`empty`, `partial`, `query_failed`,
+    /// `model_not_cached`, `init_failed`, `latency_budget_exceeded`, …).
+    pub reason: String,
+    /// Human-readable specifics (counts, elapsed times, model ids).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+    /// What restores full capability (`run 'kin embed'`, …).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub remediation: String,
 }
 
 /// Honest, in-band report of how complete the embedding (semantic) signal was
@@ -220,6 +246,48 @@ pub struct LocateDebugInfo {
     pub pruned_files: Vec<PrunedFile>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol_cap: Option<SymbolCapTrace>,
+    /// Per-stage prune attribution: every point in the pipeline where a
+    /// candidate (or a whole signal) was cut before surfacing, with the stage,
+    /// the mechanism, and the limit in force. Turns "the graph had a path but
+    /// the answer didn't show it" from a mystery into a per-stage diagnosis.
+    /// Recorded only under `--explain`; empty otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prune_ledger: Vec<PruneEvent>,
+}
+
+/// One prune decision in the locate pipeline, attributed to the stage and
+/// mechanism that made it. Item-level where cheap (file-rank cuts), aggregate
+/// where item-level would flood (seed floors, frontier truncation).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PruneEvent {
+    /// Pipeline stage that cut the candidate(s): `entity_discovery`,
+    /// `embedding_seed_floor`, `multihop_seed_cap`, `multihop_timeout`,
+    /// `resolve_support_cap`, `adaptive_cap`, `symbol_cap`, ….
+    pub stage: String,
+    /// Cut mechanism: `cap`, `threshold`, `hop_limit`, `timeout`,
+    /// `rank_floor`, `adaptive_shrink`, `budget_skip`.
+    pub kind: String,
+    /// File path of the pruned candidate, when the cut was item-level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Entity/symbol name of the pruned candidate, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Candidate score at the moment it was cut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
+    /// Number of candidates removed by this event when aggregate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped: Option<usize>,
+    /// The cap/limit in force (top-k, frontier size, …), when numeric.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    /// The threshold in force (score floor, similarity floor), when numeric.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<f32>,
+    /// Free-form specifics (elapsed times, env var controlling the limit).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -811,6 +879,62 @@ fn evaluate_embedding_coverage(
     })
 }
 
+/// Push a degradation once per (component, reason); repeated hits within one
+/// query add no new information and would bloat the payload.
+fn record_degradation(sink: &mut Vec<RetrievalDegradation>, event: RetrievalDegradation) {
+    if sink
+        .iter()
+        .any(|existing| existing.component == event.component && existing.reason == event.reason)
+    {
+        return;
+    }
+    sink.push(event);
+}
+
+/// Record the vector-index state for this query as a structured degradation
+/// when it is empty or partial. The `SemanticCoverage` object already carries
+/// the numbers; this adds the machine-readable component/reason/remediation
+/// entry so an empty vector index can never read as a clean lexical answer.
+fn record_vector_index_degradation(
+    coverage: &SemanticCoverage,
+    vector_source: Option<&kin_db::InMemoryGraph>,
+    sink: &mut Vec<RetrievalDegradation>,
+) {
+    if coverage.complete {
+        return;
+    }
+    let vector_arm_present = coverage.indexed > 0
+        || vector_source.is_some_and(|source| source.embedding_status().indexed > 0);
+    let (reason, detail) = if vector_arm_present {
+        (
+            "partial",
+            format!(
+                "semantic signal partial: {}/{} entities embedded ({} pending)",
+                coverage.indexed, coverage.total, coverage.pending
+            ),
+        )
+    } else {
+        (
+            "empty",
+            format!(
+                "vector index empty: 0/{} entities embedded — semantic ranking disabled, \
+                 lexical + graph signals only",
+                coverage.total
+            ),
+        )
+    };
+    record_degradation(
+        sink,
+        RetrievalDegradation {
+            component: "vector_index".to_string(),
+            reason: reason.to_string(),
+            detail,
+            remediation: "run 'kin embed' until kin status reports full embedding coverage"
+                .to_string(),
+        },
+    );
+}
+
 fn file_path_from_retrieval_key(
     graph: &kin_db::InMemoryGraph,
     key: &kin_db::RetrievalKey,
@@ -1108,6 +1232,16 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     let text = semantic_text.as_str();
     let semantic_coverage = evaluate_embedding_coverage(graph, vector_source)?;
 
+    // Quality profile: supplies the DEFAULT for each retrieval lever below;
+    // explicit env vars always win. Resolved once per query so one run cannot
+    // mix profiles.
+    let quality = crate::retrieval_profile::RetrievalProfile::from_env();
+    // No-silent-degradation ledger for this query (attached to the result).
+    let mut degradations: Vec<RetrievalDegradation> = Vec::new();
+    record_vector_index_degradation(&semantic_coverage, vector_source, &mut degradations);
+    // Per-stage prune attribution, recorded only under --explain.
+    let mut prune_ledger: Vec<PruneEvent> = Vec::new();
+
     let mut budget = LocateBudget::new();
     let pipeline_report = std::env::var("KIN_LOCATE_PIPELINE_REPORT").is_ok();
     let profile = LocateProfile::detect();
@@ -1138,31 +1272,71 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // ═══════════════════════════════════════════════════════════════════════
 
     // Phase 1a: Entity-first signals — return entity seeds
-    let (search_entity_seeds, embedding_entity_seeds) =
-        if budget.phase_should_skip("entity_discovery") {
-            (HashMap::new(), HashMap::new())
-        } else {
-            let phase_start = std::time::Instant::now();
-            let search = extract_search_signals(text, graph, test_query)?;
-            let embedding = if budget.phase_remaining("entity_discovery") < 2.0 {
-                tracing::info!(
-                    "skipping embedding sub-phase: entity_discovery budget nearly exhausted"
-                );
-                HashMap::new()
-            } else {
-                extract_embedding_signals(text, graph, test_query, vector_source)?
-            };
-            if phase_start.elapsed().as_secs_f64()
-                > budget
-                    .phase_budgets
-                    .get("entity_discovery")
-                    .copied()
-                    .unwrap_or(30.0)
-            {
-                budget.warn_phase_timeout("entity_discovery", phase_start.elapsed());
+    let (search_entity_seeds, embedding_entity_seeds) = if budget
+        .phase_should_skip("entity_discovery")
+    {
+        if explain {
+            prune_ledger.push(PruneEvent {
+                stage: "entity_discovery".to_string(),
+                kind: "budget_skip".to_string(),
+                path: None,
+                name: None,
+                score: None,
+                dropped: None,
+                limit: None,
+                threshold: None,
+                detail: "phase skipped: total locate budget exhausted".to_string(),
+            });
+        }
+        (HashMap::new(), HashMap::new())
+    } else {
+        let phase_start = std::time::Instant::now();
+        let search = extract_search_signals(text, graph, test_query)?;
+        let embedding = if budget.phase_remaining("entity_discovery") < 2.0 {
+            tracing::info!(
+                "skipping embedding sub-phase: entity_discovery budget nearly exhausted"
+            );
+            if explain {
+                prune_ledger.push(PruneEvent {
+                    stage: "embedding_discovery".to_string(),
+                    kind: "budget_skip".to_string(),
+                    path: None,
+                    name: None,
+                    score: None,
+                    dropped: None,
+                    limit: None,
+                    threshold: None,
+                    detail: "embedding sub-phase skipped: entity_discovery budget nearly exhausted"
+                        .to_string(),
+                });
             }
-            (search, embedding)
+            HashMap::new()
+        } else {
+            extract_embedding_signals(
+                text,
+                graph,
+                test_query,
+                vector_source,
+                quality,
+                &mut degradations,
+                if explain {
+                    Some(&mut prune_ledger)
+                } else {
+                    None
+                },
+            )?
         };
+        if phase_start.elapsed().as_secs_f64()
+            > budget
+                .phase_budgets
+                .get("entity_discovery")
+                .copied()
+                .unwrap_or(30.0)
+        {
+            budget.warn_phase_timeout("entity_discovery", phase_start.elapsed());
+        }
+        (search, embedding)
+    };
 
     // Phase 1b: File-based signals — these bypass entity resolution
     let traceback = extract_traceback_signals(text, graph)?;
@@ -1336,6 +1510,20 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
 
     // Phase 2b: Multihop expansion from resolved files (graph follow-up)
     let multihop = if fast_entity_dominant || budget.phase_should_skip("multihop") {
+        if explain && !fast_entity_dominant {
+            prune_ledger.push(PruneEvent {
+                stage: "multihop".to_string(),
+                kind: "budget_skip".to_string(),
+                path: None,
+                name: None,
+                score: None,
+                dropped: None,
+                limit: None,
+                threshold: None,
+                detail: "graph multihop expansion skipped: total locate budget exhausted"
+                    .to_string(),
+            });
+        }
         HashMap::new()
     } else {
         let phase_start = std::time::Instant::now();
@@ -1349,7 +1537,17 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             &imports,
             &errors,
         ];
-        let result = extract_multihop_signals(&multihop_seed_sets, graph, profile, test_query)?;
+        let result = extract_multihop_signals(
+            &multihop_seed_sets,
+            graph,
+            profile,
+            test_query,
+            if explain {
+                Some(&mut prune_ledger)
+            } else {
+                None
+            },
+        )?;
         if phase_start.elapsed().as_secs_f64()
             > budget
                 .phase_budgets
@@ -1414,6 +1612,18 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         let debug_info = if explain {
             let mut info = LocateDebugInfo::default();
             info.skipped_signals = budget.warnings.clone();
+            prune_ledger.push(PruneEvent {
+                stage: "scoring".to_string(),
+                kind: "budget_skip".to_string(),
+                path: None,
+                name: None,
+                score: None,
+                dropped: None,
+                limit: None,
+                threshold: None,
+                detail: "pipeline returned early: scoring budget exhausted".to_string(),
+            });
+            info.prune_ledger = std::mem::take(&mut prune_ledger);
             Some(info)
         } else {
             None
@@ -1423,7 +1633,19 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             warnings = ?budget.warnings,
             "locate pipeline returning early: scoring budget exhausted"
         );
-        return Ok(build_result(
+        record_degradation(
+            &mut degradations,
+            RetrievalDegradation {
+                component: "pipeline".to_string(),
+                reason: "budget_exhausted".to_string(),
+                detail: format!(
+                    "scoring budget exhausted after {:.1}s; partial result returned",
+                    budget.elapsed_secs()
+                ),
+                remediation: "raise KIN_LOCATE_TOTAL_TIMEOUT_SECS for this repo size".to_string(),
+            },
+        );
+        let mut early = build_result(
             &fallback_files,
             &[],
             &HashMap::new(),
@@ -1434,7 +1656,18 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             debug_info,
             explain,
         )
-        .with_semantic_coverage(semantic_coverage));
+        .with_semantic_coverage(semantic_coverage);
+        for degradation in &degradations {
+            tracing::warn!(
+                component = %degradation.component,
+                reason = %degradation.reason,
+                detail = %degradation.detail,
+                remediation = %degradation.remediation,
+                "locate ran degraded"
+            );
+        }
+        early.degradations = degradations;
+        return Ok(early);
     }
 
     let signal_confidence_weights = [
@@ -1560,7 +1793,8 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     // floors/adaptive_cap) below runs unchanged. When unset, the original
     // track-regime path fusion runs verbatim — see the flip-plan in
     // crates/kin-cli/docs/locate-entity-fusion-flip-plan.md for scope and A/B.
-    let mut fused = if locate_env_bool("KIN_LOCATE_ENTITY_FUSION", false) {
+    let mut fused = if locate_env_bool("KIN_LOCATE_ENTITY_FUSION", quality.entity_fusion_default())
+    {
         entity_granular_fused_files(
             &ranked_lists,
             &all_entity_seeds,
@@ -1773,6 +2007,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             },
             pruned_files: Vec::new(),
             symbol_cap: None,
+            prune_ledger: Vec::new(),
         })
     } else {
         None
@@ -2455,7 +2690,35 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     }
 
     // ── Optional Cross-Encoder reranking ──
-    if locate_env_bool("KIN_LOCATE_CROSS_ENCODER_ENABLED", false) {
+    // Default comes from the quality profile: the accuracy profile turns the
+    // reranker on only when its model is already cached locally (a default
+    // must never trigger a mid-query network download); an explicit env value
+    // always wins. A profile that WANTED the reranker but could not run it is
+    // reported as a structured degradation, never silently skipped.
+    let ce_model_id = std::env::var("KIN_LOCATE_CROSS_ENCODER_MODEL")
+        .unwrap_or_else(|_| "BAAI/bge-reranker-base".to_string());
+    let ce_model_cached = crate::retrieval_profile::cross_encoder_model_cached(&ce_model_id);
+    if quality.cross_encoder_default(true)
+        && !ce_model_cached
+        && std::env::var("KIN_LOCATE_CROSS_ENCODER_ENABLED").is_err()
+    {
+        record_degradation(
+            &mut degradations,
+            RetrievalDegradation {
+                component: "cross_encoder".to_string(),
+                reason: "model_not_cached".to_string(),
+                detail: format!("reranker model {ce_model_id} is not in the local model cache"),
+                remediation: format!(
+                    "prefetch the model (set KIN_LOCATE_CROSS_ENCODER_ENABLED=1 once to \
+                     download {ce_model_id}), then rerun"
+                ),
+            },
+        );
+    }
+    if locate_env_bool(
+        "KIN_LOCATE_CROSS_ENCODER_ENABLED",
+        quality.cross_encoder_default(ce_model_cached),
+    ) {
         let ltr_window = locate_env_usize("KIN_LOCATE_LTR_WINDOW", 20).min(fused.len());
         if ltr_window > 0 {
             // Gate the cross-encoder rerank on graph presence, not a live
@@ -2466,8 +2729,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             // keeping a populated graph, so the gate must key on the graph to stay
             // effective in that mode.
             if cross_encoder_has_graph_candidates(graph) {
-                let model_id = std::env::var("KIN_LOCATE_CROSS_ENCODER_MODEL")
-                    .unwrap_or_else(|_| "BAAI/bge-reranker-base".to_string());
+                let model_id = ce_model_id.clone();
                 let revision = std::env::var("KIN_LOCATE_CROSS_ENCODER_REVISION")
                     .unwrap_or_else(|_| "main".to_string());
 
@@ -2489,12 +2751,19 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                         let doc_refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
                         if let Ok(scores) = encoder.rerank(text, &doc_refs) {
                             let elapsed_ms = rerank_started.elapsed().as_millis();
-                            // `0` means unbounded (no latency gate), matching
-                            // `rerank_within_budget`'s 0-is-off contract — never a
-                            // 0 ms budget that gates every rerank.
+                            // Unset falls back to the active profile's budget;
+                            // an explicit `0` means unbounded (no latency gate),
+                            // matching `rerank_within_budget`'s 0-is-off contract —
+                            // never a 0 ms budget that gates every rerank.
+                            let profile_budget_ms = quality.rerank_latency_budget_ms_default();
+                            let profile_bound = if profile_budget_ms == 0 {
+                                kin_core::env_registry::MsBound::Unbounded
+                            } else {
+                                kin_core::env_registry::MsBound::Limited(profile_budget_ms as u64)
+                            };
                             let budget_ms = kin_core::env_registry::env_ms_bound(
                                 "KIN_LOCATE_RERANK_LATENCY_BUDGET_MS",
-                                kin_core::env_registry::MsBound::Unbounded,
+                                profile_bound,
                             )
                             .as_millis_u128();
                             if rerank_within_budget(elapsed_ms, budget_ms) {
@@ -2507,7 +2776,10 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                                 // term so scores are monotonically non-decreasing (a gold can
                                 // only move up, never below its fused floor); confidence-gated
                                 // to skip flat distributions where the encoder isn't separating.
-                                if locate_env_bool("KIN_LOCATE_RERANK_BLEND", false) {
+                                if locate_env_bool(
+                                    "KIN_LOCATE_RERANK_BLEND",
+                                    quality.rerank_blend_default(),
+                                ) {
                                     let sig: Vec<f32> =
                                         scores.iter().map(|&l| 1.0 / (1.0 + (-l).exp())).collect();
                                     let mn = sig.iter().copied().fold(f32::INFINITY, f32::min);
@@ -2556,6 +2828,20 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                                      KIN_LOCATE_RERANK_LATENCY_BUDGET_MS={budget_ms}ms; \
                                      keeping pre-rerank order"
                                 );
+                                record_degradation(
+                                    &mut degradations,
+                                    RetrievalDegradation {
+                                        component: "cross_encoder".to_string(),
+                                        reason: "latency_budget_exceeded".to_string(),
+                                        detail: format!(
+                                            "rerank took {elapsed_ms}ms against a {budget_ms}ms \
+                                             budget; pre-rerank order kept"
+                                        ),
+                                        remediation: "raise KIN_LOCATE_RERANK_LATENCY_BUDGET_MS \
+                                                      or keep the fused order"
+                                            .to_string(),
+                                    },
+                                );
                                 if explain {
                                     record_debug_stage(
                                         &mut score_breakdown,
@@ -2569,12 +2855,34 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                     }
                     Err(e) => {
                         tracing::warn!("CrossEncoder init failed: {}", e);
+                        record_degradation(
+                            &mut degradations,
+                            RetrievalDegradation {
+                                component: "cross_encoder".to_string(),
+                                reason: "init_failed".to_string(),
+                                detail: format!("CrossEncoder init failed for {model_id}: {e}"),
+                                remediation:
+                                    "verify the reranker model files and network access, or unset \
+                                     KIN_LOCATE_CROSS_ENCODER_ENABLED"
+                                        .to_string(),
+                            },
+                        );
                     }
                 }
             } else {
                 tracing::warn!(
                     "skipping cross-encoder rerank because the graph has no entities \
                      to derive candidate text from"
+                );
+                record_degradation(
+                    &mut degradations,
+                    RetrievalDegradation {
+                        component: "cross_encoder".to_string(),
+                        reason: "no_candidates".to_string(),
+                        detail: "graph has no retrievable artifacts to derive candidate text from"
+                            .to_string(),
+                        remediation: "re-ingest the repo so graph artifacts exist".to_string(),
+                    },
                 );
             }
         }
@@ -2603,7 +2911,10 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         );
     }
 
-    if locate_env_bool("KIN_LOCATE_LEXICAL_FLOOR_READMIT", false) {
+    if locate_env_bool(
+        "KIN_LOCATE_LEXICAL_FLOOR_READMIT",
+        quality.lexical_floor_readmit_default(),
+    ) {
         apply_lexical_parity_floor(&mut fused, graph, text);
         if explain {
             record_debug_stage(
@@ -2642,8 +2953,24 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         },
     );
     if explain {
+        // Mirror the adaptive-cap drops into the per-stage prune ledger so one
+        // surface attributes EVERY cut. `reason` doubles as the mechanism.
+        for pruned in &pruned_files {
+            prune_ledger.push(PruneEvent {
+                stage: "adaptive_cap".to_string(),
+                kind: pruned.reason.clone(),
+                path: Some(pruned.path.clone()),
+                name: None,
+                score: Some(pruned.score),
+                dropped: None,
+                limit: Some(max_files),
+                threshold: None,
+                detail: String::new(),
+            });
+        }
         if let Some(debug) = debug_info.as_mut() {
             debug.pruned_files = pruned_files;
+            debug.prune_ledger = std::mem::take(&mut prune_ledger);
         }
     }
     if legacy_debug {
@@ -2756,6 +3083,18 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         explain,
     )
     .with_semantic_coverage(semantic_coverage);
+    // No-silent-degradation contract: every capability that could not fully
+    // run for this query rides on the result AND hits the daemon log at WARN.
+    for degradation in &degradations {
+        tracing::warn!(
+            component = %degradation.component,
+            reason = %degradation.reason,
+            detail = %degradation.detail,
+            remediation = %degradation.remediation,
+            "locate ran degraded"
+        );
+    }
+    result.degradations = degradations;
     // Project bounded inline snippets from graph-owned content (no extra IO on
     // the working tree). No-op unless requested; the early budget-exhausted
     // return above carries no symbols, so it needs no snippets.
@@ -6826,6 +7165,7 @@ fn extract_multihop_signals(
     graph: &kin_db::InMemoryGraph,
     profile: LocateProfile,
     test_query: bool,
+    mut ledger: Option<&mut Vec<PruneEvent>>,
 ) -> Result<HashMap<String, Vec<FileHit>>> {
     let _span = tracing::info_span!(
         "locate.extract_multihop_signals",
@@ -6836,6 +7176,13 @@ fn extract_multihop_signals(
     use std::collections::VecDeque;
 
     let mut hits: HashMap<String, Vec<FileHit>> = HashMap::new();
+
+    // Traversal-cut accounting for the prune ledger (aggregated; only
+    // collected when the caller passed a ledger, i.e. under --explain).
+    let mut cut_depth_limit_hits = 0usize;
+    let mut cut_frontier_truncated = 0usize;
+    let mut cut_artifact_frontier_truncated = 0usize;
+    let mut cut_timeout = false;
 
     // Profile-adaptive BFS parameters, overridable via env vars but capped by profile
     let profile_max_depth = profile.multihop_max_depth();
@@ -6897,7 +7244,25 @@ fn extract_multihop_signals(
             }
         }
     }
+    let seeds_before_cap = seed_files.len();
     seed_files = retained_seed_files;
+    if seeds_before_cap > seed_files.len() {
+        if let Some(ledger) = ledger.as_deref_mut() {
+            ledger.push(PruneEvent {
+                stage: "multihop_seed_cap".to_string(),
+                kind: "cap".to_string(),
+                path: seed_files.last().map(|(path, _)| path.clone()),
+                name: None,
+                score: None,
+                dropped: Some(seeds_before_cap - seed_files.len()),
+                limit: Some(seed_limit),
+                threshold: None,
+                detail: "seed files beyond KIN_LOCATE_MULTIHOP_SEED_FILES never enter the \
+                         graph walk"
+                    .to_string(),
+            });
+        }
+    }
 
     let default_artifact_hops = if test_query { 2 } else { 1 };
     let artifact_hops =
@@ -6922,6 +7287,7 @@ fn extract_multihop_signals(
 
             while let Some((artifact_node, _via_path, depth)) = queue.pop_front() {
                 if depth >= artifact_hops {
+                    cut_depth_limit_hits += 1;
                     continue;
                 }
                 let mut rels = graph.get_all_relations_for_node(&artifact_node)?;
@@ -6936,6 +7302,14 @@ fn extract_multihop_signals(
                         .then_with(|| format!("{:?}", left.id).cmp(&format!("{:?}", right.id)))
                 });
 
+                if ledger.is_some() {
+                    let eligible = rels
+                        .iter()
+                        .filter(|rel| relation_allows_artifact_traversal(rel, &artifact_node))
+                        .count();
+                    cut_artifact_frontier_truncated +=
+                        eligible.saturating_sub(artifact_frontier_limit);
+                }
                 for rel in rels
                     .iter()
                     .filter(|rel| relation_allows_artifact_traversal(rel, &artifact_node))
@@ -7005,6 +7379,7 @@ fn extract_multihop_signals(
                 "multihop BFS timeout reached after {:?}",
                 bfs_start.elapsed()
             );
+            cut_timeout = true;
             break;
         }
 
@@ -7013,10 +7388,25 @@ fn extract_multihop_signals(
             ..Default::default()
         };
         let entities = graph.query_entities(&filter)?;
-        for entity in entities
-            .iter()
-            .take(locate_env_usize("KIN_LOCATE_MULTIHOP_ENTITY_LIMIT", 64))
-        {
+        let entity_limit = locate_env_usize("KIN_LOCATE_MULTIHOP_ENTITY_LIMIT", 64);
+        if entities.len() > entity_limit {
+            if let Some(ledger) = ledger.as_deref_mut() {
+                ledger.push(PruneEvent {
+                    stage: "multihop_entity_cap".to_string(),
+                    kind: "cap".to_string(),
+                    path: Some(seed_path.clone()),
+                    name: None,
+                    score: None,
+                    dropped: Some(entities.len() - entity_limit),
+                    limit: Some(entity_limit),
+                    threshold: None,
+                    detail: "seed-file entities beyond KIN_LOCATE_MULTIHOP_ENTITY_LIMIT never \
+                             start a walk"
+                        .to_string(),
+                });
+            }
+        }
+        for entity in entities.iter().take(entity_limit) {
             let mut queue = VecDeque::from([(entity.id, 0usize)]);
             let mut visited = HashSet::from([entity.id]);
 
@@ -7024,10 +7414,12 @@ fn extract_multihop_signals(
                 // Timeout guard within BFS loop
                 if bfs_start.elapsed() > timeout {
                     tracing::debug!("multihop BFS timeout reached mid-walk");
+                    cut_timeout = true;
                     break 'outer;
                 }
 
                 if depth >= max_depth {
+                    cut_depth_limit_hits += 1;
                     continue;
                 }
 
@@ -7048,6 +7440,7 @@ fn extract_multihop_signals(
                 });
                 // Frontier size limit: only process up to frontier_limit relations per BFS level
                 let rels_to_process = if rels.len() > frontier_limit {
+                    cut_frontier_truncated += rels.len() - frontier_limit;
                     &rels[..frontier_limit]
                 } else {
                     &rels
@@ -7169,6 +7562,70 @@ fn extract_multihop_signals(
                     queue.push_back((neighbor_id, depth + 1));
                 }
             }
+        }
+    }
+
+    if let Some(ledger) = ledger.as_deref_mut() {
+        if cut_depth_limit_hits > 0 {
+            ledger.push(PruneEvent {
+                stage: "multihop_depth".to_string(),
+                kind: "hop_limit".to_string(),
+                path: None,
+                name: None,
+                score: None,
+                dropped: Some(cut_depth_limit_hits),
+                limit: Some(max_depth),
+                threshold: None,
+                detail: "walk nodes reached the max hop depth unexpanded \
+                         (KIN_LOCATE_MULTIHOP_MAX_DEPTH, profile-capped)"
+                    .to_string(),
+            });
+        }
+        if cut_frontier_truncated > 0 {
+            ledger.push(PruneEvent {
+                stage: "multihop_frontier".to_string(),
+                kind: "cap".to_string(),
+                path: None,
+                name: None,
+                score: None,
+                dropped: Some(cut_frontier_truncated),
+                limit: Some(frontier_limit),
+                threshold: None,
+                detail: "relations beyond KIN_LOCATE_MULTIHOP_FRONTIER_LIMIT never expanded"
+                    .to_string(),
+            });
+        }
+        if cut_artifact_frontier_truncated > 0 {
+            ledger.push(PruneEvent {
+                stage: "multihop_artifact_frontier".to_string(),
+                kind: "cap".to_string(),
+                path: None,
+                name: None,
+                score: None,
+                dropped: Some(cut_artifact_frontier_truncated),
+                limit: Some(artifact_frontier_limit),
+                threshold: None,
+                detail: "artifact relations beyond KIN_LOCATE_MULTIHOP_ARTIFACT_FRONTIER_LIMIT \
+                         never expanded"
+                    .to_string(),
+            });
+        }
+        if cut_timeout {
+            ledger.push(PruneEvent {
+                stage: "multihop_timeout".to_string(),
+                kind: "timeout".to_string(),
+                path: None,
+                name: None,
+                score: None,
+                dropped: None,
+                limit: Some(timeout.as_millis() as usize),
+                threshold: None,
+                detail: format!(
+                    "graph walk stopped early at {:?} (KIN_LOCATE_MULTIHOP_TIMEOUT_MS, \
+                     profile-scaled); remaining seeds/frontier unexplored",
+                    bfs_start.elapsed()
+                ),
+            });
         }
     }
 
@@ -8327,6 +8784,9 @@ fn extract_embedding_signals(
     graph: &kin_db::InMemoryGraph,
     test_query: bool,
     vector_source: Option<&kin_db::InMemoryGraph>,
+    quality: crate::retrieval_profile::RetrievalProfile,
+    degradations: &mut Vec<RetrievalDegradation>,
+    mut ledger: Option<&mut Vec<PruneEvent>>,
 ) -> Result<HashMap<kin_model::EntityId, EntityDiscovery>> {
     let _span =
         tracing::info_span!("locate.extract_embedding_signals", text_len = text.len()).entered();
@@ -8412,6 +8872,16 @@ fn extract_embedding_signals(
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("semantic_search_batch_filtered failed: {:?}", e);
+                record_degradation(
+                    degradations,
+                    RetrievalDegradation {
+                        component: "vector_index".to_string(),
+                        reason: "query_failed".to_string(),
+                        detail: format!("scoped semantic search failed at query time: {e:?}"),
+                        remediation: "check daemon embed worker health (kin status), then retry"
+                            .to_string(),
+                    },
+                );
                 return Ok(entity_seeds);
             }
         }
@@ -8420,10 +8890,31 @@ fn extract_embedding_signals(
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("semantic_search_batch failed: {:?}", e);
+                record_degradation(
+                    degradations,
+                    RetrievalDegradation {
+                        component: "vector_index".to_string(),
+                        reason: "query_failed".to_string(),
+                        detail: format!("semantic search failed at query time: {e:?}"),
+                        remediation: "check daemon embed worker health (kin status), then retry"
+                            .to_string(),
+                    },
+                );
                 return Ok(entity_seeds);
             }
         }
     };
+
+    // Drop weak semantic matches before they enter the signal column. The
+    // floor is expressed in RELEVANCE units ((1 + cos) / 2), not raw cosine;
+    // the profile default rejects near-orthogonal noise (see
+    // `RetrievalProfile::embedding_min_relevance_default`).
+    let min_relevance = locate_env_f32(
+        "KIN_LOCATE_EMBEDDING_MIN_SIMILARITY",
+        quality.embedding_min_relevance_default(),
+    );
+    let mut floor_dropped = 0usize;
+    let mut floor_best_dropped: Option<(String, f32)> = None;
 
     for ((_, query_weight), results) in queries.iter().zip(all_results) {
         for (retrieval_key, distance) in &results {
@@ -8441,11 +8932,14 @@ fn extract_embedding_signals(
 
             // Cosine distance → relevance
             let relevance = ((2.0 - distance) / 2.0).max(0.0);
-            // Drop weak semantic matches before they enter the signal column.
-            // Cosine similarity below ~0.25 is noise that was previously drowning
-            // stronger seeds when merged into entity_resolve.
-            let min_relevance = locate_env_f32("KIN_LOCATE_EMBEDDING_MIN_SIMILARITY", 0.25);
             if relevance < min_relevance {
+                floor_dropped += 1;
+                let is_best = floor_best_dropped
+                    .as_ref()
+                    .is_none_or(|(_, best)| relevance > *best);
+                if is_best {
+                    floor_best_dropped = Some((entity.name.clone(), relevance));
+                }
                 continue;
             }
 
@@ -8472,6 +8966,26 @@ fn extract_embedding_signals(
             if !entry.signals.contains(&"embeddings") {
                 entry.signals.push("embeddings");
             }
+        }
+    }
+
+    if floor_dropped > 0 {
+        if let Some(ledger) = ledger.as_deref_mut() {
+            let (best_name, best_relevance) = floor_best_dropped.unwrap_or_default();
+            ledger.push(PruneEvent {
+                stage: "embedding_seed_floor".to_string(),
+                kind: "threshold".to_string(),
+                path: None,
+                name: (!best_name.is_empty()).then_some(best_name),
+                score: Some(best_relevance),
+                dropped: Some(floor_dropped),
+                limit: None,
+                threshold: Some(min_relevance),
+                detail: format!(
+                    "vector hits below KIN_LOCATE_EMBEDDING_MIN_SIMILARITY; best dropped \
+                     relevance {best_relevance:.3}"
+                ),
+            });
         }
     }
 
@@ -13863,6 +14377,19 @@ fn build_result(
     if explain {
         if let Some(debug) = debug.as_mut() {
             dropped_symbols = rank_and_cap_symbols_with(dropped_symbols, 0);
+            for symbol in &dropped_symbols {
+                debug.prune_ledger.push(PruneEvent {
+                    stage: "symbol_cap".to_string(),
+                    kind: "cap".to_string(),
+                    path: None,
+                    name: Some(symbol.name.clone()),
+                    score: Some(symbol.score),
+                    dropped: None,
+                    limit: Some(cap),
+                    threshold: None,
+                    detail: "symbol beyond KIN_LOCATE_SYMBOL_CAP for its file".to_string(),
+                });
+            }
             debug.symbol_cap = Some(SymbolCapTrace {
                 cap,
                 dropped: dropped_symbols,
@@ -13874,6 +14401,7 @@ fn build_result(
         files,
         debug,
         semantic_coverage: None,
+        degradations: Vec::new(),
     }
 }
 
@@ -13914,6 +14442,25 @@ fn output_text(result: &LocateResult) {
     // stderr so the stdout file list stays clean for piping.
     if let Some(banner) = result.semantic_coverage.as_ref().and_then(coverage_banner) {
         eprintln!("⚠ {banner}");
+    }
+    // No-silent-degradation: one stderr line per capability that could not
+    // fully run, with the remediation. The coverage banner above already
+    // covers the vector-index state, so skip its duplicate entry here.
+    for degradation in &result.degradations {
+        if degradation.component == "vector_index"
+            && result.semantic_coverage.is_some()
+            && degradation.reason != "query_failed"
+        {
+            continue;
+        }
+        if degradation.remediation.is_empty() {
+            eprintln!("⚠ {}: {}", degradation.component, degradation.detail);
+        } else {
+            eprintln!(
+                "⚠ {}: {} — {}",
+                degradation.component, degradation.detail, degradation.remediation
+            );
+        }
     }
     if result.files.is_empty() {
         println!("No relevant files found.");
@@ -17726,7 +18273,8 @@ mod tests {
         )]);
 
         let hits =
-            extract_multihop_signals(&[&seeds], &graph, LocateProfile::Standard, false).unwrap();
+            extract_multihop_signals(&[&seeds], &graph, LocateProfile::Standard, false, None)
+                .unwrap();
         assert!(hits.contains_key("src/b.py"));
         assert!(hits.contains_key("src/c.py"));
     }
@@ -17787,7 +18335,8 @@ mod tests {
         )]);
 
         let hits =
-            extract_multihop_signals(&[&seeds], &graph, LocateProfile::Standard, false).unwrap();
+            extract_multihop_signals(&[&seeds], &graph, LocateProfile::Standard, false, None)
+                .unwrap();
         assert!(
             hits.contains_key("include/nlohmann/detail/iterators/internal_iterator.hpp"),
             "artifact-level Includes edge should project included headers from file-backed seeds"
@@ -17840,7 +18389,8 @@ mod tests {
 
         let seeds = HashMap::from([(source.0.clone(), hit(72.0))]);
         let hits =
-            extract_multihop_signals(&[&seeds], &graph, LocateProfile::Standard, false).unwrap();
+            extract_multihop_signals(&[&seeds], &graph, LocateProfile::Standard, false, None)
+                .unwrap();
         assert!(
             hits.contains_key(&generated.0),
             "source artifact hits should project to generated artifacts through DerivedFrom"
@@ -18580,8 +19130,8 @@ mod tests {
             &graph,
         )
         .unwrap();
-        let hits =
-            extract_multihop_signals(&[&seeds], &graph, LocateProfile::Standard, true).unwrap();
+        let hits = extract_multihop_signals(&[&seeds], &graph, LocateProfile::Standard, true, None)
+            .unwrap();
 
         let iter_score: f32 = hits
             .get("include/nlohmann/detail/iterators/iter_impl.hpp")
@@ -19443,9 +19993,14 @@ mod tests {
             }],
         )]);
 
-        let hits =
-            extract_multihop_signals(&[&direct_hits], &graph, LocateProfile::Standard, false)
-                .unwrap();
+        let hits = extract_multihop_signals(
+            &[&direct_hits],
+            &graph,
+            LocateProfile::Standard,
+            false,
+            None,
+        )
+        .unwrap();
         assert!(hits.contains_key("pkg/prompt/prompt.go"));
     }
 
@@ -20062,6 +20617,7 @@ mod tests {
             }],
             debug: None,
             semantic_coverage: None,
+            degradations: Vec::new(),
         }
     }
 

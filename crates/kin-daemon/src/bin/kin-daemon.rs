@@ -305,22 +305,17 @@ fn daemon_env_filter() -> EnvFilter {
 }
 
 fn init_tracing() {
+    // Logs go to stderr: stdout is a protocol surface (`--compat-json` emits
+    // machine-read JSON there), and any log line on stdout corrupts it —
+    // an env-registry override warning printed before the compat payload
+    // makes the CLI's compat probe report the daemon binary as stale.
     tracing_subscriber::fmt()
         .with_env_filter(daemon_env_filter())
+        .with_writer(std::io::stderr)
         .init();
 }
 
 async fn async_main() -> i32 {
-    init_tracing();
-
-    // Validate the KIN_* environment surface at startup: unknown names and
-    // out-of-range values are surfaced loudly; an invalid correctness-relevant
-    // value refuses to boot. Governed by KIN_ENV_VALIDATION (off/warn/strict).
-    if let Err(err) = kin_core::env_registry::enforce_startup_env() {
-        eprintln!("kin-daemon: {err}");
-        return 2;
-    }
-
     let program = env::args()
         .next()
         .unwrap_or_else(|| "kin-daemon".to_string());
@@ -333,6 +328,9 @@ async fn async_main() -> i32 {
         }
     };
 
+    // Answer the compat probe before logging or env validation can write
+    // anything: its stdout must stay pure JSON, and a probe must succeed even
+    // in an environment the registry would refuse to boot with.
     if args.compat_json {
         println!(
             "{}",
@@ -344,6 +342,20 @@ async fn async_main() -> i32 {
         );
         return 0;
     }
+
+    init_tracing();
+
+    // Validate the KIN_* environment surface at startup: unknown names and
+    // out-of-range values are surfaced loudly; an invalid correctness-relevant
+    // value refuses to boot. Governed by KIN_ENV_VALIDATION (off/warn/strict).
+    if let Err(err) = kin_core::env_registry::enforce_startup_env() {
+        eprintln!("kin-daemon: {err}");
+        return 2;
+    }
+
+    // Resident serving daemon: profile-driven retrieval defaults that assume
+    // model residency (cross-encoder rerank) may apply in this process.
+    kin_cli::retrieval_profile::mark_daemon_serving();
 
     if args.supervisor {
         let idle_timeout = match supervisor_idle_timeout_from_env() {
