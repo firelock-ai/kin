@@ -4360,6 +4360,10 @@ fn build_semantic_locate_result(
         };
 
         let score = 1.0_f32 - distance;
+        let span = match &item {
+            kin_db::ResolvedRetrievalItem::Entity(entity) => entity.span.as_ref(),
+            _ => None,
+        };
         let mut hit = json!({
             "entity_id": entity_id,
             "kind": kind,
@@ -4368,6 +4372,10 @@ fn build_semantic_locate_result(
             "score": score,
             "provenance": { "file": file },
         });
+        if let Some(span) = span {
+            hit["start_line"] = json!(span.start_line);
+            hit["end_line"] = json!(span.end_line);
+        }
         if let Some(snippet) = snippet {
             hit["snippet"] = json!(snippet);
         }
