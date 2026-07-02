@@ -160,9 +160,16 @@ pub fn write_pid_file(kin_root: &Path) {
     }
 }
 
-/// Write port file so the CLI knows where to connect.
+/// Write the port file so the CLI knows where to connect.
+///
+/// Written atomically (temp + rename) so a CLI polling the port file during the
+/// daemon→CLI port handshake never parses a torn or partial value.
 pub fn write_port_file(kin_root: &Path, port: u16) {
-    let _ = std::fs::write(kin_root.join("daemon.port"), port.to_string());
+    let tmp = kin_root.join("daemon.port.tmp");
+    let dst = kin_root.join("daemon.port");
+    if std::fs::write(&tmp, port.to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, &dst);
+    }
 }
 
 /// Read port from `.kin/daemon.port`.

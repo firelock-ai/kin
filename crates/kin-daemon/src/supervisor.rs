@@ -176,7 +176,12 @@ fn write_supervisor_endpoint_files(port: u16) {
     if std::fs::write(&pid_tmp, std::process::id().to_string()).is_ok() {
         let _ = std::fs::rename(pid_tmp, supervisor_pid_path());
     }
-    let _ = std::fs::write(supervisor_port_path(), port.to_string());
+    // Written atomically (temp + rename) so a CLI polling the port file during
+    // the supervisor→CLI port handshake never parses a torn or partial value.
+    let port_tmp = dir.join(format!("{SUPERVISOR_PORT_FILE}.tmp"));
+    if std::fs::write(&port_tmp, port.to_string()).is_ok() {
+        let _ = std::fs::rename(port_tmp, supervisor_port_path());
+    }
 }
 
 fn remove_supervisor_endpoint_files_if_current_process() {
