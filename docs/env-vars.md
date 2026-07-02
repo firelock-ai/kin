@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (373 total, 284 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (383 total, 290 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -43,6 +43,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_MCP_TOOL_PROFILE` | string | *(unset)* | operational | MCP tool exposure profile |
 | `KIN_NO_DAEMON` | bool | false | operational | force in-process execution instead of the daemon |
 | `KIN_NO_KEYRING` | bool | false | operational | skip the OS keyring for credential storage |
+| `KIN_NO_VFS` | bool | false | operational | kin-vfs shim projection bypass: set to 1 to skip VFS initialization and exec the real binary directly (only the literal '1' bypasses), default off |
 | `KIN_ORG_ID` | string | *(unset)* | operational | organization id for federation/remote |
 | `KIN_ORIGINAL_PATH` | path | *(unset)* | operational | caller's original PATH preserved across a with/exec shim |
 | `KIN_PLUGIN_DIR` | path | *(unset)* | operational | plugin directory override |
@@ -53,12 +54,13 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_REPO_ID` | string | *(unset)* | operational | active repo id override |
 | `KIN_REPO_IDS` | string | *(unset)* | operational | comma-separated repo ids the daemon should serve |
 | `KIN_REQUIRE_COMPLETE_EMBEDDINGS` | bool | false | correctness | require full embedding coverage before answering locate/search |
-| `KIN_RESOURCE_PROFILE` | string | *(unset)* | operational | resource profile hint for embed batch sizing |
+| `KIN_RESOURCE_PROFILE` | enum | proof | correctness | runtime resource profile (kin-cli/kin-daemon/kin-infer/kin-db): proof/interactive/throughput/ci; unset resolves to proof (bit-identical), throughput may engage CPU/GPU hybrid embedding and is non-citable |
 | `KIN_SCOPE_TIMING` | bool | false | diagnostic | print scope graph build timing to stderr |
 | `KIN_SEARCH_MODE` | enum | *(unset)* | correctness | search strictness; 'precise' rejects broad show-body searches |
 | `KIN_STORAGE` | string | local | operational | daemon storage backend selector (e.g. local, gcs) |
 | `KIN_STRICT_BEHAVIOR_ENV` | bool | false | operational | escalate a CLI/daemon behavior-env divergence from a warning to a hard error |
 | `KIN_STRICT_BUILD_MATCH` | bool | false | correctness | require a strict historical build match when resolving a ref view |
+| `KIN_WORKSPACE_DIR` | path | *(unset)* | operational | docker-entrypoint workspace override for both storage modes; unset uses /tmp/kin-workspace (backed by an emptyDir in k8s); set to /workspace to opt into a legacy mounted volume |
 | `KIN_WORKSPACE_ROOT` | path | *(unset)* | operational | workspace root override for orchestration commands |
 | `KIN_WRITE_VETO` | enum | warn | correctness | write-veto mode: 'warn' (default) annotates would-be vetoes into foreign-held scopes, 'enforce' rejects them with a 409, 'off' disables |
 
@@ -121,7 +123,13 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
+| `KIN_EMBED_BACKEND` | enum | auto | correctness | kin-db embedding compute backend: auto (default) uses batched Metal, 'cpu' forces the SIMD/pure path, 'metal'/'gpu' forces Metal; cpu vs metal shifts embeddings in the last ULPs |
+| `KIN_EMBED_CACHE` | bool | true | operational | kin-db on-disk embedding cache; set to 0 to disable and always recompute (only the literal '0' disables), default on |
+| `KIN_EMBED_CACHE_DIR` | path | *(unset)* | operational | kin-db on-disk embedding cache directory; unset uses ~/.kin/cache/embeddings |
 | `KIN_EMBED_HTTP_TIMEOUT_SECS` | seconds>=0 | *(unset)* | operational | HTTP timeout for the embedding service client |
+| `KIN_EMBED_HYBRID` | string | off | correctness | kin-db hybrid CPU/GPU embedding split: off (default), 'seq'/'floor' for the sequence-length floor, or any other truthy value for the balanced split; engaging the CPU twin computes some vectors off the Metal device |
+| `KIN_EMBED_HYBRID_CPU_MAX_SEQ_LEN` | usize | 256 | correctness | kin-db hybrid CPU lane cutoff: entities tokenized at or below this sequence length embed on the CPU twin, heavier ones on Metal; 0 or invalid falls back to 256 |
+| `KIN_EMBED_HYBRID_GPU_TPUT_RATIO` | float>=0 | *(unset)* | correctness | kin-db hybrid split ratio: pins the GPU:CPU throughput ratio for the balanced split; unset (or <= 0) measures it adaptively per batch |
 | `KIN_EMBED_MAX_PASSES` | usize | *(unset)* | operational | cap on embedding passes per embed run |
 | `KIN_EMBED_PASS_SECONDS` | seconds>=0 | *(unset)* | operational | per-pass wall-clock budget for an embed run |
 
@@ -129,7 +137,9 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
+| `KIN_INFER_CPU_BACKEND` | enum | accelerate | correctness | kin-infer CPU matmul backend: 'pure-rust' forces the deterministic pure-Rust GEMM for bit-reproducible runs; 'accelerate' uses Apple Accelerate BLAS (the macOS default). BLAS differs from pure-Rust in the last ULPs |
 | `KIN_INFER_METAL_PROFILE` | string | *(unset)* | operational | Metal inference profile selection |
+| `KIN_INFER_OCCUPANCY_DISPATCH` | bool | false | operational | kin-infer Metal occupancy-informed pointwise threadgroup sizing; numerically identical to the one-simdgroup baseline (a perf A/B lever), default off |
 
 ## Init
 

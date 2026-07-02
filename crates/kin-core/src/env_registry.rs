@@ -312,6 +312,8 @@ pub const DOWNSTREAM: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_EMBED_CACHE_DIR", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "kin-db on-disk embedding cache directory; unset uses ~/.kin/cache/embeddings" },
     // ---- kin-vfs shim: projection bypass --------------------------------------
     EnvVarSpec { name: "KIN_NO_VFS", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "kin-vfs shim projection bypass: set to 1 to skip VFS initialization and exec the real binary directly (only the literal '1' bypasses), default off" },
+    // ---- container entrypoint (shell-consumed; inherited by the daemon) -------
+    EnvVarSpec { name: "KIN_WORKSPACE_DIR", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "docker-entrypoint workspace override for both storage modes; unset uses /tmp/kin-workspace (backed by an emptyDir in k8s); set to /workspace to opt into a legacy mounted volume" },
 ];
 
 /// The full registry: hand-curated operational/safety/correctness specs, the
@@ -1136,7 +1138,10 @@ mod tests {
             "KIN_EMBED_CACHE_DIR",
             "KIN_NO_VFS",
         ] {
-            assert!(spec(name).is_some(), "{name} must be registered in DOWNSTREAM");
+            assert!(
+                spec(name).is_some(),
+                "{name} must be registered in DOWNSTREAM"
+            );
             let report = audit_env([(name.to_string(), "1".to_string())], false);
             assert!(
                 report.unknown.is_empty(),
