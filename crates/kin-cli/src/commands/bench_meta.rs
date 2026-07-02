@@ -458,6 +458,8 @@ mod tests {
             .unwrap();
         Command::new("git")
             .args(["commit", "-m", "init"])
+            .env("GIT_AUTHOR_DATE", "1000000000 +0000")
+            .env("GIT_COMMITTER_DATE", "1000000000 +0000")
             .current_dir(repo.path())
             .output()
             .unwrap();
@@ -502,6 +504,8 @@ mod tests {
             .unwrap();
         Command::new("git")
             .args(["commit", "-m", "init"])
+            .env("GIT_AUTHOR_DATE", "1000000100 +0000")
+            .env("GIT_COMMITTER_DATE", "1000000100 +0000")
             .current_dir(repo.path())
             .output()
             .unwrap();

@@ -29,13 +29,19 @@ fn cochange_env_usize(name: &str, default: usize) -> usize {
 /// (commit time descending, then id ascending).
 ///
 /// A `ByCommitTime` walk orders commits by time but leaves the order among
-/// equal-timestamp commits unspecified and process-dependent, so truncating the
-/// raw walk with `take(max_commits)` can select a different boundary set on each
-/// run. That shifts per-pair co-change counts — and therefore the `confidence`
-/// folded into each relation's content hash — making the mined graph
-/// non-deterministic. Sorting by the id tie-break before truncating makes the
-/// selected set independent of the walk's emission order.
-fn select_commit_oids<Id: Ord>(mut timed: Vec<(i64, Id)>, max_commits: usize) -> Vec<Id> {
+/// equal-timestamp commits unspecified and process-dependent, so both truncating
+/// the raw walk with `take(max_commits)` and consuming it in emission order can
+/// vary run to run whenever a timestamp tie straddles the cutoff or feeds an
+/// order-sensitive consumer. Imposing the id tie-break before truncating makes
+/// the selected set — and its order — depend only on commit content. Shared by
+/// the co-change miner (where it stabilizes per-pair counts folded into each
+/// relation's content hash) and the semantic-history import (where it stabilizes
+/// how entity/relation deltas partition across the imported changes), so the two
+/// paths cannot drift.
+pub(crate) fn select_commit_oids<Id: Ord>(
+    mut timed: Vec<(i64, Id)>,
+    max_commits: usize,
+) -> Vec<Id> {
     timed.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     if max_commits > 0 {
         timed.truncate(max_commits);
