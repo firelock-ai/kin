@@ -35,8 +35,9 @@ Codex, Gemini, Windsurf) and your shell hook. In short:
    resolved against the graph and fail loudly if the entity does not exist.
 2. **Run.** The command executes locally in that workspace (never through the
    daemon), with `KIN_SESSION`, `KIN_SESSION_ID`, and `KIN_SESSION_DIR` set.
-3. **Reconcile.** On success, Kin diffs the workspace against the source
-   surface and reconciles changes into the graph, then removes the workspace.
+3. **Reconcile.** On success, Kin reconciles the workspace's own changes into
+   the graph — a change-set replay against the base state it was materialized
+   from, not a whole-tree overwrite — then removes the workspace.
 4. **Fail loud, lose nothing.** On a non-zero exit — or if reconcile itself
    fails — the workspace is **preserved** and Kin prints the recovery
    commands:
@@ -167,9 +168,18 @@ with `KIN_DAEMON_ALLOW_EXEC=1`.
 | Ran with `--discard` | delete workspace, no reconcile | nothing |
 | Not sure what's pending | — | `kin doctor` lists leftover session workspaces |
 
-One reconcile semantic to know: reconcile diffs the **entire workspace** against
-the current source surface — it is a state sync, not a change-set replay. A
-workspace kept around while the repo moves on will, when reconciled later,
-also revert whatever changed in the meantime (including deleting files created
-after the workspace was materialized). Reconcile kept workspaces promptly, or
-discard them.
+One reconcile semantic to know: reconcile replays the **workspace's own
+change-set**, not a whole-tree state sync. When a workspace is materialized Kin
+records the base graph version it started from; at reconcile it applies only the
+edits the workspace itself made relative to that base and leaves files the
+workspace never touched alone — even if the source advanced in the meantime. So a
+kept workspace reconciled late does **not** revert source changes made since it
+was materialized, and does not delete files created in the source afterward.
+
+If the workspace and the source both changed the same file, reconcile merges
+them when they agree and **fails loud** — naming the conflicting files and
+exiting non-zero — when they do not, rather than overwriting newer source truth.
+The workspace is preserved on conflict so you can resolve it by hand or discard
+it. Workspaces materialized before base tracking carry no recorded base;
+reconcile refuses them unless they are already identical to the source, and asks
+you to re-run the work in a fresh session or discard the workspace.

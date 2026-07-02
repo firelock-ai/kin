@@ -135,7 +135,7 @@ pub fn execute_reconcile_session_dir_scoped(
     );
     println!("Against source: {}", source.display());
 
-    let changes = diff_directories(session_dir, &source)?;
+    let changes = plan_reconcile_changes(session_dir, &source)?;
 
     if changes.is_empty() {
         return Ok(ReconcileSummary {
@@ -313,7 +313,7 @@ where
     println!("Reconciling session workspace: {}", session_dir.display());
     println!("Against source: {}", source.display());
 
-    let changes = diff_directories(session_dir, &source)?;
+    let changes = plan_reconcile_changes(session_dir, &source)?;
 
     if changes.is_empty() {
         return Ok(ReconcileSummary {
@@ -659,6 +659,157 @@ fn resolve_session_dir(
     Ok(sessions.last().unwrap().path())
 }
 
+/// Compute the change-set to apply when reconciling a session workspace.
+///
+/// Reconcile replays only the workspace's own edits — the delta between the
+/// base state captured when the workspace was materialized and the workspace's
+/// current contents — instead of force-syncing the entire tree. Files the
+/// workspace never touched are left untouched even when the source has advanced
+/// past the base, so a workspace reconciled late never reverts intervening
+/// source truth. When the workspace and the source both changed the same file,
+/// the edits are merged when they agree and reported as a conflict when they do
+/// not; the source is never silently overwritten with older content.
+fn plan_reconcile_changes(session_dir: &Path, source: &Path) -> Result<Vec<FileChange>> {
+    match super::session_base::load_base(session_dir)? {
+        Some(base) => plan_from_base(session_dir, source, &base),
+        None => plan_without_base(session_dir, source),
+    }
+}
+
+/// Change-set plan for a workspace with a recorded base: a file-level three-way
+/// merge of base -> workspace against base -> source.
+fn plan_from_base(
+    session_dir: &Path,
+    source: &Path,
+    base: &super::session_base::SessionBase,
+) -> Result<Vec<FileChange>> {
+    let workspace_state = super::session_base::hash_dir(session_dir)?;
+    let source_state = super::session_base::hash_dir(source)?;
+    let base_state = &base.files;
+
+    let mut candidate_paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    candidate_paths.extend(base_state.keys().cloned());
+    candidate_paths.extend(workspace_state.keys().cloned());
+
+    let mut changes = Vec::new();
+    let mut conflicts = Vec::new();
+
+    for path in candidate_paths {
+        let base_hash = base_state.get(&path);
+        let workspace_hash = workspace_state.get(&path);
+        if base_hash == workspace_hash {
+            // The workspace never changed this path; leave it untouched even if
+            // the source advanced it. This is the change-set guarantee.
+            continue;
+        }
+
+        let source_hash = source_state.get(&path);
+        if source_hash != base_hash {
+            // Both the workspace and the source moved this path off the base.
+            if workspace_hash == source_hash {
+                // They converged to identical content — nothing to apply.
+                continue;
+            }
+            conflicts.push(describe_reconcile_conflict(
+                &path,
+                base_hash,
+                workspace_hash,
+                source_hash,
+            ));
+            continue;
+        }
+
+        // Disjoint edit: the source is still at the base here, so the
+        // workspace's own change applies cleanly.
+        let kind = match (base_hash.is_some(), workspace_hash.is_some()) {
+            (false, true) => ChangeKind::Added,
+            (true, true) => ChangeKind::Modified,
+            (true, false) => ChangeKind::Deleted,
+            // Unreachable: base_hash != workspace_hash is guaranteed above.
+            (false, false) => continue,
+        };
+        changes.push(FileChange {
+            relative_path: PathBuf::from(path),
+            kind,
+        });
+    }
+
+    if !conflicts.is_empty() {
+        let base_head = base.base_head.as_deref().unwrap_or("unknown");
+        anyhow::bail!(
+            "session reconcile conflict for {}: {} file(s) changed both in the session workspace \
+             and in the source since it was materialized (base graph head {base_head}). Kin will \
+             not overwrite newer source truth. Resolve the workspace by hand or discard it. \
+             Conflicting files:\n  {}",
+            session_dir.display(),
+            conflicts.len(),
+            conflicts.join("\n  "),
+        );
+    }
+
+    Ok(changes)
+}
+
+/// Human-readable description of how a file diverged in both the workspace and
+/// the source, for conflict reporting.
+fn describe_reconcile_conflict(
+    path: &str,
+    base: Option<&String>,
+    workspace: Option<&String>,
+    source: Option<&String>,
+) -> String {
+    let workspace_action = match (base.is_some(), workspace.is_some()) {
+        (false, true) => "added in session",
+        (true, true) => "modified in session",
+        (true, false) => "deleted in session",
+        (false, false) => "unchanged in session",
+    };
+    let source_action = match (base.is_some(), source.is_some()) {
+        (false, true) => "added in source",
+        (true, true) => "modified in source",
+        (true, false) => "deleted in source",
+        (false, false) => "unchanged in source",
+    };
+    format!("{path} ({workspace_action}; {source_action})")
+}
+
+/// Change-set plan for a legacy workspace with no recorded base.
+///
+/// Without a base the workspace's own edits cannot be separated from source
+/// changes made since it was materialized. Additions are the one provably safe
+/// class — the path does not exist in the source tree, so writing it cannot
+/// overwrite or remove source truth — and they apply. Modifications and
+/// deletions of source-existing paths could revert newer source truth, so any
+/// of those fails loud and asks the operator to rematerialize.
+fn plan_without_base(session_dir: &Path, source: &Path) -> Result<Vec<FileChange>> {
+    let changes = diff_directories(session_dir, source)?;
+    let dangerous: Vec<String> = changes
+        .iter()
+        .filter(|change| !matches!(change.kind, ChangeKind::Added))
+        .map(|change| {
+            let action = match change.kind {
+                ChangeKind::Modified => "modified in session",
+                ChangeKind::Deleted => "missing from session",
+                ChangeKind::Added => unreachable!("filtered above"),
+            };
+            format!("{} ({action})", change.relative_path.display())
+        })
+        .collect();
+    if dangerous.is_empty() {
+        return Ok(changes);
+    }
+    anyhow::bail!(
+        "session workspace {} has no recorded base version, so its edits to {} existing source \
+         path(s) cannot be separated from source changes made since it was materialized; \
+         reconciling could revert newer source truth. Re-run the work in a fresh session \
+         (kin exec/shell/with) or discard this workspace (rm -rf {}). Affected:\n  {}",
+        session_dir.display(),
+        dangerous.len(),
+        session_dir.display(),
+        dangerous.join("\n  "),
+    )
+}
+
 /// Compare two directories and find differences.
 fn diff_directories(session: &Path, source: &Path) -> Result<Vec<FileChange>> {
     let mut changes = Vec::new();
@@ -701,7 +852,7 @@ fn diff_directories(session: &Path, source: &Path) -> Result<Vec<FileChange>> {
 }
 
 /// Collect all file paths relative to root, skipping hidden dirs and common large dirs.
-fn collect_relative_files(root: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn collect_relative_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     collect_recursive(root, root, &mut files)?;
     Ok(files)
@@ -761,6 +912,22 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    /// Record a base manifest for a hand-built session workspace, modeling the
+    /// base a real materialization captures: a snapshot of the source tree at
+    /// the moment the workspace was materialized. With the source unchanged
+    /// afterward, the change-set plan reduces to the workspace's own edits.
+    fn record_base_from_source(layout: &kin_core::KinLayout, session_dir: &Path) {
+        let files = crate::commands::session_base::hash_dir(&kin_core::source_dir(layout)).unwrap();
+        crate::commands::session_base::write_base(
+            session_dir,
+            &crate::commands::session_base::SessionBase {
+                base_head: None,
+                files,
+            },
+        )
+        .unwrap();
+    }
 
     // --- files_differ tests ---
 
@@ -835,6 +1002,7 @@ mod tests {
             "pub fn persisted_reconcile() -> &'static str { \"ok\" }\n",
         )
         .unwrap();
+        record_base_from_source(&layout, &session_dir);
 
         let summary = reconcile_session_dir_sync(&layout, &session_dir).unwrap();
         assert_eq!(summary.files_indexed, 1);
@@ -858,6 +1026,7 @@ mod tests {
         fs::write(&source_file, original).unwrap();
         fs::create_dir_all(session_dir.join("src")).unwrap();
         fs::write(session_dir.join("src/lib.rs"), "pub fn stable_source( {\n").unwrap();
+        record_base_from_source(&layout, &session_dir);
 
         let err = reconcile_session_dir_sync(&layout, &session_dir)
             .unwrap_err()
@@ -880,6 +1049,7 @@ mod tests {
         fs::write(&source_file, original).unwrap();
         fs::create_dir_all(session_dir.join("src")).unwrap();
         fs::write(session_dir.join("src/lib.rs"), updated).unwrap();
+        record_base_from_source(&layout, &session_dir);
 
         // Block the snapshot's atomic-write tmp path so the persist fails. The
         // tmp name is the full snapshot path with `.tmp` APPENDED (graph.kndb ->
@@ -897,6 +1067,211 @@ mod tests {
             .to_string();
         assert!(err.contains("failed to persist reconciled graph snapshot"));
         assert_eq!(fs::read_to_string(&source_file).unwrap(), original);
+    }
+
+    // --- change-set reconcile tests ---
+
+    const A_V1: &str = "pub fn a() -> u8 { 1 }\n";
+    const A_V2: &str = "pub fn a() -> u8 { 2 }\n";
+    const A_V3: &str = "pub fn a() -> u8 { 3 }\n";
+
+    /// Fast path: with the source still at the base, the workspace's own edit
+    /// applies exactly as before — behavior is unchanged for the common case.
+    #[test]
+    fn change_set_fast_path_applies_workspace_edit() {
+        let repo = tempdir().unwrap();
+        let layout = kin_core::init(repo.path()).unwrap().layout;
+        let source = kin_core::source_dir(&layout);
+
+        fs::create_dir_all(source.join("src")).unwrap();
+        fs::write(source.join("src/a.rs"), A_V1).unwrap();
+
+        let session_dir = layout.root().join("runs/session-fast-path");
+        fs::create_dir_all(session_dir.join("src")).unwrap();
+        fs::write(session_dir.join("src/a.rs"), A_V2).unwrap();
+        record_base_from_source(&layout, &session_dir);
+
+        let summary = reconcile_session_dir_sync(&layout, &session_dir).unwrap();
+
+        assert_eq!(summary.change_count, 1);
+        assert!(summary
+            .changes
+            .contains(&("modified".into(), "src/a.rs".into())));
+        assert_eq!(fs::read_to_string(source.join("src/a.rs")).unwrap(), A_V2);
+    }
+
+    /// Regression for the session-workspace data-loss edge: a file created in
+    /// the source after the workspace was materialized must survive a late
+    /// reconcile, never be deleted as "absent from the workspace".
+    #[test]
+    fn change_set_preserves_source_file_added_after_materialization() {
+        let repo = tempdir().unwrap();
+        let layout = kin_core::init(repo.path()).unwrap().layout;
+        let source = kin_core::source_dir(&layout);
+
+        // Base state: the source has only a.rs.
+        fs::create_dir_all(source.join("src")).unwrap();
+        fs::write(source.join("src/a.rs"), A_V1).unwrap();
+
+        // Materialize + edit a.rs in the workspace.
+        let session_dir = layout.root().join("runs/session-late-add");
+        fs::create_dir_all(session_dir.join("src")).unwrap();
+        fs::write(session_dir.join("src/a.rs"), A_V2).unwrap();
+        record_base_from_source(&layout, &session_dir);
+
+        // The source advances after materialization: a new file appears.
+        let new_source_file = "pub fn b() -> u8 { 9 }\n";
+        fs::write(source.join("src/b.rs"), new_source_file).unwrap();
+
+        let summary = reconcile_session_dir_sync(&layout, &session_dir).unwrap();
+
+        // The workspace's own edit is applied...
+        assert_eq!(fs::read_to_string(source.join("src/a.rs")).unwrap(), A_V2);
+        // ...and the intervening source file is preserved, not reverted.
+        assert!(
+            source.join("src/b.rs").exists(),
+            "reconcile must not delete source files created after materialization"
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("src/b.rs")).unwrap(),
+            new_source_file
+        );
+        assert_eq!(summary.change_count, 1);
+        assert!(!summary.changes.iter().any(|(_, path)| path == "src/b.rs"));
+    }
+
+    /// A source file modified after materialization but never touched by the
+    /// workspace must keep the newer source content, not be reverted to base.
+    #[test]
+    fn change_set_preserves_unrelated_source_edit() {
+        let repo = tempdir().unwrap();
+        let layout = kin_core::init(repo.path()).unwrap().layout;
+        let source = kin_core::source_dir(&layout);
+
+        fs::create_dir_all(source.join("src")).unwrap();
+        fs::write(source.join("src/a.rs"), A_V1).unwrap();
+        fs::write(source.join("src/c.rs"), "pub fn c() -> u8 { 1 }\n").unwrap();
+
+        // Workspace edits a.rs, leaves c.rs at the base content.
+        let session_dir = layout.root().join("runs/session-unrelated");
+        fs::create_dir_all(session_dir.join("src")).unwrap();
+        fs::write(session_dir.join("src/a.rs"), A_V2).unwrap();
+        fs::write(session_dir.join("src/c.rs"), "pub fn c() -> u8 { 1 }\n").unwrap();
+        record_base_from_source(&layout, &session_dir);
+
+        // The source advances c.rs after materialization.
+        let advanced_c = "pub fn c() -> u8 { 2 }\n";
+        fs::write(source.join("src/c.rs"), advanced_c).unwrap();
+
+        let summary = reconcile_session_dir_sync(&layout, &session_dir).unwrap();
+
+        assert_eq!(fs::read_to_string(source.join("src/a.rs")).unwrap(), A_V2);
+        assert_eq!(
+            fs::read_to_string(source.join("src/c.rs")).unwrap(),
+            advanced_c,
+            "reconcile must not revert a source edit the workspace never touched"
+        );
+        assert_eq!(summary.change_count, 1);
+    }
+
+    /// When the workspace and the source both change the same file to different
+    /// content, reconcile fails loud and leaves the newer source truth intact.
+    #[test]
+    fn change_set_conflicting_edit_fails_loud() {
+        let repo = tempdir().unwrap();
+        let layout = kin_core::init(repo.path()).unwrap().layout;
+        let source = kin_core::source_dir(&layout);
+
+        fs::create_dir_all(source.join("src")).unwrap();
+        fs::write(source.join("src/a.rs"), A_V1).unwrap();
+
+        let session_dir = layout.root().join("runs/session-conflict");
+        fs::create_dir_all(session_dir.join("src")).unwrap();
+        fs::write(session_dir.join("src/a.rs"), A_V2).unwrap();
+        record_base_from_source(&layout, &session_dir);
+
+        // The source moves the same file to a third state.
+        fs::write(source.join("src/a.rs"), A_V3).unwrap();
+
+        let err = reconcile_session_dir_sync(&layout, &session_dir)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("conflict"), "unexpected error: {err}");
+        assert!(err.contains("src/a.rs"), "unexpected error: {err}");
+        // Newer source truth is untouched, and the workspace is preserved.
+        assert_eq!(fs::read_to_string(source.join("src/a.rs")).unwrap(), A_V3);
+        assert_eq!(
+            fs::read_to_string(session_dir.join("src/a.rs")).unwrap(),
+            A_V2
+        );
+    }
+
+    /// If the workspace and source converged to identical content, there is no
+    /// conflict and nothing to apply.
+    #[test]
+    fn change_set_converged_edit_is_noop() {
+        let repo = tempdir().unwrap();
+        let layout = kin_core::init(repo.path()).unwrap().layout;
+        let source = kin_core::source_dir(&layout);
+
+        fs::create_dir_all(source.join("src")).unwrap();
+        fs::write(source.join("src/a.rs"), A_V1).unwrap();
+
+        let session_dir = layout.root().join("runs/session-converged");
+        fs::create_dir_all(session_dir.join("src")).unwrap();
+        fs::write(session_dir.join("src/a.rs"), A_V2).unwrap();
+        record_base_from_source(&layout, &session_dir);
+
+        // The source independently reaches the same content as the workspace.
+        fs::write(source.join("src/a.rs"), A_V2).unwrap();
+
+        let summary = reconcile_session_dir_sync(&layout, &session_dir).unwrap();
+        assert_eq!(summary.change_count, 0);
+        assert_eq!(fs::read_to_string(source.join("src/a.rs")).unwrap(), A_V2);
+    }
+
+    /// A legacy workspace with no recorded base refuses to reconcile when its
+    /// contents differ from the source, rather than risk reverting source truth.
+    #[test]
+    fn change_set_without_base_refuses_when_workspace_differs() {
+        let repo = tempdir().unwrap();
+        let layout = kin_core::init(repo.path()).unwrap().layout;
+        let source = kin_core::source_dir(&layout);
+
+        fs::create_dir_all(source.join("src")).unwrap();
+        fs::write(source.join("src/a.rs"), A_V1).unwrap();
+
+        // Hand-built session with no base manifest (legacy workspace).
+        let session_dir = layout.root().join("runs/session-legacy-diff");
+        fs::create_dir_all(session_dir.join("src")).unwrap();
+        fs::write(session_dir.join("src/a.rs"), A_V2).unwrap();
+
+        let err = reconcile_session_dir_sync(&layout, &session_dir)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no recorded base"), "unexpected error: {err}");
+        // The source is untouched — reconcile refused before applying anything.
+        assert_eq!(fs::read_to_string(source.join("src/a.rs")).unwrap(), A_V1);
+    }
+
+    /// A legacy workspace already identical to the source is a provable no-op
+    /// and is allowed.
+    #[test]
+    fn change_set_without_base_allows_identical_noop() {
+        let repo = tempdir().unwrap();
+        let layout = kin_core::init(repo.path()).unwrap().layout;
+        let source = kin_core::source_dir(&layout);
+
+        fs::create_dir_all(source.join("src")).unwrap();
+        fs::write(source.join("src/a.rs"), A_V1).unwrap();
+
+        let session_dir = layout.root().join("runs/session-legacy-noop");
+        fs::create_dir_all(session_dir.join("src")).unwrap();
+        fs::write(session_dir.join("src/a.rs"), A_V1).unwrap();
+
+        let summary = reconcile_session_dir_sync(&layout, &session_dir).unwrap();
+        assert_eq!(summary.change_count, 0);
     }
 
     // --- collect_relative_files tests ---

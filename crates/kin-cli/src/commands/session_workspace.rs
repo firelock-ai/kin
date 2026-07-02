@@ -94,14 +94,22 @@ pub fn create_session_workspace_from_graph(
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
         .map_err(|e| anyhow::anyhow!("failed to open blob store: {}", e))?;
 
-    Ok(MaterializedWorkspace::create_from_source(
+    let workspace = MaterializedWorkspace::create_from_source(
         MaterializationSource::BlobTree {
             blob_store: &blob_store,
             tree: &tree,
         },
         session_dir,
         scope,
-    )?)
+    )?;
+
+    // Record the workspace's base version so a later reconcile replays only the
+    // workspace's own change-set instead of force-syncing whole-tree state.
+    // Immediately after materialization the workspace mirrors the projected
+    // graph head, so hashing it captures the correct base.
+    super::session_base::record_materialized_base(session_dir, Some(branch.head.to_string()))?;
+
+    Ok(workspace)
 }
 
 pub fn materialize_session_workspace(
