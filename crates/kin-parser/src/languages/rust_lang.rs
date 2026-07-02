@@ -349,6 +349,32 @@ fn extract_rust_node(
                 });
             }
         }
+        "macro_definition" => {
+            // `macro_rules! name { ... }`. The declarative-macro definition is a
+            // first-class symbol; capturing it keeps the macro name graph-visible
+            // so lookups resolve at ingestion rather than missing silently. The
+            // rule bodies are intentionally not expanded (expansion would fabricate
+            // entities at synthetic spans), mirroring the C/C++ macro boundary.
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = name_node.utf8_text(source).unwrap_or("").to_string();
+                if !name.is_empty() {
+                    let visibility = if has_macro_export(node, source) {
+                        Visibility::Public
+                    } else {
+                        detect_rust_visibility(node, source)
+                    };
+                    entities.push(ExtractedEntity {
+                        kind: EntityKind::Macro,
+                        name,
+                        signature: node_signature(node, source),
+                        visibility,
+                        doc_summary: extract_doc_comment(node, source),
+                        fingerprint: compute_fingerprint(node, source),
+                        span: span_from_node(node, file_id),
+                    });
+                }
+            }
+        }
         "use_declaration" => {}
         _ => {}
     }
@@ -418,6 +444,27 @@ fn detect_rust_visibility(node: &tree_sitter::Node, source: &[u8]) -> Visibility
         }
     }
     Visibility::Private
+}
+
+/// Detect a `#[macro_export]` attribute preceding a `macro_rules!` definition.
+/// An exported macro is crate-public regardless of its module position, whereas
+/// an unexported `macro_rules!` is module-local (Private).
+fn has_macro_export(node: &tree_sitter::Node, source: &[u8]) -> bool {
+    let mut prev = node.prev_sibling();
+    while let Some(p) = prev {
+        match p.kind() {
+            "attribute_item" => {
+                if p.utf8_text(source).unwrap_or("").contains("macro_export") {
+                    return true;
+                }
+            }
+            // Doc comments may sit between the attribute and the macro; skip them.
+            "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        prev = p.prev_sibling();
+    }
+    false
 }
 
 fn node_signature(node: &tree_sitter::Node, source: &[u8]) -> String {
@@ -706,6 +753,88 @@ fn extract_rust_tests_from_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_macro_rules_definition_as_macro_entity() {
+        // A `macro_rules!` definition is a first-class declarative-macro symbol.
+        // Without an extraction arm for it the macro name is invisible to the
+        // graph, so a query for the macro misses at ingestion time, not ranking.
+        let adapter = RustAdapter;
+        let source = br#"
+macro_rules! assemble_widget {
+    ($n:expr) => { $n + 1 };
+    ($a:expr, $b:expr) => { $a + $b };
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("src/widget.rs");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let macros: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Macro)
+            .collect();
+        assert_eq!(
+            macros.len(),
+            1,
+            "macro_rules! definition should yield exactly one Macro entity, got {:?}",
+            output
+                .entities
+                .iter()
+                .map(|e| (&e.kind, &e.name))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(macros[0].name, "assemble_widget");
+        assert!(
+            macros[0].signature.contains("assemble_widget"),
+            "signature should carry the macro name, got {:?}",
+            macros[0].signature
+        );
+    }
+
+    #[test]
+    fn plain_macro_rules_is_module_private() {
+        let adapter = RustAdapter;
+        let source = b"macro_rules! internal_only { () => {}; }";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("src/lib.rs");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let m = output
+            .entities
+            .iter()
+            .find(|e| e.kind == EntityKind::Macro && e.name == "internal_only")
+            .expect("macro_rules! should be extracted as a Macro entity");
+        assert_eq!(
+            m.visibility,
+            Visibility::Private,
+            "a macro_rules! without #[macro_export] is module-local"
+        );
+    }
+
+    #[test]
+    fn macro_export_promotes_macro_to_public() {
+        let adapter = RustAdapter;
+        let source = br#"
+#[macro_export]
+macro_rules! public_api {
+    () => {};
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("src/lib.rs");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let m = output
+            .entities
+            .iter()
+            .find(|e| e.kind == EntityKind::Macro && e.name == "public_api")
+            .expect("exported macro should be extracted");
+        assert_eq!(
+            m.visibility,
+            Visibility::Public,
+            "#[macro_export] promotes a macro to crate-public visibility"
+        );
+    }
 
     #[test]
     fn parse_rust_function() {
