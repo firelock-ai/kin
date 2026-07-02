@@ -3147,24 +3147,65 @@ fn warm_cache_manifest_is_valid(dir: &Path, manifest: &WarmCacheRepoManifest) ->
 }
 
 fn resolve_warm_cache_graph_path(dir: &Path, cache_dir: &Path) -> Result<Option<PathBuf>> {
+    resolve_warm_cache_graph_path_for_head(dir, cache_dir, read_git_head(dir))
+}
+
+/// Resolve the warm-cache bundle graph to graft for a working tree currently at
+/// `current_head`, or `None` to fall back to a cold init.
+///
+/// The bundle is selected by the tree's CURRENT git HEAD (via the manifest's
+/// `heads` map), NOT by the manifest's last-written `current_bundle_id`.
+/// `current_bundle_id` is whatever state was published LAST under this repo
+/// identity, so adopting it grafts that state into any checkout that merely
+/// shares the identity — the cross-state contamination where a warm init's
+/// entity count swings with publish order. When the tree has a HEAD, only a
+/// bundle recorded for exactly that HEAD is trustworthy; every other case
+/// rejects rather than adopts a foreign state, and a cold init re-derives truth.
+/// A non-git working tree has no HEAD to key on: its cache is
+/// path-identity-scoped and single-state, so the last bundle is the only
+/// meaningful one.
+fn resolve_warm_cache_graph_path_for_head(
+    dir: &Path,
+    cache_dir: &Path,
+    current_head: Option<String>,
+) -> Result<Option<PathBuf>> {
     let manifest_path = warm_cache_manifest_path(cache_dir);
     if let Some(manifest) = read_warm_cache_manifest(&manifest_path)? {
         if !warm_cache_manifest_is_valid(dir, &manifest) {
             return Ok(None);
         }
-        if let Some(bundle_id) = manifest.current_bundle_id.as_deref() {
-            let bundle_graph_path = warm_cache_bundle_graph_path(cache_dir, bundle_id);
-            if bundle_graph_path.exists()
-                && warm_cache_ready_marker_path(cache_dir, bundle_id).exists()
-            {
-                return Ok(Some(bundle_graph_path));
-            }
+        let bundle_id = match &current_head {
+            Some(head) => match manifest.heads.get(head) {
+                Some(id) => id.clone(),
+                // Reject-don't-adopt: no bundle recorded for this exact HEAD, so
+                // a cold init is the only trustworthy path — never graft another
+                // HEAD's (or the last-published) state.
+                None => return Ok(None),
+            },
+            None => match manifest.current_bundle_id.clone() {
+                Some(id) => id,
+                None => return Ok(None),
+            },
+        };
+        let bundle_graph_path = warm_cache_bundle_graph_path(cache_dir, &bundle_id);
+        if bundle_graph_path.exists()
+            && warm_cache_ready_marker_path(cache_dir, &bundle_id).exists()
+        {
+            return Ok(Some(bundle_graph_path));
         }
+        // The resolved bundle is absent or not yet marked ready: reject rather
+        // than fall back to a legacy or foreign bundle.
+        return Ok(None);
     }
 
-    let legacy_graph_path = cache_dir.join("graph.kndb");
-    if legacy_graph_path.exists() {
-        return Ok(Some(legacy_graph_path));
+    // No manifest: only the un-versioned legacy single-graph cache may exist. It
+    // carries no HEAD provenance, so a git working tree cannot trust it
+    // (reject-don't-adopt); a non-git, path-scoped tree may still reuse it.
+    if current_head.is_none() {
+        let legacy_graph_path = cache_dir.join("graph.kndb");
+        if legacy_graph_path.exists() {
+            return Ok(Some(legacy_graph_path));
+        }
     }
 
     Ok(None)
@@ -4891,6 +4932,108 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some(warm_cache_bundle_graph_path(cache_dir.path(), &bundle_id).as_path())
+        );
+    }
+
+    #[test]
+    fn warm_cache_resolves_by_current_head_not_last_published_bundle() {
+        // Publish-order contamination guard: two commits of the same repo
+        // identity each publish a bundle, and `current_bundle_id` points at
+        // whichever was published LAST. Resolving must return the bundle for the
+        // CURRENT head, not the last-published one — otherwise a checkout at head
+        // A grafts head B's state (the 10k <-> 127k entity swing).
+        let repo_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        let entry = |root: &str, entities: usize| WarmCacheBundleManifestEntry {
+            graph_root_hash: root.to_string(),
+            entity_count: entities,
+            relation_count: entities,
+            indexed_files: 1,
+            published_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let bundle_a = "bundle-a".to_string();
+        let bundle_b = "bundle-b".to_string();
+        let manifest = WarmCacheRepoManifest {
+            schema: INIT_WARM_CACHE_SCHEMA_VERSION.to_string(),
+            pipeline_epoch: INIT_WARM_CACHE_PIPELINE_EPOCH.to_string(),
+            repo_identity: repo_cache_identity(repo_dir.path()),
+            // Head B was published last, so the manifest's current_bundle_id
+            // points at it — the pre-fix contamination source.
+            current_bundle_id: Some(bundle_b.clone()),
+            heads: BTreeMap::from([
+                ("head_a".to_string(), bundle_a.clone()),
+                ("head_b".to_string(), bundle_b.clone()),
+            ]),
+            bundles: BTreeMap::from([
+                (bundle_a.clone(), entry("aaaa", 10)),
+                (bundle_b.clone(), entry("bbbb", 127)),
+            ]),
+            ..Default::default()
+        };
+        fs::write(
+            warm_cache_manifest_path(cache_dir.path()),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        for bundle in [&bundle_a, &bundle_b] {
+            fs::create_dir_all(cache_dir.path().join("bundles").join(bundle)).unwrap();
+            fs::write(
+                warm_cache_bundle_graph_path(cache_dir.path(), bundle),
+                b"graph",
+            )
+            .unwrap();
+            fs::write(
+                warm_cache_ready_marker_path(cache_dir.path(), bundle),
+                b"ready",
+            )
+            .unwrap();
+        }
+
+        // At head A, resolve MUST pick bundle A — not the last-published B.
+        assert_eq!(
+            resolve_warm_cache_graph_path_for_head(
+                repo_dir.path(),
+                cache_dir.path(),
+                Some("head_a".to_string()),
+            )
+            .unwrap()
+            .as_deref(),
+            Some(warm_cache_bundle_graph_path(cache_dir.path(), &bundle_a).as_path()),
+            "head A must resolve its own bundle, not the last-published bundle B",
+        );
+
+        // At head B, resolve picks bundle B.
+        assert_eq!(
+            resolve_warm_cache_graph_path_for_head(
+                repo_dir.path(),
+                cache_dir.path(),
+                Some("head_b".to_string()),
+            )
+            .unwrap()
+            .as_deref(),
+            Some(warm_cache_bundle_graph_path(cache_dir.path(), &bundle_b).as_path()),
+        );
+
+        // An uncached head rejects-don't-adopt: cold init, never graft B.
+        assert!(
+            resolve_warm_cache_graph_path_for_head(
+                repo_dir.path(),
+                cache_dir.path(),
+                Some("head_unknown".to_string()),
+            )
+            .unwrap()
+            .is_none(),
+            "an uncached head must cold-init rather than adopt the last-published bundle",
+        );
+
+        // A non-git (path-scoped) tree has no head; the single last bundle is
+        // still the one meaningful state, so it is reused.
+        assert_eq!(
+            resolve_warm_cache_graph_path_for_head(repo_dir.path(), cache_dir.path(), None)
+                .unwrap()
+                .as_deref(),
+            Some(warm_cache_bundle_graph_path(cache_dir.path(), &bundle_b).as_path()),
         );
     }
 
