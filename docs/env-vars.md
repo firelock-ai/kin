@@ -59,7 +59,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_STORAGE` | string | local | operational | daemon storage backend selector (e.g. local, gcs) |
 | `KIN_STRICT_BUILD_MATCH` | bool | false | correctness | require a strict historical build match when resolving a ref view |
 | `KIN_WORKSPACE_ROOT` | path | *(unset)* | operational | workspace root override for orchestration commands |
-| `KIN_WRITE_VETO` | enum | off | correctness | write-veto mode; 'enforce' rejects writes into foreign-held scopes |
+| `KIN_WRITE_VETO` | enum | warn | correctness | write-veto mode: 'warn' (default) annotates would-be vetoes into foreign-held scopes, 'enforce' rejects them with a 409, 'off' disables |
 
 ## Daemon
 

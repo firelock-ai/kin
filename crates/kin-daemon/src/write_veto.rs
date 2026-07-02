@@ -29,21 +29,35 @@
 //!   writes only ever produce `Entity` / `Artifact` touched-scopes, so nothing
 //!   emits a `Contract` touched-scope to check against.
 //!
-//! The veto is **off by default**: with `KIN_WRITE_VETO` unset (or any value
-//! other than `enforce`), the apply path is byte-identical to prior behavior.
+//! The veto **warns by default**: with `KIN_WRITE_VETO` unset it evaluates
+//! collisions and, on a would-be veto, logs and annotates the response envelope
+//! (`write_veto_warning`) naming the blocking intent(s) — but the write still
+//! proceeds (no `409`). `KIN_WRITE_VETO=enforce` upgrades the warn to a pre-write
+//! `409`; `KIN_WRITE_VETO=off` restores the byte-identical pre-veto path (no
+//! evaluation, no annotation).
 
 use kin_model::session::{Intent, IntentScope, IntentSummary, LockType};
 use kin_model::SessionId;
 
-/// Whether the write veto rejects colliding writes or stays out of the way.
+/// How the write veto reacts when a write collides with a foreign hard intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteVetoMode {
-    /// Default. The veto never rejects; the apply path behaves exactly as it
-    /// did before this module existed.
+    /// Explicit escape hatch (`KIN_WRITE_VETO=off`). The veto never evaluates;
+    /// the apply path is byte-identical to pre-veto behavior.
     Off,
+    /// Default. A would-be veto is logged and annotated onto the response
+    /// envelope ("you would have been blocked, and by whom") but the write is
+    /// NOT rejected — no `409`.
+    Warn,
     /// Reject a write that touches a scope held under a foreign hard intent
-    /// with a pre-write `409`.
+    /// with a pre-write `409` (`KIN_WRITE_VETO=enforce`).
     Enforce,
+}
+
+impl Default for WriteVetoMode {
+    fn default() -> Self {
+        Self::Warn
+    }
 }
 
 impl WriteVetoMode {
@@ -52,20 +66,34 @@ impl WriteVetoMode {
         Self::parse(std::env::var("KIN_WRITE_VETO").ok().as_deref())
     }
 
-    /// Parse a raw flag value. Only the literal `enforce` (case-insensitive,
-    /// trimmed) enables the veto; every other value — including `None`, empty,
-    /// `off`, `0` — resolves to [`WriteVetoMode::Off`] so the default path is
-    /// unchanged. Pure, so it is testable without touching process env.
+    /// Parse a raw flag value into a mode. `enforce` selects hard rejection;
+    /// `off` selects [`WriteVetoMode::Off`]; every other value — including
+    /// `None`, empty, `warn`, and unrecognized strings — resolves to the default
+    /// [`WriteVetoMode::Warn`], matching the env registry's enum fallback (a
+    /// value outside the documented set falls back to the default at the read
+    /// site). Pure, so it is testable without touching process env.
     fn parse(raw: Option<&str>) -> Self {
-        match raw {
-            Some(v) if v.trim().eq_ignore_ascii_case("enforce") => Self::Enforce,
-            _ => Self::Off,
+        match raw.map(str::trim) {
+            Some(v) if v.eq_ignore_ascii_case("enforce") => Self::Enforce,
+            Some(v) if v.eq_ignore_ascii_case("off") => Self::Off,
+            _ => Self::Warn,
         }
     }
 
-    /// Whether the veto is in enforcing mode.
+    /// Whether the veto is in enforcing mode (rejects with `409`).
     pub fn is_enforcing(self) -> bool {
         matches!(self, Self::Enforce)
+    }
+
+    /// Whether the veto is fully off (never evaluates a collision).
+    pub fn is_off(self) -> bool {
+        matches!(self, Self::Off)
+    }
+
+    /// Whether the veto evaluates collisions at all (warn or enforce). When
+    /// false, the apply path stays byte-identical to pre-veto behavior.
+    pub fn evaluates(self) -> bool {
+        !self.is_off()
     }
 }
 
@@ -142,6 +170,23 @@ fn summarize(intent: &Intent) -> IntentSummary {
     }
 }
 
+/// Serialize the blocking intents into the attribution array shared by the
+/// enforce `409` body and the warn annotation: session, intent, lock, and task
+/// so an agent can see exactly who holds the colliding scope.
+fn blocking_intents_json(blocking: &[IntentSummary]) -> Vec<serde_json::Value> {
+    blocking
+        .iter()
+        .map(|b| {
+            serde_json::json!({
+                "intent_id": b.intent_id.to_string(),
+                "session_id": b.session_id.to_string(),
+                "lock_type": format!("{:?}", b.lock_type),
+                "task_description": b.task_description,
+            })
+        })
+        .collect()
+}
+
 /// Build the structured `409 Conflict` JSON body naming the blocking intents.
 ///
 /// Mirrors the shape of the existing commit-path `lease_conflict` body so a
@@ -152,17 +197,27 @@ pub fn veto_conflict_body(file_path: &str, blocking: &[IntentSummary]) -> serde_
         "error": "write_veto",
         "conflict_type": "HardCollision",
         "file_path": file_path,
-        "blocking_intents": blocking
-            .iter()
-            .map(|b| serde_json::json!({
-                "intent_id": b.intent_id.to_string(),
-                "session_id": b.session_id.to_string(),
-                "lock_type": format!("{:?}", b.lock_type),
-                "task_description": b.task_description,
-            }))
-            .collect::<Vec<_>>(),
+        "blocking_intents": blocking_intents_json(blocking),
         "message": format!(
             "write blocked: {} scope(s) held by active foreign hard intent(s)",
+            blocking.len()
+        ),
+    })
+}
+
+/// Build the `write_veto_warning` annotation attached to a write response under
+/// warn mode. The write PROCEEDED, but the annotation names the foreign hard
+/// intent(s) that WOULD have rejected it under `enforce`, so an agent (and the
+/// MCP envelope that carries this payload) sees the collision without a `409`.
+pub fn veto_warning_annotation(file_path: &str, blocking: &[IntentSummary]) -> serde_json::Value {
+    serde_json::json!({
+        "would_block": true,
+        "conflict_type": "HardCollision",
+        "file_path": file_path,
+        "blocking_intents": blocking_intents_json(blocking),
+        "message": format!(
+            "write would be rejected under KIN_WRITE_VETO=enforce: {} scope(s) held by \
+             active foreign hard intent(s); the write proceeded (warn mode)",
             blocking.len()
         ),
     })
@@ -186,12 +241,18 @@ mod tests {
     }
 
     #[test]
-    fn mode_parse_only_enforce_enables() {
-        assert_eq!(WriteVetoMode::parse(None), WriteVetoMode::Off);
-        assert_eq!(WriteVetoMode::parse(Some("")), WriteVetoMode::Off);
+    fn mode_parse_maps_off_warn_enforce() {
+        // Default (unset / empty / unrecognized, incl. "0"/"false") → Warn.
+        assert_eq!(WriteVetoMode::parse(None), WriteVetoMode::Warn);
+        assert_eq!(WriteVetoMode::parse(Some("")), WriteVetoMode::Warn);
+        assert_eq!(WriteVetoMode::parse(Some("warn")), WriteVetoMode::Warn);
+        assert_eq!(WriteVetoMode::parse(Some("banana")), WriteVetoMode::Warn);
+        assert_eq!(WriteVetoMode::parse(Some("0")), WriteVetoMode::Warn);
+        assert_eq!(WriteVetoMode::parse(Some("false")), WriteVetoMode::Warn);
+        // The documented off-switch → Off (case-insensitive, trimmed).
         assert_eq!(WriteVetoMode::parse(Some("off")), WriteVetoMode::Off);
-        assert_eq!(WriteVetoMode::parse(Some("0")), WriteVetoMode::Off);
-        assert_eq!(WriteVetoMode::parse(Some("warn")), WriteVetoMode::Off);
+        assert_eq!(WriteVetoMode::parse(Some("  OFF  ")), WriteVetoMode::Off);
+        // Enforce is explicit only.
         assert_eq!(
             WriteVetoMode::parse(Some("enforce")),
             WriteVetoMode::Enforce
@@ -200,8 +261,17 @@ mod tests {
             WriteVetoMode::parse(Some("  ENFORCE  ")),
             WriteVetoMode::Enforce
         );
+        // Predicates + default.
+        assert_eq!(WriteVetoMode::default(), WriteVetoMode::Warn);
         assert!(!WriteVetoMode::Off.is_enforcing());
+        assert!(!WriteVetoMode::Warn.is_enforcing());
         assert!(WriteVetoMode::Enforce.is_enforcing());
+        assert!(WriteVetoMode::Off.is_off());
+        assert!(!WriteVetoMode::Warn.is_off());
+        assert!(!WriteVetoMode::Enforce.is_off());
+        assert!(!WriteVetoMode::Off.evaluates());
+        assert!(WriteVetoMode::Warn.evaluates());
+        assert!(WriteVetoMode::Enforce.evaluates());
     }
 
     #[test]
@@ -311,5 +381,25 @@ mod tests {
         assert_eq!(body["blocking_intents"].as_array().unwrap().len(), 1);
         assert_eq!(body["blocking_intents"][0]["session_id"], other.to_string());
         assert_eq!(body["blocking_intents"][0]["lock_type"], "Hard");
+    }
+
+    #[test]
+    fn warning_annotation_names_blocking_intent_without_error() {
+        let other = SessionId::new();
+        let blocking = vec![summarize(&intent(
+            other,
+            IntentScope::Entity(EntityId::new()),
+            LockType::Hard,
+        ))];
+        let ann = veto_warning_annotation("src/lib.rs", &blocking);
+
+        // Warn annotation names who-would-block, carries no error code, and
+        // never claims the write was rejected.
+        assert_eq!(ann["would_block"], true);
+        assert!(ann.get("error").is_none());
+        assert_eq!(ann["file_path"], "src/lib.rs");
+        assert_eq!(ann["blocking_intents"].as_array().unwrap().len(), 1);
+        assert_eq!(ann["blocking_intents"][0]["session_id"], other.to_string());
+        assert_eq!(ann["blocking_intents"][0]["lock_type"], "Hard");
     }
 }

@@ -34,16 +34,22 @@
 //!
 //! # Write veto (`KIN_WRITE_VETO`)
 //!
-//! Rung-3 of the write path. The agent-write apply path (`POST /vfs/write-notify`)
-//! can reject a write *before* it is folded into the graph when it touches a
-//! scope held under another session's hard intent.
+//! Rung-3 of the write path. The agent-write apply paths (`POST /vfs/write-notify`,
+//! `POST /vfs/file-changed`) evaluate whether a write touches a scope held under
+//! another session's hard intent and, by default, surface the collision without
+//! blocking.
 //!
-//! - Default (unset / any value other than `enforce`): **off**. The apply path
-//!   is byte-identical to prior behavior — a colliding write is declined by the
-//!   reconciler's own check and reported as a soft `200 {reindexed:false}`
-//!   notification.
-//! - `KIN_WRITE_VETO=enforce`: the write is rejected with a structured
-//!   `409 Conflict` (`error: "write_veto"`) naming the blocking intent(s).
+//! - Default (unset): **warn**. The write still proceeds — a colliding write is
+//!   declined by the reconciler's own check and reported as a soft notification —
+//!   but a would-be veto is logged and the response is annotated with
+//!   `write_veto_warning` naming the blocking intent(s), so an agent sees the
+//!   collision it would hit under enforce.
+//! - `KIN_WRITE_VETO=enforce`: the write is rejected *before* it is folded into
+//!   the graph with a structured `409 Conflict` (`error: "write_veto"`) naming
+//!   the blocking intent(s).
+//! - `KIN_WRITE_VETO=off` (`0`/`false`/`disabled`/`none`): the veto never
+//!   evaluates; the apply path is byte-identical to pre-veto behavior (no
+//!   annotation).
 //!
 //! What rung-3 enforces today is exactly **entity/artifact scope containment
 //! versus other sessions' hard intents** — the only "contract" expressible with
@@ -57,20 +63,22 @@
 //! ## Write-path inventory
 //!
 //! Every state-mutating route and its current *pre-write* gate, as of this
-//! change. The two VFS apply paths (`vfs_write_notify`, `vfs_file_changed`) are
-//! flag-gated by the write-veto and `graph_commit` is always-on; the rest
-//! either rely on the reconciler's own soft-block, gate upstream, or are out of
-//! this crate's veto scope.
+//! change. The two VFS apply paths (`vfs_write_notify`, `vfs_file_changed`)
+//! evaluate the write-veto (default **warn** → annotate; `enforce` → pre-write
+//! 409; `off` → byte-identical) and `graph_commit` is always-on; the rest either
+//! rely on the reconciler's own soft-block, gate upstream, or are out of this
+//! crate's veto scope.
 //!
-//! - `POST /vfs/write-notify` (`vfs_write_notify`): **write-veto** under
-//!   `KIN_WRITE_VETO=enforce` (pre-write 409); default = reconciler soft-block
-//!   (`200 {reindexed:false}`).
-//! - `POST /vfs/file-changed` (`vfs_file_changed`): **write-veto** under
-//!   `KIN_WRITE_VETO=enforce` (pre-write 409); default = reconciler soft-block
-//!   (`200 {status:"error"}`). The general-purpose sibling of write-notify;
-//!   gated through the same shared `write_veto_precheck` /
-//!   `write_veto_collision_response` helpers so the two paths cannot drift and
-//!   enforce cannot be bypassed by choosing one endpoint over the other.
+//! - `POST /vfs/write-notify` (`vfs_write_notify`): **write-veto**. Default
+//!   **warn** annotates the soft `200 {reindexed:false}` with `write_veto_warning`
+//!   on a would-be veto; `KIN_WRITE_VETO=enforce` upgrades to a pre-write `409`;
+//!   `KIN_WRITE_VETO=off` restores the byte-identical soft path.
+//! - `POST /vfs/file-changed` (`vfs_file_changed`): **write-veto**, same
+//!   default-warn / enforce-409 / off ladder (soft `200 {status:"error"}` under
+//!   warn/off). The general-purpose sibling of write-notify; gated through the
+//!   same shared `write_veto_precheck` / `write_veto_collision_response` helpers
+//!   so the two paths cannot drift and enforce cannot be bypassed by choosing one
+//!   endpoint over the other.
 //! - `POST /graph/commit` (`graph_commit`): always-on lease **409** on a
 //!   foreign hard intent (the CLI semantic-commit path).
 //! - `POST /commands/commit` (`command_commit`): commits the already-reconciled
