@@ -62,20 +62,3 @@ jobs:
 
       - name: Test
         run: cargo test
-
-  notify-downstream:
-    name: Notify Downstream Repos
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    needs: [check]
-    runs-on: ubuntu-latest
-    env:
-      DISPATCH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
-    steps:
-      - name: Trigger kin CI
-        if: ${{ env.DISPATCH_TOKEN != '' }}
-        uses: peter-evans/repository-dispatch@v3
-        with:
-          token: ${{ secrets.DISPATCH_TOKEN }}
-          repository: firelock-ai/kin
-          event-type: dependency-updated
-          client-payload: '{"source": "kin-infer", "sha": "${{ github.sha }}"}'

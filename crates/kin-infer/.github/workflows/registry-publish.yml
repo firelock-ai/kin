@@ -9,7 +9,7 @@ on:
 
 jobs:
   release:
-    uses: firelock-ai/kin-actions/.github/workflows/cargo-registry-release.yml@v0.1.8
+    uses: firelock-ai/kin-actions/.github/workflows/cargo-registry-release.yml@v0.1.9
     with:
       package: kin-infer
       manifest: Cargo.toml
