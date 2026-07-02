@@ -810,6 +810,10 @@ enum Command {
         /// Skip signature and checksum verification (NOT recommended)
         #[arg(long)]
         skip_verify: bool,
+        /// Release channel: `stable` (default) or `alpha` (latest pre-release,
+        /// unstable). The chosen channel is saved as the default for future updates.
+        #[arg(long, value_enum)]
+        channel: Option<commands::update::Channel>,
     },
     /// Show or manage the global Kin repository registry
     Registry {
@@ -2607,7 +2611,10 @@ fn main() -> Result<()> {
                     );
                     Ok(())
                 }
-                Command::Update { skip_verify } => commands::update::run(skip_verify).await,
+                Command::Update {
+                    skip_verify,
+                    channel,
+                } => commands::update::run(skip_verify, channel).await,
                 Command::Registry { action } => match action {
                     Some(RegistryAction::Daemons { json }) => {
                         commands::registry::daemons(json).await
