@@ -204,6 +204,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_DAEMON_SHUTDOWN_GRACE_SECS", kind: Kind::Secs, default: "25", sensitivity: Sensitivity::Operational, summary: "grace before the shutdown watchdog force-exits; 0 escalates immediately" },
     EnvVarSpec { name: "KIN_DAEMON_RUNTIME_SHUTDOWN_GRACE_SECS", kind: Kind::Secs, default: "8", sensitivity: Sensitivity::Operational, summary: "bound on tokio runtime teardown waiting for blocking tasks" },
     EnvVarSpec { name: "KIN_ALLOW_DAEMON_BOOTSTRAP_ADMIN", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "allow the CLI to bootstrap an admin-scoped daemon" },
+    EnvVarSpec { name: "KIN_STRICT_BEHAVIOR_ENV", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "escalate a CLI/daemon behavior-env divergence from a warning to a hard error" },
 
     // ---- supervisor -----------------------------------------------------------
     EnvVarSpec { name: "KIN_SUPERVISOR_URL", kind: Kind::Url, default: "", sensitivity: Sensitivity::Operational, summary: "explicit supervisor endpoint URL" },

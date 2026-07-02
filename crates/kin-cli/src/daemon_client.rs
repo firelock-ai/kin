@@ -37,6 +37,11 @@ pub struct HealthResponse {
     pub repo_root: Option<String>,
     #[serde(default)]
     pub pid: Option<u32>,
+    /// Behavior-relevant environment the daemon captured at start (see
+    /// `kin_core::behavior_env`). Empty when the daemon predates this surface,
+    /// which yields no divergence rather than a false one.
+    #[serde(default)]
+    pub behavior_env: kin_core::behavior_env::BehaviorEnv,
     #[serde(default)]
     pub build: Option<BuildResponse>,
 }
@@ -254,6 +259,35 @@ impl DaemonClient {
             anyhow::bail!("daemon error (HTTP {}): {}", status, body);
         }
         Ok(resp.json().await?)
+    }
+
+    /// Compare this command's behavior-relevant environment against what the
+    /// running daemon captured at start, and surface any divergence.
+    ///
+    /// A repo daemon is a long-lived per-user singleton: it inherited its
+    /// environment from whichever command first started it, and later commands
+    /// reach it over HTTP without re-exporting their own environment. So a
+    /// behavior knob set on *this* command (e.g. `KIN_EMBED_HYBRID`) is silently
+    /// ignored by the already-running worker. This makes that mismatch loud.
+    ///
+    /// Best-effort: if the daemon cannot be reached, or predates the
+    /// `behavior_env` health field, this is a no-op — the command's own request
+    /// still surfaces any genuine connectivity failure, so the check never
+    /// double-reports one. On divergence it warns to stderr; under
+    /// `KIN_STRICT_BEHAVIOR_ENV` it returns an error so scripted and proof runs
+    /// fail closed instead of measuring the wrong lever.
+    pub async fn warn_on_behavior_env_divergence(&self) -> Result<()> {
+        let Ok(health) = self.health().await else {
+            return Ok(());
+        };
+        let divergences = kin_core::behavior_env::compare(
+            &kin_core::behavior_env::snapshot_from_process(),
+            &health.behavior_env,
+        );
+        report_behavior_env_divergence(
+            &divergences,
+            is_transient_bool_env("KIN_STRICT_BEHAVIOR_ENV"),
+        )
     }
 
     /// Get the working copy status from the daemon.
@@ -1161,6 +1195,47 @@ fn build_match_error(cli: &str, daemon: &str, strict: bool) -> Result<Option<Str
         bail!("{message}");
     }
     Ok(Some(message))
+}
+
+/// Route a behavior-env divergence report to a warning or, in strict mode, an
+/// error. Pure in its inputs so the warn-vs-error policy and the message are
+/// unit-testable without a live daemon. Returns `Err` under strict mode when
+/// there is any divergence; otherwise warns to stderr and returns `Ok`.
+fn report_behavior_env_divergence(
+    divergences: &[kin_core::behavior_env::Divergence],
+    strict: bool,
+) -> Result<()> {
+    if divergences.is_empty() {
+        return Ok(());
+    }
+    let message = behavior_env_divergence_message(divergences);
+    if strict {
+        bail!("{message}");
+    }
+    warn!("{message}");
+    Ok(())
+}
+
+/// Human-facing message for a behavior-env divergence: the boundary that causes
+/// it, each diverging variable with both sides' values, and the accurate remedy.
+fn behavior_env_divergence_message(divergences: &[kin_core::behavior_env::Divergence]) -> String {
+    let mut message = String::from(
+        "behavior-relevant environment differs between this command and the running kin daemon. \
+         The daemon inherited its environment when it started and does not pick up a later \
+         command's overrides, so these variables take effect from the daemon, not from this \
+         invocation:",
+    );
+    for d in divergences {
+        message.push_str("\n  - ");
+        message.push_str(&d.describe());
+    }
+    message.push_str(
+        "\nremedy: restart the daemon so it re-inherits the current environment — stop it with \
+         `kill $(cat .kin/daemon.pid)` (it also self-stops after its KIN_DAEMON_IDLE_TIMEOUT_SECS \
+         idle window) and the next kin command respawns it. \
+         Set KIN_STRICT_BEHAVIOR_ENV=1 to make this a hard error.",
+    );
+    message
 }
 
 fn check_response_build_match(headers: &reqwest::header::HeaderMap) -> Result<()> {
@@ -2485,6 +2560,7 @@ mod tests {
             repo_id: Some("wrong".to_string()),
             repo_root: Some(canonical_path_string(other.path())),
             pid: Some(std::process::id()),
+            behavior_env: Default::default(),
             build: None,
         };
 
@@ -2503,6 +2579,7 @@ mod tests {
             repo_id: Some("repo".to_string()),
             repo_root: Some(canonical_path_string(repo_root)),
             pid: Some(std::process::id()),
+            behavior_env: Default::default(),
             build: None,
         }
     }
@@ -2566,6 +2643,86 @@ mod tests {
         let err = build_match_error("bd7cd12", "a09f882", true).unwrap_err();
 
         assert!(err.to_string().contains("restart the daemon to match"));
+    }
+
+    fn one_divergence() -> Vec<kin_core::behavior_env::Divergence> {
+        vec![kin_core::behavior_env::Divergence {
+            var: "KIN_EMBED_HYBRID".to_string(),
+            cli: Some("balanced".to_string()),
+            daemon: None,
+        }]
+    }
+
+    #[test]
+    fn behavior_env_no_divergence_is_ok_in_either_mode() {
+        assert!(report_behavior_env_divergence(&[], false).is_ok());
+        assert!(report_behavior_env_divergence(&[], true).is_ok());
+    }
+
+    #[test]
+    fn behavior_env_divergence_warns_without_strict_mode() {
+        // Non-strict: surfaced as a warning; the command is allowed to continue.
+        assert!(report_behavior_env_divergence(&one_divergence(), false).is_ok());
+    }
+
+    #[test]
+    fn behavior_env_divergence_errors_in_strict_mode() {
+        let err = report_behavior_env_divergence(&one_divergence(), true).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("KIN_EMBED_HYBRID"));
+        assert!(text.contains("restart the daemon"));
+    }
+
+    #[test]
+    fn behavior_env_message_names_each_var_and_remedy() {
+        let divergences = vec![
+            kin_core::behavior_env::Divergence {
+                var: "KIN_EMBED_HYBRID".to_string(),
+                cli: Some("balanced".to_string()),
+                daemon: None,
+            },
+            kin_core::behavior_env::Divergence {
+                var: "KIN_RESOURCE_PROFILE".to_string(),
+                cli: None,
+                daemon: Some("throughput".to_string()),
+            },
+        ];
+        let message = behavior_env_divergence_message(&divergences);
+        // Each diverging var names both sides' values...
+        assert!(message.contains("KIN_EMBED_HYBRID: cli=\"balanced\" daemon=(unset)"));
+        assert!(message.contains("KIN_RESOURCE_PROFILE: cli=(unset) daemon=\"throughput\""));
+        // ...and the message states the accurate remedy and the strict escalation.
+        assert!(message.contains(".kin/daemon.pid"));
+        assert!(message.contains("KIN_STRICT_BEHAVIOR_ENV=1"));
+    }
+
+    #[test]
+    fn health_without_behavior_env_defaults_empty() {
+        // A daemon that predates the behavior_env field must still deserialize,
+        // with an empty surface, so an old daemon yields no divergence warnings.
+        let json = r#"{
+            "status":"ok","version":"0.0.0","uptime_seconds":1,
+            "graph_entity_count":10,"graph_loaded":true,
+            "reconciliation_status":"idle"
+        }"#;
+        let health: HealthResponse = serde_json::from_str(json).unwrap();
+        assert!(health.behavior_env.is_empty());
+    }
+
+    #[test]
+    fn health_with_behavior_env_deserializes_surface() {
+        let json = r#"{
+            "status":"ok","version":"0.0.0","uptime_seconds":1,
+            "graph_entity_count":10,"graph_loaded":true,
+            "reconciliation_status":"idle",
+            "behavior_env":{"KIN_EMBED_HYBRID":"balanced","KIN_RESOURCE_PROFILE":null}
+        }"#;
+        let health: HealthResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            health.behavior_env.get("KIN_EMBED_HYBRID"),
+            Some(&Some("balanced".to_string()))
+        );
+        assert_eq!(health.behavior_env.get("KIN_RESOURCE_PROFILE"), Some(&None));
     }
 
     #[test]

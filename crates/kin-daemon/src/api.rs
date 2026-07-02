@@ -104,6 +104,14 @@ pub struct HealthResponse {
     /// reads. Additive; `0` before the first snapshot is committed.
     #[serde(default)]
     pub graph_generation: u64,
+    /// Behavior-relevant environment the daemon worker captured at process
+    /// start (variable name → value, or `null` when unset). A repo daemon
+    /// inherits its environment from whichever command first started it and does
+    /// not pick up a later command's per-invocation overrides; a client compares
+    /// this against its own environment to surface a silently-ignored knob. See
+    /// `kin_core::behavior_env`.
+    #[serde(default)]
+    pub behavior_env: kin_core::behavior_env::BehaviorEnv,
     pub build: BuildResponse,
 }
 
@@ -1259,6 +1267,7 @@ async fn health(
         mass_deletion_blocked,
         embed_worker_failed,
         graph_generation: DaemonState::read_generation_marker(&state.layout),
+        behavior_env: kin_core::behavior_env::snapshot_from_process(),
         build: current_build_response(),
     }))
 }
@@ -7884,6 +7893,35 @@ mod tests {
         assert!(!json.build.built_at.is_empty());
         // Additive freshness marker present; 0 before any snapshot is committed.
         assert_eq!(json.graph_generation, 0);
+    }
+
+    #[tokio::test]
+    async fn health_reports_full_behavior_env_surface() {
+        // The health payload must carry every behavior-relevant variable (value
+        // or null) so a client can compare it against its own environment and
+        // detect a knob the long-lived daemon silently ignores.
+        let state = test_state();
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let json: HealthResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json.behavior_env.len(),
+            kin_core::behavior_env::BEHAVIOR_ENV_VARS.len(),
+            "health must report exactly the shared behavior-env surface"
+        );
+        for var in kin_core::behavior_env::BEHAVIOR_ENV_VARS {
+            assert!(
+                json.behavior_env.contains_key(*var),
+                "health payload missing behavior-env var {var}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@
 
 pub mod assistant;
 pub mod assistant_sync;
+pub mod behavior_env;
 pub mod config;
 pub mod dependencies;
 pub mod diff;
