@@ -1,0 +1,15 @@
+# Intentional exceptions for the `every_kin_env_read_in_workspace_is_registered`
+# test in src/env_registry.rs.
+#
+# List one `KIN_*` name per line to exempt a direct `env::var` / `env::var_os`
+# read site in kin's own source from the registry-completeness guard. `#` comments
+# and blank lines are ignored.
+#
+# Use this ONLY for a name that is genuinely not part of the operator-facing env
+# surface — e.g. a test-only fixture read, or a name assembled for a fixture. The
+# default and correct action is to register the variable in env_registry.rs so the
+# startup audit stops calling a live lever "unrecognized". An entry here is a
+# conscious decision to keep a name out of the registry, not a place to silence a
+# real gap.
+#
+# (currently empty — every KIN_* read in kin's workspace is registered)

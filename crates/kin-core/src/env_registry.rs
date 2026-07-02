@@ -227,7 +227,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_EMBED_MAX_PASSES", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "cap on embedding passes per embed run" },
     EnvVarSpec { name: "KIN_EMBED_PASS_SECONDS", kind: Kind::Secs, default: "", sensitivity: Sensitivity::Operational, summary: "per-pass wall-clock budget for an embed run" },
     EnvVarSpec { name: "KIN_EMBED_HTTP_TIMEOUT_SECS", kind: Kind::Secs, default: "", sensitivity: Sensitivity::Operational, summary: "HTTP timeout for the embedding service client" },
-    EnvVarSpec { name: "KIN_RESOURCE_PROFILE", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "resource profile hint for embed batch sizing" },
+    EnvVarSpec { name: "KIN_RESOURCE_PROFILE", kind: Kind::OneOf(&["proof", "interactive", "throughput", "ci"]), default: "proof", sensitivity: Sensitivity::Correctness, summary: "runtime resource profile (kin-cli/kin-daemon/kin-infer/kin-db): proof/interactive/throughput/ci; unset resolves to proof (bit-identical), throughput may engage CPU/GPU hybrid embedding and is non-citable" },
     EnvVarSpec { name: "KIN_INFER_METAL_PROFILE", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "Metal inference profile selection" },
     EnvVarSpec { name: "KIN_REGISTRY_URL", kind: Kind::Url, default: "", sensitivity: Sensitivity::Operational, summary: "kin registry base URL" },
     EnvVarSpec { name: "KIN_REGISTRY_BASE_URL", kind: Kind::Url, default: "", sensitivity: Sensitivity::Operational, summary: "kin registry base URL (alternate key)" },
@@ -280,11 +280,48 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_REGEN_ENV_DOC", kind: Kind::Str, default: "", sensitivity: Sensitivity::Diagnostic, summary: "dev/test tooling: set to regenerate docs/env-vars.md from the registry" },
 ];
 
-/// The full registry: hand-curated operational/safety/correctness specs plus the
-/// auto-extracted locate/ranking tuning knobs.
+/// Behavior levers **read by sibling first-party crates** that are linked into, or
+/// projected around, the kin runtime — kin-db (`embed/mod.rs`), kin-infer
+/// (`gpu.rs`, `resource.rs`), and the kin-vfs shim. Kin's own binary never calls
+/// `env::var` for these names (a sibling does), so they carry into kin's process
+/// environment yet cannot be discovered by the workspace-completeness test. Left
+/// unregistered, the startup audit would report them as "unrecognized … no effect"
+/// even though setting them changes real behavior — the exact false negative this
+/// table removes.
+///
+/// This list is necessarily **hand-maintained**: the sibling crates resolve through
+/// the private cargo registry, not a path dependency, so a build-time cross-repo
+/// scan is not possible from here. When a downstream crate adds, renames, or removes
+/// a `KIN_*` lever, update this table to match — the kind, default, and sensitivity
+/// are lifted from the actual read site so both the audit and `docs/env-vars.md`
+/// stay honest. `Correctness` marks a lever that shifts embedding/inference *output*
+/// (compute device, precision, or split); `Operational` marks a perf/cache/lifecycle
+/// lever that leaves numerical output identical.
+#[rustfmt::skip]
+pub const DOWNSTREAM: &[EnvVarSpec] = &[
+    // ---- kin-infer: compute backend / dispatch --------------------------------
+    EnvVarSpec { name: "KIN_INFER_CPU_BACKEND", kind: Kind::OneOf(&["pure-rust", "pure_rust", "accelerate"]), default: "accelerate", sensitivity: Sensitivity::Correctness, summary: "kin-infer CPU matmul backend: 'pure-rust' forces the deterministic pure-Rust GEMM for bit-reproducible runs; 'accelerate' uses Apple Accelerate BLAS (the macOS default). BLAS differs from pure-Rust in the last ULPs" },
+    EnvVarSpec { name: "KIN_INFER_OCCUPANCY_DISPATCH", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "kin-infer Metal occupancy-informed pointwise threadgroup sizing; numerically identical to the one-simdgroup baseline (a perf A/B lever), default off" },
+    // ---- kin-db: embedding compute path (shifts embedding vectors) ------------
+    EnvVarSpec { name: "KIN_EMBED_BACKEND", kind: Kind::OneOf(&["auto", "cpu", "metal", "gpu"]), default: "auto", sensitivity: Sensitivity::Correctness, summary: "kin-db embedding compute backend: auto (default) uses batched Metal, 'cpu' forces the SIMD/pure path, 'metal'/'gpu' forces Metal; cpu vs metal shifts embeddings in the last ULPs" },
+    EnvVarSpec { name: "KIN_EMBED_HYBRID", kind: Kind::Str, default: "off", sensitivity: Sensitivity::Correctness, summary: "kin-db hybrid CPU/GPU embedding split: off (default), 'seq'/'floor' for the sequence-length floor, or any other truthy value for the balanced split; engaging the CPU twin computes some vectors off the Metal device" },
+    EnvVarSpec { name: "KIN_EMBED_HYBRID_CPU_MAX_SEQ_LEN", kind: Kind::Usize, default: "256", sensitivity: Sensitivity::Correctness, summary: "kin-db hybrid CPU lane cutoff: entities tokenized at or below this sequence length embed on the CPU twin, heavier ones on Metal; 0 or invalid falls back to 256" },
+    EnvVarSpec { name: "KIN_EMBED_HYBRID_GPU_TPUT_RATIO", kind: Kind::NonNegF32, default: "", sensitivity: Sensitivity::Correctness, summary: "kin-db hybrid split ratio: pins the GPU:CPU throughput ratio for the balanced split; unset (or <= 0) measures it adaptively per batch" },
+    // ---- kin-db: embedding cache (perf/lifecycle, identical vectors) ----------
+    EnvVarSpec { name: "KIN_EMBED_CACHE", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Operational, summary: "kin-db on-disk embedding cache; set to 0 to disable and always recompute (only the literal '0' disables), default on" },
+    EnvVarSpec { name: "KIN_EMBED_CACHE_DIR", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "kin-db on-disk embedding cache directory; unset uses ~/.kin/cache/embeddings" },
+    // ---- kin-vfs shim: projection bypass --------------------------------------
+    EnvVarSpec { name: "KIN_NO_VFS", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "kin-vfs shim projection bypass: set to 1 to skip VFS initialization and exec the real binary directly (only the literal '1' bypasses), default off" },
+];
+
+/// The full registry: hand-curated operational/safety/correctness specs, the
+/// hand-tracked downstream sibling-crate levers, plus the auto-extracted
+/// locate/ranking tuning knobs.
 pub fn registry() -> Vec<EnvVarSpec> {
-    let mut all: Vec<EnvVarSpec> = Vec::with_capacity(OPERATIONAL.len() + GENERATED_KNOBS.len());
+    let mut all: Vec<EnvVarSpec> =
+        Vec::with_capacity(OPERATIONAL.len() + DOWNSTREAM.len() + GENERATED_KNOBS.len());
     all.extend_from_slice(OPERATIONAL);
+    all.extend_from_slice(DOWNSTREAM);
     all.extend_from_slice(GENERATED_KNOBS);
     all
 }
@@ -293,6 +330,7 @@ pub fn registry() -> Vec<EnvVarSpec> {
 pub fn spec(name: &str) -> Option<EnvVarSpec> {
     OPERATIONAL
         .iter()
+        .chain(DOWNSTREAM.iter())
         .chain(GENERATED_KNOBS.iter())
         .find(|s| s.name == name)
         .copied()
@@ -866,14 +904,31 @@ mod tests {
     }
 
     #[test]
-    fn generated_and_operational_are_disjoint() {
-        let op: std::collections::HashSet<&str> = OPERATIONAL.iter().map(|s| s.name).collect();
-        for s in GENERATED_KNOBS {
-            assert!(
-                !op.contains(s.name),
-                "{} is in both operational and generated tables",
-                s.name
-            );
+    fn tables_are_pairwise_disjoint() {
+        // No name may appear in more than one source table; `registry()` simply
+        // concatenates them, so an overlap would silently double-count.
+        for (a_name, a) in [
+            ("operational", OPERATIONAL),
+            ("downstream", DOWNSTREAM),
+            ("generated", GENERATED_KNOBS),
+        ] {
+            for (b_name, b) in [
+                ("operational", OPERATIONAL),
+                ("downstream", DOWNSTREAM),
+                ("generated", GENERATED_KNOBS),
+            ] {
+                if a_name >= b_name {
+                    continue; // each unordered pair once
+                }
+                let a_names: std::collections::HashSet<&str> = a.iter().map(|s| s.name).collect();
+                for s in b {
+                    assert!(
+                        !a_names.contains(s.name),
+                        "{} is in both the {a_name} and {b_name} tables",
+                        s.name
+                    );
+                }
+            }
         }
     }
 
@@ -1059,6 +1114,184 @@ mod tests {
                 .iter()
                 .all(|f| !f.message.contains("s3cr3t")),
             "secret value must never appear in a finding"
+        );
+    }
+
+    // ---- downstream sibling-crate levers ----------------------------------
+
+    #[test]
+    fn downstream_levers_are_registered_not_unknown() {
+        // The bug this closes: these levers are consumed by kin-db / kin-infer /
+        // the kin-vfs shim but were absent from the registry, so the startup audit
+        // called them "unrecognized … no effect" while they were changing real
+        // behavior. Registered, they must never surface as unknown.
+        for name in [
+            "KIN_INFER_CPU_BACKEND",
+            "KIN_INFER_OCCUPANCY_DISPATCH",
+            "KIN_EMBED_BACKEND",
+            "KIN_EMBED_HYBRID",
+            "KIN_EMBED_HYBRID_CPU_MAX_SEQ_LEN",
+            "KIN_EMBED_HYBRID_GPU_TPUT_RATIO",
+            "KIN_EMBED_CACHE",
+            "KIN_EMBED_CACHE_DIR",
+            "KIN_NO_VFS",
+        ] {
+            assert!(spec(name).is_some(), "{name} must be registered in DOWNSTREAM");
+            let report = audit_env([(name.to_string(), "1".to_string())], false);
+            assert!(
+                report.unknown.is_empty(),
+                "{name} must be recognized, not reported unknown: {:?}",
+                report.unknown
+            );
+        }
+    }
+
+    #[test]
+    fn downstream_correctness_lever_override_is_loud() {
+        // A behavior-relevant downstream lever set off its default gets the same
+        // "correctness-relevant override active" treatment as any correctness var —
+        // behavior drift is never silent.
+        let cpu = audit_env(
+            [("KIN_EMBED_BACKEND".to_string(), "cpu".to_string())],
+            false,
+        );
+        assert!(
+            cpu.non_default.iter().any(|f| f.var == "KIN_EMBED_BACKEND"),
+            "forcing the embedding backend to cpu must be recorded as active drift"
+        );
+        // A resource profile pinned to throughput (a non-citable mode) likewise.
+        let tput = audit_env(
+            [("KIN_RESOURCE_PROFILE".to_string(), "throughput".to_string())],
+            false,
+        );
+        assert!(
+            tput.non_default
+                .iter()
+                .any(|f| f.var == "KIN_RESOURCE_PROFILE"),
+            "throughput profile must be surfaced as a live behavior override"
+        );
+        // An operational downstream lever (numerically identical output) is not
+        // drift and must stay quiet.
+        let occ = audit_env(
+            [("KIN_INFER_OCCUPANCY_DISPATCH".to_string(), "1".to_string())],
+            false,
+        );
+        assert!(
+            occ.non_default.is_empty(),
+            "a numerically-identical perf lever must not be logged as correctness drift"
+        );
+    }
+
+    // ---- workspace env-read completeness ----------------------------------
+
+    /// Extract every `KIN_*` name read through the direct `env::var` / `env::var_os`
+    /// shape in `text`. Env *writes* (`set_var`, `remove_var`), helper-wrapped
+    /// reads, and dynamic reads (a non-literal name) are intentionally excluded.
+    fn scan_kin_env_reads(text: &str) -> Vec<String> {
+        // Assemble the read-shape needles from a bare quote char so this scanner's
+        // own source never contains the literal pattern it searches for.
+        let q = '"';
+        let needles = [format!("env::var({q}KIN_"), format!("env::var_os({q}KIN_")];
+        let bytes = text.as_bytes();
+        let mut found = Vec::new();
+        for needle in &needles {
+            let mut from = 0;
+            while let Some(rel) = text[from..].find(needle.as_str()) {
+                // `start` points at the 'K' of the KIN_ name.
+                let start = from + rel + needle.len() - "KIN_".len();
+                let mut end = start;
+                while end < bytes.len() {
+                    let c = bytes[end];
+                    if c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_' {
+                        end += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if end - start > "KIN_".len() {
+                    found.push(text[start..end].to_string());
+                }
+                from += rel + needle.len();
+            }
+        }
+        found
+    }
+
+    /// Load the intentional-exception allowlist (one `KIN_*` name per line, `#`
+    /// comments and blanks ignored). Missing file → empty set.
+    fn load_env_var_allowlist(manifest: &std::path::Path) -> std::collections::BTreeSet<String> {
+        let mut set = std::collections::BTreeSet::new();
+        if let Ok(text) = std::fs::read_to_string(manifest.join("env_var_allowlist.txt")) {
+            for line in text.lines() {
+                let line = line.trim();
+                if !line.is_empty() && !line.starts_with('#') {
+                    set.insert(line.to_string());
+                }
+            }
+        }
+        set
+    }
+
+    #[test]
+    fn every_kin_env_read_in_workspace_is_registered() {
+        // Guardrail for kin's OWN surface: scan the workspace source for direct
+        // KIN_* env reads and assert each is registered. A new lever added to kin
+        // without a registry entry would make the startup audit lie ("unrecognized
+        // … no effect") about a live knob. Cross-repo consumers (kin-db, kin-infer,
+        // kin-vfs) cannot be scanned from here — their levers are hand-tracked in
+        // DOWNSTREAM; see that table's note. Helper-wrapped locate/ranking knobs are
+        // extracted into GENERATED_KNOBS by scripts/gen_env_registry.py and are
+        // covered by is_known() the same way.
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest.join("../..");
+        // Skip in a packaged/published single-crate context (mirrors the doc test):
+        // without the sibling crates there is nothing to scan.
+        if !root.join("crates/kin-cli/src").is_dir() {
+            eprintln!("workspace crates not present; skipping env-read completeness scan");
+            return;
+        }
+
+        let allow = load_env_var_allowlist(manifest);
+        let mut offenders: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let file_name = entry.file_name();
+                let file_name = file_name.to_string_lossy();
+                if path.is_dir() {
+                    // Skip build output, vendored deps, and hidden/coordination dirs.
+                    if file_name == "target"
+                        || file_name == "node_modules"
+                        || file_name.starts_with('.')
+                    {
+                        continue;
+                    }
+                    stack.push(path);
+                } else if file_name.ends_with(".rs") {
+                    let Ok(text) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    for read in scan_kin_env_reads(&text) {
+                        if allow.contains(&read) || is_known(&read) {
+                            continue;
+                        }
+                        offenders
+                            .entry(read)
+                            .or_insert_with(|| path.display().to_string());
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these KIN_* vars are read in kin source but not registered in the env \
+             registry (register them in env_registry.rs, or, for a deliberate \
+             exception, add them to crates/kin-core/env_var_allowlist.txt): {offenders:?}"
         );
     }
 
