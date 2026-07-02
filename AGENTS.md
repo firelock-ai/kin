@@ -10,7 +10,7 @@ workspace `AGENTS.md`:
 **`kin-ecosystem/AGENTS.md`** (also symlinked as `kin-ecosystem/CLAUDE.md`)
 
 When working inside this repo as part of the umbrella workspace, that file is
-loaded automatically by Claude Code. If working in this repo in isolation,
+loaded automatically by agent CLIs that read `CLAUDE.md`. If working in this repo in isolation,
 read the umbrella `AGENTS.md` before making architectural or process decisions.
 
 ## This repo's role
