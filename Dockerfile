@@ -32,4 +32,8 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 USER kin
 EXPOSE 4219
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-CMD ["--repo", "/workspace", "--port", "4219"]
+# The entrypoint owns --repo: it resolves and prepares the workspace
+# (KIN_WORKSPACE_DIR, default /tmp/kin-workspace) and passes it to the daemon.
+# Hardcoding --repo /workspace here would name an unwritable image-root path with
+# no volume mounted, so only pass the port and let the entrypoint set the repo.
+CMD ["--port", "4219"]

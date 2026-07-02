@@ -32,7 +32,78 @@ jobs:
           context: .
           file: ./Dockerfile
           push: false
-          load: false
+          # Load the built image into the local Docker daemon so the smoke step
+          # below can `docker run` it. Single-platform, so `load` is supported.
+          load: true
           tags: kin:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Container-level smoke on the freshly built image. Proves the entrypoint
+      # boots the daemon in local mode with NO /workspace volume — the case that
+      # previously crash-looped on a bare `mkdir /workspace` — that GCS mode
+      # prepares the same workspace path, and that an unwritable workspace fails
+      # loudly instead of dying on mkdir. Creds-free and bounded well under 2 min.
+      - name: Entrypoint smoke (local boot + SIGTERM, gcs prep, unwritable fail)
+        run: |
+          set -uo pipefail
+          IMAGE=kin:ci
+
+          dump() { echo "---- docker logs $1 ----"; docker logs "$1" 2>&1 || true; }
+
+          echo "::group::Local mode — no /workspace mount, default workspace"
+          docker rm -f kin-local >/dev/null 2>&1 || true
+          docker run -d --name kin-local "$IMAGE" >/dev/null
+          # The daemon binds and logs "daemon API server listening" before the
+          # slower graph/model startup, so it is the deterministic offline signal
+          # that it reached serving state — independent of reconcile/embed timing.
+          listening=0
+          for _ in $(seq 1 40); do
+            if docker logs kin-local 2>&1 | grep -q "daemon API server listening"; then listening=1; break; fi
+            if [ "$(docker inspect -f '{{.State.Running}}' kin-local 2>/dev/null)" != "true" ]; then break; fi
+            sleep 1
+          done
+          if [ "$listening" -ne 1 ]; then echo "::error::kin-daemon never reached its listening line in local mode"; dump kin-local; exit 1; fi
+          if ! docker logs kin-local 2>&1 | grep -q "Starting kin-daemon (storage=local"; then echo "::error::entrypoint did not report local storage prep"; dump kin-local; exit 1; fi
+          # Best-effort readiness probe (an empty repo may still be initializing);
+          # logged for signal only — the listening line is the hard gate.
+          if docker exec kin-local sh -c 'curl -fsS http://127.0.0.1:4219/readiness' >/dev/null 2>&1; then
+            echo "readiness: 200 (ready)"
+          else
+            echo "readiness: not yet 200 (empty-repo init timing; listening already asserted)"
+          fi
+          # SIGTERM must shut the daemon down cleanly (exit 0), not get SIGKILLed.
+          docker stop -t 15 kin-local >/dev/null
+          code="$(docker inspect -f '{{.State.ExitCode}}' kin-local)"
+          if [ "$code" != "0" ]; then echo "::error::kin-daemon did not exit cleanly on SIGTERM (exit=$code)"; dump kin-local; exit 1; fi
+          echo "local mode: reached listening + clean SIGTERM (exit 0)"
+          docker rm -f kin-local >/dev/null 2>&1 || true
+          echo "::endgroup::"
+
+          echo "::group::GCS mode — same workspace prep path (creds-free)"
+          # No bucket/creds in CI, so the daemon exits right after workspace prep;
+          # assert the unified prep ran on the same /tmp/kin-workspace and reached
+          # daemon exec without the unwritable fatal — i.e. prep is mode-agnostic.
+          out_gcs="$(timeout 30 docker run --rm -e KIN_STORAGE=gcs "$IMAGE" 2>&1)" || true
+          echo "$out_gcs"
+          if ! printf '%s\n' "$out_gcs" | grep -q "Starting kin-daemon (storage=gcs"; then echo "::error::gcs mode did not reach daemon exec after workspace prep"; exit 1; fi
+          if printf '%s\n' "$out_gcs" | grep -q "FATAL: workspace"; then echo "::error::gcs mode hit the unwritable-workspace fatal on the default path"; exit 1; fi
+          echo "gcs mode: workspace prepared and reached daemon exec"
+          echo "::endgroup::"
+
+          echo "::group::Unwritable workspace — loud fatal, no bare mkdir death"
+          # KIN_WORKSPACE_DIR=/workspace is an unwritable image-root path with no
+          # mount: the entrypoint must print an actionable fatal and exit 1.
+          # Expected-failure capture: suspend errexit so the nonzero exit lands
+          # in code_bad instead of aborting the step at the assignment.
+          set +e
+          out_bad="$(docker run --rm -e KIN_WORKSPACE_DIR=/workspace "$IMAGE" 2>&1)"
+          code_bad=$?
+          set -e
+          echo "$out_bad"
+          if [ "$code_bad" -ne 1 ]; then echo "::error::unwritable workspace should exit 1 (got $code_bad)"; exit 1; fi
+          if ! printf '%s\n' "$out_bad" | grep -q "FATAL: workspace '/workspace' is not writable"; then echo "::error::missing actionable fatal naming the dir"; exit 1; fi
+          if ! printf '%s\n' "$out_bad" | grep -q "KIN_WORKSPACE_DIR"; then echo "::error::fatal should name the KIN_WORKSPACE_DIR remedy"; exit 1; fi
+          if printf '%s\n' "$out_bad" | grep -qi "Permission denied"; then echo "::error::leaked a bare mkdir permission-denied death"; exit 1; fi
+          echo "unwritable workspace: loud fatal + exit 1, no bare mkdir death"
+          echo "::endgroup::"
