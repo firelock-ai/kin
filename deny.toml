@@ -26,6 +26,12 @@ ignore = [
     { id = "RUSTSEC-2024-0384", reason = "instant unmaintained — transitive; no safe upgrade; no vuln" },
     { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 unmaintained — transitive build-time macro dep; no safe upgrade; no vuln" },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained — transitive via the TLS stack; no safe upgrade; no vuln" },
+    # Real vulnerabilities with NO upstream fix path today (patched only in a
+    # semver range no dependent admits). Permitted ONLY with a documented
+    # no-exposure justification and an explicit removal trigger — never for
+    # vulns with an available fix (see NOTE below).
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml quadratic attribute-duplication DoS — patched only in >=0.41 while object_store caps quick-xml ^0.40 at every release; the XML parsed is GCS API responses over TLS behind the off-by-default gcs feature, no attacker-supplied XML in the default configuration; remove when object_store admits quick-xml >=0.41" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml unbounded namespace allocation DoS — same transitive object_store cap and exposure as RUSTSEC-2026-0194; remove when object_store admits quick-xml >=0.41" },
     # NOTE: RUSTSEC-2026-0098 / -0099 / -0104 (rustls-webpki 0.103.10 name-constraint
     # + CRL-panic VULNERABILITIES) are intentionally NOT ignored. They have a fix:
     # `cargo update -p rustls-webpki` (>=0.103.13). That is a Cargo.lock change and
