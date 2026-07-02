@@ -126,6 +126,7 @@ pub async fn run_health_checks() -> HealthReport {
         check_daemon_running().await,
         check_vfs_projection(),
         check_repo_init(),
+        check_session_runtime(),
         check_shell_path(),
     ];
     checks.extend(check_mcp_clients());
@@ -296,7 +297,8 @@ fn check_vfs_projection() -> HealthCheck {
                 lib_path.display()
             ),
         )
-        .with_manual_fix(format!("rm {} && kin setup", lib_path.display()))
+        .fixable()
+        .with_manual_fix("run `kin doctor --fix` to reinstall the shim (or reinstall kin if no local copy remains)")
     } else {
         HealthCheck::new(
             "vfs_projection",
@@ -304,7 +306,10 @@ fn check_vfs_projection() -> HealthCheck {
             HealthStatus::Missing,
             format!("shim not installed at {}", lib_path.display()),
         )
-        .with_manual_fix("run `kin setup` (builds/copies the VFS shim into ~/.kin/lib)")
+        .fixable()
+        .with_manual_fix(
+            "run `kin doctor --fix` (or `kin setup`) to install the VFS shim into ~/.kin/lib",
+        )
     }
 }
 
@@ -324,6 +329,62 @@ fn check_repo_init() -> HealthCheck {
             "current directory is not inside a Kin repository",
         )
         .with_manual_fix("run `kin init .` to initialize a repository here"),
+    }
+}
+
+/// Teach the session runtime path and surface leftover session workspaces.
+///
+/// Ordinary project tools run through graph-backed session workspaces
+/// (`kin exec`, `kin shell`, `kin with --session`); a workspace left under
+/// `.kin/runs/` is either an active session or a failed run waiting for
+/// `kin reconcile`.
+fn check_session_runtime() -> HealthCheck {
+    let cwd = env::current_dir().unwrap_or_default();
+    session_runtime_check_for(kin_core::KinLayout::discover(&cwd).as_ref())
+}
+
+fn session_runtime_check_for(layout: Option<&kin_core::KinLayout>) -> HealthCheck {
+    let Some(layout) = layout else {
+        return HealthCheck::new(
+            "session_runtime",
+            "Session runtime",
+            HealthStatus::Unsupported,
+            "not inside a Kin repository — from a Kin repo, run project tools with `kin exec -- <cmd>`",
+        );
+    };
+
+    let runs_dir = layout.root().join("runs");
+    let pending: Vec<String> = std::fs::read_dir(&runs_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().to_str().map(ToOwned::to_owned))
+        .filter(|name| name.starts_with("session-") || name.starts_with("exec-"))
+        .collect();
+
+    if pending.is_empty() {
+        HealthCheck::new(
+            "session_runtime",
+            "Session runtime",
+            HealthStatus::Healthy,
+            "run project tools with `kin exec -- <cmd>` (alias `kin run`), \
+             open an interactive env with `kin shell`, \
+             launch agents with `kin with --session <assistant>`",
+        )
+    } else {
+        HealthCheck::new(
+            "session_runtime",
+            "Session runtime",
+            HealthStatus::Stale,
+            format!(
+                "{} session workspace(s) under {} (active session, or a finished run waiting for reconcile)",
+                pending.len(),
+                runs_dir.display()
+            ),
+        )
+        .with_manual_fix(
+            "reconcile a finished session with `kin reconcile <session-id> --cleanup`, or remove it with `rm -rf <workspace>`",
+        )
     }
 }
 
@@ -471,6 +532,21 @@ pub(crate) fn evaluate_mcp_client(path: &PathBuf) -> (HealthStatus, String) {
             format!("no mcpServers.kin entry in {}", path.display()),
         ),
         Some(entry) => {
+            // Entries written by older releases pass `--global`, which the MCP
+            // server refuses at startup — the agent sees a dead kin server.
+            let has_retired_global_flag = entry
+                .get("args")
+                .and_then(|args| args.as_array())
+                .is_some_and(|args| args.iter().any(|arg| arg.as_str() == Some("--global")));
+            if has_retired_global_flag {
+                return (
+                    HealthStatus::Misconfigured,
+                    format!(
+                        "mcpServers.kin uses the retired `--global` mode and cannot start in {}",
+                        path.display()
+                    ),
+                );
+            }
             let profile = entry
                 .get("env")
                 .and_then(|e| e.get("KIN_MCP_TOOL_PROFILE"))
@@ -821,7 +897,7 @@ mod tests {
                 "mcpServers": {
                     "kin": {
                         "command": "kin",
-                        "args": ["mcp", "start", "--global"],
+                        "args": ["mcp", "start"],
                         "env": {}
                     }
                 }
@@ -844,7 +920,7 @@ mod tests {
                 "mcpServers": {
                     "kin": {
                         "command": "kin",
-                        "args": ["mcp", "start", "--global"],
+                        "args": ["mcp", "start"],
                         "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
                     }
                 }
@@ -858,10 +934,74 @@ mod tests {
     }
 
     #[test]
+    fn mcp_config_with_retired_global_flag_is_misconfigured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "kin": {
+                        "command": "kin",
+                        "args": ["mcp", "start", "--global"],
+                        "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (status, detail) = evaluate_mcp_client(&path);
+        assert!(matches!(status, HealthStatus::Misconfigured));
+        assert!(detail.contains("--global"));
+    }
+
+    #[test]
     fn mcp_config_missing_file_is_missing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("does-not-exist.json");
         let (status, _detail) = evaluate_mcp_client(&path);
         assert!(matches!(status, HealthStatus::Missing));
+    }
+
+    #[test]
+    fn session_runtime_outside_repo_is_skipped_with_hint() {
+        let check = session_runtime_check_for(None);
+        assert_eq!(check.id, "session_runtime");
+        assert!(matches!(check.status, HealthStatus::Unsupported));
+        assert!(check.detail.contains("kin exec"));
+    }
+
+    #[test]
+    fn session_runtime_in_clean_repo_teaches_the_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(&kin_dir).unwrap();
+        std::fs::write(kin_dir.join("HEAD"), "main").unwrap();
+        let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
+
+        let check = session_runtime_check_for(Some(&layout));
+        assert!(matches!(check.status, HealthStatus::Healthy));
+        assert!(check.detail.contains("kin exec"));
+        assert!(check.detail.contains("kin shell"));
+        assert!(check.detail.contains("kin with --session"));
+    }
+
+    #[test]
+    fn session_runtime_reports_pending_session_workspaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir_all(kin_dir.join("runs/session-leftover")).unwrap();
+        std::fs::write(kin_dir.join("HEAD"), "main").unwrap();
+        let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
+
+        let check = session_runtime_check_for(Some(&layout));
+        assert!(matches!(check.status, HealthStatus::Stale));
+        assert!(check.detail.contains("1 session workspace(s)"));
+        assert!(check
+            .manual_fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("kin reconcile")));
     }
 }

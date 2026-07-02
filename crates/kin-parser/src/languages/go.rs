@@ -47,7 +47,7 @@ impl LanguageAdapter for GoAdapter {
         let mut entities = Vec::new();
         let mut relations = Vec::new();
         let mut imports = Vec::new();
-        let mut interface_methods: Vec<(String, Vec<String>)> = Vec::new();
+        let mut interface_methods: Vec<(String, InterfaceContract)> = Vec::new();
         let mut type_methods: HashMap<String, Vec<String>> = HashMap::new();
         // Parallel bookkeeping: (index into `relations`, leftmost qualifier).
         // Populated for selector-expression calls like `fmt.Println` so that
@@ -74,9 +74,14 @@ impl LanguageAdapter for GoAdapter {
         }
 
         // Infer implicit interface satisfaction by comparing method sets.
-        // If a type's method names are a superset of an interface's method
-        // names, emit an Implements relation.
-        for (iface_name, iface_method_names) in &interface_methods {
+        // Same-file embedded interfaces are folded into the embedder's method
+        // set first, so `type ReadCloser interface { Reader; Close() error }`
+        // requires Read AND Close. Cross-file embeds cannot be resolved at
+        // parse time; they contribute an Extends edge (emitted above) and are
+        // otherwise ignored here. If a type's method names are a superset of
+        // an interface's (expanded) method names, emit an Implements relation.
+        let expanded_interfaces = expand_embedded_interface_methods(&interface_methods);
+        for (iface_name, iface_method_names) in &expanded_interfaces {
             if iface_method_names.is_empty() {
                 continue;
             }
@@ -160,7 +165,7 @@ fn extract_go_node(
     file_id: &FilePathId,
     entities: &mut Vec<ExtractedEntity>,
     relations: &mut Vec<ExtractedRelation>,
-    interface_methods: &mut Vec<(String, Vec<String>)>,
+    interface_methods: &mut Vec<(String, InterfaceContract)>,
     type_methods: &mut HashMap<String, Vec<String>>,
     call_prefixes: &mut Vec<(usize, String)>,
 ) {
@@ -240,13 +245,54 @@ fn extract_go_node(
                             _ => EntityKind::TypeAlias,
                         };
 
-                        // For interfaces, extract method names for implicit
-                        // satisfaction inference.
+                        // For interfaces, extract the contract surface as
+                        // first-class entities: every method spec becomes a
+                        // Method entity (qualified `Interface.Method`, like
+                        // concrete `Receiver.Method`), contained by the
+                        // interface — so the contract is retrievable, not just
+                        // an inference input. Embedded interfaces are recorded
+                        // for Extends edges and same-file method-set expansion.
                         if kind == EntityKind::Interface {
                             if let Some(ref iface_node) = type_node {
-                                let method_names =
-                                    extract_interface_method_names(iface_node, source);
-                                interface_methods.push((name.clone(), method_names));
+                                let members =
+                                    extract_interface_members(iface_node, source, file_id);
+                                for member in &members.methods {
+                                    let qualified = format!("{}.{}", name, member.name);
+                                    entities.push(ExtractedEntity {
+                                        kind: EntityKind::Method,
+                                        name: qualified.clone(),
+                                        signature: member.signature.clone(),
+                                        visibility: go_visibility_with_path(&member.name, file_id),
+                                        doc_summary: member.doc_summary.clone(),
+                                        fingerprint: member.fingerprint.clone(),
+                                        span: member.span.clone(),
+                                    });
+                                    relations.push(ExtractedRelation {
+                                        kind: kin_model::RelationKind::Contains,
+                                        src_name: name.clone(),
+                                        dst_name: qualified,
+                                        import_source: None,
+                                    });
+                                }
+                                for embedded in &members.embedded {
+                                    relations.push(ExtractedRelation {
+                                        kind: kin_model::RelationKind::Extends,
+                                        src_name: name.clone(),
+                                        dst_name: embedded.clone(),
+                                        import_source: None,
+                                    });
+                                }
+                                interface_methods.push((
+                                    name.clone(),
+                                    InterfaceContract {
+                                        method_names: members
+                                            .methods
+                                            .iter()
+                                            .map(|member| member.name.clone())
+                                            .collect(),
+                                        embedded: members.embedded,
+                                    },
+                                ));
                             }
                         }
 
@@ -346,19 +392,51 @@ fn extract_embedded_types(node: &tree_sitter::Node, source: &[u8]) -> Vec<String
     embedded
 }
 
-/// Extract method names from a Go interface_type node.
+/// One method spec declared directly in a Go interface body, carrying
+/// everything needed to materialize it as a graph entity.
+struct InterfaceMethodSpec {
+    name: String,
+    signature: String,
+    doc_summary: Option<String>,
+    fingerprint: kin_model::SemanticFingerprint,
+    span: kin_model::SourceSpan,
+}
+
+/// The members of one interface body: directly declared method specs plus
+/// the names of embedded interfaces.
+struct InterfaceMembers {
+    methods: Vec<InterfaceMethodSpec>,
+    embedded: Vec<String>,
+}
+
+/// An interface's contract surface as needed for satisfaction inference:
+/// its direct method names and the embedded interfaces they extend.
+struct InterfaceContract {
+    method_names: Vec<String>,
+    embedded: Vec<String>,
+}
+
+/// Extract the members of a Go interface_type node.
 ///
-/// Go interfaces declare method signatures like:
-///   type Shape interface {
-///       Area() float64
-///       Perimeter() float64
+/// Go interfaces declare method signatures and may embed other interfaces:
+///   type ReadCloser interface {
+///       Reader        // embedded — folds Reader's contract in
+///       Close() error // direct method spec
 ///   }
 ///
-/// We walk the interface body looking for method_spec nodes and collect
-/// their names. This list is later compared against concrete type method
-/// sets to infer implicit interface satisfaction.
-fn extract_interface_method_names(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
-    let mut names = Vec::new();
+/// Direct method specs (`method_elem` nodes with a `field_identifier` name)
+/// come back as full [`InterfaceMethodSpec`]s so the caller can emit them as
+/// first-class Method entities. Embedded interfaces (`type_elem` nodes)
+/// come back by name; only their simple identifier is kept (a qualified
+/// `io.Reader` stays `io.Reader` for the Extends edge, but cannot be
+/// expanded same-file).
+fn extract_interface_members(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    file_id: &FilePathId,
+) -> InterfaceMembers {
+    let mut methods = Vec::new();
+    let mut embedded = Vec::new();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         // tree-sitter-go uses "method_elem" for interface method declarations,
@@ -369,13 +447,97 @@ fn extract_interface_method_names(node: &tree_sitter::Node, source: &[u8]) -> Ve
                 if field.kind() == "field_identifier" {
                     let name = field.utf8_text(source).unwrap_or("").to_string();
                     if !name.is_empty() {
-                        names.push(name);
+                        methods.push(InterfaceMethodSpec {
+                            name,
+                            signature: node_signature(&child, source),
+                            doc_summary: extract_preceding_comment(&child, source),
+                            fingerprint: compute_fingerprint(&child, source),
+                            span: span_from_node(&child, file_id),
+                        });
                     }
+                    break;
                 }
             }
         }
+        // Embedded interfaces appear as "type_elem" children (possibly a
+        // union in Go 1.18+ generics; each term is a type identifier or a
+        // qualified type). Record each named term.
+        if child.kind() == "type_elem" {
+            collect_embedded_interface_names(&child, source, &mut embedded);
+        }
     }
-    names
+    InterfaceMembers { methods, embedded }
+}
+
+/// Collect embedded-interface names from a `type_elem` node: plain
+/// `type_identifier`s and package-qualified `qualified_type`s, skipping
+/// operators/underlying-type markers from generics union syntax.
+fn collect_embedded_interface_names(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    out: &mut Vec<String>,
+) {
+    match node.kind() {
+        "type_identifier" | "qualified_type" => {
+            let name = node.utf8_text(source).unwrap_or("").to_string();
+            if !name.is_empty() {
+                out.push(name);
+            }
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_embedded_interface_names(&child, source, out);
+            }
+        }
+    }
+}
+
+/// Expand same-file embedded interfaces into their embedder's method-name
+/// set (transitively, cycle-safe), yielding the effective contract each
+/// interface requires for satisfaction inference. Cross-file embeds (names
+/// not declared in this file, including package-qualified ones) cannot be
+/// resolved here and are skipped.
+fn expand_embedded_interface_methods(
+    interfaces: &[(String, InterfaceContract)],
+) -> Vec<(String, Vec<String>)> {
+    fn collect(
+        name: &str,
+        by_name: &HashMap<&str, &InterfaceContract>,
+        visiting: &mut Vec<String>,
+        out: &mut Vec<String>,
+    ) {
+        if visiting.iter().any(|seen| seen == name) {
+            return;
+        }
+        let Some(contract) = by_name.get(name) else {
+            return;
+        };
+        visiting.push(name.to_string());
+        for method in &contract.method_names {
+            if !out.contains(method) {
+                out.push(method.clone());
+            }
+        }
+        for embedded in &contract.embedded {
+            collect(embedded, by_name, visiting, out);
+        }
+        visiting.pop();
+    }
+
+    let by_name: HashMap<&str, &InterfaceContract> = interfaces
+        .iter()
+        .map(|(name, contract)| (name.as_str(), contract))
+        .collect();
+    interfaces
+        .iter()
+        .map(|(name, _)| {
+            let mut methods = Vec::new();
+            let mut visiting = Vec::new();
+            collect(name, &by_name, &mut visiting, &mut methods);
+            (name.clone(), methods)
+        })
+        .collect()
 }
 
 fn extract_receiver_type(receiver: &tree_sitter::Node, source: &[u8]) -> Option<String> {
@@ -765,6 +927,125 @@ func (s Square) Area() float64 {
                 .iter()
                 .any(|r| r.src_name == "Square" && r.dst_name == "Shape"),
             "Square should NOT implement Shape (missing Perimeter)"
+        );
+    }
+
+    #[test]
+    fn interface_methods_are_first_class_entities() {
+        let adapter = GoAdapter;
+        let source = br#"
+package shapes
+
+// Shape is the contract for closed figures.
+type Shape interface {
+    // Area returns the enclosed area.
+    Area() float64
+    Perimeter() float64
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("shapes.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let methods: Vec<_> = output
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Method)
+            .collect();
+        let area = methods
+            .iter()
+            .find(|e| e.name == "Shape.Area")
+            .unwrap_or_else(|| panic!("Shape.Area must be a Method entity, got: {methods:?}"));
+        assert_eq!(area.visibility, Visibility::Public);
+        assert_eq!(area.signature, "Area() float64");
+        assert!(
+            area.span.start_line > 0,
+            "interface method span must point at the method spec line"
+        );
+        assert!(
+            methods.iter().any(|e| e.name == "Shape.Perimeter"),
+            "Shape.Perimeter must be a Method entity"
+        );
+
+        let contains: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Contains)
+            .collect();
+        assert!(
+            contains
+                .iter()
+                .any(|r| r.src_name == "Shape" && r.dst_name == "Shape.Area"),
+            "Shape should contain Shape.Area, found: {contains:?}"
+        );
+    }
+
+    #[test]
+    fn embedded_interface_expands_contract_and_extends() {
+        let adapter = GoAdapter;
+        let source = br#"
+package io
+
+type Reader interface {
+    Read(p []byte) (int, error)
+}
+
+type ReadCloser interface {
+    Reader
+    Close() error
+}
+
+// OnlyClose has Close but not Read: must NOT satisfy ReadCloser.
+type OnlyClose struct{}
+
+func (o OnlyClose) Close() error { return nil }
+
+// File has both: satisfies Reader AND ReadCloser.
+type File struct{}
+
+func (f File) Read(p []byte) (int, error) { return 0, nil }
+
+func (f File) Close() error { return nil }
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("io.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let extends: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Extends)
+            .collect();
+        assert!(
+            extends
+                .iter()
+                .any(|r| r.src_name == "ReadCloser" && r.dst_name == "Reader"),
+            "ReadCloser should extend embedded Reader, found: {extends:?}"
+        );
+
+        let impls: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Implements)
+            .collect();
+        assert!(
+            impls
+                .iter()
+                .any(|r| r.src_name == "File" && r.dst_name == "ReadCloser"),
+            "File (Read+Close) should implement ReadCloser via embedded expansion, found: {impls:?}"
+        );
+        assert!(
+            impls
+                .iter()
+                .any(|r| r.src_name == "File" && r.dst_name == "Reader"),
+            "File should implement Reader, found: {impls:?}"
+        );
+        assert!(
+            !impls
+                .iter()
+                .any(|r| r.src_name == "OnlyClose" && r.dst_name == "ReadCloser"),
+            "OnlyClose (missing Read) must NOT implement ReadCloser — embedded methods are \
+             part of the contract, found: {impls:?}"
         );
     }
 

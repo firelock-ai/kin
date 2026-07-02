@@ -1552,6 +1552,20 @@ namespace ns {
     }
 }
 
+/// Bounded lexical preprocessing before tree-sitter parsing.
+///
+/// Scope boundary — macro-GENERATED symbols are out of extraction scope:
+/// `#define` definitions themselves ARE captured (as `EntityKind::Macro`),
+/// and macro invocations are captured as call relations, but code a
+/// function-like macro would EXPAND to (X-macros, Qt MOC, Boost.PP,
+/// `DEFINE_*` registration patterns) is never expanded here and therefore
+/// never becomes entities. Faithful expansion requires the full include
+/// graph and compiler flags, which a per-file parse does not have; partial
+/// heuristic expansion would fabricate entities at wrong spans. Retrieval
+/// consequence: symbols that only exist post-expansion are findable via the
+/// macro's definition/invocation sites, not as first-class entities. Only
+/// namespace-shaping macros are rewritten below, because they otherwise
+/// break the surrounding — real — declarations' extraction.
 fn preprocess_cpp_source(source: &[u8]) -> Vec<u8> {
     let mut s = source.to_vec();
     replace_namespace_macros(&mut s);

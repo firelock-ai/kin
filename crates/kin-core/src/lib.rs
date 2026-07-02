@@ -7,6 +7,7 @@ pub mod config;
 pub mod dependencies;
 pub mod diff;
 pub mod disambiguation;
+pub mod env_registry;
 pub mod error;
 pub mod hooks;
 pub mod init;

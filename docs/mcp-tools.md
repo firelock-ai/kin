@@ -28,7 +28,7 @@ small curated surface below instead of the full internal one):
   "mcpServers": {
     "kin": {
       "command": "kin",
-      "args": ["mcp", "start", "--global"],
+      "args": ["mcp", "start"],
       "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
     }
   }

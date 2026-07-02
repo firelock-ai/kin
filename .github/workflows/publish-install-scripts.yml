@@ -48,7 +48,7 @@ jobs:
       sha256_llms: ${{ steps.upload_llms.outputs.sha256 }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Authenticate to Google Cloud (keyless WIF)
         uses: google-github-actions/auth@v3
@@ -117,7 +117,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Verify install.sh checksum at get.kinlab.dev
         run: |

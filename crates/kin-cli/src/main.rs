@@ -549,13 +549,18 @@ enum Command {
         #[command(subcommand)]
         action: VerifyAction,
     },
-    /// Execute a command in a materialized workspace
+    /// Run a command in a graph-backed session workspace
+    #[command(visible_alias = "run")]
     Exec {
-        /// Command to execute
-        command: String,
-        /// Keep the workspace after execution
+        /// Command to run (put kin flags before it: `kin exec --keep -- npm test`)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+        /// Keep the session workspace after the run and defer reconcile
         #[arg(long)]
         keep: bool,
+        /// Discard all workspace changes after the run (no reconcile)
+        #[arg(long, conflicts_with = "keep")]
+        discard: bool,
         /// Materialization strategy
         #[arg(long)]
         strategy: Option<String>,
@@ -747,6 +752,11 @@ enum Command {
     With {
         /// Assistant to launch: claude, codex, gemini
         assistant: String,
+        /// Launch inside a graph-backed session workspace: the assistant starts
+        /// with its cwd in the session, receives session/daemon env, and its
+        /// changes reconcile into the graph on a successful exit
+        #[arg(long)]
+        session: bool,
         /// Pass the raw task only; keep AGENTS/bootstrap docs on disk but do not inject prompt guidance
         #[arg(long)]
         passive_guidance: bool,
@@ -1115,6 +1125,32 @@ enum IntentAction {
 
 #[derive(Subcommand)]
 enum ReviewAction {
+    /// Shadow-mode merge gate: evaluate a PR-shaped change and emit a
+    /// report-only verdict with blast radius, repair context, and audit
+    /// evidence. Never blocks and never mutates graph state.
+    Shadow {
+        /// Change range as <base>..<head>. Refs accept branch names,
+        /// semantic change IDs, and imported Git commit SHAs.
+        range: Option<String>,
+        /// Base ref (alternative to the positional range)
+        #[arg(long)]
+        base: Option<String>,
+        /// Head ref (alternative to the positional range)
+        #[arg(long)]
+        head: Option<String>,
+        /// Change title for the report (e.g. PR title)
+        #[arg(long)]
+        title: Option<String>,
+        /// Source URL for the report (e.g. PR URL)
+        #[arg(long = "source-url")]
+        source_url: Option<String>,
+        /// Change author identity for the report
+        #[arg(long)]
+        author: Option<String>,
+        /// Emit the report as machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Create a new review
     Create {
         /// Review title
@@ -1701,6 +1737,15 @@ fn main() -> Result<()> {
             .init();
     }
 
+    // Validate the KIN_* environment surface once logging is live. Unknown names
+    // (likely typos) and out-of-range values are surfaced loudly instead of
+    // silently no-op'ing; an invalid correctness-relevant value refuses to run
+    // rather than mis-behaving. Governed by KIN_ENV_VALIDATION (off/warn/strict).
+    if let Err(err) = kin_core::env_registry::enforce_startup_env() {
+        eprintln!("kin: {err}");
+        std::process::exit(2);
+    }
+
     let root_span = tracing::info_span!(
         "kin.command",
         command = %command_name,
@@ -2072,6 +2117,37 @@ fn main() -> Result<()> {
                 } => {
                     if let Some(review_action) = action {
                         match review_action {
+                            ReviewAction::Shadow {
+                                range,
+                                base,
+                                head,
+                                title,
+                                source_url,
+                                author,
+                                json,
+                            } => {
+                                let (base, head) = match (range, base, head) {
+                                    (Some(range), None, None) => match range.split_once("..") {
+                                        Some((base, head))
+                                            if !base.is_empty() && !head.is_empty() =>
+                                        {
+                                            (base.to_string(), head.to_string())
+                                        }
+                                        _ => anyhow::bail!(
+                                            "invalid range '{}': expected <base>..<head>",
+                                            range
+                                        ),
+                                    },
+                                    (None, Some(base), Some(head)) => (base, head),
+                                    _ => anyhow::bail!(
+                                        "provide a <base>..<head> range or both --base and --head"
+                                    ),
+                                };
+                                commands::review::shadow_report(
+                                    base, head, title, source_url, author, json,
+                                )
+                                .await
+                            }
                             ReviewAction::Create {
                                 title,
                                 base,
@@ -2259,9 +2335,10 @@ fn main() -> Result<()> {
                 Command::Exec {
                     command,
                     keep,
+                    discard,
                     strategy,
                     scope,
-                } => commands::exec::run_full(command, keep, strategy, scope).await,
+                } => commands::exec::run_full(command, keep, discard, strategy, scope).await,
                 Command::Telemetry { action } => match action {
                     TelemetryAction::Status => commands::telemetry::run_status().await,
                     TelemetryAction::Consent => commands::telemetry::run_consent().await,
@@ -2493,6 +2570,7 @@ fn main() -> Result<()> {
                 }
                 Command::With {
                     assistant,
+                    session,
                     passive_guidance,
                     restrict_discovery,
                     restrict_filesystem,
@@ -2501,6 +2579,7 @@ fn main() -> Result<()> {
                     commands::with::run(
                         assistant,
                         task,
+                        session,
                         passive_guidance,
                         restrict_discovery,
                         restrict_filesystem,
@@ -2642,6 +2721,14 @@ mod tests {
 
     #[test]
     fn cli_definition_is_valid() {
-        Cli::command().debug_assert();
+        // clap's debug_assert recurses over the full command tree, which has
+        // outgrown the default 2 MiB test-thread stack; give it a dedicated
+        // thread with room to validate every subcommand.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| Cli::command().debug_assert())
+            .expect("spawn cli validation thread")
+            .join()
+            .expect("cli definition validation must succeed");
     }
 }

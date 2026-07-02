@@ -18,6 +18,15 @@ pub enum ReviewRequest {
         #[serde(default)]
         json: bool,
     },
+    Shadow {
+        base: String,
+        head: String,
+        title: Option<String>,
+        source_url: Option<String>,
+        author: Option<String>,
+        #[serde(default)]
+        json: bool,
+    },
     Create {
         title: String,
         base: String,
@@ -168,6 +177,19 @@ pub async fn execute_review_request(
             )?,
             mutated: false,
         }),
+        ReviewRequest::Shadow {
+            base,
+            head,
+            title,
+            source_url,
+            author,
+            json,
+        } => Ok(ReviewExecution {
+            response: build_shadow_run_response(
+                layout, graph, base, head, title, source_url, author, json,
+            )?,
+            mutated: false,
+        }),
         ReviewRequest::Create {
             title,
             base,
@@ -254,6 +276,56 @@ fn build_review_run_response(
     }
 
     Ok(ReviewResponse { text, json: None })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_shadow_run_response(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    base: String,
+    head: String,
+    title: Option<String>,
+    source_url: Option<String>,
+    author: Option<String>,
+    json: bool,
+) -> Result<ReviewResponse> {
+    let resolved_base = crate::commands::ref_lookup::resolve_ref_importing_git_if_needed(
+        graph,
+        layout,
+        Some(base.as_str()),
+    )
+    .with_context(|| format!("resolve shadow base ref '{}'", base))?;
+    let resolved_head = crate::commands::ref_lookup::resolve_ref_importing_git_if_needed(
+        graph,
+        layout,
+        Some(head.as_str()),
+    )
+    .with_context(|| format!("resolve shadow head ref '{}'", head))?;
+
+    let request = kin_review::ShadowRequest {
+        base_ref: base,
+        head_ref: head,
+        resolved_base,
+        resolved_head,
+        title,
+        source_url,
+        author,
+        actor: crate::provenance::current_actor_label(),
+    };
+
+    let report = kin_review::build_shadow_report(graph, &request)?;
+
+    if json {
+        return Ok(ReviewResponse {
+            text: String::new(),
+            json: Some(serde_json::to_string_pretty(&report)?),
+        });
+    }
+
+    Ok(ReviewResponse {
+        text: kin_review::format_shadow_report(&report),
+        json: None,
+    })
 }
 
 fn compute_review(
@@ -485,6 +557,28 @@ fn parse_change_ids(change_csv: &str) -> Result<Vec<kin_model::SemanticChangeId>
 // ── Review mutation subcommands (Phase 11) ──
 // These depend on kin_model::review types being added by a teammate.
 // Structurally complete; will compile once kin-model review types land.
+
+pub async fn shadow_report(
+    base: String,
+    head: String,
+    title: Option<String>,
+    source_url: Option<String>,
+    author: Option<String>,
+    json: bool,
+) -> Result<()> {
+    print_review_response(
+        run_daemon_review(&ReviewRequest::Shadow {
+            base,
+            head,
+            title,
+            source_url,
+            author,
+            json,
+        })
+        .await?,
+    );
+    Ok(())
+}
 
 pub async fn create_review(
     title: String,

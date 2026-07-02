@@ -10,6 +10,7 @@ description = "MCP server for Kin — assistant-neutral integration"
 
 [dependencies]
 kin-core = { workspace = true }
+kin-git = { workspace = true }
 kin-model = { workspace = true }
 kin-db = { workspace = true }
 kin-blobs = { workspace = true }

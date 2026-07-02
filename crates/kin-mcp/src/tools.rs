@@ -226,6 +226,22 @@ pub fn tool_definitions() -> ToolsListResult {
                 }),
             },
             ToolDefinition {
+                name: "shadow_gate_report".into(),
+                description: crate::handlers::review::SHADOW_GATE_REPORT_DESC.into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "base": { "type": "string", "description": "Base ref: branch name, semantic change ID (hex), or imported Git commit SHA" },
+                        "head": { "type": "string", "description": "Head ref: branch name, semantic change ID (hex), or imported Git commit SHA" },
+                        "title": { "type": "string", "description": "Change title for the report (e.g. PR title)" },
+                        "source_url": { "type": "string", "description": "Source URL for the report (e.g. PR URL)" },
+                        "author": { "type": "string", "description": "Change author identity for the report" },
+                        "actor": { "type": "string", "description": "Identity running the evaluation (defaults to mcp-client)" }
+                    },
+                    "required": ["base", "head"]
+                }),
+            },
+            ToolDefinition {
                 name: "dead_code".into(),
                 description: crate::handlers::entities::DEAD_CODE_DESC.into(),
                 input_schema: serde_json::json!({
@@ -974,8 +990,8 @@ mod tests {
     #[test]
     fn expected_tool_count() {
         let list = tool_definitions();
-        // 54 + 5 transaction tools + 1 semantic_locate = 60
-        assert_eq!(list.tools.len(), 60);
+        // 54 + 5 transaction tools + 1 semantic_locate + 1 shadow_gate_report = 61
+        assert_eq!(list.tools.len(), 61);
     }
 
     #[test]

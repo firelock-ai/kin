@@ -1,0 +1,281 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kin://contracts/shadow-gate-report",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "mode",
+    "input",
+    "changed_entities",
+    "blast_radius",
+    "policy",
+    "repair_context",
+    "evidence_gaps",
+    "audit"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "enum": [1] },
+    "mode": { "type": "string", "enum": ["shadow"] },
+    "input": {
+      "type": "object",
+      "required": ["base_ref", "head_ref", "resolved_base", "resolved_head"],
+      "properties": {
+        "base_ref": { "type": "string" },
+        "head_ref": { "type": "string" },
+        "resolved_base": { "type": "string" },
+        "resolved_head": { "type": "string" },
+        "title": { "type": "string" },
+        "source_url": { "type": "string" },
+        "author": { "type": "string" }
+      }
+    },
+    "changed_entities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "entity_id",
+          "name",
+          "kind",
+          "change",
+          "signature_changed",
+          "visibility_changed"
+        ],
+        "properties": {
+          "entity_id": { "type": "string" },
+          "name": { "type": "string" },
+          "kind": { "type": "string" },
+          "change": { "type": "string", "enum": ["added", "modified", "removed"] },
+          "file": { "type": "string" },
+          "start_line": { "type": "number" },
+          "end_line": { "type": "number" },
+          "signature_changed": { "type": "boolean" },
+          "visibility_changed": { "type": "boolean" }
+        }
+      }
+    },
+    "blast_radius": {
+      "type": "object",
+      "required": [
+        "callers",
+        "dependents",
+        "contract_consumers",
+        "tests",
+        "open_work_items",
+        "total_affected",
+        "cross_repo"
+      ],
+      "properties": {
+        "callers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["entity_id", "name", "kind", "via"],
+            "properties": {
+              "entity_id": { "type": "string" },
+              "name": { "type": "string" },
+              "kind": { "type": "string" },
+              "file": { "type": "string" },
+              "via": { "type": "string" }
+            }
+          }
+        },
+        "dependents": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["entity_id", "name", "kind", "via"],
+            "properties": {
+              "entity_id": { "type": "string" },
+              "name": { "type": "string" },
+              "kind": { "type": "string" },
+              "file": { "type": "string" },
+              "via": { "type": "string" }
+            }
+          }
+        },
+        "contract_consumers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["entity_id", "name", "kind", "via"],
+            "properties": {
+              "entity_id": { "type": "string" },
+              "name": { "type": "string" },
+              "kind": { "type": "string" },
+              "file": { "type": "string" },
+              "via": { "type": "string" }
+            }
+          }
+        },
+        "tests": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["entity_id", "name", "kind", "via"],
+            "properties": {
+              "entity_id": { "type": "string" },
+              "name": { "type": "string" },
+              "kind": { "type": "string" },
+              "file": { "type": "string" },
+              "via": { "type": "string" }
+            }
+          }
+        },
+        "open_work_items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["work_id", "title", "status"],
+            "properties": {
+              "work_id": { "type": "string" },
+              "title": { "type": "string" },
+              "status": { "type": "string" }
+            }
+          }
+        },
+        "total_affected": { "type": "number" },
+        "cross_repo": {
+          "type": "object",
+          "required": ["status", "detail", "nodes"],
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": ["not_evaluated", "unavailable", "available"]
+            },
+            "detail": { "type": "string" },
+            "nodes": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["repo_id", "entity_id", "name"],
+                "properties": {
+                  "repo_id": { "type": "string" },
+                  "entity_id": { "type": "string" },
+                  "name": { "type": "string" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "required": [
+        "enforcement",
+        "verdict",
+        "risk_level",
+        "blocking_count",
+        "attention_count",
+        "summary",
+        "findings"
+      ],
+      "properties": {
+        "enforcement": { "type": "string", "enum": ["report_only"] },
+        "verdict": {
+          "type": "string",
+          "enum": ["pass", "needs_attention", "would_block"]
+        },
+        "risk_level": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "critical"]
+        },
+        "blocking_count": { "type": "number" },
+        "attention_count": { "type": "number" },
+        "summary": { "type": "string" },
+        "findings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["kind", "severity", "blocking", "message"],
+            "properties": {
+              "kind": { "type": "string" },
+              "severity": { "type": "string", "enum": ["error", "warning", "info"] },
+              "blocking": { "type": "boolean" },
+              "message": { "type": "string" },
+              "file": { "type": "string" },
+              "line": { "type": "number" }
+            }
+          }
+        }
+      }
+    },
+    "repair_context": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["finding", "kind", "covering_tests", "affected_consumers", "guidance"],
+        "properties": {
+          "finding": { "type": "string" },
+          "kind": { "type": "string" },
+          "file": { "type": "string" },
+          "line": { "type": "number" },
+          "covering_tests": { "type": "array", "items": { "type": "string" } },
+          "affected_consumers": { "type": "array", "items": { "type": "string" } },
+          "guidance": { "type": "string" }
+        }
+      }
+    },
+    "evidence_gaps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "subject", "detail"],
+        "properties": {
+          "kind": { "type": "string" },
+          "subject": { "type": "string" },
+          "detail": { "type": "string" }
+        }
+      }
+    },
+    "audit": {
+      "type": "object",
+      "required": [
+        "generated_at",
+        "actor",
+        "actor_kind",
+        "tool",
+        "tool_version",
+        "base_change",
+        "head_change",
+        "changes_in_range",
+        "entity_attribution",
+        "head_approvals"
+      ],
+      "properties": {
+        "generated_at": {},
+        "actor": { "type": "string" },
+        "actor_kind": { "type": "string", "enum": ["human", "assistant", "service"] },
+        "tool": { "type": "string" },
+        "tool_version": { "type": "string" },
+        "base_change": { "type": "string" },
+        "head_change": { "type": "string" },
+        "changes_in_range": { "type": "number" },
+        "entity_attribution": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["entity_id", "actor_kind"],
+            "properties": {
+              "entity_id": { "type": "string" },
+              "actor_kind": { "type": "string" }
+            }
+          }
+        },
+        "head_approvals": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["approver", "decision", "reason"],
+            "properties": {
+              "approver": { "type": "string" },
+              "decision": { "type": "string" },
+              "reason": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

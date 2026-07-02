@@ -7,7 +7,7 @@ use dialoguer::MultiSelect;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Embedded shell hooks (from kin-vfs/shell/)
@@ -539,17 +539,58 @@ pub(crate) fn shim_filename() -> &'static str {
     }
 }
 
+/// True when `path` is a shim we can actually inject: it exists and is
+/// non-empty. A 0-byte file — e.g. a shim an earlier self-copy truncated — is
+/// not a usable source; returning it would let a repair re-copy the corruption.
+fn is_usable_shim(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.len() > 0)
+        .unwrap_or(false)
+}
+
+/// Whether two paths resolve to the same file on disk (after following symlinks
+/// and normalizing `..`). Both must exist; a non-existent path is never "same".
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Outcome of a guarded shim copy.
+#[derive(Debug, PartialEq, Eq)]
+enum ShimCopy {
+    /// Source and destination are the same file — nothing copied.
+    Skipped,
+    /// Source was copied to the destination.
+    Copied,
+}
+
+/// Copy `src` to `dest`, skipping when they are the same file.
+///
+/// `fs::copy` truncates the destination before reading the source, so copying a
+/// file onto itself zeroes it out — the root cause of the "0-byte shim" that
+/// crashes every injected process. Both the setup flow and the doctor repair go
+/// through this guard so neither can truncate the shim.
+fn copy_shim(src: &Path, dest: &Path) -> Result<ShimCopy> {
+    if same_file(src, dest) {
+        return Ok(ShimCopy::Skipped);
+    }
+    fs::copy(src, dest).with_context(|| format!("failed to copy shim to {}", dest.display()))?;
+    Ok(ShimCopy::Copied)
+}
+
 fn find_shim() -> Option<PathBuf> {
     let name = shim_filename();
 
     if let Ok(exe) = env::current_exe() {
         if let Some(dir) = exe.parent() {
             let candidate = dir.join(name);
-            if candidate.exists() {
+            if is_usable_shim(&candidate) {
                 return Some(candidate);
             }
             let lib_candidate = dir.join("../lib").join(name);
-            if lib_candidate.exists() {
+            if is_usable_shim(&lib_candidate) {
                 return Some(lib_candidate);
             }
         }
@@ -557,18 +598,18 @@ fn find_shim() -> Option<PathBuf> {
 
     if let Ok(cargo_home) = env::var("CARGO_HOME") {
         let candidate = PathBuf::from(&cargo_home).join("lib").join(name);
-        if candidate.exists() {
+        if is_usable_shim(&candidate) {
             return Some(candidate);
         }
     }
 
     let cwd_candidate = PathBuf::from("target/release").join(name);
-    if cwd_candidate.exists() {
+    if is_usable_shim(&cwd_candidate) {
         return Some(cwd_candidate);
     }
 
     let cwd_debug = PathBuf::from("target/debug").join(name);
-    if cwd_debug.exists() {
+    if is_usable_shim(&cwd_debug) {
         return Some(cwd_debug);
     }
 
@@ -679,6 +720,11 @@ fn prompt_yn(prompt: &str, default_yes: bool, interactive: bool) -> bool {
 /// Prefers an absolute path to the `kin` binary (resolved from the current
 /// executable) so the entry works in agent processes that do not inherit the
 /// user's PATH.
+///
+/// The entry starts the MCP server in single-repo mode: `kin mcp start`
+/// resolves the repo from the agent's working directory (or from
+/// `KIN_DAEMON_URL` when a session launch pinned one), so each agent session
+/// binds to the daemon of the repository it is actually working in.
 fn kin_mcp_entry() -> serde_json::Value {
     // Try to resolve an absolute path from the running executable.  The
     // installed binary lives alongside the other kin-* binaries, so
@@ -692,7 +738,7 @@ fn kin_mcp_entry() -> serde_json::Value {
     };
     serde_json::json!({
         "command": command,
-        "args": ["mcp", "start", "--global"],
+        "args": ["mcp", "start"],
         "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
     })
 }
@@ -941,13 +987,22 @@ fn install_shell_hook(shell_name: &str) -> Result<(PathBuf, String)> {
 
     if let Some(shim_path) = find_shim() {
         let dest = lib_dir.join(shim_filename());
-        fs::copy(&shim_path, &dest)
-            .with_context(|| format!("failed to copy shim to {}", dest.display()))?;
-        println!(
-            "  Copied VFS shim: {} -> {}",
-            shim_path.display(),
-            dest.display()
-        );
+        // On the standard install layout the shim already lives at ~/.kin/lib
+        // and `find_shim` resolves the source via ~/.kin/bin/../lib — i.e. the
+        // source and destination are the SAME FILE. `copy_shim` no-ops that case
+        // so the shim is never truncated onto itself.
+        match copy_shim(&shim_path, &dest)? {
+            ShimCopy::Skipped => {
+                println!("  VFS shim already in place: {}", dest.display());
+            }
+            ShimCopy::Copied => {
+                println!(
+                    "  Copied VFS shim: {} -> {}",
+                    shim_path.display(),
+                    dest.display()
+                );
+            }
+        }
     } else {
         println!("  VFS shim not found. Build it with:");
         println!("    cargo build --release -p kin-vfs-shim");
@@ -999,6 +1054,28 @@ pub(crate) fn reinstall_shell_hook() -> Result<PathBuf> {
     let shell_name = detect_shell();
     let (hook_file, _source_line) = install_shell_hook(shell_name)?;
     Ok(hook_file)
+}
+
+/// Re-source a usable VFS shim into `~/.kin/lib`.
+///
+/// Used by `kin doctor --fix` to repair the `vfs_projection` check when the
+/// installed shim is missing or was truncated to 0 bytes. Returns the
+/// destination path when a usable shim was installed, or `None` when no usable
+/// source shim exists anywhere — in that case the bytes cannot be reconstructed
+/// locally and the caller directs the user to reinstall.
+pub(crate) fn reinstall_vfs_shim() -> Result<Option<PathBuf>> {
+    let lib_dir = kin_dir()?.join("lib");
+    fs::create_dir_all(&lib_dir).context("failed to create ~/.kin/lib/")?;
+    let dest = lib_dir.join(shim_filename());
+
+    // `find_shim` only returns non-empty candidates, so a truncated shim is
+    // never re-selected as the source. `copy_shim` no-ops if the usable shim
+    // already is the destination.
+    let Some(shim_path) = find_shim() else {
+        return Ok(None);
+    };
+    copy_shim(&shim_path, &dest)?;
+    Ok(Some(dest))
 }
 
 /// Re-merge the kin MCP server entry (with the agent-default profile) into the
@@ -1591,6 +1668,24 @@ pub async fn doctor(fix: bool, json: bool) -> Result<()> {
         }
     }
 
+    // Re-source the VFS shim when it is missing or was truncated to 0 bytes.
+    let vfs_needs_fix = report.checks.iter().any(|c| {
+        c.id == "vfs_projection"
+            && c.fixable
+            && !matches!(c.status, crate::commands::health::HealthStatus::Healthy)
+    });
+    if vfs_needs_fix {
+        match reinstall_vfs_shim() {
+            Ok(Some(dest)) => applied.push(format!("reinstalled VFS shim ({})", dest.display())),
+            Ok(None) => println!(
+                "  {} no usable VFS shim found to reinstall — re-run the installer \
+                 (curl -fsSL https://get.kinlab.dev/install | sh)",
+                style("✗").red()
+            ),
+            Err(e) => println!("  {} VFS shim reinstall failed: {e}", style("✗").red()),
+        }
+    }
+
     // Start the repo daemon if we're inside a Kin repo and it isn't running.
     let daemon_needs_fix = report.checks.iter().any(|c| {
         c.id == "daemon_running"
@@ -1709,6 +1804,69 @@ mod tests {
             no_interactive: true,
             intent: None,
         }
+    }
+
+    #[test]
+    fn is_usable_shim_requires_a_nonempty_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("empty.dylib");
+        fs::write(&empty, b"").unwrap();
+        let full = tmp.path().join("full.dylib");
+        fs::write(&full, b"real bytes").unwrap();
+        let missing = tmp.path().join("missing.dylib");
+
+        assert!(!is_usable_shim(&empty), "0-byte shim must not be usable");
+        assert!(is_usable_shim(&full));
+        assert!(!is_usable_shim(&missing));
+    }
+
+    #[test]
+    fn same_file_detects_the_bin_dotdot_lib_aliasing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("lib");
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&lib).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        let dest = lib.join(shim_filename());
+        fs::write(&dest, b"shim").unwrap();
+
+        // The exact path find_shim produces on the standard install layout.
+        let aliased = bin.join("..").join("lib").join(shim_filename());
+        assert!(same_file(&aliased, &dest));
+
+        let other = lib.join("other.dylib");
+        fs::write(&other, b"x").unwrap();
+        assert!(!same_file(&other, &dest));
+    }
+
+    #[test]
+    fn copy_shim_skips_self_copy_and_preserves_bytes() {
+        // Regression: `kin setup` copied the shim onto itself (bin/../lib aliases
+        // lib) and fs::copy truncated it to 0 bytes. The guard must no-op and
+        // leave the bytes intact.
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("lib");
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&lib).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        let dest = lib.join(shim_filename());
+        fs::write(&dest, b"REAL_SHIM_BYTES").unwrap();
+        let aliased_src = bin.join("..").join("lib").join(shim_filename());
+
+        assert_eq!(copy_shim(&aliased_src, &dest).unwrap(), ShimCopy::Skipped);
+        assert_eq!(fs::read(&dest).unwrap(), b"REAL_SHIM_BYTES");
+    }
+
+    #[test]
+    fn copy_shim_copies_a_distinct_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("source.dylib");
+        fs::write(&src, b"SOURCE_BYTES").unwrap();
+        let dest = tmp.path().join("lib").join(shim_filename());
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+
+        assert_eq!(copy_shim(&src, &dest).unwrap(), ShimCopy::Copied);
+        assert_eq!(fs::read(&dest).unwrap(), b"SOURCE_BYTES");
     }
 
     #[test]

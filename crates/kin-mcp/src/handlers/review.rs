@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use kin_model::graph::GraphStore;
+use kin_model::ids::SemanticChangeId;
 use kin_review::{format_review, SemanticReview};
 
 use crate::error::{McpError, Result};
@@ -200,6 +201,108 @@ fn collect_review_traffic_lines(
         }
     }
     traffic_lines
+}
+
+pub const SHADOW_GATE_REPORT_DESC: &str = "\
+Run the shadow-mode merge gate over a PR-shaped change (base ref .. head ref) and return \
+ONE report: changed entities, graph-proven blast radius, the policy verdict the gate \
+WOULD have issued (report-only — shadow mode never blocks), the repair context a reviewer \
+or agent needs to fix findings, explicit evidence gaps, and audit evidence for the \
+evaluation. Refs accept branch names and semantic change IDs; imported Git commit SHAs \
+resolve when their history has been imported into the graph. When the graph cannot prove \
+something — unparsed files, missing spans, an empty impact signal — the report says so in \
+`evidence_gaps` instead of passing silently. Reach for it to evaluate an AI-authored \
+change before merge, or to feed a merge-gate dashboard.";
+
+fn resolve_shadow_ref<G: GraphStore>(store: &G, reference: &str) -> Result<SemanticChangeId> {
+    if let Some(branch_name) = reference.strip_prefix("branch:") {
+        return resolve_shadow_branch(store, branch_name);
+    }
+
+    if let Some(change_ref) = reference
+        .strip_prefix("kin:")
+        .or_else(|| reference.strip_prefix("change:"))
+    {
+        return resolve_shadow_change(store, change_ref);
+    }
+
+    if let Some(git_oid) = reference.strip_prefix("git:") {
+        return resolve_shadow_git(store, git_oid);
+    }
+
+    if let Ok(Some(branch)) = store.get_branch(&kin_model::BranchName::new(reference)) {
+        return Ok(branch.head);
+    }
+
+    if reference.len() == 40 {
+        return resolve_shadow_git(store, reference);
+    }
+
+    resolve_shadow_change(store, reference)
+}
+
+fn resolve_shadow_branch<G: GraphStore>(store: &G, branch_name: &str) -> Result<SemanticChangeId> {
+    match store
+        .get_branch(&kin_model::BranchName::new(branch_name))
+        .map_err(McpError::graph)?
+    {
+        Some(branch) => Ok(branch.head),
+        None => Err(McpError::InvalidParams(format!(
+            "branch '{}' not found in the graph",
+            branch_name
+        ))),
+    }
+}
+
+fn resolve_shadow_change<G: GraphStore>(store: &G, change_ref: &str) -> Result<SemanticChangeId> {
+    let change_id = parse_change_id(change_ref)?;
+    match store.get_change(&change_id).map_err(McpError::graph)? {
+        Some(_) => Ok(change_id),
+        None => Err(McpError::InvalidParams(format!(
+            "change '{}' not found in the graph",
+            change_ref
+        ))),
+    }
+}
+
+fn resolve_shadow_git<G: GraphStore>(store: &G, git_oid: &str) -> Result<SemanticChangeId> {
+    let change_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid)
+        .map_err(|e| McpError::InvalidParams(format!("invalid git commit '{}': {}", git_oid, e)))?;
+    match store.get_change(&change_id).map_err(McpError::graph)? {
+        Some(_) => Ok(change_id),
+        None => Err(McpError::InvalidParams(format!(
+            "imported Git commit '{}' is not in the graph; import its history first (e.g. run \
+             `kin review shadow` in the repo, which hydrates imported Git refs)",
+            git_oid
+        ))),
+    }
+}
+
+pub fn handle_shadow_gate_report<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    let base_ref = get_string_param(args, "base")?;
+    let head_ref = get_string_param(args, "head")?;
+    let resolved_base = resolve_shadow_ref(store, &base_ref)?;
+    let resolved_head = resolve_shadow_ref(store, &head_ref)?;
+
+    let request = kin_review::ShadowRequest {
+        base_ref,
+        head_ref,
+        resolved_base,
+        resolved_head,
+        title: get_optional_string_param(args, "title"),
+        source_url: get_optional_string_param(args, "source_url"),
+        author: get_optional_string_param(args, "author"),
+        actor: get_optional_string_param(args, "actor").unwrap_or_else(|| "mcp-client".into()),
+    };
+
+    let report = kin_review::build_shadow_report(store, &request)
+        .map_err(|e| McpError::Review(e.to_string()))?;
+
+    let json = serde_json::to_string_pretty(&report).map_err(McpError::Json)?;
+    Ok(ToolCallResult::text(json))
 }
 
 pub const ENTITY_HISTORY_DESC: &str = "\
@@ -885,5 +988,39 @@ mod tests {
         let identity = parse_identity_arg(&args, "author", "author_kind", "mcp-client");
         assert_eq!(identity.name, "troy");
         assert!(matches!(identity.kind, kin_model::IdentityKind::Human));
+    }
+
+    #[test]
+    fn shadow_gate_report_fails_loud_on_unknown_base_ref() {
+        let store = kin_db::InMemoryGraph::new();
+        let mut args = HashMap::new();
+        args.insert("base".into(), serde_json::json!("branch:missing"));
+        args.insert("head".into(), serde_json::json!("branch:missing"));
+
+        let err = handle_shadow_gate_report(&args, &store).unwrap_err();
+        assert!(
+            err.to_string().contains("not found"),
+            "unknown branch must error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn shadow_gate_report_fails_loud_on_unimported_git_sha() {
+        let store = kin_db::InMemoryGraph::new();
+        let mut args = HashMap::new();
+        args.insert(
+            "base".into(),
+            serde_json::json!("1111111111111111111111111111111111111111"),
+        );
+        args.insert(
+            "head".into(),
+            serde_json::json!("2222222222222222222222222222222222222222"),
+        );
+
+        let err = handle_shadow_gate_report(&args, &store).unwrap_err();
+        assert!(
+            err.to_string().contains("not in the graph"),
+            "unimported git sha must error, got: {err}"
+        );
     }
 }
