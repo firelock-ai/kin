@@ -1509,6 +1509,54 @@ mod tests {
         }
     }
 
+    /// With Accelerate compiled in, the raw `cblas_sgemm` kernels must agree with
+    /// their pure-Rust twins on BOTH the `A·Bᵀ` and `A·B` shapes across
+    /// rectangular, non-power-of-two dimensions. This pins the cblas leading
+    /// dimensions and transpose flags directly, rather than only transitively
+    /// through the auto-selected `CpuCompute::matmul` backend.
+    #[cfg(all(feature = "accelerate", target_os = "macos"))]
+    #[test]
+    fn accelerate_matches_pure_rust_across_shapes() {
+        for &(m, n, k) in &[
+            (1, 1, 1),
+            (2, 3, 5),
+            (7, 4, 9),
+            (17, 31, 13),
+            (64, 48, 40),
+            (33, 1, 96),
+        ] {
+            let a: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 7 % 17) as f32 - 8.0) * 0.05)
+                .collect();
+            // A·Bᵀ: B is [n, k].
+            let b_nt: Vec<f32> = (0..n * k)
+                .map(|i| ((i * 5 % 13) as f32 - 6.0) * 0.075)
+                .collect();
+            let blas = accelerate_matmul(&a, &b_nt, m, n, k);
+            let pure = pure_rust_matmul(&a, &b_nt, m, n, k);
+            assert_eq!(blas.len(), m * n);
+            for (x, y) in blas.iter().zip(pure.iter()) {
+                assert!(
+                    (x - y).abs() < 1e-3,
+                    "A·Bᵀ blas {x} vs pure {y} at {m}x{n}x{k}"
+                );
+            }
+            // A·B (no transpose): B is [k, n].
+            let b_nn: Vec<f32> = (0..k * n)
+                .map(|i| ((i * 3 % 11) as f32 - 5.0) * 0.06)
+                .collect();
+            let blas_nn = accelerate_matmul_nn(&a, &b_nn, m, n, k);
+            let pure_nn = blocked_gemm_nn(&a, &b_nn, m, n, k);
+            assert_eq!(blas_nn.len(), m * n);
+            for (x, y) in blas_nn.iter().zip(pure_nn.iter()) {
+                assert!(
+                    (x - y).abs() < 1e-3,
+                    "A·B blas {x} vs pure {y} at {m}x{n}x{k}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn cpu_batched_attention_matches_naive_reference() {
         // nh*seq*seq*hd = 9600 >= 4096 → exercises the head-parallel blocked path

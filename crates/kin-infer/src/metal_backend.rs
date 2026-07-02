@@ -3369,7 +3369,18 @@ impl MetalCompute {
         }
         let thread_w = pipeline.thread_execution_width() as usize;
         let threads = MTLSize::new(total_threads as u64, 1, 1);
-        let tg_size = MTLSize::new(thread_w.min(total_threads) as u64, 1, 1);
+        // Pointwise kernels have no cross-thread dependency, so widening the
+        // threadgroup toward the pipeline's occupancy ceiling only changes how many
+        // SIMD groups pack per threadgroup, not the result. Off by default: the
+        // helper returns the historical one-simdgroup width, so this dispatch is
+        // byte-identical unless the occupancy lever is explicitly engaged.
+        let tg_threads = crate::resource::occupancy_1d_threadgroup(
+            thread_w,
+            pipeline.max_total_threads_per_threadgroup() as usize,
+            total_threads,
+            crate::resource::occupancy_dispatch_enabled(),
+        );
+        let tg_size = MTLSize::new(tg_threads as u64, 1, 1);
         enc.dispatch_threads(threads, tg_size);
         enc.end_encoding();
     }

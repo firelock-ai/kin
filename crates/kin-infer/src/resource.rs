@@ -83,6 +83,54 @@ pub fn env_flag_override(name: &str) -> Option<bool> {
     }
 }
 
+/// Whether occupancy-informed 1D threadgroup sizing is engaged for the Metal
+/// forward path. Off by default — `KIN_INFER_OCCUPANCY_DISPATCH=1` turns it on so
+/// the wider pointwise threadgroups can be A/B-measured against the one-simdgroup
+/// baseline. Read once and cached, mirroring the other per-lever Metal gates.
+pub fn occupancy_dispatch_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag_override("KIN_INFER_OCCUPANCY_DISPATCH").unwrap_or(false))
+}
+
+/// Threadgroup width (thread count) for a 1D *pointwise* Metal dispatch, given the
+/// pipeline's SIMD width and its `max_total_threads_per_threadgroup` ceiling.
+///
+/// Pointwise kernels (elementwise activations, adds, copies) have no cross-thread
+/// dependency, so the threadgroup size does not change the numerical result — only
+/// how many SIMD groups the scheduler packs per threadgroup, i.e. occupancy.
+/// Today's dispatch pins a single SIMD group (`thread_execution_width`) per
+/// threadgroup, leaving the pipeline occupancy ceiling unused.
+///
+/// When `enabled` is `false` this returns exactly the historical
+/// `thread_execution_width.min(total_threads)` width, so the dispatch is
+/// byte-identical to the pre-lever path (real Metal pipelines always report a SIMD
+/// width ≥ 1). When `enabled`, it returns the largest whole number of SIMD groups
+/// that fits under both the pipeline ceiling and the actual work size — a multiple
+/// of the SIMD width, never below the one-group baseline, and never larger than
+/// the grid.
+pub fn occupancy_1d_threadgroup(
+    thread_execution_width: usize,
+    max_total_threads: usize,
+    total_threads: usize,
+    enabled: bool,
+) -> usize {
+    let simd_width = thread_execution_width.max(1);
+    // One SIMD group, or the whole grid when it is smaller than a group. This is
+    // the historical width and the flag-off / sub-group-tail answer.
+    let baseline = simd_width.min(total_threads);
+    if !enabled || total_threads <= simd_width {
+        return baseline;
+    }
+    // Cap at the occupancy ceiling and the work size, then round DOWN to whole
+    // SIMD groups so every lane belongs to a full group. `ceiling >= simd_width`
+    // and `total_threads > simd_width` here, so the result is in
+    // `[simd_width, total_threads]` and a multiple of `simd_width`.
+    let ceiling = max_total_threads.min(total_threads).max(simd_width);
+    let simd_groups = ceiling / simd_width;
+    simd_groups * simd_width
+}
+
 /// The GPU kernel-family selection for the active embedding process, resolved
 /// once from the canonical [`Profile::from_env`] selector and the detected
 /// accelerator backend. kin-infer's Metal forward path consults this to decide
@@ -903,6 +951,69 @@ mod tests {
             reserve_device_bytes: None,
             allow_cpu_fallback: true,
         }
+    }
+
+    #[test]
+    fn occupancy_dispatch_off_is_byte_identical_baseline() {
+        // Flag off: exactly the historical `thread_execution_width.min(total)` for
+        // every shape, including the sub-SIMD-width tail — the dispatch stays
+        // byte-identical to the pre-lever path.
+        for &(tw, max_tg, total) in &[
+            (32, 1024, 1000),
+            (32, 1024, 10),
+            (32, 512, 32),
+            (16, 256, 5),
+        ] {
+            assert_eq!(
+                occupancy_1d_threadgroup(tw, max_tg, total, false),
+                tw.min(total),
+                "off-path must equal the pre-lever width for tw={tw} total={total}"
+            );
+        }
+    }
+
+    #[test]
+    fn occupancy_dispatch_on_packs_whole_simd_groups_under_ceiling() {
+        // 1000 elements, SIMD width 32, ceiling 1024 → 31 whole groups = 992.
+        assert_eq!(occupancy_1d_threadgroup(32, 1024, 1000, true), 992);
+        // Pipeline ceiling is the binding cap: 4096 elements, ceiling 512.
+        assert_eq!(occupancy_1d_threadgroup(32, 512, 4096, true), 512);
+        // Work size is the binding cap: 100 elements → 3 groups = 96.
+        assert_eq!(occupancy_1d_threadgroup(32, 1024, 100, true), 96);
+    }
+
+    #[test]
+    fn occupancy_dispatch_on_result_is_a_valid_threadgroup() {
+        // Enabled result stays a whole multiple of the SIMD width, never exceeds
+        // the grid or the ceiling, and never drops below the one-group baseline.
+        for &(tw, max_tg, total) in &[
+            (32, 1024, 1),
+            (32, 1024, 31),
+            (32, 1024, 33),
+            (32, 768, 5000),
+            (16, 256, 999),
+            (64, 1024, 4097),
+        ] {
+            let got = occupancy_1d_threadgroup(tw, max_tg, total, true);
+            let baseline = tw.min(total);
+            assert!(
+                got >= baseline,
+                "{got} < baseline {baseline} (tw={tw} total={total})"
+            );
+            assert!(got <= total, "{got} > grid {total}");
+            assert!(got <= max_tg.max(tw), "{got} exceeds ceiling {max_tg}");
+            if total >= tw {
+                assert_eq!(got % tw, 0, "{got} not a multiple of simd width {tw}");
+            }
+        }
+    }
+
+    #[test]
+    fn occupancy_dispatch_tolerates_degenerate_simd_width() {
+        // A zero SIMD width never occurs on a real pipeline, but the helper must
+        // still yield a valid, non-zero, ≤ grid width rather than divide by zero.
+        assert_eq!(occupancy_1d_threadgroup(0, 1024, 64, true), 64);
+        assert_eq!(occupancy_1d_threadgroup(0, 1024, 0, false), 0);
     }
 
     fn mem_with(total: Option<u64>) -> MemoryInfo {
