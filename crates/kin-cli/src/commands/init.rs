@@ -2244,9 +2244,20 @@ fn try_warm_init_from_cache(
     let Some(cache_dir) = init_cache_repo_path(dir) else {
         return Ok(None);
     };
-    let Some(cache_graph_path) = resolve_warm_cache_graph_path(dir, &cache_dir)? else {
-        return Ok(None);
-    };
+    // A HEAD recorded in the manifest resolves to a trusted bundle. An
+    // unrecorded HEAD may still share semantic truth with a cached bundle (a
+    // sibling clone, a no-op commit, or a doc-only change); adopt that
+    // content-addressed candidate only speculatively, and confirm below that no
+    // entity-source file diverged before grafting so a divergent HEAD still
+    // cold-inits.
+    let (cache_graph_path, speculative_candidate) =
+        match resolve_warm_cache_graph_path(dir, &cache_dir)? {
+            Some(path) => (path, false),
+            None => match resolve_warm_cache_content_candidate(dir, &cache_dir)? {
+                Some(path) => (path, true),
+                None => return Ok(None),
+            },
+        };
     if !cache_graph_path.exists() {
         return Ok(None);
     }
@@ -2277,6 +2288,29 @@ fn try_warm_init_from_cache(
         diff.modified_files.len(),
         diff.removed_files.len()
     );
+
+    // A speculative candidate (the current HEAD is not recorded in the manifest)
+    // may only be grafted when the working tree's parsed semantic truth matches
+    // it. An added, modified, or removed entity-source or shallow-syntax file
+    // diverges that truth, so reject to a cold init rather than graft a foreign
+    // semantic base onto an unrecorded HEAD. Artifact and opaque deltas (docs,
+    // configs, manifests) carry no entity truth and stay reusable.
+    if speculative_candidate {
+        let semantic_source_diverged = diff
+            .added_files
+            .iter()
+            .chain(diff.modified_files.iter())
+            .chain(diff.removed_files.iter())
+            .any(|path| {
+                matches!(
+                    FileClassifier::classify(Path::new(path)),
+                    FileClassification::EntitySource | FileClassification::ShallowSyntax { .. }
+                )
+            });
+        if semantic_source_diverged {
+            return Ok(None);
+        }
+    }
 
     let delta = if diff.is_empty() {
         wphase!("apply_delta (skipped — no changes)");
@@ -3147,26 +3181,102 @@ fn warm_cache_manifest_is_valid(dir: &Path, manifest: &WarmCacheRepoManifest) ->
 }
 
 fn resolve_warm_cache_graph_path(dir: &Path, cache_dir: &Path) -> Result<Option<PathBuf>> {
+    resolve_warm_cache_graph_path_for_head(dir, cache_dir, read_git_head(dir))
+}
+
+/// Resolve the warm-cache bundle graph to graft for a working tree currently at
+/// `current_head`, or `None` to fall back to a cold init.
+///
+/// The bundle is selected by the tree's CURRENT git HEAD (via the manifest's
+/// `heads` map), NOT by the manifest's last-written `current_bundle_id`.
+/// `current_bundle_id` is whatever state was published LAST under this repo
+/// identity, so adopting it grafts that state into any checkout that merely
+/// shares the identity — the cross-state contamination where a warm init's
+/// entity count swings with publish order. When the tree has a HEAD, only a
+/// bundle recorded for exactly that HEAD is trustworthy; every other case
+/// rejects rather than adopts a foreign state, and a cold init re-derives truth.
+/// A non-git working tree has no HEAD to key on: its cache is
+/// path-identity-scoped and single-state, so the last bundle is the only
+/// meaningful one.
+fn resolve_warm_cache_graph_path_for_head(
+    dir: &Path,
+    cache_dir: &Path,
+    current_head: Option<String>,
+) -> Result<Option<PathBuf>> {
     let manifest_path = warm_cache_manifest_path(cache_dir);
     if let Some(manifest) = read_warm_cache_manifest(&manifest_path)? {
         if !warm_cache_manifest_is_valid(dir, &manifest) {
             return Ok(None);
         }
-        if let Some(bundle_id) = manifest.current_bundle_id.as_deref() {
-            let bundle_graph_path = warm_cache_bundle_graph_path(cache_dir, bundle_id);
-            if bundle_graph_path.exists()
-                && warm_cache_ready_marker_path(cache_dir, bundle_id).exists()
-            {
-                return Ok(Some(bundle_graph_path));
-            }
+        let bundle_id = match &current_head {
+            Some(head) => match manifest.heads.get(head) {
+                Some(id) => id.clone(),
+                // Reject-don't-adopt: no bundle recorded for this exact HEAD, so
+                // a cold init is the only trustworthy path — never graft another
+                // HEAD's (or the last-published) state.
+                None => return Ok(None),
+            },
+            None => match manifest.current_bundle_id.clone() {
+                Some(id) => id,
+                None => return Ok(None),
+            },
+        };
+        let bundle_graph_path = warm_cache_bundle_graph_path(cache_dir, &bundle_id);
+        if bundle_graph_path.exists()
+            && warm_cache_ready_marker_path(cache_dir, &bundle_id).exists()
+        {
+            return Ok(Some(bundle_graph_path));
+        }
+        // The resolved bundle is absent or not yet marked ready: reject rather
+        // than fall back to a legacy or foreign bundle.
+        return Ok(None);
+    }
+
+    // No manifest: only the un-versioned legacy single-graph cache may exist. It
+    // carries no HEAD provenance, so a git working tree cannot trust it
+    // (reject-don't-adopt); a non-git, path-scoped tree may still reuse it.
+    if current_head.is_none() {
+        let legacy_graph_path = cache_dir.join("graph.kndb");
+        if legacy_graph_path.exists() {
+            return Ok(Some(legacy_graph_path));
         }
     }
 
-    let legacy_graph_path = cache_dir.join("graph.kndb");
-    if legacy_graph_path.exists() {
-        return Ok(Some(legacy_graph_path));
-    }
+    Ok(None)
+}
 
+/// Resolve a *content-addressed* warm-cache bundle candidate for a working tree
+/// whose current HEAD is not recorded in the manifest.
+///
+/// The trusted head-scoped resolver rejects an unrecorded HEAD so it never
+/// grafts a foreign or last-published state. That correctly refuses divergent
+/// truth, but it also refuses the legitimate case where a different HEAD carries
+/// *identical* graph truth — a sibling clone, a fresh checkout, or a commit that
+/// changes no indexed file. Because a bundle is addressed by its graph root
+/// hash, identical file content always maps to the same bundle, so such a tree
+/// can safely reuse the last-published state.
+///
+/// This returns only a CANDIDATE: the caller MUST confirm no entity-source file
+/// diverged (a semantic-truth-preserving diff) before grafting. An entity-level
+/// divergence falls back to a cold init instead of adopting the candidate,
+/// preserving the reject-don't-adopt guarantee against publish-order
+/// contamination while still reusing shared semantic truth across doc- or
+/// config-only changes.
+fn resolve_warm_cache_content_candidate(dir: &Path, cache_dir: &Path) -> Result<Option<PathBuf>> {
+    let manifest_path = warm_cache_manifest_path(cache_dir);
+    let Some(manifest) = read_warm_cache_manifest(&manifest_path)? else {
+        return Ok(None);
+    };
+    if !warm_cache_manifest_is_valid(dir, &manifest) {
+        return Ok(None);
+    }
+    let Some(bundle_id) = manifest.current_bundle_id.as_deref() else {
+        return Ok(None);
+    };
+    let bundle_graph_path = warm_cache_bundle_graph_path(cache_dir, bundle_id);
+    if bundle_graph_path.exists() && warm_cache_ready_marker_path(cache_dir, bundle_id).exists() {
+        return Ok(Some(bundle_graph_path));
+    }
     Ok(None)
 }
 
@@ -4891,6 +5001,182 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some(warm_cache_bundle_graph_path(cache_dir.path(), &bundle_id).as_path())
+        );
+    }
+
+    #[test]
+    fn warm_cache_resolves_by_current_head_not_last_published_bundle() {
+        // Publish-order contamination guard: two commits of the same repo
+        // identity each publish a bundle, and `current_bundle_id` points at
+        // whichever was published LAST. Resolving must return the bundle for the
+        // CURRENT head, not the last-published one — otherwise a checkout at head
+        // A grafts head B's state (the 10k <-> 127k entity swing).
+        let repo_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        let entry = |root: &str, entities: usize| WarmCacheBundleManifestEntry {
+            graph_root_hash: root.to_string(),
+            entity_count: entities,
+            relation_count: entities,
+            indexed_files: 1,
+            published_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let bundle_a = "bundle-a".to_string();
+        let bundle_b = "bundle-b".to_string();
+        let manifest = WarmCacheRepoManifest {
+            schema: INIT_WARM_CACHE_SCHEMA_VERSION.to_string(),
+            pipeline_epoch: INIT_WARM_CACHE_PIPELINE_EPOCH.to_string(),
+            repo_identity: repo_cache_identity(repo_dir.path()),
+            // Head B was published last, so the manifest's current_bundle_id
+            // points at it — the pre-fix contamination source.
+            current_bundle_id: Some(bundle_b.clone()),
+            heads: BTreeMap::from([
+                ("head_a".to_string(), bundle_a.clone()),
+                ("head_b".to_string(), bundle_b.clone()),
+            ]),
+            bundles: BTreeMap::from([
+                (bundle_a.clone(), entry("aaaa", 10)),
+                (bundle_b.clone(), entry("bbbb", 127)),
+            ]),
+            ..Default::default()
+        };
+        fs::write(
+            warm_cache_manifest_path(cache_dir.path()),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        for bundle in [&bundle_a, &bundle_b] {
+            fs::create_dir_all(cache_dir.path().join("bundles").join(bundle)).unwrap();
+            fs::write(
+                warm_cache_bundle_graph_path(cache_dir.path(), bundle),
+                b"graph",
+            )
+            .unwrap();
+            fs::write(
+                warm_cache_ready_marker_path(cache_dir.path(), bundle),
+                b"ready",
+            )
+            .unwrap();
+        }
+
+        // At head A, resolve MUST pick bundle A — not the last-published B.
+        assert_eq!(
+            resolve_warm_cache_graph_path_for_head(
+                repo_dir.path(),
+                cache_dir.path(),
+                Some("head_a".to_string()),
+            )
+            .unwrap()
+            .as_deref(),
+            Some(warm_cache_bundle_graph_path(cache_dir.path(), &bundle_a).as_path()),
+            "head A must resolve its own bundle, not the last-published bundle B",
+        );
+
+        // At head B, resolve picks bundle B.
+        assert_eq!(
+            resolve_warm_cache_graph_path_for_head(
+                repo_dir.path(),
+                cache_dir.path(),
+                Some("head_b".to_string()),
+            )
+            .unwrap()
+            .as_deref(),
+            Some(warm_cache_bundle_graph_path(cache_dir.path(), &bundle_b).as_path()),
+        );
+
+        // An uncached head rejects-don't-adopt: cold init, never graft B.
+        assert!(
+            resolve_warm_cache_graph_path_for_head(
+                repo_dir.path(),
+                cache_dir.path(),
+                Some("head_unknown".to_string()),
+            )
+            .unwrap()
+            .is_none(),
+            "an uncached head must cold-init rather than adopt the last-published bundle",
+        );
+
+        // A non-git (path-scoped) tree has no head; the single last bundle is
+        // still the one meaningful state, so it is reused.
+        assert_eq!(
+            resolve_warm_cache_graph_path_for_head(repo_dir.path(), cache_dir.path(), None)
+                .unwrap()
+                .as_deref(),
+            Some(warm_cache_bundle_graph_path(cache_dir.path(), &bundle_b).as_path()),
+        );
+    }
+
+    #[test]
+    fn warm_cache_content_candidate_offers_ready_last_bundle_head_agnostically() {
+        // The speculative content candidate recovers reuse for an unrecorded
+        // HEAD that still shares semantic truth (a sibling clone or a doc-only
+        // change). It offers the last-published bundle head-agnostically; the
+        // caller diff-gates it on entity-source divergence, so the candidate
+        // itself only needs to exist and be marked ready.
+        let repo_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        // No manifest yet: nothing to offer.
+        assert!(
+            resolve_warm_cache_content_candidate(repo_dir.path(), cache_dir.path())
+                .unwrap()
+                .is_none(),
+            "no manifest means no candidate",
+        );
+
+        let bundle_id = "content-bundle".to_string();
+        let manifest = WarmCacheRepoManifest {
+            schema: INIT_WARM_CACHE_SCHEMA_VERSION.to_string(),
+            pipeline_epoch: INIT_WARM_CACHE_PIPELINE_EPOCH.to_string(),
+            repo_identity: repo_cache_identity(repo_dir.path()),
+            current_bundle_id: Some(bundle_id.clone()),
+            // A different HEAD is the only one recorded; the candidate must not
+            // depend on the current tree's HEAD being present.
+            heads: BTreeMap::from([("recorded_head".to_string(), bundle_id.clone())]),
+            bundles: BTreeMap::from([(
+                bundle_id.clone(),
+                WarmCacheBundleManifestEntry {
+                    graph_root_hash: bundle_id.clone(),
+                    entity_count: 1,
+                    relation_count: 1,
+                    indexed_files: 1,
+                    published_at: chrono::Utc::now().to_rfc3339(),
+                },
+            )]),
+            ..Default::default()
+        };
+        fs::write(
+            warm_cache_manifest_path(cache_dir.path()),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(cache_dir.path().join("bundles").join(&bundle_id)).unwrap();
+        fs::write(
+            warm_cache_bundle_graph_path(cache_dir.path(), &bundle_id),
+            b"graph",
+        )
+        .unwrap();
+
+        // Bundle present but not yet marked ready: still nothing to offer.
+        assert!(
+            resolve_warm_cache_content_candidate(repo_dir.path(), cache_dir.path())
+                .unwrap()
+                .is_none(),
+            "an unready bundle is not a candidate",
+        );
+
+        fs::write(
+            warm_cache_ready_marker_path(cache_dir.path(), &bundle_id),
+            b"ready",
+        )
+        .unwrap();
+
+        // Ready last-published bundle: offered regardless of the current HEAD.
+        assert_eq!(
+            resolve_warm_cache_content_candidate(repo_dir.path(), cache_dir.path())
+                .unwrap()
+                .as_deref(),
+            Some(warm_cache_bundle_graph_path(cache_dir.path(), &bundle_id).as_path()),
         );
     }
 
