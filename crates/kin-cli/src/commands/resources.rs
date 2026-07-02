@@ -320,6 +320,11 @@ async fn run_daemon_resources(
         )
     })?;
     let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    // Resource sizing reflects the daemon worker's captured environment; warn
+    // loudly (or fail under KIN_STRICT_BEHAVIOR_ENV) if this command's
+    // environment diverges from what that worker started with, so an inspector
+    // is not misled about which levers are actually in effect.
+    client.warn_on_behavior_env_divergence().await?;
     client
         .command_resources(request)
         .await

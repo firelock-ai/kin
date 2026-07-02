@@ -156,6 +156,44 @@ Agent-session launches do **not** require the daemon's remote command
 execution endpoint, which stays disabled unless an operator explicitly opts in
 with `KIN_DAEMON_ALLOW_EXEC=1`.
 
+## Daemon environment boundary
+
+The repo daemon is a long-lived, per-user singleton. The **first** `kin` command
+that needs it spawns it, and the daemon inherits **that** command's environment.
+Every later command reaches the already-running daemon over HTTP and does **not**
+re-export its own environment into the worker. So a behavior-relevant knob that
+is read inside the daemon worker — or in the embedding / inference substrate it
+hosts — is fixed at whatever value the daemon captured when it started.
+
+The consequence is a quiet footgun: running
+
+```
+KIN_EMBED_HYBRID=balanced kin embed
+```
+
+against a daemon that started **without** that variable applies the daemon's
+captured value, not the one on this command line. The override is silently
+ignored, because the substrate reads it at the worker's process start, not per
+request.
+
+Kin makes that mismatch loud rather than fixing the value in place:
+
+- The daemon reports the value it holds for each behavior-relevant variable in
+  its `/health` payload (`behavior_env`).
+- Environment-sensitive commands (`kin embed`, `kin resources`) compare the
+  current environment against that report and, on any divergence, print a
+  warning to stderr naming each variable with both sides' values.
+- The remedy is to restart the daemon so it re-inherits the current environment:
+  stop it (`kill $(cat .kin/daemon.pid)`; it also self-stops after its
+  `KIN_DAEMON_IDLE_TIMEOUT_SECS` idle window) and the next `kin` command
+  respawns it.
+- Set `KIN_STRICT_BEHAVIOR_ENV=1` to escalate the warning to a hard error, so
+  scripted and proof runs fail closed instead of measuring the wrong lever.
+
+The authoritative list of behavior-relevant variables is defined once in
+`kin-core` (`behavior_env`) and shared by both the daemon (which reports them)
+and the CLI (which compares them), so the two sides cannot drift apart.
+
 ## Recovery reference
 
 | Situation | What Kin does | Your move |

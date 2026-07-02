@@ -255,6 +255,10 @@ async fn run_daemon_embed(
         anyhow::anyhow!("Kin daemon is required for embed but no daemon endpoint is available")
     })?;
     let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    // Embedding behavior is decided in the long-lived daemon worker; warn loudly
+    // (or fail under KIN_STRICT_BEHAVIOR_ENV) if this command's environment
+    // diverges from what that worker captured at start.
+    client.warn_on_behavior_env_divergence().await?;
     client
         .embed(request)
         .await
