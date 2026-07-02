@@ -1620,6 +1620,8 @@ mod tests {
             .output();
         let commit = std::process::Command::new("git")
             .args(["commit", "-m", "initial"])
+            .env("GIT_AUTHOR_DATE", "1000000000 +0000")
+            .env("GIT_COMMITTER_DATE", "1000000000 +0000")
             .current_dir(root)
             .output();
         matches!(commit, Ok(output) if output.status.success())
@@ -1892,6 +1894,8 @@ mod tests {
             .output();
         let commit = std::process::Command::new("git")
             .args(["commit", "-m", "initial"])
+            .env("GIT_AUTHOR_DATE", "1000000100 +0000")
+            .env("GIT_COMMITTER_DATE", "1000000100 +0000")
             .current_dir(root)
             .output();
         matches!(commit, Ok(output) if output.status.success())

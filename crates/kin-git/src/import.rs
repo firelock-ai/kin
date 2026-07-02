@@ -198,7 +198,7 @@ fn import_full(
     )
     .entered();
 
-    // Walk commits in topological order (parents before children).
+    // Walk commits by commit time (approximates parent-before-child order).
     let walk = repo
         .rev_walk([head_id])
         .sorting(gix::revision::walk::Sorting::ByCommitTime(
@@ -207,19 +207,26 @@ fn import_full(
         .all()
         .map_err(|e| GitError::Git(e.to_string()))?;
 
-    // Phase 1: collect OIDs in walk order (cheap sequential walk), honoring
-    // max_commits. The order here is the authority for the final output order.
+    // Phase 1: collect every commit as (commit time, oid), then impose a
+    // deterministic total order (time descending, then oid) before honoring
+    // max_commits. A raw `ByCommitTime` walk leaves equal-timestamp commits in a
+    // process-dependent order, so truncating it — or handing it to the
+    // order-sensitive enrichment pass that partitions entity/relation deltas per
+    // commit — would select or order the imported commits differently across two
+    // preps of identical history. `select_commit_oids` makes the selected set and
+    // its order a pure function of commit content, so the per-commit change
+    // partition (and every EntityRevisionId/RelationRevisionId derived from an
+    // imported change id) is byte-identical run to run. This order is the
+    // authority for the final output order.
     let oids: Vec<gix::ObjectId> = {
         let _span = tracing::info_span!("kin.git.import_full.collect_oids").entered();
-        let iter = walk.map(|r| {
-            r.map(|info| info.id().detach())
-                .map_err(|e| GitError::Git(e.to_string()))
-        });
-        if max_commits > 0 {
-            iter.take(max_commits).collect::<Result<Vec<_>>>()?
-        } else {
-            iter.collect::<Result<Vec<_>>>()?
-        }
+        let timed: Vec<(i64, gix::ObjectId)> = walk
+            .map(|r| {
+                r.map(|info| (info.commit_time.unwrap_or(0), info.id().detach()))
+                    .map_err(|e| GitError::Git(e.to_string()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        crate::cochange::select_commit_oids(timed, max_commits)
     };
 
     // Phase 2: map each commit to an ImportedChange in parallel. Each commit's
@@ -251,10 +258,18 @@ fn import_full(
         oids.par_iter()
             .map(|oid| {
                 let local = thread_safe.to_thread_local();
-                let commit = local
-                    .find_object(*oid)
-                    .map_err(|e| GitError::Git(e.to_string()))?
-                    .into_commit();
+                // Object lookups can transiently miss while another worker is
+                // still initializing a shared object-database slot (the loose-
+                // object analogue of the pack-index window pre-warmed above), so
+                // a miss is retried once before it is treated as genuinely
+                // absent and fails loud.
+                let commit = match local.find_object(*oid) {
+                    Ok(object) => object,
+                    Err(_) => local
+                        .find_object(*oid)
+                        .map_err(|e| GitError::Git(e.to_string()))?,
+                }
+                .into_commit();
                 let is_root = commit.parent_ids().count() == 0;
                 let change = commit_to_change(&local, &commit, genesis_id, is_root, blob_store)?;
                 let oid_str = oid.to_string();
@@ -293,26 +308,28 @@ fn import_full_serial(
         .all()
         .map_err(|e| GitError::Git(e.to_string()))?;
 
-    for info_result in walk {
-        let info = info_result.map_err(|e| GitError::Git(e.to_string()))?;
-        let commit = info
-            .id()
-            .object()
+    // Same deterministic (time desc, then oid) selection as `import_full`, so the
+    // serial reference stays byte-identical to the parallel path under
+    // equal-timestamp ties and `max_commits` truncation.
+    let timed: Vec<(i64, gix::ObjectId)> = walk
+        .map(|r| {
+            r.map(|info| (info.commit_time.unwrap_or(0), info.id().detach()))
+                .map_err(|e| GitError::Git(e.to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let oids = crate::cochange::select_commit_oids(timed, max_commits);
+
+    for oid in &oids {
+        let commit = repo
+            .find_object(*oid)
             .map_err(|e| GitError::Git(e.to_string()))?
             .into_commit();
-
         let is_root = commit.parent_ids().count() == 0;
         let change = commit_to_change(repo, &commit, genesis_id, is_root, blob_store)?;
-        let oid_str = info.id.to_string();
-
         changes.push(ImportedChange {
             change,
-            git_oid: oid_str,
+            git_oid: oid.to_string(),
         });
-
-        if max_commits > 0 && changes.len() >= max_commits {
-            break;
-        }
     }
 
     changes.reverse();
@@ -635,6 +652,8 @@ mod tests {
             .output();
         let _ = Command::new("git")
             .args(["commit", "-m", "initial"])
+            .env("GIT_AUTHOR_DATE", "1000000000 +0000")
+            .env("GIT_COMMITTER_DATE", "1000000000 +0000")
             .current_dir(dir.path())
             .output();
 
@@ -645,6 +664,8 @@ mod tests {
             .output();
         let _ = Command::new("git")
             .args(["commit", "-m", "modify alpha"])
+            .env("GIT_AUTHOR_DATE", "1000000100 +0000")
+            .env("GIT_COMMITTER_DATE", "1000000100 +0000")
             .current_dir(dir.path())
             .output();
 
@@ -741,10 +762,116 @@ mod tests {
                 .output();
             let _ = Command::new("git")
                 .args(["commit", "-m", &format!("commit {c}")])
+                // Every commit shares one timestamp on purpose: equal-time ties
+                // are the case the deterministic selection order exists for, so
+                // the identity tests exercise it on every run instead of only on
+                // machines fast enough to commit twice in one second.
+                .env("GIT_AUTHOR_DATE", "1000000000 +0000")
+                .env("GIT_COMMITTER_DATE", "1000000000 +0000")
                 .current_dir(dir.path())
                 .output();
         }
         Some(dir)
+    }
+
+    /// Build a git repo whose commits all share ONE pinned committer/author
+    /// timestamp, so a `ByCommitTime` walk cannot order them by time — the exact
+    /// condition under which a raw `take(max_commits)` truncation (or an
+    /// order-sensitive downstream consumer) becomes process-dependent. Each commit
+    /// still touches a distinct file, so every commit has a distinct tree and oid.
+    fn build_equal_timestamp_repo(num_commits: usize) -> Option<tempfile::TempDir> {
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo(dir.path()) {
+            return None;
+        }
+        // Disable any globally-configured hooks for this throwaway repo so a
+        // commit-date-rewriting hook cannot override the pinned dates below (a
+        // clean CI checkout has no such hook; this only neutralizes a local one).
+        let _ = Command::new("git")
+            .args(["config", "core.hooksPath", "/dev/null"])
+            .current_dir(dir.path())
+            .output();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+
+        // One fixed instant for every commit (a real git epoch string). Author and
+        // committer dates are pinned so the committer time — what `ByCommitTime`
+        // sorts on — ties across all commits.
+        let fixed_date = "1112911993 +0000";
+        for c in 0..num_commits {
+            let path = dir.path().join("src").join(format!("f{c}.rs"));
+            std::fs::write(&path, format!("fn f{c}() {{}}\n")).unwrap();
+            let _ = Command::new("git")
+                .args(["add", "."])
+                .current_dir(dir.path())
+                .output();
+            let _ = Command::new("git")
+                .args(["commit", "-m", &format!("commit {c}")])
+                .env("GIT_AUTHOR_DATE", fixed_date)
+                .env("GIT_COMMITTER_DATE", fixed_date)
+                .current_dir(dir.path())
+                .output();
+        }
+        Some(dir)
+    }
+
+    /// Determinism regression: two preps of byte-identical history must partition the
+    /// same commits into the same imported changes. When every commit shares a
+    /// timestamp, the pre-fix `take(max_commits)` over a raw `ByCommitTime` walk
+    /// selected a process-dependent subset; the content-addressed
+    /// `select_commit_oids` total order must instead pick the same subset — the
+    /// `max_commits` smallest oids — and emit it in the same order every run, so
+    /// every imported change id (and the entity/relation revision ids derived from
+    /// it) is stable across preps.
+    #[test]
+    fn import_full_truncation_is_deterministic_under_equal_timestamps() {
+        let Some(dir) = build_equal_timestamp_repo(8) else {
+            eprintln!("git not available, skipping equal-timestamp determinism test");
+            return;
+        };
+        let repo = open_repo(dir.path()).expect("open repo");
+        let head_id = repo
+            .head_ref()
+            .expect("head_ref")
+            .expect("non-empty repo")
+            .id()
+            .detach();
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x55; 32]));
+
+        // The full import enumerates every commit; its ids are the ground truth.
+        let full = import_full(&repo, head_id, genesis_id, 0, None).expect("full import");
+        assert_eq!(full.len(), 8, "all commits import when max_commits == 0");
+
+        // Expected truncated selection: the 4 smallest oids (content tie-break),
+        // emitted oldest-first — i.e. that ascending set reversed, matching how
+        // `import_full` reverses the time-desc/oid-asc order it selects.
+        let mut all_oids: Vec<String> = full.iter().map(|c| c.git_oid.clone()).collect();
+        all_oids.sort();
+        let expected: Vec<String> = all_oids.into_iter().take(4).rev().collect();
+
+        // Two independent truncated imports must both equal the expected set, in
+        // the same order — proving the boundary depends on content, not on the
+        // walk's (process-dependent) emission order for the tied commits.
+        for _ in 0..2 {
+            let limited = import_full(&repo, head_id, genesis_id, 4, None).expect("limited import");
+            let got_oids: Vec<String> = limited.iter().map(|c| c.git_oid.clone()).collect();
+            assert_eq!(
+                got_oids, expected,
+                "equal-timestamp truncation must select the oid-deterministic subset"
+            );
+            let got_ids: Vec<String> = limited.iter().map(|c| c.change.id.to_string()).collect();
+            let expected_ids: Vec<String> = expected
+                .iter()
+                .map(|oid| {
+                    semantic_change_id_from_git_oid_hex(oid)
+                        .expect("valid oid")
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(
+                got_ids, expected_ids,
+                "imported change ids must be stable across preps"
+            );
+        }
     }
 
     /// Determinism gate: the parallel commit-mapping path must produce a

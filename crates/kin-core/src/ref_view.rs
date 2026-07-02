@@ -1604,10 +1604,18 @@ mod tests {
     }
 
     fn run_git(repo: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(repo).args(args);
+        // Explicit increasing commit timestamps: order-sensitive fixtures must
+        // not depend on wall-clock second granularity.
+        if args.first() == Some(&"commit") {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COMMIT_EPOCH: AtomicU64 = AtomicU64::new(1_000_000_000);
+            let date = format!("{} +0000", COMMIT_EPOCH.fetch_add(100, Ordering::Relaxed));
+            cmd.env("GIT_AUTHOR_DATE", &date)
+                .env("GIT_COMMITTER_DATE", &date);
+        }
+        let output = cmd
             .output()
             .unwrap_or_else(|err| panic!("failed to run git {args:?}: {err}"));
         assert!(

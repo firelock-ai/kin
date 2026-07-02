@@ -160,11 +160,18 @@ fn init_git_repo(path: &Path, remote: &str) {
         &["commit", "-m", "init"],
     ];
     for args in commands {
-        let output = Command::new("git")
-            .args(*args)
-            .current_dir(path)
-            .output()
-            .expect("git command");
+        let mut cmd = Command::new("git");
+        cmd.args(*args);
+        // Explicit increasing commit timestamps: order-sensitive fixtures must
+        // not depend on wall-clock second granularity.
+        if args.first() == Some(&"commit") {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COMMIT_EPOCH: AtomicU64 = AtomicU64::new(1_000_000_000);
+            let date = format!("{} +0000", COMMIT_EPOCH.fetch_add(100, Ordering::Relaxed));
+            cmd.env("GIT_AUTHOR_DATE", &date)
+                .env("GIT_COMMITTER_DATE", &date);
+        }
+        let output = cmd.current_dir(path).output().expect("git command");
         assert!(
             output.status.success(),
             "git {:?} failed: stdout={} stderr={}",
@@ -184,11 +191,18 @@ fn add_rust_source_and_commit(path: &Path) {
     .expect("write rust source");
     let commands: &[&[&str]] = &[&["add", "src/lib.rs"], &["commit", "-m", "add source"]];
     for args in commands {
-        let output = Command::new("git")
-            .args(*args)
-            .current_dir(path)
-            .output()
-            .expect("git command");
+        let mut cmd = Command::new("git");
+        cmd.args(*args);
+        // Explicit increasing commit timestamps: order-sensitive fixtures must
+        // not depend on wall-clock second granularity.
+        if args.first() == Some(&"commit") {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COMMIT_EPOCH: AtomicU64 = AtomicU64::new(1_000_000_000);
+            let date = format!("{} +0000", COMMIT_EPOCH.fetch_add(100, Ordering::Relaxed));
+            cmd.env("GIT_AUTHOR_DATE", &date)
+                .env("GIT_COMMITTER_DATE", &date);
+        }
+        let output = cmd.current_dir(path).output().expect("git command");
         assert!(
             output.status.success(),
             "git {:?} failed: stdout={} stderr={}",
@@ -205,11 +219,18 @@ fn checkout_branch_and_add_empty_commit(path: &Path, branch: &str) {
         &["commit", "--allow-empty", "-m", "branch marker"],
     ];
     for args in commands {
-        let output = Command::new("git")
-            .args(*args)
-            .current_dir(path)
-            .output()
-            .expect("git command");
+        let mut cmd = Command::new("git");
+        cmd.args(*args);
+        // Explicit increasing commit timestamps: order-sensitive fixtures must
+        // not depend on wall-clock second granularity.
+        if args.first() == Some(&"commit") {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COMMIT_EPOCH: AtomicU64 = AtomicU64::new(1_000_000_000);
+            let date = format!("{} +0000", COMMIT_EPOCH.fetch_add(100, Ordering::Relaxed));
+            cmd.env("GIT_AUTHOR_DATE", &date)
+                .env("GIT_COMMITTER_DATE", &date);
+        }
+        let output = cmd.current_dir(path).output().expect("git command");
         assert!(
             output.status.success(),
             "git {:?} failed: stdout={} stderr={}",

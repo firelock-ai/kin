@@ -21,11 +21,19 @@ fn kin_command() -> Command {
 }
 
 fn run_git(repo: &Path, args: &[&str]) {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .expect("run git");
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(repo);
+    // Fixture commits carry explicit, strictly increasing timestamps so tests
+    // that assert commit order or ancestry semantics never depend on how fast
+    // the machine can commit within git's one-second timestamp granularity.
+    if args.first() == Some(&"commit") {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COMMIT_EPOCH: AtomicU64 = AtomicU64::new(1_000_000_000);
+        let date = format!("{} +0000", COMMIT_EPOCH.fetch_add(100, Ordering::Relaxed));
+        cmd.env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date);
+    }
+    let output = cmd.output().expect("run git");
     assert!(
         output.status.success(),
         "git {:?} failed: stdout={} stderr={}",
