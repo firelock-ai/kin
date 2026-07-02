@@ -7,14 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-07-01
+
+Session-aware runtime, a shadow-mode merge gate, a hardened first-run installer, and a central environment registry.
+
 ### Added
 
+- Retrieval quality profiles (`KIN_PROFILE`): `compat-v0` (default, the pre-profile serving behavior) and `accuracy-v1` (opt-in candidate: fused `semantic_locate` serving, entity-granularity fusion, lexical parity floor, promotion-only cross-encoder blend). Both ship structured `degradations[]` reporting and a per-stage prune ledger for miss forensics; the candidate graduates to default only on measured wins.
+- Go interface methods are extracted as first-class graph entities, closing a symbol-recall gap on Go codebases.
 - Session runtime for ordinary tools: `kin exec -- <cmd>` (new alias `kin run`) runs commands in a graph-backed session workspace, reconciles on success, and preserves the workspace with recovery commands on failure; `--keep` defers reconcile and `--discard` skips it.
 - Agent session launches: `kin with --session <assistant> -- <task>` starts the assistant inside a session workspace with its cwd, file shims, session identity (`KIN_SESSION`, `KIN_SESSION_ID`, `KIN_SESSION_DIR`), and daemon binding (`KIN_DAEMON_URL`, `KIN_REPO_ID`) pointed at the same repository — MCP tools spawned by the assistant bind to the same daemon and session.
 - External-tool detection now covers package managers (`npm`, `npx`, `pnpm`, `pnpx`, `yarn`, `bun`, `bunx`, `corepack`), which widen scoped execution to a full workspace under the default policy.
 - `kin doctor` gains a session-runtime check that teaches the `kin exec` / `kin shell` / `kin with --session` path and reports leftover session workspaces with recovery commands.
 - Session workspace materialization resolves `entity:`/`artifact:` scopes against graph truth for every session surface, failing loudly on unknown entities instead of silently widening.
 - New [Session Runtime](docs/session-runtime.md) guide: execution contract, closeout flags, generated-file policy, and Docker/Compose caveats.
+- `kin review shadow`: a non-blocking shadow-mode merge-gate report that evaluates a proposed change and emits a structured JSON verdict, so an AI-authored change can be judged before merge without gating the workflow.
+- A central `KIN_*` environment registry with startup validation and zero-safe bound parsing: unknown or malformed `KIN_*` overrides are surfaced at startup instead of being silently ignored.
+- `kin locate` and the agent search surfaces now report a confidence score and the end of each match's line span in their JSON output.
 
 ### Changed
 
@@ -23,6 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `kin setup` and `kin doctor --fix` now write MCP client entries that start (`kin mcp start`); the previously written `--global` mode was refused at startup, leaving agents with a dead kin MCP server. `kin doctor` flags the retired entries and `--fix` repairs them.
+- First-run installer: `curl … | sh` now survives POSIX `dash` (the default `/bin/sh` on Debian/Ubuntu and most container base images), parses the resolved version correctly, and logs daemon startup at info level.
+- `kin setup` no longer truncates the bundled VFS shim to 0 bytes, so transparent filesystem projection works on a fresh install.
+- `get_entity_source` distinguishes "entity not found" from "entity found but has no source" instead of collapsing both into one error.
+- Release builds no longer self-report a spurious `-dirty` version suffix: the in-tree CI checkouts of `kin-vfs`/`kin-db` are ignored, so a clean tagged tree stamps a clean version.
+- Unified `sha1`/`sha2` on `digest` 0.11 to repair a registry checksum break, and refreshed pinned dependencies (`anyhow`, `uuid`, `tree-sitter-rust`, `notify`, `sysinfo`).
+- `kin-daemon --compat-json` emits its payload before logging or env validation can write to stdout, so a `KIN_*` override warning can no longer corrupt the CLI's daemon-compat probe into a spurious "daemon stale" failure; a regression test guards the probe's stdout purity.
 
 ## [0.2.5] - 2026-07-01
 

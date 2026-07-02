@@ -40,3 +40,7 @@ __pycache__/
 
 # Snapshot working copies
 /.kin-snapshot-tmp/
+
+# CI release sibling checkouts (release.yml checks these out in-tree)
+/kin-vfs/
+/kin-db-local/
