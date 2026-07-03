@@ -1363,6 +1363,7 @@ impl BertEmbedder {
         dimensions: usize,
     ) -> Result<Vec<(usize, Vec<f32>)>, KinDbError> {
         let count = token_ids.len();
+        let trace_start = batch_trace::enabled().then(std::time::Instant::now);
         let (vectors, forward_model): (Vec<Vec<f32>>, &BertModel) = match backend_choice {
             EmbedBackendChoice::Metal { reason } => {
                 if let Some((attention_area, attention_area_cap)) =
@@ -1492,6 +1493,10 @@ impl BertEmbedder {
                 (vectors, model)
             }
         };
+
+        if let Some(start) = trace_start {
+            batch_trace::record_batch(count, longest, token_ids, start.elapsed());
+        }
 
         // Defense in depth: if the dispatched path still returned any non-finite
         // vectors, retry per-sample through the single-input forward path of the
@@ -2367,6 +2372,153 @@ pub(crate) fn throughput_graph_chunk_size() -> usize {
     throughput_embedding_plan(GpuBackend::Cpu).max_entities_per_graph_chunk
 }
 
+/// Per-sub-batch embed shape + forward-timing trace (`KIN_EMBED_BATCH_TRACE`).
+///
+/// The finer-grained companion to [`EmbedStageTimings`]: that accumulator records
+/// the whole `Forward` stage per drained batch, while this records each GPU
+/// dispatch the [`BatchBudget`] actually packs — its padded vs real tokens and
+/// attention area (`longest² × count`) alongside the forward wall. It surfaces the
+/// *effective* batch budget (which the `resources inspect` report does not reflect)
+/// and the padding waste a wide token budget introduces.
+///
+/// Off by default and zero-cost when off: gated by a cached env flag, the atomics
+/// and the per-dispatch line are only touched on the trace path.
+#[cfg(feature = "embeddings")]
+pub mod batch_trace {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    pub(crate) fn enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("KIN_EMBED_BATCH_TRACE")
+                .map(|value| !value.is_empty() && value != "0")
+                .unwrap_or(false)
+        })
+    }
+
+    static MAX_TOKENS: AtomicUsize = AtomicUsize::new(0);
+    static MAX_AREA: AtomicUsize = AtomicUsize::new(0);
+    static BATCHES: AtomicU64 = AtomicU64::new(0);
+    static ENTITIES: AtomicU64 = AtomicU64::new(0);
+    static REAL_TOKENS: AtomicU64 = AtomicU64::new(0);
+    static PADDED_TOKENS: AtomicU64 = AtomicU64::new(0);
+    static REAL_AREA: AtomicU64 = AtomicU64::new(0);
+    static PADDED_AREA: AtomicU64 = AtomicU64::new(0);
+    static FORWARD_NANOS: AtomicU64 = AtomicU64::new(0);
+    static MAX_COUNT: AtomicU64 = AtomicU64::new(0);
+    static MAX_LONGEST: AtomicU64 = AtomicU64::new(0);
+
+    /// Record the effective budget resolved for the run (set once by `from_env`).
+    pub(crate) fn record_budget(max_tokens: usize, max_attention_area: usize) {
+        MAX_TOKENS.store(max_tokens, Ordering::Relaxed);
+        MAX_AREA.store(max_attention_area, Ordering::Relaxed);
+    }
+
+    /// Record one dispatched sub-batch: its shape, its padded vs real work, and
+    /// the wall time of the forward that embedded it.
+    pub(crate) fn record_batch(count: usize, longest: usize, ids: &[Vec<u32>], forward: Duration) {
+        let real_tokens: u64 = ids.iter().map(|v| v.len() as u64).sum();
+        let real_area: u64 = ids
+            .iter()
+            .map(|v| {
+                let len = v.len() as u64;
+                len.saturating_mul(len)
+            })
+            .sum();
+        let count = count as u64;
+        let longest = longest as u64;
+        let padded_tokens = longest.saturating_mul(count);
+        let padded_area = longest.saturating_mul(longest).saturating_mul(count);
+        let forward_nanos = forward.as_nanos().min(u64::MAX as u128) as u64;
+        BATCHES.fetch_add(1, Ordering::Relaxed);
+        ENTITIES.fetch_add(count, Ordering::Relaxed);
+        REAL_TOKENS.fetch_add(real_tokens, Ordering::Relaxed);
+        PADDED_TOKENS.fetch_add(padded_tokens, Ordering::Relaxed);
+        REAL_AREA.fetch_add(real_area, Ordering::Relaxed);
+        PADDED_AREA.fetch_add(padded_area, Ordering::Relaxed);
+        FORWARD_NANOS.fetch_add(forward_nanos, Ordering::Relaxed);
+        MAX_COUNT.fetch_max(count, Ordering::Relaxed);
+        MAX_LONGEST.fetch_max(longest, Ordering::Relaxed);
+        eprintln!(
+            "[embed_batch_trace] count={count} longest={longest} real_tok={real_tokens} \
+             padded_tok={padded_tokens} pad_tok_x={:.2} real_area={real_area} \
+             padded_area={padded_area} pad_area_x={:.2} forward_us={}",
+            padded_tokens as f64 / real_tokens.max(1) as f64,
+            padded_area as f64 / real_area.max(1) as f64,
+            forward.as_micros(),
+        );
+    }
+
+    /// Cumulative totals for the trace, since the last [`reset`].
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct Summary {
+        pub max_tokens: usize,
+        pub max_attention_area: usize,
+        pub batches: u64,
+        pub entities: u64,
+        pub real_tokens: u64,
+        pub padded_tokens: u64,
+        pub real_area: u64,
+        pub padded_area: u64,
+        pub forward_nanos: u64,
+        pub max_count: u64,
+        pub max_longest: u64,
+    }
+
+    impl Summary {
+        /// Padded ÷ real token ratio: linear-buffer (FFN/projection) waste.
+        pub fn token_waste(&self) -> f64 {
+            self.padded_tokens as f64 / self.real_tokens.max(1) as f64
+        }
+        /// Padded ÷ real attention-area ratio: O(seq²) attention waste.
+        pub fn area_waste(&self) -> f64 {
+            self.padded_area as f64 / self.real_area.max(1) as f64
+        }
+        pub fn mean_count(&self) -> f64 {
+            self.entities as f64 / self.batches.max(1) as f64
+        }
+        pub fn forward_secs(&self) -> f64 {
+            self.forward_nanos as f64 / 1.0e9
+        }
+    }
+
+    /// Point-in-time snapshot of the cumulative totals.
+    pub fn snapshot() -> Summary {
+        Summary {
+            max_tokens: MAX_TOKENS.load(Ordering::Relaxed),
+            max_attention_area: MAX_AREA.load(Ordering::Relaxed),
+            batches: BATCHES.load(Ordering::Relaxed),
+            entities: ENTITIES.load(Ordering::Relaxed),
+            real_tokens: REAL_TOKENS.load(Ordering::Relaxed),
+            padded_tokens: PADDED_TOKENS.load(Ordering::Relaxed),
+            real_area: REAL_AREA.load(Ordering::Relaxed),
+            padded_area: PADDED_AREA.load(Ordering::Relaxed),
+            forward_nanos: FORWARD_NANOS.load(Ordering::Relaxed),
+            max_count: MAX_COUNT.load(Ordering::Relaxed),
+            max_longest: MAX_LONGEST.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Zero the per-dispatch accumulators (the resolved budget is retained).
+    pub fn reset() {
+        for counter in [
+            &BATCHES,
+            &ENTITIES,
+            &REAL_TOKENS,
+            &PADDED_TOKENS,
+            &REAL_AREA,
+            &PADDED_AREA,
+            &FORWARD_NANOS,
+            &MAX_COUNT,
+            &MAX_LONGEST,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 /// The two budgets that bound a single embed GPU dispatch, and the rule that packs
 /// a length-sorted run of entities into one.
 ///
@@ -2415,9 +2567,14 @@ impl BatchBudget {
             )
         };
         let requested_area = env_usize("KIN_EMBED_MAX_ATTENTION_AREA", default_area);
+        let max_tokens = env_usize("KIN_EMBED_MAX_BATCH_TOKENS", default_tokens);
+        let max_attention_area = cap_attention_area_for_backend(backend, requested_area);
+        if batch_trace::enabled() {
+            batch_trace::record_budget(max_tokens, max_attention_area);
+        }
         Self {
-            max_tokens: env_usize("KIN_EMBED_MAX_BATCH_TOKENS", default_tokens),
-            max_attention_area: cap_attention_area_for_backend(backend, requested_area),
+            max_tokens,
+            max_attention_area,
         }
     }
 
