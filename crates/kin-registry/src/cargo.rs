@@ -442,8 +442,7 @@ fn verify_crate_coordinates(crate_bytes: &[u8], name: &str, version: &str) -> Re
         return Err(format!("crate does not contain {expected_manifest}"));
     }
 
-    let toml_value: toml::Value = cargo_toml_content
-        .parse()
+    let toml_value: toml::Value = toml::from_str(&cargo_toml_content)
         .map_err(|e| format!("crate {expected_manifest} is not valid TOML: {e}"))?;
 
     let package = toml_value
@@ -506,7 +505,7 @@ fn extract_crate_metadata(crate_bytes: &[u8], name: &str, version: &str) -> serd
     }
 
     // Parse Cargo.toml to extract features and deps
-    let toml_value: toml::Value = match cargo_toml_content.parse() {
+    let toml_value: toml::Value = match toml::from_str(&cargo_toml_content) {
         Ok(v) => v,
         Err(_) => return serde_json::json!({}),
     };
