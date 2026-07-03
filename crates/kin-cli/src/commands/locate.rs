@@ -655,7 +655,7 @@ fn split_identifier_parts(name: &str) -> Vec<String> {
             if !current.is_empty() {
                 // Check if this is start of a new word (camelCase boundary)
                 // but NOT a run of capitals (like "HTTP" in "HTTPClient")
-                let prev_was_lower = current.chars().last().map_or(false, |c| c.is_lowercase());
+                let prev_was_lower = current.chars().last().is_some_and(|c| c.is_lowercase());
                 if prev_was_lower {
                     parts.push(std::mem::take(&mut current).to_lowercase());
                 }
@@ -2671,7 +2671,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                     .extra
                     .get("embedding_body_preview")
                     .and_then(|v| v.as_str())
-                    .map_or(false, |s| !s.is_empty());
+                    .is_some_and(|s| !s.is_empty());
                 let body_tag = if has_body { "DEF" } else { "ref" };
                 let test_tag = if is_test_by_role(file, Some(&e)) {
                     " [TEST]"
@@ -9715,7 +9715,7 @@ fn resolve_entities_to_files(
         let entity_is_test = entity
             .file_origin
             .as_ref()
-            .map_or(false, |fo| is_test_by_role(&fo.0, Some(&entity)));
+            .is_some_and(|fo| is_test_by_role(&fo.0, Some(&entity)));
 
         if let Some(ref fo) = entity.file_origin {
             let path = &fo.0;
@@ -9732,7 +9732,7 @@ fn resolve_entities_to_files(
                     .extra
                     .get("embedding_body_preview")
                     .and_then(|v| v.as_str())
-                    .map_or(false, |s| !s.is_empty());
+                    .is_some_and(|s| !s.is_empty());
 
                 // KIND-FLOOR lever (default OFF == current bytes): the definition
                 // flag (and its `definition_authority` score multiplier) key only
@@ -9988,7 +9988,7 @@ fn resolve_entities_to_files(
                     .extra
                     .get("embedding_body_preview")
                     .and_then(|v| v.as_str())
-                    .map_or(false, |s| !s.is_empty());
+                    .is_some_and(|s| !s.is_empty());
                 let def_mult = if neighbor_has_body {
                     definition_authority
                 } else {
@@ -13899,7 +13899,7 @@ fn enrich_empty_file_symbols(
     for (path, _) in results {
         if projection_symbols
             .get(path)
-            .map_or(false, |syms| !syms.is_empty())
+            .is_some_and(|syms| !syms.is_empty())
         {
             continue;
         }
@@ -14096,7 +14096,7 @@ fn emit_inner_methods(
 ) {
     let topk = locate_env_usize("KIN_LOCATE_INNER_METHOD_TOPK", 5);
     for (path, _) in results {
-        let has_class_like = projection_symbols.get(path).map_or(false, |syms| {
+        let has_class_like = projection_symbols.get(path).is_some_and(|syms| {
             syms.iter()
                 .any(|s| matches!(s.kind.as_str(), "class" | "interface" | "module"))
         });
