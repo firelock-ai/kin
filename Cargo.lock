@@ -3279,9 +3279,9 @@ dependencies = [
 
 [[package]]
 name = "kin-infer"
-version = "0.2.38"
+version = "0.2.40"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "4c025d1d3f9f57340298c18205fa6eec1cc25644ade3790eeda5c6cf0b3091c3"
+checksum = "97fd7176da2b74e8e261285856d812f917b35a7e13eab7c2589e1868652f94a1"
 dependencies = [
  "block",
  "half",
@@ -3609,9 +3609,9 @@ dependencies = [
 
 [[package]]
 name = "kin-vector"
-version = "0.1.4"
+version = "0.1.6"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "66280d81b3a20f465351aa9cab72e63d4eff8643bb30314e1beca369b564b732"
+checksum = "4a0675c99c00faf3fd2a8cb71f73513677daef4fb35b2eb7d300da07f4990550"
 dependencies = [
  "fs2",
  "hashbrown 0.15.5",
