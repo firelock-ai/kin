@@ -10913,7 +10913,7 @@ fn apply_module_prefix_affinity(
         }
     }
     // Also count priority file prefixes with extra weight.
-    for (path, _trace) in priority_traces {
+    for path in priority_traces.keys() {
         if let Some(prefix) = top_level_module_prefix(path) {
             *prefix_counts.entry(prefix).or_default() += 2;
         }
