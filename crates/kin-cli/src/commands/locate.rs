@@ -14430,9 +14430,7 @@ fn rank_and_cap_symbols_with(mut symbols: Vec<LocateSymbol>, cap: usize) -> Vec<
 fn explain_line_score(reason: &str) -> f32 {
     if let Some(idx) = reason.find("(score ") {
         let rest = &reason[idx + 7..];
-        let end = rest
-            .find([',', ')'])
-            .unwrap_or(rest.len());
+        let end = rest.find([',', ')']).unwrap_or(rest.len());
         return rest[..end].trim().parse::<f32>().unwrap_or(-1.0);
     }
     -1.0
