@@ -833,6 +833,11 @@ enum Command {
         #[command(subcommand)]
         action: Option<RegistryAction>,
     },
+    /// Inspect and gracefully stop Kin daemons
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
     /// Probe first-run health and optionally apply safe repairs
     Doctor {
         /// Apply safe automatic repairs (shell hook, MCP configs, config dirs)
@@ -1615,6 +1620,25 @@ enum RegistryAction {
     },
     /// Remove stale entries (paths that no longer contain .kin/)
     Clean,
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Show the supervisor and every repo worker daemon, with stale-file detection
+    Status {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Gracefully stop the current repo's worker daemon (or every daemon with --all)
+    Stop {
+        /// Stop every worker daemon and the supervisor (supervisor last)
+        #[arg(long)]
+        all: bool,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2665,6 +2689,10 @@ fn main() -> Result<()> {
                     }
                     Some(RegistryAction::Clean) => commands::registry::clean().await,
                     None => commands::registry::list().await,
+                },
+                Command::Daemon { action } => match action {
+                    DaemonAction::Status { json } => commands::daemon::status(json).await,
+                    DaemonAction::Stop { all, json } => commands::daemon::stop(all, json).await,
                 },
                 Command::Doctor {
                     fix,

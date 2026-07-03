@@ -5,24 +5,9 @@ use anyhow::Result;
 use kin_core::registry::KinRegistry;
 use std::collections::HashSet;
 
-use super::deps;
+use crate::daemon_client::RegisteredRepoDaemon;
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
-struct RegisteredRepoDaemon {
-    repo_id: String,
-    #[serde(default)]
-    display_name: String,
-    #[serde(default)]
-    instance_id: String,
-    repo_root: String,
-    pid: u32,
-    port: u16,
-    endpoint: String,
-    graph_entity_count: Option<usize>,
-    #[serde(default)]
-    registered_at: Option<String>,
-    last_heartbeat_at: String,
-}
+use super::deps;
 
 #[derive(Debug, serde::Serialize)]
 struct RegisteredRepoDaemonsOutput {
@@ -63,13 +48,7 @@ pub async fn list() -> Result<()> {
 /// List repo daemons registered with the central local supervisor.
 pub async fn daemons(json: bool) -> Result<()> {
     let supervisor_url = crate::daemon_client::ensure_supervisor_running().await?;
-    let daemons: Vec<RegisteredRepoDaemon> = reqwest::Client::new()
-        .get(format!("{}/daemons", supervisor_url.trim_end_matches('/')))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let daemons = crate::daemon_client::fetch_registered_daemons(&supervisor_url).await?;
 
     if json {
         let output = RegisteredRepoDaemonsOutput {

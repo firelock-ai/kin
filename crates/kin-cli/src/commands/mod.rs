@@ -18,6 +18,7 @@ pub mod commit;
 pub mod conflicts;
 pub mod context;
 pub mod contextbench_locate;
+pub mod daemon;
 pub mod dead_code;
 pub mod deps;
 pub mod diff;
