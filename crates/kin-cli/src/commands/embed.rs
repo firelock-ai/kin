@@ -114,6 +114,72 @@ fn max_passes() -> usize {
         .unwrap_or(DEFAULT_MAX_PASSES)
 }
 
+/// Default total wall-clock budget (seconds) for one `kin embed` invocation on
+/// a constrained resource profile. Instead of driving to full coverage — which
+/// extrapolates to hours on a 2–4 core CPU box — a constrained profile makes
+/// progress up to this budget and leaves the remainder pending for the next
+/// `kin embed` (each pass persists, so coverage resumes). Overridable via
+/// `KIN_EMBED_MAX_TOTAL_SECONDS`; not applied on unconstrained profiles.
+pub const DEFAULT_CONSTRAINED_TOTAL_SECONDS: u64 = 600;
+
+/// Total wall-clock budget for the drive-to-completion loop, or `None` to drive
+/// to full coverage. A constrained resource profile (`interactive` / `small` —
+/// the small-machine selectors) auto-bounds so `kin embed` returns a resumable
+/// partial index rather than looping for hours; `KIN_EMBED_MAX_TOTAL_SECONDS`
+/// overrides the value explicitly on any profile.
+fn constrained_total_budget_seconds() -> Option<u64> {
+    let override_secs = std::env::var("KIN_EMBED_MAX_TOTAL_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    let profile = std::env::var("KIN_RESOURCE_PROFILE").unwrap_or_default();
+    resolve_total_budget(override_secs, &profile)
+}
+
+/// Pure budget resolution: an explicit positive override wins on any profile;
+/// otherwise a constrained profile gets the default budget and everything else
+/// gets `None` (drive to full coverage).
+fn resolve_total_budget(override_secs: Option<u64>, profile: &str) -> Option<u64> {
+    if let Some(secs) = override_secs.filter(|s| *s > 0) {
+        return Some(secs);
+    }
+    match profile.trim().to_ascii_lowercase().as_str() {
+        "interactive" | "small" => Some(DEFAULT_CONSTRAINED_TOTAL_SECONDS),
+        _ => None,
+    }
+}
+
+/// Embedding throughput (objects per second), or `0.0` before any wall time has
+/// elapsed. "Objects" counts entities + artifacts, the unit of embedding work.
+fn throughput_per_sec(embedded: usize, elapsed_secs: f64) -> f64 {
+    if elapsed_secs > 0.0 {
+        embedded as f64 / elapsed_secs
+    } else {
+        0.0
+    }
+}
+
+/// A `, ETA <human>` suffix for a progress line, or empty when the rate is not
+/// yet known (no throughput) or nothing is left to embed.
+fn eta_suffix(rate_per_sec: f64, pending: usize) -> String {
+    if rate_per_sec <= 0.0 || pending == 0 {
+        return String::new();
+    }
+    let secs = (pending as f64 / rate_per_sec).ceil() as u64;
+    format!(", ETA {}", format_duration_secs(secs))
+}
+
+/// Compact hours/minutes/seconds formatting for ETA display.
+fn format_duration_secs(total: u64) -> String {
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}h{m:02}m")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
 /// Whether the drive-to-completion loop should issue another embed pass.
 ///
 /// Continue only while retrievable work remains AND the last pass actually
@@ -181,9 +247,16 @@ pub async fn run(
 
     let pass_seconds = pass_budget_seconds();
     let max_passes = max_passes();
+    // Constrained profiles (2–4 core CPU boxes) bound the total wall time so a
+    // single `kin embed` returns a resumable partial index instead of driving to
+    // full coverage for hours; unconstrained profiles keep driving to zero
+    // pending. Each pass persists, so coverage resumes on the next invocation.
+    let total_budget = constrained_total_budget_seconds();
+    let embed_started = std::time::Instant::now();
     let mut pass = 0usize;
     let mut embedded_entities = 0usize;
     let mut embedded_artifacts = 0usize;
+    let mut budget_stopped = false;
     let final_result = loop {
         pass += 1;
         let response = run_daemon_embed(
@@ -205,21 +278,32 @@ pub async fn run(
         embedded_artifacts += result.embedded_artifacts;
         let made_progress = result.embedded_entities + result.embedded_artifacts > 0;
 
+        let elapsed = embed_started.elapsed().as_secs_f64();
+        let pending_now = result.pending_entities + result.pending_artifacts;
         if !json {
+            let rate = throughput_per_sec(embedded_entities + embedded_artifacts, elapsed);
             println!(
-                "Pass {pass}: +{} entities, +{} artifacts ({} entities, {} artifacts still pending)",
+                "Pass {pass}: +{} entities, +{} artifacts ({} entities, {} artifacts still pending) [{:.2} ent/s{}]",
                 result.embedded_entities,
                 result.embedded_artifacts,
                 result.pending_entities,
-                result.pending_artifacts
+                result.pending_artifacts,
+                rate,
+                eta_suffix(rate, pending_now),
             );
         }
 
         if !embed_pass_should_continue(&result, made_progress) || pass >= max_passes {
             break result;
         }
+        if total_budget.is_some_and(|budget| elapsed >= budget as f64) {
+            budget_stopped = true;
+            break result;
+        }
     };
     let pending = final_result.pending_entities + final_result.pending_artifacts;
+    let elapsed = embed_started.elapsed().as_secs_f64();
+    let rate = throughput_per_sec(embedded_entities + embedded_artifacts, elapsed);
     if json {
         let aggregate = EmbedResult {
             embedded_entities,
@@ -230,8 +314,17 @@ pub async fn run(
         println!("{}", serde_json::to_string_pretty(&aggregate)?);
     } else if pending == 0 {
         println!(
-            "Done. Full coverage: {} entities, {} artifacts embedded across {pass} pass(es), index saved to {}",
-            embedded_entities, embedded_artifacts, final_result.vector_index_path
+            "Done. Full coverage: {} entities, {} artifacts embedded across {pass} pass(es) at {:.2} ent/s, index saved to {}",
+            embedded_entities, embedded_artifacts, rate, final_result.vector_index_path
+        );
+    } else if budget_stopped {
+        println!(
+            "Time budget reached after {:.0}s ({pass} pass(es), {:.2} ent/s): {} entities + {} artifacts still pending{}. Progress is persisted — re-run `kin embed` to continue.",
+            elapsed,
+            rate,
+            final_result.pending_entities,
+            final_result.pending_artifacts,
+            eta_suffix(rate, pending),
         );
     } else {
         println!(
@@ -425,8 +518,9 @@ pub fn build_embed_response(
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_batch_size, embed_pass_should_continue, should_queue_missing_embedding_pass,
-        EmbedResult, DEFAULT_BATCH_SIZE,
+        effective_batch_size, embed_pass_should_continue, eta_suffix, format_duration_secs,
+        resolve_total_budget, should_queue_missing_embedding_pass, throughput_per_sec, EmbedResult,
+        DEFAULT_BATCH_SIZE, DEFAULT_CONSTRAINED_TOTAL_SECONDS,
     };
 
     fn result_with(pending_entities: usize, pending_artifacts: usize) -> EmbedResult {
@@ -522,5 +616,63 @@ mod tests {
             rendered.contains("Graph error: kindb foo"),
             "underlying cause was flattened away: {rendered}"
         );
+    }
+
+    #[test]
+    fn constrained_profiles_get_a_default_total_budget() {
+        // interactive / small are the small-machine selectors → auto-bounded.
+        assert_eq!(
+            resolve_total_budget(None, "interactive"),
+            Some(DEFAULT_CONSTRAINED_TOTAL_SECONDS)
+        );
+        assert_eq!(
+            resolve_total_budget(None, "  SMALL "),
+            Some(DEFAULT_CONSTRAINED_TOTAL_SECONDS)
+        );
+    }
+
+    #[test]
+    fn unconstrained_profiles_drive_to_full_coverage() {
+        // Proof/throughput/ci/unset keep the drive-to-completion behavior.
+        for profile in ["", "proof", "throughput", "ci", "unknown"] {
+            assert_eq!(
+                resolve_total_budget(None, profile),
+                None,
+                "profile={profile}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_total_budget_override_wins_on_any_profile() {
+        assert_eq!(resolve_total_budget(Some(120), "throughput"), Some(120));
+        assert_eq!(resolve_total_budget(Some(120), "proof"), Some(120));
+        // A zero override is ignored (falls back to profile default / none).
+        assert_eq!(resolve_total_budget(Some(0), "proof"), None);
+        assert_eq!(
+            resolve_total_budget(Some(0), "interactive"),
+            Some(DEFAULT_CONSTRAINED_TOTAL_SECONDS)
+        );
+    }
+
+    #[test]
+    fn throughput_is_zero_before_any_elapsed_time() {
+        assert_eq!(throughput_per_sec(100, 0.0), 0.0);
+        assert!((throughput_per_sec(100, 50.0) - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn eta_suffix_is_empty_without_rate_or_work() {
+        assert_eq!(eta_suffix(0.0, 100), "");
+        assert_eq!(eta_suffix(5.0, 0), "");
+        // 100 pending at 2/s = 50s.
+        assert_eq!(eta_suffix(2.0, 100), ", ETA 50s");
+    }
+
+    #[test]
+    fn duration_formats_scale_by_magnitude() {
+        assert_eq!(format_duration_secs(45), "45s");
+        assert_eq!(format_duration_secs(125), "2m05s");
+        assert_eq!(format_duration_secs(3 * 3600 + 4 * 60 + 9), "3h04m");
     }
 }
