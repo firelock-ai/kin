@@ -4785,7 +4785,7 @@ fn query_backed_tracked_file_score(path: &str, term_lower: &str) -> Option<f32> 
     }
 
     let basename_exact_segment = basename_lower
-        .split(|ch: char| matches!(ch, '/' | '.' | '_' | '-'))
+        .split(['/', '.', '_', '-'])
         .filter(|segment| !segment.is_empty())
         .any(|segment| segment == term_lower);
     if basename_exact_segment {
@@ -4794,7 +4794,7 @@ fn query_backed_tracked_file_score(path: &str, term_lower: &str) -> Option<f32> 
 
     let path_lower = path.to_ascii_lowercase();
     let exact_segment = path_lower
-        .split(|ch: char| matches!(ch, '/' | '.' | '_' | '-'))
+        .split(['/', '.', '_', '-'])
         .filter(|segment| !segment.is_empty())
         .any(|segment| segment == term_lower);
     if exact_segment && is_manifest_like_basename(&basename_lower) {
@@ -14431,7 +14431,7 @@ fn explain_line_score(reason: &str) -> f32 {
     if let Some(idx) = reason.find("(score ") {
         let rest = &reason[idx + 7..];
         let end = rest
-            .find(|c: char| c == ',' || c == ')')
+            .find([',', ')'])
             .unwrap_or(rest.len());
         return rest[..end].trim().parse::<f32>().unwrap_or(-1.0);
     }
