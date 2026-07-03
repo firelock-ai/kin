@@ -397,7 +397,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon locate error (HTTP {}): {}", status, body);
         }
-        Ok(resp.json().await.context("parse daemon locate response")?)
+        resp.json().await.context("parse daemon locate response")
     }
 
     pub async fn search(
@@ -417,7 +417,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon search error (HTTP {}): {}", status, body);
         }
-        Ok(resp.json().await.context("parse daemon search response")?)
+        resp.json().await.context("parse daemon search response")
     }
 
     pub async fn support(&self) -> Result<crate::commands::support::SupportJson> {
@@ -432,7 +432,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon support error (HTTP {}): {}", status, body);
         }
-        Ok(resp.json().await.context("parse daemon support response")?)
+        resp.json().await.context("parse daemon support response")
     }
 
     pub async fn context(
@@ -452,7 +452,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon context error (HTTP {}): {}", status, body);
         }
-        Ok(resp.json().await.context("parse daemon context response")?)
+        resp.json().await.context("parse daemon context response")
     }
 
     pub async fn trace(
@@ -472,7 +472,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon trace error (HTTP {}): {}", status, body);
         }
-        Ok(resp.json().await.context("parse daemon trace response")?)
+        resp.json().await.context("parse daemon trace response")
     }
 
     pub async fn impact(
@@ -492,7 +492,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon impact error (HTTP {}): {}", status, body);
         }
-        Ok(resp.json().await.context("parse daemon impact response")?)
+        resp.json().await.context("parse daemon impact response")
     }
 
     pub async fn review(
@@ -512,7 +512,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon review error (HTTP {}): {}", status, body);
         }
-        Ok(resp.json().await.context("parse daemon review response")?)
+        resp.json().await.context("parse daemon review response")
     }
 
     pub async fn embed(
@@ -555,7 +555,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon embed error (HTTP {}): {}", status, body);
         }
-        Ok(resp.json().await.context("parse daemon embed response")?)
+        resp.json().await.context("parse daemon embed response")
     }
 
     pub async fn blame(
@@ -575,7 +575,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon blame error (HTTP {}): {}", status, body);
         }
-        Ok(resp.json().await.context("parse daemon blame response")?)
+        resp.json().await.context("parse daemon blame response")
     }
 
     pub async fn history(
@@ -595,7 +595,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon history error (HTTP {}): {}", status, body);
         }
-        Ok(resp.json().await.context("parse daemon history response")?)
+        resp.json().await.context("parse daemon history response")
     }
 
     pub async fn verify_run(
@@ -615,10 +615,10 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon verify run error (HTTP {}): {}", status, body);
         }
-        Ok(resp
+        resp
             .json()
             .await
-            .context("parse daemon verify run response")?)
+            .context("parse daemon verify run response")
     }
 
     pub async fn verify_command(
@@ -638,7 +638,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon verify error (HTTP {}): {}", status, body);
         }
-        Ok(resp.json().await.context("parse daemon verify response")?)
+        resp.json().await.context("parse daemon verify response")
     }
 
     pub async fn reconcile(
@@ -658,10 +658,10 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon reconcile error (HTTP {}): {}", status, body);
         }
-        Ok(resp
+        resp
             .json()
             .await
-            .context("parse daemon reconcile response")?)
+            .context("parse daemon reconcile response")
     }
 
     pub async fn command_status(
@@ -681,10 +681,10 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon command status error (HTTP {}): {}", status, body);
         }
-        Ok(resp
+        resp
             .json()
             .await
-            .context("parse daemon command status response")?)
+            .context("parse daemon command status response")
     }
 
     pub async fn command_resources(
@@ -704,10 +704,10 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon command resources error (HTTP {}): {}", status, body);
         }
-        Ok(resp
+        resp
             .json()
             .await
-            .context("parse daemon command resources response")?)
+            .context("parse daemon command resources response")
     }
 
     pub async fn graph_command(
@@ -727,10 +727,10 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon graph command error (HTTP {}): {}", status, body);
         }
-        Ok(resp
+        resp
             .json()
             .await
-            .context("parse daemon graph command response")?)
+            .context("parse daemon graph command response")
     }
 
     pub async fn overview(
@@ -750,10 +750,10 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon overview error (HTTP {}): {}", status, body);
         }
-        Ok(resp
+        resp
             .json()
             .await
-            .context("parse daemon overview response")?)
+            .context("parse daemon overview response")
     }
 
     pub async fn dead_code(
@@ -773,10 +773,10 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon dead-code error (HTTP {}): {}", status, body);
         }
-        Ok(resp
+        resp
             .json()
             .await
-            .context("parse daemon dead-code response")?)
+            .context("parse daemon dead-code response")
     }
 
     pub async fn dead_code_seeded(
@@ -796,10 +796,10 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon seeded dead-code error (HTTP {}): {}", status, body);
         }
-        Ok(resp
+        resp
             .json()
             .await
-            .context("parse daemon seeded dead-code response")?)
+            .context("parse daemon seeded dead-code response")
     }
 
     pub async fn trace_data_flow(
@@ -819,10 +819,10 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon trace-data-flow error (HTTP {}): {}", status, body);
         }
-        Ok(resp
+        resp
             .json()
             .await
-            .context("parse daemon trace-data-flow response")?)
+            .context("parse daemon trace-data-flow response")
     }
 
     pub async fn refs(
@@ -842,7 +842,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon refs error (HTTP {}): {}", status, body);
         }
-        Ok(resp.json().await.context("parse daemon refs response")?)
+        resp.json().await.context("parse daemon refs response")
     }
 
     pub async fn bulk_refs(
@@ -862,10 +862,10 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon bulk-refs error (HTTP {}): {}", status, body);
         }
-        Ok(resp
+        resp
             .json()
             .await
-            .context("parse daemon bulk-refs response")?)
+            .context("parse daemon bulk-refs response")
     }
 
     pub async fn xref(
@@ -885,7 +885,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon xref error (HTTP {}): {}", status, body);
         }
-        Ok(resp.json().await.context("parse daemon xref response")?)
+        resp.json().await.context("parse daemon xref response")
     }
 
     pub async fn diff(
@@ -905,7 +905,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon diff error (HTTP {}): {}", status, body);
         }
-        Ok(resp.json().await.context("parse daemon diff response")?)
+        resp.json().await.context("parse daemon diff response")
     }
 
     pub async fn log(
@@ -925,7 +925,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon log error (HTTP {}): {}", status, body);
         }
-        Ok(resp.json().await.context("parse daemon log response")?)
+        resp.json().await.context("parse daemon log response")
     }
 
     pub async fn audit(
@@ -945,7 +945,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon audit error (HTTP {}): {}", status, body);
         }
-        Ok(resp.json().await.context("parse daemon audit response")?)
+        resp.json().await.context("parse daemon audit response")
     }
 
     pub async fn approvals(
@@ -965,10 +965,10 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon approvals error (HTTP {}): {}", status, body);
         }
-        Ok(resp
+        resp
             .json()
             .await
-            .context("parse daemon approvals response")?)
+            .context("parse daemon approvals response")
     }
 
     pub async fn security(
@@ -988,10 +988,10 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon security error (HTTP {}): {}", status, body);
         }
-        Ok(resp
+        resp
             .json()
             .await
-            .context("parse daemon security response")?)
+            .context("parse daemon security response")
     }
 
     pub async fn branch(
@@ -1011,7 +1011,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon branch error (HTTP {}): {}", status, body);
         }
-        Ok(resp.json().await.context("parse daemon branch response")?)
+        resp.json().await.context("parse daemon branch response")
     }
 
     pub async fn checkout(
@@ -1031,10 +1031,10 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon checkout error (HTTP {}): {}", status, body);
         }
-        Ok(resp
+        resp
             .json()
             .await
-            .context("parse daemon checkout response")?)
+            .context("parse daemon checkout response")
     }
 
     pub async fn rename(
@@ -1054,7 +1054,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon rename error (HTTP {}): {}", status, body);
         }
-        Ok(resp.json().await.context("parse daemon rename response")?)
+        resp.json().await.context("parse daemon rename response")
     }
 
     pub async fn session_workspace(
@@ -1074,10 +1074,10 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon session workspace error (HTTP {}): {}", status, body);
         }
-        Ok(resp
+        resp
             .json()
             .await
-            .context("parse daemon session workspace response")?)
+            .context("parse daemon session workspace response")
     }
 
     pub async fn exec(
@@ -1097,7 +1097,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon exec error (HTTP {}): {}", status, body);
         }
-        Ok(resp.json().await.context("parse daemon exec response")?)
+        resp.json().await.context("parse daemon exec response")
     }
 
     pub async fn work(
@@ -1117,7 +1117,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon work error (HTTP {}): {}", status, body);
         }
-        Ok(resp.json().await.context("parse daemon work response")?)
+        resp.json().await.context("parse daemon work response")
     }
 
     pub async fn note(
@@ -1137,7 +1137,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon note error (HTTP {}): {}", status, body);
         }
-        Ok(resp.json().await.context("parse daemon note response")?)
+        resp.json().await.context("parse daemon note response")
     }
 
     pub async fn set_scope(&self, session_id: &str, ref_string: &str) -> Result<ScopeResponse> {
@@ -1154,7 +1154,7 @@ impl DaemonClient {
             let body = resp.text().await.unwrap_or_default();
             bail!("daemon error (HTTP {}): {}", status, body);
         }
-        Ok(resp.json().await.context("parse scope response")?)
+        resp.json().await.context("parse scope response")
     }
 
     pub async fn clear_scope(&self, session_id: &str) -> Result<()> {
@@ -1922,7 +1922,7 @@ async fn wait_for_daemon_ready(
             match client.get(format!("{base_url}/readiness")).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     let health_result: Result<HealthResponse> = async {
-                        Ok(client
+                        client
                             .get(format!("{base_url}/health"))
                             .send()
                             .await
@@ -1931,7 +1931,7 @@ async fn wait_for_daemon_ready(
                             .context("daemon health returned an error")?
                             .json()
                             .await
-                            .context("parse daemon health response")?)
+                            .context("parse daemon health response")
                     }
                     .await;
                     match health_result.and_then(|health| {
