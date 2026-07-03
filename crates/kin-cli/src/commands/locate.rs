@@ -7535,7 +7535,7 @@ fn extract_multihop_signals(
                 continue;
             };
             let start = GraphNodeId::Artifact(start_artifact_id);
-            let mut visited = HashSet::from([start.clone()]);
+            let mut visited = HashSet::from([start]);
             let mut queue = VecDeque::from([(start, seed_path.clone(), 0usize)]);
             let seed_strength = (*seed_score / 72.0).clamp(0.35, 2.0);
 
@@ -7602,7 +7602,7 @@ fn extract_multihop_signals(
                         spans: vec![],
                     });
 
-                    if visited.insert(next.clone()) {
+                    if visited.insert(next) {
                         queue.push_back((next, path, depth + 1));
                     }
                 }
@@ -9672,7 +9672,7 @@ fn resolve_entities_to_files(
             // retained set so it never double-counts an entity.
             if locate_env_bool("KIN_LOCATE_BODY_SEED_PROTECT", false) {
                 let retained_ids: HashSet<kin_model::EntityId> =
-                    retained.iter().map(|pair| pair.0.clone()).collect();
+                    retained.iter().map(|pair| *pair.0).collect();
                 for seed in seeds[cut_at..].iter() {
                     if seed.1.signals.contains(&"body") && !retained_ids.contains(seed.0) {
                         retained.push(*seed);
@@ -9820,7 +9820,7 @@ fn resolve_entities_to_files(
                 graph.artifact_id_for_path(&kin_model::FilePathId::new(fo.0.as_str()));
             if let Some(start_artifact_id) = start_artifact_id {
                 let start_artifact = GraphNodeId::Artifact(start_artifact_id);
-                let mut visited_artifacts = HashSet::from([start_artifact.clone()]);
+                let mut visited_artifacts = HashSet::from([start_artifact]);
                 let mut artifact_frontier_queue =
                     VecDeque::from([(start_artifact, fo.0.clone(), 0usize)]);
 
@@ -9903,7 +9903,7 @@ fn resolve_entities_to_files(
                             );
                         }
 
-                        if visited_artifacts.insert(next_artifact.clone()) {
+                        if visited_artifacts.insert(next_artifact) {
                             artifact_frontier_queue.push_back((next_artifact, path, depth + 1));
                         }
                     }
@@ -17479,7 +17479,7 @@ mod tests {
                 .upsert_relation(&Relation {
                     id: RelationId::new(),
                     kind: RelationKind::Includes,
-                    src: GraphNodeId::Artifact(iter_artifact.clone()),
+                    src: GraphNodeId::Artifact(iter_artifact),
                     dst: GraphNodeId::Artifact(target_artifact),
                     confidence: 1.0,
                     origin: RelationOrigin::Parsed,

@@ -1604,7 +1604,7 @@ fn stabilize_reparsed_file_entities(
 
         if let Some(old) = existing {
             parsed_entity.id = old.id;
-            parsed_entity.lineage_parent = old.lineage_parent.clone();
+            parsed_entity.lineage_parent = old.lineage_parent;
             parsed_entity.created_in = old.created_in;
             matched_old_entities.insert(old.id);
             remap.insert(parser_id, old.id);
