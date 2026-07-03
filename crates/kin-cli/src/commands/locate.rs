@@ -5834,7 +5834,7 @@ fn extract_traceback_signals(
         // still look like stdlib/venv noise.
         if let Some(ref path) = rel_path {
             hits.entry(path.clone()).or_default().push(FileHit {
-                score: score,
+                score,
                 spans: vec![[line, line]],
             });
         } else if is_stdlib_path(file_path) {
