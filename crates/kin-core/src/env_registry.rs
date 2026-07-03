@@ -188,6 +188,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_DAEMON_URL", kind: Kind::Url, default: "", sensitivity: Sensitivity::Operational, summary: "explicit daemon endpoint URL (skip local discovery)" },
     EnvVarSpec { name: "KIN_DAEMON_BIN", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "override path to the kin-daemon binary" },
     EnvVarSpec { name: "KIN_DAEMON_BIND_HOST", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "host/interface the daemon binds its HTTP endpoint to" },
+    EnvVarSpec { name: "KIN_DAEMON_STOP_TIMEOUT_SECS", kind: Kind::Secs, default: "30", sensitivity: Sensitivity::Operational, summary: "ceiling in seconds kin daemon stop waits for a signaled daemon to exit" },
     EnvVarSpec { name: "KIN_DAEMON_REQUIRE_TOKEN", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "require a bearer token for all daemon requests" },
     EnvVarSpec { name: "KIN_DAEMON_ALLOW_EXEC", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "permit the daemon to run exec commands" },
     EnvVarSpec { name: "KIN_DAEMON_WATCH_PID", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Operational, summary: "pid the daemon watches; it exits when that process dies" },

@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (383 total, 290 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (384 total, 290 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -87,6 +87,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_DAEMON_SCOPE_BUILD_TIMEOUT_SECS` | seconds>=0 | *(unset)* | operational | timeout for a daemon-side scope graph build |
 | `KIN_DAEMON_SHUTDOWN_GRACE_SECS` | seconds>=0 | 25 | operational | grace before the shutdown watchdog force-exits; 0 escalates immediately |
 | `KIN_DAEMON_STARTUP_LOCK_TIMEOUT_SECS` | seconds>=0 | *(unset)* | operational | how long to wait for the daemon startup lock |
+| `KIN_DAEMON_STOP_TIMEOUT_SECS` | seconds>=0 | 30 | operational | ceiling in seconds kin daemon stop waits for a signaled daemon to exit |
 | `KIN_DAEMON_URL` | url | *(unset)* | operational | explicit daemon endpoint URL (skip local discovery) |
 | `KIN_DAEMON_WATCH_PID` | usize | *(unset)* | operational | pid the daemon watches; it exits when that process dies |
 
