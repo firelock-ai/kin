@@ -3044,6 +3044,221 @@ mod tests {
         assert_eq!(reopened.live_document_count(), fixture_docs().len() + 1);
     }
 
+    // -----------------------------------------------------------------------
+    // Graduation soak: KIN_SEARCH_INCREMENTAL_PERSIST
+    //
+    // A long, seeded churn workload (interleaved upserts / updates / removes /
+    // commits) run through the incremental (segmented) persist path, asserting
+    // at intervals that the index reopened from disk is semantically identical
+    // to a full rebuild over the same live document set. This is the graduation
+    // evidence for flipping the gate default-on: correctness of incremental
+    // persistence across churn patterns, not just a single write.
+    //
+    // Bounded by a hard wall-clock cap so it can never run unbounded, and
+    // #[ignore]'d so the default suite never triggers it. No GPU, no daemon —
+    // pure in-process fs over a tempdir. Run:
+    //
+    //   cargo test -p kin-search --release \
+    //     incremental_persist_churn_soak_matches_full_rebuild -- --ignored --nocapture
+    // -----------------------------------------------------------------------
+
+    /// Deterministic, dependency-free xorshift64* PRNG so the churn workload is
+    /// fully reproducible from a single seed.
+    struct SoakRng(u64);
+
+    impl SoakRng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        /// Uniform-ish index in `0..n`. `n` must be non-zero.
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+    }
+
+    /// Small recurring vocabulary so generated documents share terms — this
+    /// makes the query battery exercise BM25 ranking and result *ordering*, not
+    /// just membership.
+    const SOAK_VOCAB: &[&str] = &[
+        "user", "parse", "cache", "index", "query", "graph", "token", "segment", "schema",
+        "render", "config", "auth", "buffer", "codec", "retry", "planner", "checksum", "template",
+        "loader", "validate", "builder", "eviction", "payload", "lookup",
+    ];
+
+    fn soak_word(rng: &mut SoakRng) -> &'static str {
+        SOAK_VOCAB[rng.below(SOAK_VOCAB.len())]
+    }
+
+    fn soak_gen_doc(rng: &mut SoakRng) -> TestDoc {
+        let a = soak_word(rng);
+        let b = soak_word(rng);
+        let c = soak_word(rng);
+        let name = format!("{a}_{b}_{c}");
+        TestDoc {
+            signature: format!("fn {name}()"),
+            file_path: format!("src/{a}/{b}.rs"),
+            kind: ["Function", "Struct", "Enum", "Trait"][rng.below(4)].to_string(),
+            name,
+        }
+    }
+
+    /// The battery every equivalence check runs against both indexes: every
+    /// vocabulary term (multi-hit, ranking-sensitive) plus guaranteed misses and
+    /// path fragments.
+    fn soak_queries() -> Vec<String> {
+        let mut q: Vec<String> = SOAK_VOCAB.iter().map(|w| (*w).to_string()).collect();
+        q.push("zzz_no_match".to_string());
+        q.push("src".to_string());
+        q.push("rs".to_string());
+        q
+    }
+
+    fn soak_query_results(idx: &TextIndex<TestId>, queries: &[String]) -> Vec<Vec<(TestId, f32)>> {
+        queries
+            .iter()
+            .map(|q| idx.fuzzy_search(q, 25).unwrap())
+            .collect()
+    }
+
+    /// Full rebuild reference: a fresh index built from scratch over the current
+    /// live set. In-memory (no path) so `commit` only promotes staged→live; the
+    /// existing golden test already proves a monolithic persist+reload is
+    /// retrieval-identical to in-memory, so this isolates the question under
+    /// test — does the *incrementally persisted, reopened* index match a rebuild?
+    fn soak_full_rebuild(live: &std::collections::BTreeMap<u64, TestDoc>) -> TextIndex<TestId> {
+        let idx = TextIndex::<TestId>::new();
+        for (id, doc) in live {
+            idx.upsert_searchable(TestId(*id), doc).unwrap();
+        }
+        idx.commit().unwrap();
+        idx
+    }
+
+    #[test]
+    #[ignore = "bounded churn soak; run explicitly for KIN_SEARCH_INCREMENTAL_PERSIST graduation evidence"]
+    fn incremental_persist_churn_soak_matches_full_rebuild() {
+        use std::collections::BTreeMap;
+        use std::time::{Duration, Instant};
+
+        fn env_usize(key: &str, default: usize) -> usize {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        }
+
+        let rounds = env_usize("KIN_SEARCH_SOAK_ROUNDS", 500);
+        let check_every = env_usize("KIN_SEARCH_SOAK_CHECK_EVERY", 25).max(1);
+        let max_live = env_usize("KIN_SEARCH_SOAK_MAX_LIVE", 1200).max(50);
+        let seed = std::env::var("KIN_SEARCH_SOAK_SEED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0x51ED_1233_2026_0703u64);
+        // Hard wall-clock cap: the loop can never run unbounded. Default 25 min,
+        // never above 30.
+        let cap_secs = env_usize("KIN_SEARCH_SOAK_SECS", 1500).min(1800) as u64;
+        let deadline = Instant::now() + Duration::from_secs(cap_secs);
+        let start = Instant::now();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("seg");
+        let mut idx = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+        // Exercise the segmented/incremental persist path deterministically,
+        // independent of the process-env default; spread churn over many
+        // segments so multi-segment incremental rewrite is genuinely stressed.
+        idx.incremental_enabled = true;
+        idx.seg.write().segment_count = 16;
+
+        let queries = soak_queries();
+        let mut rng = SoakRng(seed | 1);
+        let mut live: BTreeMap<u64, TestDoc> = BTreeMap::new();
+        let mut next_id: u64 = 1;
+        let mut total_ops: u64 = 0;
+        let mut checks: u64 = 0;
+        let mut rounds_done: usize = 0;
+        let mut stopped_early = false;
+
+        for round in 0..rounds {
+            let ops = 8 + rng.below(17); // 8..=24 mutations per round
+            for _ in 0..ops {
+                let roll = rng.below(100);
+                let force_remove = live.len() >= max_live;
+                if (force_remove || roll < 30) && !live.is_empty() {
+                    let victim = *live.keys().nth(rng.below(live.len())).unwrap();
+                    idx.remove(&TestId(victim)).unwrap();
+                    live.remove(&victim);
+                } else if roll < 55 && !live.is_empty() {
+                    let target = *live.keys().nth(rng.below(live.len())).unwrap();
+                    let doc = soak_gen_doc(&mut rng);
+                    idx.upsert_searchable(TestId(target), &doc).unwrap();
+                    live.insert(target, doc);
+                } else {
+                    let id = next_id;
+                    next_id += 1;
+                    let doc = soak_gen_doc(&mut rng);
+                    idx.upsert_searchable(TestId(id), &doc).unwrap();
+                    live.insert(id, doc);
+                }
+                total_ops += 1;
+            }
+            idx.commit().unwrap();
+            rounds_done = round + 1;
+
+            if rounds_done.is_multiple_of(check_every) || rounds_done == rounds {
+                // Reopen the incrementally persisted index straight from disk...
+                let reopened = TextIndex::<TestId>::open(Some(&dir)).unwrap();
+                // ...and compare to a from-scratch full rebuild over the live set.
+                let reference = soak_full_rebuild(&live);
+
+                assert_eq!(
+                    reopened.live_document_count(),
+                    live.len(),
+                    "reopened incremental live count drifted at round {rounds_done} (seed {seed:#x})"
+                );
+                assert_eq!(
+                    reference.live_document_count(),
+                    live.len(),
+                    "reference live count drifted at round {rounds_done}"
+                );
+                assert_eq!(
+                    soak_query_results(&reopened, &queries),
+                    soak_query_results(&reference, &queries),
+                    "reopened incremental index diverged from full rebuild at round {rounds_done} (seed {seed:#x})"
+                );
+                checks += 1;
+            }
+
+            if Instant::now() >= deadline {
+                stopped_early = true;
+                break;
+            }
+        }
+
+        let elapsed = start.elapsed();
+        if stopped_early {
+            println!(
+                "[soak] KIN_SEARCH_INCREMENTAL_PERSIST: wall-clock cap {cap_secs}s reached — \
+                 stopped at round {rounds_done}/{rounds}"
+            );
+        }
+        println!(
+            "[soak] KIN_SEARCH_INCREMENTAL_PERSIST: PASS — rounds={rounds_done} ops={total_ops} \
+             equivalence_checks={checks} live_final={} seed={seed:#x} elapsed={:.1}s",
+            live.len(),
+            elapsed.as_secs_f64()
+        );
+        assert!(
+            checks > 0,
+            "soak must perform at least one equivalence check"
+        );
+    }
+
     /// Truncating a referenced segment file is caught on load as a typed
     /// `CorruptIndex` (manifest archived for a clean reopen), NEVER served as a
     /// partial/garbled index. The torn-segment crash-consistency contract.
