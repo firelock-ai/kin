@@ -1054,6 +1054,42 @@ fn record_vector_index_degradation(
     );
 }
 
+/// Record the active hardware capability tier as a structured degradation when
+/// it runs below the full pipeline. `LocateProfile` silently scales retrieval
+/// quality with the machine's effective cores/RAM (shallower multihop, reranker
+/// / PRF / LTR off on smaller tiers); without this entry the same query returns
+/// different-quality results on different hardware with no in-band signal. On
+/// the `Performance` tier nothing is disabled and no entry is added.
+fn record_capability_tier_degradation(
+    profile: LocateProfile,
+    sink: &mut Vec<RetrievalDegradation>,
+) {
+    let disabled = profile.disabled_signals();
+    if disabled.is_empty() {
+        return;
+    }
+    record_degradation(
+        sink,
+        RetrievalDegradation {
+            component: "capability_tier".to_string(),
+            reason: profile.name().to_string(),
+            detail: format!(
+                "hardware capability tier '{}': {} disabled; multihop depth {}/{}, frontier {}/{}",
+                profile.name(),
+                disabled.join(", "),
+                profile.multihop_max_depth(),
+                LocateProfile::Performance.multihop_max_depth(),
+                profile.multihop_frontier_limit(),
+                LocateProfile::Performance.multihop_frontier_limit(),
+            ),
+            remediation:
+                "set KIN_LOCATE_PROFILE=performance to force the full pipeline, or run on a host \
+                 with >=8 cores and >=16GB RAM"
+                    .to_string(),
+        },
+    );
+}
+
 fn file_path_from_retrieval_key(
     graph: &kin_db::InMemoryGraph,
     key: &kin_db::RetrievalKey,
@@ -1383,6 +1419,9 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     let mut budget = LocateBudget::new();
     let pipeline_report = std::env::var("KIN_LOCATE_PIPELINE_REPORT").is_ok();
     let profile = LocateProfile::detect();
+    // Surface a hardware-driven quality downgrade in-band: on a sub-Performance
+    // tier some retrieval signals are off, and that must never be silent.
+    record_capability_tier_degradation(profile, &mut degradations);
     let test_query = is_test_query(text);
     let text_lower = text.to_ascii_lowercase();
     let source_text_priority_query = test_query

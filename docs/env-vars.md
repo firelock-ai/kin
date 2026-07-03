@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (389 total, 294 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (390 total, 294 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -133,6 +133,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_EMBED_HYBRID_CPU_MAX_SEQ_LEN` | usize | 256 | correctness | kin-db hybrid CPU lane cutoff: entities tokenized at or below this sequence length embed on the CPU twin, heavier ones on Metal; 0 or invalid falls back to 256 |
 | `KIN_EMBED_HYBRID_GPU_TPUT_RATIO` | float>=0 | *(unset)* | correctness | kin-db hybrid split ratio: pins the GPU:CPU throughput ratio for the balanced split; unset (or <= 0) measures it adaptively per batch |
 | `KIN_EMBED_MAX_PASSES` | usize | *(unset)* | operational | cap on embedding passes per embed run |
+| `KIN_EMBED_MAX_TOTAL_SECONDS` | seconds>=0 | 600 | operational | total wall-clock budget for a single `kin embed` under the interactive/small resource profiles; the run stops at the budget with a resumable partial index; unconstrained profiles ignore it |
 | `KIN_EMBED_PASS_SECONDS` | seconds>=0 | *(unset)* | operational | per-pass wall-clock budget for an embed run |
 
 ## Inference
