@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (385 total, 290 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (389 total, 294 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -248,6 +248,9 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_DEBUG_LIST_LIMIT` | usize | 12 | correctness | locate tuning knob: debug list limit |
 | `KIN_LOCATE_DEBUG_PRECAP_LIMIT` | usize | unbounded | correctness | locate tuning knob: debug precap limit |
 | `KIN_LOCATE_DEBUG_STAGE_LIMIT` | usize | 12 | correctness | locate tuning knob: debug stage limit |
+| `KIN_LOCATE_DECLARATION_CUTOFF` | bool | context-dependent | correctness | locate tuning knob: declaration cutoff |
+| `KIN_LOCATE_DECLARATION_CUTOFF_GAP` | float>=0 | 2.0 | correctness | locate tuning knob: declaration cutoff gap |
+| `KIN_LOCATE_DECLARATION_CUTOFF_MIN_KEEP` | usize | 1 | correctness | locate tuning knob: declaration cutoff min keep |
 | `KIN_LOCATE_DECL_SOURCE_SEED_BOOST` | float>=0 | 1.05 | correctness | locate tuning knob: decl source seed boost |
 | `KIN_LOCATE_DECL_SOURCE_SIBLING_LIMIT` | usize | 6 | correctness | locate tuning knob: decl source sibling limit |
 | `KIN_LOCATE_DECL_SOURCE_TOP_FLOOR` | float>=0 | 0.46 | correctness | locate tuning knob: decl source top floor |
@@ -268,6 +271,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_ENRICH_EMPTY_FILES` | bool | true | correctness | locate tuning knob: enrich empty files |
 | `KIN_LOCATE_ENRICH_TOPK` | usize | 3 | correctness | locate tuning knob: enrich topk |
 | `KIN_LOCATE_ENTITY_BEARING_MODULE_INFRA_PENALTY` | float>=0 | 0.6 | correctness | locate tuning knob: entity bearing module infra penalty |
+| `KIN_LOCATE_ENTITY_CAP` | usize | DEFAULT_ENTITY_PAGE_SIZE | correctness | locate tuning knob: entity cap |
 | `KIN_LOCATE_ENTITY_DOMINANT_EMBEDDING_WEIGHT` | float>=0 | 2.0 | correctness | locate tuning knob: entity dominant embedding weight |
 | `KIN_LOCATE_ENTITY_DOMINANT_GAP_MIN` | float>=0 | 0.15 | correctness | locate tuning knob: entity dominant gap min |
 | `KIN_LOCATE_ENTITY_DOMINANT_OTHER_CEILING` | float>=0 | 0.4 | correctness | locate tuning knob: entity dominant other ceiling |
