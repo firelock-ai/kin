@@ -600,10 +600,23 @@ impl MetalGovernorPlan {
 
 /// Detect host topology. `rayon_threads`/`reserve_logical_cores`/`blas_threads`
 /// are defaulted here and finalized by [`ResourcePlan::for_profile`].
+///
+/// `logical_cores` is the effective schedulable core count: the host topology
+/// (`available_parallelism`) capped by a container CPU quota when one is set
+/// (cgroup v2 `cpu.max` / v1 CFS quota). Inside a `--cpus 2` container this is 2
+/// even though the process still sees every host core, so the derived
+/// `rayon_threads` and embedding working-set never over-provision against a CFS
+/// quota. A bare-metal host with no quota keeps the raw host count unchanged.
 pub fn detect_host() -> HostInfo {
-    let logical_cores = std::thread::available_parallelism()
+    let host_logical = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
+    // A cgroup CPU quota caps the effective cores below the host topology; with
+    // no quota (bare metal, or an unlimited group) keep the host count exactly.
+    let logical_cores = match detect_cgroup_cpu_quota() {
+        Some(quota) => host_logical.min(quota).max(1),
+        None => host_logical,
+    };
     let (physical_cores, performance_cores, efficiency_cores) = detect_core_topology();
     HostInfo {
         arch: std::env::consts::ARCH.to_string(),
@@ -646,13 +659,28 @@ fn detect_core_topology() -> (Option<usize>, Option<usize>, Option<usize>) {
     (None, None, None)
 }
 
-/// Detect total system memory. Other fields are best-effort `None`.
+/// Detect total system memory. `system_total_bytes` is the effective memory
+/// budget: the host physical total, capped by a container memory limit when one
+/// is set (cgroup v2 `memory.max` / v1 `memory.limit_in_bytes`). Other fields
+/// are best-effort `None`.
 pub fn detect_memory() -> MemoryInfo {
     MemoryInfo {
-        system_total_bytes: detect_system_total_bytes(),
+        system_total_bytes: detect_effective_total_bytes(),
         system_available_bytes: None,
         max_process_rss_bytes: None,
         hot_graph_budget_bytes: None,
+    }
+}
+
+/// Effective total-memory budget: a container `memory.max` cap when present
+/// (kept below the true host RAM if both are known), otherwise the historical
+/// host detection. A bare-metal host with no cgroup limit is unchanged — macOS
+/// reports `hw.memsize`, Linux reports `None` — so the plan only diverges from
+/// host topology when a real container cap exists.
+fn detect_effective_total_bytes() -> Option<u64> {
+    match detect_cgroup_memory_limit() {
+        Some(limit) => Some(detect_host_total_bytes().map_or(limit, |host| limit.min(host))),
+        None => detect_system_total_bytes(),
     }
 }
 
@@ -671,6 +699,159 @@ fn detect_system_total_bytes() -> Option<u64> {
 #[cfg(not(target_os = "macos"))]
 fn detect_system_total_bytes() -> Option<u64> {
     None
+}
+
+// ---------------------------------------------------------------------------
+// Container (cgroup) quota detection — Linux only
+// ---------------------------------------------------------------------------
+//
+// `detect_host`/`detect_memory` build the plan from the effective container
+// budget, not raw host topology, so a Kin process inside a CFS-quota'd container
+// does not over-provision rayon/BLAS threads or embedding working-set ~5x. The
+// FS-reading probes are Linux-only and return `None` when no quota is set (an
+// unlimited group, absent files, or off-Linux), which keeps every bare-metal
+// host on its historical detection. The string/number parsing is factored into
+// pure helpers so the quota arithmetic is unit-tested on any platform.
+
+/// Effective CPU count from a container CPU quota, or `None` when unlimited,
+/// unset, unparsable, or off Linux.
+#[cfg(target_os = "linux")]
+fn detect_cgroup_cpu_quota() -> Option<usize> {
+    // cgroup v2 unified hierarchy: `cpu.max` is "<quota> <period>" (microseconds)
+    // or "max <period>" when unthrottled.
+    if let Ok(contents) = std::fs::read_to_string("/sys/fs/cgroup/cpu.max") {
+        if let Some(cores) = parse_cgroup_v2_cpu_max(&contents) {
+            return Some(cores);
+        }
+        // A present v2 file that parsed to no cap ("max ...") is authoritative;
+        // do not fall through to stale v1 files in a hybrid tree.
+        if contents.trim_start().starts_with("max") {
+            return None;
+        }
+    }
+    // cgroup v1: cpu.cfs_quota_us / cpu.cfs_period_us.
+    let quota = read_i64_file("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")?;
+    let period = read_i64_file("/sys/fs/cgroup/cpu/cpu.cfs_period_us")?;
+    parse_cgroup_v1_cpu_quota(quota, period)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_cgroup_cpu_quota() -> Option<usize> {
+    None
+}
+
+/// Effective memory-limit bytes from a container memory cap, or `None` when
+/// unlimited, unset, unparsable, or off Linux.
+#[cfg(target_os = "linux")]
+fn detect_cgroup_memory_limit() -> Option<u64> {
+    // cgroup v2: `memory.max` is a byte count or "max". A readable v2 file is
+    // authoritative (its "max" means no cap), so only fall to v1 when absent.
+    if let Ok(contents) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        return parse_cgroup_v2_memory_max(&contents);
+    }
+    // cgroup v1: memory.limit_in_bytes reports a huge page-aligned sentinel when
+    // unlimited, which parse_cgroup_v1_memory_limit rejects.
+    let raw = read_u64_file("/sys/fs/cgroup/memory/memory.limit_in_bytes")?;
+    parse_cgroup_v1_memory_limit(raw)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_cgroup_memory_limit() -> Option<u64> {
+    None
+}
+
+/// True host physical RAM, used only to keep a container cap below real RAM. On
+/// Linux this reads `/proc/meminfo` (the host detection returns `None`); off
+/// Linux the container branch never runs, so `None` is never observed.
+#[cfg(target_os = "linux")]
+fn detect_host_total_bytes() -> Option<u64> {
+    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_host_total_bytes() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn read_i64_file(path: &str) -> Option<i64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn read_u64_file(path: &str) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Whole-core count for a cgroup v2 `cpu.max` value ("<quota> <period>" in
+/// microseconds, or "max <period>" for unlimited). Rounds a fractional quota up
+/// so a sub-core allotment still yields one schedulable core; `None` when
+/// unlimited or unparsable.
+#[cfg(any(target_os = "linux", test))]
+fn parse_cgroup_v2_cpu_max(contents: &str) -> Option<usize> {
+    let mut fields = contents.split_whitespace();
+    let quota = fields.next()?;
+    if quota == "max" {
+        return None;
+    }
+    let quota: u64 = quota.parse().ok()?;
+    let period: u64 = fields
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(100_000);
+    cores_from_quota(quota, period)
+}
+
+/// Whole-core count for cgroup v1 CFS `quota`/`period` (microseconds). A quota
+/// of -1 (or any non-positive quota/period) means unlimited → `None`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_cgroup_v1_cpu_quota(quota_us: i64, period_us: i64) -> Option<usize> {
+    if quota_us <= 0 || period_us <= 0 {
+        return None;
+    }
+    cores_from_quota(quota_us as u64, period_us as u64)
+}
+
+/// Round `quota / period` up to whole cores, clamped to at least 1. `None` on a
+/// zero period.
+#[cfg(any(target_os = "linux", test))]
+fn cores_from_quota(quota: u64, period: u64) -> Option<usize> {
+    if period == 0 {
+        return None;
+    }
+    let cores = quota.div_ceil(period);
+    Some((cores as usize).max(1))
+}
+
+/// Byte limit from a cgroup v2 `memory.max` value, or `None` for "max"
+/// (unlimited) / unparsable.
+#[cfg(any(target_os = "linux", test))]
+fn parse_cgroup_v2_memory_max(contents: &str) -> Option<u64> {
+    let trimmed = contents.trim();
+    if trimmed == "max" {
+        return None;
+    }
+    trimmed.parse().ok()
+}
+
+/// Byte limit from a cgroup v1 `memory.limit_in_bytes`. The kernel reports an
+/// unconstrained group as a huge page-aligned sentinel (near `u64::MAX`); any
+/// value at or above 1 PiB is that sentinel, not a real container cap.
+#[cfg(any(target_os = "linux", test))]
+fn parse_cgroup_v1_memory_limit(raw: u64) -> Option<u64> {
+    const ONE_PIB: u64 = 1 << 50;
+    if raw >= ONE_PIB {
+        None
+    } else {
+        Some(raw)
+    }
 }
 
 /// Best-effort GPU core count via the IORegistry `gpu-core-count` property
@@ -1519,5 +1700,59 @@ mod tests {
             back.metal_governor.resident_stack_budget_bytes,
             RESIDENT_STACK_ABS_CEILING_BYTES
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Container (cgroup) quota parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cgroup_v2_cpu_max_parses_quota_and_period() {
+        // 200ms per 100ms period = 2 whole cores (the SMALL-profile rig case).
+        assert_eq!(parse_cgroup_v2_cpu_max("200000 100000"), Some(2));
+        // A period-only default (no second field) assumes the 100ms kernel default.
+        assert_eq!(parse_cgroup_v2_cpu_max("400000"), Some(4));
+    }
+
+    #[test]
+    fn cgroup_v2_cpu_max_rounds_fractional_quota_up_to_one_core() {
+        // Half a core still needs one schedulable thread, never zero.
+        assert_eq!(parse_cgroup_v2_cpu_max("50000 100000"), Some(1));
+        // 1.5 cores rounds up to 2.
+        assert_eq!(parse_cgroup_v2_cpu_max("150000 100000"), Some(2));
+    }
+
+    #[test]
+    fn cgroup_v2_cpu_max_unlimited_and_garbage_are_none() {
+        assert_eq!(parse_cgroup_v2_cpu_max("max 100000"), None);
+        assert_eq!(parse_cgroup_v2_cpu_max("max"), None);
+        assert_eq!(parse_cgroup_v2_cpu_max(""), None);
+        assert_eq!(parse_cgroup_v2_cpu_max("not-a-number 100000"), None);
+    }
+
+    #[test]
+    fn cgroup_v1_cpu_quota_parses_and_treats_negative_as_unlimited() {
+        assert_eq!(parse_cgroup_v1_cpu_quota(200000, 100000), Some(2));
+        // The v1 "no limit" sentinel is -1.
+        assert_eq!(parse_cgroup_v1_cpu_quota(-1, 100000), None);
+        assert_eq!(parse_cgroup_v1_cpu_quota(0, 100000), None);
+        assert_eq!(parse_cgroup_v1_cpu_quota(200000, 0), None);
+    }
+
+    #[test]
+    fn cgroup_v2_memory_max_parses_bytes_and_unlimited() {
+        assert_eq!(parse_cgroup_v2_memory_max("4294967296"), Some(4 * GIB));
+        assert_eq!(parse_cgroup_v2_memory_max("  4294967296\n"), Some(4 * GIB));
+        assert_eq!(parse_cgroup_v2_memory_max("max"), None);
+        assert_eq!(parse_cgroup_v2_memory_max("max\n"), None);
+    }
+
+    #[test]
+    fn cgroup_v1_memory_limit_rejects_unlimited_sentinel() {
+        // A real container cap passes through.
+        assert_eq!(parse_cgroup_v1_memory_limit(4 * GIB), Some(4 * GIB));
+        // The kernel's page-aligned "unlimited" sentinel (~8 EiB) is not a cap.
+        assert_eq!(parse_cgroup_v1_memory_limit(0x7FFF_FFFF_FFFF_F000), None);
+        assert_eq!(parse_cgroup_v1_memory_limit(u64::MAX), None);
     }
 }
