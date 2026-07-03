@@ -130,6 +130,7 @@ pub async fn run_health_checks() -> HealthReport {
         check_shell_path(),
     ];
     checks.extend(check_mcp_clients());
+    checks.push(check_setup_ledger());
     checks.push(check_editor());
     checks.push(check_kinlab_connect());
     checks.push(check_semantic_query_readiness().await);
@@ -609,6 +610,83 @@ fn check_mcp_clients() -> Vec<HealthCheck> {
         .collect()
 }
 
+/// Verify the install ledger against current disk state: are the artifacts
+/// `kin setup` recorded still present and unmodified?
+///
+/// This is informational and recoverable by construction — it never reports
+/// Missing/Misconfigured, so a drifted ledger does not flip first-run readiness
+/// to broken. No ledger yet (setup not run) is Unsupported; drift (removed or
+/// user-modified artifacts) is Stale with a remediation hint.
+fn check_setup_ledger() -> HealthCheck {
+    use crate::commands::setup_ledger::{ledger_path, verify_ledger, EntryState};
+
+    let path = match ledger_path() {
+        Ok(p) => p,
+        Err(e) => {
+            return HealthCheck::new(
+                "setup_ledger",
+                "Install ledger",
+                HealthStatus::Unsupported,
+                format!("could not resolve ledger path: {e}"),
+            );
+        }
+    };
+
+    let verifications = match verify_ledger(&path) {
+        Ok(v) => v,
+        Err(_) => {
+            return HealthCheck::new(
+                "setup_ledger",
+                "Install ledger",
+                HealthStatus::Stale,
+                format!(
+                    "install ledger at {} is unreadable or corrupt",
+                    path.display()
+                ),
+            )
+            .with_manual_fix("remove the ledger file and re-run `kin setup` to rebuild it");
+        }
+    };
+
+    if verifications.is_empty() {
+        return HealthCheck::new(
+            "setup_ledger",
+            "Install ledger",
+            HealthStatus::Unsupported,
+            "no install ledger yet — run `kin setup` to record what gets installed",
+        );
+    }
+
+    let total = verifications.len();
+    let modified = verifications
+        .iter()
+        .filter(|v| matches!(v.state, EntryState::Modified))
+        .count();
+    let removed = verifications
+        .iter()
+        .filter(|v| matches!(v.state, EntryState::Removed))
+        .count();
+
+    if modified == 0 && removed == 0 {
+        HealthCheck::new(
+            "setup_ledger",
+            "Install ledger",
+            HealthStatus::Healthy,
+            format!("{total} artifact(s) tracked, all present and unmodified"),
+        )
+    } else {
+        HealthCheck::new(
+            "setup_ledger",
+            "Install ledger",
+            HealthStatus::Stale,
+            format!("{total} tracked: {removed} removed, {modified} modified since install"),
+        )
+        .with_manual_fix(
+            "`kin setup ledger` for detail; `kin setup` re-applies removed artifacts; `kin setup uninstall` removes tracked ones",
+        )
+    }
+}
+
 fn check_editor() -> HealthCheck {
     let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
     let extensions_glob = home.as_ref().map(|h| h.join(".vscode").join("extensions"));
@@ -787,6 +865,7 @@ mod tests {
         assert!(json.contains("\"daemon_running\""));
         assert!(json.contains("\"vfs_projection\""));
         assert!(json.contains("\"shell_path\""));
+        assert!(json.contains("\"setup_ledger\""));
         assert!(json.contains("\"platform\""));
         assert!(json.contains("\"healthy\""));
         assert!(json.contains("\"retrieval_profile\""));

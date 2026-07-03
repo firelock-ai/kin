@@ -980,6 +980,22 @@ fn has_kin_mcp_config(path: &PathBuf) -> bool {
 // Shell hook installation
 // ---------------------------------------------------------------------------
 
+/// The `source <hook>` line Kin adds to a shell rc file (`.` for PowerShell).
+fn rc_source_line(shell_name: &str, hook_file: &Path) -> String {
+    if shell_name == "powershell" {
+        format!(". {}", hook_file.display())
+    } else {
+        format!("source {}", hook_file.display())
+    }
+}
+
+/// The exact block Kin appends to a shell rc file (comment + source line). This
+/// is the slice Kin owns; the install ledger fingerprints it so uninstall can
+/// excise precisely it.
+fn rc_integration_block(source_line: &str) -> String {
+    format!("\n# kin-vfs shell integration\n{source_line}\n")
+}
+
 fn install_shell_hook(shell_name: &str) -> Result<(PathBuf, String)> {
     let kin_home = kin_dir()?;
     let shell_dir = kin_home.join("shell");
@@ -1016,11 +1032,7 @@ fn install_shell_hook(shell_name: &str) -> Result<(PathBuf, String)> {
         println!("    cargo build --release -p kin-vfs-shim");
     }
 
-    let source_line = if shell_name == "powershell" {
-        format!(". {}", hook_file.display())
-    } else {
-        format!("source {}", hook_file.display())
-    };
+    let source_line = rc_source_line(shell_name, &hook_file);
 
     let rc_path = shell_rc(shell_name)?;
     let already_installed = if rc_path.exists() {
@@ -1045,7 +1057,7 @@ fn install_shell_hook(shell_name: &str) -> Result<(PathBuf, String)> {
         if !rc_content.ends_with('\n') && !rc_content.is_empty() {
             rc_content.push('\n');
         }
-        rc_content.push_str(&format!("\n# kin-vfs shell integration\n{source_line}\n"));
+        rc_content.push_str(&rc_integration_block(&source_line));
         fs::write(&rc_path, &rc_content)
             .with_context(|| format!("failed to update {}", rc_path.display()))?;
         println!("  Appended to {}", rc_path.display());
@@ -1457,7 +1469,146 @@ async fn apply_plan(
         }
     );
 
+    // Record what we wrote into the install ledger so `kin doctor` can verify it
+    // and `kin setup uninstall` can remove exactly it.
+    record_setup_ledger(plan, shell_name);
+
     Ok(configured_assistants)
+}
+
+/// Stable ledger id for an AI-client index, matching the ids used by
+/// [`crate::commands::health::mcp_client_config_paths`].
+fn client_id_for_index(idx: usize) -> &'static str {
+    match idx {
+        IDX_CLAUDE_CODE => "claude",
+        IDX_CURSOR => "cursor",
+        IDX_CODEX => "codex",
+        IDX_GEMINI => "gemini",
+        IDX_WINDSURF => "windsurf",
+        _ => "unknown",
+    }
+}
+
+/// Read the `mcpServers.kin` sub-value from a client config, if present.
+fn read_kin_mcp_entry(path: &Path) -> Option<serde_json::Value> {
+    let content = fs::read_to_string(path).ok()?;
+    let root: serde_json::Value = serde_json::from_str(&content).ok()?;
+    root.get("mcpServers")?.get("kin").cloned()
+}
+
+/// Record everything the applied [`SetupPlan`] wrote into the install ledger.
+///
+/// Re-derives each artifact from final on-disk state and upserts it, preserving
+/// original install timestamps across idempotent re-runs. Ledger failures are
+/// non-fatal: setup already succeeded, so a ledger write error is a warning, not
+/// a setup failure.
+fn record_setup_ledger(plan: &SetupPlan, shell_name: &str) {
+    use crate::commands::setup_ledger::{ArtifactKind, LedgerEntry, SetupLedger};
+
+    let Ok(ledger_path) = crate::commands::setup_ledger::ledger_path() else {
+        return;
+    };
+    let mut ledger = SetupLedger::load(&ledger_path).unwrap_or_default();
+
+    if plan.install_shell_hook {
+        if let Ok(kin_home) = kin_dir() {
+            // Shell hook file — a whole file Kin owns.
+            let hook_file = kin_home.join("shell").join(hook_filename(shell_name));
+            ledger.record(LedgerEntry::whole_file(
+                ArtifactKind::ShellHook,
+                shell_name,
+                hook_file.clone(),
+                hook_content(shell_name).as_bytes(),
+            ));
+
+            // VFS shim — a whole file, recorded only when a usable one landed.
+            let shim = kin_home.join("lib").join(shim_filename());
+            if let Ok(bytes) = fs::read(&shim) {
+                if !bytes.is_empty() {
+                    ledger.record(LedgerEntry::whole_file(
+                        ArtifactKind::VfsShim,
+                        "shim",
+                        shim,
+                        &bytes,
+                    ));
+                }
+            }
+
+            // rc source-line block — an appended marker, recorded only when it
+            // is actually present in the rc (i.e. we appended it this run or a
+            // prior one).
+            if let Ok(rc_path) = shell_rc(shell_name) {
+                let block = rc_integration_block(&rc_source_line(shell_name, &hook_file));
+                let present = fs::read_to_string(&rc_path)
+                    .map(|c| c.contains(&block))
+                    .unwrap_or(false);
+                if present {
+                    ledger.record(LedgerEntry::appended(
+                        ArtifactKind::ShellRcLine,
+                        shell_name,
+                        rc_path,
+                        block,
+                    ));
+                }
+            }
+        }
+    }
+
+    if plan.configure_mcp {
+        for idx in &plan.mcp_assistant_indices {
+            let Some(path) = mcp_config_path_for_index(*idx) else {
+                continue;
+            };
+            if let Some(kin_entry) = read_kin_mcp_entry(&path) {
+                ledger.record(LedgerEntry::mcp(
+                    client_id_for_index(*idx),
+                    path,
+                    &kin_entry,
+                ));
+            }
+        }
+    }
+
+    if plan.inject_discovery_reminders {
+        if let Ok(home) = home_dir() {
+            for (target, path) in [
+                ("claude-md", home.join(".claude").join("CLAUDE.md")),
+                ("codex-agents", home.join(".codex").join("AGENTS.md")),
+            ] {
+                let present = fs::read_to_string(&path)
+                    .map(|c| c.contains(KIN_DISCOVERY_REMINDER))
+                    .unwrap_or(false);
+                if present {
+                    ledger.record(LedgerEntry::appended(
+                        ArtifactKind::DiscoveryReminder,
+                        target,
+                        path,
+                        KIN_DISCOVERY_REMINDER,
+                    ));
+                }
+            }
+        }
+    }
+
+    // Daemon auto-start config — always written by apply_plan.
+    if let Ok(kin_home) = kin_dir() {
+        let cfg = kin_home.join("config").join("setup.toml");
+        if let Ok(bytes) = fs::read(&cfg) {
+            ledger.record(LedgerEntry::whole_file(
+                ArtifactKind::DaemonConfig,
+                "daemon",
+                cfg,
+                &bytes,
+            ));
+        }
+    }
+
+    if let Err(e) = ledger.save(&ledger_path) {
+        println!(
+            "  {} could not write install ledger: {e}",
+            style("!").yellow()
+        );
+    }
 }
 
 /// The MCP config path an assistant index writes to, if any.
@@ -1536,6 +1687,8 @@ fn print_next_steps(
     println!("  kin init             -- initialize a Kin repository in the current directory");
     println!("  kin setup status     -- show what's installed");
     println!("  kin setup doctor     -- run health checks (use --fix to repair)");
+    println!("  kin setup ledger     -- show what setup wrote + verify it on disk");
+    println!("  kin setup uninstall  -- remove exactly what setup wrote (ledger-verified)");
 
     let configured_any = configured_assistants.iter().any(|(_, p)| p.is_some());
     if matches!(intent, SetupIntent::AgentOnly | SetupIntent::Advanced) && configured_any {
@@ -1798,6 +1951,134 @@ fn cleanup_stale_daemons() -> usize {
         }
     }
     cleaned
+}
+
+// ---------------------------------------------------------------------------
+// `kin setup ledger` and `kin setup uninstall`
+// ---------------------------------------------------------------------------
+
+/// Show the install ledger and each entry's verification state against disk.
+pub fn ledger_status(json: bool) -> Result<()> {
+    use crate::commands::setup_ledger::{ledger_path, verify_ledger, EntryState};
+
+    let path = ledger_path()?;
+    let verifications = verify_ledger(&path)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&verifications)?);
+        return Ok(());
+    }
+
+    if verifications.is_empty() {
+        println!("No install ledger at {}.", path.display());
+        println!("Run `kin setup` to configure Kin and record what it writes.");
+        return Ok(());
+    }
+
+    println!("Install ledger: {}", path.display());
+    println!();
+    for v in &verifications {
+        let mark = match v.state {
+            EntryState::Verified => style("✓").green(),
+            EntryState::Modified => style("!").yellow(),
+            EntryState::Removed => style("✗").red(),
+        };
+        println!("  {mark} {:<16} {}", v.entry.target, v.detail);
+        println!("      path: {}", v.entry.path.display());
+    }
+    println!();
+
+    let verified = verifications
+        .iter()
+        .filter(|v| matches!(v.state, EntryState::Verified))
+        .count();
+    let modified = verifications
+        .iter()
+        .filter(|v| matches!(v.state, EntryState::Modified))
+        .count();
+    let removed = verifications
+        .iter()
+        .filter(|v| matches!(v.state, EntryState::Removed))
+        .count();
+    println!(
+        "{} artifact(s) tracked: {} verified, {} modified, {} removed.",
+        verifications.len(),
+        style(verified).green(),
+        if modified > 0 {
+            style(modified).yellow()
+        } else {
+            style(modified).dim()
+        },
+        if removed > 0 {
+            style(removed).red()
+        } else {
+            style(removed).dim()
+        },
+    );
+    Ok(())
+}
+
+/// Remove exactly what `kin setup` recorded in the install ledger.
+///
+/// Ledger-verified: an artifact modified since install is left in place (unless
+/// `--force`) so a user's own edits are never clobbered. `--dry-run` reports
+/// what would be removed without touching disk.
+pub fn uninstall(dry_run: bool, force: bool, json: bool) -> Result<()> {
+    use crate::commands::setup_ledger::{ledger_path, run_uninstall, RemovalAction};
+
+    let path = ledger_path()?;
+    let outcomes = run_uninstall(&path, dry_run, force)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&outcomes)?);
+        return Ok(());
+    }
+
+    if outcomes.is_empty() {
+        println!("No install ledger found — nothing recorded to uninstall.");
+        println!("(The ledger is written by `kin setup`; run it first if you expected entries.)");
+        return Ok(());
+    }
+
+    if dry_run {
+        println!("Dry run — no changes will be written.");
+    } else {
+        println!("Uninstalling Kin-written artifacts (ledger-verified)...");
+    }
+    println!();
+    for o in &outcomes {
+        let mark = match o.action {
+            RemovalAction::Removed => style("✓").green(),
+            RemovalAction::SkippedModified => style("!").yellow(),
+            RemovalAction::AlreadyAbsent => style("→").cyan(),
+            RemovalAction::Failed => style("✗").red(),
+        };
+        println!("  {mark} {}", o.detail);
+    }
+    println!();
+
+    let removed = outcomes
+        .iter()
+        .filter(|o| matches!(o.action, RemovalAction::Removed))
+        .count();
+    let skipped = outcomes
+        .iter()
+        .filter(|o| matches!(o.action, RemovalAction::SkippedModified))
+        .count();
+    let failed = outcomes
+        .iter()
+        .filter(|o| matches!(o.action, RemovalAction::Failed))
+        .count();
+
+    if dry_run {
+        println!("Would remove {removed}, skip {skipped} (modified since install).");
+    } else {
+        println!("Removed {removed}, skipped {skipped} (modified since install), {failed} failed.");
+        if skipped > 0 {
+            println!("Re-run with --force to remove entries modified since install.");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
