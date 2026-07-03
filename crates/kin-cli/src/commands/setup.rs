@@ -757,6 +757,14 @@ const IDX_CODEX: usize = 2;
 const IDX_GEMINI: usize = 3;
 const IDX_WINDSURF: usize = 4;
 
+/// Detect installed AI assistants eligible for MCP auto-configuration.
+///
+/// Detection heuristics per client:
+/// - Claude Code: `claude` binary on PATH
+/// - Cursor: `cursor` binary on PATH, or `/Applications/Cursor.app`
+/// - Codex CLI: `codex` binary on PATH
+/// - Gemini CLI: `gemini` binary on PATH, or `~/.gemini` directory
+/// - Windsurf: `windsurf` binary on PATH, or `/Applications/Windsurf.app`
 fn detect_ai_assistants() -> Vec<AiAssistant> {
     let claude_detected = check_binary_in_path("claude").is_some();
     let cursor_detected = check_binary_in_path("cursor").is_some()
