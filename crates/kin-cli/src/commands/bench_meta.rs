@@ -199,14 +199,14 @@ fn embedding_meta() -> EmbeddingMeta {
     #[cfg(feature = "embeddings")]
     {
         let runtime = kin_db::embed::configured_embedding_runtime();
-        return EmbeddingMeta {
+        EmbeddingMeta {
             vector_enabled: cfg!(feature = "vector"),
             embeddings_enabled: true,
             metal_enabled: metal_active(),
             model_id: Some(runtime.model_id),
             model_revision: Some(runtime.revision),
             pipeline_epoch: Some(runtime.pipeline_epoch),
-        };
+        }
     }
 
     #[cfg(not(feature = "embeddings"))]

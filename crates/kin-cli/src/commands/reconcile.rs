@@ -69,7 +69,7 @@ pub async fn reconcile_session_dir(
     {
         let snap = crate::backend::open_kindb_snapshot(layout)
             .map_err(|e| anyhow::anyhow!("failed to open graph store: {}", e))?;
-        return reconcile_session_dir_with_snapshot(layout, session_dir, snap);
+        reconcile_session_dir_with_snapshot(layout, session_dir, snap)
     }
 
     #[cfg(not(test))]
