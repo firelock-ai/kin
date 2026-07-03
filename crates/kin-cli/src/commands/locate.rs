@@ -3769,18 +3769,15 @@ fn direct_query_priority_paths(
 ) -> HashSet<String> {
     priority_traces
         .iter()
-        .filter_map(|(path, trace)| {
-            trace
-                .reasons
-                .iter()
-                .any(|reason| {
-                    matches!(
-                        reason.kind.as_str(),
-                        "explicit_path" | "tracked_explicit_name"
-                    )
-                })
-                .then(|| path.clone())
+        .filter(|&(_path, trace)| {
+            trace.reasons.iter().any(|reason| {
+                matches!(
+                    reason.kind.as_str(),
+                    "explicit_path" | "tracked_explicit_name"
+                )
+            })
         })
+        .map(|(path, _trace)| path.clone())
         .collect()
 }
 
@@ -3790,19 +3787,16 @@ fn injectable_priority_paths(
     let historical_paths = historical_priority_retention_paths(priority_traces);
     priority_traces
         .iter()
-        .filter_map(|(path, trace)| {
-            trace
-                .reasons
-                .iter()
-                .any(|reason| {
-                    if reason.kind == "historical_priority_seed" {
-                        historical_paths.contains(path)
-                    } else {
-                        priority_reason_allows_injection(&reason.kind)
-                    }
-                })
-                .then(|| path.clone())
+        .filter(|&(path, trace)| {
+            trace.reasons.iter().any(|reason| {
+                if reason.kind == "historical_priority_seed" {
+                    historical_paths.contains(path)
+                } else {
+                    priority_reason_allows_injection(&reason.kind)
+                }
+            })
         })
+        .map(|(path, _trace)| path.clone())
         .collect()
 }
 
