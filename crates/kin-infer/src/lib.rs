@@ -279,6 +279,52 @@ fn pooled_output_enabled() -> bool {
     })
 }
 
+/// Whether the batched forward should split its wall time into the device
+/// encode+readback stage and the host pooling/normalize tail (`KIN_INFER_STAGE_TIMINGS`).
+///
+/// Off by default and zero-cost: the accumulators below are only touched when
+/// the gate is set. It decomposes the `Forward` stage that kin-db's
+/// `EmbedStageTimings` records at batch granularity, so a throughput regression
+/// can be attributed to GPU encode vs host post-processing.
+fn stage_timings_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("KIN_INFER_STAGE_TIMINGS").is_some())
+}
+
+static STAGE_ENCODE_NANOS: AtomicU64 = AtomicU64::new(0);
+static STAGE_POOL_NANOS: AtomicU64 = AtomicU64::new(0);
+static STAGE_TIMING_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the accumulated per-stage batched-forward timings.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StageTimings {
+    /// Wall time in `encode_batched` (device forward plus the hidden readback).
+    pub encode_nanos: u64,
+    /// Wall time in `pool_and_normalize` (host pooling + L2 normalize).
+    pub pool_nanos: u64,
+    /// Number of batched forwards that recorded a split.
+    pub calls: u64,
+}
+
+/// Read the accumulated per-stage batched-forward timings since the last reset.
+/// Populated only while `KIN_INFER_STAGE_TIMINGS` is set on the standard
+/// (non-pooled) batched path.
+pub fn stage_timings_snapshot() -> StageTimings {
+    StageTimings {
+        encode_nanos: STAGE_ENCODE_NANOS.load(Ordering::Relaxed),
+        pool_nanos: STAGE_POOL_NANOS.load(Ordering::Relaxed),
+        calls: STAGE_TIMING_CALLS.load(Ordering::Relaxed),
+    }
+}
+
+/// Reset the per-stage batched-forward timing accumulators to zero.
+pub fn reset_stage_timings() {
+    STAGE_ENCODE_NANOS.store(0, Ordering::Relaxed);
+    STAGE_POOL_NANOS.store(0, Ordering::Relaxed);
+    STAGE_TIMING_CALLS.store(0, Ordering::Relaxed);
+}
+
 /// Conservative guardrail for the whole-stack pooled-output Metal path. The path
 /// encodes every transformer layer plus final pooling into one command buffer up
 /// to `POOLED_OUTPUT_DEFAULT_MAX_SEQ`. Longer sequences may use the segmented
@@ -2891,12 +2937,22 @@ impl BertModel {
             return Ok(results);
         }
 
+        let stage_split = stage_timings_enabled();
+        let encode_start = stage_split.then(std::time::Instant::now);
         let (hidden, masks, max_len) = self.encode_batched(token_ids, attention_masks)?;
+        if let Some(start) = encode_start {
+            STAGE_ENCODE_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
 
         // 4. Per-input mean/CLS pooling + L2 normalize
         let _pool_span =
             tracing::info_span!("kin_infer.model.forward_batched.pool_and_normalize").entered();
+        let pool_start = stage_split.then(std::time::Instant::now);
         let results = self.pool_and_normalize(&hidden, &masks, max_len);
+        if let Some(start) = pool_start {
+            STAGE_POOL_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            STAGE_TIMING_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
         ensure_finite_embeddings(&results)?;
         Ok(results)
     }
