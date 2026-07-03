@@ -654,3 +654,89 @@ jobs:
             echo "::warning::Homebrew tap dispatch returned HTTP ${code}; the tap self-updates on its 6h schedule, not failing the release."
             cat /tmp/tap-dispatch.out 2>/dev/null || true
           fi
+
+  # Version-tag the public daemon image so operators can pin a release
+  # (`docker pull ghcr.io/firelock-ai/kin:0.2.7`). daemon-image.yml already pushed
+  # `ghcr.io/firelock-ai/kin:<commit-sha>` + `:latest` on the main push that this
+  # release was cut from; here we add `:<version>` and `:v<version>` as extra tags
+  # pointing at that same image — a registry-side manifest copy, no rebuild — so
+  # the version tags resolve to the exact image built for the release commit. Kept
+  # out of daemon-image.yml on purpose: rebuilding on the tag would produce a
+  # second, differently-built image, and "on a version tag" logic belongs with the
+  # other release surfaces here.
+  version_tag_image:
+    name: Version-tag ghcr image
+    needs: publish
+    # Mirror publish's always() guard so a skipped notarize_linux does not
+    # transitively skip this job, and only tag real version-tag pushes (not a
+    # workflow_dispatch on a branch) so `:<version>` never points at an
+    # unreleased or non-tag build.
+    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    # Least privilege: read the repo (to peel the tag to its commit) and push
+    # tags to ghcr — not the workflow-level `contents: write`.
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Version-tag the release commit's daemon image (no rebuild)
+        env:
+          IMAGE: ghcr.io/firelock-ai/kin
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+
+          # daemon-image.yml tags every push to main as `${IMAGE}:<commit-sha>`
+          # (github.sha on a branch push is the head commit) plus `:latest`. The
+          # release tag was cut on that same commit, so peel the tag to its commit
+          # and retag THAT image. Peel with git rather than trusting github.sha,
+          # whose value for an annotated tag is the tag object, not the commit the
+          # daemon image was keyed on.
+          COMMIT="$(git rev-parse HEAD)"
+          SRC="${IMAGE}:${COMMIT}"
+
+          # daemon-image.yml (push:main) and this release run were kicked off by the
+          # same bump commit, so the commit image is normally already present by the
+          # time Publish Release finishes. Poll rather than assume: a hand-pushed tag
+          # or a slow/failed daemon-image build then fails loud instead of silently
+          # tagging nothing.
+          deadline=$(( SECONDS + 1800 ))
+          until docker buildx imagetools inspect "$SRC" >/dev/null 2>&1; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::$SRC was not found after 30m — daemon-image.yml did not publish an image for this commit (did it run and succeed?). Refusing to version-tag via a rebuild."
+              exit 1
+            fi
+            echo "Waiting for $SRC (published by daemon-image.yml on the main push)…"
+            sleep 20
+          done
+
+          # Registry-side manifest copy: `:<version>` and `:v<version>` become new
+          # tags pointing at the same image as `:<commit>` and `:latest` — no pull,
+          # no push of layers, no rebuild, just extra manifest references to pin.
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${VERSION}" \
+            --tag "${IMAGE}:${GITHUB_REF_NAME}" \
+            "$SRC"
+
+          digest="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{.Manifest.Digest}}' 2>/dev/null || true)"
+          {
+            echo "Version-tagged the release daemon image (no rebuild):"
+            echo ""
+            echo "- \`${IMAGE}:${VERSION}\`"
+            echo "- \`${IMAGE}:${GITHUB_REF_NAME}\`"
+            echo "- source: \`${SRC}\`"
+            if [ -n "${digest}" ]; then echo "- digest: \`${digest}\`"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
