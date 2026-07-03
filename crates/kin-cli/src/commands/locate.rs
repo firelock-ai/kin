@@ -1787,8 +1787,10 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         });
         fallback_files.truncate(max_files);
         let debug_info = if explain {
-            let mut info = LocateDebugInfo::default();
-            info.skipped_signals = budget.warnings.clone();
+            let mut info = LocateDebugInfo {
+                skipped_signals: budget.warnings.clone(),
+                ..Default::default()
+            };
             prune_ledger.push(PruneEvent {
                 stage: "scoring".to_string(),
                 kind: "budget_skip".to_string(),

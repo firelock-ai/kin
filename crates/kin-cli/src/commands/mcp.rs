@@ -68,10 +68,11 @@ fn session_authority_notice() -> &'static str {
 }
 
 fn build_mcp_start_config() -> kin_mcp::McpServerConfig {
-    let mut config = kin_mcp::McpServerConfig::default();
-    config.session_authority_mode = kin_mcp::SessionAuthorityMode::DaemonRequired;
-    config.snapshot_path = None;
-    config
+    kin_mcp::McpServerConfig {
+        session_authority_mode: kin_mcp::SessionAuthorityMode::DaemonRequired,
+        snapshot_path: None,
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]
