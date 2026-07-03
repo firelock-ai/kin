@@ -2015,10 +2015,12 @@ mod tests {
 
         // Reported counts are correct for the fixture (six entities: module
         // `helper`, fns `entry`/`value`/`doubled`, struct `Widget`, method
-        // `Widget::new`; four relations: two `Contains`, two `Calls`).
+        // `Widget::new`; five relations: two `Contains`, three `Calls` — the
+        // module-qualified `helper::value()` call resolves through the
+        // qualified-path linker stage alongside the two bare calls).
         assert_eq!(result_a.files_indexed, 2, "files_indexed");
         assert_eq!(result_a.entities_extracted, 6, "entities_extracted");
-        assert_eq!(result_a.relations_extracted, 4, "relations_extracted");
+        assert_eq!(result_a.relations_extracted, 5, "relations_extracted");
 
         // Counts are stable run-to-run.
         assert_eq!(result_a.files_indexed, result_b.files_indexed);

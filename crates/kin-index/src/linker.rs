@@ -493,6 +493,28 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
             }
         }
 
+        // (c3) Path-qualified calls (`crate::mod::func`, `Type::method`,
+        // `alias::Type::method`) arrive with the full lexical path as `dst_name`
+        // and no import source, so they miss (a)/(b) and the exact/bare indices
+        // in (c)/(c2). Reduce the path to its resolvable suffixes and link only
+        // an unambiguous single target in another file — idiomatic qualified
+        // Rust would otherwise leave callers uncounted in refs/impact.
+        if !linked && matches!(rel.kind, RelationKind::Calls | RelationKind::References) {
+            if let Some(dst_id) =
+                resolve_qualified_suffix(rel.dst_name.as_str(), file.file_path.as_str(), ctx)
+            {
+                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                    resolved.push(make_relation(
+                        rel.kind,
+                        src_id,
+                        dst_id,
+                        QUALIFIED_SUFFIX_CONFIDENCE,
+                    ));
+                    linked = true;
+                }
+            }
+        }
+
         if linked {
             continue;
         }
@@ -800,6 +822,191 @@ fn split_member_access(name: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((prefix, leaf))
+}
+
+/// Confidence for a call/reference edge resolved by reducing a path-qualified
+/// callee (`crate::mod::func`, `Type::method`, `alias::Type::method`) to a unique
+/// local entity via suffix matching. Inferred: the module/crate prefix is dropped
+/// before matching, so it ranks below an import-verified edge (0.95) yet above the
+/// ambiguous receiver-method guess (0.3) because the suffix match is required to
+/// be unambiguous.
+const QUALIFIED_SUFFIX_CONFIDENCE: f32 = 0.6;
+
+/// Whether a `::`-path segment is a plain Rust identifier (`crate`, `self`,
+/// `Widget`, `run`). Rejects generic/turbofish fragments (`<T>`, `run::<T>`) and
+/// other non-identifier forms so suffix resolution never keys off a mangled
+/// segment.
+fn is_path_identifier(seg: &str) -> bool {
+    let mut chars = seg.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c.is_alphanumeric())
+}
+
+/// Collect the distinct target entity ids among `candidates` that live in a file
+/// other than `current_file`.
+fn distinct_cross_file_targets(
+    candidates: Option<&Vec<(&str, EntityId)>>,
+    current_file: &str,
+    out: &mut HashSet<EntityId>,
+) {
+    if let Some(candidates) = candidates {
+        for &(fp, id) in candidates {
+            if fp != current_file {
+                out.insert(id);
+            }
+        }
+    }
+}
+
+/// Resolve a Rust-style path-qualified call/reference target to a unique local
+/// entity by matching the path's resolvable suffixes against the entity indices.
+///
+/// The Rust adapter preserves the full lexical path written at the call site as
+/// `dst_name` (`crate::work::run`, `Widget::make`, `crate::model::Widget::make`),
+/// but entities are keyed by their *simple* name (free function `run`) or their
+/// *type-qualified* name (method `Widget::make`). This reduces the path to the two
+/// suffixes that can name a real entity:
+///
+///   1. the type-qualified suffix `Type::method` (the last two segments), which
+///      pins the receiver type and resolves e.g. `crate::model::Widget::make`; and
+///   2. the bare leaf `func`/`method`, which resolves a module-qualified free
+///      function (`crate::work::run`) and receiver methods stored bare.
+///
+/// It links only when exactly one distinct target entity exists in a file other
+/// than the caller's. Ambiguous suffixes (more than one distinct target) resolve
+/// to `None` and are logged — a missing edge is preferred over a wrong one.
+fn resolve_qualified_suffix(
+    dst_name: &str,
+    current_file: &str,
+    ctx: &LinkContext<'_>,
+) -> Option<EntityId> {
+    let segments: Vec<&str> = dst_name.split("::").collect();
+    // Must be a genuine `::` path of identifier-like segments. Rejects bare names
+    // (handled by (c)/(c2)), leading/trailing `::`, and turbofish/exotic forms.
+    if segments.len() < 2 || !segments.iter().all(|s| is_path_identifier(s)) {
+        return None;
+    }
+    let last = segments[segments.len() - 1];
+
+    // Tier 1: type-qualified suffix `Penult::last` against the full-name index.
+    // Resolves a method reached through a module/crate prefix. If this pinned
+    // suffix is itself ambiguous, stop — widening to the bare leaf would be less
+    // precise, not more.
+    let type_qualified = format!("{}::{}", segments[segments.len() - 2], last);
+    let mut tq_targets: HashSet<EntityId> = HashSet::new();
+    distinct_cross_file_targets(
+        ctx.entity_by_name.get(type_qualified.as_str()),
+        current_file,
+        &mut tq_targets,
+    );
+    match tq_targets.len() {
+        1 => return tq_targets.into_iter().next(),
+        n if n > 1 => {
+            debug!(
+                dst = %dst_name,
+                suffix = %type_qualified,
+                count = n,
+                "linker: ambiguous type-qualified suffix, leaving unresolved"
+            );
+            return None;
+        }
+        _ => {}
+    }
+
+    // Tier 2: bare leaf. Free functions live in `entity_by_name` under `last`;
+    // methods live in `entity_by_bare_name` under `last`. Union both and require
+    // a single distinct target.
+    let mut leaf_targets: HashSet<EntityId> = HashSet::new();
+    distinct_cross_file_targets(
+        ctx.entity_by_name.get(last),
+        current_file,
+        &mut leaf_targets,
+    );
+    distinct_cross_file_targets(
+        ctx.entity_by_bare_name.get(last),
+        current_file,
+        &mut leaf_targets,
+    );
+    match leaf_targets.len() {
+        1 => leaf_targets.into_iter().next(),
+        0 => None,
+        n => {
+            debug!(
+                dst = %dst_name,
+                leaf = %last,
+                count = n,
+                "linker: ambiguous qualified-call leaf, leaving unresolved"
+            );
+            None
+        }
+    }
+}
+
+/// Incremental-linker counterpart of [`resolve_qualified_suffix`]. The
+/// incremental index keys entities by their owned simple name and carries no
+/// bare-name index, so only the type-qualified suffix (`Type::method`) and the
+/// bare leaf free-function name are matched; ambiguous suffixes stay unresolved.
+fn resolve_qualified_suffix_incremental(
+    dst_name: &str,
+    current_file: &str,
+    linker: &IncrementalLinker,
+) -> Option<EntityId> {
+    let segments: Vec<&str> = dst_name.split("::").collect();
+    if segments.len() < 2 || !segments.iter().all(|s| is_path_identifier(s)) {
+        return None;
+    }
+    let last = segments[segments.len() - 1];
+
+    // Tier 1: type-qualified suffix `Penult::last`.
+    let type_qualified = format!("{}::{}", segments[segments.len() - 2], last);
+    let mut tq_targets: HashSet<EntityId> = HashSet::new();
+    if let Some(cands) = linker.entity_by_name.get(type_qualified.as_str()) {
+        for (fp, id) in cands {
+            if fp != current_file {
+                tq_targets.insert(*id);
+            }
+        }
+    }
+    match tq_targets.len() {
+        1 => return tq_targets.into_iter().next(),
+        n if n > 1 => {
+            debug!(
+                dst = %dst_name,
+                suffix = %type_qualified,
+                count = n,
+                "linker(incremental): ambiguous type-qualified suffix, leaving unresolved"
+            );
+            return None;
+        }
+        _ => {}
+    }
+
+    // Tier 2: bare leaf (free functions; the incremental index has no bare-method
+    // index, so receiver methods reached without their type stay unresolved here).
+    let mut leaf_targets: HashSet<EntityId> = HashSet::new();
+    if let Some(cands) = linker.entity_by_name.get(last) {
+        for (fp, id) in cands {
+            if fp != current_file {
+                leaf_targets.insert(*id);
+            }
+        }
+    }
+    match leaf_targets.len() {
+        1 => leaf_targets.into_iter().next(),
+        0 => None,
+        n => {
+            debug!(
+                dst = %dst_name,
+                leaf = %last,
+                count = n,
+                "linker(incremental): ambiguous qualified-call leaf, leaving unresolved"
+            );
+            None
+        }
+    }
 }
 
 /// Build a Relation with a deterministic ID derived from (src, dst, kind).
@@ -1740,6 +1947,25 @@ pub fn link_cross_file_incremental(
                 if let Some((_, dst_id)) = other_file_match {
                     if add_deduped(&mut seen, src_id, *dst_id, rel.kind) {
                         resolved.push(make_relation(rel.kind, src_id, *dst_id, 0.7));
+                    }
+                    continue;
+                }
+            }
+
+            // (c3) Path-qualified suffix resolution — the incremental counterpart
+            // of the batch linker's (c3). Live edits reach this daemon path, so
+            // qualified calls must resolve here too, not only on a full re-index.
+            if matches!(rel.kind, RelationKind::Calls | RelationKind::References) {
+                if let Some(dst_id) =
+                    resolve_qualified_suffix_incremental(&rel.dst_name, &file.file_path, linker)
+                {
+                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                        resolved.push(make_relation(
+                            rel.kind,
+                            src_id,
+                            dst_id,
+                            QUALIFIED_SUFFIX_CONFIDENCE,
+                        ));
                     }
                     continue;
                 }
@@ -3136,5 +3362,387 @@ void f();
             result.iter().all(|r| r.kind != RelationKind::Calls),
             "a broken local import must not be emitted as a cross-repo edge"
         );
+    }
+
+    // ---- Path-qualified call resolution ----
+    //
+    // The Rust adapter preserves the full lexical path of a qualified call
+    // (`crate::mod::func`, `Type::method`, `alias::Type::method`) as the
+    // relation `dst_name`. Before (c3), those names matched no entity index and
+    // callers were silently dropped from refs/impact. These tests pin the
+    // matrix {path-qualified free fn, module-qualified, Type::method,
+    // crate::Type::method, alias::Type::method} x {resolve, ambiguous, absent}
+    // for both the batch and incremental linkers.
+
+    fn make_method_entity(name: &str, file_path: &str) -> Entity {
+        let mut e = make_entity(name, file_path);
+        e.kind = EntityKind::Method;
+        e.language = LanguageId::Rust;
+        e
+    }
+
+    fn rust_fn(name: &str, file_path: &str) -> Entity {
+        let mut e = make_entity(name, file_path);
+        e.language = LanguageId::Rust;
+        e
+    }
+
+    fn calls_relation(src: &str, dst: &str) -> ExtractedRelation {
+        ExtractedRelation {
+            kind: RelationKind::Calls,
+            src_name: src.to_string(),
+            dst_name: dst.to_string(),
+            import_source: None,
+        }
+    }
+
+    fn find_calls_edge<'a>(
+        result: &'a [Relation],
+        src: &Entity,
+        dst: &Entity,
+    ) -> Option<&'a Relation> {
+        result.iter().find(|r| {
+            r.kind == RelationKind::Calls
+                && r.src == GraphNodeId::Entity(src.id)
+                && r.dst == GraphNodeId::Entity(dst.id)
+        })
+    }
+
+    #[test]
+    fn qualified_free_fn_call_resolves_cross_file() {
+        // `crate::work::run(...)` in caller.rs -> free fn `run` in work.rs.
+        let caller = rust_fn("caller", "src/caller.rs");
+        let target = rust_fn("run", "src/work.rs");
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/caller.rs".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![calls_relation("caller", "crate::work::run")],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/work.rs".to_string(),
+                entities: vec![target.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let edge = find_calls_edge(&result, &caller, &target)
+            .expect("qualified free-fn call should resolve to the target fn");
+        assert_eq!(edge.confidence, QUALIFIED_SUFFIX_CONFIDENCE);
+        assert_eq!(edge.origin, RelationOrigin::Inferred);
+    }
+
+    #[test]
+    fn module_qualified_free_fn_resolves() {
+        // The exact ticket case: `impact::analyze_impact(...)` -> free fn.
+        let caller = rust_fn("review_from_diff", "kin-review/src/review.rs");
+        let target = rust_fn("analyze_impact", "kin-review/src/impact.rs");
+
+        let files = vec![
+            FileParseData {
+                file_path: "kin-review/src/review.rs".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![calls_relation("review_from_diff", "impact::analyze_impact")],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "kin-review/src/impact.rs".to_string(),
+                entities: vec![target.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        assert!(
+            find_calls_edge(&result, &caller, &target).is_some(),
+            "module-qualified call should resolve"
+        );
+    }
+
+    #[test]
+    fn crate_type_method_call_resolves_via_type_qualified_suffix() {
+        // `crate::model::Widget::make(...)` -> method entity `Widget::make`.
+        let caller = rust_fn("caller", "src/caller.rs");
+        let method = make_method_entity("Widget::make", "src/model.rs");
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/caller.rs".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![calls_relation("caller", "crate::model::Widget::make")],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/model.rs".to_string(),
+                entities: vec![method.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        assert!(
+            find_calls_edge(&result, &caller, &method).is_some(),
+            "crate::Type::method should resolve via the type-qualified suffix"
+        );
+    }
+
+    #[test]
+    fn alias_type_method_call_resolves() {
+        // `alias::Widget::make(...)` (renamed-crate prefix) -> `Widget::make`.
+        let caller = rust_fn("caller", "src/caller.rs");
+        let method = make_method_entity("Widget::make", "vendor/src/model.rs");
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/caller.rs".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![calls_relation("caller", "alias::Widget::make")],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "vendor/src/model.rs".to_string(),
+                entities: vec![method.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        assert!(
+            find_calls_edge(&result, &caller, &method).is_some(),
+            "alias::Type::method should resolve via the type-qualified suffix"
+        );
+    }
+
+    #[test]
+    fn two_segment_type_method_still_resolves() {
+        // Guard: plain `Widget::make(...)` cross-file already resolves via the
+        // exact (c) name match; (c3) must not disturb it.
+        let caller = rust_fn("caller", "src/caller.rs");
+        let method = make_method_entity("Widget::make", "src/model.rs");
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/caller.rs".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![calls_relation("caller", "Widget::make")],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/model.rs".to_string(),
+                entities: vec![method.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        assert!(
+            find_calls_edge(&result, &caller, &method).is_some(),
+            "two-segment Type::method should still resolve"
+        );
+    }
+
+    #[test]
+    fn ambiguous_qualified_leaf_leaves_unresolved() {
+        // Two distinct free fns named `run` in different files; the qualified
+        // call cannot be pinned to one -> conservative miss (no wrong edge).
+        let caller = rust_fn("caller", "src/caller.rs");
+        let run_a = rust_fn("run", "src/a.rs");
+        let run_b = rust_fn("run", "src/b.rs");
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/caller.rs".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![calls_relation("caller", "crate::somewhere::run")],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/a.rs".to_string(),
+                entities: vec![run_a.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/b.rs".to_string(),
+                entities: vec![run_b.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        assert!(
+            result.iter().all(|r| r.kind != RelationKind::Calls),
+            "ambiguous qualified leaf must not mint a Calls edge, got {:?}",
+            result
+                .iter()
+                .filter(|r| r.kind == RelationKind::Calls)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn qualified_call_to_absent_target_is_honest_miss() {
+        // Target not in the universe and no import source -> no edge, no fake.
+        let caller = rust_fn("caller", "src/caller.rs");
+
+        let files = vec![FileParseData {
+            file_path: "src/caller.rs".to_string(),
+            entities: vec![caller.clone()],
+            relations: vec![calls_relation("caller", "crate::gone::vanished")],
+            imports: vec![],
+        }];
+
+        let result = link_cross_file(&files);
+        assert!(
+            result.iter().all(|r| r.kind != RelationKind::Calls),
+            "absent qualified target must produce no Calls edge"
+        );
+    }
+
+    #[test]
+    fn qualified_calls_recover_all_three_callers() {
+        // Mirrors the ticket acceptance at the linker layer: three qualified
+        // call sites across two files all resolve to one target fn, so impact
+        // would report three callers instead of one.
+        let target = rust_fn("analyze_impact", "kin-review/src/impact.rs");
+        let caller_review = rust_fn("review_from_diff", "kin-review/src/review.rs");
+        let caller_mcp = rust_fn("handle_review", "kin-mcp/src/handlers/review.rs");
+
+        let files = vec![
+            FileParseData {
+                file_path: "kin-review/src/impact.rs".to_string(),
+                entities: vec![target.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "kin-review/src/review.rs".to_string(),
+                entities: vec![caller_review.clone()],
+                // same-crate module-qualified, twice (deduped to one edge)
+                relations: vec![
+                    calls_relation("review_from_diff", "impact::analyze_impact"),
+                    calls_relation("review_from_diff", "impact::analyze_impact"),
+                ],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "kin-mcp/src/handlers/review.rs".to_string(),
+                entities: vec![caller_mcp.clone()],
+                // cross-crate crate-qualified
+                relations: vec![calls_relation(
+                    "handle_review",
+                    "kin_review::analyze_impact",
+                )],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let callers: HashSet<GraphNodeId> = result
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls && r.dst == GraphNodeId::Entity(target.id))
+            .map(|r| r.src)
+            .collect();
+        assert_eq!(
+            callers.len(),
+            2,
+            "both caller functions should link to analyze_impact, got {:?}",
+            callers
+        );
+        assert!(callers.contains(&GraphNodeId::Entity(caller_review.id)));
+        assert!(callers.contains(&GraphNodeId::Entity(caller_mcp.id)));
+    }
+
+    #[test]
+    fn incremental_linker_resolves_qualified_free_fn() {
+        // The daemon's live-edit path uses the incremental linker; qualified
+        // calls must resolve there too (the ticket repro was a live edit).
+        let caller = rust_fn("caller", "src/caller.rs");
+        let target = rust_fn("run", "src/work.rs");
+
+        let mut linker = IncrementalLinker::new();
+        linker.add_file("src/caller.rs", std::slice::from_ref(&caller));
+        linker.add_file("src/work.rs", std::slice::from_ref(&target));
+
+        let files = vec![FileParseData {
+            file_path: "src/caller.rs".to_string(),
+            entities: vec![caller.clone()],
+            relations: vec![calls_relation("caller", "crate::work::run")],
+            imports: vec![],
+        }];
+
+        let result = link_cross_file_incremental(&files, &linker);
+        let edge = find_calls_edge(&result, &caller, &target)
+            .expect("incremental linker should resolve the qualified free-fn call");
+        assert_eq!(edge.confidence, QUALIFIED_SUFFIX_CONFIDENCE);
+    }
+
+    #[test]
+    fn incremental_linker_resolves_crate_type_method() {
+        let caller = rust_fn("caller", "src/caller.rs");
+        let method = make_method_entity("Widget::make", "src/model.rs");
+
+        let mut linker = IncrementalLinker::new();
+        linker.add_file("src/caller.rs", std::slice::from_ref(&caller));
+        linker.add_file("src/model.rs", std::slice::from_ref(&method));
+
+        let files = vec![FileParseData {
+            file_path: "src/caller.rs".to_string(),
+            entities: vec![caller.clone()],
+            relations: vec![calls_relation("caller", "crate::model::Widget::make")],
+            imports: vec![],
+        }];
+
+        let result = link_cross_file_incremental(&files, &linker);
+        assert!(
+            find_calls_edge(&result, &caller, &method).is_some(),
+            "incremental linker should resolve crate::Type::method"
+        );
+    }
+
+    #[test]
+    fn incremental_linker_ambiguous_qualified_leaf_is_miss() {
+        let caller = rust_fn("caller", "src/caller.rs");
+        let run_a = rust_fn("run", "src/a.rs");
+        let run_b = rust_fn("run", "src/b.rs");
+
+        let mut linker = IncrementalLinker::new();
+        linker.add_file("src/caller.rs", std::slice::from_ref(&caller));
+        linker.add_file("src/a.rs", std::slice::from_ref(&run_a));
+        linker.add_file("src/b.rs", std::slice::from_ref(&run_b));
+
+        let files = vec![FileParseData {
+            file_path: "src/caller.rs".to_string(),
+            entities: vec![caller.clone()],
+            relations: vec![calls_relation("caller", "crate::somewhere::run")],
+            imports: vec![],
+        }];
+
+        let result = link_cross_file_incremental(&files, &linker);
+        assert!(
+            result.iter().all(|r| r.kind != RelationKind::Calls),
+            "incremental ambiguous qualified leaf must not mint a Calls edge"
+        );
+    }
+
+    #[test]
+    fn is_path_identifier_rejects_non_idents() {
+        assert!(is_path_identifier("crate"));
+        assert!(is_path_identifier("Widget"));
+        assert!(is_path_identifier("_private"));
+        assert!(is_path_identifier("run2"));
+        assert!(!is_path_identifier(""));
+        assert!(!is_path_identifier("<T>"));
+        assert!(!is_path_identifier("2run"));
+        assert!(!is_path_identifier("a-b"));
     }
 }
