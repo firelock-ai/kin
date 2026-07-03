@@ -348,6 +348,19 @@ fn extract_rust_node(
                     span: span_from_node(node, file_id),
                 });
             }
+            // Descend into an inline module body so functions, impls, and nested
+            // modules declared inside `mod m { ... }` are extracted with their own
+            // entities and call edges. Without this, everything below a module is
+            // dropped, and calls made from module-scoped functions never reach
+            // refs/impact — attribution effectively collapses onto the file/module
+            // instead of the innermost enclosing function. `mod m;` (no body) has
+            // nothing to descend into.
+            if let Some(body) = node.child_by_field_name("body") {
+                let mut cursor = body.walk();
+                for child in body.children(&mut cursor) {
+                    extract_rust_node(&child, source, file_id, entities, relations);
+                }
+            }
         }
         "macro_definition" => {
             // `macro_rules! name { ... }`. The declarative-macro definition is a
@@ -1201,5 +1214,157 @@ pub enum Status {
             "Status should derive PartialEq"
         );
         assert!(status_impls.contains(&"Hash"), "Status should derive Hash");
+    }
+
+    // ---- Module-scoped extraction ----
+    //
+    // Inline `mod m { ... }` bodies must be descended into so functions, impls,
+    // and nested modules inside them become graph entities and their calls are
+    // attributed to the innermost enclosing function. Before this, everything
+    // under a module was dropped and module-scoped callers vanished from
+    // refs/impact.
+
+    fn call_edges(output: &crate::extract::ParseOutput) -> Vec<(&str, &str)> {
+        output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect()
+    }
+
+    fn entity_names(output: &crate::extract::ParseOutput, kind: EntityKind) -> Vec<&str> {
+        output
+            .entities
+            .iter()
+            .filter(|e| e.kind == kind)
+            .map(|e| e.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn mod_nested_function_and_call_are_extracted() {
+        let adapter = RustAdapter;
+        let source = br#"
+mod handlers {
+    pub fn review() {
+        do_work(1);
+    }
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let out = adapter
+            .extract(&tree, source, &FilePathId::new("src/lib.rs"))
+            .unwrap();
+
+        assert!(
+            entity_names(&out, EntityKind::Function).contains(&"review"),
+            "module-scoped fn `review` should be an entity, got {:?}",
+            entity_names(&out, EntityKind::Function)
+        );
+        assert!(
+            call_edges(&out).contains(&("review", "do_work")),
+            "the call should attribute to the enclosing fn `review`, got {:?}",
+            call_edges(&out)
+        );
+    }
+
+    #[test]
+    fn deeply_nested_mod_functions_are_extracted() {
+        let adapter = RustAdapter;
+        let source = br#"
+mod outer {
+    mod inner {
+        fn deep() {
+            leaf_call(1);
+        }
+    }
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let out = adapter
+            .extract(&tree, source, &FilePathId::new("src/lib.rs"))
+            .unwrap();
+
+        assert!(
+            entity_names(&out, EntityKind::Function).contains(&"deep"),
+            "doubly-nested fn `deep` should be extracted, got {:?}",
+            entity_names(&out, EntityKind::Function)
+        );
+        assert!(
+            call_edges(&out).contains(&("deep", "leaf_call")),
+            "call in a doubly-nested fn should attribute to `deep`, got {:?}",
+            call_edges(&out)
+        );
+        let mods = entity_names(&out, EntityKind::Module);
+        assert!(mods.contains(&"outer") && mods.contains(&"inner"));
+    }
+
+    #[test]
+    fn impl_methods_inside_mod_are_extracted() {
+        let adapter = RustAdapter;
+        let source = br#"
+mod model {
+    struct Widget;
+    impl Widget {
+        fn make() {
+            build(1);
+        }
+    }
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let out = adapter
+            .extract(&tree, source, &FilePathId::new("src/lib.rs"))
+            .unwrap();
+
+        assert!(
+            entity_names(&out, EntityKind::Method).contains(&"Widget::make"),
+            "method inside a module impl should be extracted, got {:?}",
+            entity_names(&out, EntityKind::Method)
+        );
+        assert!(
+            call_edges(&out).contains(&("Widget::make", "build")),
+            "the method's call should attribute to `Widget::make`, got {:?}",
+            call_edges(&out)
+        );
+    }
+
+    #[test]
+    fn qualified_call_inside_mod_keeps_full_path() {
+        let adapter = RustAdapter;
+        let source = br#"
+mod handlers {
+    fn review() {
+        crate::impact::analyze_impact(1);
+    }
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let out = adapter
+            .extract(&tree, source, &FilePathId::new("src/lib.rs"))
+            .unwrap();
+
+        assert!(
+            call_edges(&out).contains(&("review", "crate::impact::analyze_impact")),
+            "a qualified call inside a module fn should be emitted with its full \
+             path for the linker to resolve, got {:?}",
+            call_edges(&out)
+        );
+    }
+
+    #[test]
+    fn mod_without_body_is_still_a_module_entity() {
+        // `mod other;` (declaration only) must not panic and still yields the
+        // module entity without a body to descend into.
+        let adapter = RustAdapter;
+        let source = b"mod other;\nfn top() { local(1); }\n";
+        let tree = adapter.parse(source).unwrap();
+        let out = adapter
+            .extract(&tree, source, &FilePathId::new("src/lib.rs"))
+            .unwrap();
+
+        assert!(entity_names(&out, EntityKind::Module).contains(&"other"));
+        assert!(call_edges(&out).contains(&("top", "local")));
     }
 }
