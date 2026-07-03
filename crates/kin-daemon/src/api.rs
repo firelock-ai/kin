@@ -4429,38 +4429,49 @@ fn build_semantic_locate_result(
     )
 }
 
-/// Resolve the graph entity behind one fused-locate symbol so a
-/// `semantic_locate` hit stays act-on-able (`get_entity_source(entity_id)`)
-/// without a name search round-trip. Matches by file + exact name, breaking
-/// ties by span start; graph-owned truth only.
-fn resolve_symbol_entity_id(
-    graph: &kin_db::InMemoryGraph,
-    file_path: &str,
-    symbol: &kin_cli::commands::locate::LocateSymbol,
-) -> Option<String> {
-    let filter = kin_model::EntityFilter {
-        file_path: Some(kin_model::FilePathId::new(file_path)),
-        ..Default::default()
+/// Serialize a fused-locate [`LocateResult`] into the `semantic_locate` tool
+/// result. The body is the SAME schema `kin locate --json` and `POST /locate`
+/// emit — the reused `LocateResult` types verbatim: `files[].symbols[]`, the
+/// paged graph-native `entities[]` (each act-on-able via `get_entity_source`),
+/// and the `next_cursor`/`page`/`total_ranked` paging fields — so a consumer
+/// parses every Kin locate surface with one schema. The fused arm's extra
+/// top-level fields ride alongside: `routing: "fused-v1"`, the query/granularity
+/// echo, and the structured `semantic_coverage_detail`. `degradations` and the
+/// struct `semantic_coverage` are already carried by the `LocateResult` itself.
+///
+/// [`LocateResult`]: kin_cli::commands::locate::LocateResult
+fn fused_semantic_locate_payload(
+    result: kin_cli::commands::locate::LocateResult,
+    query: &str,
+    file_granularity: bool,
+) -> kin_mcp::ToolCallResult {
+    let coverage_detail = result.semantic_coverage.clone();
+    // Serialize the reused CLI types rather than duplicating their JSON shape:
+    // this is the single source of the locate schema, so the MCP surface can
+    // never drift from `kin locate --json`.
+    let mut payload = match serde_json::to_value(&result) {
+        Ok(serde_json::Value::Object(map)) => map,
+        Ok(_) => {
+            return kin_mcp::ToolCallResult::error(
+                "locate result did not serialize to a JSON object".to_string(),
+            );
+        }
+        Err(error) => return kin_mcp::ToolCallResult::error(error.to_string()),
     };
-    let entities = graph.query_entities(&filter).ok()?;
-    let mut candidates: Vec<_> = entities
-        .into_iter()
-        .filter(|entity| entity.name == symbol.name)
-        .collect();
-    if candidates.is_empty() {
-        return None;
+    payload.insert("query".to_string(), json!(query));
+    payload.insert(
+        "granularity".to_string(),
+        json!(if file_granularity { "file" } else { "entity" }),
+    );
+    payload.insert("routing".to_string(), json!("fused-v1"));
+    if let Some(coverage) = coverage_detail {
+        payload.insert("semantic_coverage_detail".to_string(), json!(coverage));
     }
-    if let Some(span) = symbol.span {
-        candidates.sort_by_key(|entity| {
-            let start = entity
-                .span
-                .as_ref()
-                .map(|entity_span| entity_span.start_line)
-                .unwrap_or(u32::MAX);
-            start.abs_diff(span[0])
-        });
+
+    match serde_json::to_string_pretty(&serde_json::Value::Object(payload)) {
+        Ok(text) => kin_mcp::ToolCallResult::text(text),
+        Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
     }
-    candidates.first().map(|entity| entity.id.to_string())
 }
 
 /// Build the `semantic_locate` response from the full fused locate pipeline
@@ -4468,12 +4479,18 @@ fn resolve_symbol_entity_id(
 /// the single-vector cosine ranking. Selected by the retrieval quality
 /// profile (`KIN_PROFILE`) or an explicit per-call `pipeline` argument.
 ///
-/// Contract: args `{query, limit?=20, granularity?="entity"|"file",
-/// include_snippet?=true, explain?=false, pipeline?}`. Response keeps the
-/// legacy shape — ranked `results` array plus a `semantic_coverage` float —
-/// and adds per-hit line spans/kind/definition, a structured
-/// `semantic_coverage_detail`, the `degradations` array, and
-/// `routing: "fused-v1"` so a caller can tell which pipeline answered.
+/// Contract: args `{query, limit?=20, page_size?, cursor?,
+/// granularity?="entity"|"file", include_snippet?=true, explain?=false,
+/// pipeline?}`. The response is the SAME schema `kin locate --json` emits —
+/// the reused `LocateResult` types (`files[].symbols[]` plus the paged
+/// graph-native `entities[]`) — with the fused extras `routing: "fused-v1"`,
+/// `semantic_coverage_detail`, and `degradations` alongside, so a caller can
+/// tell which pipeline answered and parse it with the one locate schema.
+///
+/// Paging is arm-symmetric with the cosine arm and `POST /locate`: `page_size`
+/// (default `limit`) windows the graph-native `entities[]` ranking, the full
+/// ranking is cached under a graph-version-stamped key, and a `cursor` pages it
+/// straight from cache with no retrieval re-run.
 async fn build_fused_semantic_locate_result(
     state: &Arc<DaemonState>,
     session_id: Option<&SessionId>,
@@ -4482,6 +4499,15 @@ async fn build_fused_semantic_locate_result(
 ) -> kin_mcp::ToolCallResult {
     let query = match arguments.get("query").and_then(serde_json::Value::as_str) {
         Some(value) if !value.trim().is_empty() => value.to_string(),
+        // A paging request carries the query in its cached ranking, so an empty
+        // query is allowed only when a cursor is present.
+        _ if arguments
+            .get("cursor")
+            .and_then(serde_json::Value::as_str)
+            .is_some() =>
+        {
+            String::new()
+        }
         _ => {
             return kin_mcp::ToolCallResult::error("missing required parameter: query".to_string());
         }
@@ -4492,6 +4518,14 @@ async fn build_fused_semantic_locate_result(
         .map(|value| value as usize)
         .filter(|value| *value > 0)
         .unwrap_or(20);
+    // Entities per page: `page_size` if given, else the historical `limit` — the
+    // same default the cosine arm uses, so the two arms page symmetrically.
+    let page_size = arguments
+        .get("page_size")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value as usize)
+        .filter(|value| *value > 0)
+        .unwrap_or(limit);
     let file_granularity = arguments
         .get("granularity")
         .and_then(serde_json::Value::as_str)
@@ -4507,6 +4541,58 @@ async fn build_fused_semantic_locate_result(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
+    // Graph version stamps the paging cursor: any mutation bumps `vfs_version`,
+    // so a stale cursor can never page a ranking built against different truth.
+    let graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+    // Scope token for the cursor key (the session's temporal scope) so cursors
+    // never collide across scopes for the same query — matching `POST /locate`.
+    let scope_token: Option<String> = if let Some(sid) = session_id {
+        state
+            .get_session_scope(sid)
+            .await
+            .map(|(ref_str, _, _, _)| ref_str)
+    } else {
+        None
+    };
+
+    // Paging fast path: a valid cursor whose ranking is still cached at the
+    // current graph version is windowed straight from cache — no re-search.
+    // Shares the `POST /locate` ranking cache so the two fused surfaces page
+    // the same ranking identically.
+    if let Some(cursor_token) = arguments.get("cursor").and_then(serde_json::Value::as_str) {
+        if let Some(parsed) = kin_cli::commands::locate::LocateCursor::decode(cursor_token) {
+            let cached = {
+                let cache = state.locate_rankings.lock().unwrap();
+                cache
+                    .get(&parsed.key)
+                    .filter(|entry| entry.graph_version == graph_version)
+                    .map(|entry| entry.entities.clone())
+            };
+            if let Some(entities) = cached {
+                let mut result = kin_cli::commands::locate::LocateResult {
+                    entities,
+                    ..Default::default()
+                };
+                kin_cli::commands::locate::apply_entity_page(
+                    &mut result,
+                    &parsed.key,
+                    parsed.page,
+                    page_size,
+                );
+                // A cache hit runs no retrieval, so re-report coverage from the
+                // live embedding status — the same struct the fresh page carried.
+                result.semantic_coverage =
+                    Some(kin_cli::commands::locate::local_semantic_coverage(
+                        graph,
+                        Some(state.graph.as_ref()),
+                    ));
+                return fused_semantic_locate_payload(result, &query, file_granularity);
+            }
+        }
+        // Cache miss / stale / undecodable cursor: fall through to a fresh run
+        // (returns page 0) rather than silently failing the page.
+    }
+
     let snippet_opts = if include_snippet {
         kin_cli::commands::locate::SnippetOptions::enabled(None)
     } else {
@@ -4515,9 +4601,9 @@ async fn build_fused_semantic_locate_result(
 
     // The agent asked for `limit` ranked hits; give the fused pipeline the
     // same number of file slots EXPLICITLY so the adaptive cap cannot shrink
-    // the pool below what the caller asked to see (entity hits flatten from
-    // the file ranking in file-major order).
-    let locate_result = match run_fused_locate_for_state(
+    // the pool below what the caller asked to see (the graph-native entity
+    // ranking is projected from the file ranking).
+    let mut locate_result = match run_fused_locate_for_state(
         state,
         session_id,
         graph,
@@ -4535,104 +4621,15 @@ async fn build_fused_semantic_locate_result(
         }
     };
 
-    let coverage_fraction = locate_result
-        .semantic_coverage
-        .as_ref()
-        .map(|coverage| {
-            if coverage.total == 0 {
-                0.0_f32
-            } else {
-                coverage.indexed as f32 / coverage.total as f32
-            }
-        })
-        .unwrap_or(0.0);
+    // Cache the full entity ranking and window page 0 so a follow-up cursor
+    // pages it from cache without re-running retrieval — the same paging the
+    // `POST /locate` endpoint and the cosine arm provide (arm-symmetric).
+    let key =
+        kin_cli::commands::locate::locate_cursor_key(&query, scope_token.as_deref(), graph_version);
+    cache_locate_ranking(state, &key, &locate_result.entities, graph_version);
+    kin_cli::commands::locate::apply_entity_page(&mut locate_result, &key, 0, page_size);
 
-    let mut results = Vec::with_capacity(limit);
-    let mut seen_entities: HashSet<String> = HashSet::new();
-    'files: for file_entry in &locate_result.files {
-        if file_granularity {
-            let name = FsPath::new(&file_entry.path)
-                .file_name()
-                .and_then(|component| component.to_str())
-                .unwrap_or_default()
-                .to_string();
-            let mut hit = json!({
-                "entity_id": file_entry.path,
-                "name": name,
-                "file": file_entry.path,
-                "score": file_entry.score,
-            });
-            if !file_entry.spans.is_empty() {
-                hit["spans"] = json!(file_entry.spans);
-            }
-            if !file_entry.signals.is_empty() {
-                hit["signals"] = json!(file_entry.signals);
-            }
-            results.push(hit);
-            if results.len() >= limit {
-                break 'files;
-            }
-            continue;
-        }
-        for symbol in &file_entry.symbols {
-            let Some(entity_id) = resolve_symbol_entity_id(graph, &file_entry.path, symbol) else {
-                // A symbol Kin cannot re-attach to a graph entity is not
-                // act-on-able over MCP (no source read without an id); skip it
-                // rather than emit a dead hit.
-                continue;
-            };
-            if !seen_entities.insert(entity_id.clone()) {
-                continue;
-            }
-            let mut hit = json!({
-                "entity_id": entity_id,
-                "name": symbol.name,
-                "file": file_entry.path,
-                "score": symbol.score,
-                "file_score": file_entry.score,
-                "kind": symbol.kind,
-                "definition": symbol.definition,
-            });
-            if let Some(span) = symbol.span {
-                hit["start_line"] = json!(span[0]);
-                hit["end_line"] = json!(span[1]);
-            }
-            if let Some(snippet) = symbol.snippet.as_ref() {
-                hit["snippet"] = json!(snippet);
-            }
-            if !file_entry.signals.is_empty() {
-                hit["signals"] = json!(file_entry.signals);
-            }
-            results.push(hit);
-            if results.len() >= limit {
-                break 'files;
-            }
-        }
-    }
-
-    let mut payload = json!({
-        "query": query,
-        "granularity": if file_granularity { "file" } else { "entity" },
-        "routing": "fused-v1",
-        "semantic_coverage": coverage_fraction,
-        "results": results,
-    });
-    if let Some(coverage) = locate_result.semantic_coverage.as_ref() {
-        payload["semantic_coverage_detail"] = json!(coverage);
-    }
-    if !locate_result.degradations.is_empty() {
-        payload["degradations"] = json!(locate_result.degradations);
-    }
-    if explain {
-        if let Some(debug) = locate_result.debug.as_ref() {
-            payload["debug"] = json!(debug);
-        }
-    }
-
-    match serde_json::to_string_pretty(&payload) {
-        Ok(text) => kin_mcp::ToolCallResult::text(text),
-        Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
-    }
+    fused_semantic_locate_payload(locate_result, &query, file_granularity)
 }
 
 /// Map a resolved [`kin_cli::commands::graph::EntitySourceOutcome`] to an MCP
@@ -11847,11 +11844,13 @@ mod tests {
         )
         .await;
         assert_eq!(payload["routing"], "fused-v1");
-        let mcp_files: Vec<String> = payload["results"]
+        // The fused arm now serves the CLI `LocateResult` schema verbatim: the
+        // file ranking lives under `files[].path`, not a bespoke flat array.
+        let mcp_files: Vec<String> = payload["files"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|hit| hit["file"].as_str().unwrap().to_string())
+            .map(|entry| entry["path"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(
             mcp_files, locate_files,
@@ -11886,16 +11885,20 @@ mod tests {
         assert_eq!(payload["granularity"], "entity");
         assert!(
             payload.get("semantic_coverage").is_some(),
-            "fused payload keeps the legacy semantic_coverage float"
+            "fused payload carries the structured semantic_coverage from LocateResult"
         );
-        let results = payload["results"].as_array().unwrap();
-        assert!(!results.is_empty(), "expected at least one entity hit");
-        let hit = &results[0];
+        // Graph-native entity hits are the same `entities[]` surface `kin locate
+        // --json` emits: each act-on-able via `get_entity_source(entity_id)`,
+        // with the file demoted to provenance and a `[start, end]` span array.
+        let entities = payload["entities"].as_array().unwrap();
+        assert!(!entities.is_empty(), "expected at least one entity hit");
+        let hit = &entities[0];
         assert_eq!(hit["entity_id"], expected_id);
         assert_eq!(hit["name"], "parse_config");
-        assert_eq!(hit["file"], "src/config.py");
-        let start_line = hit["start_line"].as_u64().unwrap();
-        let end_line = hit["end_line"].as_u64().unwrap();
+        assert_eq!(hit["provenance"]["file"], "src/config.py");
+        let span = hit["span"].as_array().unwrap();
+        let start_line = span[0].as_u64().unwrap();
+        let end_line = span[1].as_u64().unwrap();
         assert!(
             start_line >= 1 && end_line >= start_line,
             "1-based inclusive line span expected, got {start_line}..{end_line}"
@@ -11946,6 +11949,199 @@ mod tests {
             .unwrap();
         let result: kin_mcp::ToolCallResult = serde_json::from_slice(&body).unwrap();
         assert_eq!(result.is_error, Some(true));
+    }
+
+    // FIR-1180 schema parity: the fused MCP payload IS the `LocateResult` schema
+    // `kin locate --json` serializes — it deserializes straight back into the
+    // shared type, so a consumer needs one parser across surfaces.
+    #[tokio::test]
+    async fn mcp_semantic_locate_fused_payload_round_trips_into_locate_schema() {
+        let state = test_state();
+        let entity = test_entity("parse_config", "src/config.py");
+        let expected_id = entity.id.to_string();
+        state.graph.upsert_entity(&entity).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+
+        // The fused MCP payload parses into the reused `LocateResult` type.
+        let payload = call_semantic_locate(
+            app.clone(),
+            json!({ "query": "parse config", "pipeline": "fused" }),
+        )
+        .await;
+        let fused_text = serde_json::to_string(&payload).unwrap();
+        let fused_as_locate: kin_cli::commands::locate::LocateResult =
+            serde_json::from_str(&fused_text).unwrap();
+        assert!(
+            fused_as_locate
+                .entities
+                .iter()
+                .any(|entity| entity.entity_id == expected_id),
+            "fused payload must deserialize into LocateResult carrying the located entity"
+        );
+
+        // A `POST /locate` (`kin locate --json`) payload parses into the SAME
+        // type — proving one shared schema, not two look-alike shapes.
+        let locate_response = app
+            .oneshot(
+                Request::post("/locate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&kin_cli::daemon_client::LocateRequest {
+                            text: "parse config".to_string(),
+                            explain: false,
+                            max_files: 10,
+                            max_files_explicit: true,
+                            reference: None,
+                            snippets: true,
+                            snippet_lines: None,
+                            cursor: None,
+                            page_size: None,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(locate_response.status(), StatusCode::OK);
+        let locate_body = axum::body::to_bytes(locate_response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let locate_as_locate: kin_cli::commands::locate::LocateResult =
+            serde_json::from_slice(&locate_body).unwrap();
+        assert!(
+            locate_as_locate
+                .entities
+                .iter()
+                .any(|entity| entity.entity_id == expected_id),
+            "POST /locate must parse into the same LocateResult shape with the same entity"
+        );
+    }
+
+    // FIR-1232 paging symmetry: the fused arm consumes `page_size`/`cursor` and
+    // emits `total_ranked`/`page`/`next_cursor` over the graph-native entity
+    // ranking, exactly like the cosine arm and `POST /locate`. The cursor is
+    // stable — re-issuing it returns the identical next page from cache.
+    #[tokio::test]
+    async fn mcp_semantic_locate_fused_pages_entities_with_stable_cursor() {
+        let state = test_state();
+        for (name, path) in [
+            ("parse_config", "src/a.py"),
+            ("parse_header", "src/b.py"),
+            ("parse_body", "src/c.py"),
+        ] {
+            state.graph.upsert_entity(&test_entity(name, path)).unwrap();
+        }
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+
+        let page0 = call_semantic_locate(
+            app.clone(),
+            json!({ "query": "parse", "page_size": 2, "pipeline": "fused" }),
+        )
+        .await;
+        let total = page0["total_ranked"].as_u64().unwrap();
+        assert!(total >= 3, "expected >= 3 ranked entities, got {total}");
+        let first_page: Vec<String> = page0["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entity| entity["entity_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            first_page.len(),
+            2,
+            "page 0 holds exactly `page_size` entities"
+        );
+        let cursor = page0["next_cursor"]
+            .as_str()
+            .expect("more entities remain, so a next_cursor is present")
+            .to_string();
+
+        // Page the cursor (empty query is allowed on a paging continuation).
+        let page1 = call_semantic_locate(
+            app.clone(),
+            json!({ "cursor": cursor, "page_size": 2, "pipeline": "fused" }),
+        )
+        .await;
+        assert_eq!(page1["page"].as_u64().unwrap(), 1);
+        let second_page: Vec<String> = page1["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entity| entity["entity_id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !second_page.is_empty(),
+            "the next page must carry the remainder"
+        );
+        assert!(
+            first_page.iter().all(|id| !second_page.contains(id)),
+            "consecutive pages must not overlap"
+        );
+
+        // Cursor stability: the same cursor yields the same page from cache.
+        let page1_again = call_semantic_locate(
+            app,
+            json!({ "cursor": cursor, "page_size": 2, "pipeline": "fused" }),
+        )
+        .await;
+        let second_again: Vec<String> = page1_again["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entity| entity["entity_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            second_page, second_again,
+            "a stable cursor must return the identical page on re-issue"
+        );
+    }
+
+    // FIR-1180: the fused arm's extra top-level fields survive the switch to the
+    // shared schema — routing distinguishes the pipeline, and the structured
+    // coverage/degradations contract rides alongside the LocateResult body.
+    #[tokio::test]
+    async fn mcp_semantic_locate_fused_carries_routing_and_coverage_extras() {
+        let state = test_state();
+        state
+            .graph
+            .upsert_entity(&test_entity("parse_config", "src/config.py"))
+            .unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+
+        let payload =
+            call_semantic_locate(app, json!({ "query": "parse config", "pipeline": "fused" }))
+                .await;
+        assert_eq!(payload["routing"], "fused-v1");
+        let detail = payload["semantic_coverage_detail"]
+            .as_object()
+            .expect("structured semantic_coverage_detail is preserved");
+        assert!(detail.contains_key("indexed"));
+        assert!(detail.contains_key("total"));
+        assert!(detail.contains_key("complete"));
+        // The struct `semantic_coverage` rides on the LocateResult itself, so the
+        // two coverage surfaces agree rather than drifting.
+        assert_eq!(
+            payload["semantic_coverage"],
+            payload["semantic_coverage_detail"]
+        );
+        // `degradations` is a LocateResult field: omitted on a clean run, an
+        // array when a capability degraded — never a bespoke shape.
+        if let Some(degradations) = payload.get("degradations") {
+            assert!(
+                degradations.is_array(),
+                "degradations must serialize as an array"
+            );
+        }
     }
 
     // ---------------------------------------------------------------

@@ -953,31 +953,49 @@ fn evaluate_embedding_coverage(
     vector_source: Option<&kin_db::InMemoryGraph>,
 ) -> Result<SemanticCoverage> {
     let status = effective_embedding_status(graph, vector_source);
-    let complete = embedding_status_complete(&status);
 
-    if !complete && embedding_strict_mode() {
+    if !embedding_status_complete(&status) && embedding_strict_mode() {
         anyhow::bail!(
             "semantic locate requires complete embeddings; graph has {}. Run `kin embed` until `kin status --json` reports embeddingsIndexed == embeddingsTotal and embeddingsPending == 0. (Set KIN_REQUIRE_COMPLETE_EMBEDDINGS=0 to allow graceful degradation.)",
             embedding_status_summary(&status)
         );
     }
 
+    Ok(coverage_from_status(&status))
+}
+
+/// Build the non-gating [`SemanticCoverage`] report from an embedding status.
+/// This is the default (non-strict) coverage `evaluate_embedding_coverage`
+/// returns, factored out so post-retrieval surfaces can re-report coverage
+/// without re-running the strict benchmark gate.
+fn coverage_from_status(status: &kin_db::EmbeddingStatus) -> SemanticCoverage {
+    let complete = embedding_status_complete(status);
     let note = if complete {
         None
     } else {
         Some(format!(
             "semantic signal partial: {} embedded. Lexical + graph results returned; run `kin embed` for full semantic ranking.",
-            embedding_status_summary(&status)
+            embedding_status_summary(status)
         ))
     };
-
-    Ok(SemanticCoverage {
+    SemanticCoverage {
         indexed: status.indexed,
         total: status.total,
         pending: status.pending,
         complete,
         note,
-    })
+    }
+}
+
+/// Semantic coverage for a query's graph plus optional HEAD vector source,
+/// without the benchmark strict-mode gate. Shared with the daemon so a
+/// `semantic_locate` paging continuation (served from cache, no retrieval)
+/// re-reports the same coverage the fresh page did.
+pub fn local_semantic_coverage(
+    graph: &kin_db::InMemoryGraph,
+    vector_source: Option<&kin_db::InMemoryGraph>,
+) -> SemanticCoverage {
+    coverage_from_status(&effective_embedding_status(graph, vector_source))
 }
 
 /// Push a degradation once per (component, reason); repeated hits within one
