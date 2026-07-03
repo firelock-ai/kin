@@ -1696,7 +1696,7 @@ fn index_files_with_stable_entity_ids(
                         kin_index::extract_projection_source_markers(&file.rel_path, &source);
 
                     let done = parsed_count.fetch_add(1, Ordering::Relaxed) + 1;
-                    if done % 100 == 0 || done == total {
+                    if done.is_multiple_of(100) || done == total {
                         eprint!(
                             "\r  [parse {}/{}] {}% | {:.1}s",
                             done,

@@ -43,7 +43,7 @@ impl Progress {
         } else {
             // Non-TTY: print every 10th update as a full line
             // (avoids flooding CI/pipe output with hundreds of lines)
-            if self.updates <= 1 || self.updates % 10 == 0 {
+            if self.updates <= 1 || self.updates.is_multiple_of(10) {
                 eprintln!("  {msg}");
             }
         }
