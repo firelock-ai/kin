@@ -3154,10 +3154,10 @@ async fn run_fused_locate_for_state(
     let extra_priority_files = scope_ref_string
         .as_deref()
         .map(|ref_str| {
+            // `graph` is the session's ref-scoped graph, so the historical
+            // test-artifact signal is read from its graph-owned truth.
             kin_cli::commands::locate::discover_historical_test_artifact_priority_files(
-                &state.layout,
-                ref_str,
-                text,
+                graph, ref_str, text,
             )
         })
         .unwrap_or_default();
