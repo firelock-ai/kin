@@ -3471,9 +3471,7 @@ const PRIORITY_FILE_EXCLUDED_BASENAMES: &[&str] = &[
 
 fn is_excluded_priority_basename(path: &str) -> bool {
     let basename = path.rsplit('/').next().unwrap_or(path);
-    PRIORITY_FILE_EXCLUDED_BASENAMES
-        .iter()
-        .any(|b| basename == *b)
+    PRIORITY_FILE_EXCLUDED_BASENAMES.contains(&basename)
 }
 
 fn note_priority_reason(

@@ -383,7 +383,7 @@ fn locate_ref_can_resolve_historical_files_from_the_public_cli() {
         .collect();
 
     assert!(
-        historical_paths.iter().any(|path| *path == "src/lib.py"),
+        historical_paths.contains(&"src/lib.py"),
         "historical locate should surface src/lib.py, got {historical_paths:?}"
     );
     assert!(
@@ -517,7 +517,7 @@ fn locate_ref_hydrates_missing_imported_git_history_on_demand() {
         .filter_map(|entry| entry["path"].as_str())
         .collect::<Vec<_>>();
     assert!(
-        files.iter().any(|path| *path == "src/lib.py"),
+        files.contains(&"src/lib.py"),
         "historical locate should surface hydrated imported Git file, got {:?}",
         files
     );
