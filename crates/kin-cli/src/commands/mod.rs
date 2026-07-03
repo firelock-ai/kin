@@ -11,6 +11,7 @@ pub mod bench_meta;
 pub mod blame;
 pub mod branch;
 pub mod branch_bootstrap;
+pub mod cache;
 pub mod checkout;
 pub mod clone;
 pub mod cochange;
