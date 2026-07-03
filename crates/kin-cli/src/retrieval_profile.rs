@@ -114,6 +114,23 @@ impl RetrievalProfile {
         matches!(self, Self::AccuracyV1)
     }
 
+    /// Default for `KIN_LOCATE_DECLARATION_CUTOFF` (confidence-calibrated
+    /// declaration cutoff: trim the low-confidence tail of the located file list
+    /// when the fused score distribution shows a decisive separation, and keep
+    /// the full list when scores are flat / genuinely ambiguous).
+    ///
+    /// Dark for every profile today: the lever ships without changing any
+    /// profile's serving behavior. It graduates to a profile default (e.g.
+    /// `accuracy-v1`) only through the paired-A/B measurement gate — split this
+    /// arm to `Self::AccuracyV1 => true` at graduation. Until then the A/B itself
+    /// runs via an explicit `KIN_LOCATE_DECLARATION_CUTOFF=1`, which always wins
+    /// over this default at the read site, so no serving default silently flips.
+    pub fn declaration_cutoff_default(self) -> bool {
+        match self {
+            Self::AccuracyV1 | Self::CompatV0 => false,
+        }
+    }
+
     /// Default for `KIN_LOCATE_LEXICAL_FLOOR_READMIT` (readmit strong lexical
     /// candidates the fused ranking dropped, subsuming grep on keyword
     /// queries).
@@ -277,6 +294,23 @@ mod tests {
         assert!(!compat.rerank_blend_default());
         assert_eq!(compat.rerank_latency_budget_ms_default(), 0);
         assert_eq!(compat.embedding_min_relevance_default(), 0.25);
+        // The declaration cutoff ships dark: unset + compat is byte-identical to
+        // the pre-lever file list (no truncation applied at the read site).
+        assert!(!compat.declaration_cutoff_default());
+    }
+
+    #[test]
+    fn declaration_cutoff_is_dark_for_every_profile() {
+        // The confidence cutoff is a graduation-gated lever: it must not be a
+        // silent default under ANY profile, so that shipping it changes nothing
+        // until a paired A/B flips it on. An explicit env override drives the A/B.
+        for profile in [RetrievalProfile::AccuracyV1, RetrievalProfile::CompatV0] {
+            assert!(
+                !profile.declaration_cutoff_default(),
+                "{} must not enable the declaration cutoff by default",
+                profile.name()
+            );
+        }
     }
 
     #[test]

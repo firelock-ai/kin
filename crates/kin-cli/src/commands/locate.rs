@@ -3075,7 +3075,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
 
     // Adaptive cap
     let mut pruned_files: Vec<PrunedFile> = Vec::new();
-    let results = adaptive_cap(
+    let mut results = adaptive_cap(
         &fused,
         &all_hits,
         max_files,
@@ -3112,6 +3112,43 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
             debug.prune_ledger = std::mem::take(&mut prune_ledger);
         }
     }
+
+    // Confidence-calibrated declaration cutoff (profile lever, default OFF ==
+    // byte-identical). Kin recalls the right files but declares too many, so a
+    // pinned result cap reads as low precision on every F1/Acc@k comparison. When
+    // the fused score distribution shows a decisive separation at the head, trim
+    // the low-confidence tail; when scores are flat the query is genuinely
+    // ambiguous and the full list is kept. An explicit env var overrides the
+    // profile default so the A/B can force it on without a serving default flip.
+    if locate_env_bool(
+        "KIN_LOCATE_DECLARATION_CUTOFF",
+        quality.declaration_cutoff_default(),
+    ) {
+        let gap = locate_env_f32("KIN_LOCATE_DECLARATION_CUTOFF_GAP", 2.0);
+        let min_keep = locate_env_usize("KIN_LOCATE_DECLARATION_CUTOFF_MIN_KEEP", 1);
+        let keep = declaration_cutoff_len(&results, gap, min_keep);
+        // No-silent-elimination: attribute every cut file in the prune ledger the
+        // adaptive-cap block already moved into debug_info.
+        if explain {
+            if let Some(debug) = debug_info.as_mut() {
+                for (path, score) in results.iter().skip(keep) {
+                    debug.prune_ledger.push(PruneEvent {
+                        stage: "declaration_cutoff".to_string(),
+                        kind: "confidence_gap".to_string(),
+                        path: Some(path.clone()),
+                        name: None,
+                        score: Some(*score),
+                        dropped: None,
+                        limit: None,
+                        threshold: Some(gap),
+                        detail: String::new(),
+                    });
+                }
+            }
+        }
+        results.truncate(keep);
+    }
+
     if legacy_debug {
         let stage_count = debug_info
             .as_ref()
@@ -11246,6 +11283,44 @@ fn adaptive_cap(
     result
 }
 
+/// Confidence-calibrated declaration cutoff over a rank-ordered file list
+/// (highest-confidence first). Returns how many leading files to keep.
+///
+/// Walking adjacent ranks from the top, the first pair where the next file retains
+/// less than `1/gap` of the current file's score — a `score[i] / score[i+1] > gap`
+/// separation — is the cutoff: the tail from `i + 1` on is dropped (return
+/// `i + 1`). A non-positive next score is treated as an infinite separation (a
+/// zero/negative-scored file is never a real declaration). When no adjacent pair
+/// clears `gap` the distribution is flat / genuinely ambiguous and the full list
+/// is kept (return the length).
+///
+/// At least `min_keep` (clamped to `>= 1`) files are always retained, so a
+/// decisive top can never truncate to zero. A `gap <= 1.0` disables the cut (a
+/// ratio of one would fire on any strictly-decreasing pair, which is not a
+/// *separation*); a non-finite `gap` likewise keeps the full list. The list order
+/// is never changed — the cutoff only ever removes a suffix — so rank quality
+/// inside the kept prefix is preserved.
+fn declaration_cutoff_len(results: &[(String, f32)], gap: f32, min_keep: usize) -> usize {
+    let n = results.len();
+    let floor = min_keep.max(1);
+    if n <= floor || gap <= 1.0 || !gap.is_finite() {
+        return n;
+    }
+    // The earliest boundary we may cut after is index `floor - 1`, which keeps
+    // exactly `floor` files.
+    for i in (floor - 1)..(n - 1) {
+        let cur = results[i].1;
+        let next = results[i + 1].1;
+        if next <= 0.0 {
+            return i + 1;
+        }
+        if cur > 0.0 && cur / next > gap {
+            return i + 1;
+        }
+    }
+    n
+}
+
 fn demote_zero_signal_files(
     fused: &mut Vec<(String, f32)>,
     all_hits: &[HashMap<String, Vec<FileHit>>],
@@ -15934,6 +16009,142 @@ mod tests {
         );
         assert_eq!(capped.len(), 1);
         assert_eq!(capped[0].0, "src/main.py");
+    }
+
+    // ---- confidence-calibrated declaration cutoff -------------------------
+
+    fn cutoff_list(scores: &[f32]) -> Vec<(String, f32)> {
+        scores
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (format!("f{i}.rs"), *s))
+            .collect()
+    }
+
+    #[test]
+    fn declaration_cutoff_clear_separation_keeps_single_winner() {
+        // Top scores 10, next 2 (< 50%): a decisive separation, keep only the top.
+        let list = cutoff_list(&[10.0, 2.0, 1.5]);
+        assert_eq!(declaration_cutoff_len(&list, 2.0, 1), 1);
+    }
+
+    #[test]
+    fn declaration_cutoff_flat_distribution_keeps_full_k() {
+        // A gently decaying / ambiguous head: no adjacent pair drops past 1/gap,
+        // so the full list survives — the cutoff never fabricates confidence.
+        let list = cutoff_list(&[10.0, 9.0, 8.0, 7.0]);
+        assert_eq!(declaration_cutoff_len(&list, 2.0, 1), list.len());
+    }
+
+    #[test]
+    fn declaration_cutoff_keeps_leading_cluster_then_trims() {
+        // 10, 9, 8 are one cluster; 8 -> 2 is the first decisive gap. Keep 3.
+        let list = cutoff_list(&[10.0, 9.0, 8.0, 2.0, 1.0]);
+        assert_eq!(declaration_cutoff_len(&list, 2.0, 1), 3);
+    }
+
+    #[test]
+    fn declaration_cutoff_min_keep_raises_the_floor() {
+        // The first gap (10 -> 1) would keep a single file, but min_keep forces at
+        // least two through; the next gap (1 -> 0.1) then trims the tail.
+        let list = cutoff_list(&[10.0, 1.0, 0.1]);
+        assert_eq!(declaration_cutoff_len(&list, 2.0, 1), 1);
+        assert_eq!(declaration_cutoff_len(&list, 2.0, 2), 2);
+    }
+
+    #[test]
+    fn declaration_cutoff_nonpositive_next_is_infinite_separation() {
+        // A zero/negative-scored file is never a real declaration: it terminates
+        // the kept prefix immediately (subject to min_keep).
+        let list = cutoff_list(&[5.0, 0.0, 0.0]);
+        assert_eq!(declaration_cutoff_len(&list, 2.0, 1), 1);
+        let neg = cutoff_list(&[5.0, 4.0, -1.0]);
+        assert_eq!(declaration_cutoff_len(&neg, 2.0, 1), 2);
+    }
+
+    #[test]
+    fn declaration_cutoff_min_keep_never_truncates_to_zero() {
+        // min_keep is clamped to >= 1: even an immediate non-positive gap keeps one.
+        let list = cutoff_list(&[5.0, 0.0]);
+        assert_eq!(declaration_cutoff_len(&list, 2.0, 0), 1);
+    }
+
+    #[test]
+    fn declaration_cutoff_gap_at_or_below_one_is_disabled() {
+        // gap <= 1.0 is not a separation threshold; the cut is disabled -> keep k.
+        let list = cutoff_list(&[10.0, 1.0, 0.1]);
+        assert_eq!(declaration_cutoff_len(&list, 1.0, 1), list.len());
+        assert_eq!(declaration_cutoff_len(&list, 0.5, 1), list.len());
+    }
+
+    #[test]
+    fn declaration_cutoff_ratio_is_strict_at_the_boundary() {
+        // Exactly gap does NOT cut (10/5 == 2.0); just past it does (10/4 == 2.5).
+        assert_eq!(
+            declaration_cutoff_len(&cutoff_list(&[10.0, 5.0]), 2.0, 1),
+            2
+        );
+        assert_eq!(
+            declaration_cutoff_len(&cutoff_list(&[10.0, 4.0]), 2.0, 1),
+            1
+        );
+    }
+
+    #[test]
+    fn declaration_cutoff_empty_single_and_nonfinite_gap_are_noops() {
+        assert_eq!(declaration_cutoff_len(&cutoff_list(&[]), 2.0, 1), 0);
+        assert_eq!(declaration_cutoff_len(&cutoff_list(&[7.0]), 2.0, 1), 1);
+        // A non-finite gap can never be exceeded: keep the full list.
+        let list = cutoff_list(&[10.0, 0.01]);
+        assert_eq!(declaration_cutoff_len(&list, f32::NAN, 1), list.len());
+        assert_eq!(declaration_cutoff_len(&list, f32::INFINITY, 1), list.len());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn declaration_cutoff_env_gate_defaults_off_is_byte_identical() {
+        use crate::retrieval_profile::RetrievalProfile;
+        std::env::remove_var("KIN_LOCATE_DECLARATION_CUTOFF");
+        // A decisive single-winner distribution the cutoff WOULD trim if enabled.
+        let results = cutoff_list(&[10.0, 0.2, 0.1]);
+        for profile in [RetrievalProfile::CompatV0, RetrievalProfile::AccuracyV1] {
+            let enabled = locate_env_bool(
+                "KIN_LOCATE_DECLARATION_CUTOFF",
+                profile.declaration_cutoff_default(),
+            );
+            assert!(
+                !enabled,
+                "unset + {} must leave the cutoff OFF (byte-identical file list)",
+                profile.name()
+            );
+            // OFF path returns the list exactly as adaptive_cap produced it.
+            let keep = if enabled {
+                declaration_cutoff_len(&results, 2.0, 1)
+            } else {
+                results.len()
+            };
+            assert_eq!(keep, results.len(), "OFF path must not truncate any file");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn declaration_cutoff_env_override_forces_the_trim() {
+        // The A/B path: an explicit env var wins over the (dark) profile default
+        // and drives the trim, using the registered gap/min_keep defaults.
+        std::env::set_var("KIN_LOCATE_DECLARATION_CUTOFF", "1");
+        std::env::remove_var("KIN_LOCATE_DECLARATION_CUTOFF_GAP");
+        std::env::remove_var("KIN_LOCATE_DECLARATION_CUTOFF_MIN_KEEP");
+        let enabled = locate_env_bool("KIN_LOCATE_DECLARATION_CUTOFF", false);
+        assert!(
+            enabled,
+            "explicit KIN_LOCATE_DECLARATION_CUTOFF=1 must enable"
+        );
+        let gap = locate_env_f32("KIN_LOCATE_DECLARATION_CUTOFF_GAP", 2.0);
+        let min_keep = locate_env_usize("KIN_LOCATE_DECLARATION_CUTOFF_MIN_KEEP", 1);
+        let results = cutoff_list(&[10.0, 0.2, 0.1]);
+        assert_eq!(declaration_cutoff_len(&results, gap, min_keep), 1);
+        std::env::remove_var("KIN_LOCATE_DECLARATION_CUTOFF");
     }
 
     #[test]
