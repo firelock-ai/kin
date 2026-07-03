@@ -625,11 +625,11 @@ pub async fn run(
             })
             .collect();
         let all_entities = graph.list_all_entities()?;
-        let entity_deltas = all_entities
-            .iter()
-            .cloned()
-            .map(EntityDelta::Added)
-            .collect();
+        // Gather relation deltas while only borrowing the entity list, then
+        // consume the list itself into the entity deltas. Building the Added
+        // entity deltas by value (instead of `.iter().cloned()`) avoids holding
+        // a second full copy of every entity during genesis — a ~repo-sized
+        // transient that inflates the init RSS peak on constrained machines.
         let mut relation_ids = HashSet::new();
         let mut relation_deltas = Vec::new();
         for entity in &all_entities {
@@ -639,6 +639,7 @@ pub async fn run(
                 }
             }
         }
+        let entity_deltas = all_entities.into_iter().map(EntityDelta::Added).collect();
 
         let change = SemanticChange {
             id: change_id,
