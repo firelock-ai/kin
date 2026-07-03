@@ -851,13 +851,36 @@ where
                 if !seen.insert(id) {
                     continue;
                 }
-                let change = graph
+                match graph
                     .get_change(&id)
                     .map_err(|err| KinError::Graph(err.to_string()))?
-                    .ok_or_else(|| KinError::Graph(format!("change {} not found", id)))?;
-                stack.push(Frame::Emit(change.clone()));
-                for parent in change.parents.iter().rev() {
-                    stack.push(Frame::Visit(*parent));
+                {
+                    Some(change) => {
+                        stack.push(Frame::Emit(change.clone()));
+                        for parent in change.parents.iter().rev() {
+                            stack.push(Frame::Visit(*parent));
+                        }
+                    }
+                    None => {
+                        // An absent ancestor is the import horizon, not
+                        // corruption: `kin init --git-history recent` imports a
+                        // bounded window (default 50 commits), so the oldest
+                        // imported change can reference a Git parent that was
+                        // never imported. Stop the walk at that edge — treating
+                        // it as the root of the visible history — instead of
+                        // failing the whole ref-scoped read with a bare "change
+                        // not found", which otherwise 500s `locate --ref
+                        // git:<oid>` even for HEAD (HEAD's own ancestry crosses
+                        // the horizon). Newer imports close this gap by
+                        // re-pointing boundary parents at genesis (see
+                        // kin_git::import::close_truncated_history_dag), so this
+                        // only fires for histories imported before that fix or
+                        // pruned below the requested ref.
+                        tracing::warn!(
+                            change = %id,
+                            "ref history walk stopped at an unresolved ancestor (import horizon); returning the changes reachable above it"
+                        );
+                    }
                 }
             }
             Frame::Emit(change) => ordered.push(change),
@@ -2199,6 +2222,41 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
         assert_eq!(ordered.len(), 3_001);
         assert_eq!(ordered.first().map(|change| change.id), Some(genesis_id));
         assert_eq!(ordered.last().map(|change| change.id), Some(head));
+    }
+
+    /// A truncated import can leave the oldest imported change pointing at a
+    /// parent that was never inserted (the import horizon). The ref-scoped
+    /// history walk must treat that dangling edge as the root of the visible
+    /// history and return the reachable changes, NOT fail "change not found" —
+    /// the bare error that 500s `locate --ref git:<oid>` even for HEAD.
+    #[test]
+    fn collect_changes_at_ref_stops_at_import_horizon_instead_of_erroring() {
+        let graph = InMemoryGraph::new();
+        let missing_ancestor = SemanticChangeId::from_hash(Hash256::from_bytes([0x77; 32]));
+        let boundary = SemanticChangeId::from_hash(Hash256::from_bytes([0x78; 32]));
+        let head = SemanticChangeId::from_hash(Hash256::from_bytes([0x79; 32]));
+
+        // `missing_ancestor` is deliberately never inserted, so `boundary`'s
+        // parent edge dangles exactly as a pre-fix truncated import would leave it.
+        graph
+            .create_change(&change(boundary, vec![missing_ancestor], vec![]))
+            .unwrap();
+        graph
+            .create_change(&change(head, vec![boundary], vec![]))
+            .unwrap();
+
+        let ordered = collect_changes_at_ref(&graph, &head)
+            .expect("history walk must not fail at the import horizon");
+        let ids: Vec<_> = ordered.iter().map(|change| change.id).collect();
+        assert_eq!(
+            ids,
+            vec![boundary, head],
+            "walk returns the changes reachable above the horizon, oldest first"
+        );
+        assert!(
+            !ids.contains(&missing_ancestor),
+            "the unresolved ancestor must not appear in the collected history"
+        );
     }
 
     fn test_entity(name: &str, path: &str) -> Entity {

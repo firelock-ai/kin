@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use chrono::TimeZone;
@@ -282,6 +283,9 @@ fn import_full(
             .collect::<Result<Vec<_>>>()?
     };
 
+    // Close the DAG at the truncation horizon before emitting (see the helper).
+    close_truncated_history_dag(&mut changes, genesis_id);
+
     // Reverse so oldest commit is first (topological order).
     changes.reverse();
 
@@ -332,8 +336,51 @@ fn import_full_serial(
         });
     }
 
+    close_truncated_history_dag(&mut changes, genesis_id);
+
     changes.reverse();
     Ok(changes)
+}
+
+/// Re-point dangling boundary parents at `genesis_id` so a truncated import is a
+/// self-contained DAG.
+///
+/// `max_commits` truncation keeps only the newest commits, so the oldest kept
+/// commit's Git parents can fall outside the imported set. `commit_to_change`
+/// derives every non-root commit's parents from its Git parent OIDs regardless
+/// of whether those parents were selected, so a truncated import emits changes
+/// whose parent ids were never inserted into the graph. A later ancestry walk
+/// (`kin_core::collect_changes_at_ref`, used by ref-scoped locate/log/blame)
+/// then fails "change <id> not found" the moment it reaches that dangling
+/// edge — 500ing `locate --ref git:<oid>` even for HEAD, because HEAD's own
+/// history walk crosses the horizon.
+///
+/// Re-pointing every parent that was not imported to `genesis_id` closes the DAG
+/// at the import horizon — the same shape a true root commit already has — so
+/// every parent reference resolves within the imported set ∪ {genesis}. A full
+/// import (`max_commits == 0`) walks the entire ancestry, so no parent is ever
+/// missing and this is a no-op; it only rewrites the boundary of a truncated
+/// window. The rewrite depends solely on the imported id set and `genesis_id`
+/// and preserves parent order (dedup keeps the first occurrence), so the
+/// parallel and serial import paths stay byte-identical.
+fn close_truncated_history_dag(changes: &mut [ImportedChange], genesis_id: SemanticChangeId) {
+    let imported: HashSet<SemanticChangeId> = changes.iter().map(|ic| ic.change.id).collect();
+    for ic in changes.iter_mut() {
+        let original = std::mem::take(&mut ic.change.parents);
+        let mut seen = HashSet::new();
+        let mut rewritten = Vec::with_capacity(original.len());
+        for parent in original {
+            let resolved = if parent == genesis_id || imported.contains(&parent) {
+                parent
+            } else {
+                genesis_id
+            };
+            if seen.insert(resolved) {
+                rewritten.push(resolved);
+            }
+        }
+        ic.change.parents = rewritten;
+    }
 }
 
 /// Convert a gitoxide commit into a SemanticChange.
@@ -871,6 +918,125 @@ mod tests {
                 got_ids, expected_ids,
                 "imported change ids must be stable across preps"
             );
+        }
+    }
+
+    /// A SemanticChange carrying only an id and parents — enough to exercise the
+    /// boundary-parent rewrite without a real Git commit.
+    fn bare_change(id: SemanticChangeId, parents: Vec<SemanticChangeId>) -> ImportedChange {
+        ImportedChange {
+            change: SemanticChange {
+                id,
+                parents,
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: String::new(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            },
+            git_oid: id.to_string(),
+        }
+    }
+
+    fn cid(byte: u8) -> SemanticChangeId {
+        SemanticChangeId::from_hash(Hash256::from_bytes([byte; 32]))
+    }
+
+    /// A parent dropped by truncation is re-pointed to genesis; an in-window
+    /// parent is left untouched. This is the edge that otherwise dangles and
+    /// fails a later `collect_changes_at_ref` history walk.
+    #[test]
+    fn close_truncated_history_dag_repoints_dangling_parents_to_genesis() {
+        let (genesis, a, b, c) = (cid(0x00), cid(0x0A), cid(0x0B), cid(0x0C));
+        // Window kept b (parent a) and c (parent b) but dropped a: b's parent is
+        // now dangling, c's parent is still present.
+        let mut changes = vec![bare_change(b, vec![a]), bare_change(c, vec![b])];
+        close_truncated_history_dag(&mut changes, genesis);
+        assert_eq!(
+            changes[0].change.parents,
+            vec![genesis],
+            "dangling boundary parent must collapse to genesis"
+        );
+        assert_eq!(
+            changes[1].change.parents,
+            vec![b],
+            "in-window parent must be preserved"
+        );
+    }
+
+    /// A merge commit whose parents were both dropped collapses to a single
+    /// genesis parent — never a duplicated `[genesis, genesis]`.
+    #[test]
+    fn close_truncated_history_dag_dedups_collapsed_parents() {
+        let (genesis, p1, p2, merge) = (cid(0x00), cid(0x01), cid(0x02), cid(0x0D));
+        let mut changes = vec![bare_change(merge, vec![p1, p2])];
+        close_truncated_history_dag(&mut changes, genesis);
+        assert_eq!(changes[0].change.parents, vec![genesis]);
+    }
+
+    /// A complete window (every parent present, root already on genesis) is
+    /// untouched — closing only rewrites genuinely dangling edges.
+    #[test]
+    fn close_truncated_history_dag_is_noop_for_complete_history() {
+        let (genesis, root, child) = (cid(0x00), cid(0x0A), cid(0x0B));
+        let mut changes = vec![
+            bare_change(root, vec![genesis]),
+            bare_change(child, vec![root]),
+        ];
+        let before = format!("{changes:?}");
+        close_truncated_history_dag(&mut changes, genesis);
+        assert_eq!(
+            format!("{changes:?}"),
+            before,
+            "a self-contained window must be left unchanged"
+        );
+    }
+
+    /// End-to-end through the real import path: a truncated import must yield a
+    /// DAG in which every parent resolves within the imported set ∪ {genesis},
+    /// so the oldest imported change can never dangle. Without closing, the
+    /// window's boundary commit points at an un-imported Git parent.
+    #[test]
+    fn truncated_import_produces_closed_dag() {
+        let Some(dir) = build_test_repo(12, 4) else {
+            eprintln!("git not available, skipping truncated-import closed-DAG test");
+            return;
+        };
+        let repo = open_repo(dir.path()).expect("open repo");
+        let head_id = repo
+            .head_ref()
+            .expect("head_ref")
+            .expect("non-empty repo")
+            .id()
+            .detach();
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x66; 32]));
+
+        let full = import_full(&repo, head_id, genesis_id, 0, None).expect("full import");
+        assert_eq!(full.len(), 12, "all commits import when max_commits == 0");
+
+        let limited = import_full(&repo, head_id, genesis_id, 5, None).expect("limited import");
+        assert_eq!(
+            limited.len(),
+            5,
+            "truncation must keep exactly max_commits changes"
+        );
+
+        let imported: HashSet<SemanticChangeId> = limited.iter().map(|ic| ic.change.id).collect();
+        for ic in &limited {
+            for parent in &ic.change.parents {
+                assert!(
+                    *parent == genesis_id || imported.contains(parent),
+                    "imported change {} has dangling parent {} (neither genesis nor in the imported window)",
+                    ic.change.id,
+                    parent
+                );
+            }
         }
     }
 

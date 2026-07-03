@@ -522,3 +522,154 @@ fn locate_ref_hydrates_missing_imported_git_history_on_demand() {
         files
     );
 }
+
+/// `kin init` imports a bounded history window (default `recent` = 50 commits).
+/// On a repo with more than 50 commits the oldest imported change used to
+/// reference an un-imported Git parent, so the ref-scoped history walk for
+/// `locate --ref git:<oid>` hit that dangling edge and 500'd "change <id> not
+/// found" — even for HEAD, whose own ancestry crosses the truncation boundary.
+/// Import now closes that boundary onto genesis (and the walk stops at the import
+/// horizon), so both HEAD and an out-of-window commit resolve without a 500.
+#[test]
+#[serial]
+fn locate_ref_resolves_head_and_out_of_window_commits_after_truncated_init() {
+    let repo = tempdir().expect("temp repo");
+
+    let git_init = Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .current_dir(repo.path())
+        .output()
+        .expect("git init");
+    assert!(
+        git_init.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&git_init.stderr)
+    );
+
+    // Neutralize any globally-configured commit-date-rewriting hook so the pinned
+    // dates below survive — the deterministic newest-50 window depends on them.
+    let _ = Command::new("git")
+        .args(["config", "core.hooksPath", "/dev/null"])
+        .current_dir(repo.path())
+        .output();
+
+    let commit = |message: &str, seq: u32| {
+        // Distinct, strictly increasing dates so the truncation window is
+        // time-ordered and deterministic (the fixtures gotcha: equal timestamps
+        // make the window oid-ordered instead, so "out of window" is ambiguous).
+        let date = format!("{} +0000", 1_600_000_000 + seq);
+        let out = Command::new("git")
+            .args([
+                "-c",
+                "user.name=kin-ci",
+                "-c",
+                "user.email=ci@kin.dev",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                message,
+            ])
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .current_dir(repo.path())
+            .output()
+            .expect("git commit");
+        assert!(
+            out.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let rev_parse = |rev: &str| -> String {
+        String::from_utf8_lossy(
+            &Command::new("git")
+                .args(["rev-parse", rev])
+                .current_dir(repo.path())
+                .output()
+                .expect("git rev-parse")
+                .stdout,
+        )
+        .trim()
+        .to_string()
+    };
+
+    // Commit 1 carries real content (so an out-of-window hydration has a file to
+    // surface) and is the oldest commit — it falls outside the newest-50 window.
+    fs::create_dir_all(repo.path().join("src")).expect("create src dir");
+    fs::write(
+        repo.path().join("src/lib.py"),
+        "def legacy_handler(value):\n    return value + 1\n",
+    )
+    .expect("write source");
+    let add = Command::new("git")
+        .args(["add", "."])
+        .current_dir(repo.path())
+        .output()
+        .expect("git add");
+    assert!(add.status.success());
+    commit("c1 initial", 1);
+    let out_of_window_sha = rev_parse("HEAD");
+
+    // 51 more commits (52 total) so the newest-50 window excludes commit 1 and
+    // its boundary parent — the dangling edge the fix closes.
+    for seq in 2..=52u32 {
+        commit(&format!("c{seq}"), seq);
+    }
+    let head_sha = rev_parse("HEAD");
+
+    let init = kin_command()
+        .arg("init")
+        .arg(".")
+        .arg("--no-lsp")
+        .current_dir(repo.path())
+        .output()
+        .expect("run kin init");
+    assert!(
+        init.status.success(),
+        "kin init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&init.stdout),
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    // HEAD resolves: the history walk reaches the genesis-closed horizon instead
+    // of a dangling parent, so the daemon does not 500.
+    let head_locate = kin_command()
+        .arg("locate")
+        .arg("--json")
+        .arg("--ref")
+        .arg(format!("git:{head_sha}"))
+        .arg("legacy_handler")
+        .current_dir(repo.path())
+        .output()
+        .expect("run head-ref locate");
+    assert!(
+        head_locate.status.success(),
+        "locate --ref git:<HEAD> failed (truncated-history regression): stdout={} stderr={}",
+        String::from_utf8_lossy(&head_locate.stdout),
+        String::from_utf8_lossy(&head_locate.stderr)
+    );
+    serde_json::from_slice::<serde_json::Value>(&head_locate.stdout)
+        .expect("HEAD-ref locate stdout should be valid JSON");
+
+    // An out-of-window commit resolves via on-demand hydration, which imports its
+    // full ancestry down to a genesis-rooted boundary.
+    let old_locate = kin_command()
+        .arg("locate")
+        .arg("--json")
+        .arg("--ref")
+        .arg(format!("git:{out_of_window_sha}"))
+        .arg("Investigate legacy_handler in src/lib.py")
+        .current_dir(repo.path())
+        .output()
+        .expect("run out-of-window-ref locate");
+    assert!(
+        old_locate.status.success(),
+        "locate --ref git:<out-of-window> failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&old_locate.stdout),
+        String::from_utf8_lossy(&old_locate.stderr)
+    );
+    serde_json::from_slice::<serde_json::Value>(&old_locate.stdout)
+        .expect("out-of-window-ref locate stdout should be valid JSON");
+}
