@@ -29,6 +29,11 @@ COPY --from=builder /build/kin/target/release/kin-daemon /usr/local/bin/kin-daem
 COPY --from=builder /build/kin/target/release/kin /usr/local/bin/kin
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+# Pre-create the default workspace owned by the runtime user. Docker seeds a
+# freshly created named volume from the image path's ownership, so a volume
+# mounted here (see docker-compose.yml) stays writable by the non-root daemon;
+# without this the volume is created root-owned and the daemon cannot write it.
+RUN mkdir -p /tmp/kin-workspace && chown kin:kin /tmp/kin-workspace
 USER kin
 EXPOSE 4219
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

@@ -13,7 +13,11 @@ services:
     ports:
       - "4219:4219"
     volumes:
-      - workspace-data:/workspace
+      # Persist the daemon's on-disk repo. The mount target must match the
+      # workspace the entrypoint resolves (KIN_WORKSPACE_DIR, default
+      # /tmp/kin-workspace); mounting anywhere else leaves the daemon writing to
+      # an ephemeral path and the named volume vestigial.
+      - workspace-data:/tmp/kin-workspace
     environment:
       - RUST_LOG=${RUST_LOG:-info}
     healthcheck:
