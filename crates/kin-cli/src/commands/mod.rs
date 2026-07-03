@@ -75,6 +75,7 @@ pub mod session_base;
 pub mod session_closeout;
 pub mod session_workspace;
 pub mod setup;
+pub mod setup_ledger;
 pub mod shell;
 pub mod spec;
 pub mod stash;

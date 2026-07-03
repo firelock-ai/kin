@@ -1636,6 +1636,24 @@ enum SetupAction {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Show the install ledger and verify it against disk
+    Ledger {
+        /// Emit the ledger + verification as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Remove exactly what `kin setup` recorded (ledger-verified)
+    Uninstall {
+        /// Show what would be removed without changing anything
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Also remove entries modified since install (never done by default)
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Emit the per-artifact outcomes as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2757,6 +2775,12 @@ fn main() -> Result<()> {
                     Some(SetupAction::Doctor { fix, json }) => {
                         commands::setup::doctor(fix, json).await
                     }
+                    Some(SetupAction::Ledger { json }) => commands::setup::ledger_status(json),
+                    Some(SetupAction::Uninstall {
+                        dry_run,
+                        force,
+                        json,
+                    }) => commands::setup::uninstall(dry_run, force, json),
                     // `kin setup --check` is shorthand for the first-run health
                     // check without running the wizard.
                     None if check => commands::setup::doctor(false, false).await,
