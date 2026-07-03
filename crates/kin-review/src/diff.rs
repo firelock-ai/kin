@@ -91,6 +91,18 @@ impl SemanticDiff {
     }
 }
 
+/// Stable ordering key for a relation change. Relation deltas are accumulated
+/// through HashMaps whose iteration order is not stable, so emitted diffs sort
+/// on this key to stay byte-identical across repeated runs. A relation id is
+/// unique to a single add-or-remove within one diff, so the id alone totally
+/// orders the set.
+fn relation_change_key(change: &RelationChange) -> String {
+    match &change.kind {
+        RelationChangeKind::Added(rel) => rel.id.to_string(),
+        RelationChangeKind::Removed(id) => id.to_string(),
+    }
+}
+
 /// Compute a semantic diff between two change IDs by collecting all
 /// intermediate changes from the graph store.
 pub fn compute_diff<G: GraphStore>(
@@ -166,10 +178,16 @@ pub fn compute_diff<G: GraphStore>(
         }
     }
 
-    diff.entity_changes = entity_states
+    // `entity_states` is a HashMap, so its iteration order is not stable across
+    // runs. Emit entity changes in a deterministic entity-id order so every
+    // downstream consumer (findings, inline comments, JSON payloads) is
+    // byte-identical across repeated evaluations of the same change.
+    let mut entity_changes: Vec<EntityChange> = entity_states
         .into_iter()
         .map(|(entity_id, kind)| EntityChange { entity_id, kind })
         .collect();
+    entity_changes.sort_by_key(|change| change.entity_id);
+    diff.entity_changes = entity_changes;
 
     // Accumulate relation deltas
     let mut relation_added: HashMap<RelationId, Relation> = HashMap::new();
@@ -201,6 +219,8 @@ pub fn compute_diff<G: GraphStore>(
             kind: RelationChangeKind::Removed(id),
         });
     }
+    diff.relation_changes
+        .sort_by(|a, b| relation_change_key(a).cmp(&relation_change_key(b)));
 
     Ok(diff)
 }
@@ -296,10 +316,14 @@ pub fn diff_from_changes(changes: &[SemanticChange]) -> SemanticDiff {
         }
     }
 
-    diff.entity_changes = entity_states
+    // Deterministic entity-id order: `entity_states` is a HashMap whose
+    // iteration order varies run-to-run.
+    let mut entity_changes: Vec<EntityChange> = entity_states
         .into_iter()
         .map(|(entity_id, kind)| EntityChange { entity_id, kind })
         .collect();
+    entity_changes.sort_by_key(|change| change.entity_id);
+    diff.entity_changes = entity_changes;
 
     // Accumulate relation deltas
     let mut relation_added: HashMap<RelationId, Relation> = HashMap::new();
@@ -331,6 +355,8 @@ pub fn diff_from_changes(changes: &[SemanticChange]) -> SemanticDiff {
             kind: RelationChangeKind::Removed(id),
         });
     }
+    diff.relation_changes
+        .sort_by(|a, b| relation_change_key(a).cmp(&relation_change_key(b)));
 
     diff
 }
@@ -721,6 +747,52 @@ mod tests {
         assert!(diff.added_entities().is_empty());
         assert!(diff.modified_entities().is_empty());
         assert_eq!(diff.removed_entity_ids().len(), 2);
+    }
+
+    #[test]
+    fn diff_from_changes_emits_entity_changes_in_id_order() {
+        // Deltas arrive out of id order and are accumulated through a HashMap,
+        // whose iteration order is not stable. The builder must emit entity
+        // changes in a deterministic entity-id order so anything derived from
+        // them (findings, inline comments, JSON payloads) is byte-identical
+        // across repeated runs of the same change.
+        let ids: Vec<EntityId> = (0..6u32)
+            .map(|i| EntityId::from_content("src/tie.rs", &format!("e{i}"), "function", i))
+            .collect();
+        let entity_deltas: Vec<EntityDelta> = ids
+            .iter()
+            .rev()
+            .map(|id| EntityDelta::Removed(*id))
+            .collect();
+        let change = SemanticChange {
+            id: test_change_id(21),
+            parents: vec![test_change_id(20)],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "remove many".into(),
+            entity_deltas,
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: None,
+        };
+
+        let emitted: Vec<EntityId> = diff_from_changes(&[change])
+            .entity_changes
+            .iter()
+            .map(|change| change.entity_id)
+            .collect();
+
+        assert_eq!(emitted.len(), ids.len());
+        let mut sorted = emitted.clone();
+        sorted.sort();
+        assert_eq!(
+            emitted, sorted,
+            "entity_changes must be emitted in ascending entity-id order"
+        );
     }
 
     #[test]
