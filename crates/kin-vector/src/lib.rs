@@ -189,16 +189,19 @@ fn hnsw_level_for_key<Id: Hash>(id: &Id) -> usize {
 
 /// Cosine distance: 1.0 - cosine_similarity.  Lower is more similar.
 ///
-/// The default path is the scalar reduction in [`cosine_distance_scalar`], so the
-/// shipped default is bit-identical to the frozen benchmark on every target. The
-/// aarch64 NEON kernel in [`cosine_distance_neon`] is compiled in under the `simd`
-/// feature but is OPT-IN: it runs only when the `KIN_VECTOR_SIMD` env gate is set
-/// to an on value (default off). It is taken intentionally because the two kernels
-/// are NOT bit-identical — SIMD reduces four lanes then folds, a different (but
-/// fixed, cross-run-deterministic) summation order than the scalar sequential sum.
-/// That ~2-ulp delta can transpose effectively-equidistant neighbors, so the
-/// kernel stays gated off until the swap is measured and approved; the delta is
-/// characterized and bounded in the `simd` tests.
+/// On aarch64 built with the `simd` feature (both the shipped default), the default
+/// path is the NEON kernel in [`cosine_distance_neon`], taken whenever the
+/// `KIN_VECTOR_SIMD` env gate resolves on — which it does by default now that the
+/// kernel's scalar parity and CPU efficiency are measured and approved. The two
+/// kernels are NOT bit-identical: SIMD reduces four lanes then folds, a different
+/// (but fixed, cross-run-deterministic) summation order than the scalar sequential
+/// sum. That ~2-ulp delta only ever transposes effectively-equidistant neighbors;
+/// it is characterized and bounded in the `simd` tests.
+///
+/// The scalar reduction in [`cosine_distance_scalar`] stays reachable for A/B (or a
+/// bit-identical-to-frozen-benchmark run) by setting `KIN_VECTOR_SIMD` to `0`,
+/// `false`, `no`, or `off`; it is also the only path when the `simd` feature is off
+/// or the target is not aarch64.
 #[inline]
 pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
@@ -240,22 +243,36 @@ fn cosine_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
     1.0 - dot / denom
 }
 
-/// Runtime gate for the SIMD distance kernel (`KIN_VECTOR_SIMD`, default OFF).
-/// Off by default so the scalar path stays the bit-identical default result
-/// authority; enable with `KIN_VECTOR_SIMD=1` once the kernel swap is approved.
-/// Sampled once per process so the hot path never re-reads the environment.
-/// Gated to aarch64 to match its only caller (the NEON branch of
-/// [`cosine_distance`]); on other targets there is no SIMD kernel to gate.
+/// Runtime gate for the SIMD distance kernel (`KIN_VECTOR_SIMD`, default ON).
+/// On by default now that the NEON kernel's scalar parity and CPU efficiency are
+/// measured and approved; the scalar reduction stays reachable for A/B by setting
+/// the env to an off value (see [`simd_enabled_from_env`]). Sampled once per
+/// process so the hot path never re-reads the environment. Gated to aarch64 to
+/// match its only caller (the NEON branch of [`cosine_distance`]); on other targets
+/// there is no SIMD kernel to gate.
 #[cfg(all(feature = "simd", target_arch = "aarch64"))]
 fn simd_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("KIN_VECTOR_SIMD").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
-    })
+    *ENABLED.get_or_init(|| simd_enabled_from_env(std::env::var("KIN_VECTOR_SIMD").ok().as_deref()))
+}
+
+/// Resolve the `KIN_VECTOR_SIMD` gate from its raw env value. Default ON: an unset
+/// value — or any value that is not an explicit off token — enables the NEON
+/// kernel, while `0`, `false`, `no`, or `off` (case-insensitive, surrounding
+/// whitespace ignored) select the scalar reduction. Mirrors kin-search's
+/// `KIN_SEARCH_INCREMENTAL_PERSIST` resolution so the two graduated gates share one
+/// default-on convention. Kept as a pure fn of the raw value so the resolution is
+/// unit-testable without the process-global `OnceLock`.
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+fn simd_enabled_from_env(value: Option<&str>) -> bool {
+    let Some(value) = value.map(str::trim) else {
+        return true;
+    };
+    !(value == "0"
+        || value.eq_ignore_ascii_case("false")
+        || value.eq_ignore_ascii_case("no")
+        || value.eq_ignore_ascii_case("off"))
 }
 
 /// aarch64 NEON cosine distance. Accumulates `dot`, `norm_a`, `norm_b` in four
@@ -3029,43 +3046,33 @@ mod tests {
         assert!((cosine_distance(&[1.0, 0.0], &[-1.0, 0.0]) - 2.0).abs() < 1e-6);
     }
 
-    /// The public `cosine_distance` must be BIT-IDENTICAL to the scalar reduction
-    /// in its default configuration — the property the frozen benchmark depends on.
-    /// The SIMD kernel is opt-in (`KIN_VECTOR_SIMD=1`) precisely because it is not
-    /// bit-identical; with the gate at its default (off) the default path is the
-    /// scalar reduction on every target and feature combination. This guards
-    /// against a future re-flip of the default silently changing results.
+    /// The `KIN_VECTOR_SIMD` gate resolves default-ON now that the NEON kernel has
+    /// graduated: an unset value — or any value that is not an explicit off token —
+    /// takes the SIMD path, while `0`, `false`, `no`, or `off` keep the scalar
+    /// reduction reachable for A/B. Mirrors kin-search's incremental-persist gate.
+    /// Pinning the full truth table here guards against a silent re-flip of the
+    /// default and documents the exact off-switch tokens. Pure resolution, so it
+    /// never touches the once-per-process gate the running kernel samples.
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
     #[test]
-    fn default_cosine_distance_is_bit_identical_to_scalar() {
-        // N/A if the environment forced the SIMD kernel on for this process.
-        if matches!(
-            std::env::var("KIN_VECTOR_SIMD").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        ) {
-            return;
-        }
-        fn vec_for(seed: u64, dim: usize) -> Vec<f32> {
-            (0..dim)
-                .map(|d| {
-                    let h = seed
-                        .wrapping_mul(6364136223846793005)
-                        .wrapping_add((d as u64).wrapping_mul(1442695040888963407))
-                        .wrapping_add(0x9E3779B97F4A7C15);
-                    ((h >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0
-                })
-                .collect()
-        }
-        for &dim in &[1usize, 2, 3, 4, 7, 8, 31, 48, 127, 768] {
-            for s in 0..8u64 {
-                let a = vec_for(dim as u64 * 100 + s, dim);
-                let b = vec_for(dim as u64 * 100 + s + 50, dim);
-                assert_eq!(
-                    cosine_distance(&a, &b).to_bits(),
-                    cosine_distance_scalar(&a, &b).to_bits(),
-                    "default cosine_distance diverged from scalar (dim {dim}, seed {s})"
-                );
-            }
-        }
+    fn simd_gate_defaults_on_and_scalar_stays_reachable() {
+        // Default ON: unset and any non-off token enable the NEON kernel.
+        assert!(simd_enabled_from_env(None));
+        assert!(simd_enabled_from_env(Some("")));
+        assert!(simd_enabled_from_env(Some("1")));
+        assert!(simd_enabled_from_env(Some("true")));
+        assert!(simd_enabled_from_env(Some("TRUE")));
+        assert!(simd_enabled_from_env(Some("yes")));
+        assert!(simd_enabled_from_env(Some("on")));
+        assert!(simd_enabled_from_env(Some("unexpected")));
+
+        // Scalar reduction stays reachable via the explicit off tokens (A/B switch).
+        assert!(!simd_enabled_from_env(Some("0")));
+        assert!(!simd_enabled_from_env(Some("false")));
+        assert!(!simd_enabled_from_env(Some("FALSE")));
+        assert!(!simd_enabled_from_env(Some("no")));
+        assert!(!simd_enabled_from_env(Some("off")));
+        assert!(!simd_enabled_from_env(Some("  off  ")));
     }
 
     /// Determinism + delta characterization for the aarch64 NEON distance kernel.

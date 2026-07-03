@@ -253,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "kin-vector"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "fs2",
  "hashbrown 0.15.5",
