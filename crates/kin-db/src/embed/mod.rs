@@ -2,12 +2,12 @@
 // Copyright 2026 Firelock, LLC
 
 #[cfg(feature = "embeddings")]
+pub mod cache_admin;
+#[cfg(feature = "embeddings")]
 mod inference;
 #[cfg(feature = "embeddings")]
 pub mod rerank;
 
-#[cfg(feature = "embeddings")]
-use directories::BaseDirs;
 #[cfg(feature = "embeddings")]
 use hf_hub::{api::sync::Api, Repo, RepoType};
 #[cfg(feature = "embeddings")]
@@ -3311,11 +3311,7 @@ impl EmbeddingCache {
             return None;
         }
 
-        let base_dir = std::env::var_os("KIN_EMBED_CACHE_DIR")
-            .map(PathBuf::from)
-            .or_else(|| {
-                BaseDirs::new().map(|dirs| dirs.home_dir().join(".kin/cache/embeddings"))
-            })?;
+        let base_dir = cache_admin::embedding_cache_base_dir()?;
         Self::new_in(base_dir, namespace, dimensions)
     }
 
