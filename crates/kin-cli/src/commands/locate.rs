@@ -2745,7 +2745,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 top.sort_by(|a, b| {
                     b.1.partial_cmp(&a.1)
                         .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.0.cmp(&b.0))
+                        .then_with(|| a.0.cmp(b.0))
                 });
                 let top_str: Vec<String> = top
                     .iter()
@@ -8438,7 +8438,7 @@ fn extract_source_text_signals(
             bonus += locate_env_f32("KIN_LOCATE_SOURCE_TEXT_SYMBOLIC_SUPPORT_BONUS", 8.0)
                 * (symbolic_count.min(2) as f32);
         }
-        if cli_flag_query && is_cli_surface_path(&path) {
+        if cli_flag_query && is_cli_surface_path(path) {
             bonus += locate_env_f32("KIN_LOCATE_SOURCE_TEXT_CLI_SURFACE_BONUS", 22.0);
         }
         if bonus > 0.0 {
@@ -12345,7 +12345,7 @@ fn promote_cli_surface_local_headers(
     let empty_paths = HashSet::new();
     let mut changed = false;
     for seed in seed_paths {
-        let Some(header_path) = sibling_header_for_cli_surface(&seed, &workspace_root) else {
+        let Some(header_path) = sibling_header_for_cli_surface(&seed, workspace_root) else {
             continue;
         };
         changed |= upsert_fused_floor(fused, header_path.clone(), direct_floor);
@@ -12361,7 +12361,7 @@ fn promote_cli_surface_local_headers(
             &header_path,
             &header_text,
             &empty_paths,
-            Some(&workspace_root),
+            Some(workspace_root),
         ) {
             if is_header_like_path(&include_path) {
                 changed |= upsert_fused_floor(fused, include_path, nested_floor);

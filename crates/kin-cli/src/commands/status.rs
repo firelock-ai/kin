@@ -147,8 +147,8 @@ pub fn build_status_summary(
     layout: &kin_core::KinLayout,
     graph: &kin_db::InMemoryGraph,
 ) -> Result<StatusSummary> {
-    let current = kin_core::read_current_branch(&layout)?;
-    let source_root = kin_core::source_dir(&layout);
+    let current = kin_core::read_current_branch(layout)?;
+    let source_root = kin_core::source_dir(layout);
     let config = kin_core::KinConfig::load_or_default(&layout.config_path())?;
     let default_remote = config
         .resolve_remote(None)
@@ -197,7 +197,7 @@ pub fn build_status_summary(
     };
 
     // Check for in-progress merge.
-    let merge_state = crate::commands::conflicts::load_merge_state(&layout)
+    let merge_state = crate::commands::conflicts::load_merge_state(layout)
         .ok()
         .flatten()
         .map(|ms| {

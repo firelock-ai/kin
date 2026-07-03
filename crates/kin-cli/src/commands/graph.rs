@@ -399,7 +399,7 @@ fn build_graph_validate_response(
     }
 
     // Check for orphaned entities (file_origin that doesn't exist on disk)
-    let source_root = kin_core::source_dir(&layout);
+    let source_root = kin_core::source_dir(layout);
     let mut orphaned = 0usize;
     for e in &entities {
         if let Some(ref fo) = e.file_origin {

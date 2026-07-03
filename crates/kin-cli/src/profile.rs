@@ -507,7 +507,7 @@ where
             if attrs.is_contextual() {
                 ctx.current_span()
                     .id()
-                    .and_then(|parent| span_profile_id(&parent, ctx))
+                    .and_then(|parent| span_profile_id(parent, ctx))
             } else {
                 None
             }

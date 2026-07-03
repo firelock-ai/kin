@@ -75,7 +75,7 @@ fn build_approvals_show_response(
     graph: &kin_db::InMemoryGraph,
     change_id: &str,
 ) -> Result<ApprovalsResponse> {
-    let id = parse_change_id(&change_id)?;
+    let id = parse_change_id(change_id)?;
     let approvals = graph.get_approvals_for_change(&id)?;
 
     if approvals.is_empty() {

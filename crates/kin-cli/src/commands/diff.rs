@@ -53,11 +53,11 @@ pub fn build_diff_response(
     match (&request.base, &request.head) {
         (Some(b), Some(h)) => {
             let base_id = kin_model::SemanticChangeId::from_hash(
-                kin_model::Hash256::from_hex(&b)
+                kin_model::Hash256::from_hex(b)
                     .map_err(|e| anyhow::anyhow!("invalid base hash: {}", e))?,
             );
             let head_id = kin_model::SemanticChangeId::from_hash(
-                kin_model::Hash256::from_hex(&h)
+                kin_model::Hash256::from_hex(h)
                     .map_err(|e| anyhow::anyhow!("invalid head hash: {}", e))?,
             );
             let changes = graph.get_changes_since(&base_id, &head_id)?;

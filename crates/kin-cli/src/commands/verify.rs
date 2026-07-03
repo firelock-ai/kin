@@ -362,7 +362,7 @@ pub fn execute_verify_run(
         }
     };
 
-    let evidence_blob = store_evidence_blob(&layout, &evidence_text);
+    let evidence_blob = store_evidence_blob(layout, &evidence_text);
     let run_id = VerificationRunId::new();
     let verification_run = VerificationRun {
         run_id,
