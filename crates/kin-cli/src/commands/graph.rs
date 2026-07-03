@@ -216,7 +216,7 @@ fn build_graph_status_response(
     let mut total_relations = 0usize;
     for e in &entities {
         for rel in graph.get_all_relations_for_entity(&e.id)? {
-            if seen_relation_ids.insert(rel.id.clone()) {
+            if seen_relation_ids.insert(rel.id) {
                 *relation_counts.entry(rel.kind).or_insert(0) += 1;
                 total_relations += 1;
             }
@@ -399,7 +399,7 @@ fn build_graph_validate_response(
     }
 
     // Check for orphaned entities (file_origin that doesn't exist on disk)
-    let source_root = kin_core::source_dir(&layout);
+    let source_root = kin_core::source_dir(layout);
     let mut orphaned = 0usize;
     for e in &entities {
         if let Some(ref fo) = e.file_origin {

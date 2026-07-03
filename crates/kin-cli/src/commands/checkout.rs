@@ -106,14 +106,14 @@ pub fn execute_checkout_request(
         // 2. Clean up any files in the working directory that are NOT in the tree
         let source_root = layout.working_dir();
         let mut files_to_delete = Vec::new();
-        collect_non_tree_files(&source_root, &source_root, &tree, &mut files_to_delete)?;
+        collect_non_tree_files(source_root, source_root, &tree, &mut files_to_delete)?;
 
         for file_path in files_to_delete {
             let _ = std::fs::remove_file(file_path);
         }
 
         // Clean up empty directories
-        clean_empty_dirs(&source_root, &source_root)?;
+        clean_empty_dirs(source_root, source_root)?;
 
         return Ok(CheckoutResponse {
             lines: vec![format!("Checked out all files from change {}", target_head)],

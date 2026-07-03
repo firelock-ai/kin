@@ -171,7 +171,7 @@ fn render_support_json(report: &SupportJson) -> Vec<String> {
         let total = report.total_entities;
         let mut parts: Vec<String> = Vec::new();
         let mut sorted: Vec<_> = report.role_counts.iter().collect();
-        sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
+        sorted.sort_by_key(|(a, _)| *a);
         for (role, count) in sorted {
             parts.push(format!("{}: {}", role.to_lowercase(), count));
         }
@@ -222,7 +222,7 @@ fn render_support_json(report: &SupportJson) -> Vec<String> {
 
 fn render_counts(counts: &BTreeMap<String, usize>) -> Vec<String> {
     let mut entries: Vec<_> = counts.iter().collect();
-    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    entries.sort_by_key(|(a, _)| *a);
     if entries.is_empty() {
         return vec!["  (none)".to_string()];
     }

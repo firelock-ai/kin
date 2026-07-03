@@ -719,6 +719,73 @@ fn collect_files_recursive(
     Ok(())
 }
 
+/// Fetch the remote repo catalog from a KinLab spine, if configured.
+/// Returns empty vec if no remote is configured or if the request fails.
+/// 3-second timeout to avoid blocking `kin commit`.
+///
+/// First fetches with no filter to get the full catalog (for small orgs).
+/// For large orgs (>1000 repos), the endpoint supports ?q=name1,name2,...
+/// filtering which the caller can use to narrow to dependency candidates.
+#[cfg(test)]
+#[allow(dead_code)]
+fn fetch_remote_catalog() -> Vec<String> {
+    let remote_url = match kin_core::registry::KinRegistry::remote_url() {
+        Some(url) => url,
+        None => return Vec::new(),
+    };
+
+    let base_url = remote_url.trim_end_matches('/');
+    let url = format!("{}/api/repos", base_url);
+    let auth_header = super::remote::native_remote_bearer_token(base_url)
+        .map(|t| format!("Authorization: Bearer {}", t));
+
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-s", "--max-time", "3"]);
+    if let Some(ref header) = auth_header {
+        cmd.args(["-H", header.as_str()]);
+    }
+    cmd.arg(&url);
+
+    match cmd.output() {
+        Ok(output) if output.status.success() => {
+            let body = String::from_utf8_lossy(&output.stdout);
+            kin_core::registry::KinRegistry::parse_repo_catalog(&body)
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Fetch only repos matching specific names from the remote catalog.
+/// Used when the caller already knows what dependency names to check.
+#[allow(dead_code)]
+fn fetch_remote_catalog_filtered(names: &[&str]) -> Vec<String> {
+    let remote_url = match kin_core::registry::KinRegistry::remote_url() {
+        Some(url) => url,
+        None => return Vec::new(),
+    };
+
+    let base_url = remote_url.trim_end_matches('/');
+    let query = names.join(",");
+    let url = format!("{}/api/repos?q={}", base_url, query);
+    let auth_header = super::remote::native_remote_bearer_token(base_url)
+        .map(|t| format!("Authorization: Bearer {}", t));
+
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-s", "--max-time", "3"]);
+    if let Some(ref header) = auth_header {
+        cmd.args(["-H", header.as_str()]);
+    }
+    cmd.arg(&url);
+
+    match cmd.output() {
+        Ok(output) if output.status.success() => {
+            let body = String::from_utf8_lossy(&output.stdout);
+            kin_core::registry::KinRegistry::parse_repo_catalog(&body)
+        }
+        _ => Vec::new(),
+    }
+}
+
 // should_skip_dir moved to kin_index::should_skip_dir (canonical skip list).
 
 #[cfg(test)]
@@ -799,72 +866,5 @@ mod tests {
         assert!(collected.contains("README.md"));
         assert!(!collected.contains(".kin-snapshot-tmp/nested/manifest.json"));
         assert!(!collected.contains(".kin-export/cache/state.json"));
-    }
-}
-
-/// Fetch the remote repo catalog from a KinLab spine, if configured.
-/// Returns empty vec if no remote is configured or if the request fails.
-/// 3-second timeout to avoid blocking `kin commit`.
-///
-/// First fetches with no filter to get the full catalog (for small orgs).
-/// For large orgs (>1000 repos), the endpoint supports ?q=name1,name2,...
-/// filtering which the caller can use to narrow to dependency candidates.
-#[cfg(test)]
-#[allow(dead_code)]
-fn fetch_remote_catalog() -> Vec<String> {
-    let remote_url = match kin_core::registry::KinRegistry::remote_url() {
-        Some(url) => url,
-        None => return Vec::new(),
-    };
-
-    let base_url = remote_url.trim_end_matches('/');
-    let url = format!("{}/api/repos", base_url);
-    let auth_header = super::remote::native_remote_bearer_token(base_url)
-        .map(|t| format!("Authorization: Bearer {}", t));
-
-    let mut cmd = std::process::Command::new("curl");
-    cmd.args(["-s", "--max-time", "3"]);
-    if let Some(ref header) = auth_header {
-        cmd.args(["-H", header.as_str()]);
-    }
-    cmd.arg(&url);
-
-    match cmd.output() {
-        Ok(output) if output.status.success() => {
-            let body = String::from_utf8_lossy(&output.stdout);
-            kin_core::registry::KinRegistry::parse_repo_catalog(&body)
-        }
-        _ => Vec::new(),
-    }
-}
-
-/// Fetch only repos matching specific names from the remote catalog.
-/// Used when the caller already knows what dependency names to check.
-#[allow(dead_code)]
-fn fetch_remote_catalog_filtered(names: &[&str]) -> Vec<String> {
-    let remote_url = match kin_core::registry::KinRegistry::remote_url() {
-        Some(url) => url,
-        None => return Vec::new(),
-    };
-
-    let base_url = remote_url.trim_end_matches('/');
-    let query = names.join(",");
-    let url = format!("{}/api/repos?q={}", base_url, query);
-    let auth_header = super::remote::native_remote_bearer_token(base_url)
-        .map(|t| format!("Authorization: Bearer {}", t));
-
-    let mut cmd = std::process::Command::new("curl");
-    cmd.args(["-s", "--max-time", "3"]);
-    if let Some(ref header) = auth_header {
-        cmd.args(["-H", header.as_str()]);
-    }
-    cmd.arg(&url);
-
-    match cmd.output() {
-        Ok(output) if output.status.success() => {
-            let body = String::from_utf8_lossy(&output.stdout);
-            kin_core::registry::KinRegistry::parse_repo_catalog(&body)
-        }
-        _ => Vec::new(),
     }
 }

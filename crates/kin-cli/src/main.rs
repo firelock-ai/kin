@@ -2126,18 +2126,13 @@ fn main() -> Result<()> {
                                                 }
                                             }
                                         }
-                                        if stage_info.is_empty() {
-                                            if !debug.resolved_files.is_empty() {
-                                                if let Some(rf) = debug
-                                                    .resolved_files
-                                                    .iter()
-                                                    .find(|r| r.path == *g)
-                                                {
-                                                    stage_info = format!(
-                                                        " (resolved at score {:.1})",
-                                                        rf.score
-                                                    );
-                                                }
+                                        if stage_info.is_empty() && !debug.resolved_files.is_empty()
+                                        {
+                                            if let Some(rf) =
+                                                debug.resolved_files.iter().find(|r| r.path == *g)
+                                            {
+                                                stage_info =
+                                                    format!(" (resolved at score {:.1})", rf.score);
                                             }
                                         }
                                         if stage_info.is_empty() {

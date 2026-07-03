@@ -655,7 +655,7 @@ fn split_identifier_parts(name: &str) -> Vec<String> {
             if !current.is_empty() {
                 // Check if this is start of a new word (camelCase boundary)
                 // but NOT a run of capitals (like "HTTP" in "HTTPClient")
-                let prev_was_lower = current.chars().last().map_or(false, |c| c.is_lowercase());
+                let prev_was_lower = current.chars().last().is_some_and(|c| c.is_lowercase());
                 if prev_was_lower {
                     parts.push(std::mem::take(&mut current).to_lowercase());
                 }
@@ -1787,8 +1787,10 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         });
         fallback_files.truncate(max_files);
         let debug_info = if explain {
-            let mut info = LocateDebugInfo::default();
-            info.skipped_signals = budget.warnings.clone();
+            let mut info = LocateDebugInfo {
+                skipped_signals: budget.warnings.clone(),
+                ..Default::default()
+            };
             prune_ledger.push(PruneEvent {
                 stage: "scoring".to_string(),
                 kind: "budget_skip".to_string(),
@@ -2671,7 +2673,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                     .extra
                     .get("embedding_body_preview")
                     .and_then(|v| v.as_str())
-                    .map_or(false, |s| !s.is_empty());
+                    .is_some_and(|s| !s.is_empty());
                 let body_tag = if has_body { "DEF" } else { "ref" };
                 let test_tag = if is_test_by_role(file, Some(&e)) {
                     " [TEST]"
@@ -2745,7 +2747,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
                 top.sort_by(|a, b| {
                     b.1.partial_cmp(&a.1)
                         .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.0.cmp(&b.0))
+                        .then_with(|| a.0.cmp(b.0))
                 });
                 let top_str: Vec<String> = top
                     .iter()
@@ -3471,9 +3473,7 @@ const PRIORITY_FILE_EXCLUDED_BASENAMES: &[&str] = &[
 
 fn is_excluded_priority_basename(path: &str) -> bool {
     let basename = path.rsplit('/').next().unwrap_or(path);
-    PRIORITY_FILE_EXCLUDED_BASENAMES
-        .iter()
-        .any(|b| basename == *b)
+    PRIORITY_FILE_EXCLUDED_BASENAMES.contains(&basename)
 }
 
 fn note_priority_reason(
@@ -3771,18 +3771,15 @@ fn direct_query_priority_paths(
 ) -> HashSet<String> {
     priority_traces
         .iter()
-        .filter_map(|(path, trace)| {
-            trace
-                .reasons
-                .iter()
-                .any(|reason| {
-                    matches!(
-                        reason.kind.as_str(),
-                        "explicit_path" | "tracked_explicit_name"
-                    )
-                })
-                .then(|| path.clone())
+        .filter(|&(_path, trace)| {
+            trace.reasons.iter().any(|reason| {
+                matches!(
+                    reason.kind.as_str(),
+                    "explicit_path" | "tracked_explicit_name"
+                )
+            })
         })
+        .map(|(path, _trace)| path.clone())
         .collect()
 }
 
@@ -3792,19 +3789,16 @@ fn injectable_priority_paths(
     let historical_paths = historical_priority_retention_paths(priority_traces);
     priority_traces
         .iter()
-        .filter_map(|(path, trace)| {
-            trace
-                .reasons
-                .iter()
-                .any(|reason| {
-                    if reason.kind == "historical_priority_seed" {
-                        historical_paths.contains(path)
-                    } else {
-                        priority_reason_allows_injection(&reason.kind)
-                    }
-                })
-                .then(|| path.clone())
+        .filter(|&(path, trace)| {
+            trace.reasons.iter().any(|reason| {
+                if reason.kind == "historical_priority_seed" {
+                    historical_paths.contains(path)
+                } else {
+                    priority_reason_allows_injection(&reason.kind)
+                }
+            })
         })
+        .map(|(path, _trace)| path.clone())
         .collect()
 }
 
@@ -4172,7 +4166,7 @@ fn extract_priority_file_traces(
             if let Ok(mut all) = graph.query_entities(&EntityFilter::default()) {
                 // Determinism: sort before the take() clip so the scanned subset
                 // is stable across processes (query order is not stable on its own).
-                all.sort_by(|a, b| a.id.cmp(&b.id));
+                all.sort_by_key(|a| a.id);
                 let mut seen_paths = HashSet::new();
                 let mut matched_paths = Vec::new();
                 for entity in all.iter().take(2000) {
@@ -4253,7 +4247,7 @@ fn extract_priority_file_traces(
             let mut dir_to_files: HashMap<String, Vec<String>> = HashMap::new();
             if let Ok(mut all_entities) = graph.query_entities(&EntityFilter::default()) {
                 // Determinism: stable subset under the take() clip.
-                all_entities.sort_by(|a, b| a.id.cmp(&b.id));
+                all_entities.sort_by_key(|a| a.id);
                 let mut seen_files = HashSet::new();
                 for entity in all_entities.iter().take(5000) {
                     if let Some(ref fo) = entity.file_origin {
@@ -4787,7 +4781,7 @@ fn query_backed_tracked_file_score(path: &str, term_lower: &str) -> Option<f32> 
     }
 
     let basename_exact_segment = basename_lower
-        .split(|ch: char| matches!(ch, '/' | '.' | '_' | '-'))
+        .split(['/', '.', '_', '-'])
         .filter(|segment| !segment.is_empty())
         .any(|segment| segment == term_lower);
     if basename_exact_segment {
@@ -4796,7 +4790,7 @@ fn query_backed_tracked_file_score(path: &str, term_lower: &str) -> Option<f32> 
 
     let path_lower = path.to_ascii_lowercase();
     let exact_segment = path_lower
-        .split(|ch: char| matches!(ch, '/' | '.' | '_' | '-'))
+        .split(['/', '.', '_', '-'])
         .filter(|segment| !segment.is_empty())
         .any(|segment| segment == term_lower);
     if exact_segment && is_manifest_like_basename(&basename_lower) {
@@ -5834,7 +5828,7 @@ fn extract_traceback_signals(
         // still look like stdlib/venv noise.
         if let Some(ref path) = rel_path {
             hits.entry(path.clone()).or_default().push(FileHit {
-                score: score,
+                score,
                 spans: vec![[line, line]],
             });
         } else if is_stdlib_path(file_path) {
@@ -5882,8 +5876,8 @@ fn normalize_traceback_path(path: &str) -> String {
     let path = path.replace('\\', "/");
 
     // Strip ~ prefix (e.g. ~/dev/astropy/astropy/... → /dev/astropy/astropy/...)
-    let path = if path.starts_with("~/") {
-        format!("/{}", &path[2..])
+    let path = if let Some(rest) = path.strip_prefix("~/") {
+        format!("/{rest}")
     } else {
         path
     };
@@ -7535,7 +7529,7 @@ fn extract_multihop_signals(
                 continue;
             };
             let start = GraphNodeId::Artifact(start_artifact_id);
-            let mut visited = HashSet::from([start.clone()]);
+            let mut visited = HashSet::from([start]);
             let mut queue = VecDeque::from([(start, seed_path.clone(), 0usize)]);
             let seed_strength = (*seed_score / 72.0).clamp(0.35, 2.0);
 
@@ -7602,7 +7596,7 @@ fn extract_multihop_signals(
                         spans: vec![],
                     });
 
-                    if visited.insert(next.clone()) {
+                    if visited.insert(next) {
                         queue.push_back((next, path, depth + 1));
                     }
                 }
@@ -7819,7 +7813,7 @@ fn extract_multihop_signals(
         }
     }
 
-    if let Some(ledger) = ledger.as_deref_mut() {
+    if let Some(ledger) = ledger {
         if cut_depth_limit_hits > 0 {
             ledger.push(PruneEvent {
                 stage: "multihop_depth".to_string(),
@@ -8030,7 +8024,7 @@ fn extract_test_signals(
             };
             let mut name_matched = graph.query_entities(&filter)?;
             // Determinism: stable subset under the take() clip.
-            name_matched.sort_by(|a, b| a.id.cmp(&b.id));
+            name_matched.sort_by_key(|a| a.id);
             for entity in name_matched.into_iter().take(12) {
                 if !seen_entities.insert(entity.id) {
                     continue;
@@ -8438,7 +8432,7 @@ fn extract_source_text_signals(
             bonus += locate_env_f32("KIN_LOCATE_SOURCE_TEXT_SYMBOLIC_SUPPORT_BONUS", 8.0)
                 * (symbolic_count.min(2) as f32);
         }
-        if cli_flag_query && is_cli_surface_path(&path) {
+        if cli_flag_query && is_cli_surface_path(path) {
             bonus += locate_env_f32("KIN_LOCATE_SOURCE_TEXT_CLI_SURFACE_BONUS", 22.0);
         }
         if bonus > 0.0 {
@@ -8455,13 +8449,13 @@ fn extract_source_text_signals(
         &source_previews,
         &source_paths,
         cli_flag_query,
-        workspace_root.as_deref(),
+        workspace_root,
     );
     promote_cli_surface_companion_headers_in_source_text(
         &mut hits,
         &path_term_support,
         &source_previews,
-        workspace_root.as_deref(),
+        workspace_root,
     );
 
     Ok(hits)
@@ -9040,7 +9034,7 @@ fn extract_embedding_signals(
     vector_source: Option<&kin_db::InMemoryGraph>,
     quality: crate::retrieval_profile::RetrievalProfile,
     degradations: &mut Vec<RetrievalDegradation>,
-    mut ledger: Option<&mut Vec<PruneEvent>>,
+    ledger: Option<&mut Vec<PruneEvent>>,
 ) -> Result<HashMap<kin_model::EntityId, EntityDiscovery>> {
     let _span =
         tracing::info_span!("locate.extract_embedding_signals", text_len = text.len()).entered();
@@ -9224,7 +9218,7 @@ fn extract_embedding_signals(
     }
 
     if floor_dropped > 0 {
-        if let Some(ledger) = ledger.as_deref_mut() {
+        if let Some(ledger) = ledger {
             let (best_name, best_relevance) = floor_best_dropped.unwrap_or_default();
             ledger.push(PruneEvent {
                 stage: "embedding_seed_floor".to_string(),
@@ -9393,7 +9387,7 @@ fn compute_import_centrality(
         // exact/near-tie candidates in/out of the cap (the #20 bug class). Sort
         // by entity id so the considered subset — and thus import_count — is
         // deterministic.
-        entities.sort_by(|a, b| a.id.cmp(&b.id));
+        entities.sort_by_key(|a| a.id);
 
         let mut importer_files: HashSet<String> = HashSet::new();
         for entity in entities
@@ -9672,7 +9666,7 @@ fn resolve_entities_to_files(
             // retained set so it never double-counts an entity.
             if locate_env_bool("KIN_LOCATE_BODY_SEED_PROTECT", false) {
                 let retained_ids: HashSet<kin_model::EntityId> =
-                    retained.iter().map(|pair| pair.0.clone()).collect();
+                    retained.iter().map(|pair| *pair.0).collect();
                 for seed in seeds[cut_at..].iter() {
                     if seed.1.signals.contains(&"body") && !retained_ids.contains(seed.0) {
                         retained.push(*seed);
@@ -9715,7 +9709,7 @@ fn resolve_entities_to_files(
         let entity_is_test = entity
             .file_origin
             .as_ref()
-            .map_or(false, |fo| is_test_by_role(&fo.0, Some(&entity)));
+            .is_some_and(|fo| is_test_by_role(&fo.0, Some(&entity)));
 
         if let Some(ref fo) = entity.file_origin {
             let path = &fo.0;
@@ -9732,7 +9726,7 @@ fn resolve_entities_to_files(
                     .extra
                     .get("embedding_body_preview")
                     .and_then(|v| v.as_str())
-                    .map_or(false, |s| !s.is_empty());
+                    .is_some_and(|s| !s.is_empty());
 
                 // KIND-FLOOR lever (default OFF == current bytes): the definition
                 // flag (and its `definition_authority` score multiplier) key only
@@ -9820,7 +9814,7 @@ fn resolve_entities_to_files(
                 graph.artifact_id_for_path(&kin_model::FilePathId::new(fo.0.as_str()));
             if let Some(start_artifact_id) = start_artifact_id {
                 let start_artifact = GraphNodeId::Artifact(start_artifact_id);
-                let mut visited_artifacts = HashSet::from([start_artifact.clone()]);
+                let mut visited_artifacts = HashSet::from([start_artifact]);
                 let mut artifact_frontier_queue =
                     VecDeque::from([(start_artifact, fo.0.clone(), 0usize)]);
 
@@ -9903,7 +9897,7 @@ fn resolve_entities_to_files(
                             );
                         }
 
-                        if visited_artifacts.insert(next_artifact.clone()) {
+                        if visited_artifacts.insert(next_artifact) {
                             artifact_frontier_queue.push_back((next_artifact, path, depth + 1));
                         }
                     }
@@ -9988,7 +9982,7 @@ fn resolve_entities_to_files(
                     .extra
                     .get("embedding_body_preview")
                     .and_then(|v| v.as_str())
-                    .map_or(false, |s| !s.is_empty());
+                    .is_some_and(|s| !s.is_empty());
                 let def_mult = if neighbor_has_body {
                     definition_authority
                 } else {
@@ -10913,7 +10907,7 @@ fn apply_module_prefix_affinity(
         }
     }
     // Also count priority file prefixes with extra weight.
-    for (path, _trace) in priority_traces {
+    for path in priority_traces.keys() {
         if let Some(prefix) = top_level_module_prefix(path) {
             *prefix_counts.entry(prefix).or_default() += 2;
         }
@@ -11620,10 +11614,8 @@ fn demote_cochange_only_outliers(
 
     let penalty = locate_env_f32("KIN_LOCATE_COCHANGE_ONLY_OUTLIER_PENALTY", 0.25);
     let noisy_path_penalty = locate_env_f32("KIN_LOCATE_NOISY_COCHANGE_ONLY_PENALTY", 0.08);
-    if penalty >= 1.0 {
-        if noisy_path_penalty >= 1.0 {
-            return;
-        }
+    if penalty >= 1.0 && noisy_path_penalty >= 1.0 {
+        return;
     }
 
     let mut changed = false;
@@ -12345,7 +12337,7 @@ fn promote_cli_surface_local_headers(
     let empty_paths = HashSet::new();
     let mut changed = false;
     for seed in seed_paths {
-        let Some(header_path) = sibling_header_for_cli_surface(&seed, &workspace_root) else {
+        let Some(header_path) = sibling_header_for_cli_surface(&seed, workspace_root) else {
             continue;
         };
         changed |= upsert_fused_floor(fused, header_path.clone(), direct_floor);
@@ -12361,7 +12353,7 @@ fn promote_cli_surface_local_headers(
             &header_path,
             &header_text,
             &empty_paths,
-            Some(&workspace_root),
+            Some(workspace_root),
         ) {
             if is_header_like_path(&include_path) {
                 changed |= upsert_fused_floor(fused, include_path, nested_floor);
@@ -13899,7 +13891,7 @@ fn enrich_empty_file_symbols(
     for (path, _) in results {
         if projection_symbols
             .get(path)
-            .map_or(false, |syms| !syms.is_empty())
+            .is_some_and(|syms| !syms.is_empty())
         {
             continue;
         }
@@ -14096,7 +14088,7 @@ fn emit_inner_methods(
 ) {
     let topk = locate_env_usize("KIN_LOCATE_INNER_METHOD_TOPK", 5);
     for (path, _) in results {
-        let has_class_like = projection_symbols.get(path).map_or(false, |syms| {
+        let has_class_like = projection_symbols.get(path).is_some_and(|syms| {
             syms.iter()
                 .any(|s| matches!(s.kind.as_str(), "class" | "interface" | "module"))
         });
@@ -14432,9 +14424,7 @@ fn rank_and_cap_symbols_with(mut symbols: Vec<LocateSymbol>, cap: usize) -> Vec<
 fn explain_line_score(reason: &str) -> f32 {
     if let Some(idx) = reason.find("(score ") {
         let rest = &reason[idx + 7..];
-        let end = rest
-            .find(|c: char| c == ',' || c == ')')
-            .unwrap_or(rest.len());
+        let end = rest.find([',', ')']).unwrap_or(rest.len());
         return rest[..end].trim().parse::<f32>().unwrap_or(-1.0);
     }
     -1.0
@@ -17479,7 +17469,7 @@ mod tests {
                 .upsert_relation(&Relation {
                     id: RelationId::new(),
                     kind: RelationKind::Includes,
-                    src: GraphNodeId::Artifact(iter_artifact.clone()),
+                    src: GraphNodeId::Artifact(iter_artifact),
                     dst: GraphNodeId::Artifact(target_artifact),
                     confidence: 1.0,
                     origin: RelationOrigin::Parsed,

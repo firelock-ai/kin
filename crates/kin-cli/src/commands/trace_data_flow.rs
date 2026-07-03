@@ -29,7 +29,7 @@ const MAX_LIMIT_PER_STEP: usize = 25;
 const MAX_TOTAL_STEPS: usize = 200;
 
 /// Direction of traversal from the focal entity.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TraceDirection {
     /// Walk outgoing edges (the focal calls / imports / references these).
@@ -37,13 +37,8 @@ pub enum TraceDirection {
     /// Walk incoming edges (these call / import / reference the focal).
     Callers,
     /// Walk both directions and merge into a single chain.
+    #[default]
     Both,
-}
-
-impl Default for TraceDirection {
-    fn default() -> Self {
-        TraceDirection::Both
-    }
 }
 
 impl TraceDirection {

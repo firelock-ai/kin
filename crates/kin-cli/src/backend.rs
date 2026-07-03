@@ -145,7 +145,7 @@ pub async fn open_snapshot_explicit_admin_read_only(
 ) -> std::result::Result<kin_db::SnapshotManager, kin_db::KinDbError> {
     // 1. Daemon-first: the canonical live authority. Auto-starts if needed.
     match open_snapshot_daemon_first_read_only(layout).await {
-        Ok(snapshot) => return Ok(snapshot),
+        Ok(snapshot) => Ok(snapshot),
         Err(daemon_err) => {
             // 2. Offline/admin escape hatch: explicit local snapshot read.
             if daemon_bootstrap_admin_allowed() {

@@ -514,11 +514,11 @@ fn parse_gold(task: &Value) -> Vec<GoldEntry> {
 ///
 /// - `FOUND`    — gold is in the final emitted list.
 /// - `CAP`      — gold was pruned by the adaptive cap / cluster prune
-///                (`debug.pruned_files` carries the reason).
+///   (`debug.pruned_files` carries the reason).
 /// - `RANKING`  — gold reached the pre-cap pool but was ranked below the kept
-///                set without an explicit prune reason.
+///   set without an explicit prune reason.
 /// - `COVERAGE` — gold never reached the pre-cap pool (a retrieval gap, not a
-///                ranking/cap one). This is the most actionable miss class.
+///   ranking/cap one). This is the most actionable miss class.
 ///
 /// Returns `None` only when the task carries no gold at all.
 fn build_gold_trace(

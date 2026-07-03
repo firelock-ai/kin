@@ -1010,9 +1010,9 @@ fn show_review_with_graph(
         for d in &decisions {
             writeln!(
                 text,
-                "  {:?} by {}{}",
+                "  {:?} by {:?}{}",
                 d.state,
-                format!("{:?}", d.reviewer),
+                d.reviewer,
                 d.comment
                     .as_ref()
                     .map(|comment| format!(" - {}", comment))

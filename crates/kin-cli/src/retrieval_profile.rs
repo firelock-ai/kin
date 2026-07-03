@@ -52,12 +52,13 @@ pub fn reset_daemon_serving_for_tests() {
 }
 
 /// Versioned retrieval quality profile. Selected via `KIN_PROFILE`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RetrievalProfile {
     /// Measured-accuracy defaults (current version).
     AccuracyV1,
     /// Pre-profile behavior: cosine-only `semantic_locate`, historical lever
     /// defaults. Kept for A/B comparison and as an escape hatch.
+    #[default]
     CompatV0,
 }
 
@@ -190,12 +191,6 @@ impl RetrievalProfile {
             Self::AccuracyV1 => 0.625,
             Self::CompatV0 => 0.25,
         }
-    }
-}
-
-impl Default for RetrievalProfile {
-    fn default() -> Self {
-        Self::CompatV0
     }
 }
 
