@@ -3281,7 +3281,7 @@ pub fn run_with_graph_capture_at_ref(
     .map_err(|err| anyhow::anyhow!(err.to_string()))?;
     let _ = crate::commands::cochange::refresh_from_changes(&historical, &changes);
     let extra_priority_files =
-        discover_historical_test_artifact_priority_files(layout, reference, text);
+        discover_historical_test_artifact_priority_files(&historical, reference, text);
     run_with_graph_capture_with_priority_files_and_vector_source(
         &historical,
         None,
@@ -3881,14 +3881,61 @@ fn record_full_debug_stage(
     }
 }
 
+/// Distinct named-test-artifact file paths the graph tracks at the current ref.
+///
+/// Derived from two graph surfaces: files carrying an entity the graph
+/// classified as test code (`EntityRole::Test`), plus the graph's opaque
+/// source-body artifacts (a ref-scoped graph stores every source file's body as
+/// one, so this also covers named test files whose role classification is not
+/// `Test`, e.g. a repo-root `test_*.py`). The result is gated by the
+/// named-test-artifact naming rule and returned in sorted order so downstream
+/// scoring is deterministic.
+fn graph_named_test_artifact_paths(graph: &kin_db::InMemoryGraph) -> Vec<String> {
+    let mut paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    if let Ok(entities) = graph.query_entities(&EntityFilter {
+        roles: Some(vec![EntityRole::Test]),
+        ..Default::default()
+    }) {
+        for entity in entities {
+            if let Some(origin) = entity.file_origin {
+                paths.insert(origin.0);
+            }
+        }
+    }
+
+    if let Ok(artifacts) = graph.list_opaque_artifacts() {
+        for artifact in artifacts {
+            paths.insert(artifact.file_id.0);
+        }
+    }
+
+    paths
+        .into_iter()
+        .filter(|path| is_named_test_artifact_path(path))
+        .collect()
+}
+
+/// Historically test-relevant priority files, derived entirely from graph
+/// truth at the requested ref.
+///
+/// The graph built for a ref-scoped locate carries every source file's body as
+/// a graph-owned artifact and classifies test code via `EntityRole::Test`, so
+/// the "named test artifacts that contain triple-quoted strings" signal is read
+/// from those graph surfaces rather than by shelling out to `git grep`/`git
+/// show` over raw working-tree contents. `graph` is the ref-scoped graph
+/// (`build_graph_at_git_ref_with_repo` output); a file with no graph-owned body
+/// is dropped honestly instead of being re-read from disk.
 pub fn discover_historical_test_artifact_priority_files(
-    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
     reference: &str,
     text: &str,
 ) -> Vec<(String, f32)> {
-    let Some(git_ref) = reference.strip_prefix("git:") else {
+    // Only the historical git-ref locate path seeds this signal; a working-ref
+    // graph is scored by the standard priority path.
+    if !reference.starts_with("git:") {
         return Vec::new();
-    };
+    }
 
     let text_lower = text.to_ascii_lowercase();
     if !mentions_triple_quoted_strings(&text_lower) {
@@ -3901,38 +3948,25 @@ pub fn discover_historical_test_artifact_priority_files(
         .filter(|term| term.len() >= 5 && !is_common_english_word(term))
         .collect::<Vec<_>>();
 
-    let grep_output = match std::process::Command::new("git")
-        .arg("-C")
-        .arg(layout.working_dir())
-        .args([
-            "grep", "-l", "\"\"\"", git_ref, "--", "*_test.*", "test_*.*",
-        ])
-        .output()
-    {
-        Ok(output) if output.status.success() || !output.stdout.is_empty() => output,
-        _ => return Vec::new(),
-    };
-
     let mut candidates = Vec::new();
-    for raw_line in String::from_utf8_lossy(&grep_output.stdout).lines() {
-        let Some((_, path)) = raw_line.split_once(':') else {
-            continue;
+    for path in graph_named_test_artifact_paths(graph) {
+        // Body served from graph-owned source text (the historical builder stores
+        // each source file's contents as an opaque artifact). A graph gap yields
+        // no body, so the candidate is dropped rather than read back from git/disk.
+        let content = match graph_source_text(graph, &path) {
+            Ok(body) => body,
+            Err(_) => {
+                tracing::debug!(
+                    file = %path,
+                    "historical test-artifact priority: no graph-owned body at ref, dropping candidate"
+                );
+                continue;
+            }
         };
-        if !is_named_test_artifact_path(path) {
+        if !content.contains("\"\"\"") {
             continue;
         }
-
-        let show_output = match std::process::Command::new("git")
-            .arg("-C")
-            .arg(layout.working_dir())
-            .arg("show")
-            .arg(format!("{git_ref}:{path}"))
-            .output()
-        {
-            Ok(output) if output.status.success() => output,
-            _ => continue,
-        };
-        let content = String::from_utf8_lossy(&show_output.stdout);
+        let path = path.as_str();
         let line_count = content.lines().count().max(1);
         let triple_quote_count = content.match_indices("\"\"\"").count();
         let inline_triple_quote = count_non_standalone_triple_quotes(&content) > 0;
@@ -15264,6 +15298,156 @@ mod tests {
             locate_graph_source_gap_count(),
             before,
             "a complete-graph locate must record zero source-text graph gaps"
+        );
+    }
+
+    fn mk_test_role_entity(name: &str, path: &str) -> Entity {
+        let mut entity = test_entity(name, path, 1, 10);
+        entity.role = EntityRole::Test;
+        entity
+    }
+
+    fn seed_opaque_body(graph: &kin_db::InMemoryGraph, path: &str, seed: u8, body: &str) {
+        graph
+            .upsert_opaque_artifact(&OpaqueArtifact {
+                file_id: FilePathId::new(path),
+                content_hash: Hash256::from_bytes([seed; 32]),
+                mime_type: Some("text/x-source".into()),
+                text_preview: Some(body.to_string()),
+            })
+            .unwrap();
+    }
+
+    // The historical test-artifact priority signal is derived entirely from
+    // graph truth: named test artifacts whose graph-owned body contains
+    // triple-quoted strings, sourced from test-role entities and the ref-scoped
+    // graph's opaque source bodies — never from `git grep`/`git show`.
+    #[test]
+    fn historical_test_artifact_priority_derives_from_graph_truth() {
+        let graph = kin_db::InMemoryGraph::new();
+
+        // Compact named test file with an inline triple-quoted string. It is also
+        // carried as a test-role entity, so both the role query and the opaque
+        // body query surface it — it must appear exactly once (BTreeSet dedup).
+        let registry = "astropy/io/tests/test_registry.py";
+        seed_opaque_body(
+            &graph,
+            registry,
+            1,
+            "def test_registry_roundtrip():\n    payload = \"\"\"inline docstring body\"\"\"\n    assert payload\n",
+        );
+        graph
+            .upsert_entity(&mk_test_role_entity("test_registry_roundtrip", registry))
+            .unwrap();
+
+        // Large named test suite with a standalone module docstring — penalized
+        // below the compact files by the large-suite penalty.
+        let table = "astropy/table/tests/test_table.py";
+        let mut big = String::from("\"\"\"\nModule level docstring.\n\"\"\"\n");
+        for _ in 0..450 {
+            big.push_str("    pass\n");
+        }
+        seed_opaque_body(&graph, table, 2, &big);
+
+        // Repo-root named test file classified Source (no test-role entity):
+        // proves the graph-owned source-body enumeration covers named test files
+        // that role classification does not mark as Test.
+        let helpers = "test_helpers.py";
+        seed_opaque_body(
+            &graph,
+            helpers,
+            3,
+            "def test_helper_smoke():\n    return \"\"\"helper docstring\"\"\"\n",
+        );
+
+        // Test-role file that is NOT a named test artifact — excluded by naming.
+        let conftest = "astropy/io/tests/conftest.py";
+        seed_opaque_body(
+            &graph,
+            conftest,
+            4,
+            "FIXTURE = \"\"\"conftest docstring\"\"\"\n",
+        );
+        graph
+            .upsert_entity(&mk_test_role_entity("fixture", conftest))
+            .unwrap();
+
+        // Non-test source with triple-quotes — excluded by naming.
+        seed_opaque_body(
+            &graph,
+            "astropy/io/registry.py",
+            5,
+            "def load():\n    return \"\"\"registry module docstring\"\"\"\n",
+        );
+
+        // Named test artifact WITHOUT triple-quotes — excluded by content.
+        seed_opaque_body(
+            &graph,
+            "astropy/tests/test_nostrings.py",
+            6,
+            "def test_plain():\n    assert True\n",
+        );
+
+        let query = "parse triple-quoted string literals used in test files";
+        let result =
+            discover_historical_test_artifact_priority_files(&graph, "git:0123abcd", query);
+
+        let paths: Vec<&str> = result.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths.iter().filter(|p| **p == registry).count(),
+            1,
+            "a file surfaced by both the role query and the body query must not duplicate"
+        );
+        let path_set: std::collections::BTreeSet<&str> = paths.iter().copied().collect();
+        assert_eq!(
+            path_set,
+            [registry, table, helpers].into_iter().collect(),
+            "only named test artifacts with graph-owned triple-quoted bodies qualify"
+        );
+        assert_eq!(
+            paths.last().copied(),
+            Some(table),
+            "the large test suite is penalized below the compact inline-docstring files"
+        );
+
+        // Determinism: identical inputs yield a byte-identical ranking.
+        let again = discover_historical_test_artifact_priority_files(&graph, "git:0123abcd", query);
+        assert_eq!(
+            result, again,
+            "graph-native derivation must be order-stable"
+        );
+    }
+
+    #[test]
+    fn historical_test_artifact_priority_requires_git_ref_and_triple_quote_query() {
+        let graph = kin_db::InMemoryGraph::new();
+        seed_opaque_body(
+            &graph,
+            "pkg/tests/test_thing.py",
+            1,
+            "def test_thing():\n    doc = \"\"\"x\"\"\"\n    assert doc\n",
+        );
+
+        // Non-git reference: this signal only seeds the historical git-ref path.
+        assert!(
+            discover_historical_test_artifact_priority_files(
+                &graph,
+                "kin:main",
+                "triple-quoted string in tests",
+            )
+            .is_empty(),
+            "a non-git reference must not seed historical priority files"
+        );
+
+        // Git ref but a query that does not mention triple-quoted strings.
+        assert!(
+            discover_historical_test_artifact_priority_files(
+                &graph,
+                "git:0123abcd",
+                "where is the config loader",
+            )
+            .is_empty(),
+            "a query unrelated to triple-quoted strings seeds nothing"
         );
     }
 
