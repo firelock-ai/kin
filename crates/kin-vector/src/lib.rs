@@ -3235,6 +3235,95 @@ mod tests {
         );
     }
 
+    /// CPU-efficiency measurement for KIN_VECTOR_SIMD: wall-clock ns/op for the
+    /// scalar vs NEON cosine-distance kernel over a fixed, deterministic workload,
+    /// and the speedup ratio. This is the perf half of the graduation evidence —
+    /// the correctness half is `simd_neon_matches_scalar_and_is_deterministic`,
+    /// `simd_ranking_only_transposes_near_ties_vs_scalar`, and the query-path
+    /// parity binary.
+    ///
+    /// #[ignore]'d on purpose: it is BUILT with the suite but never run as part of
+    /// it, because a fair timing number requires a quiet machine (no concurrent
+    /// GPU / other perf lanes) — a number taken under contention is meaningless.
+    /// Schedule it deliberately in a quiet window with:
+    ///
+    ///   cargo test -p kin-vector --release --features simd \
+    ///     simd_vs_scalar_cpu_efficiency_measurement -- --ignored --nocapture
+    ///
+    /// It reports numbers and never asserts a speedup threshold: the default-flip
+    /// decision is made on the measured value, not gated inside the test.
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "CPU-efficiency measurement; run only in a quiet window (no GPU/other perf lanes) — timing is contaminated otherwise"]
+    fn simd_vs_scalar_cpu_efficiency_measurement() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn env_usize(key: &str, default: usize) -> usize {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        }
+        // Deterministic pseudo-random vector, matching the parity tests' generator
+        // so the timed workload is reproducible across machines and runs.
+        fn vec_for(seed: u64, dim: usize) -> Vec<f32> {
+            (0..dim)
+                .map(|d| {
+                    let h = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add((d as u64).wrapping_mul(1442695040888963407))
+                        .wrapping_add(0x9E3779B97F4A7C15);
+                    ((h >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0
+                })
+                .collect()
+        }
+
+        let dim = env_usize("KIN_VECTOR_BENCH_DIM", 768);
+        let n_vectors = env_usize("KIN_VECTOR_BENCH_VECTORS", 1024);
+        let iters = env_usize("KIN_VECTOR_BENCH_ITERS", 200).max(1);
+
+        let corpus: Vec<Vec<f32>> = (0..n_vectors as u64).map(|k| vec_for(k, dim)).collect();
+        let query = vec_for(0x00C0_FFEE, dim);
+
+        // Warm both paths so caches and CPU state are settled before timing.
+        let mut warm = 0.0f32;
+        for v in &corpus {
+            warm += cosine_distance_scalar(&query, v);
+            warm += unsafe { cosine_distance_neon(&query, v) };
+        }
+        black_box(warm);
+
+        let time = |f: &dyn Fn(&[f32], &[f32]) -> f32| -> f64 {
+            let start = Instant::now();
+            let mut acc = 0.0f32;
+            for _ in 0..iters {
+                for v in &corpus {
+                    acc += f(black_box(&query), black_box(v.as_slice()));
+                }
+            }
+            black_box(acc);
+            start.elapsed().as_secs_f64()
+        };
+
+        let ops = (iters * n_vectors) as f64;
+        let scalar_s = time(&|a, b| cosine_distance_scalar(a, b));
+        let neon_s = time(&|a, b| unsafe { cosine_distance_neon(a, b) });
+        let scalar_ns = scalar_s / ops * 1e9;
+        let neon_ns = neon_s / ops * 1e9;
+        let speedup = scalar_ns / neon_ns;
+
+        println!(
+            "[simd-cpu] KIN_VECTOR_SIMD cosine_distance dim={dim} vectors={n_vectors} iters={iters} \
+             ops={ops:.0} | scalar={scalar_ns:.2} ns/op neon={neon_ns:.2} ns/op speedup={speedup:.2}x"
+        );
+        // Measurement, not a gate: guard only against a degenerate/zero reading.
+        assert!(
+            scalar_ns > 0.0 && neon_ns > 0.0,
+            "degenerate timing (scalar={scalar_ns} neon={neon_ns})"
+        );
+    }
+
     #[test]
     fn load_from_disk_round_trip() {
         let dir = tempfile::tempdir().unwrap();
