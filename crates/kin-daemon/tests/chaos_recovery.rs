@@ -41,6 +41,36 @@ fn assert_child_alive(child: &mut Child, port: u16, what: &str) {
     }
 }
 
+/// Wait for the daemon to publish its OS-assigned port to `.kin/daemon.port`
+/// and return it. Spawning with `--port 0` lets the daemon own port selection
+/// and advertise the real bound port here — the same handshake the CLI uses —
+/// so a kill/restart never depends on reusing one port's teardown timing.
+async fn read_published_port(child: &mut Child, repo_root: &Path) -> u16 {
+    let port_file = repo_root.join(".kin/daemon.port");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut backoff = Duration::from_millis(20);
+
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(&port_file) {
+            if let Ok(port) = contents.trim().parse::<u16>() {
+                if port != 0 {
+                    return port;
+                }
+            }
+        }
+
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("daemon exited before publishing its port: {status}");
+        }
+        if Instant::now() >= deadline {
+            panic!("daemon never published its port to {}", port_file.display());
+        }
+
+        tokio::time::sleep(backoff).await;
+        backoff = backoff_after(backoff);
+    }
+}
+
 fn init_repo(root: &Path) {
     kin_core::init(root).unwrap();
 }
@@ -176,8 +206,15 @@ async fn daemon_recovers_after_process_kill_and_restart() {
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
 
-    let port = free_port();
-    let mut child = spawn_daemon(repo.path(), port);
+    // Bind an OS-assigned port (`--port 0`) and discover it from the handshake
+    // file the daemon publishes, rather than pre-reserving an explicit port.
+    // This asserts recovery semantics — the daemon comes back and serves on the
+    // same repo — without depending on reusing the same port across the
+    // kill/restart, which races the kernel's socket teardown on macOS
+    // (EADDRINUSE). The product bind path additionally retries EADDRINUSE, so a
+    // real same-port restart also recovers.
+    let mut child = spawn_daemon(repo.path(), 0);
+    let port = read_published_port(&mut child, repo.path()).await;
 
     let first = wait_for_health(&mut child, port).await;
     assert_eq!(first.status, "ok");
@@ -193,8 +230,13 @@ async fn daemon_recovers_after_process_kill_and_restart() {
         "killed kin-daemon should not report success"
     );
 
-    let mut restarted = spawn_daemon(repo.path(), port);
-    let second = wait_for_health(&mut restarted, port).await;
+    // A SIGKILL leaves the dead daemon's port file behind; remove it so the read
+    // below observes the restarted daemon's freshly published port.
+    let _ = std::fs::remove_file(repo.path().join(".kin/daemon.port"));
+
+    let mut restarted = spawn_daemon(repo.path(), 0);
+    let restarted_port = read_published_port(&mut restarted, repo.path()).await;
+    let second = wait_for_health(&mut restarted, restarted_port).await;
     assert_eq!(second.status, "ok");
     assert!(second.uptime_seconds < 20);
 
