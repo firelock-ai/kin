@@ -5880,8 +5880,8 @@ fn normalize_traceback_path(path: &str) -> String {
     let path = path.replace('\\', "/");
 
     // Strip ~ prefix (e.g. ~/dev/astropy/astropy/... → /dev/astropy/astropy/...)
-    let path = if path.starts_with("~/") {
-        format!("/{}", &path[2..])
+    let path = if let Some(rest) = path.strip_prefix("~/") {
+        format!("/{rest}")
     } else {
         path
     };
