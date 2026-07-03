@@ -113,7 +113,7 @@ fn parse_task_file(path: &str) -> Result<(String, Vec<String>)> {
         let mut seen = std::collections::HashSet::new();
         gold_context_value
             .iter()
-            .filter_map(|c| c["file"].as_str().map(|s| strip_workspace_prefix(s)))
+            .filter_map(|c| c["file"].as_str().map(strip_workspace_prefix))
             .filter(|path| seen.insert(path.clone()))
             .collect()
     };
