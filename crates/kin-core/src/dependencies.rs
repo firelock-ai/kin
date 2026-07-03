@@ -304,7 +304,7 @@ fn parse_cargo_deps(path: &Path, registry_repo_ids: &[String]) -> Vec<RepoDepend
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    let table: toml::Value = match content.parse() {
+    let table: toml::Value = match toml::from_str(&content) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
