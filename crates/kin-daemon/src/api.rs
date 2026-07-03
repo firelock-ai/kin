@@ -6,7 +6,7 @@ use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::state::{
     CachedLocateRanking, CachedSemanticPage, DaemonEvent, DaemonState, ProjectionChangedSet,
@@ -7501,16 +7501,44 @@ fn bind_listener(
         IpAddr::V4(_) => Domain::IPV4,
         IpAddr::V6(_) => Domain::IPV6,
     };
-    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-    socket.set_reuse_address(true)?;
-    if matches!(bind_ip, IpAddr::V6(_)) {
-        socket.set_only_v6(false)?;
-    }
-    socket.bind(&address.into())?;
-    socket.listen(1024)?;
 
-    let listener: StdTcpListener = socket.into();
-    listener.set_nonblocking(true)?;
+    // A failed bind leaves the socket unusable, so each attempt builds a fresh
+    // one and configures it before binding.
+    let bind_once = || -> std::io::Result<StdTcpListener> {
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_reuse_address(true)?;
+        if matches!(bind_ip, IpAddr::V6(_)) {
+            socket.set_only_v6(false)?;
+        }
+        socket.bind(&address.into())?;
+        socket.listen(1024)?;
+        let listener: StdTcpListener = socket.into();
+        listener.set_nonblocking(true)?;
+        Ok(listener)
+    };
+
+    // A daemon restarted on the same explicit port can race the kernel's
+    // teardown of the previous process's listening socket: on macOS the bind
+    // observes EADDRINUSE for a short window after the old daemon dies, because
+    // SO_REUSEADDR does not cover a socket still being reclaimed. Retry the bind
+    // with bounded backoff so a same-port restart recovers instead of failing;
+    // a port that stays held still fails loudly once the budget is spent. An
+    // ephemeral (`:0`) bind never collides, so it returns on the first attempt.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut backoff = Duration::from_millis(20);
+    let listener = loop {
+        match bind_once() {
+            Ok(listener) => break listener,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AddrInUse
+                    && Instant::now() + backoff < deadline =>
+            {
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_millis(250));
+            }
+            Err(error) => return Err(error),
+        }
+    };
     tokio::net::TcpListener::from_std(listener)
 }
 
@@ -10979,6 +11007,30 @@ mod tests {
         assert!(err
             .to_string()
             .contains("KIN_DAEMON_AUTH_TOKEN is required"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bind_listener_recovers_from_transient_addr_in_use() {
+        // Occupy an explicit loopback port, then free it shortly after a
+        // competing bind begins. bind_listener must ride out the EADDRINUSE with
+        // its bounded backoff and succeed once the port is released — the same
+        // recovery a daemon restarted on a still-closing port depends on.
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(held); // frees the port well within bind_listener's 3s budget
+        });
+
+        // bind_listener retries with a blocking backoff; on the multi-threaded
+        // test runtime that briefly parks this worker while the releaser thread
+        // frees the port, after which the bind succeeds.
+        let listener = bind_listener("127.0.0.1", port, false)
+            .expect("bind_listener should recover once the held port is released");
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+
+        releaser.join().unwrap();
     }
 
     #[tokio::test]
