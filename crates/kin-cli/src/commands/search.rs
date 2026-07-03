@@ -669,7 +669,7 @@ fn collect_search_results(
     }
 
     if pattern.trim().is_empty() {
-        results.sort_by(|left, right| record_sort_key(left).cmp(&record_sort_key(right)));
+        results.sort_by_key(|left| record_sort_key(left));
     }
     Ok(results)
 }

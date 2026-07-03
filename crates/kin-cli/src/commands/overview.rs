@@ -137,7 +137,7 @@ pub fn build_overview_response(
     }
     lines.push("--- Languages ---".to_string());
     let mut langs: Vec<_> = by_lang.iter().collect();
-    langs.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    langs.sort_by_key(|b| std::cmp::Reverse(b.1 .0));
     for (lang, (count, files)) in &langs {
         lines.push(format!(
             "  {}: {} entities across {} files",
@@ -158,7 +158,7 @@ pub fn build_overview_response(
         // Compact mode: just counts per kind, no entity listings
         lines.push("--- Entity Kinds ---".to_string());
         let mut kinds: Vec<_> = by_kind.iter().collect();
-        kinds.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        kinds.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
         for (kind, ents) in &kinds {
             lines.push(format!("  {}: {}", kind, ents.len()));
         }
@@ -167,7 +167,7 @@ pub fn build_overview_response(
         let top_n = 5;
         lines.push("--- Top Entities by Kind ---".to_string());
         let mut kinds: Vec<_> = by_kind.iter().collect();
-        kinds.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        kinds.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
         for (kind, ents) in &kinds {
             lines.push(format!("{} ({}):", kind, ents.len()));
             for e in ents.iter().take(top_n) {

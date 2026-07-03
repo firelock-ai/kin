@@ -4172,7 +4172,7 @@ fn extract_priority_file_traces(
             if let Ok(mut all) = graph.query_entities(&EntityFilter::default()) {
                 // Determinism: sort before the take() clip so the scanned subset
                 // is stable across processes (query order is not stable on its own).
-                all.sort_by(|a, b| a.id.cmp(&b.id));
+                all.sort_by_key(|a| a.id);
                 let mut seen_paths = HashSet::new();
                 let mut matched_paths = Vec::new();
                 for entity in all.iter().take(2000) {
@@ -4253,7 +4253,7 @@ fn extract_priority_file_traces(
             let mut dir_to_files: HashMap<String, Vec<String>> = HashMap::new();
             if let Ok(mut all_entities) = graph.query_entities(&EntityFilter::default()) {
                 // Determinism: stable subset under the take() clip.
-                all_entities.sort_by(|a, b| a.id.cmp(&b.id));
+                all_entities.sort_by_key(|a| a.id);
                 let mut seen_files = HashSet::new();
                 for entity in all_entities.iter().take(5000) {
                     if let Some(ref fo) = entity.file_origin {
@@ -8030,7 +8030,7 @@ fn extract_test_signals(
             };
             let mut name_matched = graph.query_entities(&filter)?;
             // Determinism: stable subset under the take() clip.
-            name_matched.sort_by(|a, b| a.id.cmp(&b.id));
+            name_matched.sort_by_key(|a| a.id);
             for entity in name_matched.into_iter().take(12) {
                 if !seen_entities.insert(entity.id) {
                     continue;
@@ -9393,7 +9393,7 @@ fn compute_import_centrality(
         // exact/near-tie candidates in/out of the cap (the #20 bug class). Sort
         // by entity id so the considered subset — and thus import_count — is
         // deterministic.
-        entities.sort_by(|a, b| a.id.cmp(&b.id));
+        entities.sort_by_key(|a| a.id);
 
         let mut importer_files: HashSet<String> = HashSet::new();
         for entity in entities
