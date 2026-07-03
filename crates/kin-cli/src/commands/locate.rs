@@ -7819,7 +7819,7 @@ fn extract_multihop_signals(
         }
     }
 
-    if let Some(ledger) = ledger.as_deref_mut() {
+    if let Some(ledger) = ledger {
         if cut_depth_limit_hits > 0 {
             ledger.push(PruneEvent {
                 stage: "multihop_depth".to_string(),
@@ -8455,13 +8455,13 @@ fn extract_source_text_signals(
         &source_previews,
         &source_paths,
         cli_flag_query,
-        workspace_root.as_deref(),
+        workspace_root,
     );
     promote_cli_surface_companion_headers_in_source_text(
         &mut hits,
         &path_term_support,
         &source_previews,
-        workspace_root.as_deref(),
+        workspace_root,
     );
 
     Ok(hits)
@@ -9040,7 +9040,7 @@ fn extract_embedding_signals(
     vector_source: Option<&kin_db::InMemoryGraph>,
     quality: crate::retrieval_profile::RetrievalProfile,
     degradations: &mut Vec<RetrievalDegradation>,
-    mut ledger: Option<&mut Vec<PruneEvent>>,
+    ledger: Option<&mut Vec<PruneEvent>>,
 ) -> Result<HashMap<kin_model::EntityId, EntityDiscovery>> {
     let _span =
         tracing::info_span!("locate.extract_embedding_signals", text_len = text.len()).entered();
@@ -9224,7 +9224,7 @@ fn extract_embedding_signals(
     }
 
     if floor_dropped > 0 {
-        if let Some(ledger) = ledger.as_deref_mut() {
+        if let Some(ledger) = ledger {
             let (best_name, best_relevance) = floor_best_dropped.unwrap_or_default();
             ledger.push(PruneEvent {
                 stage: "embedding_seed_floor".to_string(),
