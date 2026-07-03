@@ -486,7 +486,14 @@ fn derive_policy(review: &Review, evidence_gaps: &[ShadowEvidenceGap]) -> Shadow
         + review.impact.affected_dependents.len()
         + review.impact.affected_contract_consumers.len();
     if downstream_count > 0 {
-        for change in &review.diff.entity_changes {
+        // Emit contract-surface findings in a deterministic entity-id order.
+        // Removed entities have no span, so several collapse onto the same
+        // `(file=None, line=None)` dedup key; iterating in a stable order fixes
+        // which one survives as the representative, keeping the finding prose
+        // byte-identical across repeated evaluations.
+        let mut surface_candidates: Vec<_> = review.diff.entity_changes.iter().collect();
+        surface_candidates.sort_by_key(|change| change.entity_id);
+        for change in surface_candidates {
             let (name, location, surface_changed) = match &change.kind {
                 EntityChangeKind::Modified { old, new } => (
                     new.name.clone(),
@@ -1175,6 +1182,100 @@ mod tests {
             .evidence_gaps
             .iter()
             .any(|gap| gap.kind == "cross_repo_not_evaluated"));
+    }
+
+    #[test]
+    fn contract_surface_representative_is_deterministic() {
+        use crate::diff::{EntityChange, EntityChangeKind, SemanticDiff};
+        use crate::impact::ImpactReport;
+        use kin_model::review::{RiskLevel, RiskSummary};
+
+        // A tie of removed entities: each renders with location=None, so the
+        // finding builder's (file,line) dedup collapses them onto a single
+        // representative. Before the fix the survivor was whichever the source
+        // collection happened to yield first; it must now be the smallest id.
+        let ids: Vec<EntityId> = ["gamma", "alpha", "beta", "delta"]
+            .iter()
+            .map(|&name| EntityId::from_content("src/tie.rs", name, "function", 1))
+            .collect();
+        let expected = *ids.iter().min().unwrap();
+
+        let build_review = |order: &[usize]| -> Review {
+            let entity_changes: Vec<EntityChange> = order
+                .iter()
+                .map(|&i| EntityChange {
+                    entity_id: ids[i],
+                    kind: EntityChangeKind::Removed(ids[i]),
+                })
+                .collect();
+            Review {
+                base: None,
+                head: None,
+                diff: SemanticDiff {
+                    base: None,
+                    head: None,
+                    entity_changes,
+                    relation_changes: vec![],
+                },
+                // One downstream dependent makes the contract-surface rule fire.
+                impact: ImpactReport {
+                    affected_dependents: vec![entity_with_span(
+                        "downstream_consumer",
+                        "src/consumer.rs",
+                        1,
+                        EntityRole::Source,
+                    )],
+                    ..Default::default()
+                },
+                risk: RiskSummary {
+                    overall_risk: RiskLevel::Low,
+                    breaking_changes: vec![],
+                    test_coverage_gaps: vec![],
+                    contract_violations: vec![],
+                    work_risks: vec![],
+                    notes: vec![],
+                },
+                inline_comments: vec![],
+            }
+        };
+
+        // Exactly one contract-surface representative survives, naming the
+        // smallest entity id regardless of the input order.
+        let natural = derive_policy(&build_review(&[0, 1, 2, 3]), &[]);
+        let contract: Vec<&ShadowPolicyFinding> = natural
+            .findings
+            .iter()
+            .filter(|finding| finding.kind == "downstream_risk")
+            .collect();
+        assert_eq!(
+            contract.len(),
+            1,
+            "removed tie must collapse to a single representative finding"
+        );
+        assert_eq!(
+            contract[0].message,
+            format!(
+                "Contract surface of `{expected}` changed with 1 graph-known downstream entity(ies)"
+            ),
+        );
+
+        // Emitted findings must be byte-identical across repeated in-process
+        // runs and across every input order — the determinism the merge-trust
+        // n=3 bit-identity gate depends on.
+        let baseline =
+            serde_json::to_string(&derive_policy(&build_review(&[0, 1, 2, 3]), &[]).findings)
+                .unwrap();
+        for order in [[0, 1, 2, 3], [3, 2, 1, 0], [1, 3, 0, 2], [2, 0, 3, 1]] {
+            for _ in 0..3 {
+                let result = derive_policy(&build_review(&order), &[]);
+                assert_eq!(result.verdict, ShadowGateVerdict::WouldBlock);
+                assert_eq!(
+                    serde_json::to_string(&result.findings).unwrap(),
+                    baseline,
+                    "findings must be byte-identical regardless of entity_changes order"
+                );
+            }
+        }
     }
 
     #[test]
