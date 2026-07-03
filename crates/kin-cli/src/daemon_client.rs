@@ -80,6 +80,44 @@ struct SupervisorRegistration {
     graph_entity_count: Option<usize>,
 }
 
+/// A repo worker daemon as recorded by the per-user supervisor's `/daemons`
+/// registry. Mirrors the supervisor's own `RegisteredRepoDaemon` payload; shared
+/// by `kin registry daemons` and `kin daemon status`/`stop` so the supervisor
+/// listing plumbing lives in one place.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RegisteredRepoDaemon {
+    pub repo_id: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub instance_id: String,
+    pub repo_root: String,
+    pub pid: u32,
+    pub port: u16,
+    pub endpoint: String,
+    #[serde(default)]
+    pub graph_entity_count: Option<usize>,
+    #[serde(default)]
+    pub registered_at: Option<String>,
+    #[serde(default)]
+    pub last_heartbeat_at: String,
+}
+
+/// Fetch the repo daemons registered with a running supervisor via `GET
+/// /daemons`. The caller supplies a supervisor URL it already resolved (e.g. via
+/// [`ensure_supervisor_running`] or [`supervisor_recorded_endpoint`]); this does
+/// not itself start a supervisor.
+pub async fn fetch_registered_daemons(supervisor_url: &str) -> Result<Vec<RegisteredRepoDaemon>> {
+    let daemons = reqwest::Client::new()
+        .get(format!("{}/daemons", supervisor_url.trim_end_matches('/')))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(daemons)
+}
+
 /// A single entity entry from the daemon's entity search.
 #[derive(Debug, Deserialize)]
 pub struct DaemonEntityEntry {
@@ -1231,8 +1269,8 @@ fn behavior_env_divergence_message(divergences: &[kin_core::behavior_env::Diverg
     }
     message.push_str(
         "\nremedy: restart the daemon so it re-inherits the current environment — stop it with \
-         `kill $(cat .kin/daemon.pid)` (it also self-stops after its KIN_DAEMON_IDLE_TIMEOUT_SECS \
-         idle window) and the next kin command respawns it. \
+         `kin daemon stop` (or `kill $(cat .kin/daemon.pid)`; it also self-stops after its \
+         KIN_DAEMON_IDLE_TIMEOUT_SECS idle window) and the next kin command respawns it. \
          Set KIN_STRICT_BEHAVIOR_ENV=1 to make this a hard error.",
     );
     message
@@ -1269,7 +1307,10 @@ pub fn daemon_required() -> bool {
     true
 }
 
-fn is_process_alive(pid: u32) -> bool {
+/// Whether a process with the given pid currently exists (signal 0 probe on
+/// unix). Used by the daemon lifecycle and by `kin daemon status`/`stop` to
+/// classify a recorded pid as live or stale.
+pub fn is_process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
@@ -1281,7 +1322,10 @@ fn is_process_alive(pid: u32) -> bool {
     }
 }
 
-fn is_port_open(port: u16) -> bool {
+/// Whether a TCP port on localhost is accepting connections. Distinguishes a
+/// daemon that is alive and serving from one whose process exists but whose
+/// port is not (yet) bound.
+pub fn is_port_open(port: u16) -> bool {
     let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
     std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
 }
@@ -1292,9 +1336,22 @@ struct LiveDaemonEndpoint {
     port: u16,
 }
 
-fn remove_stale_daemon_files(kin_root: &Path) {
-    let _ = std::fs::remove_file(kin_root.join("daemon.pid"));
-    let _ = std::fs::remove_file(kin_root.join("daemon.port"));
+/// Path to the current repo's worker daemon pid file.
+pub fn repo_daemon_pid_path(kin_root: &Path) -> PathBuf {
+    kin_root.join("daemon.pid")
+}
+
+/// Path to the current repo's worker daemon port file.
+pub fn repo_daemon_port_path(kin_root: &Path) -> PathBuf {
+    kin_root.join("daemon.port")
+}
+
+/// Remove a repo worker daemon's pid/port endpoint files. The daemon deletes
+/// these itself on graceful shutdown; `kin daemon stop` also calls this after a
+/// confirmed stop so a later `status` never reports the dead endpoint as stale.
+pub fn remove_stale_daemon_files(kin_root: &Path) {
+    let _ = std::fs::remove_file(repo_daemon_pid_path(kin_root));
+    let _ = std::fs::remove_file(repo_daemon_port_path(kin_root));
 }
 
 fn supervisor_dir() -> PathBuf {
@@ -1304,29 +1361,54 @@ fn supervisor_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".kin"))
 }
 
-fn supervisor_pid_path() -> PathBuf {
+/// Path to the per-user supervisor pid file (under the Kin registry directory).
+pub fn supervisor_pid_path() -> PathBuf {
     supervisor_dir().join("supervisor.pid")
 }
 
-fn supervisor_port_path() -> PathBuf {
+/// Path to the per-user supervisor port file (under the Kin registry directory).
+pub fn supervisor_port_path() -> PathBuf {
     supervisor_dir().join("supervisor.port")
 }
 
-fn remove_stale_supervisor_files() {
+/// Remove the supervisor's pid/port endpoint files. Called after a confirmed
+/// supervisor stop so a later `status` never reports the dead endpoint as stale.
+pub fn remove_stale_supervisor_files() {
     let _ = std::fs::remove_file(supervisor_pid_path());
     let _ = std::fs::remove_file(supervisor_port_path());
 }
 
 fn read_pid_file(kin_root: &Path) -> Option<u32> {
-    std::fs::read_to_string(kin_root.join("daemon.pid"))
+    std::fs::read_to_string(repo_daemon_pid_path(kin_root))
         .ok()
         .and_then(|s| s.trim().parse().ok())
 }
 
 fn read_port_file(kin_root: &Path) -> Option<u16> {
-    std::fs::read_to_string(kin_root.join("daemon.port"))
+    std::fs::read_to_string(repo_daemon_port_path(kin_root))
         .ok()
         .and_then(|s| s.trim().parse().ok())
+}
+
+/// The (pid, port) recorded for the current repo's worker daemon, read from its
+/// `.kin/daemon.{pid,port}` files with no liveness probe. Either component is
+/// `None` when its file is absent or unparseable. Callers classify liveness
+/// separately via [`is_process_alive`]/[`is_port_open`].
+pub fn repo_daemon_recorded_endpoint(kin_root: &Path) -> (Option<u32>, Option<u16>) {
+    (read_pid_file(kin_root), read_port_file(kin_root))
+}
+
+/// The (pid, port) recorded for the per-user supervisor, read from its
+/// `supervisor.{pid,port}` files with no liveness probe. Either component is
+/// `None` when its file is absent or unparseable.
+pub fn supervisor_recorded_endpoint() -> (Option<u32>, Option<u16>) {
+    let pid = std::fs::read_to_string(supervisor_pid_path())
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
+    let port = std::fs::read_to_string(supervisor_port_path())
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
+    (pid, port)
 }
 
 fn live_daemon_endpoint(kin_root: &Path) -> Option<LiveDaemonEndpoint> {
@@ -2692,6 +2774,9 @@ mod tests {
         assert!(message.contains("KIN_EMBED_HYBRID: cli=\"balanced\" daemon=(unset)"));
         assert!(message.contains("KIN_RESOURCE_PROFILE: cli=(unset) daemon=\"throughput\""));
         // ...and the message states the accurate remedy and the strict escalation.
+        // The remedy now names the supported `kin daemon stop` command and keeps
+        // the raw kill as a fallback.
+        assert!(message.contains("kin daemon stop"));
         assert!(message.contains(".kin/daemon.pid"));
         assert!(message.contains("KIN_STRICT_BEHAVIOR_ENV=1"));
     }
