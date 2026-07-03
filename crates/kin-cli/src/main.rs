@@ -689,6 +689,11 @@ enum Command {
         #[arg(long)]
         resume: bool,
     },
+    /// Inspect and bound the on-disk embedding cache
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
     /// Reclaim space from the global ~/.kin warm-start cache
     Gc {
         /// Report what would be reclaimed without deleting anything
@@ -1036,6 +1041,29 @@ enum GraphAction {
         /// Open the visualization in the system default browser
         #[arg(long, default_value_t = false)]
         open: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheAction {
+    /// Report embedding-cache size, composition, and age distribution
+    Status {
+        /// Output machine-readable JSON instead of a human summary
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Reclaim space: drop abandoned schema versions and/or evict oldest entries to a budget
+    Gc {
+        /// Report what would be reclaimed without deleting anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Evict the oldest entries until the cache fits this many gigabytes.
+        /// Overrides KIN_EMBED_CACHE_BUDGET_GB; unset means no budget eviction.
+        #[arg(long, value_name = "GB")]
+        budget_gb: Option<f64>,
+        /// Also remove every abandoned (non-current) schema-version subtree
+        #[arg(long)]
+        prune_stale_schema: bool,
     },
 }
 
@@ -2517,6 +2545,14 @@ fn main() -> Result<()> {
                     depth,
                     resume,
                 } => commands::migrate::run(source, depth, resume).await,
+                Command::Cache { action } => match action {
+                    CacheAction::Status { json } => commands::cache::status(json).await,
+                    CacheAction::Gc {
+                        dry_run,
+                        budget_gb,
+                        prune_stale_schema,
+                    } => commands::cache::gc(dry_run, budget_gb, prune_stale_schema).await,
+                },
                 Command::Gc {
                     dry_run,
                     max_age_days,

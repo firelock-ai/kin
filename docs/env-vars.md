@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (384 total, 290 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (385 total, 290 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -126,6 +126,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | --- | --- | --- | --- | --- |
 | `KIN_EMBED_BACKEND` | enum | auto | correctness | kin-db embedding compute backend: auto (default) uses batched Metal, 'cpu' forces the SIMD/pure path, 'metal'/'gpu' forces Metal; cpu vs metal shifts embeddings in the last ULPs |
 | `KIN_EMBED_CACHE` | bool | true | operational | kin-db on-disk embedding cache; set to 0 to disable and always recompute (only the literal '0' disables), default on |
+| `KIN_EMBED_CACHE_BUDGET_GB` | float>=0 | *(unset)* | operational | kin-db on-disk embedding cache disk budget in GB for `kin cache gc`; unset (default) evicts nothing — the cache is pruned only by an explicit budget or command |
 | `KIN_EMBED_CACHE_DIR` | path | *(unset)* | operational | kin-db on-disk embedding cache directory; unset uses ~/.kin/cache/embeddings |
 | `KIN_EMBED_HTTP_TIMEOUT_SECS` | seconds>=0 | *(unset)* | operational | HTTP timeout for the embedding service client |
 | `KIN_EMBED_HYBRID` | string | off | correctness | kin-db hybrid CPU/GPU embedding split: off (default), 'seq'/'floor' for the sequence-length floor, or any other truthy value for the balanced split; engaging the CPU twin computes some vectors off the Metal device |

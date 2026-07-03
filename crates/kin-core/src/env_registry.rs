@@ -310,6 +310,7 @@ pub const DOWNSTREAM: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_EMBED_HYBRID_GPU_TPUT_RATIO", kind: Kind::NonNegF32, default: "", sensitivity: Sensitivity::Correctness, summary: "kin-db hybrid split ratio: pins the GPU:CPU throughput ratio for the balanced split; unset (or <= 0) measures it adaptively per batch" },
     // ---- kin-db: embedding cache (perf/lifecycle, identical vectors) ----------
     EnvVarSpec { name: "KIN_EMBED_CACHE", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Operational, summary: "kin-db on-disk embedding cache; set to 0 to disable and always recompute (only the literal '0' disables), default on" },
+    EnvVarSpec { name: "KIN_EMBED_CACHE_BUDGET_GB", kind: Kind::NonNegF32, default: "", sensitivity: Sensitivity::Operational, summary: "kin-db on-disk embedding cache disk budget in GB for `kin cache gc`; unset (default) evicts nothing — the cache is pruned only by an explicit budget or command" },
     EnvVarSpec { name: "KIN_EMBED_CACHE_DIR", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "kin-db on-disk embedding cache directory; unset uses ~/.kin/cache/embeddings" },
     // ---- kin-vfs shim: projection bypass --------------------------------------
     EnvVarSpec { name: "KIN_NO_VFS", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "kin-vfs shim projection bypass: set to 1 to skip VFS initialization and exec the real binary directly (only the literal '1' bypasses), default off" },
