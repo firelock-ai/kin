@@ -11618,10 +11618,8 @@ fn demote_cochange_only_outliers(
 
     let penalty = locate_env_f32("KIN_LOCATE_COCHANGE_ONLY_OUTLIER_PENALTY", 0.25);
     let noisy_path_penalty = locate_env_f32("KIN_LOCATE_NOISY_COCHANGE_ONLY_PENALTY", 0.08);
-    if penalty >= 1.0 {
-        if noisy_path_penalty >= 1.0 {
-            return;
-        }
+    if penalty >= 1.0 && noisy_path_penalty >= 1.0 {
+        return;
     }
 
     let mut changed = false;
