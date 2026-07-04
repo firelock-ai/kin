@@ -228,7 +228,7 @@ fn shadow_report_end_to_end_change_in_report_out() {
 }
 
 #[test]
-fn shadow_report_fails_loud_on_unparsed_artifact_change() {
+fn shadow_report_labels_config_only_change_without_demoting() {
     let dir = tempdir().expect("tempdir");
     let repo = dir.path();
     let (_base, head, artifact_head) = setup_fixture_repo(repo);
@@ -237,7 +237,7 @@ fn shadow_report_fails_loud_on_unparsed_artifact_change() {
     let report = run_shadow_json(repo, &head, &artifact_head);
 
     // The YAML-only change is invisible to the semantic graph: the report
-    // must say so explicitly instead of passing green.
+    // must say so explicitly as an evidence gap.
     let gaps = report["evidence_gaps"].as_array().unwrap();
     assert!(
         gaps.iter()
@@ -245,10 +245,13 @@ fn shadow_report_fails_loud_on_unparsed_artifact_change() {
         "artifact-only change must surface as an explicit evidence gap: {gaps:?}"
     );
 
+    // A config-class artifact carries no semantic entities by design, so the
+    // reported gap does not demote the verdict: a config-only change is an
+    // honest pass with the gap attached, not an attention signal.
     let verdict = report["policy"]["verdict"].as_str().unwrap();
-    assert_ne!(
+    assert_eq!(
         verdict, "pass",
-        "missing evidence must never certify a pass"
+        "config-class artifact gap must be reported without demoting the verdict"
     );
 }
 
