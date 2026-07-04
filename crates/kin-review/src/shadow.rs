@@ -1279,13 +1279,12 @@ mod tests {
         assert!(report.blast_radius.total_affected >= 2);
 
         // Signature change with graph-known downstream entities -> would block.
+        // The blocking anchor is the per-entity breaking finding; downstream_risk
+        // dedups against an existing blocking finding at the same location.
         assert_eq!(report.policy.verdict, ShadowGateVerdict::WouldBlock);
         assert!(report.policy.blocking_count >= 1);
-        assert!(report
-            .policy
-            .findings
-            .iter()
-            .any(|finding| finding.blocking && finding.kind == "downstream_risk"));
+        assert!(report.policy.findings.iter().any(|finding| finding.blocking
+            && (finding.kind == "breaking" || finding.kind == "downstream_risk")));
 
         // Repair context points at the covering test.
         assert!(!report.repair_context.is_empty());
