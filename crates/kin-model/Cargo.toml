@@ -3,7 +3,7 @@
 
 [package]
 name = "kin-model"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 license = "Apache-2.0"
 description = "Canonical types for Kin semantic VCS"
@@ -12,7 +12,7 @@ authors = ["Troy Fortin <troy@firelock.ai>"]
 
 [dependencies]
 kin-blobs = { version = "0.1.1", registry = "kin", features = ["schema"] }
-kin-vector = { version = "0.1.4", registry = "kin" }
+kin-vector = { version = "0.1.6", registry = "kin" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
