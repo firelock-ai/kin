@@ -2692,7 +2692,7 @@ mod tests {
         assert!(filtered_ids.contains(&ts_entity.id));
         assert!(!filtered_ids.contains(&py_entity.id));
 
-        let loaded_vectors = VectorIndex::load(&vector_path, 4).unwrap();
+        let loaded_vectors = VectorIndex::load_from_disk(&vector_path).unwrap();
         let results_after = loaded_vectors
             .search_similar(&[1.0, 0.0, 0.0, 0.0], 2)
             .unwrap();
@@ -3049,8 +3049,8 @@ mod tests {
         }
         deferred.save(&deferred_path).unwrap();
 
-        let eager_idx = VectorIndex::load(&eager_path, 4).unwrap();
-        let deferred_idx = VectorIndex::load(&deferred_path, 4).unwrap();
+        let eager_idx = VectorIndex::load_from_disk(&eager_path).unwrap();
+        let deferred_idx = VectorIndex::load_from_disk(&deferred_path).unwrap();
 
         // Same coverage: both indexes hold exactly the inserted vector set. Use
         // the exact count + membership rather than search, which is bounded by

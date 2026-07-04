@@ -248,6 +248,13 @@ impl VectorIndex {
     ///
     /// Returns a new `VectorIndex` with the loaded index data.
     /// The `dimensions` parameter is used to validate the loaded data matches.
+    #[deprecated(
+        note = "dimension-only validation cannot detect a same-dimension model or \
+                graph swap and will serve silently-wrong neighbors; use \
+                `load_compatible` / `load_compatible_grandfathered` to verify the \
+                index self-description, or `load_from_disk` when no expectation \
+                exists"
+    )]
     pub fn load(path: &Path, dimensions: usize) -> Result<Self, KinDbError> {
         let _span = tracing::info_span!(
             "kindb.vector_index.load",
@@ -255,9 +262,14 @@ impl VectorIndex {
             dimensions = dimensions
         )
         .entered();
-        let inner = kin_vector::VectorIndex::<RetrievalKey>::load(path, dimensions)
-            .map_err(|e| KinDbError::IndexError(e.to_string()))?;
-        Ok(Self { inner })
+        let loaded = Self::load_from_disk(path)?;
+        let loaded_dims = loaded.dimensions();
+        if loaded_dims != dimensions {
+            return Err(KinDbError::IndexError(format!(
+                "loaded vector index has dimensions {loaded_dims}, expected {dimensions}"
+            )));
+        }
+        Ok(loaded)
     }
 
     /// Load a previously saved HNSW index from disk without dimension validation.
@@ -451,7 +463,7 @@ mod tests {
         idx.upsert(e3, &[0.9, 0.1, 0.0, 0.0]).unwrap();
         idx.save(&path).unwrap();
 
-        let loaded = VectorIndex::load(&path, 4).unwrap();
+        let loaded = VectorIndex::load_from_disk(&path).unwrap();
         let results = loaded.search_similar(&[1.0, 0.0, 0.0, 0.0], 2).unwrap();
 
         assert_eq!(results.len(), 2);
@@ -470,7 +482,7 @@ mod tests {
 
         std::fs::write(&path, b"corrupted hnsw index").unwrap();
 
-        let error = VectorIndex::load(&path, 4).unwrap_err();
+        let error = VectorIndex::load_from_disk(&path).unwrap_err();
         assert!(
             error.to_string().contains("failed to deserialize")
                 || error.to_string().contains("recovery"),

@@ -32,10 +32,10 @@ gcs = ["object_store/gcp", "tokio", "bytes"]
 sql = ["rusqlite"]
 
 [dependencies]
-kin-model = { version = "0.2.1", registry = "kin" }
-kin-infer = { version = "0.2.38", registry = "kin", optional = true }
-kin-vector = { version = "0.1.4", registry = "kin", optional = true }
-kin-search = { version = "0.1.2", registry = "kin" }
+kin-model = { version = "0.2.2", registry = "kin" }
+kin-infer = { version = "0.2.40", registry = "kin", optional = true }
+kin-vector = { version = "0.1.6", registry = "kin", optional = true }
+kin-search = { version = "0.1.4", registry = "kin" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -68,5 +68,5 @@ tracing = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
 
 [dev-dependencies]
-kin-vector = { version = "0.1.4", registry = "kin" }
+kin-vector = { version = "0.1.6", registry = "kin" }
 rand = "0.10"

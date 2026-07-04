@@ -1166,7 +1166,7 @@ mod tests {
             "trainPy"
         );
 
-        let loaded_vectors = VectorIndex::load(&vector_path, 4).unwrap();
+        let loaded_vectors = VectorIndex::load_from_disk(&vector_path).unwrap();
         let results_after = loaded_vectors
             .search_similar(&[1.0, 0.0, 0.0, 0.0], 2)
             .unwrap();
