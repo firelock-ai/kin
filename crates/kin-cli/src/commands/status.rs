@@ -514,6 +514,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn load_status_rejects_non_kin_repo() {
         let dir = tempfile::tempdir().unwrap();
         let err = load_status(dir.path()).await.unwrap_err();
@@ -523,6 +524,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn load_status_marks_bootstrap_only_repo_as_blocked() {
         let dir = tempfile::tempdir().unwrap();
         let result = kin_core::init(dir.path()).unwrap();
@@ -550,6 +552,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn load_status_marks_materialized_repo_as_ready() {
         let dir = tempfile::tempdir().unwrap();
         let result = kin_core::init(dir.path()).unwrap();
@@ -576,6 +579,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn run_for_cwd_returns_error_for_bootstrap_only_repo() {
         let dir = tempfile::tempdir().unwrap();
         kin_core::init(dir.path()).unwrap();
@@ -589,6 +593,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn status_hints_do_not_mention_git_import() {
         let dir = tempfile::tempdir().unwrap();
         kin_core::init(dir.path()).unwrap();
@@ -607,6 +612,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn run_for_cwd_returns_error_when_current_branch_is_missing_from_graph() {
         let dir = tempfile::tempdir().unwrap();
         let result = kin_core::init(dir.path()).unwrap();
