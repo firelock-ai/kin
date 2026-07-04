@@ -389,6 +389,17 @@ pub struct DaemonState {
     pub locate_rankings: Mutex<HashMap<String, CachedLocateRanking>>,
     /// Cached `semantic_locate` result pages keyed by paging-cursor key.
     pub semantic_locate_pages: Mutex<HashMap<String, CachedSemanticPage>>,
+    /// Serializes lazy git-ancestry hydration — the full-history import behind a
+    /// `review`/`history`/`blame`/`locate --ref`/`scope` ref that names an
+    /// unimported Git commit. At most one such import runs at a time: two
+    /// concurrent deep imports roughly double peak memory and can OOM-kill the
+    /// daemon. Concurrent requests for the SAME unimported commit coalesce —
+    /// whoever wins the gate imports it, and later waiters observe it already
+    /// present (the get-or-build guard in `hydrate_imported_git_ref`) and skip
+    /// the re-import. Held across the request `.await` (and moved into the
+    /// `set_scope` blocking task), so it is a tokio mutex behind an `Arc` — not
+    /// the std locks used for the synchronous critical sections above.
+    pub hydration_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Cached full locate entity-ranking for cursor paging. The daemon caches the
@@ -661,6 +672,7 @@ impl DaemonState {
             mcp_transactions: Mutex::new(HashMap::new()),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
+            hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
         };
         // Restore in-flight MCP transactions persisted before a restart
         // so staged-but-uncommitted work is not silently dropped across a daemon
@@ -798,6 +810,7 @@ impl DaemonState {
             mcp_transactions: Mutex::new(HashMap::new()),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
+            hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
         };
 
         // Restore in-flight MCP transactions persisted before a restart.
@@ -2072,6 +2085,7 @@ mod tests {
             mcp_transactions: Mutex::new(HashMap::new()),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
+            hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
