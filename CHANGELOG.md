@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-07-03
+
+Call-graph recall and byte-deterministic review on the blast-radius surface, plus default-on SIMD and container-aware resource planning through refreshed primitives.
+
+### Added
+
+- Python call-resolution regression tests across the parser and linker pipelines (bare-import, module-attribute, and instance-method calls, same-file and cross-file, with innermost-enclosing-function attribution pins).
+- `kin setup` records a fingerprinted install ledger, `kin doctor`/`status` verify every recorded artifact against disk, and `kin setup uninstall` removes exactly the recorded slice — never clobbering entries the user modified — with `kin setup ledger` to inspect.
+- `kin embed` reports live throughput and ETA per pass, and under the interactive/small resource profiles a single invocation is bounded by a total wall budget (`KIN_EMBED_MAX_TOTAL_SECONDS`, default 600s) returning a resumable partial index.
+- A confidence-calibrated declaration cutoff for locate file lists (`KIN_LOCATE_DECLARATION_CUTOFF`, off for every profile) with prune-ledger attribution for anything it trims.
+
+### Fixed
+
+- Path-qualified call expressions (`crate::mod::func(...)`, `Type::method(...)`) now resolve to Calls/References edges in both the batch and incremental linkers via conservative suffix resolution — impact and refs no longer under-report callers reached through qualified paths. The Rust adapter also descends into inline module bodies, so module-scoped functions get entities and their calls attribute to the innermost enclosing function.
+- Review output is byte-deterministic: emitted entity and relation changes are sorted, and the contract-surface finding selects a stable representative among tied entities.
+- The locate capability tier respects cgroup CPU and memory quotas (a constrained container no longer mis-detects as a high-resource host), and any sub-Performance tier emits an explicit degradation naming the disabled signals and the `KIN_LOCATE_PROFILE` override.
+- `kin init` genesis no longer holds two full copies of every entity in memory, reducing peak RSS on large repositories.
+- Dependency and registry metadata scanning work under toml 1.x (three call sites ported off document-parsing `FromStr`; serialization is byte-stable with 0.8).
+
+### Changed
+
+- kin-vector 0.1.6: the NEON SIMD kernel is enabled by default (scalar remains reachable via `KIN_VECTOR_SIMD=0` for A/B).
+- kin-infer 0.2.40: resource planning caps cores and memory by cgroup v2/v1 quotas when present; bare-metal hosts are unchanged.
+- The public daemon image is version-tagged (`:X.Y.Z` and `:vX.Y.Z`) on tagged releases via a registry-side retag of the already-smoked commit image.
+
 ## [0.2.7] - 2026-07-02
 
 Determinism hardened end to end — real-inference byte-identity, deterministic history import, change-set session reconcile — plus the Accelerate compute default and wider parser fidelity.
