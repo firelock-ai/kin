@@ -15,6 +15,15 @@ pub enum ReviewError {
     #[error("graph store error: {0}")]
     GraphStore(#[source] Box<dyn std::error::Error + Send + Sync>),
 
+    #[error(
+        "graph state at ref not materialized: change {missing} in the ancestry of {at} is not \
+         in the graph"
+    )]
+    RefStateUnavailable {
+        at: SemanticChangeId,
+        missing: SemanticChangeId,
+    },
+
     #[error("no changes between base and head")]
     NoChanges,
 

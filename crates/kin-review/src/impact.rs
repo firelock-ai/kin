@@ -5,14 +5,121 @@ use std::collections::{BTreeSet, HashSet};
 
 use kin_model::entity::{Entity, EntityRole};
 use kin_model::graph::GraphStore;
-use kin_model::ids::EntityId;
-use kin_model::provenance::{ActorKind, ApprovalDecision};
-use kin_model::relation::{GraphNodeId, RelationKind};
+use kin_model::ids::{EntityId, SemanticChangeId};
+use kin_model::provenance::{Actor, ActorId, ActorKind, Approval, ApprovalDecision, AuditEvent};
+use kin_model::relation::{GraphNodeId, Relation, RelationKind};
 use kin_model::work::{Annotation, StalenessState, WorkItem, WorkScope};
 use serde::{Deserialize, Serialize};
 
 use crate::diff::SemanticDiff;
 use crate::error::ReviewError;
+
+/// The exact read surface the impact walker consumes.
+///
+/// Structural queries (`get_entity`, `get_relations`,
+/// `get_all_relations_for_entity`, `get_downstream_impact`) determine the
+/// blast radius and must be answered by the graph state the review is scoped
+/// to. Overlay queries (work items, annotations, approvals, audit events,
+/// actors) are operational state keyed by stable IDs, not part of the
+/// replayed structural graph, and are answered by the live store.
+///
+/// The trait deliberately has no write surface: impact analysis is read-only
+/// by construction, so a ref-scoped implementation cannot be misused to
+/// mutate graph state.
+pub trait ImpactGraph {
+    fn get_entity(&self, id: &EntityId) -> Result<Option<Entity>, ReviewError>;
+    fn get_relations(
+        &self,
+        id: &EntityId,
+        kinds: &[RelationKind],
+    ) -> Result<Vec<Relation>, ReviewError>;
+    /// Every entity-to-entity edge touching `id`, outgoing and incoming,
+    /// deduplicated and sorted by relation id. The inbound-only impact
+    /// harvest reads this full set and keeps the incoming side.
+    fn get_all_relations_for_entity(&self, id: &EntityId) -> Result<Vec<Relation>, ReviewError>;
+    fn get_downstream_impact(
+        &self,
+        id: &EntityId,
+        max_depth: u32,
+    ) -> Result<Vec<Entity>, ReviewError>;
+    fn get_work_for_scope(&self, scope: &WorkScope) -> Result<Vec<WorkItem>, ReviewError>;
+    fn get_annotations_for_scope(&self, scope: &WorkScope) -> Result<Vec<Annotation>, ReviewError>;
+    fn get_approvals_for_change(&self, id: &SemanticChangeId)
+        -> Result<Vec<Approval>, ReviewError>;
+    fn query_audit_events(
+        &self,
+        actor_id: Option<&ActorId>,
+        limit: usize,
+    ) -> Result<Vec<AuditEvent>, ReviewError>;
+    fn get_actor(&self, id: &ActorId) -> Result<Option<Actor>, ReviewError>;
+}
+
+/// Live-store view of [`ImpactGraph`]: every query answered by the current
+/// graph state.
+pub struct LiveGraph<'a, G>(pub &'a G);
+
+impl<G: GraphStore> ImpactGraph for LiveGraph<'_, G> {
+    fn get_entity(&self, id: &EntityId) -> Result<Option<Entity>, ReviewError> {
+        self.0.get_entity(id).map_err(ReviewError::graph)
+    }
+
+    fn get_relations(
+        &self,
+        id: &EntityId,
+        kinds: &[RelationKind],
+    ) -> Result<Vec<Relation>, ReviewError> {
+        self.0.get_relations(id, kinds).map_err(ReviewError::graph)
+    }
+
+    fn get_all_relations_for_entity(&self, id: &EntityId) -> Result<Vec<Relation>, ReviewError> {
+        self.0
+            .get_all_relations_for_entity(id)
+            .map_err(ReviewError::graph)
+    }
+
+    fn get_downstream_impact(
+        &self,
+        id: &EntityId,
+        max_depth: u32,
+    ) -> Result<Vec<Entity>, ReviewError> {
+        self.0
+            .get_downstream_impact(id, max_depth)
+            .map_err(ReviewError::graph)
+    }
+
+    fn get_work_for_scope(&self, scope: &WorkScope) -> Result<Vec<WorkItem>, ReviewError> {
+        self.0.get_work_for_scope(scope).map_err(ReviewError::graph)
+    }
+
+    fn get_annotations_for_scope(&self, scope: &WorkScope) -> Result<Vec<Annotation>, ReviewError> {
+        self.0
+            .get_annotations_for_scope(scope)
+            .map_err(ReviewError::graph)
+    }
+
+    fn get_approvals_for_change(
+        &self,
+        id: &SemanticChangeId,
+    ) -> Result<Vec<Approval>, ReviewError> {
+        self.0
+            .get_approvals_for_change(id)
+            .map_err(ReviewError::graph)
+    }
+
+    fn query_audit_events(
+        &self,
+        actor_id: Option<&ActorId>,
+        limit: usize,
+    ) -> Result<Vec<AuditEvent>, ReviewError> {
+        self.0
+            .query_audit_events(actor_id, limit)
+            .map_err(ReviewError::graph)
+    }
+
+    fn get_actor(&self, id: &ActorId) -> Result<Option<Actor>, ReviewError> {
+        self.0.get_actor(id).map_err(ReviewError::graph)
+    }
+}
 
 /// Structured impact report for a set of changed entities.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -108,9 +215,23 @@ impl ImpactReport {
 }
 
 /// Analyze the impact of changes described in a `SemanticDiff` by walking
-/// the graph for each changed entity.
+/// the current (live) graph for each changed entity.
 pub fn analyze_impact<G: GraphStore>(
     store: &G,
+    diff: &SemanticDiff,
+) -> Result<ImpactReport, ReviewError> {
+    analyze_impact_at(&LiveGraph(store), diff)
+}
+
+/// Analyze the impact of changes described in a `SemanticDiff` by walking
+/// the supplied [`ImpactGraph`] for each changed entity.
+///
+/// Callers reviewing a committed `base..head` range should pass a graph
+/// scoped to the head ref (see `GraphAtRef`) so the blast radius reflects
+/// the adjacency at that ref rather than whatever the mutable live adjacency
+/// happens to hold.
+pub fn analyze_impact_at<I: ImpactGraph>(
+    graph: &I,
     diff: &SemanticDiff,
 ) -> Result<ImpactReport, ReviewError> {
     let changed_ids = diff.changed_entity_ids();
@@ -140,9 +261,7 @@ pub fn analyze_impact<G: GraphStore>(
         // Find relations pointing TO this entity (callers, dependents, etc.).
         // `get_relations` serves outgoing edges only, so the inbound harvest
         // reads the full edge set and keeps the incoming side.
-        let relations = store
-            .get_all_relations_for_entity(&entity_id)
-            .map_err(ReviewError::graph)?;
+        let relations = graph.get_all_relations_for_entity(&entity_id)?;
 
         for rel in &relations {
             if !matches!(
@@ -172,7 +291,7 @@ pub fn analyze_impact<G: GraphStore>(
                 continue;
             }
 
-            if let Some(entity) = store.get_entity(&affected_id).map_err(ReviewError::graph)? {
+            if let Some(entity) = graph.get_entity(&affected_id)? {
                 let is_test = entity.role == EntityRole::Test || rel.kind == RelationKind::Tests;
                 if is_test {
                     ent_tests.insert(affected_id);
@@ -213,9 +332,7 @@ pub fn analyze_impact<G: GraphStore>(
 
         // Also use get_downstream_impact for transitive effects; the walk
         // follows incoming edges, so its results are inbound by construction.
-        let downstream = store
-            .get_downstream_impact(&entity_id, 2)
-            .map_err(ReviewError::graph)?;
+        let downstream = graph.get_downstream_impact(&entity_id, 2)?;
 
         for entity in downstream {
             if changed_set.contains(&entity.id) {
@@ -257,7 +374,7 @@ pub fn analyze_impact<G: GraphStore>(
     for &entity_id in &changed_ids {
         let scope = WorkScope::Entity(entity_id);
 
-        if let Ok(items) = store.get_work_for_scope(&scope) {
+        if let Ok(items) = graph.get_work_for_scope(&scope) {
             for item in items {
                 if !item.is_closed() && seen_work_ids.insert(item.work_id) {
                     work_items.push(item);
@@ -265,7 +382,7 @@ pub fn analyze_impact<G: GraphStore>(
             }
         }
 
-        if let Ok(anns) = store.get_annotations_for_scope(&scope) {
+        if let Ok(anns) = graph.get_annotations_for_scope(&scope) {
             for ann in anns {
                 if ann.staleness != StalenessState::Stale && seen_ann_ids.insert(ann.annotation_id)
                 {
@@ -281,13 +398,13 @@ pub fn analyze_impact<G: GraphStore>(
 
     if let Some(head_id) = &diff.head {
         // Query approvals for the head change to find unapproved agent modifications.
-        if let Ok(approvals) = store.get_approvals_for_change(head_id) {
+        if let Ok(approvals) = graph.get_approvals_for_change(head_id) {
             let has_human_approval = approvals
                 .iter()
                 .any(|a| a.decision == ApprovalDecision::Approved);
 
             // Query audit events to determine who made the changes.
-            if let Ok(events) = store.query_audit_events(None, 100) {
+            if let Ok(events) = graph.query_audit_events(None, 100) {
                 for &entity_id in &changed_ids {
                     // Find the most recent audit event targeting this entity.
                     let actor_event = events.iter().find(|e| {
@@ -296,7 +413,7 @@ pub fn analyze_impact<G: GraphStore>(
 
                     if let Some(event) = actor_event {
                         // Resolve actor kind from the actor ID.
-                        if let Ok(Some(actor)) = store.get_actor(&event.actor_id) {
+                        if let Ok(Some(actor)) = graph.get_actor(&event.actor_id) {
                             actor_attribution.push((entity_id, actor.kind));
 
                             // Non-human actors without approval are unreviewed.
