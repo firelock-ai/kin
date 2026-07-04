@@ -1444,8 +1444,22 @@ async fn set_scope(
     let state_clone = Arc::clone(&state);
     let ref_string = req.ref_string.clone();
     let timeout = scope_build_timeout();
+    // A deep scope base_commit lazily imports its full ancestry; serialize that
+    // against every other daemon hydration so two deep imports never run at once
+    // (roughly 2x peak memory → OOM). Already-imported refs skip the gate and
+    // stay on the fast path. Acquired here (async) and moved into the blocking
+    // task so it is held for the whole import.
+    let hydration_gate = if kin_cli::commands::ref_lookup::git_ref_requires_hydration(
+        state.graph.as_ref(),
+        &ref_string,
+    ) {
+        Some(Arc::clone(&state.hydration_gate).lock_owned().await)
+    } else {
+        None
+    };
     let scope_task = tokio::task::spawn_blocking(
         move || -> std::result::Result<_, (StatusCode, String)> {
+            let _hydration_gate = hydration_gate;
             // Resolve the ref to a SemanticChangeId using the LOCATE resolve mode
             // (enrich_semantics=false). Scope-for-retrieval only needs the
             // base_commit's tree state; the full per-commit semantic-delta enrichment
@@ -3069,6 +3083,17 @@ async fn locate(
 
     let mut result = if let Some(reference) = req.reference.as_deref() {
         // Explicit --ref always takes precedence over session scope.
+        // Locating at an unimported Git ref lazily imports its full ancestry;
+        // serialize that against every other daemon hydration. Already-imported
+        // refs skip the gate and stay on the fast path.
+        let _hydration_gate = if kin_cli::commands::ref_lookup::git_ref_requires_hydration(
+            state.graph.as_ref(),
+            reference,
+        ) {
+            Some(state.hydration_gate.lock().await)
+        } else {
+            None
+        };
         let resolved = kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate_with_report(
             state.graph.as_ref(),
             &state.layout,
@@ -3354,6 +3379,22 @@ async fn review(
         let session_id = extract_session_id_from_headers(&headers)?;
         resolve_session_graph(&state, session_id.as_ref()).await
     };
+    // A shadow review over an unimported Git ref lazily imports its full
+    // ancestry; serialize that against every other daemon hydration so two deep
+    // imports never run at once. Already-imported (or non-Git) refs skip the
+    // gate and stay on the fast path.
+    let needs_hydration = match &req {
+        kin_cli::commands::review::ReviewRequest::Shadow { base, head, .. } => {
+            kin_cli::commands::ref_lookup::git_ref_requires_hydration(graph.as_ref(), base)
+                || kin_cli::commands::ref_lookup::git_ref_requires_hydration(graph.as_ref(), head)
+        }
+        _ => false,
+    };
+    let _hydration_gate = if needs_hydration {
+        Some(state.hydration_gate.lock().await)
+    } else {
+        None
+    };
     let execution =
         kin_cli::commands::review::execute_review_request(&state.layout, graph.as_ref(), req)
             .await
@@ -3578,6 +3619,17 @@ async fn blame(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    // Blaming at an unimported Git ref lazily imports its full ancestry;
+    // serialize that against every other daemon hydration. Already-imported (or
+    // absent) refs skip the gate and stay on the fast path.
+    let needs_hydration = req.reference.as_deref().is_some_and(|reference| {
+        kin_cli::commands::ref_lookup::git_ref_requires_hydration(graph.as_ref(), reference)
+    });
+    let _hydration_gate = if needs_hydration {
+        Some(state.hydration_gate.lock().await)
+    } else {
+        None
+    };
     let execution =
         kin_cli::commands::blame::execute_blame_request(&state.layout, graph.as_ref(), &req)
             .map_err(internal_error)?;
@@ -3607,6 +3659,17 @@ async fn history(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    // History at an unimported Git ref lazily imports its full ancestry;
+    // serialize that against every other daemon hydration. Already-imported (or
+    // absent) refs skip the gate and stay on the fast path.
+    let needs_hydration = req.reference.as_deref().is_some_and(|reference| {
+        kin_cli::commands::ref_lookup::git_ref_requires_hydration(graph.as_ref(), reference)
+    });
+    let _hydration_gate = if needs_hydration {
+        Some(state.hydration_gate.lock().await)
+    } else {
+        None
+    };
     let execution =
         kin_cli::commands::history::execute_history_request(&state.layout, graph.as_ref(), &req)
             .map_err(internal_error)?;

@@ -254,6 +254,22 @@ fn extract_git_ref(reference: &str) -> Option<&str> {
     None
 }
 
+/// Returns true when resolving `reference` would import a full Git ancestry that
+/// is not yet present in `graph`. Callers use this to decide whether a request
+/// must take a serialized hydration gate before resolving: already-imported or
+/// non-Git refs stay on the lock-free fast path. Conservative on lookup error —
+/// an unresolved presence check reports `true` so a real import is never left
+/// unserialized.
+pub fn git_ref_requires_hydration(graph: &kin_db::InMemoryGraph, reference: &str) -> bool {
+    let Some(git_oid) = extract_git_ref(reference) else {
+        return false;
+    };
+    let Ok(imported_change_id) = kin_git::semantic_change_id_from_git_oid_hex(git_oid) else {
+        return false;
+    };
+    !matches!(graph.get_change(&imported_change_id), Ok(Some(_)))
+}
+
 fn hydrate_imported_git_ref(
     graph: &kin_db::InMemoryGraph,
     layout: &kin_core::KinLayout,
