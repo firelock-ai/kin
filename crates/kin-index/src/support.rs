@@ -238,7 +238,16 @@ fn file_has_imports(ext: &str, content: &str) -> bool {
         "py" => content.contains("import ") || content.contains("from "),
         "rs" => content.contains("use "),
         "go" => content.contains("import "),
-        "java" => content.contains("import "),
+        // `import` declarations: Java, Kotlin, Swift.
+        "java" | "kt" | "kts" | "swift" => content.contains("import "),
+        // C / C++ preprocessor includes.
+        "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" => content.contains("#include"),
+        // C# `using` namespace imports.
+        "cs" => content.contains("using "),
+        // Ruby `require` / `require_relative`.
+        "rb" => content.contains("require ") || content.contains("require_relative"),
+        // PHP `use` imports and `require`/`require_once` file loads.
+        "php" => content.contains("use ") || content.contains("require"),
         _ => false,
     }
 }
@@ -564,6 +573,59 @@ mod tests {
             report.c5_cross_file_count + report.c4_intra_file_count,
             report.entity_source_count,
         );
+    }
+
+    #[test]
+    fn coverage_report_c4_vs_c5_additional_languages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // C5: import-bearing files across the languages whose import syntax was
+        // previously unrecognized (permanently bucketing them as C4).
+        fs::write(
+            root.join("main.c"),
+            "#include <stdio.h>\nint main() { return 0; }",
+        )
+        .unwrap();
+        fs::write(
+            root.join("engine.cpp"),
+            "#include \"engine.h\"\nvoid run() {}",
+        )
+        .unwrap();
+        fs::write(root.join("Program.cs"), "using System;\nclass P {}").unwrap();
+        fs::write(root.join("app.rb"), "require 'set'\nclass Foo; end").unwrap();
+        fs::write(root.join("Main.kt"), "import kotlin.math.PI\nfun main() {}").unwrap();
+        fs::write(
+            root.join("App.swift"),
+            "import Foundation\nfunc render() {}",
+        )
+        .unwrap();
+        fs::write(root.join("index.php"), "<?php\nuse App\\Model;\n").unwrap();
+
+        // C4: same languages, no imports.
+        fs::write(
+            root.join("pure.c"),
+            "int add(int a, int b) { return a + b; }",
+        )
+        .unwrap();
+        fs::write(root.join("plain.rb"), "class Bar; end").unwrap();
+
+        let report = compute_coverage_report(root).unwrap();
+
+        assert_eq!(report.entity_source_count, 9);
+        assert_eq!(report.c5_cross_file_count, 7);
+        assert_eq!(report.c4_intra_file_count, 2);
+
+        assert_eq!(report.c5_languages.get("c"), Some(&1));
+        assert_eq!(report.c5_languages.get("cpp"), Some(&1));
+        assert_eq!(report.c5_languages.get("cs"), Some(&1));
+        assert_eq!(report.c5_languages.get("rb"), Some(&1));
+        assert_eq!(report.c5_languages.get("kt"), Some(&1));
+        assert_eq!(report.c5_languages.get("swift"), Some(&1));
+        assert_eq!(report.c5_languages.get("php"), Some(&1));
+
+        assert_eq!(report.c4_languages.get("c"), Some(&1));
+        assert_eq!(report.c4_languages.get("rb"), Some(&1));
     }
 
     /// Serial counterpart of [`compute_coverage_report`], retained as the

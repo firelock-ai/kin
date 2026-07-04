@@ -4181,7 +4181,9 @@ mod tests {
             .all(|path| is_repo_owned_graph_path(path)));
 
         assert_eq!(graph.indexed_file_paths().len(), expected_paths.len());
-        assert_eq!(graph.list_shallow_files().unwrap().len(), 1);
+        // Swift is an entity-source language, so docs/guide.swift is fully
+        // indexed rather than shallow-tracked — no fixture file is shallow.
+        assert_eq!(graph.list_shallow_files().unwrap().len(), 0);
         assert_eq!(graph.list_structured_artifacts().unwrap().len(), 1);
         assert_eq!(graph.list_opaque_artifacts().unwrap().len(), 1);
     }

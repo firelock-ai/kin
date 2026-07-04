@@ -25,30 +25,28 @@ pub enum FileClassification {
 }
 
 /// Extensions that have tree-sitter adapters for full entity extraction.
+///
+/// This must mirror the adapters registered in `kin-parser`'s `AdapterRegistry`:
+/// an extension the registry parses via `get_by_extension` but that is missing
+/// here would route whole-repo ingest to a shallower tier than incremental edits
+/// (which resolve the adapter directly), producing a smaller graph for the same
+/// repo depending on ingest path.
 const ENTITY_SOURCE_EXTENSIONS: &[&str] = &[
     "ts", "tsx", "js", "jsx", "py", "go", "java", "rs", "c", "h", "cpp", "hpp", "cc", "cxx", "cs",
-    "rb", "kt", "kts",
+    "rb", "kt", "kts", "swift", "php", "tf", "tfvars",
 ];
 
-/// Extensions eligible for C2 shallow syntax extraction.
-/// These have tree-sitter grammars available but no full Kin semantic adapter.
-const SHALLOW_SYNTAX_EXTENSIONS: &[(&str, &str)] = &[
-    ("swift", "swift"),
-    ("scala", "scala"),
-    ("lua", "lua"),
-    ("r", "r"),
-    ("R", "r"),
-    ("zig", "zig"),
-    ("ex", "elixir"),
-    ("exs", "elixir"),
-    ("erl", "erlang"),
-    ("hs", "haskell"),
-    ("ml", "ocaml"),
-    ("mli", "ocaml"),
-    ("php", "php"),
-    ("pl", "perl"),
-    ("pm", "perl"),
-];
+/// Extensions eligible for C2 shallow syntax extraction: a tree-sitter grammar
+/// exists (see `get_shallow_grammar` in `kin-parser`) but there is no full Kin
+/// semantic adapter.
+///
+/// Currently empty by design. Every language that has a shallow grammar
+/// (c, cpp, csharp, ruby, php, swift) also has a full entity-extraction adapter,
+/// so all of them classify as `EntitySource` above. Only add an extension here
+/// if `get_shallow_grammar` can parse it AND it has no full adapter — otherwise
+/// `classify` returns `ShallowSyntax` for a language that shallow parsing cannot
+/// handle, and ingest silently falls back to opaque (see `pipeline.rs`).
+const SHALLOW_SYNTAX_EXTENSIONS: &[(&str, &str)] = &[];
 
 /// Package manifest filenames.
 const PACKAGE_MANIFEST_FILENAMES: &[&str] = &[
@@ -635,7 +633,7 @@ mod tests {
         );
     }
 
-    // ── ShallowSyntax (C2) ───────────────────────────────────────────
+    // ── Grammar-backed languages with full adapters (EntitySource) ───
 
     #[test]
     fn entity_source_c() {
@@ -664,12 +662,10 @@ mod tests {
     }
 
     #[test]
-    fn shallow_syntax_swift() {
+    fn entity_source_swift() {
         assert_eq!(
             classify("Sources/App.swift"),
-            FileClassification::ShallowSyntax {
-                language_hint: "swift".to_string(),
-            },
+            FileClassification::EntitySource
         );
     }
 
@@ -692,20 +688,54 @@ mod tests {
     }
 
     #[test]
-    fn shallow_syntax_php() {
+    fn entity_source_php() {
+        assert_eq!(classify("index.php"), FileClassification::EntitySource);
+    }
+
+    #[test]
+    fn entity_source_tf() {
+        assert_eq!(classify("infra/main.tf"), FileClassification::EntitySource);
+    }
+
+    #[test]
+    fn entity_source_tfvars() {
         assert_eq!(
-            classify("index.php"),
-            FileClassification::ShallowSyntax {
-                language_hint: "php".to_string(),
-            },
+            classify("infra/prod.tfvars"),
+            FileClassification::EntitySource
         );
     }
 
     #[test]
-    fn shallow_syntax_does_not_override_entity_source() {
-        // .rs is EntitySource (C3+), NOT ShallowSyntax
+    fn entity_source_precedence_over_other_tiers() {
+        // EntitySource is checked first, so full-adapter languages never fall
+        // through to shallow/opaque classification.
         assert_eq!(classify("src/lib.rs"), FileClassification::EntitySource);
         assert_eq!(classify("main.py"), FileClassification::EntitySource);
+    }
+
+    // ── Grammarless extensions: honest opaque (no shallow grammar) ───
+
+    #[test]
+    fn removed_grammarless_shallow_extensions_are_opaque() {
+        // These languages were listed for C2 shallow extraction, but
+        // `get_shallow_grammar` in kin-parser has no grammar for them: shallow
+        // parsing always returned None and ingest silently fell back to opaque.
+        // Classify them as opaque directly instead of advertising a tier that
+        // cannot be delivered.
+        let opaque = FileClassification::OpaqueArtifact { mime_hint: None };
+        assert_eq!(classify("Main.scala"), opaque);
+        assert_eq!(classify("script.lua"), opaque);
+        assert_eq!(classify("analysis.r"), opaque);
+        assert_eq!(classify("analysis.R"), opaque);
+        assert_eq!(classify("main.zig"), opaque);
+        assert_eq!(classify("app.ex"), opaque);
+        assert_eq!(classify("app.exs"), opaque);
+        assert_eq!(classify("gen_server.erl"), opaque);
+        assert_eq!(classify("Main.hs"), opaque);
+        assert_eq!(classify("types.ml"), opaque);
+        assert_eq!(classify("types.mli"), opaque);
+        assert_eq!(classify("script.pl"), opaque);
+        assert_eq!(classify("Module.pm"), opaque);
     }
 
     // ── Edge cases ──────────────────────────────────────────────────
