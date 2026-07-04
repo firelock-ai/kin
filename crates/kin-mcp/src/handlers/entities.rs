@@ -211,6 +211,305 @@ pub fn handle_get_entity_source<G: GraphStore>(
     }
 }
 
+pub const GET_ENTITY_SOURCES_DESC: &str = "\
+Return the source bodies for many entities in one budgeted call — the batch form of \
+get_entity_source. Hand it a list of entity IDs (up to 50, in priority order) and it \
+returns each entity's metadata plus its implementation body. Reach for it once \
+semantic_search, find_references, or a graph traversal has handed you a set of IDs you \
+want to read together: one call replaces the N separate get_entity_source round-trips \
+(and N response envelopes) that would otherwise burn your tool-call budget. Bodies are \
+filled in the order you list the IDs until the shared token_budget is reached; entities \
+past that point come back signature-only with omitted=true and reason=\"budget\", and \
+the envelope's truncated flag tells you to raise the budget or split the list. Pass \
+compact=true for signature-only rows when you only need to confirm shape, and \
+max_lines_per_body / max_bytes_per_body to bound each body. One bad ID never fails the \
+batch — an unresolved ID returns its own row with reason=\"not_found\" or \"no_source\". \
+Prefer get_context_pack when you need one entity plus its neighborhood rather than a \
+flat set of bodies.";
+
+/// Upper bound on IDs per `get_entity_sources` call. Smaller than
+/// `bulk_check_references`' 200 because each row can carry a full source body,
+/// not just a reference count — 50 keeps a worst-case response bounded even
+/// before the token budget clamps it.
+pub const MAX_BULK_SOURCE_ENTITIES: usize = 50;
+
+/// One resolved entity's source facts, projected into a path-independent shape:
+/// the generic graph store and the daemon graph both build this before the batch
+/// envelope is assembled, so the response row is identical across serving paths.
+#[derive(Debug, Clone)]
+pub struct EntitySourceRow {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub language: String,
+    pub file_path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub signature: String,
+    pub body: String,
+}
+
+/// Per-ID outcome for the batched source tool. Mirrors the single tool's
+/// found / not-found / no-source taxonomy so one bad ID degrades to a single
+/// omitted row instead of failing the whole batch.
+#[derive(Debug, Clone)]
+pub enum ResolvedEntitySource {
+    /// The entity resolved and its source body was read from graph truth.
+    Found(EntitySourceRow),
+    /// The ID did not resolve (invalid, stale, or not a UUID). Non-retryable.
+    NotFound { id: String, message: String },
+    /// The ID resolved but no source body could be served.
+    NoSource { id: String, message: String },
+}
+
+/// Parsed, defaulted `get_entity_sources` options shared by both serving paths.
+#[derive(Debug, Clone)]
+pub struct BatchSourceOptions {
+    /// Token budget shared across all bodies. `None` = unbounded.
+    pub token_budget: Option<usize>,
+    /// Emit signature-only rows (no bodies) for every entity when true.
+    pub compact: bool,
+    pub max_lines_per_body: usize,
+    pub max_bytes_per_body: usize,
+}
+
+/// Parse and validate the shared `get_entity_sources` arguments. Enforces the
+/// 1..=[`MAX_BULK_SOURCE_ENTITIES`] bound up front so both the generic and the
+/// daemon path reject the same malformed requests identically.
+pub fn parse_batch_source_args(
+    args: &HashMap<String, serde_json::Value>,
+) -> Result<(Vec<String>, BatchSourceOptions)> {
+    let entity_ids = get_optional_string_array(args, "entity_ids").ok_or_else(|| {
+        McpError::InvalidParams(
+            "missing required parameter: entity_ids (array of entity UUIDs)".into(),
+        )
+    })?;
+    if entity_ids.is_empty() {
+        return Err(McpError::InvalidParams(
+            "entity_ids must contain at least one UUID".into(),
+        ));
+    }
+    if entity_ids.len() > MAX_BULK_SOURCE_ENTITIES {
+        return Err(McpError::InvalidParams(format!(
+            "entity_ids contains {} entries; maximum is {}",
+            entity_ids.len(),
+            MAX_BULK_SOURCE_ENTITIES
+        )));
+    }
+    // `token_budget` stays optional (None = unbounded); the others default to
+    // the single-tool body bounds so an unclamped batch matches get_entity_source.
+    let token_budget = args
+        .get("token_budget")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value as usize);
+    let compact = get_optional_bool(args, "compact", false);
+    let max_lines_per_body =
+        get_optional_u64(args, "max_lines_per_body", DEFAULT_SOURCE_MAX_LINES as u64) as usize;
+    let max_bytes_per_body =
+        get_optional_u64(args, "max_bytes_per_body", DEFAULT_SOURCE_MAX_BYTES as u64) as usize;
+    Ok((
+        entity_ids,
+        BatchSourceOptions {
+            token_budget,
+            compact,
+            max_lines_per_body,
+            max_bytes_per_body,
+        },
+    ))
+}
+
+/// Render one resolved-and-found row. A present `body` yields a full-body row;
+/// `None` yields a signature-only row. `omitted`/`reason` follow the batch
+/// contract: `omitted` is true (with a `reason`) exactly when a body the caller
+/// asked for is absent — never for a compact row, where signatures are the
+/// contract and the envelope-level `compact` flag is the signal.
+fn source_row_json(
+    row: &EntitySourceRow,
+    body: Option<&str>,
+    omitted: bool,
+    reason: Option<&str>,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "id": row.id,
+        "name": row.name,
+        "kind": row.kind,
+        "language": row.language,
+        "file_path": row.file_path,
+        "start_line": row.start_line,
+        "end_line": row.end_line,
+        "signature": row.signature,
+        "omitted": omitted,
+    });
+    if let Some(body) = body {
+        value["body"] = serde_json::json!(body);
+    }
+    if let Some(reason) = reason {
+        value["reason"] = serde_json::json!(reason);
+    }
+    value
+}
+
+/// Assemble the batch envelope from ordered per-ID resolutions, applying the
+/// per-body clamp and the shared token budget.
+///
+/// Budget mechanics are first-come-first-served: bodies are emitted in request
+/// order until the running token estimate would exceed `token_budget`; from that
+/// point every remaining resolved body is omitted (signature-only) with
+/// `reason = "budget"`, so `truncated` tells the caller to raise the budget or
+/// page. `compact` suppresses every body up front with no budget accounting. One
+/// row is always emitted per requested ID. `returned` counts the IDs that
+/// resolved to a real sourced entity, so `total_requested - returned` is the
+/// number of not-found / no-source IDs.
+pub fn assemble_entity_sources_response(
+    resolved: Vec<ResolvedEntitySource>,
+    opts: &BatchSourceOptions,
+) -> ToolCallResult {
+    let total_requested = resolved.len();
+    let mut returned = 0usize;
+    let mut truncated = false;
+    let mut budget_used = 0usize;
+    let mut budget_exhausted = false;
+    let mut results = Vec::with_capacity(total_requested);
+
+    for outcome in resolved {
+        match outcome {
+            ResolvedEntitySource::Found(row) => {
+                returned += 1;
+                if opts.compact {
+                    results.push(source_row_json(&row, None, false, None));
+                    continue;
+                }
+                let body =
+                    clamp_source_body(&row.body, opts.max_lines_per_body, opts.max_bytes_per_body);
+                if budget_exhausted {
+                    truncated = true;
+                    results.push(source_row_json(&row, None, true, Some("budget")));
+                    continue;
+                }
+                match opts.token_budget {
+                    Some(budget) => {
+                        let body_tokens = kin_context::estimate_tokens(&body);
+                        if budget_used + body_tokens <= budget {
+                            budget_used += body_tokens;
+                            results.push(source_row_json(&row, Some(body.as_str()), false, None));
+                        } else {
+                            budget_exhausted = true;
+                            truncated = true;
+                            results.push(source_row_json(&row, None, true, Some("budget")));
+                        }
+                    }
+                    None => results.push(source_row_json(&row, Some(body.as_str()), false, None)),
+                }
+            }
+            ResolvedEntitySource::NotFound { id, message } => {
+                results.push(serde_json::json!({
+                    "id": id,
+                    "omitted": true,
+                    "reason": "not_found",
+                    "message": message,
+                }));
+            }
+            ResolvedEntitySource::NoSource { id, message } => {
+                results.push(serde_json::json!({
+                    "id": id,
+                    "omitted": true,
+                    "reason": "no_source",
+                    "message": message,
+                }));
+            }
+        }
+    }
+
+    let envelope = serde_json::json!({
+        "total_requested": total_requested,
+        "returned": returned,
+        "truncated": truncated,
+        "compact": opts.compact,
+        "results": results,
+    });
+    match serde_json::to_string_pretty(&envelope) {
+        Ok(json) => ToolCallResult::text(json),
+        Err(error) => ToolCallResult::error(error.to_string()),
+    }
+}
+
+/// Resolve one ID to a [`ResolvedEntitySource`] via the generic graph store,
+/// mirroring the single-tool `handle_get_entity_source` body read. Never returns
+/// `Err`: a per-ID failure becomes a `NotFound` / `NoSource` row so one bad ID
+/// cannot fail the batch. Field formatting matches the daemon path's
+/// `GraphSourceRecord` (debug-formatted kind, `to_string` language, raw
+/// file path) so the row shape is identical whichever path resolved it.
+fn resolve_entity_source_generic<G: GraphStore>(store: &G, id: &str) -> ResolvedEntitySource {
+    let entity_id = match parse_entity_id(id) {
+        Ok(entity_id) => entity_id,
+        Err(_) => {
+            return ResolvedEntitySource::NotFound {
+                id: id.to_string(),
+                message: format!("invalid entity_id (not a UUID): {id}"),
+            };
+        }
+    };
+    match store.get_entity(&entity_id) {
+        Ok(Some(entity)) => {
+            match read_entity_source_excerpt_detailed(
+                store,
+                &entity,
+                DEFAULT_SOURCE_MAX_LINES,
+                DEFAULT_SOURCE_MAX_BYTES,
+            ) {
+                Some(body) => ResolvedEntitySource::Found(EntitySourceRow {
+                    id: entity.id.to_string(),
+                    name: entity.name.clone(),
+                    kind: format!("{:?}", entity.kind),
+                    language: entity.language.to_string(),
+                    file_path: entity
+                        .file_origin
+                        .as_ref()
+                        .map(|path| path.0.clone())
+                        .unwrap_or_default(),
+                    start_line: entity
+                        .span
+                        .as_ref()
+                        .map(|span| span.start_line)
+                        .unwrap_or(0),
+                    end_line: entity.span.as_ref().map(|span| span.end_line).unwrap_or(0),
+                    signature: entity.signature.clone(),
+                    body,
+                }),
+                None => ResolvedEntitySource::NoSource {
+                    id: entity.id.to_string(),
+                    message: "entity source body unavailable".to_string(),
+                },
+            }
+        }
+        Ok(None) => ResolvedEntitySource::NotFound {
+            id: id.to_string(),
+            message: format!("Entity not found: {id}"),
+        },
+        Err(error) => ResolvedEntitySource::NoSource {
+            id: id.to_string(),
+            message: format!("graph read failed: {error}"),
+        },
+    }
+}
+
+/// Batched `get_entity_source`: resolve every requested ID against the generic
+/// graph store and assemble the budgeted envelope. This is the offline/no-daemon
+/// dispatch arm; in product mode the daemon special-cases the tool against its
+/// concrete graph before falling through here, exactly as it does for the single
+/// tool.
+pub fn handle_get_entity_sources<G: GraphStore>(
+    args: &HashMap<String, serde_json::Value>,
+    store: &G,
+) -> Result<ToolCallResult> {
+    let (entity_ids, opts) = parse_batch_source_args(args)?;
+    let resolved = entity_ids
+        .iter()
+        .map(|id| resolve_entity_source_generic(store, id))
+        .collect();
+    Ok(assemble_entity_sources_response(resolved, &opts))
+}
+
 pub const GET_CONTEXT_PACK_DESC: &str = "\
 Assemble a focused, ready-to-read context bundle around one entity, fitted to a token \
 budget. Starting from a focal entity ID, Kin walks the relation graph to gather the \
@@ -1745,6 +2044,196 @@ mod tests {
             .first()
             .expect("expected at least one content block");
         serde_json::from_str(text).expect("response must be valid JSON")
+    }
+
+    fn found_source(id: &str, name: &str, body: &str) -> ResolvedEntitySource {
+        ResolvedEntitySource::Found(EntitySourceRow {
+            id: id.to_string(),
+            name: name.to_string(),
+            kind: "Function".to_string(),
+            language: "rust".to_string(),
+            file_path: format!("src/{name}.rs"),
+            start_line: 1,
+            end_line: 3,
+            signature: format!("fn {name}()"),
+            body: body.to_string(),
+        })
+    }
+
+    fn default_source_opts() -> BatchSourceOptions {
+        BatchSourceOptions {
+            token_budget: None,
+            compact: false,
+            max_lines_per_body: crate::handlers::common::DEFAULT_SOURCE_MAX_LINES,
+            max_bytes_per_body: crate::handlers::common::DEFAULT_SOURCE_MAX_BYTES,
+        }
+    }
+
+    #[test]
+    fn get_entity_sources_happy_batch_returns_all_bodies() {
+        let resolved = vec![
+            found_source("id-1", "one", "fn one() { 1 }"),
+            found_source("id-2", "two", "fn two() { 2 }"),
+        ];
+        let env = parsed_response(&assemble_entity_sources_response(
+            resolved,
+            &default_source_opts(),
+        ));
+        assert_eq!(env["total_requested"], 2);
+        assert_eq!(env["returned"], 2);
+        assert_eq!(env["truncated"], false);
+        assert_eq!(env["compact"], false);
+        let rows = env["results"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["id"], "id-1");
+        assert_eq!(rows[0]["body"], "fn one() { 1 }");
+        assert_eq!(rows[0]["omitted"], false);
+        assert!(rows[0].get("reason").is_none());
+        assert_eq!(rows[1]["body"], "fn two() { 2 }");
+    }
+
+    #[test]
+    fn get_entity_sources_isolates_bad_ids() {
+        let resolved = vec![
+            found_source("id-1", "one", "fn one() {}"),
+            ResolvedEntitySource::NotFound {
+                id: "id-2".into(),
+                message: "no entity".into(),
+            },
+            ResolvedEntitySource::NoSource {
+                id: "id-3".into(),
+                message: "no body".into(),
+            },
+        ];
+        let env = parsed_response(&assemble_entity_sources_response(
+            resolved,
+            &default_source_opts(),
+        ));
+        assert_eq!(env["total_requested"], 3);
+        // Only the first ID resolved to a real sourced entity.
+        assert_eq!(env["returned"], 1);
+        let rows = env["results"].as_array().unwrap();
+        assert_eq!(rows[0]["omitted"], false);
+        assert_eq!(rows[1]["id"], "id-2");
+        assert_eq!(rows[1]["omitted"], true);
+        assert_eq!(rows[1]["reason"], "not_found");
+        assert!(rows[1].get("body").is_none());
+        assert_eq!(rows[2]["omitted"], true);
+        assert_eq!(rows[2]["reason"], "no_source");
+    }
+
+    #[test]
+    fn get_entity_sources_budget_truncates_in_request_order() {
+        let b1 = "fn one() { 1 }";
+        let b2 = "fn two() { 2 }";
+        let b3 = "fn three() { 3 }";
+        // A budget that fits the first two bodies but not the third.
+        let budget = kin_context::estimate_tokens(b1) + kin_context::estimate_tokens(b2);
+        let resolved = vec![
+            found_source("id-1", "one", b1),
+            found_source("id-2", "two", b2),
+            found_source("id-3", "three", b3),
+        ];
+        let opts = BatchSourceOptions {
+            token_budget: Some(budget),
+            ..default_source_opts()
+        };
+        let env = parsed_response(&assemble_entity_sources_response(resolved, &opts));
+        assert_eq!(env["truncated"], true);
+        // All three resolved; the third is body-suppressed, not dropped.
+        assert_eq!(env["returned"], 3);
+        let rows = env["results"].as_array().unwrap();
+        assert_eq!(rows[0]["body"], b1);
+        assert!(rows[0].get("reason").is_none());
+        assert_eq!(rows[1]["body"], b2);
+        assert_eq!(rows[2]["omitted"], true);
+        assert_eq!(rows[2]["reason"], "budget");
+        assert!(rows[2].get("body").is_none());
+        // The budget-omitted row still carries its signature for a follow-up read.
+        assert_eq!(rows[2]["signature"], "fn three()");
+    }
+
+    #[test]
+    fn get_entity_sources_compact_is_signature_only() {
+        let resolved = vec![
+            found_source("id-1", "one", "fn one() {}"),
+            found_source("id-2", "two", "fn two() {}"),
+        ];
+        let opts = BatchSourceOptions {
+            compact: true,
+            ..default_source_opts()
+        };
+        let env = parsed_response(&assemble_entity_sources_response(resolved, &opts));
+        assert_eq!(env["compact"], true);
+        assert_eq!(env["returned"], 2);
+        assert_eq!(env["truncated"], false);
+        for row in env["results"].as_array().unwrap() {
+            assert!(row.get("body").is_none(), "compact rows carry no body");
+            assert_eq!(row["omitted"], false);
+            assert!(row["signature"].as_str().unwrap().starts_with("fn "));
+        }
+    }
+
+    #[test]
+    fn get_entity_sources_applies_per_body_clamp() {
+        let resolved = vec![found_source("id-1", "one", "line1\nline2\nline3\nline4\n")];
+        let opts = BatchSourceOptions {
+            max_lines_per_body: 2,
+            ..default_source_opts()
+        };
+        let env = parsed_response(&assemble_entity_sources_response(resolved, &opts));
+        assert_eq!(env["results"][0]["body"], "line1\nline2\n");
+    }
+
+    #[test]
+    fn clamp_source_body_bounds_lines_and_bytes() {
+        use crate::handlers::common::clamp_source_body;
+        assert_eq!(clamp_source_body("a\nb\nc\n", 2, 1_000), "a\nb\n");
+        assert_eq!(clamp_source_body("abcdef", 10, 3), "abc");
+        // A 2-byte char is never split: capping at 1 byte drops it entirely.
+        assert_eq!(clamp_source_body("é", 10, 1), "");
+    }
+
+    #[test]
+    fn get_entity_sources_rejects_empty_and_oversized() {
+        let store = InMemoryGraph::new();
+
+        let missing = HashMap::new();
+        assert!(matches!(
+            handle_get_entity_sources(&missing, &store).unwrap_err(),
+            McpError::InvalidParams(_)
+        ));
+
+        let mut empty_list = HashMap::new();
+        empty_list.insert("entity_ids".to_string(), serde_json::json!([]));
+        assert!(matches!(
+            handle_get_entity_sources(&empty_list, &store).unwrap_err(),
+            McpError::InvalidParams(_)
+        ));
+
+        // One past the bound of 50 is rejected before any graph access.
+        let too_many: Vec<String> = (0..=MAX_BULK_SOURCE_ENTITIES)
+            .map(|_| EntityId::new().to_string())
+            .collect();
+        assert_eq!(too_many.len(), 51);
+        let mut over = HashMap::new();
+        over.insert("entity_ids".to_string(), serde_json::json!(too_many));
+        assert!(matches!(
+            handle_get_entity_sources(&over, &store).unwrap_err(),
+            McpError::InvalidParams(_)
+        ));
+
+        // Exactly 50 IDs is accepted; against an empty graph every ID is a
+        // not-found row, but the batch itself succeeds.
+        let at_bound: Vec<String> = (0..MAX_BULK_SOURCE_ENTITIES)
+            .map(|_| EntityId::new().to_string())
+            .collect();
+        let mut ok = HashMap::new();
+        ok.insert("entity_ids".to_string(), serde_json::json!(at_bound));
+        let env = parsed_response(&handle_get_entity_sources(&ok, &store).unwrap());
+        assert_eq!(env["total_requested"], 50);
+        assert_eq!(env["returned"], 0);
+        assert_eq!(env["results"][0]["reason"], "not_found");
     }
 
     #[test]

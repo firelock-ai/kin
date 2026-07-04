@@ -91,6 +91,40 @@ pub fn tool_definitions() -> ToolsListResult {
                 }),
             },
             ToolDefinition {
+                name: "get_entity_sources".into(),
+                description: crate::handlers::entities::GET_ENTITY_SOURCES_DESC.into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "entity_ids": {
+                            "type": "array",
+                            "description": "Entity UUIDs to fetch source for, in priority order. Minimum 1, maximum 50.",
+                            "items": { "type": "string" },
+                            "minItems": 1,
+                            "maxItems": 50
+                        },
+                        "token_budget": {
+                            "type": "integer",
+                            "description": "Optional token budget shared across all bodies. Bodies are filled in request order until the budget is reached; remaining entities return signature-only with reason \"budget\". Omit for unbounded."
+                        },
+                        "compact": {
+                            "type": "boolean",
+                            "description": "If true, return signature-only rows (no bodies) for every entity. Default false.",
+                            "default": false
+                        },
+                        "max_lines_per_body": {
+                            "type": "integer",
+                            "description": "Clamp each body to at most this many lines before token budgeting. Default 10000."
+                        },
+                        "max_bytes_per_body": {
+                            "type": "integer",
+                            "description": "Clamp each body to at most this many bytes before token budgeting. Default 1000000."
+                        }
+                    },
+                    "required": ["entity_ids"]
+                }),
+            },
+            ToolDefinition {
                 name: "get_context_pack".into(),
                 description: crate::handlers::entities::GET_CONTEXT_PACK_DESC.into(),
                 input_schema: serde_json::json!({
@@ -995,6 +1029,7 @@ mod tests {
         assert!(json.contains("semantic_search"));
         assert!(json.contains("semantic_locate"));
         assert!(json.contains("get_entity_source"));
+        assert!(json.contains("get_entity_sources"));
         assert!(json.contains("find_references"));
         assert!(json.contains("bulk_check_references"));
         assert!(json.contains("impact_analysis"));
@@ -1017,8 +1052,9 @@ mod tests {
     #[test]
     fn expected_tool_count() {
         let list = tool_definitions();
-        // 54 + 5 transaction tools + 1 semantic_locate + 1 shadow_gate_report = 61
-        assert_eq!(list.tools.len(), 61);
+        // 54 + 5 transaction tools + 1 semantic_locate + 1 shadow_gate_report
+        // + 1 get_entity_sources = 62
+        assert_eq!(list.tools.len(), 62);
     }
 
     #[test]
