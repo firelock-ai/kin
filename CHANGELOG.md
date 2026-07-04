@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-07-04
+
+First-touch hardening: the daemon's git-ancestry hydration is serialized (no more concurrent-review crashes), whole-repo ingest routes every full language adapter, and agents get a budgeted batch source tool.
+
+### Added
+
+- `get_entity_sources` MCP tool: batched entity-source fetch (1–50 ids) with a shared token budget, per-body line/byte clamps, compact signature-only mode, and per-row fault isolation — one envelope instead of N iterative calls.
+- `docs/language-support.md`: the honest per-language support matrix (extraction depth, shallow tiers, LSP enrichment, and current routing gaps).
+
+### Changed
+
+- Shadow review verdicts are calibrated on per-entity inbound evidence: findings key on each entity's own consumers and covering tests (never diff-global counts), docs/CI-only changes can pass cleanly, removed entities are named in findings, and a consumer-fanout check flags body-only changes consumed from multiple files.
+- Whole-repo ingest now routes Swift, PHP, and HCL/Terraform to their full semantic adapters (previously shallow or opaque despite complete adapters), and no longer advertises shallow support for nine languages that have no grammar wired — they classify opaque, honestly.
+- The coverage self-report recognizes import syntax across all deep-adapter languages, so cross-file depth is no longer understated for C, C++, C#, Ruby, and Kotlin.
+
+### Fixed
+
+- Concurrent reviews (or review + locate/blame/history) that both needed git-ancestry hydration could double peak memory and crash the daemon mid-request; hydration is now single-flight behind a per-daemon gate with a lock-free warm path.
+- A test-suite race on process-global environment reads in the status command's tests.
+
 ## [0.2.8] - 2026-07-03
 
 Call-graph recall and byte-deterministic review on the blast-radius surface, plus default-on SIMD and container-aware resource planning through refreshed primitives.
