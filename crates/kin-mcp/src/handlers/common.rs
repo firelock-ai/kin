@@ -851,6 +851,39 @@ pub fn push_indented_body(
     true
 }
 
+/// Default per-body clamp for the batched entity-source tool, matching the
+/// single-entity `get_entity_source` generic path (which reads via
+/// [`read_entity_source_excerpt_detailed`] with these same bounds). Callers can
+/// tighten with `max_lines_per_body` / `max_bytes_per_body`; the batch never
+/// serves an unbounded body.
+pub const DEFAULT_SOURCE_MAX_LINES: usize = 10_000;
+pub const DEFAULT_SOURCE_MAX_BYTES: usize = 1_000_000;
+
+/// Clamp a source body to at most `max_lines` lines and `max_bytes` bytes.
+///
+/// Lines are bounded first (newlines preserved), then bytes, truncating at the
+/// largest UTF-8 char boundary at or below `max_bytes` so the result is always
+/// valid UTF-8. The batched entity-source tool applies this to each body
+/// *before* token-budget accounting, so the clamp is independent of which
+/// serving path (generic graph store or daemon graph) resolved the entity.
+pub fn clamp_source_body(body: &str, max_lines: usize, max_bytes: usize) -> String {
+    let mut clamped = String::new();
+    for (idx, line) in body.split_inclusive('\n').enumerate() {
+        if idx >= max_lines {
+            break;
+        }
+        clamped.push_str(line);
+    }
+    if clamped.len() > max_bytes {
+        let mut end = max_bytes;
+        while end > 0 && !clamped.is_char_boundary(end) {
+            end -= 1;
+        }
+        clamped.truncate(end);
+    }
+    clamped
+}
+
 // ── Reference row types ──
 
 #[derive(Debug, Clone)]

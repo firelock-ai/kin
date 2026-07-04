@@ -4723,6 +4723,47 @@ fn entity_source_tool_result<E: std::fmt::Display>(
     }
 }
 
+/// Map a single-ID [`kin_cli::commands::graph::EntitySourceOutcome`] to the
+/// batch tool's path-independent
+/// [`kin_mcp::handlers::entities::ResolvedEntitySource`] row.
+///
+/// The batched `get_entity_sources` reuses the exact per-entity resolution the
+/// single tool uses, so the two stay consistent. A genuine read failure (`Err`)
+/// for one ID degrades to a `NoSource` row rather than propagating — the batch
+/// must not fail because one entity's span/blob could not be read.
+fn resolved_entity_source_from_outcome<E: std::fmt::Display>(
+    id: &str,
+    outcome: Result<kin_cli::commands::graph::EntitySourceOutcome, E>,
+) -> kin_mcp::handlers::entities::ResolvedEntitySource {
+    use kin_cli::commands::graph::EntitySourceOutcome;
+    use kin_mcp::handlers::entities::{EntitySourceRow, ResolvedEntitySource};
+    match outcome {
+        Ok(EntitySourceOutcome::Found(record)) => ResolvedEntitySource::Found(EntitySourceRow {
+            id: record.id,
+            name: record.name,
+            kind: record.kind,
+            language: record.language,
+            file_path: record.file_path,
+            start_line: record.start_line,
+            end_line: record.end_line,
+            signature: record.signature,
+            body: record.body,
+        }),
+        Ok(EntitySourceOutcome::NotFound(message)) => ResolvedEntitySource::NotFound {
+            id: id.to_string(),
+            message,
+        },
+        Ok(EntitySourceOutcome::NoSource(message)) => ResolvedEntitySource::NoSource {
+            id: id.to_string(),
+            message,
+        },
+        Err(error) => ResolvedEntitySource::NoSource {
+            id: id.to_string(),
+            message: error.to_string(),
+        },
+    }
+}
+
 async fn mcp_tools_call(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
@@ -4772,6 +4813,33 @@ async fn mcp_tools_call(
                 graph.as_ref(),
                 entity_id,
             ));
+        return Ok(Json(result));
+    }
+
+    // Batched `get_entity_source`: resolve each ID against the one already-open
+    // graph, reusing the same typed outcome the single tool consumes, then hand
+    // the ordered resolutions to the shared budgeted-envelope assembler. One bad
+    // ID becomes a single omitted row (never a failed batch).
+    if request.name == "get_entity_sources" {
+        let parsed = kin_mcp::handlers::entities::parse_batch_source_args(&request.arguments);
+        let (entity_ids, opts) = match parsed {
+            Ok(parsed) => parsed,
+            Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error.to_string()))),
+        };
+        let resolved = entity_ids
+            .iter()
+            .map(|entity_id| {
+                resolved_entity_source_from_outcome(
+                    entity_id,
+                    kin_cli::commands::graph::build_entity_source_outcome(
+                        &state.layout,
+                        graph.as_ref(),
+                        entity_id,
+                    ),
+                )
+            })
+            .collect();
+        let result = kin_mcp::handlers::entities::assemble_entity_sources_response(resolved, &opts);
         return Ok(Json(result));
     }
 
@@ -7716,6 +7784,70 @@ mod tests {
             text.contains("graph blob for file 'src/lib.rs' is unavailable"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn get_entity_sources_batch_maps_outcomes_and_isolates_failures() {
+        use kin_cli::commands::graph::{EntitySourceOutcome, GraphSourceRecord};
+        use kin_mcp::handlers::entities::{assemble_entity_sources_response, BatchSourceOptions};
+
+        let record = GraphSourceRecord {
+            id: "id-1".into(),
+            name: "target".into(),
+            kind: "Function".into(),
+            language: "rust".into(),
+            file_path: "src/lib.rs".into(),
+            start_line: 1,
+            end_line: 3,
+            start_byte: 0,
+            end_byte: 14,
+            signature: "fn target()".into(),
+            body: "fn target() {}".into(),
+        };
+        let resolved = vec![
+            resolved_entity_source_from_outcome(
+                "id-1",
+                Ok::<_, String>(EntitySourceOutcome::Found(record)),
+            ),
+            resolved_entity_source_from_outcome(
+                "id-2",
+                Ok::<_, String>(EntitySourceOutcome::NotFound("stale id".into())),
+            ),
+            resolved_entity_source_from_outcome(
+                "id-3",
+                Ok::<_, String>(EntitySourceOutcome::NoSource("no body".into())),
+            ),
+            // A genuine read failure for one ID must degrade to a row, not fail
+            // the whole batch.
+            resolved_entity_source_from_outcome(
+                "id-4",
+                Err::<EntitySourceOutcome, _>("blob unavailable".to_string()),
+            ),
+        ];
+        let opts = BatchSourceOptions {
+            token_budget: None,
+            compact: false,
+            max_lines_per_body: 10_000,
+            max_bytes_per_body: 1_000_000,
+        };
+        let result = assemble_entity_sources_response(resolved, &opts);
+        let json = tool_result_json(&result);
+        // A success envelope carries no isError flag.
+        assert!(json.get("isError").is_none());
+        let env: serde_json::Value =
+            serde_json::from_str(json["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(env["total_requested"], 4);
+        assert_eq!(env["returned"], 1);
+        assert_eq!(env["truncated"], false);
+        let rows = env["results"].as_array().unwrap();
+        assert_eq!(rows[0]["id"], "id-1");
+        assert_eq!(rows[0]["body"], "fn target() {}");
+        assert_eq!(rows[0]["omitted"], false);
+        assert_eq!(rows[1]["reason"], "not_found");
+        assert_eq!(rows[2]["reason"], "no_source");
+        assert_eq!(rows[3]["id"], "id-4");
+        assert_eq!(rows[3]["reason"], "no_source");
+        assert_eq!(rows[3]["message"], "blob unavailable");
     }
 
     #[test]
