@@ -24,10 +24,13 @@ use kin_model::ids::SemanticChangeId;
 use kin_model::timestamp::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::diff::EntityChangeKind;
+use crate::diff::{self, EntityChangeKind};
 use crate::gate::{derive_decision, GateStatus, ReviewFinding, ReviewSignalKind};
-use crate::inline::InlineCommentKind;
+use crate::impact::ImpactReport;
+use crate::inline::{self, InlineCommentKind};
+use crate::ref_graph::GraphAtRef;
 use crate::review::{Review, SemanticReview};
+use crate::risk;
 use crate::ReviewError;
 
 /// Version of the shadow gate report payload schema. Mirrored by
@@ -201,7 +204,7 @@ pub struct ShadowRepairItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShadowEvidenceGap {
     /// "artifact_only_change" | "missing_span" | "actor_attribution_unavailable"
-    /// | "impact_signal_absent" | "cross_repo_not_evaluated"
+    /// | "impact_signal_absent" | "cross_repo_not_evaluated" | "ref_state_unavailable"
     pub kind: String,
     pub subject: String,
     pub detail: String,
@@ -256,20 +259,101 @@ pub struct ShadowGateReport {
 /// Build a shadow-mode merge-gate report for a resolved base..head range.
 ///
 /// Read-only: consumes graph truth, produces a report, records nothing.
+///
+/// Blast radius and impact are computed against the graph state materialized
+/// at the resolved head ref, never against the mutable live adjacency. When
+/// that state cannot be materialized the report carries an explicit
+/// `ref_state_unavailable` evidence gap with an empty blast radius instead of
+/// silently answering from another era's adjacency.
 pub fn build_shadow_report<G: GraphStore>(
     store: &G,
     request: &ShadowRequest,
 ) -> Result<ShadowGateReport, ReviewError> {
-    let review =
-        SemanticReview::create_review(&request.resolved_base, &request.resolved_head, store)?;
+    match GraphAtRef::materialize(store, &request.resolved_head) {
+        Ok(at_head) => build_shadow_report_at(store, request, &at_head),
+        Err(ReviewError::RefStateUnavailable { at, missing }) => {
+            build_report_without_ref_state(store, request, at, missing)
+        }
+        Err(other) => Err(other),
+    }
+}
 
+/// Build a shadow report with an already-materialized head state.
+///
+/// Callers evaluating the same head repeatedly (e.g. repeated determinism
+/// passes) can materialize the [`GraphAtRef`] once and reuse it here;
+/// [`build_shadow_report`] materializes per call.
+pub fn build_shadow_report_at<G: GraphStore>(
+    store: &G,
+    request: &ShadowRequest,
+    at_head: &GraphAtRef<'_, G>,
+) -> Result<ShadowGateReport, ReviewError> {
+    let review = SemanticReview::create_review_at(
+        &request.resolved_base,
+        &request.resolved_head,
+        store,
+        at_head,
+    )?;
+    assemble_report(store, request, review, None)
+}
+
+/// The graph state at the head ref could not be materialized. Report the gap
+/// loudly with an empty blast radius; the live adjacency is deliberately not
+/// consulted — it reflects another era's graph, not this ref.
+fn build_report_without_ref_state<G: GraphStore>(
+    store: &G,
+    request: &ShadowRequest,
+    at: SemanticChangeId,
+    missing: SemanticChangeId,
+) -> Result<ShadowGateReport, ReviewError> {
+    let semantic_diff = diff::compute_diff(store, &request.resolved_base, &request.resolved_head)?;
+    let impact_report = ImpactReport {
+        changed_ids: semantic_diff.changed_entity_ids(),
+        ..Default::default()
+    };
+    let risk_summary = risk::assess_risk(&semantic_diff, &impact_report);
+    let inline_comments = inline::collect_inline_comments(&semantic_diff, &impact_report);
+    let review = Review {
+        base: Some(request.resolved_base),
+        head: Some(request.resolved_head),
+        diff: semantic_diff,
+        impact: impact_report,
+        risk: risk_summary,
+        inline_comments,
+    };
+
+    let gap = ShadowEvidenceGap {
+        kind: "ref_state_unavailable".to_string(),
+        subject: request.head_ref.clone(),
+        detail: format!(
+            "graph state at ref not materialized: change {missing} in the ancestry of {at} is \
+             not in the graph; blast radius and impact were NOT computed for this report, and \
+             the live adjacency was deliberately not consulted in its place"
+        ),
+    };
+    assemble_report(store, request, review, Some(gap))
+}
+
+fn assemble_report<G: GraphStore>(
+    store: &G,
+    request: &ShadowRequest,
+    review: Review,
+    ref_state_gap: Option<ShadowEvidenceGap>,
+) -> Result<ShadowGateReport, ReviewError> {
     let changes = store
         .get_changes_since(&request.resolved_base, &request.resolved_head)
         .map_err(ReviewError::graph)?;
 
     let changed_entities = collect_changed_entities(store, &review)?;
     let blast_radius = collect_blast_radius(&review);
-    let evidence_gaps = collect_evidence_gaps(&review, &changes, &changed_entities);
+    let mut evidence_gaps = collect_evidence_gaps(&review, &changes, &changed_entities);
+    if let Some(gap) = ref_state_gap {
+        // The generic empty-impact gap advises verifying relation ingestion,
+        // which misleads here: impact was not computed at all. The specific
+        // ref-state gap subsumes it.
+        evidence_gaps.retain(|existing| existing.kind != "impact_signal_absent");
+        evidence_gaps.insert(0, gap);
+    }
     let policy = derive_policy(&review, &evidence_gaps, &changed_entities);
     let repair_context = collect_repair_context(&policy.findings, &review);
     let audit = collect_audit_evidence(store, request, &review, changes.len())?;
@@ -483,6 +567,10 @@ fn is_blocking(kind: InlineCommentKind) -> bool {
 ///   non-source artifacts stays reported but does not demote — those files
 ///   are EXPECTED to carry no entities, and demoting on them turns every
 ///   docs-only change into a false attention signal.
+/// - `ref_state_unavailable`: the graph state at the reviewed head ref could
+///   not be materialized, so blast radius and impact were not computed at
+///   all. The gate cannot certify `pass` over an impact surface it never
+///   evaluated.
 /// - `impact_signal_absent` is reported but never demotes the verdict: an
 ///   empty relation channel cannot distinguish "genuinely isolated" from
 ///   "relations never ingested", and treating that ambiguity as risk flags
@@ -494,7 +582,7 @@ fn is_blocking(kind: InlineCommentKind) -> bool {
 ///   unavailable) are constant framing, reported but never demoting.
 fn gap_blocks_pass(gap: &ShadowEvidenceGap) -> bool {
     match gap.kind.as_str() {
-        "missing_span" => true,
+        "missing_span" | "ref_state_unavailable" => true,
         "artifact_only_change" => artifact_subject_is_source_class(&gap.subject),
         _ => false,
     }
@@ -1095,7 +1183,9 @@ pub fn format_shadow_report(report: &ShadowGateReport) -> String {
 mod tests {
     use super::*;
     use kin_db::InMemoryGraph;
-    use kin_model::change::{ArtifactDelta, ArtifactDeltaKind, EntityDelta, SemanticChange};
+    use kin_model::change::{
+        ArtifactDelta, ArtifactDeltaKind, EntityDelta, RelationDelta, SemanticChange,
+    };
     use kin_model::entity::{
         Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint,
         SourceSpan, Visibility,
@@ -1148,6 +1238,7 @@ mod tests {
         id: SemanticChangeId,
         parents: Vec<SemanticChangeId>,
         entity_deltas: Vec<EntityDelta>,
+        relation_deltas: Vec<RelationDelta>,
         artifact_deltas: Vec<ArtifactDelta>,
     ) -> SemanticChange {
         SemanticChange {
@@ -1157,7 +1248,7 @@ mod tests {
             author: AuthorId::new("test-author"),
             message: "test change".into(),
             entity_deltas,
-            relation_deltas: vec![],
+            relation_deltas,
             artifact_deltas,
             projected_files: vec![],
             spec_link: None,
@@ -1196,7 +1287,8 @@ mod tests {
 
     /// Graph with: base change adding `target` + `caller` + `test`, head
     /// change modifying `target`'s signature. Caller and test are wired to
-    /// `target` via graph relations.
+    /// `target` via relations recorded in the committed change DAG and
+    /// mirrored into the live adjacency (a consistent repo).
     fn signature_change_graph() -> (InMemoryGraph, SemanticChangeId, SemanticChangeId) {
         let graph = InMemoryGraph::new();
 
@@ -1212,15 +1304,14 @@ mod tests {
             EntityRole::Test,
         );
 
+        let calls_rel = relation(&caller, &target_v2, RelationKind::Calls);
+        let tests_rel = relation(&test, &target_v2, RelationKind::Tests);
+
         graph.upsert_entity(&target_v2).unwrap();
         graph.upsert_entity(&caller).unwrap();
         graph.upsert_entity(&test).unwrap();
-        graph
-            .upsert_relation(&relation(&caller, &target_v2, RelationKind::Calls))
-            .unwrap();
-        graph
-            .upsert_relation(&relation(&test, &target_v2, RelationKind::Tests))
-            .unwrap();
+        graph.upsert_relation(&calls_rel).unwrap();
+        graph.upsert_relation(&tests_rel).unwrap();
 
         let base_id = change_id(1);
         let head_id = change_id(2);
@@ -1232,6 +1323,10 @@ mod tests {
                 EntityDelta::Added(caller),
                 EntityDelta::Added(test),
             ],
+            vec![
+                RelationDelta::Added(calls_rel),
+                RelationDelta::Added(tests_rel),
+            ],
             vec![],
         );
         let head = change_with_deltas(
@@ -1241,6 +1336,7 @@ mod tests {
                 old: target_v1,
                 new: target_v2,
             }],
+            vec![],
             vec![],
         );
         graph.create_change(&base).unwrap();
@@ -1431,6 +1527,7 @@ mod tests {
             vec![],
             vec![EntityDelta::Added(entity.clone())],
             vec![],
+            vec![],
         );
         let head = change_with_deltas(
             head_id,
@@ -1439,6 +1536,7 @@ mod tests {
                 old: entity.clone(),
                 new: entity,
             }],
+            vec![],
             vec![ArtifactDelta {
                 file_id: FilePathId::new("config/policy.yaml"),
                 kind: ArtifactDeltaKind::Modified,
@@ -1490,6 +1588,7 @@ mod tests {
             vec![],
             vec![EntityDelta::Added(entity.clone())],
             vec![],
+            vec![],
         );
         let head = change_with_deltas(
             head_id,
@@ -1498,6 +1597,7 @@ mod tests {
                 old: entity.clone(),
                 new: entity,
             }],
+            vec![],
             vec![ArtifactDelta {
                 file_id: FilePathId::new("src/legacy.c"),
                 kind: ArtifactDeltaKind::Modified,
@@ -1586,11 +1686,10 @@ mod tests {
         let graph = InMemoryGraph::new();
         let legacy = entity_with_span("legacy_helper", "src/old.rs", 4, EntityRole::Source);
         let consumer = entity_with_span("still_calls_it", "src/live.rs", 9, EntityRole::Source);
+        let calls_rel = relation(&consumer, &legacy, RelationKind::Calls);
         graph.upsert_entity(&legacy).unwrap();
         graph.upsert_entity(&consumer).unwrap();
-        graph
-            .upsert_relation(&relation(&consumer, &legacy, RelationKind::Calls))
-            .unwrap();
+        graph.upsert_relation(&calls_rel).unwrap();
 
         let base_id = change_id(8);
         let head_id = change_id(9);
@@ -1601,12 +1700,14 @@ mod tests {
                 EntityDelta::Added(legacy.clone()),
                 EntityDelta::Added(consumer.clone()),
             ],
+            vec![RelationDelta::Added(calls_rel)],
             vec![],
         );
         let head = change_with_deltas(
             head_id,
             vec![base_id],
             vec![EntityDelta::Removed(legacy.id)],
+            vec![],
             vec![],
         );
         graph.create_change(&base).unwrap();
@@ -1622,8 +1723,9 @@ mod tests {
         assert_eq!(removed.name, "legacy_helper");
         assert_eq!(removed.file.as_deref(), Some("src/old.rs"));
 
-        // Removal with a live graph-known consumer is a blocking downstream
-        // risk, and the finding names the entity, not its uuid.
+        // Removal with a graph-known consumer — committed at base, severed
+        // by the removal at head — is a blocking downstream risk, and the
+        // finding names the entity, not its uuid.
         let downstream = report
             .policy
             .findings
@@ -1803,10 +1905,153 @@ mod tests {
     }
 
     #[test]
+    fn blast_radius_derives_from_ref_state_not_live_adjacency() {
+        // The production bug shape: committed changes carry relation deltas,
+        // but the live adjacency was never updated from them and holds a
+        // divergent set. The blast radius must come from the committed state
+        // at the head ref, not from whatever happens to be resident.
+        let graph = InMemoryGraph::new();
+
+        let target_v1 = entity_with_span("compute_total", "src/billing.rs", 10, EntityRole::Source);
+        let mut target_v2 = target_v1.clone();
+        target_v2.signature = "fn compute_total(currency: &str)".into();
+        let caller = entity_with_span("render_invoice", "src/invoice.rs", 5, EntityRole::Source);
+        let live_only =
+            entity_with_span("live_only_consumer", "src/live.rs", 8, EntityRole::Source);
+
+        // Live store: entities present, but the ONLY resident relation is one
+        // the committed history never recorded.
+        graph.upsert_entity(&target_v2).unwrap();
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&live_only).unwrap();
+        graph
+            .upsert_relation(&relation(&live_only, &target_v2, RelationKind::Calls))
+            .unwrap();
+
+        let base_id = change_id(0x21);
+        let head_id = change_id(0x22);
+        let base = change_with_deltas(
+            base_id,
+            vec![],
+            vec![
+                EntityDelta::Added(target_v1.clone()),
+                EntityDelta::Added(caller.clone()),
+            ],
+            vec![RelationDelta::Added(relation(
+                &caller,
+                &target_v1,
+                RelationKind::Calls,
+            ))],
+            vec![],
+        );
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![EntityDelta::Modified {
+                old: target_v1,
+                new: target_v2,
+            }],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&base).unwrap();
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+
+        // The committed caller is reached through the replayed ref state even
+        // though the live adjacency never held that relation.
+        assert!(report
+            .blast_radius
+            .dependents
+            .iter()
+            .any(|dependent| dependent.name == "render_invoice"));
+
+        // The live-only relation is invisible: it belongs to another era.
+        let mentions_live_only = report
+            .blast_radius
+            .callers
+            .iter()
+            .chain(report.blast_radius.dependents.iter())
+            .chain(report.blast_radius.contract_consumers.iter())
+            .chain(report.blast_radius.tests.iter())
+            .any(|affected| affected.name == "live_only_consumer");
+        assert!(!mentions_live_only);
+    }
+
+    #[test]
+    fn unmaterializable_ref_state_reports_loud_gap_not_live_fallback() {
+        let graph = InMemoryGraph::new();
+
+        let target_v1 = entity_with_span("orphan_target", "src/orphan.rs", 4, EntityRole::Source);
+        let mut target_v2 = target_v1.clone();
+        target_v2.signature = "fn orphan_target(x: u8)".into();
+        let live_caller = entity_with_span("live_caller", "src/live.rs", 6, EntityRole::Source);
+
+        // The live adjacency has a caller wired to the changed entity; a
+        // silent fallback would report it as blast radius.
+        graph.upsert_entity(&target_v2).unwrap();
+        graph.upsert_entity(&live_caller).unwrap();
+        graph
+            .upsert_relation(&relation(&live_caller, &target_v2, RelationKind::Calls))
+            .unwrap();
+
+        // base's parent was never imported, so the state at head cannot be
+        // replayed even though the base..head rows themselves exist.
+        let ghost_parent = change_id(0x31);
+        let base_id = change_id(0x32);
+        let head_id = change_id(0x33);
+        let base = change_with_deltas(
+            base_id,
+            vec![ghost_parent],
+            vec![EntityDelta::Added(target_v1.clone())],
+            vec![],
+            vec![],
+        );
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![EntityDelta::Modified {
+                old: target_v1,
+                new: target_v2,
+            }],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&base).unwrap();
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+
+        let gap = report
+            .evidence_gaps
+            .iter()
+            .find(|gap| gap.kind == "ref_state_unavailable")
+            .expect("unmaterializable ref state must surface as an evidence gap");
+        assert!(gap.detail.contains("graph state at ref not materialized"));
+        assert!(gap.detail.contains(&ghost_parent.to_string()));
+
+        // No silent fallback: the blast radius stays empty even though the
+        // live adjacency holds a caller for the changed entity.
+        assert_eq!(report.blast_radius.total_affected, 0);
+        assert!(report.blast_radius.callers.is_empty());
+        assert!(report.blast_radius.dependents.is_empty());
+
+        // The specific ref-state gap subsumes the generic empty-impact gap.
+        assert!(!report
+            .evidence_gaps
+            .iter()
+            .any(|gap| gap.kind == "impact_signal_absent"));
+
+        // Missing evidence never certifies a pass.
+        assert_ne!(report.policy.verdict, ShadowGateVerdict::Pass);
+    }
+
+    #[test]
     fn empty_range_fails_loud() {
         let graph = InMemoryGraph::new();
         let base_id = change_id(5);
-        let base = change_with_deltas(base_id, vec![], vec![], vec![]);
+        let base = change_with_deltas(base_id, vec![], vec![], vec![], vec![]);
         graph.create_change(&base).unwrap();
 
         let result = build_shadow_report(&graph, &request(base_id, base_id));

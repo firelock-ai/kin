@@ -639,6 +639,12 @@ pub async fn run(
                 }
             }
         }
+        // Store-iteration order is not a contract; sort by relation id so the
+        // committed change record is deterministic.
+        relation_deltas.sort_by_key(|delta| match delta {
+            RelationDelta::Added(relation) => relation.id.0,
+            RelationDelta::Removed(relation_id) => relation_id.0,
+        });
         let entity_deltas = all_entities.into_iter().map(EntityDelta::Added).collect();
 
         let change = SemanticChange {
@@ -1316,6 +1322,14 @@ pub(crate) fn enrich_imported_changes_with_semantics(
             total_closure_diffing_time += post_link_start.elapsed();
         }
 
+        // Relation deltas accumulate from HashMap iteration above; sort by
+        // relation id so the committed change record is byte-stable across
+        // runs. The sort is stable, so a Removed(id)+Added(id) replacement
+        // pair keeps its replay order.
+        relation_deltas.sort_by_key(|delta| match delta {
+            RelationDelta::Added(relation) => relation.id.0,
+            RelationDelta::Removed(relation_id) => relation_id.0,
+        });
         imported_change.change.entity_deltas = entity_deltas;
         imported_change.change.relation_deltas = relation_deltas;
     }

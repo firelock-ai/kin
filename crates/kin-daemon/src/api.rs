@@ -3399,6 +3399,11 @@ async fn review(
         kin_cli::commands::review::execute_review_request(&state.layout, graph.as_ref(), req)
             .await
             .map_err(internal_error)?;
+    if execution.hydrated_git_history {
+        state.bump_version();
+        state.save_snapshot().map_err(internal_error)?;
+        state.mark_clean();
+    }
     if execution.mutated {
         state.bump_version();
         state.emit_event(DaemonEvent::GraphRootChanged {

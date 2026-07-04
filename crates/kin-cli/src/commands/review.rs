@@ -79,6 +79,10 @@ pub struct ReviewResponse {
 pub struct ReviewExecution {
     pub response: ReviewResponse,
     pub mutated: bool,
+    /// A shadow evaluation lazily imported Git ancestry into the graph;
+    /// daemon owners should persist the hydrated state so the import happens
+    /// once per repo instead of once per process.
+    pub hydrated_git_history: bool,
 }
 
 #[derive(Serialize)]
@@ -176,6 +180,7 @@ pub async fn execute_review_request(
                 layout, graph, change, entities, files, changes, json,
             )?,
             mutated: false,
+            hydrated_git_history: false,
         }),
         ReviewRequest::Shadow {
             base,
@@ -184,12 +189,16 @@ pub async fn execute_review_request(
             source_url,
             author,
             json,
-        } => Ok(ReviewExecution {
-            response: build_shadow_run_response(
+        } => {
+            let (response, hydrated_git_history) = build_shadow_run_response(
                 layout, graph, base, head, title, source_url, author, json,
-            )?,
-            mutated: false,
-        }),
+            )?;
+            Ok(ReviewExecution {
+                response,
+                mutated: false,
+                hydrated_git_history,
+            })
+        }
         ReviewRequest::Create {
             title,
             base,
@@ -288,25 +297,29 @@ fn build_shadow_run_response(
     source_url: Option<String>,
     author: Option<String>,
     json: bool,
-) -> Result<ReviewResponse> {
-    let resolved_base = crate::commands::ref_lookup::resolve_ref_importing_git_if_needed(
-        graph,
-        layout,
-        Some(base.as_str()),
-    )
-    .with_context(|| format!("resolve shadow base ref '{}'", base))?;
-    let resolved_head = crate::commands::ref_lookup::resolve_ref_importing_git_if_needed(
-        graph,
-        layout,
-        Some(head.as_str()),
-    )
-    .with_context(|| format!("resolve shadow head ref '{}'", head))?;
+) -> Result<(ReviewResponse, bool)> {
+    let resolved_base =
+        crate::commands::ref_lookup::resolve_ref_importing_git_if_needed_with_report(
+            graph,
+            layout,
+            Some(base.as_str()),
+        )
+        .with_context(|| format!("resolve shadow base ref '{}'", base))?;
+    let resolved_head =
+        crate::commands::ref_lookup::resolve_ref_importing_git_if_needed_with_report(
+            graph,
+            layout,
+            Some(head.as_str()),
+        )
+        .with_context(|| format!("resolve shadow head ref '{}'", head))?;
+    let hydrated_git_history =
+        resolved_base.hydrated_git_history || resolved_head.hydrated_git_history;
 
     let request = kin_review::ShadowRequest {
         base_ref: base,
         head_ref: head,
-        resolved_base,
-        resolved_head,
+        resolved_base: resolved_base.head,
+        resolved_head: resolved_head.head,
         title,
         source_url,
         author,
@@ -316,16 +329,22 @@ fn build_shadow_run_response(
     let report = kin_review::build_shadow_report(graph, &request)?;
 
     if json {
-        return Ok(ReviewResponse {
-            text: String::new(),
-            json: Some(serde_json::to_string_pretty(&report)?),
-        });
+        return Ok((
+            ReviewResponse {
+                text: String::new(),
+                json: Some(serde_json::to_string_pretty(&report)?),
+            },
+            hydrated_git_history,
+        ));
     }
 
-    Ok(ReviewResponse {
-        text: kin_review::format_shadow_report(&report),
-        json: None,
-    })
+    Ok((
+        ReviewResponse {
+            text: kin_review::format_shadow_report(&report),
+            json: None,
+        },
+        hydrated_git_history,
+    ))
 }
 
 fn compute_review(
@@ -425,6 +444,11 @@ fn compute_review(
     let review = if let Some(parent_id) = semantic_change.parents.first() {
         match kin_review::SemanticReview::create_review(parent_id, &change_id, graph) {
             Ok(r) => r,
+            // An unmaterializable ref state must surface, not degrade into a
+            // live-adjacency review of another era's graph.
+            Err(err @ kin_review::ReviewError::RefStateUnavailable { .. }) => {
+                return Err(err.into())
+            }
             Err(_) => {
                 let diff = kin_review::diff_from_change(&semantic_change);
                 kin_review::SemanticReview::review_from_diff(diff, graph)?
@@ -654,6 +678,7 @@ fn create_review_with_graph(
             json: None,
         },
         mutated: true,
+        hydrated_git_history: false,
     })
 }
 
@@ -713,6 +738,7 @@ fn decide_review_with_graph(
             json: None,
         },
         mutated: true,
+        hydrated_git_history: false,
     })
 }
 
@@ -759,6 +785,7 @@ fn add_note_with_graph(
     Ok(ReviewExecution {
         response: ReviewResponse { text, json: None },
         mutated: true,
+        hydrated_git_history: false,
     })
 }
 
@@ -819,6 +846,7 @@ fn start_discussion_with_graph(
     Ok(ReviewExecution {
         response: ReviewResponse { text, json: None },
         mutated: true,
+        hydrated_git_history: false,
     })
 }
 
@@ -855,6 +883,7 @@ fn reply_discussion_with_graph(
             json: None,
         },
         mutated: true,
+        hydrated_git_history: false,
     })
 }
 
@@ -877,6 +906,7 @@ fn resolve_discussion_with_graph(
             json: None,
         },
         mutated: true,
+        hydrated_git_history: false,
     })
 }
 
@@ -914,6 +944,7 @@ fn assign_reviewer_with_graph(
             json: None,
         },
         mutated: true,
+        hydrated_git_history: false,
     })
 }
 
@@ -956,6 +987,7 @@ fn list_reviews_with_graph(
                 json: None,
             },
             mutated: false,
+            hydrated_git_history: false,
         });
     }
 
@@ -975,6 +1007,7 @@ fn list_reviews_with_graph(
     Ok(ReviewExecution {
         response: ReviewResponse { text, json: None },
         mutated: false,
+        hydrated_git_history: false,
     })
 }
 
@@ -1067,6 +1100,7 @@ fn show_review_with_graph(
     Ok(ReviewExecution {
         response: ReviewResponse { text, json: None },
         mutated: false,
+        hydrated_git_history: false,
     })
 }
 

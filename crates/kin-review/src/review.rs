@@ -13,6 +13,7 @@ use crate::diff::{self, SemanticDiff};
 use crate::error::ReviewError;
 use crate::impact::{self, ImpactReport};
 use crate::inline::{self, InlineComment};
+use crate::ref_graph::GraphAtRef;
 use crate::risk;
 
 /// A complete semantic review: diff + impact + risk + inline comments.
@@ -34,15 +35,35 @@ impl SemanticReview {
     ///
     /// This computes:
     /// 1. Entity-level diff between base and head
-    /// 2. Impact analysis (callers, dependents, contracts, tests)
+    /// 2. Impact analysis (callers, dependents, contracts, tests) against
+    ///    the graph state materialized at `head`
     /// 3. Risk assessment (breaking changes, coverage gaps, violations)
+    ///
+    /// Fails with [`ReviewError::RefStateUnavailable`] when the graph state
+    /// at `head` cannot be materialized; it never answers impact from the
+    /// live adjacency for a committed range.
     pub fn create_review<G: GraphStore>(
         base: &SemanticChangeId,
         head: &SemanticChangeId,
         store: &G,
     ) -> Result<Review, ReviewError> {
+        let at_head = GraphAtRef::materialize(store, head)?;
+        Self::create_review_at(base, head, store, &at_head)
+    }
+
+    /// Create a full semantic review between a base and head change, with
+    /// impact analysis answered by an already-materialized head state.
+    ///
+    /// Callers evaluating the same head repeatedly can materialize the
+    /// [`GraphAtRef`] once and reuse it across evaluations.
+    pub fn create_review_at<G: GraphStore>(
+        base: &SemanticChangeId,
+        head: &SemanticChangeId,
+        store: &G,
+        at_head: &GraphAtRef<'_, G>,
+    ) -> Result<Review, ReviewError> {
         let semantic_diff = diff::compute_diff(store, base, head)?;
-        let impact_report = impact::analyze_impact(store, &semantic_diff)?;
+        let impact_report = impact::analyze_impact_at(at_head, &semantic_diff)?;
         let risk_summary = risk::assess_risk(&semantic_diff, &impact_report);
         let inline_comments = inline::collect_inline_comments(&semantic_diff, &impact_report);
 
