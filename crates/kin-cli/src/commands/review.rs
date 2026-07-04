@@ -1078,6 +1078,7 @@ fn inline_comment_severity(kind: kin_review::InlineCommentKind) -> &'static str 
         InlineCommentKind::CoverageGap
         | InlineCommentKind::SignatureChange
         | InlineCommentKind::VisibilityChange
+        | InlineCommentKind::ConsumerFanout
         | InlineCommentKind::Renamed
         | InlineCommentKind::AgentUnreviewed => "warning",
         InlineCommentKind::Added | InlineCommentKind::Removed => "info",

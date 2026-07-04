@@ -21,8 +21,11 @@ pub use format::{
     format_diff, format_impact, format_inline_comments, format_review, format_risk_highlights,
 };
 pub use gate::{derive_decision, GateStatus, ReviewDecision, ReviewFinding, ReviewSignalKind};
-pub use impact::{analyze_impact, ImpactReport};
-pub use inline::{collect_inline_comments, group_by_file, InlineComment, InlineCommentKind};
+pub use impact::{analyze_impact, EntityImpact, ImpactReport};
+pub use inline::{
+    collect_inline_comments, group_by_file, InlineComment, InlineCommentKind,
+    CONSUMER_FANOUT_FILE_THRESHOLD,
+};
 pub use release_gate::{
     entities_touched_by_change, security_findings, unapproved_agent_changes, SecurityFinding,
     SecurityFindingCounts, SecuritySeverity, UnapprovedAgentChange,

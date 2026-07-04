@@ -3532,6 +3532,7 @@ version = "0.2.8"
 dependencies = [
  "kin-blobs",
  "kin-db",
+ "kin-index",
  "kin-model",
  "pretty_assertions",
  "serde",

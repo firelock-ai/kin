@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 
 use kin_model::entity::{Entity, EntityKind, EntityRole, Visibility};
+use kin_model::ids::EntityId;
 use serde::{Deserialize, Serialize};
 
 use crate::diff::{EntityChangeKind, SemanticDiff};
@@ -27,6 +28,7 @@ pub enum InlineCommentKind {
     ContractViolation,
     SignatureChange,
     VisibilityChange,
+    ConsumerFanout,
     Added,
     Removed,
     Renamed,
@@ -41,6 +43,7 @@ impl InlineCommentKind {
             Self::CoverageGap => "?",
             Self::SignatureChange => "~",
             Self::VisibilityChange => "~",
+            Self::ConsumerFanout => "~",
             Self::Added => "+",
             Self::Removed => "-",
             Self::Renamed => "~",
@@ -48,6 +51,13 @@ impl InlineCommentKind {
         }
     }
 }
+
+/// Distinct non-test consumer files at or above which a body-only
+/// modification (signature and visibility unchanged) emits a consumer-fanout
+/// attention comment. Body changes below this fanout stay silent: the
+/// signature channels own contract-surface changes, and a body edit consumed
+/// from a single file is ordinary local iteration.
+pub const CONSUMER_FANOUT_FILE_THRESHOLD: usize = 2;
 
 /// Collect line-level inline comments from a review's diff and impact data.
 ///
@@ -77,6 +87,13 @@ pub fn collect_inline_comments(diff: &SemanticDiff, impact: &ImpactReport) -> Ve
     comments
 }
 
+/// Graph-known tests covering one changed entity.
+fn covering_tests(impact: &ImpactReport, entity_id: &EntityId) -> usize {
+    impact
+        .entity_impact(entity_id)
+        .map_or(0, |entry| entry.covering_tests)
+}
+
 fn collect_added_comments(
     entity: &Entity,
     impact: &ImpactReport,
@@ -98,10 +115,15 @@ fn collect_added_comments(
         ),
     });
 
-    // Public entity without test coverage
+    // Public entity without test coverage. Keyed on THIS entity's covering
+    // tests, not the diff-global test bucket, and suppressed when the diff
+    // has no impact signal at all — an empty channel cannot distinguish
+    // "uncovered" from "relations never ingested", and the report already
+    // carries that deficit as an `impact_signal_absent` evidence gap.
     if entity.visibility == Visibility::Public
         && entity.role != EntityRole::Test
-        && impact.affected_tests.is_empty()
+        && !impact.is_empty()
+        && covering_tests(impact, &entity.id) == 0
     {
         comments.push(InlineComment {
             file: span.file.to_string(),
@@ -139,8 +161,13 @@ fn collect_modified_comments(
         None => return,
     };
 
-    let has_callers = !impact.affected_callers.is_empty();
-    let has_consumers = !impact.affected_contract_consumers.is_empty();
+    // All gate-relevant rules key on THIS entity's inbound edges. Another
+    // entity's consumers are that entity's risk, not this one's.
+    let per_entity = impact.entity_impact(&new.id);
+    let consumer_count = per_entity.map_or(0, |e| e.consumer_count);
+    let contract_consumer_count = per_entity.map_or(0, |e| e.contract_consumer_count);
+    let consumer_file_count = per_entity.map_or(0, |e| e.consumer_files.len());
+    let entity_covering_tests = per_entity.map_or(0, |e| e.covering_tests);
 
     // Signature change
     if old.signature != new.signature {
@@ -155,9 +182,10 @@ fn collect_modified_comments(
             ),
         });
 
-        // Breaking if callers or consumers exist
-        if has_callers || has_consumers {
-            let affected = impact.affected_callers.len() + impact.affected_contract_consumers.len();
+        // Breaking only when THIS entity has non-test consumers to break.
+        // Test-only consumers are the covering evidence for the change, not
+        // a contract it is breaking.
+        if consumer_count > 0 {
             comments.push(InlineComment {
                 file: span.file.to_string(),
                 start_line: span.start_line,
@@ -165,7 +193,7 @@ fn collect_modified_comments(
                 kind: InlineCommentKind::Breaking,
                 message: format!(
                     "Breaking change: signature modification affects {} downstream entity(ies)",
-                    affected,
+                    consumer_count,
                 ),
             });
         }
@@ -184,15 +212,15 @@ fn collect_modified_comments(
             ),
         });
 
-        if has_callers {
+        if consumer_count > 0 {
             comments.push(InlineComment {
                 file: span.file.to_string(),
                 start_line: span.start_line,
                 end_line: span.end_line,
                 kind: InlineCommentKind::Breaking,
                 message: format!(
-                    "Breaking change: visibility reduced with {} caller(s)",
-                    impact.affected_callers.len(),
+                    "Breaking change: visibility reduced with {} consumer(s)",
+                    consumer_count,
                 ),
             });
         }
@@ -209,11 +237,11 @@ fn collect_modified_comments(
         });
     }
 
-    // Contract entity with consumers
+    // Contract entity whose own consumers are exposed to this modification.
     if matches!(
         new.kind,
         EntityKind::ApiEndpoint | EntityKind::EventContract | EntityKind::Schema
-    ) && has_consumers
+    ) && contract_consumer_count > 0
     {
         comments.push(InlineComment {
             file: span.file.to_string(),
@@ -222,15 +250,34 @@ fn collect_modified_comments(
             kind: InlineCommentKind::ContractViolation,
             message: format!(
                 "Contract {:?} `{}` modified with {} consumer(s)",
-                new.kind,
-                new.name,
-                impact.affected_contract_consumers.len(),
+                new.kind, new.name, contract_consumer_count,
             ),
         });
     }
 
-    // No test coverage
-    if new.role != EntityRole::Test && impact.affected_tests.is_empty() {
+    // Body-only modification with wide consumer fanout. The contract surface
+    // is unchanged, so the breaking channels stay silent, but a behavior
+    // change consumed from many distinct non-test files deserves attention.
+    if old.signature == new.signature
+        && old.visibility == new.visibility
+        && consumer_file_count >= CONSUMER_FANOUT_FILE_THRESHOLD
+    {
+        comments.push(InlineComment {
+            file: span.file.to_string(),
+            start_line: span.start_line,
+            end_line: span.end_line,
+            kind: InlineCommentKind::ConsumerFanout,
+            message: format!(
+                "Behavior of `{}` changed with {} distinct non-test consumer file(s)",
+                new.name, consumer_file_count,
+            ),
+        });
+    }
+
+    // No test coverage. Keyed on THIS entity's covering tests and suppressed
+    // when the diff-wide impact signal is absent — that deficit is already
+    // reported as an `impact_signal_absent` evidence gap.
+    if new.role != EntityRole::Test && !impact.is_empty() && entity_covering_tests == 0 {
         comments.push(InlineComment {
             file: span.file.to_string(),
             start_line: span.start_line,
@@ -270,7 +317,7 @@ pub fn group_by_file(comments: &[InlineComment]) -> BTreeMap<&str, Vec<&InlineCo
 mod tests {
     use super::*;
     use crate::diff::{EntityChange, EntityChangeKind, SemanticDiff};
-    use crate::impact::ImpactReport;
+    use crate::impact::{EntityImpact, ImpactReport};
     use kin_model::entity::{
         Entity, EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, SemanticFingerprint,
         SourceSpan, Visibility,
@@ -418,10 +465,328 @@ mod tests {
         let impact = ImpactReport {
             affected_callers: vec![caller],
             changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 1,
+                contract_consumer_count: 0,
+                consumer_files: vec!["src/client.rs".to_string()],
+                covering_tests: 0,
+            }],
             ..Default::default()
         };
 
         let comments = collect_inline_comments(&diff, &impact);
+        assert!(comments
+            .iter()
+            .any(|c| c.kind == InlineCommentKind::Breaking));
+    }
+
+    #[test]
+    fn breaking_requires_this_entitys_consumers_not_the_diffs() {
+        // Entity A changes signature but nothing consumes A; the diff-global
+        // caller belongs to entity B. A must NOT be reported as breaking.
+        let old_a = test_entity_with_span("isolated_fn", "src/a.rs", 1, 10);
+        let mut new_a = old_a.clone();
+        new_a.signature = "fn isolated_fn(x: i32)".to_string();
+        let b = test_entity_with_span("popular_fn", "src/b.rs", 1, 10);
+        let caller_of_b = test_entity_with_span("caller_fn", "src/client.rs", 1, 5);
+
+        let diff = SemanticDiff {
+            entity_changes: vec![
+                EntityChange {
+                    entity_id: new_a.id,
+                    kind: EntityChangeKind::Modified {
+                        old: old_a.clone(),
+                        new: new_a.clone(),
+                    },
+                },
+                EntityChange {
+                    entity_id: b.id,
+                    kind: EntityChangeKind::Modified {
+                        old: b.clone(),
+                        new: b.clone(),
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            affected_callers: vec![caller_of_b],
+            changed_ids: vec![new_a.id, b.id],
+            entity_impacts: vec![
+                EntityImpact {
+                    entity_id: new_a.id,
+                    consumer_count: 0,
+                    contract_consumer_count: 0,
+                    consumer_files: vec![],
+                    covering_tests: 0,
+                },
+                EntityImpact {
+                    entity_id: b.id,
+                    consumer_count: 1,
+                    contract_consumer_count: 0,
+                    consumer_files: vec!["src/client.rs".to_string()],
+                    covering_tests: 0,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let comments = collect_inline_comments(&diff, &impact);
+        assert!(
+            !comments
+                .iter()
+                .any(|c| c.kind == InlineCommentKind::Breaking),
+            "another entity's consumers must not make this signature change breaking"
+        );
+        assert!(comments
+            .iter()
+            .any(|c| c.kind == InlineCommentKind::SignatureChange));
+    }
+
+    #[test]
+    fn breaking_suppressed_when_only_tests_consume() {
+        // Signature change whose only inbound edges are tests: the tests are
+        // the covering evidence, not a broken contract. Not breaking.
+        let old = test_entity_with_span("tested_fn", "src/core.rs", 1, 10);
+        let mut new = old.clone();
+        new.signature = "fn tested_fn(flag: bool)".to_string();
+        let test_entity = test_entity_with_span("test_tested_fn", "tests/core.rs", 1, 5);
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            affected_tests: vec![test_entity],
+            changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 0,
+                contract_consumer_count: 0,
+                consumer_files: vec![],
+                covering_tests: 1,
+            }],
+            ..Default::default()
+        };
+
+        let comments = collect_inline_comments(&diff, &impact);
+        assert!(
+            !comments
+                .iter()
+                .any(|c| c.kind == InlineCommentKind::Breaking),
+            "test-only consumers must not produce a breaking finding"
+        );
+        assert!(
+            !comments
+                .iter()
+                .any(|c| c.kind == InlineCommentKind::CoverageGap),
+            "a tested entity has no coverage gap"
+        );
+    }
+
+    #[test]
+    fn coverage_gap_keys_on_the_entity_not_the_diff() {
+        // Covered entity + uncovered entity in one diff: exactly the
+        // uncovered one carries the gap. Under the old diff-global rule the
+        // covered entity's test silenced both.
+        let covered = test_entity_with_span("covered_fn", "src/covered.rs", 1, 10);
+        let uncovered = test_entity_with_span("uncovered_fn", "src/uncovered.rs", 1, 10);
+        let test_entity = test_entity_with_span("test_covered_fn", "tests/covered.rs", 1, 5);
+
+        let diff = SemanticDiff {
+            entity_changes: vec![
+                EntityChange {
+                    entity_id: covered.id,
+                    kind: EntityChangeKind::Modified {
+                        old: covered.clone(),
+                        new: covered.clone(),
+                    },
+                },
+                EntityChange {
+                    entity_id: uncovered.id,
+                    kind: EntityChangeKind::Modified {
+                        old: uncovered.clone(),
+                        new: uncovered.clone(),
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            affected_tests: vec![test_entity],
+            changed_ids: vec![covered.id, uncovered.id],
+            entity_impacts: vec![
+                EntityImpact {
+                    entity_id: covered.id,
+                    consumer_count: 0,
+                    contract_consumer_count: 0,
+                    consumer_files: vec![],
+                    covering_tests: 1,
+                },
+                EntityImpact {
+                    entity_id: uncovered.id,
+                    consumer_count: 0,
+                    contract_consumer_count: 0,
+                    consumer_files: vec![],
+                    covering_tests: 0,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let comments = collect_inline_comments(&diff, &impact);
+        let gaps: Vec<&InlineComment> = comments
+            .iter()
+            .filter(|c| c.kind == InlineCommentKind::CoverageGap)
+            .collect();
+        assert_eq!(gaps.len(), 1, "exactly the uncovered entity carries a gap");
+        assert_eq!(gaps[0].file, "src/uncovered.rs");
+    }
+
+    #[test]
+    fn coverage_gap_suppressed_when_impact_signal_absent() {
+        // The graph connects nothing to this diff: an empty channel cannot
+        // prove a coverage gap, and the shadow report already carries the
+        // deficit as an impact_signal_absent evidence gap.
+        let old = test_entity_with_span("quiet_fn", "src/quiet.rs", 1, 10);
+        let new = old.clone();
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            changed_ids: vec![new.id],
+            ..Default::default()
+        };
+
+        let comments = collect_inline_comments(&diff, &impact);
+        assert!(
+            !comments
+                .iter()
+                .any(|c| c.kind == InlineCommentKind::CoverageGap),
+            "no coverage gap may be claimed from an absent impact signal"
+        );
+    }
+
+    #[test]
+    fn consumer_fanout_fires_on_body_change_at_threshold() {
+        // Body-only modification (signature and visibility unchanged)
+        // consumed from two distinct non-test files -> attention comment.
+        let old = test_entity_with_span("hot_path", "src/hot.rs", 1, 20);
+        let new = old.clone();
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let consumer_a = test_entity_with_span("use_a", "src/a.rs", 1, 5);
+        let consumer_b = test_entity_with_span("use_b", "src/b.rs", 1, 5);
+        let impact = ImpactReport {
+            affected_callers: vec![consumer_a, consumer_b],
+            changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 2,
+                contract_consumer_count: 0,
+                consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+                covering_tests: 1,
+            }],
+            ..Default::default()
+        };
+
+        let comments = collect_inline_comments(&diff, &impact);
+        let fanout: Vec<&InlineComment> = comments
+            .iter()
+            .filter(|c| c.kind == InlineCommentKind::ConsumerFanout)
+            .collect();
+        assert_eq!(fanout.len(), 1);
+        assert!(fanout[0].message.contains("2 distinct non-test consumer"));
+    }
+
+    #[test]
+    fn consumer_fanout_silent_below_threshold_and_on_surface_changes() {
+        let old = test_entity_with_span("narrow_fn", "src/narrow.rs", 1, 20);
+        let new = old.clone();
+        let consumer = test_entity_with_span("only_use", "src/only.rs", 1, 5);
+
+        // One consumer file: below threshold, silent.
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            affected_callers: vec![consumer.clone()],
+            changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 1,
+                contract_consumer_count: 0,
+                consumer_files: vec!["src/only.rs".to_string()],
+                covering_tests: 0,
+            }],
+            ..Default::default()
+        };
+        let comments = collect_inline_comments(&diff, &impact);
+        assert!(!comments
+            .iter()
+            .any(|c| c.kind == InlineCommentKind::ConsumerFanout));
+
+        // Signature change with wide fanout: the breaking/signature channels
+        // own it; fanout stays silent.
+        let mut resigned = old.clone();
+        resigned.signature = "fn narrow_fn(extra: u8)".to_string();
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: resigned.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: resigned.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            affected_callers: vec![consumer],
+            changed_ids: vec![resigned.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: resigned.id,
+                consumer_count: 2,
+                contract_consumer_count: 0,
+                consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+                covering_tests: 0,
+            }],
+            ..Default::default()
+        };
+        let comments = collect_inline_comments(&diff, &impact);
+        assert!(!comments
+            .iter()
+            .any(|c| c.kind == InlineCommentKind::ConsumerFanout));
         assert!(comments
             .iter()
             .any(|c| c.kind == InlineCommentKind::Breaking));
