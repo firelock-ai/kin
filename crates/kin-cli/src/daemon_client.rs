@@ -242,8 +242,13 @@ impl DaemonClient {
                 headers.insert(reqwest::header::AUTHORIZATION, value);
             }
         }
+        let request_timeout = std::env::var("KIN_DAEMON_HTTP_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&secs| secs > 0)
+            .unwrap_or(300);
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
+            .timeout(Duration::from_secs(request_timeout))
             .connect_timeout(Duration::from_secs(2))
             .default_headers(headers)
             .build()

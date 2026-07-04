@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (390 total, 294 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (391 total, 294 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -77,6 +77,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_DAEMON_DISABLE_LSP` | bool | false | correctness | disable LSP enrichment in the daemon, reducing relation coverage |
 | `KIN_DAEMON_EMBED_BATCH_SIZE` | usize | *(unset)* | operational | embedding batch size for daemon-side embed passes |
 | `KIN_DAEMON_EXISTING_READY_TIMEOUT_SECS` | seconds>=0 | 3 | operational | readiness wait for an already-running daemon |
+| `KIN_DAEMON_HTTP_TIMEOUT_SECS` | seconds>=0 | 300 | operational | per-request HTTP timeout for the CLI's daemon client; 0 or invalid falls back to 300 — long-running requests (large-repo review) need a higher value |
 | `KIN_DAEMON_IDLE_FLUSH_SECS` | seconds>=0 | 2 | operational | idle debounce before a full-graph persistence flush |
 | `KIN_DAEMON_IDLE_TIMEOUT_SECS` | seconds>=0 | 3600 | operational | auto-shutdown after this idle period; 0 disables idle shutdown |
 | `KIN_DAEMON_LOCATE_ONLY` | bool | false | correctness | daemon serves locate-only from a snapshot, changing what it answers |
