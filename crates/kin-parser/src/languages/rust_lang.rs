@@ -546,9 +546,92 @@ fn extract_calls_from_context(
                     });
                 }
             }
+        } else if child.kind() == "macro_invocation" {
+            // Macro arguments are token soup: tree-sitter does not parse
+            // expressions inside token trees, so `format!("{}", total(x))`
+            // carries no call_expression node for `total(x)`. Without this,
+            // calls made inside format!/println!/assert!-style invocations
+            // never become graph relations and downstream consumers vanish
+            // from cross-file adjacency. Reconstruct call-shaped token runs
+            // from the delimited token tree instead.
+            let mut macro_cursor = child.walk();
+            for macro_child in child.children(&mut macro_cursor) {
+                if macro_child.kind() == "token_tree" {
+                    extract_calls_from_token_tree(&macro_child, source, context_name, relations);
+                }
+            }
         }
         // Recurse into child nodes
         extract_calls_from_context(&child, source, context_name, relations);
+    }
+}
+
+/// Extract call-shaped token runs from a macro-invocation token tree.
+///
+/// Inside a token tree an invocation like `billing::compute_total(amount)`
+/// is a flat token run: `identifier ("::" identifier)*` followed by a
+/// parenthesized `token_tree`. Treat that shape as a call, mirroring the
+/// `call_expression` extraction rules:
+/// - method calls (`x.method(..)`) collapse to the bare method name, exactly
+///   like the `field_expression` arm above;
+/// - qualified paths keep their `a::b` text, exactly like scoped callees;
+/// - `name!(..)` runs are nested macro uses, not calls (the identifier is
+///   followed by `!`, never directly by the token tree);
+/// - bracket/brace groups (`v[i]`, `S { .. }`) are not argument lists.
+///
+/// Nested token trees are scanned recursively so calls inside argument lists
+/// and nested macro bodies are also captured.
+fn extract_calls_from_token_tree(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    context_name: &str,
+    relations: &mut Vec<ExtractedRelation>,
+) {
+    let mut cursor = node.walk();
+    let tokens: Vec<tree_sitter::Node> = node.children(&mut cursor).collect();
+
+    for (index, token) in tokens.iter().enumerate() {
+        if token.kind() == "token_tree" {
+            extract_calls_from_token_tree(token, source, context_name, relations);
+            continue;
+        }
+        if token.kind() != "identifier" {
+            continue;
+        }
+        // A call needs a parenthesized group immediately after the name.
+        let Some(next) = tokens.get(index + 1) else {
+            continue;
+        };
+        if next.kind() != "token_tree" || next.child(0).map(|open| open.kind()) != Some("(") {
+            continue;
+        }
+        // `x.method(..)`: bare method name, matching the field_expression arm.
+        let is_method_call = index > 0 && tokens[index - 1].kind() == ".";
+        let mut callee_name = token.utf8_text(source).unwrap_or("").to_string();
+        if !is_method_call {
+            // Reconstruct a leading `a::b::` path so qualified callees keep
+            // the same shape the call_expression arm extracts.
+            let mut start = index;
+            while start >= 2
+                && tokens[start - 1].kind() == "::"
+                && tokens[start - 2].kind() == "identifier"
+            {
+                start -= 2;
+                callee_name = format!(
+                    "{}::{}",
+                    tokens[start].utf8_text(source).unwrap_or(""),
+                    callee_name
+                );
+            }
+        }
+        if is_valid_callee_name(&callee_name) {
+            relations.push(ExtractedRelation {
+                kind: kin_model::RelationKind::Calls,
+                src_name: context_name.to_string(),
+                dst_name: callee_name,
+                import_source: None,
+            });
+        }
     }
 }
 
@@ -803,6 +886,61 @@ macro_rules! assemble_widget {
             macros[0].signature.contains("assemble_widget"),
             "signature should carry the macro name, got {:?}",
             macros[0].signature
+        );
+    }
+
+    #[test]
+    fn extracts_calls_inside_macro_token_trees() {
+        // Macro arguments are token trees, not parsed expressions: without
+        // token-run reconstruction, a consumer calling through `format!` has
+        // no Calls edge and disappears from cross-file impact entirely.
+        let adapter = RustAdapter;
+        let source = br#"
+pub fn render_invoice(amount: u64) -> String {
+    format!("total: {}", compute_total(amount))
+}
+
+fn callers() {
+    assert_eq!(outer(inner(1)), billing::qualified(2));
+    println!("{}", target.method(3));
+    let v = vec![element(4)];
+    log!("{}", matches!(v, _));
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("src/invoice.rs");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let calls: Vec<(&str, &str)> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect();
+
+        // The cross-file consumer edge the shadow gate depends on.
+        assert!(
+            calls.contains(&("render_invoice", "compute_total")),
+            "call inside format! must be extracted, got {calls:?}"
+        );
+        // Nested argument-list calls, qualified paths, method calls, and
+        // bracket-delimited macro bodies are all reconstructed.
+        for expected in [
+            ("callers", "outer"),
+            ("callers", "inner"),
+            ("callers", "billing::qualified"),
+            ("callers", "method"),
+            ("callers", "element"),
+        ] {
+            assert!(
+                calls.contains(&expected),
+                "expected {expected:?} in {calls:?}"
+            );
+        }
+        // `matches!` is a nested macro use inside the token tree, not a call.
+        assert!(
+            !calls.iter().any(|(_, dst)| *dst == "matches"),
+            "nested macro names must not become Calls edges, got {calls:?}"
         );
     }
 
