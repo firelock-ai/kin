@@ -846,31 +846,36 @@ fn derive_policy(
         }
     };
 
-    // Warning-only evidence (coverage_gap, consumer_fanout) documents the
-    // change but must not drive the verdict for a pure body-only refactor.
-    // When nothing blocks AND no changed entity altered its contract surface
-    // (signature or visibility), these signals stay in the report yet do not
-    // feed the gate — a benign body-only change is not escalated by them. Any
-    // blocking finding or a real surface change restores their gate weight.
+    // The coverage-gap channel is warning-only: it documents a missing test
+    // but must not drive the verdict for a pure body-only refactor. When
+    // nothing blocks AND no changed entity altered its contract surface
+    // (signature or visibility), a lone coverage_gap stays in the report yet
+    // does not feed the gate — a benign body-only change is not escalated by
+    // it. Any blocking finding or a real surface change restores its gate
+    // weight.
+    //
+    // consumer_fanout is deliberately NOT suppressed this way. It already
+    // requires a graph-native wide blast — at least CONSUMER_FANOUT_THRESHOLD
+    // distinct non-test consumer entities — so a body-only behavior change
+    // reaching that many consumers is a genuine downstream-risk signal that
+    // must feed the gate on its own weight even when the contract surface is
+    // unchanged. The decision is on graph-owned consumer entities, never files.
     let has_blocking_finding = findings.iter().any(|finding| finding.blocking);
     let has_surface_change = changed_entities
         .iter()
         .any(|entity| entity.signature_changed || entity.visibility_changed);
-    let warning_only_feeds_gate = has_blocking_finding || has_surface_change;
+    let coverage_gap_feeds_gate = has_blocking_finding || has_surface_change;
 
     // Informational findings (entity added/removed) describe the diff, not a
     // gate signal; they are reported but do not feed the verdict. Surface
     // findings on graph-isolated entities are likewise reported without
-    // feeding the gate, and warning-only evidence is withheld from the gate on
-    // a benign body-only change.
+    // feeding the gate, and the warning-only coverage-gap channel is withheld
+    // from the gate on a benign body-only change.
     let gate_findings: Vec<ReviewFinding> = findings
         .iter()
         .filter(|finding| finding.severity != "info")
         .filter(|finding| surface_finding_feeds_gate(finding))
-        .filter(|finding| {
-            warning_only_feeds_gate
-                || (finding.kind != "coverage_gap" && finding.kind != "consumer_fanout")
-        })
+        .filter(|finding| coverage_gap_feeds_gate || finding.kind != "coverage_gap")
         .map(|finding| ReviewFinding {
             kind: match finding.kind.as_str() {
                 "contract_violation" | "agent_unreviewed" => ReviewSignalKind::PolicyViolation,
@@ -2398,17 +2403,18 @@ mod tests {
     }
 
     #[test]
-    fn body_only_warning_evidence_reported_but_does_not_gate() {
+    fn body_only_coverage_gap_only_does_not_gate() {
         use crate::diff::SemanticDiff;
         use crate::impact::ImpactReport;
         use crate::inline::{InlineComment, InlineCommentKind};
         use kin_model::review::{RiskLevel, RiskSummary};
 
         // A pure body-only modification (no signature/visibility change, no
-        // blocking finding) carrying warning-only evidence — a coverage gap
-        // and a wide consumer fanout. Those signals stay in the report but
-        // must not drive the verdict: before this calibration they escalated
-        // the benign refactor to needs_attention; now the gate passes.
+        // blocking finding) whose ONLY warning-only evidence is a coverage
+        // gap. The coverage-gap channel documents a missing test but must not
+        // drive the verdict for a benign refactor: it stays in the report yet
+        // does not feed the gate, so the verdict is a pass. This is the benign
+        // case that must not regress when consumer_fanout begins to gate.
         let review = Review {
             base: None,
             head: None,
@@ -2422,24 +2428,13 @@ mod tests {
                 work_risks: vec![],
                 notes: vec![],
             },
-            inline_comments: vec![
-                InlineComment {
-                    file: "src/hot.rs".to_string(),
-                    start_line: 10,
-                    end_line: 20,
-                    kind: InlineCommentKind::CoverageGap,
-                    message: "Modified entity `hot_path` has no test coverage".to_string(),
-                },
-                InlineComment {
-                    file: "src/hot.rs".to_string(),
-                    start_line: 10,
-                    end_line: 20,
-                    kind: InlineCommentKind::ConsumerFanout,
-                    message: "Behavior of `hot_path` changed with 3 distinct non-test consumer \
-                              file(s)"
-                        .to_string(),
-                },
-            ],
+            inline_comments: vec![InlineComment {
+                file: "src/hot.rs".to_string(),
+                start_line: 10,
+                end_line: 20,
+                kind: InlineCommentKind::CoverageGap,
+                message: "Modified entity `hot_path` has no test coverage".to_string(),
+            }],
         };
 
         let mut changed = vec![ShadowChangedEntity {
@@ -2454,20 +2449,97 @@ mod tests {
             visibility_changed: false,
         }];
 
-        // Body-only: warning-only evidence is reported but withheld from the
-        // gate — the verdict is a pass.
+        // Body-only: the coverage gap is reported but withheld from the gate —
+        // the verdict is a pass.
         let policy = derive_policy(&review, &[], &changed);
         assert!(policy.findings.iter().any(|f| f.kind == "coverage_gap"));
-        assert!(policy.findings.iter().any(|f| f.kind == "consumer_fanout"));
         assert_eq!(policy.verdict, ShadowGateVerdict::Pass);
         assert_eq!(policy.attention_count, 0);
 
         // A real contract-surface change on the same entity restores the gate
-        // weight of the very same warning-only evidence.
+        // weight of the coverage-gap channel.
         changed[0].signature_changed = true;
         let policy = derive_policy(&review, &[], &changed);
         assert_eq!(policy.verdict, ShadowGateVerdict::NeedsAttention);
-        assert_eq!(policy.attention_count, 2);
+        assert_eq!(policy.attention_count, 1);
+    }
+
+    #[test]
+    fn body_only_consumer_fanout_gates_to_needs_attention() {
+        use crate::diff::SemanticDiff;
+        use crate::impact::ImpactReport;
+        use crate::inline::{InlineComment, InlineCommentKind};
+        use kin_model::review::{RiskLevel, RiskSummary};
+
+        // A pure body-only modification (no signature/visibility change, no
+        // blocking finding) that fires consumer_fanout — a graph-native wide
+        // blast reaching many distinct non-test consumer entities. Unlike the
+        // coverage-gap channel, this signal is NOT suppressed on a body-only
+        // change: a behavior change with that reach is a genuine downstream
+        // risk, so it feeds the gate and escalates the verdict to
+        // needs_attention. This is the risky-revert case that previously
+        // slipped through as a pass.
+        let review = Review {
+            base: None,
+            head: None,
+            diff: SemanticDiff::default(),
+            impact: ImpactReport::default(),
+            risk: RiskSummary {
+                overall_risk: RiskLevel::Low,
+                breaking_changes: vec![],
+                test_coverage_gaps: vec![],
+                contract_violations: vec![],
+                work_risks: vec![],
+                notes: vec![],
+            },
+            inline_comments: vec![InlineComment {
+                file: "src/hot.rs".to_string(),
+                start_line: 10,
+                end_line: 20,
+                kind: InlineCommentKind::ConsumerFanout,
+                message: "Behavior of `hot_path` changed with 3 distinct non-test consumer(s) \
+                          across 3 file(s)"
+                    .to_string(),
+            }],
+        };
+
+        let changed = vec![ShadowChangedEntity {
+            entity_id: EntityId::new().to_string(),
+            name: "hot_path".to_string(),
+            kind: "Function".to_string(),
+            change: "modified".to_string(),
+            file: Some("src/hot.rs".to_string()),
+            start_line: Some(10),
+            end_line: Some(20),
+            signature_changed: false,
+            visibility_changed: false,
+        }];
+
+        // Body-only, but the wide consumer fanout gates: the verdict escalates
+        // to needs_attention, driven by the single fanout signal.
+        let policy = derive_policy(&review, &[], &changed);
+        assert!(policy.findings.iter().any(|f| f.kind == "consumer_fanout"));
+        assert_eq!(policy.verdict, ShadowGateVerdict::NeedsAttention);
+        assert_eq!(policy.attention_count, 1);
+
+        // The two channels are independent: with the noisy coverage-gap channel
+        // ALSO present on the same body-only change, only the fanout gates. The
+        // coverage gap stays suppressed, so the attention count is driven by
+        // the fanout alone (1, not 2) — this is the shape of the real risky
+        // revert that carries both signals.
+        let mut review_both = review.clone();
+        review_both.inline_comments.push(InlineComment {
+            file: "src/hot.rs".to_string(),
+            start_line: 10,
+            end_line: 20,
+            kind: InlineCommentKind::CoverageGap,
+            message: "Modified entity `hot_path` has no test coverage".to_string(),
+        });
+        let policy = derive_policy(&review_both, &[], &changed);
+        assert!(policy.findings.iter().any(|f| f.kind == "consumer_fanout"));
+        assert!(policy.findings.iter().any(|f| f.kind == "coverage_gap"));
+        assert_eq!(policy.verdict, ShadowGateVerdict::NeedsAttention);
+        assert_eq!(policy.attention_count, 1);
     }
 
     #[test]
