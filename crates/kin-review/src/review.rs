@@ -62,7 +62,20 @@ impl SemanticReview {
         store: &G,
         at_head: &GraphAtRef<'_, G>,
     ) -> Result<Review, ReviewError> {
-        let semantic_diff = diff::compute_diff(store, base, head)?;
+        Self::create_review_scoped(base, head, store, at_head, |_| true)
+    }
+
+    /// Create a review whose diff accumulates only the walked changes
+    /// `in_range` accepts — the DAG-true `base..head` membership test for
+    /// range-aware callers. See [`diff::compute_diff_scoped`].
+    pub fn create_review_scoped<G: GraphStore>(
+        base: &SemanticChangeId,
+        head: &SemanticChangeId,
+        store: &G,
+        at_head: &GraphAtRef<'_, G>,
+        in_range: impl Fn(&SemanticChangeId) -> bool,
+    ) -> Result<Review, ReviewError> {
+        let semantic_diff = diff::compute_diff_scoped(store, base, head, in_range)?;
         let impact_report = impact::analyze_impact_at(at_head, &semantic_diff)?;
         let risk_summary = risk::assess_risk(&semantic_diff, &impact_report);
         let inline_comments = inline::collect_inline_comments(&semantic_diff, &impact_report);

@@ -39,6 +39,10 @@ use crate::impact::ImpactGraph;
 pub struct GraphAtRef<'a, G> {
     live: &'a G,
     at: SemanticChangeId,
+    // Every change id reachable from `at` through parent edges, including
+    // `at` itself — the set the materialization walk already visited. Range
+    // queries use it to refuse bases that are not on this head's history.
+    ancestry: HashSet<SemanticChangeId>,
     entities: HashMap<EntityId, Entity>,
     relations: HashMap<RelationId, Relation>,
     // BTree-keyed with relation-id-sorted edge lists: every traversal is
@@ -93,7 +97,7 @@ impl<'a, G: GraphStore> GraphAtRef<'a, G> {
         }
 
         let state = live.resolve_graph_at(at).map_err(ReviewError::graph)?;
-        Ok(Self::from_state(live, *at, state))
+        Ok(Self::from_state(live, *at, visited, state))
     }
 
     /// The ref this state was materialized at (cache key for reuse across
@@ -102,7 +106,23 @@ impl<'a, G: GraphStore> GraphAtRef<'a, G> {
         &self.at
     }
 
-    fn from_state(live: &'a G, at: SemanticChangeId, state: ResolvedGraphState) -> Self {
+    /// Whether `id` is the materialized ref itself or one of its ancestors
+    /// in the change DAG.
+    pub fn ancestry_contains(&self, id: &SemanticChangeId) -> bool {
+        self.ancestry.contains(id)
+    }
+
+    /// Every change reachable from the materialized ref, including itself.
+    pub fn ancestry(&self) -> &HashSet<SemanticChangeId> {
+        &self.ancestry
+    }
+
+    fn from_state(
+        live: &'a G,
+        at: SemanticChangeId,
+        ancestry: HashSet<SemanticChangeId>,
+        state: ResolvedGraphState,
+    ) -> Self {
         let mut outgoing: BTreeMap<EntityId, Vec<RelationId>> = BTreeMap::new();
         let mut incoming: BTreeMap<EntityId, Vec<RelationId>> = BTreeMap::new();
         for relation in state.relations.values() {
@@ -152,6 +172,7 @@ impl<'a, G: GraphStore> GraphAtRef<'a, G> {
         Self {
             live,
             at,
+            ancestry,
             entities: state.entities,
             relations: state.relations,
             outgoing,
@@ -159,6 +180,32 @@ impl<'a, G: GraphStore> GraphAtRef<'a, G> {
             severed,
         }
     }
+}
+
+/// Every change reachable from `at` through parent edges, including `at`
+/// itself. Fails like [`GraphAtRef::materialize`] when a row in the walk is
+/// missing: a partial ancestry would silently misscope range queries.
+pub fn collect_ancestry<G: GraphStore>(
+    store: &G,
+    at: &SemanticChangeId,
+) -> Result<HashSet<SemanticChangeId>, ReviewError> {
+    let mut visited = HashSet::new();
+    let mut pending = vec![*at];
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
+        match store.get_change(&id).map_err(ReviewError::graph)? {
+            Some(change) => pending.extend(change.parents.iter().copied()),
+            None => {
+                return Err(ReviewError::RefStateUnavailable {
+                    at: *at,
+                    missing: id,
+                })
+            }
+        }
+    }
+    Ok(visited)
 }
 
 impl<G: GraphStore> ImpactGraph for GraphAtRef<'_, G> {
