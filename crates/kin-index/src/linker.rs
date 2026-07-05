@@ -330,6 +330,8 @@ fn build_link_context<'a>(
 fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation> {
     let mut resolved = Vec::new();
     let mut seen: HashSet<(EntityId, EntityId, RelationKind)> = HashSet::new();
+    // Lazily resolved once per file: only ambiguous name buckets need it.
+    let mut caller_import_targets: Option<HashSet<String>> = None;
 
     for rel in &file.relations {
         let src_id = ctx
@@ -442,13 +444,45 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
             }
         }
 
-        // (c) Global name-match fallback
         let exact_candidates = ctx
             .entity_by_name
             .get(rel.dst_name.as_str())
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
+        let other_file_candidates: Vec<(&str, EntityId)> = exact_candidates
+            .iter()
+            .filter(|(fp, _)| *fp != file.file_path.as_str())
+            .map(|&(fp, id)| (fp, id))
+            .collect();
 
+        // (b3) Parser-pinned import resolution: the relation carries the module
+        // its callee was imported from. A pinned callee must resolve inside
+        // that module (or its package directory) — never through the global
+        // name bucket, whose order is residency-accidental.
+        let mut name_fallback_allowed = true;
+        match resolve_import_pinned_target(
+            rel,
+            &file.file_path,
+            &ctx.known_files,
+            |target_file, name| ctx.entity_by_file_name.get(&(target_file, name)).copied(),
+            &other_file_candidates,
+        ) {
+            ImportPinnedTarget::Resolved(dst_id) => {
+                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                    resolved.push(make_relation(
+                        rel.kind,
+                        src_id,
+                        dst_id,
+                        IMPORT_PINNED_CONFIDENCE,
+                    ));
+                }
+                continue;
+            }
+            ImportPinnedTarget::PinnedMiss => name_fallback_allowed = false,
+            ImportPinnedTarget::NoPin => {}
+        }
+
+        // (c) Global name-match fallback
         let bare_candidates = if rel.kind == RelationKind::Calls {
             ctx.entity_by_bare_name
                 .get(rel.dst_name.as_str())
@@ -460,13 +494,28 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
 
         let mut linked = false;
 
-        // Pick the first exact candidate from a different file
-        if let Some(&(_, dst_id)) = exact_candidates
-            .iter()
-            .find(|(fp, _)| *fp != file.file_path.as_str())
-        {
+        if name_fallback_allowed && !other_file_candidates.is_empty() {
+            let distinct_ids: HashSet<EntityId> =
+                other_file_candidates.iter().map(|&(_, id)| id).collect();
+            let (dst_id, confidence) = if distinct_ids.len() == 1 {
+                (other_file_candidates[0].1, 0.7)
+            } else {
+                let targets = caller_import_targets.get_or_insert_with(|| {
+                    resolve_caller_import_targets(&file.file_path, &file.imports, &ctx.known_files)
+                });
+                match disambiguate_same_name_candidates(
+                    &file.file_path,
+                    targets,
+                    &other_file_candidates,
+                ) {
+                    Some(dst_id) => (dst_id, LOCALITY_DISAMBIGUATED_CONFIDENCE),
+                    // No locality signal: keep the historical bucket-order
+                    // pick so signal-less repos do not lose existing edges.
+                    None => (other_file_candidates[0].1, 0.7),
+                }
+            };
             if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                resolved.push(make_relation(rel.kind, src_id, dst_id, 0.7));
+                resolved.push(make_relation(rel.kind, src_id, dst_id, confidence));
                 linked = true;
             }
         }
@@ -477,7 +526,7 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
         // that name in another file. Ambiguous names (`new`, `run`, `get`) have
         // an unknowable receiver type, so linking every candidate would mint
         // spurious callers; leave those to the inconclusive-absence gate.
-        if !linked && !bare_candidates.is_empty() {
+        if name_fallback_allowed && !linked && !bare_candidates.is_empty() {
             let mut distinct_targets: HashSet<EntityId> = HashSet::new();
             for &(fp, dst_id) in bare_candidates {
                 if fp != file.file_path.as_str() {
@@ -499,7 +548,10 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
         // in (c)/(c2). Reduce the path to its resolvable suffixes and link only
         // an unambiguous single target in another file — idiomatic qualified
         // Rust would otherwise leave callers uncounted in refs/impact.
-        if !linked && matches!(rel.kind, RelationKind::Calls | RelationKind::References) {
+        if name_fallback_allowed
+            && !linked
+            && matches!(rel.kind, RelationKind::Calls | RelationKind::References)
+        {
             if let Some(dst_id) =
                 resolve_qualified_suffix(rel.dst_name.as_str(), file.file_path.as_str(), ctx)
             {
@@ -1008,6 +1060,144 @@ fn resolve_qualified_suffix_incremental(
         }
     }
 }
+
+/// Directory component of a repo-relative path (`""` for top-level files).
+fn parent_dir(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(idx) => &path[..idx],
+        None => "",
+    }
+}
+
+/// Repo-local files reachable through the caller's own import/include
+/// declarations, resolved with the same module-path resolution the artifact
+/// import edges use. Used to disambiguate same-name candidates: a candidate
+/// defined in a file the caller explicitly imports outranks one it never
+/// references.
+fn resolve_caller_import_targets<S>(
+    caller_file: &str,
+    imports: &[FileImport],
+    known_files: &HashSet<S>,
+) -> HashSet<String>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    let mut targets = HashSet::new();
+    for import in imports {
+        if let Some(resolved) = resolve_module_path(caller_file, &import.module_path, known_files) {
+            targets.insert(resolved);
+        }
+    }
+    targets
+}
+
+/// Choose one target among same-name candidates that live in other files.
+///
+/// Tier 1: exactly one distinct target in the caller's own directory — the
+/// same Go package, or a C-family sibling header/impl pair. Tier 2: exactly
+/// one distinct target among the files the caller itself imports/includes.
+/// Both tiers are count-based over entity-id sets, so bucket insertion order
+/// can never pick the winner. No unique winner → `None`; the caller decides
+/// whether a legacy fallback applies.
+fn disambiguate_same_name_candidates(
+    caller_file: &str,
+    caller_import_targets: &HashSet<String>,
+    candidates: &[(&str, EntityId)],
+) -> Option<EntityId> {
+    let caller_dir = parent_dir(caller_file);
+    let mut same_dir: HashSet<EntityId> = HashSet::new();
+    for (candidate_file, candidate_id) in candidates {
+        if parent_dir(candidate_file) == caller_dir {
+            same_dir.insert(*candidate_id);
+        }
+    }
+    if same_dir.len() == 1 {
+        return same_dir.into_iter().next();
+    }
+
+    let mut imported: HashSet<EntityId> = HashSet::new();
+    for (candidate_file, candidate_id) in candidates {
+        if caller_import_targets.contains(*candidate_file) {
+            imported.insert(*candidate_id);
+        }
+    }
+    if imported.len() == 1 {
+        return imported.into_iter().next();
+    }
+    None
+}
+
+/// Outcome of resolving a relation through its parser-recorded import source.
+enum ImportPinnedTarget {
+    /// The pinned module resolved and names exactly one local target.
+    Resolved(EntityId),
+    /// The relation is pinned to a module — external, or local without the
+    /// symbol — so name-global fallbacks must not run: binding a pinned callee
+    /// to a same-named entity in an unrelated file mints a false consumer.
+    PinnedMiss,
+    /// The relation carries no import source; name-global tiers may run.
+    NoPin,
+}
+
+/// Resolve a relation through `rel.import_source` — the module the parser saw
+/// the callee imported from (`create.NewCmdCreate` arrives as dst `NewCmdCreate`
+/// pinned to `github.com/.../pr/create`). Looks up the symbol in the resolved
+/// module file first, then uniquely within that file's directory (a Go package
+/// spans multiple files).
+fn resolve_import_pinned_target<S>(
+    rel: &ExtractedRelation,
+    caller_file: &str,
+    known_files: &HashSet<S>,
+    lookup_in_file: impl Fn(&str, &str) -> Option<EntityId>,
+    same_name_candidates: &[(&str, EntityId)],
+) -> ImportPinnedTarget
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    let Some(import_source) = rel
+        .import_source
+        .as_deref()
+        .map(str::trim)
+        .filter(|source| !source.is_empty())
+    else {
+        return ImportPinnedTarget::NoPin;
+    };
+    let Some(target_file) = resolve_module_path(caller_file, import_source, known_files) else {
+        // Path-shaped module sources (`github.com/...`, `@scope/pkg`) that do
+        // not resolve locally are external: the external reference tier owns
+        // them, and a local name-match would be fabricated. Bare module names
+        // (`helpers`, `django.db`) have ambiguous provenance when unresolved —
+        // leave those to the name-global tiers rather than orphaning them.
+        return if import_source.contains('/') {
+            ImportPinnedTarget::PinnedMiss
+        } else {
+            ImportPinnedTarget::NoPin
+        };
+    };
+    if let Some(dst_id) = lookup_in_file(&target_file, &rel.dst_name) {
+        return ImportPinnedTarget::Resolved(dst_id);
+    }
+    let target_dir = parent_dir(&target_file);
+    let mut in_target_dir: HashSet<EntityId> = HashSet::new();
+    for (candidate_file, candidate_id) in same_name_candidates {
+        if parent_dir(candidate_file) == target_dir {
+            in_target_dir.insert(*candidate_id);
+        }
+    }
+    if in_target_dir.len() == 1 {
+        return ImportPinnedTarget::Resolved(
+            in_target_dir.into_iter().next().expect("len checked == 1"),
+        );
+    }
+    ImportPinnedTarget::PinnedMiss
+}
+
+/// Confidence for a target reached through the relation's own import source.
+const IMPORT_PINNED_CONFIDENCE: f32 = 0.9;
+
+/// Confidence for an ambiguous name bucket settled by locality (same
+/// directory / caller-imported file) rather than a direct module hit.
+const LOCALITY_DISAMBIGUATED_CONFIDENCE: f32 = 0.8;
 
 /// Build a Relation with a deterministic ID derived from (src, dst, kind).
 ///
@@ -1823,6 +2013,8 @@ pub fn link_cross_file_incremental(
                 link_start.elapsed().as_secs_f64()
             );
         }
+        // Lazily resolved once per file: only ambiguous name buckets need it.
+        let mut caller_import_targets: Option<HashSet<String>> = None;
         for rel in &file.relations {
             let src_id = linker
                 .entity_by_file_name
@@ -1940,22 +2132,87 @@ pub fn link_cross_file_incremental(
                 }
             }
 
-            // (c) Global name-match fallback
-            if let Some(candidates) = linker.entity_by_name.get(&rel.dst_name) {
-                let other_file_match = candidates.iter().find(|(fp, _)| fp != &file.file_path);
+            let other_file_candidates: Vec<(&str, EntityId)> = linker
+                .entity_by_name
+                .get(&rel.dst_name)
+                .map(|candidates| {
+                    candidates
+                        .iter()
+                        .filter(|(fp, _)| fp != &file.file_path)
+                        .map(|(fp, id)| (fp.as_str(), *id))
+                        .collect()
+                })
+                .unwrap_or_default();
 
-                if let Some((_, dst_id)) = other_file_match {
-                    if add_deduped(&mut seen, src_id, *dst_id, rel.kind) {
-                        resolved.push(make_relation(rel.kind, src_id, *dst_id, 0.7));
+            // (b3) Parser-pinned import resolution — mirrors the batch linker:
+            // a callee pinned to a module must resolve inside that module (or
+            // its package directory), never through the global name bucket.
+            let mut name_fallback_allowed = true;
+            match resolve_import_pinned_target(
+                rel,
+                &file.file_path,
+                &linker.known_files,
+                |target_file, name| {
+                    linker
+                        .entity_by_file_name
+                        .get(target_file)
+                        .and_then(|m| m.get(name))
+                        .copied()
+                },
+                &other_file_candidates,
+            ) {
+                ImportPinnedTarget::Resolved(dst_id) => {
+                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                        resolved.push(make_relation(
+                            rel.kind,
+                            src_id,
+                            dst_id,
+                            IMPORT_PINNED_CONFIDENCE,
+                        ));
                     }
                     continue;
                 }
+                ImportPinnedTarget::PinnedMiss => name_fallback_allowed = false,
+                ImportPinnedTarget::NoPin => {}
+            }
+
+            // (c) Global name-match fallback
+            if name_fallback_allowed && !other_file_candidates.is_empty() {
+                let distinct_ids: HashSet<EntityId> =
+                    other_file_candidates.iter().map(|&(_, id)| id).collect();
+                let (dst_id, confidence) = if distinct_ids.len() == 1 {
+                    (other_file_candidates[0].1, 0.7)
+                } else {
+                    let targets = caller_import_targets.get_or_insert_with(|| {
+                        resolve_caller_import_targets(
+                            &file.file_path,
+                            &file.imports,
+                            &linker.known_files,
+                        )
+                    });
+                    match disambiguate_same_name_candidates(
+                        &file.file_path,
+                        targets,
+                        &other_file_candidates,
+                    ) {
+                        Some(dst_id) => (dst_id, LOCALITY_DISAMBIGUATED_CONFIDENCE),
+                        // No locality signal: keep the historical bucket-order
+                        // pick so signal-less repos do not lose existing edges.
+                        None => (other_file_candidates[0].1, 0.7),
+                    }
+                };
+                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                    resolved.push(make_relation(rel.kind, src_id, dst_id, confidence));
+                }
+                continue;
             }
 
             // (c3) Path-qualified suffix resolution — the incremental counterpart
             // of the batch linker's (c3). Live edits reach this daemon path, so
             // qualified calls must resolve here too, not only on a full re-index.
-            if matches!(rel.kind, RelationKind::Calls | RelationKind::References) {
+            if name_fallback_allowed
+                && matches!(rel.kind, RelationKind::Calls | RelationKind::References)
+            {
                 if let Some(dst_id) =
                     resolve_qualified_suffix_incremental(&rel.dst_name, &file.file_path, linker)
                 {
@@ -3744,5 +4001,280 @@ void f();
         assert!(!is_path_identifier("<T>"));
         assert!(!is_path_identifier("2run"));
         assert!(!is_path_identifier("a-b"));
+    }
+
+    fn go_fn(name: &str, file_path: &str) -> Entity {
+        let mut e = make_entity(name, file_path);
+        e.language = LanguageId::Go;
+        e
+    }
+
+    fn pinned_calls_relation(src: &str, dst: &str, import_source: &str) -> ExtractedRelation {
+        ExtractedRelation {
+            kind: RelationKind::Calls,
+            src_name: src.to_string(),
+            dst_name: dst.to_string(),
+            import_source: Some(import_source.to_string()),
+        }
+    }
+
+    /// Two Go packages define the same function name; the caller's relation is
+    /// pinned to one package via its import source. The pinned package must
+    /// win even though the other package sits first in the name bucket.
+    #[test]
+    fn import_pinned_call_resolves_to_pinned_package() {
+        let decoy = go_fn("NewCmdCreate", "pkg/cmd/project/create/create.go");
+        let target = go_fn("NewCmdCreate", "pkg/cmd/pr/create/create.go");
+        let caller = go_fn("NewCmdPR", "pkg/cmd/pr/pr.go");
+
+        let files = vec![
+            // Decoy package first: bucket order would pick it without the pin.
+            FileParseData {
+                file_path: "pkg/cmd/project/create/create.go".to_string(),
+                entities: vec![decoy.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "pkg/cmd/pr/create/create.go".to_string(),
+                entities: vec![target.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "pkg/cmd/pr/pr.go".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![pinned_calls_relation(
+                    "NewCmdPR",
+                    "NewCmdCreate",
+                    "github.com/cli/cli/v2/pkg/cmd/pr/create",
+                )],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let edge = find_calls_edge(&result, &caller, &target)
+            .expect("pinned call must resolve into the pinned package");
+        assert_eq!(edge.confidence, IMPORT_PINNED_CONFIDENCE);
+        assert!(
+            find_calls_edge(&result, &caller, &decoy).is_none(),
+            "pinned call must not bind to the same-named entity in another package"
+        );
+    }
+
+    /// A bare same-package call (Go test file calling its package's function)
+    /// must prefer the same-directory candidate over an earlier bucket entry
+    /// from an unrelated package.
+    #[test]
+    fn same_package_bare_call_prefers_same_directory() {
+        let decoy = go_fn("createRun", "pkg/cmd/label/create.go");
+        let target = go_fn("createRun", "pkg/cmd/pr/create/create.go");
+        let caller = go_fn("TestCreateRun", "pkg/cmd/pr/create/create_test.go");
+
+        let files = vec![
+            FileParseData {
+                file_path: "pkg/cmd/label/create.go".to_string(),
+                entities: vec![decoy.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "pkg/cmd/pr/create/create.go".to_string(),
+                entities: vec![target.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "pkg/cmd/pr/create/create_test.go".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![calls_relation("TestCreateRun", "createRun")],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let edge = find_calls_edge(&result, &caller, &target)
+            .expect("bare same-package call must resolve within its own directory");
+        assert_eq!(edge.confidence, LOCALITY_DISAMBIGUATED_CONFIDENCE);
+        assert!(find_calls_edge(&result, &caller, &decoy).is_none());
+    }
+
+    /// A call pinned to an external module must not bind to a same-named
+    /// local entity; it stays an external reference edge.
+    #[test]
+    fn import_pinned_external_call_never_binds_local_name() {
+        let local_decoy = go_fn("Execute", "internal/run/run.go");
+        let caller = go_fn("main", "cmd/gh/main.go");
+
+        let files = vec![
+            FileParseData {
+                file_path: "internal/run/run.go".to_string(),
+                entities: vec![local_decoy.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "cmd/gh/main.go".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![pinned_calls_relation(
+                    "main",
+                    "Execute",
+                    "github.com/spf13/cobra",
+                )],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        assert!(
+            find_calls_edge(&result, &caller, &local_decoy).is_none(),
+            "externally pinned call must not mint a local consumer"
+        );
+        let external = result
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls && r.src == GraphNodeId::Entity(caller.id))
+            .expect("externally pinned call keeps its cross-repo reference edge");
+        assert_eq!(external.confidence, EXTERNAL_REFERENCE_CONFIDENCE);
+        assert_eq!(
+            external.import_source.as_deref(),
+            Some("github.com/spf13/cobra")
+        );
+    }
+
+    /// An ambiguous bucket with no import pin and no locality signal keeps the
+    /// historical first-candidate link, so signal-less repos lose no edges.
+    #[test]
+    fn ambiguous_bucket_without_signal_keeps_first_candidate() {
+        let first = go_fn("parse", "src/x/parse.go");
+        let second = go_fn("parse", "src/y/parse.go");
+        let caller = go_fn("drive", "src/z/drive.go");
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/x/parse.go".to_string(),
+                entities: vec![first.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/y/parse.go".to_string(),
+                entities: vec![second.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/z/drive.go".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![calls_relation("drive", "parse")],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let edge = find_calls_edge(&result, &caller, &first)
+            .expect("signal-less ambiguity keeps the historical first-bucket pick");
+        assert_eq!(edge.confidence, 0.7);
+    }
+
+    #[test]
+    fn incremental_import_pinned_call_resolves_to_pinned_package() {
+        let decoy = go_fn("NewCmdCreate", "pkg/cmd/project/create/create.go");
+        let target = go_fn("NewCmdCreate", "pkg/cmd/pr/create/create.go");
+        let caller = go_fn("NewCmdPR", "pkg/cmd/pr/pr.go");
+
+        let mut linker = IncrementalLinker::new();
+        // Decoy first: bucket order would pick it without the pin.
+        linker.add_file(
+            "pkg/cmd/project/create/create.go",
+            std::slice::from_ref(&decoy),
+        );
+        linker.add_file("pkg/cmd/pr/create/create.go", std::slice::from_ref(&target));
+        linker.add_file("pkg/cmd/pr/pr.go", std::slice::from_ref(&caller));
+
+        let files = vec![FileParseData {
+            file_path: "pkg/cmd/pr/pr.go".to_string(),
+            entities: vec![caller.clone()],
+            relations: vec![pinned_calls_relation(
+                "NewCmdPR",
+                "NewCmdCreate",
+                "github.com/cli/cli/v2/pkg/cmd/pr/create",
+            )],
+            imports: vec![],
+        }];
+
+        let result = link_cross_file_incremental(&files, &linker);
+        let edge = find_calls_edge(&result, &caller, &target)
+            .expect("incremental pinned call must resolve into the pinned package");
+        assert_eq!(edge.confidence, IMPORT_PINNED_CONFIDENCE);
+        assert!(find_calls_edge(&result, &caller, &decoy).is_none());
+    }
+
+    #[test]
+    fn incremental_same_package_bare_call_prefers_same_directory() {
+        let decoy = go_fn("createRun", "pkg/cmd/label/create.go");
+        let target = go_fn("createRun", "pkg/cmd/pr/create/create.go");
+        let caller = go_fn("TestCreateRun", "pkg/cmd/pr/create/create_test.go");
+
+        let mut linker = IncrementalLinker::new();
+        linker.add_file("pkg/cmd/label/create.go", std::slice::from_ref(&decoy));
+        linker.add_file("pkg/cmd/pr/create/create.go", std::slice::from_ref(&target));
+        linker.add_file(
+            "pkg/cmd/pr/create/create_test.go",
+            std::slice::from_ref(&caller),
+        );
+
+        let files = vec![FileParseData {
+            file_path: "pkg/cmd/pr/create/create_test.go".to_string(),
+            entities: vec![caller.clone()],
+            relations: vec![calls_relation("TestCreateRun", "createRun")],
+            imports: vec![],
+        }];
+
+        let result = link_cross_file_incremental(&files, &linker);
+        let edge = find_calls_edge(&result, &caller, &target)
+            .expect("incremental bare same-package call must resolve within its own directory");
+        assert_eq!(edge.confidence, LOCALITY_DISAMBIGUATED_CONFIDENCE);
+        assert!(find_calls_edge(&result, &caller, &decoy).is_none());
+    }
+
+    /// C-family sibling pair: an impl file calling into its same-directory
+    /// header must not bind to a same-named duplicate in a bundled single
+    /// include.
+    #[test]
+    fn cpp_sibling_header_beats_bundled_duplicate() {
+        let mut bundled = make_entity("toString", "single_include/catch.hpp");
+        bundled.language = LanguageId::Cpp;
+        let mut header = make_entity("toString", "include/internal/catch_tostring.h");
+        header.language = LanguageId::Cpp;
+        let mut caller = make_entity("writeValue", "include/internal/catch_tostring.cpp");
+        caller.language = LanguageId::Cpp;
+
+        let files = vec![
+            FileParseData {
+                file_path: "single_include/catch.hpp".to_string(),
+                entities: vec![bundled.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "include/internal/catch_tostring.h".to_string(),
+                entities: vec![header.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "include/internal/catch_tostring.cpp".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![calls_relation("writeValue", "toString")],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let edge = find_calls_edge(&result, &caller, &header)
+            .expect("impl file must resolve into its sibling header");
+        assert_eq!(edge.confidence, LOCALITY_DISAMBIGUATED_CONFIDENCE);
+        assert!(find_calls_edge(&result, &caller, &bundled).is_none());
     }
 }
