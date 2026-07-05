@@ -183,7 +183,15 @@ fn extract_go_node(
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
                 });
-                extract_calls_from_body(node, source, &name, relations, call_prefixes);
+                let mut ref_seen = std::collections::HashSet::new();
+                extract_calls_from_body(
+                    node,
+                    source,
+                    &name,
+                    relations,
+                    call_prefixes,
+                    &mut ref_seen,
+                );
             }
         }
         "method_declaration" => {
@@ -229,7 +237,15 @@ fn extract_go_node(
                     });
                 }
 
-                extract_calls_from_body(node, source, &qualified, relations, call_prefixes);
+                let mut ref_seen = std::collections::HashSet::new();
+                extract_calls_from_body(
+                    node,
+                    source,
+                    &qualified,
+                    relations,
+                    call_prefixes,
+                    &mut ref_seen,
+                );
             }
         }
         "type_declaration" => {
@@ -338,13 +354,23 @@ fn extract_go_node(
                         };
                         entities.push(ExtractedEntity {
                             kind,
-                            name,
+                            name: name.clone(),
                             signature: node_signature(&spec, source),
                             visibility: go_visibility(name_node.utf8_text(source).unwrap_or("")),
                             doc_summary: extract_preceding_comment(node, source),
                             fingerprint: compute_fingerprint(&spec, source),
                             span: span_from_node(&spec, file_id),
                         });
+
+                        // A package-level const/var initializer references the
+                        // identifiers read in its value expression (e.g. a
+                        // cobra `&cobra.Command{RunE: prCheckout}` var
+                        // references the handler `prCheckout`). Emit those as
+                        // References edges sourced from the declared name.
+                        if let Some(value) = spec.child_by_field_name("value") {
+                            let mut ref_seen = std::collections::HashSet::new();
+                            emit_value_references(&value, source, &name, relations, &mut ref_seen);
+                        }
                     }
                 }
             }
@@ -624,9 +650,32 @@ fn extract_calls_from_body(
     context_name: &str,
     relations: &mut Vec<ExtractedRelation>,
     call_prefixes: &mut Vec<(usize, String)>,
+    ref_seen: &mut std::collections::HashSet<String>,
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        // Value-position references: an identifier read as a VALUE (passed as a
+        // call argument, used as a composite-literal element value, or on the
+        // RHS of an assignment/declaration/return) is a `References` edge — not
+        // a `Calls` edge. This is what wires cobra-style `RunE: prCheckout`
+        // function-value handoffs and package-level const/var reads into impact.
+        match child.kind() {
+            "argument_list" | "literal_value" | "return_statement" => {
+                emit_value_references(&child, source, context_name, relations, ref_seen);
+            }
+            "assignment_statement" | "short_var_declaration" => {
+                if let Some(rhs) = child.child_by_field_name("right") {
+                    emit_value_references(&rhs, source, context_name, relations, ref_seen);
+                }
+            }
+            "var_spec" | "const_spec" => {
+                if let Some(value) = child.child_by_field_name("value") {
+                    emit_value_references(&value, source, context_name, relations, ref_seen);
+                }
+            }
+            _ => {}
+        }
+
         if child.kind() == "call_expression" {
             if let Some(function) = child.child_by_field_name("function") {
                 let (callee, prefix) = match function.kind() {
@@ -695,7 +744,100 @@ fn extract_calls_from_body(
                 }
             }
         }
-        extract_calls_from_body(&child, source, context_name, relations, call_prefixes);
+        extract_calls_from_body(
+            &child,
+            source,
+            context_name,
+            relations,
+            call_prefixes,
+            ref_seen,
+        );
+    }
+}
+
+/// Emit `References` edges for the value-position identifiers read within
+/// `node`, sourced from `context_name`. Deduped by destination name against
+/// `ref_seen` so a name referenced several times in one body yields one edge.
+/// The linker resolves References by name and drops unresolvables, so locals
+/// and parameters that match no package-level entity are harmless.
+fn emit_value_references(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    context_name: &str,
+    relations: &mut Vec<ExtractedRelation>,
+    ref_seen: &mut std::collections::HashSet<String>,
+) {
+    let mut names = Vec::new();
+    collect_value_refs(node, source, &mut names);
+    for name in names {
+        if name != context_name && ref_seen.insert(name.clone()) {
+            relations.push(ExtractedRelation {
+                kind: kin_model::RelationKind::References,
+                src_name: context_name.to_string(),
+                dst_name: name,
+                import_source: None,
+            });
+        }
+    }
+}
+
+/// Collect bare identifier names read as VALUES within an expression subtree.
+///
+/// Walks value expressions while pruning positions that are not value reads:
+/// a call's callee (already captured as a `Calls` edge), a selector's `.field`
+/// selector, a composite literal's `type`, and a `keyed_element`'s key. Type
+/// identifiers and the blank identifier `_` are never collected. The receiver
+/// of a method call (`obj` in `obj.M()`) and every call argument ARE collected,
+/// since they are genuine value reads.
+fn collect_value_refs(node: &tree_sitter::Node, source: &[u8], out: &mut Vec<String>) {
+    match node.kind() {
+        "identifier" => {
+            let name = node.utf8_text(source).unwrap_or("");
+            if !name.is_empty() && name != "_" {
+                out.push(name.to_string());
+            }
+        }
+        // `x.Field` reads the operand value `x`; the `.Field` selector itself
+        // is not an independent value read.
+        "selector_expression" => {
+            if let Some(operand) = node.child_by_field_name("operand") {
+                collect_value_refs(&operand, source, out);
+            }
+        }
+        // A call in value position contributes its receiver (for `obj.M()`) and
+        // its arguments; the callee is captured as a `Calls` edge elsewhere.
+        "call_expression" => {
+            if let Some(function) = node.child_by_field_name("function") {
+                if function.kind() == "selector_expression" {
+                    if let Some(operand) = function.child_by_field_name("operand") {
+                        collect_value_refs(&operand, source, out);
+                    }
+                }
+            }
+            if let Some(args) = node.child_by_field_name("arguments") {
+                collect_value_refs(&args, source, out);
+            }
+        }
+        // `T{...}`: element values are reads, the `type` field is not.
+        "composite_literal" => {
+            if let Some(body) = node.child_by_field_name("body") {
+                collect_value_refs(&body, source, out);
+            }
+        }
+        // `Key: Value`: only the value is a read (the key names a field).
+        "keyed_element" => {
+            if let Some(value) = node.child_by_field_name("value") {
+                collect_value_refs(&value, source, out);
+            }
+        }
+        // Leaf type positions are never value reads.
+        "type_identifier" | "qualified_type" | "package_identifier" | "field_identifier" => {}
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_value_refs(&child, source, out);
+            }
+        }
     }
 }
 
@@ -1172,5 +1314,182 @@ func (s *Server) Start() { fmt.Println("starting") }
         assert_eq!(spawns.len(), 1, "expected 1 Spawns, got {:?}", spawns);
         assert_eq!(spawns[0].src_name, "main");
         assert_eq!(spawns[0].dst_name, "processItem");
+    }
+
+    fn go_references(output: &ParseOutput) -> Vec<(&str, &str)> {
+        output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::References)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn func_value_in_composite_literal_emits_reference() {
+        // cobra-style: a function passed by name as a struct-field value
+        // (`RunE: prCheckout`) must reference the handler, not silently drop it.
+        let adapter = GoAdapter;
+        let source = br#"
+package cmd
+
+func prCheckout() {}
+
+func newCmd() {
+    cmd := &Command{RunE: prCheckout}
+    _ = cmd
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("cmd.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let refs = go_references(&output);
+        assert!(
+            refs.contains(&("newCmd", "prCheckout")),
+            "newCmd should reference prCheckout via the RunE field value, found: {refs:?}"
+        );
+        // The struct type name and the field key are not value reads.
+        assert!(
+            !refs
+                .iter()
+                .any(|(_, dst)| *dst == "Command" || *dst == "RunE"),
+            "composite-literal type name and keys must not be referenced, found: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn package_var_initializer_references_function_value() {
+        // `var prCheckoutCmd = &cobra.Command{RunE: prCheckout}` must yield a
+        // References edge prCheckoutCmd -> prCheckout so a change to the handler
+        // shows impact on the command var.
+        let adapter = GoAdapter;
+        let source = br#"
+package cmd
+
+import "github.com/spf13/cobra"
+
+func prCheckout(cmd *cobra.Command, args []string) error { return nil }
+
+var prCheckoutCmd = &cobra.Command{
+    Use:  "checkout",
+    RunE: prCheckout,
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("checkout.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let refs = go_references(&output);
+        assert!(
+            refs.contains(&("prCheckoutCmd", "prCheckout")),
+            "package var initializer should reference prCheckout, found: {refs:?}"
+        );
+        // `cobra.Command` is the composite type, not a value read.
+        assert!(
+            !refs.iter().any(|(_, dst)| *dst == "Command"),
+            "composite-literal type must not be referenced, found: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn call_argument_var_emits_reference_not_the_callee() {
+        // A package-level var passed as a call argument
+        // (`RunCommand(prCheckoutCmd, ...)`) must be referenced; the callee is a
+        // Call, never a References edge.
+        let adapter = GoAdapter;
+        let source = br#"
+package cmd
+
+var prCheckoutCmd = 0
+
+func run() {
+    RunCommand(prCheckoutCmd, "arg")
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("run.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let refs = go_references(&output);
+        assert!(
+            refs.contains(&("run", "prCheckoutCmd")),
+            "run should reference prCheckoutCmd passed as an argument, found: {refs:?}"
+        );
+        assert!(
+            !refs.iter().any(|(_, dst)| *dst == "RunCommand"),
+            "the callee must be a Calls edge, not a References edge, found: {refs:?}"
+        );
+        let calls: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect();
+        assert!(
+            calls.contains(&("run", "RunCommand")),
+            "run should still Call RunCommand, found: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn package_const_read_in_body_emits_reference() {
+        // A plain read of a package-level const inside a body is a reference.
+        let adapter = GoAdapter;
+        let source = br#"
+package cmd
+
+const defaultConfigStr = "default"
+
+func load() string {
+    return defaultConfigStr
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("load.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let refs = go_references(&output);
+        assert!(
+            refs.contains(&("load", "defaultConfigStr")),
+            "load should reference defaultConfigStr it returns, found: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn value_references_skip_lhs_types_and_blank() {
+        // Binding names (LHS), type identifiers, keys, and the blank identifier
+        // are not value reads — keep References targeted to bound noise.
+        let adapter = GoAdapter;
+        let source = br#"
+package cmd
+
+type Config struct { Name string }
+
+func handler() {}
+
+func build() {
+    var h = handler
+    _ = h
+    cfg := Config{Name: "x"}
+    _ = cfg
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("build.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let refs = go_references(&output);
+        assert!(
+            refs.contains(&("build", "handler")),
+            "the RHS function value `handler` should be referenced, found: {refs:?}"
+        );
+        assert!(
+            !refs
+                .iter()
+                .any(|(_, dst)| matches!(*dst, "Config" | "Name" | "_")),
+            "type name, struct key, and blank identifier must not be referenced, found: {refs:?}"
+        );
+        // A reference edge is deduped to one per (src, dst) within a body.
+        assert_eq!(
+            refs.iter().filter(|(_, dst)| *dst == "handler").count(),
+            1,
+            "handler should be referenced exactly once, found: {refs:?}"
+        );
     }
 }

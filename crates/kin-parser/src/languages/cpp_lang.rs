@@ -341,13 +341,42 @@ fn extract_cpp_node(
                 if !name.is_empty() {
                     entities.push(ExtractedEntity {
                         kind: EntityKind::Macro,
-                        name,
+                        name: name.clone(),
                         signature: node_signature(node, source),
                         visibility: Visibility::Public,
                         doc_summary: extract_preceding_comment(node, source),
                         fingerprint: compute_fingerprint(node, source),
                         span: span_from_node(node, file_id),
                     });
+
+                    // tree-sitter leaves a macro's replacement list as an opaque
+                    // `preproc_arg`, so references made INSIDE a macro body are
+                    // never walked as identifier nodes. Lex the body text and
+                    // emit `UsesMacro` edges to the ALL_CAPS macros it expands to
+                    // (e.g. Catch2's INTERNAL_CATCH_* chains), sourced from this
+                    // macro. The macro's own name, its parameters, and reserved
+                    // `__`-prefixed identifiers are excluded; the linker drops
+                    // any target that resolves to no Macro entity.
+                    if let Some(value_node) = node.child_by_field_name("value") {
+                        let body = value_node.utf8_text(source).unwrap_or("");
+                        let params = macro_parameter_names(node, source);
+                        let mut seen = std::collections::HashSet::new();
+                        for token in lex_identifiers(body) {
+                            if token != name
+                                && !token.starts_with("__")
+                                && !params.contains(token)
+                                && is_all_caps_macro(token)
+                                && seen.insert(token.to_string())
+                            {
+                                relations.push(ExtractedRelation {
+                                    kind: kin_model::RelationKind::UsesMacro,
+                                    src_name: name.clone(),
+                                    dst_name: token.to_string(),
+                                    import_source: None,
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -908,6 +937,70 @@ fn is_all_caps_macro(name: &str) -> bool {
         }
     }
     has_upper && name.len() >= 3 // avoid single-letter macros
+}
+
+/// Collect the parameter names of a function-like macro (`#define M(a, b) ...`)
+/// so they are not mistaken for referenced macros in the replacement list.
+fn macro_parameter_names(
+    node: &tree_sitter::Node,
+    source: &[u8],
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    if let Some(params) = node.child_by_field_name("parameters") {
+        let mut cursor = params.walk();
+        for child in params.children(&mut cursor) {
+            if child.kind() == "identifier" {
+                if let Ok(text) = child.utf8_text(source) {
+                    if !text.is_empty() {
+                        names.insert(text.to_string());
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Lex identifier tokens from raw text, skipping the contents of string and
+/// char literals so quoted words are never treated as identifiers. Used to
+/// scan opaque macro-body text that tree-sitter does not tokenize.
+fn lex_identifiers(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            b'"' | b'\'' => {
+                let quote = c;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    let closed = bytes[i] == quote;
+                    i += 1;
+                    if closed {
+                        break;
+                    }
+                }
+            }
+            _ if c == b'_' || c.is_ascii_alphabetic() => {
+                let start = i;
+                while i < bytes.len() && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric()) {
+                    i += 1;
+                }
+                if let Ok(tok) = std::str::from_utf8(&bytes[start..i]) {
+                    tokens.push(tok);
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    tokens
 }
 
 /// Extract a `#include` directive into a `FileImport`.
@@ -1554,6 +1647,88 @@ namespace ns {
         for call in &calls {
             assert_eq!(call.src_name, "MyClass::my_method");
         }
+    }
+
+    #[test]
+    fn macro_body_references_emit_uses_macro_edges() {
+        // Catch2-style macros expand to INTERNAL_CATCH_* chains. tree-sitter
+        // leaves the replacement list as opaque text, so without lexing the body
+        // these macro->macro references are lost and a behavioral revert made
+        // inside a macro body is invisible to impact analysis.
+        let adapter = CppAdapter;
+        let source = br#"
+#define CATCH_FLAG 1
+#define INTERNAL_CATCH_TEST(expr, flag) do_check(expr, flag)
+#define INTERNAL_CATCH_TESTCASE2(name) do_register(name)
+#define INTERNAL_CATCH_TEST_CASE(...) INTERNAL_CATCH_TESTCASE2(__VA_ARGS__)
+#define CATCH_REQUIRE(expr) INTERNAL_CATCH_TEST(expr, CATCH_FLAG)
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("catch.hpp");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let uses: Vec<(&str, &str)> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::UsesMacro)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect();
+
+        assert!(
+            uses.contains(&("INTERNAL_CATCH_TEST_CASE", "INTERNAL_CATCH_TESTCASE2")),
+            "a macro should reference the macro its body expands to, found: {uses:?}"
+        );
+        assert!(
+            uses.contains(&("CATCH_REQUIRE", "INTERNAL_CATCH_TEST")),
+            "CATCH_REQUIRE should reference INTERNAL_CATCH_TEST from its body, found: {uses:?}"
+        );
+        assert!(
+            uses.contains(&("CATCH_REQUIRE", "CATCH_FLAG")),
+            "CATCH_REQUIRE should reference the CATCH_FLAG token in its body, found: {uses:?}"
+        );
+        // `__VA_ARGS__` is a reserved builtin, not a repo macro.
+        assert!(
+            !uses.iter().any(|(_, dst)| *dst == "__VA_ARGS__"),
+            "reserved __-prefixed identifiers must not be referenced, found: {uses:?}"
+        );
+        // `expr` is a macro parameter (and lowercase) — never a macro reference.
+        assert!(
+            !uses.iter().any(|(_, dst)| *dst == "expr"),
+            "macro parameters must not be referenced, found: {uses:?}"
+        );
+        // A macro must never reference itself.
+        assert!(
+            !uses.iter().any(|(src, dst)| src == dst),
+            "a macro must not reference itself, found: {uses:?}"
+        );
+    }
+
+    #[test]
+    fn macro_body_ignores_string_literal_contents() {
+        // ALL_CAPS words inside a string literal are text, not macro references.
+        let adapter = CppAdapter;
+        let source = br#"
+#define LOG_MESSAGE(x) emit("ERROR", x, OTHER_MACRO)
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("log.hpp");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+
+        let uses: Vec<(&str, &str)> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::UsesMacro)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect();
+
+        assert!(
+            uses.contains(&("LOG_MESSAGE", "OTHER_MACRO")),
+            "the bare macro token should be referenced, found: {uses:?}"
+        );
+        assert!(
+            !uses.iter().any(|(_, dst)| *dst == "ERROR"),
+            "ALL_CAPS words inside a string literal must not be referenced, found: {uses:?}"
+        );
     }
 
     #[test]
