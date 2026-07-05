@@ -138,6 +138,23 @@ fn entity_link_order(a: &Entity, b: &Entity) -> std::cmp::Ordering {
         .then_with(|| a.id.0.cmp(&b.id.0))
 }
 
+/// The bare (unqualified) leaf of an entity name: the part after the final
+/// `::` or `.` separator, or the whole name when it carries no qualifier.
+///
+/// Shared by the batch [`link_cross_file`] entity index and the
+/// [`IncrementalLinker`] bare-name index so both derive receiver-method leaf
+/// names identically — a divergence here would resolve the same call to
+/// different entities across the two linkers.
+fn bare_entity_name(name: &str) -> &str {
+    match name.rfind("::") {
+        Some(idx) => &name[idx + 2..],
+        None => match name.rfind('.') {
+            Some(idx) => &name[idx + 1..],
+            None => name,
+        },
+    }
+}
+
 /// Resolve cross-file relations for `files` against a broader target universe.
 ///
 /// This is used by warm/incremental indexing paths where only a subset of files
@@ -267,13 +284,7 @@ fn build_link_context<'a>(
                 .or_default()
                 .push((file_path, entity.id));
 
-            let bare_name = match entity.name.rfind("::") {
-                Some(idx) => &entity.name[idx + 2..],
-                None => match entity.name.rfind('.') {
-                    Some(idx) => &entity.name[idx + 1..],
-                    None => &*entity.name,
-                },
-            };
+            let bare_name = bare_entity_name(&entity.name);
             if bare_name != entity.name {
                 entity_by_bare_name
                     .entry(bare_name)
@@ -1104,8 +1115,10 @@ fn resolve_qualified_suffix_incremental(
         _ => {}
     }
 
-    // Tier 2: bare leaf (free functions; the incremental index has no bare-method
-    // index, so receiver methods reached without their type stay unresolved here).
+    // Tier 2: bare leaf (free functions) resolved through `entity_by_name`. A
+    // qualified path whose leaf is a receiver method (`Type::method`) is not in
+    // `entity_by_name` under the bare leaf; those are resolved by the caller's
+    // (c2) bare-name step via `entity_by_bare_name`, not here.
     let mut leaf_targets: HashSet<EntityId> = HashSet::new();
     if let Some(cands) = linker.entity_by_name.get(last) {
         for (fp, id) in cands {
@@ -2007,6 +2020,11 @@ pub struct IncrementalLinker {
     pub entity_by_file_name: HashMap<String, HashMap<String, EntityId>>,
     /// entity_name -> Vec<(file_path, EntityId)>
     pub entity_by_name: HashMap<String, Vec<(String, EntityId)>>,
+    /// bare (unqualified) leaf name -> Vec<(file_path, EntityId)>, for entities
+    /// whose name carries a `::`/`.` qualifier (e.g. `Widget::work` -> `work`).
+    /// Backs the incremental (c2) receiver-method resolution, mirroring the
+    /// batch linker's `entity_by_bare_name`.
+    pub entity_by_bare_name: HashMap<String, Vec<(String, EntityId)>>,
     /// entity_id -> kind
     pub entity_kind_by_id: HashMap<EntityId, EntityKind>,
     /// Set of all known files
@@ -2026,6 +2044,7 @@ impl IncrementalLinker {
         Self {
             entity_by_file_name: HashMap::new(),
             entity_by_name: HashMap::new(),
+            entity_by_bare_name: HashMap::new(),
             entity_kind_by_id: HashMap::new(),
             known_files: HashSet::new(),
             entities_by_file: HashMap::new(),
@@ -2044,6 +2063,15 @@ impl IncrementalLinker {
                     candidates.retain(|(fp, _)| fp != file_path);
                     if candidates.is_empty() {
                         self.entity_by_name.remove(&entity_name);
+                    }
+                }
+                let bare = bare_entity_name(&entity_name);
+                if bare != entity_name {
+                    if let Some(candidates) = self.entity_by_bare_name.get_mut(bare) {
+                        candidates.retain(|(fp, _)| fp != file_path);
+                        if candidates.is_empty() {
+                            self.entity_by_bare_name.remove(bare);
+                        }
                     }
                 }
             }
@@ -2088,6 +2116,14 @@ impl IncrementalLinker {
                 .entry(entity.name.clone())
                 .or_default()
                 .push((file_path.to_string(), entity.id));
+
+            let bare = bare_entity_name(&entity.name);
+            if bare != entity.name {
+                self.entity_by_bare_name
+                    .entry(bare.to_string())
+                    .or_default()
+                    .push((file_path.to_string(), entity.id));
+            }
 
             file_entities_list.push((entity.id, entity.visibility));
         }
@@ -2383,6 +2419,34 @@ pub fn link_cross_file_incremental(
                     resolved.push(make_relation(rel.kind, src_id, dst_id, confidence));
                 }
                 continue;
+            }
+
+            // (c2) Receiver-method calls (`x.method()`) arrive as the bare method
+            // name with no exact cross-file entity of that name, so (c) above
+            // never fires. Resolve them through the bare-name index only when
+            // unambiguous — exactly one method of that name in another file —
+            // mirroring the batch linker's (c2). Ambiguous names have an
+            // unknowable receiver type, so linking every candidate would mint
+            // spurious callers; leave those unresolved. This is the incremental
+            // counterpart the batch resolver already had; without it a receiver
+            // method resolved into a full-tree snapshot is dropped the moment an
+            // incremental relink of the caller re-derives its edges.
+            if name_fallback_allowed && rel.kind == RelationKind::Calls {
+                if let Some(bare_candidates) = linker.entity_by_bare_name.get(rel.dst_name.as_str())
+                {
+                    let distinct_targets: HashSet<EntityId> = bare_candidates
+                        .iter()
+                        .filter(|(fp, _)| fp != &file.file_path)
+                        .map(|(_, id)| *id)
+                        .collect();
+                    if distinct_targets.len() == 1 {
+                        let dst_id = *distinct_targets.iter().next().expect("len checked == 1");
+                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                            resolved.push(make_relation(rel.kind, src_id, dst_id, 0.3));
+                        }
+                        continue;
+                    }
+                }
             }
 
             // (c3) Path-qualified suffix resolution — the incremental counterpart
@@ -3271,6 +3335,78 @@ void f();
         assert_eq!(
             calls, 0,
             "ambiguous bare-name receiver call must not link to any candidate, got {calls} edges"
+        );
+    }
+
+    #[test]
+    fn incremental_receiver_method_call_resolves_when_bare_name_unambiguous() {
+        // Incremental (c2) parity with `receiver_method_call_resolves_when_bare_name_unambiguous`:
+        // a bare receiver-method call resolves to the single `Type::method` through
+        // the incremental bare-name index. Before the parity fix the incremental
+        // linker had no bare-name index and left this unresolved.
+        let caller = make_entity("project_after_mcp_commit", "src/wiring.rs");
+        let callee = make_entity("Reconciler::project_overlay_to_files", "src/reconciler.rs");
+
+        let mut linker = IncrementalLinker::new();
+        linker.add_file("src/wiring.rs", std::slice::from_ref(&caller));
+        linker.add_file("src/reconciler.rs", std::slice::from_ref(&callee));
+
+        let files = vec![FileParseData {
+            file_path: "src/wiring.rs".to_string(),
+            entities: vec![caller.clone()],
+            relations: vec![ExtractedRelation {
+                kind: RelationKind::Calls,
+                src_name: "project_after_mcp_commit".to_string(),
+                dst_name: "project_overlay_to_files".to_string(),
+                import_source: None,
+            }],
+            imports: vec![],
+        }];
+
+        let result = link_cross_file_incremental(&files, &linker);
+        let calls = result
+            .iter()
+            .find(|r| r.kind == RelationKind::Calls)
+            .expect("incremental unambiguous receiver-method call should resolve to Type::method");
+        assert_eq!(calls.src, GraphNodeId::Entity(caller.id));
+        assert_eq!(calls.dst, GraphNodeId::Entity(callee.id));
+    }
+
+    #[test]
+    fn incremental_receiver_method_call_skipped_when_bare_name_ambiguous() {
+        // Incremental (c2) parity with `receiver_method_call_skipped_when_bare_name_ambiguous`:
+        // bare `new` could be `Foo::new` or `Bar::new`; the receiver type is
+        // unknowable, so it must stay unlinked (matching the batch resolver's
+        // conservatism — no spurious callers).
+        let caller = make_entity("build", "src/caller.rs");
+        let foo_new = make_entity("Foo::new", "src/foo.rs");
+        let bar_new = make_entity("Bar::new", "src/bar.rs");
+
+        let mut linker = IncrementalLinker::new();
+        linker.add_file("src/caller.rs", std::slice::from_ref(&caller));
+        linker.add_file("src/foo.rs", std::slice::from_ref(&foo_new));
+        linker.add_file("src/bar.rs", std::slice::from_ref(&bar_new));
+
+        let files = vec![FileParseData {
+            file_path: "src/caller.rs".to_string(),
+            entities: vec![caller.clone()],
+            relations: vec![ExtractedRelation {
+                kind: RelationKind::Calls,
+                src_name: "build".to_string(),
+                dst_name: "new".to_string(),
+                import_source: None,
+            }],
+            imports: vec![],
+        }];
+
+        let result = link_cross_file_incremental(&files, &linker);
+        let calls = result
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls)
+            .count();
+        assert_eq!(
+            calls, 0,
+            "incremental ambiguous bare-name receiver call must not link, got {calls} edges"
         );
     }
 

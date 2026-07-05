@@ -1141,6 +1141,7 @@ impl Clone for ImportedCommitSemanticState {
             linker: kin_index::IncrementalLinker {
                 entity_by_file_name: self.linker.entity_by_file_name.clone(),
                 entity_by_name: self.linker.entity_by_name.clone(),
+                entity_by_bare_name: self.linker.entity_by_bare_name.clone(),
                 entity_kind_by_id: self.linker.entity_kind_by_id.clone(),
                 known_files: self.linker.known_files.clone(),
                 entities_by_file: self.linker.entities_by_file.clone(),
@@ -4511,6 +4512,128 @@ mod tests {
         assert!(
             !replayed_edge_present(&control, control_head, "handler", "foo"),
             "pre-Fix-D control: an untouched consumer edge must NOT be reachable at the head"
+        );
+    }
+
+    #[test]
+    fn base_link_cpp_receiver_method_edge_survives_at_historical_head() {
+        // Regression guard for the FIR-1267 (c2) parity fix. A C++ receiver-method
+        // call `w.work()` resolves to a `Type::method` (`Widget::work`) only through
+        // the linker's bare-name index. The batch resolver has always had that
+        // index; the incremental linker did not, so a base-link built as a
+        // full-tree snapshot would carry the edge but the FIRST windowed commit
+        // that touches the callee re-links the consumer via the reverse-dependency
+        // closure with the incremental linker, which could not reproduce the edge
+        // and emitted a spurious Removed — deleting it at exactly the historical
+        // head a revert lands on. The existing TS e2e test cannot catch this: TS
+        // import edges resolve in BOTH linkers, so they always survive. This test
+        // uses a batch-only edge shape and asserts survival at the HEAD ref (not
+        // just the base-link), which is what a ref-scoped blast query reads.
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo_for_test(dir.path()) {
+            eprintln!("git not available, skipping c2 survival test");
+            return;
+        }
+
+        let lib_path = dir.path().join("widget.hpp");
+        let app_path = dir.path().join("app.cpp");
+
+        let commit = |msg: &str, epoch: i64| {
+            let stamp = format!("{epoch} +0000");
+            let _ = Command::new("git")
+                .args(["add", "."])
+                .current_dir(dir.path())
+                .output();
+            let _ = Command::new("git")
+                .args(["commit", "-m", msg])
+                .env("GIT_AUTHOR_DATE", &stamp)
+                .env("GIT_COMMITTER_DATE", &stamp)
+                .current_dir(dir.path())
+                .output();
+        };
+
+        // c1 (base, falls OUTSIDE a 3-commit window): the callee `Widget::work`
+        // and its cross-file consumer `run`, which calls it via `w.work()` — a
+        // bare-name receiver-method call resolvable only through the bare-name
+        // index, never an exact cross-file name match or an ES-style import.
+        fs::write(&lib_path, "struct Widget { int work() { return 1; } };\n").unwrap();
+        fs::write(
+            &app_path,
+            "#include \"widget.hpp\"\nint run() { Widget w; return w.work(); }\n",
+        )
+        .unwrap();
+        commit("c1 base", 1_000_000_000);
+        // c2..c4 touch ONLY widget.hpp (the callee); app.cpp (the consumer) is
+        // never touched anywhere inside the imported window.
+        for (epoch, body) in [
+            (1_000_000_100_i64, "2"),
+            (1_000_000_200, "3"),
+            (1_000_000_300, "4"),
+        ] {
+            fs::write(
+                &lib_path,
+                format!("struct Widget {{ int work() {{ return {body}; }} }};\n"),
+            )
+            .unwrap();
+            commit("touch widget", epoch);
+        }
+
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x71; 32]));
+        let opts = kin_git::ImportOptions {
+            max_commits: 3,
+            ..Default::default()
+        };
+
+        // --- Anchored path (Fix D base-link + incremental (c2) parity) ---
+        let mut anchored = kin_git::import_git_history_with_blobs(
+            dir.path(),
+            genesis_id,
+            &opts,
+            Some(&blob_store),
+        )
+        .unwrap();
+        let base_id = kin_git::anchor_imported_history_at_base_link(
+            dir.path(),
+            &mut anchored,
+            genesis_id,
+            Some(&blob_store),
+        )
+        .unwrap()
+        .expect("a truncated window must yield a base-link change");
+        enrich_imported_changes_with_semantics(&mut anchored, &blob_store).unwrap();
+
+        // The base-link carries the bare-name receiver-method edge...
+        assert!(
+            replayed_edge_present(&anchored, base_id, "run", "Widget::work"),
+            "base-link must carry the receiver-method edge run->Widget::work"
+        );
+        // ...and it must SURVIVE at the historical head, even though every windowed
+        // commit touches the callee (pulling the consumer into the reverse-dep
+        // closure). Before the (c2) parity fix the incremental relink dropped it
+        // here, so this assertion is the one that fails on the half-fix.
+        let head = anchored.last().unwrap().change.id;
+        assert!(
+            replayed_edge_present(&anchored, head, "run", "Widget::work"),
+            "anchored: the receiver-method edge must remain live at the historical head"
+        );
+
+        // --- Negative control: the SAME window with NO base-link anchor ---
+        // Without the anchor the consumer file is never in the graph at any
+        // windowed ref, so the edge cannot exist — proving the anchor is what
+        // brings the base universe in and the (c2) parity is what keeps it.
+        let mut control = kin_git::import_git_history_with_blobs(
+            dir.path(),
+            genesis_id,
+            &opts,
+            Some(&blob_store),
+        )
+        .unwrap();
+        enrich_imported_changes_with_semantics(&mut control, &blob_store).unwrap();
+        let control_head = control.last().unwrap().change.id;
+        assert!(
+            !replayed_edge_present(&control, control_head, "run", "Widget::work"),
+            "unanchored control: an untouched consumer edge must NOT be reachable at the head"
         );
     }
 
