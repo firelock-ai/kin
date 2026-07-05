@@ -118,6 +118,61 @@ fn hash_token_stream(node: &Node, source: &[u8], hasher: &mut Sha256) {
     }
 }
 
+/// Whitespace-collapsed declaration text of a node, cut before its `body`
+/// child and any C++ member-initializer list, falling back to the full node
+/// text for body-less declarations. Line wrapping and indentation must not
+/// leak into signatures: a multi-line declarator and its single-line
+/// reformat are the same declaration, and a signature string that differs
+/// only by formatting reads as a false signature change downstream.
+pub fn declaration_signature(node: &Node, source: &[u8]) -> String {
+    let start = node.start_byte();
+    let mut end = node.end_byte();
+    if let Some(body) = node.child_by_field_name("body") {
+        end = end.min(body.start_byte());
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "field_initializer_list" {
+            end = end.min(child.start_byte());
+        }
+    }
+    let end = end.max(start);
+    let text = source
+        .get(start..end)
+        .map(String::from_utf8_lossy)
+        .unwrap_or_default();
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    canonicalize_signature_spacing(&collapsed)
+        .trim_end_matches(['{', ':'])
+        .trim()
+        .to_string()
+}
+
+/// Canonicalize spacing around punctuation in a collapsed signature so that
+/// a line break at a token boundary (`ArgParser\n(...)`) and its inline form
+/// (`ArgParser(...)`) render identically: no space before `()[],;<>`, none
+/// after an opening bracket.
+fn canonicalize_signature_spacing(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '(' | ')' | ',' | '[' | ']' | ';' | '<' | '>' => {
+                while out.ends_with(' ') {
+                    out.pop();
+                }
+                out.push(ch);
+            }
+            ' ' => {
+                if !matches!(out.chars().last(), Some('(') | Some('[') | Some('<') | None) {
+                    out.push(' ');
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn finalize_hash(hasher: Sha256) -> Hash256 {
     let result = hasher.finalize();
     let mut bytes = [0u8; 32];

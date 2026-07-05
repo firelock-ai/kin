@@ -172,3 +172,57 @@ def guard(x):
         "moving a statement between blocks reuses the same tokens but must alter the behavior hash"
     );
 }
+
+#[test]
+fn cpp_multiline_declarator_keeps_signature_string() {
+    let single_line = r#"
+class ArgParser {
+public:
+    ArgParser( int argc, char* const argv[], Config& config )
+    : m_mode( modeNone )
+    {
+        parse();
+    }
+};
+"#;
+    let multi_line = r#"
+class ArgParser {
+public:
+    ArgParser
+    (   int argc, char* const argv[], Config& config )
+    :   m_mode( modeNone )
+    {
+        parse();
+    }
+};
+"#;
+    let adapter = CppAdapter;
+    let sig = |src: &str| {
+        let bytes = src.as_bytes();
+        let tree = adapter.parse(bytes).expect("parse should succeed");
+        let file_id = FilePathId("test/sig.hpp".to_string());
+        let output = adapter
+            .extract(&tree, bytes, &file_id)
+            .expect("extract should succeed");
+        output
+            .entities
+            .iter()
+            .find(|e| e.name == "ArgParser::ArgParser")
+            .map(|e| e.signature.clone())
+            .expect("constructor entity")
+    };
+    let a = sig(single_line);
+    let b = sig(multi_line);
+    assert_eq!(
+        a, b,
+        "line wrapping must not change the extracted signature string"
+    );
+    assert!(
+        a.contains("int argc"),
+        "signature must carry the parameter list, got: {a}"
+    );
+    assert!(
+        !a.contains("m_mode"),
+        "member-initializer list must not leak into the signature, got: {a}"
+    );
+}

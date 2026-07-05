@@ -768,13 +768,7 @@ fn detect_file_scope_visibility(node: &tree_sitter::Node, source: &[u8]) -> Visi
 
 /// First line of the node text, trimmed of trailing `{`.
 fn node_signature(node: &tree_sitter::Node, source: &[u8]) -> String {
-    let text = node.utf8_text(source).unwrap_or("");
-    text.lines()
-        .next()
-        .unwrap_or(text)
-        .trim_end_matches('{')
-        .trim()
-        .to_string()
+    crate::adapter::declaration_signature(node, source)
 }
 
 /// Extract the preceding comment (// or /* ... */) as a doc summary.

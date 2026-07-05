@@ -609,13 +609,7 @@ fn go_visibility_with_path(name: &str, file_id: &FilePathId) -> Visibility {
 }
 
 fn node_signature(node: &tree_sitter::Node, source: &[u8]) -> String {
-    let text = node.utf8_text(source).unwrap_or("");
-    text.lines()
-        .next()
-        .unwrap_or(text)
-        .trim_end_matches('{')
-        .trim()
-        .to_string()
+    crate::adapter::declaration_signature(node, source)
 }
 
 fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
