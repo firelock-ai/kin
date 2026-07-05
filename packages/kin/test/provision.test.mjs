@@ -1,0 +1,214 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Firelock, LLC
+
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { test } from 'node:test';
+
+import {
+  artifactName,
+  releaseDownloadUrl,
+  parseSha256File,
+  sha256Hex,
+  provision,
+  probeBinaryVersion,
+  ensureProvisioned,
+} from '../lib/provision.mjs';
+import { readLauncherStamp, writeLauncherStamp } from '../lib/resolve.mjs';
+
+test('artifactName maps every released host and matches release.yml naming', () => {
+  assert.equal(artifactName('darwin', 'arm64'), 'kin-macos-aarch64.tar.gz');
+  assert.equal(artifactName('darwin', 'x64'), 'kin-macos-x86_64.tar.gz');
+  assert.equal(artifactName('linux', 'arm64'), 'kin-linux-aarch64.tar.gz');
+  assert.equal(artifactName('linux', 'x64'), 'kin-linux-x86_64.tar.gz');
+  assert.equal(artifactName('win32', 'x64'), 'kin-windows-x86_64.zip');
+});
+
+test('artifactName is honest about windows-aarch64 having no artifact', () => {
+  assert.throws(() => artifactName('win32', 'arm64'), /no native windows-aarch64/);
+});
+
+test('releaseDownloadUrl pins the tag and file', () => {
+  assert.equal(
+    releaseDownloadUrl('1.2.3', 'kin-macos-aarch64.tar.gz'),
+    'https://github.com/firelock-ai/kin/releases/download/v1.2.3/kin-macos-aarch64.tar.gz',
+  );
+});
+
+test('parseSha256File accepts shasum output and rejects junk', () => {
+  const hex = 'a'.repeat(64);
+  assert.equal(parseSha256File(`${hex}  kin-macos-aarch64.tar.gz\n`), hex);
+  assert.equal(parseSha256File(`${hex.toUpperCase()}  x`), hex);
+  assert.throws(() => parseSha256File('not-a-digest  file'), /malformed \.sha256/);
+  assert.throws(() => parseSha256File(''), /malformed \.sha256/);
+});
+
+// ── offline provision fixture ──────────────────────────────────────────────
+//
+// Builds a real tar.gz in a tempdir (via the same `tar` the provisioner uses)
+// containing the archive layout install.sh documents: a kin-* subdirectory
+// with kin + kin-daemon. The fake fetch serves those bytes; no network.
+
+function makeFixture({ withDaemon = true } = {}) {
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-prov-fixture-'));
+  const stage = path.join(work, 'kin-macos-aarch64');
+  fs.mkdirSync(stage, { recursive: true });
+  fs.writeFileSync(path.join(stage, 'kin'), '#!/bin/sh\necho "kin 9.9.9 (test)"\n');
+  if (withDaemon) {
+    fs.writeFileSync(path.join(stage, 'kin-daemon'), '#!/bin/sh\necho daemon\n');
+  }
+  const archivePath = path.join(work, 'kin-macos-aarch64.tar.gz');
+  const tar = spawnSync('tar', ['-czf', archivePath, '-C', work, 'kin-macos-aarch64'], {
+    encoding: 'utf8',
+  });
+  assert.equal(tar.status, 0, tar.stderr);
+  const bytes = fs.readFileSync(archivePath);
+  const sha = `${sha256Hex(bytes)}  kin-macos-aarch64.tar.gz\n`;
+  const fetchImpl = async (url) => {
+    const body = url.endsWith('.sha256') ? Buffer.from(sha) : bytes;
+    return {
+      ok: true,
+      status: 200,
+      arrayBuffer: async () => body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength),
+    };
+  };
+  return { work, bytes, sha, fetchImpl };
+}
+
+test('provision verifies, installs kin + kin-daemon, and stamps the version', async () => {
+  const { work, fetchImpl } = makeFixture();
+  const home = path.join(work, 'kin-home');
+  const env = { KIN_HOME: home };
+  const installed = await provision('9.9.9', {
+    env,
+    platform: 'darwin',
+    arch: 'arm64',
+    fetchImpl,
+    log: () => {},
+  });
+  assert.equal(installed, path.join(home, 'bin', 'kin'));
+  assert.ok(fs.existsSync(path.join(home, 'bin', 'kin')));
+  assert.ok(fs.existsSync(path.join(home, 'bin', 'kin-daemon')));
+  assert.equal(fs.statSync(installed).mode & 0o111 && true, true);
+  assert.equal(readLauncherStamp(env), '9.9.9');
+  fs.rmSync(work, { recursive: true, force: true });
+});
+
+test('provision refuses a checksum mismatch without installing', async () => {
+  const { work, bytes } = makeFixture();
+  const home = path.join(work, 'kin-home');
+  const badSha = `${'0'.repeat(64)}  kin-macos-aarch64.tar.gz\n`;
+  const fetchImpl = async (url) => {
+    const body = url.endsWith('.sha256') ? Buffer.from(badSha) : bytes;
+    return {
+      ok: true,
+      status: 200,
+      arrayBuffer: async () => body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength),
+    };
+  };
+  await assert.rejects(
+    provision('9.9.9', { env: { KIN_HOME: home }, platform: 'darwin', arch: 'arm64', fetchImpl, log: () => {} }),
+    /SHA-256 mismatch/,
+  );
+  assert.ok(!fs.existsSync(path.join(home, 'bin', 'kin')));
+  fs.rmSync(work, { recursive: true, force: true });
+});
+
+test('provision refuses a daemon-less archive before moving anything', async () => {
+  const { work, fetchImpl } = makeFixture({ withDaemon: false });
+  const home = path.join(work, 'kin-home');
+  await assert.rejects(
+    provision('9.9.9', { env: { KIN_HOME: home }, platform: 'darwin', arch: 'arm64', fetchImpl, log: () => {} }),
+    /daemon-less/,
+  );
+  assert.ok(!fs.existsSync(path.join(home, 'bin', 'kin')));
+  fs.rmSync(work, { recursive: true, force: true });
+});
+
+test('provision surfaces a failed download loudly', async () => {
+  const fetchImpl = async () => ({ ok: false, status: 404, arrayBuffer: async () => new ArrayBuffer(0) });
+  await assert.rejects(
+    provision('9.9.9', { env: { KIN_HOME: '/nonexistent-home' }, platform: 'darwin', arch: 'arm64', fetchImpl, log: () => {} }),
+    /download failed \(404\)/,
+  );
+});
+
+test('probeBinaryVersion parses the kin version line and null on failure', () => {
+  const okSpawn = () => ({ status: 0, stdout: 'kin 1.2.3 (abc detached)\n' });
+  const badSpawn = () => ({ status: 1, stdout: '', stderr: 'boom' });
+  assert.equal(probeBinaryVersion('/any', okSpawn), '1.2.3');
+  assert.equal(probeBinaryVersion('/any', badSpawn), null);
+});
+
+test('ensureProvisioned respects KIN_MANAGED_BIN and never provisions over it', async () => {
+  const real = process.execPath;
+  const result = await ensureProvisioned({
+    env: { KIN_MANAGED_BIN: real },
+    fetchImpl: async () => {
+      throw new Error('network must not be touched');
+    },
+    log: () => {},
+  });
+  assert.equal(result, real);
+});
+
+test('ensureProvisioned is resolve-only under KIN_NO_PROVISION', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-noprov-'));
+  const result = await ensureProvisioned({
+    env: { KIN_HOME: home, KIN_NO_PROVISION: '1' },
+    fetchImpl: async () => {
+      throw new Error('network must not be touched');
+    },
+    log: () => {},
+  });
+  assert.equal(result, null);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('ensureProvisioned runs a stamped current install without probing or network', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-stamped-'));
+  const env = { KIN_HOME: home };
+  const binDir = path.join(home, 'bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  const { targetKinVersion } = await import('../lib/resolve.mjs');
+  fs.writeFileSync(path.join(binDir, 'kin'), '#!/bin/sh\n');
+  writeLauncherStamp(targetKinVersion(), env);
+  const result = await ensureProvisioned({
+    env,
+    platform: process.platform,
+    fetchImpl: async () => {
+      throw new Error('network must not be touched');
+    },
+    spawnImpl: () => {
+      throw new Error('probe must not run');
+    },
+    log: () => {},
+  });
+  assert.equal(result, path.join(binDir, 'kin'));
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('ensureProvisioned respects a foreign install on version mismatch (no adopt)', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-foreign-'));
+  const env = { KIN_HOME: home };
+  const binDir = path.join(home, 'bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(path.join(binDir, 'kin'), '#!/bin/sh\n');
+  const notices = [];
+  const result = await ensureProvisioned({
+    env,
+    platform: process.platform,
+    fetchImpl: async () => {
+      throw new Error('must not re-provision a foreign install without opt-in');
+    },
+    spawnImpl: () => ({ status: 0, stdout: 'kin 0.0.1-foreign (x)\n' }),
+    log: (line) => notices.push(line),
+  });
+  assert.equal(result, path.join(binDir, 'kin'));
+  assert.equal(readLauncherStamp(env), null);
+  assert.ok(notices.some((l) => l.includes('KIN_LAUNCHER_ADOPT=1')));
+  fs.rmSync(home, { recursive: true, force: true });
+});

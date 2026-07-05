@@ -1,5 +1,10 @@
 # @kinlab/kin-mcp
 
+> **Superseded by [`@kinlab/kin`](https://www.npmjs.com/package/@kinlab/kin)** — the
+> canonical Kin install surface, which includes the MCP server (`kin mcp start`) along
+> with the full CLI. This package keeps working for existing configurations; new setups
+> should install `@kinlab/kin`.
+
 `@kinlab/kin-mcp` is the npm-friendly launcher for Kin's MCP server (the installed
 command is still `kin-mcp`).
 

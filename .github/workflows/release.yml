@@ -582,6 +582,85 @@ jobs:
           jq -nc --arg c "📦 \`${PKG}@${VER}\` published to **npm**." '{content:$c}' \
             | curl -fsS -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
 
+  publish_npm_canonical:
+    name: Publish npm Canonical Package (@kinlab/kin)
+    needs: publish
+    # Runs parallel to publish_npm (independent packages: a kin-mcp registry
+    # failure must not block the canonical package, and vice versa). Mirror
+    # publish's always() guard so a skipped notarize_linux does not
+    # transitively skip this job.
+    if: ${{ always() && !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    # Trusted Publishing (OIDC), same as publish_npm. Requires a Trusted
+    # Publisher configured on npm for @kinlab/kin pointing at firelock-ai/kin +
+    # this workflow (release.yml). Until that npm-side configuration (or a
+    # one-time manual first publish) exists, this job fails visibly here
+    # without affecting the release or the kin-mcp compatibility publish.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Upgrade npm for OIDC trusted publishing (needs >= 11.5.1)
+        run: npm install -g npm@latest
+
+      - name: Verify npm package version matches tag
+        run: |
+          PACKAGE_VERSION=$(node -p "require('./packages/kin/package.json').version")
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          test "$PACKAGE_VERSION" = "$TAG_VERSION"
+
+      - name: Run launcher tests
+        run: npm test --prefix ./packages/kin
+
+      - name: Resolve npm dist-tag
+        id: dist-tag
+        shell: bash
+        run: |
+          ref="${GITHUB_REF_NAME#v}"
+          case "$ref" in
+            *-alpha*) tag="alpha" ;;
+            *-beta*) tag="beta" ;;
+            *-rc*) tag="rc" ;;
+            *) tag="latest" ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Publish npm package (Trusted Publishing via OIDC)
+        id: npm_pub_kin
+        run: |
+          PKG=$(node -p "require('./packages/kin/package.json').name")
+          VER=$(node -p "require('./packages/kin/package.json').version")
+          echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          if npm view "${PKG}@${VER}" version >/dev/null 2>&1; then
+            echo "${PKG}@${VER} already published — skipping (idempotent recut)."
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          npm publish ./packages/kin --access public --tag "${NPM_DIST_TAG}"
+          echo "published=true" >> "$GITHUB_OUTPUT"
+        env:
+          NPM_DIST_TAG: ${{ steps.dist-tag.outputs.tag }}
+
+      - name: Notify Discord (npm publish)
+        if: steps.npm_pub_kin.outputs.published == 'true' && env.DISCORD_WEBHOOK_URL != ''
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          PKG: ${{ steps.npm_pub_kin.outputs.pkg }}
+          VER: ${{ steps.npm_pub_kin.outputs.ver }}
+        run: |
+          jq -nc --arg c "📦 \`${PKG}@${VER}\` published to **npm** (canonical Kin install surface)." '{content:$c}' \
+            | curl -fsS -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
+
   publish_boundary_contracts:
     name: Publish boundary contracts to KinLab
     needs: publish

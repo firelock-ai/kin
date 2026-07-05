@@ -51,6 +51,23 @@ jobs:
           done < <(git rev-list "${base}..${head}")
           exit "$missing"
 
+  npm-launchers:
+    name: npm launcher tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      - name: Test @kinlab/kin (canonical launcher)
+        run: npm test --prefix ./packages/kin && npm run lint --prefix ./packages/kin
+
+      - name: Test @kinlab/kin-mcp (compatibility wrapper)
+        run: npm test --prefix ./packages/kin-mcp && npm run lint --prefix ./packages/kin-mcp
+
   check:
     name: Check & Test
     runs-on: ${{ matrix.os }}

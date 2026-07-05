@@ -10,9 +10,10 @@ const run = promisify(execFile);
 // the workspace version and asserts every surface that a tag-driven release
 // depends on is already in sync, BEFORE a tag is cut:
 //
-//   - the npm wrapper (packages/kin-mcp/package.json) version equals the
-//     workspace version — release.yml's publish_npm job hard-asserts this, so a
-//     mismatch would otherwise only surface AFTER the tag is already pushed;
+//   - every npm package version (packages/kin-mcp and the canonical
+//     packages/kin) equals the workspace version — release.yml's npm publish
+//     jobs hard-assert this, so a mismatch would otherwise only surface AFTER
+//     the tag is already pushed;
 //   - a CHANGELOG section exists for the version (required for a stable
 //     release; a warning for a prerelease, which falls back to auto-notes);
 //   - the version moves strictly forward of the newest existing vX.Y.Z tag.
@@ -46,7 +47,10 @@ function parseArgs(argv) {
   }
   return {
     manifest: args.get('manifest') ?? 'Cargo.toml',
-    npm: args.get('npm') ?? 'packages/kin-mcp/package.json',
+    npm: (args.get('npm') ?? 'packages/kin-mcp/package.json,packages/kin/package.json')
+      .split(',')
+      .map((p) => p.trim())
+      .filter(Boolean),
     changelog: args.get('changelog') ?? 'CHANGELOG.md',
     json: args.get('json') === 'true',
   };
@@ -155,17 +159,22 @@ async function main() {
   const failures = [];
   const warnings = [];
 
-  // 1. npm wrapper version must equal the workspace version.
-  const npmText = await readFileOrNull(opts.npm);
-  let npmVersion = null;
-  if (npmText === null) {
-    failures.push(`npm wrapper manifest not found: ${opts.npm}`);
-  } else {
-    npmVersion = JSON.parse(npmText).version;
-    if (npmVersion !== version) {
-      failures.push(`npm wrapper ${opts.npm} is ${npmVersion}, workspace is ${version} — they must match (publish_npm asserts it)`);
+  // 1. Every npm package version must equal the workspace version.
+  const npmVersions = [];
+  for (const manifest of opts.npm) {
+    const npmText = await readFileOrNull(manifest);
+    if (npmText === null) {
+      failures.push(`npm manifest not found: ${manifest}`);
+      npmVersions.push({ manifest, version: null });
+      continue;
+    }
+    const v = JSON.parse(npmText).version;
+    npmVersions.push({ manifest, version: v });
+    if (v !== version) {
+      failures.push(`npm manifest ${manifest} is ${v}, workspace is ${version} — they must match (the npm publish jobs assert it)`);
     }
   }
+  const npmVersion = npmVersions.map((n) => `${n.manifest.split('/').slice(-2, -1)[0] ?? n.manifest}@${n.version ?? '<missing>'}`).join(', ');
 
   // 2. CHANGELOG section: required for a stable release, advisory for prereleases.
   const changelogText = await readFileOrNull(opts.changelog);
@@ -206,7 +215,7 @@ async function main() {
   } else {
     console.log('Kin release-intent gate');
     console.log(`  workspace version : ${version}`);
-    console.log(`  npm wrapper       : ${npmVersion ?? '<missing>'}`);
+    console.log(`  npm packages      : ${npmVersion || '<missing>'}`);
     console.log(`  changelog section : ${hasChangelog ? 'present' : 'absent'}`);
     console.log(`  newest tag        : ${newest ?? '<none>'}`);
     console.log(`  tag ${tag}${' '.repeat(Math.max(0, 13 - tag.length))}: ${tagExists ? 'exists' : 'absent'}`);
