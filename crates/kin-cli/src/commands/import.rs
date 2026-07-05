@@ -243,7 +243,7 @@ fn parse_and_index(
         }
 
         let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let adapter = match registry.get_by_extension(ext) {
+        let adapter = match registry.get_by_extension_and_content(ext, &source) {
             Some(a) => a,
             None => continue,
         };

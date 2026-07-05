@@ -20,7 +20,7 @@ fn main() {
         .unwrap_or("");
     let registry = AdapterRegistry::new();
     let adapter = registry
-        .get_by_extension(extension)
+        .get_by_extension_and_content(extension, &content)
         .unwrap_or_else(|| panic!("no parser adapter for extension `{extension}`"));
     let tree = adapter.parse(&content).expect("failed to parse");
     let path_id = kin_model::FilePathId::new(path);

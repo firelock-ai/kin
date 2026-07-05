@@ -24,7 +24,7 @@ use kin_model::ids::SemanticChangeId;
 use kin_model::timestamp::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::diff::{self, EntityChangeKind};
+use crate::diff::{self, EntityChangeKind, SemanticDiff};
 use crate::gate::{derive_decision, GateStatus, ReviewFinding, ReviewSignalKind};
 use crate::impact::ImpactReport;
 use crate::inline::{self, InlineCommentKind};
@@ -205,6 +205,7 @@ pub struct ShadowRepairItem {
 pub struct ShadowEvidenceGap {
     /// "artifact_only_change" | "missing_span" | "actor_attribution_unavailable"
     /// | "impact_signal_absent" | "cross_repo_not_evaluated" | "ref_state_unavailable"
+    /// | "base_not_on_head_ancestry"
     pub kind: String,
     pub subject: String,
     pub detail: String,
@@ -288,13 +289,32 @@ pub fn build_shadow_report_at<G: GraphStore>(
     request: &ShadowRequest,
     at_head: &GraphAtRef<'_, G>,
 ) -> Result<ShadowGateReport, ReviewError> {
-    let review = SemanticReview::create_review_at(
+    if !at_head.ancestry_contains(&request.resolved_base) {
+        return build_report_with_base_off_ancestry(store, request);
+    }
+    // DAG-true `base..head` membership: reachable from head, not reachable
+    // from base. The store's backward walk stops only at the literal base
+    // node, so on a merge head it crosses into the base's own history
+    // through the other parent; every consumer of the walked rows below
+    // scopes them with this test so the diff and the audited range describe
+    // the reviewed range and nothing older.
+    let base_ancestry = crate::ref_graph::collect_ancestry(store, &request.resolved_base)?;
+    let in_range =
+        |id: &SemanticChangeId| at_head.ancestry_contains(id) && !base_ancestry.contains(id);
+    let review = SemanticReview::create_review_scoped(
         &request.resolved_base,
         &request.resolved_head,
         store,
         at_head,
+        in_range,
     )?;
-    assemble_report(store, request, review, None)
+    let changes: Vec<_> = store
+        .get_changes_since(&request.resolved_base, &request.resolved_head)
+        .map_err(ReviewError::graph)?
+        .into_iter()
+        .filter(|change| in_range(&change.id))
+        .collect();
+    assemble_report_with_changes(store, request, review, None, &changes)
 }
 
 /// The graph state at the head ref could not be materialized. Report the gap
@@ -334,23 +354,72 @@ fn build_report_without_ref_state<G: GraphStore>(
     assemble_report(store, request, review, Some(gap))
 }
 
+/// The resolved base is not on the head's ancestry in the change DAG. A range
+/// walk from that base would not describe this head's history — it degrades
+/// into a sweep across unrelated eras of the DAG — so the range is refused
+/// loudly: no diff, no blast radius, no impact, no range walk, and an
+/// explicit blocking evidence gap in their place.
+fn build_report_with_base_off_ancestry<G: GraphStore>(
+    store: &G,
+    request: &ShadowRequest,
+) -> Result<ShadowGateReport, ReviewError> {
+    let semantic_diff = SemanticDiff {
+        base: Some(request.resolved_base),
+        head: Some(request.resolved_head),
+        ..Default::default()
+    };
+    let impact_report = ImpactReport::default();
+    let risk_summary = risk::assess_risk(&semantic_diff, &impact_report);
+    let inline_comments = inline::collect_inline_comments(&semantic_diff, &impact_report);
+    let review = Review {
+        base: Some(request.resolved_base),
+        head: Some(request.resolved_head),
+        diff: semantic_diff,
+        impact: impact_report,
+        risk: risk_summary,
+        inline_comments,
+    };
+
+    let gap = ShadowEvidenceGap {
+        kind: "base_not_on_head_ancestry".to_string(),
+        subject: format!("{}..{}", request.base_ref, request.head_ref),
+        detail: format!(
+            "resolved base {} is not on the ancestry of head {} in the change DAG; a range walk \
+             from this base would span unrelated history, so diff, blast radius, and impact were \
+             NOT computed for this report",
+            request.resolved_base, request.resolved_head
+        ),
+    };
+    assemble_report_with_changes(store, request, review, Some(gap), &[])
+}
+
 fn assemble_report<G: GraphStore>(
     store: &G,
     request: &ShadowRequest,
     review: Review,
-    ref_state_gap: Option<ShadowEvidenceGap>,
+    range_gap: Option<ShadowEvidenceGap>,
 ) -> Result<ShadowGateReport, ReviewError> {
     let changes = store
         .get_changes_since(&request.resolved_base, &request.resolved_head)
         .map_err(ReviewError::graph)?;
+    assemble_report_with_changes(store, request, review, range_gap, &changes)
+}
 
+fn assemble_report_with_changes<G: GraphStore>(
+    store: &G,
+    request: &ShadowRequest,
+    review: Review,
+    range_gap: Option<ShadowEvidenceGap>,
+    changes: &[kin_model::change::SemanticChange],
+) -> Result<ShadowGateReport, ReviewError> {
     let changed_entities = collect_changed_entities(store, &review)?;
     let blast_radius = collect_blast_radius(&review);
-    let mut evidence_gaps = collect_evidence_gaps(&review, &changes, &changed_entities);
-    if let Some(gap) = ref_state_gap {
+    let mut evidence_gaps = collect_evidence_gaps(&review, changes, &changed_entities);
+    if let Some(gap) = range_gap {
         // The generic empty-impact gap advises verifying relation ingestion,
         // which misleads here: impact was not computed at all. The specific
-        // ref-state gap subsumes it.
+        // range gap (unmaterializable ref state, base off the head ancestry)
+        // subsumes it.
         evidence_gaps.retain(|existing| existing.kind != "impact_signal_absent");
         evidence_gaps.insert(0, gap);
     }
@@ -571,6 +640,10 @@ fn is_blocking(kind: InlineCommentKind) -> bool {
 ///   not be materialized, so blast radius and impact were not computed at
 ///   all. The gate cannot certify `pass` over an impact surface it never
 ///   evaluated.
+/// - `base_not_on_head_ancestry`: the resolved base is not on the head's
+///   ancestry in the change DAG, so the requested range does not describe
+///   this head's history and diff, blast radius, and impact were refused.
+///   The gate cannot certify `pass` over a range it never evaluated.
 /// - `impact_signal_absent` is reported but never demotes the verdict: an
 ///   empty relation channel cannot distinguish "genuinely isolated" from
 ///   "relations never ingested", and treating that ambiguity as risk flags
@@ -582,7 +655,7 @@ fn is_blocking(kind: InlineCommentKind) -> bool {
 ///   unavailable) are constant framing, reported but never demoting.
 fn gap_blocks_pass(gap: &ShadowEvidenceGap) -> bool {
     match gap.kind.as_str() {
-        "missing_span" | "ref_state_unavailable" => true,
+        "missing_span" | "ref_state_unavailable" | "base_not_on_head_ancestry" => true,
         "artifact_only_change" => artifact_subject_is_source_class(&gap.subject),
         _ => false,
     }
@@ -2045,6 +2118,164 @@ mod tests {
 
         // Missing evidence never certifies a pass.
         assert_ne!(report.policy.verdict, ShadowGateVerdict::Pass);
+    }
+
+    #[test]
+    fn base_off_head_ancestry_reports_loud_gap_not_range_walk() {
+        let graph = InMemoryGraph::new();
+
+        let target_v1 = entity_with_span("routed_target", "src/routed.rs", 4, EntityRole::Source);
+        let mut target_v2 = target_v1.clone();
+        target_v2.signature = "fn routed_target(x: u8)".into();
+        let stray = entity_with_span("stray_entity", "src/stray.rs", 9, EntityRole::Source);
+
+        // Main line: root -> head, fully materializable.
+        let root_id = change_id(0x41);
+        let head_id = change_id(0x42);
+        let root = change_with_deltas(
+            root_id,
+            vec![],
+            vec![EntityDelta::Added(target_v1.clone())],
+            vec![],
+            vec![],
+        );
+        let head = change_with_deltas(
+            head_id,
+            vec![root_id],
+            vec![EntityDelta::Modified {
+                old: target_v1,
+                new: target_v2,
+            }],
+            vec![],
+            vec![],
+        );
+        // Disjoint branch: a change that is NOT on head's ancestry.
+        let disjoint_id = change_id(0x43);
+        let disjoint = change_with_deltas(
+            disjoint_id,
+            vec![],
+            vec![EntityDelta::Added(stray)],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&root).unwrap();
+        graph.create_change(&head).unwrap();
+        graph.create_change(&disjoint).unwrap();
+
+        let report = build_shadow_report(&graph, &request(disjoint_id, head_id)).unwrap();
+
+        let gap = report
+            .evidence_gaps
+            .iter()
+            .find(|gap| gap.kind == "base_not_on_head_ancestry")
+            .expect("a base off the head ancestry must surface as an evidence gap");
+        assert!(gap.detail.contains("not on the ancestry"));
+        assert!(gap.detail.contains(&disjoint_id.to_string()));
+
+        // The range walk is refused: no genesis-spanning diff, no changed
+        // entities, no blast radius, and zero changes in range.
+        assert!(report.changed_entities.is_empty());
+        assert_eq!(report.blast_radius.total_affected, 0);
+        assert_eq!(report.audit.changes_in_range, 0);
+
+        // The specific range gap subsumes the generic empty-impact gap.
+        assert!(!report
+            .evidence_gaps
+            .iter()
+            .any(|gap| gap.kind == "impact_signal_absent"));
+
+        // A range the gate never evaluated is never certified as a pass.
+        assert_ne!(report.policy.verdict, ShadowGateVerdict::Pass);
+
+        // The refusal is deterministic modulo the generation timestamp.
+        let strip = |report: ShadowGateReport| {
+            let mut value = serde_json::to_value(&report).unwrap();
+            value["audit"]["generated_at"] = serde_json::json!(null);
+            value
+        };
+        let second = build_shadow_report(&graph, &request(disjoint_id, head_id)).unwrap();
+        assert_eq!(strip(report), strip(second));
+    }
+
+    #[test]
+    fn merge_head_range_excludes_base_side_history() {
+        let graph = InMemoryGraph::new();
+
+        let stale = entity_with_span("stale_entity", "src/stale.rs", 3, EntityRole::Source);
+        let mainline = entity_with_span("mainline_entity", "src/main.rs", 5, EntityRole::Source);
+        let branch_v1 = entity_with_span("branch_entity", "src/branch.rs", 7, EntityRole::Source);
+        let mut branch_v2 = branch_v1.clone();
+        branch_v2.signature = "fn branch_entity(x: u8)".into();
+
+        // G -> A (base, mainline); G -> B (branch); head merges [A, B]. The
+        // store's backward walk from head reaches G through B because it
+        // only stops at the literal base node, so an unscoped diff would
+        // carry G's deltas — history the base already contains.
+        let genesis_id = change_id(0x51);
+        let base_id = change_id(0x52);
+        let branch_id = change_id(0x53);
+        let head_id = change_id(0x54);
+        let genesis = change_with_deltas(
+            genesis_id,
+            vec![],
+            vec![EntityDelta::Added(stale.clone())],
+            vec![],
+            vec![],
+        );
+        let base = change_with_deltas(
+            base_id,
+            vec![genesis_id],
+            vec![EntityDelta::Added(mainline.clone())],
+            vec![],
+            vec![],
+        );
+        let branch = change_with_deltas(
+            branch_id,
+            vec![genesis_id],
+            vec![EntityDelta::Added(branch_v1.clone())],
+            vec![],
+            vec![],
+        );
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id, branch_id],
+            vec![EntityDelta::Modified {
+                old: branch_v1,
+                new: branch_v2,
+            }],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&genesis).unwrap();
+        graph.create_change(&base).unwrap();
+        graph.create_change(&branch).unwrap();
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+
+        // Only the merged-in side of the range is in scope: two changes
+        // (branch + head), one changed entity.
+        assert_eq!(report.audit.changes_in_range, 2);
+        let changed_names: Vec<&str> = report
+            .changed_entities
+            .iter()
+            .map(|entity| entity.name.as_str())
+            .collect();
+        assert!(changed_names.contains(&"branch_entity"));
+        assert!(
+            !changed_names.contains(&"stale_entity"),
+            "history reachable from the base must not enter the range diff"
+        );
+        assert!(!changed_names.contains(&"mainline_entity"));
+
+        // The scoped range stays deterministic modulo the timestamp.
+        let strip = |report: ShadowGateReport| {
+            let mut value = serde_json::to_value(&report).unwrap();
+            value["audit"]["generated_at"] = serde_json::json!(null);
+            value
+        };
+        let second = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+        assert_eq!(strip(report), strip(second));
     }
 
     #[test]

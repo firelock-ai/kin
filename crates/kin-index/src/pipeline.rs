@@ -126,7 +126,7 @@ impl IndexPipeline {
 
         let adapter = self
             .registry
-            .get_by_extension(ext)
+            .get_by_extension_and_content(ext, source)
             .ok_or_else(|| IndexError::UnsupportedFile(ext.to_string()))?;
         let language = adapter.language_id();
 
@@ -234,13 +234,13 @@ impl IndexPipeline {
             .and_then(|e| e.to_str())
             .ok_or_else(|| IndexError::UnsupportedFile(path.display().to_string()))?;
 
-        let adapter = self
-            .registry
-            .get_by_extension(ext)
-            .ok_or_else(|| IndexError::UnsupportedFile(ext.to_string()))?;
-
         let source =
             std::fs::read(path).map_err(|e| IndexError::io(path.display().to_string(), e))?;
+
+        let adapter = self
+            .registry
+            .get_by_extension_and_content(ext, &source)
+            .ok_or_else(|| IndexError::UnsupportedFile(ext.to_string()))?;
 
         // Store the raw source as a blob
         let blob_hash = blob_store.write(&source)?;
@@ -248,9 +248,13 @@ impl IndexPipeline {
 
         let language = adapter.language_id();
 
-        // Parse: incremental when hints are available, full otherwise
+        // Parse: incremental when hints are available, full otherwise. An
+        // edit can flip a content-disambiguated extension to another
+        // adapter, and an old tree from the other grammar must never seed an
+        // incremental parse — those files always take the full parse.
+        let content_disambiguated = ext == "h";
         let tree = match (old_tree, edit_hint) {
-            (Some(old), Some(hint)) => {
+            (Some(old), Some(hint)) if !content_disambiguated => {
                 debug!(
                     path = %path.display(),
                     start = hint.start_byte,

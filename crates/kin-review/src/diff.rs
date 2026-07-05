@@ -110,9 +110,30 @@ pub fn compute_diff<G: GraphStore>(
     base: &SemanticChangeId,
     head: &SemanticChangeId,
 ) -> Result<SemanticDiff, ReviewError> {
-    let changes = store
+    compute_diff_scoped(store, base, head, |_| true)
+}
+
+/// Compute a semantic diff accumulating only the walked changes `in_range`
+/// accepts, in their walked order.
+///
+/// The store's backward walk stops at the literal base node, not at the
+/// base's ancestors, so on a merge head it crosses into the base's own
+/// history through the other parent and the accumulated diff spans eras the
+/// range never touched. Range-aware callers pass the DAG-true membership
+/// test (reachable from head, not reachable from base) to restore
+/// `base..head` semantics without a storage-layer change.
+pub fn compute_diff_scoped<G: GraphStore>(
+    store: &G,
+    base: &SemanticChangeId,
+    head: &SemanticChangeId,
+    in_range: impl Fn(&SemanticChangeId) -> bool,
+) -> Result<SemanticDiff, ReviewError> {
+    let changes: Vec<_> = store
         .get_changes_since(base, head)
-        .map_err(ReviewError::graph)?;
+        .map_err(ReviewError::graph)?
+        .into_iter()
+        .filter(|change| in_range(&change.id))
+        .collect();
 
     if changes.is_empty() {
         return Err(ReviewError::NoChanges);
