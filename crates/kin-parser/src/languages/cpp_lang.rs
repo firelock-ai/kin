@@ -810,6 +810,29 @@ fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<
     }
 }
 
+/// Strip template-argument lists from a callee path while preserving its
+/// `::` structure: `ratio_string<Ratio>::symbol` → `ratio_string::symbol`.
+/// Template args in a callee name defeat every name index downstream (the
+/// suffix resolver rejects `<`/`>` outright), so the emitted reference must
+/// carry the instantiation-free path. Operator names are kept verbatim —
+/// their angle brackets are not template arguments.
+fn strip_callee_template_args(raw: &str) -> String {
+    if !raw.contains('<') || raw.contains("operator") {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut depth = 0usize;
+    for ch in raw.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            c if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Recursively walk a function/method body to find `call_expression` nodes.
 fn extract_calls_from_body(
     node: &tree_sitter::Node,
@@ -831,6 +854,7 @@ fn extract_calls_from_body(
                     }
                     _ => function.utf8_text(source).unwrap_or("").to_string(),
                 };
+                let callee_name = strip_callee_template_args(&callee_name);
                 if is_valid_callee(&callee_name) {
                     relations.push(ExtractedRelation {
                         kind: kin_model::RelationKind::Calls,
