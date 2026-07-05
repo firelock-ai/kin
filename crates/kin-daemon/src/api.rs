@@ -10418,12 +10418,12 @@ mod tests {
             .extension()
             .and_then(|e| e.to_str())
             .expect("file extension");
-        let adapter = registry
-            .get_by_extension(ext)
-            .expect("language adapter for extension");
-        let language = adapter.language_id();
         let file_id = FilePathId::new(file_path);
         let bytes = source.as_bytes();
+        let adapter = registry
+            .get_by_extension_and_content(ext, bytes)
+            .expect("language adapter for extension");
+        let language = adapter.language_id();
         let tree = adapter.parse(bytes).expect("parse");
         let output = adapter.extract(&tree, bytes, &file_id).expect("extract");
         let entities = output

@@ -1267,6 +1267,7 @@ pub(crate) fn enrich_imported_changes_with_semantics(
 
         if !changed_parse_data.is_empty() {
             let link_start_time = std::time::Instant::now();
+            incremental_linker.record_file_includes(&changed_parse_data);
             let mut new_relations_by_id = HashMap::<RelationId, Relation>::new();
             for relation in
                 kin_index::link_cross_file_incremental(&changed_parse_data, &incremental_linker)
@@ -1728,7 +1729,8 @@ fn index_files_with_stable_entity_ids(
                                 .extension()
                                 .and_then(|e| e.to_str())
                                 .unwrap_or("");
-                            let adapter = match registry.get_by_extension(ext) {
+                            let adapter = match registry.get_by_extension_and_content(ext, &source)
+                            {
                                 Some(adapter) => adapter,
                                 None => return ParsedFileResult::Skipped,
                             };
@@ -2675,8 +2677,9 @@ fn build_incremental_linker_from_graph(
     graph: &kin_db::InMemoryGraph,
 ) -> Result<kin_index::IncrementalLinker> {
     let mut linker = kin_index::IncrementalLinker::new();
-    for path in graph.indexed_file_paths() {
-        linker.known_files.insert(path);
+    let indexed_paths = graph.indexed_file_paths();
+    for path in &indexed_paths {
+        linker.known_files.insert(path.clone());
     }
 
     let mut entities_by_file = BTreeMap::<String, Vec<Entity>>::new();
@@ -2688,6 +2691,31 @@ fn build_incremental_linker_from_graph(
     }
     for (file_path, entities) in entities_by_file {
         linker.add_file(&file_path, &entities);
+    }
+
+    // Rehydrate per-file include state from the committed artifact include
+    // edges so include-closure disambiguation keeps working across reopen —
+    // the reparsed subset alone would only see step-local includes.
+    for path in &indexed_paths {
+        let artifact_node = GraphNodeId::Artifact(artifact_id_for_file(graph, path));
+        let mut targets = Vec::new();
+        for relation in graph.get_all_relations_for_node(&artifact_node)? {
+            if relation.kind != RelationKind::Includes || relation.src != artifact_node {
+                continue;
+            }
+            let GraphNodeId::Artifact(dst_artifact) = relation.dst else {
+                continue;
+            };
+            let Some(dst_path) = graph.path_for_artifact_id(&dst_artifact) else {
+                continue;
+            };
+            targets.push(dst_path.0);
+        }
+        if !targets.is_empty() {
+            targets.sort();
+            targets.dedup();
+            linker.include_targets_by_file.insert(path.clone(), targets);
+        }
     }
 
     Ok(linker)

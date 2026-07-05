@@ -216,6 +216,7 @@ struct LinkContext<'a> {
     entity_by_name: HashMap<&'a str, Vec<(&'a str, EntityId)>>,
     entity_by_bare_name: HashMap<&'a str, Vec<(&'a str, EntityId)>>,
     entity_kind_by_id: HashMap<EntityId, EntityKind>,
+    entity_count_by_file: HashMap<&'a str, usize>,
     known_files: HashSet<&'a str>,
     import_map: HashMap<&'a str, HashMap<&'a str, (&'a str, &'a str)>>,
     include_graph: HashMap<String, Vec<String>>,
@@ -233,7 +234,14 @@ fn build_link_context<'a>(
     };
     // Step 1: Build entity indices
     //   (file_path, entity_name) -> EntityId
-    let (entity_by_file_name, entity_by_name, entity_by_bare_name, entity_kind_by_id, known_files) = {
+    let (
+        entity_by_file_name,
+        entity_by_name,
+        entity_by_bare_name,
+        entity_kind_by_id,
+        entity_count_by_file,
+        known_files,
+    ) = {
         let _span = tracing::info_span!(
             "kin.index.link_cross_file.build_entity_indices",
             universe_entities = sorted_universe.len()
@@ -243,6 +251,7 @@ fn build_link_context<'a>(
         let mut entity_by_name: HashMap<&str, Vec<(&str, EntityId)>> = HashMap::new();
         let mut entity_by_bare_name: HashMap<&str, Vec<(&str, EntityId)>> = HashMap::new();
         let mut entity_kind_by_id: HashMap<EntityId, EntityKind> = HashMap::new();
+        let mut entity_count_by_file: HashMap<&str, usize> = HashMap::new();
         let mut known_files: HashSet<&str> = HashSet::new();
 
         for &entity in &sorted_universe {
@@ -251,6 +260,7 @@ fn build_link_context<'a>(
                 continue;
             };
             known_files.insert(file_path);
+            *entity_count_by_file.entry(file_path).or_insert(0) += 1;
             entity_by_file_name.insert((file_path, &entity.name), entity.id);
             entity_by_name
                 .entry(&*entity.name)
@@ -281,6 +291,7 @@ fn build_link_context<'a>(
             entity_by_name,
             entity_by_bare_name,
             entity_kind_by_id,
+            entity_count_by_file,
             known_files,
         )
     };
@@ -317,6 +328,7 @@ fn build_link_context<'a>(
         entity_by_name,
         entity_by_bare_name,
         entity_kind_by_id,
+        entity_count_by_file,
         known_files,
         import_map,
         include_graph,
@@ -330,8 +342,9 @@ fn build_link_context<'a>(
 fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation> {
     let mut resolved = Vec::new();
     let mut seen: HashSet<(EntityId, EntityId, RelationKind)> = HashSet::new();
-    // Lazily resolved once per file: only ambiguous name buckets need it.
+    // Lazily resolved once per file: only ambiguous name buckets need them.
     let mut caller_import_targets: Option<HashSet<String>> = None;
+    let mut caller_include_closure: Option<HashMap<String, usize>> = None;
 
     for rel in &file.relations {
         let src_id = ctx
@@ -503,10 +516,15 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                 let targets = caller_import_targets.get_or_insert_with(|| {
                     resolve_caller_import_targets(&file.file_path, &file.imports, &ctx.known_files)
                 });
+                let closure = caller_include_closure.get_or_insert_with(|| {
+                    include_closure_depths(&file.file_path, &ctx.include_graph)
+                });
                 match disambiguate_same_name_candidates(
                     &file.file_path,
                     targets,
+                    closure,
                     &other_file_candidates,
+                    |path| ctx.entity_count_by_file.get(path).copied().unwrap_or(0),
                 ) {
                     Some(dst_id) => (dst_id, LOCALITY_DISAMBIGUATED_CONFIDENCE),
                     // No locality signal: keep the historical bucket-order
@@ -739,6 +757,33 @@ fn merge_resolved_serial(
     resolved
 }
 
+/// Resolve the include-like import targets of one file, sorted and deduped.
+///
+/// Shared by batch include-graph construction and the incremental linker's
+/// persistent per-file include state so both record identical edges.
+fn resolve_include_targets<S>(
+    file_path: &str,
+    imports: &[FileImport],
+    known_files: &HashSet<S>,
+) -> Vec<String>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    let mut targets = Vec::new();
+    for import in imports {
+        let Some(resolved_path) = resolve_module_path(file_path, &import.module_path, known_files)
+        else {
+            continue;
+        };
+        if is_include_like_path(&import.module_path) || is_include_like_path(&resolved_path) {
+            targets.push(resolved_path);
+        }
+    }
+    targets.sort();
+    targets.dedup();
+    targets
+}
+
 fn build_include_graph<S>(
     files: &[FileParseData],
     known_files: &HashSet<S>,
@@ -755,18 +800,7 @@ where
     let per_file: Vec<(String, Vec<String>)> = files
         .par_iter()
         .filter_map(|file| {
-            let mut targets = Vec::new();
-            for import in &file.imports {
-                let Some(resolved_path) =
-                    resolve_module_path(&file.file_path, &import.module_path, known_files)
-                else {
-                    continue;
-                };
-                if is_include_like_path(&import.module_path) || is_include_like_path(&resolved_path)
-                {
-                    targets.push(resolved_path);
-                }
-            }
+            let targets = resolve_include_targets(&file.file_path, &file.imports, known_files);
             if targets.is_empty() {
                 None
             } else {
@@ -812,6 +846,40 @@ fn reachable_include_files(
     let mut reachable = seen.into_iter().collect::<Vec<_>>();
     reachable.sort();
     reachable
+}
+
+/// Depth bound for include-closure traversal. Real header trees stay well
+/// inside this; the bound keeps closure construction linear on pathological
+/// include chains.
+const INCLUDE_CLOSURE_MAX_DEPTH: usize = 16;
+
+/// Files reachable through the caller's include edges, keyed by resolved path
+/// with the shortest include distance (1 = directly included).
+///
+/// The walk is level-by-level, so every recorded depth is minimal regardless
+/// of visit order within a level, and cycles terminate on the visited check.
+fn include_closure_depths(
+    caller_file: &str,
+    include_graph: &HashMap<String, Vec<String>>,
+) -> HashMap<String, usize> {
+    let mut depth_by_file: HashMap<String, usize> = HashMap::new();
+    let mut frontier: Vec<String> = include_graph.get(caller_file).cloned().unwrap_or_default();
+    let mut depth = 1usize;
+    while !frontier.is_empty() && depth <= INCLUDE_CLOSURE_MAX_DEPTH {
+        let mut next = Vec::new();
+        for path in frontier {
+            if depth_by_file.contains_key(&path) || path == caller_file {
+                continue;
+            }
+            if let Some(targets) = include_graph.get(&path) {
+                next.extend(targets.iter().cloned());
+            }
+            depth_by_file.insert(path, depth);
+        }
+        frontier = next;
+        depth += 1;
+    }
+    depth_by_file
 }
 
 fn resolve_reachable_macro_target<'a>(
@@ -1096,13 +1164,30 @@ where
 /// Tier 1: exactly one distinct target in the caller's own directory — the
 /// same Go package, or a C-family sibling header/impl pair. Tier 2: exactly
 /// one distinct target among the files the caller itself imports/includes.
-/// Both tiers are count-based over entity-id sets, so bucket insertion order
-/// can never pick the winner. No unique winner → `None`; the caller decides
-/// whether a legacy fallback applies.
+/// Tier 3: exactly one distinct target among the files in the caller's
+/// include closure — a C-family caller reaching a definition through an
+/// umbrella header sees no direct-import signal, but the transitive include
+/// walk pins the defining header.
+///
+/// When several closure candidates remain, the most *specific* defining file
+/// wins: the file defining the fewest entities. An amalgamated single-include
+/// bundles the whole library and so re-defines the symbol alongside thousands
+/// of others, while the focused header that owns it defines a handful —
+/// entity count identifies the authoritative definition site structurally,
+/// without path heuristics. Nearness (minimal include depth) breaks ties only
+/// between equally specific files: an umbrella is *nearer* by construction
+/// (the caller includes it, it includes the focused header), so depth alone
+/// would systematically prefer the bundle.
+///
+/// All tiers are count-based over entity-id sets and integer minima, so
+/// bucket insertion order can never pick the winner. No unique winner →
+/// `None`; the caller decides whether a legacy fallback applies.
 fn disambiguate_same_name_candidates(
     caller_file: &str,
     caller_import_targets: &HashSet<String>,
+    caller_include_closure: &HashMap<String, usize>,
     candidates: &[(&str, EntityId)],
+    defined_entity_count: impl Fn(&str) -> usize,
 ) -> Option<EntityId> {
     let caller_dir = parent_dir(caller_file);
     let mut same_dir: HashSet<EntityId> = HashSet::new();
@@ -1123,6 +1208,48 @@ fn disambiguate_same_name_candidates(
     }
     if imported.len() == 1 {
         return imported.into_iter().next();
+    }
+
+    // Tier 3: candidates whose defining file the caller (transitively)
+    // includes, carried as (id, include depth, defining-file entity count).
+    let mut in_closure: Vec<(EntityId, usize, usize)> = Vec::new();
+    let mut closure_ids: HashSet<EntityId> = HashSet::new();
+    for (candidate_file, candidate_id) in candidates {
+        if let Some(&depth) = caller_include_closure.get(*candidate_file) {
+            in_closure.push((*candidate_id, depth, defined_entity_count(candidate_file)));
+            closure_ids.insert(*candidate_id);
+        }
+    }
+    if closure_ids.len() == 1 {
+        return closure_ids.into_iter().next();
+    }
+    if closure_ids.len() > 1 {
+        let min_count = in_closure
+            .iter()
+            .map(|&(_, _, count)| count)
+            .min()
+            .expect("closure candidates checked non-empty");
+        let specific: Vec<&(EntityId, usize, usize)> = in_closure
+            .iter()
+            .filter(|&&(_, _, count)| count == min_count)
+            .collect();
+        let specific_ids: HashSet<EntityId> = specific.iter().map(|&&(id, _, _)| id).collect();
+        if specific_ids.len() == 1 {
+            return specific_ids.into_iter().next();
+        }
+        let min_depth = specific
+            .iter()
+            .map(|&&(_, depth, _)| depth)
+            .min()
+            .expect("specific candidates checked non-empty");
+        let nearest_ids: HashSet<EntityId> = specific
+            .iter()
+            .filter(|&&&(_, depth, _)| depth == min_depth)
+            .map(|&&(id, _, _)| id)
+            .collect();
+        if nearest_ids.len() == 1 {
+            return nearest_ids.into_iter().next();
+        }
     }
     None
 }
@@ -1886,6 +2013,12 @@ pub struct IncrementalLinker {
     pub known_files: HashSet<String>,
     /// file_path -> Vec<(EntityId, Visibility)>
     pub entities_by_file: HashMap<String, Vec<(EntityId, Visibility)>>,
+    /// file_path -> resolved include targets (sorted, deduped).
+    ///
+    /// Evolves across steps alongside the entity indexes so include-closure
+    /// walks see edges recorded when other files were parsed, not only the
+    /// step-local ones.
+    pub include_targets_by_file: HashMap<String, Vec<String>>,
 }
 
 impl IncrementalLinker {
@@ -1896,6 +2029,7 @@ impl IncrementalLinker {
             entity_kind_by_id: HashMap::new(),
             known_files: HashSet::new(),
             entities_by_file: HashMap::new(),
+            include_targets_by_file: HashMap::new(),
         }
     }
 
@@ -1916,6 +2050,25 @@ impl IncrementalLinker {
         }
 
         self.entities_by_file.remove(file_path);
+        self.include_targets_by_file.remove(file_path);
+    }
+
+    /// Record the resolved include targets of each file, replacing any prior
+    /// entry (a file whose includes all resolved away is cleared).
+    ///
+    /// Call after the step's entity indexes are up to date so module
+    /// resolution sees every file known at this point in history.
+    pub fn record_file_includes(&mut self, files: &[FileParseData]) {
+        for file in files {
+            let targets =
+                resolve_include_targets(&file.file_path, &file.imports, &self.known_files);
+            if targets.is_empty() {
+                self.include_targets_by_file.remove(&file.file_path);
+            } else {
+                self.include_targets_by_file
+                    .insert(file.file_path.clone(), targets);
+            }
+        }
     }
 
     /// Add or update a file and its entities in the indexes.
@@ -1996,7 +2149,20 @@ pub fn link_cross_file_incremental(
 
     let mut resolved = Vec::new();
     let mut seen: HashSet<(EntityId, EntityId, RelationKind)> = HashSet::new();
-    let include_graph = build_include_graph(files, &linker.known_files);
+    // Step-local include edges overlay the linker's persistent per-file
+    // include state: files parsed this step resolve fresh (including files
+    // that dropped every include), every other file keeps the edges recorded
+    // when it was last parsed. Closure walks therefore cross step boundaries.
+    let include_graph = {
+        let mut merged = linker.include_targets_by_file.clone();
+        for file in files {
+            merged.remove(&file.file_path);
+        }
+        for (file_path, targets) in build_include_graph(files, &linker.known_files) {
+            merged.insert(file_path, targets);
+        }
+        merged
+    };
 
     let total_files = files.len();
     let progress_interval = std::cmp::max(total_files / 50, 1);
@@ -2013,8 +2179,9 @@ pub fn link_cross_file_incremental(
                 link_start.elapsed().as_secs_f64()
             );
         }
-        // Lazily resolved once per file: only ambiguous name buckets need it.
+        // Lazily resolved once per file: only ambiguous name buckets need them.
         let mut caller_import_targets: Option<HashSet<String>> = None;
+        let mut caller_include_closure: Option<HashMap<String, usize>> = None;
         for rel in &file.relations {
             let src_id = linker
                 .entity_by_file_name
@@ -2190,10 +2357,21 @@ pub fn link_cross_file_incremental(
                             &linker.known_files,
                         )
                     });
+                    let closure = caller_include_closure.get_or_insert_with(|| {
+                        include_closure_depths(&file.file_path, &include_graph)
+                    });
                     match disambiguate_same_name_candidates(
                         &file.file_path,
                         targets,
+                        closure,
                         &other_file_candidates,
+                        |path| {
+                            linker
+                                .entities_by_file
+                                .get(path)
+                                .map(|entities| entities.len())
+                                .unwrap_or(0)
+                        },
                     ) {
                         Some(dst_id) => (dst_id, LOCALITY_DISAMBIGUATED_CONFIDENCE),
                         // No locality signal: keep the historical bucket-order
@@ -4276,5 +4454,352 @@ void f();
             .expect("impl file must resolve into its sibling header");
         assert_eq!(edge.confidence, LOCALITY_DISAMBIGUATED_CONFIDENCE);
         assert!(find_calls_edge(&result, &caller, &bundled).is_none());
+    }
+
+    fn cpp_entity(name: &str, file_path: &str) -> Entity {
+        let mut e = make_entity(name, file_path);
+        e.language = LanguageId::Cpp;
+        e
+    }
+
+    fn include_import(module_path: &str) -> FileImport {
+        FileImport {
+            module_path: module_path.to_string(),
+            specifiers: vec![],
+        }
+    }
+
+    /// A caller reaching a definition through an umbrella header has no
+    /// direct-import signal for the defining file; the transitive include
+    /// closure must pin it over a same-named duplicate elsewhere.
+    #[test]
+    fn cpp_include_closure_resolves_transitive_header_target() {
+        let bundled = cpp_entity("convert", "single_include/catch2/catch.hpp");
+        let target = cpp_entity("convert", "include/internal/catch_tostring.h");
+        let caller = cpp_entity("TestToString", "projects/SelfTest/ToStringTests.cpp");
+
+        let files = vec![
+            // Bundled duplicate first: bucket order would pick it without the
+            // closure signal.
+            FileParseData {
+                file_path: "single_include/catch2/catch.hpp".to_string(),
+                entities: vec![bundled.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "include/internal/catch_tostring.h".to_string(),
+                entities: vec![target.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "include/catch.hpp".to_string(),
+                entities: vec![],
+                relations: vec![],
+                imports: vec![include_import("internal/catch_tostring.h")],
+            },
+            FileParseData {
+                file_path: "projects/SelfTest/ToStringTests.cpp".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![calls_relation("TestToString", "convert")],
+                imports: vec![include_import("catch.hpp")],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let edge = find_calls_edge(&result, &caller, &target)
+            .expect("include closure must resolve the transitively included header");
+        assert_eq!(edge.confidence, LOCALITY_DISAMBIGUATED_CONFIDENCE);
+        assert!(
+            find_calls_edge(&result, &caller, &bundled).is_none(),
+            "closure-resolved call must not bind to the bundled duplicate"
+        );
+    }
+
+    /// When both the amalgamated single include and the focused header sit in
+    /// the caller's closure, the focused header (fewer defined entities) wins.
+    #[test]
+    fn cpp_umbrella_duplicate_loses_to_specific_header_in_closure() {
+        let bundled = cpp_entity("Session", "single_include/catch2/catch.hpp");
+        let bundled_extra_a = cpp_entity("Approx", "single_include/catch2/catch.hpp");
+        let bundled_extra_b = cpp_entity("AutoReg", "single_include/catch2/catch.hpp");
+        let target = cpp_entity("Session", "include/internal/catch_session.h");
+        let caller = cpp_entity("runMain", "projects/SelfTest/MainTests.cpp");
+
+        let files = vec![
+            FileParseData {
+                file_path: "single_include/catch2/catch.hpp".to_string(),
+                entities: vec![bundled.clone(), bundled_extra_a, bundled_extra_b],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "include/internal/catch_session.h".to_string(),
+                entities: vec![target.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "projects/SelfTest/MainTests.cpp".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![calls_relation("runMain", "Session")],
+                imports: vec![
+                    include_import("catch2/catch.hpp"),
+                    include_import("internal/catch_session.h"),
+                ],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let edge = find_calls_edge(&result, &caller, &target)
+            .expect("focused header must win over the amalgamated duplicate");
+        assert_eq!(edge.confidence, LOCALITY_DISAMBIGUATED_CONFIDENCE);
+        assert!(
+            find_calls_edge(&result, &caller, &bundled).is_none(),
+            "amalgamated single include must lose to the focused header"
+        );
+    }
+
+    /// Same-named candidates in headers the caller never includes carry no
+    /// closure signal; the historical first-bucket pick must survive.
+    #[test]
+    fn cpp_closure_ambiguity_without_signal_keeps_first_candidate() {
+        let first = cpp_entity("format", "alpha/format.hpp");
+        let second = cpp_entity("format", "beta/format.hpp");
+        let caller = cpp_entity("render", "src/render.cpp");
+
+        let files = vec![
+            FileParseData {
+                file_path: "alpha/format.hpp".to_string(),
+                entities: vec![first.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "beta/format.hpp".to_string(),
+                entities: vec![second.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/other.hpp".to_string(),
+                entities: vec![],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/render.cpp".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![calls_relation("render", "format")],
+                imports: vec![include_import("src/other.hpp")],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let edge = find_calls_edge(&result, &caller, &first)
+            .expect("signal-less closure ambiguity keeps the historical first-bucket pick");
+        assert_eq!(edge.confidence, 0.7);
+    }
+
+    /// Incremental counterpart of the transitive-closure test: the umbrella's
+    /// include edge was recorded in an earlier step, so resolution must walk
+    /// the linker's persistent include state, not only the step-local edges.
+    #[test]
+    fn incremental_include_closure_resolves_transitive_header_target() {
+        let bundled = cpp_entity("convert", "single_include/catch2/catch.hpp");
+        let target = cpp_entity("convert", "include/internal/catch_tostring.h");
+        let caller = cpp_entity("TestToString", "projects/SelfTest/ToStringTests.cpp");
+
+        let mut linker = IncrementalLinker::new();
+        // Bundled duplicate first: bucket order would pick it without the
+        // closure signal.
+        linker.add_file(
+            "single_include/catch2/catch.hpp",
+            std::slice::from_ref(&bundled),
+        );
+        linker.add_file(
+            "include/internal/catch_tostring.h",
+            std::slice::from_ref(&target),
+        );
+        linker.add_file("include/catch.hpp", &[]);
+        linker.add_file(
+            "projects/SelfTest/ToStringTests.cpp",
+            std::slice::from_ref(&caller),
+        );
+        // Earlier step: the umbrella header was parsed and its include edge
+        // recorded into persistent state.
+        linker.record_file_includes(&[FileParseData {
+            file_path: "include/catch.hpp".to_string(),
+            entities: vec![],
+            relations: vec![],
+            imports: vec![include_import("internal/catch_tostring.h")],
+        }]);
+
+        // Later step: only the caller is (re)parsed.
+        let files = vec![FileParseData {
+            file_path: "projects/SelfTest/ToStringTests.cpp".to_string(),
+            entities: vec![caller.clone()],
+            relations: vec![calls_relation("TestToString", "convert")],
+            imports: vec![include_import("catch.hpp")],
+        }];
+
+        let result = link_cross_file_incremental(&files, &linker);
+        let edge = find_calls_edge(&result, &caller, &target)
+            .expect("persistent include state must resolve the transitive header");
+        assert_eq!(edge.confidence, LOCALITY_DISAMBIGUATED_CONFIDENCE);
+        assert!(find_calls_edge(&result, &caller, &bundled).is_none());
+    }
+
+    /// Incremental counterpart of the umbrella-specificity test, with the
+    /// defining-file entity counts served by the incremental indexes.
+    #[test]
+    fn incremental_umbrella_duplicate_loses_to_specific_header_in_closure() {
+        let bundled = cpp_entity("Session", "single_include/catch2/catch.hpp");
+        let bundled_extra_a = cpp_entity("Approx", "single_include/catch2/catch.hpp");
+        let bundled_extra_b = cpp_entity("AutoReg", "single_include/catch2/catch.hpp");
+        let target = cpp_entity("Session", "include/internal/catch_session.h");
+        let caller = cpp_entity("runMain", "projects/SelfTest/MainTests.cpp");
+
+        let mut linker = IncrementalLinker::new();
+        linker.add_file(
+            "single_include/catch2/catch.hpp",
+            &[bundled.clone(), bundled_extra_a, bundled_extra_b],
+        );
+        linker.add_file(
+            "include/internal/catch_session.h",
+            std::slice::from_ref(&target),
+        );
+        linker.add_file(
+            "projects/SelfTest/MainTests.cpp",
+            std::slice::from_ref(&caller),
+        );
+
+        let files = vec![FileParseData {
+            file_path: "projects/SelfTest/MainTests.cpp".to_string(),
+            entities: vec![caller.clone()],
+            relations: vec![calls_relation("runMain", "Session")],
+            imports: vec![
+                include_import("catch2/catch.hpp"),
+                include_import("internal/catch_session.h"),
+            ],
+        }];
+
+        let result = link_cross_file_incremental(&files, &linker);
+        let edge = find_calls_edge(&result, &caller, &target)
+            .expect("incremental focused header must win over the amalgamated duplicate");
+        assert_eq!(edge.confidence, LOCALITY_DISAMBIGUATED_CONFIDENCE);
+        assert!(find_calls_edge(&result, &caller, &bundled).is_none());
+    }
+
+    /// Persistent include state must evolve with reparses: when the umbrella
+    /// drops its include of the focused header, the closure signal disappears
+    /// and the legacy bucket-order pick returns — no edge is lost.
+    #[test]
+    fn incremental_include_state_evolves_with_reparse() {
+        let bundled = cpp_entity("convert", "single_include/catch2/catch.hpp");
+        let target = cpp_entity("convert", "include/internal/catch_tostring.h");
+        let caller = cpp_entity("TestToString", "projects/SelfTest/ToStringTests.cpp");
+
+        let mut linker = IncrementalLinker::new();
+        linker.add_file(
+            "single_include/catch2/catch.hpp",
+            std::slice::from_ref(&bundled),
+        );
+        linker.add_file(
+            "include/internal/catch_tostring.h",
+            std::slice::from_ref(&target),
+        );
+        linker.add_file("include/catch.hpp", &[]);
+        linker.add_file(
+            "projects/SelfTest/ToStringTests.cpp",
+            std::slice::from_ref(&caller),
+        );
+        linker.record_file_includes(&[FileParseData {
+            file_path: "include/catch.hpp".to_string(),
+            entities: vec![],
+            relations: vec![],
+            imports: vec![include_import("internal/catch_tostring.h")],
+        }]);
+
+        let caller_step = vec![FileParseData {
+            file_path: "projects/SelfTest/ToStringTests.cpp".to_string(),
+            entities: vec![caller.clone()],
+            relations: vec![calls_relation("TestToString", "convert")],
+            imports: vec![include_import("catch.hpp")],
+        }];
+
+        let before = link_cross_file_incremental(&caller_step, &linker);
+        assert!(
+            find_calls_edge(&before, &caller, &target).is_some(),
+            "closure signal must resolve the focused header before the reparse"
+        );
+
+        // Later step: the umbrella is reparsed without the include.
+        linker.record_file_includes(&[FileParseData {
+            file_path: "include/catch.hpp".to_string(),
+            entities: vec![],
+            relations: vec![],
+            imports: vec![],
+        }]);
+
+        let after = link_cross_file_incremental(&caller_step, &linker);
+        let edge = find_calls_edge(&after, &caller, &bundled)
+            .expect("losing the closure signal falls back to the first-bucket pick");
+        assert_eq!(edge.confidence, 0.7);
+        assert!(find_calls_edge(&after, &caller, &target).is_none());
+    }
+
+    /// The closure walk is depth-bounded: a definition past the bound carries
+    /// no signal, so the legacy pick survives instead of an unbounded scan.
+    #[test]
+    fn include_closure_depth_is_bounded() {
+        let decoy = cpp_entity("probe", "aux/probe.hpp");
+        let chain_len = INCLUDE_CLOSURE_MAX_DEPTH + 1;
+        let deep_file = format!("chain/h{:02}.hpp", chain_len - 1);
+        let deep = cpp_entity("probe", &deep_file);
+        let caller = cpp_entity("drive", "src/drive.cpp");
+
+        let mut files = vec![
+            FileParseData {
+                file_path: "aux/probe.hpp".to_string(),
+                entities: vec![decoy.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/drive.cpp".to_string(),
+                entities: vec![caller.clone()],
+                relations: vec![calls_relation("drive", "probe")],
+                imports: vec![include_import("chain/h00.hpp")],
+            },
+        ];
+        // h00 -> h01 -> ... -> h{chain_len-1}; the caller reaches h00 at depth
+        // 1, so the deep definition sits at depth chain_len, past the bound.
+        for i in 0..chain_len {
+            let file_path = format!("chain/h{i:02}.hpp");
+            let entities = if i == chain_len - 1 {
+                vec![deep.clone()]
+            } else {
+                vec![]
+            };
+            let imports = if i + 1 < chain_len {
+                vec![include_import(&format!("chain/h{:02}.hpp", i + 1))]
+            } else {
+                vec![]
+            };
+            files.push(FileParseData {
+                file_path,
+                entities,
+                relations: vec![],
+                imports,
+            });
+        }
+
+        let result = link_cross_file(&files);
+        let edge = find_calls_edge(&result, &caller, &decoy)
+            .expect("definition past the closure bound keeps the historical pick");
+        assert_eq!(edge.confidence, 0.7);
+        assert!(find_calls_edge(&result, &caller, &deep).is_none());
     }
 }
