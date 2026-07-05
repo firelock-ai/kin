@@ -117,6 +117,23 @@ impl<'a, G: GraphStore> GraphAtRef<'a, G> {
         &self.ancestry
     }
 
+    /// Whether the committed state at this ref anchors any entity in `file`,
+    /// by source span or file origin. Distinguishes an inert edit of a real
+    /// source file — entities captured at head, none altered in this range —
+    /// from an unparsed artifact the graph never captured entities for.
+    pub fn has_entity_in_file(&self, file: &str) -> bool {
+        self.entities.values().any(|entity| {
+            entity
+                .span
+                .as_ref()
+                .is_some_and(|span| span.file.to_string() == file)
+                || entity
+                    .file_origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.to_string() == file)
+        })
+    }
+
     fn from_state(
         live: &'a G,
         at: SemanticChangeId,
