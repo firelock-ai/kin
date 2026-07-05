@@ -52,12 +52,13 @@ impl InlineCommentKind {
     }
 }
 
-/// Distinct non-test consumer files at or above which a body-only
+/// Distinct non-test consumer ENTITIES at or above which a body-only
 /// modification (signature and visibility unchanged) emits a consumer-fanout
-/// attention comment. Body changes below this fanout stay silent: the
-/// signature channels own contract-surface changes, and a body edit consumed
-/// from a single file is ordinary local iteration.
-pub const CONSUMER_FANOUT_FILE_THRESHOLD: usize = 2;
+/// attention comment. The decision is graph-native — it counts consuming
+/// entities (typed inbound edges), not the files they happen to live in; a body
+/// change reaching a single consumer is ordinary local iteration. The signature
+/// channels own contract-surface changes.
+pub const CONSUMER_FANOUT_THRESHOLD: usize = 2;
 
 /// Collect line-level inline comments from a review's diff and impact data.
 ///
@@ -257,10 +258,12 @@ fn collect_modified_comments(
 
     // Body-only modification with wide consumer fanout. The contract surface
     // is unchanged, so the breaking channels stay silent, but a behavior
-    // change consumed from many distinct non-test files deserves attention.
+    // change reaching many distinct non-test consumer entities deserves
+    // attention. Decided on the graph-native consumer entity count; the file
+    // list is reported only as human-readable context.
     if old.signature == new.signature
         && old.visibility == new.visibility
-        && consumer_file_count >= CONSUMER_FANOUT_FILE_THRESHOLD
+        && consumer_count >= CONSUMER_FANOUT_THRESHOLD
     {
         comments.push(InlineComment {
             file: span.file.to_string(),
@@ -268,8 +271,8 @@ fn collect_modified_comments(
             end_line: span.end_line,
             kind: InlineCommentKind::ConsumerFanout,
             message: format!(
-                "Behavior of `{}` changed with {} distinct non-test consumer file(s)",
-                new.name, consumer_file_count,
+                "Behavior of `{}` changed with {} distinct non-test consumer(s) across {} file(s)",
+                new.name, consumer_count, consumer_file_count,
             ),
         });
     }
@@ -684,8 +687,8 @@ mod tests {
 
     #[test]
     fn consumer_fanout_fires_on_body_change_at_threshold() {
-        // Body-only modification (signature and visibility unchanged)
-        // consumed from two distinct non-test files -> attention comment.
+        // Body-only modification (signature and visibility unchanged) reaching
+        // two distinct non-test consumer entities -> attention comment.
         let old = test_entity_with_span("hot_path", "src/hot.rs", 1, 20);
         let new = old.clone();
 
@@ -721,6 +724,54 @@ mod tests {
             .collect();
         assert_eq!(fanout.len(), 1);
         assert!(fanout[0].message.contains("2 distinct non-test consumer"));
+    }
+
+    #[test]
+    fn consumer_fanout_decides_on_entity_count_not_file_count() {
+        // Two distinct consumer entities that live in the SAME file: one file,
+        // two entities. The fanout decision is graph-native — it keys on the
+        // consumer ENTITY count (2 >= threshold), so it fires even though the
+        // consumers project onto a single file. A file-count decision would
+        // have stayed silent here; that is exactly the file-first behavior this
+        // rule must not have.
+        let old = test_entity_with_span("hot_path", "src/hot.rs", 1, 20);
+        let new = old.clone();
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 2,
+                contract_consumer_count: 0,
+                // Both consumers in one file: file count (1) is below threshold,
+                // entity count (2) is at it.
+                consumer_files: vec!["src/shared.rs".to_string()],
+                covering_tests: 0,
+            }],
+            ..Default::default()
+        };
+        let comments = collect_inline_comments(&diff, &impact);
+        let fanout: Vec<&InlineComment> = comments
+            .iter()
+            .filter(|c| c.kind == InlineCommentKind::ConsumerFanout)
+            .collect();
+        assert_eq!(
+            fanout.len(),
+            1,
+            "fanout fires on 2 consumer entities even though they share one file"
+        );
+        assert!(fanout[0]
+            .message
+            .contains("2 distinct non-test consumer(s) across 1 file(s)"));
     }
 
     #[test]

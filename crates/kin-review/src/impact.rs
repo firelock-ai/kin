@@ -256,14 +256,12 @@ pub fn analyze_impact_at<I: ImpactGraph>(
         let mut ent_consumers: HashSet<EntityId> = HashSet::new();
         let mut ent_contract_consumers: HashSet<EntityId> = HashSet::new();
         let mut ent_tests: HashSet<EntityId> = HashSet::new();
+        // `consumer_files` is the human-readable projection of the consumer
+        // ENTITY set below (which the fanout decision keys on) — the files those
+        // consuming entities live in, for the report message only. It is never a
+        // decision input: a consumer that happens to share the changed entity's
+        // file is still a distinct consumer entity with a real inbound edge.
         let mut ent_consumer_files: BTreeSet<String> = BTreeSet::new();
-
-        // The changed entity's own source file. Consumer-fanout counts
-        // DISTINCT EXTERNAL consumer files, so a sibling consumer living in
-        // the same file is ordinary local iteration, not fanout: its file is
-        // excluded from the set below. A removed entity is absent at the ref
-        // and has no own file, so nothing is excluded for it.
-        let changed_own_file = graph.get_entity(&entity_id)?.as_ref().and_then(entity_file);
 
         // Find relations pointing TO this entity (callers, dependents, etc.).
         // `get_relations` serves outgoing edges only, so the inbound harvest
@@ -308,11 +306,7 @@ pub fn analyze_impact_at<I: ImpactGraph>(
                         ent_contract_consumers.insert(affected_id);
                     }
                     if let Some(file) = entity_file(&entity) {
-                        // A consumer in the changed entity's own file is not
-                        // fanout; only distinct EXTERNAL consumer files count.
-                        if Some(&file) != changed_own_file.as_ref() {
-                            ent_consumer_files.insert(file);
-                        }
+                        ent_consumer_files.insert(file);
                     }
                 }
                 match rel.kind {
@@ -732,12 +726,13 @@ mod tests {
     }
 
     #[test]
-    fn consumer_files_exclude_the_changed_entitys_own_file() {
-        // A (changed) in src/foo.rs is consumed by a same-file sibling B and
-        // by an external C in src/bar.rs. Fanout counts DISTINCT EXTERNAL
-        // consumer files, so A's own file must not count — only src/bar.rs.
-        // Before this fix the own file counted and a self-contained change
-        // could trip fanout.
+    fn consumer_count_is_entity_native_including_a_same_file_consumer() {
+        // A (changed) in src/foo.rs is consumed by a same-file sibling B and by
+        // an external C in src/bar.rs. Both B and C are distinct consumer
+        // ENTITIES with real inbound edges, so both count — the fanout decision
+        // is graph-native and never special-cases a consumer by the file it
+        // lives in. `consumer_files` is the reported projection of that entity
+        // set (both files), used only for the message, never for the decision.
         let a = entity_in_file("hot_path", "src/foo.rs", 1);
         let b = entity_in_file("sibling", "src/foo.rs", 40);
         let c = entity_in_file("external", "src/bar.rs", 1);
@@ -758,13 +753,13 @@ mod tests {
         let report = analyze_impact_at(&graph, &diff).unwrap();
         let impact_a = report.entity_impact(&a.id).expect("A has an impact entry");
         assert_eq!(
-            impact_a.consumer_files,
-            vec!["src/bar.rs".to_string()],
-            "the changed entity's own file is not a fanout consumer file"
+            impact_a.consumer_count, 2,
+            "both consumer entities count, regardless of the file they live in"
         );
         assert_eq!(
-            impact_a.consumer_count, 2,
-            "both consumers still count toward consumer_count; only the file set drops the own file"
+            impact_a.consumer_files,
+            vec!["src/bar.rs".to_string(), "src/foo.rs".to_string()],
+            "consumer_files is the projected file set of the consumer entities (both), report-only"
         );
     }
 }
