@@ -14,6 +14,7 @@
   ],
   "scripts": {
     "test": "node --test",
+    "test:unit": "node --test ./test/index.test.js",
     "lint": "node --check ./bin/kin-mcp.js && node --check ./src/index.js && node --check ./test/index.test.js && node --check ./test/smoke-first-run.mjs",
     "smoke": "node ./test/smoke-first-run.mjs"
   },

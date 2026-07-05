@@ -65,8 +65,10 @@ jobs:
       - name: Test @kinlab/kin (canonical launcher)
         run: npm test --prefix ./packages/kin && npm run lint --prefix ./packages/kin
 
+      # test:unit, not test: full `node --test` discovery pulls in the first-run
+      # smoke, which requires a built kin binary a fresh CI runner does not have.
       - name: Test @kinlab/kin-mcp (compatibility wrapper)
-        run: npm test --prefix ./packages/kin-mcp && npm run lint --prefix ./packages/kin-mcp
+        run: npm run test:unit --prefix ./packages/kin-mcp && npm run lint --prefix ./packages/kin-mcp
 
   check:
     name: Check & Test
