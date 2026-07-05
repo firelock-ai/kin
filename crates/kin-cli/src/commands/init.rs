@@ -1076,18 +1076,108 @@ impl ImportedSemanticFileState {
     }
 }
 
+/// Per-commit semantic accumulator state: file entities, cross-file relations
+/// (plus their src indexes), and the incremental linker index. Historical
+/// ingest forks a fresh copy of this state from each commit's FIRST git parent,
+/// so a commit's entity and relation deltas are computed against its true DAG
+/// parent rather than the linearized running state of an interleaved
+/// commit-time walk.
+struct ImportedCommitSemanticState {
+    files: HashMap<String, ImportedSemanticFileState>,
+    relations: HashMap<RelationId, Relation>,
+    relations_by_src: HashMap<EntityId, HashSet<RelationId>>,
+    relations_by_src_artifact: HashMap<ArtifactId, HashSet<RelationId>>,
+    linker: kin_index::IncrementalLinker,
+}
+
+impl Default for ImportedCommitSemanticState {
+    fn default() -> Self {
+        Self {
+            files: HashMap::new(),
+            relations: HashMap::new(),
+            relations_by_src: HashMap::new(),
+            relations_by_src_artifact: HashMap::new(),
+            linker: kin_index::IncrementalLinker::new(),
+        }
+    }
+}
+
+impl Clone for ImportedCommitSemanticState {
+    fn clone(&self) -> Self {
+        Self {
+            files: self.files.clone(),
+            relations: self.relations.clone(),
+            relations_by_src: self.relations_by_src.clone(),
+            relations_by_src_artifact: self.relations_by_src_artifact.clone(),
+            // `IncrementalLinker` derives no `Clone`; its fields are all public
+            // and cloneable, so copy them explicitly. A new field there makes
+            // this fail to compile (fail loud) rather than silently drop linker
+            // state from a forked baseline.
+            linker: kin_index::IncrementalLinker {
+                entity_by_file_name: self.linker.entity_by_file_name.clone(),
+                entity_by_name: self.linker.entity_by_name.clone(),
+                entity_kind_by_id: self.linker.entity_kind_by_id.clone(),
+                known_files: self.linker.known_files.clone(),
+                entities_by_file: self.linker.entities_by_file.clone(),
+                include_targets_by_file: self.linker.include_targets_by_file.clone(),
+            },
+        }
+    }
+}
+
+/// Deterministic topological order over the first-parent forest.
+///
+/// `first_parent_index[c]` is the slice index of commit `c`'s first git parent
+/// when that parent is itself in the imported set (`None` for a root or a parent
+/// below the import horizon). Each commit has at most one in-set first parent,
+/// so "process a commit after its first parent" is a forest constraint; Kahn's
+/// algorithm seeded and drained in ascending index order yields a stable order
+/// in which every commit follows its first parent, staying as close as possible
+/// to the input order. Any commit left unvisited by an (impossible for git)
+/// cycle is appended in index order so no commit is silently dropped.
+fn first_parent_topological_order(first_parent_index: &[Option<usize>]) -> Vec<usize> {
+    let n = first_parent_index.len();
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut indegree = vec![0usize; n];
+    for (child, parent) in first_parent_index.iter().enumerate() {
+        if let Some(parent) = *parent {
+            children[parent].push(child);
+            indegree[child] += 1;
+        }
+    }
+
+    let mut queue: std::collections::VecDeque<usize> =
+        (0..n).filter(|&i| indegree[i] == 0).collect();
+    let mut order = Vec::with_capacity(n);
+    let mut seen = vec![false; n];
+    while let Some(i) = queue.pop_front() {
+        if seen[i] {
+            continue;
+        }
+        seen[i] = true;
+        order.push(i);
+        for &child in &children[i] {
+            indegree[child] -= 1;
+            if indegree[child] == 0 {
+                queue.push_back(child);
+            }
+        }
+    }
+    for (i, visited) in seen.iter().enumerate() {
+        if !visited {
+            order.push(i);
+        }
+    }
+    order
+}
+
 pub(crate) fn enrich_imported_changes_with_semantics(
     imported: &mut [kin_git::ImportedChange],
     blob_store: &kin_blobs::BlobStore,
 ) -> Result<()> {
     let pipeline = kin_index::IndexPipeline::new();
-    let mut current_files = HashMap::<String, ImportedSemanticFileState>::new();
-    let mut current_relations = HashMap::<RelationId, Relation>::new();
-    let mut relations_by_src = HashMap::<EntityId, HashSet<RelationId>>::new();
-    let mut relations_by_src_artifact = HashMap::<ArtifactId, HashSet<RelationId>>::new();
-    let mut incremental_linker = kin_index::IncrementalLinker::new();
 
-    // Profiling timers
+    // Profiling timers (accumulated across every commit in the pass).
     let mut total_blob_read_time = std::time::Duration::ZERO;
     let mut total_parsing_time = std::time::Duration::ZERO;
     let mut total_linking_time = std::time::Duration::ZERO;
@@ -1096,25 +1186,86 @@ pub(crate) fn enrich_imported_changes_with_semantics(
     let total_commits = imported.len();
     let start_time = std::time::Instant::now();
 
-    for (i, imported_change) in imported.iter_mut().enumerate() {
+    // Resolve each imported commit's FIRST git parent to an in-set slice index.
+    // kin-git derives a commit's artifact deltas by diffing its tree against its
+    // first parent's tree, so the first parent's semantic state is the correct
+    // baseline for that commit's entity and relation deltas. Diffing against a
+    // linearized commit-time running map instead attributes an interleaved
+    // sibling commit's entities/signatures to the wrong commit on a non-linear
+    // history (merges or branch interleaving), producing phantom deltas at
+    // historical refs.
+    let mut index_by_change_id = HashMap::<SemanticChangeId, usize>::with_capacity(total_commits);
+    for (i, imported_change) in imported.iter().enumerate() {
+        index_by_change_id.insert(imported_change.change.id, i);
+    }
+    let first_parent_index: Vec<Option<usize>> = imported
+        .iter()
+        .map(|imported_change| {
+            imported_change
+                .change
+                .parents
+                .first()
+                .and_then(|parent| index_by_change_id.get(parent).copied())
+        })
+        .collect();
+
+    // Count how many in-set commits fork from each commit as their first parent,
+    // so a commit's snapshot is retained only while children still need it. This
+    // bounds live snapshots to the DAG's branch width, not the whole history.
+    let mut remaining_children = vec![0usize; total_commits];
+    for parent in first_parent_index.iter().flatten() {
+        remaining_children[*parent] += 1;
+    }
+
+    let order = first_parent_topological_order(&first_parent_index);
+    let mut snapshots = HashMap::<SemanticChangeId, ImportedCommitSemanticState>::new();
+
+    for (processed, &i) in order.iter().enumerate() {
         if total_commits > 0 {
-            let percent = ((i + 1) * 100) / total_commits;
-            let short_oid: String = imported_change.git_oid.chars().take(7).collect();
+            let percent = ((processed + 1) * 100) / total_commits;
+            let short_oid: String = imported[i].git_oid.chars().take(7).collect();
             eprint!(
                 "\r  Hydrating History: [{}/{}] {}% | Commit: {} | {:.1}s",
-                i + 1,
+                processed + 1,
                 total_commits,
                 percent,
                 short_oid,
                 start_time.elapsed().as_secs_f64()
             );
         }
+
+        // Fork this commit's baseline from its first parent's resulting state.
+        // The parent's last child moves the snapshot (zero-copy, so a purely
+        // linear history keeps the original single-accumulator cost); earlier
+        // children clone it. Roots and below-horizon parents start from empty
+        // state. Then rebind the forked accumulators into the names the
+        // per-commit body below already uses.
+        let baseline = match first_parent_index[i] {
+            Some(parent_idx) => {
+                remaining_children[parent_idx] -= 1;
+                let parent_id = imported[parent_idx].change.id;
+                if remaining_children[parent_idx] == 0 {
+                    snapshots.remove(&parent_id).unwrap_or_default()
+                } else {
+                    snapshots.get(&parent_id).cloned().unwrap_or_default()
+                }
+            }
+            None => ImportedCommitSemanticState::default(),
+        };
+        let ImportedCommitSemanticState {
+            files: mut current_files,
+            relations: mut current_relations,
+            mut relations_by_src,
+            mut relations_by_src_artifact,
+            linker: mut incremental_linker,
+        } = baseline;
+
         let mut entity_deltas = Vec::new();
         let mut relation_deltas = Vec::new();
         let mut changed_source_files = BTreeSet::<String>::new();
         let mut previous_file_states = HashMap::<String, ImportedSemanticFileState>::new();
 
-        for artifact_delta in &imported_change.change.artifact_deltas {
+        for artifact_delta in &imported[i].change.artifact_deltas {
             let file_path = artifact_delta.file_id.0.clone();
             let old_state = current_files.get(&file_path).cloned();
             if let Some(old_state) = &old_state {
@@ -1331,8 +1482,23 @@ pub(crate) fn enrich_imported_changes_with_semantics(
             RelationDelta::Added(relation) => relation.id.0,
             RelationDelta::Removed(relation_id) => relation_id.0,
         });
-        imported_change.change.entity_deltas = entity_deltas;
-        imported_change.change.relation_deltas = relation_deltas;
+        imported[i].change.entity_deltas = entity_deltas;
+        imported[i].change.relation_deltas = relation_deltas;
+
+        // Retain this commit's resulting state only while a later child will
+        // fork from it; leaves are dropped immediately.
+        if remaining_children[i] > 0 {
+            snapshots.insert(
+                imported[i].change.id,
+                ImportedCommitSemanticState {
+                    files: current_files,
+                    relations: current_relations,
+                    relations_by_src,
+                    relations_by_src_artifact,
+                    linker: incremental_linker,
+                },
+            );
+        }
     }
 
     if total_commits > 0 {
@@ -3997,6 +4163,111 @@ mod tests {
                 .any(|delta| matches!(delta, EntityDelta::Removed(entity_id) if *entity_id == first_entity_id)),
             "expected stale imported function removal, got {:?}",
             imported[1].change.entity_deltas
+        );
+    }
+
+    #[test]
+    fn enrich_imported_changes_keys_entity_deltas_to_git_parent_not_linear_running_map() {
+        // Non-linear history: a root R forks into two sibling commits that both
+        // touch the SAME file. Branch A rewrites `f`'s body; branch B leaves `f`
+        // byte-identical to R and only adds `g`. In commit-time slice order the
+        // sibling A is processed between R and B, so a linear running-map keying
+        // would diff B against A's state and report a PHANTOM `Modified f`. DAG
+        // keying diffs B against its real first parent R, where `f` is unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+
+        let f_v1 = blob_store.write(b"def f():\n    return 1\n").unwrap();
+        let f_v2 = blob_store.write(b"def f():\n    return 2\n").unwrap();
+        // `f` here is byte-identical to f_v1; only `g` is new.
+        let f_v3 = blob_store
+            .write(b"def f():\n    return 1\ndef g():\n    return 2\n")
+            .unwrap();
+
+        // R id = 0x51; both branches list R (0x51) as their first parent.
+        let mut imported = vec![
+            imported_change(
+                [0x51; 32],
+                [0x50; 32],
+                "root: add f",
+                vec![artifact_delta(
+                    "src/lib.py",
+                    kin_model::ArtifactDeltaKind::Added,
+                    None,
+                    Some(Hash256::from_bytes(f_v1.0)),
+                )],
+            ),
+            imported_change(
+                [0x52; 32],
+                [0x51; 32],
+                "branch A: rewrite f body",
+                vec![artifact_delta(
+                    "src/lib.py",
+                    kin_model::ArtifactDeltaKind::Modified,
+                    Some(Hash256::from_bytes(f_v1.0)),
+                    Some(Hash256::from_bytes(f_v2.0)),
+                )],
+            ),
+            imported_change(
+                [0x53; 32],
+                [0x51; 32],
+                "branch B: add g, f unchanged",
+                vec![artifact_delta(
+                    "src/lib.py",
+                    kin_model::ArtifactDeltaKind::Modified,
+                    Some(Hash256::from_bytes(f_v1.0)),
+                    Some(Hash256::from_bytes(f_v3.0)),
+                )],
+            ),
+        ];
+
+        enrich_imported_changes_with_semantics(&mut imported, &blob_store).unwrap();
+
+        // Sanity: R adds function `f`; branch A really did modify `f` (its body)
+        // against its parent R. `single_modified_function` filters to the
+        // function-kind delta, so the file's module-level entity is ignored here.
+        let f_id = single_added_function_id(&imported[0].change.entity_deltas);
+        let (a_old, a_new) = single_modified_function(&imported[1].change.entity_deltas);
+        assert_eq!(
+            a_old.id, f_id,
+            "branch A should modify the same `f` R added"
+        );
+        assert_eq!(a_new.id, f_id);
+
+        // Branch B is keyed to its git parent R, where `f` is byte-identical, so
+        // the ONLY function-level change B introduces is `Added g`. The phantom
+        // this fix eliminates is a function-level `Modified f`/`Removed f`, which
+        // the old linear running-map keying produced by diffing B against sibling
+        // A's rewritten `f`. (The file's module-level entity legitimately changes
+        // because `g` was added — that is a real delta under old and new code and
+        // is intentionally not asserted against.)
+        let b_deltas = &imported[2].change.entity_deltas;
+        let added_functions: Vec<&str> = b_deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                EntityDelta::Added(entity) if entity.kind == EntityKind::Function => {
+                    Some(entity.name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            added_functions,
+            vec!["g"],
+            "branch B should add exactly function `g` against its git parent, got {b_deltas:?}"
+        );
+        assert!(
+            !b_deltas.iter().any(|delta| matches!(
+                delta,
+                EntityDelta::Modified { old, .. } if old.kind == EntityKind::Function
+            )),
+            "branch B must not report a phantom function Modified for the unchanged `f`, got {b_deltas:?}"
+        );
+        assert!(
+            !b_deltas
+                .iter()
+                .any(|delta| matches!(delta, EntityDelta::Removed(id) if *id == f_id)),
+            "branch B must not report a phantom Removed for `f`, got {b_deltas:?}"
         );
     }
 
