@@ -22,7 +22,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Discovery cap for `kin init`. When more than this many indexable files are
 /// found, init refuses to grind unless the caller explicitly opts in (`--force`)
@@ -696,6 +696,31 @@ pub async fn run(
                     Some(&blob_store),
                 ) {
                     Ok(mut imported) if !imported.is_empty() => {
+                        // Anchor the (possibly truncated) history at a full base
+                        // universe so ref-scoped blast at historical refs sees
+                        // committed inbound edges across files untouched inside
+                        // the window. Must run BEFORE enrichment: the base-link
+                        // change is then parsed, linked, and used as each
+                        // windowed commit's semantic baseline by the same pass.
+                        match kin_git::anchor_imported_history_at_base_link(
+                            &dir,
+                            &mut imported,
+                            genesis_id,
+                            Some(&blob_store),
+                        ) {
+                            Ok(Some(base_id)) => {
+                                debug!(base_link = %base_id, "anchored imported history at base-link change");
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                warn!(
+                                    error = %err,
+                                    mode = %git_history,
+                                    "failed to anchor imported Git history at a base-link change; continuing without base-universe anchoring"
+                                );
+                            }
+                        }
+
                         if let Err(err) =
                             enrich_imported_changes_with_semantics(&mut imported, &blob_store)
                         {
@@ -4268,6 +4293,381 @@ mod tests {
                 .iter()
                 .any(|delta| matches!(delta, EntityDelta::Removed(id) if *id == f_id)),
             "branch B must not report a phantom Removed for `f`, got {b_deltas:?}"
+        );
+    }
+
+    /// Minimal git repo bootstrap for history-import tests. Returns false when
+    /// git is unavailable so the caller can skip (mirrors the kin-git tests).
+    fn init_git_repo_for_test(dir: &Path) -> bool {
+        let ok = Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            return false;
+        }
+        for (k, v) in [("user.email", "test@test.com"), ("user.name", "Test")] {
+            let _ = Command::new("git")
+                .args(["config", k, v])
+                .current_dir(dir)
+                .output();
+        }
+        true
+    }
+
+    /// Replay the DAG reachable from `head` and report whether a LIVE relation
+    /// exists whose source entity is named `src_name` and destination entity is
+    /// named `dst_name`. Names are resolved from the reachable entity deltas;
+    /// relation deltas are applied in the returned parents-first order.
+    fn replayed_edge_present(
+        imported: &[kin_git::ImportedChange],
+        head: SemanticChangeId,
+        src_name: &str,
+        dst_name: &str,
+    ) -> bool {
+        let graph = kin_db::InMemoryGraph::new();
+        for ic in imported {
+            graph.create_change(&ic.change).unwrap();
+        }
+        let reachable = kin_core::collect_changes_at_ref(&graph, &head).unwrap();
+
+        let mut names: HashMap<EntityId, String> = HashMap::new();
+        for change in &reachable {
+            for delta in &change.entity_deltas {
+                match delta {
+                    EntityDelta::Added(entity) => {
+                        names.insert(entity.id, entity.name.clone());
+                    }
+                    EntityDelta::Modified { new, .. } => {
+                        names.insert(new.id, new.name.clone());
+                    }
+                    EntityDelta::Removed(_) => {}
+                }
+            }
+        }
+
+        let mut live: HashMap<RelationId, Relation> = HashMap::new();
+        for change in &reachable {
+            for delta in &change.relation_deltas {
+                match delta {
+                    RelationDelta::Added(relation) => {
+                        live.insert(relation.id, relation.clone());
+                    }
+                    RelationDelta::Removed(id) => {
+                        live.remove(id);
+                    }
+                }
+            }
+        }
+
+        let node_name = |node: &GraphNodeId| -> Option<&str> {
+            match node {
+                GraphNodeId::Entity(id) => names.get(id).map(String::as_str),
+                _ => None,
+            }
+        };
+        live.values().any(|relation| {
+            node_name(&relation.src) == Some(src_name) && node_name(&relation.dst) == Some(dst_name)
+        })
+    }
+
+    #[test]
+    fn base_link_anchor_surfaces_untouched_consumer_edge_at_historical_head() {
+        // End-to-end proof of FIR-1267 Fix D: a consumer living in a file NEVER
+        // touched inside a truncated import window must still yield a committed
+        // inbound relation delta that ref-scoped replay surfaces at a historical
+        // head. Pre-Fix-D the window base linked against a touched-files-only
+        // universe, so the consumer edge existed ONLY in live adjacency and the
+        // genesis auto-parse change — both siblings of the historical chain — and
+        // blast radius at a historical ref replayed as 0.
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo_for_test(dir.path()) {
+            eprintln!("git not available, skipping base-link anchor e2e test");
+            return;
+        }
+
+        let tools_path = dir.path().join("src/utils/tools.ts");
+        let api_path = dir.path().join("src/routes/api.ts");
+        fs::create_dir_all(tools_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(api_path.parent().unwrap()).unwrap();
+
+        let commit = |msg: &str, epoch: i64| {
+            let stamp = format!("{epoch} +0000");
+            let _ = Command::new("git")
+                .args(["add", "."])
+                .current_dir(dir.path())
+                .output();
+            let _ = Command::new("git")
+                .args(["commit", "-m", msg])
+                .env("GIT_AUTHOR_DATE", &stamp)
+                .env("GIT_COMMITTER_DATE", &stamp)
+                .current_dir(dir.path())
+                .output();
+        };
+
+        // c1 (base, will fall OUTSIDE a 3-commit window): callee `foo` and its
+        // cross-file consumer `handler`, which calls `foo`.
+        fs::write(&tools_path, "export function foo() { return 1; }\n").unwrap();
+        fs::write(
+            &api_path,
+            "import { foo } from '../utils/tools';\nexport function handler() { foo(); }\n",
+        )
+        .unwrap();
+        commit("c1 base", 1_000_000_000);
+        // c2..c4 touch ONLY tools.ts — api.ts (the consumer) is never touched
+        // anywhere inside the imported window.
+        for (epoch, body) in [
+            (1_000_000_100_i64, "2"),
+            (1_000_000_200, "3"),
+            (1_000_000_300, "4"),
+        ] {
+            fs::write(
+                &tools_path,
+                format!("export function foo() {{ return {body}; }}\n"),
+            )
+            .unwrap();
+            commit("touch tools", epoch);
+        }
+
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x60; 32]));
+        let opts = kin_git::ImportOptions {
+            max_commits: 3,
+            ..Default::default()
+        };
+
+        // --- Anchored path (Fix D) ---
+        let mut anchored = kin_git::import_git_history_with_blobs(
+            dir.path(),
+            genesis_id,
+            &opts,
+            Some(&blob_store),
+        )
+        .unwrap();
+        let base_id = kin_git::anchor_imported_history_at_base_link(
+            dir.path(),
+            &mut anchored,
+            genesis_id,
+            Some(&blob_store),
+        )
+        .unwrap()
+        .expect("a truncated window must yield a base-link change");
+        enrich_imported_changes_with_semantics(&mut anchored, &blob_store).unwrap();
+
+        // The base-link root change itself must carry the inbound handler→foo
+        // edge, resolved against the FULL base universe.
+        let base_change = &anchored[0].change;
+        assert_eq!(base_change.id, base_id, "base-link is the prepended root");
+        let mut base_names: HashMap<EntityId, String> = HashMap::new();
+        for delta in &base_change.entity_deltas {
+            match delta {
+                EntityDelta::Added(entity) => {
+                    base_names.insert(entity.id, entity.name.clone());
+                }
+                EntityDelta::Modified { new, .. } => {
+                    base_names.insert(new.id, new.name.clone());
+                }
+                EntityDelta::Removed(_) => {}
+            }
+        }
+        let base_node_name = |node: &GraphNodeId| -> Option<&str> {
+            match node {
+                GraphNodeId::Entity(id) => base_names.get(id).map(String::as_str),
+                _ => None,
+            }
+        };
+        assert!(
+            base_change.relation_deltas.iter().any(|delta| matches!(
+                delta,
+                RelationDelta::Added(relation)
+                    if base_node_name(&relation.src) == Some("handler")
+                        && base_node_name(&relation.dst) == Some("foo")
+            )),
+            "base-link must carry the committed inbound handler→foo edge, got {:?}",
+            base_change.relation_deltas
+        );
+
+        // ...and ref-scoped replay from the historical head must surface it live.
+        let head = anchored.last().unwrap().change.id;
+        assert!(
+            replayed_edge_present(&anchored, head, "handler", "foo"),
+            "anchored: the inbound handler→foo edge must be live at the historical head"
+        );
+
+        // --- Negative control: the SAME window with NO base-link anchor ---
+        // This is the pre-Fix-D behavior; the untouched consumer edge must be
+        // absent, proving the anchor is what surfaces it.
+        let mut control = kin_git::import_git_history_with_blobs(
+            dir.path(),
+            genesis_id,
+            &opts,
+            Some(&blob_store),
+        )
+        .unwrap();
+        enrich_imported_changes_with_semantics(&mut control, &blob_store).unwrap();
+        let control_head = control.last().unwrap().change.id;
+        assert!(
+            !replayed_edge_present(&control, control_head, "handler", "foo"),
+            "pre-Fix-D control: an untouched consumer edge must NOT be reachable at the head"
+        );
+    }
+
+    #[test]
+    fn base_link_anchor_and_enrichment_are_byte_stable_across_runs() {
+        // Determinism is the whole risk of Fix D: a citable proof is void if the
+        // anchored, enriched history is not byte-identical run to run. Build one
+        // truncated-window history, then run import → anchor → enrich twice and
+        // assert every change (id, parents, and the ORDER of every delta list) is
+        // identical. This exercises: the deterministic first-parent walk to the
+        // window base, the sorted-path base-tree enumeration, content-addressed
+        // entity ids, and the relation-delta id sort.
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo_for_test(dir.path()) {
+            eprintln!("git not available, skipping base-link determinism test");
+            return;
+        }
+
+        let tools_path = dir.path().join("src/utils/tools.ts");
+        let api_path = dir.path().join("src/routes/api.ts");
+        let extra_path = dir.path().join("src/utils/extra.ts");
+        fs::create_dir_all(tools_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(api_path.parent().unwrap()).unwrap();
+
+        let commit = |msg: &str, epoch: i64| {
+            let stamp = format!("{epoch} +0000");
+            let _ = Command::new("git")
+                .args(["add", "."])
+                .current_dir(dir.path())
+                .output();
+            let _ = Command::new("git")
+                .args(["commit", "-m", msg])
+                .env("GIT_AUTHOR_DATE", &stamp)
+                .env("GIT_COMMITTER_DATE", &stamp)
+                .current_dir(dir.path())
+                .output();
+        };
+
+        // Base carries several files (multiple consumers) so the base-link's
+        // delta ordering has real surface to be unstable if anything is unsorted.
+        fs::write(&tools_path, "export function foo() { return 1; }\n").unwrap();
+        fs::write(&extra_path, "export function bar() { return 9; }\n").unwrap();
+        fs::write(
+            &api_path,
+            "import { foo } from '../utils/tools';\nimport { bar } from '../utils/extra';\n\
+             export function handler() { foo(); bar(); }\n",
+        )
+        .unwrap();
+        commit("c1 base", 1_000_000_000);
+        for (epoch, body) in [
+            (1_000_000_100_i64, "2"),
+            (1_000_000_200, "3"),
+            (1_000_000_300, "4"),
+        ] {
+            fs::write(
+                &tools_path,
+                format!("export function foo() {{ return {body}; }}\n"),
+            )
+            .unwrap();
+            commit("touch tools", epoch);
+        }
+
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x61; 32]));
+        let opts = kin_git::ImportOptions {
+            max_commits: 3,
+            ..Default::default()
+        };
+
+        let run = || -> Vec<SemanticChange> {
+            // A fresh blob store per run proves the output does not depend on
+            // pre-existing store state either.
+            let blob_root = tempfile::tempdir().unwrap();
+            let blob_store = kin_blobs::BlobStore::new(blob_root.path().join("objects")).unwrap();
+            let mut imported = kin_git::import_git_history_with_blobs(
+                dir.path(),
+                genesis_id,
+                &opts,
+                Some(&blob_store),
+            )
+            .unwrap();
+            kin_git::anchor_imported_history_at_base_link(
+                dir.path(),
+                &mut imported,
+                genesis_id,
+                Some(&blob_store),
+            )
+            .unwrap();
+            enrich_imported_changes_with_semantics(&mut imported, &blob_store).unwrap();
+            imported.into_iter().map(|ic| ic.change).collect()
+        };
+
+        let first = run();
+        let second = run();
+
+        // Guard against a vacuous pass: the base-link plus the 3-commit window.
+        assert_eq!(first.len(), 4, "expected base-link + 3 windowed commits");
+
+        // (1) THE Fix-D determinism guarantee: change ids, parents, and the ORDER
+        // and identity of every entity/relation/artifact delta are byte-identical.
+        // The only non-deterministic surface in a SemanticChange is
+        // `Entity.metadata.extra`, a `HashMap` of auxiliary embedding-context
+        // strings (a pre-existing, kin-wide parser artifact that no entity id,
+        // relation id, blast, or review path keys on — those derive from
+        // (file, name, kind, index) and (src, dst, kind)). Neutralize only that
+        // key-iteration order, then require the rest to match exactly.
+        let structural = |changes: &[SemanticChange]| -> Vec<String> {
+            changes
+                .iter()
+                .map(|change| {
+                    let mut change = change.clone();
+                    for delta in &mut change.entity_deltas {
+                        match delta {
+                            EntityDelta::Added(entity) => entity.metadata.extra.clear(),
+                            EntityDelta::Modified { old, new } => {
+                                old.metadata.extra.clear();
+                                new.metadata.extra.clear();
+                            }
+                            EntityDelta::Removed(_) => {}
+                        }
+                    }
+                    format!("{change:#?}")
+                })
+                .collect()
+        };
+        assert_eq!(
+            structural(&first),
+            structural(&second),
+            "anchored + enriched history (ids, fingerprints, spans, delta ordering, \
+             relations, artifacts) must be byte-identical across runs"
+        );
+
+        // (2) The auxiliary metadata.extra CONTENT is itself stable — only its
+        // key order varies. Compare as a sorted multiset so a genuine content
+        // drift would still fail, but key-order alone does not.
+        let extra_multiset = |changes: &[SemanticChange]| -> Vec<String> {
+            let mut lines = Vec::new();
+            for change in changes {
+                for delta in &change.entity_deltas {
+                    let entities: Vec<&Entity> = match delta {
+                        EntityDelta::Added(entity) => vec![entity],
+                        EntityDelta::Modified { old, new } => vec![old, new],
+                        EntityDelta::Removed(_) => vec![],
+                    };
+                    for entity in entities {
+                        for (key, value) in &entity.metadata.extra {
+                            lines.push(format!("{:?}|{key}={value}", entity.id));
+                        }
+                    }
+                }
+            }
+            lines.sort();
+            lines
+        };
+        assert_eq!(
+            extra_multiset(&first),
+            extra_multiset(&second),
+            "metadata.extra content must be identical across runs (order-independent)"
         );
     }
 

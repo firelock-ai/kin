@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use chrono::TimeZone;
@@ -574,6 +574,232 @@ fn blob_hash(
     Ok(Hash256::from_bytes(kin_blobs::digest(&content).0))
 }
 
+/// Deterministic id for the synthetic base-link change, derived from the import
+/// window base's first-parent Git OID.
+///
+/// A domain prefix distinct from `change_id_from_git_oid`'s keeps this id from
+/// ever colliding with a real imported commit's id — even if a later, wider
+/// import window brings that parent commit in-set and imports it directly.
+fn base_link_change_id_from_git_oid(oid: &gix::ObjectId) -> SemanticChangeId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kin-git-base-link-v1:");
+    hasher.update(oid.as_bytes());
+    let result = hasher.finalize();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&result);
+    SemanticChangeId::from_hash(Hash256::from_bytes(bytes))
+}
+
+/// Enumerate every blob in a tree as `(path, blob_oid)`, sorted by path.
+///
+/// Implemented as a diff of the tree against the empty tree (`None`), which
+/// yields one Addition per blob — the same machinery `commit_file_deltas` uses
+/// for a root commit. The explicit path sort makes the output a pure, stable
+/// function of the tree's content, independent of traversal order.
+fn full_tree_blob_entries(
+    repo: &gix::Repository,
+    tree: &gix::Tree<'_>,
+) -> Result<Vec<(String, gix::ObjectId)>> {
+    let options = gix::diff::Options::default().with_rewrites(None);
+    let changes = repo
+        .diff_tree_to_tree(None, Some(tree), Some(options))
+        .map_err(|e| GitError::Git(e.to_string()))?;
+
+    let mut entries = Vec::new();
+    for change in changes {
+        if let gix::object::tree::diff::ChangeDetached::Addition {
+            location,
+            entry_mode,
+            id,
+            ..
+        } = change
+        {
+            if entry_mode.is_blob() {
+                entries.push((location.to_string(), id));
+            }
+        }
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(entries)
+}
+
+/// Anchor a (possibly truncated) imported history at a synthetic "base-link"
+/// change carrying the FULL file universe present at the import window's base.
+///
+/// # Why
+///
+/// `import_git_history_*` diffs every commit against its first parent, so a
+/// truncated window (`--git-history recent`, default 50 commits) records only
+/// the files each windowed commit *touched*. The oldest kept commit's own
+/// artifact deltas therefore cover just its changed files, never the whole tree
+/// it was built on. Semantic enrichment then links each commit against that
+/// touched-files-only universe, so a cross-file inbound edge whose *consumer*
+/// lives in a file untouched anywhere inside the window is never committed into
+/// any imported change — it exists only in live adjacency and the genesis
+/// auto-parse change, both of which sit *outside* every historical head's
+/// ancestry. Ref-scoped replay (`kin review shadow`, `locate --ref git:<oid>`)
+/// then reports blast radius 0 for entities whose only consumers are in those
+/// untouched files.
+///
+/// # What
+///
+/// This walks the complete Git tree at the window base's first parent — the
+/// state the window was built on — and inserts one root change carrying every
+/// base file as an Addition (`parents = [genesis_id]`), then re-points the
+/// window base's dangling first parent from `genesis_id` to this change. The
+/// subsequent semantic-enrichment pass (in `kin-cli`) then parses and links the
+/// whole base universe into the base-link change exactly as it does a true root
+/// commit, and forks each windowed commit's baseline from it,
+/// so every imported head inherits the base-era inbound edges and each commit's
+/// delta only records what it actually changed.
+///
+/// `changes` must be oldest-first, as returned by `import_git_history_*`.
+///
+/// Returns the inserted base-link change id, or `None` when no anchoring is
+/// needed: an empty import, or a full import whose oldest commit is a true Git
+/// root (its own artifact deltas already carry the entire tree).
+///
+/// # Determinism
+///
+/// The window base is found by a first-parent walk from the newest change (a
+/// pure function of the already-deterministic imported DAG). The base id is a
+/// hash of the base commit's parent OID. The base-link's artifact deltas are
+/// built in sorted-path order with content-addressed blob hashes, and its
+/// author/timestamp come from Git commit content, never wall-clock. The output
+/// is therefore byte-identical across runs for identical history + window.
+pub fn anchor_imported_history_at_base_link(
+    repo_path: &Path,
+    changes: &mut Vec<ImportedChange>,
+    genesis_id: SemanticChangeId,
+    blob_store: Option<&BlobStore>,
+) -> Result<Option<SemanticChangeId>> {
+    if changes.is_empty() {
+        return Ok(None);
+    }
+
+    // Map change id -> slice position so the first-parent walk stays in-set.
+    let index_by_id: HashMap<SemanticChangeId, usize> = changes
+        .iter()
+        .enumerate()
+        .map(|(i, ic)| (ic.change.id, i))
+        .collect();
+
+    // Window base = the oldest commit reachable from the import head (the newest
+    // change, last in oldest-first order) by following the FIRST parent while it
+    // stays inside the imported set. `close_truncated_history_dag` has already
+    // re-pointed the base's out-of-window first parent to `genesis_id`, so the
+    // walk halts there (or at a true root, whose first parent is also genesis).
+    let mut cursor = changes.len() - 1;
+    loop {
+        match changes[cursor].change.parents.first().copied() {
+            Some(pid) if pid != genesis_id => match index_by_id.get(&pid) {
+                Some(&next) => cursor = next,
+                // Dangling parent (should not occur post-close): treat as base.
+                None => break,
+            },
+            // First parent is genesis (re-pointed horizon or true root) or none.
+            _ => break,
+        }
+    }
+    let window_base_idx = cursor;
+
+    let repo = open_repo(repo_path).map_err(|e| GitError::Git(e.to_string()))?;
+
+    let base_git_oid = gix::ObjectId::from_hex(changes[window_base_idx].git_oid.as_bytes())
+        .map_err(|e| {
+            GitError::Git(format!(
+                "invalid git oid '{}': {}",
+                changes[window_base_idx].git_oid, e
+            ))
+        })?;
+    let base_commit = repo
+        .find_commit(base_git_oid)
+        .map_err(|e| GitError::CommitNotFound(format!("{base_git_oid}: {e}")))?;
+
+    // The state the window was built on is the base commit's FIRST parent tree.
+    // No first parent means this is a true Git root: a full import whose own
+    // deltas already carry the whole tree, so there is nothing to anchor.
+    let parent_oid = match base_commit.parent_ids().next() {
+        Some(pid) => pid.detach(),
+        None => return Ok(None),
+    };
+    let parent_commit = repo
+        .find_commit(parent_oid)
+        .map_err(|e| GitError::CommitNotFound(format!("{parent_oid}: {e}")))?;
+    let parent_tree = parent_commit
+        .tree()
+        .map_err(|e| GitError::Git(e.to_string()))?;
+
+    // Full base universe as Added artifact deltas, in stable path order. Blobs
+    // are materialized into the store so the semantic pass can read and parse
+    // them (mirrors how imported commits materialize their changed blobs).
+    let entries = full_tree_blob_entries(&repo, &parent_tree)?;
+    let mut artifact_deltas = Vec::with_capacity(entries.len());
+    for (path, blob_id) in entries {
+        let new_hash = blob_hash(&repo, blob_id, blob_store)?;
+        artifact_deltas.push(ArtifactDelta {
+            file_id: FilePathId::new(path),
+            kind: ArtifactDeltaKind::Added,
+            old_hash: None,
+            new_hash: Some(new_hash),
+        });
+    }
+
+    // Author/timestamp come from the base parent commit so the synthetic change
+    // is a pure function of Git content (no wall-clock), matching how
+    // `commit_to_change` derives them for every real imported commit.
+    let author_sig = parent_commit
+        .author()
+        .map_err(|e| GitError::Git(e.to_string()))?;
+    let author = AuthorId::new(format!("{} <{}>", author_sig.name, author_sig.email));
+    let git_time = author_sig
+        .time()
+        .map_err(|e| GitError::Git(e.to_string()))?;
+    let timestamp = Timestamp::from(
+        chrono::Utc
+            .timestamp_opt(git_time.seconds, 0)
+            .single()
+            .unwrap_or_else(chrono::Utc::now),
+    );
+
+    let base_id = base_link_change_id_from_git_oid(&parent_oid);
+    let base_change = SemanticChange {
+        id: base_id,
+        parents: vec![genesis_id],
+        timestamp,
+        author,
+        message: "kin import: base-link (window base universe)".to_string(),
+        entity_deltas: vec![],   // populated by the semantic enrichment pass
+        relation_deltas: vec![], // populated by the semantic enrichment pass
+        artifact_deltas,
+        projected_files: vec![],
+        spec_link: None,
+        evidence: vec![],
+        risk_summary: None,
+        authored_on: Some(BranchName::new("main")),
+    };
+
+    // Re-point the window base's first parent from genesis to the base-link so
+    // every head's first-parent ancestry now flows through the base universe.
+    if let Some(first) = changes[window_base_idx].change.parents.first_mut() {
+        if *first == genesis_id {
+            *first = base_id;
+        }
+    }
+
+    // Prepend: created before its child, and processed first by the topological
+    // enrichment pass (its own parent, genesis, is out of the imported set).
+    changes.insert(
+        0,
+        ImportedChange {
+            change: base_change,
+            git_oid: parent_oid.to_string(),
+        },
+    );
+
+    Ok(Some(base_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,6 +956,163 @@ mod tests {
         assert_eq!(
             paths,
             vec![("alpha.txt".to_string(), ArtifactDeltaKind::Modified)]
+        );
+    }
+
+    #[test]
+    fn anchor_base_link_carries_full_base_tree_and_reparents_window_base() {
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo(dir.path()) {
+            eprintln!("git not available, skipping base-link anchor test");
+            return;
+        }
+
+        let commit = |msg: &str, epoch: i64| {
+            let stamp = format!("{epoch} +0000");
+            let _ = Command::new("git")
+                .args(["add", "."])
+                .current_dir(dir.path())
+                .output();
+            let _ = Command::new("git")
+                .args(["commit", "-m", msg])
+                .env("GIT_AUTHOR_DATE", &stamp)
+                .env("GIT_COMMITTER_DATE", &stamp)
+                .current_dir(dir.path())
+                .output();
+        };
+
+        // c1 (base, will fall OUTSIDE a 3-commit window): both files exist.
+        std::fs::write(dir.path().join("alpha.txt"), "a1\n").unwrap();
+        std::fs::write(dir.path().join("beta.txt"), "b1\n").unwrap();
+        commit("c1 base", 1_000_000_000);
+        // c2..c4: touch alpha.txt only — beta.txt is untouched across the window.
+        std::fs::write(dir.path().join("alpha.txt"), "a2\n").unwrap();
+        commit("c2", 1_000_000_100);
+        std::fs::write(dir.path().join("alpha.txt"), "a3\n").unwrap();
+        commit("c3", 1_000_000_200);
+        std::fs::write(dir.path().join("alpha.txt"), "a4\n").unwrap();
+        commit("c4", 1_000_000_300);
+
+        let blob_store = BlobStore::new(dir.path().join("kin-blobs")).unwrap();
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x33; 32]));
+        let mut imported = import_git_history_with_blobs(
+            dir.path(),
+            genesis_id,
+            &ImportOptions {
+                max_commits: 3,
+                ..Default::default()
+            },
+            Some(&blob_store),
+        )
+        .expect("git import should succeed");
+
+        // Truncated to the newest 3 commits (c2, c3, c4); c2's real parent (c1)
+        // is out of window, so beta.txt appears in NO windowed artifact delta.
+        assert_eq!(imported.len(), 3, "window should hold exactly 3 commits");
+        assert!(
+            imported
+                .iter()
+                .flat_map(|ic| ic.change.artifact_deltas.iter())
+                .all(|d| d.file_id.0 != "beta.txt"),
+            "pre-anchor: the untouched consumer file must not appear in any windowed commit"
+        );
+        let window_base_id = imported[0].change.id;
+        assert_eq!(
+            imported[0].change.parents,
+            vec![genesis_id],
+            "pre-anchor: window base's out-of-window parent is re-pointed to genesis"
+        );
+
+        let base_id = anchor_imported_history_at_base_link(
+            dir.path(),
+            &mut imported,
+            genesis_id,
+            Some(&blob_store),
+        )
+        .expect("anchoring should succeed")
+        .expect("a truncated window should yield a base-link change");
+
+        // The base-link is prepended, rooted at genesis, and carries the FULL
+        // base tree (both files) — including the untouched consumer beta.txt.
+        assert_eq!(imported.len(), 4, "base-link prepended to the window");
+        assert_eq!(imported[0].change.id, base_id);
+        assert_eq!(imported[0].change.parents, vec![genesis_id]);
+        let base_paths: Vec<(String, ArtifactDeltaKind)> = imported[0]
+            .change
+            .artifact_deltas
+            .iter()
+            .map(|d| (d.file_id.0.clone(), d.kind))
+            .collect();
+        assert_eq!(
+            base_paths,
+            vec![
+                ("alpha.txt".to_string(), ArtifactDeltaKind::Added),
+                ("beta.txt".to_string(), ArtifactDeltaKind::Added),
+            ],
+            "base-link must carry the full base universe as sorted Additions"
+        );
+
+        // The window base is re-parented off genesis onto the base-link, so
+        // every head's first-parent ancestry now flows through the base universe.
+        let reparented = imported
+            .iter()
+            .find(|ic| ic.change.id == window_base_id)
+            .expect("window base still present");
+        assert_eq!(
+            reparented.change.parents.first().copied(),
+            Some(base_id),
+            "window base's first parent must be re-pointed to the base-link"
+        );
+    }
+
+    #[test]
+    fn anchor_base_link_is_noop_for_full_import_true_root() {
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo(dir.path()) {
+            eprintln!("git not available, skipping base-link no-op test");
+            return;
+        }
+
+        std::fs::write(dir.path().join("alpha.txt"), "a1\n").unwrap();
+        std::fs::write(dir.path().join("beta.txt"), "b1\n").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output();
+        let _ = Command::new("git")
+            .args(["commit", "-m", "root"])
+            .env("GIT_AUTHOR_DATE", "1000000000 +0000")
+            .env("GIT_COMMITTER_DATE", "1000000000 +0000")
+            .current_dir(dir.path())
+            .output();
+
+        let blob_store = BlobStore::new(dir.path().join("kin-blobs")).unwrap();
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x44; 32]));
+        let mut imported = import_git_history_with_blobs(
+            dir.path(),
+            genesis_id,
+            &ImportOptions::default(),
+            Some(&blob_store),
+        )
+        .expect("git import should succeed");
+        let before = imported.len();
+
+        let result = anchor_imported_history_at_base_link(
+            dir.path(),
+            &mut imported,
+            genesis_id,
+            Some(&blob_store),
+        )
+        .expect("anchoring should succeed");
+
+        assert!(
+            result.is_none(),
+            "a full import whose oldest commit is a true Git root needs no base-link"
+        );
+        assert_eq!(
+            imported.len(),
+            before,
+            "no synthetic change should be added"
         );
     }
 
