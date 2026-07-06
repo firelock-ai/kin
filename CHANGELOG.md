@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `kin review shadow` resolves the head ref before the base ref, so an
+  ancestor..descendant pair (the common review shape) hydrates git history in a
+  single pass instead of re-walking the ancestry for each side — first reviews on
+  large-history repos start substantially faster.
+
 ## [0.2.11] - 2026-07-06
 
 Python inheritance-aware dispatch: the graph now knows that a subclass calling an inherited method consumes the ancestor that defines it.
