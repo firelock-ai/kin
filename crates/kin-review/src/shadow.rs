@@ -18,6 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use kin_blobs::{BlobStore, Hash256};
 use kin_model::entity::Entity;
 use kin_model::graph::GraphStore;
 use kin_model::ids::SemanticChangeId;
@@ -27,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use crate::diff::{self, EntityChangeKind, SemanticDiff};
 use crate::gate::{derive_decision, GateStatus, ReviewFinding, ReviewSignalKind};
 use crate::impact::ImpactReport;
-use crate::inline::{self, InlineCommentKind};
+use crate::inline::{self, InlineComment, InlineCommentKind};
 use crate::ref_graph::GraphAtRef;
 use crate::review::{Review, SemanticReview};
 use crate::risk;
@@ -414,14 +415,19 @@ fn assemble_report<G: GraphStore>(
 fn assemble_report_with_changes<G: GraphStore>(
     store: &G,
     request: &ShadowRequest,
-    review: Review,
+    mut review: Review,
     range_gap: Option<ShadowEvidenceGap>,
     changes: &[kin_model::change::SemanticChange],
     at_head: Option<&GraphAtRef<'_, G>>,
 ) -> Result<ShadowGateReport, ReviewError> {
     let changed_entities = collect_changed_entities(store, &review)?;
     let blast_radius = collect_blast_radius(&review);
-    let mut evidence_gaps = collect_evidence_gaps(&review, changes, &changed_entities, at_head);
+    // No blob reader is reachable here: the shadow entry points take only the
+    // graph store, and threading a real reader would change their public
+    // signature and their out-of-crate callers. The toolchain-surface channel
+    // is therefore inert on this path (blobs = None) until that wiring lands.
+    let (mut evidence_gaps, toolchain_findings) =
+        collect_evidence_gaps(&review, changes, &changed_entities, at_head, None);
     if let Some(gap) = range_gap {
         // The generic empty-impact gap advises verifying relation ingestion,
         // which misleads here: impact was not computed at all. The specific
@@ -430,6 +436,9 @@ fn assemble_report_with_changes<G: GraphStore>(
         evidence_gaps.retain(|existing| existing.kind != "impact_signal_absent");
         evidence_gaps.insert(0, gap);
     }
+    // Toolchain-surface findings feed the gate as ordinary warning findings via
+    // the inline-comment channel, never through the evidence-gap demotion path.
+    review.inline_comments.extend(toolchain_findings);
     let policy = derive_policy(&review, &evidence_gaps, &changed_entities);
     let repair_context = collect_repair_context(&policy.findings, &review);
     let audit = collect_audit_evidence(store, request, &review, changes.len())?;
@@ -612,6 +621,7 @@ fn finding_kind_label(kind: InlineCommentKind) -> &'static str {
         InlineCommentKind::Removed => "entity_removed",
         InlineCommentKind::Renamed => "entity_renamed",
         InlineCommentKind::AgentUnreviewed => "agent_unreviewed",
+        InlineCommentKind::ToolchainSurfaceChange => "toolchain_surface_change",
     }
 }
 
@@ -624,7 +634,8 @@ fn finding_severity(kind: InlineCommentKind) -> &'static str {
         | InlineCommentKind::CommandEffectContract
         | InlineCommentKind::ConsumerFanout
         | InlineCommentKind::Renamed
-        | InlineCommentKind::AgentUnreviewed => "warning",
+        | InlineCommentKind::AgentUnreviewed
+        | InlineCommentKind::ToolchainSurfaceChange => "warning",
         InlineCommentKind::Added | InlineCommentKind::Removed => "info",
     }
 }
@@ -972,6 +983,10 @@ fn repair_guidance(kind: &str) -> &'static str {
             "The contract surface changed with graph-known downstream entities; verify each \
              listed dependent and consumer, then run the covering tests."
         }
+        "toolchain_surface_change" => {
+            "Inline lint or deprecation directives changed; confirm the shift in toolchain \
+             enforcement is intended before merging."
+        }
         _ => "Review the change against the listed blast radius.",
     }
 }
@@ -1026,30 +1041,133 @@ fn collect_repair_context(
         .collect()
 }
 
+/// Inline lint-suppression and deprecation directives whose presence changes
+/// what the toolchain enforces. A source edit touching only these lines alters
+/// no semantic entity — comment-insensitive fingerprints produce zero entity
+/// deltas — yet it shifts lint or deprecation enforcement, which is
+/// review-worthy. Matched as case-sensitive substrings: a line counts only when
+/// one of these tokens appears in it.
+const TOOLCHAIN_DIRECTIVE_TOKENS: &[&str] = &[
+    "//nolint",
+    "# noqa",
+    "# type: ignore",
+    "eslint-disable",
+    "#[allow(",
+    "#[expect(",
+    "@SuppressWarnings",
+    "// Deprecated:",
+    "@deprecated",
+];
+
+/// Whether a single line carries a toolchain-surface directive token.
+fn line_has_directive(line: &str) -> bool {
+    TOOLCHAIN_DIRECTIVE_TOKENS
+        .iter()
+        .any(|token| line.contains(token))
+}
+
+/// The set of directive-bearing lines in `bytes`, trimmed so relocation or
+/// re-indentation of an otherwise unchanged directive does not read as a
+/// change. Non-UTF8 bytes are decoded lossily; directive tokens are ASCII, so
+/// that never changes which lines match.
+fn directive_line_set(bytes: &[u8]) -> BTreeSet<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(str::trim)
+        .filter(|line| line_has_directive(line))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Directive lines added and removed between two blob revisions of a file.
+/// Compares directive-line SETS, so a directive moved with identical text nets
+/// to zero. Returns `None` when neither set changed. Deterministic: the sets
+/// are ordered and the difference counts are order-independent.
+fn directive_surface_delta(old: &[u8], new: &[u8]) -> Option<(usize, usize)> {
+    let old_set = directive_line_set(old);
+    let new_set = directive_line_set(new);
+    let added = new_set.difference(&old_set).count();
+    let removed = old_set.difference(&new_set).count();
+    if added == 0 && removed == 0 {
+        None
+    } else {
+        Some((added, removed))
+    }
+}
+
+/// Build a toolchain-surface finding for one inert source edit when its two
+/// blob revisions differ in directive lines. Reads are hash-addressed against
+/// the blob store — never the filesystem. Silent when either hash is absent,
+/// the two hashes are identical, a blob cannot be read, or no directive line
+/// changed.
+fn toolchain_surface_finding(
+    blobs: &BlobStore,
+    file: &str,
+    old_hash: Option<Hash256>,
+    new_hash: Option<Hash256>,
+) -> Option<InlineComment> {
+    let (old_hash, new_hash) = (old_hash?, new_hash?);
+    if old_hash == new_hash {
+        return None;
+    }
+    let old_bytes = blobs.read(&old_hash).ok()?;
+    let new_bytes = blobs.read(&new_hash).ok()?;
+    let (added, removed) = directive_surface_delta(&old_bytes, &new_bytes)?;
+    Some(InlineComment {
+        file: file.to_string(),
+        start_line: 1,
+        end_line: 1,
+        kind: InlineCommentKind::ToolchainSurfaceChange,
+        message: format!(
+            "Toolchain directives changed in {file}: {added} added, {removed} removed; \
+             lint/deprecation enforcement shifted"
+        ),
+    })
+}
+
+/// Collect evidence gaps for the report, plus any toolchain-surface findings
+/// discovered while classifying inert source edits.
+///
+/// The findings are returned separately from the gaps: a directive change on an
+/// inert edit is a normal warning finding that feeds the gate through
+/// [`derive_policy`], NOT an evidence-gap demotion. `blobs` is `Option` because
+/// the current shadow entry points cannot reach a blob reader without changing
+/// their public signature (and their out-of-crate callers); the toolchain
+/// channel is emitted only when a reader is supplied.
 fn collect_evidence_gaps<G: GraphStore>(
     review: &Review,
     changes: &[kin_model::change::SemanticChange],
     changed_entities: &[ShadowChangedEntity],
     at_head: Option<&GraphAtRef<'_, G>>,
-) -> Vec<ShadowEvidenceGap> {
+    blobs: Option<&BlobStore>,
+) -> (Vec<ShadowEvidenceGap>, Vec<InlineComment>) {
     let mut gaps = Vec::new();
+    let mut toolchain_findings: Vec<InlineComment> = Vec::new();
 
     // Files whose changes were recorded only as raw artifacts: the graph has
     // no entities for them, so they are invisible to blast radius and policy.
+    // Retain each file's net old->new blob hashes across the range — first old,
+    // last new, folded in stable slice order — so an inert source edit can be
+    // inspected for toolchain-directive churn. Ordered by file (BTreeMap) so
+    // both the gaps and any findings emit deterministically.
     let entity_files: BTreeSet<String> = changed_entities
         .iter()
         .filter_map(|entity| entity.file.clone())
         .collect();
-    let mut artifact_only: BTreeSet<String> = BTreeSet::new();
+    let mut artifact_hashes: BTreeMap<String, (Option<Hash256>, Option<Hash256>)> = BTreeMap::new();
     for change in changes {
         for delta in &change.artifact_deltas {
             let file = delta.file_id.to_string();
-            if !entity_files.contains(&file) {
-                artifact_only.insert(file);
+            if entity_files.contains(&file) {
+                continue;
             }
+            let entry = artifact_hashes
+                .entry(file)
+                .or_insert((delta.old_hash, delta.new_hash));
+            entry.1 = delta.new_hash;
         }
     }
-    for file in artifact_only {
+    for (file, (old_hash, new_hash)) in &artifact_hashes {
         // A source-class file whose raw bytes changed but whose entities the
         // graph DID capture at head is an inert edit — a comment, formatting,
         // or preprocessor-only change that altered no entity — not an
@@ -1057,9 +1175,20 @@ fn collect_evidence_gaps<G: GraphStore>(
         // source file with living entities does not flip the verdict merely
         // for a comment touch. Genuinely uncaptured files (no entity anchored
         // at head, or head state unavailable) keep the demoting kind.
-        let inert_source_edit = artifact_subject_is_source_class(&file)
-            && at_head.is_some_and(|at| at.has_entity_in_file(&file));
+        let inert_source_edit = artifact_subject_is_source_class(file)
+            && at_head.is_some_and(|at| at.has_entity_in_file(file));
         let (kind, detail) = if inert_source_edit {
+            // The edit altered no entity, but if it changed inline lint or
+            // deprecation directives it shifted what the toolchain enforces —
+            // review-worthy on its own. Surface that as a normal warning
+            // finding (not an evidence-gap demotion) when a blob reader is
+            // available to diff the two revisions hash-addressed.
+            if let Some(blobs) = blobs {
+                if let Some(finding) = toolchain_surface_finding(blobs, file, *old_hash, *new_hash)
+                {
+                    toolchain_findings.push(finding);
+                }
+            }
             (
                 "entity_inert_change",
                 "source file changed but no semantic entity was altered (comment, formatting, or \
@@ -1076,7 +1205,7 @@ fn collect_evidence_gaps<G: GraphStore>(
         };
         gaps.push(ShadowEvidenceGap {
             kind: kind.to_string(),
-            subject: file,
+            subject: file.clone(),
             detail: detail.to_string(),
         });
     }
@@ -1128,7 +1257,7 @@ fn collect_evidence_gaps<G: GraphStore>(
             .to_string(),
     });
 
-    gaps
+    (gaps, toolchain_findings)
 }
 
 fn actor_kind_label(actor: &str) -> &'static str {
@@ -2802,5 +2931,209 @@ mod tests {
             .any(|finding| finding.kind == "signature_change"));
         // ... and, because isolation is unprovable, still feeds the gate.
         assert_eq!(report.policy.verdict, ShadowGateVerdict::NeedsAttention);
+    }
+
+    // ── Toolchain-surface directive channel ─────────────────────────────
+
+    fn empty_review() -> Review {
+        use crate::diff::SemanticDiff;
+        use crate::impact::ImpactReport;
+        use kin_model::review::{RiskLevel, RiskSummary};
+        Review {
+            base: None,
+            head: None,
+            diff: SemanticDiff::default(),
+            impact: ImpactReport::default(),
+            risk: RiskSummary {
+                overall_risk: RiskLevel::Low,
+                breaking_changes: vec![],
+                test_coverage_gaps: vec![],
+                contract_violations: vec![],
+                work_risks: vec![],
+                notes: vec![],
+            },
+            inline_comments: vec![],
+        }
+    }
+
+    #[test]
+    fn directive_added_blob_pair_fires() {
+        // A source edit that only adds a lint-suppression directive alters no
+        // entity, but it shifts what the toolchain enforces: the directive
+        // delta must be detected.
+        let old = b"fn compute() -> i32 {\n    let x = 1;\n    x\n}\n";
+        let new = b"#[allow(dead_code)]\nfn compute() -> i32 {\n    let x = 1;\n    x\n}\n";
+        let delta = directive_surface_delta(old, new).expect("added directive must be detected");
+        assert_eq!(delta, (1, 0), "one directive added, none removed");
+    }
+
+    #[test]
+    fn plain_comment_edit_is_silent() {
+        // Editing an ordinary comment carrying no directive token is not a
+        // toolchain-surface change.
+        let old = b"// old note\nfn f() {}\n";
+        let new = b"// a completely different note\nfn f() {}\n";
+        assert!(
+            directive_surface_delta(old, new).is_none(),
+            "a plain comment edit carries no toolchain directive"
+        );
+    }
+
+    #[test]
+    fn relocated_directive_is_silent() {
+        // The same directive line moved to a new position nets to zero against
+        // the directive-line SET: no enforcement changed.
+        let old = b"#[allow(unused)]\nfn a() {}\nfn b() {}\n";
+        let new = b"fn a() {}\nfn b() {}\n#[allow(unused)]\n";
+        assert!(
+            directive_surface_delta(old, new).is_none(),
+            "relocating an unchanged directive is not a surface change"
+        );
+    }
+
+    #[test]
+    fn one_sided_hash_is_silent() {
+        // A delta missing either side's blob hash cannot be diffed; emit
+        // nothing rather than guessing.
+        use kin_blobs::BlobStore;
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::new(dir.path().to_path_buf()).unwrap();
+        let present = blobs.write(b"#[allow(dead_code)]\nfn f() {}\n").unwrap();
+
+        assert!(
+            toolchain_surface_finding(&blobs, "src/foo.rs", None, Some(present)).is_none(),
+            "missing old hash must stay silent"
+        );
+        assert!(
+            toolchain_surface_finding(&blobs, "src/foo.rs", Some(present), None).is_none(),
+            "missing new hash must stay silent"
+        );
+    }
+
+    #[test]
+    fn toolchain_finding_maps_like_command_effect_contract() {
+        // Mirror the command-effect-contract mapping: a reported, non-blocking
+        // warning finding — never an error, never blocking.
+        assert_eq!(
+            finding_kind_label(InlineCommentKind::ToolchainSurfaceChange),
+            "toolchain_surface_change"
+        );
+        assert_eq!(
+            finding_severity(InlineCommentKind::ToolchainSurfaceChange),
+            "warning"
+        );
+        assert!(!is_blocking(InlineCommentKind::ToolchainSurfaceChange));
+
+        // Same gate shape as the channel it mirrors.
+        assert_eq!(
+            finding_severity(InlineCommentKind::CommandEffectContract),
+            finding_severity(InlineCommentKind::ToolchainSurfaceChange)
+        );
+        assert_eq!(
+            is_blocking(InlineCommentKind::CommandEffectContract),
+            is_blocking(InlineCommentKind::ToolchainSurfaceChange)
+        );
+    }
+
+    #[test]
+    fn toolchain_finding_feeds_gate_as_needs_attention() {
+        // A toolchain-surface finding moves the verdict to needs_attention as
+        // an ordinary non-blocking warning — through the finding channel, not
+        // the evidence-gap demotion path (no gaps supplied here).
+        let mut review = empty_review();
+        review.inline_comments.push(InlineComment {
+            file: "src/foo.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+            kind: InlineCommentKind::ToolchainSurfaceChange,
+            message: "Toolchain directives changed in src/foo.rs: 1 added, 0 removed; \
+                      lint/deprecation enforcement shifted"
+                .to_string(),
+        });
+
+        let policy = derive_policy(&review, &[], &[]);
+        assert!(
+            policy
+                .findings
+                .iter()
+                .any(|finding| finding.kind == "toolchain_surface_change"
+                    && finding.severity == "warning"
+                    && !finding.blocking),
+            "the toolchain finding is reported as a non-blocking warning"
+        );
+        assert_eq!(policy.verdict, ShadowGateVerdict::NeedsAttention);
+    }
+
+    #[test]
+    fn inert_directive_edit_emits_toolchain_finding_through_collect() {
+        // End-to-end through collect_evidence_gaps: an inert edit of a captured
+        // source file whose directive lines changed yields a toolchain finding
+        // when a blob reader is present, and stays silent without one — while
+        // the inert edit itself is still reported as a non-demoting gap either
+        // way.
+        use kin_blobs::BlobStore;
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::new(dir.path().to_path_buf()).unwrap();
+        let old_hash = blobs.write(b"fn sensor() {}\n").unwrap();
+        let new_hash = blobs
+            .write(b"// Deprecated: use sensor_v2\nfn sensor() {}\n")
+            .unwrap();
+
+        // Graph with an entity anchored in src/sensor.c at head, so the
+        // artifact edit classifies as an inert source edit (entity captured,
+        // none altered).
+        let graph = InMemoryGraph::new();
+        let sensor = entity_with_span("sensor", "src/sensor.c", 2, EntityRole::Source);
+        let base_id = change_id(0x91);
+        let base = change_with_deltas(
+            base_id,
+            vec![],
+            vec![EntityDelta::Added(sensor.clone())],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&base).unwrap();
+        let at_head = GraphAtRef::materialize(&graph, &base_id).unwrap();
+
+        let changes = vec![change_with_deltas(
+            change_id(0x92),
+            vec![base_id],
+            vec![],
+            vec![],
+            vec![ArtifactDelta {
+                file_id: FilePathId::new("src/sensor.c"),
+                kind: ArtifactDeltaKind::Modified,
+                old_hash: Some(old_hash),
+                new_hash: Some(new_hash),
+            }],
+        )];
+
+        let review = empty_review();
+
+        let (gaps, findings) =
+            collect_evidence_gaps(&review, &changes, &[], Some(&at_head), Some(&blobs));
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.kind == "entity_inert_change" && gap.subject == "src/sensor.c"),
+            "the inert edit is still reported as a non-demoting gap"
+        );
+        assert!(
+            findings.iter().any(|finding| finding.kind
+                == InlineCommentKind::ToolchainSurfaceChange
+                && finding.file == "src/sensor.c"),
+            "the directive change surfaces as a toolchain finding"
+        );
+
+        // No blob reader → the branch cannot inspect directives, so it stays
+        // silent even though the inert-edit gap is unchanged.
+        let (gaps_no_blob, findings_no_blob) =
+            collect_evidence_gaps(&review, &changes, &[], Some(&at_head), None);
+        assert!(gaps_no_blob
+            .iter()
+            .any(|gap| gap.kind == "entity_inert_change" && gap.subject == "src/sensor.c"));
+        assert!(
+            findings_no_blob.is_empty(),
+            "without a blob reader the toolchain channel emits nothing"
+        );
     }
 }

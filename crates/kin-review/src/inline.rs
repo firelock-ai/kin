@@ -36,6 +36,7 @@ pub enum InlineCommentKind {
     Removed,
     Renamed,
     AgentUnreviewed,
+    ToolchainSurfaceChange,
 }
 
 impl InlineCommentKind {
@@ -52,6 +53,7 @@ impl InlineCommentKind {
             Self::Removed => "-",
             Self::Renamed => "~",
             Self::AgentUnreviewed => "@",
+            Self::ToolchainSurfaceChange => "~",
         }
     }
 }
