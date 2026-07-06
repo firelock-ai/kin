@@ -237,6 +237,11 @@ struct LinkContext<'a> {
     known_files: HashSet<&'a str>,
     import_map: HashMap<&'a str, HashMap<&'a str, (&'a str, &'a str)>>,
     include_graph: HashMap<String, Vec<String>>,
+    /// (file, class name) -> that class's declared base names, lexicographically
+    /// sorted, deduped. Backs inheritance-aware receiver-method resolution;
+    /// keyed per file because class names repeat across a repo (django alone
+    /// has dozens of `Command` classes).
+    class_bases_by_file_class: HashMap<(&'a str, &'a str), Vec<&'a str>>,
 }
 
 fn build_link_context<'a>(
@@ -333,6 +338,29 @@ fn build_link_context<'a>(
 
     let include_graph = build_include_graph(files, &known_files);
 
+    // Step 3: class hierarchy from parser-emitted Extends relations, keyed per
+    // (file, class). Bases are sorted lexicographically — NOT declaration
+    // order — because the reopen path rehydrates this index from committed
+    // graph edges, which carry no declaration order; one uniform order keeps
+    // cold, incremental, and reopened graphs resolving identically.
+    let mut class_bases_by_file_class: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
+    for file in files {
+        for rel in &file.relations {
+            if rel.kind != RelationKind::Extends {
+                continue;
+            }
+            let bases = class_bases_by_file_class
+                .entry((file.file_path.as_str(), rel.src_name.as_str()))
+                .or_default();
+            if !bases.contains(&rel.dst_name.as_str()) {
+                bases.push(rel.dst_name.as_str());
+            }
+        }
+    }
+    for bases in class_bases_by_file_class.values_mut() {
+        bases.sort_unstable();
+    }
+
     LinkContext {
         sorted_universe,
         entity_by_file_name,
@@ -343,6 +371,7 @@ fn build_link_context<'a>(
         known_files,
         import_map,
         include_graph,
+        class_bases_by_file_class,
     }
 }
 
@@ -438,6 +467,44 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
             continue;
         }
 
+        // (a2) Inheritance-aware receiver-method resolution. The Python adapter
+        // emits `self.m()` / `cls.m()` class-qualified (`EnclosingClass.m`), so
+        // when the owner half names a class in this file — i.e. the parser
+        // pinned the dispatch class — and (a) found no local override, walk the
+        // class's Extends chain to the defining ancestor. That edge is dispatch
+        // evidence and must not fall through to the blind bare-name fan-out.
+        // When the walk finds nothing in-graph (builtin/external base, dynamic
+        // hierarchy), the call continues through the tiers below as its bare
+        // leaf, so recall never drops below the pre-qualification behavior.
+        // Dotted callees whose owner is NOT a local class (namespace members
+        // like `util.finalize()`) skip this tier untouched.
+        let mut dst_lookup: &str = rel.dst_name.as_str();
+        if rel.kind == RelationKind::Calls {
+            if let Some((owner, method)) = split_owner_method(rel.dst_name.as_str()) {
+                let owner_is_class = ctx
+                    .entity_by_file_name
+                    .get(&(file.file_path.as_str(), owner))
+                    .map(|id| is_class_like(ctx.entity_kind_by_id.get(id)))
+                    .unwrap_or(false);
+                if owner_is_class {
+                    if let Some(dst_id) =
+                        resolve_inherited_method(&file.file_path, owner, method, ctx)
+                    {
+                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                            resolved.push(make_relation(
+                                rel.kind,
+                                src_id,
+                                dst_id,
+                                INHERITED_METHOD_CONFIDENCE,
+                            ));
+                        }
+                        continue;
+                    }
+                    dst_lookup = method;
+                }
+            }
+        }
+
         // (b) Import-based cross-file resolution
         if let Some(file_imports) = ctx.import_map.get(file.file_path.as_str()) {
             if let Some(&(module_path, original_name)) = file_imports.get(rel.dst_name.as_str()) {
@@ -490,7 +557,7 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
 
         let exact_candidates = ctx
             .entity_by_name
-            .get(rel.dst_name.as_str())
+            .get(dst_lookup)
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
         let other_file_candidates: Vec<(&str, EntityId)> = exact_candidates
@@ -529,7 +596,7 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
         // (c) Global name-match fallback
         let bare_candidates = if rel.kind == RelationKind::Calls {
             ctx.entity_by_bare_name
-                .get(rel.dst_name.as_str())
+                .get(dst_lookup)
                 .map(|v| v.as_slice())
                 .unwrap_or(&[])
         } else {
@@ -990,6 +1057,35 @@ fn split_member_access(name: &str) -> Option<(&str, &str)> {
 /// the same whether one target or several survive.
 const QUALIFIED_SUFFIX_CONFIDENCE: f32 = 0.6;
 
+/// Confidence for a method call resolved through the receiver class's Extends
+/// chain (`self.m()` in `Sub(Base)` linking to `Base.m`). The parser pinned the
+/// dispatch class and the class hierarchy pinned the defining ancestor, so this
+/// is dispatch evidence, not a name guess — above locality disambiguation (0.8)
+/// and well above the review-side strong-consumer floor, below an
+/// import-verified edge (0.95) because the base-class link itself may have been
+/// name-resolved.
+const INHERITED_METHOD_CONFIDENCE: f32 = 0.85;
+
+/// Split a dotted `Owner.method` dst_name into its owner and method parts at
+/// the FINAL dot (`N.Class.Method` → (`N.Class`, `Method`)). Returns `None` for
+/// undotted names, `::` paths (those belong to the qualified-suffix resolver),
+/// and empty halves, so only receiver-qualified method keys reach the
+/// inheritance walk.
+fn split_owner_method(name: &str) -> Option<(&str, &str)> {
+    if name.contains("::") {
+        return None;
+    }
+    let idx = name.rfind('.')?;
+    let (owner, method) = (&name[..idx], &name[idx + 1..]);
+    (!owner.is_empty() && !method.is_empty()).then_some((owner, method))
+}
+
+/// Upper bound on how many classes an inheritance walk may visit before giving
+/// up. Real hierarchies are shallow; the cap is cycle/pathology insurance so a
+/// malformed `Extends` graph (self-inheritance, giant generated lattices) can
+/// never stall linking.
+const INHERITANCE_WALK_CAP: usize = 64;
+
 /// Whether a `::`-path segment is a plain Rust identifier (`crate`, `self`,
 /// `Widget`, `run`). Rejects generic/turbofish fragments (`<T>`, `run::<T>`) and
 /// other non-identifier forms so suffix resolution never keys off a mangled
@@ -1209,6 +1305,300 @@ fn resolve_qualified_suffix_incremental(
             Vec::new()
         }
     }
+}
+
+/// Whether an entity id names a type that can anchor an inheritance walk.
+fn is_class_like(kind: Option<&EntityKind>) -> bool {
+    matches!(
+        kind,
+        Some(
+            EntityKind::Class | EntityKind::EnumDef | EntityKind::Interface | EntityKind::TraitDef
+        )
+    )
+}
+
+/// Collapse a file's Extends relations into per-class base lists, sorted
+/// lexicographically (see the batch index comment: committed graph edges carry
+/// no declaration order, so one uniform order keeps every linking path
+/// bit-identical).
+fn collect_class_bases(relations: &[ExtractedRelation]) -> Vec<(String, Vec<String>)> {
+    let mut classes: Vec<(String, Vec<String>)> = Vec::new();
+    for rel in relations {
+        if rel.kind != RelationKind::Extends {
+            continue;
+        }
+        match classes.iter_mut().find(|(class, _)| class == &rel.src_name) {
+            Some((_, bases)) => {
+                if !bases.contains(&rel.dst_name) {
+                    bases.push(rel.dst_name.clone());
+                }
+            }
+            None => classes.push((rel.src_name.clone(), vec![rel.dst_name.clone()])),
+        }
+    }
+    for (_, bases) in &mut classes {
+        bases.sort_unstable();
+    }
+    classes
+}
+
+/// Declared base names of `class_name` in `file_path` within a per-file
+/// hierarchy map, if recorded.
+fn class_bases_in<'m>(
+    map: &'m HashMap<String, Vec<(String, Vec<String>)>>,
+    file_path: &str,
+    class_name: &str,
+) -> Option<&'m [String]> {
+    map.get(file_path)?
+        .iter()
+        .find(|(class, _)| class == class_name)
+        .map(|(_, bases)| bases.as_slice())
+}
+
+/// Locate the class a declared base NAME refers to, from `class_file`'s point
+/// of view: a same-file class shadows everything; then the file's own import
+/// bindings (`from pkg.base import Base [as B]`, or a `models.Model` member of
+/// an imported module); then a repo-globally unique class name (Python's
+/// absolute `pkg.mod` imports do not resolve to files — see
+/// `resolve_import_pinned_target` — so uniqueness is the honest cross-file
+/// evidence tier). Returns the (file, class entity name) to continue the walk
+/// from, or `None` when the base is external, builtin, or ambiguous — a walk
+/// must never guess a hierarchy.
+fn locate_base_class(
+    class_file: &str,
+    base_raw: &str,
+    ctx: &LinkContext<'_>,
+) -> Option<(String, String)> {
+    let base_leaf = bare_entity_name(base_raw);
+
+    if let Some(id) = ctx.entity_by_file_name.get(&(class_file, base_leaf)) {
+        if is_class_like(ctx.entity_kind_by_id.get(id)) {
+            return Some((class_file.to_string(), base_leaf.to_string()));
+        }
+    }
+
+    if let Some(file_imports) = ctx.import_map.get(class_file) {
+        let (binding, target_name) = match base_raw.split_once('.') {
+            // `models.Model`: the binding is the first segment, the class is
+            // the leaf inside the imported module.
+            Some((first, _)) => (first, base_leaf),
+            // `Base` bound by `from m import Base [as B]`: the target file
+            // declares the original name.
+            None => (base_raw, ""),
+        };
+        if let Some(&(module_path, original_name)) = file_imports.get(binding) {
+            let target_name = if target_name.is_empty() {
+                original_name
+            } else {
+                target_name
+            };
+            if let Some(target_file) =
+                resolve_module_path(class_file, module_path, &ctx.known_files)
+            {
+                if let Some(id) = ctx
+                    .entity_by_file_name
+                    .get(&(target_file.as_str(), target_name))
+                {
+                    if is_class_like(ctx.entity_kind_by_id.get(id)) {
+                        return Some((target_file, target_name.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut unique: Option<(&str, EntityId)> = None;
+    if let Some(candidates) = ctx.entity_by_name.get(base_leaf) {
+        for &(fp, id) in candidates {
+            match unique {
+                None => unique = Some((fp, id)),
+                Some((_, seen)) if seen == id => {}
+                Some(_) => return None,
+            }
+        }
+    }
+    if let Some((fp, id)) = unique {
+        if is_class_like(ctx.entity_kind_by_id.get(&id)) {
+            return Some((fp.to_string(), base_leaf.to_string()));
+        }
+    }
+    None
+}
+
+/// Resolve an inherited receiver-method call (`Sub.method` where `Sub` does
+/// not define `method`) to the defining ancestor's method entity by walking
+/// `Sub`'s Extends chain breadth-first. Level order matches Python's MRO
+/// property that nearer ancestors shadow farther ones; among a level's several
+/// bases the walk visits lexicographically (a documented approximation of C3's
+/// left-to-right rule — declaration order cannot be rehydrated from committed
+/// graph edges, and one uniform order keeps cold/incremental/reopened graphs
+/// bit-identical). The walk is bounded by [`INHERITANCE_WALK_CAP`] and
+/// cycle-guarded, and ends any branch whose base cannot be located
+/// ([`locate_base_class`]) — it never guesses. Kept in exact resolution parity
+/// with [`resolve_inherited_method_incremental`].
+fn resolve_inherited_method(
+    src_file: &str,
+    owner: &str,
+    method: &str,
+    ctx: &LinkContext<'_>,
+) -> Option<EntityId> {
+    let start = (src_file.to_string(), owner.to_string());
+    let mut visited: HashSet<(String, String)> = HashSet::new();
+    let mut queue: std::collections::VecDeque<(String, String)> = std::collections::VecDeque::new();
+    visited.insert(start.clone());
+    queue.push_back(start);
+
+    while let Some((class_file, class_name)) = queue.pop_front() {
+        let Some(bases) = ctx
+            .class_bases_by_file_class
+            .get(&(class_file.as_str(), class_name.as_str()))
+        else {
+            continue;
+        };
+        for &base_raw in bases {
+            let Some((base_file, base_class)) = locate_base_class(&class_file, base_raw, ctx)
+            else {
+                continue;
+            };
+            let method_key = format!("{}.{}", base_class, method);
+            if let Some(&dst_id) = ctx
+                .entity_by_file_name
+                .get(&(base_file.as_str(), method_key.as_str()))
+            {
+                return Some(dst_id);
+            }
+            if visited.len() >= INHERITANCE_WALK_CAP {
+                return None;
+            }
+            let key = (base_file, base_class);
+            if !visited.contains(&key) {
+                visited.insert(key.clone());
+                queue.push_back(key);
+            }
+        }
+    }
+    None
+}
+
+/// Incremental-linker counterpart of [`locate_base_class`], kept in exact
+/// resolution parity: same-file class, then the caller file's import bindings,
+/// then a repo-globally unique class name. `import_map` is the step-local
+/// import index, so the import tier only sees files parsed this step — files
+/// recorded at earlier steps still resolve through the same-file and
+/// global-unique tiers.
+fn locate_base_class_incremental(
+    class_file: &str,
+    base_raw: &str,
+    linker: &IncrementalLinker,
+    import_map: &HashMap<&str, HashMap<&str, (&str, &str)>>,
+) -> Option<(String, String)> {
+    let base_leaf = bare_entity_name(base_raw);
+
+    if let Some(id) = linker
+        .entity_by_file_name
+        .get(class_file)
+        .and_then(|m| m.get(base_leaf))
+    {
+        if is_class_like(linker.entity_kind_by_id.get(id)) {
+            return Some((class_file.to_string(), base_leaf.to_string()));
+        }
+    }
+
+    if let Some(file_imports) = import_map.get(class_file) {
+        let (binding, target_name) = match base_raw.split_once('.') {
+            Some((first, _)) => (first, base_leaf),
+            None => (base_raw, ""),
+        };
+        if let Some(&(module_path, original_name)) = file_imports.get(binding) {
+            let target_name = if target_name.is_empty() {
+                original_name
+            } else {
+                target_name
+            };
+            if let Some(target_file) =
+                resolve_module_path(class_file, module_path, &linker.known_files)
+            {
+                if let Some(id) = linker
+                    .entity_by_file_name
+                    .get(&target_file)
+                    .and_then(|m| m.get(target_name))
+                {
+                    if is_class_like(linker.entity_kind_by_id.get(id)) {
+                        return Some((target_file, target_name.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut unique: Option<(&str, EntityId)> = None;
+    if let Some(candidates) = linker.entity_by_name.get(base_leaf) {
+        for (fp, id) in candidates {
+            match unique {
+                None => unique = Some((fp.as_str(), *id)),
+                Some((_, seen)) if seen == *id => {}
+                Some(_) => return None,
+            }
+        }
+    }
+    if let Some((fp, id)) = unique {
+        if is_class_like(linker.entity_kind_by_id.get(&id)) {
+            return Some((fp.to_string(), base_leaf.to_string()));
+        }
+    }
+    None
+}
+
+/// Incremental-linker counterpart of [`resolve_inherited_method`], kept in
+/// exact resolution parity: breadth-first over declaration-ordered bases,
+/// cycle-guarded, bounded by [`INHERITANCE_WALK_CAP`], never guessing an
+/// unlocatable base. Without this twin an inherited-method edge resolved into a
+/// full-tree snapshot would drop the moment an incremental relink of the
+/// caller re-derives its edges — the exact failure mode the (c2) parity work
+/// fixed for bare receiver methods.
+fn resolve_inherited_method_incremental(
+    src_file: &str,
+    owner: &str,
+    method: &str,
+    linker: &IncrementalLinker,
+    import_map: &HashMap<&str, HashMap<&str, (&str, &str)>>,
+    class_bases: &HashMap<String, Vec<(String, Vec<String>)>>,
+) -> Option<EntityId> {
+    let start = (src_file.to_string(), owner.to_string());
+    let mut visited: HashSet<(String, String)> = HashSet::new();
+    let mut queue: std::collections::VecDeque<(String, String)> = std::collections::VecDeque::new();
+    visited.insert(start.clone());
+    queue.push_back(start);
+
+    while let Some((class_file, class_name)) = queue.pop_front() {
+        let Some(bases) = class_bases_in(class_bases, &class_file, &class_name) else {
+            continue;
+        };
+        for base_raw in bases {
+            let Some((base_file, base_class)) =
+                locate_base_class_incremental(&class_file, base_raw, linker, import_map)
+            else {
+                continue;
+            };
+            let method_key = format!("{}.{}", base_class, method);
+            if let Some(&dst_id) = linker
+                .entity_by_file_name
+                .get(&base_file)
+                .and_then(|m| m.get(method_key.as_str()))
+            {
+                return Some(dst_id);
+            }
+            if visited.len() >= INHERITANCE_WALK_CAP {
+                return None;
+            }
+            let key = (base_file, base_class);
+            if !visited.contains(&key) {
+                visited.insert(key.clone());
+                queue.push_back(key);
+            }
+        }
+    }
+    None
 }
 
 /// Directory component of a repo-relative path (`""` for top-level files).
@@ -2106,6 +2496,12 @@ pub struct IncrementalLinker {
     /// walks see edges recorded when other files were parsed, not only the
     /// step-local ones.
     pub include_targets_by_file: HashMap<String, Vec<String>>,
+    /// file_path -> that file's classes with their declared base names,
+    /// lexicographically sorted, deduped. The incremental mirror of the batch
+    /// linker's per-(file, class) hierarchy index; persists across steps like
+    /// `include_targets_by_file` so an inheritance walk can cross into files
+    /// recorded at earlier steps.
+    pub class_bases_by_file: HashMap<String, Vec<(String, Vec<String>)>>,
 }
 
 impl IncrementalLinker {
@@ -2118,6 +2514,7 @@ impl IncrementalLinker {
             known_files: HashSet::new(),
             entities_by_file: HashMap::new(),
             include_targets_by_file: HashMap::new(),
+            class_bases_by_file: HashMap::new(),
         }
     }
 
@@ -2148,6 +2545,24 @@ impl IncrementalLinker {
 
         self.entities_by_file.remove(file_path);
         self.include_targets_by_file.remove(file_path);
+        self.class_bases_by_file.remove(file_path);
+    }
+
+    /// Record each file's class hierarchy (Extends declarations), replacing any
+    /// prior entry — a file whose classes lost all bases is cleared. The
+    /// incremental counterpart of the batch linker's hierarchy index; call
+    /// alongside [`IncrementalLinker::record_file_includes`] wherever a step's
+    /// parse data is recorded.
+    pub fn record_class_bases(&mut self, files: &[FileParseData]) {
+        for file in files {
+            let classes = collect_class_bases(&file.relations);
+            if classes.is_empty() {
+                self.class_bases_by_file.remove(&file.file_path);
+            } else {
+                self.class_bases_by_file
+                    .insert(file.file_path.clone(), classes);
+            }
+        }
     }
 
     /// Record the resolved include targets of each file, replacing any prior
@@ -2269,6 +2684,26 @@ pub fn link_cross_file_incremental(
         merged
     };
 
+    // Step-local class hierarchy overlays the linker's persistent per-file
+    // state, exactly like the include graph above: files parsed this step
+    // resolve from their fresh Extends declarations (including files whose
+    // classes lost every base), every other file keeps the hierarchy recorded
+    // when it was last parsed or rehydrated. Inheritance walks therefore cross
+    // step boundaries without reading committed-stale bases for edited files.
+    let class_bases = {
+        let mut merged = linker.class_bases_by_file.clone();
+        for file in files {
+            merged.remove(&file.file_path);
+        }
+        for file in files {
+            let classes = collect_class_bases(&file.relations);
+            if !classes.is_empty() {
+                merged.insert(file.file_path.clone(), classes);
+            }
+        }
+        merged
+    };
+
     let total_files = files.len();
     let progress_interval = std::cmp::max(total_files / 50, 1);
     let link_start = std::time::Instant::now();
@@ -2373,6 +2808,44 @@ pub fn link_cross_file_incremental(
                 continue;
             }
 
+            // (a2) Inheritance-aware receiver-method resolution — mirrors the
+            // batch linker: a class-qualified `self.m()`/`cls.m()` callee whose
+            // owner is a class in this file resolves through the recorded
+            // Extends chain to the defining ancestor; an unresolvable hierarchy
+            // falls back to the bare leaf for the tiers below.
+            let mut dst_lookup: &str = rel.dst_name.as_str();
+            if rel.kind == RelationKind::Calls {
+                if let Some((owner, method)) = split_owner_method(rel.dst_name.as_str()) {
+                    let owner_is_class = linker
+                        .entity_by_file_name
+                        .get(&file.file_path)
+                        .and_then(|m| m.get(owner))
+                        .map(|id| is_class_like(linker.entity_kind_by_id.get(id)))
+                        .unwrap_or(false);
+                    if owner_is_class {
+                        if let Some(dst_id) = resolve_inherited_method_incremental(
+                            &file.file_path,
+                            owner,
+                            method,
+                            linker,
+                            &import_map,
+                            &class_bases,
+                        ) {
+                            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                                resolved.push(make_relation(
+                                    rel.kind,
+                                    src_id,
+                                    dst_id,
+                                    INHERITED_METHOD_CONFIDENCE,
+                                ));
+                            }
+                            continue;
+                        }
+                        dst_lookup = method;
+                    }
+                }
+            }
+
             // (b) Import-based cross-file resolution
             if let Some(file_imports) = import_map.get(file.file_path.as_str()) {
                 if let Some(&(module_path, original_name)) = file_imports.get(rel.dst_name.as_str())
@@ -2428,7 +2901,7 @@ pub fn link_cross_file_incremental(
 
             let other_file_candidates: Vec<(&str, EntityId)> = linker
                 .entity_by_name
-                .get(&rel.dst_name)
+                .get(dst_lookup)
                 .map(|candidates| {
                     candidates
                         .iter()
@@ -2523,8 +2996,7 @@ pub fn link_cross_file_incremental(
             // snapshot is dropped the moment an incremental relink of the caller
             // re-derives its edges.
             if name_fallback_allowed && rel.kind == RelationKind::Calls {
-                if let Some(bare_candidates) = linker.entity_by_bare_name.get(rel.dst_name.as_str())
-                {
+                if let Some(bare_candidates) = linker.entity_by_bare_name.get(dst_lookup) {
                     let distinct_targets: HashSet<EntityId> = bare_candidates
                         .iter()
                         .filter(|(fp, _)| fp != &file.file_path)

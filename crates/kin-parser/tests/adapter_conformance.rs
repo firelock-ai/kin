@@ -824,7 +824,7 @@ fn python_resolves_attribute_calls_as_method_name() {
 }
 
 #[test]
-fn python_self_calls_strip_to_method_name() {
+fn python_self_calls_qualify_with_enclosing_class() {
     let adapter = PythonAdapter;
     let source = load_fixture("python", "calls.py");
     let output = parse_fixture(&adapter, &source);
@@ -836,9 +836,11 @@ fn python_self_calls_strip_to_method_name() {
         .map(|r| r.dst_name.as_str())
         .collect();
 
+    // A self-receiver dispatches through the enclosing class, so the callee is
+    // emitted class-qualified — the key the linker's inheritance walk resolves.
     assert!(
-        call_dsts.contains(&"validate"),
-        "Python should strip self. prefix and emit method name as Calls dst, got: {:?}",
+        call_dsts.contains(&"Service.validate"),
+        "Python should emit self.validate() as the class-qualified 'Service.validate', got: {:?}",
         call_dsts
     );
     assert!(

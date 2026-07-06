@@ -7,15 +7,18 @@
 //! call-resolution test, even though every other one (Go, JS/TS, Kotlin, Swift,
 //! C++ qualified-name) does. This file closes that gap.
 //!
-//! Python narrows attribute callees to their **leaf name at extraction time**:
-//! `module.func()`, `obj.method()`, and `self.member.save()` all emit a `Calls`
-//! edge whose `dst_name` is the trailing identifier (`func`, `method`, `save`),
-//! never the dotted form. Because the parser already hands the linker a simple
-//! name, name-based cross-file resolution matches the target's own simple name —
-//! so the qualified-callee gap that let dotted `dst_name`s slip past resolution
-//! in other adapters never applied to Python. These tests are the regression net
-//! that keeps it that way; they would already have been green before that
-//! resolution work landed.
+//! Python narrows attribute callees to their **leaf name at extraction time**,
+//! with one deliberate exception. `module.func()`, `obj.method()`, and
+//! `self.member.save()` all emit a `Calls` edge whose `dst_name` is the trailing
+//! identifier (`func`, `method`, `save`) — their receiver's type is unknowable
+//! at parse time. But `self.m()` / `cls.m()` dispatch through the *enclosing
+//! class*, so they emit the class-qualified form (`Service.validate`): that
+//! qualifier is what lets the linker resolve an inherited method through the
+//! class's Extends chain instead of fanning out on the bare name. Because the
+//! parser hands the linker either a simple name or a `Class.method` key that
+//! matches how method entities are named, name-based cross-file resolution
+//! stays aligned with the entity keyspace. These tests are the regression net
+//! for both halves of that contract.
 //!
 //! Same-file extraction (entities + `Calls` `dst_name`s) is asserted here. The
 //! cross-file dimension of the matrix — the same three call shapes resolving to
@@ -242,7 +245,29 @@ fn class_method_nested_def_calls_attribute_to_method_entity() {
     );
 }
 
-// ---- fixture: every Calls dst_name is a simple leaf identifier ----
+// ---- self/cls receivers: class-qualified dst_name ----
+
+#[test]
+fn self_call_emits_class_qualified_dst() {
+    let output = extract(
+        "class Command:\n    def handle(self):\n        self.validate()\n        cls_free()\n",
+    );
+    assert!(
+        calls_named(&output, "Command.validate")
+            .iter()
+            .any(|r| r.src_name == "Command.handle"),
+        "self.validate() inside Command must emit the class-qualified dst \
+         'Command.validate' so the linker can walk the Extends chain, got {:?}",
+        calls(&output)
+    );
+    assert!(
+        calls_named(&output, "validate").is_empty(),
+        "the bare form must not be emitted alongside the qualified one, got {:?}",
+        calls(&output)
+    );
+}
+
+// ---- fixture: dst_names are leaf identifiers, except self/cls dispatch ----
 
 #[test]
 fn fixture_calls_are_all_leaf_names() {
@@ -254,29 +279,31 @@ fn fixture_calls_are_all_leaf_names() {
         .expect("extract fixture");
     let call_edges = calls(&output);
 
-    // Regression invariant: attribute/method callees are always narrowed, so a
-    // dotted dst_name would mean the narrowing broke.
+    // Regression invariant: attribute/method callees are narrowed unless the
+    // receiver is `self`/`cls`, whose dispatch class is known — those emit the
+    // `Class.method` form. Any other dotted dst_name means the narrowing broke.
     let dotted: Vec<&str> = call_edges
         .iter()
         .map(|r| r.dst_name.as_str())
-        .filter(|n| n.contains('.'))
+        .filter(|n| n.contains('.') && *n != "Service.validate")
         .collect();
     assert!(
         dotted.is_empty(),
-        "Calls dst_names must be simple identifiers, but got dotted: {:?}",
+        "Calls dst_names must be simple identifiers (or self/cls-qualified \
+         Class.method), but got dotted: {:?}",
         dotted
     );
 
-    // Every call shape in the matrix is represented as a leaf name.
+    // Every call shape in the matrix is represented.
     for expected in &[
-        "handler",       // bare call in plain()
-        "add_url_rule",  // attribute call on a local (app.add_url_rule)
-        "query",         // chained attribute call (db.session.query())
-        "save",          // attribute call on an instance member (self.store.save)
-        "validate",      // self-call (self.validate)
-        "Store",         // constructor call
-        "route",         // decorator call @app.route(...)
-        "requires_auth", // bare decorator @requires_auth
+        "handler",          // bare call in plain()
+        "add_url_rule",     // attribute call on a local (app.add_url_rule)
+        "query",            // chained attribute call (db.session.query())
+        "save",             // attribute call on an instance member (self.store.save)
+        "Service.validate", // self-call (self.validate) — class-qualified
+        "Store",            // constructor call
+        "route",            // decorator call @app.route(...)
+        "requires_auth",    // bare decorator @requires_auth
     ] {
         assert!(
             call_edges.iter().any(|r| r.dst_name == *expected),

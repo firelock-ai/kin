@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Python method calls dispatched through `self`/`cls` now resolve through the class's
+  inheritance chain to the defining ancestor, in batch linking, incremental linking, and
+  reopened graphs alike: `self.validate()` inside `Command(BaseCommand)` links to
+  `BaseCommand.validate` as a verdict-driving consumer edge instead of vanishing into the
+  bare-name fan-out. Deleting an inherited-but-consumed API is therefore flagged as
+  breaking — this extends 0.2.10's removed-entity rule, whose consumer harvest was scoped
+  to directly-captured edges, to inheritance-reached consumers. Local overrides still
+  shadow the base, unknown-receiver calls keep their previous behavior, and unresolvable
+  hierarchies fall back to the old fan-out so recall never regresses.
+
 ## [0.2.10] - 2026-07-06
 
 Review-accuracy hardening across the shadow-review gate, the semantic substrate, and the language adapters — the graph now reasons about entity roles and the base-vs-head sides of a change the way a reviewer does.
