@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-07-06
+
+Python inheritance-aware dispatch: the graph now knows that a subclass calling an inherited method consumes the ancestor that defines it.
+
 ### Fixed
 
 - Python method calls dispatched through `self`/`cls` now resolve through the class's
