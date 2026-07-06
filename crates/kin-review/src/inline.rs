@@ -170,6 +170,11 @@ fn collect_modified_comments(
     let contract_consumer_count = per_entity.map_or(0, |e| e.contract_consumer_count);
     let consumer_file_count = per_entity.map_or(0, |e| e.consumer_files.len());
     let entity_covering_tests = per_entity.map_or(0, |e| e.covering_tests);
+    let fanout_gate_consumer_count = if entity_covering_tests > 0 {
+        strong_consumer_count
+    } else {
+        consumer_count
+    };
 
     // Signature change
     if old.signature != new.signature {
@@ -260,13 +265,14 @@ fn collect_modified_comments(
     // Body-only modification with wide consumer fanout. The contract surface
     // is unchanged, so the breaking channels stay silent, but a behavior
     // change reaching many distinct non-test consumer entities deserves
-    // attention. Decided on the graph-native STRONG consumer entity count:
-    // ambiguous-dispatch fan-out edges are displayed in the blast radius but
-    // a possibly-reaching consumer must not alone escalate the verdict. The
-    // file list is reported only as human-readable context.
+    // attention. Graph-known covering tests can absorb weak/ambiguous fanout,
+    // so covered body-only changes gate on strong consumers only. Uncovered
+    // body-only changes gate on all graph-native consumer entities: weak
+    // fanout plus no tests is still a review risk. The file list is reported
+    // only as human-readable context.
     if old.signature == new.signature
         && old.visibility == new.visibility
-        && strong_consumer_count >= CONSUMER_FANOUT_THRESHOLD
+        && fanout_gate_consumer_count >= CONSUMER_FANOUT_THRESHOLD
     {
         comments.push(InlineComment {
             file: span.file.to_string(),
@@ -275,7 +281,7 @@ fn collect_modified_comments(
             kind: InlineCommentKind::ConsumerFanout,
             message: format!(
                 "Behavior of `{}` changed with {} distinct non-test consumer(s) across {} file(s)",
-                new.name, strong_consumer_count, consumer_file_count,
+                new.name, fanout_gate_consumer_count, consumer_file_count,
             ),
         });
     }
@@ -737,12 +743,11 @@ mod tests {
     }
 
     #[test]
-    fn consumer_fanout_ignores_weak_confidence_consumers() {
+    fn consumer_fanout_uses_weak_consumers_only_when_uncovered() {
         // Ambiguous-dispatch fan-out links every possible implementor at low
-        // confidence; those consumers appear in the blast radius but a
-        // possibly-reaching edge must not alone escalate the verdict. Four
-        // weak-only consumers stay silent; the same shape with two strong
-        // consumers fires.
+        // confidence. Covered body-only changes need strong consumers to gate;
+        // uncovered body-only changes still gate on weak fanout, because the
+        // graph has no test evidence to absorb that possible blast radius.
         let old = test_entity_with_span("hot_path", "src/hot.rs", 1, 20);
         let new = old.clone();
         let diff = SemanticDiff {
@@ -755,7 +760,27 @@ mod tests {
             }],
             ..Default::default()
         };
-        let weak_only = ImpactReport {
+        let covered_weak_only = ImpactReport {
+            changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 4,
+                strong_consumer_count: 0,
+                contract_consumer_count: 0,
+                consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+                covering_tests: 1,
+            }],
+            ..Default::default()
+        };
+        let comments = collect_inline_comments(&diff, &covered_weak_only);
+        assert!(
+            !comments
+                .iter()
+                .any(|c| c.kind == InlineCommentKind::ConsumerFanout),
+            "covered weak-only consumers must not fire the fanout gate"
+        );
+
+        let uncovered_weak_only = ImpactReport {
             changed_ids: vec![new.id],
             entity_impacts: vec![EntityImpact {
                 entity_id: new.id,
@@ -767,12 +792,19 @@ mod tests {
             }],
             ..Default::default()
         };
-        let comments = collect_inline_comments(&diff, &weak_only);
+        let comments = collect_inline_comments(&diff, &uncovered_weak_only);
+        let fanout: Vec<&InlineComment> = comments
+            .iter()
+            .filter(|c| c.kind == InlineCommentKind::ConsumerFanout)
+            .collect();
+        assert_eq!(
+            fanout.len(),
+            1,
+            "uncovered weak fanout must still fire the review gate"
+        );
         assert!(
-            !comments
-                .iter()
-                .any(|c| c.kind == InlineCommentKind::ConsumerFanout),
-            "weak-only consumers must not fire the fanout gate"
+            fanout[0].message.contains("4 distinct non-test consumer"),
+            "uncovered fanout reports the full graph-native consumer count"
         );
 
         let mixed = ImpactReport {
@@ -783,7 +815,7 @@ mod tests {
                 strong_consumer_count: 2,
                 contract_consumer_count: 0,
                 consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
-                covering_tests: 0,
+                covering_tests: 1,
             }],
             ..Default::default()
         };
