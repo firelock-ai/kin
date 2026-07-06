@@ -31,7 +31,8 @@ pub use linker::{
 };
 pub use overlay::{apply_file_removal, apply_to_graph, ApplyResult};
 pub use pipeline::{
-    classify_file_role, normalize_file_path_id, IndexPipeline, IndexedAny, IndexedFile,
+    classify_file_role, entity_semantics_changed, normalize_file_path_id, IndexPipeline,
+    IndexedAny, IndexedFile,
 };
 pub use support::{compute_coverage_report, CoverageReport};
 pub use watcher::{FileEvent, FileWatcher};

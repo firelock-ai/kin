@@ -239,9 +239,7 @@ async fn run_local_commit_pipeline_for_tests(
                         .and_then(|entities| entities.iter().find(|e| e.name == new_entity.name));
 
                     match existing {
-                        Some(old)
-                            if old.fingerprint.ast_hash != new_entity.fingerprint.ast_hash =>
-                        {
+                        Some(old) if super::init::entity_fingerprint_changed(old, &new_entity) => {
                             // Modified — reuse old ID for a true update, not a duplicate insert
                             let mut updated = new_entity.clone();
                             updated.id = old.id;

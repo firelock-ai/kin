@@ -1732,21 +1732,8 @@ fn imported_relations_equivalent(old: &Relation, new: &Relation) -> bool {
 
 const COMMAND_EFFECT_CONTRACT_KEY: &str = "command_effect_contract";
 
-fn entity_fingerprint_changed(old: &Entity, new: &Entity) -> bool {
-    // The contract key participates only when BOTH sides carry it: not every
-    // persist path attaches the contract, so key-absent vs key-present is
-    // coverage skew between paths, never evidence that behavior changed.
-    let contract_changed = match (
-        old.metadata.extra.get(COMMAND_EFFECT_CONTRACT_KEY),
-        new.metadata.extra.get(COMMAND_EFFECT_CONTRACT_KEY),
-    ) {
-        (Some(a), Some(b)) => a != b,
-        _ => false,
-    };
-    old.fingerprint.ast_hash != new.fingerprint.ast_hash
-        || old.fingerprint.signature_hash != new.fingerprint.signature_hash
-        || old.fingerprint.behavior_hash != new.fingerprint.behavior_hash
-        || contract_changed
+pub(crate) fn entity_fingerprint_changed(old: &Entity, new: &Entity) -> bool {
+    kin_index::entity_semantics_changed(old, new)
 }
 
 fn reconcile_imported_file_entities(
