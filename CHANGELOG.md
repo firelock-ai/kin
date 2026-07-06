@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.12] - 2026-07-06
+
+First-touch review latency: ancestor..descendant review pairs hydrate git history once instead of twice.
+
 ### Changed
 
 - `kin review shadow` resolves the head ref before the base ref, so an
