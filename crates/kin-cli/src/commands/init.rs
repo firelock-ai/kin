@@ -1730,14 +1730,8 @@ fn imported_relations_equivalent(old: &Relation, new: &Relation) -> bool {
         && (old.confidence - new.confidence).abs() < f32::EPSILON
 }
 
-const COMMAND_EFFECT_CONTRACT_KEY: &str = "command_effect_contract";
-
-fn entity_fingerprint_changed(old: &Entity, new: &Entity) -> bool {
-    old.fingerprint.ast_hash != new.fingerprint.ast_hash
-        || old.fingerprint.signature_hash != new.fingerprint.signature_hash
-        || old.fingerprint.behavior_hash != new.fingerprint.behavior_hash
-        || old.metadata.extra.get(COMMAND_EFFECT_CONTRACT_KEY)
-            != new.metadata.extra.get(COMMAND_EFFECT_CONTRACT_KEY)
+pub(crate) fn entity_fingerprint_changed(old: &Entity, new: &Entity) -> bool {
+    kin_index::entity_semantics_changed(old, new)
 }
 
 fn reconcile_imported_file_entities(
@@ -1961,6 +1955,13 @@ fn index_files_with_stable_entity_ids(
                                     &file_imports,
                                 );
                                 file_entities.push(entity);
+                            }
+                            if language == kin_model::LanguageId::Go {
+                                kin_parser::attach_go_command_effect_contract_metadata(
+                                    &tree,
+                                    &source,
+                                    &mut file_entities,
+                                );
                             }
                             let discovered_tests = promote_discovered_tests(
                                 &file_id,
@@ -3778,6 +3779,7 @@ fn whoami() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_index::COMMAND_EFFECT_CONTRACT_KEY;
     use kin_model::{
         EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, LanguageId,
         SemanticFingerprint, Visibility,

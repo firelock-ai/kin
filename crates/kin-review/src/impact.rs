@@ -311,6 +311,11 @@ pub fn analyze_impact_at<I: ImpactGraph>(
                 let is_test = entity.role == EntityRole::Test || rel.kind == RelationKind::Tests;
                 if is_test {
                     ent_tests.insert(affected_id);
+                } else if matches!(entity.role, EntityRole::Generated | EntityRole::Vendored) {
+                    // Derived copies (amalgamated bundles, vendored snapshots)
+                    // regenerate from their sources; they appear in the blast
+                    // radius for navigation but cannot be "broken" consumers,
+                    // so they never feed consumer counts or breaking findings.
                 } else {
                     ent_consumers.insert(affected_id);
                     if rel.confidence >= STRONG_CONSUMER_CONFIDENCE {

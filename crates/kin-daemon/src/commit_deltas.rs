@@ -116,7 +116,7 @@ pub fn compute_deltas_vs_last_commit(
                 // Not in last commit → Added
                 entity_deltas.push(EntityDelta::Added(entity.clone()));
             }
-            Some(committed) if committed.fingerprint.ast_hash != entity.fingerprint.ast_hash => {
+            Some(committed) if kin_index::entity_semantics_changed(committed, entity) => {
                 // Fingerprint changed → Modified (old from DAG, new from graph)
                 entity_deltas.push(EntityDelta::Modified {
                     old: committed.clone(),

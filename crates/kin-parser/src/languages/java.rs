@@ -411,6 +411,11 @@ fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<
 }
 
 /// Recursively walk a method body to find `method_invocation` nodes.
+///
+/// A `method_invocation` carries the invoked method in its `name` field, so
+/// `obj.execute()` and `a.b.execute()` both emit the simple `execute`. Graph
+/// edges key on that rightmost name rather than the dotted source text, which
+/// no name index could match.
 fn extract_calls_from_body(
     node: &tree_sitter::Node,
     source: &[u8],
@@ -423,26 +428,10 @@ fn extract_calls_from_body(
             if let Some(name_node) = child.child_by_field_name("name") {
                 let method_name = name_node.utf8_text(source).unwrap_or("");
                 if !method_name.is_empty() {
-                    // Qualify with the receiver object when available.
-                    let callee = match child.child_by_field_name("object") {
-                        Some(obj) => {
-                            let obj_text = obj.utf8_text(source).unwrap_or("");
-                            // Use the last segment of the receiver for qualification.
-                            // e.g., `this.mapper.copy()` → `mapper.copy`
-                            let qualifier = obj_text.rsplit('.').next().unwrap_or(obj_text);
-                            if qualifier == "this" || qualifier == "super" {
-                                // `this.method()` or `super.method()` — just use method name
-                                method_name.to_string()
-                            } else {
-                                format!("{}.{}", qualifier, method_name)
-                            }
-                        }
-                        None => method_name.to_string(),
-                    };
                     relations.push(ExtractedRelation {
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
-                        dst_name: callee,
+                        dst_name: method_name.to_string(),
                         import_source: None,
                     });
                 }
@@ -603,10 +592,10 @@ mod tests {
             calls.len()
         );
         let dst_names: Vec<&str> = calls.iter().map(|c| c.dst_name.as_str()).collect();
-        // System.out.println → qualified as out.println (last segment of receiver)
+        // System.out.println → narrowed to the rightmost name
         assert!(
-            dst_names.contains(&"out.println"),
-            "expected out.println in {:?}",
+            dst_names.contains(&"println"),
+            "expected println in {:?}",
             dst_names
         );
         assert!(
@@ -665,10 +654,10 @@ public class Service {
             .filter(|r| r.kind == kin_model::RelationKind::Calls)
             .map(|r| r.dst_name.as_str())
             .collect();
-        // mapper.writeValue — simple receiver qualification
+        // mapper.writeValue(...) → rightmost name
         assert!(
-            calls.contains(&"mapper.writeValue"),
-            "expected mapper.writeValue in {:?}",
+            calls.contains(&"writeValue"),
+            "expected writeValue in {:?}",
             calls
         );
         // this.init() → bare method name
@@ -683,16 +672,22 @@ public class Service {
             "expected close (super stripped) in {:?}",
             calls
         );
-        // helper.nested.transform → last segment is nested
+        // helper.nested.transform(...) → rightmost name, chained receiver dropped
         assert!(
-            calls.contains(&"nested.transform"),
-            "expected nested.transform in {:?}",
+            calls.contains(&"transform"),
+            "expected transform in {:?}",
             calls
         );
         // standalone() → bare method name (no receiver)
         assert!(
             calls.contains(&"standalone"),
             "expected standalone in {:?}",
+            calls
+        );
+        // No dotted callee may survive narrowing.
+        assert!(
+            calls.iter().all(|c| !c.contains('.')),
+            "expected only simple callee names in {:?}",
             calls
         );
     }

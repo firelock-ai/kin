@@ -120,10 +120,13 @@ fn hash_token_stream(node: &Node, source: &[u8], hasher: &mut Sha256) {
 
 /// Whitespace-collapsed declaration text of a node, cut before its `body`
 /// child and any C++ member-initializer list, falling back to the full node
-/// text for body-less declarations. Line wrapping and indentation must not
-/// leak into signatures: a multi-line declarator and its single-line
-/// reformat are the same declaration, and a signature string that differs
-/// only by formatting reads as a false signature change downstream.
+/// text for body-less declarations. Grammars that expose the body as a
+/// plainly-kinded child instead of a `body` field (e.g. Kotlin's
+/// `function_body`/`class_body`) are cut at that child by kind. Line
+/// wrapping and indentation must not leak into signatures: a multi-line
+/// declarator and its single-line reformat are the same declaration, and a
+/// signature string that differs only by formatting reads as a false
+/// signature change downstream.
 pub fn declaration_signature(node: &Node, source: &[u8]) -> String {
     let start = node.start_byte();
     let mut end = node.end_byte();
@@ -132,7 +135,10 @@ pub fn declaration_signature(node: &Node, source: &[u8]) -> String {
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() == "field_initializer_list" {
+        if matches!(
+            child.kind(),
+            "field_initializer_list" | "function_body" | "class_body" | "enum_class_body"
+        ) {
             end = end.min(child.start_byte());
         }
     }

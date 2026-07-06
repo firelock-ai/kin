@@ -588,6 +588,29 @@ pub fn normalize_file_path_id(path: &Path, root: &Path) -> FilePathId {
     FilePathId::new(normalized)
 }
 
+/// Key under which language adapters attach command-effect contracts to
+/// entity metadata.
+pub const COMMAND_EFFECT_CONTRACT_KEY: &str = "command_effect_contract";
+
+/// Whether two versions of the same entity differ semantically: any of the
+/// three fingerprint hashes, or an attached command-effect contract when BOTH
+/// sides carry one (key-absent vs key-present is persist-path coverage skew,
+/// never evidence of change). Every entity-delta producer must use this one
+/// definition so graph truth does not depend on which write path recorded it.
+pub fn entity_semantics_changed(old: &Entity, new: &Entity) -> bool {
+    let contract_changed = match (
+        old.metadata.extra.get(COMMAND_EFFECT_CONTRACT_KEY),
+        new.metadata.extra.get(COMMAND_EFFECT_CONTRACT_KEY),
+    ) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    };
+    old.fingerprint.ast_hash != new.fingerprint.ast_hash
+        || old.fingerprint.signature_hash != new.fingerprint.signature_hash
+        || old.fingerprint.behavior_hash != new.fingerprint.behavior_hash
+        || contract_changed
+}
+
 /// Classify a file path into an [`EntityRole`] based on directory and filename patterns.
 ///
 /// Entities from the same file share the same role. The classifier checks path
@@ -647,11 +670,16 @@ pub fn classify_file_role(path: &str) -> EntityRole {
         return EntityRole::External;
     }
 
-    // Generated paths
+    // Generated paths. Amalgamated single-header bundles are byte-copies of
+    // real sources regenerated out-of-band: their entities must never read as
+    // independent consumers of the sources they were copied from.
     if lower.starts_with("generated/")
         || lower.contains("/generated/")
         || lower.starts_with("__generated__/")
         || lower.contains("/__generated__/")
+        || lower.starts_with("single_include/")
+        || lower.contains("/single_include/")
+        || lower.contains("amalgamated")
         || lower.ends_with(".pb.go")
         || lower.ends_with("_pb2.py")
         || lower.ends_with(".generated.ts")

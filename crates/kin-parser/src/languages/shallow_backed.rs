@@ -411,7 +411,17 @@ fn extract_csharp_calls(
     recurse_children(node, source, |child| {
         if child.kind() == "invocation_expression" {
             if let Some(function) = child.child_by_field_name("function") {
-                let callee = normalize_scoped_name(text_of(&function, source).trim());
+                // A member access carries the invoked method in its `name`
+                // field, so `obj.Execute()` and `Console.WriteLine(...)` emit
+                // the rightmost simple name the name index can match, never
+                // the dotted source text.
+                let callee = match function.kind() {
+                    "member_access_expression" | "member_binding_expression" => function
+                        .child_by_field_name("name")
+                        .map(|name| text_of(&name, source).trim().to_string())
+                        .unwrap_or_default(),
+                    _ => normalize_scoped_name(text_of(&function, source).trim()),
+                };
                 if !callee.is_empty() {
                     relations.push(ExtractedRelation {
                         kind: kin_model::RelationKind::Calls,
