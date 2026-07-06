@@ -7,6 +7,9 @@
 //! fail-loud contract: a change the graph cannot see must surface as an
 //! explicit evidence gap, never as a silent pass.
 
+use kin_cli::commands::ref_lookup::{
+    git_ref_requires_hydration, resolve_ref_importing_git_if_needed_with_report,
+};
 use serde_json::Value;
 use std::path::Path;
 use std::process::Command;
@@ -276,5 +279,65 @@ fn shadow_report_fails_loud_on_unknown_ref() {
         !output.status.success(),
         "unknown base ref must fail loud, got stdout={}",
         String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// A review pair is almost always ancestor..descendant, and `review shadow`
+/// resolves the head ref before the base ref so that ancestry hydrates in a
+/// single pass. This proves the invariant that makes head-first cheap: once the
+/// head is imported, its ancestor base is already in the graph and needs no
+/// second hydration, so the base resolve takes the fast path with no re-walk of
+/// the shared history. Base-first and head-first yield the same graph state and
+/// the same `hydrated_git_history` union — the only difference is that head-first
+/// avoids re-importing the ancestry the base and head share.
+#[test]
+fn shadow_head_import_hydrates_ancestor_base_in_single_pass() {
+    let dir = tempdir().expect("tempdir");
+    let repo = dir.path();
+    // `base` -> `head` is a linear ancestor pair (head's parent is base).
+    let (base, head, _artifact_head) = setup_fixture_repo(repo);
+    kin_init(repo);
+
+    // A fresh in-memory graph: the git commits exist on disk, but neither ref is
+    // imported as a semantic change yet, so both would require hydration.
+    let layout = kin_core::KinLayout::new(repo.join(".kin"));
+    let graph = kin_db::InMemoryGraph::new();
+    assert!(
+        git_ref_requires_hydration(&graph, &head),
+        "head must require hydration before any import"
+    );
+    assert!(
+        git_ref_requires_hydration(&graph, &base),
+        "base must require hydration before any import"
+    );
+
+    // Resolve ONLY the head. Its import walks genesis..head, which contains base.
+    let resolved_head =
+        resolve_ref_importing_git_if_needed_with_report(&graph, &layout, Some(head.as_str()))
+            .expect("resolve head imports its git ancestry");
+    assert!(
+        resolved_head.hydrated_git_history,
+        "resolving the head on a fresh graph must hydrate git history"
+    );
+
+    // Single-pass invariant: base is now already present, so it needs no further
+    // hydration — the head's import subsumed the ancestor.
+    assert!(
+        !git_ref_requires_hydration(&graph, &base),
+        "after importing the head, its ancestor base must need no second pass"
+    );
+
+    // Resolving the base now takes the fast path: it resolves to a distinct
+    // change without re-walking (hydrated_git_history == false).
+    let resolved_base =
+        resolve_ref_importing_git_if_needed_with_report(&graph, &layout, Some(base.as_str()))
+            .expect("resolve base after head takes the fast path");
+    assert!(
+        !resolved_base.hydrated_git_history,
+        "base must resolve without a second hydration pass"
+    );
+    assert_ne!(
+        resolved_base.head, resolved_head.head,
+        "base and head must resolve to distinct semantic changes"
     );
 }

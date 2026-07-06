@@ -298,13 +298,10 @@ fn build_shadow_run_response(
     author: Option<String>,
     json: bool,
 ) -> Result<(ReviewResponse, bool)> {
-    let resolved_base =
-        crate::commands::ref_lookup::resolve_ref_importing_git_if_needed_with_report(
-            graph,
-            layout,
-            Some(base.as_str()),
-        )
-        .with_context(|| format!("resolve shadow base ref '{}'", base))?;
+    // Resolve the head ref before the base ref. A review pair is almost always
+    // ancestor..descendant, so importing the head first hydrates the full git
+    // ancestry in a single pass; the base is then already present in the graph
+    // and resolves on the fast path instead of re-walking the shared history.
     let resolved_head =
         crate::commands::ref_lookup::resolve_ref_importing_git_if_needed_with_report(
             graph,
@@ -312,6 +309,13 @@ fn build_shadow_run_response(
             Some(head.as_str()),
         )
         .with_context(|| format!("resolve shadow head ref '{}'", head))?;
+    let resolved_base =
+        crate::commands::ref_lookup::resolve_ref_importing_git_if_needed_with_report(
+            graph,
+            layout,
+            Some(base.as_str()),
+        )
+        .with_context(|| format!("resolve shadow base ref '{}'", base))?;
     let hydrated_git_history =
         resolved_base.hydrated_git_history || resolved_head.hydrated_git_history;
 
