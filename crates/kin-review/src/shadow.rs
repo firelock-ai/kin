@@ -600,6 +600,7 @@ fn finding_kind_label(kind: InlineCommentKind) -> &'static str {
         InlineCommentKind::Breaking => "breaking",
         InlineCommentKind::CoverageGap => "coverage_gap",
         InlineCommentKind::ContractViolation => "contract_violation",
+        InlineCommentKind::CommandEffectContract => "command_effect_contract_change",
         InlineCommentKind::SignatureChange => "signature_change",
         InlineCommentKind::VisibilityChange => "visibility_change",
         InlineCommentKind::ConsumerFanout => "consumer_fanout",
@@ -616,6 +617,7 @@ fn finding_severity(kind: InlineCommentKind) -> &'static str {
         InlineCommentKind::CoverageGap
         | InlineCommentKind::SignatureChange
         | InlineCommentKind::VisibilityChange
+        | InlineCommentKind::CommandEffectContract
         | InlineCommentKind::ConsumerFanout
         | InlineCommentKind::Renamed
         | InlineCommentKind::AgentUnreviewed => "warning",
@@ -2541,6 +2543,58 @@ mod tests {
         let policy = derive_policy(&review_both, &[], &changed);
         assert!(policy.findings.iter().any(|f| f.kind == "consumer_fanout"));
         assert!(policy.findings.iter().any(|f| f.kind == "coverage_gap"));
+        assert_eq!(policy.verdict, ShadowGateVerdict::NeedsAttention);
+        assert_eq!(policy.attention_count, 1);
+    }
+
+    #[test]
+    fn command_effect_contract_change_feeds_shadow_gate() {
+        use crate::diff::SemanticDiff;
+        use crate::impact::ImpactReport;
+        use crate::inline::{InlineComment, InlineCommentKind};
+        use kin_model::review::{RiskLevel, RiskSummary};
+
+        let review = Review {
+            base: None,
+            head: None,
+            diff: SemanticDiff::default(),
+            impact: ImpactReport::default(),
+            risk: RiskSummary {
+                overall_risk: RiskLevel::Low,
+                breaking_changes: vec![],
+                test_coverage_gaps: vec![],
+                contract_violations: vec![],
+                work_risks: vec![],
+                notes: vec![],
+            },
+            inline_comments: vec![InlineComment {
+                file: "command/pr_checkout.go".to_string(),
+                start_line: 14,
+                end_line: 102,
+                kind: InlineCommentKind::CommandEffectContract,
+                message: "Command-effect contract for `prCheckout` changed; external command \
+                          behavior needs review"
+                    .to_string(),
+            }],
+        };
+
+        let changed = vec![ShadowChangedEntity {
+            entity_id: EntityId::new().to_string(),
+            name: "prCheckout".to_string(),
+            kind: "Function".to_string(),
+            change: "modified".to_string(),
+            file: Some("command/pr_checkout.go".to_string()),
+            start_line: Some(14),
+            end_line: Some(102),
+            signature_changed: false,
+            visibility_changed: false,
+        }];
+
+        let policy = derive_policy(&review, &[], &changed);
+        assert!(policy
+            .findings
+            .iter()
+            .any(|finding| finding.kind == "command_effect_contract_change"));
         assert_eq!(policy.verdict, ShadowGateVerdict::NeedsAttention);
         assert_eq!(policy.attention_count, 1);
     }

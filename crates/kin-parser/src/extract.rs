@@ -7,6 +7,7 @@ use kin_model::{
 };
 
 pub const EMBEDDING_BODY_PREVIEW_KEY: &str = "embedding_body_preview";
+pub const COMMAND_EFFECT_CONTRACT_KEY: &str = "command_effect_contract";
 pub const FILE_IMPORT_CONTEXT_KEY: &str = "file_import_context";
 pub const FILE_SURFACE_CONTEXT_KEY: &str = "file_surface_context";
 

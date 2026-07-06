@@ -1730,10 +1730,14 @@ fn imported_relations_equivalent(old: &Relation, new: &Relation) -> bool {
         && (old.confidence - new.confidence).abs() < f32::EPSILON
 }
 
+const COMMAND_EFFECT_CONTRACT_KEY: &str = "command_effect_contract";
+
 fn entity_fingerprint_changed(old: &Entity, new: &Entity) -> bool {
     old.fingerprint.ast_hash != new.fingerprint.ast_hash
         || old.fingerprint.signature_hash != new.fingerprint.signature_hash
         || old.fingerprint.behavior_hash != new.fingerprint.behavior_hash
+        || old.metadata.extra.get(COMMAND_EFFECT_CONTRACT_KEY)
+            != new.metadata.extra.get(COMMAND_EFFECT_CONTRACT_KEY)
 }
 
 fn reconcile_imported_file_entities(
@@ -3995,6 +3999,148 @@ mod tests {
         assert!(
             entity_fingerprint_changed(old, new),
             "modified imported entity should record a semantic fingerprint change"
+        );
+    }
+
+    #[test]
+    fn entity_fingerprint_changed_includes_command_effect_contract_metadata() {
+        let mut old = test_entity("prCheckout", "command/pr_checkout.go");
+        let mut new = old.clone();
+        old.metadata.extra.insert(
+            COMMAND_EFFECT_CONTRACT_KEY.into(),
+            serde_json::json!({
+                "effects": [{
+                    "kind": "queued_git_argv",
+                    "bindings": { "newBranchName": "pr.HeadRefName" }
+                }]
+            }),
+        );
+        new.metadata.extra.insert(
+            COMMAND_EFFECT_CONTRACT_KEY.into(),
+            serde_json::json!({
+                "effects": [{
+                    "kind": "queued_git_argv",
+                    "bindings": {
+                        "newBranchName": "fmt.Sprintf(\"pr/%d/%s\", pr.Number, pr.HeadRefName)"
+                    }
+                }]
+            }),
+        );
+
+        assert!(
+            entity_fingerprint_changed(&old, &new),
+            "command-effect contract metadata changes must produce an imported entity delta"
+        );
+    }
+
+    #[test]
+    fn imported_go_command_effect_contract_change_records_entity_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let old_source = br#"
+package command
+
+import (
+    "fmt"
+    "os/exec"
+
+    "github.com/cli/cli/git"
+    "github.com/spf13/cobra"
+)
+
+type pullRequest struct {
+    Number int
+    HeadRefName string
+}
+
+func prCheckout(cmd *cobra.Command, args []string) error {
+    pr := pullRequest{Number: 123, HeadRefName: "feature"}
+    cmdQueue := [][]string{}
+    newBranchName := pr.HeadRefName
+    if git.VerifyRef("refs/heads/" + newBranchName) {
+        cmdQueue = append(cmdQueue, []string{"git", "checkout", newBranchName})
+    } else {
+        cmdQueue = append(cmdQueue, []string{"git", "checkout", "-b", newBranchName, "--no-track", "origin/feature"})
+    }
+    exec.Command("git", "config", fmt.Sprintf("branch.%s.remote", newBranchName), "origin")
+    _ = cmdQueue
+    return nil
+}
+"#;
+        let new_source = br#"
+package command
+
+import (
+    "fmt"
+    "os/exec"
+
+    "github.com/cli/cli/git"
+    "github.com/spf13/cobra"
+)
+
+type pullRequest struct {
+    Number int
+    HeadRefName string
+}
+
+func prCheckout(cmd *cobra.Command, args []string) error {
+    pr := pullRequest{Number: 123, HeadRefName: "feature"}
+    cmdQueue := [][]string{}
+    newBranchName := fmt.Sprintf("pr/%d/%s", pr.Number, pr.HeadRefName)
+    if git.VerifyRef("refs/heads/" + newBranchName) {
+        cmdQueue = append(cmdQueue, []string{"git", "checkout", newBranchName})
+    } else {
+        cmdQueue = append(cmdQueue, []string{"git", "checkout", "-b", newBranchName, "--no-track", "origin/feature"})
+    }
+    exec.Command("git", "config", fmt.Sprintf("branch.%s.remote", newBranchName), "origin")
+    _ = cmdQueue
+    return nil
+}
+"#;
+        let blob_v1 = blob_store.write(old_source).unwrap();
+        let blob_v2 = blob_store.write(new_source).unwrap();
+        let mut imported = vec![
+            imported_change(
+                [0x21; 32],
+                [0x20; 32],
+                "imported root",
+                vec![artifact_delta(
+                    "command/pr_checkout.go",
+                    kin_model::ArtifactDeltaKind::Added,
+                    None,
+                    Some(Hash256::from_bytes(blob_v1.0)),
+                )],
+            ),
+            imported_change(
+                [0x22; 32],
+                [0x21; 32],
+                "prefix branch names",
+                vec![artifact_delta(
+                    "command/pr_checkout.go",
+                    kin_model::ArtifactDeltaKind::Modified,
+                    Some(Hash256::from_bytes(blob_v1.0)),
+                    Some(Hash256::from_bytes(blob_v2.0)),
+                )],
+            ),
+        ];
+
+        enrich_imported_changes_with_semantics(&mut imported, &blob_store).unwrap();
+        let (old, new) = imported[1]
+            .change
+            .entity_deltas
+            .iter()
+            .find_map(|delta| match delta {
+                EntityDelta::Modified { old, new } if new.name == "prCheckout" => Some((old, new)),
+                _ => None,
+            })
+            .expect("prCheckout should be recorded as a modified entity");
+        let old_contract = old.metadata.extra.get(COMMAND_EFFECT_CONTRACT_KEY);
+        let new_contract = new.metadata.extra.get(COMMAND_EFFECT_CONTRACT_KEY);
+        assert!(old_contract.is_some(), "old contract metadata missing");
+        assert!(new_contract.is_some(), "new contract metadata missing");
+        assert_ne!(
+            old_contract, new_contract,
+            "branch naming contract change must be visible in metadata"
         );
     }
 

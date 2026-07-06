@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use kin_model::{EntityKind, FilePathId, LanguageId, ParseState, Visibility};
+use kin_model::{Entity, EntityKind, FilePathId, LanguageId, ParseState, Visibility};
+use serde_json::{json, Value};
 use tree_sitter::Tree;
 
 use crate::adapter::{
@@ -12,10 +13,30 @@ use crate::adapter::{
 use crate::error::Result;
 use crate::extract::{
     ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName,
-    ParseOutput,
+    ParseOutput, COMMAND_EFFECT_CONTRACT_KEY,
 };
 
 pub struct GoAdapter;
+
+pub fn attach_go_command_effect_contract_metadata(
+    tree: &Tree,
+    source: &[u8],
+    entities: &mut [Entity],
+) {
+    let contracts = extract_go_command_effect_contracts(tree, source);
+    if contracts.is_empty() {
+        return;
+    }
+
+    for entity in entities {
+        if let Some(contract) = contracts.get(entity.name.as_str()) {
+            entity
+                .metadata
+                .extra
+                .insert(COMMAND_EFFECT_CONTRACT_KEY.into(), contract.clone());
+        }
+    }
+}
 
 impl LanguageAdapter for GoAdapter {
     fn language_id(&self) -> LanguageId {
@@ -156,6 +177,198 @@ impl LanguageAdapter for GoAdapter {
             parse_state,
         })
     }
+}
+
+fn extract_go_command_effect_contracts(tree: &Tree, source: &[u8]) -> BTreeMap<String, Value> {
+    let mut contracts = BTreeMap::new();
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+
+    for child in root.children(&mut cursor) {
+        if child.kind() != "function_declaration" {
+            continue;
+        }
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+        let name = name_node.utf8_text(source).unwrap_or("").to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let Some(body) = child.child_by_field_name("body") else {
+            continue;
+        };
+        let Some(contract) = command_effect_contract_for_body(&body, source) else {
+            continue;
+        };
+        contracts.insert(name, contract);
+    }
+
+    contracts
+}
+
+fn command_effect_contract_for_body(node: &tree_sitter::Node, source: &[u8]) -> Option<Value> {
+    let mut bindings = BTreeMap::new();
+    collect_go_bindings(node, source, &mut bindings);
+
+    let mut effects = Vec::new();
+    let mut seen = BTreeSet::new();
+    collect_go_command_effects(node, source, &bindings, &mut effects, &mut seen);
+    if effects.is_empty() {
+        return None;
+    }
+
+    Some(json!({
+        "schema_version": 1,
+        "language": "go",
+        "effects": effects,
+    }))
+}
+
+fn collect_go_bindings(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    bindings: &mut BTreeMap<String, String>,
+) {
+    match node.kind() {
+        "short_var_declaration" | "assignment_statement" => {
+            if let (Some(left), Some(right)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            ) {
+                let names = assigned_identifier_names(&left, source);
+                if names.len() == 1 {
+                    let rhs = normalize_go_contract_expr(&right, source);
+                    if !rhs.is_empty() {
+                        bindings.insert(names[0].clone(), rhs);
+                    }
+                }
+            }
+        }
+        "var_spec" | "const_spec" => {
+            if let (Some(name), Some(value)) = (
+                node.child_by_field_name("name"),
+                node.child_by_field_name("value"),
+            ) {
+                let name = name.utf8_text(source).unwrap_or("").trim().to_string();
+                let rhs = normalize_go_contract_expr(&value, source);
+                if !name.is_empty() && !rhs.is_empty() {
+                    bindings.insert(name, rhs);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_go_bindings(&child, source, bindings);
+    }
+}
+
+fn collect_go_command_effects(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    bindings: &BTreeMap<String, String>,
+    effects: &mut Vec<Value>,
+    seen: &mut BTreeSet<String>,
+) {
+    if node.kind() == "call_expression" {
+        if let Some((kind, expr)) = classify_go_command_effect_call(node, source) {
+            if seen.insert(format!("{kind}\n{expr}")) {
+                let identifiers = identifiers_in_node(node, source);
+                let mut consumed_bindings = serde_json::Map::new();
+                for ident in identifiers {
+                    if let Some(value) = bindings.get(&ident) {
+                        consumed_bindings.insert(ident, Value::String(value.clone()));
+                    }
+                }
+                effects.push(json!({
+                    "kind": kind,
+                    "expr": expr,
+                    "bindings": consumed_bindings,
+                }));
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_go_command_effects(&child, source, bindings, effects, seen);
+    }
+}
+
+fn classify_go_command_effect_call(
+    node: &tree_sitter::Node,
+    source: &[u8],
+) -> Option<(&'static str, String)> {
+    let function = node.child_by_field_name("function")?;
+    let callee = normalize_go_contract_expr(&function, source);
+    let expr = normalize_go_contract_expr(node, source);
+
+    if callee == "exec.Command" {
+        return Some(("subprocess_argv", expr));
+    }
+    if callee == "git.Config" || callee == "git.VerifyRef" {
+        return Some(("git_state_query", expr));
+    }
+    if callee == "append" && expr.contains("\"git\"") {
+        return Some(("queued_git_argv", expr));
+    }
+
+    None
+}
+
+fn assigned_identifier_names(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    match node.kind() {
+        "identifier" => {
+            let name = node.utf8_text(source).unwrap_or("").trim();
+            if !name.is_empty() && name != "_" {
+                names.push(name.to_string());
+            }
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                names.extend(assigned_identifier_names(&child, source));
+            }
+        }
+    }
+    names
+}
+
+fn identifiers_in_node(node: &tree_sitter::Node, source: &[u8]) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    collect_identifiers_in_node(node, source, &mut names);
+    names
+}
+
+fn collect_identifiers_in_node(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    names: &mut BTreeSet<String>,
+) {
+    if node.kind() == "identifier" {
+        let name = node.utf8_text(source).unwrap_or("").trim();
+        if !name.is_empty() && name != "_" {
+            names.insert(name.to_string());
+        }
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_identifiers_in_node(&child, source, names);
+    }
+}
+
+fn normalize_go_contract_expr(node: &tree_sitter::Node, source: &[u8]) -> String {
+    node.utf8_text(source)
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1317,6 +1530,84 @@ func (s *Server) Start() { fmt.Println("starting") }
             .filter(|r| r.kind == kin_model::RelationKind::References)
             .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
             .collect()
+    }
+
+    #[test]
+    fn command_effect_contract_captures_git_branch_binding() {
+        let adapter = GoAdapter;
+        let source = br#"
+package command
+
+import (
+    "fmt"
+    "os/exec"
+
+    "github.com/spf13/cobra"
+)
+
+func prCheckout(cmd *cobra.Command, args []string) error {
+    newBranchName := fmt.Sprintf("pr/%d/%s", pr.Number, pr.HeadRefName)
+    if git.VerifyRef("refs/heads/" + newBranchName) {
+        cmdQueue = append(cmdQueue, []string{"git", "checkout", newBranchName})
+    } else {
+        cmdQueue = append(cmdQueue, []string{"git", "checkout", "-b", newBranchName, "--no-track", remoteBranch})
+    }
+    exec.Command("git", "config", fmt.Sprintf("branch.%s.remote", newBranchName), remote)
+    return nil
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("checkout.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let mut entities: Vec<_> = output
+            .entities
+            .into_iter()
+            .map(|entity| entity.into_entity(LanguageId::Go, &file_id))
+            .collect();
+        attach_go_command_effect_contract_metadata(&tree, source, &mut entities);
+        let entity = entities
+            .iter()
+            .find(|entity| entity.name == "prCheckout")
+            .expect("handler entity should exist");
+        let contract = entity
+            .metadata
+            .extra
+            .get(COMMAND_EFFECT_CONTRACT_KEY)
+            .expect("command contract metadata should be attached")
+            .to_string();
+
+        assert!(
+            contract.contains("queued_git_argv"),
+            "queued git argv effects should be captured: {contract}"
+        );
+        assert!(
+            contract.contains("subprocess_argv"),
+            "direct exec.Command effects should be captured: {contract}"
+        );
+        assert!(
+            contract.contains("fmt.Sprintf(\\\"pr/%d/%s\\\", pr.Number, pr.HeadRefName)"),
+            "branch-name binding should be captured: {contract}"
+        );
+    }
+
+    #[test]
+    fn debug_print_change_does_not_emit_command_effect_contract() {
+        let adapter = GoAdapter;
+        let source = br#"
+package command
+
+import "fmt"
+
+func prCheckout() error {
+    fmt.Println("debug")
+    return nil
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        assert!(
+            extract_go_command_effect_contracts(&tree, source).is_empty(),
+            "debug-only output must not become a command-effect contract"
+        );
     }
 
     #[test]

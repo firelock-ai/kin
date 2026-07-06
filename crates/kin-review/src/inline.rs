@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use crate::diff::{EntityChangeKind, SemanticDiff};
 use crate::impact::ImpactReport;
 
+const COMMAND_EFFECT_CONTRACT_KEY: &str = "command_effect_contract";
+
 /// A review comment anchored to a specific source location.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InlineComment {
@@ -26,6 +28,7 @@ pub enum InlineCommentKind {
     Breaking,
     CoverageGap,
     ContractViolation,
+    CommandEffectContract,
     SignatureChange,
     VisibilityChange,
     ConsumerFanout,
@@ -40,6 +43,7 @@ impl InlineCommentKind {
         match self {
             Self::Breaking => "!!",
             Self::ContractViolation => "!!",
+            Self::CommandEffectContract => "~",
             Self::CoverageGap => "?",
             Self::SignatureChange => "~",
             Self::VisibilityChange => "~",
@@ -258,6 +262,21 @@ fn collect_modified_comments(
             message: format!(
                 "Contract {:?} `{}` modified with {} consumer(s)",
                 new.kind, new.name, contract_consumer_count,
+            ),
+        });
+    }
+
+    if old.metadata.extra.get(COMMAND_EFFECT_CONTRACT_KEY)
+        != new.metadata.extra.get(COMMAND_EFFECT_CONTRACT_KEY)
+    {
+        comments.push(InlineComment {
+            file: span.file.to_string(),
+            start_line: span.start_line,
+            end_line: span.end_line,
+            kind: InlineCommentKind::CommandEffectContract,
+            message: format!(
+                "Command-effect contract for `{}` changed; external command behavior needs review",
+                new.name,
             ),
         });
     }
@@ -697,6 +716,65 @@ mod tests {
                 .iter()
                 .any(|c| c.kind == InlineCommentKind::CoverageGap),
             "no coverage gap may be claimed from an absent impact signal"
+        );
+    }
+
+    #[test]
+    fn command_contract_delta_emits_inline_finding() {
+        let mut old = test_entity_with_span("prCheckout", "command/pr_checkout.go", 14, 102);
+        old.metadata.extra.insert(
+            COMMAND_EFFECT_CONTRACT_KEY.into(),
+            serde_json::json!({
+                "schema_version": 1,
+                "effects": [{
+                    "kind": "queued_git_argv",
+                    "expr": "append(cmdQueue, []string{\"git\", \"checkout\", newBranchName})",
+                    "bindings": { "newBranchName": "pr.HeadRefName" }
+                }]
+            }),
+        );
+        let mut new = old.clone();
+        new.metadata.extra.insert(
+            COMMAND_EFFECT_CONTRACT_KEY.into(),
+            serde_json::json!({
+                "schema_version": 1,
+                "effects": [{
+                    "kind": "queued_git_argv",
+                    "expr": "append(cmdQueue, []string{\"git\", \"checkout\", newBranchName})",
+                    "bindings": { "newBranchName": "fmt.Sprintf(\"pr/%d/%s\", pr.Number, pr.HeadRefName)" }
+                }]
+            }),
+        );
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 0,
+                strong_consumer_count: 0,
+                contract_consumer_count: 0,
+                consumer_files: vec![],
+                covering_tests: 1,
+            }],
+            ..Default::default()
+        };
+
+        let comments = collect_inline_comments(&diff, &impact);
+        assert!(
+            comments
+                .iter()
+                .any(|comment| comment.kind == InlineCommentKind::CommandEffectContract),
+            "command contract metadata delta should emit an attention finding: {comments:?}"
         );
     }
 

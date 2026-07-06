@@ -150,6 +150,9 @@ impl IndexPipeline {
             })
             .collect();
         attach_file_context_metadata(&mut entities, file_id, &imports);
+        if language == LanguageId::Go {
+            kin_parser::attach_go_command_effect_contract_metadata(&tree, source, &mut entities);
+        }
 
         let (relations, unresolved_relations) = resolve_relations(&extracted_relations, &entities);
         let file_layout = build_layout(
@@ -286,6 +289,9 @@ impl IndexPipeline {
             })
             .collect();
         attach_file_context_metadata(&mut entities, file_id, &imports);
+        if language == LanguageId::Go {
+            kin_parser::attach_go_command_effect_contract_metadata(&tree, &source, &mut entities);
+        }
 
         // Resolve extracted relations to model relations using entity name mapping
         let (relations, unresolved_relations) = resolve_relations(&extracted_relations, &entities);

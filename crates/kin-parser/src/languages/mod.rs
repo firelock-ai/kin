@@ -17,7 +17,7 @@ pub mod typescript;
 
 pub use c_lang::CAdapter;
 pub use cpp_lang::CppAdapter;
-pub use go::GoAdapter;
+pub use go::{attach_go_command_effect_contract_metadata, GoAdapter};
 pub use hcl::HclAdapter;
 pub use java::JavaAdapter;
 pub use javascript::JavaScriptAdapter;
