@@ -647,11 +647,16 @@ pub fn classify_file_role(path: &str) -> EntityRole {
         return EntityRole::External;
     }
 
-    // Generated paths
+    // Generated paths. Amalgamated single-header bundles are byte-copies of
+    // real sources regenerated out-of-band: their entities must never read as
+    // independent consumers of the sources they were copied from.
     if lower.starts_with("generated/")
         || lower.contains("/generated/")
         || lower.starts_with("__generated__/")
         || lower.contains("/__generated__/")
+        || lower.starts_with("single_include/")
+        || lower.contains("/single_include/")
+        || lower.contains("amalgamated")
         || lower.ends_with(".pb.go")
         || lower.ends_with("_pb2.py")
         || lower.ends_with(".generated.ts")

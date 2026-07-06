@@ -1733,11 +1733,20 @@ fn imported_relations_equivalent(old: &Relation, new: &Relation) -> bool {
 const COMMAND_EFFECT_CONTRACT_KEY: &str = "command_effect_contract";
 
 fn entity_fingerprint_changed(old: &Entity, new: &Entity) -> bool {
+    // The contract key participates only when BOTH sides carry it: not every
+    // persist path attaches the contract, so key-absent vs key-present is
+    // coverage skew between paths, never evidence that behavior changed.
+    let contract_changed = match (
+        old.metadata.extra.get(COMMAND_EFFECT_CONTRACT_KEY),
+        new.metadata.extra.get(COMMAND_EFFECT_CONTRACT_KEY),
+    ) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    };
     old.fingerprint.ast_hash != new.fingerprint.ast_hash
         || old.fingerprint.signature_hash != new.fingerprint.signature_hash
         || old.fingerprint.behavior_hash != new.fingerprint.behavior_hash
-        || old.metadata.extra.get(COMMAND_EFFECT_CONTRACT_KEY)
-            != new.metadata.extra.get(COMMAND_EFFECT_CONTRACT_KEY)
+        || contract_changed
 }
 
 fn reconcile_imported_file_entities(
@@ -1961,6 +1970,13 @@ fn index_files_with_stable_entity_ids(
                                     &file_imports,
                                 );
                                 file_entities.push(entity);
+                            }
+                            if language == kin_model::LanguageId::Go {
+                                kin_parser::attach_go_command_effect_contract_metadata(
+                                    &tree,
+                                    &source,
+                                    &mut file_entities,
+                                );
                             }
                             let discovered_tests = promote_discovered_tests(
                                 &file_id,

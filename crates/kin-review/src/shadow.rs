@@ -501,7 +501,11 @@ fn collect_changed_entities<G: GraphStore>(
                     file,
                     start_line,
                     end_line,
-                    signature_changed: old.signature != new.signature,
+                    signature_changed: old.signature != new.signature
+                        && !crate::inline::signature_strengthened_only(
+                            &old.signature,
+                            &new.signature,
+                        ),
                     visibility_changed: old.visibility != new.visibility,
                 });
             }

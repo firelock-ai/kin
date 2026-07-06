@@ -227,6 +227,13 @@ async fn run_local_commit_pipeline_for_tests(
                         &file_id,
                         &file_imports,
                     );
+                    if language == kin_model::LanguageId::Go {
+                        kin_parser::attach_go_command_effect_contract_metadata(
+                            &tree,
+                            &source,
+                            std::slice::from_mut(&mut new_entity),
+                        );
+                    }
                     parsed_names.insert(new_entity.name.clone());
                     let existing = existing_file_entities
                         .and_then(|entities| entities.iter().find(|e| e.name == new_entity.name));

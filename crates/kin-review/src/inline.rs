@@ -64,6 +64,37 @@ impl InlineCommentKind {
 /// channels own contract-surface changes.
 pub const CONSUMER_FANOUT_THRESHOLD: usize = 2;
 
+/// Qualifiers whose ADDITION strengthens a declaration without invalidating
+/// any existing caller. Removal of one is a real surface change.
+const STRENGTHENING_QUALIFIERS: &[&str] = &["constexpr", "inline", "[[nodiscard]]"];
+
+/// True when `old` → `new` differs ONLY by adding strengthening qualifiers:
+/// the qualifier-stripped declarations are identical and `new` carries more
+/// strengthening qualifiers than `old`.
+pub fn signature_strengthened_only(old: &str, new: &str) -> bool {
+    if old == new {
+        return false;
+    }
+    fn strip(sig: &str) -> (String, usize) {
+        let mut removed = 0usize;
+        let kept: Vec<&str> = sig
+            .split_whitespace()
+            .filter(|tok| {
+                if STRENGTHENING_QUALIFIERS.contains(tok) {
+                    removed += 1;
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        (kept.join(" "), removed)
+    }
+    let (old_core, old_quals) = strip(old);
+    let (new_core, new_quals) = strip(new);
+    old_core == new_core && new_quals > old_quals
+}
+
 /// Collect line-level inline comments from a review's diff and impact data.
 ///
 /// Each comment is anchored to a file + line range derived from the entity's
@@ -180,8 +211,13 @@ fn collect_modified_comments(
         consumer_count
     };
 
-    // Signature change
-    if old.signature != new.signature {
+    // Signature change. A difference that only ADDS strengthening qualifiers
+    // (constexpr/inline/[[nodiscard]]) cannot invalidate existing callers and
+    // is not a contract-surface change; anything else — including removing
+    // such qualifiers — remains one.
+    if old.signature != new.signature
+        && !signature_strengthened_only(&old.signature, &new.signature)
+    {
         comments.push(InlineComment {
             file: span.file.to_string(),
             start_line: span.start_line,
@@ -266,19 +302,25 @@ fn collect_modified_comments(
         });
     }
 
-    if old.metadata.extra.get(COMMAND_EFFECT_CONTRACT_KEY)
-        != new.metadata.extra.get(COMMAND_EFFECT_CONTRACT_KEY)
-    {
-        comments.push(InlineComment {
-            file: span.file.to_string(),
-            start_line: span.start_line,
-            end_line: span.end_line,
-            kind: InlineCommentKind::CommandEffectContract,
-            message: format!(
-                "Command-effect contract for `{}` changed; external command behavior needs review",
-                new.name,
-            ),
-        });
+    // Fire only when BOTH sides carry a contract: persist paths differ in
+    // whether they attach the key, so one-sided presence is path-coverage
+    // skew, not a behavior change.
+    if let (Some(old_contract), Some(new_contract)) = (
+        old.metadata.extra.get(COMMAND_EFFECT_CONTRACT_KEY),
+        new.metadata.extra.get(COMMAND_EFFECT_CONTRACT_KEY),
+    ) {
+        if old_contract != new_contract {
+            comments.push(InlineComment {
+                file: span.file.to_string(),
+                start_line: span.start_line,
+                end_line: span.end_line,
+                kind: InlineCommentKind::CommandEffectContract,
+                message: format!(
+                    "Command-effect contract for `{}` changed; external command behavior needs review",
+                    new.name,
+                ),
+            });
+        }
     }
 
     // Body-only modification with wide consumer fanout. The contract surface
@@ -904,6 +946,91 @@ mod tests {
             .collect();
         assert_eq!(fanout.len(), 1, "strong consumers at threshold must fire");
         assert!(fanout[0].message.contains("2 distinct non-test consumer"));
+    }
+
+    #[test]
+    fn strengthened_only_signature_is_not_a_signature_change() {
+        assert!(signature_strengthened_only(
+            "TestRunInfo(StringRef _name)",
+            "constexpr TestRunInfo(StringRef _name)"
+        ));
+        assert!(!signature_strengthened_only(
+            "constexpr TestRunInfo(StringRef _name)",
+            "TestRunInfo(StringRef _name)"
+        ));
+        assert!(!signature_strengthened_only(
+            "TestRunInfo(StringRef _name)",
+            "TestRunInfo(StringRef _name, int mode)"
+        ));
+        assert!(!signature_strengthened_only(
+            "inline int f()",
+            "constexpr int f()"
+        ));
+        assert!(!signature_strengthened_only("int f()", "int f()"));
+    }
+
+    #[test]
+    fn strengthened_only_change_emits_no_signature_or_breaking_comment() {
+        let old = test_entity_with_span("hot_path", "src/hot.rs", 1, 20);
+        let mut new = old.clone();
+        new.signature = format!("constexpr {}", old.signature);
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 3,
+                strong_consumer_count: 3,
+                contract_consumer_count: 0,
+                consumer_files: vec!["src/a.rs".to_string()],
+                covering_tests: 0,
+            }],
+            ..Default::default()
+        };
+        let comments = collect_inline_comments(&diff, &impact);
+        assert!(
+            !comments.iter().any(|c| matches!(
+                c.kind,
+                InlineCommentKind::SignatureChange | InlineCommentKind::Breaking
+            )),
+            "qualifier strengthening must not read as signature change or breaking"
+        );
+    }
+
+    #[test]
+    fn command_contract_absent_on_one_side_is_no_signal() {
+        let old = test_entity_with_span("runner", "cmd/run.go", 1, 20);
+        let mut new = old.clone();
+        new.metadata.extra.insert(
+            COMMAND_EFFECT_CONTRACT_KEY.to_string(),
+            serde_json::json!({"schema_version": 1, "effects": []}),
+        );
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let comments = collect_inline_comments(&diff, &ImpactReport::default());
+        assert!(
+            !comments
+                .iter()
+                .any(|c| c.kind == InlineCommentKind::CommandEffectContract),
+            "key present on only one side is persist-path coverage skew, not a change"
+        );
     }
 
     #[test]
