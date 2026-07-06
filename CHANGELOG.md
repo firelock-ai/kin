@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-07-06
+
+Review-accuracy hardening across the shadow-review gate, the semantic substrate, and the language adapters — the graph now reasons about entity roles and the base-vs-head sides of a change the way a reviewer does.
+
+### Added
+
+- Toolchain-surface channel: edits that only add or remove lint-suppression and deprecation directives (`//nolint`, `# noqa`, `eslint-disable`, `#[allow]`, `@deprecated`, …) now surface a non-blocking review signal, diffed graph-natively from content-addressed blobs.
+- Executable per-language capability matrix covering all thirteen full adapters (entity extraction, cosmetic stability, call/import edges, cross-file resolution) as permanent regression tests.
+
+### Changed
+
+- Fingerprints and declaration signatures are formatting-independent across every language adapter: comment-only, whitespace-only, and line-wrapping edits no longer read as behavior or signature changes.
+- Entity role now scopes review findings consistently: test, generated, and vendored declarations are covering evidence, never a contract surface — a test's signature change no longer escalates a benign diff, and amalgamated single-header bundles no longer count as consumers.
+- Adding a strengthening qualifier (`constexpr`/`inline`/`[[nodiscard]]`) is no longer reported as a signature change.
+- One shared definition of "entity semantically changed" now governs every write path (commit, history hydration, daemon delta generation), so graph truth no longer depends on which path recorded a change.
+
+### Fixed
+
+- Deleting a public entity that has live non-test consumers is now flagged as a breaking change: removed-entity impact is harvested from the base graph (where the entity and its inbound edges still exist) instead of the head graph (where it is already gone), and the removed entity resolves to its real name rather than an opaque id.
+- Java and C# method calls resolve to their rightmost name (matching every other adapter), so cross-file call edges are no longer lost to dotted callees; Kotlin declaration signatures no longer leak the method body.
+
 ## [0.2.9] - 2026-07-04
 
 First-touch hardening: the daemon's git-ancestry hydration is serialized (no more concurrent-review crashes), whole-repo ingest routes every full language adapter, and agents get a budgeted batch source tool.
