@@ -403,13 +403,7 @@ fn extract_decorator_payload_name(node: &tree_sitter::Node, source: &[u8]) -> Op
 }
 
 fn node_signature(node: &tree_sitter::Node, source: &[u8]) -> String {
-    let text = node.utf8_text(source).unwrap_or("");
-    text.lines()
-        .next()
-        .unwrap_or(text)
-        .trim_end_matches(':')
-        .trim()
-        .to_string()
+    crate::adapter::declaration_signature(node, source)
 }
 
 fn extract_docstring(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {

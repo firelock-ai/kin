@@ -25,7 +25,7 @@ pub use gate::{derive_decision, GateStatus, ReviewDecision, ReviewFinding, Revie
 pub use impact::{analyze_impact, analyze_impact_at, EntityImpact, ImpactGraph, ImpactReport};
 pub use inline::{
     collect_inline_comments, group_by_file, InlineComment, InlineCommentKind,
-    CONSUMER_FANOUT_FILE_THRESHOLD,
+    CONSUMER_FANOUT_THRESHOLD,
 };
 pub use ref_graph::GraphAtRef;
 pub use release_gate::{

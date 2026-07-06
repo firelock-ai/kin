@@ -148,6 +148,12 @@ pub struct ImpactReport {
     pub entity_impacts: Vec<EntityImpact>,
 }
 
+/// Minimum inbound-edge confidence for a consumer to count toward
+/// verdict-driving fanout decisions. Ambiguous-dispatch fan-out links carry
+/// low confidence: they are real enough to display in the blast radius, but a
+/// possibly-reaching edge must not alone escalate a verdict.
+pub const STRONG_CONSUMER_CONFIDENCE: f32 = 0.6;
+
 /// Graph-proven inbound impact attributed to one directly changed entity.
 ///
 /// All counts are inbound-only: entities that reach the changed entity via
@@ -160,6 +166,10 @@ pub struct EntityImpact {
     pub entity_id: EntityId,
     /// Distinct non-test entities that consume this entity.
     pub consumer_count: usize,
+    /// Subset of `consumer_count` whose inbound edge confidence is at least
+    /// [`STRONG_CONSUMER_CONFIDENCE`] — the count verdict gates key on.
+    #[serde(default)]
+    pub strong_consumer_count: usize,
     /// Distinct non-test entities consuming this entity as a contract.
     pub contract_consumer_count: usize,
     /// Sorted distinct source files of the non-test consumers above.
@@ -254,8 +264,14 @@ pub fn analyze_impact_at<I: ImpactGraph>(
         // buckets. Sets are used only for distinct counts, never for output
         // ordering, so iteration order cannot leak into the report.
         let mut ent_consumers: HashSet<EntityId> = HashSet::new();
+        let mut ent_strong_consumers: HashSet<EntityId> = HashSet::new();
         let mut ent_contract_consumers: HashSet<EntityId> = HashSet::new();
         let mut ent_tests: HashSet<EntityId> = HashSet::new();
+        // `consumer_files` is the human-readable projection of the consumer
+        // ENTITY set below (which the fanout decision keys on) — the files those
+        // consuming entities live in, for the report message only. It is never a
+        // decision input: a consumer that happens to share the changed entity's
+        // file is still a distinct consumer entity with a real inbound edge.
         let mut ent_consumer_files: BTreeSet<String> = BTreeSet::new();
 
         // Find relations pointing TO this entity (callers, dependents, etc.).
@@ -297,6 +313,9 @@ pub fn analyze_impact_at<I: ImpactGraph>(
                     ent_tests.insert(affected_id);
                 } else {
                     ent_consumers.insert(affected_id);
+                    if rel.confidence >= STRONG_CONSUMER_CONFIDENCE {
+                        ent_strong_consumers.insert(affected_id);
+                    }
                     if rel.kind == RelationKind::ConsumesContract {
                         ent_contract_consumers.insert(affected_id);
                     }
@@ -344,10 +363,13 @@ pub fn analyze_impact_at<I: ImpactGraph>(
                     tests.push(entity);
                 }
             } else {
-                ent_consumers.insert(entity.id);
-                if let Some(file) = entity_file(&entity) {
-                    ent_consumer_files.insert(file);
-                }
+                // Transitive (2-hop) reach populates the blast-radius
+                // dependents bucket for the report, but must NOT feed the
+                // per-entity consumer_count / consumer_files that drive the
+                // breaking and consumer-fanout signals. Those attribute from
+                // DIRECT inbound edges outside the changed set only, so a path
+                // that routes through a co-updated intermediate cannot inflate
+                // this entity's contract-surface risk.
                 if seen_dependents.insert(entity.id) {
                     dependents.push(entity);
                 }
@@ -357,6 +379,7 @@ pub fn analyze_impact_at<I: ImpactGraph>(
         entity_impacts.push(EntityImpact {
             entity_id,
             consumer_count: ent_consumers.len(),
+            strong_consumer_count: ent_strong_consumers.len(),
             contract_consumer_count: ent_contract_consumers.len(),
             consumer_files: ent_consumer_files.into_iter().collect(),
             covering_tests: ent_tests.len(),
@@ -543,5 +566,215 @@ mod tests {
             ..Default::default()
         };
         assert!(!report.is_empty());
+    }
+
+    // ── Per-entity attribution: direct-only consumer_count / consumer_files ──
+
+    use crate::diff::{EntityChange, EntityChangeKind};
+    use kin_model::entity::SourceSpan;
+    use kin_model::provenance::{Actor, ActorId, Approval, AuditEvent};
+    use kin_model::relation::{GraphNodeId, Relation, RelationKind, RelationOrigin};
+    use kin_model::work::{Annotation, WorkItem, WorkScope};
+    use std::collections::HashMap;
+
+    fn entity_in_file(name: &str, file: &str, line: u32) -> Entity {
+        Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: name.to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([0; 32]),
+                behavior_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new(file)),
+            span: Some(SourceSpan {
+                file: FilePathId::new(file),
+                start_byte: 0,
+                end_byte: 10,
+                start_line: line,
+                start_col: 0,
+                end_line: line + 1,
+                end_col: 0,
+            }),
+            signature: format!("fn {}()", name),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn calls(src: &Entity, dst: &Entity) -> Relation {
+        Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(src.id),
+            dst: GraphNodeId::Entity(dst.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: vec![],
+        }
+    }
+
+    fn modified(entity: &Entity) -> EntityChange {
+        EntityChange {
+            entity_id: entity.id,
+            kind: EntityChangeKind::Modified {
+                old: entity.clone(),
+                new: entity.clone(),
+            },
+        }
+    }
+
+    /// Hand-built [`ImpactGraph`] returning exactly the inbound edges and
+    /// transitive downstream entities each test wires — no dependency on
+    /// live-store or ref-replay traversal semantics.
+    #[derive(Default)]
+    struct MockImpactGraph {
+        entities: HashMap<EntityId, Entity>,
+        inbound: HashMap<EntityId, Vec<Relation>>,
+        downstream: HashMap<EntityId, Vec<Entity>>,
+    }
+
+    impl ImpactGraph for MockImpactGraph {
+        fn get_entity(&self, id: &EntityId) -> Result<Option<Entity>, ReviewError> {
+            Ok(self.entities.get(id).cloned())
+        }
+        fn get_relations(
+            &self,
+            _id: &EntityId,
+            _kinds: &[RelationKind],
+        ) -> Result<Vec<Relation>, ReviewError> {
+            Ok(vec![])
+        }
+        fn get_all_relations_for_entity(
+            &self,
+            id: &EntityId,
+        ) -> Result<Vec<Relation>, ReviewError> {
+            Ok(self.inbound.get(id).cloned().unwrap_or_default())
+        }
+        fn get_downstream_impact(
+            &self,
+            id: &EntityId,
+            _max_depth: u32,
+        ) -> Result<Vec<Entity>, ReviewError> {
+            Ok(self.downstream.get(id).cloned().unwrap_or_default())
+        }
+        fn get_work_for_scope(&self, _scope: &WorkScope) -> Result<Vec<WorkItem>, ReviewError> {
+            Ok(vec![])
+        }
+        fn get_annotations_for_scope(
+            &self,
+            _scope: &WorkScope,
+        ) -> Result<Vec<Annotation>, ReviewError> {
+            Ok(vec![])
+        }
+        fn get_approvals_for_change(
+            &self,
+            _id: &SemanticChangeId,
+        ) -> Result<Vec<Approval>, ReviewError> {
+            Ok(vec![])
+        }
+        fn query_audit_events(
+            &self,
+            _actor_id: Option<&ActorId>,
+            _limit: usize,
+        ) -> Result<Vec<AuditEvent>, ReviewError> {
+            Ok(vec![])
+        }
+        fn get_actor(&self, _id: &ActorId) -> Result<Option<Actor>, ReviewError> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn consumer_count_counts_direct_inbound_not_two_hop_through_changed() {
+        // A and B are both changed (co-updated). B consumes A directly, C
+        // consumes B, and D consumes A directly. The 2-hop walk from A reaches
+        // C through the co-updated intermediate B. C must NOT inflate A's
+        // consumer_count — breaking risk is attributed from DIRECT external
+        // consumers only, so A counts D alone. Before this fix C leaked in via
+        // the 2-hop walk and A's consumer_count was 2.
+        let a = entity_in_file("target_a", "src/a.rs", 1);
+        let b = entity_in_file("mid_b", "src/b.rs", 1);
+        let c = entity_in_file("far_c", "src/c.rs", 1);
+        let d = entity_in_file("direct_d", "src/d.rs", 1);
+
+        let mut graph = MockImpactGraph::default();
+        for entity in [&a, &b, &c, &d] {
+            graph.entities.insert(entity.id, entity.clone());
+        }
+        // Direct inbound to A: B and D call A.
+        graph
+            .inbound
+            .insert(a.id, vec![calls(&b, &a), calls(&d, &a)]);
+        // Direct inbound to B: C calls B.
+        graph.inbound.insert(b.id, vec![calls(&c, &b)]);
+        // Transitive downstream of A reaches B (depth 1) and C (depth 2).
+        graph
+            .downstream
+            .insert(a.id, vec![b.clone(), c.clone(), d.clone()]);
+
+        let diff = SemanticDiff {
+            entity_changes: vec![modified(&a), modified(&b)],
+            ..Default::default()
+        };
+
+        let report = analyze_impact_at(&graph, &diff).unwrap();
+        let impact_a = report.entity_impact(&a.id).expect("A has an impact entry");
+        assert_eq!(
+            impact_a.consumer_count, 1,
+            "only the direct external consumer D counts; C (2-hop via co-updated B) must not"
+        );
+        // C is still reachable as transitive blast radius (report surface),
+        // just not as a direct-consumer attribution.
+        assert!(report.affected_dependents.iter().any(|e| e.id == c.id));
+    }
+
+    #[test]
+    fn consumer_count_is_entity_native_including_a_same_file_consumer() {
+        // A (changed) in src/foo.rs is consumed by a same-file sibling B and by
+        // an external C in src/bar.rs. Both B and C are distinct consumer
+        // ENTITIES with real inbound edges, so both count — the fanout decision
+        // is graph-native and never special-cases a consumer by the file it
+        // lives in. `consumer_files` is the reported projection of that entity
+        // set (both files), used only for the message, never for the decision.
+        let a = entity_in_file("hot_path", "src/foo.rs", 1);
+        let b = entity_in_file("sibling", "src/foo.rs", 40);
+        let c = entity_in_file("external", "src/bar.rs", 1);
+
+        let mut graph = MockImpactGraph::default();
+        for entity in [&a, &b, &c] {
+            graph.entities.insert(entity.id, entity.clone());
+        }
+        graph
+            .inbound
+            .insert(a.id, vec![calls(&b, &a), calls(&c, &a)]);
+
+        let diff = SemanticDiff {
+            entity_changes: vec![modified(&a)],
+            ..Default::default()
+        };
+
+        let report = analyze_impact_at(&graph, &diff).unwrap();
+        let impact_a = report.entity_impact(&a.id).expect("A has an impact entry");
+        assert_eq!(
+            impact_a.consumer_count, 2,
+            "both consumer entities count, regardless of the file they live in"
+        );
+        assert_eq!(
+            impact_a.consumer_files,
+            vec!["src/bar.rs".to_string(), "src/foo.rs".to_string()],
+            "consumer_files is the projected file set of the consumer entities (both), report-only"
+        );
     }
 }

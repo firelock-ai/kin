@@ -1112,6 +1112,7 @@ fn inline_comment_severity(kind: kin_review::InlineCommentKind) -> &'static str 
         InlineCommentKind::CoverageGap
         | InlineCommentKind::SignatureChange
         | InlineCommentKind::VisibilityChange
+        | InlineCommentKind::CommandEffectContract
         | InlineCommentKind::ConsumerFanout
         | InlineCommentKind::Renamed
         | InlineCommentKind::AgentUnreviewed => "warning",
@@ -1123,6 +1124,14 @@ fn inline_comment_severity(kind: kin_review::InlineCommentKind) -> &'static str 
 mod tests {
     use super::*;
     use kin_model::ProvenanceStore;
+
+    #[test]
+    fn command_effect_contract_comment_severity_is_warning() {
+        assert_eq!(
+            inline_comment_severity(kin_review::InlineCommentKind::CommandEffectContract),
+            "warning"
+        );
+    }
 
     #[test]
     fn create_review_records_audit_event() {

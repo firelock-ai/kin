@@ -19,13 +19,13 @@ pub use adapter::{EditHint, LanguageAdapter};
 pub use error::{ParseError, Result};
 pub use extract::{
     attach_file_context_metadata, ExtractedEntity, ExtractedRelation, ExtractedTest,
-    ExtractedTestKind, FileImport, ImportedName, ParseOutput, FILE_IMPORT_CONTEXT_KEY,
-    FILE_SURFACE_CONTEXT_KEY,
+    ExtractedTestKind, FileImport, ImportedName, ParseOutput, COMMAND_EFFECT_CONTRACT_KEY,
+    FILE_IMPORT_CONTEXT_KEY, FILE_SURFACE_CONTEXT_KEY,
 };
 pub use languages::{
-    AdapterRegistry, CAdapter, CSharpAdapter, CppAdapter, GoAdapter, HclAdapter, JavaAdapter,
-    JavaScriptAdapter, KotlinAdapter, PhpAdapter, PythonAdapter, RubyAdapter, RustAdapter,
-    SwiftAdapter, TypeScriptAdapter,
+    attach_go_command_effect_contract_metadata, AdapterRegistry, CAdapter, CSharpAdapter,
+    CppAdapter, GoAdapter, HclAdapter, JavaAdapter, JavaScriptAdapter, KotlinAdapter, PhpAdapter,
+    PythonAdapter, RubyAdapter, RustAdapter, SwiftAdapter, TypeScriptAdapter,
 };
 pub use shallow::{
     extract_shallow, get_shallow_grammar, parse_shallow_file, ShallowDecl, ShallowDeclKind,

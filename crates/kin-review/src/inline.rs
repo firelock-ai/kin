@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use crate::diff::{EntityChangeKind, SemanticDiff};
 use crate::impact::ImpactReport;
 
+const COMMAND_EFFECT_CONTRACT_KEY: &str = "command_effect_contract";
+
 /// A review comment anchored to a specific source location.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InlineComment {
@@ -26,6 +28,7 @@ pub enum InlineCommentKind {
     Breaking,
     CoverageGap,
     ContractViolation,
+    CommandEffectContract,
     SignatureChange,
     VisibilityChange,
     ConsumerFanout,
@@ -40,6 +43,7 @@ impl InlineCommentKind {
         match self {
             Self::Breaking => "!!",
             Self::ContractViolation => "!!",
+            Self::CommandEffectContract => "~",
             Self::CoverageGap => "?",
             Self::SignatureChange => "~",
             Self::VisibilityChange => "~",
@@ -52,12 +56,13 @@ impl InlineCommentKind {
     }
 }
 
-/// Distinct non-test consumer files at or above which a body-only
+/// Distinct non-test consumer ENTITIES at or above which a body-only
 /// modification (signature and visibility unchanged) emits a consumer-fanout
-/// attention comment. Body changes below this fanout stay silent: the
-/// signature channels own contract-surface changes, and a body edit consumed
-/// from a single file is ordinary local iteration.
-pub const CONSUMER_FANOUT_FILE_THRESHOLD: usize = 2;
+/// attention comment. The decision is graph-native — it counts consuming
+/// entities (typed inbound edges), not the files they happen to live in; a body
+/// change reaching a single consumer is ordinary local iteration. The signature
+/// channels own contract-surface changes.
+pub const CONSUMER_FANOUT_THRESHOLD: usize = 2;
 
 /// Collect line-level inline comments from a review's diff and impact data.
 ///
@@ -165,9 +170,15 @@ fn collect_modified_comments(
     // entity's consumers are that entity's risk, not this one's.
     let per_entity = impact.entity_impact(&new.id);
     let consumer_count = per_entity.map_or(0, |e| e.consumer_count);
+    let strong_consumer_count = per_entity.map_or(0, |e| e.strong_consumer_count);
     let contract_consumer_count = per_entity.map_or(0, |e| e.contract_consumer_count);
     let consumer_file_count = per_entity.map_or(0, |e| e.consumer_files.len());
     let entity_covering_tests = per_entity.map_or(0, |e| e.covering_tests);
+    let fanout_gate_consumer_count = if entity_covering_tests > 0 {
+        strong_consumer_count
+    } else {
+        consumer_count
+    };
 
     // Signature change
     if old.signature != new.signature {
@@ -255,12 +266,32 @@ fn collect_modified_comments(
         });
     }
 
+    if old.metadata.extra.get(COMMAND_EFFECT_CONTRACT_KEY)
+        != new.metadata.extra.get(COMMAND_EFFECT_CONTRACT_KEY)
+    {
+        comments.push(InlineComment {
+            file: span.file.to_string(),
+            start_line: span.start_line,
+            end_line: span.end_line,
+            kind: InlineCommentKind::CommandEffectContract,
+            message: format!(
+                "Command-effect contract for `{}` changed; external command behavior needs review",
+                new.name,
+            ),
+        });
+    }
+
     // Body-only modification with wide consumer fanout. The contract surface
     // is unchanged, so the breaking channels stay silent, but a behavior
-    // change consumed from many distinct non-test files deserves attention.
+    // change reaching many distinct non-test consumer entities deserves
+    // attention. Graph-known covering tests can absorb weak/ambiguous fanout,
+    // so covered body-only changes gate on strong consumers only. Uncovered
+    // body-only changes gate on all graph-native consumer entities: weak
+    // fanout plus no tests is still a review risk. The file list is reported
+    // only as human-readable context.
     if old.signature == new.signature
         && old.visibility == new.visibility
-        && consumer_file_count >= CONSUMER_FANOUT_FILE_THRESHOLD
+        && fanout_gate_consumer_count >= CONSUMER_FANOUT_THRESHOLD
     {
         comments.push(InlineComment {
             file: span.file.to_string(),
@@ -268,8 +299,8 @@ fn collect_modified_comments(
             end_line: span.end_line,
             kind: InlineCommentKind::ConsumerFanout,
             message: format!(
-                "Behavior of `{}` changed with {} distinct non-test consumer file(s)",
-                new.name, consumer_file_count,
+                "Behavior of `{}` changed with {} distinct non-test consumer(s) across {} file(s)",
+                new.name, fanout_gate_consumer_count, consumer_file_count,
             ),
         });
     }
@@ -468,6 +499,7 @@ mod tests {
             entity_impacts: vec![EntityImpact {
                 entity_id: new.id,
                 consumer_count: 1,
+                strong_consumer_count: 1,
                 contract_consumer_count: 0,
                 consumer_files: vec!["src/client.rs".to_string()],
                 covering_tests: 0,
@@ -517,6 +549,7 @@ mod tests {
                 EntityImpact {
                     entity_id: new_a.id,
                     consumer_count: 0,
+                    strong_consumer_count: 0,
                     contract_consumer_count: 0,
                     consumer_files: vec![],
                     covering_tests: 0,
@@ -524,6 +557,7 @@ mod tests {
                 EntityImpact {
                     entity_id: b.id,
                     consumer_count: 1,
+                    strong_consumer_count: 1,
                     contract_consumer_count: 0,
                     consumer_files: vec!["src/client.rs".to_string()],
                     covering_tests: 0,
@@ -569,6 +603,7 @@ mod tests {
             entity_impacts: vec![EntityImpact {
                 entity_id: new.id,
                 consumer_count: 0,
+                strong_consumer_count: 0,
                 contract_consumer_count: 0,
                 consumer_files: vec![],
                 covering_tests: 1,
@@ -626,6 +661,7 @@ mod tests {
                 EntityImpact {
                     entity_id: covered.id,
                     consumer_count: 0,
+                    strong_consumer_count: 0,
                     contract_consumer_count: 0,
                     consumer_files: vec![],
                     covering_tests: 1,
@@ -633,6 +669,7 @@ mod tests {
                 EntityImpact {
                     entity_id: uncovered.id,
                     consumer_count: 0,
+                    strong_consumer_count: 0,
                     contract_consumer_count: 0,
                     consumer_files: vec![],
                     covering_tests: 0,
@@ -683,9 +720,68 @@ mod tests {
     }
 
     #[test]
+    fn command_contract_delta_emits_inline_finding() {
+        let mut old = test_entity_with_span("prCheckout", "command/pr_checkout.go", 14, 102);
+        old.metadata.extra.insert(
+            COMMAND_EFFECT_CONTRACT_KEY.into(),
+            serde_json::json!({
+                "schema_version": 1,
+                "effects": [{
+                    "kind": "queued_git_argv",
+                    "expr": "append(cmdQueue, []string{\"git\", \"checkout\", newBranchName})",
+                    "bindings": { "newBranchName": "pr.HeadRefName" }
+                }]
+            }),
+        );
+        let mut new = old.clone();
+        new.metadata.extra.insert(
+            COMMAND_EFFECT_CONTRACT_KEY.into(),
+            serde_json::json!({
+                "schema_version": 1,
+                "effects": [{
+                    "kind": "queued_git_argv",
+                    "expr": "append(cmdQueue, []string{\"git\", \"checkout\", newBranchName})",
+                    "bindings": { "newBranchName": "fmt.Sprintf(\"pr/%d/%s\", pr.Number, pr.HeadRefName)" }
+                }]
+            }),
+        );
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 0,
+                strong_consumer_count: 0,
+                contract_consumer_count: 0,
+                consumer_files: vec![],
+                covering_tests: 1,
+            }],
+            ..Default::default()
+        };
+
+        let comments = collect_inline_comments(&diff, &impact);
+        assert!(
+            comments
+                .iter()
+                .any(|comment| comment.kind == InlineCommentKind::CommandEffectContract),
+            "command contract metadata delta should emit an attention finding: {comments:?}"
+        );
+    }
+
+    #[test]
     fn consumer_fanout_fires_on_body_change_at_threshold() {
-        // Body-only modification (signature and visibility unchanged)
-        // consumed from two distinct non-test files -> attention comment.
+        // Body-only modification (signature and visibility unchanged) reaching
+        // two distinct non-test consumer entities -> attention comment.
         let old = test_entity_with_span("hot_path", "src/hot.rs", 1, 20);
         let new = old.clone();
 
@@ -707,6 +803,7 @@ mod tests {
             entity_impacts: vec![EntityImpact {
                 entity_id: new.id,
                 consumer_count: 2,
+                strong_consumer_count: 2,
                 contract_consumer_count: 0,
                 consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
                 covering_tests: 1,
@@ -721,6 +818,141 @@ mod tests {
             .collect();
         assert_eq!(fanout.len(), 1);
         assert!(fanout[0].message.contains("2 distinct non-test consumer"));
+    }
+
+    #[test]
+    fn consumer_fanout_uses_weak_consumers_only_when_uncovered() {
+        // Ambiguous-dispatch fan-out links every possible implementor at low
+        // confidence. Covered body-only changes need strong consumers to gate;
+        // uncovered body-only changes still gate on weak fanout, because the
+        // graph has no test evidence to absorb that possible blast radius.
+        let old = test_entity_with_span("hot_path", "src/hot.rs", 1, 20);
+        let new = old.clone();
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let covered_weak_only = ImpactReport {
+            changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 4,
+                strong_consumer_count: 0,
+                contract_consumer_count: 0,
+                consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+                covering_tests: 1,
+            }],
+            ..Default::default()
+        };
+        let comments = collect_inline_comments(&diff, &covered_weak_only);
+        assert!(
+            !comments
+                .iter()
+                .any(|c| c.kind == InlineCommentKind::ConsumerFanout),
+            "covered weak-only consumers must not fire the fanout gate"
+        );
+
+        let uncovered_weak_only = ImpactReport {
+            changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 4,
+                strong_consumer_count: 0,
+                contract_consumer_count: 0,
+                consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+                covering_tests: 0,
+            }],
+            ..Default::default()
+        };
+        let comments = collect_inline_comments(&diff, &uncovered_weak_only);
+        let fanout: Vec<&InlineComment> = comments
+            .iter()
+            .filter(|c| c.kind == InlineCommentKind::ConsumerFanout)
+            .collect();
+        assert_eq!(
+            fanout.len(),
+            1,
+            "uncovered weak fanout must still fire the review gate"
+        );
+        assert!(
+            fanout[0].message.contains("4 distinct non-test consumer"),
+            "uncovered fanout reports the full graph-native consumer count"
+        );
+
+        let mixed = ImpactReport {
+            changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 4,
+                strong_consumer_count: 2,
+                contract_consumer_count: 0,
+                consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+                covering_tests: 1,
+            }],
+            ..Default::default()
+        };
+        let comments = collect_inline_comments(&diff, &mixed);
+        let fanout: Vec<&InlineComment> = comments
+            .iter()
+            .filter(|c| c.kind == InlineCommentKind::ConsumerFanout)
+            .collect();
+        assert_eq!(fanout.len(), 1, "strong consumers at threshold must fire");
+        assert!(fanout[0].message.contains("2 distinct non-test consumer"));
+    }
+
+    #[test]
+    fn consumer_fanout_decides_on_entity_count_not_file_count() {
+        // Two distinct consumer entities that live in the SAME file: one file,
+        // two entities. The fanout decision is graph-native — it keys on the
+        // consumer ENTITY count (2 >= threshold), so it fires even though the
+        // consumers project onto a single file. A file-count decision would
+        // have stayed silent here; that is exactly the file-first behavior this
+        // rule must not have.
+        let old = test_entity_with_span("hot_path", "src/hot.rs", 1, 20);
+        let new = old.clone();
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 2,
+                strong_consumer_count: 2,
+                contract_consumer_count: 0,
+                // Both consumers in one file: file count (1) is below threshold,
+                // entity count (2) is at it.
+                consumer_files: vec!["src/shared.rs".to_string()],
+                covering_tests: 0,
+            }],
+            ..Default::default()
+        };
+        let comments = collect_inline_comments(&diff, &impact);
+        let fanout: Vec<&InlineComment> = comments
+            .iter()
+            .filter(|c| c.kind == InlineCommentKind::ConsumerFanout)
+            .collect();
+        assert_eq!(
+            fanout.len(),
+            1,
+            "fanout fires on 2 consumer entities even though they share one file"
+        );
+        assert!(fanout[0]
+            .message
+            .contains("2 distinct non-test consumer(s) across 1 file(s)"));
     }
 
     #[test]
@@ -746,6 +978,7 @@ mod tests {
             entity_impacts: vec![EntityImpact {
                 entity_id: new.id,
                 consumer_count: 1,
+                strong_consumer_count: 1,
                 contract_consumer_count: 0,
                 consumer_files: vec!["src/only.rs".to_string()],
                 covering_tests: 0,
@@ -777,6 +1010,7 @@ mod tests {
             entity_impacts: vec![EntityImpact {
                 entity_id: resigned.id,
                 consumer_count: 2,
+                strong_consumer_count: 2,
                 contract_consumer_count: 0,
                 consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
                 covering_tests: 0,

@@ -138,6 +138,23 @@ fn entity_link_order(a: &Entity, b: &Entity) -> std::cmp::Ordering {
         .then_with(|| a.id.0.cmp(&b.id.0))
 }
 
+/// The bare (unqualified) leaf of an entity name: the part after the final
+/// `::` or `.` separator, or the whole name when it carries no qualifier.
+///
+/// Shared by the batch [`link_cross_file`] entity index and the
+/// [`IncrementalLinker`] bare-name index so both derive receiver-method leaf
+/// names identically — a divergence here would resolve the same call to
+/// different entities across the two linkers.
+fn bare_entity_name(name: &str) -> &str {
+    match name.rfind("::") {
+        Some(idx) => &name[idx + 2..],
+        None => match name.rfind('.') {
+            Some(idx) => &name[idx + 1..],
+            None => name,
+        },
+    }
+}
+
 /// Resolve cross-file relations for `files` against a broader target universe.
 ///
 /// This is used by warm/incremental indexing paths where only a subset of files
@@ -267,13 +284,7 @@ fn build_link_context<'a>(
                 .or_default()
                 .push((file_path, entity.id));
 
-            let bare_name = match entity.name.rfind("::") {
-                Some(idx) => &entity.name[idx + 2..],
-                None => match entity.name.rfind('.') {
-                    Some(idx) => &entity.name[idx + 1..],
-                    None => &*entity.name,
-                },
-            };
+            let bare_name = bare_entity_name(&entity.name);
             if bare_name != entity.name {
                 entity_by_bare_name
                     .entry(bare_name)
@@ -399,10 +410,30 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
             continue;
         }
 
-        // (a) Same-file resolution
+        // (a) Same-file resolution. A same-file entity still wins and is emitted
+        // first at full confidence, but it is frequently a declaration/prototype
+        // whose definition lives in another file; when cross-file entities share
+        // the exact name, also fan out to them (bounded so the same-file target
+        // plus its cross-file twins stay within the cap) so the real definition
+        // is linked, not just the local stub. Cross-file twins are name-inferred,
+        // so they carry the (c) name-match confidence (0.7), below the
+        // parser-certain same-file edge (1.0).
         if let Some(&dst_id) = dst_same_file {
             if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
                 resolved.push(make_relation(rel.kind, src_id, dst_id, 1.0));
+            }
+            let mut cross_file_twins: HashSet<EntityId> = HashSet::new();
+            distinct_cross_file_targets(
+                ctx.entity_by_name.get(rel.dst_name.as_str()),
+                file.file_path.as_str(),
+                &mut cross_file_twins,
+            );
+            if !cross_file_twins.is_empty() && cross_file_twins.len() < AMBIGUOUS_CALL_FANOUT_CAP {
+                for cross_id in sorted_fanout_targets(cross_file_twins) {
+                    if add_deduped(&mut seen, src_id, cross_id, rel.kind) {
+                        resolved.push(make_relation(rel.kind, src_id, cross_id, 0.7));
+                    }
+                }
             }
             continue;
         }
@@ -540,10 +571,12 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
 
         // (c2) Receiver-method calls (`x.method()`) arrive as the bare method
         // name and never match (b)'s `Type::method` key. Resolve them through
-        // the bare-name index only when unambiguous — exactly one method of
-        // that name in another file. Ambiguous names (`new`, `run`, `get`) have
-        // an unknowable receiver type, so linking every candidate would mint
-        // spurious callers; leave those to the inconclusive-absence gate.
+        // the bare-name index. A single distinct cross-file method links as
+        // before; when several implementor classes define the name — virtual
+        // dispatch has an unknowable receiver type — fan out to all of them up
+        // to the cap so every plausible dispatch target is counted rather than
+        // dropped. Beyond the cap the name is too ubiquitous to guess, so it
+        // stays unlinked for the inconclusive-absence gate.
         if name_fallback_allowed && !linked && !bare_candidates.is_empty() {
             let mut distinct_targets: HashSet<EntityId> = HashSet::new();
             for &(fp, dst_id) in bare_candidates {
@@ -551,11 +584,12 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                     distinct_targets.insert(dst_id);
                 }
             }
-            if distinct_targets.len() == 1 {
-                let dst_id = *distinct_targets.iter().next().expect("len checked == 1");
-                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                    resolved.push(make_relation(rel.kind, src_id, dst_id, 0.3));
-                    linked = true;
+            if (1..=AMBIGUOUS_CALL_FANOUT_CAP).contains(&distinct_targets.len()) {
+                for dst_id in sorted_fanout_targets(distinct_targets) {
+                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                        resolved.push(make_relation(rel.kind, src_id, dst_id, 0.3));
+                        linked = true;
+                    }
                 }
             }
         }
@@ -570,7 +604,9 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
             && !linked
             && matches!(rel.kind, RelationKind::Calls | RelationKind::References)
         {
-            if let Some(dst_id) =
+            // Fan out: an ambiguous qualified leaf resolves to every distinct
+            // cross-file target (overloads / amalgamated copies), not just one.
+            for dst_id in
                 resolve_qualified_suffix(rel.dst_name.as_str(), file.file_path.as_str(), ctx)
             {
                 if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
@@ -945,11 +981,13 @@ fn split_member_access(name: &str) -> Option<(&str, &str)> {
 }
 
 /// Confidence for a call/reference edge resolved by reducing a path-qualified
-/// callee (`crate::mod::func`, `Type::method`, `alias::Type::method`) to a unique
-/// local entity via suffix matching. Inferred: the module/crate prefix is dropped
-/// before matching, so it ranks below an import-verified edge (0.95) yet above the
-/// ambiguous receiver-method guess (0.3) because the suffix match is required to
-/// be unambiguous.
+/// callee (`crate::mod::func`, `Type::method`, `alias::Type::method`) to local
+/// entities via suffix matching. Inferred: the module/crate prefix is dropped
+/// before matching, so it ranks below an import-verified edge (0.95) yet above
+/// the ambiguous receiver-method guess (0.3). A single suffix target and a
+/// fanned-out set of ambiguous ones share this confidence: every emitted target
+/// is a real definition the suffix genuinely names, so the resolution quality is
+/// the same whether one target or several survive.
 const QUALIFIED_SUFFIX_CONFIDENCE: f32 = 0.6;
 
 /// Whether a `::`-path segment is a plain Rust identifier (`crate`, `self`,
@@ -964,6 +1002,20 @@ fn is_path_identifier(seg: &str) -> bool {
     }
     chars.all(|c| c == '_' || c.is_alphanumeric())
 }
+
+/// Upper bound on how many ambiguous same-name targets one call or reference
+/// may fan out to.
+///
+/// A virtual-dispatch method call, a set of overloads, or a
+/// declaration/definition split has several equally-plausible definitions.
+/// Linking every one keeps the caller visible in refs/impact instead of
+/// silently dropping the edge when the target cannot be pinned to exactly one.
+/// The cap bounds that over-approximation: a ubiquitous leaf name (`new`,
+/// `get`, `run`) can occur in dozens of files, and fanning out to all of them
+/// would flood the graph with low-value guesses. At or below the cap every
+/// distinct candidate is linked; above it the resolver stays silent rather than
+/// emit a wall of edges.
+const AMBIGUOUS_CALL_FANOUT_CAP: usize = 8;
 
 /// Collect the distinct target entity ids among `candidates` that live in a file
 /// other than `current_file`.
@@ -981,6 +1033,19 @@ fn distinct_cross_file_targets(
     }
 }
 
+/// Order a fanned-out target set deterministically before emitting relations.
+///
+/// Fan-out gathers candidates into a `HashSet`, whose iteration order is not
+/// stable across processes. Sorting by [`EntityId`] — content-derived, hence
+/// reproducible — fixes the emitted relation order so a re-run is byte-stable
+/// and the batch and incremental linkers emit identical edges for identical
+/// input.
+fn sorted_fanout_targets(targets: HashSet<EntityId>) -> Vec<EntityId> {
+    let mut ids: Vec<EntityId> = targets.into_iter().collect();
+    ids.sort_unstable();
+    ids
+}
+
 /// Resolve a Rust-style path-qualified call/reference target to a unique local
 /// entity by matching the path's resolvable suffixes against the entity indices.
 ///
@@ -995,19 +1060,24 @@ fn distinct_cross_file_targets(
 ///   2. the bare leaf `func`/`method`, which resolves a module-qualified free
 ///      function (`crate::work::run`) and receiver methods stored bare.
 ///
-/// It links only when exactly one distinct target entity exists in a file other
-/// than the caller's. Ambiguous suffixes (more than one distinct target) resolve
-/// to `None` and are logged — a missing edge is preferred over a wrong one.
+/// Returns every distinct cross-file target the suffix can name, in a
+/// deterministic order; an empty vector is an honest miss. The type-qualified
+/// suffix is precise, so it resolves a single target and stops (empty) when it
+/// is itself ambiguous — widening to the bare leaf would be less precise, not
+/// more. The bare leaf is the ambiguous tier: when it names several cross-file
+/// targets (overloads, or amalgamated header copies of one symbol) it fans out
+/// to all of them, bounded by [`AMBIGUOUS_CALL_FANOUT_CAP`]; beyond the cap it
+/// stays silent and is logged — a wall of guesses is worse than a missing edge.
 fn resolve_qualified_suffix(
     dst_name: &str,
     current_file: &str,
     ctx: &LinkContext<'_>,
-) -> Option<EntityId> {
+) -> Vec<EntityId> {
     let segments: Vec<&str> = dst_name.split("::").collect();
     // Must be a genuine `::` path of identifier-like segments. Rejects bare names
     // (handled by (c)/(c2)), leading/trailing `::`, and turbofish/exotic forms.
     if segments.len() < 2 || !segments.iter().all(|s| is_path_identifier(s)) {
-        return None;
+        return Vec::new();
     }
     let last = segments[segments.len() - 1];
 
@@ -1023,7 +1093,7 @@ fn resolve_qualified_suffix(
         &mut tq_targets,
     );
     match tq_targets.len() {
-        1 => return tq_targets.into_iter().next(),
+        1 => return tq_targets.into_iter().collect(),
         n if n > 1 => {
             debug!(
                 dst = %dst_name,
@@ -1031,14 +1101,15 @@ fn resolve_qualified_suffix(
                 count = n,
                 "linker: ambiguous type-qualified suffix, leaving unresolved"
             );
-            return None;
+            return Vec::new();
         }
         _ => {}
     }
 
     // Tier 2: bare leaf. Free functions live in `entity_by_name` under `last`;
-    // methods live in `entity_by_bare_name` under `last`. Union both and require
-    // a single distinct target.
+    // methods live in `entity_by_bare_name` under `last`. Union both, then fan
+    // out to every distinct cross-file target up to the cap so overload sets and
+    // amalgamated duplicate definitions all link instead of dropping the edge.
     let mut leaf_targets: HashSet<EntityId> = HashSet::new();
     distinct_cross_file_targets(
         ctx.entity_by_name.get(last),
@@ -1051,32 +1122,34 @@ fn resolve_qualified_suffix(
         &mut leaf_targets,
     );
     match leaf_targets.len() {
-        1 => leaf_targets.into_iter().next(),
-        0 => None,
+        0 => Vec::new(),
+        n if n <= AMBIGUOUS_CALL_FANOUT_CAP => sorted_fanout_targets(leaf_targets),
         n => {
             debug!(
                 dst = %dst_name,
                 leaf = %last,
                 count = n,
-                "linker: ambiguous qualified-call leaf, leaving unresolved"
+                "linker: qualified-call leaf beyond fan-out cap, leaving unresolved"
             );
-            None
+            Vec::new()
         }
     }
 }
 
-/// Incremental-linker counterpart of [`resolve_qualified_suffix`]. The
-/// incremental index keys entities by their owned simple name and carries no
-/// bare-name index, so only the type-qualified suffix (`Type::method`) and the
-/// bare leaf free-function name are matched; ambiguous suffixes stay unresolved.
+/// Incremental-linker counterpart of [`resolve_qualified_suffix`], kept in exact
+/// resolution parity with it: the type-qualified suffix (`Type::method`) resolves
+/// a single target or stops on ambiguity, and the bare leaf unions the
+/// simple-name and bare-name indices, then fans out to every distinct cross-file
+/// target up to [`AMBIGUOUS_CALL_FANOUT_CAP`]. Returns the targets in the same
+/// deterministic order as the batch resolver; an empty vector is an honest miss.
 fn resolve_qualified_suffix_incremental(
     dst_name: &str,
     current_file: &str,
     linker: &IncrementalLinker,
-) -> Option<EntityId> {
+) -> Vec<EntityId> {
     let segments: Vec<&str> = dst_name.split("::").collect();
     if segments.len() < 2 || !segments.iter().all(|s| is_path_identifier(s)) {
-        return None;
+        return Vec::new();
     }
     let last = segments[segments.len() - 1];
 
@@ -1091,7 +1164,7 @@ fn resolve_qualified_suffix_incremental(
         }
     }
     match tq_targets.len() {
-        1 => return tq_targets.into_iter().next(),
+        1 => return tq_targets.into_iter().collect(),
         n if n > 1 => {
             debug!(
                 dst = %dst_name,
@@ -1099,13 +1172,15 @@ fn resolve_qualified_suffix_incremental(
                 count = n,
                 "linker(incremental): ambiguous type-qualified suffix, leaving unresolved"
             );
-            return None;
+            return Vec::new();
         }
         _ => {}
     }
 
-    // Tier 2: bare leaf (free functions; the incremental index has no bare-method
-    // index, so receiver methods reached without their type stay unresolved here).
+    // Tier 2: bare leaf. Free functions live in `entity_by_name` under `last`;
+    // methods live in `entity_by_bare_name` under `last`. Union both so the
+    // incremental linker resolves the same leaf targets as the batch resolver,
+    // then fan out to every distinct cross-file target up to the cap.
     let mut leaf_targets: HashSet<EntityId> = HashSet::new();
     if let Some(cands) = linker.entity_by_name.get(last) {
         for (fp, id) in cands {
@@ -1114,17 +1189,24 @@ fn resolve_qualified_suffix_incremental(
             }
         }
     }
+    if let Some(cands) = linker.entity_by_bare_name.get(last) {
+        for (fp, id) in cands {
+            if fp != current_file {
+                leaf_targets.insert(*id);
+            }
+        }
+    }
     match leaf_targets.len() {
-        1 => leaf_targets.into_iter().next(),
-        0 => None,
+        0 => Vec::new(),
+        n if n <= AMBIGUOUS_CALL_FANOUT_CAP => sorted_fanout_targets(leaf_targets),
         n => {
             debug!(
                 dst = %dst_name,
                 leaf = %last,
                 count = n,
-                "linker(incremental): ambiguous qualified-call leaf, leaving unresolved"
+                "linker(incremental): qualified-call leaf beyond fan-out cap, leaving unresolved"
             );
-            None
+            Vec::new()
         }
     }
 }
@@ -2007,6 +2089,11 @@ pub struct IncrementalLinker {
     pub entity_by_file_name: HashMap<String, HashMap<String, EntityId>>,
     /// entity_name -> Vec<(file_path, EntityId)>
     pub entity_by_name: HashMap<String, Vec<(String, EntityId)>>,
+    /// bare (unqualified) leaf name -> Vec<(file_path, EntityId)>, for entities
+    /// whose name carries a `::`/`.` qualifier (e.g. `Widget::work` -> `work`).
+    /// Backs the incremental (c2) receiver-method resolution, mirroring the
+    /// batch linker's `entity_by_bare_name`.
+    pub entity_by_bare_name: HashMap<String, Vec<(String, EntityId)>>,
     /// entity_id -> kind
     pub entity_kind_by_id: HashMap<EntityId, EntityKind>,
     /// Set of all known files
@@ -2026,6 +2113,7 @@ impl IncrementalLinker {
         Self {
             entity_by_file_name: HashMap::new(),
             entity_by_name: HashMap::new(),
+            entity_by_bare_name: HashMap::new(),
             entity_kind_by_id: HashMap::new(),
             known_files: HashSet::new(),
             entities_by_file: HashMap::new(),
@@ -2044,6 +2132,15 @@ impl IncrementalLinker {
                     candidates.retain(|(fp, _)| fp != file_path);
                     if candidates.is_empty() {
                         self.entity_by_name.remove(&entity_name);
+                    }
+                }
+                let bare = bare_entity_name(&entity_name);
+                if bare != entity_name {
+                    if let Some(candidates) = self.entity_by_bare_name.get_mut(bare) {
+                        candidates.retain(|(fp, _)| fp != file_path);
+                        if candidates.is_empty() {
+                            self.entity_by_bare_name.remove(bare);
+                        }
                     }
                 }
             }
@@ -2088,6 +2185,14 @@ impl IncrementalLinker {
                 .entry(entity.name.clone())
                 .or_default()
                 .push((file_path.to_string(), entity.id));
+
+            let bare = bare_entity_name(&entity.name);
+            if bare != entity.name {
+                self.entity_by_bare_name
+                    .entry(bare.to_string())
+                    .or_default()
+                    .push((file_path.to_string(), entity.id));
+            }
 
             file_entities_list.push((entity.id, entity.visibility));
         }
@@ -2238,10 +2343,32 @@ pub fn link_cross_file_incremental(
                 continue;
             }
 
-            // (a) Same-file resolution
+            // (a) Same-file resolution. Mirrors the batch linker: the same-file
+            // entity wins and is emitted first at full confidence, but when
+            // cross-file entities share the exact name (a declaration/prototype
+            // whose definition lives elsewhere) also fan out to them, bounded so
+            // the same-file target plus its cross-file twins stay within the cap.
+            // Cross-file twins carry the (c) name-match confidence (0.7).
             if let Some(dst_id) = dst_same_file {
                 if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
                     resolved.push(make_relation(rel.kind, src_id, dst_id, 1.0));
+                }
+                let mut cross_file_twins: HashSet<EntityId> = HashSet::new();
+                if let Some(candidates) = linker.entity_by_name.get(&rel.dst_name) {
+                    for (fp, id) in candidates {
+                        if fp != &file.file_path {
+                            cross_file_twins.insert(*id);
+                        }
+                    }
+                }
+                if !cross_file_twins.is_empty()
+                    && cross_file_twins.len() < AMBIGUOUS_CALL_FANOUT_CAP
+                {
+                    for cross_id in sorted_fanout_targets(cross_file_twins) {
+                        if add_deduped(&mut seen, src_id, cross_id, rel.kind) {
+                            resolved.push(make_relation(rel.kind, src_id, cross_id, 0.7));
+                        }
+                    }
                 }
                 continue;
             }
@@ -2385,22 +2512,55 @@ pub fn link_cross_file_incremental(
                 continue;
             }
 
+            // (c2) Receiver-method calls (`x.method()`) arrive as the bare method
+            // name with no exact cross-file entity of that name, so (c) above
+            // never fires. Resolve them through the bare-name index, mirroring
+            // the batch linker's (c2): a single distinct cross-file method links,
+            // and several implementor classes fan out to all of them up to the
+            // cap (virtual dispatch has an unknowable receiver type). Beyond the
+            // cap the name is too ubiquitous to guess and stays unresolved.
+            // Without this step a receiver method resolved into a full-tree
+            // snapshot is dropped the moment an incremental relink of the caller
+            // re-derives its edges.
+            if name_fallback_allowed && rel.kind == RelationKind::Calls {
+                if let Some(bare_candidates) = linker.entity_by_bare_name.get(rel.dst_name.as_str())
+                {
+                    let distinct_targets: HashSet<EntityId> = bare_candidates
+                        .iter()
+                        .filter(|(fp, _)| fp != &file.file_path)
+                        .map(|(_, id)| *id)
+                        .collect();
+                    if (1..=AMBIGUOUS_CALL_FANOUT_CAP).contains(&distinct_targets.len()) {
+                        for dst_id in sorted_fanout_targets(distinct_targets) {
+                            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                                resolved.push(make_relation(rel.kind, src_id, dst_id, 0.3));
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+
             // (c3) Path-qualified suffix resolution — the incremental counterpart
             // of the batch linker's (c3). Live edits reach this daemon path, so
             // qualified calls must resolve here too, not only on a full re-index.
             if name_fallback_allowed
                 && matches!(rel.kind, RelationKind::Calls | RelationKind::References)
             {
-                if let Some(dst_id) =
-                    resolve_qualified_suffix_incremental(&rel.dst_name, &file.file_path, linker)
-                {
-                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                        resolved.push(make_relation(
-                            rel.kind,
-                            src_id,
-                            dst_id,
-                            QUALIFIED_SUFFIX_CONFIDENCE,
-                        ));
+                // Fan out: an ambiguous qualified leaf resolves to every distinct
+                // cross-file target, matching the batch resolver.
+                let qualified_targets =
+                    resolve_qualified_suffix_incremental(&rel.dst_name, &file.file_path, linker);
+                if !qualified_targets.is_empty() {
+                    for dst_id in qualified_targets {
+                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                            resolved.push(make_relation(
+                                rel.kind,
+                                src_id,
+                                dst_id,
+                                QUALIFIED_SUFFIX_CONFIDENCE,
+                            ));
+                        }
                     }
                     continue;
                 }
@@ -3229,10 +3389,12 @@ void f();
     }
 
     #[test]
-    fn receiver_method_call_skipped_when_bare_name_ambiguous() {
-        // A call to bare `new` could target either `Foo::new` or `Bar::new`; the
-        // receiver type is unknowable from the name, so linking to either would mint
-        // a spurious caller. Leave it unlinked for the inconclusive gate.
+    fn receiver_method_call_fans_out_to_all_implementors() {
+        // A call to bare `new` could target either `Foo::new` or `Bar::new`. The
+        // receiver type is unknowable from the name, so rather than drop the edge
+        // the resolver fans out to every implementor (bounded by the cap): both
+        // `Foo::new` and `Bar::new` link, keeping the caller visible in refs.
+        // (Updated from the old refuse-on-ambiguity contract.)
         let caller = make_entity("build", "src/caller.rs");
         let foo_new = make_entity("Foo::new", "src/foo.rs");
         let bar_new = make_entity("Bar::new", "src/bar.rs");
@@ -3251,27 +3413,109 @@ void f();
             },
             FileParseData {
                 file_path: "src/foo.rs".to_string(),
-                entities: vec![foo_new],
+                entities: vec![foo_new.clone()],
                 relations: vec![],
                 imports: vec![],
             },
             FileParseData {
                 file_path: "src/bar.rs".to_string(),
-                entities: vec![bar_new],
+                entities: vec![bar_new.clone()],
                 relations: vec![],
                 imports: vec![],
             },
         ];
 
         let result = link_cross_file(&files);
+        let calls: Vec<&Relation> = result
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls && r.src == GraphNodeId::Entity(caller.id))
+            .collect();
+        let targets: HashSet<GraphNodeId> = calls.iter().map(|r| r.dst).collect();
+        assert_eq!(
+            targets.len(),
+            2,
+            "ambiguous bare-name receiver call must fan out to both implementors, got {targets:?}"
+        );
+        assert!(targets.contains(&GraphNodeId::Entity(foo_new.id)));
+        assert!(targets.contains(&GraphNodeId::Entity(bar_new.id)));
+        // Fan-out edges keep the ambiguous receiver-method confidence.
+        assert!(calls.iter().all(|r| r.confidence == 0.3));
+    }
+
+    #[test]
+    fn incremental_receiver_method_call_resolves_when_bare_name_unambiguous() {
+        // Incremental (c2) parity with `receiver_method_call_resolves_when_bare_name_unambiguous`:
+        // a bare receiver-method call resolves to the single `Type::method` through
+        // the incremental bare-name index. Before the parity fix the incremental
+        // linker had no bare-name index and left this unresolved.
+        let caller = make_entity("project_after_mcp_commit", "src/wiring.rs");
+        let callee = make_entity("Reconciler::project_overlay_to_files", "src/reconciler.rs");
+
+        let mut linker = IncrementalLinker::new();
+        linker.add_file("src/wiring.rs", std::slice::from_ref(&caller));
+        linker.add_file("src/reconciler.rs", std::slice::from_ref(&callee));
+
+        let files = vec![FileParseData {
+            file_path: "src/wiring.rs".to_string(),
+            entities: vec![caller.clone()],
+            relations: vec![ExtractedRelation {
+                kind: RelationKind::Calls,
+                src_name: "project_after_mcp_commit".to_string(),
+                dst_name: "project_overlay_to_files".to_string(),
+                import_source: None,
+            }],
+            imports: vec![],
+        }];
+
+        let result = link_cross_file_incremental(&files, &linker);
         let calls = result
             .iter()
-            .filter(|r| r.kind == RelationKind::Calls)
-            .count();
+            .find(|r| r.kind == RelationKind::Calls)
+            .expect("incremental unambiguous receiver-method call should resolve to Type::method");
+        assert_eq!(calls.src, GraphNodeId::Entity(caller.id));
+        assert_eq!(calls.dst, GraphNodeId::Entity(callee.id));
+    }
+
+    #[test]
+    fn incremental_receiver_method_call_fans_out_to_all_implementors() {
+        // Incremental (c2) parity with `receiver_method_call_fans_out_to_all_implementors`:
+        // bare `new` could be `Foo::new` or `Bar::new`; both implementors link,
+        // matching the batch resolver's fan-out. (Updated from the old
+        // refuse-on-ambiguity contract.)
+        let caller = make_entity("build", "src/caller.rs");
+        let foo_new = make_entity("Foo::new", "src/foo.rs");
+        let bar_new = make_entity("Bar::new", "src/bar.rs");
+
+        let mut linker = IncrementalLinker::new();
+        linker.add_file("src/caller.rs", std::slice::from_ref(&caller));
+        linker.add_file("src/foo.rs", std::slice::from_ref(&foo_new));
+        linker.add_file("src/bar.rs", std::slice::from_ref(&bar_new));
+
+        let files = vec![FileParseData {
+            file_path: "src/caller.rs".to_string(),
+            entities: vec![caller.clone()],
+            relations: vec![ExtractedRelation {
+                kind: RelationKind::Calls,
+                src_name: "build".to_string(),
+                dst_name: "new".to_string(),
+                import_source: None,
+            }],
+            imports: vec![],
+        }];
+
+        let result = link_cross_file_incremental(&files, &linker);
+        let targets: HashSet<GraphNodeId> = result
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls && r.src == GraphNodeId::Entity(caller.id))
+            .map(|r| r.dst)
+            .collect();
         assert_eq!(
-            calls, 0,
-            "ambiguous bare-name receiver call must not link to any candidate, got {calls} edges"
+            targets.len(),
+            2,
+            "incremental ambiguous bare-name receiver call must fan out to both implementors, got {targets:?}"
         );
+        assert!(targets.contains(&GraphNodeId::Entity(foo_new.id)));
+        assert!(targets.contains(&GraphNodeId::Entity(bar_new.id)));
     }
 
     #[test]
@@ -3985,12 +4229,15 @@ void f();
     }
 
     #[test]
-    fn ambiguous_qualified_leaf_leaves_unresolved() {
-        // Two distinct free fns named `run` in different files; the qualified
-        // call cannot be pinned to one -> conservative miss (no wrong edge).
+    fn qualified_leaf_fans_out_to_all_overloads() {
+        // Three distinct free fns named `run` in different files (overloads /
+        // amalgamated copies of one symbol). The qualified call's leaf cannot be
+        // pinned to one, so it fans out to all three rather than dropping the
+        // edge. (Updated from the old refuse-on-ambiguity contract.)
         let caller = rust_fn("caller", "src/caller.rs");
         let run_a = rust_fn("run", "src/a.rs");
         let run_b = rust_fn("run", "src/b.rs");
+        let run_c = rust_fn("run", "src/c.rs");
 
         let files = vec![
             FileParseData {
@@ -4011,17 +4258,25 @@ void f();
                 relations: vec![],
                 imports: vec![],
             },
+            FileParseData {
+                file_path: "src/c.rs".to_string(),
+                entities: vec![run_c.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
         ];
 
         let result = link_cross_file(&files);
-        assert!(
-            result.iter().all(|r| r.kind != RelationKind::Calls),
-            "ambiguous qualified leaf must not mint a Calls edge, got {:?}",
-            result
-                .iter()
-                .filter(|r| r.kind == RelationKind::Calls)
-                .collect::<Vec<_>>()
-        );
+        for target in [&run_a, &run_b, &run_c] {
+            let edge = find_calls_edge(&result, &caller, target)
+                .expect("qualified leaf must fan out to every overload");
+            assert_eq!(edge.confidence, QUALIFIED_SUFFIX_CONFIDENCE);
+        }
+        let count = result
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls)
+            .count();
+        assert_eq!(count, 3, "exactly the three overloads should link");
     }
 
     #[test]
@@ -4145,15 +4400,20 @@ void f();
     }
 
     #[test]
-    fn incremental_linker_ambiguous_qualified_leaf_is_miss() {
+    fn incremental_qualified_leaf_fans_out_to_all_overloads() {
+        // Incremental parity with `qualified_leaf_fans_out_to_all_overloads`:
+        // the qualified leaf fans out to all three overloads. (Updated from the
+        // old refuse-on-ambiguity contract.)
         let caller = rust_fn("caller", "src/caller.rs");
         let run_a = rust_fn("run", "src/a.rs");
         let run_b = rust_fn("run", "src/b.rs");
+        let run_c = rust_fn("run", "src/c.rs");
 
         let mut linker = IncrementalLinker::new();
         linker.add_file("src/caller.rs", std::slice::from_ref(&caller));
         linker.add_file("src/a.rs", std::slice::from_ref(&run_a));
         linker.add_file("src/b.rs", std::slice::from_ref(&run_b));
+        linker.add_file("src/c.rs", std::slice::from_ref(&run_c));
 
         let files = vec![FileParseData {
             file_path: "src/caller.rs".to_string(),
@@ -4163,10 +4423,332 @@ void f();
         }];
 
         let result = link_cross_file_incremental(&files, &linker);
-        assert!(
-            result.iter().all(|r| r.kind != RelationKind::Calls),
-            "incremental ambiguous qualified leaf must not mint a Calls edge"
+        for target in [&run_a, &run_b, &run_c] {
+            assert!(
+                find_calls_edge(&result, &caller, target).is_some(),
+                "incremental qualified leaf must fan out to every overload"
+            );
+        }
+        let count = result
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls)
+            .count();
+        assert_eq!(count, 3, "exactly the three overloads should link");
+    }
+
+    #[test]
+    fn qualified_leaf_fanout_respects_cap() {
+        // A qualified call whose leaf `run` has `n` distinct cross-file targets:
+        // at the cap every target links; one beyond the cap it stays unresolved.
+        let calls_for = |n: usize| -> usize {
+            let caller = rust_fn("caller", "src/caller.rs");
+            let mut files = vec![FileParseData {
+                file_path: "src/caller.rs".to_string(),
+                entities: vec![caller],
+                relations: vec![calls_relation("caller", "crate::somewhere::run")],
+                imports: vec![],
+            }];
+            for i in 0..n {
+                let path = format!("src/t{i}.rs");
+                files.push(FileParseData {
+                    file_path: path.clone(),
+                    entities: vec![rust_fn("run", &path)],
+                    relations: vec![],
+                    imports: vec![],
+                });
+            }
+            link_cross_file(&files)
+                .iter()
+                .filter(|r| r.kind == RelationKind::Calls)
+                .count()
+        };
+
+        assert_eq!(
+            calls_for(AMBIGUOUS_CALL_FANOUT_CAP),
+            AMBIGUOUS_CALL_FANOUT_CAP,
+            "at the cap every distinct target links"
         );
+        assert_eq!(
+            calls_for(AMBIGUOUS_CALL_FANOUT_CAP + 1),
+            0,
+            "above the cap the qualified leaf stays unresolved"
+        );
+    }
+
+    #[test]
+    fn receiver_method_fanout_respects_cap() {
+        // A bare receiver-method call `make` with `n` distinct implementor
+        // methods: at the cap every implementor links; beyond it, none do.
+        let calls_for = |n: usize| -> usize {
+            let caller = make_entity("build", "src/caller.rs");
+            let mut files = vec![FileParseData {
+                file_path: "src/caller.rs".to_string(),
+                entities: vec![caller],
+                relations: vec![calls_relation("build", "make")],
+                imports: vec![],
+            }];
+            for i in 0..n {
+                let path = format!("src/impl{i}.rs");
+                files.push(FileParseData {
+                    file_path: path.clone(),
+                    entities: vec![make_entity(&format!("Impl{i}::make"), &path)],
+                    relations: vec![],
+                    imports: vec![],
+                });
+            }
+            link_cross_file(&files)
+                .iter()
+                .filter(|r| r.kind == RelationKind::Calls)
+                .count()
+        };
+
+        assert_eq!(
+            calls_for(AMBIGUOUS_CALL_FANOUT_CAP),
+            AMBIGUOUS_CALL_FANOUT_CAP,
+            "at the cap every implementor links"
+        );
+        assert_eq!(
+            calls_for(AMBIGUOUS_CALL_FANOUT_CAP + 1),
+            0,
+            "above the cap the receiver-method call stays unresolved"
+        );
+    }
+
+    #[test]
+    fn same_file_prototype_and_cross_file_definition_both_link() {
+        // The caller's own file declares a prototype `compute`; the definition
+        // lives in another file. (a) links the same-file prototype at full
+        // confidence and (D) also fans out to the cross-file definition, so the
+        // real definition is not dropped onto the local stub.
+        let caller = rust_fn("run_caller", "src/caller.rs");
+        let prototype = rust_fn("compute", "src/caller.rs");
+        let definition = rust_fn("compute", "src/impl.rs");
+
+        let files = vec![
+            FileParseData {
+                file_path: "src/caller.rs".to_string(),
+                entities: vec![caller.clone(), prototype.clone()],
+                relations: vec![calls_relation("run_caller", "compute")],
+                imports: vec![],
+            },
+            FileParseData {
+                file_path: "src/impl.rs".to_string(),
+                entities: vec![definition.clone()],
+                relations: vec![],
+                imports: vec![],
+            },
+        ];
+
+        let result = link_cross_file(&files);
+        let same_file = find_calls_edge(&result, &caller, &prototype)
+            .expect("same-file prototype must still link");
+        assert_eq!(same_file.confidence, 1.0);
+        let cross_file = find_calls_edge(&result, &caller, &definition)
+            .expect("cross-file definition must also link");
+        assert_eq!(cross_file.confidence, 0.7);
+    }
+
+    #[test]
+    fn incremental_same_file_prototype_and_cross_file_definition_both_link() {
+        // Incremental parity with
+        // `same_file_prototype_and_cross_file_definition_both_link`.
+        let caller = rust_fn("run_caller", "src/caller.rs");
+        let prototype = rust_fn("compute", "src/caller.rs");
+        let definition = rust_fn("compute", "src/impl.rs");
+
+        let mut linker = IncrementalLinker::new();
+        linker.add_file("src/caller.rs", &[caller.clone(), prototype.clone()]);
+        linker.add_file("src/impl.rs", std::slice::from_ref(&definition));
+
+        let files = vec![FileParseData {
+            file_path: "src/caller.rs".to_string(),
+            entities: vec![caller.clone(), prototype.clone()],
+            relations: vec![calls_relation("run_caller", "compute")],
+            imports: vec![],
+        }];
+
+        let result = link_cross_file_incremental(&files, &linker);
+        let same_file = find_calls_edge(&result, &caller, &prototype)
+            .expect("same-file prototype must still link");
+        assert_eq!(same_file.confidence, 1.0);
+        let cross_file = find_calls_edge(&result, &caller, &definition)
+            .expect("cross-file definition must also link");
+        assert_eq!(cross_file.confidence, 0.7);
+    }
+
+    #[test]
+    fn fanout_relation_order_is_deterministic() {
+        // The qualified-leaf fan-out orders targets by EntityId, so repeated runs
+        // and a reordered universe both yield identically ordered edges — no
+        // HashSet iteration order leaks into the output.
+        let caller = rust_fn("caller", "src/caller.rs");
+        let run_a = rust_fn("run", "src/a.rs");
+        let run_b = rust_fn("run", "src/b.rs");
+        let run_c = rust_fn("run", "src/c.rs");
+
+        let make_files = || {
+            vec![
+                FileParseData {
+                    file_path: "src/caller.rs".to_string(),
+                    entities: vec![caller.clone()],
+                    relations: vec![calls_relation("caller", "crate::somewhere::run")],
+                    imports: vec![],
+                },
+                FileParseData {
+                    file_path: "src/a.rs".to_string(),
+                    entities: vec![run_a.clone()],
+                    relations: vec![],
+                    imports: vec![],
+                },
+                FileParseData {
+                    file_path: "src/b.rs".to_string(),
+                    entities: vec![run_b.clone()],
+                    relations: vec![],
+                    imports: vec![],
+                },
+                FileParseData {
+                    file_path: "src/c.rs".to_string(),
+                    entities: vec![run_c.clone()],
+                    relations: vec![],
+                    imports: vec![],
+                },
+            ]
+        };
+
+        let calls_order = |result: &[Relation]| -> Vec<GraphNodeId> {
+            result
+                .iter()
+                .filter(|r| r.kind == RelationKind::Calls)
+                .map(|r| r.dst)
+                .collect()
+        };
+
+        let files = make_files();
+        let first = link_cross_file(&files);
+        let second = link_cross_file(&files);
+        assert_eq!(
+            calls_order(&first),
+            calls_order(&second),
+            "repeated runs must emit fan-out edges in the same order"
+        );
+        assert_eq!(calls_order(&first).len(), 3, "expected the full fan-out");
+
+        // Same entities, universe presented in reversed order: the EntityId sort
+        // makes the emitted order independent of input order.
+        let universe = vec![caller.clone(), run_a.clone(), run_b.clone(), run_c.clone()];
+        let mut reversed_universe = universe.clone();
+        reversed_universe.reverse();
+        let forward = link_cross_file_against_entities(&files, &universe);
+        let backward = link_cross_file_against_entities(&files, &reversed_universe);
+        assert_eq!(
+            calls_order(&forward),
+            calls_order(&backward),
+            "fan-out order must not depend on universe entity order"
+        );
+    }
+
+    #[test]
+    fn batch_and_incremental_fanout_are_identical() {
+        // Each fan-out scenario must resolve to the same Calls edge set in the
+        // batch and incremental linkers. Compares sorted debug renderings so the
+        // check needs no `Ord` on graph ids.
+        let scenarios: Vec<Vec<FileParseData>> = vec![
+            // Qualified-leaf fan-out (three overloads).
+            vec![
+                FileParseData {
+                    file_path: "src/caller.rs".to_string(),
+                    entities: vec![rust_fn("caller", "src/caller.rs")],
+                    relations: vec![calls_relation("caller", "crate::somewhere::run")],
+                    imports: vec![],
+                },
+                FileParseData {
+                    file_path: "src/a.rs".to_string(),
+                    entities: vec![rust_fn("run", "src/a.rs")],
+                    relations: vec![],
+                    imports: vec![],
+                },
+                FileParseData {
+                    file_path: "src/b.rs".to_string(),
+                    entities: vec![rust_fn("run", "src/b.rs")],
+                    relations: vec![],
+                    imports: vec![],
+                },
+                FileParseData {
+                    file_path: "src/c.rs".to_string(),
+                    entities: vec![rust_fn("run", "src/c.rs")],
+                    relations: vec![],
+                    imports: vec![],
+                },
+            ],
+            // Receiver-method fan-out (two implementors).
+            vec![
+                FileParseData {
+                    file_path: "src/caller.rs".to_string(),
+                    entities: vec![make_entity("build", "src/caller.rs")],
+                    relations: vec![calls_relation("build", "new")],
+                    imports: vec![],
+                },
+                FileParseData {
+                    file_path: "src/foo.rs".to_string(),
+                    entities: vec![make_entity("Foo::new", "src/foo.rs")],
+                    relations: vec![],
+                    imports: vec![],
+                },
+                FileParseData {
+                    file_path: "src/bar.rs".to_string(),
+                    entities: vec![make_entity("Bar::new", "src/bar.rs")],
+                    relations: vec![],
+                    imports: vec![],
+                },
+            ],
+            // Same-file prototype + cross-file definition.
+            vec![
+                FileParseData {
+                    file_path: "src/caller.rs".to_string(),
+                    entities: vec![
+                        rust_fn("run_caller", "src/caller.rs"),
+                        rust_fn("compute", "src/caller.rs"),
+                    ],
+                    relations: vec![calls_relation("run_caller", "compute")],
+                    imports: vec![],
+                },
+                FileParseData {
+                    file_path: "src/impl.rs".to_string(),
+                    entities: vec![rust_fn("compute", "src/impl.rs")],
+                    relations: vec![],
+                    imports: vec![],
+                },
+            ],
+        ];
+
+        let calls_set = |rels: &[Relation]| -> Vec<String> {
+            let mut v: Vec<String> = rels
+                .iter()
+                .filter(|r| r.kind == RelationKind::Calls)
+                .map(|r| format!("{:?}->{:?}@{}", r.src, r.dst, r.confidence))
+                .collect();
+            v.sort();
+            v
+        };
+
+        for files in scenarios {
+            let batch = calls_set(&link_cross_file(&files));
+
+            let mut linker = IncrementalLinker::new();
+            for file in &files {
+                linker.add_file(&file.file_path, &file.entities);
+            }
+            let incremental = calls_set(&link_cross_file_incremental(&files, &linker));
+
+            assert!(
+                batch.len() >= 2,
+                "scenario should fan out to multiple targets, got {batch:?}"
+            );
+            assert_eq!(
+                batch, incremental,
+                "batch and incremental must resolve identical Calls edges"
+            );
+        }
     }
 
     #[test]

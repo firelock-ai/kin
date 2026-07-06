@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use kin_model::{EntityKind, FilePathId, LanguageId, ParseState, Visibility};
+use kin_model::{Entity, EntityKind, FilePathId, LanguageId, ParseState, Visibility};
+use serde_json::{json, Value};
 use tree_sitter::Tree;
 
 use crate::adapter::{
@@ -12,10 +13,30 @@ use crate::adapter::{
 use crate::error::Result;
 use crate::extract::{
     ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName,
-    ParseOutput,
+    ParseOutput, COMMAND_EFFECT_CONTRACT_KEY,
 };
 
 pub struct GoAdapter;
+
+pub fn attach_go_command_effect_contract_metadata(
+    tree: &Tree,
+    source: &[u8],
+    entities: &mut [Entity],
+) {
+    let contracts = extract_go_command_effect_contracts(tree, source);
+    if contracts.is_empty() {
+        return;
+    }
+
+    for entity in entities {
+        if let Some(contract) = contracts.get(entity.name.as_str()) {
+            entity
+                .metadata
+                .extra
+                .insert(COMMAND_EFFECT_CONTRACT_KEY.into(), contract.clone());
+        }
+    }
+}
 
 impl LanguageAdapter for GoAdapter {
     fn language_id(&self) -> LanguageId {
@@ -158,6 +179,244 @@ impl LanguageAdapter for GoAdapter {
     }
 }
 
+fn extract_go_command_effect_contracts(tree: &Tree, source: &[u8]) -> BTreeMap<String, Value> {
+    let mut contracts = BTreeMap::new();
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+
+    for child in root.children(&mut cursor) {
+        let name = match child.kind() {
+            "function_declaration" => child
+                .child_by_field_name("name")
+                .map(|name| name.utf8_text(source).unwrap_or("").to_string()),
+            "method_declaration" => child.child_by_field_name("name").map(|name| {
+                let method_name = name.utf8_text(source).unwrap_or("").to_string();
+                let receiver_type = child
+                    .child_by_field_name("receiver")
+                    .and_then(|receiver| extract_receiver_type(&receiver, source))
+                    .unwrap_or_default();
+                if receiver_type.is_empty() {
+                    method_name
+                } else {
+                    format!("{receiver_type}.{method_name}")
+                }
+            }),
+            _ => None,
+        };
+
+        if let (Some(name), Some(body)) = (name, child.child_by_field_name("body")) {
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(contract) = command_effect_contract_for_body(&body, source) {
+                contracts.insert(name, contract);
+            }
+        }
+    }
+
+    contracts
+}
+
+fn command_effect_contract_for_body(node: &tree_sitter::Node, source: &[u8]) -> Option<Value> {
+    let mut bindings = BTreeMap::new();
+    let mut effects = Vec::new();
+    let mut seen = BTreeSet::new();
+    collect_go_command_effects_flow(node, source, &mut bindings, &mut effects, &mut seen);
+    if effects.is_empty() {
+        return None;
+    }
+
+    Some(json!({
+        "schema_version": 1,
+        "language": "go",
+        "effects": effects,
+    }))
+}
+
+fn collect_go_command_effects_flow(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    bindings: &mut BTreeMap<String, String>,
+    effects: &mut Vec<Value>,
+    seen: &mut BTreeSet<String>,
+) {
+    match node.kind() {
+        "short_var_declaration" | "assignment_statement" => {
+            if let (Some(left), Some(right)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            ) {
+                collect_go_command_effects_flow(&right, source, bindings, effects, seen);
+                let names = assigned_identifier_names(&left, source);
+                if names.len() == 1 && is_contract_binding_value(&right, source) {
+                    let rhs = normalize_go_contract_expr(&right, source);
+                    if !rhs.is_empty() {
+                        bindings.insert(names[0].clone(), rhs);
+                    }
+                }
+            }
+            return;
+        }
+        "var_spec" | "const_spec" => {
+            if let (Some(name), Some(value)) = (
+                node.child_by_field_name("name"),
+                node.child_by_field_name("value"),
+            ) {
+                collect_go_command_effects_flow(&value, source, bindings, effects, seen);
+                let name = name.utf8_text(source).unwrap_or("").trim().to_string();
+                if !name.is_empty() && is_contract_binding_value(&value, source) {
+                    let rhs = normalize_go_contract_expr(&value, source);
+                    if !rhs.is_empty() {
+                        bindings.insert(name, rhs);
+                    }
+                }
+            }
+            return;
+        }
+        "if_statement" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "block" || child.kind() == "else" {
+                    let mut branch_bindings = bindings.clone();
+                    collect_go_command_effects_flow(
+                        &child,
+                        source,
+                        &mut branch_bindings,
+                        effects,
+                        seen,
+                    );
+                } else {
+                    collect_go_command_effects_flow(&child, source, bindings, effects, seen);
+                }
+            }
+            return;
+        }
+        "for_statement" | "range_clause" => {
+            let mut loop_bindings = bindings.clone();
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_go_command_effects_flow(&child, source, &mut loop_bindings, effects, seen);
+            }
+            return;
+        }
+        "call_expression" => {
+            if let Some((kind, expr)) = classify_go_command_effect_call(node, source) {
+                if seen.insert(format!("{kind}\n{expr}")) {
+                    let identifiers = identifiers_in_node(node, source);
+                    let mut consumed_bindings = serde_json::Map::new();
+                    for ident in identifiers {
+                        if let Some(value) = bindings.get(&ident) {
+                            consumed_bindings.insert(ident, Value::String(value.clone()));
+                        }
+                    }
+                    effects.push(json!({
+                        "kind": kind,
+                        "expr": expr,
+                        "bindings": consumed_bindings,
+                    }));
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_go_command_effects_flow(&child, source, bindings, effects, seen);
+    }
+}
+
+fn is_contract_binding_value(node: &tree_sitter::Node, source: &[u8]) -> bool {
+    if node.kind() == "composite_literal" {
+        return false;
+    }
+    !contains_go_command_effect_call(node, source)
+}
+
+fn contains_go_command_effect_call(node: &tree_sitter::Node, source: &[u8]) -> bool {
+    if node.kind() == "call_expression" && classify_go_command_effect_call(node, source).is_some() {
+        return true;
+    }
+    let mut cursor = node.walk();
+    let found = node
+        .children(&mut cursor)
+        .any(|child| contains_go_command_effect_call(&child, source));
+    found
+}
+
+fn classify_go_command_effect_call(
+    node: &tree_sitter::Node,
+    source: &[u8],
+) -> Option<(&'static str, String)> {
+    let function = node.child_by_field_name("function")?;
+    let callee = normalize_go_contract_expr(&function, source);
+    let expr = normalize_go_contract_expr(node, source);
+
+    if callee == "exec.Command" {
+        return Some(("subprocess_argv", expr));
+    }
+    if callee == "git.Config" || callee == "git.VerifyRef" {
+        return Some(("git_state_query", expr));
+    }
+    if callee == "append" && expr.contains("\"git\"") {
+        return Some(("queued_git_argv", expr));
+    }
+
+    None
+}
+
+fn assigned_identifier_names(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    match node.kind() {
+        "identifier" => {
+            let name = node.utf8_text(source).unwrap_or("").trim();
+            if !name.is_empty() && name != "_" {
+                names.push(name.to_string());
+            }
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                names.extend(assigned_identifier_names(&child, source));
+            }
+        }
+    }
+    names
+}
+
+fn identifiers_in_node(node: &tree_sitter::Node, source: &[u8]) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    collect_identifiers_in_node(node, source, &mut names);
+    names
+}
+
+fn collect_identifiers_in_node(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    names: &mut BTreeSet<String>,
+) {
+    if node.kind() == "identifier" {
+        let name = node.utf8_text(source).unwrap_or("").trim();
+        if !name.is_empty() && name != "_" {
+            names.insert(name.to_string());
+        }
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_identifiers_in_node(&child, source, names);
+    }
+}
+
+fn normalize_go_contract_expr(node: &tree_sitter::Node, source: &[u8]) -> String {
+    node.utf8_text(source)
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn extract_go_node(
     node: &tree_sitter::Node,
@@ -183,7 +442,15 @@ fn extract_go_node(
                     fingerprint: compute_fingerprint(node, source),
                     span: span_from_node(node, file_id),
                 });
-                extract_calls_from_body(node, source, &name, relations, call_prefixes);
+                let mut ref_seen = std::collections::HashSet::new();
+                extract_calls_from_body(
+                    node,
+                    source,
+                    &name,
+                    relations,
+                    call_prefixes,
+                    &mut ref_seen,
+                );
             }
         }
         "method_declaration" => {
@@ -229,7 +496,15 @@ fn extract_go_node(
                     });
                 }
 
-                extract_calls_from_body(node, source, &qualified, relations, call_prefixes);
+                let mut ref_seen = std::collections::HashSet::new();
+                extract_calls_from_body(
+                    node,
+                    source,
+                    &qualified,
+                    relations,
+                    call_prefixes,
+                    &mut ref_seen,
+                );
             }
         }
         "type_declaration" => {
@@ -338,13 +613,23 @@ fn extract_go_node(
                         };
                         entities.push(ExtractedEntity {
                             kind,
-                            name,
+                            name: name.clone(),
                             signature: node_signature(&spec, source),
                             visibility: go_visibility(name_node.utf8_text(source).unwrap_or("")),
                             doc_summary: extract_preceding_comment(node, source),
                             fingerprint: compute_fingerprint(&spec, source),
                             span: span_from_node(&spec, file_id),
                         });
+
+                        // A package-level const/var initializer references the
+                        // identifiers read in its value expression (e.g. a
+                        // cobra `&cobra.Command{RunE: prCheckout}` var
+                        // references the handler `prCheckout`). Emit those as
+                        // References edges sourced from the declared name.
+                        if let Some(value) = spec.child_by_field_name("value") {
+                            let mut ref_seen = std::collections::HashSet::new();
+                            emit_value_references(&value, source, &name, relations, &mut ref_seen);
+                        }
                     }
                 }
             }
@@ -583,13 +868,7 @@ fn go_visibility_with_path(name: &str, file_id: &FilePathId) -> Visibility {
 }
 
 fn node_signature(node: &tree_sitter::Node, source: &[u8]) -> String {
-    let text = node.utf8_text(source).unwrap_or("");
-    text.lines()
-        .next()
-        .unwrap_or(text)
-        .trim_end_matches('{')
-        .trim()
-        .to_string()
+    crate::adapter::declaration_signature(node, source)
 }
 
 fn extract_preceding_comment(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
@@ -624,9 +903,32 @@ fn extract_calls_from_body(
     context_name: &str,
     relations: &mut Vec<ExtractedRelation>,
     call_prefixes: &mut Vec<(usize, String)>,
+    ref_seen: &mut std::collections::HashSet<String>,
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        // Value-position references: an identifier read as a VALUE (passed as a
+        // call argument, used as a composite-literal element value, or on the
+        // RHS of an assignment/declaration/return) is a `References` edge — not
+        // a `Calls` edge. This is what wires cobra-style `RunE: prCheckout`
+        // function-value handoffs and package-level const/var reads into impact.
+        match child.kind() {
+            "argument_list" | "literal_value" | "return_statement" => {
+                emit_value_references(&child, source, context_name, relations, ref_seen);
+            }
+            "assignment_statement" | "short_var_declaration" => {
+                if let Some(rhs) = child.child_by_field_name("right") {
+                    emit_value_references(&rhs, source, context_name, relations, ref_seen);
+                }
+            }
+            "var_spec" | "const_spec" => {
+                if let Some(value) = child.child_by_field_name("value") {
+                    emit_value_references(&value, source, context_name, relations, ref_seen);
+                }
+            }
+            _ => {}
+        }
+
         if child.kind() == "call_expression" {
             if let Some(function) = child.child_by_field_name("function") {
                 let (callee, prefix) = match function.kind() {
@@ -695,7 +997,100 @@ fn extract_calls_from_body(
                 }
             }
         }
-        extract_calls_from_body(&child, source, context_name, relations, call_prefixes);
+        extract_calls_from_body(
+            &child,
+            source,
+            context_name,
+            relations,
+            call_prefixes,
+            ref_seen,
+        );
+    }
+}
+
+/// Emit `References` edges for the value-position identifiers read within
+/// `node`, sourced from `context_name`. Deduped by destination name against
+/// `ref_seen` so a name referenced several times in one body yields one edge.
+/// The linker resolves References by name and drops unresolvables, so locals
+/// and parameters that match no package-level entity are harmless.
+fn emit_value_references(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    context_name: &str,
+    relations: &mut Vec<ExtractedRelation>,
+    ref_seen: &mut std::collections::HashSet<String>,
+) {
+    let mut names = Vec::new();
+    collect_value_refs(node, source, &mut names);
+    for name in names {
+        if name != context_name && ref_seen.insert(name.clone()) {
+            relations.push(ExtractedRelation {
+                kind: kin_model::RelationKind::References,
+                src_name: context_name.to_string(),
+                dst_name: name,
+                import_source: None,
+            });
+        }
+    }
+}
+
+/// Collect bare identifier names read as VALUES within an expression subtree.
+///
+/// Walks value expressions while pruning positions that are not value reads:
+/// a call's callee (already captured as a `Calls` edge), a selector's `.field`
+/// selector, a composite literal's `type`, and a `keyed_element`'s key. Type
+/// identifiers and the blank identifier `_` are never collected. The receiver
+/// of a method call (`obj` in `obj.M()`) and every call argument ARE collected,
+/// since they are genuine value reads.
+fn collect_value_refs(node: &tree_sitter::Node, source: &[u8], out: &mut Vec<String>) {
+    match node.kind() {
+        "identifier" => {
+            let name = node.utf8_text(source).unwrap_or("");
+            if !name.is_empty() && name != "_" {
+                out.push(name.to_string());
+            }
+        }
+        // `x.Field` reads the operand value `x`; the `.Field` selector itself
+        // is not an independent value read.
+        "selector_expression" => {
+            if let Some(operand) = node.child_by_field_name("operand") {
+                collect_value_refs(&operand, source, out);
+            }
+        }
+        // A call in value position contributes its receiver (for `obj.M()`) and
+        // its arguments; the callee is captured as a `Calls` edge elsewhere.
+        "call_expression" => {
+            if let Some(function) = node.child_by_field_name("function") {
+                if function.kind() == "selector_expression" {
+                    if let Some(operand) = function.child_by_field_name("operand") {
+                        collect_value_refs(&operand, source, out);
+                    }
+                }
+            }
+            if let Some(args) = node.child_by_field_name("arguments") {
+                collect_value_refs(&args, source, out);
+            }
+        }
+        // `T{...}`: element values are reads, the `type` field is not.
+        "composite_literal" => {
+            if let Some(body) = node.child_by_field_name("body") {
+                collect_value_refs(&body, source, out);
+            }
+        }
+        // `Key: Value`: only the value is a read (the key names a field).
+        "keyed_element" => {
+            if let Some(value) = node.child_by_field_name("value") {
+                collect_value_refs(&value, source, out);
+            }
+        }
+        // Leaf type positions are never value reads.
+        "type_identifier" | "qualified_type" | "package_identifier" | "field_identifier" => {}
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_value_refs(&child, source, out);
+            }
+        }
     }
 }
 
@@ -1172,5 +1567,335 @@ func (s *Server) Start() { fmt.Println("starting") }
         assert_eq!(spawns.len(), 1, "expected 1 Spawns, got {:?}", spawns);
         assert_eq!(spawns[0].src_name, "main");
         assert_eq!(spawns[0].dst_name, "processItem");
+    }
+
+    fn go_references(output: &ParseOutput) -> Vec<(&str, &str)> {
+        output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::References)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn command_effect_contract_captures_git_branch_binding() {
+        let adapter = GoAdapter;
+        let source = br#"
+package command
+
+import (
+    "fmt"
+    "os/exec"
+
+    "github.com/spf13/cobra"
+)
+
+func prCheckout(cmd *cobra.Command, args []string) error {
+    newBranchName := fmt.Sprintf("pr/%d/%s", pr.Number, pr.HeadRefName)
+    if git.VerifyRef("refs/heads/" + newBranchName) {
+        cmdQueue = append(cmdQueue, []string{"git", "checkout", newBranchName})
+    } else {
+        cmdQueue = append(cmdQueue, []string{"git", "checkout", "-b", newBranchName, "--no-track", remoteBranch})
+    }
+    exec.Command("git", "config", fmt.Sprintf("branch.%s.remote", newBranchName), remote)
+    return nil
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("checkout.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let mut entities: Vec<_> = output
+            .entities
+            .into_iter()
+            .map(|entity| entity.into_entity(LanguageId::Go, &file_id))
+            .collect();
+        attach_go_command_effect_contract_metadata(&tree, source, &mut entities);
+        let entity = entities
+            .iter()
+            .find(|entity| entity.name == "prCheckout")
+            .expect("handler entity should exist");
+        let contract = entity
+            .metadata
+            .extra
+            .get(COMMAND_EFFECT_CONTRACT_KEY)
+            .expect("command contract metadata should be attached")
+            .to_string();
+
+        assert!(
+            contract.contains("queued_git_argv"),
+            "queued git argv effects should be captured: {contract}"
+        );
+        assert!(
+            contract.contains("subprocess_argv"),
+            "direct exec.Command effects should be captured: {contract}"
+        );
+        assert!(
+            contract.contains("fmt.Sprintf(\\\"pr/%d/%s\\\", pr.Number, pr.HeadRefName)"),
+            "branch-name binding should be captured: {contract}"
+        );
+    }
+
+    #[test]
+    fn debug_print_change_does_not_emit_command_effect_contract() {
+        let adapter = GoAdapter;
+        let source = br#"
+package command
+
+import "fmt"
+
+func prCheckout() error {
+    fmt.Println("debug")
+    return nil
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        assert!(
+            extract_go_command_effect_contracts(&tree, source).is_empty(),
+            "debug-only output must not become a command-effect contract"
+        );
+    }
+
+    #[test]
+    fn command_effect_contract_uses_bindings_at_call_site() {
+        let adapter = GoAdapter;
+        let source = br#"
+package command
+
+import (
+    "fmt"
+    "os/exec"
+)
+
+func prCheckout() error {
+    newBranchName := pr.HeadRefName
+    exec.Command("git", "checkout", newBranchName)
+    newBranchName = fmt.Sprintf("pr/%d/%s", pr.Number, pr.HeadRefName)
+    exec.Command("git", "config", fmt.Sprintf("branch.%s.remote", newBranchName), "origin")
+    return nil
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let contracts = extract_go_command_effect_contracts(&tree, source);
+        let contract = contracts
+            .get("prCheckout")
+            .expect("contract should be extracted");
+        let effects = contract["effects"].as_array().expect("effects array");
+        assert_eq!(effects.len(), 2, "expected two command effects: {contract}");
+        assert_eq!(
+            effects[0]["bindings"]["newBranchName"], "pr.HeadRefName",
+            "first command must use the binding visible before reassignment"
+        );
+        assert_eq!(
+            effects[1]["bindings"]["newBranchName"],
+            "fmt.Sprintf(\"pr/%d/%s\", pr.Number, pr.HeadRefName)",
+            "second command must use the reassigned binding"
+        );
+    }
+
+    #[test]
+    fn command_effect_contract_attaches_to_go_methods() {
+        let adapter = GoAdapter;
+        let source = br#"
+package command
+
+import "os/exec"
+
+type Runner struct{}
+
+func (r *Runner) prCheckout() error {
+    newBranchName := pr.HeadRefName
+    exec.Command("git", "checkout", newBranchName)
+    return nil
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("checkout.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let mut entities: Vec<_> = output
+            .entities
+            .into_iter()
+            .map(|entity| entity.into_entity(LanguageId::Go, &file_id))
+            .collect();
+        attach_go_command_effect_contract_metadata(&tree, source, &mut entities);
+        let entity = entities
+            .iter()
+            .find(|entity| entity.name == "Runner.prCheckout")
+            .expect("method entity should be qualified by receiver type");
+        assert!(
+            entity
+                .metadata
+                .extra
+                .contains_key(COMMAND_EFFECT_CONTRACT_KEY),
+            "command-effect metadata should attach to method entities"
+        );
+    }
+
+    #[test]
+    fn func_value_in_composite_literal_emits_reference() {
+        // cobra-style: a function passed by name as a struct-field value
+        // (`RunE: prCheckout`) must reference the handler, not silently drop it.
+        let adapter = GoAdapter;
+        let source = br#"
+package cmd
+
+func prCheckout() {}
+
+func newCmd() {
+    cmd := &Command{RunE: prCheckout}
+    _ = cmd
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("cmd.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let refs = go_references(&output);
+        assert!(
+            refs.contains(&("newCmd", "prCheckout")),
+            "newCmd should reference prCheckout via the RunE field value, found: {refs:?}"
+        );
+        // The struct type name and the field key are not value reads.
+        assert!(
+            !refs
+                .iter()
+                .any(|(_, dst)| *dst == "Command" || *dst == "RunE"),
+            "composite-literal type name and keys must not be referenced, found: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn package_var_initializer_references_function_value() {
+        // `var prCheckoutCmd = &cobra.Command{RunE: prCheckout}` must yield a
+        // References edge prCheckoutCmd -> prCheckout so a change to the handler
+        // shows impact on the command var.
+        let adapter = GoAdapter;
+        let source = br#"
+package cmd
+
+import "github.com/spf13/cobra"
+
+func prCheckout(cmd *cobra.Command, args []string) error { return nil }
+
+var prCheckoutCmd = &cobra.Command{
+    Use:  "checkout",
+    RunE: prCheckout,
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("checkout.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let refs = go_references(&output);
+        assert!(
+            refs.contains(&("prCheckoutCmd", "prCheckout")),
+            "package var initializer should reference prCheckout, found: {refs:?}"
+        );
+        // `cobra.Command` is the composite type, not a value read.
+        assert!(
+            !refs.iter().any(|(_, dst)| *dst == "Command"),
+            "composite-literal type must not be referenced, found: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn call_argument_var_emits_reference_not_the_callee() {
+        // A package-level var passed as a call argument
+        // (`RunCommand(prCheckoutCmd, ...)`) must be referenced; the callee is a
+        // Call, never a References edge.
+        let adapter = GoAdapter;
+        let source = br#"
+package cmd
+
+var prCheckoutCmd = 0
+
+func run() {
+    RunCommand(prCheckoutCmd, "arg")
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("run.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let refs = go_references(&output);
+        assert!(
+            refs.contains(&("run", "prCheckoutCmd")),
+            "run should reference prCheckoutCmd passed as an argument, found: {refs:?}"
+        );
+        assert!(
+            !refs.iter().any(|(_, dst)| *dst == "RunCommand"),
+            "the callee must be a Calls edge, not a References edge, found: {refs:?}"
+        );
+        let calls: Vec<_> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
+            .collect();
+        assert!(
+            calls.contains(&("run", "RunCommand")),
+            "run should still Call RunCommand, found: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn package_const_read_in_body_emits_reference() {
+        // A plain read of a package-level const inside a body is a reference.
+        let adapter = GoAdapter;
+        let source = br#"
+package cmd
+
+const defaultConfigStr = "default"
+
+func load() string {
+    return defaultConfigStr
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("load.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let refs = go_references(&output);
+        assert!(
+            refs.contains(&("load", "defaultConfigStr")),
+            "load should reference defaultConfigStr it returns, found: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn value_references_skip_lhs_types_and_blank() {
+        // Binding names (LHS), type identifiers, keys, and the blank identifier
+        // are not value reads — keep References targeted to bound noise.
+        let adapter = GoAdapter;
+        let source = br#"
+package cmd
+
+type Config struct { Name string }
+
+func handler() {}
+
+func build() {
+    var h = handler
+    _ = h
+    cfg := Config{Name: "x"}
+    _ = cfg
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("build.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let refs = go_references(&output);
+        assert!(
+            refs.contains(&("build", "handler")),
+            "the RHS function value `handler` should be referenced, found: {refs:?}"
+        );
+        assert!(
+            !refs
+                .iter()
+                .any(|(_, dst)| matches!(*dst, "Config" | "Name" | "_")),
+            "type name, struct key, and blank identifier must not be referenced, found: {refs:?}"
+        );
+        // A reference edge is deduped to one per (src, dst) within a body.
+        assert_eq!(
+            refs.iter().filter(|(_, dst)| *dst == "handler").count(),
+            1,
+            "handler should be referenced exactly once, found: {refs:?}"
+        );
     }
 }

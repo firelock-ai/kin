@@ -203,8 +203,9 @@ pub struct ShadowRepairItem {
 /// Explicit statement that the graph could not prove something.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShadowEvidenceGap {
-    /// "artifact_only_change" | "missing_span" | "actor_attribution_unavailable"
-    /// | "impact_signal_absent" | "cross_repo_not_evaluated" | "ref_state_unavailable"
+    /// "artifact_only_change" | "entity_inert_change" | "missing_span"
+    /// | "actor_attribution_unavailable" | "impact_signal_absent"
+    /// | "cross_repo_not_evaluated" | "ref_state_unavailable"
     /// | "base_not_on_head_ancestry"
     pub kind: String,
     pub subject: String,
@@ -314,7 +315,7 @@ pub fn build_shadow_report_at<G: GraphStore>(
         .into_iter()
         .filter(|change| in_range(&change.id))
         .collect();
-    assemble_report_with_changes(store, request, review, None, &changes)
+    assemble_report_with_changes(store, request, review, None, &changes, Some(at_head))
 }
 
 /// The graph state at the head ref could not be materialized. Report the gap
@@ -351,7 +352,9 @@ fn build_report_without_ref_state<G: GraphStore>(
              the live adjacency was deliberately not consulted in its place"
         ),
     };
-    assemble_report(store, request, review, Some(gap))
+    // Head state is unmaterializable here, so there is nothing to prove
+    // entities-in-file against: artifact-only gaps stay demoting.
+    assemble_report(store, request, review, Some(gap), None)
 }
 
 /// The resolved base is not on the head's ancestry in the change DAG. A range
@@ -390,7 +393,9 @@ fn build_report_with_base_off_ancestry<G: GraphStore>(
             request.resolved_base, request.resolved_head
         ),
     };
-    assemble_report_with_changes(store, request, review, Some(gap), &[])
+    // No range was walked, so there are no artifact deltas to reclassify;
+    // pass no head state.
+    assemble_report_with_changes(store, request, review, Some(gap), &[], None)
 }
 
 fn assemble_report<G: GraphStore>(
@@ -398,11 +403,12 @@ fn assemble_report<G: GraphStore>(
     request: &ShadowRequest,
     review: Review,
     range_gap: Option<ShadowEvidenceGap>,
+    at_head: Option<&GraphAtRef<'_, G>>,
 ) -> Result<ShadowGateReport, ReviewError> {
     let changes = store
         .get_changes_since(&request.resolved_base, &request.resolved_head)
         .map_err(ReviewError::graph)?;
-    assemble_report_with_changes(store, request, review, range_gap, &changes)
+    assemble_report_with_changes(store, request, review, range_gap, &changes, at_head)
 }
 
 fn assemble_report_with_changes<G: GraphStore>(
@@ -411,10 +417,11 @@ fn assemble_report_with_changes<G: GraphStore>(
     review: Review,
     range_gap: Option<ShadowEvidenceGap>,
     changes: &[kin_model::change::SemanticChange],
+    at_head: Option<&GraphAtRef<'_, G>>,
 ) -> Result<ShadowGateReport, ReviewError> {
     let changed_entities = collect_changed_entities(store, &review)?;
     let blast_radius = collect_blast_radius(&review);
-    let mut evidence_gaps = collect_evidence_gaps(&review, changes, &changed_entities);
+    let mut evidence_gaps = collect_evidence_gaps(&review, changes, &changed_entities, at_head);
     if let Some(gap) = range_gap {
         // The generic empty-impact gap advises verifying relation ingestion,
         // which misleads here: impact was not computed at all. The specific
@@ -593,6 +600,7 @@ fn finding_kind_label(kind: InlineCommentKind) -> &'static str {
         InlineCommentKind::Breaking => "breaking",
         InlineCommentKind::CoverageGap => "coverage_gap",
         InlineCommentKind::ContractViolation => "contract_violation",
+        InlineCommentKind::CommandEffectContract => "command_effect_contract_change",
         InlineCommentKind::SignatureChange => "signature_change",
         InlineCommentKind::VisibilityChange => "visibility_change",
         InlineCommentKind::ConsumerFanout => "consumer_fanout",
@@ -609,6 +617,7 @@ fn finding_severity(kind: InlineCommentKind) -> &'static str {
         InlineCommentKind::CoverageGap
         | InlineCommentKind::SignatureChange
         | InlineCommentKind::VisibilityChange
+        | InlineCommentKind::CommandEffectContract
         | InlineCommentKind::ConsumerFanout
         | InlineCommentKind::Renamed
         | InlineCommentKind::AgentUnreviewed => "warning",
@@ -705,6 +714,17 @@ fn derive_policy(
         .filter(|entity| entity.change == "added")
         .map(|entity| entity.name.as_str())
         .collect();
+    // Removed entities the graph can no longer resolve are surfaced as a raw
+    // UUID (kind "unknown" from `collect_changed_entities`). We cannot certify
+    // a confident BLOCKING breakage for a surface we cannot even name, so such
+    // a removal's downstream risk is demoted to an attention signal rather
+    // than a would_block. A resolvable removal with surviving consumers still
+    // blocks.
+    let unresolvable_removed: BTreeSet<&str> = changed_entities
+        .iter()
+        .filter(|entity| entity.change == "removed" && entity.kind == "unknown")
+        .map(|entity| entity.entity_id.as_str())
+        .collect();
 
     // Gate rule: a contract-surface change (signature/visibility/removal) is
     // a blocking downstream risk when THAT entity has graph-known non-test
@@ -719,16 +739,18 @@ fn derive_policy(
         let mut surface_candidates: Vec<_> = review.diff.entity_changes.iter().collect();
         surface_candidates.sort_by_key(|change| change.entity_id);
         for change in surface_candidates {
-            let (name, location, surface_changed) = match &change.kind {
+            let (name, location, surface_changed, demote_removal) = match &change.kind {
                 EntityChangeKind::Modified { old, new } => (
                     new.name.clone(),
                     new.span
                         .as_ref()
                         .map(|span| (span.file.to_string(), span.start_line)),
                     old.signature != new.signature || old.visibility != new.visibility,
+                    false,
                 ),
                 EntityChangeKind::Removed(id) => {
                     let id_string = id.to_string();
+                    let unresolvable = unresolvable_removed.contains(id_string.as_str());
                     let name = resolved_names
                         .get(id_string.as_str())
                         .map(|name| name.to_string())
@@ -738,7 +760,7 @@ fn derive_policy(
                     if added_names.contains(name.as_str()) {
                         continue;
                     }
-                    (name, None, true)
+                    (name, None, true, unresolvable)
                 }
                 EntityChangeKind::Added(_) => continue,
             };
@@ -760,10 +782,13 @@ fn derive_policy(
             if already_blocking {
                 continue;
             }
+            // An unresolvable removal reports its downstream risk as attention,
+            // not a would_block: naming the severed surface as a raw UUID is
+            // not enough proof to certify a blocking breakage.
             findings.push(ShadowPolicyFinding {
                 kind: "downstream_risk".to_string(),
-                severity: "error".to_string(),
-                blocking: true,
+                severity: if demote_removal { "warning" } else { "error" }.to_string(),
+                blocking: !demote_removal,
                 message: format!(
                     "Contract surface of `{}` changed with {} graph-known downstream entity(ies)",
                     name, entity_consumers
@@ -795,8 +820,22 @@ fn derive_policy(
             }
         }
     }
+    // An entirely absent relation channel is not proof of isolation. When the
+    // report carries an `impact_signal_absent` gap, the graph held no relations
+    // to answer with, so an anchor's zero inbound is "never ingested", not
+    // "genuinely isolated" — the same trust condition the coverage-gap channel
+    // uses. In that state a real signature/visibility change must still feed
+    // the gate rather than be silently suppressed into a pass.
+    let relation_channel_absent = evidence_gaps
+        .iter()
+        .any(|gap| gap.kind == "impact_signal_absent");
     let surface_finding_feeds_gate = |finding: &ShadowPolicyFinding| -> bool {
         if finding.kind != "signature_change" && finding.kind != "visibility_change" {
+            return true;
+        }
+        // Suppression is a claim of proven isolation; an absent channel cannot
+        // make that claim, so the surface change keeps feeding the gate.
+        if relation_channel_absent {
             return true;
         }
         match (&finding.file, finding.line) {
@@ -809,14 +848,36 @@ fn derive_policy(
         }
     };
 
+    // The coverage-gap channel is warning-only: it documents a missing test
+    // but must not drive the verdict for a pure body-only refactor. When
+    // nothing blocks AND no changed entity altered its contract surface
+    // (signature or visibility), a lone coverage_gap stays in the report yet
+    // does not feed the gate — a benign body-only change is not escalated by
+    // it. Any blocking finding or a real surface change restores its gate
+    // weight.
+    //
+    // consumer_fanout is deliberately NOT suppressed this way. It already
+    // requires a graph-native wide blast — at least CONSUMER_FANOUT_THRESHOLD
+    // distinct non-test consumer entities — so a body-only behavior change
+    // reaching that many consumers is a genuine downstream-risk signal that
+    // must feed the gate on its own weight even when the contract surface is
+    // unchanged. The decision is on graph-owned consumer entities, never files.
+    let has_blocking_finding = findings.iter().any(|finding| finding.blocking);
+    let has_surface_change = changed_entities
+        .iter()
+        .any(|entity| entity.signature_changed || entity.visibility_changed);
+    let coverage_gap_feeds_gate = has_blocking_finding || has_surface_change;
+
     // Informational findings (entity added/removed) describe the diff, not a
     // gate signal; they are reported but do not feed the verdict. Surface
     // findings on graph-isolated entities are likewise reported without
-    // feeding the gate.
+    // feeding the gate, and the warning-only coverage-gap channel is withheld
+    // from the gate on a benign body-only change.
     let gate_findings: Vec<ReviewFinding> = findings
         .iter()
         .filter(|finding| finding.severity != "info")
         .filter(|finding| surface_finding_feeds_gate(finding))
+        .filter(|finding| coverage_gap_feeds_gate || finding.kind != "coverage_gap")
         .map(|finding| ReviewFinding {
             kind: match finding.kind.as_str() {
                 "contract_violation" | "agent_unreviewed" => ReviewSignalKind::PolicyViolation,
@@ -961,10 +1022,11 @@ fn collect_repair_context(
         .collect()
 }
 
-fn collect_evidence_gaps(
+fn collect_evidence_gaps<G: GraphStore>(
     review: &Review,
     changes: &[kin_model::change::SemanticChange],
     changed_entities: &[ShadowChangedEntity],
+    at_head: Option<&GraphAtRef<'_, G>>,
 ) -> Vec<ShadowEvidenceGap> {
     let mut gaps = Vec::new();
 
@@ -984,13 +1046,34 @@ fn collect_evidence_gaps(
         }
     }
     for file in artifact_only {
+        // A source-class file whose raw bytes changed but whose entities the
+        // graph DID capture at head is an inert edit — a comment, formatting,
+        // or preprocessor-only change that altered no entity — not an
+        // unparsed artifact. Report it with a non-demoting kind so a real
+        // source file with living entities does not flip the verdict merely
+        // for a comment touch. Genuinely uncaptured files (no entity anchored
+        // at head, or head state unavailable) keep the demoting kind.
+        let inert_source_edit = artifact_subject_is_source_class(&file)
+            && at_head.is_some_and(|at| at.has_entity_in_file(&file));
+        let (kind, detail) = if inert_source_edit {
+            (
+                "entity_inert_change",
+                "source file changed but no semantic entity was altered (comment, formatting, or \
+                 preprocessor-only edit); entities for this file remain captured at head, so the \
+                 change is inert rather than an unparsed-source gap",
+            )
+        } else {
+            (
+                "artifact_only_change",
+                "file changed but no semantic entities were captured for it (unsupported \
+                 language or unparsed artifact); its impact is NOT included in the blast radius \
+                 or policy result",
+            )
+        };
         gaps.push(ShadowEvidenceGap {
-            kind: "artifact_only_change".to_string(),
+            kind: kind.to_string(),
             subject: file,
-            detail: "file changed but no semantic entities were captured for it (unsupported \
-                     language or unparsed artifact); its impact is NOT included in the blast \
-                     radius or policy result"
-                .to_string(),
+            detail: detail.to_string(),
         });
     }
 
@@ -1525,6 +1608,7 @@ mod tests {
                         .map(|&entity_id| EntityImpact {
                             entity_id,
                             consumer_count: 1,
+                            strong_consumer_count: 1,
                             contract_consumer_count: 0,
                             consumer_files: vec!["src/consumer.rs".to_string()],
                             covering_tests: 0,
@@ -1844,6 +1928,7 @@ mod tests {
                 entity_impacts: vec![EntityImpact {
                     entity_id: moved_old_id,
                     consumer_count: 1,
+                    strong_consumer_count: 1,
                     contract_consumer_count: 0,
                     consumer_files: vec!["src/consumer.rs".to_string()],
                     covering_tests: 0,
@@ -1938,6 +2023,7 @@ mod tests {
                 entity_impacts: vec![EntityImpact {
                     entity_id: new.id,
                     consumer_count: 0,
+                    strong_consumer_count: 0,
                     contract_consumer_count: 0,
                     consumer_files: vec![],
                     covering_tests: 0,
@@ -2319,5 +2405,398 @@ mod tests {
         assert!(text.contains("Blast radius"));
         assert!(text.contains("Evidence gaps"));
         assert!(text.contains("Audit:"));
+    }
+
+    #[test]
+    fn body_only_coverage_gap_only_does_not_gate() {
+        use crate::diff::SemanticDiff;
+        use crate::impact::ImpactReport;
+        use crate::inline::{InlineComment, InlineCommentKind};
+        use kin_model::review::{RiskLevel, RiskSummary};
+
+        // A pure body-only modification (no signature/visibility change, no
+        // blocking finding) whose ONLY warning-only evidence is a coverage
+        // gap. The coverage-gap channel documents a missing test but must not
+        // drive the verdict for a benign refactor: it stays in the report yet
+        // does not feed the gate, so the verdict is a pass. This is the benign
+        // case that must not regress when consumer_fanout begins to gate.
+        let review = Review {
+            base: None,
+            head: None,
+            diff: SemanticDiff::default(),
+            impact: ImpactReport::default(),
+            risk: RiskSummary {
+                overall_risk: RiskLevel::Low,
+                breaking_changes: vec![],
+                test_coverage_gaps: vec![],
+                contract_violations: vec![],
+                work_risks: vec![],
+                notes: vec![],
+            },
+            inline_comments: vec![InlineComment {
+                file: "src/hot.rs".to_string(),
+                start_line: 10,
+                end_line: 20,
+                kind: InlineCommentKind::CoverageGap,
+                message: "Modified entity `hot_path` has no test coverage".to_string(),
+            }],
+        };
+
+        let mut changed = vec![ShadowChangedEntity {
+            entity_id: EntityId::new().to_string(),
+            name: "hot_path".to_string(),
+            kind: "Function".to_string(),
+            change: "modified".to_string(),
+            file: Some("src/hot.rs".to_string()),
+            start_line: Some(10),
+            end_line: Some(20),
+            signature_changed: false,
+            visibility_changed: false,
+        }];
+
+        // Body-only: the coverage gap is reported but withheld from the gate —
+        // the verdict is a pass.
+        let policy = derive_policy(&review, &[], &changed);
+        assert!(policy.findings.iter().any(|f| f.kind == "coverage_gap"));
+        assert_eq!(policy.verdict, ShadowGateVerdict::Pass);
+        assert_eq!(policy.attention_count, 0);
+
+        // A real contract-surface change on the same entity restores the gate
+        // weight of the coverage-gap channel.
+        changed[0].signature_changed = true;
+        let policy = derive_policy(&review, &[], &changed);
+        assert_eq!(policy.verdict, ShadowGateVerdict::NeedsAttention);
+        assert_eq!(policy.attention_count, 1);
+    }
+
+    #[test]
+    fn body_only_consumer_fanout_gates_to_needs_attention() {
+        use crate::diff::SemanticDiff;
+        use crate::impact::ImpactReport;
+        use crate::inline::{InlineComment, InlineCommentKind};
+        use kin_model::review::{RiskLevel, RiskSummary};
+
+        // A pure body-only modification (no signature/visibility change, no
+        // blocking finding) that fires consumer_fanout — a graph-native wide
+        // blast reaching many distinct non-test consumer entities. Unlike the
+        // coverage-gap channel, this signal is NOT suppressed on a body-only
+        // change: a behavior change with that reach is a genuine downstream
+        // risk, so it feeds the gate and escalates the verdict to
+        // needs_attention. This is the risky-revert case that previously
+        // slipped through as a pass.
+        let review = Review {
+            base: None,
+            head: None,
+            diff: SemanticDiff::default(),
+            impact: ImpactReport::default(),
+            risk: RiskSummary {
+                overall_risk: RiskLevel::Low,
+                breaking_changes: vec![],
+                test_coverage_gaps: vec![],
+                contract_violations: vec![],
+                work_risks: vec![],
+                notes: vec![],
+            },
+            inline_comments: vec![InlineComment {
+                file: "src/hot.rs".to_string(),
+                start_line: 10,
+                end_line: 20,
+                kind: InlineCommentKind::ConsumerFanout,
+                message: "Behavior of `hot_path` changed with 3 distinct non-test consumer(s) \
+                          across 3 file(s)"
+                    .to_string(),
+            }],
+        };
+
+        let changed = vec![ShadowChangedEntity {
+            entity_id: EntityId::new().to_string(),
+            name: "hot_path".to_string(),
+            kind: "Function".to_string(),
+            change: "modified".to_string(),
+            file: Some("src/hot.rs".to_string()),
+            start_line: Some(10),
+            end_line: Some(20),
+            signature_changed: false,
+            visibility_changed: false,
+        }];
+
+        // Body-only, but the wide consumer fanout gates: the verdict escalates
+        // to needs_attention, driven by the single fanout signal.
+        let policy = derive_policy(&review, &[], &changed);
+        assert!(policy.findings.iter().any(|f| f.kind == "consumer_fanout"));
+        assert_eq!(policy.verdict, ShadowGateVerdict::NeedsAttention);
+        assert_eq!(policy.attention_count, 1);
+
+        // The two channels are independent: with the noisy coverage-gap channel
+        // ALSO present on the same body-only change, only the fanout gates. The
+        // coverage gap stays suppressed, so the attention count is driven by
+        // the fanout alone (1, not 2) — this is the shape of the real risky
+        // revert that carries both signals.
+        let mut review_both = review.clone();
+        review_both.inline_comments.push(InlineComment {
+            file: "src/hot.rs".to_string(),
+            start_line: 10,
+            end_line: 20,
+            kind: InlineCommentKind::CoverageGap,
+            message: "Modified entity `hot_path` has no test coverage".to_string(),
+        });
+        let policy = derive_policy(&review_both, &[], &changed);
+        assert!(policy.findings.iter().any(|f| f.kind == "consumer_fanout"));
+        assert!(policy.findings.iter().any(|f| f.kind == "coverage_gap"));
+        assert_eq!(policy.verdict, ShadowGateVerdict::NeedsAttention);
+        assert_eq!(policy.attention_count, 1);
+    }
+
+    #[test]
+    fn command_effect_contract_change_feeds_shadow_gate() {
+        use crate::diff::SemanticDiff;
+        use crate::impact::ImpactReport;
+        use crate::inline::{InlineComment, InlineCommentKind};
+        use kin_model::review::{RiskLevel, RiskSummary};
+
+        let review = Review {
+            base: None,
+            head: None,
+            diff: SemanticDiff::default(),
+            impact: ImpactReport::default(),
+            risk: RiskSummary {
+                overall_risk: RiskLevel::Low,
+                breaking_changes: vec![],
+                test_coverage_gaps: vec![],
+                contract_violations: vec![],
+                work_risks: vec![],
+                notes: vec![],
+            },
+            inline_comments: vec![InlineComment {
+                file: "command/pr_checkout.go".to_string(),
+                start_line: 14,
+                end_line: 102,
+                kind: InlineCommentKind::CommandEffectContract,
+                message: "Command-effect contract for `prCheckout` changed; external command \
+                          behavior needs review"
+                    .to_string(),
+            }],
+        };
+
+        let changed = vec![ShadowChangedEntity {
+            entity_id: EntityId::new().to_string(),
+            name: "prCheckout".to_string(),
+            kind: "Function".to_string(),
+            change: "modified".to_string(),
+            file: Some("command/pr_checkout.go".to_string()),
+            start_line: Some(14),
+            end_line: Some(102),
+            signature_changed: false,
+            visibility_changed: false,
+        }];
+
+        let policy = derive_policy(&review, &[], &changed);
+        assert!(policy
+            .findings
+            .iter()
+            .any(|finding| finding.kind == "command_effect_contract_change"));
+        assert_eq!(policy.verdict, ShadowGateVerdict::NeedsAttention);
+        assert_eq!(policy.attention_count, 1);
+    }
+
+    #[test]
+    fn unresolvable_removed_downstream_risk_is_attention_not_would_block() {
+        use crate::diff::{EntityChange, EntityChangeKind, SemanticDiff};
+        use crate::impact::{EntityImpact, ImpactReport};
+        use kin_model::review::{RiskLevel, RiskSummary};
+
+        // A removed entity the graph can no longer resolve renders as a raw
+        // UUID (kind "unknown"). We cannot certify a blocking breakage for a
+        // surface we cannot even name, so its downstream risk is reported as
+        // attention, not a would_block. The identical removal, resolvable to a
+        // named entity, still blocks.
+        let removed_id = EntityId::new();
+        let review = Review {
+            base: None,
+            head: None,
+            diff: SemanticDiff {
+                base: None,
+                head: None,
+                entity_changes: vec![EntityChange {
+                    entity_id: removed_id,
+                    kind: EntityChangeKind::Removed(removed_id),
+                }],
+                relation_changes: vec![],
+            },
+            impact: ImpactReport {
+                entity_impacts: vec![EntityImpact {
+                    entity_id: removed_id,
+                    consumer_count: 1,
+                    strong_consumer_count: 1,
+                    contract_consumer_count: 0,
+                    consumer_files: vec!["src/consumer.rs".to_string()],
+                    covering_tests: 0,
+                }],
+                ..Default::default()
+            },
+            risk: RiskSummary {
+                overall_risk: RiskLevel::Low,
+                breaking_changes: vec![],
+                test_coverage_gaps: vec![],
+                contract_violations: vec![],
+                work_risks: vec![],
+                notes: vec![],
+            },
+            inline_comments: vec![],
+        };
+
+        // Unresolvable removal (kind "unknown"): attention, not would_block.
+        let unresolvable = vec![ShadowChangedEntity {
+            entity_id: removed_id.to_string(),
+            name: removed_id.to_string(),
+            kind: "unknown".to_string(),
+            change: "removed".to_string(),
+            file: None,
+            start_line: None,
+            end_line: None,
+            signature_changed: false,
+            visibility_changed: false,
+        }];
+        let policy = derive_policy(&review, &[], &unresolvable);
+        let finding = policy
+            .findings
+            .iter()
+            .find(|f| f.kind == "downstream_risk")
+            .expect("removal with a surviving consumer carries a downstream risk");
+        assert!(
+            !finding.blocking,
+            "an unnameable removal cannot certify a block"
+        );
+        assert_eq!(finding.severity, "warning");
+        assert_eq!(policy.verdict, ShadowGateVerdict::NeedsAttention);
+
+        // The identical removal, resolvable to a named entity, still blocks.
+        let resolvable = vec![ShadowChangedEntity {
+            kind: "Function".to_string(),
+            name: "legacy_helper".to_string(),
+            ..unresolvable[0].clone()
+        }];
+        let policy = derive_policy(&review, &[], &resolvable);
+        let finding = policy
+            .findings
+            .iter()
+            .find(|f| f.kind == "downstream_risk")
+            .expect("resolvable removal with a consumer carries a downstream risk");
+        assert!(finding.blocking);
+        assert_eq!(policy.verdict, ShadowGateVerdict::WouldBlock);
+    }
+
+    #[test]
+    fn inert_source_edit_with_captured_entities_reports_without_demoting() {
+        // A source-class file (src/sensor.c) gets a comment/preprocessor-only
+        // artifact change that alters no entity. The graph still has an entity
+        // anchored in it at head, so the change is inert — reported as a
+        // non-demoting entity_inert_change, not an unparsed-source gap — and
+        // the verdict stays pass. (Contrast `source_class_artifact_gap_still_
+        // demotes`, where the file has no captured entity at all.)
+        let graph = InMemoryGraph::new();
+        let sensor = entity_with_span("sensor", "src/sensor.c", 3, EntityRole::Source);
+        let app = entity_with_span("app", "src/app.rs", 1, EntityRole::Source);
+        graph.upsert_entity(&sensor).unwrap();
+        graph.upsert_entity(&app).unwrap();
+
+        let base_id = change_id(0x61);
+        let head_id = change_id(0x62);
+        let base = change_with_deltas(
+            base_id,
+            vec![],
+            vec![
+                EntityDelta::Added(sensor.clone()),
+                EntityDelta::Added(app.clone()),
+            ],
+            vec![],
+            vec![],
+        );
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![EntityDelta::Modified {
+                old: app.clone(),
+                new: app,
+            }],
+            vec![],
+            vec![ArtifactDelta {
+                file_id: FilePathId::new("src/sensor.c"),
+                kind: ArtifactDeltaKind::Modified,
+                old_hash: Some(Hash256::from_bytes([11; 32])),
+                new_hash: Some(Hash256::from_bytes([12; 32])),
+            }],
+        );
+        graph.create_change(&base).unwrap();
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+
+        assert!(
+            report
+                .evidence_gaps
+                .iter()
+                .any(|gap| gap.kind == "entity_inert_change" && gap.subject == "src/sensor.c"),
+            "an inert edit of a captured source file is reported as a non-demoting gap"
+        );
+        assert!(
+            !report
+                .evidence_gaps
+                .iter()
+                .any(|gap| gap.kind == "artifact_only_change" && gap.subject == "src/sensor.c"),
+            "the inert edit must not be flagged as an unparsed-source artifact gap"
+        );
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::Pass);
+    }
+
+    #[test]
+    fn absent_relation_channel_keeps_surface_change_feeding_gate() {
+        // A real signature change in a repo whose relation channel was never
+        // ingested: the empty channel cannot prove the change is isolated, so
+        // it must still feed the gate → needs_attention, rather than being
+        // silently suppressed into a pass on an unprovable zero inbound.
+        let graph = InMemoryGraph::new();
+        let widget_v1 = entity_with_span("widget", "src/widget.rs", 4, EntityRole::Source);
+        let mut widget_v2 = widget_v1.clone();
+        widget_v2.signature = "fn widget(scale: u8)".into();
+        graph.upsert_entity(&widget_v2).unwrap();
+
+        let base_id = change_id(0x71);
+        let head_id = change_id(0x72);
+        let base = change_with_deltas(
+            base_id,
+            vec![],
+            vec![EntityDelta::Added(widget_v1.clone())],
+            vec![],
+            vec![],
+        );
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![EntityDelta::Modified {
+                old: widget_v1,
+                new: widget_v2,
+            }],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&base).unwrap();
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+
+        // The relation channel is entirely absent (no relations committed).
+        assert!(report
+            .evidence_gaps
+            .iter()
+            .any(|gap| gap.kind == "impact_signal_absent"));
+        // The signature change is reported ...
+        assert!(report
+            .policy
+            .findings
+            .iter()
+            .any(|finding| finding.kind == "signature_change"));
+        // ... and, because isolation is unprovable, still feeds the gate.
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::NeedsAttention);
     }
 }
