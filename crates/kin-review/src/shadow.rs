@@ -21,13 +21,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use kin_blobs::{BlobStore, Hash256};
 use kin_model::entity::Entity;
 use kin_model::graph::GraphStore;
-use kin_model::ids::SemanticChangeId;
+use kin_model::ids::{EntityId, SemanticChangeId};
 use kin_model::timestamp::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::diff::{self, EntityChangeKind, SemanticDiff};
 use crate::gate::{derive_decision, GateStatus, ReviewFinding, ReviewSignalKind};
-use crate::impact::ImpactReport;
+use crate::impact::{analyze_impact_at, ImpactGraph, ImpactReport};
 use crate::inline::{self, InlineComment, InlineCommentKind};
 use crate::ref_graph::GraphAtRef;
 use crate::review::{Review, SemanticReview};
@@ -303,7 +303,7 @@ pub fn build_shadow_report_at<G: GraphStore>(
     let base_ancestry = crate::ref_graph::collect_ancestry(store, &request.resolved_base)?;
     let in_range =
         |id: &SemanticChangeId| at_head.ancestry_contains(id) && !base_ancestry.contains(id);
-    let review = SemanticReview::create_review_scoped(
+    let mut review = SemanticReview::create_review_scoped(
         &request.resolved_base,
         &request.resolved_head,
         store,
@@ -316,7 +316,70 @@ pub fn build_shadow_report_at<G: GraphStore>(
         .into_iter()
         .filter(|change| in_range(&change.id))
         .collect();
-    assemble_report_with_changes(store, request, review, None, &changes, Some(at_head))
+    // A removed entity is absent at head: its head-scoped inbound edges and
+    // its own name/kind cannot be read there. The base ref still holds the
+    // entity and the edges its removal severs, so removed-entity impact and
+    // identity are harvested from base state. Materialization is sound here —
+    // `at_head` already validated the base is on-ancestry and every ancestry
+    // row is present, so the base state (a subset of that ancestry) resolves.
+    let at_base = GraphAtRef::materialize(store, &request.resolved_base)?;
+    overlay_removed_entity_impact_from_base(&mut review, &at_base)?;
+    assemble_report_with_changes(
+        store,
+        request,
+        review,
+        None,
+        &changes,
+        Some(at_head),
+        Some(&at_base),
+    )
+}
+
+/// Overlay base-side inbound attribution onto the head-computed impact for
+/// every REMOVED entity.
+///
+/// A removed entity does not exist at head, so its head-scoped
+/// `consumer_count` understates (often to zero) the surviving non-test
+/// consumers that still reference the deleted surface. The base ref still
+/// holds the entity and its inbound edges, so the breaking-removal rule reads
+/// the surviving-consumer count from there. Only removed-entity entries are
+/// replaced; Added/Modified attribution stays head-scoped. The FULL diff is
+/// harvested so a consumer that was itself changed in the same range is
+/// excluded exactly as the head-side harvest excludes a co-updated consumer —
+/// a consumer that let go of the removed surface in the same change is not a
+/// broken contract. Removed ids are iterated in sorted order and the impacts
+/// are re-sorted by id, so the overlay is replay-deterministic.
+fn overlay_removed_entity_impact_from_base<G: GraphStore>(
+    review: &mut Review,
+    at_base: &GraphAtRef<'_, G>,
+) -> Result<(), ReviewError> {
+    let removed_ids: BTreeSet<EntityId> = review
+        .diff
+        .entity_changes
+        .iter()
+        .filter_map(|change| match &change.kind {
+            EntityChangeKind::Removed(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    if removed_ids.is_empty() {
+        return Ok(());
+    }
+    let base_impact = analyze_impact_at(at_base, &review.diff)?;
+    for removed_id in &removed_ids {
+        if let Some(base_entry) = base_impact.entity_impact(removed_id) {
+            review
+                .impact
+                .entity_impacts
+                .retain(|entry| entry.entity_id != *removed_id);
+            review.impact.entity_impacts.push(base_entry.clone());
+        }
+    }
+    review
+        .impact
+        .entity_impacts
+        .sort_by_key(|entry| entry.entity_id);
+    Ok(())
 }
 
 /// The graph state at the head ref could not be materialized. Report the gap
@@ -395,8 +458,8 @@ fn build_report_with_base_off_ancestry<G: GraphStore>(
         ),
     };
     // No range was walked, so there are no artifact deltas to reclassify;
-    // pass no head state.
-    assemble_report_with_changes(store, request, review, Some(gap), &[], None)
+    // pass no head or base state.
+    assemble_report_with_changes(store, request, review, Some(gap), &[], None, None)
 }
 
 fn assemble_report<G: GraphStore>(
@@ -409,7 +472,7 @@ fn assemble_report<G: GraphStore>(
     let changes = store
         .get_changes_since(&request.resolved_base, &request.resolved_head)
         .map_err(ReviewError::graph)?;
-    assemble_report_with_changes(store, request, review, range_gap, &changes, at_head)
+    assemble_report_with_changes(store, request, review, range_gap, &changes, at_head, None)
 }
 
 fn assemble_report_with_changes<G: GraphStore>(
@@ -419,8 +482,9 @@ fn assemble_report_with_changes<G: GraphStore>(
     range_gap: Option<ShadowEvidenceGap>,
     changes: &[kin_model::change::SemanticChange],
     at_head: Option<&GraphAtRef<'_, G>>,
+    at_base: Option<&GraphAtRef<'_, G>>,
 ) -> Result<ShadowGateReport, ReviewError> {
-    let changed_entities = collect_changed_entities(store, &review)?;
+    let changed_entities = collect_changed_entities(store, &review, at_base)?;
     let blast_radius = collect_blast_radius(&review);
     // No blob reader is reachable here: the shadow entry points take only the
     // graph store, and threading a real reader would change their public
@@ -482,6 +546,7 @@ fn entity_location(entity: &Entity) -> (Option<String>, Option<u32>, Option<u32>
 fn collect_changed_entities<G: GraphStore>(
     store: &G,
     review: &Review,
+    at_base: Option<&GraphAtRef<'_, G>>,
 ) -> Result<Vec<ShadowChangedEntity>, ReviewError> {
     let mut changed = Vec::new();
     for change in &review.diff.entity_changes {
@@ -519,12 +584,21 @@ fn collect_changed_entities<G: GraphStore>(
                 });
             }
             EntityChangeKind::Removed(id) => {
-                // The diff carries only the removed entity's id; the graph
-                // still knows what the id named. Resolve so findings and the
-                // entity list read as code, not opaque ids. When the graph
-                // has genuinely forgotten the entity, fall back to the id
-                // string rather than inventing a name.
-                let removed = store.get_entity(id).map_err(ReviewError::graph)?;
+                // The diff carries only the removed entity's id, and the entity
+                // is absent at head. Resolve its name/kind/file where it still
+                // exists — the base ref — so findings and the entity list read
+                // as code, not opaque ids, and the breaking-removal rule keeps
+                // demotion only for a surface the BASE graph also cannot name.
+                // Fall back to the live store, then to the id string when the
+                // graph has genuinely forgotten the entity.
+                let removed = match at_base {
+                    Some(base) => base.get_entity(id)?,
+                    None => None,
+                };
+                let removed = match removed {
+                    Some(entity) => Some(entity),
+                    None => store.get_entity(id).map_err(ReviewError::graph)?,
+                };
                 let (name, kind, file) = match removed {
                     Some(entity) => {
                         let (file, _, _) = entity_location(&entity);
@@ -2028,6 +2102,205 @@ mod tests {
             downstream.message
         );
         assert_eq!(report.policy.verdict, ShadowGateVerdict::WouldBlock);
+    }
+
+    /// Committed DAG modelling a real deletion: a base change adds a public
+    /// entity, a non-test consumer, and (optionally) a covering test wired by
+    /// committed relations; the head change removes the entity. Nothing is
+    /// mirrored into the live adjacency, so the removed entity is genuinely
+    /// absent at head — `store.get_entity` on the live store returns `None`,
+    /// exactly as after a real removal. The removed entity and its inbound
+    /// edges survive only in the base ref's replayed state.
+    fn removal_graph(
+        consumer_role: EntityRole,
+        include_consumer: bool,
+    ) -> (InMemoryGraph, SemanticChangeId, SemanticChangeId) {
+        let graph = InMemoryGraph::new();
+        let validate = entity_with_span("validate", "src/base.rs", 111, EntityRole::Source);
+        let (consumer_file, consumer_name) = match consumer_role {
+            EntityRole::Test => ("tests/base.rs", "test_validate"),
+            _ => ("src/runserver.rs", "run_from_argv"),
+        };
+        let consumer = entity_with_span(consumer_name, consumer_file, 111, consumer_role);
+        let calls_kind = match consumer_role {
+            EntityRole::Test => RelationKind::Tests,
+            _ => RelationKind::Calls,
+        };
+        let consume_rel = relation(&consumer, &validate, calls_kind);
+
+        let base_id = change_id(20);
+        let head_id = change_id(21);
+        let mut base_entities = vec![EntityDelta::Added(validate.clone())];
+        let mut base_relations = vec![];
+        if include_consumer {
+            base_entities.push(EntityDelta::Added(consumer));
+            base_relations.push(RelationDelta::Added(consume_rel));
+        }
+        let base = change_with_deltas(base_id, vec![], base_entities, base_relations, vec![]);
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![EntityDelta::Removed(validate.id)],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&base).unwrap();
+        graph.create_change(&head).unwrap();
+        (graph, base_id, head_id)
+    }
+
+    #[test]
+    fn removed_public_entity_with_live_consumer_blocks_from_base_state() {
+        // (a) `validate` is deleted while a live non-test consumer still calls
+        // it. The consumer edge and the entity's identity survive only in the
+        // base ref, so the breaking-removal rule must harvest the
+        // surviving-consumer count and the entity name from base state: a
+        // blocking downstream_risk that names `validate`, verdict WouldBlock.
+        let (graph, base_id, head_id) = removal_graph(EntityRole::Source, true);
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+
+        let downstream = report
+            .policy
+            .findings
+            .iter()
+            .find(|finding| finding.kind == "downstream_risk")
+            .expect("deleting a consumed public entity is a downstream risk");
+        assert!(
+            downstream.blocking,
+            "a deleted-yet-consumed API is a genuine block, not a demoted warning"
+        );
+        assert_eq!(downstream.severity, "error");
+        assert!(
+            downstream.message.contains("validate"),
+            "finding must name the removed entity from base state: {}",
+            downstream.message
+        );
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::WouldBlock);
+    }
+
+    #[test]
+    fn removed_entity_with_only_test_consumers_does_not_block() {
+        // (b) The only base consumer of the removed entity is a test. Tests
+        // that cover a deleted thing are co-updated, not a broken contract, so
+        // the base harvest excludes them: no downstream_risk, no block.
+        let (graph, base_id, head_id) = removal_graph(EntityRole::Test, true);
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+
+        assert!(
+            !report
+                .policy
+                .findings
+                .iter()
+                .any(|finding| finding.kind == "downstream_risk" || finding.kind == "breaking"),
+            "a removal whose only base consumers are tests is not a breaking removal"
+        );
+        assert_ne!(report.policy.verdict, ShadowGateVerdict::WouldBlock);
+        // The name still resolves from base even without a blocking finding.
+        let removed = report
+            .changed_entities
+            .iter()
+            .find(|entity| entity.change == "removed")
+            .expect("removed entity is listed");
+        assert_eq!(removed.name, "validate");
+    }
+
+    #[test]
+    fn removed_entity_with_no_base_consumers_does_not_block() {
+        // (c) The removed entity has zero base consumers. There is no surviving
+        // surface to break, so no downstream_risk fires and the gate does not
+        // block.
+        let (graph, base_id, head_id) = removal_graph(EntityRole::Source, false);
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+
+        assert!(
+            !report
+                .policy
+                .findings
+                .iter()
+                .any(|finding| finding.kind == "downstream_risk" || finding.kind == "breaking"),
+            "a removal with no base consumers is not a breaking removal"
+        );
+        assert_ne!(report.policy.verdict, ShadowGateVerdict::WouldBlock);
+    }
+
+    #[test]
+    fn remove_and_readd_same_name_is_move_not_breaking_from_base() {
+        // (d) One diff removes `validate` (which has a base consumer) and adds a
+        // fresh entity of the SAME name. Because the removed id now resolves to
+        // `validate` from base, the same-name re-add is recognised as a move:
+        // no downstream_risk despite the base consumer. Without base-side name
+        // resolution the removed side reads as a uuid, fails the move match,
+        // and fires a demoted downstream_risk instead.
+        let graph = InMemoryGraph::new();
+        let validate_old = entity_with_span("validate", "src/base.rs", 111, EntityRole::Source);
+        let validate_new = entity_with_span("validate", "src/base_v2.rs", 5, EntityRole::Source);
+        let consumer =
+            entity_with_span("run_from_argv", "src/runserver.rs", 111, EntityRole::Source);
+        let calls_rel = relation(&consumer, &validate_old, RelationKind::Calls);
+
+        let base_id = change_id(22);
+        let head_id = change_id(23);
+        let base = change_with_deltas(
+            base_id,
+            vec![],
+            vec![
+                EntityDelta::Added(validate_old.clone()),
+                EntityDelta::Added(consumer),
+            ],
+            vec![RelationDelta::Added(calls_rel)],
+            vec![],
+        );
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![
+                EntityDelta::Removed(validate_old.id),
+                EntityDelta::Added(validate_new),
+            ],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&base).unwrap();
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+        assert!(
+            !report
+                .policy
+                .findings
+                .iter()
+                .any(|finding| finding.kind == "downstream_risk"),
+            "same-diff remove + re-add of one name is a move, not a breaking removal"
+        );
+        assert_ne!(report.policy.verdict, ShadowGateVerdict::WouldBlock);
+        let removed = report
+            .changed_entities
+            .iter()
+            .find(|entity| entity.change == "removed")
+            .expect("removed entity is listed");
+        assert_eq!(removed.name, "validate");
+    }
+
+    #[test]
+    fn removed_entity_name_resolves_from_base_not_uuid() {
+        // (e) A removed entity absent at head still resolves its name, kind, and
+        // file from the base ref for the changed-entities output — never the
+        // raw uuid / "unknown" fallback the head-only lookup produced.
+        let (graph, base_id, head_id) = removal_graph(EntityRole::Source, false);
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+
+        let removed = report
+            .changed_entities
+            .iter()
+            .find(|entity| entity.change == "removed")
+            .expect("removed entity is listed");
+        assert_eq!(removed.name, "validate");
+        assert_eq!(removed.kind, "Function");
+        assert_eq!(removed.file.as_deref(), Some("src/base.rs"));
+        assert_ne!(
+            removed.name, removed.entity_id,
+            "the name must not fall back to the raw id"
+        );
     }
 
     #[test]
