@@ -148,6 +148,12 @@ pub struct ImpactReport {
     pub entity_impacts: Vec<EntityImpact>,
 }
 
+/// Minimum inbound-edge confidence for a consumer to count toward
+/// verdict-driving fanout decisions. Ambiguous-dispatch fan-out links carry
+/// low confidence: they are real enough to display in the blast radius, but a
+/// possibly-reaching edge must not alone escalate a verdict.
+pub const STRONG_CONSUMER_CONFIDENCE: f32 = 0.6;
+
 /// Graph-proven inbound impact attributed to one directly changed entity.
 ///
 /// All counts are inbound-only: entities that reach the changed entity via
@@ -160,6 +166,10 @@ pub struct EntityImpact {
     pub entity_id: EntityId,
     /// Distinct non-test entities that consume this entity.
     pub consumer_count: usize,
+    /// Subset of `consumer_count` whose inbound edge confidence is at least
+    /// [`STRONG_CONSUMER_CONFIDENCE`] — the count verdict gates key on.
+    #[serde(default)]
+    pub strong_consumer_count: usize,
     /// Distinct non-test entities consuming this entity as a contract.
     pub contract_consumer_count: usize,
     /// Sorted distinct source files of the non-test consumers above.
@@ -254,6 +264,7 @@ pub fn analyze_impact_at<I: ImpactGraph>(
         // buckets. Sets are used only for distinct counts, never for output
         // ordering, so iteration order cannot leak into the report.
         let mut ent_consumers: HashSet<EntityId> = HashSet::new();
+        let mut ent_strong_consumers: HashSet<EntityId> = HashSet::new();
         let mut ent_contract_consumers: HashSet<EntityId> = HashSet::new();
         let mut ent_tests: HashSet<EntityId> = HashSet::new();
         // `consumer_files` is the human-readable projection of the consumer
@@ -302,6 +313,9 @@ pub fn analyze_impact_at<I: ImpactGraph>(
                     ent_tests.insert(affected_id);
                 } else {
                     ent_consumers.insert(affected_id);
+                    if rel.confidence >= STRONG_CONSUMER_CONFIDENCE {
+                        ent_strong_consumers.insert(affected_id);
+                    }
                     if rel.kind == RelationKind::ConsumesContract {
                         ent_contract_consumers.insert(affected_id);
                     }
@@ -365,6 +379,7 @@ pub fn analyze_impact_at<I: ImpactGraph>(
         entity_impacts.push(EntityImpact {
             entity_id,
             consumer_count: ent_consumers.len(),
+            strong_consumer_count: ent_strong_consumers.len(),
             contract_consumer_count: ent_contract_consumers.len(),
             consumer_files: ent_consumer_files.into_iter().collect(),
             covering_tests: ent_tests.len(),

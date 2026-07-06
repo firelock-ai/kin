@@ -166,6 +166,7 @@ fn collect_modified_comments(
     // entity's consumers are that entity's risk, not this one's.
     let per_entity = impact.entity_impact(&new.id);
     let consumer_count = per_entity.map_or(0, |e| e.consumer_count);
+    let strong_consumer_count = per_entity.map_or(0, |e| e.strong_consumer_count);
     let contract_consumer_count = per_entity.map_or(0, |e| e.contract_consumer_count);
     let consumer_file_count = per_entity.map_or(0, |e| e.consumer_files.len());
     let entity_covering_tests = per_entity.map_or(0, |e| e.covering_tests);
@@ -259,11 +260,13 @@ fn collect_modified_comments(
     // Body-only modification with wide consumer fanout. The contract surface
     // is unchanged, so the breaking channels stay silent, but a behavior
     // change reaching many distinct non-test consumer entities deserves
-    // attention. Decided on the graph-native consumer entity count; the file
-    // list is reported only as human-readable context.
+    // attention. Decided on the graph-native STRONG consumer entity count:
+    // ambiguous-dispatch fan-out edges are displayed in the blast radius but
+    // a possibly-reaching consumer must not alone escalate the verdict. The
+    // file list is reported only as human-readable context.
     if old.signature == new.signature
         && old.visibility == new.visibility
-        && consumer_count >= CONSUMER_FANOUT_THRESHOLD
+        && strong_consumer_count >= CONSUMER_FANOUT_THRESHOLD
     {
         comments.push(InlineComment {
             file: span.file.to_string(),
@@ -272,7 +275,7 @@ fn collect_modified_comments(
             kind: InlineCommentKind::ConsumerFanout,
             message: format!(
                 "Behavior of `{}` changed with {} distinct non-test consumer(s) across {} file(s)",
-                new.name, consumer_count, consumer_file_count,
+                new.name, strong_consumer_count, consumer_file_count,
             ),
         });
     }
@@ -471,6 +474,7 @@ mod tests {
             entity_impacts: vec![EntityImpact {
                 entity_id: new.id,
                 consumer_count: 1,
+                strong_consumer_count: 1,
                 contract_consumer_count: 0,
                 consumer_files: vec!["src/client.rs".to_string()],
                 covering_tests: 0,
@@ -520,6 +524,7 @@ mod tests {
                 EntityImpact {
                     entity_id: new_a.id,
                     consumer_count: 0,
+                    strong_consumer_count: 0,
                     contract_consumer_count: 0,
                     consumer_files: vec![],
                     covering_tests: 0,
@@ -527,6 +532,7 @@ mod tests {
                 EntityImpact {
                     entity_id: b.id,
                     consumer_count: 1,
+                    strong_consumer_count: 1,
                     contract_consumer_count: 0,
                     consumer_files: vec!["src/client.rs".to_string()],
                     covering_tests: 0,
@@ -572,6 +578,7 @@ mod tests {
             entity_impacts: vec![EntityImpact {
                 entity_id: new.id,
                 consumer_count: 0,
+                strong_consumer_count: 0,
                 contract_consumer_count: 0,
                 consumer_files: vec![],
                 covering_tests: 1,
@@ -629,6 +636,7 @@ mod tests {
                 EntityImpact {
                     entity_id: covered.id,
                     consumer_count: 0,
+                    strong_consumer_count: 0,
                     contract_consumer_count: 0,
                     consumer_files: vec![],
                     covering_tests: 1,
@@ -636,6 +644,7 @@ mod tests {
                 EntityImpact {
                     entity_id: uncovered.id,
                     consumer_count: 0,
+                    strong_consumer_count: 0,
                     contract_consumer_count: 0,
                     consumer_files: vec![],
                     covering_tests: 0,
@@ -710,6 +719,7 @@ mod tests {
             entity_impacts: vec![EntityImpact {
                 entity_id: new.id,
                 consumer_count: 2,
+                strong_consumer_count: 2,
                 contract_consumer_count: 0,
                 consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
                 covering_tests: 1,
@@ -723,6 +733,66 @@ mod tests {
             .filter(|c| c.kind == InlineCommentKind::ConsumerFanout)
             .collect();
         assert_eq!(fanout.len(), 1);
+        assert!(fanout[0].message.contains("2 distinct non-test consumer"));
+    }
+
+    #[test]
+    fn consumer_fanout_ignores_weak_confidence_consumers() {
+        // Ambiguous-dispatch fan-out links every possible implementor at low
+        // confidence; those consumers appear in the blast radius but a
+        // possibly-reaching edge must not alone escalate the verdict. Four
+        // weak-only consumers stay silent; the same shape with two strong
+        // consumers fires.
+        let old = test_entity_with_span("hot_path", "src/hot.rs", 1, 20);
+        let new = old.clone();
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let weak_only = ImpactReport {
+            changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 4,
+                strong_consumer_count: 0,
+                contract_consumer_count: 0,
+                consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+                covering_tests: 0,
+            }],
+            ..Default::default()
+        };
+        let comments = collect_inline_comments(&diff, &weak_only);
+        assert!(
+            !comments
+                .iter()
+                .any(|c| c.kind == InlineCommentKind::ConsumerFanout),
+            "weak-only consumers must not fire the fanout gate"
+        );
+
+        let mixed = ImpactReport {
+            changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 4,
+                strong_consumer_count: 2,
+                contract_consumer_count: 0,
+                consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+                covering_tests: 0,
+            }],
+            ..Default::default()
+        };
+        let comments = collect_inline_comments(&diff, &mixed);
+        let fanout: Vec<&InlineComment> = comments
+            .iter()
+            .filter(|c| c.kind == InlineCommentKind::ConsumerFanout)
+            .collect();
+        assert_eq!(fanout.len(), 1, "strong consumers at threshold must fire");
         assert!(fanout[0].message.contains("2 distinct non-test consumer"));
     }
 
@@ -751,6 +821,7 @@ mod tests {
             entity_impacts: vec![EntityImpact {
                 entity_id: new.id,
                 consumer_count: 2,
+                strong_consumer_count: 2,
                 contract_consumer_count: 0,
                 // Both consumers in one file: file count (1) is below threshold,
                 // entity count (2) is at it.
@@ -797,6 +868,7 @@ mod tests {
             entity_impacts: vec![EntityImpact {
                 entity_id: new.id,
                 consumer_count: 1,
+                strong_consumer_count: 1,
                 contract_consumer_count: 0,
                 consumer_files: vec!["src/only.rs".to_string()],
                 covering_tests: 0,
@@ -828,6 +900,7 @@ mod tests {
             entity_impacts: vec![EntityImpact {
                 entity_id: resigned.id,
                 consumer_count: 2,
+                strong_consumer_count: 2,
                 contract_consumer_count: 0,
                 consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
                 covering_tests: 0,

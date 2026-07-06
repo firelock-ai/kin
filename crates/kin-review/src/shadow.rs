@@ -1606,6 +1606,7 @@ mod tests {
                         .map(|&entity_id| EntityImpact {
                             entity_id,
                             consumer_count: 1,
+                            strong_consumer_count: 1,
                             contract_consumer_count: 0,
                             consumer_files: vec!["src/consumer.rs".to_string()],
                             covering_tests: 0,
@@ -1925,6 +1926,7 @@ mod tests {
                 entity_impacts: vec![EntityImpact {
                     entity_id: moved_old_id,
                     consumer_count: 1,
+                    strong_consumer_count: 1,
                     contract_consumer_count: 0,
                     consumer_files: vec!["src/consumer.rs".to_string()],
                     covering_tests: 0,
@@ -2019,6 +2021,7 @@ mod tests {
                 entity_impacts: vec![EntityImpact {
                     entity_id: new.id,
                     consumer_count: 0,
+                    strong_consumer_count: 0,
                     contract_consumer_count: 0,
                     consumer_files: vec![],
                     covering_tests: 0,
@@ -2570,6 +2573,7 @@ mod tests {
                 entity_impacts: vec![EntityImpact {
                     entity_id: removed_id,
                     consumer_count: 1,
+                    strong_consumer_count: 1,
                     contract_consumer_count: 0,
                     consumer_files: vec!["src/consumer.rs".to_string()],
                     covering_tests: 0,
