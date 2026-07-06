@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use kin_blobs::{BlobStore, Hash256};
-use kin_model::entity::Entity;
+use kin_model::entity::{Entity, EntityRole};
 use kin_model::graph::GraphStore;
 use kin_model::ids::{EntityId, SemanticChangeId};
 use kin_model::timestamp::Timestamp;
@@ -93,7 +93,14 @@ pub struct ShadowChangedEntity {
     pub end_line: Option<u32>,
     pub signature_changed: bool,
     pub visibility_changed: bool,
+    /// Graph role of the changed entity. Test/Generated/Vendored entities are
+    /// not a contract surface any non-test consumer depends on, so their
+    /// signature/visibility changes must not feed the gate.
+    #[serde(default)]
+    pub role: EntityRole,
 }
+
+use crate::inline::is_non_contract_surface_role;
 
 /// One entity reached by blast-radius traversal, with the graph relationship
 /// bucket that proves why it is affected.
@@ -563,6 +570,7 @@ fn collect_changed_entities<G: GraphStore>(
                     end_line,
                     signature_changed: false,
                     visibility_changed: false,
+                    role: entity.role,
                 });
             }
             EntityChangeKind::Modified { old, new } => {
@@ -581,6 +589,7 @@ fn collect_changed_entities<G: GraphStore>(
                             &new.signature,
                         ),
                     visibility_changed: old.visibility != new.visibility,
+                    role: new.role,
                 });
             }
             EntityChangeKind::Removed(id) => {
@@ -599,12 +608,22 @@ fn collect_changed_entities<G: GraphStore>(
                     Some(entity) => Some(entity),
                     None => store.get_entity(id).map_err(ReviewError::graph)?,
                 };
-                let (name, kind, file) = match removed {
+                let (name, kind, file, role) = match removed {
                     Some(entity) => {
                         let (file, _, _) = entity_location(&entity);
-                        (entity.name.clone(), format!("{:?}", entity.kind), file)
+                        (
+                            entity.name.clone(),
+                            format!("{:?}", entity.kind),
+                            file,
+                            entity.role,
+                        )
                     }
-                    None => (id.to_string(), "unknown".to_string(), None),
+                    None => (
+                        id.to_string(),
+                        "unknown".to_string(),
+                        None,
+                        EntityRole::Source,
+                    ),
                 };
                 changed.push(ShadowChangedEntity {
                     entity_id: id.to_string(),
@@ -616,6 +635,7 @@ fn collect_changed_entities<G: GraphStore>(
                     end_line: None,
                     signature_changed: false,
                     visibility_changed: false,
+                    role,
                 });
             }
         }
@@ -803,6 +823,13 @@ fn derive_policy(
         .filter(|entity| entity.change == "added")
         .map(|entity| entity.name.as_str())
         .collect();
+    // Graph role per changed entity, so the surface-finding loop can skip
+    // roles that are not a contract surface (test/generated/vendored) even for
+    // removed entities, whose role was resolved from the base graph.
+    let resolved_roles: BTreeMap<&str, EntityRole> = changed_entities
+        .iter()
+        .map(|entity| (entity.entity_id.as_str(), entity.role))
+        .collect();
     // Removed entities the graph can no longer resolve are surfaced as a raw
     // UUID (kind "unknown" from `collect_changed_entities`). We cannot certify
     // a confident BLOCKING breakage for a surface we cannot even name, so such
@@ -854,6 +881,15 @@ fn derive_policy(
                 EntityChangeKind::Added(_) => continue,
             };
             if !surface_changed {
+                continue;
+            }
+            // A test's, generated artifact's, or vendored copy's declaration is
+            // not a contract surface — its signature change breaks no consumer
+            // the review protects, so it never emits a downstream-risk finding.
+            if resolved_roles
+                .get(change.entity_id.to_string().as_str())
+                .is_some_and(|role| is_non_contract_surface_role(*role))
+            {
                 continue;
             }
             let entity_consumers = review
@@ -952,9 +988,10 @@ fn derive_policy(
     // must feed the gate on its own weight even when the contract surface is
     // unchanged. The decision is on graph-owned consumer entities, never files.
     let has_blocking_finding = findings.iter().any(|finding| finding.blocking);
-    let has_surface_change = changed_entities
-        .iter()
-        .any(|entity| entity.signature_changed || entity.visibility_changed);
+    let has_surface_change = changed_entities.iter().any(|entity| {
+        (entity.signature_changed || entity.visibility_changed)
+            && !is_non_contract_surface_role(entity.role)
+    });
     let coverage_gap_feeds_gate = has_blocking_finding || has_surface_change;
 
     // Informational findings (entity added/removed) describe the diff, not a
@@ -2362,6 +2399,7 @@ mod tests {
             end_line: None,
             signature_changed: false,
             visibility_changed: false,
+            role: EntityRole::Source,
         };
         let added_entry = ShadowChangedEntity {
             entity_id: readded.id.to_string(),
@@ -2373,6 +2411,7 @@ mod tests {
             end_line: Some(3),
             signature_changed: false,
             visibility_changed: false,
+            role: EntityRole::Source,
         };
 
         // With the same-name re-add present, the removal is a move: no
@@ -2858,6 +2897,7 @@ mod tests {
             end_line: Some(20),
             signature_changed: false,
             visibility_changed: false,
+            role: EntityRole::Source,
         }];
 
         // Body-only: the coverage gap is reported but withheld from the gate —
@@ -2924,6 +2964,7 @@ mod tests {
             end_line: Some(20),
             signature_changed: false,
             visibility_changed: false,
+            role: EntityRole::Source,
         }];
 
         // Body-only, but the wide consumer fanout gates: the verdict escalates
@@ -2994,6 +3035,7 @@ mod tests {
             end_line: Some(102),
             signature_changed: false,
             visibility_changed: false,
+            role: EntityRole::Source,
         }];
 
         let policy = derive_policy(&review, &[], &changed);
@@ -3062,6 +3104,7 @@ mod tests {
             end_line: None,
             signature_changed: false,
             visibility_changed: false,
+            role: EntityRole::Source,
         }];
         let policy = derive_policy(&review, &[], &unresolvable);
         let finding = policy
@@ -3204,6 +3247,77 @@ mod tests {
             .any(|finding| finding.kind == "signature_change"));
         // ... and, because isolation is unprovable, still feeds the gate.
         assert_eq!(report.policy.verdict, ShadowGateVerdict::NeedsAttention);
+    }
+
+    #[test]
+    fn test_role_surface_change_does_not_feed_gate() {
+        // A test method whose signature changed (e.g. a decorator/async edit)
+        // is not a contract surface: nothing the review protects depends on it,
+        // so it must not emit a downstream-risk finding or drive the verdict —
+        // even with a live caller. The Source-role twin below still fires. This
+        // is the c042 false positive: benign prod change + a test-method
+        // signature edit escalated to needs_attention.
+        for (role, expect_risk) in [(EntityRole::Test, false), (EntityRole::Source, true)] {
+            let graph = InMemoryGraph::new();
+            let target_v1 = entity_with_span("streaming_case", "tests/handlers.rs", 4, role);
+            let mut target_v2 = target_v1.clone();
+            target_v2.signature = "fn streaming_case(scale: u8)".into();
+            let caller = entity_with_span("driver", "src/driver.rs", 6, EntityRole::Source);
+            graph.upsert_entity(&target_v2).unwrap();
+            graph.upsert_entity(&caller).unwrap();
+            graph
+                .upsert_relation(&relation(&caller, &target_v2, RelationKind::Calls))
+                .unwrap();
+
+            let base_id = change_id(0x73);
+            let head_id = change_id(0x74);
+            let base = change_with_deltas(
+                base_id,
+                vec![],
+                vec![
+                    EntityDelta::Added(target_v1.clone()),
+                    EntityDelta::Added(caller.clone()),
+                ],
+                vec![],
+                vec![],
+            );
+            let head = change_with_deltas(
+                head_id,
+                vec![base_id],
+                vec![EntityDelta::Modified {
+                    old: target_v1,
+                    new: target_v2,
+                }],
+                vec![],
+                vec![],
+            );
+            graph.create_change(&base).unwrap();
+            graph.create_change(&head).unwrap();
+
+            let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+            let has_surface_finding = report.policy.findings.iter().any(|finding| {
+                finding.kind == "signature_change"
+                    || finding.kind == "downstream_risk"
+                    || finding.kind == "breaking"
+            });
+            assert_eq!(
+                has_surface_finding,
+                expect_risk,
+                "role {:?} should {}emit a contract-surface finding",
+                role,
+                if expect_risk { "" } else { "not " }
+            );
+            let expected_verdict = if expect_risk {
+                ShadowGateVerdict::NeedsAttention
+            } else {
+                ShadowGateVerdict::Pass
+            };
+            assert_eq!(
+                report.policy.verdict, expected_verdict,
+                "role {:?} verdict",
+                role
+            );
+        }
     }
 
     // ── Toolchain-surface directive channel ─────────────────────────────

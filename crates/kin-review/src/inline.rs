@@ -70,6 +70,18 @@ pub const CONSUMER_FANOUT_THRESHOLD: usize = 2;
 /// any existing caller. Removal of one is a real surface change.
 const STRENGTHENING_QUALIFIERS: &[&str] = &["constexpr", "inline", "[[nodiscard]]"];
 
+/// True for roles that are not a contract surface: a test's, a generated
+/// artifact's, or a vendored copy's declaration is consumed by nothing the
+/// review protects, so a signature/visibility change to one is not a
+/// downstream risk and must not produce a gate-feeding surface finding.
+/// Mirrors the consumer-exclusion set the impact harvest already applies.
+pub(crate) fn is_non_contract_surface_role(role: EntityRole) -> bool {
+    matches!(
+        role,
+        EntityRole::Test | EntityRole::Generated | EntityRole::Vendored
+    )
+}
+
 /// True when `old` → `new` differs ONLY by adding strengthening qualifiers:
 /// the qualifier-stripped declarations are identical and `new` carries more
 /// strengthening qualifiers than `old`.
@@ -217,7 +229,8 @@ fn collect_modified_comments(
     // (constexpr/inline/[[nodiscard]]) cannot invalidate existing callers and
     // is not a contract-surface change; anything else — including removing
     // such qualifiers — remains one.
-    if old.signature != new.signature
+    if !is_non_contract_surface_role(new.role)
+        && old.signature != new.signature
         && !signature_strengthened_only(&old.signature, &new.signature)
     {
         comments.push(InlineComment {
@@ -249,7 +262,10 @@ fn collect_modified_comments(
     }
 
     // Visibility reduction
-    if old.visibility == Visibility::Public && new.visibility != Visibility::Public {
+    if !is_non_contract_surface_role(new.role)
+        && old.visibility == Visibility::Public
+        && new.visibility != Visibility::Public
+    {
         comments.push(InlineComment {
             file: span.file.to_string(),
             start_line: span.start_line,
