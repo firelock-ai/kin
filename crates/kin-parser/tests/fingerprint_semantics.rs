@@ -12,7 +12,11 @@
 //! changed" evidence to review gates.
 
 use kin_model::{FilePathId, Hash256};
-use kin_parser::{CppAdapter, GoAdapter, LanguageAdapter, PythonAdapter, RustAdapter};
+use kin_parser::{
+    CAdapter, CSharpAdapter, CppAdapter, GoAdapter, JavaAdapter, JavaScriptAdapter, KotlinAdapter,
+    LanguageAdapter, PhpAdapter, PythonAdapter, RubyAdapter, RustAdapter, SwiftAdapter,
+    TypeScriptAdapter,
+};
 
 fn entity_hashes(
     adapter: &dyn LanguageAdapter,
@@ -224,5 +228,135 @@ public:
     assert!(
         !a.contains("m_mode"),
         "member-initializer list must not leak into the signature, got: {a}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cosmetic-stability matrix (FIR-1313): extend the comment-only + whitespace-
+// only invariant to every full-adapter language not covered above. Go, C++,
+// Rust, and Python are already exercised earlier in this file; the block below
+// adds TypeScript, JavaScript, Java, C, C#, Ruby, PHP, Kotlin, and Swift. All
+// are GREEN — `compute_fingerprint` is shared and skips comment `extra` nodes
+// and inter-token whitespace, so every adapter inherits the invariant.
+// ---------------------------------------------------------------------------
+
+/// A comment-only edit and a whitespace-only reformat must each leave all three
+/// fingerprint hashes of `name` unchanged.
+fn assert_cosmetic_stable(
+    adapter: &dyn LanguageAdapter,
+    name: &str,
+    base: &str,
+    comment_only: &str,
+    whitespace_only: &str,
+) {
+    let b = entity_hashes(adapter, base, name);
+    assert_eq!(
+        b,
+        entity_hashes(adapter, comment_only, name),
+        "comment-only edit must not change any fingerprint hash ({name})"
+    );
+    assert_eq!(
+        b,
+        entity_hashes(adapter, whitespace_only, name),
+        "whitespace-only edit must not change any fingerprint hash ({name})"
+    );
+}
+
+#[test]
+fn typescript_cosmetic_edits_keep_fingerprint() {
+    assert_cosmetic_stable(
+        &TypeScriptAdapter,
+        "total",
+        "function total(a: number, b: number): number { return a + b; }",
+        "function total(a: number, b: number): number {\n  // sum them\n  return a + b;\n}",
+        "function total(a:number,b:number):number{return a+b;}",
+    );
+}
+
+#[test]
+fn javascript_cosmetic_edits_keep_fingerprint() {
+    assert_cosmetic_stable(
+        &JavaScriptAdapter,
+        "total",
+        "function total(a, b) { return a + b; }",
+        "function total(a, b) {\n  // sum them\n  return a + b;\n}",
+        "function total(a,b){return a+b;}",
+    );
+}
+
+#[test]
+fn java_cosmetic_edits_keep_fingerprint() {
+    assert_cosmetic_stable(
+        &JavaAdapter,
+        "C.total",
+        "class C { int total(int a, int b) { return a + b; } }",
+        "class C { int total(int a, int b) {\n    // sum them\n    return a + b; } }",
+        "class C{int total(int a,int b){return a+b;}}",
+    );
+}
+
+#[test]
+fn c_cosmetic_edits_keep_fingerprint() {
+    assert_cosmetic_stable(
+        &CAdapter,
+        "total",
+        "int total(int a, int b) { return a + b; }",
+        "int total(int a, int b) {\n    /* sum them */\n    return a + b;\n}",
+        "int total(int a,int b){return a+b;}",
+    );
+}
+
+#[test]
+fn csharp_cosmetic_edits_keep_fingerprint() {
+    assert_cosmetic_stable(
+        &CSharpAdapter,
+        "N.C.Total",
+        "namespace N { class C { int Total(int a, int b) { return a + b; } } }",
+        "namespace N { class C { int Total(int a, int b) {\n    // sum them\n    return a + b; } } }",
+        "namespace N{class C{int Total(int a,int b){return a+b;}}}",
+    );
+}
+
+#[test]
+fn ruby_cosmetic_edits_keep_fingerprint() {
+    assert_cosmetic_stable(
+        &RubyAdapter,
+        "C.total",
+        "class C\n    def total(a, b)\n        a + b\n    end\nend\n",
+        "class C\n    def total(a, b)\n        # sum them\n        a + b\n    end\nend\n",
+        "class C\n  def total(a,b)\n    a + b\n  end\nend\n",
+    );
+}
+
+#[test]
+fn php_cosmetic_edits_keep_fingerprint() {
+    assert_cosmetic_stable(
+        &PhpAdapter,
+        "total",
+        "<?php\nfunction total($a, $b) { return $a + $b; }\n",
+        "<?php\nfunction total($a, $b) {\n    // sum them\n    return $a + $b;\n}\n",
+        "<?php\nfunction total($a,$b){return $a+$b;}\n",
+    );
+}
+
+#[test]
+fn kotlin_cosmetic_edits_keep_fingerprint() {
+    assert_cosmetic_stable(
+        &KotlinAdapter,
+        "total",
+        "fun total(a: Int, b: Int): Int { return a + b }",
+        "fun total(a: Int, b: Int): Int {\n    // sum them\n    return a + b\n}",
+        "fun total(a:Int,b:Int):Int{return a+b}",
+    );
+}
+
+#[test]
+fn swift_cosmetic_edits_keep_fingerprint() {
+    assert_cosmetic_stable(
+        &SwiftAdapter,
+        "total",
+        "func total(a: Int, b: Int) -> Int { return a + b }",
+        "func total(a: Int, b: Int) -> Int {\n    // sum them\n    return a + b\n}",
+        "func total(a:Int,b:Int)->Int{return a+b}",
     );
 }
