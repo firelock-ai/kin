@@ -1146,6 +1146,7 @@ impl Clone for ImportedCommitSemanticState {
                 known_files: self.linker.known_files.clone(),
                 entities_by_file: self.linker.entities_by_file.clone(),
                 include_targets_by_file: self.linker.include_targets_by_file.clone(),
+                class_bases_by_file: self.linker.class_bases_by_file.clone(),
             },
         }
     }
@@ -1445,6 +1446,7 @@ pub(crate) fn enrich_imported_changes_with_semantics(
         if !changed_parse_data.is_empty() {
             let link_start_time = std::time::Instant::now();
             incremental_linker.record_file_includes(&changed_parse_data);
+            incremental_linker.record_class_bases(&changed_parse_data);
             let mut new_relations_by_id = HashMap::<RelationId, Relation>::new();
             for relation in
                 kin_index::link_cross_file_incremental(&changed_parse_data, &incremental_linker)
@@ -2880,14 +2882,48 @@ fn build_incremental_linker_from_graph(
     }
 
     let mut entities_by_file = BTreeMap::<String, Vec<Entity>>::new();
+    let mut entity_meta = HashMap::<EntityId, (String, String)>::new();
     for entity in graph.query_entities(&EntityFilter::default())? {
         let Some(file_path) = entity.file_origin.as_ref().map(|path| path.0.clone()) else {
             continue;
         };
+        entity_meta.insert(entity.id, (entity.name.clone(), file_path.clone()));
         entities_by_file.entry(file_path).or_default().push(entity);
     }
     for (file_path, entities) in entities_by_file {
         linker.add_file(&file_path, &entities);
+    }
+
+    // Rehydrate per-file class hierarchies from the committed Extends edges so
+    // inheritance-aware method resolution keeps working across reopen — the
+    // reparsed subset alone would only see step-local hierarchies, and an
+    // inheritance walk crossing into an unchanged file would dead-end.
+    // Committed edges carry no declaration order, so bases are sorted
+    // lexicographically — the same order every other recording path uses.
+    let mut bases_by_file_class = BTreeMap::<(String, String), Vec<String>>::new();
+    for (src, kind, dst, _confidence) in graph.list_all_entity_edges() {
+        if kind != RelationKind::Extends {
+            continue;
+        }
+        let (Some((src_name, src_file)), Some((dst_name, _))) =
+            (entity_meta.get(&src), entity_meta.get(&dst))
+        else {
+            continue;
+        };
+        let bases = bases_by_file_class
+            .entry((src_file.clone(), src_name.clone()))
+            .or_default();
+        if !bases.contains(dst_name) {
+            bases.push(dst_name.clone());
+        }
+    }
+    for ((file_path, class_name), mut bases) in bases_by_file_class {
+        bases.sort_unstable();
+        linker
+            .class_bases_by_file
+            .entry(file_path)
+            .or_default()
+            .push((class_name, bases));
     }
 
     // Rehydrate per-file include state from the committed artifact include

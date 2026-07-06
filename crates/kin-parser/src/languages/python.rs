@@ -184,7 +184,7 @@ fn extract_py_node(
                     span: span_from_node(node, file_id),
                 });
                 // Extract calls within function/method body
-                extract_calls_from_context(node, source, &name, relations);
+                extract_calls_from_context(node, source, &name, class_ctx, relations);
                 if let Some(cls) = class_ctx {
                     relations.push(ExtractedRelation {
                         kind: kin_model::RelationKind::Contains,
@@ -454,6 +454,7 @@ fn extract_calls_from_context(
     node: &tree_sitter::Node,
     source: &[u8],
     context_name: &str,
+    class_ctx: Option<&str>,
     relations: &mut Vec<ExtractedRelation>,
 ) {
     let mut cursor = node.walk();
@@ -461,10 +462,30 @@ fn extract_calls_from_context(
         if child.kind() == "call" {
             if let Some(function) = child.child_by_field_name("function") {
                 let callee_name = match function.kind() {
-                    "attribute" => function
-                        .child_by_field_name("attribute")
-                        .map(|f| f.utf8_text(source).unwrap_or("").to_string())
-                        .unwrap_or_default(),
+                    "attribute" => {
+                        let attr = function
+                            .child_by_field_name("attribute")
+                            .map(|f| f.utf8_text(source).unwrap_or("").to_string())
+                            .unwrap_or_default();
+                        // `self.m()` / `cls.m()` dispatch through the enclosing
+                        // class, so qualify the callee with it: the linker can
+                        // then resolve an inherited method through the class's
+                        // Extends chain instead of fanning out on the bare name.
+                        // Any other receiver (`obj.m()`, `self.store.m()`) stays
+                        // bare — its type is unknown at parse time.
+                        let self_or_cls_receiver = function
+                            .child_by_field_name("object")
+                            .filter(|obj| obj.kind() == "identifier")
+                            .and_then(|obj| obj.utf8_text(source).ok())
+                            .map(|text| text == "self" || text == "cls")
+                            .unwrap_or(false);
+                        match class_ctx {
+                            Some(cls) if self_or_cls_receiver && !attr.is_empty() => {
+                                format!("{}.{}", cls, attr)
+                            }
+                            _ => attr,
+                        }
+                    }
                     "identifier" => {
                         let raw = function.utf8_text(source).unwrap_or("");
                         raw.strip_prefix("self.")
@@ -485,7 +506,7 @@ fn extract_calls_from_context(
             }
         }
         // Recurse into child nodes
-        extract_calls_from_context(&child, source, context_name, relations);
+        extract_calls_from_context(&child, source, context_name, class_ctx, relations);
     }
 }
 
@@ -733,7 +754,7 @@ mod tests {
     }
 
     #[test]
-    fn self_prefix_stripped_from_calls() {
+    fn self_calls_qualified_with_enclosing_class() {
         let adapter = PythonAdapter;
         let source =
             b"class Foo:\n    def run(self):\n        self.process()\n        self.helper(1)";
@@ -746,12 +767,13 @@ mod tests {
             .filter(|r| r.kind == kin_model::RelationKind::Calls)
             .collect();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].dst_name, "process");
-        assert_eq!(calls[1].dst_name, "helper");
+        assert_eq!(calls[0].src_name, "Foo.run");
+        assert_eq!(calls[0].dst_name, "Foo.process");
+        assert_eq!(calls[1].dst_name, "Foo.helper");
     }
 
     #[test]
-    fn cls_prefix_stripped_from_calls() {
+    fn cls_calls_qualified_with_enclosing_class() {
         let adapter = PythonAdapter;
         let source = b"class Foo:\n    @classmethod\n    def make(cls):\n        cls.create()";
         let tree = adapter.parse(source).unwrap();
@@ -763,7 +785,26 @@ mod tests {
             .filter(|r| r.kind == kin_model::RelationKind::Calls && r.dst_name != "classmethod")
             .collect();
         assert_eq!(body_calls.len(), 1);
-        assert_eq!(body_calls[0].dst_name, "create");
+        assert_eq!(body_calls[0].dst_name, "Foo.create");
+    }
+
+    #[test]
+    fn non_self_receivers_stay_bare() {
+        let adapter = PythonAdapter;
+        let source = b"class Foo:\n    def run(self):\n        obj.render()\n        self.store.save()\n\ndef free():\n    conn.close()";
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.py");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let dsts: Vec<&str> = output
+            .relations
+            .iter()
+            .filter(|r| r.kind == kin_model::RelationKind::Calls)
+            .map(|r| r.dst_name.as_str())
+            .collect();
+        // `obj.render()` has an unknown receiver type; `self.store.save()`
+        // dispatches through an attribute, not the class itself — both stay
+        // bare. Only direct self./cls. receivers gain the class qualifier.
+        assert_eq!(dsts, vec!["render", "save", "close"]);
     }
 
     #[test]
