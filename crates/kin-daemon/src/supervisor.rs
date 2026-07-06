@@ -988,6 +988,12 @@ const REAPER_SIGTERM_GRACE: Duration = Duration::from_secs(5);
 const REAPER_DEFAULT_CPU_PINNED_PERCENT: f32 = 80.0;
 /// Default consecutive pinned sweeps before the CPU heuristic fires.
 const REAPER_DEFAULT_CPU_PINNED_SWEEPS: u32 = 2;
+/// Consecutive sweeps a daemon must show zero persisted progress — no growth in
+/// its repo `daemon.log` — before an unreachable or CPU-pinned daemon becomes
+/// reap-eligible. 4 sweeps × 15s = a minute of zero persisted progress while
+/// unreachable, long enough that a merely-busy daemon that missed a probe
+/// deadline is never mistaken for a wedged one.
+const REAPER_STALL_SWEEPS: u32 = 4;
 /// Default slack (in seconds) a daemon's start_time may lag the deployed binary
 /// mtime before it counts as stale — absorbs clock/filesystem timestamp jitter.
 const REDEPLOY_DEFAULT_GRACE_SECS: u64 = 2;
@@ -1003,8 +1009,14 @@ const SUPERVISOR_REEXECED_FOR_MTIME_ENV: &str = "KIN_SUPERVISOR_REEXECED_FOR_MTI
 enum DaemonHealth {
     /// `/health` responded 2xx; carries observed activity.
     Healthy(DaemonActivity),
-    /// `/health` failed, timed out, or returned non-2xx.
+    /// The daemon ANSWERED but the answer was broken: a served non-success HTTP
+    /// status, or a 2xx body that could not be parsed. It is responding, just
+    /// wrong — a genuinely broken daemon.
     Unhealthy,
+    /// The `/health` probe could not reach the daemon at all: it timed out or the
+    /// connection failed. A daemon pinned doing real work can miss a probe
+    /// deadline, so this is treated as "no answer yet", not proof of breakage.
+    Unreachable,
     /// No port was discoverable, so health could not be probed.
     Unknown,
 }
@@ -1019,10 +1031,16 @@ struct DaemonActivity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReapReason {
-    /// Orphaned (reparented to init) and the health probe failed/timed out.
+    /// Orphaned (reparented to init) and the daemon ANSWERED its health probe
+    /// with a broken response (non-success status or unparseable body).
     OrphanedUnhealthy,
-    /// Orphaned, healthy but idle (no clients, not reconciling), and CPU-pinned
-    /// across enough consecutive sweeps — the busy-spinner case.
+    /// Orphaned and UNREACHABLE (probe timed out or the connection failed) across
+    /// the full stall window with zero persisted progress — a wedged daemon,
+    /// distinguished from a merely-busy one that keeps advancing its log.
+    OrphanedUnreachableStalled,
+    /// Orphaned, healthy but idle (no clients, not reconciling), CPU-pinned across
+    /// enough consecutive sweeps, AND showing no persisted progress across the
+    /// stall window — the busy-spinner case, never a daemon still advancing work.
     OrphanedBusyNoClients,
     /// Orphaned duplicate of a registered, healthy daemon on the same repo root.
     DuplicateOrphanTwin,
@@ -1201,6 +1219,10 @@ struct DaemonObservation {
     health: DaemonHealth,
     /// Consecutive sweeps this pid has been CPU-pinned.
     cpu_pinned_sweeps: u32,
+    /// Consecutive sweeps this pid's repo `daemon.log` has not grown — a
+    /// persisted-progress stall. Gates the unreachable and CPU-pinned reap
+    /// criteria so a busy-but-advancing daemon is never reaped.
+    stall_sweeps: u32,
     /// How this daemon relates to the registry entry for its repo root.
     registry: RegistryRelation,
     /// The deployed binary was rebuilt after this process started — it is running
@@ -1217,8 +1239,14 @@ struct DaemonObservation {
 /// - A daemon doing real work (active clients or active reconciliation) is NEVER
 ///   reaped, even if unregistered — but it MAY still be adopted to restore
 ///   visibility (adoption never reaps).
-/// - The safe reap criterion (orphaned + unhealthy) is always enabled.
-/// - The CPU-pinned and duplicate-twin reap criteria are policy-gated.
+/// - The safe reap criteria are always enabled: an orphaned daemon that ANSWERED
+///   its probe with a broken response is reaped at once; an orphaned daemon that
+///   is merely UNREACHABLE (probe timed out / connection failed) is reaped only
+///   after it has also shown zero persisted progress across the stall window, so a
+///   busy daemon that missed a probe deadline is never mistaken for a wedged one.
+/// - The CPU-pinned and duplicate-twin reap criteria are policy-gated. The
+///   CPU-pinned criterion additionally requires the same persisted-progress stall,
+///   so a busy-but-advancing daemon is never reaped.
 /// - Reaping always wins over redeploy, which wins over adoption. The only
 ///   healthy reap path is the orphaned idle busy-spinner; a daemon matching it is
 ///   reaped, not redeployed or adopted.
@@ -1239,9 +1267,23 @@ fn classify_daemon(obs: &DaemonObservation, policy: &ReapPolicy) -> DaemonDecisi
     );
 
     if !active {
-        // (a) Safe criterion, always on: orphaned and its health probe failed.
+        // (a) Safe criterion, always on: orphaned and the daemon ANSWERED its
+        //     probe with a broken response (non-success status or unparseable
+        //     body). A daemon that answers with garbage is genuinely broken, so it
+        //     is reaped at once — no progress grace.
         if obs.orphaned && obs.health == DaemonHealth::Unhealthy {
             return DaemonDecision::Reap(ReapReason::OrphanedUnhealthy);
+        }
+
+        // (a') Orphaned and UNREACHABLE (probe timed out / connection failed). A
+        //      busy daemon can miss a probe deadline, so an unreachable probe alone
+        //      is not proof of a rogue daemon. Reap only once it has ALSO made zero
+        //      persisted progress across the stall window — unreachable AND wedged.
+        if obs.orphaned
+            && obs.health == DaemonHealth::Unreachable
+            && obs.stall_sweeps >= REAPER_STALL_SWEEPS
+        {
+            return DaemonDecision::Reap(ReapReason::OrphanedUnreachableStalled);
         }
 
         // (c) Orphaned, IDLE duplicate twin of a registered, alive daemon on the
@@ -1254,12 +1296,15 @@ fn classify_daemon(obs: &DaemonObservation, policy: &ReapPolicy) -> DaemonDecisi
             return DaemonDecision::Reap(ReapReason::DuplicateOrphanTwin);
         }
 
-        // (b) Orphaned busy-spinner: healthy but idle (ensured by `!active`)
-        //     and CPU-pinned across enough consecutive sweeps.
+        // (b) Orphaned busy-spinner: healthy but idle (ensured by `!active`),
+        //     CPU-pinned across enough consecutive sweeps, AND making no persisted
+        //     progress across the stall window. The stall gate is what separates a
+        //     rogue spinner from a daemon legitimately busy advancing its log.
         if policy.cpu_heuristic_enabled
             && obs.orphaned
             && matches!(obs.health, DaemonHealth::Healthy(_))
             && obs.cpu_pinned_sweeps >= policy.cpu_pinned_min_sweeps
+            && obs.stall_sweeps >= REAPER_STALL_SWEEPS
         {
             return DaemonDecision::Reap(ReapReason::OrphanedBusyNoClients);
         }
@@ -1317,6 +1362,8 @@ fn spawn_rogue_daemon_reaper(
         let mut sys = sysinfo::System::new();
         // pid -> consecutive CPU-pinned sweep count.
         let mut pinned_sweeps: HashMap<u32, u32> = HashMap::new();
+        // pid -> (last observed repo daemon.log length, consecutive no-growth sweeps).
+        let mut stalled_sweeps: HashMap<u32, (u64, u32)> = HashMap::new();
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(REAPER_SWEEP_INTERVAL) => {}
@@ -1330,6 +1377,7 @@ fn spawn_rogue_daemon_reaper(
                 &client,
                 &mut sys,
                 &mut pinned_sweeps,
+                &mut stalled_sweeps,
                 self_pid,
                 policy,
             )
@@ -1366,6 +1414,7 @@ async fn reaper_sweep(
     client: &reqwest::Client,
     sys: &mut sysinfo::System,
     pinned_sweeps: &mut HashMap<u32, u32>,
+    stalled_sweeps: &mut HashMap<u32, (u64, u32)>,
     self_pid: u32,
     policy: ReapPolicy,
 ) {
@@ -1406,6 +1455,29 @@ async fn reaper_sweep(
             *counter = counter.saturating_add(1);
         } else {
             *counter = 0;
+        }
+    }
+
+    // Update persisted-progress streaks alongside the CPU streaks: a daemon whose
+    // repo `daemon.log` has not grown since the last sweep made no persisted
+    // progress this sweep. A daemon that IS growing its log is doing real work even
+    // when its health probe looks idle or times out, so its streak resets to 0. The
+    // first sighting of a pid only records a baseline length (no stall counted yet).
+    stalled_sweeps.retain(|pid, _| live_pids.contains(pid));
+    for daemon in &discovered {
+        let log_len = daemon_log_len(&daemon.repo_root);
+        match stalled_sweeps.get_mut(&daemon.pid) {
+            Some((last_len, no_growth)) => {
+                if log_len > *last_len {
+                    *no_growth = 0;
+                } else {
+                    *no_growth = no_growth.saturating_add(1);
+                }
+                *last_len = log_len;
+            }
+            None => {
+                stalled_sweeps.insert(daemon.pid, (log_len, 0));
+            }
         }
     }
 
@@ -1453,6 +1525,10 @@ async fn reaper_sweep(
             orphaned: daemon.ppid == Some(1),
             health,
             cpu_pinned_sweeps: pinned_sweeps.get(&daemon.pid).copied().unwrap_or(0),
+            stall_sweeps: stalled_sweeps
+                .get(&daemon.pid)
+                .map(|(_, no_growth)| *no_growth)
+                .unwrap_or(0),
             registry: registry_relation,
             stale_binary,
         };
@@ -1460,10 +1536,12 @@ async fn reaper_sweep(
             DaemonDecision::Reap(reason) => {
                 reap_daemon(&observation, reason).await;
                 pinned_sweeps.remove(&daemon.pid);
+                stalled_sweeps.remove(&daemon.pid);
             }
             DaemonDecision::Redeploy(reason) => {
                 redeploy_daemon(&observation, reason).await;
                 pinned_sweeps.remove(&daemon.pid);
+                stalled_sweeps.remove(&daemon.pid);
             }
             DaemonDecision::Adopt(reason) => {
                 adopt_daemon(state, daemon, reason).await;
@@ -1628,6 +1706,16 @@ fn same_binary(a: Option<&std::path::Path>, b: Option<&std::path::Path>) -> bool
     }
 }
 
+/// Size in bytes of a repo daemon's persisted activity log — the reaper's
+/// persisted-progress signal. A daemon doing real work grows
+/// `<repo_root>/.kin/daemon.log`; a missing or unreadable log reads as 0 so a
+/// daemon that has simply never written one never looks like it is "shrinking".
+#[cfg(unix)]
+fn daemon_log_len(repo_root: &str) -> u64 {
+    let log_path = Path::new(repo_root).join(".kin").join("daemon.log");
+    std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0)
+}
+
 /// Probe a repo daemon's unauthenticated `/health` endpoint and classify it.
 #[cfg(unix)]
 async fn probe_daemon_health(client: &reqwest::Client, port: u16) -> DaemonHealth {
@@ -1640,7 +1728,7 @@ async fn probe_daemon_health(client: &reqwest::Client, port: u16) -> DaemonHealt
     {
         Ok(response) if response.status().is_success() => response,
         Ok(_) => return DaemonHealth::Unhealthy,
-        Err(_) => return DaemonHealth::Unhealthy,
+        Err(_) => return DaemonHealth::Unreachable,
     };
     let Ok(body) = response.json::<serde_json::Value>().await else {
         return DaemonHealth::Unhealthy;
@@ -1704,13 +1792,26 @@ async fn graceful_terminate(pid: u32, repo_root: &str, action: &str, reason: &st
 }
 
 /// Reap a daemon: graceful SIGTERM, then SIGKILL if it survives the grace window.
+/// The logged reason carries the evidence the decision rested on — the probe
+/// outcome plus the CPU-pinned and persisted-progress-stall streak counts — so an
+/// operator can see exactly why a daemon was judged rogue.
 #[cfg(unix)]
 async fn reap_daemon(observation: &DaemonObservation, reason: ReapReason) {
+    let probe = match observation.health {
+        DaemonHealth::Healthy(_) => "healthy",
+        DaemonHealth::Unhealthy => "answered-unhealthy",
+        DaemonHealth::Unreachable => "unreachable",
+        DaemonHealth::Unknown => "unknown",
+    };
+    let context = format!(
+        "{reason:?} (probe={probe}, cpu_pinned_sweeps={}, stall_sweeps={})",
+        observation.cpu_pinned_sweeps, observation.stall_sweeps
+    );
     graceful_terminate(
         observation.pid,
         &observation.repo_root,
         "reaping misbehaving repo daemon",
-        &format!("{reason:?}"),
+        &context,
     )
     .await;
 }
@@ -2010,6 +2111,7 @@ mod tests {
             orphaned,
             health,
             cpu_pinned_sweeps: 0,
+            stall_sweeps: 0,
             registry: RegistryRelation::RegisteredSelf,
             stale_binary: false,
         }
@@ -2062,14 +2164,76 @@ mod tests {
     }
 
     #[test]
+    fn reaper_reaps_answered_unhealthy_without_waiting_for_stall() {
+        // A daemon that ANSWERED with a broken response is genuinely broken, so it
+        // is reaped immediately — the stall window only guards the unreachable and
+        // CPU-pinned paths, not this one.
+        let policy = ReapPolicy::default();
+        let mut obs = observation(DaemonHealth::Unhealthy, true);
+        obs.stall_sweeps = 0;
+        assert_eq!(
+            classify_daemon(&obs, &policy),
+            DaemonDecision::Reap(ReapReason::OrphanedUnhealthy)
+        );
+    }
+
+    #[test]
+    fn reaper_keeps_orphaned_unreachable_without_stall() {
+        // Orphaned and unreachable (probe timed out / connection failed) but still
+        // making persisted progress: a busy daemon that missed a probe deadline is
+        // never reaped on the probe result alone.
+        let policy = ReapPolicy::default();
+        let mut obs = observation(DaemonHealth::Unreachable, true);
+        obs.stall_sweeps = REAPER_STALL_SWEEPS - 1;
+        assert_eq!(classify_daemon(&obs, &policy), DaemonDecision::Keep);
+    }
+
+    #[test]
+    fn reaper_reaps_orphaned_unreachable_when_stalled() {
+        // Orphaned, unreachable, AND no persisted progress across the full stall
+        // window: a wedged daemon, reaped.
+        let policy = ReapPolicy::default();
+        let mut obs = observation(DaemonHealth::Unreachable, true);
+        obs.stall_sweeps = REAPER_STALL_SWEEPS;
+        assert_eq!(
+            classify_daemon(&obs, &policy),
+            DaemonDecision::Reap(ReapReason::OrphanedUnreachableStalled)
+        );
+    }
+
+    #[test]
+    fn reaper_keeps_non_orphaned_unreachable_even_when_stalled() {
+        // A daemon with a live parent is never reaped by the safe criteria, even
+        // unreachable and stalled: its launching process still owns its lifecycle.
+        let policy = ReapPolicy::default();
+        let mut obs = observation(DaemonHealth::Unreachable, false);
+        obs.stall_sweeps = REAPER_STALL_SWEEPS;
+        assert_eq!(classify_daemon(&obs, &policy), DaemonDecision::Keep);
+    }
+
+    #[test]
     fn reaper_reaps_orphaned_idle_cpu_spinner() {
+        // CPU-pinned past threshold AND stalled (no persisted progress): a genuine
+        // busy-spinner, reaped.
         let policy = ReapPolicy::default();
         let mut obs = observation(healthy(false, false), true);
         obs.cpu_pinned_sweeps = REAPER_DEFAULT_CPU_PINNED_SWEEPS;
+        obs.stall_sweeps = REAPER_STALL_SWEEPS;
         assert_eq!(
             classify_daemon(&obs, &policy),
             DaemonDecision::Reap(ReapReason::OrphanedBusyNoClients)
         );
+    }
+
+    #[test]
+    fn reaper_keeps_progressing_cpu_spinner() {
+        // CPU-pinned past threshold but STILL advancing its log (stall_sweeps below
+        // the window): busy doing real work, never reaped.
+        let policy = ReapPolicy::default();
+        let mut obs = observation(healthy(false, false), true);
+        obs.cpu_pinned_sweeps = 99;
+        obs.stall_sweeps = REAPER_STALL_SWEEPS - 1;
+        assert_eq!(classify_daemon(&obs, &policy), DaemonDecision::Keep);
     }
 
     #[test]
@@ -2241,6 +2405,7 @@ mod tests {
         let mut obs = observation(healthy(false, false), true);
         obs.registry = RegistryRelation::Unregistered;
         obs.cpu_pinned_sweeps = REAPER_DEFAULT_CPU_PINNED_SWEEPS;
+        obs.stall_sweeps = REAPER_STALL_SWEEPS;
         assert_eq!(
             classify_daemon(&obs, &policy),
             DaemonDecision::Reap(ReapReason::OrphanedBusyNoClients)
@@ -2416,6 +2581,7 @@ mod tests {
         let policy = ReapPolicy::default();
         let mut obs = observation(healthy(false, false), true);
         obs.cpu_pinned_sweeps = REAPER_DEFAULT_CPU_PINNED_SWEEPS;
+        obs.stall_sweeps = REAPER_STALL_SWEEPS;
         obs.stale_binary = true;
         assert_eq!(
             classify_daemon(&obs, &policy),
