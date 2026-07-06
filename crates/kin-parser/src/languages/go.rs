@@ -185,23 +185,33 @@ fn extract_go_command_effect_contracts(tree: &Tree, source: &[u8]) -> BTreeMap<S
     let mut cursor = root.walk();
 
     for child in root.children(&mut cursor) {
-        if child.kind() != "function_declaration" {
-            continue;
+        let name = match child.kind() {
+            "function_declaration" => child
+                .child_by_field_name("name")
+                .map(|name| name.utf8_text(source).unwrap_or("").to_string()),
+            "method_declaration" => child.child_by_field_name("name").map(|name| {
+                let method_name = name.utf8_text(source).unwrap_or("").to_string();
+                let receiver_type = child
+                    .child_by_field_name("receiver")
+                    .and_then(|receiver| extract_receiver_type(&receiver, source))
+                    .unwrap_or_default();
+                if receiver_type.is_empty() {
+                    method_name
+                } else {
+                    format!("{receiver_type}.{method_name}")
+                }
+            }),
+            _ => None,
+        };
+
+        if let (Some(name), Some(body)) = (name, child.child_by_field_name("body")) {
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(contract) = command_effect_contract_for_body(&body, source) {
+                contracts.insert(name, contract);
+            }
         }
-        let Some(name_node) = child.child_by_field_name("name") else {
-            continue;
-        };
-        let name = name_node.utf8_text(source).unwrap_or("").to_string();
-        if name.is_empty() {
-            continue;
-        }
-        let Some(body) = child.child_by_field_name("body") else {
-            continue;
-        };
-        let Some(contract) = command_effect_contract_for_body(&body, source) else {
-            continue;
-        };
-        contracts.insert(name, contract);
     }
 
     contracts
@@ -209,11 +219,9 @@ fn extract_go_command_effect_contracts(tree: &Tree, source: &[u8]) -> BTreeMap<S
 
 fn command_effect_contract_for_body(node: &tree_sitter::Node, source: &[u8]) -> Option<Value> {
     let mut bindings = BTreeMap::new();
-    collect_go_bindings(node, source, &mut bindings);
-
     let mut effects = Vec::new();
     let mut seen = BTreeSet::new();
-    collect_go_command_effects(node, source, &bindings, &mut effects, &mut seen);
+    collect_go_command_effects_flow(node, source, &mut bindings, &mut effects, &mut seen);
     if effects.is_empty() {
         return None;
     }
@@ -225,10 +233,12 @@ fn command_effect_contract_for_body(node: &tree_sitter::Node, source: &[u8]) -> 
     }))
 }
 
-fn collect_go_bindings(
+fn collect_go_command_effects_flow(
     node: &tree_sitter::Node,
     source: &[u8],
     bindings: &mut BTreeMap<String, String>,
+    effects: &mut Vec<Value>,
+    seen: &mut BTreeSet<String>,
 ) {
     match node.kind() {
         "short_var_declaration" | "assignment_statement" => {
@@ -236,24 +246,74 @@ fn collect_go_bindings(
                 node.child_by_field_name("left"),
                 node.child_by_field_name("right"),
             ) {
+                collect_go_command_effects_flow(&right, source, bindings, effects, seen);
                 let names = assigned_identifier_names(&left, source);
-                if names.len() == 1 {
+                if names.len() == 1 && is_contract_binding_value(&right, source) {
                     let rhs = normalize_go_contract_expr(&right, source);
                     if !rhs.is_empty() {
                         bindings.insert(names[0].clone(), rhs);
                     }
                 }
             }
+            return;
         }
         "var_spec" | "const_spec" => {
             if let (Some(name), Some(value)) = (
                 node.child_by_field_name("name"),
                 node.child_by_field_name("value"),
             ) {
+                collect_go_command_effects_flow(&value, source, bindings, effects, seen);
                 let name = name.utf8_text(source).unwrap_or("").trim().to_string();
-                let rhs = normalize_go_contract_expr(&value, source);
-                if !name.is_empty() && !rhs.is_empty() {
-                    bindings.insert(name, rhs);
+                if !name.is_empty() && is_contract_binding_value(&value, source) {
+                    let rhs = normalize_go_contract_expr(&value, source);
+                    if !rhs.is_empty() {
+                        bindings.insert(name, rhs);
+                    }
+                }
+            }
+            return;
+        }
+        "if_statement" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "block" || child.kind() == "else" {
+                    let mut branch_bindings = bindings.clone();
+                    collect_go_command_effects_flow(
+                        &child,
+                        source,
+                        &mut branch_bindings,
+                        effects,
+                        seen,
+                    );
+                } else {
+                    collect_go_command_effects_flow(&child, source, bindings, effects, seen);
+                }
+            }
+            return;
+        }
+        "for_statement" | "range_clause" => {
+            let mut loop_bindings = bindings.clone();
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_go_command_effects_flow(&child, source, &mut loop_bindings, effects, seen);
+            }
+            return;
+        }
+        "call_expression" => {
+            if let Some((kind, expr)) = classify_go_command_effect_call(node, source) {
+                if seen.insert(format!("{kind}\n{expr}")) {
+                    let identifiers = identifiers_in_node(node, source);
+                    let mut consumed_bindings = serde_json::Map::new();
+                    for ident in identifiers {
+                        if let Some(value) = bindings.get(&ident) {
+                            consumed_bindings.insert(ident, Value::String(value.clone()));
+                        }
+                    }
+                    effects.push(json!({
+                        "kind": kind,
+                        "expr": expr,
+                        "bindings": consumed_bindings,
+                    }));
                 }
             }
         }
@@ -262,40 +322,26 @@ fn collect_go_bindings(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_go_bindings(&child, source, bindings);
+        collect_go_command_effects_flow(&child, source, bindings, effects, seen);
     }
 }
 
-fn collect_go_command_effects(
-    node: &tree_sitter::Node,
-    source: &[u8],
-    bindings: &BTreeMap<String, String>,
-    effects: &mut Vec<Value>,
-    seen: &mut BTreeSet<String>,
-) {
-    if node.kind() == "call_expression" {
-        if let Some((kind, expr)) = classify_go_command_effect_call(node, source) {
-            if seen.insert(format!("{kind}\n{expr}")) {
-                let identifiers = identifiers_in_node(node, source);
-                let mut consumed_bindings = serde_json::Map::new();
-                for ident in identifiers {
-                    if let Some(value) = bindings.get(&ident) {
-                        consumed_bindings.insert(ident, Value::String(value.clone()));
-                    }
-                }
-                effects.push(json!({
-                    "kind": kind,
-                    "expr": expr,
-                    "bindings": consumed_bindings,
-                }));
-            }
-        }
+fn is_contract_binding_value(node: &tree_sitter::Node, source: &[u8]) -> bool {
+    if node.kind() == "composite_literal" {
+        return false;
     }
+    !contains_go_command_effect_call(node, source)
+}
 
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_go_command_effects(&child, source, bindings, effects, seen);
+fn contains_go_command_effect_call(node: &tree_sitter::Node, source: &[u8]) -> bool {
+    if node.kind() == "call_expression" && classify_go_command_effect_call(node, source).is_some() {
+        return true;
     }
+    let mut cursor = node.walk();
+    let found = node
+        .children(&mut cursor)
+        .any(|child| contains_go_command_effect_call(&child, source));
+    found
 }
 
 fn classify_go_command_effect_call(
@@ -1607,6 +1653,81 @@ func prCheckout() error {
         assert!(
             extract_go_command_effect_contracts(&tree, source).is_empty(),
             "debug-only output must not become a command-effect contract"
+        );
+    }
+
+    #[test]
+    fn command_effect_contract_uses_bindings_at_call_site() {
+        let adapter = GoAdapter;
+        let source = br#"
+package command
+
+import (
+    "fmt"
+    "os/exec"
+)
+
+func prCheckout() error {
+    newBranchName := pr.HeadRefName
+    exec.Command("git", "checkout", newBranchName)
+    newBranchName = fmt.Sprintf("pr/%d/%s", pr.Number, pr.HeadRefName)
+    exec.Command("git", "config", fmt.Sprintf("branch.%s.remote", newBranchName), "origin")
+    return nil
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let contracts = extract_go_command_effect_contracts(&tree, source);
+        let contract = contracts
+            .get("prCheckout")
+            .expect("contract should be extracted");
+        let effects = contract["effects"].as_array().expect("effects array");
+        assert_eq!(effects.len(), 2, "expected two command effects: {contract}");
+        assert_eq!(
+            effects[0]["bindings"]["newBranchName"], "pr.HeadRefName",
+            "first command must use the binding visible before reassignment"
+        );
+        assert_eq!(
+            effects[1]["bindings"]["newBranchName"],
+            "fmt.Sprintf(\"pr/%d/%s\", pr.Number, pr.HeadRefName)",
+            "second command must use the reassigned binding"
+        );
+    }
+
+    #[test]
+    fn command_effect_contract_attaches_to_go_methods() {
+        let adapter = GoAdapter;
+        let source = br#"
+package command
+
+import "os/exec"
+
+type Runner struct{}
+
+func (r *Runner) prCheckout() error {
+    newBranchName := pr.HeadRefName
+    exec.Command("git", "checkout", newBranchName)
+    return nil
+}
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("checkout.go");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let mut entities: Vec<_> = output
+            .entities
+            .into_iter()
+            .map(|entity| entity.into_entity(LanguageId::Go, &file_id))
+            .collect();
+        attach_go_command_effect_contract_metadata(&tree, source, &mut entities);
+        let entity = entities
+            .iter()
+            .find(|entity| entity.name == "Runner.prCheckout")
+            .expect("method entity should be qualified by receiver type");
+        assert!(
+            entity
+                .metadata
+                .extra
+                .contains_key(COMMAND_EFFECT_CONTRACT_KEY),
+            "command-effect metadata should attach to method entities"
         );
     }
 

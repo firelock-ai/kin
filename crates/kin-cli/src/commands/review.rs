@@ -1126,6 +1126,14 @@ mod tests {
     use kin_model::ProvenanceStore;
 
     #[test]
+    fn command_effect_contract_comment_severity_is_warning() {
+        assert_eq!(
+            inline_comment_severity(kin_review::InlineCommentKind::CommandEffectContract),
+            "warning"
+        );
+    }
+
+    #[test]
     fn create_review_records_audit_event() {
         let graph = kin_db::InMemoryGraph::new();
 
