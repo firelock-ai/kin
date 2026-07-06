@@ -10,11 +10,11 @@
 //! `cpp_multiline_declarator_keeps_signature_string`).
 //!
 //! Signatures come from the shared `declaration_signature`, which cuts before a
-//! node's `body` field. Adapters that expose a `body` field get clean,
-//! body-free signatures automatically; the `#[ignore]`d tests at the bottom pin
-//! the two cells where that contract is not met today (Kotlin: no body field, so
-//! the whole body leaks into the signature; Ruby: an empty-body method keeps a
-//! trailing `end`) plus the shared trailing-comma wart.
+//! node's `body` field, or before a plainly-kinded body child (Kotlin's
+//! `function_body`/`class_body`) when the grammar exposes no such field. The
+//! `#[ignore]`d tests at the bottom pin the cells where that contract is not met
+//! today (Ruby: an empty-body method keeps a trailing `end`) plus the shared
+//! trailing-comma wart.
 
 use kin_model::{EntityKind, FilePathId};
 use kin_parser::{
@@ -412,7 +412,6 @@ fn kotlin_entities_extract_with_nonempty_signatures() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "RED: Kotlin function/method signatures leak the whole body — declaration_signature finds no `body` field on Kotlin function_declaration, so it falls back to full node text (`fun total(...): Int { return a + b }`)"]
 fn kotlin_signature_should_exclude_body() {
     let sig = sig_of(
         &KotlinAdapter,

@@ -9,10 +9,10 @@
 //! (3) handlers wired as values/callbacks — whatever the language idiomatically
 //! uses — probed for what the adapter *actually* emits.
 //!
-//! GREEN cells are locked as regression tests. The dotted-callee bug still lives
-//! in the Java and C# adapters (they emit `obj.execute` / `Console.WriteLine`),
-//! and several callback shapes are not wired to edges; those cells are written
-//! and `#[ignore]`d with the observed behavior named on the reason line.
+//! GREEN cells are locked as regression tests, including the rightmost-name
+//! narrowing of dotted method calls in every adapter. Several callback shapes
+//! are not wired to edges; those cells are written and `#[ignore]`d with the
+//! observed behavior named on the reason line.
 
 use kin_model::{FilePathId, RelationKind};
 use kin_parser::{
@@ -362,7 +362,6 @@ fn typescript_arrow_body_calls_are_captured() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "RED: Java emits the dotted `obj.execute` as the Calls dst_name (not narrowed to `execute`), so name-based cross-file resolution can never match it"]
 fn java_method_call_should_narrow_to_rightmost_name() {
     let out = extract(
         &JavaAdapter,
@@ -374,7 +373,6 @@ fn java_method_call_should_narrow_to_rightmost_name() {
 }
 
 #[test]
-#[ignore = "RED: C# emits the dotted `obj.Execute` as the Calls dst_name (not narrowed to `Execute`) via normalize_scoped_name on the whole invocation function text"]
 fn csharp_method_call_should_narrow_to_rightmost_name() {
     let out = extract(
         &CSharpAdapter,
@@ -386,7 +384,6 @@ fn csharp_method_call_should_narrow_to_rightmost_name() {
 }
 
 #[test]
-#[ignore = "RED: C# emits the dotted `Console.WriteLine` for a namespace/static call instead of the rightmost `WriteLine`"]
 fn csharp_static_qualified_call_should_narrow_to_rightmost_name() {
     let out = extract(
         &CSharpAdapter,

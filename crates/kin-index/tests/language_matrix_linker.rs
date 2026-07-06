@@ -12,9 +12,9 @@
 //!    (the linker picks one, it does not fan out for exact free-function names);
 //!  * a receiver-method name defined in several classes fans out to every
 //!    implementor, bounded by the fan-out cap;
-//!  * a dotted `obj.execute` callee (what the Java/C# adapters emit today) does
-//!    NOT resolve — the fix belongs in those adapters, not the linker. This test
-//!    encodes that contract: simple names resolve, dotted ones do not.
+//!  * a dotted `obj.execute` callee (what a non-narrowing adapter would emit)
+//!    does NOT resolve — narrowing belongs in the adapters, not the linker. This
+//!    test encodes that contract: simple names resolve, dotted ones do not.
 //!
 //! The linker is language-agnostic (it matches `dst_name` against entity
 //! `name`), so these behaviors hold for every language once the adapter hands it
@@ -26,7 +26,9 @@ use kin_model::{
     GraphNodeId, Hash256, LanguageId, Relation, RelationKind, SemanticFingerprint, SourceSpan,
     Visibility,
 };
-use kin_parser::{ExtractedRelation, LanguageAdapter, TypeScriptAdapter};
+use kin_parser::{
+    CSharpAdapter, ExtractedRelation, JavaAdapter, LanguageAdapter, TypeScriptAdapter,
+};
 
 // ---- helpers: direct entity construction (mirrors linker.rs unit-test idiom) ----
 
@@ -107,8 +109,7 @@ const FANOUT_CAP: usize = 8;
 
 // ---- (A) name-based cross-file resolution through the real parser ----
 
-fn parse_ts(path: &str, src: &str) -> FileParseData {
-    let adapter = TypeScriptAdapter;
+fn parse_with(adapter: &dyn LanguageAdapter, path: &str, src: &str) -> FileParseData {
     let file_id = FilePathId::new(path);
     let bytes = src.as_bytes();
     let tree = adapter.parse(bytes).expect("parse");
@@ -126,7 +127,7 @@ fn parse_ts(path: &str, src: &str) -> FileParseData {
     }
 }
 
-fn ts_entity_id(files: &[FileParseData], file: &str, name: &str) -> EntityId {
+fn entity_id_in(files: &[FileParseData], file: &str, name: &str) -> EntityId {
     files
         .iter()
         .flat_map(|f| f.entities.iter())
@@ -140,19 +141,68 @@ fn name_based_cross_file_call_resolves() {
     // caller.ts imports and calls a function defined in m.ts; the simple-name
     // call must resolve to the real cross-file target.
     let files = vec![
-        parse_ts(
+        parse_with(
+            &TypeScriptAdapter,
             "caller.ts",
             "import { compute } from \"./m\";\nfunction run() { compute(); }\n",
         ),
-        parse_ts("m.ts", "export function compute() { return 1; }\n"),
+        parse_with(
+            &TypeScriptAdapter,
+            "m.ts",
+            "export function compute() { return 1; }\n",
+        ),
     ];
-    let run = ts_entity_id(&files, "caller.ts", "run");
-    let compute = ts_entity_id(&files, "m.ts", "compute");
+    let run = entity_id_in(&files, "caller.ts", "run");
+    let compute = entity_id_in(&files, "m.ts", "compute");
 
     let rels = link_cross_file(&files);
     assert!(
         has_call(&rels, run, compute),
         "imported call `compute()` should resolve run -> m.ts::compute"
+    );
+}
+
+#[test]
+fn java_and_csharp_narrowed_method_calls_resolve_cross_file() {
+    // The Java and C# adapters narrow `w.execute()` / `w.Execute()` to the
+    // rightmost simple name; the linker resolves that leaf to the method
+    // defined in the other file.
+    let java = vec![
+        parse_with(
+            &JavaAdapter,
+            "Caller.java",
+            "class Caller { void run() { w.execute(); } }",
+        ),
+        parse_with(
+            &JavaAdapter,
+            "Worker.java",
+            "class Worker { public void execute() {} }",
+        ),
+    ];
+    let run = entity_id_in(&java, "Caller.java", "Caller.run");
+    let execute = entity_id_in(&java, "Worker.java", "Worker.execute");
+    assert!(
+        has_call(&link_cross_file(&java), run, execute),
+        "narrowed Java method call should resolve Caller.run -> Worker.execute"
+    );
+
+    let csharp = vec![
+        parse_with(
+            &CSharpAdapter,
+            "Caller.cs",
+            "namespace N { class C { void Run() { w.Execute(); } } }",
+        ),
+        parse_with(
+            &CSharpAdapter,
+            "Worker.cs",
+            "namespace N { class Worker { public void Execute() {} } }",
+        ),
+    ];
+    let run = entity_id_in(&csharp, "Caller.cs", "N.C.Run");
+    let execute = entity_id_in(&csharp, "Worker.cs", "N.Worker.Execute");
+    assert!(
+        has_call(&link_cross_file(&csharp), run, execute),
+        "narrowed C# method call should resolve N.C.Run -> N.Worker.Execute"
     );
 }
 
@@ -243,9 +293,9 @@ fn receiver_method_fanout_respects_cap() {
 #[test]
 fn simple_name_resolves_but_dotted_receiver_name_does_not() {
     // The linker matches `dst_name` against entity `name`. A simple `execute`
-    // resolves cross-file; the dotted `obj.execute` that the Java/C# adapters
-    // still emit resolves to nothing — proof the dotted-callee fix belongs in
-    // those adapters (narrow to the rightmost name), not in the linker.
+    // resolves cross-file; a dotted `obj.execute` resolves to nothing — which
+    // is why every adapter narrows callees to the rightmost simple name rather
+    // than the linker splitting dotted text.
     let target = func("execute", "target.rs");
 
     let simple = vec![

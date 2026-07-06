@@ -1730,7 +1730,7 @@ fn imported_relations_equivalent(old: &Relation, new: &Relation) -> bool {
         && (old.confidence - new.confidence).abs() < f32::EPSILON
 }
 
-const COMMAND_EFFECT_CONTRACT_KEY: &str = "command_effect_contract";
+use kin_index::COMMAND_EFFECT_CONTRACT_KEY;
 
 pub(crate) fn entity_fingerprint_changed(old: &Entity, new: &Entity) -> bool {
     kin_index::entity_semantics_changed(old, new)
