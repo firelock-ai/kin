@@ -1730,8 +1730,6 @@ fn imported_relations_equivalent(old: &Relation, new: &Relation) -> bool {
         && (old.confidence - new.confidence).abs() < f32::EPSILON
 }
 
-use kin_index::COMMAND_EFFECT_CONTRACT_KEY;
-
 pub(crate) fn entity_fingerprint_changed(old: &Entity, new: &Entity) -> bool {
     kin_index::entity_semantics_changed(old, new)
 }
@@ -3781,6 +3779,7 @@ fn whoami() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_index::COMMAND_EFFECT_CONTRACT_KEY;
     use kin_model::{
         EntityKind, EntityMetadata, EntityRole, FingerprintAlgorithm, LanguageId,
         SemanticFingerprint, Visibility,
