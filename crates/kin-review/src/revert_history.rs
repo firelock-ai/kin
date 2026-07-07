@@ -187,6 +187,14 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
         }
     }
 
+    // Body reversions are REPORTED, never verdict-driving. The 60-benign
+    // sweep measured why: a module entity is a content aggregate of its file,
+    // so any single-function reversion makes the module co-revert to the same
+    // change by construction — "coherence" of two entities is nearly free, and
+    // gating on it re-flagged ~a third of clean benigns. The temporal evidence
+    // stays visible to reviewers (and to future evidence-composition in
+    // ranking) at info severity; coherence is still computed because it is the
+    // strongest hint in the message.
     let mut undone_counts: HashMap<SemanticChangeId, usize> = HashMap::new();
     for (_, _, undone, _) in &reversion_matches {
         *undone_counts.entry(*undone).or_insert(0) += 1;
@@ -205,9 +213,7 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
             },
         );
         let mut finding = inline_finding(entity, message);
-        if !coherent {
-            finding.kind = InlineCommentKind::RevertHistoryIncidental;
-        }
+        finding.kind = InlineCommentKind::RevertHistoryIncidental;
         findings.push(finding);
     }
 
