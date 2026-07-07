@@ -3886,7 +3886,7 @@ mod tests {
     }
 
     #[test]
-    fn coherent_body_reversion_group_gates() {
+    fn coherent_body_reversion_group_reports_without_gating() {
         // Two entities whose new bodies both restore states un-done by the
         // SAME historical change: a coherent snapshot restoration — the true
         // revert shape — gates as a warning.
@@ -3957,16 +3957,20 @@ mod tests {
         graph.create_change(&head).unwrap();
 
         let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
-        let gating: Vec<_> = report
+        // Body reversions never gate — the 60-benign sweep measured module
+        // co-reversion making two-entity "coherence" nearly free on real
+        // repos, re-flagging ~a third of clean benigns. The evidence is still
+        // reported, carrying the coherence hint for the reviewer.
+        let informational: Vec<_> = report
             .policy
             .findings
             .iter()
-            .filter(|f| f.kind == "revert_history")
+            .filter(|f| f.kind == "revert_history_incidental")
             .collect();
         assert_eq!(
-            gating.len(),
+            informational.len(),
             2,
-            "both coherent reversions must gate, got findings: {:?}",
+            "both reversions must be reported, got findings: {:?}",
             report
                 .policy
                 .findings
@@ -3974,8 +3978,10 @@ mod tests {
                 .map(|f| (&f.kind, &f.message))
                 .collect::<Vec<_>>()
         );
-        assert!(gating.iter().all(|f| f.severity == "warning"));
-        assert!(gating[0].message.contains("un-doing the same change"));
-        assert_eq!(report.policy.verdict, ShadowGateVerdict::NeedsAttention);
+        assert!(informational.iter().all(|f| f.severity == "info"));
+        assert!(informational[0]
+            .message
+            .contains("un-doing the same change"));
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::Pass);
     }
 }
