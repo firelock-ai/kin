@@ -77,7 +77,8 @@ pub async fn reconcile_session_dir(
         let daemon_url = crate::daemon_client::resolve_daemon_url(layout)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Kin daemon is required for reconcile"))?;
-        let client = crate::daemon_client::DaemonClient::from_base_url(daemon_url)?;
+        let client =
+            crate::daemon_client::DaemonClient::from_base_url_for_layout(daemon_url, layout)?;
         client
             .reconcile(&ReconcileRequest {
                 session_dir: session_dir.to_path_buf(),
