@@ -3579,6 +3579,51 @@ mod tests {
         prev.expect("chain is non-empty")
     }
 
+    /// A Function-kind entity with an explicit end line, for building leaf and
+    /// container entities whose spans nest (a Method inside a Class).
+    fn entity_kind_span(
+        name: &str,
+        file: &str,
+        start_line: u32,
+        end_line: u32,
+        kind: EntityKind,
+    ) -> Entity {
+        let mut entity = entity_with_span(name, file, start_line, EntityRole::Source);
+        entity.kind = kind;
+        if let Some(span) = entity.span.as_mut() {
+            span.end_line = end_line;
+        }
+        entity
+    }
+
+    /// Build a linear change chain where change `i` (1-based) carries
+    /// `deltas_by_change[i - 1]` (empty past the end), padded to `pad_to`
+    /// changes, and return the tip. Generalizes `padded_history_graph` to any
+    /// number of seeded changes so coherent multi-entity reverts can be staged.
+    fn linear_graph(
+        graph: &InMemoryGraph,
+        deltas_by_change: Vec<Vec<EntityDelta>>,
+        pad_to: u8,
+    ) -> SemanticChangeId {
+        let mut prev: Option<SemanticChangeId> = None;
+        for i in 1..=pad_to {
+            let deltas = deltas_by_change
+                .get((i - 1) as usize)
+                .cloned()
+                .unwrap_or_default();
+            let change = change_with_deltas(
+                change_id(i),
+                prev.map(|p| vec![p]).unwrap_or_default(),
+                deltas,
+                vec![],
+                vec![],
+            );
+            graph.create_change(&change).unwrap();
+            prev = Some(change_id(i));
+        }
+        prev.expect("chain is non-empty")
+    }
+
     #[test]
     fn revert_history_reintroduction_flags_needs_attention() {
         // c1 adds `retry_budget`, c2 removes it, padding to depth 30, then the
@@ -3886,10 +3931,10 @@ mod tests {
     }
 
     #[test]
-    fn coherent_body_reversion_group_reports_without_gating() {
-        // Two entities whose new bodies both restore states un-done by the
-        // SAME historical change: a coherent snapshot restoration — the true
-        // revert shape — gates as a warning.
+    fn leaf_coherent_body_reversion_group_gates() {
+        // Two LEAF (function-level) entities whose new bodies both restore
+        // states un-done by the SAME historical change: a coherent leaf
+        // snapshot restoration — the true revert shape — drives the verdict.
         let graph = InMemoryGraph::new();
         let mut a1 = entity_with_span("alpha", "src/a.rs", 5, EntityRole::Source);
         a1.fingerprint.behavior_hash = Hash256::from_bytes([11; 32]);
@@ -3901,14 +3946,14 @@ mod tests {
         b2.fingerprint.behavior_hash = Hash256::from_bytes([22; 32]);
 
         // c1 adds both; c2 edits BOTH (the change the head un-does); padding.
-        let mut prev: Option<SemanticChangeId> = None;
-        for i in 1..=30u8 {
-            let deltas = match i {
-                1 => vec![
+        let base_id = linear_graph(
+            &graph,
+            vec![
+                vec![
                     EntityDelta::Added(a1.clone()),
                     EntityDelta::Added(b1.clone()),
                 ],
-                2 => vec![
+                vec![
                     EntityDelta::Modified {
                         old: a1.clone(),
                         new: a2.clone(),
@@ -3918,19 +3963,9 @@ mod tests {
                         new: b2.clone(),
                     },
                 ],
-                _ => vec![],
-            };
-            let change = change_with_deltas(
-                change_id(i),
-                prev.map(|p| vec![p]).unwrap_or_default(),
-                deltas,
-                vec![],
-                vec![],
-            );
-            graph.create_change(&change).unwrap();
-            prev = Some(change_id(i));
-        }
-        let base_id = prev.unwrap();
+            ],
+            30,
+        );
         let mut a_back = a2.clone();
         a_back.fingerprint.behavior_hash = Hash256::from_bytes([11; 32]);
         let mut b_back = b2.clone();
@@ -3957,20 +3992,18 @@ mod tests {
         graph.create_change(&head).unwrap();
 
         let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
-        // Body reversions never gate — the 60-benign sweep measured module
-        // co-reversion making two-entity "coherence" nearly free on real
-        // repos, re-flagging ~a third of clean benigns. The evidence is still
-        // reported, carrying the coherence hint for the reviewer.
-        let informational: Vec<_> = report
+        // Two independent leaf reversions to the same change is the coherent
+        // revert shape: both findings gate as warnings and move the verdict.
+        let gating: Vec<_> = report
             .policy
             .findings
             .iter()
-            .filter(|f| f.kind == "revert_history_incidental")
+            .filter(|f| f.kind == "revert_history")
             .collect();
         assert_eq!(
-            informational.len(),
+            gating.len(),
             2,
-            "both reversions must be reported, got findings: {:?}",
+            "both leaf reversions must gate, got findings: {:?}",
             report
                 .policy
                 .findings
@@ -3978,10 +4011,416 @@ mod tests {
                 .map(|f| (&f.kind, &f.message))
                 .collect::<Vec<_>>()
         );
-        assert!(informational.iter().all(|f| f.severity == "info"));
-        assert!(informational[0]
-            .message
-            .contains("un-doing the same change"));
+        assert!(gating.iter().all(|f| f.severity == "warning"));
+        assert!(gating
+            .iter()
+            .all(|f| f.message.contains("leaf entities un-doing the same change")));
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::NeedsAttention);
+    }
+
+    #[test]
+    fn module_plus_member_body_reversion_stays_incidental() {
+        // A module is a content aggregate of its file: when one member function
+        // reverts, the module co-reverts to the same change by construction.
+        // That is one leaf reversion, not two — it must stay info, never gate.
+        // This is the measured false-positive class two-entity coherence
+        // re-flagged (~a third of clean benigns).
+        let graph = InMemoryGraph::new();
+        let mut fn1 = entity_with_span("handler", "src/mod_a.rs", 10, EntityRole::Source);
+        fn1.fingerprint.behavior_hash = Hash256::from_bytes([31; 32]);
+        let mut mod1 = entity_kind_span("mod_a", "src/mod_a.rs", 1, 200, EntityKind::Module);
+        mod1.fingerprint.behavior_hash = Hash256::from_bytes([41; 32]);
+        let mut fn2 = fn1.clone();
+        fn2.fingerprint.behavior_hash = Hash256::from_bytes([32; 32]);
+        let mut mod2 = mod1.clone();
+        mod2.fingerprint.behavior_hash = Hash256::from_bytes([42; 32]);
+
+        let base_id = linear_graph(
+            &graph,
+            vec![
+                vec![
+                    EntityDelta::Added(fn1.clone()),
+                    EntityDelta::Added(mod1.clone()),
+                ],
+                vec![
+                    EntityDelta::Modified {
+                        old: fn1.clone(),
+                        new: fn2.clone(),
+                    },
+                    EntityDelta::Modified {
+                        old: mod1.clone(),
+                        new: mod2.clone(),
+                    },
+                ],
+            ],
+            30,
+        );
+        let mut fn_back = fn2.clone();
+        fn_back.fingerprint.behavior_hash = Hash256::from_bytes([31; 32]);
+        let mut mod_back = mod2.clone();
+        mod_back.fingerprint.behavior_hash = Hash256::from_bytes([41; 32]);
+        graph.upsert_entity(&fn_back).unwrap();
+        graph.upsert_entity(&mod_back).unwrap();
+        let head_id = change_id(221);
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![
+                EntityDelta::Modified {
+                    old: fn2.clone(),
+                    new: fn_back,
+                },
+                EntityDelta::Modified {
+                    old: mod2.clone(),
+                    new: mod_back,
+                },
+            ],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+        assert!(
+            !report
+                .policy
+                .findings
+                .iter()
+                .any(|f| f.kind == "revert_history"),
+            "module + single member must not gate, got: {:?}",
+            report
+                .policy
+                .findings
+                .iter()
+                .map(|f| (&f.kind, &f.message))
+                .collect::<Vec<_>>()
+        );
+        let incidental: Vec<_> = report
+            .policy
+            .findings
+            .iter()
+            .filter(|f| f.kind == "revert_history_incidental")
+            .collect();
+        assert_eq!(
+            incidental.len(),
+            2,
+            "both reversions are still reported at info severity"
+        );
+        assert!(incidental.iter().all(|f| f.severity == "info"));
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::Pass);
+    }
+
+    #[test]
+    fn scattered_body_reversions_to_different_changes_stay_incidental() {
+        // Two leaf reversions, but each un-does a DIFFERENT historical change:
+        // no coherent snapshot, so neither gates and neither carries the
+        // coherence hint.
+        let graph = InMemoryGraph::new();
+        let mut p1 = entity_with_span("parse", "src/p.rs", 5, EntityRole::Source);
+        p1.fingerprint.behavior_hash = Hash256::from_bytes([51; 32]);
+        let mut q1 = entity_with_span("render", "src/q.rs", 8, EntityRole::Source);
+        q1.fingerprint.behavior_hash = Hash256::from_bytes([61; 32]);
+        let mut p2 = p1.clone();
+        p2.fingerprint.behavior_hash = Hash256::from_bytes([52; 32]);
+        let mut q2 = q1.clone();
+        q2.fingerprint.behavior_hash = Hash256::from_bytes([62; 32]);
+
+        // c1 adds both; c2 edits `parse`; c3 edits `render` — DISTINCT changes.
+        let base_id = linear_graph(
+            &graph,
+            vec![
+                vec![
+                    EntityDelta::Added(p1.clone()),
+                    EntityDelta::Added(q1.clone()),
+                ],
+                vec![EntityDelta::Modified {
+                    old: p1.clone(),
+                    new: p2.clone(),
+                }],
+                vec![EntityDelta::Modified {
+                    old: q1.clone(),
+                    new: q2.clone(),
+                }],
+            ],
+            30,
+        );
+        let mut p_back = p2.clone();
+        p_back.fingerprint.behavior_hash = Hash256::from_bytes([51; 32]);
+        let mut q_back = q2.clone();
+        q_back.fingerprint.behavior_hash = Hash256::from_bytes([61; 32]);
+        graph.upsert_entity(&p_back).unwrap();
+        graph.upsert_entity(&q_back).unwrap();
+        let head_id = change_id(222);
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![
+                EntityDelta::Modified {
+                    old: p2.clone(),
+                    new: p_back,
+                },
+                EntityDelta::Modified {
+                    old: q2.clone(),
+                    new: q_back,
+                },
+            ],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+        assert!(
+            !report
+                .policy
+                .findings
+                .iter()
+                .any(|f| f.kind == "revert_history"),
+            "reversions to different changes must not gate, got: {:?}",
+            report
+                .policy
+                .findings
+                .iter()
+                .map(|f| (&f.kind, &f.message))
+                .collect::<Vec<_>>()
+        );
+        let incidental: Vec<_> = report
+            .policy
+            .findings
+            .iter()
+            .filter(|f| f.kind == "revert_history_incidental")
+            .collect();
+        assert_eq!(incidental.len(), 2);
+        assert!(incidental
+            .iter()
+            .all(|f| !f.message.contains("un-doing the same change")));
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::Pass);
+    }
+
+    #[test]
+    fn lone_leaf_body_reversion_is_documented_recall_cost() {
+        // A single leaf function reverting to a prior body has no coherent
+        // partner. Gating lone reversions re-flagged benign textual reversions,
+        // so it stays info — the measured recall cost of leaf-coherence gating.
+        let graph = InMemoryGraph::new();
+        let mut v1 = entity_with_span("normalize", "src/n.rs", 12, EntityRole::Source);
+        v1.fingerprint.behavior_hash = Hash256::from_bytes([71; 32]);
+        let mut v2 = v1.clone();
+        v2.fingerprint.behavior_hash = Hash256::from_bytes([72; 32]);
+        let base_id = linear_graph(
+            &graph,
+            vec![
+                vec![EntityDelta::Added(v1.clone())],
+                vec![EntityDelta::Modified {
+                    old: v1.clone(),
+                    new: v2.clone(),
+                }],
+            ],
+            30,
+        );
+        let mut v_back = v2.clone();
+        v_back.fingerprint.behavior_hash = Hash256::from_bytes([71; 32]);
+        graph.upsert_entity(&v_back).unwrap();
+        let head_id = change_id(223);
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![EntityDelta::Modified {
+                old: v2.clone(),
+                new: v_back,
+            }],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+        let finding = report
+            .policy
+            .findings
+            .iter()
+            .find(|f| f.kind == "revert_history_incidental")
+            .expect("a lone leaf reversion must surface as incidental");
+        assert_eq!(finding.severity, "info");
+        assert!(
+            !finding.message.contains("un-doing the same change"),
+            "a lone reversion carries no coherence hint, got: {}",
+            finding.message
+        );
+        assert!(!report
+            .policy
+            .findings
+            .iter()
+            .any(|f| f.kind == "revert_history"));
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::Pass);
+    }
+
+    #[test]
+    fn class_reverting_alone_counts_toward_coherence() {
+        // A class whose OWN body reverts with no member leaf reverting beside it
+        // is an independent reversion. Paired with one genuine leaf reversion to
+        // the same change, the leaf-coherence count reaches two and gates. The
+        // class (src/cfg.rs) and function (src/load.rs) live in different files,
+        // so the function is not a member and cannot explain the class.
+        let graph = InMemoryGraph::new();
+        let mut cls1 = entity_kind_span("Config", "src/cfg.rs", 1, 80, EntityKind::Class);
+        cls1.fingerprint.behavior_hash = Hash256::from_bytes([81; 32]);
+        let mut fn1 = entity_with_span("load", "src/load.rs", 5, EntityRole::Source);
+        fn1.fingerprint.behavior_hash = Hash256::from_bytes([91; 32]);
+        let mut cls2 = cls1.clone();
+        cls2.fingerprint.behavior_hash = Hash256::from_bytes([82; 32]);
+        let mut fn2 = fn1.clone();
+        fn2.fingerprint.behavior_hash = Hash256::from_bytes([92; 32]);
+
+        let base_id = linear_graph(
+            &graph,
+            vec![
+                vec![
+                    EntityDelta::Added(cls1.clone()),
+                    EntityDelta::Added(fn1.clone()),
+                ],
+                vec![
+                    EntityDelta::Modified {
+                        old: cls1.clone(),
+                        new: cls2.clone(),
+                    },
+                    EntityDelta::Modified {
+                        old: fn1.clone(),
+                        new: fn2.clone(),
+                    },
+                ],
+            ],
+            30,
+        );
+        let mut cls_back = cls2.clone();
+        cls_back.fingerprint.behavior_hash = Hash256::from_bytes([81; 32]);
+        let mut fn_back = fn2.clone();
+        fn_back.fingerprint.behavior_hash = Hash256::from_bytes([91; 32]);
+        graph.upsert_entity(&cls_back).unwrap();
+        graph.upsert_entity(&fn_back).unwrap();
+        let head_id = change_id(224);
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![
+                EntityDelta::Modified {
+                    old: cls2.clone(),
+                    new: cls_back,
+                },
+                EntityDelta::Modified {
+                    old: fn2.clone(),
+                    new: fn_back,
+                },
+            ],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+        let gating: Vec<_> = report
+            .policy
+            .findings
+            .iter()
+            .filter(|f| f.kind == "revert_history")
+            .collect();
+        assert_eq!(
+            gating.len(),
+            2,
+            "a class reverting alone plus a leaf must both gate, got: {:?}",
+            report
+                .policy
+                .findings
+                .iter()
+                .map(|f| (&f.kind, &f.message))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::NeedsAttention);
+    }
+
+    #[test]
+    fn class_reversion_explained_by_member_stays_incidental() {
+        // The class body reverts only because a method INSIDE it reverts (the
+        // method's span nests in the class span, same file). That is one
+        // logical reversion, not two: the class drops from the count and the
+        // lone member leaf cannot reach the gating threshold.
+        let graph = InMemoryGraph::new();
+        let mut cls1 = entity_kind_span("Config", "src/cfg.rs", 1, 80, EntityKind::Class);
+        cls1.fingerprint.behavior_hash = Hash256::from_bytes([81; 32]);
+        let mut m1 = entity_kind_span("Config.load", "src/cfg.rs", 10, 20, EntityKind::Method);
+        m1.fingerprint.behavior_hash = Hash256::from_bytes([91; 32]);
+        let mut cls2 = cls1.clone();
+        cls2.fingerprint.behavior_hash = Hash256::from_bytes([82; 32]);
+        let mut m2 = m1.clone();
+        m2.fingerprint.behavior_hash = Hash256::from_bytes([92; 32]);
+
+        let base_id = linear_graph(
+            &graph,
+            vec![
+                vec![
+                    EntityDelta::Added(cls1.clone()),
+                    EntityDelta::Added(m1.clone()),
+                ],
+                vec![
+                    EntityDelta::Modified {
+                        old: cls1.clone(),
+                        new: cls2.clone(),
+                    },
+                    EntityDelta::Modified {
+                        old: m1.clone(),
+                        new: m2.clone(),
+                    },
+                ],
+            ],
+            30,
+        );
+        let mut cls_back = cls2.clone();
+        cls_back.fingerprint.behavior_hash = Hash256::from_bytes([81; 32]);
+        let mut m_back = m2.clone();
+        m_back.fingerprint.behavior_hash = Hash256::from_bytes([91; 32]);
+        graph.upsert_entity(&cls_back).unwrap();
+        graph.upsert_entity(&m_back).unwrap();
+        let head_id = change_id(225);
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![
+                EntityDelta::Modified {
+                    old: cls2.clone(),
+                    new: cls_back,
+                },
+                EntityDelta::Modified {
+                    old: m2.clone(),
+                    new: m_back,
+                },
+            ],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+        assert!(
+            !report
+                .policy
+                .findings
+                .iter()
+                .any(|f| f.kind == "revert_history"),
+            "a class reversion explained by its member must not gate, got: {:?}",
+            report
+                .policy
+                .findings
+                .iter()
+                .map(|f| (&f.kind, &f.message))
+                .collect::<Vec<_>>()
+        );
+        let incidental: Vec<_> = report
+            .policy
+            .findings
+            .iter()
+            .filter(|f| f.kind == "revert_history_incidental")
+            .collect();
+        assert_eq!(incidental.len(), 2, "both are still reported at info");
         assert_eq!(report.policy.verdict, ShadowGateVerdict::Pass);
     }
 }

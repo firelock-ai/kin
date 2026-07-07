@@ -135,11 +135,12 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
     //
     // Matches are grouped by the SEMANTIC CHANGE whose delta carried the
     // matching old body. A true revert restores a coherent snapshot: several
-    // of the head's entities return to bodies from the same historical change.
-    // An isolated single-entity match is usually incidental — small bodies
-    // recur naturally over long histories — so only COHERENT groups (two or
-    // more entities reverting to the same change) gate the verdict; singleton
-    // matches are still reported, at info severity, for the reviewer.
+    // of the head's LEAF entities return to bodies from the same historical
+    // change. An isolated single-entity match is usually incidental — small
+    // bodies recur naturally over long histories — and a container/aggregate
+    // co-reverting with its members is free by construction, so only groups
+    // with two or more independent LEAF reversions gate the verdict; every
+    // other match is still reported, at info severity, for the reviewer.
     let mut reversion_matches: Vec<(Entity, String, SemanticChangeId, usize)> = Vec::new();
     for (name, (old, new)) in &head_modified {
         if new.fingerprint.behavior_hash == old.fingerprint.behavior_hash {
@@ -187,33 +188,80 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
         }
     }
 
-    // Body reversions are REPORTED, never verdict-driving. The 60-benign
-    // sweep measured why: a module entity is a content aggregate of its file,
-    // so any single-function reversion makes the module co-revert to the same
-    // change by construction — "coherence" of two entities is nearly free, and
-    // gating on it re-flagged ~a third of clean benigns. The temporal evidence
-    // stays visible to reviewers (and to future evidence-composition in
-    // ranking) at info severity; coherence is still computed because it is the
-    // strongest hint in the message.
-    let mut undone_counts: HashMap<SemanticChangeId, usize> = HashMap::new();
-    for (_, _, undone, _) in &reversion_matches {
-        *undone_counts.entry(*undone).or_insert(0) += 1;
+    // A body reversion gates the verdict only when it belongs to a COHERENT
+    // LEAF group: two or more LEAF entities returning to bodies the SAME
+    // historical change carried. Container and aggregate kinds are held out of
+    // that count because they co-revert with their members by construction — a
+    // module's body is the concatenation of its members, so any single member
+    // reversion drags the module to the same change; a class's body likewise
+    // moves when one of its methods reverts. Counting those made two-entity
+    // "coherence" nearly free and re-flagged ~a third of clean benigns. So an
+    // aggregate kind never counts, a container counts only when no member leaf
+    // in the same group already explains its reversion, and a lone leaf
+    // reversion stays incidental. Matches outside a coherent leaf group are
+    // still reported at info severity for the reviewer, never driving the
+    // verdict.
+    // Grouped by the change each match un-does. Iteration order of this map
+    // never reaches the output: findings are emitted below in
+    // `reversion_matches` order (itself name-sorted and deterministic); this
+    // map only feeds per-index coherence flags and the gating-change set.
+    let mut groups: HashMap<SemanticChangeId, Vec<usize>> = HashMap::new();
+    for (idx, (_, _, undone, _)) in reversion_matches.iter().enumerate() {
+        groups.entry(*undone).or_default().push(idx);
     }
-    for (entity, name, undone, depth) in &reversion_matches {
-        let coherent = undone_counts.get(undone).copied().unwrap_or(0) >= 2;
+    let mut counts_toward_coherence = vec![false; reversion_matches.len()];
+    let mut gating_group: HashSet<SemanticChangeId> = HashSet::new();
+    for (undone, members) in &groups {
+        let mut leaf_coherence = 0usize;
+        for &idx in members {
+            let entity = &reversion_matches[idx].0;
+            let counts = match coherence_role(entity.kind) {
+                CoherenceRole::Aggregate => false,
+                CoherenceRole::Leaf => true,
+                // A container's reversion is independent evidence only when no
+                // OTHER member of the same group is a leaf nested inside it.
+                CoherenceRole::Container => !members.iter().any(|&other| {
+                    other != idx
+                        && matches!(
+                            coherence_role(reversion_matches[other].0.kind),
+                            CoherenceRole::Leaf
+                        )
+                        && is_nested_within(&reversion_matches[other].0, entity)
+                }),
+            };
+            if counts {
+                counts_toward_coherence[idx] = true;
+                leaf_coherence += 1;
+            }
+        }
+        if leaf_coherence >= 2 {
+            gating_group.insert(*undone);
+        }
+    }
+
+    for (idx, (entity, name, undone, depth)) in reversion_matches.iter().enumerate() {
+        let coherent = gating_group.contains(undone);
+        // Only a counted leaf inside a coherent group drives the verdict; every
+        // other match — aggregate co-reversions, member-explained containers,
+        // and lone reversions — stays informational.
+        let gates = coherent && counts_toward_coherence[idx];
         let message = format!(
             "Modified `{}` restores the exact body it had {} revision(s) ago{} — \
              revert-shaped body reversion",
             name,
             depth,
             if coherent {
-                ", together with other entities un-doing the same change"
+                ", together with other leaf entities un-doing the same change"
             } else {
                 ""
             },
         );
         let mut finding = inline_finding(entity, message);
-        finding.kind = InlineCommentKind::RevertHistoryIncidental;
+        finding.kind = if gates {
+            InlineCommentKind::RevertHistory
+        } else {
+            InlineCommentKind::RevertHistoryIncidental
+        };
         findings.push(finding);
     }
 
@@ -388,6 +436,54 @@ fn inline_finding(entity: &Entity, message: String) -> InlineComment {
 /// Stable string key for an entity kind (EntityKind carries no Ord).
 fn kind_key(kind: EntityKind) -> String {
     format!("{:?}", kind)
+}
+
+/// How an entity kind participates in leaf-coherence counting.
+enum CoherenceRole {
+    /// File- or namespace-level content aggregate: its body is a rollup of its
+    /// members, so it co-reverts whenever any member does. Never counted.
+    Aggregate,
+    /// Structural container that holds member entities but also carries its own
+    /// body. Counted only when a member leaf reverting in the same group does
+    /// not already explain it.
+    Container,
+    /// Atomic entity with no sub-entities. Always counted.
+    Leaf,
+}
+
+/// Classify an entity kind for leaf-coherence counting. The distinction is
+/// structural: aggregates and containers move with their members, so only a
+/// genuinely independent LEAF reversion is evidence of a coherent snapshot
+/// restore rather than a co-reversion forced by a member's change.
+fn coherence_role(kind: EntityKind) -> CoherenceRole {
+    match kind {
+        EntityKind::Module | EntityKind::File | EntityKind::Package => CoherenceRole::Aggregate,
+        EntityKind::Class | EntityKind::Interface | EntityKind::TraitDef | EntityKind::EnumDef => {
+            CoherenceRole::Container
+        }
+        _ => CoherenceRole::Leaf,
+    }
+}
+
+/// Whether `inner` is structurally nested inside `outer`: same origin file and
+/// a line span contained by the container's. Used to tell when a container's
+/// body reversion is already accounted for by a member leaf reverting in the
+/// same group. Nesting must be positively shown — a missing origin or span
+/// reads as "not nested", so a container with no locatable member still counts.
+fn is_nested_within(inner: &Entity, outer: &Entity) -> bool {
+    match (
+        &inner.file_origin,
+        &outer.file_origin,
+        &inner.span,
+        &outer.span,
+    ) {
+        (Some(inner_file), Some(outer_file), Some(inner_span), Some(outer_span)) => {
+            inner_file == outer_file
+                && outer_span.start_line <= inner_span.start_line
+                && inner_span.end_line <= outer_span.end_line
+        }
+        _ => false,
+    }
 }
 
 /// Human phrase for a window distance: the base change itself is distance 0.
