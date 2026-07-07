@@ -1103,16 +1103,23 @@ impl ImportedSemanticFileState {
 }
 
 /// Per-commit semantic accumulator state: file entities, cross-file relations
-/// (plus their src indexes), and the incremental linker index. Historical
-/// ingest forks a fresh copy of this state from each commit's FIRST git parent,
-/// so a commit's entity and relation deltas are computed against its true DAG
-/// parent rather than the linearized running state of an interleaved
-/// commit-time walk.
+/// (plus their src and dst indexes), and the incremental linker index.
+/// Historical ingest forks a fresh copy of this state from each commit's
+/// FIRST git parent, so a commit's entity and relation deltas are computed
+/// against its true DAG parent rather than the linearized running state of an
+/// interleaved commit-time walk.
 struct ImportedCommitSemanticState {
     files: HashMap<String, ImportedSemanticFileState>,
     relations: HashMap<RelationId, Relation>,
     relations_by_src: HashMap<EntityId, HashSet<RelationId>>,
     relations_by_src_artifact: HashMap<ArtifactId, HashSet<RelationId>>,
+    /// Inbound-edge index: target entity id -> ids of relations whose `dst`
+    /// is that entity. Mirrors `relations_by_src` but keyed by destination,
+    /// so a reverse-dependency lookup for an entity is a direct map lookup
+    /// instead of a scan over every relation. Maintained in lockstep with
+    /// `relations` at every insert/remove site (see `insert_relation_indexes`
+    /// / `remove_relation_indexes`), so it never goes stale mid-replay.
+    relations_by_dst: HashMap<EntityId, HashSet<RelationId>>,
     linker: kin_index::IncrementalLinker,
 }
 
@@ -1123,6 +1130,7 @@ impl Default for ImportedCommitSemanticState {
             relations: HashMap::new(),
             relations_by_src: HashMap::new(),
             relations_by_src_artifact: HashMap::new(),
+            relations_by_dst: HashMap::new(),
             linker: kin_index::IncrementalLinker::new(),
         }
     }
@@ -1135,6 +1143,7 @@ impl Clone for ImportedCommitSemanticState {
             relations: self.relations.clone(),
             relations_by_src: self.relations_by_src.clone(),
             relations_by_src_artifact: self.relations_by_src_artifact.clone(),
+            relations_by_dst: self.relations_by_dst.clone(),
             // `IncrementalLinker` derives no `Clone`; its fields are all public
             // and cloneable, so copy them explicitly. A new field there makes
             // this fail to compile (fail loud) rather than silently drop linker
@@ -1315,6 +1324,7 @@ fn enrich_imported_changes_with_semantics_inner(
             relations: mut current_relations,
             mut relations_by_src,
             mut relations_by_src_artifact,
+            mut relations_by_dst,
             linker: mut incremental_linker,
         } = baseline;
 
@@ -1486,6 +1496,7 @@ fn enrich_imported_changes_with_semantics_inner(
             &changed_source_files,
             &semantic_entities_by_file,
             &current_relations,
+            &relations_by_dst,
         );
         let old_relation_ids = collect_relation_ids_for_imported_files(
             &impacted_files,
@@ -1503,9 +1514,10 @@ fn enrich_imported_changes_with_semantics_inner(
         let mut old_relations = HashMap::<RelationId, Relation>::new();
         for relation_id in &old_relation_ids {
             if let Some(old_relation) = current_relations.remove(relation_id) {
-                remove_relation_src_index(
+                remove_relation_indexes(
                     &mut relations_by_src,
                     &mut relations_by_src_artifact,
+                    &mut relations_by_dst,
                     &old_relation,
                 );
                 old_relations.insert(*relation_id, old_relation);
@@ -1537,9 +1549,10 @@ fn enrich_imported_changes_with_semantics_inner(
                     Some(old_relation)
                         if imported_relations_equivalent(&old_relation, &relation) =>
                     {
-                        insert_relation_src_index(
+                        insert_relation_indexes(
                             &mut relations_by_src,
                             &mut relations_by_src_artifact,
+                            &mut relations_by_dst,
                             &old_relation,
                         );
                         current_relations.insert(relation_id, old_relation);
@@ -1547,18 +1560,20 @@ fn enrich_imported_changes_with_semantics_inner(
                     Some(_) => {
                         relation_deltas.push(RelationDelta::Removed(relation_id));
                         relation_deltas.push(RelationDelta::Added(relation.clone()));
-                        insert_relation_src_index(
+                        insert_relation_indexes(
                             &mut relations_by_src,
                             &mut relations_by_src_artifact,
+                            &mut relations_by_dst,
                             &relation,
                         );
                         current_relations.insert(relation_id, relation);
                     }
                     None => {
                         relation_deltas.push(RelationDelta::Added(relation.clone()));
-                        insert_relation_src_index(
+                        insert_relation_indexes(
                             &mut relations_by_src,
                             &mut relations_by_src_artifact,
+                            &mut relations_by_dst,
                             &relation,
                         );
                         current_relations.insert(relation_id, relation);
@@ -1593,6 +1608,7 @@ fn enrich_imported_changes_with_semantics_inner(
                     relations: current_relations,
                     relations_by_src,
                     relations_by_src_artifact,
+                    relations_by_dst,
                     linker: incremental_linker,
                 },
             );
@@ -1784,10 +1800,19 @@ fn build_imported_semantic_entities_by_file(
     entities_by_file
 }
 
+/// Reverse-dependency closure over `seed_files`: every file that holds an
+/// entity referenced by a relation whose target is an entity defined in one
+/// of the seed files, plus the seed files themselves. `relations_by_dst`
+/// makes this an O(inbound-degree) walk — one map lookup per entity in a seed
+/// file, followed by an O(1) relation lookup per inbound edge — rather than a
+/// scan of every relation for every seed file. Returns a `BTreeSet` so the
+/// result (and everything folded from it downstream) is byte-stable
+/// regardless of the maps' hash iteration order.
 fn imported_reverse_dependency_closure(
     seed_files: &BTreeSet<String>,
     semantic_entities_by_file: &HashMap<String, Vec<Entity>>,
     current_relations: &HashMap<RelationId, Relation>,
+    relations_by_dst: &HashMap<EntityId, HashSet<RelationId>>,
 ) -> BTreeSet<String> {
     let mut entity_to_file = HashMap::<EntityId, String>::new();
     for (file_path, entities) in semantic_entities_by_file {
@@ -1799,29 +1824,25 @@ fn imported_reverse_dependency_closure(
     let mut visited = seed_files.clone();
 
     for file_path in seed_files {
-        let entity_ids = semantic_entities_by_file
-            .get(file_path)
-            .into_iter()
-            .flat_map(|entities| entities.iter().map(|entity| entity.id))
-            .collect::<HashSet<_>>();
-        if entity_ids.is_empty() {
+        let Some(entities) = semantic_entities_by_file.get(file_path) else {
             continue;
-        }
-
-        for relation in current_relations.values() {
-            let Some(dst_entity_id) = relation.dst.as_entity() else {
+        };
+        for entity in entities {
+            let Some(inbound_relation_ids) = relations_by_dst.get(&entity.id) else {
                 continue;
             };
-            if !entity_ids.contains(&dst_entity_id) {
-                continue;
+            for relation_id in inbound_relation_ids {
+                let Some(relation) = current_relations.get(relation_id) else {
+                    continue;
+                };
+                let Some(src_entity_id) = relation.src.as_entity() else {
+                    continue;
+                };
+                let Some(src_file) = entity_to_file.get(&src_entity_id) else {
+                    continue;
+                };
+                visited.insert(src_file.clone());
             }
-            let Some(src_entity_id) = relation.src.as_entity() else {
-                continue;
-            };
-            let Some(src_file) = entity_to_file.get(&src_entity_id) else {
-                continue;
-            };
-            visited.insert(src_file.clone());
         }
     }
 
@@ -1859,9 +1880,10 @@ fn collect_relation_ids_for_imported_files(
     relation_ids
 }
 
-fn insert_relation_src_index(
+fn insert_relation_indexes(
     relations_by_src: &mut HashMap<EntityId, HashSet<RelationId>>,
     relations_by_src_artifact: &mut HashMap<ArtifactId, HashSet<RelationId>>,
+    relations_by_dst: &mut HashMap<EntityId, HashSet<RelationId>>,
     relation: &Relation,
 ) {
     match relation.src {
@@ -1879,11 +1901,18 @@ fn insert_relation_src_index(
         }
         _ => {}
     }
+    if let GraphNodeId::Entity(dst_entity) = relation.dst {
+        relations_by_dst
+            .entry(dst_entity)
+            .or_default()
+            .insert(relation.id);
+    }
 }
 
-fn remove_relation_src_index(
+fn remove_relation_indexes(
     relations_by_src: &mut HashMap<EntityId, HashSet<RelationId>>,
     relations_by_src_artifact: &mut HashMap<ArtifactId, HashSet<RelationId>>,
+    relations_by_dst: &mut HashMap<EntityId, HashSet<RelationId>>,
     relation: &Relation,
 ) {
     match relation.src {
@@ -1904,6 +1933,14 @@ fn remove_relation_src_index(
             }
         }
         _ => {}
+    }
+    if let GraphNodeId::Entity(dst_entity) = relation.dst {
+        if let Some(ids) = relations_by_dst.get_mut(&dst_entity) {
+            ids.remove(&relation.id);
+            if ids.is_empty() {
+                relations_by_dst.remove(&dst_entity);
+            }
+        }
     }
 }
 
@@ -5575,6 +5612,305 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    fn test_relation(kind: RelationKind, src: EntityId, dst: EntityId) -> Relation {
+        Relation {
+            id: RelationId::new(),
+            kind,
+            src: GraphNodeId::Entity(src),
+            dst: GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    /// Reference oracle for `imported_reverse_dependency_closure`: the
+    /// pre-index implementation, scanning every relation for every seed file
+    /// instead of consulting `relations_by_dst`. Kept here, test-only, so the
+    /// index-backed production path can be checked against it on arbitrary
+    /// fixture graphs rather than trusted by inspection.
+    fn naive_reverse_dependency_closure_scan(
+        seed_files: &BTreeSet<String>,
+        semantic_entities_by_file: &HashMap<String, Vec<Entity>>,
+        current_relations: &HashMap<RelationId, Relation>,
+    ) -> BTreeSet<String> {
+        let mut entity_to_file = HashMap::<EntityId, String>::new();
+        for (file_path, entities) in semantic_entities_by_file {
+            for entity in entities {
+                entity_to_file.insert(entity.id, file_path.clone());
+            }
+        }
+
+        let mut visited = seed_files.clone();
+
+        for file_path in seed_files {
+            let entity_ids = semantic_entities_by_file
+                .get(file_path)
+                .into_iter()
+                .flat_map(|entities| entities.iter().map(|entity| entity.id))
+                .collect::<HashSet<_>>();
+            if entity_ids.is_empty() {
+                continue;
+            }
+
+            for relation in current_relations.values() {
+                let Some(dst_entity_id) = relation.dst.as_entity() else {
+                    continue;
+                };
+                if !entity_ids.contains(&dst_entity_id) {
+                    continue;
+                }
+                let Some(src_entity_id) = relation.src.as_entity() else {
+                    continue;
+                };
+                let Some(src_file) = entity_to_file.get(&src_entity_id) else {
+                    continue;
+                };
+                visited.insert(src_file.clone());
+            }
+        }
+
+        visited
+    }
+
+    /// Fixture graph exercising the shapes the index must handle identically
+    /// to the naive scan: a direct reverse dependency (b -> a), a two-hop
+    /// chain that a single-hop closure must NOT collapse (c -> b -> a), an
+    /// isolated file with no inbound edges, a file with two entities where
+    /// only one has an inbound edge, and an artifact-anchored relation (whose
+    /// dst is not an entity) that neither path should follow.
+    struct ClosureFixture {
+        semantic_entities_by_file: HashMap<String, Vec<Entity>>,
+        current_relations: HashMap<RelationId, Relation>,
+        relations_by_dst: HashMap<EntityId, HashSet<RelationId>>,
+    }
+
+    fn build_closure_fixture() -> ClosureFixture {
+        let a = test_entity("a", "src/a.rs");
+        let b = test_entity("b", "src/b.rs");
+        let c = test_entity("c", "src/c.rs");
+        let d = test_entity("d", "src/d.rs");
+        let e1 = test_entity("e1", "src/e.rs");
+        let e2 = test_entity("e2", "src/e.rs");
+        let f = test_entity("f", "src/f.rs");
+
+        let semantic_entities_by_file: HashMap<String, Vec<Entity>> = [
+            ("src/a.rs".to_string(), vec![a.clone()]),
+            ("src/b.rs".to_string(), vec![b.clone()]),
+            ("src/c.rs".to_string(), vec![c.clone()]),
+            ("src/d.rs".to_string(), vec![d.clone()]),
+            ("src/e.rs".to_string(), vec![e1.clone(), e2.clone()]),
+            ("src/f.rs".to_string(), vec![f.clone()]),
+        ]
+        .into_iter()
+        .collect();
+
+        let b_calls_a = test_relation(RelationKind::Calls, b.id, a.id);
+        let c_calls_b = test_relation(RelationKind::Calls, c.id, b.id);
+        let f_calls_e1 = test_relation(RelationKind::Calls, f.id, e1.id);
+        let artifact_edge = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Includes,
+            src: GraphNodeId::Artifact(ArtifactId::seed_from_path("src/g.rs")),
+            dst: GraphNodeId::Artifact(ArtifactId::seed_from_path("src/a.rs")),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+
+        let mut current_relations = HashMap::<RelationId, Relation>::new();
+        let mut relations_by_src = HashMap::<EntityId, HashSet<RelationId>>::new();
+        let mut relations_by_src_artifact = HashMap::<ArtifactId, HashSet<RelationId>>::new();
+        let mut relations_by_dst = HashMap::<EntityId, HashSet<RelationId>>::new();
+        for relation in [&b_calls_a, &c_calls_b, &f_calls_e1, &artifact_edge] {
+            current_relations.insert(relation.id, relation.clone());
+            insert_relation_indexes(
+                &mut relations_by_src,
+                &mut relations_by_src_artifact,
+                &mut relations_by_dst,
+                relation,
+            );
+        }
+
+        ClosureFixture {
+            semantic_entities_by_file,
+            current_relations,
+            relations_by_dst,
+        }
+    }
+
+    #[test]
+    fn imported_reverse_dependency_closure_index_matches_naive_scan() {
+        let fixture = build_closure_fixture();
+
+        let scenarios: Vec<(BTreeSet<String>, BTreeSet<String>)> = vec![
+            (
+                BTreeSet::from(["src/a.rs".to_string()]),
+                BTreeSet::from(["src/a.rs".to_string(), "src/b.rs".to_string()]),
+            ),
+            (
+                BTreeSet::from(["src/b.rs".to_string()]),
+                BTreeSet::from(["src/b.rs".to_string(), "src/c.rs".to_string()]),
+            ),
+            (
+                BTreeSet::from(["src/d.rs".to_string()]),
+                BTreeSet::from(["src/d.rs".to_string()]),
+            ),
+            (
+                BTreeSet::from(["src/e.rs".to_string()]),
+                BTreeSet::from(["src/e.rs".to_string(), "src/f.rs".to_string()]),
+            ),
+            (
+                BTreeSet::from(["src/a.rs".to_string(), "src/e.rs".to_string()]),
+                BTreeSet::from([
+                    "src/a.rs".to_string(),
+                    "src/b.rs".to_string(),
+                    "src/e.rs".to_string(),
+                    "src/f.rs".to_string(),
+                ]),
+            ),
+            (BTreeSet::new(), BTreeSet::new()),
+            (
+                // A seed file absent from `semantic_entities_by_file` (e.g. a
+                // deleted file) must survive untouched in both paths.
+                BTreeSet::from(["src/nonexistent.rs".to_string()]),
+                BTreeSet::from(["src/nonexistent.rs".to_string()]),
+            ),
+        ];
+
+        for (seed_files, expected) in scenarios {
+            let via_index = imported_reverse_dependency_closure(
+                &seed_files,
+                &fixture.semantic_entities_by_file,
+                &fixture.current_relations,
+                &fixture.relations_by_dst,
+            );
+            let via_scan = naive_reverse_dependency_closure_scan(
+                &seed_files,
+                &fixture.semantic_entities_by_file,
+                &fixture.current_relations,
+            );
+
+            assert_eq!(
+                via_index, expected,
+                "index-backed closure mismatched the expected set for seed {seed_files:?}"
+            );
+            assert_eq!(
+                via_index, via_scan,
+                "index-backed closure diverged from the naive scan oracle for seed {seed_files:?}"
+            );
+            // Both are BTreeSets, so equal sets already imply equal iteration
+            // (sorted) order; assert on the materialized Vec too so the
+            // order-bearing contract downstream code relies on is explicit.
+            assert_eq!(
+                via_index.into_iter().collect::<Vec<_>>(),
+                via_scan.into_iter().collect::<Vec<_>>(),
+                "index-backed closure produced a different order than the naive scan for seed {seed_files:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn imported_reverse_dependency_closure_index_tracks_incremental_relation_mutation() {
+        let a = test_entity("a", "src/a.rs");
+        let b = test_entity("b", "src/b.rs");
+        let c = test_entity("c", "src/c.rs");
+
+        let semantic_entities_by_file: HashMap<String, Vec<Entity>> = [
+            ("src/a.rs".to_string(), vec![a.clone()]),
+            ("src/b.rs".to_string(), vec![b.clone()]),
+            ("src/c.rs".to_string(), vec![c.clone()]),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut current_relations = HashMap::<RelationId, Relation>::new();
+        let mut relations_by_src = HashMap::<EntityId, HashSet<RelationId>>::new();
+        let mut relations_by_src_artifact = HashMap::<ArtifactId, HashSet<RelationId>>::new();
+        let mut relations_by_dst = HashMap::<EntityId, HashSet<RelationId>>::new();
+
+        let seed = BTreeSet::from(["src/a.rs".to_string()]);
+        let assert_matches_oracle =
+            |current_relations: &HashMap<RelationId, Relation>,
+             relations_by_dst: &HashMap<EntityId, HashSet<RelationId>>,
+             expected: &BTreeSet<String>| {
+                let via_index = imported_reverse_dependency_closure(
+                    &seed,
+                    &semantic_entities_by_file,
+                    current_relations,
+                    relations_by_dst,
+                );
+                let via_scan = naive_reverse_dependency_closure_scan(
+                    &seed,
+                    &semantic_entities_by_file,
+                    current_relations,
+                );
+                assert_eq!(&via_index, expected);
+                assert_eq!(via_index, via_scan);
+            };
+
+        // No relations yet: closure is just the seed itself.
+        assert_matches_oracle(
+            &current_relations,
+            &relations_by_dst,
+            &BTreeSet::from(["src/a.rs".to_string()]),
+        );
+
+        // Add a relation between queries: b calls a.
+        let b_calls_a = test_relation(RelationKind::Calls, b.id, a.id);
+        current_relations.insert(b_calls_a.id, b_calls_a.clone());
+        insert_relation_indexes(
+            &mut relations_by_src,
+            &mut relations_by_src_artifact,
+            &mut relations_by_dst,
+            &b_calls_a,
+        );
+        assert_matches_oracle(
+            &current_relations,
+            &relations_by_dst,
+            &BTreeSet::from(["src/a.rs".to_string(), "src/b.rs".to_string()]),
+        );
+
+        // Add a second edge onto the same target: c calls a too.
+        let c_calls_a = test_relation(RelationKind::Calls, c.id, a.id);
+        current_relations.insert(c_calls_a.id, c_calls_a.clone());
+        insert_relation_indexes(
+            &mut relations_by_src,
+            &mut relations_by_src_artifact,
+            &mut relations_by_dst,
+            &c_calls_a,
+        );
+        assert_matches_oracle(
+            &current_relations,
+            &relations_by_dst,
+            &BTreeSet::from([
+                "src/a.rs".to_string(),
+                "src/b.rs".to_string(),
+                "src/c.rs".to_string(),
+            ]),
+        );
+
+        // Remove the first edge, mirroring how the replay loop retires a
+        // stale relation on relink: b no longer reverse-depends on a, c
+        // still does, and the index must not go stale.
+        current_relations.remove(&b_calls_a.id);
+        remove_relation_indexes(
+            &mut relations_by_src,
+            &mut relations_by_src_artifact,
+            &mut relations_by_dst,
+            &b_calls_a,
+        );
+        assert_matches_oracle(
+            &current_relations,
+            &relations_by_dst,
+            &BTreeSet::from(["src/a.rs".to_string(), "src/c.rs".to_string()]),
+        );
     }
 
     fn repo_truth_fixture(root: &Path) -> BTreeSet<String> {
