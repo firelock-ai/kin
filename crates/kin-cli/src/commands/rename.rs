@@ -237,33 +237,6 @@ fn build_rename_plan(
         }
     }
 
-    let text_refs = kin_core::find_text_reference_occurrences(
-        &kin_core::source_dir(layout),
-        target,
-        &[
-            RelationKind::Calls,
-            RelationKind::Imports,
-            RelationKind::References,
-        ],
-    );
-    for text_ref in text_refs {
-        for occurrence in text_ref.occurrences {
-            push_edit(
-                layout,
-                &text_ref.file_path,
-                occurrence.start_line,
-                occurrence.start_col,
-                occurrence.end_line,
-                occurrence.end_col,
-                &target.name,
-                new_name,
-                relation_reason(&occurrence.relation_kinds),
-                &mut edits,
-                &mut seen,
-            );
-        }
-    }
-
     edits.sort_by(|left, right| {
         left.file
             .cmp(&right.file)
@@ -354,15 +327,6 @@ fn resolve_target(
             })
             .unwrap_or(false);
         let relation_match = containing_targets.contains(&entity.id);
-        let text_ref_match = normalized_file_hint
-            .as_ref()
-            .map(|hint| {
-                candidate_text_ref_matches_position(layout, entity, hint, line_hint, column_hint)
-            })
-            .transpose()
-            .ok()
-            .flatten()
-            .unwrap_or(false);
         let same_file = normalized_file_hint
             .as_ref()
             .and_then(|hint| entity.file_origin.as_ref().map(|file| file.0 == *hint))
@@ -378,7 +342,6 @@ fn resolve_target(
         (
             !declaration_match,
             !relation_match,
-            !text_ref_match,
             !line_match,
             !same_file,
             !exact,
@@ -677,38 +640,6 @@ fn outgoing_relation_targets(
     Ok(targets)
 }
 
-fn candidate_text_ref_matches_position(
-    layout: &kin_core::KinLayout,
-    entity: &Entity,
-    file_hint: &str,
-    line_hint: Option<u32>,
-    column_hint: Option<u32>,
-) -> Result<bool> {
-    let Some(line_hint) = line_hint else {
-        return Ok(false);
-    };
-    let refs = kin_core::find_text_reference_occurrences(
-        &kin_core::source_dir(layout),
-        entity,
-        &[
-            RelationKind::Calls,
-            RelationKind::Imports,
-            RelationKind::References,
-        ],
-    );
-    Ok(refs.into_iter().any(|entry| {
-        entry.file_path == file_hint
-            && entry.occurrences.into_iter().any(|occurrence| {
-                occurrence.start_line == line_hint
-                    && column_hint
-                        .map(|column| {
-                            occurrence.start_col <= column && column <= occurrence.end_col
-                        })
-                        .unwrap_or(true)
-            })
-    }))
-}
-
 fn span_contains(span: &SourceSpan, line_hint: Option<u32>, column_hint: Option<u32>) -> bool {
     let Some(line_hint) = line_hint else {
         return false;
@@ -772,4 +703,99 @@ fn unique_file_count(edits: &[RenameEditJson]) -> usize {
         .map(|edit| edit.file.as_str())
         .collect::<HashSet<_>>()
         .len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_rename_response, RenameRequest};
+
+    /// A `kin rename` plan may only anchor edits on graph-owned truth: the
+    /// declaration span and graph relation edges. A caller that lives in the
+    /// working tree but is not linked into the graph must never receive an edit,
+    /// because the plan no longer discovers edit sites by scanning the raw source
+    /// tree.
+    #[test]
+    fn rename_plan_edits_come_from_graph_not_source_tree_scan() {
+        use kin_db::InMemoryGraph;
+        use kin_model::{
+            Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
+            FingerprintAlgorithm, Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".kin")).unwrap();
+        let layout = kin_core::KinLayout::new(repo.join(".kin"));
+
+        let decl_src = "fn probe_symbol() -> i32 { 0 }\n";
+        std::fs::write(repo.join("decl.rs"), decl_src).unwrap();
+        // A caller present only in the working tree, never linked into the graph.
+        // The retired scan would have planned edits here off the `use` import.
+        std::fs::write(
+            repo.join("disk_only_caller.rs"),
+            "use crate::decl::probe_symbol;\npub fn disk_only() -> i32 { probe_symbol() }\n",
+        )
+        .unwrap();
+
+        let target = Entity {
+            id: EntityId::new(),
+            kind: EntityKind::Function,
+            name: "probe_symbol".to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0; 32]),
+                signature_hash: Hash256::from_bytes([0; 32]),
+                behavior_hash: Hash256::from_bytes([0; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: Some(FilePathId::new("decl.rs")),
+            span: Some(SourceSpan {
+                file: FilePathId::new("decl.rs"),
+                start_byte: 0,
+                end_byte: decl_src.len(),
+                start_line: 1,
+                start_col: 0,
+                end_line: 1,
+                end_col: decl_src.len() as u32,
+            }),
+            signature: "probe_symbol".to_string(),
+            visibility: Visibility::Public,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata::default(),
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        };
+
+        let graph = InMemoryGraph::new();
+        graph.upsert_entity(&target).unwrap();
+
+        let response = build_rename_response(
+            &layout,
+            &graph,
+            &RenameRequest {
+                symbol: "probe_symbol".to_string(),
+                new_name: "renamed_symbol".to_string(),
+                file: None,
+                line: None,
+                column: None,
+                json: true,
+            },
+        )
+        .unwrap();
+        let json = response.json.expect("rename plan json");
+
+        // The graph-anchored declaration edit is present...
+        assert!(
+            json.contains("\"reason\":\"declaration\""),
+            "graph-anchored declaration edit must be present: {json}"
+        );
+        // ...and no edit is planned for the working-tree-only caller.
+        assert!(
+            !json.contains("disk_only_caller.rs"),
+            "rename must not plan edits discovered by scanning the raw source tree: {json}"
+        );
+    }
 }

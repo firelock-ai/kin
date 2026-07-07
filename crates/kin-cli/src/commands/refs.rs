@@ -6,7 +6,6 @@ use kin_model::{Entity, EntityId, EntityStore, GraphNodeId, GraphStore, Relation
 use kin_ranking::entity_ranking;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
 
 /// Resolve session id from KIN_SESSION_ID env var.
 ///
@@ -178,7 +177,7 @@ pub fn build_refs_response(
     };
     let target = &target;
 
-    let refs = collect_references(layout, graph, target, &relation_kinds)?;
+    let refs = collect_references(graph, target, &relation_kinds)?;
     let target_path = target
         .file_origin
         .as_ref()
@@ -410,16 +409,18 @@ struct ReferenceEntry {
     relation_kinds: Vec<RelationKind>,
 }
 
+/// Collect incoming references to `target` from graph-owned relation edges.
+///
+/// The graph is the sole authority for what references an entity. There is no
+/// raw source-tree scan: a reference the graph does not carry is a
+/// graph-completeness gap to close in ingestion, never something reconstructed
+/// by walking and grepping the working tree at query time.
 fn collect_references(
-    layout: &kin_core::KinLayout,
     graph: &impl GraphStore,
     target: &Entity,
     relation_kinds: &[RelationKind],
 ) -> Result<Vec<ReferenceEntry>> {
     let mut entries = collect_graph_references(graph, &target.id, relation_kinds)?;
-    let text_refs =
-        kin_core::find_text_references(&kin_core::source_dir(layout), target, relation_kinds);
-    merge_text_references(&mut entries, text_refs);
     entries.sort_by(|left, right| {
         left.file_path
             .cmp(&right.file_path)
@@ -471,46 +472,6 @@ fn collect_graph_references(
     Ok(entries)
 }
 
-fn merge_text_references(
-    entries: &mut Vec<ReferenceEntry>,
-    text_refs: Vec<kin_core::TextReferenceMatch>,
-) {
-    let mut index_by_key = HashMap::new();
-    for (index, entry) in entries.iter().enumerate() {
-        index_by_key.insert(
-            reference_key(entry.file_path.as_deref(), &entry.name),
-            index,
-        );
-        if let Some(path) = entry.file_path.as_deref() {
-            index_by_key.insert(path.to_string(), index);
-        }
-    }
-
-    for text_ref in text_refs {
-        let key = text_ref.file_path.clone();
-        if let Some(existing) = index_by_key.get(&key).copied() {
-            let entry = &mut entries[existing];
-            if entry.start_line.is_none() {
-                entry.start_line = text_ref.start_line;
-            }
-            for kind in text_ref.relation_kinds {
-                push_relation_kind(&mut entry.relation_kinds, kind);
-            }
-            entry.relation_kinds.sort_by_key(relation_kind_rank);
-            continue;
-        }
-
-        let index = entries.len();
-        entries.push(ReferenceEntry {
-            name: label_from_path(&text_ref.file_path),
-            file_path: Some(text_ref.file_path.clone()),
-            start_line: text_ref.start_line,
-            relation_kinds: text_ref.relation_kinds,
-        });
-        index_by_key.insert(key, index);
-    }
-}
-
 fn push_relation_kind(kinds: &mut Vec<RelationKind>, kind: RelationKind) {
     if !kinds.contains(&kind) {
         kinds.push(kind);
@@ -521,14 +482,6 @@ fn reference_key(file_path: Option<&str>, name: &str) -> String {
     file_path
         .map(|path| path.to_string())
         .unwrap_or_else(|| format!("name:{name}"))
-}
-
-fn label_from_path(rel_path: &str) -> String {
-    Path::new(rel_path)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or(rel_path)
-        .to_string()
 }
 
 fn parse_relation_kinds(kind: &str) -> Result<Vec<RelationKind>> {
@@ -571,8 +524,107 @@ fn display_read_path(_layout: &kin_core::KinLayout, rel_path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_relation_kinds, refs_not_found_guidance};
+    use super::{build_refs_response, parse_relation_kinds, refs_not_found_guidance, RefsRequest};
     use kin_model::RelationKind;
+
+    /// `kin refs` must answer only from graph-owned relation edges. A reference
+    /// that exists in the working tree but is not linked into the graph must
+    /// never be surfaced, because there is no raw source-tree scan fallback: the
+    /// retired scan walked the source root and matched import/call lines, which
+    /// is exactly the file-first drift the graph-first thesis forbids.
+    #[test]
+    fn refs_answer_comes_from_graph_relations_not_source_tree_scan() {
+        use kin_db::InMemoryGraph;
+        use kin_model::relation::{Relation, RelationOrigin};
+        use kin_model::{
+            Entity, EntityId, EntityKind, EntityMetadata, EntityRole, EntityStore, FilePathId,
+            FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId, SemanticFingerprint,
+            Visibility,
+        };
+
+        fn entity(name: &str, rel_path: &str) -> Entity {
+            Entity {
+                id: EntityId::new(),
+                kind: EntityKind::Function,
+                name: name.to_string(),
+                language: LanguageId::Rust,
+                fingerprint: SemanticFingerprint {
+                    algorithm: FingerprintAlgorithm::V1TreeSitter,
+                    ast_hash: Hash256::from_bytes([0; 32]),
+                    signature_hash: Hash256::from_bytes([0; 32]),
+                    behavior_hash: Hash256::from_bytes([0; 32]),
+                    stability_score: 1.0,
+                },
+                file_origin: Some(FilePathId::new(rel_path)),
+                span: None,
+                signature: name.to_string(),
+                visibility: Visibility::Public,
+                role: EntityRole::Source,
+                doc_summary: None,
+                metadata: EntityMetadata::default(),
+                lineage_parent: None,
+                created_in: None,
+                superseded_by: None,
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".kin")).unwrap();
+        let layout = kin_core::KinLayout::new(repo.join(".kin"));
+
+        // A caller that exists ONLY in the working tree, never linked into the
+        // graph. The retired text scan would have surfaced it by matching the
+        // `use ...::probe_symbol` import line under the source root.
+        std::fs::write(
+            repo.join("disk_only_caller.rs"),
+            "use crate::target_mod::probe_symbol;\npub fn disk_only() -> i32 { probe_symbol() }\n",
+        )
+        .unwrap();
+
+        let target = entity("probe_symbol", "target_mod.rs");
+        let graph_caller = entity("graph_caller", "graph_caller.rs");
+
+        let graph = InMemoryGraph::new();
+        graph.upsert_entity(&target).unwrap();
+        graph.upsert_entity(&graph_caller).unwrap();
+        graph
+            .upsert_relation(&Relation {
+                id: kin_model::ids::RelationId::new(),
+                kind: RelationKind::References,
+                src: GraphNodeId::Entity(graph_caller.id),
+                dst: GraphNodeId::Entity(target.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+
+        let response = build_refs_response(
+            &layout,
+            &graph,
+            &RefsRequest {
+                entity: "probe_symbol".to_string(),
+                kind: "all".to_string(),
+            },
+        )
+        .unwrap();
+        let joined = response.lines.join("\n");
+
+        // The graph-linked reference is reported...
+        assert!(
+            joined.contains("graph_caller"),
+            "graph-owned reference must be reported: {joined}"
+        );
+        // ...and the working-tree-only reference is not, proving refs no longer
+        // answers by scanning the raw source tree.
+        assert!(
+            !joined.contains("disk_only"),
+            "refs must not surface a reference that exists only in the working tree: {joined}"
+        );
+    }
 
     #[test]
     fn refs_not_found_guidance_keeps_signal_and_points_at_xref() {
