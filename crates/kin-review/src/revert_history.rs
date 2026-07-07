@@ -10,9 +10,12 @@
 //! signal at all — so without this channel the gate is blind to exactly the
 //! class regression-fix and revert commits fall into.
 //!
-//! The channel walks a bounded window of the BASE ref's ancestry (evidence
-//! available at review time; whether a commit will be reverted LATER is future
-//! information and is never consulted) and matches:
+//! The channel walks a bounded window of the BASE ref's ancestry — including
+//! the base change itself, whose deltas are part of the state the head builds
+//! on (reverting the immediately-preceding change is the most common revert
+//! shape). Only evidence available at review time is consulted; whether a
+//! commit will be reverted LATER is future information and never enters. It
+//! matches:
 //!
 //! - head-side ADDED entities against entities removed inside the window —
 //!   a behavior-fingerprint match means the added body restores removed
@@ -140,18 +143,20 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
                 by_hash.get(&added.fingerprint.behavior_hash)
             {
                 Some(format!(
-                    "Added `{}` restores the exact content of `{}`, removed {} change(s) \
-                     before the base — revert-shaped reintroduction",
-                    name, removed_name, distance
+                    "Added `{}` restores the exact content of `{}`, removed {} — \
+                     revert-shaped reintroduction",
+                    name,
+                    removed_name,
+                    distance_phrase(*distance)
                 ))
             } else {
                 by_name.get(&(kind.clone(), name.clone())).map(|distance| {
                     format!(
-                        "Added `{}` reintroduces a same-named {} removed {} change(s) \
-                         before the base, with modified content — revert-shaped surface",
+                        "Added `{}` reintroduces a same-named {} removed {}, with \
+                         modified content — revert-shaped surface",
                         name,
                         kind_label(added.kind),
-                        distance
+                        distance_phrase(*distance)
                     )
                 })
             };
@@ -175,9 +180,10 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
                 end_line: 0,
                 kind: InlineCommentKind::RevertHistory,
                 message: format!(
-                    "Removed `{}` was introduced only {} change(s) before the base — \
-                     revert-shaped removal of a recent addition",
-                    name, distance
+                    "Removed `{}` was introduced only {} — revert-shaped removal \
+                     of a recent addition",
+                    name,
+                    distance_phrase(*distance)
                 ),
             });
         }
@@ -208,15 +214,10 @@ fn walk_base_window<G: GraphStore>(
     let mut visited: HashSet<SemanticChangeId> = HashSet::new();
     let mut queue: VecDeque<(SemanticChangeId, usize)> = VecDeque::new();
 
-    if let Some(base) = store
-        .get_change(resolved_base)
-        .map_err(ReviewError::graph)?
-    {
-        for parent in &base.parents {
-            queue.push_back((*parent, 1));
-        }
-    }
-    visited.insert(*resolved_base);
+    // The base change itself is scanned at distance 0: its deltas are part of
+    // the state the head builds on, and reverting the immediately-preceding
+    // change is the most common revert shape.
+    queue.push_back((*resolved_base, 0));
 
     let mut scanned = 0usize;
     while let Some((id, distance)) = queue.pop_front() {
@@ -286,6 +287,15 @@ fn inline_finding(entity: &Entity, message: String) -> InlineComment {
 /// Stable string key for an entity kind (EntityKind carries no Ord).
 fn kind_key(kind: EntityKind) -> String {
     format!("{:?}", kind)
+}
+
+/// Human phrase for a window distance: the base change itself is distance 0.
+fn distance_phrase(distance: usize) -> String {
+    if distance == 0 {
+        "in the base change itself".to_string()
+    } else {
+        format!("{} change(s) before the base", distance)
+    }
 }
 
 fn kind_label(kind: EntityKind) -> &'static str {
