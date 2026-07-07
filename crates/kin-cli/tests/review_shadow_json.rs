@@ -107,6 +107,33 @@ fn setup_fixture_repo(repo: &Path) -> (String, String, String) {
     (base, head, artifact_head)
 }
 
+/// Fixture: a root commit followed by two commits on divergent named
+/// branches — neither is an ancestor of the other. Forks via a named branch
+/// (not a detached checkout) so the repo's Git HEAD stays on a normal branch
+/// throughout, same as every other fixture in this file.
+fn setup_divergent_repo(repo: &Path) -> (String, String) {
+    std::fs::write(repo.join("shared.txt"), "root\n").expect("write shared.txt");
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.email", "shadow-test@example.com"]);
+    run_git(repo, &["config", "user.name", "Shadow Test"]);
+    run_git(repo, &["add", "-A"]);
+    run_git(repo, &["commit", "-m", "root"]);
+    let root = git_head(repo);
+
+    std::fs::write(repo.join("shared.txt"), "branch a\n").expect("write branch a");
+    run_git(repo, &["add", "-A"]);
+    run_git(repo, &["commit", "-m", "branch a"]);
+    let branch_a = git_head(repo);
+
+    run_git(repo, &["checkout", "-b", "diverged", &root]);
+    std::fs::write(repo.join("shared.txt"), "branch b\n").expect("write branch b");
+    run_git(repo, &["add", "-A"]);
+    run_git(repo, &["commit", "-m", "branch b"]);
+    let branch_b = git_head(repo);
+
+    (branch_a, branch_b)
+}
+
 fn kin_init(repo: &Path) {
     let init = kin_command()
         .arg("init")
@@ -359,6 +386,26 @@ fn shadow_report_unsupported_ref_syntax_fails_friendly_not_opaque() {
     assert!(
         !stderr.contains("HTTP 500"),
         "an unresolvable ref must not surface as an opaque server error: {stderr}"
+    );
+}
+
+/// The everyday "your branch is behind main" case — base is not on head's
+/// ancestry — must still surface the existing gap report end to end through
+/// the real CLI and daemon, not just at the unit level.
+#[test]
+fn shadow_report_stale_base_surfaces_ancestry_gap_end_to_end() {
+    let dir = tempdir().expect("tempdir");
+    let repo = dir.path();
+    let (branch_a, branch_b) = setup_divergent_repo(repo);
+    kin_init(repo);
+
+    let report = run_shadow_json(repo, &branch_a, &branch_b);
+
+    let gaps = report["evidence_gaps"].as_array().unwrap();
+    assert!(
+        gaps.iter()
+            .any(|gap| gap["kind"] == "base_not_on_head_ancestry"),
+        "divergent refs must surface the base_not_on_head_ancestry gap: {gaps:?}"
     );
 }
 

@@ -155,6 +155,43 @@ pub fn import_git_history_to_commit_with_blobs(
     import_full(&repo, target_id, genesis_id, 0, blob_store)
 }
 
+/// Cheap, Git-native ancestry check: is `ancestor_oid_hex` reachable by
+/// walking parents from `descendant_oid_hex`? This is the same DAG
+/// relationship `git merge-base --is-ancestor` reports. The walk visits only
+/// commit objects — no trees, blobs, or diffing — so it costs a fraction of
+/// a full history import with semantic enrichment, and callers can use it to
+/// decide whether that expensive import is even worth starting.
+///
+/// Returns `None` when the question cannot be answered cheaply: either oid
+/// fails to parse, either commit is absent from the repository's object
+/// database, or the repository cannot be opened at `repo_path`. Callers
+/// should treat `None` as "unknown" and fall back to their normal resolve
+/// path rather than treating it as a negative answer.
+pub fn is_ancestor_commit(
+    repo_path: &Path,
+    ancestor_oid_hex: &str,
+    descendant_oid_hex: &str,
+) -> Option<bool> {
+    let repo = open_repo(repo_path).ok()?;
+    let ancestor_id = gix::ObjectId::from_hex(ancestor_oid_hex.as_bytes()).ok()?;
+    let descendant_id = gix::ObjectId::from_hex(descendant_oid_hex.as_bytes()).ok()?;
+    repo.find_commit(ancestor_id).ok()?;
+    repo.find_commit(descendant_id).ok()?;
+
+    if ancestor_id == descendant_id {
+        return Some(true);
+    }
+
+    let walk = repo.rev_walk([descendant_id]).all().ok()?;
+    for step in walk {
+        let info = step.ok()?;
+        if info.id().detach() == ancestor_id {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
 /// Shallow import: create a single SemanticChange from HEAD's tree.
 fn import_shallow(
     repo: &gix::Repository,
@@ -1526,5 +1563,124 @@ mod tests {
             serial_ms / parallel_ms.max(0.0001)
         );
         assert_eq!(parallel.len(), serial.len());
+    }
+
+    fn commit_sha(repo: &Path) -> String {
+        let output = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .expect("git rev-parse HEAD");
+        String::from_utf8(output.stdout)
+            .expect("utf8 sha")
+            .trim()
+            .to_string()
+    }
+
+    fn commit_file(repo: &Path, name: &str, content: &str, message: &str, epoch: &str) {
+        std::fs::write(repo.join(name), content).unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo)
+            .output();
+        let date = format!("{epoch} +0000");
+        let _ = Command::new("git")
+            .args(["commit", "-m", message])
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .current_dir(repo)
+            .output();
+    }
+
+    #[test]
+    fn is_ancestor_commit_true_for_direct_ancestor_and_self() {
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo(dir.path()) {
+            eprintln!("git not available, skipping ancestry test");
+            return;
+        }
+
+        commit_file(dir.path(), "a.txt", "1\n", "base", "1000000000");
+        let base = commit_sha(dir.path());
+        commit_file(dir.path(), "a.txt", "2\n", "head", "1000000100");
+        let head = commit_sha(dir.path());
+
+        assert_eq!(
+            is_ancestor_commit(dir.path(), &base, &head),
+            Some(true),
+            "base must be reported as an ancestor of head"
+        );
+        assert_eq!(
+            is_ancestor_commit(dir.path(), &head, &base),
+            Some(false),
+            "head must not be reported as an ancestor of base"
+        );
+        assert_eq!(
+            is_ancestor_commit(dir.path(), &base, &base),
+            Some(true),
+            "a commit is its own ancestor"
+        );
+    }
+
+    #[test]
+    fn is_ancestor_commit_false_for_unrelated_forked_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo(dir.path()) {
+            eprintln!("git not available, skipping ancestry test");
+            return;
+        }
+
+        commit_file(dir.path(), "a.txt", "1\n", "root", "1000000000");
+        let root = commit_sha(dir.path());
+
+        commit_file(dir.path(), "a.txt", "a\n", "branch a", "1000000100");
+        let branch_a = commit_sha(dir.path());
+
+        // Fork a second line of history from `root`, independent of branch a.
+        let _ = Command::new("git")
+            .args(["checkout", &root])
+            .current_dir(dir.path())
+            .output();
+        commit_file(dir.path(), "a.txt", "b\n", "branch b", "1000000200");
+        let branch_b = commit_sha(dir.path());
+
+        assert_eq!(
+            is_ancestor_commit(dir.path(), &branch_a, &branch_b),
+            Some(false),
+            "unrelated forked commits must not be reported as ancestors of each other"
+        );
+        assert_eq!(is_ancestor_commit(dir.path(), &root, &branch_a), Some(true));
+        assert_eq!(is_ancestor_commit(dir.path(), &root, &branch_b), Some(true));
+    }
+
+    #[test]
+    fn is_ancestor_commit_none_when_a_commit_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo(dir.path()) {
+            eprintln!("git not available, skipping ancestry test");
+            return;
+        }
+
+        commit_file(dir.path(), "a.txt", "1\n", "root", "1000000000");
+        let root = commit_sha(dir.path());
+        let absent = "0".repeat(40);
+
+        assert_eq!(
+            is_ancestor_commit(dir.path(), &absent, &root),
+            None,
+            "an absent ancestor commit must report None (undetermined), not a hard failure"
+        );
+        assert_eq!(
+            is_ancestor_commit(dir.path(), &root, &absent),
+            None,
+            "an absent descendant commit must report None (undetermined), not a hard failure"
+        );
+    }
+
+    #[test]
+    fn is_ancestor_commit_none_when_repo_path_is_not_a_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let sha = "1111111111111111111111111111111111111111";
+        assert_eq!(is_ancestor_commit(dir.path(), sha, sha), None);
     }
 }

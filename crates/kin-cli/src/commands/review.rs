@@ -298,6 +298,18 @@ fn build_shadow_run_response(
     author: Option<String>,
     json: bool,
 ) -> Result<(ReviewResponse, bool)> {
+    // The everyday "your branch is behind main" case: base is not on head's
+    // ancestry. That gap is provable from the Git commit-parent DAG alone —
+    // no semantic hydration needed — so it is checked before either ref pays
+    // for a full history import. Returns `None` whenever the fast
+    // conclusion can't be drawn, in which case the normal resolve-and-hydrate
+    // path below runs exactly as it always has.
+    if let Some(report) =
+        shadow_ancestry_fast_path_gap(graph, layout, &base, &head, &title, &source_url, &author)?
+    {
+        return Ok((shadow_response_from_report(&report, json)?, false));
+    }
+
     // Resolve the head ref before the base ref. A review pair is almost always
     // ancestor..descendant, so importing the head first hydrates the full git
     // ancestry in a single pass; the base is then already present in the graph
@@ -331,24 +343,82 @@ fn build_shadow_run_response(
     };
 
     let report = kin_review::build_shadow_report(graph, &request)?;
-
-    if json {
-        return Ok((
-            ReviewResponse {
-                text: String::new(),
-                json: Some(serde_json::to_string_pretty(&report)?),
-            },
-            hydrated_git_history,
-        ));
-    }
-
     Ok((
-        ReviewResponse {
-            text: kin_review::format_shadow_report(&report),
-            json: None,
-        },
+        shadow_response_from_report(&report, json)?,
         hydrated_git_history,
     ))
+}
+
+/// Cheap pre-check for the shadow path's `base_not_on_head_ancestry` gap.
+///
+/// Applies only when both refs are bare Git commit forms (`git:<oid>` or a
+/// 40-character hex oid) and at least one is not yet present in the graph —
+/// the only situation where the default path below pays for a full history
+/// import before `kin_review::build_shadow_report`'s own ancestry check
+/// would run. Reads only the on-disk Git commit-parent graph (via
+/// `kin_git::is_ancestor_commit`), never the working tree or blobs, so a
+/// stale base returns the existing gap report without importing anything.
+///
+/// Returns `Ok(None)` whenever the fast conclusion can't be drawn — either
+/// ref isn't a bare Git commit form, either commit is missing from the Git
+/// object database, or ancestry actually holds — so the caller falls
+/// through to the exact existing resolve-and-hydrate path, unchanged.
+#[allow(clippy::too_many_arguments)]
+fn shadow_ancestry_fast_path_gap(
+    graph: &kin_db::InMemoryGraph,
+    layout: &kin_core::KinLayout,
+    base: &str,
+    head: &str,
+    title: &Option<String>,
+    source_url: &Option<String>,
+    author: &Option<String>,
+) -> Result<Option<kin_review::ShadowGateReport>> {
+    let Some(base_oid) = crate::commands::ref_lookup::extract_git_ref(base) else {
+        return Ok(None);
+    };
+    let Some(head_oid) = crate::commands::ref_lookup::extract_git_ref(head) else {
+        return Ok(None);
+    };
+    let needs_check = crate::commands::ref_lookup::git_ref_requires_hydration(graph, base)
+        || crate::commands::ref_lookup::git_ref_requires_hydration(graph, head);
+    if !needs_check {
+        return Ok(None);
+    }
+
+    let Some(false) = kin_git::is_ancestor_commit(layout.working_dir(), base_oid, head_oid) else {
+        return Ok(None);
+    };
+
+    let request = kin_review::ShadowRequest {
+        base_ref: base.to_string(),
+        head_ref: head.to_string(),
+        resolved_base: kin_git::semantic_change_id_from_git_oid_hex(base_oid)?,
+        resolved_head: kin_git::semantic_change_id_from_git_oid_hex(head_oid)?,
+        title: title.clone(),
+        source_url: source_url.clone(),
+        author: author.clone(),
+        actor: crate::provenance::current_actor_label(),
+    };
+    Ok(Some(kin_review::build_shadow_report_base_off_ancestry(
+        graph, &request,
+    )?))
+}
+
+fn shadow_response_from_report(
+    report: &kin_review::ShadowGateReport,
+    json: bool,
+) -> Result<ReviewResponse> {
+    if json {
+        return Ok(ReviewResponse {
+            text: String::new(),
+            json: Some(serde_json::to_string_pretty(report)?),
+        });
+    }
+
+    Ok(ReviewResponse {
+        text: kin_review::format_shadow_report(report),
+        json: None,
+    })
 }
 
 fn compute_review(
@@ -1193,5 +1263,123 @@ mod tests {
         // query_audit_events returns most-recent first.
         assert_eq!(events[0].action, "review.decide");
         assert_eq!(events[1].action, "review.create");
+    }
+
+    /// The everyday "your branch is behind main" case: a stale, unrelated
+    /// base against a raw Git commit head that has never been imported.
+    /// Proves the fast path returns the identical `base_not_on_head_ancestry`
+    /// gap report without ever hydrating either side — checked structurally
+    /// (both refs still report "requires hydration" afterward), not by wall
+    /// clock, per the fix's own contract.
+    #[test]
+    fn shadow_stale_base_returns_gap_report_without_hydrating() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: stdout={} stderr={}",
+                args,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let commit = |file: &str, content: &str, message: &str, epoch: &str| {
+            std::fs::write(repo.join(file), content).unwrap();
+            git(&["add", "."]);
+            let date = format!("{epoch} +0000");
+            let output = Command::new("git")
+                .args(["commit", "-m", message])
+                .env("GIT_AUTHOR_DATE", &date)
+                .env("GIT_COMMITTER_DATE", &date)
+                .current_dir(repo)
+                .output()
+                .expect("git commit");
+            assert!(output.status.success(), "git commit failed");
+        };
+        let head_sha = || {
+            let output = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(repo)
+                .output()
+                .expect("git rev-parse HEAD");
+            String::from_utf8(output.stdout)
+                .expect("utf8 sha")
+                .trim()
+                .to_string()
+        };
+
+        git(&["init"]);
+        git(&["config", "user.email", "shadow-fastpath@example.com"]);
+        git(&["config", "user.name", "Shadow Fastpath Test"]);
+
+        commit("a.txt", "1\n", "root", "1000000000");
+        let root = head_sha();
+
+        commit("a.txt", "a\n", "branch a", "1000000100");
+        let branch_a = head_sha();
+
+        // Fork branch b from root, independent of branch a — neither is an
+        // ancestor of the other.
+        git(&["checkout", &root]);
+        commit("a.txt", "b\n", "branch b", "1000000200");
+        let branch_b = head_sha();
+
+        let layout = kin_core::KinLayout::new(repo.join(".kin"));
+        let graph = kin_db::InMemoryGraph::new();
+
+        assert!(
+            crate::commands::ref_lookup::git_ref_requires_hydration(&graph, &branch_a),
+            "branch a must not be imported before the call"
+        );
+        assert!(
+            crate::commands::ref_lookup::git_ref_requires_hydration(&graph, &branch_b),
+            "branch b must not be imported before the call"
+        );
+
+        let (response, hydrated) = build_shadow_run_response(
+            &layout,
+            &graph,
+            branch_a.clone(),
+            branch_b.clone(),
+            None,
+            None,
+            None,
+            true,
+        )
+        .expect("a stale base must produce a gap report, not an error");
+
+        assert!(
+            !hydrated,
+            "the fast path must report no hydration was performed"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(response.json.as_deref().expect("json response")).unwrap();
+        let gaps = json["evidence_gaps"].as_array().unwrap();
+        assert!(
+            gaps.iter()
+                .any(|gap| gap["kind"] == "base_not_on_head_ancestry"),
+            "expected a base_not_on_head_ancestry gap: {gaps:?}"
+        );
+
+        // Structural proof, not a timing assertion: neither commit was ever
+        // imported into the graph, so both still report "requires hydration".
+        assert!(
+            crate::commands::ref_lookup::git_ref_requires_hydration(&graph, &branch_a),
+            "branch a must remain un-imported: the fast path must not hydrate it"
+        );
+        assert!(
+            crate::commands::ref_lookup::git_ref_requires_hydration(&graph, &branch_b),
+            "branch b must remain un-imported: the fast path must not hydrate it"
+        );
     }
 }

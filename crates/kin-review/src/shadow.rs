@@ -299,7 +299,7 @@ pub fn build_shadow_report_at<G: GraphStore>(
     at_head: &GraphAtRef<'_, G>,
 ) -> Result<ShadowGateReport, ReviewError> {
     if !at_head.ancestry_contains(&request.resolved_base) {
-        return build_report_with_base_off_ancestry(store, request);
+        return build_shadow_report_base_off_ancestry(store, request);
     }
     // DAG-true `base..head` membership: reachable from head, not reachable
     // from base. The store's backward walk stops only at the literal base
@@ -433,7 +433,15 @@ fn build_report_without_ref_state<G: GraphStore>(
 /// into a sweep across unrelated eras of the DAG — so the range is refused
 /// loudly: no diff, no blast radius, no impact, no range walk, and an
 /// explicit blocking evidence gap in their place.
-fn build_report_with_base_off_ancestry<G: GraphStore>(
+///
+/// Unlike [`build_shadow_report`], this entry point never materializes graph
+/// state at either ref, so it is safe to call with a `resolved_base` and
+/// `resolved_head` that are not present in `store` at all. Callers that can
+/// prove ancestry does not hold through a cheaper channel than full
+/// resolution (e.g. a Git-native ancestry check ahead of importing either
+/// side) can go straight to this report instead of paying for resolution
+/// first only to reach the same conclusion.
+pub fn build_shadow_report_base_off_ancestry<G: GraphStore>(
     store: &G,
     request: &ShadowRequest,
 ) -> Result<ShadowGateReport, ReviewError> {
