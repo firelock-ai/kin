@@ -1116,6 +1116,30 @@ fn source_file_paths(graph: &kin_db::InMemoryGraph) -> HashSet<String> {
     paths
 }
 
+/// Graph-owned source-path authority set: entity-bearing and entity-origin
+/// source paths, plus source-like opaque artifacts the graph already tracks.
+/// This is the membership authority for locate's include and sibling
+/// resolution; candidate paths are accepted only when the graph owns them.
+fn graph_source_path_set(graph: &kin_db::InMemoryGraph) -> HashSet<String> {
+    let mut source_paths = source_file_paths(graph);
+    for artifact in graph.list_opaque_artifacts().unwrap_or_default() {
+        let path = &artifact.file_id.0;
+        if is_test_path(path)
+            || is_docs_or_locale_path(path)
+            || is_vendor_path(path)
+            || is_embedded_framework_noise_path(path)
+        {
+            continue;
+        }
+        if source_paths.contains(path)
+            || is_source_like_artifact_path(path, artifact.mime_type.as_deref())
+        {
+            source_paths.insert(path.clone());
+        }
+    }
+    source_paths
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -1651,7 +1675,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         HashMap::new()
     } else {
         let phase_start = std::time::Instant::now();
-        let source_text = extract_source_text_signals(text, graph, workspace_root)?;
+        let source_text = extract_source_text_signals(text, graph)?;
         if phase_start.elapsed().as_secs_f64()
             > budget
                 .phase_budgets
@@ -2459,7 +2483,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         );
     }
 
-    promote_named_test_source_siblings(&mut fused, &source_files, workspace_root);
+    promote_named_test_source_siblings(&mut fused, &source_files);
     if explain {
         record_debug_stage(
             &mut score_breakdown,
@@ -2610,7 +2634,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         );
     }
 
-    rerank_semantic_phase_paths(&mut fused, text, &all_hits, &source_files, workspace_root);
+    rerank_semantic_phase_paths(&mut fused, text, &all_hits, &source_files);
     if explain {
         record_debug_stage(
             &mut score_breakdown,
@@ -2620,7 +2644,7 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         );
     }
 
-    rerank_cli_surface_paths(&mut fused, text, &all_hits, graph, workspace_root);
+    rerank_cli_surface_paths(&mut fused, text, &all_hits, graph);
     if explain {
         record_debug_stage(
             &mut score_breakdown,
@@ -8237,7 +8261,6 @@ fn extract_snippet_signals(
 fn extract_source_text_signals(
     text: &str,
     graph: &kin_db::InMemoryGraph,
-    workspace_root: Option<&std::path::Path>,
 ) -> Result<HashMap<String, Vec<FileHit>>> {
     let _span =
         tracing::info_span!("locate.extract_source_text_signals", text_len = text.len()).entered();
@@ -8248,28 +8271,14 @@ fn extract_source_text_signals(
     let cli_flag_terms = extract_cli_flag_terms(text);
     let cli_flag_query = query_mentions_cli_flags(text);
     let body_text = text.lines().skip(1).collect::<Vec<_>>().join("\n");
-    let mut source_paths = source_file_paths(graph);
-    let artifacts = graph.list_opaque_artifacts().unwrap_or_default();
-    for artifact in &artifacts {
-        let path = &artifact.file_id.0;
-        if is_test_path(path)
-            || is_docs_or_locale_path(path)
-            || is_vendor_path(path)
-            || is_embedded_framework_noise_path(path)
-        {
-            continue;
-        }
-        if source_paths.contains(path)
-            || is_source_like_artifact_path(path, artifact.mime_type.as_deref())
-        {
-            source_paths.insert(path.clone());
-        }
-    }
+    let source_paths = graph_source_path_set(graph);
     if source_paths.is_empty() {
         return Ok(hits);
     }
 
-    let source_previews: HashMap<String, String> = artifacts
+    let source_previews: HashMap<String, String> = graph
+        .list_opaque_artifacts()
+        .unwrap_or_default()
         .into_iter()
         .filter_map(|artifact| {
             let path = artifact.file_id.0;
@@ -8449,13 +8458,12 @@ fn extract_source_text_signals(
         &source_previews,
         &source_paths,
         cli_flag_query,
-        workspace_root,
     );
     promote_cli_surface_companion_headers_in_source_text(
         &mut hits,
         &path_term_support,
         &source_previews,
-        workspace_root,
+        &source_paths,
     );
 
     Ok(hits)
@@ -8465,11 +8473,8 @@ fn promote_cli_surface_companion_headers_in_source_text(
     hits: &mut HashMap<String, Vec<FileHit>>,
     path_term_support: &HashMap<String, HashSet<String>>,
     source_previews: &HashMap<String, String>,
-    workspace_root: Option<&std::path::Path>,
+    source_paths: &HashSet<String>,
 ) {
-    let Some(workspace_root) = workspace_root else {
-        return;
-    };
     let seed_limit = locate_env_usize("KIN_LOCATE_SOURCE_TEXT_HEADER_SEED_LIMIT", 3);
     let direct_score = locate_env_f32("KIN_LOCATE_SOURCE_TEXT_HEADER_SCORE", 108.0);
     let nested_score = locate_env_f32("KIN_LOCATE_SOURCE_TEXT_HEADER_NESTED_SCORE", 84.0);
@@ -8500,9 +8505,8 @@ fn promote_cli_surface_companion_headers_in_source_text(
     });
     seed_paths.truncate(seed_limit);
 
-    let empty_paths = HashSet::new();
     for (seed, _) in seed_paths {
-        let Some(header_path) = sibling_header_for_cli_surface(&seed, workspace_root) else {
+        let Some(header_path) = sibling_header_for_cli_surface(&seed, source_paths) else {
             continue;
         };
         hits.entry(header_path.clone()).or_default().push(FileHit {
@@ -8513,12 +8517,9 @@ fn promote_cli_surface_companion_headers_in_source_text(
             record_graph_source_gap(&header_path);
             continue;
         };
-        for include_path in extract_local_quoted_include_targets(
-            &header_path,
-            &header_text,
-            &empty_paths,
-            Some(workspace_root),
-        ) {
+        for include_path in
+            extract_local_quoted_include_targets(&header_path, &header_text, source_paths)
+        {
             if is_header_like_path(&include_path) {
                 hits.entry(include_path).or_default().push(FileHit {
                     score: nested_score,
@@ -8535,7 +8536,6 @@ fn promote_local_include_source_hits(
     source_previews: &HashMap<String, String>,
     source_paths: &HashSet<String>,
     cli_flag_query: bool,
-    workspace_root: Option<&std::path::Path>,
 ) {
     if !cli_flag_query || source_previews.is_empty() {
         return;
@@ -8593,9 +8593,7 @@ fn promote_local_include_source_hits(
             continue;
         };
         let score = include_bonus * include_decay.powi(depth as i32);
-        for include_path in
-            extract_local_quoted_include_targets(&path, &preview, source_paths, workspace_root)
-        {
+        for include_path in extract_local_quoted_include_targets(&path, &preview, source_paths) {
             if !is_header_like_path(&include_path) {
                 continue;
             }
@@ -8616,14 +8614,12 @@ fn extract_local_quoted_include_targets(
     path: &str,
     preview: &str,
     source_paths: &HashSet<String>,
-    workspace_root: Option<&std::path::Path>,
 ) -> Vec<String> {
     let include_re = regex::Regex::new(r#"(?m)^\s*#\s*include\s*"([^"]+)""#).unwrap();
     let mut targets = Vec::new();
     let mut seen = HashSet::new();
     for cap in include_re.captures_iter(preview) {
-        let Some(target) = resolve_local_include_path(path, &cap[1], source_paths, workspace_root)
-        else {
+        let Some(target) = resolve_local_include_path(path, &cap[1], source_paths) else {
             continue;
         };
         if seen.insert(target.clone()) {
@@ -8637,7 +8633,6 @@ fn resolve_local_include_path(
     base_path: &str,
     include_path: &str,
     source_paths: &HashSet<String>,
-    workspace_root: Option<&std::path::Path>,
 ) -> Option<String> {
     let normalized_include = normalize_repo_relative_path(include_path)?;
     let mut candidates = Vec::new();
@@ -8649,9 +8644,9 @@ fn resolve_local_include_path(
     }
     candidates.push(normalized_include);
 
-    candidates.into_iter().find(|candidate| {
-        source_paths.contains(candidate) || workspace_source_path_exists(candidate, workspace_root)
-    })
+    candidates
+        .into_iter()
+        .find(|candidate| source_paths.contains(candidate))
 }
 
 fn normalize_repo_relative_path(path: &str) -> Option<String> {
@@ -8792,13 +8787,6 @@ fn graph_derived_candidate_text(graph: &kin_db::InMemoryGraph, path: &str) -> St
 /// reranker effective in scoped mode.
 fn cross_encoder_has_graph_candidates(graph: &kin_db::InMemoryGraph) -> bool {
     graph.artifact_count() > 0
-}
-
-fn workspace_source_path_exists(path: &str, workspace_root: Option<&std::path::Path>) -> bool {
-    let Some(root) = workspace_root else {
-        return false;
-    };
-    root.join(path).is_file()
 }
 
 fn extract_code_snippets(text: &str) -> Vec<String> {
@@ -11801,7 +11789,6 @@ fn semantic_phase_anchor_floors(
     text: &str,
     top_score: f32,
     source_files: &HashSet<String>,
-    workspace_root: Option<&std::path::Path>,
 ) -> Vec<(String, f32)> {
     if top_score <= 0.0 {
         return Vec::new();
@@ -11815,7 +11802,7 @@ fn semantic_phase_anchor_floors(
 
     let mut anchors = Vec::new();
     let mut push_if_present = |path: &str, floor: f32| {
-        if source_files.contains(path) || workspace_source_path_exists(path, workspace_root) {
+        if source_files.contains(path) {
             anchors.push((path.to_string(), floor));
         }
     };
@@ -11878,7 +11865,6 @@ fn rerank_semantic_phase_paths(
     text: &str,
     all_hits: &[HashMap<String, Vec<FileHit>>],
     source_files: &HashSet<String>,
-    workspace_root: Option<&std::path::Path>,
 ) {
     if fused.is_empty() || !is_semantic_phase_query(text) {
         return;
@@ -11958,8 +11944,7 @@ fn rerank_semantic_phase_paths(
         }
     }
 
-    for (path, floor) in semantic_phase_anchor_floors(text, top_score, source_files, workspace_root)
-    {
+    for (path, floor) in semantic_phase_anchor_floors(text, top_score, source_files) {
         if upsert_fused_floor(fused, path, floor) {
             changed = true;
         }
@@ -12124,7 +12109,6 @@ fn rerank_cli_surface_paths(
     text: &str,
     all_hits: &[HashMap<String, Vec<FileHit>>],
     graph: &kin_db::InMemoryGraph,
-    workspace_root: Option<&std::path::Path>,
 ) {
     if fused.is_empty() || !is_cli_surface_query(text) {
         return;
@@ -12294,7 +12278,7 @@ fn rerank_cli_surface_paths(
         }
     }
 
-    if promote_cli_surface_local_headers(fused, top_score, graph, workspace_root) {
+    if promote_cli_surface_local_headers(fused, top_score, graph) {
         changed = true;
     }
 
@@ -12311,11 +12295,7 @@ fn promote_cli_surface_local_headers(
     fused: &mut Vec<(String, f32)>,
     top_score: f32,
     graph: &kin_db::InMemoryGraph,
-    workspace_root: Option<&std::path::Path>,
 ) -> bool {
-    let Some(workspace_root) = workspace_root else {
-        return false;
-    };
     let seed_limit = locate_env_usize("KIN_LOCATE_CLI_HEADER_SEED_LIMIT", 3);
     let direct_floor = top_score * locate_env_f32("KIN_LOCATE_CLI_HEADER_FLOOR", 0.36);
     let nested_floor = top_score * locate_env_f32("KIN_LOCATE_CLI_HEADER_NESTED_FLOOR", 0.28);
@@ -12334,10 +12314,10 @@ fn promote_cli_surface_local_headers(
         return false;
     }
 
-    let empty_paths = HashSet::new();
+    let source_paths = graph_source_path_set(graph);
     let mut changed = false;
     for seed in seed_paths {
-        let Some(header_path) = sibling_header_for_cli_surface(&seed, workspace_root) else {
+        let Some(header_path) = sibling_header_for_cli_surface(&seed, &source_paths) else {
             continue;
         };
         changed |= upsert_fused_floor(fused, header_path.clone(), direct_floor);
@@ -12349,12 +12329,9 @@ fn promote_cli_surface_local_headers(
                 continue;
             }
         };
-        for include_path in extract_local_quoted_include_targets(
-            &header_path,
-            &header_text,
-            &empty_paths,
-            Some(workspace_root),
-        ) {
+        for include_path in
+            extract_local_quoted_include_targets(&header_path, &header_text, &source_paths)
+        {
             if is_header_like_path(&include_path) {
                 changed |= upsert_fused_floor(fused, include_path, nested_floor);
             }
@@ -12364,7 +12341,7 @@ fn promote_cli_surface_local_headers(
     changed
 }
 
-fn sibling_header_for_cli_surface(path: &str, workspace_root: &std::path::Path) -> Option<String> {
+fn sibling_header_for_cli_surface(path: &str, source_paths: &HashSet<String>) -> Option<String> {
     if is_header_like_path(path) {
         return None;
     }
@@ -12375,7 +12352,7 @@ fn sibling_header_for_cli_surface(path: &str, workspace_root: &std::path::Path) 
     [".h", ".hh", ".hpp", ".hxx"]
         .iter()
         .map(|ext| format!("{stem}{ext}"))
-        .find(|candidate| workspace_source_path_exists(candidate, Some(workspace_root)))
+        .find(|candidate| source_paths.contains(candidate))
 }
 
 fn upsert_fused_floor(fused: &mut Vec<(String, f32)>, path: String, floor: f32) -> bool {
@@ -12390,11 +12367,7 @@ fn upsert_fused_floor(fused: &mut Vec<(String, f32)>, path: String, floor: f32) 
     true
 }
 
-fn named_test_source_sibling_path(
-    path: &str,
-    source_files: &HashSet<String>,
-    workspace_root: Option<&std::path::Path>,
-) -> Option<String> {
+fn named_test_source_sibling_path(path: &str, source_files: &HashSet<String>) -> Option<String> {
     let normalized = normalize_repo_relative_path(path)?;
     let (parent, basename) = normalized
         .rsplit_once('/')
@@ -12434,15 +12407,14 @@ fn named_test_source_sibling_path(
         }
     }
 
-    candidates.into_iter().find(|candidate| {
-        source_files.contains(candidate) || workspace_source_path_exists(candidate, workspace_root)
-    })
+    candidates
+        .into_iter()
+        .find(|candidate| source_files.contains(candidate))
 }
 
 fn promote_named_test_source_siblings(
     fused: &mut Vec<(String, f32)>,
     source_files: &HashSet<String>,
-    workspace_root: Option<&std::path::Path>,
 ) {
     if fused.is_empty() {
         return;
@@ -12459,8 +12431,7 @@ fn promote_named_test_source_siblings(
         if !is_test_path(path) {
             continue;
         }
-        let Some(source_path) = named_test_source_sibling_path(path, source_files, workspace_root)
-        else {
+        let Some(source_path) = named_test_source_sibling_path(path, source_files) else {
             continue;
         };
         candidates.push((source_path, *score * promotion_factor));
@@ -12497,28 +12468,20 @@ fn is_source_impl_extension(path: &str) -> bool {
 fn same_stem_source_sibling_path(
     stem_path: &str,
     source_files: &HashSet<String>,
-    workspace_root: Option<&std::path::Path>,
 ) -> Option<String> {
     [".js", ".jsx", ".ts", ".tsx", ".rs", ".py", ".go", ".java"]
         .iter()
         .map(|ext| format!("{stem_path}{ext}"))
-        .find(|candidate| {
-            source_files.contains(candidate)
-                || workspace_source_path_exists(candidate, workspace_root)
-        })
+        .find(|candidate| source_files.contains(candidate))
 }
 
-fn declaration_source_sibling_path(
-    path: &str,
-    source_files: &HashSet<String>,
-    workspace_root: Option<&std::path::Path>,
-) -> Option<String> {
+fn declaration_source_sibling_path(path: &str, source_files: &HashSet<String>) -> Option<String> {
     let normalized = normalize_repo_relative_path(path)?;
     let stem = normalized.strip_suffix(".d.ts")?;
     if stem.ends_with("/index") {
         return None;
     }
-    same_stem_source_sibling_path(stem, source_files, workspace_root)
+    same_stem_source_sibling_path(stem, source_files)
 }
 
 fn is_declaration_heavy_query(text: &str) -> bool {
@@ -12742,9 +12705,7 @@ fn promote_named_source_surfaces(
     let mut candidates: HashMap<String, f32> = HashMap::new();
     if !is_declaration_heavy_query(text) {
         for (path, score) in fused.iter().take(decl_seed_limit.max(1)) {
-            let Some(source_path) =
-                declaration_source_sibling_path(path, source_files, workspace_root)
-            else {
+            let Some(source_path) = declaration_source_sibling_path(path, source_files) else {
                 continue;
             };
             if !is_source_impl_extension(&source_path) {
@@ -15405,6 +15366,193 @@ mod tests {
         );
     }
 
+    #[test]
+    fn graph_sibling_and_include_resolution_keys_on_graph_membership_not_disk() {
+        // Decoy siblings, headers, and include targets exist on disk but are
+        // absent from the graph source-path set. The include and sibling
+        // resolvers are rebased onto graph-owned source paths and no longer
+        // receive a workspace root, so the removed raw filesystem existence
+        // probe can never resurface an on-disk file the graph does not own.
+        let disk = tempfile::TempDir::new().unwrap();
+        for rel in [
+            "programs/tool.h",
+            "config.py",
+            "src/settings.ts",
+            "src/config.h",
+        ] {
+            let abs = disk.path().join(rel);
+            std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+            std::fs::write(&abs, "// on-disk decoy, absent from the graph").unwrap();
+        }
+
+        // Empty graph set: nothing resolves, even though every candidate exists
+        // on disk. Under the old existence probe each of these would have matched.
+        let absent: HashSet<String> = HashSet::new();
+        assert_eq!(
+            sibling_header_for_cli_surface("programs/tool.c", &absent),
+            None
+        );
+        assert_eq!(
+            named_test_source_sibling_path("tests/test_config.py", &absent),
+            None
+        );
+        assert_eq!(same_stem_source_sibling_path("src/settings", &absent), None);
+        assert_eq!(
+            resolve_local_include_path("src/main.c", "config.h", &absent),
+            None
+        );
+
+        // Graph-owned set: resolution is driven purely by graph membership.
+        let owned = HashSet::from([
+            "programs/tool.h".to_string(),
+            "config.py".to_string(),
+            "src/settings.ts".to_string(),
+            "src/config.h".to_string(),
+        ]);
+        assert_eq!(
+            sibling_header_for_cli_surface("programs/tool.c", &owned).as_deref(),
+            Some("programs/tool.h"),
+        );
+        assert_eq!(
+            named_test_source_sibling_path("tests/test_config.py", &owned).as_deref(),
+            Some("config.py"),
+        );
+        assert_eq!(
+            same_stem_source_sibling_path("src/settings", &owned).as_deref(),
+            Some("src/settings.ts"),
+        );
+        assert_eq!(
+            resolve_local_include_path("src/main.c", "config.h", &owned).as_deref(),
+            Some("src/config.h"),
+        );
+
+        drop(disk);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn locate_answer_is_identical_when_workspace_source_files_are_renamed_away() {
+        // A populated graph is the sole authority for locate's ranked answer.
+        // Whether the workspace source files are present on disk, renamed away,
+        // or absent entirely (a scoped daemon session with workspace_root=None),
+        // the ranked file list must be identical: locate no longer consults a
+        // raw filesystem existence probe.
+        let graph = kin_db::InMemoryGraph::new();
+        for entity in [
+            test_entity("parse_config", "src/config.rs", 1, 40),
+            test_entity("load_settings", "src/settings.rs", 1, 30),
+        ] {
+            graph.upsert_entity(&entity).unwrap();
+        }
+        seed_opaque_body(
+            &graph,
+            "src/config.rs",
+            21,
+            "fn parse_config() reads and parses the configuration settings",
+        );
+        seed_opaque_body(
+            &graph,
+            "src/settings.rs",
+            22,
+            "fn load_settings() loads settings from the parsed configuration",
+        );
+        graph.flush_text_index().unwrap();
+
+        let query = "where is parse_config defined";
+
+        // Present: every graph source file on disk, plus on-disk-only decoy
+        // siblings and headers the old probe would have promoted into the answer.
+        let present = tempfile::TempDir::new().unwrap();
+        for rel in [
+            "src/config.rs",
+            "src/settings.rs",
+            "src/config.h",
+            "src/settings.d.ts",
+            "tests/test_config.py",
+        ] {
+            let abs = present.path().join(rel);
+            std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+            std::fs::write(&abs, "// present on disk").unwrap();
+        }
+        // Renamed away: an empty workspace — none of the sources exist on disk.
+        let renamed = tempfile::TempDir::new().unwrap();
+
+        let answer = |root: Option<&std::path::Path>| {
+            run_with_graph_capture_in_workspace(&graph, root, query, false, 10, false)
+                .unwrap()
+                .files
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect::<Vec<_>>()
+        };
+
+        let present_answer = answer(Some(present.path()));
+        let renamed_answer = answer(Some(renamed.path()));
+        let scoped_answer = answer(None);
+
+        assert!(
+            !present_answer.is_empty(),
+            "a populated graph must yield a graph-derived locate answer"
+        );
+        assert_eq!(
+            present_answer, renamed_answer,
+            "locate's ranked answer must not change when workspace source files are renamed away"
+        );
+        assert_eq!(
+            present_answer, scoped_answer,
+            "a scoped (workspace_root=None) locate must match the on-disk answer"
+        );
+    }
+
+    #[test]
+    fn zero_file_search_guard_passes_clean_tree_and_flags_reintroduced_probe() {
+        // The Zero File-Search guard must be load-bearing: it passes on the
+        // current graph-clean answer paths, and fails the moment a raw
+        // filesystem existence probe is reintroduced into an answer module.
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let script = repo_root.join("scripts/zero_file_search_guard.sh");
+        assert!(
+            script.is_file(),
+            "guard script must exist at {}",
+            script.display()
+        );
+
+        let clean = std::process::Command::new("bash")
+            .arg(&script)
+            .arg(&repo_root)
+            .output()
+            .expect("run the guard on the current tree");
+        assert!(
+            clean.status.success(),
+            "guard must pass on the current tree.\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&clean.stdout),
+            String::from_utf8_lossy(&clean.stderr),
+        );
+
+        let poisoned = tempfile::TempDir::new().unwrap();
+        let leak = poisoned
+            .path()
+            .join("crates/kin-cli/src/commands/locate.rs");
+        std::fs::create_dir_all(leak.parent().unwrap()).unwrap();
+        std::fs::write(
+            &leak,
+            "fn workspace_source_path_exists(p: &str, root: &std::path::Path) -> bool {\n    \
+             root.join(p).is_file()\n}\n",
+        )
+        .unwrap();
+        let flagged = std::process::Command::new("bash")
+            .arg(&script)
+            .arg(poisoned.path())
+            .output()
+            .expect("run the guard on the poisoned tree");
+        assert!(
+            !flagged.status.success(),
+            "guard must fail when the raw filesystem existence probe is reintroduced"
+        );
+    }
+
     fn mk_test_role_entity(name: &str, path: &str) -> Entity {
         let mut entity = test_entity(name, path, 1, 10);
         entity.role = EntityRole::Test;
@@ -17947,7 +18095,7 @@ mod tests {
             String::from("astropy/nddata/nddata.py"),
         ]);
 
-        promote_named_test_source_siblings(&mut fused, &source_files, None);
+        promote_named_test_source_siblings(&mut fused, &source_files);
 
         assert_eq!(
             fused[0].0,
@@ -18493,7 +18641,6 @@ mod tests {
         let hits = extract_source_text_signals(
             "Add `JSON_PRIVATE_UNLESS_TESTED` for private members used by tests",
             &graph,
-            None,
         )
         .unwrap();
 
@@ -18872,7 +19019,6 @@ mod tests {
             "Fix return checking in behaviours and constructors. Returns from lambdas should not be treated like constructor returns.",
             &[],
             &source_files,
-            None,
         );
 
         let ranks: HashMap<_, _> = fused
@@ -18907,7 +19053,6 @@ mod tests {
             "Add --size-hint=# option",
             &[],
             &kin_db::InMemoryGraph::new(),
-            None,
         );
 
         let ranks: HashMap<_, _> = fused
@@ -18933,7 +19078,6 @@ mod tests {
             "fix cli issue when providing --help=false.",
             &[],
             &kin_db::InMemoryGraph::new(),
-            None,
         );
 
         let ranks: HashMap<_, _> = fused
@@ -18958,7 +19102,6 @@ mod tests {
             "Add --size-hint=# option",
             &[],
             &kin_db::InMemoryGraph::new(),
-            None,
         );
 
         let ranks: HashMap<_, _> = fused
@@ -19001,7 +19144,6 @@ mod tests {
             "fix branch flag on browse within dir",
             &all_hits,
             &kin_db::InMemoryGraph::new(),
-            None,
         );
 
         let ranks: HashMap<_, _> = fused
@@ -19043,7 +19185,6 @@ mod tests {
             "Add prototype `ZSTD_decodingBufferSize_min()` to the public API",
             &[],
             &kin_db::InMemoryGraph::new(),
-            None,
         );
 
         let ranks: HashMap<_, _> = fused
@@ -20219,7 +20360,6 @@ mod tests {
         let hits = extract_source_text_signals(
             "Fix exit code on JSON parse error\n\nThe `--exit-status` option should distinguish invalid JSON parse errors.",
             &graph,
-            None,
         )
         .unwrap();
 
@@ -20272,7 +20412,6 @@ mod tests {
         let hits = extract_source_text_signals(
             "Implement `_experimental_snapshot/2`\n\nEnable writes with `JQ_ENABLE_SNAPSHOT=1`.",
             &graph,
-            None,
         )
         .unwrap();
 
@@ -20310,7 +20449,6 @@ mod tests {
         let hits = extract_source_text_signals(
             "Implement `_experimental_snapshot/2`\n\nThis builtin performs a dry run by default before writing any data to disk.",
             &graph,
-            None,
         )
         .unwrap();
 
@@ -20348,7 +20486,6 @@ mod tests {
         let hits = extract_source_text_signals(
             "fix cli issue when providing --help=false.\n\nThe help option parser should accept bool flags.",
             &graph,
-            None,
         )
         .unwrap();
 
@@ -20379,7 +20516,6 @@ mod tests {
         let hits = extract_source_text_signals(
             "Fix #3719 : mixing -c, -o and --rm\n\n`-c` disables `--rm`, but only if it's selected.",
             &graph,
-            None,
         )
         .unwrap();
 
@@ -20405,7 +20541,6 @@ mod tests {
         let hits = extract_source_text_signals(
             "Fix #3719 : mixing -c, -o and --rm\n\n`-c` disables `--rm`, but only if it's selected.",
             &graph,
-            None,
         )
         .unwrap();
 
@@ -20458,7 +20593,6 @@ mod tests {
         let hits = extract_source_text_signals(
             "Fix #3719 : mixing -c, -o and --rm\n\n`-c` disables `--rm`, but only if it's selected.",
             &graph,
-            None,
         )
         .unwrap();
 
@@ -20515,7 +20649,6 @@ mod tests {
         let hits = extract_source_text_signals(
             "Fix #3719 : mixing -c, -o and --rm\n\n`-c` disables `--rm`, but only if it's selected.",
             &graph,
-            None,
         )
         .unwrap();
 
