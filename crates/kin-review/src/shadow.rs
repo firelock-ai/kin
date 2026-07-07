@@ -592,7 +592,7 @@ fn collect_changed_entities<G: GraphStore>(
                     start_line,
                     end_line,
                     signature_changed: old.signature != new.signature
-                        && !crate::inline::signature_strengthened_only(
+                        && !crate::inline::signature_runtime_neutral(
                             &old.signature,
                             &new.signature,
                         ),
@@ -869,7 +869,12 @@ fn derive_policy(
                     new.span
                         .as_ref()
                         .map(|span| (span.file.to_string(), span.start_line)),
-                    old.signature != new.signature || old.visibility != new.visibility,
+                    (old.signature != new.signature
+                        && !crate::inline::signature_runtime_neutral(
+                            &old.signature,
+                            &new.signature,
+                        ))
+                        || old.visibility != new.visibility,
                     false,
                 ),
                 EntityChangeKind::Removed(id) => {

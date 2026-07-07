@@ -58,12 +58,14 @@ impl InlineCommentKind {
     }
 }
 
-/// Distinct non-test consumer ENTITIES at or above which a body-only
+/// Distinct non-test consumer ENTITIES at or above which a public body-only
 /// modification (signature and visibility unchanged) emits a consumer-fanout
 /// attention comment. The decision is graph-native — it counts consuming
 /// entities (typed inbound edges), not the files they happen to live in; a body
-/// change reaching a single consumer is ordinary local iteration. The signature
-/// channels own contract-surface changes.
+/// change reaching a single consumer is ordinary local iteration. Private
+/// helper body changes are reported through coverage/evidence context, but do
+/// not gate unless their contract surface changes. The signature channels own
+/// contract-surface changes.
 pub const CONSUMER_FANOUT_THRESHOLD: usize = 2;
 
 /// Qualifiers whose ADDITION strengthens a declaration without invalidating
@@ -107,6 +109,150 @@ pub fn signature_strengthened_only(old: &str, new: &str) -> bool {
     let (old_core, old_quals) = strip(old);
     let (new_core, new_quals) = strip(new);
     old_core == new_core && new_quals > old_quals
+}
+
+/// True when a textual signature delta changes no runtime call contract.
+///
+/// Python type annotations are useful surface information, but adding or
+/// tightening them does not change the callable argument contract at runtime.
+/// The graph still records the changed body/signature text; the review gate just
+/// must not turn annotation-only edits into breaking downstream-risk findings.
+pub fn signature_runtime_neutral(old: &str, new: &str) -> bool {
+    signature_strengthened_only(old, new)
+        || python_runtime_signature_key(old)
+            .zip(python_runtime_signature_key(new))
+            .is_some_and(|(old_key, new_key)| old_key == new_key)
+}
+
+fn python_runtime_signature_key(signature: &str) -> Option<String> {
+    let without_comment = signature.split('#').next().unwrap_or(signature).trim();
+    let def_pos = without_comment.find("def ")?;
+    let after_def = &without_comment[def_pos + 4..];
+    let name_end = after_def.find('(')?;
+    let name = after_def[..name_end].trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let params_start = def_pos + 4 + name_end;
+    let params_end = matching_paren(without_comment, params_start)?;
+    let params = &without_comment[params_start + 1..params_end];
+    let params = split_python_params(params)
+        .into_iter()
+        .map(|param| normalize_python_param(&param))
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(format!("def {name}({params})"))
+}
+
+fn matching_paren(input: &str, open_byte: usize) -> Option<usize> {
+    if input.as_bytes().get(open_byte).copied() != Some(b'(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (idx, ch) in input.char_indices().skip_while(|(idx, _)| *idx < open_byte) {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_python_params(params: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut bracket_depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for ch in params.chars() {
+        if let Some(q) = quote {
+            current.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                current.push(ch);
+            }
+            '[' | '(' | '{' => {
+                bracket_depth += 1;
+                current.push(ch);
+            }
+            ']' | ')' | '}' => {
+                bracket_depth -= 1;
+                current.push(ch);
+            }
+            ',' if bracket_depth == 0 => {
+                parts.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if !current.trim().is_empty() {
+        parts.push(current.trim().to_string());
+    }
+    parts
+}
+
+fn normalize_python_param(param: &str) -> String {
+    let trimmed = param.trim();
+    let (before_default, default) = match top_level_char(trimmed, '=') {
+        Some(idx) => (&trimmed[..idx], Some(&trimmed[idx + 1..])),
+        None => (trimmed, None),
+    };
+    let name = match top_level_char(before_default, ':') {
+        Some(idx) => before_default[..idx].trim(),
+        None => before_default.trim(),
+    };
+    let name = name.split_whitespace().collect::<String>();
+    match default {
+        Some(default) => format!("{name}={}", default.split_whitespace().collect::<String>()),
+        None => name,
+    }
+}
+
+fn top_level_char(input: &str, needle: char) -> Option<usize> {
+    let mut bracket_depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (idx, ch) in input.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '[' | '(' | '{' => bracket_depth += 1,
+            ']' | ')' | '}' => bracket_depth -= 1,
+            _ if ch == needle && bracket_depth == 0 => return Some(idx),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Collect line-level inline comments from a review's diff and impact data.
@@ -231,7 +377,7 @@ fn collect_modified_comments(
     // such qualifiers — remains one.
     if !is_non_contract_surface_role(new.role)
         && old.signature != new.signature
-        && !signature_strengthened_only(&old.signature, &new.signature)
+        && !signature_runtime_neutral(&old.signature, &new.signature)
     {
         comments.push(InlineComment {
             file: span.file.to_string(),
@@ -342,16 +488,19 @@ fn collect_modified_comments(
     }
 
     // Body-only modification with wide consumer fanout. The contract surface
-    // is unchanged, so the breaking channels stay silent, but a behavior
+    // is unchanged, so the breaking channels stay silent, but a public behavior
     // change reaching many distinct non-test consumer entities deserves
     // attention. Graph-known covering tests can absorb weak/ambiguous fanout,
     // so covered body-only changes gate on strong consumers only. Uncovered
-    // body-only changes gate on all graph-native consumer entities: weak
-    // fanout plus no tests is still a review risk. The file list is reported
-    // only as human-readable context.
+    // public body-only changes gate on all graph-native consumer entities:
+    // weak fanout plus no tests is still a review risk. Private helper body
+    // changes remain visible through coverage/evidence findings, but they do
+    // not feed the gate without a signature or visibility surface change.
+    let body_only_fanout_has_enough_shape = new.visibility == Visibility::Public
+        && fanout_gate_consumer_count >= CONSUMER_FANOUT_THRESHOLD;
     if old.signature == new.signature
         && old.visibility == new.visibility
-        && fanout_gate_consumer_count >= CONSUMER_FANOUT_THRESHOLD
+        && body_only_fanout_has_enough_shape
     {
         comments.push(InlineComment {
             file: span.file.to_string(),
@@ -988,6 +1137,30 @@ mod tests {
     }
 
     #[test]
+    fn python_annotation_only_signature_is_runtime_neutral() {
+        assert!(signature_runtime_neutral(
+            "def __init__(self, reprlocation_lines): # List of(reprlocation, lines) tuples",
+            "def __init__(self, reprlocation_lines: Sequence[Tuple[ReprFileLocation, Sequence[str]]])"
+        ));
+        assert!(signature_runtime_neutral(
+            "def toterminal(self, tw)",
+            "def toterminal(self, tw) -> None"
+        ));
+        assert!(signature_runtime_neutral(
+            "def make(self, value = (1, 2), *, flag: bool = True)",
+            "def make(self, value=(1,2), *, flag=True) -> object"
+        ));
+        assert!(!signature_runtime_neutral(
+            "def _makefile(self, ext, args, kwargs, encoding=\"utf-8\")",
+            "def _makefile(self, ext, lines, files, encoding=\"utf-8\")"
+        ));
+        assert!(!signature_runtime_neutral(
+            "class Item(Node, Request)",
+            "class Item(Node)"
+        ));
+    }
+
+    #[test]
     fn strengthened_only_change_emits_no_signature_or_breaking_comment() {
         let old = test_entity_with_span("hot_path", "src/hot.rs", 1, 20);
         let mut new = old.clone();
@@ -1021,6 +1194,52 @@ mod tests {
                 InlineCommentKind::SignatureChange | InlineCommentKind::Breaking
             )),
             "qualifier strengthening must not read as signature change or breaking"
+        );
+    }
+
+    #[test]
+    fn python_annotation_only_change_emits_no_signature_or_breaking_comment() {
+        let mut old = test_entity_with_span(
+            "ReprFailDoctest.toterminal",
+            "src/_pytest/doctest.py",
+            122,
+            126,
+        );
+        old.signature = "def toterminal(self, tw)".to_string();
+        let mut new = old.clone();
+        new.signature = "def toterminal(self, tw) -> None".to_string();
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 5,
+                strong_consumer_count: 5,
+                contract_consumer_count: 0,
+                consumer_files: vec![
+                    "src/_pytest/doctest.py".to_string(),
+                    "testing/test_doctest.py".to_string(),
+                ],
+                covering_tests: 0,
+            }],
+            ..Default::default()
+        };
+        let comments = collect_inline_comments(&diff, &impact);
+        assert!(
+            !comments.iter().any(|c| matches!(
+                c.kind,
+                InlineCommentKind::SignatureChange | InlineCommentKind::Breaking
+            )),
+            "annotation-only Python changes must not read as runtime contract changes: {comments:?}"
         );
     }
 
@@ -1098,6 +1317,50 @@ mod tests {
         assert!(fanout[0]
             .message
             .contains("2 distinct non-test consumer(s) across 1 file(s)"));
+    }
+
+    #[test]
+    fn private_body_only_consumer_fanout_does_not_gate() {
+        let mut old = test_entity_with_span(
+            "_getconftestmodules",
+            "src/_pytest/config/__init__.py",
+            399,
+            422,
+        );
+        old.visibility = Visibility::Private;
+        let new = old.clone();
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 4,
+                strong_consumer_count: 2,
+                contract_consumer_count: 0,
+                consumer_files: vec![
+                    "src/_pytest/config/__init__.py".to_string(),
+                    "testing/test_conftest.py".to_string(),
+                ],
+                covering_tests: 0,
+            }],
+            ..Default::default()
+        };
+        let comments = collect_inline_comments(&diff, &impact);
+        assert!(
+            !comments
+                .iter()
+                .any(|c| c.kind == InlineCommentKind::ConsumerFanout),
+            "private helper body-only fanout must stay visible as context, not gate: {comments:?}"
+        );
     }
 
     #[test]

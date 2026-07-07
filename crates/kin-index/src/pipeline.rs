@@ -611,36 +611,53 @@ pub fn entity_semantics_changed(old: &Entity, new: &Entity) -> bool {
         || contract_changed
 }
 
+/// Whether a single path component names a test directory: one of its
+/// `[_-.]`-delimited words is an exact test keyword. Word-level matching (never a
+/// raw substring) keeps a testing tool's shipped product package — `_pytest`,
+/// `pytest`, `contest`, `latest` — out of the test role, while still catching
+/// compound test dirs such as `unit_tests`, `acceptance_test`, and `__tests__`.
+fn is_test_dir_component(component: &str) -> bool {
+    const TEST_DIR_WORDS: [&str; 5] = ["test", "tests", "testing", "spec", "specs"];
+    component
+        .split(['_', '-', '.'])
+        .any(|word| TEST_DIR_WORDS.contains(&word))
+}
+
 /// Classify a file path into an [`EntityRole`] based on directory and filename patterns.
 ///
 /// Entities from the same file share the same role. The classifier checks path
 /// components against well-known patterns (test dirs, vendor dirs, docs, generated
 /// markers) and falls back to `Source` for everything else.
+///
+/// Test-directory detection matches whole path components (via
+/// [`is_test_dir_component`]) rather than raw substrings, so a testing tool's own
+/// product package — e.g. pytest's `_pytest/` — classifies as source and keeps its
+/// signature/breaking changes on the contract surface. A repo's actual test tree
+/// (`tests/`, `__tests__/`, or any `test_*`/`*_test` file) still resolves to the
+/// test role.
 pub fn classify_file_role(path: &str) -> EntityRole {
     let lower = path.to_ascii_lowercase();
+    let components: Vec<&str> = lower.split('/').filter(|c| !c.is_empty()).collect();
+    let file_name = components.last().copied().unwrap_or("");
+    let dir_len = components.len().saturating_sub(1);
 
-    // Test paths
-    let test_markers = [
-        "test/",
-        "tests/",
-        "/test/",
-        "/tests/",
-        "/test_",
-        "/_test",
-        "/spec/",
-        "/specs/",
-        "__tests__",
-    ];
-    if test_markers.iter().any(|m| lower.contains(m))
-        || lower.ends_with("_test.py")
-        || lower.ends_with("_test.rs")
-        || lower.ends_with("_test.go")
-        || lower.ends_with(".test.ts")
-        || lower.ends_with(".test.js")
-        || lower.ends_with(".spec.ts")
-        || lower.ends_with(".spec.js")
-        || lower.contains("/test_")
-    {
+    // Test paths. A directory is a test tree only when one of its words is an
+    // exact test keyword (component match, never a substring), so `_pytest/` and
+    // peers are not swept in. Test *files* are recognized by filename convention
+    // regardless of the directory they live in.
+    let in_test_dir = components
+        .iter()
+        .take(dir_len)
+        .any(|c| is_test_dir_component(c));
+    let is_test_file = file_name.starts_with("test_")
+        || file_name.ends_with("_test.py")
+        || file_name.ends_with("_test.rs")
+        || file_name.ends_with("_test.go")
+        || file_name.ends_with(".test.ts")
+        || file_name.ends_with(".test.js")
+        || file_name.ends_with(".spec.ts")
+        || file_name.ends_with(".spec.js");
+    if in_test_dir || is_test_file {
         return EntityRole::Test;
     }
 
@@ -886,6 +903,62 @@ mod tests {
             classify_file_role("__tests__/App.test.ts"),
             EntityRole::Test
         );
+    }
+
+    /// A testing tool ships product code whose package name embeds "test"
+    /// (pytest's `_pytest/`). That code is the framework's own public API — its
+    /// signature/breaking changes are a contract surface — so it must classify
+    /// as source, never test, even though a naive substring match on "test/"
+    /// would sweep it into the test role and suppress those findings. The tool's
+    /// actual test tree (`testing/`) still classifies as test.
+    #[test]
+    fn classify_test_named_product_package_as_source() {
+        // pytest's shipped product package, in both `src/` layout and bare form.
+        assert_eq!(
+            classify_file_role("src/_pytest/python.py"),
+            EntityRole::Source
+        );
+        assert_eq!(classify_file_role("_pytest/main.py"), EntityRole::Source);
+        assert_eq!(classify_file_role("_pytest/nodes.py"), EntityRole::Source);
+        assert_eq!(
+            classify_file_role("src/_pytest/__init__.py"),
+            EntityRole::Source
+        );
+        assert_eq!(
+            classify_file_role("src/pytest/__init__.py"),
+            EntityRole::Source
+        );
+        // Other product packages whose names merely embed a test keyword.
+        assert_eq!(
+            classify_file_role("src/contest/round.py"),
+            EntityRole::Source
+        );
+        assert_eq!(classify_file_role("latest/release.rs"), EntityRole::Source);
+
+        // pytest's own test tree stays test-role: a `test_*` file is a test
+        // wherever it lives, and compound / underscore-prefixed test dirs still
+        // resolve to a `test` word.
+        assert_eq!(
+            classify_file_role("testing/test_collection.py"),
+            EntityRole::Test
+        );
+        assert_eq!(
+            classify_file_role("integration_tests/api.py"),
+            EntityRole::Test
+        );
+        assert_eq!(
+            classify_file_role("acceptance_test/flow.py"),
+            EntityRole::Test
+        );
+        assert_eq!(classify_file_role("_tests/helper.py"), EntityRole::Test);
+        // A bare helper in a `testing/` tree is still test infrastructure even
+        // without a `test_*` filename — `testing` is a test word, while
+        // `_pytest`/`contest`/`latest` embed `test` only as a substring.
+        assert_eq!(
+            classify_file_role("testing/util_helper.py"),
+            EntityRole::Test
+        );
+        assert_eq!(classify_file_role("testing/conftest.py"), EntityRole::Test);
     }
 
     #[test]
