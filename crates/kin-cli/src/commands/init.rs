@@ -22,6 +22,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// Discovery cap for `kin init`. When more than this many indexable files are
@@ -1198,10 +1199,33 @@ fn first_parent_topological_order(first_parent_index: &[Option<usize>]) -> Vec<u
     order
 }
 
+/// Pre-reconciliation parse payload memoized per `(blob_hash,
+/// PARSER_SEMANTICS_VERSION)` for one hydration pass. Holds exactly the fields
+/// the replay consumes between the parse and commit-relative entity
+/// reconciliation; reconciliation itself is deliberately excluded because it
+/// re-keys entity ids per commit. Shared via `Arc` so a blob recurring across
+/// commits reuses one allocation instead of re-parsing.
+struct CachedParse {
+    entities: Vec<Entity>,
+    extracted_relations: Vec<kin_parser::ExtractedRelation>,
+    imports: Vec<kin_parser::FileImport>,
+}
+
 pub(crate) fn enrich_imported_changes_with_semantics(
     imported: &mut [kin_git::ImportedChange],
     blob_store: &kin_blobs::BlobStore,
 ) -> Result<()> {
+    enrich_imported_changes_with_semantics_inner(imported, blob_store, true).map(|_| ())
+}
+
+/// Replay body shared by production (`parse_memo_enabled = true`) and the
+/// memo-off serial oracle used in tests. Returns `(parse_memo_hits,
+/// parse_memo_misses)` observed over the pass.
+fn enrich_imported_changes_with_semantics_inner(
+    imported: &mut [kin_git::ImportedChange],
+    blob_store: &kin_blobs::BlobStore,
+    parse_memo_enabled: bool,
+) -> Result<(usize, usize)> {
     let pipeline = kin_index::IndexPipeline::new();
 
     // Profiling timers (accumulated across every commit in the pass).
@@ -1209,6 +1233,13 @@ pub(crate) fn enrich_imported_changes_with_semantics(
     let mut total_parsing_time = std::time::Duration::ZERO;
     let mut total_linking_time = std::time::Duration::ZERO;
     let mut total_closure_diffing_time = std::time::Duration::ZERO;
+
+    // Parse memo (per-pass lifetime; the replay loop is single-threaded, so a
+    // plain HashMap is sound and deterministic). Bounds live memory to the
+    // pass's distinct source blobs.
+    let mut parse_memo: HashMap<(kin_blobs::Hash256, u32), Arc<CachedParse>> = HashMap::new();
+    let mut parse_memo_hits = 0usize;
+    let mut parse_memo_misses = 0usize;
 
     let total_commits = imported.len();
     let start_time = std::time::Instant::now();
@@ -1328,62 +1359,98 @@ pub(crate) fn enrich_imported_changes_with_semantics(
                 continue;
             };
 
-            let file_id = FilePathId::new(&file_path);
             let blob_hash = kin_blobs::Hash256::from_bytes(*new_hash.as_bytes());
 
-            let blob_start_time = std::time::Instant::now();
-            let content = match blob_store.read(&blob_hash) {
-                Ok(content) => {
-                    total_blob_read_time += blob_start_time.elapsed();
-                    content
-                }
-                Err(err) => {
-                    total_blob_read_time += blob_start_time.elapsed();
-                    warn!(
-                        file = %file_path,
-                        hash = %new_hash,
-                        error = %err,
-                        "skipping semantic enrichment for imported blob with missing content"
-                    );
-                    if remove_imported_file_semantic_state(
-                        &file_path,
-                        old_state,
-                        &mut current_files,
-                        &mut entity_deltas,
-                    ) {
-                        changed_source_files.insert(file_path.clone());
-                        incremental_linker.remove_file(&file_path);
-                    }
-                    continue;
-                }
+            // Consult the per-pass parse memo before touching the blob store or
+            // the parser. A blob hash uniquely determines the file bytes, and a
+            // parse is a pure function of (bytes, parser semantics), so the same
+            // file version recurring across commits — git blobs dedup across
+            // history — is read and parsed once. The parser-semantics version is
+            // part of the key so a grammar/extractor upgrade never serves a stale
+            // parse.
+            let memo_key = (blob_hash, kin_parser::PARSER_SEMANTICS_VERSION);
+            let memoized = if parse_memo_enabled {
+                parse_memo.get(&memo_key).cloned()
+            } else {
+                None
             };
-
-            let parse_start_time = std::time::Instant::now();
-            let indexed = match pipeline
-                .index_file_content_with_tests(&file_id, &content, blob_hash)
-            {
-                Ok(indexed) => {
-                    total_parsing_time += parse_start_time.elapsed();
-                    indexed
+            let parsed = match memoized {
+                Some(hit) => {
+                    parse_memo_hits += 1;
+                    hit
                 }
-                Err(err) => {
-                    total_parsing_time += parse_start_time.elapsed();
-                    warn!(
-                        file = %file_path,
-                        hash = %new_hash,
-                        error = %err,
-                        "skipping semantic enrichment for imported source blob that could not be parsed"
-                    );
-                    if remove_imported_file_semantic_state(
-                        &file_path,
-                        old_state,
-                        &mut current_files,
-                        &mut entity_deltas,
-                    ) {
-                        changed_source_files.insert(file_path.clone());
-                        incremental_linker.remove_file(&file_path);
+                None => {
+                    parse_memo_misses += 1;
+
+                    let blob_start_time = std::time::Instant::now();
+                    let content = match blob_store.read(&blob_hash) {
+                        Ok(content) => {
+                            total_blob_read_time += blob_start_time.elapsed();
+                            content
+                        }
+                        Err(err) => {
+                            total_blob_read_time += blob_start_time.elapsed();
+                            warn!(
+                                file = %file_path,
+                                hash = %new_hash,
+                                error = %err,
+                                "skipping semantic enrichment for imported blob with missing content"
+                            );
+                            if remove_imported_file_semantic_state(
+                                &file_path,
+                                old_state,
+                                &mut current_files,
+                                &mut entity_deltas,
+                            ) {
+                                changed_source_files.insert(file_path.clone());
+                                incremental_linker.remove_file(&file_path);
+                            }
+                            continue;
+                        }
+                    };
+
+                    let file_id = FilePathId::new(&file_path);
+                    let parse_start_time = std::time::Instant::now();
+                    let indexed = match pipeline
+                        .index_file_content_with_tests(&file_id, &content, blob_hash)
+                    {
+                        Ok(indexed) => {
+                            total_parsing_time += parse_start_time.elapsed();
+                            indexed
+                        }
+                        Err(err) => {
+                            total_parsing_time += parse_start_time.elapsed();
+                            warn!(
+                                file = %file_path,
+                                hash = %new_hash,
+                                error = %err,
+                                "skipping semantic enrichment for imported source blob that could not be parsed"
+                            );
+                            if remove_imported_file_semantic_state(
+                                &file_path,
+                                old_state,
+                                &mut current_files,
+                                &mut entity_deltas,
+                            ) {
+                                changed_source_files.insert(file_path.clone());
+                                incremental_linker.remove_file(&file_path);
+                            }
+                            continue;
+                        }
+                    };
+
+                    // Cache the pre-reconciliation payload only. Entity-id
+                    // reconciliation below is commit-relative and must run per
+                    // commit, so it is deliberately kept outside the memo.
+                    let parsed = Arc::new(CachedParse {
+                        entities: indexed.indexed_file.entities,
+                        extracted_relations: indexed.indexed_file.extracted_relations,
+                        imports: indexed.indexed_file.imports,
+                    });
+                    if parse_memo_enabled {
+                        parse_memo.insert(memo_key, Arc::clone(&parsed));
                     }
-                    continue;
+                    parsed
                 }
             };
 
@@ -1391,8 +1458,11 @@ pub(crate) fn enrich_imported_changes_with_semantics(
                 .as_ref()
                 .map(|state| state.entities.as_slice())
                 .unwrap_or(&[]);
+            // Reconcile borrows the shared parse output and clones only the
+            // entities it stabilizes, so a memo hit never deep-clones the entire
+            // entity vector.
             let (file_entity_deltas, stabilized_entities) =
-                reconcile_imported_file_entities(old_entities, indexed.indexed_file.entities);
+                reconcile_imported_file_entities(old_entities, &parsed.entities);
             entity_deltas.extend(file_entity_deltas);
 
             incremental_linker.add_file(&file_path, &stabilized_entities);
@@ -1402,8 +1472,8 @@ pub(crate) fn enrich_imported_changes_with_semantics(
                 ImportedSemanticFileState {
                     file_path: file_path.clone(),
                     entities: stabilized_entities,
-                    relations: indexed.indexed_file.extracted_relations,
-                    imports: indexed.indexed_file.imports,
+                    relations: parsed.extracted_relations.clone(),
+                    imports: parsed.imports.clone(),
                 },
             );
             changed_source_files.insert(file_path);
@@ -1571,12 +1641,14 @@ pub(crate) fn enrich_imported_changes_with_semantics(
                     total_parsing_time.as_secs_f64(),
                     total_linking_time.as_secs_f64(),
                     total_closure_diffing_time.as_secs_f64(),
+                    parse_memo_hits,
+                    parse_memo_misses,
                 )
             );
         }
     }
 
-    Ok(())
+    Ok((parse_memo_hits, parse_memo_misses))
 }
 
 /// One machine-readable record of the history-hydration replay profile, emitted
@@ -1601,6 +1673,10 @@ struct HydrateStageTimings {
     closure_diffing_s: f64,
     /// Wall-clock residue not attributed to any of the four buckets above.
     other_s: f64,
+    /// Blob parses served from the per-pass parse memo (recurring file versions).
+    parse_memo_hits: usize,
+    /// Blob parses that missed the memo and ran the parser.
+    parse_memo_misses: usize,
 }
 
 /// Outer envelope so the record serializes as `{"kin_hydrate_stage_timings":{…}}`.
@@ -1629,6 +1705,7 @@ fn hydrate_stage_timings_enabled() -> bool {
 /// `total_s`, surfaced explicitly rather than folded into a bucket so a consumer
 /// can always recover unattributed time. Pure (no env or clock reads) so the
 /// emitted shape is unit-testable.
+#[allow(clippy::too_many_arguments)]
 fn hydrate_stage_timings_json(
     total_commits: usize,
     total_s: f64,
@@ -1636,6 +1713,8 @@ fn hydrate_stage_timings_json(
     parsing_s: f64,
     linking_s: f64,
     closure_diffing_s: f64,
+    parse_memo_hits: usize,
+    parse_memo_misses: usize,
 ) -> String {
     // Guard the divide so a zero wall never yields NaN/Infinity (serde renders
     // those as `null`, which would break the "always a parseable number"
@@ -1656,6 +1735,8 @@ fn hydrate_stage_timings_json(
             linking_s,
             closure_diffing_s,
             other_s,
+            parse_memo_hits,
+            parse_memo_misses,
         },
     };
     // Only finite f64s reach here, so serialization cannot fail; fall back to an
@@ -1841,13 +1922,13 @@ pub(crate) fn entity_fingerprint_changed(old: &Entity, new: &Entity) -> bool {
 
 fn reconcile_imported_file_entities(
     old_entities: &[Entity],
-    parsed_entities: Vec<Entity>,
+    parsed_entities: &[Entity],
 ) -> (Vec<EntityDelta>, Vec<Entity>) {
     let mut entity_deltas = Vec::new();
     let mut current_entities = Vec::new();
     let mut matched_old_entities = HashSet::<EntityId>::new();
 
-    for mut parsed_entity in parsed_entities {
+    for parsed_entity in parsed_entities {
         let existing = old_entities
             .iter()
             .filter(|candidate| !matched_old_entities.contains(&candidate.id))
@@ -1865,14 +1946,18 @@ fn reconcile_imported_file_entities(
             });
 
         match existing {
-            Some(old) if entity_fingerprint_changed(old, &parsed_entity) => {
-                parsed_entity.id = old.id;
+            Some(old) if entity_fingerprint_changed(old, parsed_entity) => {
+                // Re-key the parser-assigned id onto the stable existing id for
+                // this commit. The parse output is shared across commits through
+                // the memo, so clone rather than mutate the borrowed entity.
+                let mut stabilized = parsed_entity.clone();
+                stabilized.id = old.id;
                 matched_old_entities.insert(old.id);
                 entity_deltas.push(EntityDelta::Modified {
                     old: old.clone(),
-                    new: parsed_entity.clone(),
+                    new: stabilized.clone(),
                 });
-                current_entities.push(parsed_entity);
+                current_entities.push(stabilized);
             }
             Some(old) => {
                 matched_old_entities.insert(old.id);
@@ -1880,7 +1965,7 @@ fn reconcile_imported_file_entities(
             }
             None => {
                 entity_deltas.push(EntityDelta::Added(parsed_entity.clone()));
-                current_entities.push(parsed_entity);
+                current_entities.push(parsed_entity.clone());
             }
         }
     }
@@ -3953,8 +4038,10 @@ mod tests {
 
     #[test]
     fn hydrate_stage_timings_json_is_parseable_with_explicit_residue() {
-        // Representative pass: the four buckets leave a non-trivial residue.
-        let line = hydrate_stage_timings_json(32865, 1933.4, 42.5, 261.9, 954.7, 641.2);
+        // Representative pass: the four buckets leave a non-trivial residue, and
+        // most parses were served from the memo.
+        let line =
+            hydrate_stage_timings_json(32865, 1933.4, 42.5, 261.9, 954.7, 641.2, 30000, 2865);
 
         let value: serde_json::Value =
             serde_json::from_str(&line).expect("emitted line must be parseable JSON");
@@ -3975,6 +4062,10 @@ mod tests {
         ] {
             assert!(obj[key].is_f64(), "{key} must serialize as a JSON float");
         }
+
+        // Memo counters are integers carried alongside the timings.
+        assert_eq!(obj["parse_memo_hits"].as_u64(), Some(30000));
+        assert_eq!(obj["parse_memo_misses"].as_u64(), Some(2865));
 
         let total_s = obj["total_s"].as_f64().unwrap();
         let blob = obj["blob_read_s"].as_f64().unwrap();
@@ -4009,6 +4100,8 @@ mod tests {
             "linking_s",
             "closure_diffing_s",
             "other_s",
+            "parse_memo_hits",
+            "parse_memo_misses",
         ];
         let mut cursor = 0usize;
         for key in order {
@@ -4024,13 +4117,15 @@ mod tests {
     fn hydrate_stage_timings_json_guards_zero_wall() {
         // A zero wall must not emit NaN/Infinity (serde renders those as null);
         // commits_per_s falls back to 0.0 and stays a parseable number.
-        let line = hydrate_stage_timings_json(10, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let line = hydrate_stage_timings_json(10, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0);
         let value: serde_json::Value =
             serde_json::from_str(&line).expect("emitted line must be parseable JSON");
         let obj = &value["kin_hydrate_stage_timings"];
         assert!(obj["commits_per_s"].is_f64());
         assert_eq!(obj["commits_per_s"].as_f64(), Some(0.0));
         assert_eq!(obj["other_s"].as_f64(), Some(0.0));
+        assert_eq!(obj["parse_memo_hits"].as_u64(), Some(0));
+        assert_eq!(obj["parse_memo_misses"].as_u64(), Some(0));
     }
 
     #[test]
@@ -4223,6 +4318,165 @@ mod tests {
             entity_fingerprint_changed(old, new),
             "modified imported entity should record a semantic fingerprint change"
         );
+    }
+
+    /// Canonical, key-order-insensitive JSON so two structurally identical values
+    /// compare equal regardless of `HashMap` iteration order. Entity metadata
+    /// (`extra`) is a `HashMap`, and this workspace builds serde_json with
+    /// `preserve_order`, so a freshly parsed map and a cloned map can serialize
+    /// their keys in different orders while being semantically identical.
+    fn canonical_json<T: serde::Serialize>(value: &T) -> String {
+        fn sort(value: serde_json::Value) -> serde_json::Value {
+            match value {
+                serde_json::Value::Object(map) => serde_json::Value::Object(
+                    map.into_iter()
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                        .into_iter()
+                        .map(|(key, val)| (key, sort(val)))
+                        .collect(),
+                ),
+                serde_json::Value::Array(items) => {
+                    serde_json::Value::Array(items.into_iter().map(sort).collect())
+                }
+                other => other,
+            }
+        }
+        serde_json::to_string(&sort(
+            serde_json::to_value(value).expect("value must serialize"),
+        ))
+        .expect("canonical json must serialize")
+    }
+
+    #[test]
+    fn parse_memo_hit_shares_arc_and_version_participates_in_key() {
+        let blob = kin_blobs::Hash256::from_bytes([0x42; 32]);
+        let mut memo: HashMap<(kin_blobs::Hash256, u32), Arc<CachedParse>> = HashMap::new();
+        let payload = Arc::new(CachedParse {
+            entities: Vec::new(),
+            extracted_relations: Vec::new(),
+            imports: Vec::new(),
+        });
+        memo.insert(
+            (blob, kin_parser::PARSER_SEMANTICS_VERSION),
+            Arc::clone(&payload),
+        );
+
+        // Same (blob, version): a hit hands back the SAME allocation, not a clone.
+        let hit = memo
+            .get(&(blob, kin_parser::PARSER_SEMANTICS_VERSION))
+            .expect("same key must hit");
+        assert!(
+            Arc::ptr_eq(hit, &payload),
+            "a memo hit must share the cached Arc rather than deep-clone the payload"
+        );
+
+        // Same blob, a bumped parser-semantics version: miss. A grammar or
+        // extractor upgrade can therefore never serve a stale parse.
+        assert!(
+            !memo.contains_key(&(blob, kin_parser::PARSER_SEMANTICS_VERSION.wrapping_add(1))),
+            "a parser-semantics version change must key to a different (missing) entry"
+        );
+
+        // Different blob, same version: miss.
+        let other_blob = kin_blobs::Hash256::from_bytes([0x43; 32]);
+        assert!(
+            !memo.contains_key(&(other_blob, kin_parser::PARSER_SEMANTICS_VERSION)),
+            "a different blob must not collide with the cached entry"
+        );
+    }
+
+    #[test]
+    fn parse_memo_matches_unmemoized_reconciliation_across_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+
+        // A file whose commit-3 content reverts to its commit-1 bytes. The
+        // reverted blob is parsed once (commit 1) then served from the memo
+        // (commit 3), yet commit 3's reconciliation still runs against commit 2's
+        // state — the commit-relative step the memo must NOT short-circuit.
+        let v1 = blob_store
+            .write(b"def handler():\n    return 1\n\n\ndef helper():\n    return 2\n")
+            .unwrap();
+        let v2 = blob_store
+            .write(b"def handler(value):\n    return value\n")
+            .unwrap();
+
+        let fixture = || {
+            vec![
+                imported_change(
+                    [0x31; 32],
+                    [0x30; 32],
+                    "add module",
+                    vec![artifact_delta(
+                        "src/mod.py",
+                        kin_model::ArtifactDeltaKind::Added,
+                        None,
+                        Some(Hash256::from_bytes(v1.0)),
+                    )],
+                ),
+                imported_change(
+                    [0x32; 32],
+                    [0x31; 32],
+                    "shrink module",
+                    vec![artifact_delta(
+                        "src/mod.py",
+                        kin_model::ArtifactDeltaKind::Modified,
+                        Some(Hash256::from_bytes(v1.0)),
+                        Some(Hash256::from_bytes(v2.0)),
+                    )],
+                ),
+                imported_change(
+                    [0x33; 32],
+                    [0x32; 32],
+                    "revert module",
+                    vec![artifact_delta(
+                        "src/mod.py",
+                        kin_model::ArtifactDeltaKind::Modified,
+                        Some(Hash256::from_bytes(v2.0)),
+                        Some(Hash256::from_bytes(v1.0)),
+                    )],
+                ),
+            ]
+        };
+
+        // Oracle: memo disabled — every source-blob appearance re-parses.
+        let mut oracle = fixture();
+        let (oracle_hits, oracle_misses) =
+            enrich_imported_changes_with_semantics_inner(&mut oracle, &blob_store, false).unwrap();
+        assert_eq!(oracle_hits, 0, "memo-off must never report a hit");
+        assert_eq!(
+            oracle_misses, 3,
+            "memo-off must parse every source-blob appearance"
+        );
+
+        // Memoized: the reverted blob is parsed once and reused.
+        let mut memoized = fixture();
+        let (memo_hits, memo_misses) =
+            enrich_imported_changes_with_semantics_inner(&mut memoized, &blob_store, true).unwrap();
+        assert_eq!(
+            memo_hits, 1,
+            "the reverted commit-3 blob must be served from the memo"
+        );
+        assert_eq!(
+            memo_misses, 2,
+            "only the two distinct blob versions are parsed"
+        );
+
+        // Bit-identity: memo-on and memo-off produce identical entity and
+        // relation deltas for every commit.
+        assert_eq!(oracle.len(), memoized.len());
+        for (i, (oracle_change, memo_change)) in oracle.iter().zip(memoized.iter()).enumerate() {
+            assert_eq!(
+                canonical_json(&oracle_change.change.entity_deltas),
+                canonical_json(&memo_change.change.entity_deltas),
+                "entity_deltas diverged at commit {i}"
+            );
+            assert_eq!(
+                canonical_json(&oracle_change.change.relation_deltas),
+                canonical_json(&memo_change.change.relation_deltas),
+                "relation_deltas diverged at commit {i}"
+            );
+        }
     }
 
     #[test]
