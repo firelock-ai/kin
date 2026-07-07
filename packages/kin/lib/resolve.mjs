@@ -34,6 +34,73 @@ export function targetKinVersion() {
 }
 
 /**
+ * Compare two dotted version strings by semver precedence: numeric release
+ * segments first, then any `-prerelease` suffix (a release outranks its own
+ * prerelease; prerelease identifiers compare numerically when both sides are
+ * numeric, else lexically; on an equal shared prefix, fewer identifiers ranks
+ * lower). Mirrors the precedence `kin update` applies on the native side
+ * (crates/kin-cli/src/commands/update.rs). Returns -1 when `a` is older than
+ * `b`, 0 when equal, 1 when `a` is newer than `b`. Non-numeric release
+ * segments parse as 0 rather than throwing, so a malformed string degrades to
+ * a comparison instead of crashing the launcher.
+ */
+export function compareVersions(a, b) {
+  const [aCore, aPre] = splitVersion(a);
+  const [bCore, bPre] = splitVersion(b);
+  const core = compareNumericParts(aCore, bCore);
+  return core !== 0 ? core : comparePrereleaseParts(aPre, bPre);
+}
+
+function splitVersion(version) {
+  const trimmed = String(version).trim().replace(/^v/, '');
+  const dash = trimmed.indexOf('-');
+  const core = dash === -1 ? trimmed : trimmed.slice(0, dash);
+  const pre = dash === -1 ? null : trimmed.slice(dash + 1).split('.');
+  const nums = core.split('.').map((part) => {
+    const n = Number.parseInt(part, 10);
+    return Number.isFinite(n) ? n : 0;
+  });
+  return [nums, pre];
+}
+
+function compareNumericParts(a, b) {
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len; i += 1) {
+    const x = a[i] ?? 0;
+    const y = b[i] ?? 0;
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
+function comparePrereleaseParts(a, b) {
+  if (a === null && b === null) return 0;
+  if (a === null) return 1; // a released version outranks its own prerelease
+  if (b === null) return -1;
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len; i += 1) {
+    if (i >= a.length) return -1; // shared prefix equal, fewer identifiers ranks lower
+    if (i >= b.length) return 1;
+    const cmp = comparePrereleaseIdentifier(a[i], b[i]);
+    if (cmp !== 0) return cmp;
+  }
+  return 0;
+}
+
+function comparePrereleaseIdentifier(a, b) {
+  const aNumeric = /^\d+$/.test(a);
+  const bNumeric = /^\d+$/.test(b);
+  if (aNumeric && bNumeric) {
+    const x = Number.parseInt(a, 10);
+    const y = Number.parseInt(b, 10);
+    return x === y ? 0 : x < y ? -1 : 1;
+  }
+  if (aNumeric) return -1; // numeric identifiers rank below alphanumeric
+  if (bNumeric) return 1;
+  return a === b ? 0 : a < b ? -1 : 1;
+}
+
+/**
  * Map a Node platform+arch pair to the Rust target triple of the managed
  * binary. Pure and injectable so it is testable for every supported host.
  */

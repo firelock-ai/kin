@@ -20,6 +20,7 @@ import { spawnSync } from 'node:child_process';
 
 import {
   binaryName,
+  compareVersions,
   kinHome,
   managedBinaryPath,
   readLauncherStamp,
@@ -196,16 +197,26 @@ export function probeBinaryVersion(binary, spawnImpl = spawnSync) {
  * Ensure the managed `kin` binary matching this launcher's pinned release is
  * present, provisioning (or re-provisioning) when needed. Returns the binary
  * path, or null when nothing usable exists and provisioning is unavailable.
+ * Throws when an installed release outranks the pin and the caller has not
+ * opted into a downgrade — this function never returns a value while quietly
+ * declining to honor the pin.
  *
  * Policy, in order:
  *   - $KIN_MANAGED_BIN is an explicit user pin: use it as-is, never provision.
  *   - $KIN_NO_PROVISION=1: resolve-only, no network.
- *   - launcher stamp == target and the binary exists: run it (no probe cost).
- *   - stamp differs or binary missing: provision the pinned release.
- *   - no stamp but a binary exists (foreign install, e.g. install.sh): probe
- *     its version; adopt on match. On mismatch respect the foreign install —
- *     run it with a one-line notice — unless $KIN_LAUNCHER_ADOPT=1 opts into
- *     re-provisioning. Never silently downgrade someone else's install.
+ *   - $KIN_LAUNCHER_ADOPT=1: always (re-)provision the pinned release,
+ *     regardless of what is already installed.
+ *   - nothing installed yet: provision the pinned release.
+ *   - installed version is known — from the launcher stamp when this package
+ *     provisioned it (no probe needed), otherwise by probing a foreign
+ *     install's `--version` once:
+ *       - installed == pinned: reuse it (a foreign match adopts the stamp).
+ *       - installed < pinned: the pin is an upgrade — provision it
+ *         automatically with a one-line notice. Never a silent no-op.
+ *       - installed > pinned: the pin would downgrade a newer install — fail
+ *         loud with an actionable message instead of running anything.
+ *   - installed version unparseable (foreign binary that will not report a
+ *     version): can't prove direction, so respect it — notice and reuse.
  */
 export async function ensureProvisioned(opts = {}) {
   const {
@@ -229,29 +240,37 @@ export async function ensureProvisioned(opts = {}) {
 
   const doProvision = () => provision(target, { env, platform, arch, fetchImpl, log });
 
+  if (env.KIN_LAUNCHER_ADOPT === '1') {
+    return doProvision();
+  }
   if (!existing) {
     return doProvision();
   }
 
+  const installedPath = managedBinaryPath('kin', env, platform);
   const stamp = readLauncherStamp(env);
-  if (stamp === target) {
+  const installed = stamp ?? probeBinaryVersion(existing, spawnImpl);
+
+  if (installed === null) {
+    log(
+      `kin: using existing managed kin (version unknown) at ${installedPath} ` +
+        `(this @kinlab/kin pins ${target}; set KIN_LAUNCHER_ADOPT=1 to re-provision).`,
+    );
     return existing;
-  }
-  if (stamp !== null) {
-    return doProvision();
   }
 
-  const probed = probeBinaryVersion(existing, spawnImpl);
-  if (probed === target) {
-    writeLauncherStamp(target, env);
+  const cmp = compareVersions(target, installed);
+  if (cmp === 0) {
+    if (stamp === null) writeLauncherStamp(target, env);
     return existing;
   }
-  if (env.KIN_LAUNCHER_ADOPT === '1') {
+  if (cmp > 0) {
+    log(`kin: managed kin ${installed} is older than the pinned ${target}; upgrading automatically.`);
     return doProvision();
   }
-  log(
-    `kin: using existing managed kin ${probed ?? 'unknown'} at ${managedBinaryPath('kin', env, platform)} ` +
-      `(this @kinlab/kin pins ${target}; set KIN_LAUNCHER_ADOPT=1 to re-provision).`,
+  throw new Error(
+    `refusing to downgrade managed kin ${installed} to the pinned ${target} (at ${installedPath}). ` +
+      'This @kinlab/kin would replace a newer managed install with an older one; nothing was run. ' +
+      'Set KIN_LAUNCHER_ADOPT=1 to force it if the downgrade is intended.',
   );
-  return existing;
 }

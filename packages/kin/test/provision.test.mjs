@@ -191,8 +191,17 @@ test('ensureProvisioned runs a stamped current install without probing or networ
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-test('ensureProvisioned respects a foreign install on version mismatch (no adopt)', async () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-foreign-'));
+// ── mismatch matrix ─────────────────────────────────────────────────────────
+//
+// ensureProvisioned's pin-vs-installed policy, exercised on both the stamped
+// (this package provisioned it before; no probe needed) and foreign (probed
+// via `--version`) code paths: an older install upgrades automatically, a
+// newer install is refused loudly, an equal install just runs, and
+// KIN_LAUNCHER_ADOPT=1 forces a re-provision regardless.
+
+test('ensureProvisioned auto-provisions over an older foreign install (no ADOPT needed)', async () => {
+  const { work, fetchImpl } = makeFixture();
+  const home = path.join(work, 'kin-home');
   const env = { KIN_HOME: home };
   const binDir = path.join(home, 'bin');
   fs.mkdirSync(binDir, { recursive: true });
@@ -200,15 +209,160 @@ test('ensureProvisioned respects a foreign install on version mismatch (no adopt
   const notices = [];
   const result = await ensureProvisioned({
     env,
-    platform: process.platform,
-    fetchImpl: async () => {
-      throw new Error('must not re-provision a foreign install without opt-in');
-    },
+    platform: 'darwin',
+    arch: 'arm64',
+    fetchImpl,
     spawnImpl: () => ({ status: 0, stdout: 'kin 0.0.1-foreign (x)\n' }),
     log: (line) => notices.push(line),
   });
+  const { targetKinVersion } = await import('../lib/resolve.mjs');
   assert.equal(result, path.join(binDir, 'kin'));
+  assert.match(fs.readFileSync(result, 'utf8'), /9\.9\.9/);
+  assert.equal(readLauncherStamp(env), targetKinVersion());
+  assert.ok(notices.some((l) => l.includes('older') && l.includes('upgrading automatically')));
+  fs.rmSync(work, { recursive: true, force: true });
+});
+
+test('ensureProvisioned auto-provisions when a stamped install is older than the pin', async () => {
+  const { work, fetchImpl } = makeFixture();
+  const home = path.join(work, 'kin-home');
+  const env = { KIN_HOME: home };
+  const binDir = path.join(home, 'bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(path.join(binDir, 'kin'), '#!/bin/sh\n');
+  writeLauncherStamp('0.0.1', env);
+  const notices = [];
+  const result = await ensureProvisioned({
+    env,
+    platform: 'darwin',
+    arch: 'arm64',
+    fetchImpl,
+    spawnImpl: () => {
+      throw new Error('a stamped install must not be probed');
+    },
+    log: (line) => notices.push(line),
+  });
+  const { targetKinVersion } = await import('../lib/resolve.mjs');
+  assert.equal(result, path.join(binDir, 'kin'));
+  assert.match(fs.readFileSync(result, 'utf8'), /9\.9\.9/);
+  assert.equal(readLauncherStamp(env), targetKinVersion());
+  assert.ok(notices.some((l) => l.includes('older') && l.includes('upgrading automatically')));
+  fs.rmSync(work, { recursive: true, force: true });
+});
+
+test('ensureProvisioned refuses to downgrade a newer foreign install (fail loud, no ADOPT)', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-newer-foreign-'));
+  const env = { KIN_HOME: home };
+  const binDir = path.join(home, 'bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(path.join(binDir, 'kin'), '#!/bin/sh\n');
+  await assert.rejects(
+    ensureProvisioned({
+      env,
+      platform: process.platform,
+      fetchImpl: async () => {
+        throw new Error('must not provision when refusing a downgrade');
+      },
+      spawnImpl: () => ({ status: 0, stdout: 'kin 99.0.0 (newer)\n' }),
+      log: () => {},
+    }),
+    /refusing to downgrade.*KIN_LAUNCHER_ADOPT=1/s,
+  );
   assert.equal(readLauncherStamp(env), null);
-  assert.ok(notices.some((l) => l.includes('KIN_LAUNCHER_ADOPT=1')));
+  assert.ok(fs.existsSync(path.join(binDir, 'kin')), 'the existing binary must be left in place');
   fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('ensureProvisioned refuses to downgrade when the stamp itself is newer than the pin', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-newer-stamped-'));
+  const env = { KIN_HOME: home };
+  const binDir = path.join(home, 'bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(path.join(binDir, 'kin'), '#!/bin/sh\n');
+  writeLauncherStamp('99.0.0', env);
+  await assert.rejects(
+    ensureProvisioned({
+      env,
+      platform: process.platform,
+      fetchImpl: async () => {
+        throw new Error('must not provision when refusing a downgrade');
+      },
+      spawnImpl: () => {
+        throw new Error('a stamped install must not be probed');
+      },
+      log: () => {},
+    }),
+    /refusing to downgrade.*KIN_LAUNCHER_ADOPT=1/s,
+  );
+  assert.equal(readLauncherStamp(env), '99.0.0');
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('ensureProvisioned adopts a foreign install when its version already matches the pin', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-foreign-equal-'));
+  const env = { KIN_HOME: home };
+  const binDir = path.join(home, 'bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(path.join(binDir, 'kin'), '#!/bin/sh\n');
+  const { targetKinVersion } = await import('../lib/resolve.mjs');
+  const result = await ensureProvisioned({
+    env,
+    platform: process.platform,
+    fetchImpl: async () => {
+      throw new Error('must not provision when the foreign install already matches');
+    },
+    spawnImpl: () => ({ status: 0, stdout: `kin ${targetKinVersion()} (foreign)\n` }),
+    log: () => {},
+  });
+  assert.equal(result, path.join(binDir, 'kin'));
+  assert.equal(readLauncherStamp(env), targetKinVersion());
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('KIN_LAUNCHER_ADOPT=1 forces re-provisioning even when the stamped version already matches', async () => {
+  const { work, fetchImpl } = makeFixture();
+  const home = path.join(work, 'kin-home');
+  const env = { KIN_HOME: home, KIN_LAUNCHER_ADOPT: '1' };
+  const binDir = path.join(home, 'bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(path.join(binDir, 'kin'), '#!/bin/sh\n');
+  const { targetKinVersion } = await import('../lib/resolve.mjs');
+  writeLauncherStamp(targetKinVersion(), env);
+  const result = await ensureProvisioned({
+    env,
+    platform: 'darwin',
+    arch: 'arm64',
+    fetchImpl,
+    spawnImpl: () => {
+      throw new Error('ADOPT must skip the probe and provision unconditionally');
+    },
+    log: () => {},
+  });
+  assert.equal(result, path.join(binDir, 'kin'));
+  // Reprovisioned from the fixture archive, not the pre-existing stub.
+  assert.match(fs.readFileSync(result, 'utf8'), /9\.9\.9/);
+  fs.rmSync(work, { recursive: true, force: true });
+});
+
+test('KIN_LAUNCHER_ADOPT=1 forces the downgrade it would otherwise refuse', async () => {
+  const { work, fetchImpl } = makeFixture();
+  const home = path.join(work, 'kin-home');
+  const env = { KIN_HOME: home, KIN_LAUNCHER_ADOPT: '1' };
+  const binDir = path.join(home, 'bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(path.join(binDir, 'kin'), '#!/bin/sh\n');
+  writeLauncherStamp('99.0.0', env);
+  const result = await ensureProvisioned({
+    env,
+    platform: 'darwin',
+    arch: 'arm64',
+    fetchImpl,
+    spawnImpl: () => {
+      throw new Error('ADOPT must skip the probe and provision unconditionally');
+    },
+    log: () => {},
+  });
+  assert.equal(result, path.join(binDir, 'kin'));
+  assert.match(fs.readFileSync(result, 'utf8'), /9\.9\.9/);
+  fs.rmSync(work, { recursive: true, force: true });
 });

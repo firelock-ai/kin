@@ -33,13 +33,20 @@ try {
 
 if (!binary) {
   if (provisionError) {
+    // The error message is already complete and actionable (e.g. a declined
+    // downgrade names the binary that IS present) — printing the generic
+    // not-provisioned message on top of it would contradict it.
     process.stderr.write(`kin: provisioning failed: ${provisionError.message}\n`);
+    if (wantsVersion) {
+      process.stdout.write(launcherVersionLine(', provisioning failed'));
+    }
+    process.exit(1);
   }
   if (wantsVersion) {
     // Honest launcher identity; success only when provisioning was explicitly
     // disabled rather than broken.
-    process.stdout.write(launcherVersionLine(provisionError ? ', provisioning failed' : ', not installed'));
-    process.exit(provisionError ? 1 : 0);
+    process.stdout.write(launcherVersionLine(', not installed'));
+    process.exit(0);
   }
   process.stderr.write(`${notProvisionedMessage('kin')}\n`);
   process.exit(1);
