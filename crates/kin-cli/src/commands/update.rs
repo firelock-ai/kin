@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GITHUB_RELEASES_LATEST_URL: &str =
@@ -402,6 +402,207 @@ fn parse_checksum(checksums_text: &str, filename: &str) -> Option<String> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// Doctor shim repair (FIR-1409)
+//
+// `kin doctor --fix` uses this to reinstall the VFS shim when the running
+// binary has no local copy to source from (e.g. a standalone/proof-bundle
+// binary). It pins to the release matching THIS binary's version — never
+// "latest" — because a newer release can ship an ABI-incompatible shim.
+// ---------------------------------------------------------------------------
+
+/// The `firelock-ai/kin` release for an exact tag. Suffix `v{VERSION}`.
+const GITHUB_RELEASES_TAG_URL: &str =
+    "https://api.github.com/repos/firelock-ai/kin/releases/tags/v";
+
+/// Platform stem used in Kin's release archive names, e.g. `kin-macos-aarch64`.
+///
+/// NOTE: this is the naming the release pipeline actually publishes
+/// (`macos|linux|windows` + `aarch64|x86_64`). It intentionally differs from
+/// [`detect_platform`]'s legacy `darwin`/`amd64` mapping, which does not match
+/// any current release asset.
+fn release_platform_stem() -> Result<String> {
+    let os = if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        anyhow::bail!("unsupported OS for shim download");
+    };
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        anyhow::bail!("unsupported architecture for shim download");
+    };
+    Ok(format!("kin-{os}-{arch}"))
+}
+
+/// Download the VFS shim from the GitHub release matching the running version
+/// and install it atomically at `dest`.
+///
+/// Verifies the downloaded archive's SHA-256 against the release's
+/// `checksums-sha256.txt`, requires the extracted shim to be non-empty, and
+/// writes via a temp file + atomic rename so a partial download can never land
+/// as the 0-byte shim this repairs. Returns `Err` — honestly — when offline,
+/// when the release or asset is absent, or when verification fails, so the
+/// caller can print a manual reinstall step instead of looping.
+pub(crate) async fn download_shim_for_current_version(dest: &Path) -> Result<()> {
+    let shim_name = crate::commands::setup::shim_filename();
+    let archive_name = format!("{}.tar.gz", release_platform_stem()?);
+
+    let client = reqwest::Client::builder()
+        .user_agent("kin-cli")
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let tag_url = format!("{GITHUB_RELEASES_TAG_URL}{CURRENT_VERSION}");
+    let release: GithubRelease = client
+        .get(&tag_url)
+        .send()
+        .await
+        .context("failed to reach the GitHub releases API (offline?)")?
+        .error_for_status()
+        .with_context(|| format!("no published release found for v{CURRENT_VERSION}"))?
+        .json()
+        .await
+        .context("failed to parse release JSON")?;
+
+    let asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == archive_name)
+        .with_context(|| format!("release v{CURRENT_VERSION} has no asset '{archive_name}'"))?;
+
+    let archive_bytes = client
+        .get(&asset.browser_download_url)
+        .send()
+        .await
+        .context("failed to download release archive")?
+        .error_for_status()
+        .context("archive download returned an error")?
+        .bytes()
+        .await
+        .context("failed to read archive bytes")?;
+
+    if archive_bytes.is_empty() {
+        anyhow::bail!("downloaded archive '{archive_name}' was empty");
+    }
+
+    verify_archive_checksum(&client, &release, &archive_name, &archive_bytes).await?;
+
+    let shim_bytes = extract_named_file_from_tar_gz(&archive_bytes, shim_name)
+        .with_context(|| format!("archive '{archive_name}' did not contain '{shim_name}'"))?;
+    if shim_bytes.is_empty() {
+        anyhow::bail!("the shim '{shim_name}' extracted from '{archive_name}' was empty");
+    }
+
+    write_atomically(dest, &shim_bytes)
+        .with_context(|| format!("failed to install the shim at {}", dest.display()))?;
+    Ok(())
+}
+
+/// Verify `archive_bytes` against the SHA-256 recorded for `archive_name` in the
+/// release's `checksums-sha256.txt`. Returns `Err` if the checksums asset is
+/// missing, the entry is absent, or the hash mismatches — a repair must never
+/// install unverified bytes.
+async fn verify_archive_checksum(
+    client: &reqwest::Client,
+    release: &GithubRelease,
+    archive_name: &str,
+    archive_bytes: &[u8],
+) -> Result<()> {
+    let checksums_asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == CHECKSUMS_ASSET)
+        .with_context(|| {
+            format!("release is missing '{CHECKSUMS_ASSET}' — cannot verify the download")
+        })?;
+
+    let checksums_bytes = client
+        .get(&checksums_asset.browser_download_url)
+        .send()
+        .await
+        .context("failed to download checksums file")?
+        .error_for_status()?
+        .bytes()
+        .await
+        .context("failed to read checksums bytes")?;
+
+    let checksums_text =
+        std::str::from_utf8(&checksums_bytes).context("checksums file is not valid UTF-8")?;
+    let expected = parse_checksum(checksums_text, archive_name)
+        .with_context(|| format!("'{archive_name}' not found in the checksums file"))?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(archive_bytes);
+    let actual = hex::encode(hasher.finalize());
+
+    if actual != expected {
+        anyhow::bail!("SHA-256 mismatch for '{archive_name}': expected {expected}, got {actual}");
+    }
+    Ok(())
+}
+
+/// Extract the bytes of the archive entry whose file name is exactly `target`.
+fn extract_named_file_from_tar_gz(bytes: &[u8], target: &str) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let decoder = flate2::read::GzDecoder::new(bytes);
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries().context("failed to read tar entries")? {
+        let mut entry = entry.context("corrupt tar entry")?;
+        let path = entry.path().context("invalid entry path")?.into_owned();
+        if path.file_name().and_then(|n| n.to_str()) == Some(target) {
+            let mut buf = Vec::new();
+            entry
+                .read_to_end(&mut buf)
+                .context("failed to read shim bytes from archive")?;
+            return Ok(buf);
+        }
+    }
+    anyhow::bail!("'{target}' not found in archive")
+}
+
+/// Write `bytes` to `dest` via a sibling temp file + rename, so a crash or
+/// partial write never leaves a truncated file at `dest`.
+fn write_atomically(dest: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let parent = dest
+        .parent()
+        .context("destination path has no parent directory")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+
+    let file_name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("destination path has no file name")?;
+    let tmp = parent.join(format!(".{file_name}.tmp-download"));
+
+    {
+        let mut file = std::fs::File::create(&tmp)
+            .with_context(|| format!("failed to create {}", tmp.display()))?;
+        file.write_all(bytes)
+            .context("failed to write shim bytes")?;
+        file.sync_all().ok();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644));
+    }
+    std::fs::rename(&tmp, dest).with_context(|| {
+        // Clean up the temp file if the rename fails so we don't leave litter.
+        let _ = std::fs::remove_file(&tmp);
+        format!("failed to move the shim into place at {}", dest.display())
+    })?;
+    Ok(())
+}
+
 /// Remove existing kin binaries before writing new ones.
 /// This avoids the dyld deadlock described in the debugging guide:
 /// `cp` over a mapped inode can wedge the dynamic linker on macOS.
@@ -626,6 +827,79 @@ fn is_lib(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build an in-memory `.tar.gz` with the given (name, bytes) entries.
+    fn make_tar_gz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        let mut gz = GzEncoder::new(Vec::new(), Compression::fast());
+        {
+            let mut builder = tar::Builder::new(&mut gz);
+            for (name, data) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, name, *data).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        gz.finish().unwrap()
+    }
+
+    #[test]
+    fn release_platform_stem_targets_real_asset_naming() {
+        let stem = release_platform_stem().unwrap();
+        // Must match the actual v0.2.x asset names, NOT detect_platform's legacy
+        // darwin/amd64 mapping (which matches no published asset).
+        assert!(stem.starts_with("kin-"), "unexpected stem: {stem}");
+        #[cfg(target_os = "macos")]
+        assert!(stem.contains("macos"), "stem: {stem}");
+        #[cfg(target_os = "linux")]
+        assert!(stem.contains("linux"), "stem: {stem}");
+        #[cfg(target_arch = "aarch64")]
+        assert!(stem.contains("aarch64"), "stem: {stem}");
+        #[cfg(target_arch = "x86_64")]
+        assert!(stem.contains("x86_64"), "stem: {stem}");
+    }
+
+    #[test]
+    fn extract_named_file_pulls_the_shim_out_of_the_archive() {
+        let archive = make_tar_gz(&[
+            ("kin-macos-aarch64/kin", b"binary-bytes"),
+            (
+                "kin-macos-aarch64/libkin_vfs_shim.dylib",
+                b"\xCF\xFA\xED\xFEshim-body",
+            ),
+        ]);
+        let shim = extract_named_file_from_tar_gz(&archive, "libkin_vfs_shim.dylib").unwrap();
+        assert_eq!(shim, b"\xCF\xFA\xED\xFEshim-body");
+    }
+
+    #[test]
+    fn extract_named_file_errors_when_absent() {
+        let archive = make_tar_gz(&[("kin-macos-aarch64/kin", b"binary-bytes")]);
+        assert!(extract_named_file_from_tar_gz(&archive, "libkin_vfs_shim.dylib").is_err());
+    }
+
+    #[test]
+    fn write_atomically_installs_bytes_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        // Parent dir does not exist yet — write_atomically must create it.
+        let dest = dir.path().join("lib").join("libkin_vfs_shim.dylib");
+        write_atomically(&dest, b"\xCF\xFA\xED\xFEbody").unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"\xCF\xFA\xED\xFEbody");
+        let leftovers: Vec<_> = std::fs::read_dir(dest.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp download file was not cleaned up"
+        );
+    }
 
     #[test]
     fn version_comparison() {

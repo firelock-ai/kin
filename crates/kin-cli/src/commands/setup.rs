@@ -616,6 +616,21 @@ fn find_shim() -> Option<PathBuf> {
     None
 }
 
+/// Restore the shim at `dest` from the first usable source in `sources` (a
+/// source is usable when it exists and is non-empty). Returns the dest path when
+/// a source was copied, or `None` when no usable local source exists — the
+/// caller then escalates (download) or prints a manual step. Explicit sources
+/// keep the copy logic unit-testable without a real `$HOME`.
+fn restore_shim_from_sources(dest: &Path, sources: &[PathBuf]) -> Result<Option<PathBuf>> {
+    for src in sources {
+        if is_usable_shim(src) {
+            copy_shim(src, dest)?;
+            return Ok(Some(dest.to_path_buf()));
+        }
+    }
+    Ok(None)
+}
+
 pub(crate) fn detect_shell() -> &'static str {
     if env::var("PSModulePath").is_ok() || env::var("PSVersionTable").is_ok() {
         return "powershell";
@@ -1089,13 +1104,11 @@ pub(crate) fn reinstall_vfs_shim() -> Result<Option<PathBuf>> {
     let dest = lib_dir.join(shim_filename());
 
     // `find_shim` only returns non-empty candidates, so a truncated shim is
-    // never re-selected as the source. `copy_shim` no-ops if the usable shim
-    // already is the destination.
-    let Some(shim_path) = find_shim() else {
-        return Ok(None);
-    };
-    copy_shim(&shim_path, &dest)?;
-    Ok(Some(dest))
+    // never re-selected as the source. `restore_shim_from_sources` copies the
+    // first usable one and `copy_shim` no-ops if that source already is the
+    // destination.
+    let sources: Vec<PathBuf> = find_shim().into_iter().collect();
+    restore_shim_from_sources(&dest, &sources)
 }
 
 /// Re-merge the kin MCP server entry (with the agent-default profile) into the
@@ -1829,7 +1842,11 @@ pub async fn doctor(fix: bool, json: bool) -> Result<()> {
         }
     }
 
-    // Re-source the VFS shim when it is missing or was truncated to 0 bytes.
+    // Repair the VFS shim when it is missing, truncated to 0 bytes, or corrupt.
+    // Try a local copy first; a standalone binary (no sibling shim, no ledger
+    // source) has none, so fall back to downloading the shim from the release
+    // that matches THIS binary's version. Only if both fail do we print a manual
+    // step — and never one that points back at `kin doctor --fix` (FIR-1409).
     let vfs_needs_fix = report.checks.iter().any(|c| {
         c.id == "vfs_projection"
             && c.fixable
@@ -1837,12 +1854,35 @@ pub async fn doctor(fix: bool, json: bool) -> Result<()> {
     });
     if vfs_needs_fix {
         match reinstall_vfs_shim() {
-            Ok(Some(dest)) => applied.push(format!("reinstalled VFS shim ({})", dest.display())),
-            Ok(None) => println!(
-                "  {} no usable VFS shim found to reinstall — re-run the installer \
-                 (curl -fsSL https://get.kinlab.dev/install | sh)",
-                style("✗").red()
-            ),
+            Ok(Some(dest)) => applied.push(format!(
+                "reinstalled VFS shim from a local copy ({})",
+                dest.display()
+            )),
+            Ok(None) => {
+                // No local shim source. Fetch the shim from the matching release.
+                let dest = kin_dir()?.join("lib").join(shim_filename());
+                println!(
+                    "  No local VFS shim found; fetching it from the v{} release...",
+                    env!("CARGO_PKG_VERSION")
+                );
+                match crate::commands::update::download_shim_for_current_version(&dest).await {
+                    Ok(()) => applied.push(format!(
+                        "downloaded the VFS shim from the v{} release ({})",
+                        env!("CARGO_PKG_VERSION"),
+                        dest.display()
+                    )),
+                    Err(e) => {
+                        println!(
+                            "  {} could not restore the VFS shim automatically: {e}",
+                            style("✗").red()
+                        );
+                        println!(
+                            "      reinstall kin to restore it: \
+                             curl -fsSL https://get.kinlab.dev/install | sh"
+                        );
+                    }
+                }
+            }
             Err(e) => println!("  {} VFS shim reinstall failed: {e}", style("✗").red()),
         }
     }
@@ -2107,6 +2147,47 @@ mod tests {
         assert!(!is_usable_shim(&empty), "0-byte shim must not be usable");
         assert!(is_usable_shim(&full));
         assert!(!is_usable_shim(&missing));
+    }
+
+    #[test]
+    fn restore_shim_repairs_a_zeroed_shim_from_a_usable_source() {
+        // FIR-1409 repair path: a deliberately-zeroed shim + a usable source is
+        // restored to the real bytes.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source-shim");
+        fs::write(&source, b"\xCF\xFA\xED\xFEreal-shim-bytes").unwrap();
+        let dest = tmp.path().join("lib").join(shim_filename());
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::write(&dest, b"").unwrap(); // the 0-byte crash hazard
+
+        let restored = restore_shim_from_sources(&dest, std::slice::from_ref(&source)).unwrap();
+        assert_eq!(restored.as_deref(), Some(dest.as_path()));
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            b"\xCF\xFA\xED\xFEreal-shim-bytes",
+            "dest must hold the source bytes after repair"
+        );
+    }
+
+    #[test]
+    fn restore_shim_reports_none_when_no_usable_source_exists() {
+        // FIR-1409 honest path: with no usable source, the repair reports None
+        // (so the caller escalates / prints a manual step) and never fabricates
+        // content over the zeroed shim.
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("empty-source");
+        fs::write(&empty, b"").unwrap();
+        let missing = tmp.path().join("missing-source");
+        let dest = tmp.path().join("dest-shim");
+        fs::write(&dest, b"").unwrap();
+
+        let restored = restore_shim_from_sources(&dest, &[empty, missing]).unwrap();
+        assert!(restored.is_none(), "no usable source must yield None");
+        assert_eq!(
+            fs::metadata(&dest).unwrap().len(),
+            0,
+            "dest must stay untouched when there is nothing to copy"
+        );
     }
 
     #[test]
