@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Revert-history review channel: shadow review flags revert-shaped changes — an added
+  entity that restores content removed in the recent past (behavior-fingerprint match),
+  a reintroduction of a recently-removed surface (same name and kind, modified content),
+  and removals of recently-introduced entities. The evidence is temporal, read from a
+  bounded window of the base ref's ancestry at review time, and feeds the gate as
+  ordinary warning findings; when the base has too little history to scan, the report
+  carries an explicit evidence gap instead of a silent pass.
+
 ## [0.2.12] - 2026-07-06
 
 First-touch review latency: ancestor..descendant review pairs hydrate git history once instead of twice.
