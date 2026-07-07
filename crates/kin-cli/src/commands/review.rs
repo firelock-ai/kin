@@ -1226,7 +1226,8 @@ fn inline_comment_severity(kind: kin_review::InlineCommentKind) -> &'static str 
         | InlineCommentKind::ToolchainSurfaceChange
         | InlineCommentKind::ConsumerFanout
         | InlineCommentKind::Renamed
-        | InlineCommentKind::AgentUnreviewed => "warning",
+        | InlineCommentKind::AgentUnreviewed
+        | InlineCommentKind::RevertHistory => "warning",
         InlineCommentKind::Added | InlineCommentKind::Removed => "info",
     }
 }

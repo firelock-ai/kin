@@ -518,6 +518,19 @@ fn assemble_report_with_changes<G: GraphStore>(
     // Toolchain-surface findings feed the gate as ordinary warning findings via
     // the inline-comment channel, never through the evidence-gap demotion path.
     review.inline_comments.extend(toolchain_findings);
+    // Revert-history findings feed the gate the same way: ordinary warning
+    // findings, with an honest gap when the base has too little history to
+    // scan. Temporal evidence available at review time only — the window looks
+    // strictly BEFORE the base.
+    let (revert_findings, revert_gap) = crate::revert_history::collect_revert_history_findings(
+        store,
+        &request.resolved_base,
+        changes,
+    )?;
+    review.inline_comments.extend(revert_findings);
+    if let Some(gap) = revert_gap {
+        evidence_gaps.push(gap);
+    }
     let policy = derive_policy(&review, &evidence_gaps, &changed_entities);
     let repair_context = collect_repair_context(&policy.findings, &review);
     let audit = collect_audit_evidence(store, request, &review, changes.len())?;
@@ -724,6 +737,7 @@ fn finding_kind_label(kind: InlineCommentKind) -> &'static str {
         InlineCommentKind::Renamed => "entity_renamed",
         InlineCommentKind::AgentUnreviewed => "agent_unreviewed",
         InlineCommentKind::ToolchainSurfaceChange => "toolchain_surface_change",
+        InlineCommentKind::RevertHistory => "revert_history",
     }
 }
 
@@ -737,7 +751,8 @@ fn finding_severity(kind: InlineCommentKind) -> &'static str {
         | InlineCommentKind::ConsumerFanout
         | InlineCommentKind::Renamed
         | InlineCommentKind::AgentUnreviewed
-        | InlineCommentKind::ToolchainSurfaceChange => "warning",
+        | InlineCommentKind::ToolchainSurfaceChange
+        | InlineCommentKind::RevertHistory => "warning",
         InlineCommentKind::Added | InlineCommentKind::Removed => "info",
     }
 }
@@ -1106,6 +1121,11 @@ fn repair_guidance(kind: &str) -> &'static str {
         "downstream_risk" => {
             "The contract surface changed with graph-known downstream entities; verify each \
              listed dependent and consumer, then run the covering tests."
+        }
+        "revert_history" => {
+            "This change is revert-shaped: it reintroduces or removes recently-changed \
+             history. Confirm the original removal/addition was wrong before merging, and \
+             check the linked history for the regression the earlier change addressed."
         }
         "toolchain_surface_change" => {
             "Inline lint or deprecation directives changed; confirm the shift in toolchain \
@@ -3534,6 +3554,193 @@ mod tests {
         assert!(
             findings_no_blob.is_empty(),
             "without a blob reader the toolchain channel emits nothing"
+        );
+    }
+
+    /// Chain of `n` changes: c1 applies `first_deltas`, c2 applies
+    /// `second_deltas`, the rest are empty padding so the revert-history window
+    /// sees enough depth to scan without reporting the shallow-history gap.
+    fn padded_history_graph(
+        graph: &InMemoryGraph,
+        first_deltas: Vec<EntityDelta>,
+        second_deltas: Vec<EntityDelta>,
+        n: u8,
+    ) -> SemanticChangeId {
+        let mut prev: Option<SemanticChangeId> = None;
+        for i in 1..=n {
+            let deltas = match i {
+                1 => first_deltas.clone(),
+                2 => second_deltas.clone(),
+                _ => vec![],
+            };
+            let change = change_with_deltas(
+                change_id(i),
+                prev.map(|p| vec![p]).unwrap_or_default(),
+                deltas,
+                vec![],
+                vec![],
+            );
+            graph.create_change(&change).unwrap();
+            prev = Some(change_id(i));
+        }
+        prev.expect("chain is non-empty")
+    }
+
+    #[test]
+    fn revert_history_reintroduction_flags_needs_attention() {
+        // c1 adds `retry_budget`, c2 removes it, padding to depth 30, then the
+        // head re-adds an entity with the SAME behavior fingerprint at a new
+        // location. The channel must call out the revert-shaped reintroduction
+        // and move the verdict to needs_attention.
+        let graph = InMemoryGraph::new();
+        let mut original = entity_with_span("retry_budget", "src/net.rs", 40, EntityRole::Source);
+        original.fingerprint.behavior_hash = Hash256::from_bytes([7; 32]);
+        let mut readded = original.clone();
+        readded.id = EntityId::from_content("src/net.rs", "retry_budget", "Function", 77);
+        let base_id = padded_history_graph(
+            &graph,
+            vec![EntityDelta::Added(original.clone())],
+            vec![EntityDelta::Removed(original.id)],
+            30,
+        );
+        graph.upsert_entity(&readded).unwrap();
+        let head_id = change_id(200);
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![EntityDelta::Added(readded.clone())],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+        let finding = report
+            .policy
+            .findings
+            .iter()
+            .find(|f| f.kind == "revert_history")
+            .expect("reintroduction must produce a revert_history finding");
+        assert!(
+            finding.message.contains("restores the exact content"),
+            "fingerprint match must report the strong form, got: {}",
+            finding.message
+        );
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::NeedsAttention);
+        assert!(
+            !report
+                .evidence_gaps
+                .iter()
+                .any(|g| g.kind == "revert_history_shallow"),
+            "30 changes of history must not report the shallow gap"
+        );
+    }
+
+    #[test]
+    fn revert_history_recent_addition_removal_flags() {
+        // c2 adds `beta_flag`; the head removes that exact entity id. Deleting
+        // something that only just landed is revert-shaped and must be called
+        // out even though a bare removal of an unconsumed entity would
+        // otherwise stay quiet.
+        let graph = InMemoryGraph::new();
+        let recent = entity_with_span("beta_flag", "src/flags.rs", 12, EntityRole::Source);
+        let base_id =
+            padded_history_graph(&graph, vec![], vec![EntityDelta::Added(recent.clone())], 30);
+        let head_id = change_id(201);
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![EntityDelta::Removed(recent.id)],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+        let finding = report
+            .policy
+            .findings
+            .iter()
+            .find(|f| f.kind == "revert_history")
+            .expect("recent-addition removal must produce a revert_history finding");
+        assert!(
+            finding.message.contains("revert-shaped removal"),
+            "got: {}",
+            finding.message
+        );
+    }
+
+    #[test]
+    fn fresh_addition_produces_no_revert_history_finding() {
+        // History contains an unrelated removal; the head adds a brand-new
+        // entity. No temporal match exists, so the channel must stay silent —
+        // fresh additions are the benign default this channel must never tax.
+        let graph = InMemoryGraph::new();
+        let mut unrelated = entity_with_span("old_helper", "src/util.rs", 9, EntityRole::Source);
+        unrelated.fingerprint.behavior_hash = Hash256::from_bytes([9; 32]);
+        let fresh = entity_with_span("brand_new_api", "src/api.rs", 21, EntityRole::Source);
+        let base_id = padded_history_graph(
+            &graph,
+            vec![EntityDelta::Added(unrelated.clone())],
+            vec![EntityDelta::Removed(unrelated.id)],
+            30,
+        );
+        graph.upsert_entity(&fresh).unwrap();
+        let head_id = change_id(202);
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![EntityDelta::Added(fresh)],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+        assert!(
+            !report
+                .policy
+                .findings
+                .iter()
+                .any(|f| f.kind == "revert_history"),
+            "a fresh addition must not read as revert-shaped"
+        );
+    }
+
+    #[test]
+    fn shallow_history_reports_honest_gap() {
+        // Two changes of history is not enough to assess revert evidence: the
+        // channel must say so through an evidence gap instead of certifying
+        // silence, and must not invent findings.
+        let graph = InMemoryGraph::new();
+        let fresh = entity_with_span("early_api", "src/api.rs", 5, EntityRole::Source);
+        let base_id = padded_history_graph(&graph, vec![], vec![], 2);
+        graph.upsert_entity(&fresh).unwrap();
+        let head_id = change_id(203);
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![EntityDelta::Added(fresh)],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+        assert!(
+            report
+                .evidence_gaps
+                .iter()
+                .any(|g| g.kind == "revert_history_shallow"),
+            "shallow history must surface the honesty gap"
+        );
+        assert!(
+            !report
+                .policy
+                .findings
+                .iter()
+                .any(|f| f.kind == "revert_history"),
+            "no finding may be invented from unscannable history"
         );
     }
 }
