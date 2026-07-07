@@ -730,6 +730,7 @@ fn finding_kind_label(kind: InlineCommentKind) -> &'static str {
         InlineCommentKind::AgentUnreviewed => "agent_unreviewed",
         InlineCommentKind::ToolchainSurfaceChange => "toolchain_surface_change",
         InlineCommentKind::RevertHistory => "revert_history",
+        InlineCommentKind::RevertHistoryIncidental => "revert_history_incidental",
     }
 }
 
@@ -745,6 +746,7 @@ fn finding_severity(kind: InlineCommentKind) -> &'static str {
         | InlineCommentKind::AgentUnreviewed
         | InlineCommentKind::ToolchainSurfaceChange
         | InlineCommentKind::RevertHistory => "warning",
+        InlineCommentKind::RevertHistoryIncidental => "info",
         InlineCommentKind::Added | InlineCommentKind::Removed => "info",
     }
 }
@@ -1108,6 +1110,10 @@ fn repair_guidance(kind: &str) -> &'static str {
         "downstream_risk" => {
             "The contract surface changed with graph-known downstream entities; verify each \
              listed dependent and consumer, then run the covering tests."
+        }
+        "revert_history_incidental" => {
+            "One entity's body matches an older revision — often incidental on small \
+             bodies; worth a glance at the linked history, not a gate."
         }
         "revert_history" => {
             "This change is revert-shaped: it reintroduces or removes recently-changed \
@@ -3818,16 +3824,29 @@ mod tests {
         graph.create_change(&head).unwrap();
 
         let report = build_shadow_report(&graph, &request(pad_tail, head_id)).unwrap();
+        // A single entity reverting is incidental: reported at info severity,
+        // never verdict-driving (small bodies recur naturally in long
+        // histories — the v7 backtest measured 5/6 benign regressions when
+        // singletons gated).
         let finding = report
             .policy
             .findings
             .iter()
-            .find(|f| f.kind == "revert_history")
-            .expect("a body reversion to an older revision must flag");
+            .find(|f| f.kind == "revert_history_incidental")
+            .expect("a lone body reversion must surface as incidental");
         assert!(
             finding.message.contains("revert-shaped body reversion"),
             "got: {}",
             finding.message
+        );
+        assert_eq!(finding.severity, "info");
+        assert!(
+            !report
+                .policy
+                .findings
+                .iter()
+                .any(|f| f.kind == "revert_history"),
+            "a lone body reversion must not produce the gating kind"
         );
 
         // Control: an ordinary forward edit must not produce the finding.
@@ -3864,5 +3883,99 @@ mod tests {
                 .any(|f| f.kind == "revert_history"),
             "an ordinary forward edit must not read as a body reversion"
         );
+    }
+
+    #[test]
+    fn coherent_body_reversion_group_gates() {
+        // Two entities whose new bodies both restore states un-done by the
+        // SAME historical change: a coherent snapshot restoration — the true
+        // revert shape — gates as a warning.
+        let graph = InMemoryGraph::new();
+        let mut a1 = entity_with_span("alpha", "src/a.rs", 5, EntityRole::Source);
+        a1.fingerprint.behavior_hash = Hash256::from_bytes([11; 32]);
+        let mut b1 = entity_with_span("beta", "src/b.rs", 9, EntityRole::Source);
+        b1.fingerprint.behavior_hash = Hash256::from_bytes([21; 32]);
+        let mut a2 = a1.clone();
+        a2.fingerprint.behavior_hash = Hash256::from_bytes([12; 32]);
+        let mut b2 = b1.clone();
+        b2.fingerprint.behavior_hash = Hash256::from_bytes([22; 32]);
+
+        // c1 adds both; c2 edits BOTH (the change the head un-does); padding.
+        let mut prev: Option<SemanticChangeId> = None;
+        for i in 1..=30u8 {
+            let deltas = match i {
+                1 => vec![
+                    EntityDelta::Added(a1.clone()),
+                    EntityDelta::Added(b1.clone()),
+                ],
+                2 => vec![
+                    EntityDelta::Modified {
+                        old: a1.clone(),
+                        new: a2.clone(),
+                    },
+                    EntityDelta::Modified {
+                        old: b1.clone(),
+                        new: b2.clone(),
+                    },
+                ],
+                _ => vec![],
+            };
+            let change = change_with_deltas(
+                change_id(i),
+                prev.map(|p| vec![p]).unwrap_or_default(),
+                deltas,
+                vec![],
+                vec![],
+            );
+            graph.create_change(&change).unwrap();
+            prev = Some(change_id(i));
+        }
+        let base_id = prev.unwrap();
+        let mut a_back = a2.clone();
+        a_back.fingerprint.behavior_hash = Hash256::from_bytes([11; 32]);
+        let mut b_back = b2.clone();
+        b_back.fingerprint.behavior_hash = Hash256::from_bytes([21; 32]);
+        graph.upsert_entity(&a_back).unwrap();
+        graph.upsert_entity(&b_back).unwrap();
+        let head_id = change_id(220);
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![
+                EntityDelta::Modified {
+                    old: a2.clone(),
+                    new: a_back,
+                },
+                EntityDelta::Modified {
+                    old: b2.clone(),
+                    new: b_back,
+                },
+            ],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+        let gating: Vec<_> = report
+            .policy
+            .findings
+            .iter()
+            .filter(|f| f.kind == "revert_history")
+            .collect();
+        assert_eq!(
+            gating.len(),
+            2,
+            "both coherent reversions must gate, got findings: {:?}",
+            report
+                .policy
+                .findings
+                .iter()
+                .map(|f| (&f.kind, &f.message))
+                .collect::<Vec<_>>()
+        );
+        assert!(gating.iter().all(|f| f.severity == "warning"));
+        assert!(gating[0].message.contains("un-doing the same change"));
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::NeedsAttention);
     }
 }
