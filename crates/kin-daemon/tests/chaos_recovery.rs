@@ -174,19 +174,30 @@ async fn wait_for_path_removed(path: &Path, what: &str, timeout: Duration) {
     }
 }
 
-async fn create_branch(port: u16, name: &str) {
+async fn create_branch(repo_root: &Path, port: u16, name: &str) {
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{port}/graph/branches");
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut backoff = Duration::from_millis(50);
 
     loop {
-        let result = client
-            .post(&url)
-            .json(&serde_json::json!({
-                "name": name,
-                "head": "0000000000000000000000000000000000000000000000000000000000000001"
-            }))
+        // Re-read on every attempt rather than once before the loop: this
+        // closes over the daemon's own startup ordering (listener bind vs.
+        // token provisioning) instead of assuming one happens before the
+        // other, and self-heals if the file is not there yet on an early
+        // retry.
+        let token = std::fs::read_to_string(repo_root.join(".kin/daemon.token"))
+            .ok()
+            .map(|contents| contents.trim().to_string())
+            .filter(|token| !token.is_empty());
+        let mut request = client.post(&url).json(&serde_json::json!({
+            "name": name,
+            "head": "0000000000000000000000000000000000000000000000000000000000000001"
+        }));
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        let result = request
             .send()
             .await
             .and_then(|response| response.error_for_status());
@@ -331,7 +342,7 @@ async fn daemon_exits_after_dirty_repo_control_dir_is_removed() {
     );
 
     wait_for_serving(&mut child, port).await;
-    create_branch(port, "dirty-before-delete").await;
+    create_branch(repo.path(), port, "dirty-before-delete").await;
 
     std::fs::remove_dir_all(repo.path().join(".kin")).unwrap();
 

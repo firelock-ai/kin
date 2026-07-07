@@ -7579,29 +7579,33 @@ fn ensure_loopback_token(layout: &kin_core::KinLayout) -> std::io::Result<String
 
 /// Whether the daemon should ENFORCE the per-install loopback token.
 ///
-/// Enforcement is opt-in (`KIN_DAEMON_REQUIRE_TOKEN`) because turning it on by
-/// default would `401` every local client that does not yet send the token —
-/// the CLI (`daemon_client.rs`) and any un-updated path. The file is still
-/// auto-provisioned so clients can adopt it; once CLI + MCP delegate both read
-/// it, flip this flag to require it. The primary DNS-rebinding defense
-/// (`validate_host_and_origin`) is always active regardless of this flag.
+/// Enforcement is default-on: the CLI (`daemon_client.rs`'s
+/// `resolve_daemon_auth_token`) and the MCP delegate
+/// (`daemon_delegate.rs`'s `daemon_auth_token`) both auto-read
+/// `.kin/daemon.token` and send it as a bearer token, so a fresh install
+/// authenticates out of the box with no operator setup. `KIN_DAEMON_REQUIRE_TOKEN`
+/// is the documented escape hatch: set it to a falsy value (`0`/`false`/`no`/
+/// `off`) to run without bearer auth for a local client that cannot yet send
+/// the header. The primary DNS-rebinding defense (`validate_host_and_origin`)
+/// is always active regardless of this flag.
 fn loopback_token_enforced() -> bool {
     std::env::var("KIN_DAEMON_REQUIRE_TOKEN")
         .map(|value| {
-            matches!(
+            !matches!(
                 value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
+                "0" | "false" | "no" | "off"
             )
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// Resolve the auth token the serving daemon enforces: an explicit
 /// `KIN_DAEMON_AUTH_TOKEN` override always wins. Otherwise the per-install
 /// loopback token is auto-provisioned under `.kin/` (so local clients can adopt
-/// it) but only returned for enforcement when `KIN_DAEMON_REQUIRE_TOKEN`
-/// is set. If provisioning fails the daemon still starts (loopback Host/Origin
-/// validation remains active) but logs a warning.
+/// it) and returned for enforcement unless `KIN_DAEMON_REQUIRE_TOKEN` is set to
+/// a falsy value (the opt-out escape hatch). If provisioning fails the daemon
+/// still starts (loopback Host/Origin validation remains active) but logs a
+/// warning.
 fn resolve_serve_auth_token(layout: &kin_core::KinLayout) -> Option<String> {
     if let Some(env_token) = auth_token_from_env() {
         return Some(env_token);
@@ -11916,28 +11920,103 @@ mod tests {
         std::fs::create_dir_all(dir.join(".kin")).unwrap();
         let layout = kin_core::KinLayout::new(dir.join(".kin"));
 
-        // Default: enforcement is OFF, so no token is enforced — this is what
-        // keeps existing unauthenticated local clients (CLI, integration tests,
-        // env-only MCP delegate) working. The file is still provisioned so they
-        // can adopt it ahead of a future enforcement flip.
-        assert!(resolve_serve_auth_token(&layout).is_none());
+        // Default (no env configured at all): enforcement is ON, so a fresh
+        // install requires the auto-provisioned token out of the box.
+        let provisioned_default = resolve_serve_auth_token(&layout)
+            .expect("fresh install must enforce the auto-provisioned token by default");
         let provisioned = std::fs::read_to_string(loopback_token_path(&layout)).unwrap();
         assert!(!provisioned.trim().is_empty());
+        assert_eq!(provisioned_default, provisioned.trim());
 
-        // Opt-in: enforcement returns the provisioned loopback token.
+        // Escape hatch: an explicit falsy value opts back out of enforcement —
+        // for a local client that cannot yet send the header — while the file
+        // stays provisioned.
+        std::env::set_var("KIN_DAEMON_REQUIRE_TOKEN", "0");
+        assert!(resolve_serve_auth_token(&layout).is_none());
+        std::env::set_var("KIN_DAEMON_REQUIRE_TOKEN", "false");
+        assert!(resolve_serve_auth_token(&layout).is_none());
+
+        // Explicit truthy values are equivalent to the default.
         std::env::set_var("KIN_DAEMON_REQUIRE_TOKEN", "1");
         assert_eq!(
             resolve_serve_auth_token(&layout).as_deref(),
             Some(provisioned.trim())
         );
+        std::env::remove_var("KIN_DAEMON_REQUIRE_TOKEN");
 
-        // An explicit KIN_DAEMON_AUTH_TOKEN override always wins over the gate.
+        // An explicit KIN_DAEMON_AUTH_TOKEN override always wins over the gate,
+        // even while the gate is opted out.
+        std::env::set_var("KIN_DAEMON_REQUIRE_TOKEN", "0");
         std::env::set_var("KIN_DAEMON_AUTH_TOKEN", "explicit-override");
         assert_eq!(
             resolve_serve_auth_token(&layout).as_deref(),
             Some("explicit-override")
         );
 
+        std::env::remove_var("KIN_DAEMON_AUTH_TOKEN");
+        std::env::remove_var("KIN_DAEMON_REQUIRE_TOKEN");
+    }
+
+    /// Round-trip proof of the default-on posture through the real production
+    /// entry point (`serve_bound_with_shutdown`, what `kin-daemon` itself
+    /// calls) rather than the test-only `router_with_auth` helper: with no
+    /// `KIN_DAEMON_REQUIRE_TOKEN`/`KIN_DAEMON_AUTH_TOKEN` configured, a fresh
+    /// install (a) provisions its own token, (b) rejects a request carrying no
+    /// token, (c) rejects a request carrying the wrong token, and (d) accepts
+    /// the request that presents the provisioned token.
+    #[tokio::test]
+    async fn daemon_enforces_loopback_token_by_default_end_to_end() {
+        let _env = env_test_lock();
+        std::env::remove_var("KIN_DAEMON_AUTH_TOKEN");
+        std::env::remove_var("KIN_DAEMON_REQUIRE_TOKEN");
+
+        let state = test_state();
+        // Pre-provision deterministically so this test does not race the
+        // server task's own first-call provisioning; `ensure_loopback_token`
+        // is idempotent, so whichever side calls it first, both observe the
+        // same persisted value.
+        let token = ensure_loopback_token(&state.layout).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(serve_bound_with_shutdown(state, listener, shutdown_rx));
+        let base = format!("http://{addr}");
+
+        let http = reqwest::Client::new();
+
+        let no_token = http.get(format!("{base}/status")).send().await.unwrap();
+        assert_eq!(
+            no_token.status(),
+            StatusCode::UNAUTHORIZED,
+            "a fresh install must reject an unauthenticated request by default"
+        );
+
+        let wrong_token = http
+            .get(format!("{base}/status"))
+            .header("authorization", "Bearer not-the-real-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            wrong_token.status(),
+            StatusCode::UNAUTHORIZED,
+            "an incorrect bearer token must be rejected, not just a missing one"
+        );
+
+        let accepted = http
+            .get(format!("{base}/status"))
+            .header("authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            accepted.status(),
+            StatusCode::OK,
+            "the auto-provisioned token must be accepted"
+        );
+
+        server.abort();
         std::env::remove_var("KIN_DAEMON_AUTH_TOKEN");
         std::env::remove_var("KIN_DAEMON_REQUIRE_TOKEN");
     }

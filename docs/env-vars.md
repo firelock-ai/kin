@@ -83,7 +83,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_DAEMON_LOCATE_ONLY` | bool | false | correctness | daemon serves locate-only from a snapshot, changing what it answers |
 | `KIN_DAEMON_PERIODIC_FLUSH_SECS` | seconds>=0 | 30 | operational | maximum interval before dirty graph state is flushed |
 | `KIN_DAEMON_READY_TIMEOUT_SECS` | seconds>=0 | 300 | operational | how long to wait for a starting daemon to become ready |
-| `KIN_DAEMON_REQUIRE_TOKEN` | bool | false | operational | require a bearer token for all daemon requests |
+| `KIN_DAEMON_REQUIRE_TOKEN` | bool | true | operational | require a bearer token for all daemon requests; set falsy to opt out |
 | `KIN_DAEMON_RUNTIME_SHUTDOWN_GRACE_SECS` | seconds>=0 | 8 | operational | bound on tokio runtime teardown waiting for blocking tasks |
 | `KIN_DAEMON_SCOPE_BUILD_TIMEOUT_SECS` | seconds>=0 | *(unset)* | operational | timeout for a daemon-side scope graph build |
 | `KIN_DAEMON_SHUTDOWN_GRACE_SECS` | seconds>=0 | 25 | operational | grace before the shutdown watchdog force-exits; 0 escalates immediately |

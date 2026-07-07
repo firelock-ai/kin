@@ -622,14 +622,16 @@ async fn try_daemon_command_commit(
         "dry_run": false,
     });
 
-    let resp = client
+    let mut request = client
         .post(format!(
             "{}/v1/commands/commit",
             daemon_url.trim_end_matches('/')
         ))
-        .json(&payload)
-        .send()
-        .await?;
+        .json(&payload);
+    if let Some(token) = crate::daemon_client::resolve_daemon_auth_token() {
+        request = request.bearer_auth(token);
+    }
+    let resp = request.send().await?;
 
     if !resp.status().is_success() {
         let status = resp.status();

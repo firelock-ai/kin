@@ -195,10 +195,11 @@ pub struct LocateRequest {
 ///
 /// Matches the daemon's own `resolve_serve_auth_token` order:
 /// `KIN_DAEMON_AUTH_TOKEN` env if set, else the auto-provisioned per-install
-/// `.kin/daemon.token` file, else none. When the daemon is not enforcing a
-/// token (the default), an absent value just means no header is sent and the
-/// request is still accepted.
-fn resolve_daemon_auth_token() -> Option<String> {
+/// `.kin/daemon.token` file, else none. `pub(crate)` so any other in-crate
+/// caller that builds its own client for a direct daemon request (rather
+/// than going through `DaemonClient`, which attaches this automatically)
+/// can still authenticate correctly.
+pub(crate) fn resolve_daemon_auth_token() -> Option<String> {
     if let Ok(token) = std::env::var("KIN_DAEMON_AUTH_TOKEN") {
         let token = token.trim().to_string();
         if !token.is_empty() {
