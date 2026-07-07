@@ -1211,6 +1211,32 @@ struct CachedParse {
     imports: Vec<kin_parser::FileImport>,
 }
 
+/// One artifact delta's resolved parse disposition for a commit's reconcile
+/// pass, computed by the plan/parse phases so the serial reconcile is a pure
+/// fold over pre-resolved parses with no blob I/O or parsing on its path.
+enum ImportedFileResolution {
+    /// Non-source file, deletion, or a blob whose read/parse failed: drop any
+    /// prior semantic state for this path.
+    Remove,
+    /// Parse available (memo hit or freshly parsed this commit): reconcile the
+    /// path against it.
+    Parsed(Arc<CachedParse>),
+}
+
+/// A distinct source blob scheduled for parsing within one commit. Parsing is a
+/// pure function of (blob bytes, parser semantics), so each distinct blob is
+/// read and parsed once and its `Arc` result shared across every delta in the
+/// commit that names it — the same reuse the per-pass memo gives across commits.
+struct ImportedParseJob {
+    blob_hash: kin_blobs::Hash256,
+    file_id: FilePathId,
+    /// Indices into the commit's `artifact_deltas` this parse resolves. The
+    /// first entry was counted as a memo miss when the job was scheduled; any
+    /// later entries are same-commit reappearances whose hit/miss accounting is
+    /// settled in the merge once the parse's success is known.
+    served_deltas: Vec<usize>,
+}
+
 pub(crate) fn enrich_imported_changes_with_semantics(
     imported: &mut [kin_git::ImportedChange],
     blob_store: &kin_blobs::BlobStore,
@@ -1226,8 +1252,6 @@ fn enrich_imported_changes_with_semantics_inner(
     blob_store: &kin_blobs::BlobStore,
     parse_memo_enabled: bool,
 ) -> Result<(usize, usize)> {
-    let pipeline = kin_index::IndexPipeline::new();
-
     // Profiling timers (accumulated across every commit in the pass).
     let mut total_blob_read_time = std::time::Duration::ZERO;
     let mut total_parsing_time = std::time::Duration::ZERO;
@@ -1323,160 +1347,230 @@ fn enrich_imported_changes_with_semantics_inner(
         let mut changed_source_files = BTreeSet::<String>::new();
         let mut previous_file_states = HashMap::<String, ImportedSemanticFileState>::new();
 
-        for artifact_delta in &imported[i].change.artifact_deltas {
+        // Rung-3 intra-commit parallel compute. The outer commit loop stays
+        // sequential (each commit forks its first parent's resulting semantic
+        // state), so parallelism lives inside a commit: (1) plan each delta's
+        // disposition in delta order, scheduling every distinct memo-missing
+        // source blob as a parse job; (2) read and (3) parse those jobs across
+        // the Rayon pool; (4) fold the results into the memo and reconcile
+        // serially in the original delta order. Parsing is a pure function of
+        // (blob bytes, parser semantics) and every order-sensitive step
+        // (reconcile, linker mutation, current_files, delta accumulation) stays
+        // serial, so the resulting graph is byte-identical to the serial path.
+        let deltas = &imported[i].change.artifact_deltas;
+        let mut resolutions: Vec<Option<ImportedFileResolution>> =
+            (0..deltas.len()).map(|_| None).collect();
+        let mut parse_jobs: Vec<ImportedParseJob> = Vec::new();
+        let mut scheduled_jobs: HashMap<(kin_blobs::Hash256, u32), usize> = HashMap::new();
+
+        for (delta_idx, artifact_delta) in deltas.iter().enumerate() {
+            let file_path = &artifact_delta.file_id.0;
+
+            if !matches!(
+                FileClassifier::classify(Path::new(file_path)),
+                FileClassification::EntitySource
+            ) {
+                resolutions[delta_idx] = Some(ImportedFileResolution::Remove);
+                continue;
+            }
+
+            let Some(new_hash) = artifact_delta.new_hash else {
+                resolutions[delta_idx] = Some(ImportedFileResolution::Remove);
+                continue;
+            };
+
+            // A blob hash uniquely determines the file bytes, and a parse is a
+            // pure function of (bytes, parser semantics), so the same file
+            // version recurring across commits — git blobs dedup across history —
+            // is read and parsed once. The parser-semantics version is part of
+            // the key so a grammar/extractor upgrade never serves a stale parse.
+            let memo_key = (
+                kin_blobs::Hash256::from_bytes(*new_hash.as_bytes()),
+                kin_parser::PARSER_SEMANTICS_VERSION,
+            );
+
+            if parse_memo_enabled {
+                if let Some(hit) = parse_memo.get(&memo_key) {
+                    parse_memo_hits += 1;
+                    resolutions[delta_idx] = Some(ImportedFileResolution::Parsed(Arc::clone(hit)));
+                    continue;
+                }
+                if let Some(&job_idx) = scheduled_jobs.get(&memo_key) {
+                    // Served by the parse scheduled earlier this commit; whether
+                    // it counts as a hit (parse succeeds and is memoized) or
+                    // another miss (parse fails and is never memoized) is settled
+                    // in the merge, matching the serial memo's per-appearance
+                    // accounting exactly.
+                    parse_jobs[job_idx].served_deltas.push(delta_idx);
+                    continue;
+                }
+                parse_memo_misses += 1;
+                scheduled_jobs.insert(memo_key, parse_jobs.len());
+                parse_jobs.push(ImportedParseJob {
+                    blob_hash: memo_key.0,
+                    file_id: FilePathId::new(file_path),
+                    served_deltas: vec![delta_idx],
+                });
+            } else {
+                // Memo disabled (serial oracle): every appearance re-parses.
+                parse_memo_misses += 1;
+                parse_jobs.push(ImportedParseJob {
+                    blob_hash: memo_key.0,
+                    file_id: FilePathId::new(file_path),
+                    served_deltas: vec![delta_idx],
+                });
+            }
+        }
+
+        if !parse_jobs.is_empty() {
+            // Stage 1: read each distinct blob once, in parallel. The stage's
+            // wall-clock (not summed thread time) is attributed to blob-read.
+            let blob_read_start = std::time::Instant::now();
+            let job_contents: Vec<Result<Vec<u8>, String>> = parse_jobs
+                .par_iter()
+                .map(|job| {
+                    blob_store
+                        .read(&job.blob_hash)
+                        .map_err(|err| err.to_string())
+                })
+                .collect();
+            total_blob_read_time += blob_read_start.elapsed();
+
+            // Stage 2: parse the successfully-read blobs in parallel. Each worker
+            // thread builds its own IndexPipeline (tree-sitter parsers are
+            // per-thread). Results collect in job order (`par_iter().collect()`
+            // preserves order) and the parse is pure, so the pass is
+            // deterministic. The stage's wall-clock is attributed to parsing.
+            let parse_start = std::time::Instant::now();
+            let job_parses: Vec<Option<Result<Arc<CachedParse>, String>>> = parse_jobs
+                .par_iter()
+                .zip(job_contents.par_iter())
+                .map_init(kin_index::IndexPipeline::new, |pipeline, (job, content)| {
+                    let content = content.as_ref().ok()?;
+                    Some(
+                        pipeline
+                            .index_file_content_with_tests(&job.file_id, content, job.blob_hash)
+                            .map(|indexed| {
+                                Arc::new(CachedParse {
+                                    entities: indexed.indexed_file.entities,
+                                    extracted_relations: indexed.indexed_file.extracted_relations,
+                                    imports: indexed.indexed_file.imports,
+                                })
+                            })
+                            .map_err(|err| err.to_string()),
+                    )
+                })
+                .collect();
+            total_parsing_time += parse_start.elapsed();
+
+            // Merge (serial, deterministic): populate the content-keyed memo,
+            // resolve every served delta, settle same-commit reappearance
+            // accounting, and warn on failures in job order. Memo insertion order
+            // never affects the memo's contents (keyed by blob hash + semantics).
+            let read_errors: Vec<Option<String>> = job_contents
+                .into_iter()
+                .map(|content| content.err())
+                .collect();
+            for (job_idx, job) in parse_jobs.iter().enumerate() {
+                let extra_appearances = job.served_deltas.len() - 1;
+                match &job_parses[job_idx] {
+                    Some(Ok(parsed)) => {
+                        if parse_memo_enabled {
+                            parse_memo.insert(
+                                (job.blob_hash, kin_parser::PARSER_SEMANTICS_VERSION),
+                                Arc::clone(parsed),
+                            );
+                        }
+                        // Extra same-commit appearances were served from this one
+                        // parse: hits, exactly as the serial memo would count.
+                        parse_memo_hits += extra_appearances;
+                        for &delta_idx in &job.served_deltas {
+                            resolutions[delta_idx] =
+                                Some(ImportedFileResolution::Parsed(Arc::clone(parsed)));
+                        }
+                    }
+                    Some(Err(err)) => {
+                        // Parse failed: never memoized, so every appearance is a
+                        // miss (the first was already counted at schedule time).
+                        parse_memo_misses += extra_appearances;
+                        warn!(
+                            file = %job.file_id.0,
+                            error = %err,
+                            "skipping semantic enrichment for imported source blob that could not be parsed"
+                        );
+                        for &delta_idx in &job.served_deltas {
+                            resolutions[delta_idx] = Some(ImportedFileResolution::Remove);
+                        }
+                    }
+                    None => {
+                        // Blob read failed: same removal + miss accounting.
+                        parse_memo_misses += extra_appearances;
+                        let err = read_errors[job_idx].as_deref().unwrap_or("missing content");
+                        warn!(
+                            file = %job.file_id.0,
+                            error = %err,
+                            "skipping semantic enrichment for imported blob with missing content"
+                        );
+                        for &delta_idx in &job.served_deltas {
+                            resolutions[delta_idx] = Some(ImportedFileResolution::Remove);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Reconcile serially in delta order — byte-identical to the pre-rung-3
+        // per-file body, now fed pre-resolved parses. Each commit changes a given
+        // path at most once, so a delta's baseline `old_state` is independent of
+        // its siblings and this fold reproduces the serial result exactly.
+        for (delta_idx, artifact_delta) in imported[i].change.artifact_deltas.iter().enumerate() {
             let file_path = artifact_delta.file_id.0.clone();
             let old_state = current_files.get(&file_path).cloned();
             if let Some(old_state) = &old_state {
                 previous_file_states.insert(file_path.clone(), old_state.clone());
             }
 
-            if !matches!(
-                FileClassifier::classify(Path::new(&file_path)),
-                FileClassification::EntitySource
-            ) {
-                if remove_imported_file_semantic_state(
-                    &file_path,
-                    old_state,
-                    &mut current_files,
-                    &mut entity_deltas,
-                ) {
-                    changed_source_files.insert(file_path.clone());
-                    incremental_linker.remove_file(&file_path);
-                }
-                continue;
-            }
-
-            let Some(new_hash) = artifact_delta.new_hash else {
-                if remove_imported_file_semantic_state(
-                    &file_path,
-                    old_state,
-                    &mut current_files,
-                    &mut entity_deltas,
-                ) {
-                    changed_source_files.insert(file_path.clone());
-                    incremental_linker.remove_file(&file_path);
-                }
-                continue;
-            };
-
-            let blob_hash = kin_blobs::Hash256::from_bytes(*new_hash.as_bytes());
-
-            // Consult the per-pass parse memo before touching the blob store or
-            // the parser. A blob hash uniquely determines the file bytes, and a
-            // parse is a pure function of (bytes, parser semantics), so the same
-            // file version recurring across commits — git blobs dedup across
-            // history — is read and parsed once. The parser-semantics version is
-            // part of the key so a grammar/extractor upgrade never serves a stale
-            // parse.
-            let memo_key = (blob_hash, kin_parser::PARSER_SEMANTICS_VERSION);
-            let memoized = if parse_memo_enabled {
-                parse_memo.get(&memo_key).cloned()
-            } else {
-                None
-            };
-            let parsed = match memoized {
-                Some(hit) => {
-                    parse_memo_hits += 1;
-                    hit
-                }
-                None => {
-                    parse_memo_misses += 1;
-
-                    let blob_start_time = std::time::Instant::now();
-                    let content = match blob_store.read(&blob_hash) {
-                        Ok(content) => {
-                            total_blob_read_time += blob_start_time.elapsed();
-                            content
-                        }
-                        Err(err) => {
-                            total_blob_read_time += blob_start_time.elapsed();
-                            warn!(
-                                file = %file_path,
-                                hash = %new_hash,
-                                error = %err,
-                                "skipping semantic enrichment for imported blob with missing content"
-                            );
-                            if remove_imported_file_semantic_state(
-                                &file_path,
-                                old_state,
-                                &mut current_files,
-                                &mut entity_deltas,
-                            ) {
-                                changed_source_files.insert(file_path.clone());
-                                incremental_linker.remove_file(&file_path);
-                            }
-                            continue;
-                        }
-                    };
-
-                    let file_id = FilePathId::new(&file_path);
-                    let parse_start_time = std::time::Instant::now();
-                    let indexed = match pipeline
-                        .index_file_content_with_tests(&file_id, &content, blob_hash)
-                    {
-                        Ok(indexed) => {
-                            total_parsing_time += parse_start_time.elapsed();
-                            indexed
-                        }
-                        Err(err) => {
-                            total_parsing_time += parse_start_time.elapsed();
-                            warn!(
-                                file = %file_path,
-                                hash = %new_hash,
-                                error = %err,
-                                "skipping semantic enrichment for imported source blob that could not be parsed"
-                            );
-                            if remove_imported_file_semantic_state(
-                                &file_path,
-                                old_state,
-                                &mut current_files,
-                                &mut entity_deltas,
-                            ) {
-                                changed_source_files.insert(file_path.clone());
-                                incremental_linker.remove_file(&file_path);
-                            }
-                            continue;
-                        }
-                    };
-
-                    // Cache the pre-reconciliation payload only. Entity-id
-                    // reconciliation below is commit-relative and must run per
-                    // commit, so it is deliberately kept outside the memo.
-                    let parsed = Arc::new(CachedParse {
-                        entities: indexed.indexed_file.entities,
-                        extracted_relations: indexed.indexed_file.extracted_relations,
-                        imports: indexed.indexed_file.imports,
-                    });
-                    if parse_memo_enabled {
-                        parse_memo.insert(memo_key, Arc::clone(&parsed));
+            match resolutions[delta_idx]
+                .take()
+                .expect("every artifact delta must be resolved by the plan/parse phase")
+            {
+                ImportedFileResolution::Remove => {
+                    if remove_imported_file_semantic_state(
+                        &file_path,
+                        old_state,
+                        &mut current_files,
+                        &mut entity_deltas,
+                    ) {
+                        changed_source_files.insert(file_path.clone());
+                        incremental_linker.remove_file(&file_path);
                     }
-                    parsed
                 }
-            };
+                ImportedFileResolution::Parsed(parsed) => {
+                    let old_entities = old_state
+                        .as_ref()
+                        .map(|state| state.entities.as_slice())
+                        .unwrap_or(&[]);
+                    // Reconcile borrows the shared parse output and clones only
+                    // the entities it stabilizes, so a memo hit never deep-clones
+                    // the entire entity vector.
+                    let (file_entity_deltas, stabilized_entities) =
+                        reconcile_imported_file_entities(old_entities, &parsed.entities);
+                    entity_deltas.extend(file_entity_deltas);
 
-            let old_entities = old_state
-                .as_ref()
-                .map(|state| state.entities.as_slice())
-                .unwrap_or(&[]);
-            // Reconcile borrows the shared parse output and clones only the
-            // entities it stabilizes, so a memo hit never deep-clones the entire
-            // entity vector.
-            let (file_entity_deltas, stabilized_entities) =
-                reconcile_imported_file_entities(old_entities, &parsed.entities);
-            entity_deltas.extend(file_entity_deltas);
+                    incremental_linker.add_file(&file_path, &stabilized_entities);
 
-            incremental_linker.add_file(&file_path, &stabilized_entities);
-
-            current_files.insert(
-                file_path.clone(),
-                ImportedSemanticFileState {
-                    file_path: file_path.clone(),
-                    entities: stabilized_entities,
-                    relations: parsed.extracted_relations.clone(),
-                    imports: parsed.imports.clone(),
-                },
-            );
-            changed_source_files.insert(file_path);
+                    current_files.insert(
+                        file_path.clone(),
+                        ImportedSemanticFileState {
+                            file_path: file_path.clone(),
+                            entities: stabilized_entities,
+                            relations: parsed.extracted_relations.clone(),
+                            imports: parsed.imports.clone(),
+                        },
+                    );
+                    changed_source_files.insert(file_path);
+                }
+            }
         }
 
         let closure_diff_start = std::time::Instant::now();
@@ -4477,6 +4571,206 @@ mod tests {
                 "relation_deltas diverged at commit {i}"
             );
         }
+    }
+
+    #[test]
+    fn replay_is_bit_identical_under_serial_and_parallel_execution() {
+        // End-to-end oracle for the intra-commit parallelism: the parse fan-out
+        // (parallel blob read + parse) and the parallel incremental linker both
+        // dispatch their per-item work onto the ambient Rayon pool. Pinning that
+        // pool to a single worker forces the whole hydration pass to run fully
+        // serially; a multi-worker pool exercises the concurrent path. Both arms
+        // run the identical production code with the memo enabled — the ONLY
+        // variable is worker-thread count — so any order-dependence, shared-state
+        // hazard, or nondeterministic merge in the fan-out would make the two
+        // diverge. The fixture spans several commits with cross-file imports,
+        // calls, a class-inheritance receiver-method call, a blob that reverts to
+        // an earlier version (memo hit), and a non-source file, so entities,
+        // relations, and their per-entity fingerprints are all exercised.
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+
+        // Leaf callees imported across the tree.
+        let log_v1 = blob_store
+            .write(b"export function log(msg: string) { return msg; }\n")
+            .unwrap();
+        // math v1 is reused verbatim by commit 3, so it parses once (commit 1)
+        // then serves from the memo.
+        let math_v1 = blob_store
+            .write(b"export function add(a: number, b: number) { return a + b; }\n")
+            .unwrap();
+        let math_v2 = blob_store
+            .write(
+                b"export function add(a: number, b: number) { return a + b; }\n\
+                  export function mul(a: number, b: number) { return a * b; }\n",
+            )
+            .unwrap();
+        // Base class for the inheritance-aware receiver-method tier.
+        let base_v1 = blob_store
+            .write(b"export class Base { greet() { return 0; } }\n")
+            .unwrap();
+        // Imports log + add, extends Base, and calls this.greet(): a single file
+        // that reaches the cross-file import/call tiers and the inherited-method
+        // tier at once.
+        let main_v1 = blob_store
+            .write(
+                b"import { log } from '../util/log';\n\
+                  import { add } from '../util/math';\n\
+                  import { Base } from '../core/base';\n\
+                  export class App extends Base { run() { log('x'); add(1, 2); this.greet(); } }\n",
+            )
+            .unwrap();
+        // A second importer of log so commit 2 adds independent cross-file work.
+        let worker_v1 = blob_store
+            .write(b"import { log } from '../util/log';\nexport function work() { log('w'); }\n")
+            .unwrap();
+        let readme = blob_store.write(b"# Title\n").unwrap();
+
+        let fixture = || {
+            vec![
+                imported_change(
+                    [0x41; 32],
+                    [0x40; 32],
+                    "seed the tree",
+                    vec![
+                        artifact_delta(
+                            "src/util/log.ts",
+                            kin_model::ArtifactDeltaKind::Added,
+                            None,
+                            Some(Hash256::from_bytes(log_v1.0)),
+                        ),
+                        artifact_delta(
+                            "src/util/math.ts",
+                            kin_model::ArtifactDeltaKind::Added,
+                            None,
+                            Some(Hash256::from_bytes(math_v1.0)),
+                        ),
+                        artifact_delta(
+                            "src/core/base.ts",
+                            kin_model::ArtifactDeltaKind::Added,
+                            None,
+                            Some(Hash256::from_bytes(base_v1.0)),
+                        ),
+                        artifact_delta(
+                            "src/app/main.ts",
+                            kin_model::ArtifactDeltaKind::Added,
+                            None,
+                            Some(Hash256::from_bytes(main_v1.0)),
+                        ),
+                    ],
+                ),
+                imported_change(
+                    [0x42; 32],
+                    [0x41; 32],
+                    "grow math + add a worker",
+                    vec![
+                        artifact_delta(
+                            "src/util/math.ts",
+                            kin_model::ArtifactDeltaKind::Modified,
+                            Some(Hash256::from_bytes(math_v1.0)),
+                            Some(Hash256::from_bytes(math_v2.0)),
+                        ),
+                        artifact_delta(
+                            "src/app/worker.ts",
+                            kin_model::ArtifactDeltaKind::Added,
+                            None,
+                            Some(Hash256::from_bytes(worker_v1.0)),
+                        ),
+                    ],
+                ),
+                imported_change(
+                    [0x43; 32],
+                    [0x42; 32],
+                    "revert math + add docs",
+                    vec![
+                        // Reverts to commit 1's exact bytes: a memo hit whose
+                        // reconciliation still runs against commit 2's state.
+                        artifact_delta(
+                            "src/util/math.ts",
+                            kin_model::ArtifactDeltaKind::Modified,
+                            Some(Hash256::from_bytes(math_v2.0)),
+                            Some(Hash256::from_bytes(math_v1.0)),
+                        ),
+                        // Non-source file: takes the removal path, never a job.
+                        artifact_delta(
+                            "README.md",
+                            kin_model::ArtifactDeltaKind::Added,
+                            None,
+                            Some(Hash256::from_bytes(readme.0)),
+                        ),
+                    ],
+                ),
+            ]
+        };
+
+        let serial_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let parallel_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+
+        let mut serial = fixture();
+        let (serial_hits, serial_misses) = serial_pool
+            .install(|| {
+                enrich_imported_changes_with_semantics_inner(&mut serial, &blob_store, true)
+            })
+            .unwrap();
+
+        let mut parallel = fixture();
+        let (parallel_hits, parallel_misses) = parallel_pool
+            .install(|| {
+                enrich_imported_changes_with_semantics_inner(&mut parallel, &blob_store, true)
+            })
+            .unwrap();
+
+        // Memo hit/miss accounting must not depend on worker-thread count.
+        assert_eq!(
+            (serial_hits, serial_misses),
+            (parallel_hits, parallel_misses),
+            "memo accounting diverged between serial and parallel execution"
+        );
+        assert!(
+            serial_hits >= 1,
+            "fixture must exercise a memo hit (the reverted blob)"
+        );
+
+        // Bit-identity across every commit: the enriched entity and relation
+        // deltas must match exactly. Entity deltas embed each entity's
+        // `SemanticFingerprint` (ast/signature/behavior hashes), so this
+        // comparison is also the fingerprint oracle.
+        assert_eq!(serial.len(), parallel.len());
+        let mut saw_entities = false;
+        let mut saw_relations = false;
+        let mut saw_fingerprint = false;
+        for (i, (serial_change, parallel_change)) in serial.iter().zip(parallel.iter()).enumerate()
+        {
+            let serial_entities = canonical_json(&serial_change.change.entity_deltas);
+            assert_eq!(
+                serial_entities,
+                canonical_json(&parallel_change.change.entity_deltas),
+                "entity_deltas diverged at commit {i} under parallel execution"
+            );
+            assert_eq!(
+                canonical_json(&serial_change.change.relation_deltas),
+                canonical_json(&parallel_change.change.relation_deltas),
+                "relation_deltas diverged at commit {i} under parallel execution"
+            );
+            saw_entities |= !serial_change.change.entity_deltas.is_empty();
+            saw_relations |= !serial_change.change.relation_deltas.is_empty();
+            saw_fingerprint |= serial_entities.contains("fingerprint");
+        }
+        assert!(saw_entities, "fixture must materialize entity deltas");
+        assert!(
+            saw_relations,
+            "fixture must materialize cross-file relation deltas"
+        );
+        assert!(
+            saw_fingerprint,
+            "entity deltas must carry fingerprints for the fingerprint oracle to bite"
+        );
     }
 
     #[test]
