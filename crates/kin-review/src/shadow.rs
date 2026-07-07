@@ -3730,4 +3730,55 @@ mod tests {
             "no finding may be invented from unscannable history"
         );
     }
+
+    #[test]
+    fn revert_of_the_base_change_itself_flags() {
+        // The most common revert shape: the head reverts exactly the change at
+        // the base — the removal lives in the base change's own deltas, which
+        // are part of the state the head builds on and must be scanned.
+        let graph = InMemoryGraph::new();
+        let mut original = entity_with_span("retry_budget", "src/net.rs", 40, EntityRole::Source);
+        original.fingerprint.behavior_hash = Hash256::from_bytes([5; 32]);
+        let mut readded = original.clone();
+        readded.id = EntityId::from_content("src/net2.rs", "retry_budget", "Function", 8);
+        // 29 pads, then the base change REMOVES the entity, then head re-adds.
+        let pad_tail = padded_history_graph(
+            &graph,
+            vec![EntityDelta::Added(original.clone())],
+            vec![],
+            29,
+        );
+        let base_id = change_id(150);
+        let base = change_with_deltas(
+            base_id,
+            vec![pad_tail],
+            vec![EntityDelta::Removed(original.id)],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&base).unwrap();
+        graph.upsert_entity(&readded).unwrap();
+        let head_id = change_id(151);
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![EntityDelta::Added(readded)],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+        let finding = report
+            .policy
+            .findings
+            .iter()
+            .find(|f| f.kind == "revert_history")
+            .expect("a revert of the base change itself must flag");
+        assert!(
+            finding.message.contains("in the base change itself"),
+            "distance-0 phrasing expected, got: {}",
+            finding.message
+        );
+    }
 }
