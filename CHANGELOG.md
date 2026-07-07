@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.13] - 2026-07-07
+
+Distribution becomes first-class: Kin installs from npm as `@kinlab/kin`, doctor heals its own VFS shim, and history hydration gains parse reuse and a timing profile.
+
+### Added
+
+- Canonical npm package `@kinlab/kin`: installs the platform Kin CLI + daemon and
+  exposes the `kin` and `kin-mcp` binaries; MCP stays included via `kin mcp start`.
+  `@kinlab/kin-mcp` remains as a compatibility wrapper.
+- History hydration can emit a machine-readable per-stage timing profile
+  (`KIN_HYDRATE_STAGE_TIMINGS`) for replay analysis.
+- Blob parses are memoized across history hydration: identical file contents parse
+  once per adapter version instead of once per touching commit.
+
+### Fixed
+
+- `kin doctor --fix` repairs a missing or zero-byte VFS shim by fetching the release
+  shim matching the installed version — or fails honestly — instead of printing
+  circular fix advice.
+- `kin refs` and rename queries answer only from graph truth; the raw source-tree
+  scan fallback is removed from the authority path.
+
+### Security
+
+- crossbeam-epoch updated to 0.9.20 (RUSTSEC-2026-0204).
+
 ## [0.2.12] - 2026-07-06
 
 First-touch review latency: ancestor..descendant review pairs hydrate git history once instead of twice.
