@@ -39,8 +39,24 @@ impl KinLayout {
     /// reported as having no store rather than silently sharing the parent's
     /// graph (the failure mode behind the parent-store poisoning incident). Set
     /// `KIN_ALLOW_PARENT_STORE=1` to opt back into binding the parent store.
+    ///
+    /// Reads `KIN_DAEMON_URL` once from the process environment and delegates
+    /// to [`Self::discover_with_daemon_url`]; call that directly to make the
+    /// daemon-URL input an explicit parameter instead of an ambient process
+    /// read (e.g. so a test is immune to a concurrent, unrelated test
+    /// mutating the same process-global env var).
     pub fn discover(start: &Path) -> Option<Self> {
-        if std::env::var("KIN_DAEMON_URL").is_ok() {
+        Self::discover_with_daemon_url(start, std::env::var("KIN_DAEMON_URL").ok().as_deref())
+    }
+
+    /// Same contract as [`Self::discover`], but with the daemon-URL input
+    /// taken as an explicit parameter rather than read from the process
+    /// environment. `daemon_url` mirrors what an already-resolved
+    /// `KIN_DAEMON_URL` would be: `Some(_)` (any value, content unused) skips
+    /// straight to `<start>/.kin` exactly as the env-sensing path does;
+    /// `None` runs the normal upward walk.
+    pub fn discover_with_daemon_url(start: &Path, daemon_url: Option<&str>) -> Option<Self> {
+        if daemon_url.is_some() {
             return Some(Self::new(start.join(".kin")));
         }
         let mut current = start.to_path_buf();
@@ -394,6 +410,33 @@ mod tests {
     fn discover_returns_none_when_missing() {
         let dir = tempfile::tempdir().unwrap();
         assert!(KinLayout::discover(dir.path()).is_none());
+    }
+
+    #[test]
+    fn discover_with_daemon_url_short_circuits_on_any_value() {
+        // A `Some(_)` daemon-URL input skips the walk and the missing-.kin/
+        // check entirely, exactly like the env-sensing `discover` does when
+        // `KIN_DAEMON_URL` is set to anything — content is never inspected.
+        let dir = tempfile::tempdir().unwrap();
+        let found = KinLayout::discover_with_daemon_url(dir.path(), Some("http://127.0.0.1:1"))
+            .expect("Some(_) daemon_url must short-circuit even with no .kin/ present");
+        assert_eq!(found.root(), dir.path().join(".kin"));
+    }
+
+    #[test]
+    fn discover_with_daemon_url_none_runs_the_normal_walk() {
+        // `None` must behave identically to the env-sensing `discover` with
+        // KIN_DAEMON_URL unset: no .kin/ anywhere up the tree resolves to
+        // `None`, not a fabricated layout — the explicit-parameter path and
+        // the ambient-env path must never diverge in behavior, only in how
+        // the daemon-URL input is supplied.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(KinLayout::discover_with_daemon_url(dir.path(), None).is_none());
+
+        let kin_dir = dir.path().join(".kin");
+        std::fs::create_dir(&kin_dir).unwrap();
+        let found = KinLayout::discover_with_daemon_url(dir.path(), None).unwrap();
+        assert_eq!(found.root(), kin_dir);
     }
 
     #[test]

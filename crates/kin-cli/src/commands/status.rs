@@ -360,9 +360,21 @@ fn build_id(sha: &str, dirty: bool) -> String {
     }
 }
 
+/// Test-only: open the local snapshot directly, bypassing the daemon, for
+/// exercising [`build_status_summary`] against a real repo fixture.
+///
+/// Deliberately calls `discover_with_daemon_url(cwd, None)` rather than
+/// `KinLayout::discover(cwd)`: this helper's whole point is local-only
+/// discovery, so it must never pick up whatever `KIN_DAEMON_URL` happens to
+/// be set in the process at the moment it runs. `cargo test` runs unit tests
+/// from many modules concurrently in one process and process env is global,
+/// so reading the ambient var here would make this function's result depend
+/// on which *other*, unrelated test happens to be mid-flight — parameterizing
+/// it out entirely removes that hazard rather than papering over it with
+/// serialization.
 #[cfg(test)]
 async fn load_status(cwd: &Path) -> Result<StatusSummary> {
-    let layout = kin_core::KinLayout::discover(cwd).ok_or_else(|| {
+    let layout = kin_core::KinLayout::discover_with_daemon_url(cwd, None).ok_or_else(|| {
         anyhow::anyhow!(
             "not a Kin repository (no .kin/ found)\nhint: run `kin init .` to initialize a Kin repository here"
         )
