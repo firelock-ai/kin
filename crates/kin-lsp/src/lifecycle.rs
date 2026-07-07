@@ -126,4 +126,30 @@ impl LspServer {
     pub fn has_type_definition(&self) -> bool {
         self.capabilities.type_definition_provider.is_some()
     }
+
+    /// The capabilities this live server reported during the initialize
+    /// handshake, expressed in the registry's capability vocabulary. This is the
+    /// source of truth for what actually ran and feeds the enrichment proof.
+    pub fn probed_capabilities(
+        &self,
+    ) -> std::collections::BTreeSet<crate::registry::LspCapability> {
+        use crate::registry::LspCapability;
+        let mut caps = std::collections::BTreeSet::new();
+        if self.has_definition() {
+            caps.insert(LspCapability::Definition);
+        }
+        if self.has_type_definition() {
+            caps.insert(LspCapability::TypeDefinition);
+        }
+        if self.has_references() {
+            caps.insert(LspCapability::References);
+        }
+        if self.has_call_hierarchy() {
+            caps.insert(LspCapability::CallHierarchy);
+        }
+        if self.has_type_hierarchy() {
+            caps.insert(LspCapability::TypeHierarchy);
+        }
+        caps
+    }
 }

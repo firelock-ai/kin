@@ -14,7 +14,17 @@ pub mod enrichment;
 pub mod error;
 pub mod file_enrichment;
 pub mod lifecycle;
+pub mod proof;
 pub mod protocol;
+pub mod registry;
 
 pub use enrichment::{EnrichmentResult, EntityIndex, EntityRef};
 pub use error::{LspError, Result};
+pub use proof::{
+    FileFailure, LanguageEnrichment, LspEnrichmentProof, ProofMode, ProofRecorder, ProofViolation,
+};
+pub use registry::{
+    language_from_slug, stamp_lsp_provenance, BinaryFinder, LspCapability, LspProvenance,
+    ProviderGap, ProviderGapReason, ProviderId, ProviderProbe, ProviderRegistry, RegistryConfig,
+    RegistryConfigError, ResolvedProvider, SystemBinaryFinder,
+};
