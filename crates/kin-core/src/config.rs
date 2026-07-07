@@ -219,6 +219,118 @@ pub struct RemoteConfig {
     pub refs: Vec<RemoteRefConfig>,
 }
 
+/// Proof posture for LSP enrichment. Mirrors `kin_lsp::ProofMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LspProofMode {
+    /// Best-effort enrichment; gaps are recorded but not fatal.
+    #[default]
+    Advisory,
+    /// Citable / proof run; required-language gaps and silent failures are fatal.
+    Citable,
+}
+
+impl LspProofMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Advisory => "advisory",
+            Self::Citable => "citable",
+        }
+    }
+}
+
+impl std::fmt::Display for LspProofMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// A per-language LSP provider override. Selects a specific language server for
+/// a language and optionally overrides the binaries searched / launch args.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspProviderOverride {
+    /// Language slug, e.g. `python`, `rust`, `go`.
+    pub language: String,
+    /// Provider id to prefer, e.g. `pylsp`, `rust-analyzer`, `gopls`.
+    pub provider: String,
+    /// Extra binary-name candidates, tried before the provider's defaults.
+    #[serde(default)]
+    pub binaries: Vec<String>,
+    /// Launch-arg override; when set, replaces the provider's default args.
+    #[serde(default)]
+    pub args: Option<Vec<String>>,
+}
+
+/// Repo-local LSP enrichment configuration, stored under `[lsp]` in
+/// `.kin/config.toml`.
+///
+/// LSP is default-on enrichment layered over Kin's own parsers and linkers.
+/// This section replaces environment sprawl (e.g. `KIN_DAEMON_DISABLE_LSP`) with
+/// an explicit, versioned config surface. Provider selection here maps directly
+/// into the `kin_lsp` provider registry (`RegistryConfig`): `providers` become
+/// registry overrides, `required` / `disabled` become the registry's
+/// required / disabled language policy, and `proof_mode` selects the enrichment
+/// proof posture.
+///
+/// Field order matters for TOML serialization: the scalar and string-array keys
+/// come first and `providers` (a TOML array-of-tables) is last, so a config with
+/// provider overrides serializes without moving a key past the `[[lsp.providers]]`
+/// section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LspConfig {
+    /// Whether LSP enrichment runs at all. Absent config means enabled with
+    /// auto-detection of installed servers.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Proof posture for enrichment runs.
+    #[serde(default)]
+    pub proof_mode: LspProofMode,
+    /// Languages whose enrichment is REQUIRED. A gap for a required language is
+    /// fail-loud in a citable proof run.
+    #[serde(default)]
+    pub required: Vec<String>,
+    /// Languages whose enrichment is disabled entirely.
+    #[serde(default)]
+    pub disabled: Vec<String>,
+    /// Per-language provider overrides.
+    #[serde(default)]
+    pub providers: Vec<LspProviderOverride>,
+}
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            proof_mode: LspProofMode::Advisory,
+            required: Vec::new(),
+            disabled: Vec::new(),
+            providers: Vec::new(),
+        }
+    }
+}
+
+impl LspConfig {
+    /// Validate the section for internal consistency, independent of which
+    /// servers are installed. Fail-loud: a language cannot be both required and
+    /// disabled. Provider-id and language-slug validation against the live
+    /// registry happens when this section is mapped into
+    /// `kin_lsp::RegistryConfig`.
+    pub fn validate(&self) -> Result<()> {
+        for language in &self.required {
+            if self
+                .disabled
+                .iter()
+                .any(|disabled| disabled.eq_ignore_ascii_case(language))
+            {
+                return Err(KinError::Config(format!(
+                    "language '{language}' is both required and disabled in [lsp] config"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Repo-local configuration stored in `.kin/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KinConfig {
@@ -257,6 +369,11 @@ pub struct KinConfig {
     /// Native and compatibility remote configuration.
     #[serde(default)]
     pub remote: RemoteConfig,
+
+    /// LSP enrichment configuration: provider selection, required/disabled
+    /// languages, and proof posture.
+    #[serde(default)]
+    pub lsp: LspConfig,
 }
 
 fn default_mode() -> String {
@@ -311,6 +428,7 @@ impl Default for KinConfig {
             world: WorldConfig::default(),
             execution: ExecutionPolicyConfig::default(),
             remote: RemoteConfig::default(),
+            lsp: LspConfig::default(),
         }
     }
 }
@@ -322,10 +440,21 @@ impl KinConfig {
         self.execution.external_tools = preset.defaults();
     }
 
-    /// Load config from a TOML file.
+    /// Validate cross-field invariants that serde cannot express on its own.
+    /// Fail-loud: a config that contradicts a substrate contract must not load
+    /// silently and degrade behavior at runtime.
+    pub fn validate(&self) -> Result<()> {
+        self.lsp.validate()?;
+        Ok(())
+    }
+
+    /// Load config from a TOML file. The parsed config is validated before it is
+    /// returned, so a contradictory config fails loud at load rather than
+    /// silently degrading enrichment later.
     pub fn load(path: &Path) -> Result<Self> {
         let contents = std::fs::read_to_string(path).map_err(|e| KinError::io(path, e))?;
         let config: Self = toml::from_str(&contents)?;
+        config.validate()?;
         Ok(config)
     }
 
@@ -452,5 +581,104 @@ transport = "native-kin"
         let parsed: KinConfig = toml::from_str(legacy).unwrap();
         assert_eq!(parsed.remote.refs.len(), 1);
         assert_eq!(parsed.remote.refs[0].host, RemoteHostKind::KinLab);
+    }
+
+    #[test]
+    fn lsp_config_defaults_to_enabled_advisory() {
+        let config = KinConfig::default();
+        assert!(config.lsp.enabled);
+        assert_eq!(config.lsp.proof_mode, LspProofMode::Advisory);
+        assert!(config.lsp.providers.is_empty());
+        assert!(config.lsp.required.is_empty());
+        assert!(config.lsp.disabled.is_empty());
+    }
+
+    #[test]
+    fn lsp_config_absent_section_uses_defaults() {
+        let config: KinConfig = toml::from_str("name = \"no-lsp-section\"").unwrap();
+        assert!(config.lsp.enabled);
+        assert_eq!(config.lsp.proof_mode, LspProofMode::Advisory);
+    }
+
+    #[test]
+    fn lsp_section_parses_typed_fields() {
+        let toml_str = r#"
+[lsp]
+enabled = true
+proof_mode = "citable"
+required = ["rust", "python"]
+disabled = ["go"]
+
+[[lsp.providers]]
+language = "python"
+provider = "pylsp"
+binaries = ["/opt/py/pylsp"]
+args = ["--verbose"]
+"#;
+        let config: KinConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.lsp.proof_mode, LspProofMode::Citable);
+        assert_eq!(config.lsp.required, vec!["rust", "python"]);
+        assert_eq!(config.lsp.disabled, vec!["go"]);
+        assert_eq!(config.lsp.providers.len(), 1);
+        let over = &config.lsp.providers[0];
+        assert_eq!(over.language, "python");
+        assert_eq!(over.provider, "pylsp");
+        assert_eq!(over.binaries, vec!["/opt/py/pylsp"]);
+        assert_eq!(over.args.as_deref(), Some(&["--verbose".to_string()][..]));
+    }
+
+    #[test]
+    fn lsp_proof_mode_display_round_trips() {
+        assert_eq!(LspProofMode::Advisory.as_str(), "advisory");
+        assert_eq!(LspProofMode::Citable.to_string(), "citable");
+    }
+
+    #[test]
+    fn lsp_required_and_disabled_conflict_is_rejected() {
+        let config = LspConfig {
+            required: vec!["rust".to_string()],
+            disabled: vec!["Rust".to_string()],
+            ..LspConfig::default()
+        };
+        // Case-insensitive, fail-loud.
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn load_rejects_contradictory_lsp_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[lsp]\nrequired = [\"rust\"]\ndisabled = [\"rust\"]\n",
+        )
+        .unwrap();
+        // A contradictory config must fail at load, not silently degrade later.
+        assert!(KinConfig::load(&path).is_err());
+    }
+
+    #[test]
+    fn lsp_provider_override_round_trips_through_save() {
+        // With a non-empty `providers` array-of-tables, `save()` only produces
+        // valid TOML if `providers` is the last field of the section — this
+        // exercises that ordering end to end.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = KinConfig::default();
+        config.lsp.proof_mode = LspProofMode::Citable;
+        config.lsp.required = vec!["rust".to_string()];
+        config.lsp.providers = vec![LspProviderOverride {
+            language: "rust".to_string(),
+            provider: "rust-analyzer".to_string(),
+            binaries: vec![],
+            args: None,
+        }];
+        config.save(&path).unwrap();
+
+        let loaded = KinConfig::load(&path).unwrap();
+        assert_eq!(loaded.lsp.proof_mode, LspProofMode::Citable);
+        assert_eq!(loaded.lsp.required, vec!["rust"]);
+        assert_eq!(loaded.lsp.providers.len(), 1);
+        assert_eq!(loaded.lsp.providers[0].provider, "rust-analyzer");
     }
 }
