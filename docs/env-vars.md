@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (391 total, 294 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (392 total, 294 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -476,6 +476,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
+| `KIN_HYDRATE_STAGE_TIMINGS` | bool | false | diagnostic | emit one machine-readable JSON line of per-phase history-hydration stage timings to stderr, alongside the human summary |
 | `KIN_PROFILE_DISABLE_RESOURCES` | bool | false | diagnostic | disable resource sampling in the profiler |
 | `KIN_PROFILE_OUT` | path | *(unset)* | diagnostic | write a command profiling session to this path |
 | `KIN_PROFILE_SAMPLE_MS` | usize | 250 | diagnostic | resource sampling interval for the profiler |
