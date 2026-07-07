@@ -3411,10 +3411,24 @@ async fn review(
                     internal_error(err)
                 }
             })?;
-    if execution.hydrated_git_history {
+    if execution.hydrated_changes > 0 {
+        tracing::info!(
+            hydrated_changes = execution.hydrated_changes,
+            review_mutations = 0u64,
+            "shadow review hydrated historical changes into the graph"
+        );
         state.bump_version();
         state.save_snapshot().map_err(internal_error)?;
         state.mark_clean();
+        // A live SSE subscriber (e.g. the VFS daemon) should hear about this
+        // graph growth exactly like any other root change, not just the
+        // `mutated` case below — otherwise a hydration-only shadow review is
+        // invisible to anything watching /events in real time, even though
+        // it just persisted a potentially large import.
+        state.emit_event(DaemonEvent::GraphRootChanged {
+            old_root_hash: None,
+            new_root_hash: "review-hydration".to_string(),
+        });
     }
     if execution.mutated {
         state.bump_version();

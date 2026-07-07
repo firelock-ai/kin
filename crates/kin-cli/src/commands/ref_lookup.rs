@@ -57,7 +57,15 @@ pub(crate) fn parse_change_id(input: &str) -> Result<SemanticChangeId> {
 #[derive(Debug, Clone, Copy)]
 pub struct ResolvedRef {
     pub head: SemanticChangeId,
+    /// Whether resolving this ref lazily imported Git ancestry into the graph.
+    /// Derived from `hydrated_changes > 0`; kept for callers that only need
+    /// the yes/no signal.
     pub hydrated_git_history: bool,
+    /// Count of historical changes hydration actually inserted into the
+    /// graph (0 when the ref was already present and no import ran). Distinct
+    /// from `hydrated_git_history`: a caller reporting on hydration should
+    /// show this count rather than collapse it to a boolean.
+    pub hydrated_changes: usize,
 }
 
 pub fn resolve_ref<G>(
@@ -124,6 +132,7 @@ fn resolve_ref_importing_git_if_needed_with_mode(
         Ok(head) => Ok(ResolvedRef {
             head,
             hydrated_git_history: false,
+            hydrated_changes: 0,
         }),
         Err(original_err) => {
             let Some(reference) = reference else {
@@ -132,12 +141,13 @@ fn resolve_ref_importing_git_if_needed_with_mode(
             let Some(git_oid) = extract_git_ref(reference) else {
                 return Err(original_err);
             };
-            let hydrated_git_history =
+            let hydrated_changes =
                 hydrate_imported_git_ref(graph, layout, git_oid, enrich_semantics)?;
             let head = resolve_ref(graph, layout, Some(reference))?;
             Ok(ResolvedRef {
                 head,
-                hydrated_git_history,
+                hydrated_git_history: hydrated_changes > 0,
+                hydrated_changes,
             })
         }
     }
@@ -461,15 +471,20 @@ pub fn git_ref_requires_hydration(graph: &kin_db::InMemoryGraph, reference: &str
     !matches!(graph.get_change(&imported_change_id), Ok(Some(_)))
 }
 
+/// Lazily import the Git ancestry of `git_oid` into `graph`, returning the
+/// count of changes actually inserted (0 when the ref was already present and
+/// no import ran). Callers report this count directly rather than collapsing
+/// it to a boolean, so a cold multi-thousand-change import is never described
+/// the same way as a no-op.
 fn hydrate_imported_git_ref(
     graph: &kin_db::InMemoryGraph,
     layout: &kin_core::KinLayout,
     git_oid: &str,
     enrich_semantics: bool,
-) -> Result<bool> {
+) -> Result<usize> {
     let imported_change_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid)?;
     if graph.get_change(&imported_change_id)?.is_some() {
-        return Ok(false);
+        return Ok(0);
     }
 
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
@@ -511,7 +526,7 @@ fn hydrate_imported_git_ref(
         ));
     }
 
-    Ok(inserted > 0)
+    Ok(inserted)
 }
 
 fn resolve_semantic_change<G>(
