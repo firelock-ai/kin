@@ -8,7 +8,7 @@
 //! truth behind `kin setup status [--json]` and `kin doctor [--fix]`.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -280,16 +280,114 @@ fn check_vfs_projection() -> HealthCheck {
         }
     };
 
-    let size = lib_path.metadata().map(|m| m.len()).unwrap_or(0);
-    if lib_path.exists() && size > 0 {
-        HealthCheck::new(
+    vfs_projection_check_for(&lib_path)
+}
+
+/// The durable step that repairs a missing or corrupt shim when `kin doctor
+/// --fix` cannot source one locally. It must NEVER name `kin doctor --fix`
+/// itself: this text is reprinted in the post-`--fix` "still needs manual steps"
+/// list, where pointing back at the command that just ran is a dead loop
+/// (FIR-1409).
+const SHIM_REINSTALL_HINT: &str =
+    "reinstall kin to restore the shim: curl -fsSL https://get.kinlab.dev/install | sh";
+
+/// On-disk state of the VFS shim. Existence alone is not health: a 0-byte file
+/// crashes every process the shim is injected into, and a non-object blob is a
+/// truncated or partially-written artifact the dynamic linker will reject.
+#[derive(Debug, PartialEq, Eq)]
+enum ShimState {
+    /// No file at the path.
+    Missing,
+    /// The file exists but is empty — the crash hazard doctor warns about.
+    Empty,
+    /// The file is non-empty but is not a valid platform object file.
+    Invalid,
+    /// A usable shim of the given size.
+    Valid(u64),
+}
+
+/// Classify the shim at `lib_path`. Path is explicit so this is unit-testable
+/// without a real `$HOME`, mirroring [`session_runtime_check_for`].
+fn classify_shim(lib_path: &Path) -> ShimState {
+    let meta = match std::fs::metadata(lib_path) {
+        Ok(meta) if meta.is_file() => meta,
+        _ => return ShimState::Missing,
+    };
+    if meta.len() == 0 {
+        return ShimState::Empty;
+    }
+    match read_prefix(lib_path, 4) {
+        Ok(header) if shim_magic_ok(&header) => ShimState::Valid(meta.len()),
+        _ => ShimState::Invalid,
+    }
+}
+
+/// Read up to `n` leading bytes of `path`, tolerating short reads.
+fn read_prefix(path: &Path, n: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; n];
+    let mut filled = 0;
+    while filled < n {
+        match file.read(&mut buf[filled..])? {
+            0 => break,
+            read => filled += read,
+        }
+    }
+    buf.truncate(filled);
+    Ok(buf)
+}
+
+/// Whether `header` carries the object-file magic Kin's shim must have on this
+/// platform: Mach-O on macOS, ELF on Linux. Platforms that don't inject through
+/// this shim accept any non-empty content.
+fn shim_magic_ok(header: &[u8]) -> bool {
+    if cfg!(target_os = "macos") {
+        is_macho_magic(header)
+    } else if cfg!(target_os = "linux") {
+        header.starts_with(b"\x7fELF")
+    } else {
+        !header.is_empty()
+    }
+}
+
+/// Mach-O magic numbers as the first four bytes appear on disk — thin objects
+/// (32/64-bit, both byte orders) and universal ("fat") archives. A real
+/// `libkin_vfs_shim.dylib` on arm64/x86_64 begins `CF FA ED FE` (MH_MAGIC_64).
+fn is_macho_magic(header: &[u8]) -> bool {
+    const MAGICS: [[u8; 4]; 6] = [
+        [0xFE, 0xED, 0xFA, 0xCE], // MH_MAGIC (32-bit)
+        [0xCE, 0xFA, 0xED, 0xFE], // MH_CIGAM (32-bit, byte-swapped)
+        [0xFE, 0xED, 0xFA, 0xCF], // MH_MAGIC_64
+        [0xCF, 0xFA, 0xED, 0xFE], // MH_CIGAM_64 (typical dylib on disk)
+        [0xCA, 0xFE, 0xBA, 0xBE], // FAT_MAGIC (universal)
+        [0xCA, 0xFE, 0xBA, 0xBF], // FAT_MAGIC_64 (universal)
+    ];
+    header.len() >= 4 && MAGICS.iter().any(|magic| header[..4] == *magic)
+}
+
+/// Human name for the platform's shared-object format, for the corrupt-shim message.
+fn shim_object_kind() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Mach-O library"
+    } else if cfg!(target_os = "linux") {
+        "ELF library"
+    } else {
+        "shared library"
+    }
+}
+
+/// Build the `vfs_projection` check from a resolved shim path. Split out from
+/// [`check_vfs_projection`] so the size/magic classification is testable.
+fn vfs_projection_check_for(lib_path: &Path) -> HealthCheck {
+    match classify_shim(lib_path) {
+        ShimState::Valid(size) => HealthCheck::new(
             "vfs_projection",
             "VFS projection",
             HealthStatus::Healthy,
-            format!("shim installed ({} bytes, {})", size, lib_path.display()),
-        )
-    } else if lib_path.exists() {
-        HealthCheck::new(
+            format!("shim installed ({size} bytes, {})", lib_path.display()),
+        ),
+        ShimState::Empty => HealthCheck::new(
             "vfs_projection",
             "VFS projection",
             HealthStatus::Misconfigured,
@@ -299,18 +397,27 @@ fn check_vfs_projection() -> HealthCheck {
             ),
         )
         .fixable()
-        .with_manual_fix("run `kin doctor --fix` to reinstall the shim (or reinstall kin if no local copy remains)")
-    } else {
-        HealthCheck::new(
+        .with_manual_fix(SHIM_REINSTALL_HINT),
+        ShimState::Invalid => HealthCheck::new(
+            "vfs_projection",
+            "VFS projection",
+            HealthStatus::Misconfigured,
+            format!(
+                "shim at {} is not a valid {} — it is truncated or corrupt",
+                lib_path.display(),
+                shim_object_kind()
+            ),
+        )
+        .fixable()
+        .with_manual_fix(SHIM_REINSTALL_HINT),
+        ShimState::Missing => HealthCheck::new(
             "vfs_projection",
             "VFS projection",
             HealthStatus::Missing,
             format!("shim not installed at {}", lib_path.display()),
         )
         .fixable()
-        .with_manual_fix(
-            "run `kin doctor --fix` (or `kin setup`) to install the VFS shim into ~/.kin/lib",
-        )
+        .with_manual_fix(SHIM_REINSTALL_HINT),
     }
 }
 
@@ -854,6 +961,85 @@ fn check_retrieval_profile() -> HealthCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_file(path: &Path, bytes: &[u8]) {
+        use std::io::Write;
+        std::fs::File::create(path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+    }
+
+    /// The magic bytes a valid shim carries on the current platform.
+    fn platform_object_magic() -> &'static [u8] {
+        if cfg!(target_os = "macos") {
+            &[0xCF, 0xFA, 0xED, 0xFE] // MH_MAGIC_64 as it lands on disk
+        } else if cfg!(target_os = "linux") {
+            b"\x7fELF"
+        } else {
+            &[0x00, 0x01, 0x02, 0x03]
+        }
+    }
+
+    #[test]
+    fn classify_shim_flags_missing_empty_and_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("libkin_vfs_shim");
+
+        assert_eq!(classify_shim(&path), ShimState::Missing);
+
+        write_file(&path, b"");
+        assert_eq!(classify_shim(&path), ShimState::Empty);
+
+        // A non-empty blob without object-file magic is a truncated/corrupt
+        // artifact on the platforms that enforce a magic.
+        write_file(&path, b"this is not a shared library");
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            assert_eq!(classify_shim(&path), ShimState::Invalid);
+        }
+    }
+
+    #[test]
+    fn classify_shim_accepts_a_real_object_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("libkin_vfs_shim");
+        let mut bytes = platform_object_magic().to_vec();
+        bytes.extend_from_slice(&[0u8; 128]);
+        write_file(&path, &bytes);
+        assert!(matches!(classify_shim(&path), ShimState::Valid(_)));
+    }
+
+    #[test]
+    fn macho_magic_matches_the_shipped_dylib_header() {
+        // The v0.2.x macOS shim begins CF FA ED FE (MH_MAGIC_64 little-endian).
+        assert!(is_macho_magic(&[0xCF, 0xFA, 0xED, 0xFE, 0x0C, 0x00]));
+        assert!(!is_macho_magic(b"junk"));
+        assert!(!is_macho_magic(&[0xCF, 0xFA])); // too short
+    }
+
+    #[test]
+    fn vfs_remediation_never_points_back_at_the_failed_fix() {
+        // FIR-1409: the repair text for a broken shim must name a real working
+        // step, never `kin doctor --fix` (the command that just failed).
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let empty = dir.path().join("empty");
+        write_file(&empty, b"");
+        let corrupt = dir.path().join("corrupt");
+        write_file(&corrupt, b"not an object file");
+
+        for path in [&missing, &empty, &corrupt] {
+            let check = vfs_projection_check_for(path);
+            assert!(check.fixable, "{}: should be fixable", path.display());
+            let fix = check.manual_fix.clone().unwrap_or_default();
+            assert!(!fix.is_empty(), "{}: missing manual fix", path.display());
+            assert!(
+                !fix.contains("doctor --fix"),
+                "{}: circular fix text: {fix}",
+                path.display()
+            );
+        }
+    }
 
     #[tokio::test]
     async fn report_is_non_empty_and_serializes_with_ids() {
