@@ -617,7 +617,7 @@ pub fn entity_semantics_changed(old: &Entity, new: &Entity) -> bool {
 /// `pytest`, `contest`, `latest` — out of the test role, while still catching
 /// compound test dirs such as `unit_tests`, `acceptance_test`, and `__tests__`.
 fn is_test_dir_component(component: &str) -> bool {
-    const TEST_DIR_WORDS: [&str; 4] = ["test", "tests", "spec", "specs"];
+    const TEST_DIR_WORDS: [&str; 5] = ["test", "tests", "testing", "spec", "specs"];
     component
         .split(['_', '-', '.'])
         .any(|word| TEST_DIR_WORDS.contains(&word))
@@ -951,6 +951,14 @@ mod tests {
             EntityRole::Test
         );
         assert_eq!(classify_file_role("_tests/helper.py"), EntityRole::Test);
+        // A bare helper in a `testing/` tree is still test infrastructure even
+        // without a `test_*` filename — `testing` is a test word, while
+        // `_pytest`/`contest`/`latest` embed `test` only as a substring.
+        assert_eq!(
+            classify_file_role("testing/util_helper.py"),
+            EntityRole::Test
+        );
+        assert_eq!(classify_file_role("testing/conftest.py"), EntityRole::Test);
     }
 
     #[test]
