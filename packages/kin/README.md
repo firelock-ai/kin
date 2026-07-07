@@ -29,6 +29,21 @@ The launcher and the shell installer (`scripts/install.sh`) share the same insta
 contract (`$KIN_HOME`, default `~/.kin`): either lane satisfies the other, and neither
 silently downgrades an install the other made.
 
+## Version pinning
+
+Every `@kinlab/kin` release pins one managed `kin` release — its own package version.
+Each run compares that pin against whatever is already installed at `$KIN_HOME`:
+
+- **installed is older than the pin** — upgrades it automatically (a one-line notice
+  on stderr, no prompt, no opt-in required).
+- **installed is newer than the pin** — refuses the downgrade and exits with an
+  actionable error instead of running anything; re-run with `KIN_LAUNCHER_ADOPT=1` to
+  force it on purpose (e.g. deliberately pinning to an older release).
+- **installed matches the pin** — runs it as-is.
+
+`KIN_LAUNCHER_ADOPT=1` always forces a fresh provision of the pinned release, even when
+the installed version already matches.
+
 ## Environment
 
 | Variable | Effect |
@@ -36,7 +51,7 @@ silently downgrades an install the other made.
 | `KIN_HOME` | Root of the managed install (default `~/.kin`). |
 | `KIN_MANAGED_BIN` | Explicit path to a `kin` binary; disables provisioning entirely. |
 | `KIN_NO_PROVISION=1` | Never touch the network; fail loud if no binary is present. |
-| `KIN_LAUNCHER_ADOPT=1` | Allow re-provisioning over a version-skewed non-npm install. |
+| `KIN_LAUNCHER_ADOPT=1` | Force re-provisioning to the pinned release, including over a newer install that would otherwise be refused as a downgrade. |
 
 ## MCP setup
 

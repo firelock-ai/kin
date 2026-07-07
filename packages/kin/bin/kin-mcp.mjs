@@ -26,14 +26,22 @@ if (argv.includes('--version') || argv.includes('-V')) {
 }
 
 let binary = null;
+let provisionError = null;
 try {
   binary = await ensureProvisioned();
 } catch (error) {
-  process.stderr.write(`kin-mcp: provisioning failed: ${error.message}\n`);
+  provisionError = error;
 }
 
 if (!binary) {
-  process.stderr.write(`${notProvisionedMessage('kin')}\n`);
+  // The error message is already complete and actionable (e.g. a declined
+  // downgrade names the binary that IS present) — printing the generic
+  // not-provisioned message on top of it would contradict it.
+  if (provisionError) {
+    process.stderr.write(`kin-mcp: provisioning failed: ${provisionError.message}\n`);
+  } else {
+    process.stderr.write(`${notProvisionedMessage('kin')}\n`);
+  }
   process.exit(1);
 }
 

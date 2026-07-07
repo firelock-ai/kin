@@ -10,6 +10,7 @@ import { test } from 'node:test';
 import {
   packageVersion,
   targetKinVersion,
+  compareVersions,
   platformTarget,
   binaryName,
   kinHome,
@@ -27,6 +28,35 @@ test('packageVersion reads a semver from the manifest', () => {
 
 test('targetKinVersion tracks the package version', () => {
   assert.equal(targetKinVersion(), packageVersion());
+});
+
+test('compareVersions orders numeric cores', () => {
+  assert.equal(compareVersions('0.2.0', '0.1.0'), 1);
+  assert.equal(compareVersions('1.0.0', '0.9.9'), 1);
+  assert.equal(compareVersions('0.1.0', '0.1.0'), 0);
+  assert.equal(compareVersions('0.1.0', '0.2.0'), -1);
+});
+
+test('compareVersions understands prereleases', () => {
+  // A pre-release of a higher core beats a lower stable release.
+  assert.equal(compareVersions('0.2.7-alpha.1', '0.2.6'), 1);
+  // A newer alpha beats an older alpha of the same core.
+  assert.equal(compareVersions('0.2.7-alpha.2', '0.2.7-alpha.1'), 1);
+  // A stable release outranks its own pre-release.
+  assert.equal(compareVersions('0.2.7', '0.2.7-alpha.9'), 1);
+  // A pre-release never outranks its released version (no downgrade).
+  assert.equal(compareVersions('0.2.7-alpha.1', '0.2.7'), -1);
+  // Equal pre-releases compare equal.
+  assert.equal(compareVersions('0.2.7-alpha.1', '0.2.7-alpha.1'), 0);
+  // Alphanumeric identifiers rank above numeric; 'beta' > 'alpha' lexically.
+  assert.equal(compareVersions('0.2.7-beta', '0.2.7-alpha.1'), 1);
+  // A leading 'v' is tolerated on either side.
+  assert.equal(compareVersions('v0.2.7', 'v0.2.6'), 1);
+});
+
+test('compareVersions treats unparseable segments as 0 instead of throwing', () => {
+  assert.equal(compareVersions('unknown', '0.0.0'), 0);
+  assert.equal(compareVersions('1.x.0', '1.0.0'), 0);
 });
 
 test('platformTarget maps every supported host to a Rust triple', () => {
