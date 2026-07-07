@@ -15,6 +15,7 @@ on:
     paths:
       - Cargo.toml
       - packages/kin-mcp/package.json
+      - packages/kin/package.json
       - CHANGELOG.md
 
 permissions:

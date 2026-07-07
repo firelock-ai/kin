@@ -51,6 +51,25 @@ jobs:
           done < <(git rev-list "${base}..${head}")
           exit "$missing"
 
+  npm-launchers:
+    name: npm launcher tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      - name: Test @kinlab/kin (canonical launcher)
+        run: npm test --prefix ./packages/kin && npm run lint --prefix ./packages/kin
+
+      # test:unit, not test: full `node --test` discovery pulls in the first-run
+      # smoke, which requires a built kin binary a fresh CI runner does not have.
+      - name: Test @kinlab/kin-mcp (compatibility wrapper)
+        run: npm run test:unit --prefix ./packages/kin-mcp && npm run lint --prefix ./packages/kin-mcp
+
   check:
     name: Check & Test
     runs-on: ${{ matrix.os }}

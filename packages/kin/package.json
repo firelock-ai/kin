@@ -1,0 +1,43 @@
+{
+  "name": "@kinlab/kin",
+  "version": "0.2.9",
+  "description": "Canonical installer and launcher for Kin — provisions and runs the managed kin + kin-daemon release. MCP is one included mode (kin mcp start).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "kin": "bin/kin.mjs",
+    "kin-mcp": "bin/kin-mcp.mjs"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "homepage": "https://github.com/firelock-ai/kin",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/firelock-ai/kin.git",
+    "directory": "packages/kin"
+  },
+  "bugs": {
+    "url": "https://github.com/firelock-ai/kin/issues"
+  },
+  "keywords": [
+    "kin",
+    "kinlab",
+    "cli",
+    "mcp",
+    "semantic"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "lint": "node --check ./bin/kin.mjs && node --check ./bin/kin-mcp.mjs && node --check ./lib/resolve.mjs && node --check ./lib/provision.mjs",
+    "smoke": "node bin/kin.mjs --version"
+  }
+}
