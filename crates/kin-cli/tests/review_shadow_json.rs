@@ -446,6 +446,14 @@ fn shadow_head_import_hydrates_ancestor_base_in_single_pass() {
         resolved_head.hydrated_git_history,
         "resolving the head on a fresh graph must hydrate git history"
     );
+    // Cold-import case: hydration reports a real count, never a collapsed
+    // boolean — the ancestry it just walked (genesis..head) inserted at least
+    // one change, so this must be a truthful non-zero number, not just true.
+    assert!(
+        resolved_head.hydrated_changes > 0,
+        "cold import must report a nonzero hydrated_changes count, got {}",
+        resolved_head.hydrated_changes
+    );
 
     // Single-pass invariant: base is now already present, so it needs no further
     // hydration — the head's import subsumed the ancestor.
@@ -462,6 +470,12 @@ fn shadow_head_import_hydrates_ancestor_base_in_single_pass() {
     assert!(
         !resolved_base.hydrated_git_history,
         "base must resolve without a second hydration pass"
+    );
+    // Warm case: already-imported (via the head's ancestry walk) resolves with
+    // an exact zero count, not just a falsy flag.
+    assert_eq!(
+        resolved_base.hydrated_changes, 0,
+        "warm resolve (already imported) must report exactly zero hydrated changes"
     );
     assert_ne!(
         resolved_base.head, resolved_head.head,

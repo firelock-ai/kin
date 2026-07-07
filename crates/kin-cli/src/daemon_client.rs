@@ -195,19 +195,37 @@ pub struct LocateRequest {
 ///
 /// Matches the daemon's own `resolve_serve_auth_token` order:
 /// `KIN_DAEMON_AUTH_TOKEN` env if set, else the auto-provisioned per-install
-/// `.kin/daemon.token` file, else none. When the daemon is not enforcing a
-/// token (the default), an absent value just means no header is sent and the
-/// request is still accepted.
-fn resolve_daemon_auth_token() -> Option<String> {
-    if let Ok(token) = std::env::var("KIN_DAEMON_AUTH_TOKEN") {
-        let token = token.trim().to_string();
-        if !token.is_empty() {
-            return Some(token);
-        }
+/// `.kin/daemon.token` file, else none. `pub(crate)` so any other in-crate
+/// caller that builds its own client for a direct daemon request (rather
+/// than going through `DaemonClient`, which attaches this automatically)
+/// can still authenticate correctly.
+pub(crate) fn resolve_daemon_auth_token() -> Option<String> {
+    if let Some(token) = daemon_auth_token_from_env() {
+        return Some(token);
     }
     let layout = std::env::current_dir()
         .ok()
         .and_then(|cwd| KinLayout::discover(&cwd))?;
+    daemon_auth_token_from_layout(&layout)
+}
+
+/// Layout-explicit variant for callers that already hold the repo's layout —
+/// the process working directory says nothing about which repo's daemon is
+/// being addressed (in-process library callers and tests run from arbitrary
+/// working directories).
+pub(crate) fn resolve_daemon_auth_token_for_layout(layout: &KinLayout) -> Option<String> {
+    daemon_auth_token_from_env().or_else(|| daemon_auth_token_from_layout(layout))
+}
+
+fn daemon_auth_token_from_env() -> Option<String> {
+    let token = std::env::var("KIN_DAEMON_AUTH_TOKEN")
+        .ok()?
+        .trim()
+        .to_string();
+    (!token.is_empty()).then_some(token)
+}
+
+fn daemon_auth_token_from_layout(layout: &KinLayout) -> Option<String> {
     let token = std::fs::read_to_string(layout.root().join("daemon.token"))
         .ok()?
         .trim()
@@ -217,6 +235,22 @@ fn resolve_daemon_auth_token() -> Option<String> {
 
 impl DaemonClient {
     pub fn from_base_url(base_url: impl Into<String>) -> Result<Self> {
+        Self::from_base_url_with_token(base_url, resolve_daemon_auth_token())
+    }
+
+    /// Build a client for `layout`'s daemon, resolving the bearer token from
+    /// that layout rather than from the process working directory.
+    pub fn from_base_url_for_layout(
+        base_url: impl Into<String>,
+        layout: &KinLayout,
+    ) -> Result<Self> {
+        Self::from_base_url_with_token(base_url, resolve_daemon_auth_token_for_layout(layout))
+    }
+
+    fn from_base_url_with_token(
+        base_url: impl Into<String>,
+        auth_token: Option<String>,
+    ) -> Result<Self> {
         let base_url = base_url.into();
         let mut headers = reqwest::header::HeaderMap::new();
         if let Ok(session_id) = std::env::var("KIN_SESSION_ID") {
@@ -234,7 +268,7 @@ impl DaemonClient {
             "X-Kin-CLI-Dirty",
             reqwest::header::HeaderValue::from_static(if build.dirty { "true" } else { "false" }),
         );
-        if let Some(token) = resolve_daemon_auth_token() {
+        if let Some(token) = auth_token {
             if let Ok(mut value) =
                 reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
             {

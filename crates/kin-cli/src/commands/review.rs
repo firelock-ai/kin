@@ -78,11 +78,17 @@ pub struct ReviewResponse {
 #[derive(Debug, Clone)]
 pub struct ReviewExecution {
     pub response: ReviewResponse,
+    /// Whether this review op itself mutated review/graph state (a decision,
+    /// note, discussion, etc.). Always `false` for `Run` and `Shadow`, which
+    /// are read-only evaluations.
     pub mutated: bool,
-    /// A shadow evaluation lazily imported Git ancestry into the graph;
-    /// daemon owners should persist the hydrated state so the import happens
-    /// once per repo instead of once per process.
-    pub hydrated_git_history: bool,
+    /// Count of historical changes a shadow evaluation lazily hydrated into
+    /// the graph (0 for every op other than `Shadow`, and 0 for a `Shadow`
+    /// whose base/head were already imported). Reported distinctly from
+    /// `mutated` so a cold import that persists thousands of changes is never
+    /// described the same way as a no-op: daemon owners persist the hydrated
+    /// state so the import happens once per repo instead of once per process.
+    pub hydrated_changes: usize,
 }
 
 #[derive(Serialize)]
@@ -180,7 +186,7 @@ pub async fn execute_review_request(
                 layout, graph, change, entities, files, changes, json,
             )?,
             mutated: false,
-            hydrated_git_history: false,
+            hydrated_changes: 0,
         }),
         ReviewRequest::Shadow {
             base,
@@ -190,13 +196,13 @@ pub async fn execute_review_request(
             author,
             json,
         } => {
-            let (response, hydrated_git_history) = build_shadow_run_response(
+            let (response, hydrated_changes) = build_shadow_run_response(
                 layout, graph, base, head, title, source_url, author, json,
             )?;
             Ok(ReviewExecution {
                 response,
                 mutated: false,
-                hydrated_git_history,
+                hydrated_changes,
             })
         }
         ReviewRequest::Create {
@@ -287,6 +293,26 @@ fn build_review_run_response(
     Ok(ReviewResponse { text, json: None })
 }
 
+/// Shadow review JSON payload: the gate report plus the two distinct
+/// bookkeeping signals a shadow evaluation can produce. Flattened alongside
+/// `report`'s own fields so existing consumers keep reading the report shape
+/// unchanged and additionally see these two counts.
+#[derive(Serialize)]
+struct ShadowReviewResponseJson<'a> {
+    #[serde(flatten)]
+    report: &'a kin_review::ShadowGateReport,
+    /// Historical changes lazily imported into the graph while resolving the
+    /// base/head refs (0 when both were already present). Reported as a real
+    /// count, never collapsed to a boolean, so a cold multi-thousand-change
+    /// import is never described the same way as a no-op.
+    hydrated_changes: usize,
+    /// Mutations the review operation itself made to review/graph state.
+    /// Always 0: a shadow evaluation is read-only by construction. Reported
+    /// explicitly, distinct from `hydrated_changes`, so the two never blur
+    /// into a single collapsed signal.
+    review_mutations: usize,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_shadow_run_response(
     layout: &kin_core::KinLayout,
@@ -297,7 +323,7 @@ fn build_shadow_run_response(
     source_url: Option<String>,
     author: Option<String>,
     json: bool,
-) -> Result<(ReviewResponse, bool)> {
+) -> Result<(ReviewResponse, usize)> {
     // The everyday "your branch is behind main" case: base is not on head's
     // ancestry. That gap is provable from the Git commit-parent DAG alone —
     // no semantic hydration needed — so it is checked before either ref pays
@@ -307,7 +333,9 @@ fn build_shadow_run_response(
     if let Some(report) =
         shadow_ancestry_fast_path_gap(graph, layout, &base, &head, &title, &source_url, &author)?
     {
-        return Ok((shadow_response_from_report(&report, json)?, false));
+        // The fast path never hydrates anything, so this is always a true
+        // zero, not a placeholder.
+        return Ok((shadow_response_from_report(&report, json, 0)?, 0));
     }
 
     // Resolve the head ref before the base ref. A review pair is almost always
@@ -328,8 +356,7 @@ fn build_shadow_run_response(
             Some(base.as_str()),
         )
         .with_context(|| format!("resolve shadow base ref '{}'", base))?;
-    let hydrated_git_history =
-        resolved_base.hydrated_git_history || resolved_head.hydrated_git_history;
+    let hydrated_changes = resolved_base.hydrated_changes + resolved_head.hydrated_changes;
 
     let request = kin_review::ShadowRequest {
         base_ref: base,
@@ -344,8 +371,8 @@ fn build_shadow_run_response(
 
     let report = kin_review::build_shadow_report(graph, &request)?;
     Ok((
-        shadow_response_from_report(&report, json)?,
-        hydrated_git_history,
+        shadow_response_from_report(&report, json, hydrated_changes)?,
+        hydrated_changes,
     ))
 }
 
@@ -407,18 +434,27 @@ fn shadow_ancestry_fast_path_gap(
 fn shadow_response_from_report(
     report: &kin_review::ShadowGateReport,
     json: bool,
+    hydrated_changes: usize,
 ) -> Result<ReviewResponse> {
     if json {
         return Ok(ReviewResponse {
             text: String::new(),
-            json: Some(serde_json::to_string_pretty(report)?),
+            json: Some(serde_json::to_string_pretty(&ShadowReviewResponseJson {
+                report,
+                hydrated_changes,
+                review_mutations: 0,
+            })?),
         });
     }
 
-    Ok(ReviewResponse {
-        text: kin_review::format_shadow_report(report),
-        json: None,
-    })
+    let mut text = kin_review::format_shadow_report(report);
+    if hydrated_changes > 0 {
+        writeln!(
+            text,
+            "\n(hydrated {hydrated_changes} historical change(s) into the graph; 0 review mutations)"
+        )?;
+    }
+    Ok(ReviewResponse { text, json: None })
 }
 
 fn compute_review(
@@ -752,7 +788,7 @@ fn create_review_with_graph(
             json: None,
         },
         mutated: true,
-        hydrated_git_history: false,
+        hydrated_changes: 0,
     })
 }
 
@@ -812,7 +848,7 @@ fn decide_review_with_graph(
             json: None,
         },
         mutated: true,
-        hydrated_git_history: false,
+        hydrated_changes: 0,
     })
 }
 
@@ -859,7 +895,7 @@ fn add_note_with_graph(
     Ok(ReviewExecution {
         response: ReviewResponse { text, json: None },
         mutated: true,
-        hydrated_git_history: false,
+        hydrated_changes: 0,
     })
 }
 
@@ -920,7 +956,7 @@ fn start_discussion_with_graph(
     Ok(ReviewExecution {
         response: ReviewResponse { text, json: None },
         mutated: true,
-        hydrated_git_history: false,
+        hydrated_changes: 0,
     })
 }
 
@@ -957,7 +993,7 @@ fn reply_discussion_with_graph(
             json: None,
         },
         mutated: true,
-        hydrated_git_history: false,
+        hydrated_changes: 0,
     })
 }
 
@@ -980,7 +1016,7 @@ fn resolve_discussion_with_graph(
             json: None,
         },
         mutated: true,
-        hydrated_git_history: false,
+        hydrated_changes: 0,
     })
 }
 
@@ -1018,7 +1054,7 @@ fn assign_reviewer_with_graph(
             json: None,
         },
         mutated: true,
-        hydrated_git_history: false,
+        hydrated_changes: 0,
     })
 }
 
@@ -1061,7 +1097,7 @@ fn list_reviews_with_graph(
                 json: None,
             },
             mutated: false,
-            hydrated_git_history: false,
+            hydrated_changes: 0,
         });
     }
 
@@ -1081,7 +1117,7 @@ fn list_reviews_with_graph(
     Ok(ReviewExecution {
         response: ReviewResponse { text, json: None },
         mutated: false,
-        hydrated_git_history: false,
+        hydrated_changes: 0,
     })
 }
 
@@ -1174,7 +1210,7 @@ fn show_review_with_graph(
     Ok(ReviewExecution {
         response: ReviewResponse { text, json: None },
         mutated: false,
-        hydrated_git_history: false,
+        hydrated_changes: 0,
     })
 }
 
@@ -1345,7 +1381,7 @@ mod tests {
             "branch b must not be imported before the call"
         );
 
-        let (response, hydrated) = build_shadow_run_response(
+        let (response, hydrated_changes) = build_shadow_run_response(
             &layout,
             &graph,
             branch_a.clone(),
@@ -1357,13 +1393,15 @@ mod tests {
         )
         .expect("a stale base must produce a gap report, not an error");
 
-        assert!(
-            !hydrated,
+        assert_eq!(
+            hydrated_changes, 0,
             "the fast path must report no hydration was performed"
         );
 
         let json: serde_json::Value =
             serde_json::from_str(response.json.as_deref().expect("json response")).unwrap();
+        assert_eq!(json["hydrated_changes"], 0);
+        assert_eq!(json["review_mutations"], 0);
         let gaps = json["evidence_gaps"].as_array().unwrap();
         assert!(
             gaps.iter()
@@ -1381,5 +1419,76 @@ mod tests {
             crate::commands::ref_lookup::git_ref_requires_hydration(&graph, &branch_b),
             "branch b must remain un-imported: the fast path must not hydrate it"
         );
+    }
+
+    /// Warm case: both `kin:` refs already resolve directly, so no Git
+    /// hydration ever runs. The response must report `hydrated_changes: 0`
+    /// distinctly from `review_mutations: 0` — two truthful zeros, not a
+    /// single collapsed flag — both in the returned count and in the actual
+    /// JSON payload a client parses.
+    #[test]
+    fn shadow_reports_zero_hydrated_changes_when_refs_need_no_import() {
+        let graph = kin_db::InMemoryGraph::new();
+        let layout = kin_core::KinLayout::new(std::path::PathBuf::from("/nonexistent/.kin"));
+
+        let base_id =
+            kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0x10; 32]));
+        let head_id =
+            kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0x20; 32]));
+        graph
+            .create_change(&kin_model::SemanticChange {
+                id: base_id,
+                parents: vec![],
+                timestamp: kin_model::Timestamp::now(),
+                author: kin_model::AuthorId::new("test"),
+                message: "base".into(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+        graph
+            .create_change(&kin_model::SemanticChange {
+                id: head_id,
+                parents: vec![base_id],
+                timestamp: kin_model::Timestamp::now(),
+                author: kin_model::AuthorId::new("test"),
+                message: "head".into(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            })
+            .unwrap();
+
+        let (response, hydrated_changes) = build_shadow_run_response(
+            &layout,
+            &graph,
+            format!("kin:{base_id}"),
+            format!("kin:{head_id}"),
+            None,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            hydrated_changes, 0,
+            "already-resolved refs must report zero hydrated changes"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(response.json.as_deref().expect("json response")).unwrap();
+        assert_eq!(json["hydrated_changes"], 0);
+        assert_eq!(json["review_mutations"], 0);
     }
 }

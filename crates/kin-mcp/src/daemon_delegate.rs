@@ -115,7 +115,11 @@ fn discover_kin_dir() -> Option<std::path::PathBuf> {
 }
 
 /// Attach the daemon bearer token to a request when auth is configured.
-fn with_auth(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+///
+/// `pub(crate)`: also used by `handlers::common`'s spine federation client,
+/// which talks to the daemon's `/v1/spine/*` routes directly rather than
+/// through this module's own forwarding helpers.
+pub(crate) fn with_auth(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     match daemon_auth_token() {
         Some(token) => request.bearer_auth(token),
         None => request,

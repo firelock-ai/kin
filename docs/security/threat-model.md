@@ -81,17 +81,23 @@ daemon's own control routes — the package-registry routes (cargo/npm/oci/go) s
 public so that build tooling, which does not send credentials on reads, can fetch
 from a token-protected daemon.
 
-Enforcement of the per-install token is **opt-in** and **off by default**:
+Enforcement of the per-install token is **on by default**:
 
-- With no configuration, the token file is provisioned (so clients can adopt it)
-  but the daemon does **not** require it. In this default state the daemon relies
-  on the loopback bind, the Host/Origin guard, and OS-level filesystem and
-  process isolation rather than on bearer authentication.
-- Setting `KIN_DAEMON_REQUIRE_TOKEN` to a truthy value makes the daemon enforce
-  the per-install token, returning `401` to requests that do not present it.
+- On first run the daemon provisions the token file and requires it: requests to
+  non-public routes without a valid `Authorization: Bearer <token>` header get
+  `401`. The CLI (`daemon_client.rs`) and the MCP delegate (`daemon_delegate.rs`,
+  and the spine federation client in `handlers/common.rs`) all auto-read
+  `.kin/daemon.token` and send it, so a fresh install authenticates out of the
+  box with no operator setup.
+- `KIN_DAEMON_REQUIRE_TOKEN` is the documented escape hatch: set it to a falsy
+  value (`0`, `false`, `no`, or `off`) to run without bearer auth — for example, an
+  older local client that predates token support and cannot yet send the header.
+  In that state the daemon relies on the loopback bind, the Host/Origin guard,
+  and OS-level filesystem and process isolation rather than on bearer
+  authentication. An explicit truthy value is equivalent to the default.
 - Setting `KIN_DAEMON_AUTH_TOKEN` to an explicit value always takes precedence
-  and is always enforced; this is also the token required to bind a non-loopback
-  address.
+  and is always enforced, even while `KIN_DAEMON_REQUIRE_TOKEN` is opted out;
+  this is also the token required to bind a non-loopback address.
 
 ### Resulting trust boundary
 

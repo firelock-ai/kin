@@ -271,6 +271,18 @@ fn graph_from_bootstrap_snapshot(
     }
 }
 
+/// Attach the daemon's bearer token to a request built against a bare
+/// `reqwest::Client` (as opposed to `DaemonClient`, which attaches this
+/// automatically at construction). Every helper in this module talks to the
+/// repo-scoped daemon directly rather than through `DaemonClient`, so each
+/// one needs this explicitly.
+fn with_daemon_auth(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match crate::daemon_client::resolve_daemon_auth_token() {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    }
+}
+
 async fn fetch_daemon_graph(
     daemon_url: &str,
 ) -> std::result::Result<kin_db::GraphSnapshot, String> {
@@ -286,14 +298,13 @@ async fn fetch_daemon_graph(
         .build()
         .map_err(|error| format!("build daemon bootstrap client: {error}"))?;
 
-    let resp = client
-        .get(format!(
-            "{}/graph/bootstrap",
-            daemon_url.trim_end_matches('/')
-        ))
-        .send()
-        .await
-        .map_err(|error| format!("send graph bootstrap request: {error}"))?;
+    let resp = with_daemon_auth(client.get(format!(
+        "{}/graph/bootstrap",
+        daemon_url.trim_end_matches('/')
+    )))
+    .send()
+    .await
+    .map_err(|error| format!("send graph bootstrap request: {error}"))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -329,15 +340,14 @@ pub async fn require_daemon_update_head(
         "head": head_id,
     });
 
-    let resp = client
-        .put(format!(
-            "{}/v1/graph/branches/{}/head",
-            daemon_url.trim_end_matches('/'),
-            branch_name
-        ))
-        .json(&payload)
-        .send()
-        .await?;
+    let resp = with_daemon_auth(client.put(format!(
+        "{}/v1/graph/branches/{}/head",
+        daemon_url.trim_end_matches('/'),
+        branch_name
+    )))
+    .json(&payload)
+    .send()
+    .await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -368,14 +378,13 @@ pub async fn require_daemon_commit(
         "branch_name": branch_name,
     });
 
-    let resp = client
-        .post(format!(
-            "{}/v1/graph/commit",
-            daemon_url.trim_end_matches('/')
-        ))
-        .json(&payload)
-        .send()
-        .await?;
+    let resp = with_daemon_auth(client.post(format!(
+        "{}/v1/graph/commit",
+        daemon_url.trim_end_matches('/')
+    )))
+    .json(&payload)
+    .send()
+    .await?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -423,14 +432,13 @@ pub async fn require_daemon_graph_mutations(
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
-    let resp = client
-        .post(format!(
-            "{}/v1/graph/mutations",
-            daemon_url.trim_end_matches('/')
-        ))
-        .json(&batch)
-        .send()
-        .await?;
+    let resp = with_daemon_auth(client.post(format!(
+        "{}/v1/graph/mutations",
+        daemon_url.trim_end_matches('/')
+    )))
+    .json(&batch)
+    .send()
+    .await?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -463,18 +471,17 @@ pub async fn get_spine_impact(
         .timeout(Duration::from_secs(10))
         .build()?;
 
-    let resp = client
-        .get(format!(
-            "{}/v1/spine/impact",
-            daemon_url.trim_end_matches('/')
-        ))
-        .query(&[
-            ("repo", repo_id),
-            ("entity", &entity_id.to_string()),
-            ("depth", &depth.to_string()),
-        ])
-        .send()
-        .await;
+    let resp = with_daemon_auth(client.get(format!(
+        "{}/v1/spine/impact",
+        daemon_url.trim_end_matches('/')
+    )))
+    .query(&[
+        ("repo", repo_id),
+        ("entity", &entity_id.to_string()),
+        ("depth", &depth.to_string()),
+    ])
+    .send()
+    .await;
     let status = resp.as_ref().ok().map(|r| r.status().as_u16());
 
     match classify_spine_probe(true, status) {
@@ -510,14 +517,13 @@ pub async fn get_spine_xref(
         .timeout(Duration::from_secs(10))
         .build()?;
 
-    let resp = client
-        .get(format!(
-            "{}/v1/spine/xref",
-            daemon_url.trim_end_matches('/')
-        ))
-        .query(&[("repo", repo_id), ("entity", &entity_id.to_string())])
-        .send()
-        .await;
+    let resp = with_daemon_auth(client.get(format!(
+        "{}/v1/spine/xref",
+        daemon_url.trim_end_matches('/')
+    )))
+    .query(&[("repo", repo_id), ("entity", &entity_id.to_string())])
+    .send()
+    .await;
     let status = resp.as_ref().ok().map(|r| r.status().as_u16());
 
     match classify_spine_probe(true, status) {
