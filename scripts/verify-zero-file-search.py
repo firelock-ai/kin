@@ -73,7 +73,28 @@ BOUNDARY_DIRS = [
     "crates/kin-buildinfo/",
     "crates/kin-projection/",
     "crates/kin-reconcile/",
-    "crates/kin-core/",
+    # kin-core is a mixed crate: it carries the semantic repo's config, layout,
+    # init, projection, ingestion, and git-history boundary IO — all legitimate
+    # input/output boundaries — but it must not be broadly exempted, or an
+    # answer-authority raw-filesystem path (like the retired text_refs source
+    # scan that backed `kin refs`/`kin rename`) could hide there again.
+    # Enumerate the boundary files explicitly so every other kin-core file,
+    # including any newly added one, is scanned by default.
+    "crates/kin-core/src/assistant.rs",
+    "crates/kin-core/src/assistant_sync.rs",
+    "crates/kin-core/src/config.rs",
+    "crates/kin-core/src/dependencies.rs",
+    "crates/kin-core/src/env_registry.rs",
+    "crates/kin-core/src/federation.rs",
+    "crates/kin-core/src/init.rs",
+    "crates/kin-core/src/layout.rs",
+    "crates/kin-core/src/lib.rs",
+    "crates/kin-core/src/manifest.rs",
+    "crates/kin-core/src/ref_view.rs",
+    "crates/kin-core/src/registry.rs",
+    "crates/kin-core/src/shims.rs",
+    "crates/kin-core/src/sync_state.rs",
+    "crates/kin-core/src/tree.rs",
     "crates/kin-runtime/",
     "crates/kin-parser/",
     "crates/kin-ranking/src/ltr.rs",
@@ -91,6 +112,9 @@ QUERY_COMMANDS = {
     "xref.rs",
     "review.rs",
     "ref_lookup.rs",
+    # refs answers incoming-reference queries purely from graph relation edges;
+    # scanning it keeps that authority path free of any raw source-tree walk.
+    "refs.rs",
     # Context-pack assembly is an answer authority, not an IO boundary.
     "context.rs"
 }
