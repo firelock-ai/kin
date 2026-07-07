@@ -31,11 +31,13 @@
 //! base has less history than the window can meaningfully scan, the channel
 //! reports an honest evidence gap instead of silently passing.
 //!
-//! Matching is computed at review time from the change DAG and the entity
-//! revision store. Persisting the same evidence as graph relations
-//! (Reverts/RegressedBy edges written by an ingest-time miner) is the durable
-//! follow-on; the review-time computation here is the channel's semantic
-//! contract and stays the oracle for that miner.
+//! Matching is computed at review time exclusively from the base's ancestry
+//! window — the graph may hold changes outside the reviewed lineage (other
+//! branches, other reviews' hydrations, states newer than the head), and none
+//! of those may serve as evidence. Persisting the same evidence as graph
+//! relations (Reverts/RegressedBy edges written by an ingest-time miner) is
+//! the durable follow-on; the review-time computation here is the channel's
+//! semantic contract and stays the oracle for that miner.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
@@ -56,11 +58,6 @@ const REVERT_HISTORY_WINDOW: usize = 250;
 /// about revert history, so the channel reports a gap rather than certifying
 /// silence.
 const REVERT_HISTORY_MIN_DEPTH: usize = 25;
-
-/// Upper bound on removed-entity resolutions per review. Each resolution is a
-/// revision-history lookup; windows are small in practice and this cap only
-/// guards pathological histories.
-const MAX_REMOVED_RESOLUTIONS: usize = 512;
 
 /// One removed-entity occurrence inside the scanned window.
 struct WindowRemoval {
@@ -127,11 +124,18 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
     // Body reversions: a modified entity whose NEW body equals a body it
     // carried at an OLDER revision — the head un-does a later edit. This is
     // the dominant real-world revert shape (git revert of a body change
-    // produces a Modified delta, not add/remove). The immediately-previous
-    // body is skipped: every edit trivially differs from its predecessor;
-    // only a return to DEEPER history is revert-shaped. Hash equality on the
+    // produces a Modified delta, not add/remove). Hash equality on the
     // behavior fingerprint makes the match exact, so this cannot fire on an
     // ordinary edit.
+    //
+    // Candidate bodies come ONLY from the base's ancestry window: each
+    // in-window change's pre-state for the entity (restoring it un-does that
+    // change). The graph at review time may also hold changes OUTSIDE this
+    // lineage — head-side commits, other branches, other reviews' hydrations,
+    // states newer than the head. A change made after the head trivially has
+    // the head's result as its pre-state, so consulting it would flag every
+    // entity that is ever edited again: evidence must never leave the base's
+    // causal past.
     //
     // Matches are grouped by the SEMANTIC CHANGE whose delta carried the
     // matching old body. A true revert restores a coherent snapshot: several
@@ -145,43 +149,14 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
         if new.fingerprint.behavior_hash == old.fingerprint.behavior_hash {
             continue;
         }
-        let history = match store.get_entity_history(&old.id) {
-            Ok(h) => h,
-            Err(_) => continue,
+        let Some(prior_bodies) = window.prior_bodies.get(&old.id) else {
+            continue;
         };
-        // Bodies this entity carried before the range, newest-first, capped by
-        // the window, each tagged with the change that introduced it. Position
-        // 0 is the body the range started from (old) — matching it would be a
-        // no-op edit, so matches start at depth 1.
-        let mut prior_bodies: Vec<(Hash256, SemanticChangeId)> = Vec::new();
-        for change in history.iter().rev() {
-            if prior_bodies.len() > REVERT_HISTORY_WINDOW {
-                break;
-            }
-            for delta in &change.entity_deltas {
-                match delta {
-                    EntityDelta::Modified { old: o, new: n } if n.id == old.id => {
-                        if prior_bodies.is_empty() {
-                            prior_bodies.push((n.fingerprint.behavior_hash, change.id));
-                        }
-                        // The OLD body was the entity's state BEFORE this
-                        // change; restoring it un-does this change.
-                        prior_bodies.push((o.fingerprint.behavior_hash, change.id));
-                    }
-                    EntityDelta::Added(e) if e.id == old.id && prior_bodies.is_empty() => {
-                        prior_bodies.push((e.fingerprint.behavior_hash, change.id));
-                    }
-                    _ => {}
-                }
-            }
-        }
-        if let Some((depth, (_, undone_change))) = prior_bodies
+        if let Some((distance, _, undone_change)) = prior_bodies
             .iter()
-            .enumerate()
-            .skip(1)
-            .find(|(_, (h, _))| *h == new.fingerprint.behavior_hash)
+            .find(|(_, hash, _)| *hash == new.fingerprint.behavior_hash)
         {
-            reversion_matches.push((new.clone(), name.clone(), *undone_change, depth));
+            reversion_matches.push((new.clone(), name.clone(), *undone_change, *distance));
         }
     }
 
@@ -195,14 +170,19 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
     for (_, _, undone, _) in &reversion_matches {
         *undone_counts.entry(*undone).or_insert(0) += 1;
     }
-    for (entity, name, undone, depth) in &reversion_matches {
+    for (entity, name, undone, distance) in &reversion_matches {
         let coherent = undone_counts.get(undone).copied().unwrap_or(0) >= 2;
         let gates = coherent && is_public_contract_leaf(entity);
+        let undone_phrase = if *distance == 0 {
+            "the base change".to_string()
+        } else {
+            format!("the change {} change(s) before the base", distance)
+        };
         let message = format!(
-            "Modified `{}` restores the exact body it had {} revision(s) ago{} — \
+            "Modified `{}` restores the exact body it had before {}{} — \
              revert-shaped body reversion",
             name,
-            depth,
+            undone_phrase,
             if coherent {
                 ", together with other entities un-doing the same change"
             } else {
@@ -219,19 +199,16 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
     }
 
     // Reintroductions: an added entity matching a window removal. Removed
-    // deltas carry only the id, so each candidate is resolved to its last full
-    // value through the revision history — lazily, nearest-first, and cached,
-    // so cost tracks matches rather than window size.
+    // deltas carry only the id, so each candidate resolves to the value the
+    // entity last carried inside the window — never a value from outside the
+    // base's lineage.
     if !head_added.is_empty() && !window.removals.is_empty() {
-        let mut resolved: HashMap<EntityId, Option<Entity>> = HashMap::new();
         let mut by_hash: HashMap<Hash256, (String, usize)> = HashMap::new();
         let mut by_name: HashMap<(String, String), usize> = HashMap::new();
-        let budget = window.removals.len().min(MAX_REMOVED_RESOLUTIONS);
-        for removal in window.removals.iter().take(budget) {
-            let entity = resolved
-                .entry(removal.entity_id)
-                .or_insert_with(|| last_known_entity(store, &removal.entity_id));
-            let Some(entity) = entity else { continue };
+        for removal in &window.removals {
+            let Some(entity) = window.values.get(&removal.entity_id) else {
+                continue;
+            };
             by_hash
                 .entry(entity.fingerprint.behavior_hash)
                 .or_insert((entity.name.clone(), removal.distance));
@@ -277,12 +254,11 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
     // revert shape where the added lines are deleted in place.
     for removed_id in &head_removed {
         if let Some(distance) = window.added_ids.get(removed_id) {
-            let removed = last_known_entity(store, removed_id);
+            let removed = window.values.get(removed_id);
             let name = removed
-                .as_ref()
                 .map(|e| e.name.clone())
                 .unwrap_or_else(|| "entity".to_string());
-            let gates = removed.as_ref().is_some_and(is_public_contract);
+            let gates = removed.is_some_and(is_public_contract);
             findings.push(InlineComment {
                 file: String::new(),
                 start_line: 0,
@@ -306,11 +282,19 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
 }
 
 /// Everything the channel learned from scanning the base's ancestry window.
+/// This is the channel's ONLY evidence source: nothing outside the base's
+/// causal past may influence a finding.
 struct BaseWindow {
     changes_scanned: usize,
     removals: Vec<WindowRemoval>,
     /// Entity ids ADDED inside the window, with their distance from the base.
     added_ids: HashMap<EntityId, usize>,
+    /// Per entity, the body it had BEFORE each in-window change that modified
+    /// it, in ascending distance from the base. Restoring one of these bodies
+    /// un-does the tagged change.
+    prior_bodies: HashMap<EntityId, Vec<(usize, Hash256, SemanticChangeId)>>,
+    /// The nearest-to-base full value each entity carried inside the window.
+    values: HashMap<EntityId, Entity>,
 }
 
 /// Bounded, deterministic walk of the base's ancestry: breadth-first from the
@@ -324,6 +308,9 @@ fn walk_base_window<G: GraphStore>(
 ) -> Result<BaseWindow, ReviewError> {
     let mut removals = Vec::new();
     let mut added_ids = HashMap::new();
+    let mut prior_bodies: HashMap<EntityId, Vec<(usize, Hash256, SemanticChangeId)>> =
+        HashMap::new();
+    let mut values: HashMap<EntityId, Entity> = HashMap::new();
     let mut visited: HashSet<SemanticChangeId> = HashSet::new();
     let mut queue: VecDeque<(SemanticChangeId, usize)> = VecDeque::new();
 
@@ -352,8 +339,18 @@ fn walk_base_window<G: GraphStore>(
                 }),
                 EntityDelta::Added(entity) => {
                     added_ids.entry(entity.id).or_insert(distance);
+                    values.entry(entity.id).or_insert_with(|| entity.clone());
                 }
-                EntityDelta::Modified { .. } => {}
+                EntityDelta::Modified { old, new } => {
+                    // The old body is the entity's state BEFORE this change;
+                    // a head restoring it un-does this change.
+                    let record = (distance, old.fingerprint.behavior_hash, change.id);
+                    prior_bodies.entry(new.id).or_default().push(record);
+                    if old.id != new.id {
+                        prior_bodies.entry(old.id).or_default().push(record);
+                    }
+                    values.entry(new.id).or_insert_with(|| new.clone());
+                }
             }
         }
         for parent in &change.parents {
@@ -365,20 +362,8 @@ fn walk_base_window<G: GraphStore>(
         changes_scanned: scanned,
         removals,
         added_ids,
-    })
-}
-
-/// The last full value an entity carried before disappearing, recovered from
-/// the changes that touched it: the most recent Added or Modified delta whose
-/// entity matches the id.
-fn last_known_entity<G: GraphStore>(store: &G, id: &EntityId) -> Option<Entity> {
-    let history = store.get_entity_history(id).ok()?;
-    history.iter().rev().find_map(|change| {
-        change.entity_deltas.iter().find_map(|delta| match delta {
-            EntityDelta::Added(e) if e.id == *id => Some(e.clone()),
-            EntityDelta::Modified { new, .. } if new.id == *id => Some(new.clone()),
-            _ => None,
-        })
+        prior_bodies,
+        values,
     })
 }
 

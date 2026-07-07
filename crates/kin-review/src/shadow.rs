@@ -4081,4 +4081,141 @@ mod tests {
         );
         assert_eq!(report.policy.verdict, ShadowGateVerdict::Pass);
     }
+
+    #[test]
+    fn future_change_never_supplies_prior_bodies() {
+        // A change made AFTER the head trivially has the head's result as its
+        // pre-state, so a graph holding changes newer than the reviewed head
+        // (other reviews' hydrations, a warmed shared graph) must never let
+        // them serve as "prior" bodies: that reads the head's own future back
+        // as revert evidence.
+        let graph = InMemoryGraph::new();
+        let mut v1 = entity_with_span("gamma", "src/g.rs", 5, EntityRole::Source);
+        v1.fingerprint.behavior_hash = Hash256::from_bytes([31; 32]);
+        let mut v2 = v1.clone();
+        v2.fingerprint.behavior_hash = Hash256::from_bytes([32; 32]);
+        let pad_tail = padded_history_graph(
+            &graph,
+            vec![EntityDelta::Added(v1.clone())],
+            vec![EntityDelta::Modified {
+                old: v1.clone(),
+                new: v2.clone(),
+            }],
+            30,
+        );
+        // Head gives gamma a body it has NEVER carried before.
+        let mut v_new = v2.clone();
+        v_new.fingerprint.behavior_hash = Hash256::from_bytes([33; 32]);
+        graph.upsert_entity(&v_new).unwrap();
+        let head_id = change_id(240);
+        let head = change_with_deltas(
+            head_id,
+            vec![pad_tail],
+            vec![EntityDelta::Modified {
+                old: v2.clone(),
+                new: v_new.clone(),
+            }],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+        // A future edit whose pre-state IS the head's result.
+        let mut v_future = v_new.clone();
+        v_future.fingerprint.behavior_hash = Hash256::from_bytes([34; 32]);
+        let future = change_with_deltas(
+            change_id(241),
+            vec![head_id],
+            vec![EntityDelta::Modified {
+                old: v_new.clone(),
+                new: v_future,
+            }],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&future).unwrap();
+
+        let report = build_shadow_report(&graph, &request(pad_tail, head_id)).unwrap();
+        assert!(
+            report
+                .policy
+                .findings
+                .iter()
+                .all(|f| !f.kind.starts_with("revert_history")),
+            "a future change must never read as revert history: {:?}",
+            report
+                .policy
+                .findings
+                .iter()
+                .map(|f| (&f.kind, &f.message))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn merge_branch_side_never_supplies_prior_bodies() {
+        // Changes reachable only through the head's merge (the branch being
+        // merged) are not part of the BASE's causal past; their pre-states
+        // must not serve as prior bodies either.
+        let graph = InMemoryGraph::new();
+        let mut v1 = entity_with_span("delta_fn", "src/d.rs", 5, EntityRole::Source);
+        v1.fingerprint.behavior_hash = Hash256::from_bytes([51; 32]);
+        let mut v2 = v1.clone();
+        v2.fingerprint.behavior_hash = Hash256::from_bytes([52; 32]);
+        let pad_tail = padded_history_graph(
+            &graph,
+            vec![EntityDelta::Added(v1.clone())],
+            vec![EntityDelta::Modified {
+                old: v1.clone(),
+                new: v2.clone(),
+            }],
+            30,
+        );
+        // The merge result: a body delta_fn never carried on the base lineage.
+        let mut v_new = v2.clone();
+        v_new.fingerprint.behavior_hash = Hash256::from_bytes([53; 32]);
+        // Branch-side change (parented off c1, reachable only via the merge):
+        // its pre-state equals the merge result's body.
+        let mut v_branch = v_new.clone();
+        v_branch.fingerprint.behavior_hash = Hash256::from_bytes([54; 32]);
+        let branch = change_with_deltas(
+            change_id(250),
+            vec![change_id(1)],
+            vec![EntityDelta::Modified {
+                old: v_new.clone(),
+                new: v_branch,
+            }],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&branch).unwrap();
+        graph.upsert_entity(&v_new).unwrap();
+        let head_id = change_id(251);
+        let head = change_with_deltas(
+            head_id,
+            vec![pad_tail, change_id(250)],
+            vec![EntityDelta::Modified {
+                old: v2.clone(),
+                new: v_new.clone(),
+            }],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(pad_tail, head_id)).unwrap();
+        assert!(
+            report
+                .policy
+                .findings
+                .iter()
+                .all(|f| !f.kind.starts_with("revert_history")),
+            "branch-side changes must never read as revert history: {:?}",
+            report
+                .policy
+                .findings
+                .iter()
+                .map(|f| (&f.kind, &f.message))
+                .collect::<Vec<_>>()
+        );
+    }
 }
