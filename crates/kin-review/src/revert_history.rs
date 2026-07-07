@@ -132,6 +132,15 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
     // only a return to DEEPER history is revert-shaped. Hash equality on the
     // behavior fingerprint makes the match exact, so this cannot fire on an
     // ordinary edit.
+    //
+    // Matches are grouped by the SEMANTIC CHANGE whose delta carried the
+    // matching old body. A true revert restores a coherent snapshot: several
+    // of the head's entities return to bodies from the same historical change.
+    // An isolated single-entity match is usually incidental — small bodies
+    // recur naturally over long histories — so only COHERENT groups (two or
+    // more entities reverting to the same change) gate the verdict; singleton
+    // matches are still reported, at info severity, for the reviewer.
+    let mut reversion_matches: Vec<(Entity, String, SemanticChangeId, usize)> = Vec::new();
     for (name, (old, new)) in &head_modified {
         if new.fingerprint.behavior_hash == old.fingerprint.behavior_hash {
             continue;
@@ -141,9 +150,10 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
             Err(_) => continue,
         };
         // Bodies this entity carried before the range, newest-first, capped by
-        // the window. Position 0 is the body the range started from (old) —
-        // matching it would be a no-op edit, so matches start at depth 1.
-        let mut prior_bodies: Vec<Hash256> = Vec::new();
+        // the window, each tagged with the change that introduced it. Position
+        // 0 is the body the range started from (old) — matching it would be a
+        // no-op edit, so matches start at depth 1.
+        let mut prior_bodies: Vec<(Hash256, SemanticChangeId)> = Vec::new();
         for change in history.iter().rev() {
             if prior_bodies.len() > REVERT_HISTORY_WINDOW {
                 break;
@@ -152,34 +162,53 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
                 match delta {
                     EntityDelta::Modified { old: o, new: n } if n.id == old.id => {
                         if prior_bodies.is_empty() {
-                            prior_bodies.push(n.fingerprint.behavior_hash);
+                            prior_bodies.push((n.fingerprint.behavior_hash, change.id));
                         }
-                        prior_bodies.push(o.fingerprint.behavior_hash);
+                        // The OLD body was the entity's state BEFORE this
+                        // change; restoring it un-does this change.
+                        prior_bodies.push((o.fingerprint.behavior_hash, change.id));
                     }
                     EntityDelta::Added(e) if e.id == old.id => {
                         if prior_bodies.is_empty() {
-                            prior_bodies.push(e.fingerprint.behavior_hash);
+                            prior_bodies.push((e.fingerprint.behavior_hash, change.id));
                         }
                     }
                     _ => {}
                 }
             }
         }
-        if let Some(depth) = prior_bodies
+        if let Some((depth, (_, undone_change))) = prior_bodies
             .iter()
+            .enumerate()
             .skip(1)
-            .position(|h| *h == new.fingerprint.behavior_hash)
+            .find(|(_, (h, _))| *h == new.fingerprint.behavior_hash)
         {
-            findings.push(inline_finding(
-                new,
-                format!(
-                    "Modified `{}` restores the exact body it had {} revision(s) ago — \
-                     revert-shaped body reversion",
-                    name,
-                    depth + 1
-                ),
-            ));
+            reversion_matches.push((new.clone(), name.clone(), *undone_change, depth));
         }
+    }
+
+    let mut undone_counts: HashMap<SemanticChangeId, usize> = HashMap::new();
+    for (_, _, undone, _) in &reversion_matches {
+        *undone_counts.entry(*undone).or_insert(0) += 1;
+    }
+    for (entity, name, undone, depth) in &reversion_matches {
+        let coherent = undone_counts.get(undone).copied().unwrap_or(0) >= 2;
+        let message = format!(
+            "Modified `{}` restores the exact body it had {} revision(s) ago{} — \
+             revert-shaped body reversion",
+            name,
+            depth,
+            if coherent {
+                ", together with other entities un-doing the same change"
+            } else {
+                ""
+            },
+        );
+        let mut finding = inline_finding(entity, message);
+        if !coherent {
+            finding.kind = InlineCommentKind::RevertHistoryIncidental;
+        }
+        findings.push(finding);
     }
 
     // Reintroductions: an added entity matching a window removal. Removed
