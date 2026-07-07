@@ -1555,9 +1555,112 @@ pub(crate) fn enrich_imported_changes_with_semantics(
             total_closure_diffing_time.as_secs_f64(),
             (total_closure_diffing_time.as_secs_f64() * 100.0) / total_time_sec.max(0.001)
         );
+
+        // Machine-readable sibling of the summary above: one JSON line per pass
+        // for downstream ingestion (kin-bench run artifacts, before/after
+        // comparisons). Gated so default runs are byte-for-byte unchanged, and
+        // derived from the same `total_time_sec` so the JSON reconciles exactly
+        // with the human numbers.
+        if hydrate_stage_timings_enabled() {
+            eprintln!(
+                "{}",
+                hydrate_stage_timings_json(
+                    total_commits,
+                    total_time_sec,
+                    total_blob_read_time.as_secs_f64(),
+                    total_parsing_time.as_secs_f64(),
+                    total_linking_time.as_secs_f64(),
+                    total_closure_diffing_time.as_secs_f64(),
+                )
+            );
+        }
     }
 
     Ok(())
+}
+
+/// One machine-readable record of the history-hydration replay profile, emitted
+/// as a single JSON line under `KIN_HYDRATE_STAGE_TIMINGS`. Fields serialize in
+/// declaration order (nested under the outer key by [`HydrateStageTimingsLine`])
+/// so the line reads in the same order as the human summary printed above it.
+#[derive(Serialize)]
+struct HydrateStageTimings {
+    /// Commits replayed in the pass.
+    total_commits: usize,
+    /// Wall-clock seconds for the whole pass.
+    total_s: f64,
+    /// Replay throughput (`total_commits` / `total_s`).
+    commits_per_s: f64,
+    /// Seconds spent reading blobs.
+    blob_read_s: f64,
+    /// Seconds spent parsing / indexing.
+    parsing_s: f64,
+    /// Seconds spent cross-file linking.
+    linking_s: f64,
+    /// Seconds spent on closure and diffing.
+    closure_diffing_s: f64,
+    /// Wall-clock residue not attributed to any of the four buckets above.
+    other_s: f64,
+}
+
+/// Outer envelope so the record serializes as `{"kin_hydrate_stage_timings":{…}}`.
+/// Serializing through nested structs (never `serde_json::Value`) keeps every
+/// field in declaration order.
+#[derive(Serialize)]
+struct HydrateStageTimingsLine {
+    kin_hydrate_stage_timings: HydrateStageTimings,
+}
+
+/// Whether `KIN_HYDRATE_STAGE_TIMINGS` requests the machine-readable stage-timing
+/// line (truthy `1`/`true`/`yes`/`on`, case-insensitive). Unset or falsy → off.
+fn hydrate_stage_timings_enabled() -> bool {
+    std::env::var("KIN_HYDRATE_STAGE_TIMINGS")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Serialize the hydration replay profile as one JSON line. `other_s` is the
+/// wall-clock residue left after subtracting the four phase buckets from
+/// `total_s`, surfaced explicitly rather than folded into a bucket so a consumer
+/// can always recover unattributed time. Pure (no env or clock reads) so the
+/// emitted shape is unit-testable.
+fn hydrate_stage_timings_json(
+    total_commits: usize,
+    total_s: f64,
+    blob_read_s: f64,
+    parsing_s: f64,
+    linking_s: f64,
+    closure_diffing_s: f64,
+) -> String {
+    // Guard the divide so a zero wall never yields NaN/Infinity (serde renders
+    // those as `null`, which would break the "always a parseable number"
+    // contract). A real pass always has a positive wall.
+    let commits_per_s = if total_s > 0.0 {
+        total_commits as f64 / total_s
+    } else {
+        0.0
+    };
+    let other_s = total_s - blob_read_s - parsing_s - linking_s - closure_diffing_s;
+    let line = HydrateStageTimingsLine {
+        kin_hydrate_stage_timings: HydrateStageTimings {
+            total_commits,
+            total_s,
+            commits_per_s,
+            blob_read_s,
+            parsing_s,
+            linking_s,
+            closure_diffing_s,
+            other_s,
+        },
+    };
+    // Only finite f64s reach here, so serialization cannot fail; fall back to an
+    // empty object defensively rather than panicking on a diagnostic path.
+    serde_json::to_string(&line).unwrap_or_else(|_| "{}".to_string())
 }
 
 fn remove_imported_file_semantic_state(
@@ -3846,6 +3949,88 @@ mod tests {
             }
         }
         unreachable!()
+    }
+
+    #[test]
+    fn hydrate_stage_timings_json_is_parseable_with_explicit_residue() {
+        // Representative pass: the four buckets leave a non-trivial residue.
+        let line = hydrate_stage_timings_json(32865, 1933.4, 42.5, 261.9, 954.7, 641.2);
+
+        let value: serde_json::Value =
+            serde_json::from_str(&line).expect("emitted line must be parseable JSON");
+        let obj = value
+            .get("kin_hydrate_stage_timings")
+            .expect("top-level envelope key present");
+
+        // Count is an integer; every timing is a real (finite) float, never null.
+        assert_eq!(obj["total_commits"].as_u64(), Some(32865));
+        for key in [
+            "total_s",
+            "commits_per_s",
+            "blob_read_s",
+            "parsing_s",
+            "linking_s",
+            "closure_diffing_s",
+            "other_s",
+        ] {
+            assert!(obj[key].is_f64(), "{key} must serialize as a JSON float");
+        }
+
+        let total_s = obj["total_s"].as_f64().unwrap();
+        let blob = obj["blob_read_s"].as_f64().unwrap();
+        let parsing = obj["parsing_s"].as_f64().unwrap();
+        let linking = obj["linking_s"].as_f64().unwrap();
+        let closure = obj["closure_diffing_s"].as_f64().unwrap();
+        let other = obj["other_s"].as_f64().unwrap();
+
+        // The whole point of other_s: the four buckets plus the residue
+        // reconstruct the wall total exactly, matching the human summary.
+        let reconstructed = blob + parsing + linking + closure + other;
+        assert!(
+            (reconstructed - total_s).abs() < 1e-9,
+            "buckets + other_s must sum to total_s ({reconstructed} vs {total_s})"
+        );
+        assert!(
+            (other - (1933.4 - 42.5 - 261.9 - 954.7 - 641.2)).abs() < 1e-9,
+            "other_s must be the explicit unattributed residue"
+        );
+
+        // Throughput is commits / wall.
+        assert!((obj["commits_per_s"].as_f64().unwrap() - 32865.0 / 1933.4).abs() < 1e-9);
+
+        // Keys are emitted in the documented order, not alphabetized.
+        let order = [
+            "kin_hydrate_stage_timings",
+            "total_commits",
+            "total_s",
+            "commits_per_s",
+            "blob_read_s",
+            "parsing_s",
+            "linking_s",
+            "closure_diffing_s",
+            "other_s",
+        ];
+        let mut cursor = 0usize;
+        for key in order {
+            let quoted = format!("\"{key}\"");
+            let at = line[cursor..]
+                .find(quoted.as_str())
+                .unwrap_or_else(|| panic!("key {key} must be present and in order"));
+            cursor += at + quoted.len();
+        }
+    }
+
+    #[test]
+    fn hydrate_stage_timings_json_guards_zero_wall() {
+        // A zero wall must not emit NaN/Infinity (serde renders those as null);
+        // commits_per_s falls back to 0.0 and stays a parseable number.
+        let line = hydrate_stage_timings_json(10, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let value: serde_json::Value =
+            serde_json::from_str(&line).expect("emitted line must be parseable JSON");
+        let obj = &value["kin_hydrate_stage_timings"];
+        assert!(obj["commits_per_s"].is_f64());
+        assert_eq!(obj["commits_per_s"].as_f64(), Some(0.0));
+        assert_eq!(obj["other_s"].as_f64(), Some(0.0));
     }
 
     #[test]
