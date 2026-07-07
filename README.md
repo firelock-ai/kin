@@ -193,9 +193,9 @@ else to configure. The wizard writes a `kin` server entry running `kin mcp start
 with `KIN_MCP_TOOL_PROFILE=agent-default` (the small curated tool surface).
 
 `kin mcp start` runs as a stdio server that the MCP client launches as a subprocess; you
-normally do not run it by hand. To wire up a client manually, use the canonical npm
-package (`npx -y @kinlab/kin mcp start`; `@kinlab/kin-mcp` remains as a compatibility
-wrapper), or see the exact config and config-file locations, read the
+normally do not run it by hand. To wire up a client manually, use the published npm
+package (`npx -y @kinlab/kin-mcp`; the canonical `@kinlab/kin` package ships with an
+upcoming release), or see the exact config and config-file locations, read the
 [Advanced configuration](docs/quickstart.md#9-advanced-configuration) section of the
 quickstart. For the full tool surface, see [docs/mcp-tools.md](docs/mcp-tools.md).
 
