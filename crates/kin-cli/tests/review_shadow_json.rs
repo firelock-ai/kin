@@ -468,3 +468,82 @@ fn shadow_head_import_hydrates_ancestor_base_in_single_pass() {
         "base and head must resolve to distinct semantic changes"
     );
 }
+
+/// Abbreviated commit hashes — the form users copy from `git log --oneline`
+/// — must resolve to the same changes as their full 40-character ids.
+#[test]
+fn shadow_report_abbreviated_shas_resolve_like_full() {
+    let dir = tempdir().expect("tempdir");
+    let repo = dir.path();
+    let (base, head, _artifact_head) = setup_fixture_repo(repo);
+    kin_init(repo);
+
+    let full_report = run_shadow_json(repo, &base, &head);
+    let abbrev_report = run_shadow_json(repo, &base[..8], &head[..8]);
+
+    assert_eq!(
+        abbrev_report["input"]["resolved_base"], full_report["input"]["resolved_base"],
+        "abbreviated base must resolve to the same change as the full id"
+    );
+    assert_eq!(
+        abbrev_report["input"]["resolved_head"], full_report["input"]["resolved_head"],
+        "abbreviated head must resolve to the same change as the full id"
+    );
+    assert_eq!(
+        abbrev_report["verdict"], full_report["verdict"],
+        "abbreviated and full ranges must produce the same verdict"
+    );
+}
+
+/// Abbreviated hashes compose with relative-ref hops: `<abbrev>~1..<abbrev>`
+/// names the same range as `<full-base>..<full-head>` in a linear history.
+#[test]
+fn shadow_report_abbreviated_sha_with_hop_composes() {
+    let dir = tempdir().expect("tempdir");
+    let repo = dir.path();
+    let (base, head, _artifact_head) = setup_fixture_repo(repo);
+    kin_init(repo);
+
+    let full_report = run_shadow_json(repo, &base, &head);
+    let hop_report = run_shadow_json(repo, &format!("{}~1", &head[..8]), &head[..8]);
+
+    assert_eq!(
+        hop_report["input"]["resolved_base"], full_report["input"]["resolved_base"],
+        "<abbrev>~1 must resolve to the full head's parent"
+    );
+    assert_eq!(
+        hop_report["input"]["resolved_head"], full_report["input"]["resolved_head"],
+        "abbreviated hop head must match the full head"
+    );
+}
+
+/// An abbreviated hash matching nothing must fail with the friendly
+/// ref-resolution error, exactly like any other unresolvable ref.
+#[test]
+fn shadow_report_unknown_abbreviated_sha_fails_friendly() {
+    let dir = tempdir().expect("tempdir");
+    let repo = dir.path();
+    let (_base, head, _artifact_head) = setup_fixture_repo(repo);
+    kin_init(repo);
+
+    let output = kin_command()
+        .args(["review", "shadow", &format!("deadbeef..{head}"), "--json"])
+        .current_dir(repo)
+        .output()
+        .expect("run kin review shadow with an unknown abbreviated sha");
+
+    assert!(
+        !output.status.success(),
+        "an unknown abbreviated sha must fail the command, got stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot resolve ref"),
+        "error must name the ref-resolution problem plainly: {stderr}"
+    );
+    assert!(
+        !stderr.contains("HTTP 500"),
+        "unknown abbreviated shas must not surface as opaque server errors: {stderr}"
+    );
+}

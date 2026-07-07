@@ -192,6 +192,47 @@ pub fn is_ancestor_commit(
     Some(false)
 }
 
+/// Outcome of expanding an abbreviated Git commit hash against the object
+/// database of the repository at `repo_path`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitOidPrefixExpansion {
+    /// Exactly one object matches the prefix and it is a commit; carries the
+    /// full 40-character hex id.
+    Commit(String),
+    /// More than one object in the repository shares the prefix.
+    Ambiguous,
+    /// No object matches, the unique match is not a commit, or the
+    /// repository/prefix cannot be inspected at all.
+    NotFound,
+}
+
+/// Expand an abbreviated (4–39 hex character) Git commit hash to its full id.
+///
+/// Only the Git object database is consulted for the expansion; whether the
+/// expanded commit exists as imported semantic history stays the caller's
+/// decision, so graph authority over history is unchanged. Repository-open
+/// and prefix-parse failures report as `NotFound` — callers treat that
+/// exactly like an unknown ref.
+pub fn expand_git_commit_prefix(repo_path: &Path, prefix_hex: &str) -> GitOidPrefixExpansion {
+    let Ok(repo) = open_repo(repo_path) else {
+        return GitOidPrefixExpansion::NotFound;
+    };
+    let Ok(prefix) = gix::hash::Prefix::from_hex(prefix_hex) else {
+        return GitOidPrefixExpansion::NotFound;
+    };
+    match repo.objects.lookup_prefix(prefix, None) {
+        Ok(Some(Ok(id))) => {
+            if repo.find_commit(id).is_ok() {
+                GitOidPrefixExpansion::Commit(id.to_string())
+            } else {
+                GitOidPrefixExpansion::NotFound
+            }
+        }
+        Ok(Some(Err(()))) => GitOidPrefixExpansion::Ambiguous,
+        _ => GitOidPrefixExpansion::NotFound,
+    }
+}
+
 /// Shallow import: create a single SemanticChange from HEAD's tree.
 fn import_shallow(
     repo: &gix::Repository,
@@ -1682,5 +1723,77 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sha = "1111111111111111111111111111111111111111";
         assert_eq!(is_ancestor_commit(dir.path(), sha, sha), None);
+    }
+
+    #[test]
+    fn expand_git_commit_prefix_unique_absent_and_too_short() {
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo(dir.path()) {
+            eprintln!("git not available, skipping prefix expansion test");
+            return;
+        }
+
+        commit_file(dir.path(), "a.txt", "1\n", "base", "1000000000");
+        let full = commit_sha(dir.path());
+
+        match expand_git_commit_prefix(dir.path(), &full[..8]) {
+            GitOidPrefixExpansion::Commit(expanded) => assert_eq!(
+                expanded, full,
+                "a unique prefix must expand to its full commit id"
+            ),
+            other => panic!("unique prefix must expand to a commit, got {:?}", other),
+        }
+        assert_eq!(
+            expand_git_commit_prefix(dir.path(), "deadbeef"),
+            GitOidPrefixExpansion::NotFound,
+            "a prefix matching no object must report NotFound"
+        );
+        assert_eq!(
+            expand_git_commit_prefix(dir.path(), "abc"),
+            GitOidPrefixExpansion::NotFound,
+            "prefixes below git's 4-character minimum never expand"
+        );
+    }
+
+    #[test]
+    fn expand_git_commit_prefix_outside_a_repo_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            expand_git_commit_prefix(dir.path(), "deadbeef"),
+            GitOidPrefixExpansion::NotFound
+        );
+    }
+
+    #[test]
+    fn expand_git_commit_prefix_reports_ambiguity() {
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo(dir.path()) {
+            eprintln!("git not available, skipping prefix ambiguity test");
+            return;
+        }
+
+        commit_file(dir.path(), "a.txt", "1\n", "base", "1000000000");
+
+        // Two loose-object entries sharing the 8-hex prefix `aabbccdd`; prefix
+        // lookup disambiguates on object ids (file names), so placeholder
+        // contents are enough to make the prefix ambiguous.
+        let loose_dir = dir.path().join(".git/objects/aa");
+        std::fs::create_dir_all(&loose_dir).unwrap();
+        std::fs::write(
+            loose_dir.join("bbccdd00000000000000000000000000000001"),
+            b"placeholder",
+        )
+        .unwrap();
+        std::fs::write(
+            loose_dir.join("bbccdd00000000000000000000000000000002"),
+            b"placeholder",
+        )
+        .unwrap();
+
+        assert_eq!(
+            expand_git_commit_prefix(dir.path(), "aabbccdd"),
+            GitOidPrefixExpansion::Ambiguous,
+            "two objects sharing a prefix must report Ambiguous"
+        );
     }
 }

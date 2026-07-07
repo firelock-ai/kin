@@ -345,11 +345,46 @@ where
         }
     }
 
+    if is_abbreviated_git_hex(core) {
+        match kin_git::expand_git_commit_prefix(layout.working_dir(), core) {
+            kin_git::GitOidPrefixExpansion::Commit(full_oid) => {
+                if let Ok(imported_change_id) = resolve_imported_git_ref(graph, original, &full_oid)
+                {
+                    return Ok(imported_change_id);
+                }
+                return Err(ref_error(
+                    original,
+                    format!(
+                        "git commit '{}' (full id {}) is not imported into this repository's history; use the full 40-character id to hydrate it",
+                        core, full_oid
+                    ),
+                ));
+            }
+            kin_git::GitOidPrefixExpansion::Ambiguous => {
+                return Err(ref_error(
+                    original,
+                    format!(
+                        "git commit prefix '{}' is ambiguous; use more characters or the full 40-character id",
+                        core
+                    ),
+                ));
+            }
+            kin_git::GitOidPrefixExpansion::NotFound => {}
+        }
+    }
+
     if parse_change_id(core).is_ok() {
         return resolve_semantic_change(graph, original, core);
     }
 
     Err(ref_error(original, format!("unknown ref '{}'", core)))
+}
+
+/// True for a plausible abbreviated Git commit hash: 4–39 hex characters.
+/// Full 40-character ids resolve through the exact-id path instead, and
+/// anything shorter than Git's 4-character minimum never expands.
+fn is_abbreviated_git_hex(core: &str) -> bool {
+    (4..40).contains(&core.len()) && core.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn resolve_branch_head<G>(graph: &G, original: &str, branch_name: &str) -> Result<SemanticChangeId>
