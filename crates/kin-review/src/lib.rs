@@ -9,6 +9,7 @@ pub mod impact;
 pub mod inline;
 pub mod ref_graph;
 pub mod release_gate;
+pub mod revert_history;
 pub mod review;
 pub mod risk;
 pub mod shadow;
