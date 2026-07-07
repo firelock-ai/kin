@@ -12,18 +12,10 @@ const GITHUB_RELEASES_LATEST_URL: &str =
 const GITHUB_RELEASES_LIST_URL: &str =
     "https://api.github.com/repos/firelock-ai/kin/releases?per_page=30";
 
-/// Expected release asset names for integrity verification.
+/// Expected checksums-manifest asset name published with every release.
+/// Releases do not publish a detached signature, so integrity verification
+/// is checksum-only — see `verify_sha256`/`verify_archive_checksum` below.
 const CHECKSUMS_ASSET: &str = "checksums-sha256.txt";
-const SIGNATURE_ASSET: &str = "checksums-sha256.txt.sig";
-
-/// Firelock release-signing public key (ed25519, hex-encoded).
-///
-/// Set via `KIN_RELEASE_PUBLIC_KEY` env var at compile time. CI release builds
-/// inject the real key; local dev builds get `None` and must use `--skip-verify`.
-///
-/// To rotate: generate a new keypair with `kin keygen --release`, update the CI
-/// secret, and re-sign all active release assets with the new key.
-const RELEASE_PUBLIC_KEY_HEX: Option<&str> = option_env!("KIN_RELEASE_PUBLIC_KEY");
 
 #[derive(serde::Deserialize)]
 struct GithubRelease {
@@ -118,7 +110,7 @@ fn effective_channel(flag: Option<Channel>, stored: Channel) -> Channel {
     flag.unwrap_or(stored)
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 struct GithubAsset {
     name: String,
     browser_download_url: String,
@@ -154,19 +146,8 @@ pub async fn run(skip_verify: bool, channel_flag: Option<Channel>) -> Result<()>
 
     println!("New version available: v{latest}");
 
-    let (os, arch) = detect_platform()?;
-    let archive_suffix = format!("kin-{os}-{arch}");
-
-    let asset = release
-        .assets
-        .iter()
-        .find(|a| a.name.contains(&archive_suffix))
-        .with_context(|| {
-            format!(
-                "no release asset found for platform {os}-{arch} (looked for '{archive_suffix}' in {} assets)",
-                release.assets.len()
-            )
-        })?;
+    let archive_name = current_platform_asset_name()?;
+    let asset = find_release_asset(&release, &archive_name)?;
 
     println!("Downloading {}...", asset.name);
 
@@ -184,11 +165,13 @@ pub async fn run(skip_verify: bool, channel_flag: Option<Channel>) -> Result<()>
     // --- Integrity verification ---
     if skip_verify {
         eprintln!(
-            "WARNING: --skip-verify is set. Skipping signature and checksum \
-             verification. This binary has NOT been authenticated."
+            "WARNING: --skip-verify is set. Skipping checksum verification. \
+             This binary has NOT been authenticated."
         );
     } else {
-        verify_archive(&client, &release, &asset.name, &archive_bytes).await?;
+        println!("Verifying checksum...");
+        verify_archive_checksum(&client, &release, &asset.name, &archive_bytes).await?;
+        println!("  SHA-256 checksum verified.");
     }
 
     let kin_home = kin_home_dir()?;
@@ -259,256 +242,80 @@ fn select_alpha(releases: Vec<GithubRelease>) -> Option<GithubRelease> {
         })
 }
 
-/// Download the checksums file and its ed25519 signature from the release,
-/// verify the signature, then verify the archive's SHA-256 matches.
-async fn verify_archive(
-    client: &reqwest::Client,
-    release: &GithubRelease,
-    archive_name: &str,
-    archive_bytes: &[u8],
-) -> Result<()> {
-    use ed25519_dalek::{Signature, VerifyingKey};
-
-    println!("Verifying release signature...");
-
-    // 1. Find the checksums + signature assets.
-    let checksums_asset = release
-        .assets
-        .iter()
-        .find(|a| a.name == CHECKSUMS_ASSET)
-        .with_context(|| {
-            format!(
-                "release is missing '{CHECKSUMS_ASSET}' — cannot verify integrity. \
-                 Use --skip-verify to bypass (NOT recommended)."
-            )
-        })?;
-
-    let sig_asset = release
-        .assets
-        .iter()
-        .find(|a| a.name == SIGNATURE_ASSET)
-        .with_context(|| {
-            format!(
-                "release is missing '{SIGNATURE_ASSET}' — cannot verify integrity. \
-                 Use --skip-verify to bypass (NOT recommended)."
-            )
-        })?;
-
-    // 2. Download both.
-    let checksums_bytes = client
-        .get(&checksums_asset.browser_download_url)
-        .send()
-        .await
-        .context("failed to download checksums file")?
-        .error_for_status()?
-        .bytes()
-        .await
-        .context("failed to read checksums bytes")?;
-
-    let sig_bytes = client
-        .get(&sig_asset.browser_download_url)
-        .send()
-        .await
-        .context("failed to download signature file")?
-        .error_for_status()?
-        .bytes()
-        .await
-        .context("failed to read signature bytes")?;
-
-    // 3. Verify ed25519 signature of checksums file.
-    let pub_key_hex = RELEASE_PUBLIC_KEY_HEX.with_context(|| {
-        "this binary was built without a release signing key \
-         (KIN_RELEASE_PUBLIC_KEY not set at compile time). \
-         Use --skip-verify for development builds."
-    })?;
-    let pub_key_bytes =
-        hex::decode(pub_key_hex).context("invalid release public key (hex decode failed)")?;
-    let pub_key_array: [u8; 32] = pub_key_bytes.try_into().map_err(|v: Vec<u8>| {
-        anyhow::anyhow!("release public key is {} bytes, expected 32", v.len())
-    })?;
-    let verifying_key = VerifyingKey::from_bytes(&pub_key_array)
-        .context("invalid release public key (not on curve)")?;
-
-    // Signature file contains raw 64-byte ed25519 signature.
-    let sig_array: [u8; 64] = sig_bytes.as_ref().try_into().map_err(|_| {
-        anyhow::anyhow!(
-            "signature file is {} bytes, expected 64-byte ed25519 signature",
-            sig_bytes.len()
-        )
-    })?;
-    let signature = Signature::from_bytes(&sig_array);
-
-    verifying_key
-        .verify_strict(&checksums_bytes, &signature)
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "SIGNATURE VERIFICATION FAILED.\n\
-             The checksums file was NOT signed by Firelock's release key.\n\
-             This could indicate a compromised release. Aborting update.\n\
-             If you believe this is an error, check https://github.com/firelock-ai/kin/releases"
-            )
-        })?;
-
-    println!("  Signature valid (ed25519, Firelock release key).");
-
-    // 4. Compute SHA-256 of the downloaded archive.
-    let mut hasher = Sha256::new();
-    hasher.update(archive_bytes);
-    let archive_hash = hex::encode(hasher.finalize());
-
-    // 5. Find the expected hash in the checksums file.
-    let checksums_text =
-        std::str::from_utf8(&checksums_bytes).context("checksums file is not valid UTF-8")?;
-
-    let expected_hash = parse_checksum(checksums_text, archive_name).with_context(|| {
-        format!(
-            "archive '{archive_name}' not found in signed checksums file. \
-                 Available entries:\n{checksums_text}"
-        )
-    })?;
-
-    // 6. Compare.
-    if archive_hash != expected_hash {
-        anyhow::bail!(
-            "SHA-256 MISMATCH.\n\
-             Expected: {expected_hash}\n\
-             Got:      {archive_hash}\n\
-             The downloaded archive does not match the signed checksum.\n\
-             This could indicate a corrupted download or tampered release. Aborting."
-        );
-    }
-
-    println!("  SHA-256 checksum verified ({}).", &archive_hash[..16]);
-    Ok(())
-}
-
-/// Parse a `sha256sum`-style checksums file and return the hash for `filename`.
-///
-/// Format: `<hex-hash>  <filename>` (two spaces, matching coreutils sha256sum output).
-fn parse_checksum(checksums_text: &str, filename: &str) -> Option<String> {
-    for line in checksums_text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        // Support both "hash  filename" (two spaces) and "hash filename" (one space).
-        if let Some((hash, name)) = line.split_once(char::is_whitespace) {
-            let name = name.trim();
-            if name == filename {
-                return Some(hash.to_lowercase());
-            }
-        }
-    }
-    None
-}
-
 // ---------------------------------------------------------------------------
-// Doctor shim repair (FIR-1409)
+// Release asset resolution + checksum verification
 //
-// `kin doctor --fix` uses this to reinstall the VFS shim when the running
-// binary has no local copy to source from (e.g. a standalone/proof-bundle
-// binary). It pins to the release matching THIS binary's version — never
-// "latest" — because a newer release can ship an ABI-incompatible shim.
+// Shared by the self-update flow (`run`, above) and the VFS shim repair used
+// by `kin doctor --fix` (`download_shim_for_current_version`, below). Every
+// published release names archives `kin-{macos|linux|windows}-{aarch64|x86_64}`
+// with a `.tar.gz` extension (`.zip` for Windows) and ships a
+// `checksums-sha256.txt` manifest — no detached signature — so both flows
+// resolve the asset name and verify the download the same way.
 // ---------------------------------------------------------------------------
 
-/// The `firelock-ai/kin` release for an exact tag. Suffix `v{VERSION}`.
-const GITHUB_RELEASES_TAG_URL: &str =
-    "https://api.github.com/repos/firelock-ai/kin/releases/tags/v";
-
-/// Platform stem used in Kin's release archive names, e.g. `kin-macos-aarch64`.
+/// Release archive asset name for a given OS/arch pair, e.g.
+/// `kin-macos-aarch64.tar.gz` or `kin-windows-x86_64.zip`.
 ///
-/// NOTE: this is the naming the release pipeline actually publishes
-/// (`macos|linux|windows` + `aarch64|x86_64`). It intentionally differs from
-/// [`detect_platform`]'s legacy `darwin`/`amd64` mapping, which does not match
-/// any current release asset.
-fn release_platform_stem() -> Result<String> {
-    let os = if cfg!(target_os = "macos") {
-        "macos"
-    } else if cfg!(target_os = "linux") {
-        "linux"
-    } else if cfg!(target_os = "windows") {
-        "windows"
-    } else {
-        anyhow::bail!("unsupported OS for shim download");
-    };
-    let arch = if cfg!(target_arch = "x86_64") {
-        "x86_64"
-    } else if cfg!(target_arch = "aarch64") {
-        "aarch64"
-    } else {
-        anyhow::bail!("unsupported architecture for shim download");
-    };
-    Ok(format!("kin-{os}-{arch}"))
+/// `os`/`arch` use Rust's own `std::env::consts::OS`/`ARCH` spelling
+/// (`"macos"`/`"linux"`/`"windows"`, `"x86_64"`/`"aarch64"`), which already
+/// matches the tokens the release pipeline names assets with — no separate
+/// translation table needed. Pure and host-independent, so the full platform
+/// matrix is directly testable regardless of which platform the test runs on.
+fn platform_asset_name(os: &str, arch: &str) -> Result<String> {
+    if !matches!(os, "macos" | "linux" | "windows") {
+        anyhow::bail!("unsupported OS for release download: {os}");
+    }
+    if !matches!(arch, "x86_64" | "aarch64") {
+        anyhow::bail!("unsupported architecture for release download: {arch}");
+    }
+    // release.yml packages Windows with PowerShell's Compress-Archive (.zip);
+    // every other target ships a .tar.gz.
+    let ext = if os == "windows" { "zip" } else { "tar.gz" };
+    Ok(format!("kin-{os}-{arch}.{ext}"))
 }
 
-/// Download the VFS shim from the GitHub release matching the running version
-/// and install it atomically at `dest`.
+/// Release archive asset name for the platform this binary is actually
+/// running on.
+fn current_platform_asset_name() -> Result<String> {
+    platform_asset_name(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// Find the release asset whose name exactly matches `archive_name`.
 ///
-/// Verifies the downloaded archive's SHA-256 against the release's
-/// `checksums-sha256.txt`, requires the extracted shim to be non-empty, and
-/// writes via a temp file + atomic rename so a partial download can never land
-/// as the 0-byte shim this repairs. Returns `Err` — honestly — when offline,
-/// when the release or asset is absent, or when verification fails, so the
-/// caller can print a manual reinstall step instead of looping.
-pub(crate) async fn download_shim_for_current_version(dest: &Path) -> Result<()> {
-    let shim_name = crate::commands::setup::shim_filename();
-    let archive_name = format!("{}.tar.gz", release_platform_stem()?);
-
-    let client = reqwest::Client::builder()
-        .user_agent("kin-cli")
-        .build()
-        .context("failed to build HTTP client")?;
-
-    let tag_url = format!("{GITHUB_RELEASES_TAG_URL}{CURRENT_VERSION}");
-    let release: GithubRelease = client
-        .get(&tag_url)
-        .send()
-        .await
-        .context("failed to reach the GitHub releases API (offline?)")?
-        .error_for_status()
-        .with_context(|| format!("no published release found for v{CURRENT_VERSION}"))?
-        .json()
-        .await
-        .context("failed to parse release JSON")?;
-
-    let asset = release
+/// Errors name the exact archive that was looked for and list every asset
+/// the release actually published, so a platform/naming mismatch is always
+/// an honest, actionable failure — never a silent no-match. Matching is
+/// exact rather than a substring search: every archive also has an adjacent
+/// `<archive>.sha256` asset whose name contains the archive name, which a
+/// substring match could resolve instead of the archive itself.
+fn find_release_asset<'a>(
+    release: &'a GithubRelease,
+    archive_name: &str,
+) -> Result<&'a GithubAsset> {
+    release
         .assets
         .iter()
         .find(|a| a.name == archive_name)
-        .with_context(|| format!("release v{CURRENT_VERSION} has no asset '{archive_name}'"))?;
-
-    let archive_bytes = client
-        .get(&asset.browser_download_url)
-        .send()
-        .await
-        .context("failed to download release archive")?
-        .error_for_status()
-        .context("archive download returned an error")?
-        .bytes()
-        .await
-        .context("failed to read archive bytes")?;
-
-    if archive_bytes.is_empty() {
-        anyhow::bail!("downloaded archive '{archive_name}' was empty");
-    }
-
-    verify_archive_checksum(&client, &release, &archive_name, &archive_bytes).await?;
-
-    let shim_bytes = extract_named_file_from_tar_gz(&archive_bytes, shim_name)
-        .with_context(|| format!("archive '{archive_name}' did not contain '{shim_name}'"))?;
-    if shim_bytes.is_empty() {
-        anyhow::bail!("the shim '{shim_name}' extracted from '{archive_name}' was empty");
-    }
-
-    write_atomically(dest, &shim_bytes)
-        .with_context(|| format!("failed to install the shim at {}", dest.display()))?;
-    Ok(())
+        .with_context(|| {
+            let published = release
+                .assets
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "no release asset named '{archive_name}' in release '{}'. Published assets: [{published}]",
+                release.tag_name
+            )
+        })
 }
 
-/// Verify `archive_bytes` against the SHA-256 recorded for `archive_name` in the
-/// release's `checksums-sha256.txt`. Returns `Err` if the checksums asset is
-/// missing, the entry is absent, or the hash mismatches — a repair must never
-/// install unverified bytes.
+/// Download the checksums manifest from the release and verify the archive's
+/// SHA-256 against the entry recorded for `archive_name`.
+///
+/// Checksum-only: no release currently publishes a detached signature, so
+/// this is the sole integrity gate for both `kin update` and shim repair. An
+/// update must never install unverified bytes.
 async fn verify_archive_checksum(
     client: &reqwest::Client,
     release: &GithubRelease,
@@ -538,13 +345,113 @@ async fn verify_archive_checksum(
     let expected = parse_checksum(checksums_text, archive_name)
         .with_context(|| format!("'{archive_name}' not found in the checksums file"))?;
 
+    verify_sha256(archive_bytes, &expected)
+}
+
+/// Compare the SHA-256 of `archive_bytes` against an `expected_hash_hex`
+/// already looked up from a checksums file.
+///
+/// Pure and network-free so the checksum-mismatch failure mode is directly
+/// testable without a mock server.
+fn verify_sha256(archive_bytes: &[u8], expected_hash_hex: &str) -> Result<()> {
     let mut hasher = Sha256::new();
     hasher.update(archive_bytes);
     let actual = hex::encode(hasher.finalize());
+    let expected = expected_hash_hex.to_lowercase();
 
     if actual != expected {
-        anyhow::bail!("SHA-256 mismatch for '{archive_name}': expected {expected}, got {actual}");
+        anyhow::bail!(
+            "SHA-256 MISMATCH.\n\
+             Expected: {expected}\n\
+             Got:      {actual}\n\
+             The downloaded archive does not match the published checksum.\n\
+             This could indicate a corrupted download or tampered release. Aborting."
+        );
     }
+    Ok(())
+}
+
+/// Parse a `sha256sum`-style checksums file and return the hash for `filename`.
+///
+/// Format: `<hex-hash>  <filename>` (two spaces, matching coreutils sha256sum output).
+fn parse_checksum(checksums_text: &str, filename: &str) -> Option<String> {
+    for line in checksums_text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Support both "hash  filename" (two spaces) and "hash filename" (one space).
+        if let Some((hash, name)) = line.split_once(char::is_whitespace) {
+            let name = name.trim();
+            if name == filename {
+                return Some(hash.to_lowercase());
+            }
+        }
+    }
+    None
+}
+
+/// The `firelock-ai/kin` release for an exact tag. Suffix `v{VERSION}`.
+const GITHUB_RELEASES_TAG_URL: &str =
+    "https://api.github.com/repos/firelock-ai/kin/releases/tags/v";
+
+/// Download the VFS shim from the GitHub release matching the running version
+/// and install it atomically at `dest`.
+///
+/// Verifies the downloaded archive's SHA-256 against the release's
+/// `checksums-sha256.txt`, requires the extracted shim to be non-empty, and
+/// writes via a temp file + atomic rename so a partial download can never land
+/// as the 0-byte shim this repairs. Returns `Err` — honestly — when offline,
+/// when the release or asset is absent, or when verification fails, so the
+/// caller can print a manual reinstall step instead of looping.
+pub(crate) async fn download_shim_for_current_version(dest: &Path) -> Result<()> {
+    let shim_name = crate::commands::setup::shim_filename();
+    let archive_name = current_platform_asset_name()?;
+
+    let client = reqwest::Client::builder()
+        .user_agent("kin-cli")
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let tag_url = format!("{GITHUB_RELEASES_TAG_URL}{CURRENT_VERSION}");
+    let release: GithubRelease = client
+        .get(&tag_url)
+        .send()
+        .await
+        .context("failed to reach the GitHub releases API (offline?)")?
+        .error_for_status()
+        .with_context(|| format!("no published release found for v{CURRENT_VERSION}"))?
+        .json()
+        .await
+        .context("failed to parse release JSON")?;
+
+    let asset = find_release_asset(&release, &archive_name)?;
+
+    let archive_bytes = client
+        .get(&asset.browser_download_url)
+        .send()
+        .await
+        .context("failed to download release archive")?
+        .error_for_status()
+        .context("archive download returned an error")?
+        .bytes()
+        .await
+        .context("failed to read archive bytes")?;
+
+    if archive_bytes.is_empty() {
+        anyhow::bail!("downloaded archive '{archive_name}' was empty");
+    }
+
+    verify_archive_checksum(&client, &release, &asset.name, &archive_bytes).await?;
+
+    let shim_bytes = extract_named_file_from_tar_gz(&archive_bytes, shim_name)
+        .with_context(|| format!("archive '{archive_name}' did not contain '{shim_name}'"))?;
+    if shim_bytes.is_empty() {
+        anyhow::bail!("the shim '{shim_name}' extracted from '{archive_name}' was empty");
+    }
+
+    write_atomically(dest, &shim_bytes)
+        .with_context(|| format!("failed to install the shim at {}", dest.display()))?;
     Ok(())
 }
 
@@ -695,28 +602,6 @@ fn compare_prerelease_id(a: &str, b: &str) -> Ordering {
     }
 }
 
-fn detect_platform() -> Result<(&'static str, &'static str)> {
-    let os = if cfg!(target_os = "macos") {
-        "darwin"
-    } else if cfg!(target_os = "linux") {
-        "linux"
-    } else if cfg!(target_os = "windows") {
-        "windows"
-    } else {
-        anyhow::bail!("unsupported OS");
-    };
-
-    let arch = if cfg!(target_arch = "x86_64") {
-        "amd64"
-    } else if cfg!(target_arch = "aarch64") {
-        "arm64"
-    } else {
-        anyhow::bail!("unsupported architecture");
-    };
-
-    Ok((os, arch))
-}
-
 fn kin_home_dir() -> Result<PathBuf> {
     let base = directories::BaseDirs::new().context("could not determine home directory")?;
     Ok(base.home_dir().join(".kin"))
@@ -847,20 +732,155 @@ mod tests {
         gz.finish().unwrap()
     }
 
+    /// Real asset names published for a stable release, pinned via:
+    /// `gh release view v0.2.12 --repo firelock-ai/kin --json assets --jq '.assets[].name'`
+    fn mock_v0_2_12_release() -> GithubRelease {
+        let names = [
+            "checksums-sha256.txt",
+            "kin-linux-aarch64.tar.gz",
+            "kin-linux-aarch64.tar.gz.sha256",
+            "kin-linux-x86_64.tar.gz",
+            "kin-linux-x86_64.tar.gz.sha256",
+            "kin-macos-aarch64.tar.gz",
+            "kin-macos-aarch64.tar.gz.sha256",
+            "kin-macos-x86_64.tar.gz",
+            "kin-macos-x86_64.tar.gz.sha256",
+            "kin-windows-x86_64.zip",
+            "kin-windows-x86_64.zip.sha256",
+        ];
+        GithubRelease {
+            tag_name: "v0.2.12".to_string(),
+            prerelease: false,
+            assets: names
+                .iter()
+                .map(|name| GithubAsset {
+                    name: name.to_string(),
+                    browser_download_url: format!(
+                        "https://github.com/firelock-ai/kin/releases/download/v0.2.12/{name}"
+                    ),
+                })
+                .collect(),
+        }
+    }
+
     #[test]
-    fn release_platform_stem_targets_real_asset_naming() {
-        let stem = release_platform_stem().unwrap();
-        // Must match the actual v0.2.x asset names, NOT detect_platform's legacy
-        // darwin/amd64 mapping (which matches no published asset).
-        assert!(stem.starts_with("kin-"), "unexpected stem: {stem}");
-        #[cfg(target_os = "macos")]
-        assert!(stem.contains("macos"), "stem: {stem}");
-        #[cfg(target_os = "linux")]
-        assert!(stem.contains("linux"), "stem: {stem}");
-        #[cfg(target_arch = "aarch64")]
-        assert!(stem.contains("aarch64"), "stem: {stem}");
-        #[cfg(target_arch = "x86_64")]
-        assert!(stem.contains("x86_64"), "stem: {stem}");
+    fn platform_asset_name_matches_real_release_naming() {
+        // Matrix covering the acceptance-required platforms plus every other
+        // real asset firelock-ai/kin v0.2.12 publishes.
+        assert_eq!(
+            platform_asset_name("macos", "aarch64").unwrap(),
+            "kin-macos-aarch64.tar.gz"
+        );
+        assert_eq!(
+            platform_asset_name("linux", "x86_64").unwrap(),
+            "kin-linux-x86_64.tar.gz"
+        );
+        assert_eq!(
+            platform_asset_name("linux", "aarch64").unwrap(),
+            "kin-linux-aarch64.tar.gz"
+        );
+        assert_eq!(
+            platform_asset_name("macos", "x86_64").unwrap(),
+            "kin-macos-x86_64.tar.gz"
+        );
+        // Windows is packaged as a zip (release.yml's Compress-Archive step),
+        // not a tar.gz.
+        assert_eq!(
+            platform_asset_name("windows", "x86_64").unwrap(),
+            "kin-windows-x86_64.zip"
+        );
+    }
+
+    #[test]
+    fn platform_asset_name_rejects_unsupported_platforms() {
+        assert!(platform_asset_name("freebsd", "x86_64").is_err());
+        assert!(platform_asset_name("linux", "riscv64").is_err());
+    }
+
+    #[test]
+    fn current_platform_asset_name_resolves_on_this_test_host() {
+        // Sanity check that the env::consts-based wrapper produces a name
+        // `platform_asset_name` accepts on whatever host actually runs the
+        // test suite.
+        let name = current_platform_asset_name().unwrap();
+        assert!(name.starts_with("kin-"), "unexpected asset name: {name}");
+        assert!(
+            name.ends_with(".tar.gz") || name.ends_with(".zip"),
+            "unexpected extension: {name}"
+        );
+    }
+
+    #[test]
+    fn find_release_asset_matches_macos_aarch64() {
+        let release = mock_v0_2_12_release();
+        let asset = find_release_asset(&release, "kin-macos-aarch64.tar.gz").unwrap();
+        assert_eq!(asset.name, "kin-macos-aarch64.tar.gz");
+        assert!(asset
+            .browser_download_url
+            .ends_with("kin-macos-aarch64.tar.gz"));
+    }
+
+    #[test]
+    fn find_release_asset_matches_linux_x86_64() {
+        let release = mock_v0_2_12_release();
+        let asset = find_release_asset(&release, "kin-linux-x86_64.tar.gz").unwrap();
+        assert_eq!(asset.name, "kin-linux-x86_64.tar.gz");
+        assert!(asset
+            .browser_download_url
+            .ends_with("kin-linux-x86_64.tar.gz"));
+    }
+
+    #[test]
+    fn find_release_asset_matches_the_archive_not_its_sha256_sibling() {
+        // Every real archive has an adjacent "<name>.sha256" asset whose name
+        // contains the archive name as a substring (e.g.
+        // "kin-macos-aarch64.tar.gz.sha256"). Exact-name matching must
+        // resolve the archive itself, never the checksum sidecar.
+        let release = mock_v0_2_12_release();
+        let asset = find_release_asset(&release, "kin-macos-aarch64.tar.gz").unwrap();
+        assert_eq!(asset.name, "kin-macos-aarch64.tar.gz");
+    }
+
+    #[test]
+    fn find_release_asset_reports_an_honest_actionable_error_on_no_match() {
+        let release = mock_v0_2_12_release();
+        let err = find_release_asset(&release, "kin-freebsd-riscv64.tar.gz")
+            .expect_err("freebsd is not a published platform");
+        let message = format!("{err:#}");
+        // Names exactly what was looked for...
+        assert!(
+            message.contains("kin-freebsd-riscv64.tar.gz"),
+            "error should name the asset that was looked for: {message}"
+        );
+        // ...and is actionable: it lists what actually got published, rather
+        // than failing silently with an empty/generic "not found".
+        assert!(
+            message.contains("kin-macos-aarch64.tar.gz"),
+            "error should list the assets that were actually published: {message}"
+        );
+    }
+
+    #[test]
+    fn verify_sha256_accepts_a_matching_hash() {
+        let bytes = b"hello release archive";
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let hash = hex::encode(hasher.finalize());
+
+        assert!(verify_sha256(bytes, &hash).is_ok());
+        // Case-insensitive, matching real sha256sum/shasum output conventions.
+        assert!(verify_sha256(bytes, &hash.to_uppercase()).is_ok());
+    }
+
+    #[test]
+    fn verify_sha256_refuses_install_on_mismatch() {
+        let bytes = b"hello release archive";
+        let wrong_hash = "0".repeat(64);
+
+        let err = verify_sha256(bytes, &wrong_hash).expect_err("hash must not match");
+        let message = format!("{err}");
+        assert!(message.contains("MISMATCH"), "message: {message}");
+        assert!(message.contains(&wrong_hash), "message: {message}");
     }
 
     #[test]
@@ -1017,24 +1037,5 @@ mod tests {
             parse_checksum(checksums, "kin-linux-amd64.tar.gz"),
             Some("abcdef123456".to_string())
         );
-    }
-
-    #[test]
-    fn signature_verification_roundtrip() {
-        use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-
-        // Generate a test keypair.
-        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
-        let verifying_key = VerifyingKey::from(&signing_key);
-
-        let message = b"abc123  kin-darwin-arm64.tar.gz\n";
-        let signature: Signature = signing_key.sign(message);
-
-        // Good signature passes.
-        assert!(verifying_key.verify_strict(message, &signature).is_ok());
-
-        // Tampered message fails.
-        let tampered = b"xxx123  kin-darwin-arm64.tar.gz\n";
-        assert!(verifying_key.verify_strict(tampered, &signature).is_err());
     }
 }
