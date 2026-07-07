@@ -3398,7 +3398,19 @@ async fn review(
     let execution =
         kin_cli::commands::review::execute_review_request(&state.layout, graph.as_ref(), req)
             .await
-            .map_err(internal_error)?;
+            .map_err(|err| {
+                // A ref the resolver cannot make sense of is the caller's
+                // input, not a server fault — e.g. a shadow request naming a
+                // ref that doesn't exist or uses syntax the resolver doesn't
+                // understand — so it is reported as a client error with the
+                // full "why" chain instead of falling into the generic
+                // internal-error path.
+                if kin_cli::commands::ref_lookup::is_ref_resolution_error(&err) {
+                    (StatusCode::BAD_REQUEST, format!("{err:#}"))
+                } else {
+                    internal_error(err)
+                }
+            })?;
     if execution.hydrated_git_history {
         state.bump_version();
         state.save_snapshot().map_err(internal_error)?;

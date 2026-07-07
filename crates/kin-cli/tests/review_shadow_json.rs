@@ -282,6 +282,86 @@ fn shadow_report_fails_loud_on_unknown_ref() {
     );
 }
 
+/// `HEAD^` — the idiomatic "review my last commit" — must resolve on a
+/// freshly-inited repo with no further Git ancestry import: `kin init`
+/// shallow-imports the current Git HEAD as a single change parented on
+/// genesis, so `HEAD^` walks straight to genesis in the graph.
+#[test]
+fn shadow_report_head_caret_resolves_from_a_fresh_init() {
+    let dir = tempdir().expect("tempdir");
+    let repo = dir.path();
+    setup_fixture_repo(repo);
+    kin_init(repo);
+
+    let report = run_shadow_json(repo, "HEAD^", "HEAD");
+
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["mode"], "shadow");
+    assert!(!report["input"]["resolved_base"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+    assert!(!report["input"]["resolved_head"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+}
+
+/// Caret and tilde relative-ref syntax must resolve to the same change on
+/// the shadow CLI path.
+#[test]
+fn shadow_report_head_caret_and_head_tilde_one_agree() {
+    let dir = tempdir().expect("tempdir");
+    let repo = dir.path();
+    setup_fixture_repo(repo);
+    kin_init(repo);
+
+    let caret_report = run_shadow_json(repo, "HEAD^", "HEAD");
+    let tilde_report = run_shadow_json(repo, "HEAD~1", "HEAD");
+
+    assert_eq!(
+        caret_report["input"]["resolved_base"], tilde_report["input"]["resolved_base"],
+        "HEAD^ and HEAD~1 must resolve to the same change"
+    );
+}
+
+/// A ref the resolver genuinely cannot make sense of must still fail the
+/// command, but with a friendly, specific message rather than an opaque
+/// HTTP 500 — the daemon now reports it as a client error.
+#[test]
+fn shadow_report_unsupported_ref_syntax_fails_friendly_not_opaque() {
+    let dir = tempdir().expect("tempdir");
+    let repo = dir.path();
+    let (_base, head, _artifact_head) = setup_fixture_repo(repo);
+    kin_init(repo);
+
+    let output = kin_command()
+        .args([
+            "review",
+            "shadow",
+            &format!("HEAD@{{upstream}}..{head}"),
+            "--json",
+        ])
+        .current_dir(repo)
+        .output()
+        .expect("run kin review shadow with unsupported ref syntax");
+
+    assert!(
+        !output.status.success(),
+        "unresolvable ref must still fail the command, got stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot resolve ref"),
+        "error must name the ref-resolution problem plainly: {stderr}"
+    );
+    assert!(
+        !stderr.contains("HTTP 500"),
+        "an unresolvable ref must not surface as an opaque server error: {stderr}"
+    );
+}
+
 /// A review pair is almost always ancestor..descendant, and `review shadow`
 /// resolves the head ref before the base ref so that ancestry hydrates in a
 /// single pass. This proves the invariant that makes head-first cheap: once the
