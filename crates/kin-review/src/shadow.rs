@@ -3794,4 +3794,88 @@ mod tests {
             finding.message
         );
     }
+
+    #[test]
+    fn body_reversion_to_older_revision_flags() {
+        // v1 -> v2 -> (head) back to v1's body: the head un-does the v2 edit.
+        // An ordinary new edit (v3 with a fresh body) must NOT match.
+        let graph = InMemoryGraph::new();
+        let mut v1 = entity_with_span("compute", "src/calc.rs", 10, EntityRole::Source);
+        v1.fingerprint.behavior_hash = Hash256::from_bytes([1; 32]);
+        let mut v2 = v1.clone();
+        v2.fingerprint.behavior_hash = Hash256::from_bytes([2; 32]);
+        let mut v_back = v2.clone();
+        v_back.fingerprint.behavior_hash = Hash256::from_bytes([1; 32]);
+
+        let pad_tail = padded_history_graph(
+            &graph,
+            vec![EntityDelta::Added(v1.clone())],
+            vec![EntityDelta::Modified {
+                old: v1.clone(),
+                new: v2.clone(),
+            }],
+            30,
+        );
+        graph.upsert_entity(&v_back).unwrap();
+        let head_id = change_id(210);
+        let head = change_with_deltas(
+            head_id,
+            vec![pad_tail],
+            vec![EntityDelta::Modified {
+                old: v2.clone(),
+                new: v_back,
+            }],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(pad_tail, head_id)).unwrap();
+        let finding = report
+            .policy
+            .findings
+            .iter()
+            .find(|f| f.kind == "revert_history")
+            .expect("a body reversion to an older revision must flag");
+        assert!(
+            finding.message.contains("revert-shaped body reversion"),
+            "got: {}",
+            finding.message
+        );
+
+        // Control: an ordinary forward edit must not produce the finding.
+        let graph2 = InMemoryGraph::new();
+        let mut v3 = v2.clone();
+        v3.fingerprint.behavior_hash = Hash256::from_bytes([3; 32]);
+        let pad_tail2 = padded_history_graph(
+            &graph2,
+            vec![EntityDelta::Added(v1.clone())],
+            vec![EntityDelta::Modified {
+                old: v1.clone(),
+                new: v2.clone(),
+            }],
+            30,
+        );
+        graph2.upsert_entity(&v3).unwrap();
+        let head2 = change_with_deltas(
+            change_id(211),
+            vec![pad_tail2],
+            vec![EntityDelta::Modified {
+                old: v2.clone(),
+                new: v3,
+            }],
+            vec![],
+            vec![],
+        );
+        graph2.create_change(&head2).unwrap();
+        let report2 = build_shadow_report(&graph2, &request(pad_tail2, change_id(211))).unwrap();
+        assert!(
+            !report2
+                .policy
+                .findings
+                .iter()
+                .any(|f| f.kind == "revert_history"),
+            "an ordinary forward edit must not read as a body reversion"
+        );
+    }
 }
