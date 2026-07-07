@@ -67,7 +67,7 @@ pub fn discover_servers() -> Vec<DiscoveredServer> {
 }
 
 /// Try to detect the version of an LSP server binary.
-fn detect_version(path: &std::path::Path) -> Option<String> {
+pub(crate) fn detect_version(path: &std::path::Path) -> Option<String> {
     let output = std::process::Command::new(path)
         .arg("--version")
         .output()
