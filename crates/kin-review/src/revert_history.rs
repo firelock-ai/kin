@@ -96,6 +96,7 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
     let mut head_added: BTreeMap<(String, String), Entity> = BTreeMap::new();
     let mut head_removed: Vec<EntityId> = Vec::new();
     let mut seen_removed: HashSet<EntityId> = HashSet::new();
+    let mut head_modified: BTreeMap<String, (Entity, Entity)> = BTreeMap::new();
     for change in range_changes {
         for delta in &change.entity_deltas {
             match delta {
@@ -109,12 +110,77 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
                         head_removed.push(*id);
                     }
                 }
-                EntityDelta::Modified { .. } => {}
+                EntityDelta::Modified { old, new } => {
+                    // Multiple range changes touching one entity collapse to
+                    // the net old→new pair: earliest old, latest new.
+                    head_modified
+                        .entry(new.name.clone())
+                        .and_modify(|(_, latest)| *latest = new.clone())
+                        .or_insert_with(|| (old.clone(), new.clone()));
+                }
             }
         }
     }
 
     let mut findings = Vec::new();
+
+    // Body reversions: a modified entity whose NEW body equals a body it
+    // carried at an OLDER revision — the head un-does a later edit. This is
+    // the dominant real-world revert shape (git revert of a body change
+    // produces a Modified delta, not add/remove). The immediately-previous
+    // body is skipped: every edit trivially differs from its predecessor;
+    // only a return to DEEPER history is revert-shaped. Hash equality on the
+    // behavior fingerprint makes the match exact, so this cannot fire on an
+    // ordinary edit.
+    for (name, (old, new)) in &head_modified {
+        if new.fingerprint.behavior_hash == old.fingerprint.behavior_hash {
+            continue;
+        }
+        let history = match store.get_entity_history(&old.id) {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        // Bodies this entity carried before the range, newest-first, capped by
+        // the window. Position 0 is the body the range started from (old) —
+        // matching it would be a no-op edit, so matches start at depth 1.
+        let mut prior_bodies: Vec<Hash256> = Vec::new();
+        for change in history.iter().rev() {
+            if prior_bodies.len() > REVERT_HISTORY_WINDOW {
+                break;
+            }
+            for delta in &change.entity_deltas {
+                match delta {
+                    EntityDelta::Modified { old: o, new: n } if n.id == old.id => {
+                        if prior_bodies.is_empty() {
+                            prior_bodies.push(n.fingerprint.behavior_hash);
+                        }
+                        prior_bodies.push(o.fingerprint.behavior_hash);
+                    }
+                    EntityDelta::Added(e) if e.id == old.id => {
+                        if prior_bodies.is_empty() {
+                            prior_bodies.push(e.fingerprint.behavior_hash);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(depth) = prior_bodies
+            .iter()
+            .skip(1)
+            .position(|h| *h == new.fingerprint.behavior_hash)
+        {
+            findings.push(inline_finding(
+                new,
+                format!(
+                    "Modified `{}` restores the exact body it had {} revision(s) ago — \
+                     revert-shaped body reversion",
+                    name,
+                    depth + 1
+                ),
+            ));
+        }
+    }
 
     // Reintroductions: an added entity matching a window removal. Removed
     // deltas carry only the id, so each candidate is resolved to its last full
