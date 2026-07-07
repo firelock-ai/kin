@@ -41,7 +41,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use kin_model::change::{EntityDelta, SemanticChange};
 use kin_model::graph::GraphStore;
-use kin_model::{Entity, EntityId, EntityKind, Hash256, SemanticChangeId};
+use kin_model::{Entity, EntityId, EntityKind, Hash256, SemanticChangeId, Visibility};
 
 use crate::error::ReviewError;
 use crate::inline::{InlineComment, InlineCommentKind};
@@ -168,10 +168,8 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
                         // change; restoring it un-does this change.
                         prior_bodies.push((o.fingerprint.behavior_hash, change.id));
                     }
-                    EntityDelta::Added(e) if e.id == old.id => {
-                        if prior_bodies.is_empty() {
-                            prior_bodies.push((e.fingerprint.behavior_hash, change.id));
-                        }
+                    EntityDelta::Added(e) if e.id == old.id && prior_bodies.is_empty() => {
+                        prior_bodies.push((e.fingerprint.behavior_hash, change.id));
                     }
                     _ => {}
                 }
@@ -187,20 +185,19 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
         }
     }
 
-    // Body reversions are REPORTED, never verdict-driving. The 60-benign
-    // sweep measured why: a module entity is a content aggregate of its file,
-    // so any single-function reversion makes the module co-revert to the same
-    // change by construction — "coherence" of two entities is nearly free, and
-    // gating on it re-flagged ~a third of clean benigns. The temporal evidence
-    // stays visible to reviewers (and to future evidence-composition in
-    // ranking) at info severity; coherence is still computed because it is the
-    // strongest hint in the message.
+    // A coordinated revert (>=2 entities restoring bodies from the same change)
+    // gates only the public contract leaves it touches. Module/class aggregates
+    // co-revert for free (a module mirrors its file), and private-helper or test
+    // reversions are ordinary churn — those stay informational. A singleton
+    // match is incidental (small bodies recur over long histories) and never
+    // gates.
     let mut undone_counts: HashMap<SemanticChangeId, usize> = HashMap::new();
     for (_, _, undone, _) in &reversion_matches {
         *undone_counts.entry(*undone).or_insert(0) += 1;
     }
     for (entity, name, undone, depth) in &reversion_matches {
         let coherent = undone_counts.get(undone).copied().unwrap_or(0) >= 2;
+        let gates = coherent && is_public_contract_leaf(entity);
         let message = format!(
             "Modified `{}` restores the exact body it had {} revision(s) ago{} — \
              revert-shaped body reversion",
@@ -213,7 +210,11 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
             },
         );
         let mut finding = inline_finding(entity, message);
-        finding.kind = InlineCommentKind::RevertHistoryIncidental;
+        finding.kind = if gates {
+            InlineCommentKind::RevertHistory
+        } else {
+            InlineCommentKind::RevertHistoryIncidental
+        };
         findings.push(finding);
     }
 
@@ -262,7 +263,11 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
                 })
             };
             if let Some(message) = finding {
-                findings.push(inline_finding(added, message));
+                let mut comment = inline_finding(added, message);
+                if !is_public_contract(added) {
+                    comment.kind = InlineCommentKind::RevertHistoryIncidental;
+                }
+                findings.push(comment);
             }
         }
     }
@@ -272,14 +277,21 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
     // revert shape where the added lines are deleted in place.
     for removed_id in &head_removed {
         if let Some(distance) = window.added_ids.get(removed_id) {
-            let name = last_known_entity(store, removed_id)
-                .map(|e| e.name)
+            let removed = last_known_entity(store, removed_id);
+            let name = removed
+                .as_ref()
+                .map(|e| e.name.clone())
                 .unwrap_or_else(|| "entity".to_string());
+            let gates = removed.as_ref().is_some_and(is_public_contract);
             findings.push(InlineComment {
                 file: String::new(),
                 start_line: 0,
                 end_line: 0,
-                kind: InlineCommentKind::RevertHistory,
+                kind: if gates {
+                    InlineCommentKind::RevertHistory
+                } else {
+                    InlineCommentKind::RevertHistoryIncidental
+                },
                 message: format!(
                     "Removed `{}` was introduced only {} — revert-shaped removal \
                      of a recent addition",
@@ -368,6 +380,19 @@ fn last_known_entity<G: GraphStore>(store: &G, id: &EntityId) -> Option<Entity> 
             _ => None,
         })
     })
+}
+
+// A public, non-test/generated/vendored entity — a real contract surface whose
+// revert is worth gating on, as opposed to private-helper or test churn.
+fn is_public_contract(entity: &Entity) -> bool {
+    entity.visibility == Visibility::Public
+        && !crate::inline::is_non_contract_surface_role(entity.role)
+}
+
+// Body-reversion coherence gates only on leaves (functions/methods): a module or
+// class aggregates its members, so it co-reverts for free and inflates coherence.
+fn is_public_contract_leaf(entity: &Entity) -> bool {
+    is_public_contract(entity) && matches!(entity.kind, EntityKind::Function | EntityKind::Method)
 }
 
 fn inline_finding(entity: &Entity, message: String) -> InlineComment {

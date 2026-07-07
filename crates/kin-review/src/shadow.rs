@@ -3899,7 +3899,7 @@ mod tests {
     }
 
     #[test]
-    fn coherent_body_reversion_group_reports_without_gating() {
+    fn coherent_public_leaf_body_reversion_gates() {
         // Two entities whose new bodies both restore states un-done by the
         // SAME historical change: a coherent snapshot restoration — the true
         // revert shape — gates as a warning.
@@ -3970,20 +3970,16 @@ mod tests {
         graph.create_change(&head).unwrap();
 
         let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
-        // Body reversions never gate — the 60-benign sweep measured module
-        // co-reversion making two-entity "coherence" nearly free on real
-        // repos, re-flagging ~a third of clean benigns. The evidence is still
-        // reported, carrying the coherence hint for the reviewer.
-        let informational: Vec<_> = report
+        let gating: Vec<_> = report
             .policy
             .findings
             .iter()
-            .filter(|f| f.kind == "revert_history_incidental")
+            .filter(|f| f.kind == "revert_history")
             .collect();
         assert_eq!(
-            informational.len(),
+            gating.len(),
             2,
-            "both reversions must be reported, got findings: {:?}",
+            "both public-leaf reversions must gate, got findings: {:?}",
             report
                 .policy
                 .findings
@@ -3991,10 +3987,98 @@ mod tests {
                 .map(|f| (&f.kind, &f.message))
                 .collect::<Vec<_>>()
         );
-        assert!(informational.iter().all(|f| f.severity == "info"));
-        assert!(informational[0]
-            .message
-            .contains("un-doing the same change"));
+        assert!(gating.iter().all(|f| f.severity == "warning"));
+        assert!(gating[0].message.contains("un-doing the same change"));
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::NeedsAttention);
+    }
+
+    #[test]
+    fn coherent_module_body_reversion_does_not_gate() {
+        // Module/class aggregates co-revert for free (a module mirrors its
+        // file), so a coherent group with no public leaf stays informational —
+        // the false-coherence protection that motivated the leaf filter.
+        let graph = InMemoryGraph::new();
+        let mut a1 = entity_with_span("mod_a", "src/a.rs", 1, EntityRole::Source);
+        a1.kind = EntityKind::Module;
+        a1.fingerprint.behavior_hash = Hash256::from_bytes([11; 32]);
+        let mut b1 = entity_with_span("_helper", "src/b.rs", 9, EntityRole::Source);
+        b1.visibility = Visibility::Private;
+        b1.fingerprint.behavior_hash = Hash256::from_bytes([21; 32]);
+        let mut a2 = a1.clone();
+        a2.fingerprint.behavior_hash = Hash256::from_bytes([12; 32]);
+        let mut b2 = b1.clone();
+        b2.fingerprint.behavior_hash = Hash256::from_bytes([22; 32]);
+
+        let mut prev: Option<SemanticChangeId> = None;
+        for i in 1..=30u8 {
+            let deltas = match i {
+                1 => vec![
+                    EntityDelta::Added(a1.clone()),
+                    EntityDelta::Added(b1.clone()),
+                ],
+                2 => vec![
+                    EntityDelta::Modified {
+                        old: a1.clone(),
+                        new: a2.clone(),
+                    },
+                    EntityDelta::Modified {
+                        old: b1.clone(),
+                        new: b2.clone(),
+                    },
+                ],
+                _ => vec![],
+            };
+            let change = change_with_deltas(
+                change_id(i),
+                prev.map(|p| vec![p]).unwrap_or_default(),
+                deltas,
+                vec![],
+                vec![],
+            );
+            graph.create_change(&change).unwrap();
+            prev = Some(change_id(i));
+        }
+        let base_id = prev.unwrap();
+        let mut a_back = a2.clone();
+        a_back.fingerprint.behavior_hash = Hash256::from_bytes([11; 32]);
+        let mut b_back = b2.clone();
+        b_back.fingerprint.behavior_hash = Hash256::from_bytes([21; 32]);
+        graph.upsert_entity(&a_back).unwrap();
+        graph.upsert_entity(&b_back).unwrap();
+        let head_id = change_id(220);
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![
+                EntityDelta::Modified {
+                    old: a2.clone(),
+                    new: a_back,
+                },
+                EntityDelta::Modified {
+                    old: b2.clone(),
+                    new: b_back,
+                },
+            ],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+        assert!(
+            report
+                .policy
+                .findings
+                .iter()
+                .all(|f| f.kind != "revert_history"),
+            "module/private coherent reversion must not gate: {:?}",
+            report
+                .policy
+                .findings
+                .iter()
+                .map(|f| &f.kind)
+                .collect::<Vec<_>>()
+        );
         assert_eq!(report.policy.verdict, ShadowGateVerdict::Pass);
     }
 }
