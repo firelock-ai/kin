@@ -8,6 +8,28 @@
 
 pub const PARSER_SCHEMA_EPOCH: &str = "parser-schema-2026-03-29-v1";
 
+/// Monotonic version of the parser's extraction semantics.
+///
+/// A parse is a pure function of `(source bytes, this version)`: the same bytes
+/// parsed under the same version always yield the same `ParseOutput`. Callers
+/// that memoize parse results across a run key that cache on
+/// `(blob_hash, PARSER_SEMANTICS_VERSION)` so a cached parse is never served
+/// after the parser's meaning has changed.
+///
+/// Bump contract — increment this by one on ANY change that can alter the
+/// entities, relations, imports, tests, fingerprints, or metadata a given input
+/// would produce. This includes:
+/// - tree-sitter grammar upgrades (new grammar ABI or grammar revision),
+/// - changes to entity/relation/import/test extraction logic,
+/// - changes to fingerprint computation or attached-metadata shape.
+///
+/// It is a distinct, coarser knob from [`PARSER_SCHEMA_EPOCH`]: the epoch labels
+/// the on-wire schema string, this integer gates in-memory parse reuse. When in
+/// doubt, bump — a spurious bump only costs a cold re-parse, while a missed bump
+/// silently serves stale semantics (the stale-binary class of bug). Mirrors
+/// kin-db's `GraphSnapshot::CURRENT_VERSION` convention.
+pub const PARSER_SEMANTICS_VERSION: u32 = 1;
+
 pub mod adapter;
 pub mod error;
 pub mod extract;
