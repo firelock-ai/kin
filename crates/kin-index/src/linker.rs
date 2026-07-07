@@ -2649,7 +2649,423 @@ pub fn link_cross_file_incremental(
     let _span =
         tracing::info_span!("kin.index.link_cross_file_incremental", files = files.len()).entered();
 
-    // Step 2: Build import map per file
+    // Read-only step-local overlays shared by every per-file resolution. Built
+    // once so the parallel per-file pass and its serial reference both resolve
+    // against byte-identical context.
+    let IncrementalLinkOverlays {
+        import_map,
+        include_graph,
+        class_bases,
+    } = build_incremental_link_overlays(files, linker);
+
+    // Resolve each file independently: every relation's source entity is owned
+    // by its own file, so the (src, dst, kind) triples produced by different
+    // files never collide. Per-file resolution carries its own dedup state and
+    // is therefore order-independent; results are collected in input-file order
+    // (`par_iter().collect()` preserves order) and merged serially below so the
+    // materialized relation set and ordering are identical to a serial pass —
+    // mirroring the batch `link_cross_file` resolver.
+    let total_files = files.len();
+    let progress_interval = std::cmp::max(total_files / 50, 1);
+    let link_start = std::time::Instant::now();
+    let completed = AtomicUsize::new(0);
+    let found = AtomicUsize::new(0);
+    let per_file_relations: Vec<Vec<Relation>> = files
+        .par_iter()
+        .map(|file| {
+            let relations = resolve_one_file_incremental(
+                file,
+                linker,
+                &import_map,
+                &include_graph,
+                &class_bases,
+            );
+            if total_files > 50 {
+                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                let total = found.fetch_add(relations.len(), Ordering::Relaxed) + relations.len();
+                if done % progress_interval == 0 || done == total_files {
+                    eprint!(
+                        "\r  Linking: [{}/{}] {}% | {} relations | {:.1}s",
+                        done,
+                        total_files,
+                        (done * 100) / total_files,
+                        total,
+                        link_start.elapsed().as_secs_f64()
+                    );
+                }
+            }
+            relations
+        })
+        .collect();
+    if total_files > 50 {
+        eprintln!(); // newline after \r progress
+    }
+
+    merge_incremental_resolved(per_file_relations, files, linker)
+}
+
+/// Resolve the name-based relations of a single file into entity-ID relations
+/// using the incrementally updated linker state.
+///
+/// All reads are against the shared read-only `linker` and the step-local
+/// overlays (`import_map`, `include_graph`, `class_bases`); the only mutable
+/// state is a file-local dedup set, so this is pure with respect to other files
+/// and safe to run across files in parallel. Mirrors the batch
+/// [`resolve_one_file`].
+fn resolve_one_file_incremental(
+    file: &FileParseData,
+    linker: &IncrementalLinker,
+    import_map: &HashMap<&str, HashMap<&str, (&str, &str)>>,
+    include_graph: &HashMap<String, Vec<String>>,
+    class_bases: &HashMap<String, Vec<(String, Vec<String>)>>,
+) -> Vec<Relation> {
+    let mut resolved = Vec::new();
+    let mut seen: HashSet<(EntityId, EntityId, RelationKind)> = HashSet::new();
+    // Lazily resolved once per file: only ambiguous name buckets need them.
+    let mut caller_import_targets: Option<HashSet<String>> = None;
+    let mut caller_include_closure: Option<HashMap<String, usize>> = None;
+    for rel in &file.relations {
+        let src_id = linker
+            .entity_by_file_name
+            .get(&file.file_path)
+            .and_then(|m| m.get(&rel.src_name))
+            .copied();
+        let dst_same_file = linker
+            .entity_by_file_name
+            .get(&file.file_path)
+            .and_then(|m| m.get(&rel.dst_name))
+            .copied();
+
+        let src_id = match src_id {
+            Some(id) => id,
+            None => {
+                debug!(
+                    src = %rel.src_name,
+                    dst = %rel.dst_name,
+                    file = %file.file_path,
+                    "linker: src entity not found, skipping"
+                );
+                continue;
+            }
+        };
+
+        if rel.kind == RelationKind::UsesMacro {
+            if let Some(dst_id) = dst_same_file {
+                if linker.entity_kind_by_id.get(&dst_id) == Some(&EntityKind::Macro) {
+                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                        resolved.push(make_relation(rel.kind, src_id, dst_id, 1.0));
+                    }
+                    continue;
+                }
+            }
+
+            if let Some(dst_id) = resolve_reachable_macro_target_incremental(
+                &file.file_path,
+                &rel.dst_name,
+                &include_graph,
+                linker,
+            ) {
+                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                    resolved.push(make_relation(rel.kind, src_id, dst_id, 0.95));
+                }
+                continue;
+            }
+
+            debug!(
+                src = %rel.src_name,
+                dst = %rel.dst_name,
+                file = %file.file_path,
+                "linker: macro use unresolved through same-file/include closure"
+            );
+            continue;
+        }
+
+        // (a) Same-file resolution. Mirrors the batch linker: the same-file
+        // entity wins and is emitted first at full confidence, but when
+        // cross-file entities share the exact name (a declaration/prototype
+        // whose definition lives elsewhere) also fan out to them, bounded so
+        // the same-file target plus its cross-file twins stay within the cap.
+        // Cross-file twins carry the (c) name-match confidence (0.7).
+        if let Some(dst_id) = dst_same_file {
+            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                resolved.push(make_relation(rel.kind, src_id, dst_id, 1.0));
+            }
+            let mut cross_file_twins: HashSet<EntityId> = HashSet::new();
+            if let Some(candidates) = linker.entity_by_name.get(&rel.dst_name) {
+                for (fp, id) in candidates {
+                    if fp != &file.file_path {
+                        cross_file_twins.insert(*id);
+                    }
+                }
+            }
+            if !cross_file_twins.is_empty() && cross_file_twins.len() < AMBIGUOUS_CALL_FANOUT_CAP {
+                for cross_id in sorted_fanout_targets(cross_file_twins) {
+                    if add_deduped(&mut seen, src_id, cross_id, rel.kind) {
+                        resolved.push(make_relation(rel.kind, src_id, cross_id, 0.7));
+                    }
+                }
+            }
+            continue;
+        }
+
+        // (a2) Inheritance-aware receiver-method resolution — mirrors the
+        // batch linker: a class-qualified `self.m()`/`cls.m()` callee whose
+        // owner is a class in this file resolves through the recorded
+        // Extends chain to the defining ancestor; an unresolvable hierarchy
+        // falls back to the bare leaf for the tiers below.
+        let mut dst_lookup: &str = rel.dst_name.as_str();
+        if rel.kind == RelationKind::Calls {
+            if let Some((owner, method)) = split_owner_method(rel.dst_name.as_str()) {
+                let owner_is_class = linker
+                    .entity_by_file_name
+                    .get(&file.file_path)
+                    .and_then(|m| m.get(owner))
+                    .map(|id| is_class_like(linker.entity_kind_by_id.get(id)))
+                    .unwrap_or(false);
+                if owner_is_class {
+                    if let Some(dst_id) = resolve_inherited_method_incremental(
+                        &file.file_path,
+                        owner,
+                        method,
+                        linker,
+                        &import_map,
+                        &class_bases,
+                    ) {
+                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                            resolved.push(make_relation(
+                                rel.kind,
+                                src_id,
+                                dst_id,
+                                INHERITED_METHOD_CONFIDENCE,
+                            ));
+                        }
+                        continue;
+                    }
+                    dst_lookup = method;
+                }
+            }
+        }
+
+        // (b) Import-based cross-file resolution
+        if let Some(file_imports) = import_map.get(file.file_path.as_str()) {
+            if let Some(&(module_path, original_name)) = file_imports.get(rel.dst_name.as_str()) {
+                if let Some(target_file) =
+                    resolve_module_path(&file.file_path, module_path, &linker.known_files)
+                {
+                    let direct = linker
+                        .entity_by_file_name
+                        .get(&target_file)
+                        .and_then(|m| m.get(original_name))
+                        .copied();
+                    let dst_id = if direct.is_some() {
+                        direct
+                    } else if original_name == "default" {
+                        resolve_default_export_incremental(&target_file, &linker.entities_by_file)
+                    } else {
+                        None
+                    };
+                    if let Some(dst_id) = dst_id {
+                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                            resolved.push(make_relation(rel.kind, src_id, dst_id, 0.95));
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            // (b2) Namespace/package import member resolution
+            if let Some((import_name, member_name)) = split_member_access(rel.dst_name.as_str()) {
+                if let Some(&(module_path, _original_name)) = file_imports.get(import_name) {
+                    if let Some(target_file) =
+                        resolve_module_path(&file.file_path, module_path, &linker.known_files)
+                    {
+                        if let Some(&dst_id) = linker
+                            .entity_by_file_name
+                            .get(&target_file)
+                            .and_then(|m| m.get(member_name))
+                        {
+                            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                                resolved.push(make_relation(rel.kind, src_id, dst_id, 0.9));
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        let other_file_candidates: Vec<(&str, EntityId)> = linker
+            .entity_by_name
+            .get(dst_lookup)
+            .map(|candidates| {
+                candidates
+                    .iter()
+                    .filter(|(fp, _)| fp != &file.file_path)
+                    .map(|(fp, id)| (fp.as_str(), *id))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // (b3) Parser-pinned import resolution — mirrors the batch linker:
+        // a callee pinned to a module must resolve inside that module (or
+        // its package directory), never through the global name bucket.
+        let mut name_fallback_allowed = true;
+        match resolve_import_pinned_target(
+            rel,
+            &file.file_path,
+            &linker.known_files,
+            |target_file, name| {
+                linker
+                    .entity_by_file_name
+                    .get(target_file)
+                    .and_then(|m| m.get(name))
+                    .copied()
+            },
+            &other_file_candidates,
+        ) {
+            ImportPinnedTarget::Resolved(dst_id) => {
+                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                    resolved.push(make_relation(
+                        rel.kind,
+                        src_id,
+                        dst_id,
+                        IMPORT_PINNED_CONFIDENCE,
+                    ));
+                }
+                continue;
+            }
+            ImportPinnedTarget::PinnedMiss => name_fallback_allowed = false,
+            ImportPinnedTarget::NoPin => {}
+        }
+
+        // (c) Global name-match fallback
+        if name_fallback_allowed && !other_file_candidates.is_empty() {
+            let distinct_ids: HashSet<EntityId> =
+                other_file_candidates.iter().map(|&(_, id)| id).collect();
+            let (dst_id, confidence) = if distinct_ids.len() == 1 {
+                (other_file_candidates[0].1, 0.7)
+            } else {
+                let targets = caller_import_targets.get_or_insert_with(|| {
+                    resolve_caller_import_targets(
+                        &file.file_path,
+                        &file.imports,
+                        &linker.known_files,
+                    )
+                });
+                let closure = caller_include_closure
+                    .get_or_insert_with(|| include_closure_depths(&file.file_path, &include_graph));
+                match disambiguate_same_name_candidates(
+                    &file.file_path,
+                    targets,
+                    closure,
+                    &other_file_candidates,
+                    |path| {
+                        linker
+                            .entities_by_file
+                            .get(path)
+                            .map(|entities| entities.len())
+                            .unwrap_or(0)
+                    },
+                ) {
+                    Some(dst_id) => (dst_id, LOCALITY_DISAMBIGUATED_CONFIDENCE),
+                    // No locality signal: keep the historical bucket-order
+                    // pick so signal-less repos do not lose existing edges.
+                    None => (other_file_candidates[0].1, 0.7),
+                }
+            };
+            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                resolved.push(make_relation(rel.kind, src_id, dst_id, confidence));
+            }
+            continue;
+        }
+
+        // (c2) Receiver-method calls (`x.method()`) arrive as the bare method
+        // name with no exact cross-file entity of that name, so (c) above
+        // never fires. Resolve them through the bare-name index, mirroring
+        // the batch linker's (c2): a single distinct cross-file method links,
+        // and several implementor classes fan out to all of them up to the
+        // cap (virtual dispatch has an unknowable receiver type). Beyond the
+        // cap the name is too ubiquitous to guess and stays unresolved.
+        // Without this step a receiver method resolved into a full-tree
+        // snapshot is dropped the moment an incremental relink of the caller
+        // re-derives its edges.
+        if name_fallback_allowed && rel.kind == RelationKind::Calls {
+            if let Some(bare_candidates) = linker.entity_by_bare_name.get(dst_lookup) {
+                let distinct_targets: HashSet<EntityId> = bare_candidates
+                    .iter()
+                    .filter(|(fp, _)| fp != &file.file_path)
+                    .map(|(_, id)| *id)
+                    .collect();
+                if (1..=AMBIGUOUS_CALL_FANOUT_CAP).contains(&distinct_targets.len()) {
+                    for dst_id in sorted_fanout_targets(distinct_targets) {
+                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                            resolved.push(make_relation(rel.kind, src_id, dst_id, 0.3));
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // (c3) Path-qualified suffix resolution — the incremental counterpart
+        // of the batch linker's (c3). Live edits reach this daemon path, so
+        // qualified calls must resolve here too, not only on a full re-index.
+        if name_fallback_allowed
+            && matches!(rel.kind, RelationKind::Calls | RelationKind::References)
+        {
+            // Fan out: an ambiguous qualified leaf resolves to every distinct
+            // cross-file target, matching the batch resolver.
+            let qualified_targets =
+                resolve_qualified_suffix_incremental(&rel.dst_name, &file.file_path, linker);
+            if !qualified_targets.is_empty() {
+                for dst_id in qualified_targets {
+                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                        resolved.push(make_relation(
+                            rel.kind,
+                            src_id,
+                            dst_id,
+                            QUALIFIED_SUFFIX_CONFIDENCE,
+                        ));
+                    }
+                }
+                continue;
+            }
+        }
+
+        // (d) Cross-repo external reference: preserve an unresolved
+        // reference to an external module as an inferred edge carrying the
+        // imported symbol and source, so the spine cross-repo resolver can
+        // match it against a sibling repo. See
+        // `make_external_reference_relation`.
+        if let Some(external) =
+            make_external_reference_relation(rel, src_id, &file.file_path, &linker.known_files)
+        {
+            if let GraphNodeId::Entity(dst_id) = external.dst {
+                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                    resolved.push(external);
+                }
+            }
+            continue;
+        }
+    }
+
+    resolved
+}
+
+/// Read-only step-local overlays shared by every per-file incremental
+/// resolution, built once per link so the parallel per-file pass and its serial
+/// reference resolve against byte-identical context.
+struct IncrementalLinkOverlays<'a> {
+    import_map: HashMap<&'a str, HashMap<&'a str, (&'a str, &'a str)>>,
+    include_graph: HashMap<String, Vec<String>>,
+    class_bases: HashMap<String, Vec<(String, Vec<String>)>>,
+}
+
+fn build_incremental_link_overlays<'a>(
+    files: &'a [FileParseData],
+    linker: &IncrementalLinker,
+) -> IncrementalLinkOverlays<'a> {
+    // Import map per file: local_name -> (module_path, original_name).
     let import_map: HashMap<&str, HashMap<&str, (&str, &str)>> = {
         let mut import_map: HashMap<&str, HashMap<&str, (&str, &str)>> = HashMap::new();
         for file in files {
@@ -2667,12 +3083,10 @@ pub fn link_cross_file_incremental(
         import_map
     };
 
-    let mut resolved = Vec::new();
-    let mut seen: HashSet<(EntityId, EntityId, RelationKind)> = HashSet::new();
-    // Step-local include edges overlay the linker's persistent per-file
-    // include state: files parsed this step resolve fresh (including files
-    // that dropped every include), every other file keeps the edges recorded
-    // when it was last parsed. Closure walks therefore cross step boundaries.
+    // Step-local include edges overlay the linker's persistent per-file include
+    // state: files parsed this step resolve fresh (including files that dropped
+    // every include), every other file keeps the edges recorded when it was last
+    // parsed. Closure walks therefore cross step boundaries.
     let include_graph = {
         let mut merged = linker.include_targets_by_file.clone();
         for file in files {
@@ -2684,12 +3098,12 @@ pub fn link_cross_file_incremental(
         merged
     };
 
-    // Step-local class hierarchy overlays the linker's persistent per-file
-    // state, exactly like the include graph above: files parsed this step
-    // resolve from their fresh Extends declarations (including files whose
-    // classes lost every base), every other file keeps the hierarchy recorded
-    // when it was last parsed or rehydrated. Inheritance walks therefore cross
-    // step boundaries without reading committed-stale bases for edited files.
+    // Step-local class hierarchy overlays the linker's persistent per-file state,
+    // exactly like the include graph above: files parsed this step resolve from
+    // their fresh Extends declarations (including files whose classes lost every
+    // base), every other file keeps the hierarchy recorded when it was last
+    // parsed or rehydrated. Inheritance walks therefore cross step boundaries
+    // without reading committed-stale bases for edited files.
     let class_bases = {
         let mut merged = linker.class_bases_by_file.clone();
         for file in files {
@@ -2704,354 +3118,29 @@ pub fn link_cross_file_incremental(
         merged
     };
 
-    let total_files = files.len();
-    let progress_interval = std::cmp::max(total_files / 50, 1);
-    let link_start = std::time::Instant::now();
+    IncrementalLinkOverlays {
+        import_map,
+        include_graph,
+        class_bases,
+    }
+}
 
-    for (file_idx, file) in files.iter().enumerate() {
-        if total_files > 50 && (file_idx % progress_interval == 0 || file_idx + 1 == total_files) {
-            eprint!(
-                "\r  Linking: [{}/{}] {}% | {} relations | {:.1}s",
-                file_idx + 1,
-                total_files,
-                ((file_idx + 1) * 100) / total_files,
-                resolved.len(),
-                link_start.elapsed().as_secs_f64()
-            );
-        }
-        // Lazily resolved once per file: only ambiguous name buckets need them.
-        let mut caller_import_targets: Option<HashSet<String>> = None;
-        let mut caller_include_closure: Option<HashMap<String, usize>> = None;
-        for rel in &file.relations {
-            let src_id = linker
-                .entity_by_file_name
-                .get(&file.file_path)
-                .and_then(|m| m.get(&rel.src_name))
-                .copied();
-            let dst_same_file = linker
-                .entity_by_file_name
-                .get(&file.file_path)
-                .and_then(|m| m.get(&rel.dst_name))
-                .copied();
-
-            let src_id = match src_id {
-                Some(id) => id,
-                None => {
-                    debug!(
-                        src = %rel.src_name,
-                        dst = %rel.dst_name,
-                        file = %file.file_path,
-                        "linker: src entity not found, skipping"
-                    );
-                    continue;
-                }
-            };
-
-            if rel.kind == RelationKind::UsesMacro {
-                if let Some(dst_id) = dst_same_file {
-                    if linker.entity_kind_by_id.get(&dst_id) == Some(&EntityKind::Macro) {
-                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                            resolved.push(make_relation(rel.kind, src_id, dst_id, 1.0));
-                        }
-                        continue;
-                    }
-                }
-
-                if let Some(dst_id) = resolve_reachable_macro_target_incremental(
-                    &file.file_path,
-                    &rel.dst_name,
-                    &include_graph,
-                    linker,
-                ) {
-                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                        resolved.push(make_relation(rel.kind, src_id, dst_id, 0.95));
-                    }
-                    continue;
-                }
-
-                debug!(
-                    src = %rel.src_name,
-                    dst = %rel.dst_name,
-                    file = %file.file_path,
-                    "linker: macro use unresolved through same-file/include closure"
-                );
-                continue;
-            }
-
-            // (a) Same-file resolution. Mirrors the batch linker: the same-file
-            // entity wins and is emitted first at full confidence, but when
-            // cross-file entities share the exact name (a declaration/prototype
-            // whose definition lives elsewhere) also fan out to them, bounded so
-            // the same-file target plus its cross-file twins stay within the cap.
-            // Cross-file twins carry the (c) name-match confidence (0.7).
-            if let Some(dst_id) = dst_same_file {
-                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                    resolved.push(make_relation(rel.kind, src_id, dst_id, 1.0));
-                }
-                let mut cross_file_twins: HashSet<EntityId> = HashSet::new();
-                if let Some(candidates) = linker.entity_by_name.get(&rel.dst_name) {
-                    for (fp, id) in candidates {
-                        if fp != &file.file_path {
-                            cross_file_twins.insert(*id);
-                        }
-                    }
-                }
-                if !cross_file_twins.is_empty()
-                    && cross_file_twins.len() < AMBIGUOUS_CALL_FANOUT_CAP
-                {
-                    for cross_id in sorted_fanout_targets(cross_file_twins) {
-                        if add_deduped(&mut seen, src_id, cross_id, rel.kind) {
-                            resolved.push(make_relation(rel.kind, src_id, cross_id, 0.7));
-                        }
-                    }
-                }
-                continue;
-            }
-
-            // (a2) Inheritance-aware receiver-method resolution — mirrors the
-            // batch linker: a class-qualified `self.m()`/`cls.m()` callee whose
-            // owner is a class in this file resolves through the recorded
-            // Extends chain to the defining ancestor; an unresolvable hierarchy
-            // falls back to the bare leaf for the tiers below.
-            let mut dst_lookup: &str = rel.dst_name.as_str();
-            if rel.kind == RelationKind::Calls {
-                if let Some((owner, method)) = split_owner_method(rel.dst_name.as_str()) {
-                    let owner_is_class = linker
-                        .entity_by_file_name
-                        .get(&file.file_path)
-                        .and_then(|m| m.get(owner))
-                        .map(|id| is_class_like(linker.entity_kind_by_id.get(id)))
-                        .unwrap_or(false);
-                    if owner_is_class {
-                        if let Some(dst_id) = resolve_inherited_method_incremental(
-                            &file.file_path,
-                            owner,
-                            method,
-                            linker,
-                            &import_map,
-                            &class_bases,
-                        ) {
-                            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                                resolved.push(make_relation(
-                                    rel.kind,
-                                    src_id,
-                                    dst_id,
-                                    INHERITED_METHOD_CONFIDENCE,
-                                ));
-                            }
-                            continue;
-                        }
-                        dst_lookup = method;
-                    }
-                }
-            }
-
-            // (b) Import-based cross-file resolution
-            if let Some(file_imports) = import_map.get(file.file_path.as_str()) {
-                if let Some(&(module_path, original_name)) = file_imports.get(rel.dst_name.as_str())
-                {
-                    if let Some(target_file) =
-                        resolve_module_path(&file.file_path, module_path, &linker.known_files)
-                    {
-                        let direct = linker
-                            .entity_by_file_name
-                            .get(&target_file)
-                            .and_then(|m| m.get(original_name))
-                            .copied();
-                        let dst_id = if direct.is_some() {
-                            direct
-                        } else if original_name == "default" {
-                            resolve_default_export_incremental(
-                                &target_file,
-                                &linker.entities_by_file,
-                            )
-                        } else {
-                            None
-                        };
-                        if let Some(dst_id) = dst_id {
-                            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                                resolved.push(make_relation(rel.kind, src_id, dst_id, 0.95));
-                            }
-                            continue;
-                        }
-                    }
-                }
-
-                // (b2) Namespace/package import member resolution
-                if let Some((import_name, member_name)) = split_member_access(rel.dst_name.as_str())
-                {
-                    if let Some(&(module_path, _original_name)) = file_imports.get(import_name) {
-                        if let Some(target_file) =
-                            resolve_module_path(&file.file_path, module_path, &linker.known_files)
-                        {
-                            if let Some(&dst_id) = linker
-                                .entity_by_file_name
-                                .get(&target_file)
-                                .and_then(|m| m.get(member_name))
-                            {
-                                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                                    resolved.push(make_relation(rel.kind, src_id, dst_id, 0.9));
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                }
-            }
-
-            let other_file_candidates: Vec<(&str, EntityId)> = linker
-                .entity_by_name
-                .get(dst_lookup)
-                .map(|candidates| {
-                    candidates
-                        .iter()
-                        .filter(|(fp, _)| fp != &file.file_path)
-                        .map(|(fp, id)| (fp.as_str(), *id))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            // (b3) Parser-pinned import resolution — mirrors the batch linker:
-            // a callee pinned to a module must resolve inside that module (or
-            // its package directory), never through the global name bucket.
-            let mut name_fallback_allowed = true;
-            match resolve_import_pinned_target(
-                rel,
-                &file.file_path,
-                &linker.known_files,
-                |target_file, name| {
-                    linker
-                        .entity_by_file_name
-                        .get(target_file)
-                        .and_then(|m| m.get(name))
-                        .copied()
-                },
-                &other_file_candidates,
-            ) {
-                ImportPinnedTarget::Resolved(dst_id) => {
-                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                        resolved.push(make_relation(
-                            rel.kind,
-                            src_id,
-                            dst_id,
-                            IMPORT_PINNED_CONFIDENCE,
-                        ));
-                    }
-                    continue;
-                }
-                ImportPinnedTarget::PinnedMiss => name_fallback_allowed = false,
-                ImportPinnedTarget::NoPin => {}
-            }
-
-            // (c) Global name-match fallback
-            if name_fallback_allowed && !other_file_candidates.is_empty() {
-                let distinct_ids: HashSet<EntityId> =
-                    other_file_candidates.iter().map(|&(_, id)| id).collect();
-                let (dst_id, confidence) = if distinct_ids.len() == 1 {
-                    (other_file_candidates[0].1, 0.7)
-                } else {
-                    let targets = caller_import_targets.get_or_insert_with(|| {
-                        resolve_caller_import_targets(
-                            &file.file_path,
-                            &file.imports,
-                            &linker.known_files,
-                        )
-                    });
-                    let closure = caller_include_closure.get_or_insert_with(|| {
-                        include_closure_depths(&file.file_path, &include_graph)
-                    });
-                    match disambiguate_same_name_candidates(
-                        &file.file_path,
-                        targets,
-                        closure,
-                        &other_file_candidates,
-                        |path| {
-                            linker
-                                .entities_by_file
-                                .get(path)
-                                .map(|entities| entities.len())
-                                .unwrap_or(0)
-                        },
-                    ) {
-                        Some(dst_id) => (dst_id, LOCALITY_DISAMBIGUATED_CONFIDENCE),
-                        // No locality signal: keep the historical bucket-order
-                        // pick so signal-less repos do not lose existing edges.
-                        None => (other_file_candidates[0].1, 0.7),
-                    }
-                };
-                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                    resolved.push(make_relation(rel.kind, src_id, dst_id, confidence));
-                }
-                continue;
-            }
-
-            // (c2) Receiver-method calls (`x.method()`) arrive as the bare method
-            // name with no exact cross-file entity of that name, so (c) above
-            // never fires. Resolve them through the bare-name index, mirroring
-            // the batch linker's (c2): a single distinct cross-file method links,
-            // and several implementor classes fan out to all of them up to the
-            // cap (virtual dispatch has an unknowable receiver type). Beyond the
-            // cap the name is too ubiquitous to guess and stays unresolved.
-            // Without this step a receiver method resolved into a full-tree
-            // snapshot is dropped the moment an incremental relink of the caller
-            // re-derives its edges.
-            if name_fallback_allowed && rel.kind == RelationKind::Calls {
-                if let Some(bare_candidates) = linker.entity_by_bare_name.get(dst_lookup) {
-                    let distinct_targets: HashSet<EntityId> = bare_candidates
-                        .iter()
-                        .filter(|(fp, _)| fp != &file.file_path)
-                        .map(|(_, id)| *id)
-                        .collect();
-                    if (1..=AMBIGUOUS_CALL_FANOUT_CAP).contains(&distinct_targets.len()) {
-                        for dst_id in sorted_fanout_targets(distinct_targets) {
-                            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                                resolved.push(make_relation(rel.kind, src_id, dst_id, 0.3));
-                            }
-                        }
-                        continue;
-                    }
-                }
-            }
-
-            // (c3) Path-qualified suffix resolution — the incremental counterpart
-            // of the batch linker's (c3). Live edits reach this daemon path, so
-            // qualified calls must resolve here too, not only on a full re-index.
-            if name_fallback_allowed
-                && matches!(rel.kind, RelationKind::Calls | RelationKind::References)
-            {
-                // Fan out: an ambiguous qualified leaf resolves to every distinct
-                // cross-file target, matching the batch resolver.
-                let qualified_targets =
-                    resolve_qualified_suffix_incremental(&rel.dst_name, &file.file_path, linker);
-                if !qualified_targets.is_empty() {
-                    for dst_id in qualified_targets {
-                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                            resolved.push(make_relation(
-                                rel.kind,
-                                src_id,
-                                dst_id,
-                                QUALIFIED_SUFFIX_CONFIDENCE,
-                            ));
-                        }
-                    }
-                    continue;
-                }
-            }
-
-            // (d) Cross-repo external reference: preserve an unresolved
-            // reference to an external module as an inferred edge carrying the
-            // imported symbol and source, so the spine cross-repo resolver can
-            // match it against a sibling repo. See
-            // `make_external_reference_relation`.
-            if let Some(external) =
-                make_external_reference_relation(rel, src_id, &file.file_path, &linker.known_files)
-            {
-                if let GraphNodeId::Entity(dst_id) = external.dst {
-                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                        resolved.push(external);
-                    }
-                }
-                continue;
+/// Merge per-file incremental relations in input-file order, then append
+/// artifact-level import/include edges. The cross-file dedup is a no-op across
+/// files (each relation's source entity is file-local) but is preserved so the
+/// emitted set and order match a serial pass exactly. Mirrors the batch
+/// [`merge_resolved`].
+fn merge_incremental_resolved(
+    per_file_relations: Vec<Vec<Relation>>,
+    files: &[FileParseData],
+    linker: &IncrementalLinker,
+) -> Vec<Relation> {
+    let mut resolved = Vec::new();
+    let mut seen: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
+    for file_relations in per_file_relations {
+        for rel in file_relations {
+            if seen.insert((rel.src, rel.dst, rel.kind)) {
+                resolved.push(rel);
             }
         }
     }
@@ -3072,6 +3161,27 @@ pub fn link_cross_file_incremental(
     }
 
     resolved
+}
+
+/// Serial counterpart of [`link_cross_file_incremental`], retained as the
+/// byte-identical reference for the parallel per-file resolution path.
+#[cfg(test)]
+fn link_cross_file_incremental_serial(
+    files: &[FileParseData],
+    linker: &IncrementalLinker,
+) -> Vec<Relation> {
+    let IncrementalLinkOverlays {
+        import_map,
+        include_graph,
+        class_bases,
+    } = build_incremental_link_overlays(files, linker);
+    let per_file_relations: Vec<Vec<Relation>> = files
+        .iter()
+        .map(|file| {
+            resolve_one_file_incremental(file, linker, &import_map, &include_graph, &class_bases)
+        })
+        .collect();
+    merge_incremental_resolved(per_file_relations, files, linker)
 }
 
 /// Normalize a path by resolving `.` and `..` components without touching the filesystem.
@@ -3946,6 +4056,103 @@ void f();
             .expect("incremental unambiguous receiver-method call should resolve to Type::method");
         assert_eq!(calls.src, GraphNodeId::Entity(caller.id));
         assert_eq!(calls.dst, GraphNodeId::Entity(callee.id));
+    }
+
+    #[test]
+    fn link_cross_file_incremental_parallel_matches_serial() {
+        // Rung-3 oracle for the parallel per-file resolver: exercise enough files,
+        // relation tiers, and ambiguous name buckets that any ordering or
+        // shared-state hazard in the fan-out would surface, then assert the
+        // parallel path is byte-identical to the serial reference and stable
+        // across re-runs. Mirrors `link_cross_file_against_entities`'s own
+        // parallel-vs-serial guard.
+        let mut linker = IncrementalLinker::new();
+        let mut files: Vec<FileParseData> = Vec::new();
+
+        // Two cross-file definitions of a shared ambiguous name so callers reach
+        // the same-name disambiguation tier (which picks by bucket order — a
+        // determinism-sensitive path).
+        let common_a = make_entity("common", "src/common_a.ts");
+        let common_b = make_entity("common", "src/common_b.ts");
+        linker.add_file("src/common_a.ts", std::slice::from_ref(&common_a));
+        linker.add_file("src/common_b.ts", std::slice::from_ref(&common_b));
+
+        // A single unambiguous cross-file call target.
+        let target = make_entity("shared_target", "src/target.ts");
+        linker.add_file("src/target.ts", std::slice::from_ref(&target));
+
+        // Two receiver-method implementors sharing a bare leaf `work`, so bare
+        // `work` calls fan out through `sorted_fanout_targets` (a canonical sort
+        // whose stability the parallel pass must preserve).
+        let widget_work = make_entity("Widget::work", "src/impl_foo.ts");
+        let gadget_work = make_entity("Gadget::work", "src/impl_bar.ts");
+        linker.add_file("src/impl_foo.ts", std::slice::from_ref(&widget_work));
+        linker.add_file("src/impl_bar.ts", std::slice::from_ref(&gadget_work));
+
+        // Many caller files spread the parallel pass across worker threads. Each
+        // mixes a same-file call, an unambiguous cross-file call, an ambiguous
+        // fan-out call, and a bare receiver-method call.
+        for i in 0..48 {
+            let path = format!("src/caller{i}.ts");
+            let a = make_entity(&format!("a{i}"), &path);
+            let b = make_entity(&format!("b{i}"), &path);
+            linker.add_file(&path, &[a.clone(), b.clone()]);
+            files.push(FileParseData {
+                file_path: path,
+                entities: vec![a, b],
+                relations: vec![
+                    ExtractedRelation {
+                        kind: RelationKind::Calls,
+                        src_name: format!("a{i}"),
+                        dst_name: format!("b{i}"),
+                        import_source: None,
+                    },
+                    ExtractedRelation {
+                        kind: RelationKind::Calls,
+                        src_name: format!("a{i}"),
+                        dst_name: "shared_target".to_string(),
+                        import_source: None,
+                    },
+                    ExtractedRelation {
+                        kind: RelationKind::Calls,
+                        src_name: format!("b{i}"),
+                        dst_name: "common".to_string(),
+                        import_source: None,
+                    },
+                    ExtractedRelation {
+                        kind: RelationKind::Calls,
+                        src_name: format!("b{i}"),
+                        dst_name: "work".to_string(),
+                        import_source: None,
+                    },
+                ],
+                imports: vec![],
+            });
+        }
+
+        let parallel = link_cross_file_incremental(&files, &linker);
+        let serial = link_cross_file_incremental_serial(&files, &linker);
+        assert_eq!(
+            format!("{parallel:?}"),
+            format!("{serial:?}"),
+            "parallel incremental linking must produce byte-identical relations to the serial path"
+        );
+
+        // Re-running the parallel path must also be byte-stable.
+        let parallel_again = link_cross_file_incremental(&files, &linker);
+        assert_eq!(
+            format!("{parallel:?}"),
+            format!("{parallel_again:?}"),
+            "parallel incremental linking must be byte-stable across runs"
+        );
+
+        // Guard against a vacuous fixture: every caller resolves at least its
+        // same-file, cross-file, disambiguated, and fanned-out edges.
+        assert!(
+            parallel.len() >= 48 * 4,
+            "fixture should resolve real cross-file work, got {}",
+            parallel.len()
+        );
     }
 
     #[test]
