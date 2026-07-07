@@ -107,6 +107,33 @@ fn setup_fixture_repo(repo: &Path) -> (String, String, String) {
     (base, head, artifact_head)
 }
 
+/// Fixture: a root commit followed by two commits on divergent named
+/// branches — neither is an ancestor of the other. Forks via a named branch
+/// (not a detached checkout) so the repo's Git HEAD stays on a normal branch
+/// throughout, same as every other fixture in this file.
+fn setup_divergent_repo(repo: &Path) -> (String, String) {
+    std::fs::write(repo.join("shared.txt"), "root\n").expect("write shared.txt");
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.email", "shadow-test@example.com"]);
+    run_git(repo, &["config", "user.name", "Shadow Test"]);
+    run_git(repo, &["add", "-A"]);
+    run_git(repo, &["commit", "-m", "root"]);
+    let root = git_head(repo);
+
+    std::fs::write(repo.join("shared.txt"), "branch a\n").expect("write branch a");
+    run_git(repo, &["add", "-A"]);
+    run_git(repo, &["commit", "-m", "branch a"]);
+    let branch_a = git_head(repo);
+
+    run_git(repo, &["checkout", "-b", "diverged", &root]);
+    std::fs::write(repo.join("shared.txt"), "branch b\n").expect("write branch b");
+    run_git(repo, &["add", "-A"]);
+    run_git(repo, &["commit", "-m", "branch b"]);
+    let branch_b = git_head(repo);
+
+    (branch_a, branch_b)
+}
+
 fn kin_init(repo: &Path) {
     let init = kin_command()
         .arg("init")
@@ -282,6 +309,106 @@ fn shadow_report_fails_loud_on_unknown_ref() {
     );
 }
 
+/// `HEAD^` — the idiomatic "review my last commit" — must resolve on a
+/// freshly-inited repo with no further Git ancestry import: `kin init`
+/// shallow-imports the current Git HEAD as a single change parented on
+/// genesis, so `HEAD^` walks straight to genesis in the graph.
+#[test]
+fn shadow_report_head_caret_resolves_from_a_fresh_init() {
+    let dir = tempdir().expect("tempdir");
+    let repo = dir.path();
+    setup_fixture_repo(repo);
+    kin_init(repo);
+
+    let report = run_shadow_json(repo, "HEAD^", "HEAD");
+
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["mode"], "shadow");
+    assert!(!report["input"]["resolved_base"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+    assert!(!report["input"]["resolved_head"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+}
+
+/// Caret and tilde relative-ref syntax must resolve to the same change on
+/// the shadow CLI path.
+#[test]
+fn shadow_report_head_caret_and_head_tilde_one_agree() {
+    let dir = tempdir().expect("tempdir");
+    let repo = dir.path();
+    setup_fixture_repo(repo);
+    kin_init(repo);
+
+    let caret_report = run_shadow_json(repo, "HEAD^", "HEAD");
+    let tilde_report = run_shadow_json(repo, "HEAD~1", "HEAD");
+
+    assert_eq!(
+        caret_report["input"]["resolved_base"], tilde_report["input"]["resolved_base"],
+        "HEAD^ and HEAD~1 must resolve to the same change"
+    );
+}
+
+/// A ref the resolver genuinely cannot make sense of must still fail the
+/// command, but with a friendly, specific message rather than an opaque
+/// HTTP 500 — the daemon now reports it as a client error.
+#[test]
+fn shadow_report_unsupported_ref_syntax_fails_friendly_not_opaque() {
+    let dir = tempdir().expect("tempdir");
+    let repo = dir.path();
+    let (_base, head, _artifact_head) = setup_fixture_repo(repo);
+    kin_init(repo);
+
+    let output = kin_command()
+        .args([
+            "review",
+            "shadow",
+            &format!("HEAD@{{upstream}}..{head}"),
+            "--json",
+        ])
+        .current_dir(repo)
+        .output()
+        .expect("run kin review shadow with unsupported ref syntax");
+
+    assert!(
+        !output.status.success(),
+        "unresolvable ref must still fail the command, got stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot resolve ref"),
+        "error must name the ref-resolution problem plainly: {stderr}"
+    );
+    assert!(
+        !stderr.contains("HTTP 500"),
+        "an unresolvable ref must not surface as an opaque server error: {stderr}"
+    );
+}
+
+/// The everyday "your branch is behind main" case — base is not on head's
+/// ancestry — must still surface the existing gap report end to end through
+/// the real CLI and daemon, not just at the unit level.
+#[test]
+fn shadow_report_stale_base_surfaces_ancestry_gap_end_to_end() {
+    let dir = tempdir().expect("tempdir");
+    let repo = dir.path();
+    let (branch_a, branch_b) = setup_divergent_repo(repo);
+    kin_init(repo);
+
+    let report = run_shadow_json(repo, &branch_a, &branch_b);
+
+    let gaps = report["evidence_gaps"].as_array().unwrap();
+    assert!(
+        gaps.iter()
+            .any(|gap| gap["kind"] == "base_not_on_head_ancestry"),
+        "divergent refs must surface the base_not_on_head_ancestry gap: {gaps:?}"
+    );
+}
+
 /// A review pair is almost always ancestor..descendant, and `review shadow`
 /// resolves the head ref before the base ref so that ancestry hydrates in a
 /// single pass. This proves the invariant that makes head-first cheap: once the
@@ -339,5 +466,84 @@ fn shadow_head_import_hydrates_ancestor_base_in_single_pass() {
     assert_ne!(
         resolved_base.head, resolved_head.head,
         "base and head must resolve to distinct semantic changes"
+    );
+}
+
+/// Abbreviated commit hashes — the form users copy from `git log --oneline`
+/// — must resolve to the same changes as their full 40-character ids.
+#[test]
+fn shadow_report_abbreviated_shas_resolve_like_full() {
+    let dir = tempdir().expect("tempdir");
+    let repo = dir.path();
+    let (base, head, _artifact_head) = setup_fixture_repo(repo);
+    kin_init(repo);
+
+    let full_report = run_shadow_json(repo, &base, &head);
+    let abbrev_report = run_shadow_json(repo, &base[..8], &head[..8]);
+
+    assert_eq!(
+        abbrev_report["input"]["resolved_base"], full_report["input"]["resolved_base"],
+        "abbreviated base must resolve to the same change as the full id"
+    );
+    assert_eq!(
+        abbrev_report["input"]["resolved_head"], full_report["input"]["resolved_head"],
+        "abbreviated head must resolve to the same change as the full id"
+    );
+    assert_eq!(
+        abbrev_report["verdict"], full_report["verdict"],
+        "abbreviated and full ranges must produce the same verdict"
+    );
+}
+
+/// Abbreviated hashes compose with relative-ref hops: `<abbrev>~1..<abbrev>`
+/// names the same range as `<full-base>..<full-head>` in a linear history.
+#[test]
+fn shadow_report_abbreviated_sha_with_hop_composes() {
+    let dir = tempdir().expect("tempdir");
+    let repo = dir.path();
+    let (base, head, _artifact_head) = setup_fixture_repo(repo);
+    kin_init(repo);
+
+    let full_report = run_shadow_json(repo, &base, &head);
+    let hop_report = run_shadow_json(repo, &format!("{}~1", &head[..8]), &head[..8]);
+
+    assert_eq!(
+        hop_report["input"]["resolved_base"], full_report["input"]["resolved_base"],
+        "<abbrev>~1 must resolve to the full head's parent"
+    );
+    assert_eq!(
+        hop_report["input"]["resolved_head"], full_report["input"]["resolved_head"],
+        "abbreviated hop head must match the full head"
+    );
+}
+
+/// An abbreviated hash matching nothing must fail with the friendly
+/// ref-resolution error, exactly like any other unresolvable ref.
+#[test]
+fn shadow_report_unknown_abbreviated_sha_fails_friendly() {
+    let dir = tempdir().expect("tempdir");
+    let repo = dir.path();
+    let (_base, head, _artifact_head) = setup_fixture_repo(repo);
+    kin_init(repo);
+
+    let output = kin_command()
+        .args(["review", "shadow", &format!("deadbeef..{head}"), "--json"])
+        .current_dir(repo)
+        .output()
+        .expect("run kin review shadow with an unknown abbreviated sha");
+
+    assert!(
+        !output.status.success(),
+        "an unknown abbreviated sha must fail the command, got stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot resolve ref"),
+        "error must name the ref-resolution problem plainly: {stderr}"
+    );
+    assert!(
+        !stderr.contains("HTTP 500"),
+        "unknown abbreviated shas must not surface as opaque server errors: {stderr}"
     );
 }
