@@ -421,6 +421,7 @@ mod tests {
             signature_hash: Hash256::from_bytes([2; 32]),
             behavior_hash: Hash256::from_bytes([3; 32]),
             algorithm: FingerprintAlgorithm::V1TreeSitter,
+            equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
             stability_score: 1.0,
         }
     }
@@ -549,6 +550,7 @@ mod tests {
             signature_hash: Hash256::from_bytes([21; 32]),
             behavior_hash: Hash256::from_bytes([3; 32]),
             algorithm: FingerprintAlgorithm::V1TreeSitter,
+            equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
             stability_score: 1.0,
         };
 
@@ -653,6 +655,7 @@ mod tests {
             signature_hash: Hash256::from_bytes([2; 32]),
             behavior_hash: Hash256::from_bytes([3; 32]),
             algorithm: FingerprintAlgorithm::V1TreeSitter,
+            equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
             stability_score: 1.0,
         };
 

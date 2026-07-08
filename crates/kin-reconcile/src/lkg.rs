@@ -88,6 +88,7 @@ mod tests {
                 ast_hash: Hash256::from_bytes([0xaa; 32]),
                 signature_hash: Hash256::from_bytes([0xbb; 32]),
                 behavior_hash: Hash256::from_bytes([0xcc; 32]),
+                equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
                 stability_score: 0.95,
             },
             file_origin: None,
@@ -127,6 +128,7 @@ mod tests {
             ast_hash: Hash256::from_bytes([0xaa; 32]),
             signature_hash: Hash256::from_bytes([0xbb; 32]),
             behavior_hash: Hash256::from_bytes([0xcc; 32]),
+            equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
             stability_score: 0.95,
         };
         assert!(!store.has_changed(&id, &same));
@@ -137,6 +139,7 @@ mod tests {
             ast_hash: Hash256::from_bytes([0xff; 32]),
             signature_hash: Hash256::from_bytes([0xbb; 32]),
             behavior_hash: Hash256::from_bytes([0xcc; 32]),
+            equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
             stability_score: 0.95,
         };
         assert!(store.has_changed(&id, &different));
@@ -150,6 +153,7 @@ mod tests {
             ast_hash: Hash256::from_bytes([0; 32]),
             signature_hash: Hash256::from_bytes([0; 32]),
             behavior_hash: Hash256::from_bytes([0; 32]),
+            equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
             stability_score: 0.0,
         };
         assert!(store.has_changed(&EntityId::new(), &fp));

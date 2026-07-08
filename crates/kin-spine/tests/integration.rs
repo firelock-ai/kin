@@ -30,6 +30,7 @@ fn make_fp(seed: u8) -> SemanticFingerprint {
         signature_hash: Hash256::from_bytes([seed.wrapping_add(1); 32]),
         behavior_hash: Hash256::from_bytes([seed.wrapping_add(2); 32]),
         algorithm: FingerprintAlgorithm::V1TreeSitter,
+        equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
         stability_score: 1.0,
     }
 }

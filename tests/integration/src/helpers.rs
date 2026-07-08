@@ -44,6 +44,7 @@ pub fn make_entity(name: &str, file: &str, kind: EntityKind) -> Entity {
             ast_hash: Hash256::from_bytes([0xaa; 32]),
             signature_hash: Hash256::from_bytes([0xbb; 32]),
             behavior_hash: Hash256::from_bytes([0xcc; 32]),
+            equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
             stability_score: 0.95,
         },
         file_origin: Some(kin_model::FilePathId::new(file)),

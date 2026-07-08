@@ -71,6 +71,7 @@ pub fn compute_fingerprint(node: &Node, source: &[u8]) -> SemanticFingerprint {
         ast_hash,
         signature_hash,
         behavior_hash,
+        equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
         stability_score: 0.8,
     }
 }

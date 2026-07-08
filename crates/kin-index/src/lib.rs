@@ -22,7 +22,9 @@ pub mod watcher;
 pub use artifacts::extract_artifact;
 pub use classifier::{FileClassification, FileClassifier};
 pub use error::{IndexError, Result};
-pub use fingerprint::compute_entity_fingerprint;
+pub use fingerprint::{
+    behavior_equivalence_hash, compute_entity_fingerprint, language_supports_equivalence,
+};
 pub use linker::{
     build_projection_derived_relations_for_file, build_projection_derived_relations_from_markers,
     extract_projection_source_markers, link_cross_file, link_cross_file_against_entities,
