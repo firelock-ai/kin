@@ -11,8 +11,20 @@ use kin_model::relation::{GraphNodeId, Relation, RelationKind};
 use kin_model::work::{Annotation, StalenessState, WorkItem, WorkScope};
 use serde::{Deserialize, Serialize};
 
-use crate::diff::SemanticDiff;
+use crate::diff::{EntityChangeKind, SemanticDiff};
 use crate::error::ReviewError;
+
+/// Line-independent identity of an entity: `(file, name, kind)`. `EntityId`
+/// folds in `start_line`, so a declaration that only moved carries a new id
+/// under the same identity. Co-change matching keys on this so a co-updated
+/// consumer is recognized whether or not its line (and thus id) shifted.
+fn entity_identity_key(entity: &Entity) -> (String, String, String) {
+    (
+        entity_file(entity).unwrap_or_default(),
+        entity.name.clone(),
+        format!("{:?}", entity.kind),
+    )
+}
 
 /// The exact read surface the impact walker consumes.
 ///
@@ -177,6 +189,13 @@ pub struct EntityImpact {
     /// Distinct test entities covering this entity (test-kind edges plus
     /// test-role inbound entities).
     pub covering_tests: usize,
+    /// Distinct non-test, non-derived consumers that were themselves modified
+    /// in the reviewed range — the coherent in-diff migration signal. These
+    /// are excluded from `consumer_count` (a co-updated consumer is not a
+    /// stranded external break); this field preserves the evidence that the
+    /// surface change did have consumers and that they all moved with it.
+    #[serde(default)]
+    pub consumers_migrated_in_diff: usize,
 }
 
 impl EntityImpact {
@@ -184,6 +203,15 @@ impl EntityImpact {
     /// Zero means the graph connects nothing to this entity.
     pub fn inbound_total(&self) -> usize {
         self.consumer_count + self.covering_tests
+    }
+
+    /// True when this entity has graph-known consumers and EVERY one was
+    /// itself modified in the reviewed range: a self-contained migration with
+    /// no stranded external consumer. `consumer_count` counts only external
+    /// (non-migrated) consumers, so zero external plus at least one migrated
+    /// consumer is a fully coherent in-diff migration.
+    pub fn all_consumers_migrated(&self) -> bool {
+        self.consumer_count == 0 && self.consumers_migrated_in_diff > 0
     }
 }
 
@@ -246,6 +274,22 @@ pub fn analyze_impact_at<I: ImpactGraph>(
 ) -> Result<ImpactReport, ReviewError> {
     let changed_ids = diff.changed_entity_ids();
     let changed_set: HashSet<EntityId> = changed_ids.iter().copied().collect();
+    // Line-independent identity of every entity touched in the reviewed range,
+    // for both base and head sides of a modification. A co-updated consumer
+    // that moved lines or changed its own signature keeps its (file, name,
+    // kind) even as its content-derived id changes, so this key recognizes it
+    // as migrated when exact-id matching cannot.
+    let changed_keys: HashSet<(String, String, String)> = diff
+        .entity_changes
+        .iter()
+        .flat_map(|change| match &change.kind {
+            EntityChangeKind::Added(entity) => vec![entity_identity_key(entity)],
+            EntityChangeKind::Modified { old, new } => {
+                vec![entity_identity_key(old), entity_identity_key(new)]
+            }
+            EntityChangeKind::Removed(_) => Vec::new(),
+        })
+        .collect();
 
     let mut callers = Vec::new();
     let mut dependents = Vec::new();
@@ -267,6 +311,9 @@ pub fn analyze_impact_at<I: ImpactGraph>(
         let mut ent_strong_consumers: HashSet<EntityId> = HashSet::new();
         let mut ent_contract_consumers: HashSet<EntityId> = HashSet::new();
         let mut ent_tests: HashSet<EntityId> = HashSet::new();
+        // Non-test, non-derived consumers that were themselves modified in the
+        // reviewed range: the coherent in-diff migration signal.
+        let mut ent_migrated: HashSet<EntityId> = HashSet::new();
         // `consumer_files` is the human-readable projection of the consumer
         // ENTITY set below (which the fanout decision keys on) — the files those
         // consuming entities live in, for the report message only. It is never a
@@ -302,55 +349,75 @@ pub fn analyze_impact_at<I: ImpactGraph>(
                 continue;
             };
 
-            // Skip if the affected entity is itself a changed entity
-            if changed_set.contains(&affected_id) {
+            let Some(entity) = graph.get_entity(&affected_id)? else {
+                continue;
+            };
+
+            // A consumer that was itself modified in the reviewed range is a
+            // MIGRATED consumer — it moved with the changed surface in the same
+            // diff — not a stranded external break. Match on the exact id AND a
+            // line-independent (file, name, kind) key: `EntityId` is
+            // content-derived from (file, name, kind, start_line), so a
+            // co-updated consumer whose declaration shifted lines or whose own
+            // signature changed carries a different id at head than the id its
+            // inbound edge resolves under. Exact-id matching alone would read
+            // that coherent migration as an external break.
+            if changed_set.contains(&affected_id)
+                || changed_keys.contains(&entity_identity_key(&entity))
+            {
+                let is_test = entity.role == EntityRole::Test || rel.kind == RelationKind::Tests;
+                let is_derived =
+                    matches!(entity.role, EntityRole::Generated | EntityRole::Vendored);
+                // Only a real consumer surface counts as a migrated consumer;
+                // a co-updated test or regenerated copy was never a break.
+                if !is_test && !is_derived {
+                    ent_migrated.insert(affected_id);
+                }
                 continue;
             }
 
-            if let Some(entity) = graph.get_entity(&affected_id)? {
-                let is_test = entity.role == EntityRole::Test || rel.kind == RelationKind::Tests;
-                if is_test {
-                    ent_tests.insert(affected_id);
-                } else if matches!(entity.role, EntityRole::Generated | EntityRole::Vendored) {
-                    // Derived copies (amalgamated bundles, vendored snapshots)
-                    // regenerate from their sources; they appear in the blast
-                    // radius for navigation but cannot be "broken" consumers,
-                    // so they never feed consumer counts or breaking findings.
-                } else {
-                    ent_consumers.insert(affected_id);
-                    if rel.confidence >= STRONG_CONSUMER_CONFIDENCE {
-                        ent_strong_consumers.insert(affected_id);
-                    }
-                    if rel.kind == RelationKind::ConsumesContract {
-                        ent_contract_consumers.insert(affected_id);
-                    }
-                    if let Some(file) = entity_file(&entity) {
-                        ent_consumer_files.insert(file);
+            let is_test = entity.role == EntityRole::Test || rel.kind == RelationKind::Tests;
+            if is_test {
+                ent_tests.insert(affected_id);
+            } else if matches!(entity.role, EntityRole::Generated | EntityRole::Vendored) {
+                // Derived copies (amalgamated bundles, vendored snapshots)
+                // regenerate from their sources; they appear in the blast
+                // radius for navigation but cannot be "broken" consumers,
+                // so they never feed consumer counts or breaking findings.
+            } else {
+                ent_consumers.insert(affected_id);
+                if rel.confidence >= STRONG_CONSUMER_CONFIDENCE {
+                    ent_strong_consumers.insert(affected_id);
+                }
+                if rel.kind == RelationKind::ConsumesContract {
+                    ent_contract_consumers.insert(affected_id);
+                }
+                if let Some(file) = entity_file(&entity) {
+                    ent_consumer_files.insert(file);
+                }
+            }
+            match rel.kind {
+                RelationKind::Calls => {
+                    if seen_callers.insert(affected_id) {
+                        callers.push(entity);
                     }
                 }
-                match rel.kind {
-                    RelationKind::Calls => {
-                        if seen_callers.insert(affected_id) {
-                            callers.push(entity);
-                        }
+                RelationKind::DependsOn | RelationKind::References => {
+                    if seen_dependents.insert(affected_id) {
+                        dependents.push(entity);
                     }
-                    RelationKind::DependsOn | RelationKind::References => {
-                        if seen_dependents.insert(affected_id) {
-                            dependents.push(entity);
-                        }
-                    }
-                    RelationKind::ConsumesContract => {
-                        if seen_consumers.insert(affected_id) {
-                            contract_consumers.push(entity);
-                        }
-                    }
-                    RelationKind::Tests => {
-                        if seen_tests.insert(affected_id) {
-                            tests.push(entity);
-                        }
-                    }
-                    _ => {}
                 }
+                RelationKind::ConsumesContract => {
+                    if seen_consumers.insert(affected_id) {
+                        contract_consumers.push(entity);
+                    }
+                }
+                RelationKind::Tests => {
+                    if seen_tests.insert(affected_id) {
+                        tests.push(entity);
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -388,6 +455,7 @@ pub fn analyze_impact_at<I: ImpactGraph>(
             contract_consumer_count: ent_contract_consumers.len(),
             consumer_files: ent_consumer_files.into_iter().collect(),
             covering_tests: ent_tests.len(),
+            consumers_migrated_in_diff: ent_migrated.len(),
         });
     }
 
@@ -781,5 +849,116 @@ mod tests {
             vec!["src/bar.rs".to_string(), "src/foo.rs".to_string()],
             "consumer_files is the projected file set of the consumer entities (both), report-only"
         );
+    }
+
+    #[test]
+    fn line_shifted_co_updated_consumer_is_migrated_not_an_external_break() {
+        // `target` changed its signature. Its only consumer, `mover`, was ALSO
+        // modified in the diff — but its declaration shifted lines, so the
+        // head-graph inbound edge resolves to an id that differs from the id
+        // the diff recorded for `mover`. Exact-id matching would miscount this
+        // coherent migration as an external break; the (file, name, kind)
+        // identity key recognizes it.
+        let target = entity_in_file("target", "src/http.rs", 10);
+        let mover_in_diff = entity_in_file("mover", "src/create.rs", 20);
+        let mut mover_at_head = mover_in_diff.clone();
+        mover_at_head.id = EntityId::new();
+
+        let mut graph = MockImpactGraph::default();
+        graph.entities.insert(target.id, target.clone());
+        graph
+            .entities
+            .insert(mover_at_head.id, mover_at_head.clone());
+        graph
+            .inbound
+            .insert(target.id, vec![calls(&mover_at_head, &target)]);
+
+        let diff = SemanticDiff {
+            entity_changes: vec![modified(&target), modified(&mover_in_diff)],
+            ..Default::default()
+        };
+
+        let report = analyze_impact_at(&graph, &diff).unwrap();
+        let impact = report.entity_impact(&target.id).expect("target impact");
+        assert_eq!(
+            impact.consumer_count, 0,
+            "a co-updated consumer whose id shifted is not a stranded external break"
+        );
+        assert_eq!(
+            impact.consumers_migrated_in_diff, 1,
+            "the line-shifted co-update is recognized as migrated by identity key"
+        );
+        assert!(impact.all_consumers_migrated());
+    }
+
+    #[test]
+    fn partial_migration_keeps_the_external_consumer_counted() {
+        // `target` has two consumers: `mover` (co-updated, line-shifted id) and
+        // `stranger` (untouched, in a file the diff never mentions). The
+        // migration is PARTIAL — `stranger` still counts as an external break,
+        // so the entity is not "all migrated".
+        let target = entity_in_file("target", "src/http.rs", 10);
+        let mover_in_diff = entity_in_file("mover", "src/create.rs", 20);
+        let mut mover_at_head = mover_in_diff.clone();
+        mover_at_head.id = EntityId::new();
+        let stranger = entity_in_file("stranger", "src/other.rs", 5);
+
+        let mut graph = MockImpactGraph::default();
+        for entity in [&target, &mover_at_head, &stranger] {
+            graph.entities.insert(entity.id, entity.clone());
+        }
+        graph.inbound.insert(
+            target.id,
+            vec![calls(&mover_at_head, &target), calls(&stranger, &target)],
+        );
+
+        let diff = SemanticDiff {
+            entity_changes: vec![modified(&target), modified(&mover_in_diff)],
+            ..Default::default()
+        };
+
+        let report = analyze_impact_at(&graph, &diff).unwrap();
+        let impact = report.entity_impact(&target.id).expect("target impact");
+        assert_eq!(
+            impact.consumer_count, 1,
+            "the untouched external consumer still counts"
+        );
+        assert_eq!(impact.consumers_migrated_in_diff, 1);
+        assert!(
+            !impact.all_consumers_migrated(),
+            "a partial migration is not fully coherent"
+        );
+    }
+
+    #[test]
+    fn same_name_different_file_consumer_is_not_treated_as_migrated() {
+        // A consumer that merely shares a NAME with a co-changed entity but
+        // lives in a different file is a distinct entity and a real external
+        // consumer — the identity key includes the file, so it is not
+        // misread as a migration.
+        let target = entity_in_file("target", "src/http.rs", 10);
+        let changed_helper = entity_in_file("helper", "src/a.rs", 1);
+        let unrelated_helper = entity_in_file("helper", "src/b.rs", 1);
+
+        let mut graph = MockImpactGraph::default();
+        for entity in [&target, &changed_helper, &unrelated_helper] {
+            graph.entities.insert(entity.id, entity.clone());
+        }
+        graph
+            .inbound
+            .insert(target.id, vec![calls(&unrelated_helper, &target)]);
+
+        let diff = SemanticDiff {
+            entity_changes: vec![modified(&target), modified(&changed_helper)],
+            ..Default::default()
+        };
+
+        let report = analyze_impact_at(&graph, &diff).unwrap();
+        let impact = report.entity_impact(&target.id).expect("target impact");
+        assert_eq!(
+            impact.consumer_count, 1,
+            "a same-name consumer in a different file is a real external consumer"
+        );
+        assert_eq!(impact.consumers_migrated_in_diff, 0);
     }
 }

@@ -26,6 +26,10 @@ pub struct InlineComment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InlineCommentKind {
     Breaking,
+    /// A contract-surface change whose every graph-known consumer was itself
+    /// modified in the reviewed range — a coherent in-diff migration. Visible
+    /// evidence, but not a blocking break: nothing external was stranded.
+    BreakingMigrated,
     CoverageGap,
     ContractViolation,
     CommandEffectContract,
@@ -45,6 +49,7 @@ impl InlineCommentKind {
     pub fn prefix(&self) -> &'static str {
         match self {
             Self::Breaking => "!!",
+            Self::BreakingMigrated => "~",
             Self::ContractViolation => "!!",
             Self::CommandEffectContract => "~",
             Self::CoverageGap => "?",
@@ -122,13 +127,18 @@ pub fn signature_strengthened_only(old: &str, new: &str) -> bool {
 /// The graph still records the changed body/signature text; the review gate just
 /// must not turn annotation-only edits into breaking downstream-risk findings.
 pub fn signature_runtime_neutral(old: &str, new: &str) -> bool {
+    if old == new {
+        return false;
+    }
     signature_strengthened_only(old, new)
-        || python_runtime_signature_key(old)
-            .zip(python_runtime_signature_key(new))
-            .is_some_and(|(old_key, new_key)| old_key == new_key)
+        || python_signatures_runtime_neutral(old, new)
+        || go_struct_field_addition_only(old, new)
 }
 
-fn python_runtime_signature_key(signature: &str) -> Option<String> {
+/// The callable name and normalized parameter list of a Python `def`, or
+/// `None` when the text is not one. Annotations, comments, and whitespace are
+/// normalized away so two annotation-only variants compare equal.
+fn python_signature_parts(signature: &str) -> Option<(String, Vec<String>)> {
     let without_comment = signature.split('#').next().unwrap_or(signature).trim();
     let def_pos = without_comment.find("def ")?;
     let after_def = &without_comment[def_pos + 4..];
@@ -144,9 +154,107 @@ fn python_runtime_signature_key(signature: &str) -> Option<String> {
     let params = split_python_params(params)
         .into_iter()
         .map(|param| normalize_python_param(&param))
-        .collect::<Vec<_>>()
-        .join(",");
-    Some(format!("def {name}({params})"))
+        .collect::<Vec<_>>();
+    Some((name.to_string(), params))
+}
+
+/// True when `old` → `new` preserves the Python runtime call contract: same
+/// callable, and either identical normalized parameters (annotation- or
+/// default-format-only edit) or `new` only APPENDS trailing parameters that
+/// each add no required argument — a default value or a `*`/`*args`/`**kwargs`
+/// marker. Existing positional and keyword call sites stay valid. Reordering,
+/// renaming, retyping, or removing a parameter — or appending a required one —
+/// is never neutral.
+fn python_signatures_runtime_neutral(old: &str, new: &str) -> bool {
+    let (Some((old_name, old_params)), Some((new_name, new_params))) =
+        (python_signature_parts(old), python_signature_parts(new))
+    else {
+        return false;
+    };
+    if old_name != new_name {
+        return false;
+    }
+    if old_params == new_params {
+        return true;
+    }
+    if new_params.len() <= old_params.len() || new_params[..old_params.len()] != old_params[..] {
+        return false;
+    }
+    new_params[old_params.len()..]
+        .iter()
+        .all(|param| python_param_adds_no_required_arg(param))
+}
+
+/// A normalized Python parameter that a caller can omit: it carries a default
+/// (`name=…`) or is a `*`, `/`, `*args`, or `**kwargs` marker rather than a
+/// bare required parameter.
+fn python_param_adds_no_required_arg(param: &str) -> bool {
+    let param = param.trim();
+    param.contains('=') || param == "/" || param.starts_with('*')
+}
+
+/// True when `old` and `new` are Go struct type signatures that differ ONLY by
+/// added fields: identical `Name struct` header, and every whitespace token of
+/// the old field body still appears, in order, inside a strictly larger new
+/// body. A consumer reading existing fields by name cannot be broken by the
+/// additions. Removing, renaming, reordering, or retyping a field breaks the
+/// ordered-subsequence match and is never neutral.
+fn go_struct_field_addition_only(old: &str, new: &str) -> bool {
+    let (Some((old_header, old_body)), Some((new_header, new_body))) =
+        (go_struct_parts(old), go_struct_parts(new))
+    else {
+        return false;
+    };
+    if old_header != new_header {
+        return false;
+    }
+    let old_tokens: Vec<&str> = old_body.split_whitespace().collect();
+    let new_tokens: Vec<&str> = new_body.split_whitespace().collect();
+    new_tokens.len() > old_tokens.len() && is_ordered_subsequence(&old_tokens, &new_tokens)
+}
+
+/// Split a Go `Name struct { … }` signature into its header (`Name struct`)
+/// and brace-delimited field body. `None` unless the `struct` keyword directly
+/// precedes the field brace, which excludes Rust's `struct Name { … }` form
+/// (a name sits between keyword and brace) and partial-word matches.
+fn go_struct_parts(signature: &str) -> Option<(&str, &str)> {
+    let struct_kw = signature.find("struct")?;
+    let after_kw = struct_kw + "struct".len();
+    let brace_open = signature[after_kw..].find('{')? + after_kw;
+    if !signature[after_kw..brace_open].trim().is_empty() {
+        return None;
+    }
+    let brace_close = matching_brace(signature, brace_open)?;
+    let header = signature[..brace_open].trim_end();
+    let body = signature[brace_open + 1..brace_close].trim();
+    Some((header, body))
+}
+
+fn matching_brace(input: &str, open_byte: usize) -> Option<usize> {
+    if input.as_bytes().get(open_byte).copied() != Some(b'{') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (idx, ch) in input.char_indices().skip_while(|(idx, _)| *idx < open_byte) {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// True when `needle`'s items appear in `haystack` in order (not necessarily
+/// contiguously): `haystack` is `needle` with insertions only.
+fn is_ordered_subsequence(needle: &[&str], haystack: &[&str]) -> bool {
+    let mut haystack = haystack.iter();
+    needle.iter().all(|tok| haystack.any(|hay| hay == tok))
 }
 
 fn matching_paren(input: &str, open_byte: usize) -> Option<usize> {
@@ -369,6 +477,11 @@ fn collect_modified_comments(
     let contract_consumer_count = per_entity.map_or(0, |e| e.contract_consumer_count);
     let consumer_file_count = per_entity.map_or(0, |e| e.consumer_files.len());
     let entity_covering_tests = per_entity.map_or(0, |e| e.covering_tests);
+    // Consumers that were themselves modified in the reviewed range. When a
+    // surface change has NO external consumer left but did have consumers that
+    // all moved with it, the break is a coherent in-diff migration: visible
+    // evidence, not a blocking break.
+    let consumers_migrated = per_entity.map_or(0, |e| e.consumers_migrated_in_diff);
     let fanout_gate_consumer_count = if entity_covering_tests > 0 {
         strong_consumer_count
     } else {
@@ -394,9 +507,12 @@ fn collect_modified_comments(
             ),
         });
 
-        // Breaking only when THIS entity has non-test consumers to break.
-        // Test-only consumers are the covering evidence for the change, not
-        // a contract it is breaking.
+        // Breaking only when THIS entity has EXTERNAL non-test consumers to
+        // break. Test-only consumers are covering evidence, not a broken
+        // contract. Consumers that were themselves modified in this diff are
+        // excluded from `consumer_count`; when they are the ONLY consumers the
+        // change is a coherent in-diff migration — reported as visible evidence
+        // but not a blocking break.
         if consumer_count > 0 {
             comments.push(InlineComment {
                 file: span.file.to_string(),
@@ -406,6 +522,17 @@ fn collect_modified_comments(
                 message: format!(
                     "Breaking change: signature modification affects {} downstream entity(ies)",
                     consumer_count,
+                ),
+            });
+        } else if consumers_migrated > 0 {
+            comments.push(InlineComment {
+                file: span.file.to_string(),
+                start_line: span.start_line,
+                end_line: span.end_line,
+                kind: InlineCommentKind::BreakingMigrated,
+                message: format!(
+                    "Signature changed; all {} graph-known consumer(s) were co-updated in this diff (migration verified in-range)",
+                    consumers_migrated,
                 ),
             });
         }
@@ -436,6 +563,17 @@ fn collect_modified_comments(
                 message: format!(
                     "Breaking change: visibility reduced with {} consumer(s)",
                     consumer_count,
+                ),
+            });
+        } else if consumers_migrated > 0 {
+            comments.push(InlineComment {
+                file: span.file.to_string(),
+                start_line: span.start_line,
+                end_line: span.end_line,
+                kind: InlineCommentKind::BreakingMigrated,
+                message: format!(
+                    "Visibility reduced; all {} graph-known consumer(s) were co-updated in this diff (migration verified in-range)",
+                    consumers_migrated,
                 ),
             });
         }
@@ -716,6 +854,7 @@ mod tests {
                 contract_consumer_count: 0,
                 consumer_files: vec!["src/client.rs".to_string()],
                 covering_tests: 0,
+                consumers_migrated_in_diff: 0,
             }],
             ..Default::default()
         };
@@ -766,6 +905,7 @@ mod tests {
                     contract_consumer_count: 0,
                     consumer_files: vec![],
                     covering_tests: 0,
+                    consumers_migrated_in_diff: 0,
                 },
                 EntityImpact {
                     entity_id: b.id,
@@ -774,6 +914,7 @@ mod tests {
                     contract_consumer_count: 0,
                     consumer_files: vec!["src/client.rs".to_string()],
                     covering_tests: 0,
+                    consumers_migrated_in_diff: 0,
                 },
             ],
             ..Default::default()
@@ -820,6 +961,7 @@ mod tests {
                 contract_consumer_count: 0,
                 consumer_files: vec![],
                 covering_tests: 1,
+                consumers_migrated_in_diff: 0,
             }],
             ..Default::default()
         };
@@ -836,6 +978,105 @@ mod tests {
                 .iter()
                 .any(|c| c.kind == InlineCommentKind::CoverageGap),
             "a tested entity has no coverage gap"
+        );
+    }
+
+    #[test]
+    fn all_consumers_migrated_downgrades_breaking_to_visible_evidence() {
+        // Signature changed, no external consumer left, but two consumers were
+        // co-updated in the same diff: a coherent migration. The blocking
+        // Breaking finding is replaced by a non-blocking BreakingMigrated one,
+        // and the signature change itself is still surfaced.
+        let old = test_entity_with_span("api_handler", "src/api.rs", 1, 10);
+        let mut new = old.clone();
+        new.signature = "fn api_handler(req: Request, extra: bool)".to_string();
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 0,
+                strong_consumer_count: 0,
+                contract_consumer_count: 0,
+                consumer_files: vec![],
+                covering_tests: 0,
+                consumers_migrated_in_diff: 2,
+            }],
+            ..Default::default()
+        };
+
+        let comments = collect_inline_comments(&diff, &impact);
+        assert!(
+            !comments
+                .iter()
+                .any(|c| c.kind == InlineCommentKind::Breaking),
+            "a fully co-updated migration is not a blocking break"
+        );
+        let migrated: Vec<&InlineComment> = comments
+            .iter()
+            .filter(|c| c.kind == InlineCommentKind::BreakingMigrated)
+            .collect();
+        assert_eq!(migrated.len(), 1);
+        assert!(migrated[0].message.contains("2 graph-known consumer"));
+        assert!(comments
+            .iter()
+            .any(|c| c.kind == InlineCommentKind::SignatureChange));
+    }
+
+    #[test]
+    fn partial_migration_still_breaks_and_emits_no_migrated_finding() {
+        // One external consumer remains alongside migrated ones: still a real,
+        // blocking break — not a coherent migration.
+        let old = test_entity_with_span("api_handler", "src/api.rs", 1, 10);
+        let mut new = old.clone();
+        new.signature = "fn api_handler(req: Request, extra: bool)".to_string();
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            changed_ids: vec![new.id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: new.id,
+                consumer_count: 1,
+                strong_consumer_count: 1,
+                contract_consumer_count: 0,
+                consumer_files: vec!["src/client.rs".to_string()],
+                covering_tests: 0,
+                consumers_migrated_in_diff: 2,
+            }],
+            ..Default::default()
+        };
+
+        let comments = collect_inline_comments(&diff, &impact);
+        assert!(
+            comments
+                .iter()
+                .any(|c| c.kind == InlineCommentKind::Breaking),
+            "a stranded external consumer still blocks"
+        );
+        assert!(
+            !comments
+                .iter()
+                .any(|c| c.kind == InlineCommentKind::BreakingMigrated),
+            "partial migration is a real break, not migrated evidence"
         );
     }
 
@@ -878,6 +1119,7 @@ mod tests {
                     contract_consumer_count: 0,
                     consumer_files: vec![],
                     covering_tests: 1,
+                    consumers_migrated_in_diff: 0,
                 },
                 EntityImpact {
                     entity_id: uncovered.id,
@@ -886,6 +1128,7 @@ mod tests {
                     contract_consumer_count: 0,
                     consumer_files: vec![],
                     covering_tests: 0,
+                    consumers_migrated_in_diff: 0,
                 },
             ],
             ..Default::default()
@@ -978,6 +1221,7 @@ mod tests {
                 contract_consumer_count: 0,
                 consumer_files: vec![],
                 covering_tests: 1,
+                consumers_migrated_in_diff: 0,
             }],
             ..Default::default()
         };
@@ -1020,6 +1264,7 @@ mod tests {
                 contract_consumer_count: 0,
                 consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
                 covering_tests: 1,
+                consumers_migrated_in_diff: 0,
             }],
             ..Default::default()
         };
@@ -1060,6 +1305,7 @@ mod tests {
                 contract_consumer_count: 0,
                 consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
                 covering_tests: 1,
+                consumers_migrated_in_diff: 0,
             }],
             ..Default::default()
         };
@@ -1080,6 +1326,7 @@ mod tests {
                 contract_consumer_count: 0,
                 consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
                 covering_tests: 0,
+                consumers_migrated_in_diff: 0,
             }],
             ..Default::default()
         };
@@ -1107,6 +1354,7 @@ mod tests {
                 contract_consumer_count: 0,
                 consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
                 covering_tests: 1,
+                consumers_migrated_in_diff: 0,
             }],
             ..Default::default()
         };
@@ -1165,6 +1413,104 @@ mod tests {
     }
 
     #[test]
+    fn python_appended_defaulted_params_are_runtime_neutral() {
+        // Trailing parameter with a default: existing calls stay valid.
+        assert!(signature_runtime_neutral(
+            "def render(self, node)",
+            "def render(self, node, inline=False)"
+        ));
+        // Trailing *args / **kwargs markers add no required argument.
+        assert!(signature_runtime_neutral(
+            "def emit(self, event)",
+            "def emit(self, event, *args, **kwargs)"
+        ));
+        // Keyword-only defaulted tail is neutral.
+        assert!(signature_runtime_neutral(
+            "def build(self, app)",
+            "def build(self, app, *, force=False)"
+        ));
+    }
+
+    #[test]
+    fn python_appended_required_param_is_not_neutral() {
+        // A new trailing parameter WITHOUT a default breaks existing calls.
+        assert!(!signature_runtime_neutral(
+            "def render(self, node)",
+            "def render(self, node, inline)"
+        ));
+        // A required keyword-only parameter still breaks callers that omit it.
+        assert!(!signature_runtime_neutral(
+            "def build(self, app)",
+            "def build(self, app, *, force)"
+        ));
+        // Removing a parameter is never neutral.
+        assert!(!signature_runtime_neutral(
+            "def render(self, node, inline=False)",
+            "def render(self, node)"
+        ));
+        // Reordering a defaulted param ahead of a positional is not a prefix.
+        assert!(!signature_runtime_neutral(
+            "def f(self, a, b)",
+            "def f(self, b, a, c=1)"
+        ));
+    }
+
+    #[test]
+    fn go_struct_added_field_is_runtime_neutral() {
+        // The real a742e9f8df row: ListOptions gains a `Config` field mid-list.
+        // Existing named-field consumers are unaffected.
+        assert!(signature_runtime_neutral(
+            "ListOptions struct { HttpClient func()(*http.Client, error) IO *iostreams.IOStreams BaseRepo func()(ghrepo.Interface, error) Organization string }",
+            "ListOptions struct { HttpClient func()(*http.Client, error) IO *iostreams.IOStreams Config func()(config.Config, error) BaseRepo func()(ghrepo.Interface, error) Organization string }"
+        ));
+        // Appended field at the end is also additive.
+        assert!(signature_runtime_neutral(
+            "Opts struct { A int B string }",
+            "Opts struct { A int B string C bool }"
+        ));
+    }
+
+    #[test]
+    fn go_struct_non_additive_changes_are_not_neutral() {
+        // Field removal.
+        assert!(!signature_runtime_neutral(
+            "Opts struct { A int B string C bool }",
+            "Opts struct { A int B string }"
+        ));
+        // Field rename.
+        assert!(!signature_runtime_neutral(
+            "Opts struct { A int Name string }",
+            "Opts struct { A int Label string }"
+        ));
+        // Field retype.
+        assert!(!signature_runtime_neutral(
+            "Opts struct { A int B string }",
+            "Opts struct { A int64 B string }"
+        ));
+        // Field reorder (no additions).
+        assert!(!signature_runtime_neutral(
+            "Opts struct { A int B string }",
+            "Opts struct { B string A int }"
+        ));
+        // Type header rename is not a neutral field addition.
+        assert!(!signature_runtime_neutral(
+            "Opts struct { A int }",
+            "Config struct { A int B string }"
+        ));
+    }
+
+    #[test]
+    fn rust_struct_is_not_treated_as_go_additive() {
+        // Rust's `struct Name { … }` puts a name between keyword and brace, so
+        // the Go-additive rule must not fire — a Rust field addition can still
+        // break exhaustive constructors and is not silently neutralized here.
+        assert!(!signature_runtime_neutral(
+            "struct Opts { a: i32 }",
+            "struct Opts { a: i32, b: bool }"
+        ));
+    }
+
+    #[test]
     fn strengthened_only_change_emits_no_signature_or_breaking_comment() {
         let old = test_entity_with_span("hot_path", "src/hot.rs", 1, 20);
         let mut new = old.clone();
@@ -1188,6 +1534,7 @@ mod tests {
                 contract_consumer_count: 0,
                 consumer_files: vec!["src/a.rs".to_string()],
                 covering_tests: 0,
+                consumers_migrated_in_diff: 0,
             }],
             ..Default::default()
         };
@@ -1234,6 +1581,7 @@ mod tests {
                     "testing/test_doctest.py".to_string(),
                 ],
                 covering_tests: 0,
+                consumers_migrated_in_diff: 0,
             }],
             ..Default::default()
         };
@@ -1305,6 +1653,7 @@ mod tests {
                 // entity count (2) is at it.
                 consumer_files: vec!["src/shared.rs".to_string()],
                 covering_tests: 0,
+                consumers_migrated_in_diff: 0,
             }],
             ..Default::default()
         };
@@ -1355,6 +1704,7 @@ mod tests {
                     "testing/test_conftest.py".to_string(),
                 ],
                 covering_tests: 0,
+                consumers_migrated_in_diff: 0,
             }],
             ..Default::default()
         };
@@ -1394,6 +1744,7 @@ mod tests {
                 contract_consumer_count: 0,
                 consumer_files: vec!["src/only.rs".to_string()],
                 covering_tests: 0,
+                consumers_migrated_in_diff: 0,
             }],
             ..Default::default()
         };
@@ -1426,6 +1777,7 @@ mod tests {
                 contract_consumer_count: 0,
                 consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
                 covering_tests: 0,
+                consumers_migrated_in_diff: 0,
             }],
             ..Default::default()
         };

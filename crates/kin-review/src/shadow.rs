@@ -726,6 +726,7 @@ fn collect_blast_radius(review: &Review) -> ShadowBlastRadius {
 fn finding_kind_label(kind: InlineCommentKind) -> &'static str {
     match kind {
         InlineCommentKind::Breaking => "breaking",
+        InlineCommentKind::BreakingMigrated => "breaking_migrated",
         InlineCommentKind::CoverageGap => "coverage_gap",
         InlineCommentKind::ContractViolation => "contract_violation",
         InlineCommentKind::CommandEffectContract => "command_effect_contract_change",
@@ -756,6 +757,9 @@ fn finding_severity(kind: InlineCommentKind) -> &'static str {
         | InlineCommentKind::RevertHistory => "warning",
         InlineCommentKind::RevertHistoryIncidental => "info",
         InlineCommentKind::Added | InlineCommentKind::Removed => "info",
+        // Coherent-migration evidence: reported, but never a gate signal — the
+        // break has no stranded external consumer to escalate on.
+        InlineCommentKind::BreakingMigrated => "info",
     }
 }
 
@@ -1098,6 +1102,11 @@ fn repair_guidance(kind: &str) -> &'static str {
         "breaking" => {
             "Update the listed consumers to the new contract or restore compatibility, then run \
              the covering tests."
+        }
+        "breaking_migrated" => {
+            "The contract surface changed but every graph-known consumer was co-updated in this \
+             same change — a coherent migration. Confirm no consumer outside the graph (e.g. a \
+             cross-repo caller) still depends on the old surface."
         }
         "contract_violation" => {
             "The contract has graph-known consumers; version the contract or migrate every \
@@ -1922,6 +1931,7 @@ mod tests {
                             contract_consumer_count: 0,
                             consumer_files: vec!["src/consumer.rs".to_string()],
                             covering_tests: 0,
+                            consumers_migrated_in_diff: 0,
                         })
                         .collect(),
                     ..Default::default()
@@ -2441,6 +2451,7 @@ mod tests {
                     contract_consumer_count: 0,
                     consumer_files: vec!["src/consumer.rs".to_string()],
                     covering_tests: 0,
+                    consumers_migrated_in_diff: 0,
                 }],
                 ..Default::default()
             },
@@ -2538,6 +2549,7 @@ mod tests {
                     contract_consumer_count: 0,
                     consumer_files: vec![],
                     covering_tests: 0,
+                    consumers_migrated_in_diff: 0,
                 }],
                 ..Default::default()
             },
@@ -3145,6 +3157,7 @@ mod tests {
                     contract_consumer_count: 0,
                     consumer_files: vec!["src/consumer.rs".to_string()],
                     covering_tests: 0,
+                    consumers_migrated_in_diff: 0,
                 }],
                 ..Default::default()
             },
