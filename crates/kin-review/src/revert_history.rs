@@ -25,11 +25,14 @@
 //!   deleting something that only just landed is the shape of a revert of a
 //!   recent feature.
 //!
-//! Findings feed the gate as ordinary warning findings through the
+//! Strong matches feed the gate as ordinary warning findings through the
 //! inline-comment channel (the same shape as the command-effect and
-//! toolchain-surface channels), never through evidence-gap demotion. When the
-//! base has less history than the window can meaningfully scan, the channel
-//! reports an honest evidence gap instead of silently passing.
+//! toolchain-surface channels), never through evidence-gap demotion. Weaker
+//! temporal evidence is still reported but stays informational: the benign-60
+//! sweep showed that deleting a recent addition is common cleanup unless an
+//! independent review signal also says the change is risky. When the base has
+//! less history than the window can meaningfully scan, the channel reports an
+//! honest evidence gap instead of silently passing.
 //!
 //! Matching is computed at review time exclusively from the base's ancestry
 //! window — the graph may hold changes outside the reviewed lineage (other
@@ -258,16 +261,11 @@ pub(crate) fn collect_revert_history_findings<G: GraphStore>(
             let name = removed
                 .map(|e| e.name.clone())
                 .unwrap_or_else(|| "entity".to_string());
-            let gates = removed.is_some_and(is_public_contract);
             findings.push(InlineComment {
                 file: String::new(),
                 start_line: 0,
                 end_line: 0,
-                kind: if gates {
-                    InlineCommentKind::RevertHistory
-                } else {
-                    InlineCommentKind::RevertHistoryIncidental
-                },
+                kind: InlineCommentKind::RevertHistoryIncidental,
                 message: format!(
                     "Removed `{}` was introduced only {} — revert-shaped removal \
                      of a recent addition",

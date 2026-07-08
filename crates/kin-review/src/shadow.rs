@@ -518,10 +518,10 @@ fn assemble_report_with_changes<G: GraphStore>(
     // Toolchain-surface findings feed the gate as ordinary warning findings via
     // the inline-comment channel, never through the evidence-gap demotion path.
     review.inline_comments.extend(toolchain_findings);
-    // Revert-history findings feed the gate the same way: ordinary warning
-    // findings, with an honest gap when the base has too little history to
-    // scan. Temporal evidence available at review time only — the window looks
-    // strictly BEFORE the base.
+    // Revert-history findings use the same inline-comment channel, with an
+    // honest gap when the base has too little history to scan. Strong matches
+    // may gate as warnings; weak temporal hints stay informational. Evidence is
+    // available at review time only: the window looks strictly BEFORE the base.
     let (revert_findings, revert_gap) = crate::revert_history::collect_revert_history_findings(
         store,
         &request.resolved_base,
@@ -1308,7 +1308,9 @@ fn collect_evidence_gaps<G: GraphStore>(
     for change in changes {
         for delta in &change.artifact_deltas {
             let file = delta.file_id.to_string();
-            if entity_files.contains(&file) {
+            if entity_files.contains(&file)
+                || semantic_removed_entity_accounts_for_artifact_file(&file, changed_entities)
+            {
                 continue;
             }
             let entry = artifact_hashes
@@ -1408,6 +1410,31 @@ fn collect_evidence_gaps<G: GraphStore>(
     });
 
     (gaps, toolchain_findings)
+}
+
+fn semantic_removed_entity_accounts_for_artifact_file(
+    file: &str,
+    changed_entities: &[ShadowChangedEntity],
+) -> bool {
+    changed_entities.iter().any(|entity| {
+        entity.change == "removed"
+            && entity.kind != "unknown"
+            && entity.role == EntityRole::Source
+            && entity
+                .file
+                .as_deref()
+                .is_some_and(|entity_file| same_filename(entity_file, file))
+    })
+}
+
+fn same_filename(left: &str, right: &str) -> bool {
+    let left = std::path::Path::new(left)
+        .file_name()
+        .and_then(|name| name.to_str());
+    let right = std::path::Path::new(right)
+        .file_name()
+        .and_then(|name| name.to_str());
+    left.is_some() && left == right
 }
 
 fn actor_kind_label(actor: &str) -> &'static str {
@@ -3238,6 +3265,56 @@ mod tests {
     }
 
     #[test]
+    fn removed_entity_under_historical_path_accounts_for_source_artifact_delta() {
+        // Historical rename shape: the source file changed at its current path,
+        // but the removed entity still carries the pre-rename file origin. The
+        // semantic diff did capture the deletion, so the artifact delta must
+        // not be treated as unparsed source.
+        let graph = InMemoryGraph::new();
+        let legacy = entity_with_span(
+            "animate",
+            "src/shared/keyed-each.js",
+            105,
+            EntityRole::Source,
+        );
+        graph.upsert_entity(&legacy).unwrap();
+
+        let base_id = change_id(0x71);
+        let head_id = change_id(0x72);
+        let base = change_with_deltas(
+            base_id,
+            vec![],
+            vec![EntityDelta::Added(legacy.clone())],
+            vec![],
+            vec![],
+        );
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![EntityDelta::Removed(legacy.id)],
+            vec![],
+            vec![ArtifactDelta {
+                file_id: FilePathId::new("src/internal/keyed-each.js"),
+                kind: ArtifactDeltaKind::Modified,
+                old_hash: Some(Hash256::from_bytes([21; 32])),
+                new_hash: Some(Hash256::from_bytes([22; 32])),
+            }],
+        );
+        graph.create_change(&base).unwrap();
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+
+        assert!(
+            !report.evidence_gaps.iter().any(|gap| {
+                gap.kind == "artifact_only_change" && gap.subject == "src/internal/keyed-each.js"
+            }),
+            "a captured removed entity under a historical path must account for the source delta"
+        );
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::Pass);
+    }
+
+    #[test]
     fn absent_relation_channel_keeps_surface_change_feeding_gate() {
         // A real signature change in a repo whose relation channel was never
         // ingested: the empty channel cannot prove the change is isolated, so
@@ -3643,11 +3720,11 @@ mod tests {
     }
 
     #[test]
-    fn revert_history_recent_addition_removal_flags() {
+    fn revert_history_recent_addition_removal_is_evidence_only() {
         // c2 adds `beta_flag`; the head removes that exact entity id. Deleting
         // something that only just landed is revert-shaped and must be called
-        // out even though a bare removal of an unconsumed entity would
-        // otherwise stay quiet.
+        // out, but benign-60 proved the signal is too weak to drive the gate
+        // without an independent risk channel.
         let graph = InMemoryGraph::new();
         let recent = entity_with_span("beta_flag", "src/flags.rs", 12, EntityRole::Source);
         let base_id =
@@ -3667,13 +3744,15 @@ mod tests {
             .policy
             .findings
             .iter()
-            .find(|f| f.kind == "revert_history")
-            .expect("recent-addition removal must produce a revert_history finding");
+            .find(|f| f.kind == "revert_history_incidental")
+            .expect("recent-addition removal must produce an evidence-only finding");
         assert!(
             finding.message.contains("revert-shaped removal"),
             "got: {}",
             finding.message
         );
+        assert_eq!(finding.severity, "info");
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::Pass);
     }
 
     #[test]
