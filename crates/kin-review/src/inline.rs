@@ -140,7 +140,23 @@ pub fn signature_runtime_neutral(old: &str, new: &str) -> bool {
     }
     signature_strengthened_only(old, new)
         || python_signatures_runtime_neutral(old, new)
+        || python_none_type_spelling_neutral(old, new)
         || go_struct_field_addition_only(old, new)
+}
+
+/// True when `old` and `new` are identical once the two explicit spellings of
+/// the `NoneType` singleton — `type(None)` and `types.NoneType` — are folded to
+/// one form. Python 3.10+ guarantees `type(None) is types.NoneType`, so a
+/// declaration that swaps one spelling for the other (a default value, or a
+/// non-`def` module-level declaration whose text carries the reference) changes
+/// no runtime contract. Only that exact spelling is folded, so any other type
+/// difference still counts and is never masked. Bare `NoneType` is not folded —
+/// its meaning depends on a `from types import` binding absent from the text.
+fn python_none_type_spelling_neutral(old: &str, new: &str) -> bool {
+    fn fold(signature: &str) -> String {
+        signature.replace("type(None)", "types.NoneType")
+    }
+    fold(old) == fold(new)
 }
 
 /// The callable name and normalized parameter list of a Python `def`, or
@@ -1836,6 +1852,52 @@ mod tests {
         assert!(!signature_runtime_neutral(
             "class Item(Node, Request)",
             "class Item(Node)"
+        ));
+    }
+
+    /// d25c3ad241 shape: widening a return annotation (`-> str` to
+    /// `-> Optional[str]`) changes no call contract — the parameter list (name +
+    /// arity + param names) is unchanged. Regression lock so the return-annotation
+    /// path is never quietly turned into a breaking finding.
+    #[test]
+    fn python_return_annotation_widen_is_runtime_neutral() {
+        assert!(signature_runtime_neutral(
+            "def get_node_location(node: Node) -> str",
+            "def get_node_location(node: Node) -> Optional[str]"
+        ));
+    }
+
+    /// fd21f82aa8 shape: swapping the `type(None)` spelling for `types.NoneType`
+    /// changes no runtime contract, whether it appears in a default value or a
+    /// bare module-level declaration whose text carries the reference.
+    #[test]
+    fn python_none_type_spelling_swap_is_runtime_neutral() {
+        assert!(signature_runtime_neutral(
+            "def f(x=type(None))",
+            "def f(x=types.NoneType)"
+        ));
+        assert!(signature_runtime_neutral(
+            "PROTECTED = (bool, int, type(None), bytes)",
+            "PROTECTED = (bool, int, types.NoneType, bytes)"
+        ));
+    }
+
+    /// GUARD: the None-type fold masks ONLY that exact spelling. A genuine
+    /// default-value change (d25c3ad241's `deprecated_alias` `= None` -> `= {}`),
+    /// any other type in place of `type(None)`, and bare `NoneType` all still fire.
+    #[test]
+    fn python_none_type_fold_does_not_mask_real_changes() {
+        assert!(!signature_runtime_neutral(
+            "def deprecated_alias(modname, objects, warning, names=None)",
+            "def deprecated_alias(modname, objects, warning, names={})"
+        ));
+        assert!(!signature_runtime_neutral(
+            "def f(x=type(None))",
+            "def f(x=type(int))"
+        ));
+        assert!(!signature_runtime_neutral(
+            "PROTECTED = (bool, int, type(None), bytes)",
+            "PROTECTED = (bool, int, NoneType, bytes)"
         ));
     }
 
