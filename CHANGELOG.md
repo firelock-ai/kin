@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.15] - 2026-07-08
+
+Sharper shadow review: behavior-equivalence fingerprinting, call-site argument shapes,
+and arity-aware overload binding let review distinguish behavior-preserving refactors
+from real changes with far less noise.
+
+### Added
+
+- Behavior-equivalence fingerprint: `SemanticFingerprint` now carries an
+  `equivalence_hash` capturing a change's behavior-equivalence class. Review uses it to
+  downgrade behavior-preserving consumer fanout instead of flagging it, so a refactor
+  that keeps behavior no longer cascades warnings across its callers.
+- Type-identity and annotation-neutral equivalence: type-only and annotation-only edits
+  are recognized as behavior-preserving and folded into the same equivalence class,
+  keeping their review impact proportionate.
+- Call-site argument shapes: the Python parser records the argument shape at each call
+  site on `Calls` edges and the linker persists it onto resolved calls, so review can
+  gate arity-preserving parameter renames against how a function is actually called.
+- Arity-aware C++ overload binding: overloaded C++ calls bind to the overload whose
+  arity matches the call site rather than fanning out across every same-named overload.
+
+### Changed
+
+- Pin `kin-model` 0.2.4 for the `SemanticFingerprint.equivalence_hash` surface.
+
+### Fixed
+
+- `kin-cli`: cover the equivalence-downgrade fanout kind in `inline_comment_severity`
+  so downgraded fanout is rendered at its intended severity.
+
 ## [0.2.14] - 2026-07-08
 
 First-run setup becomes Kin-native by default for new repos and smoother for agent
