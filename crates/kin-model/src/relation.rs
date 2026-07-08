@@ -104,6 +104,57 @@ pub struct Relation {
     pub evidence: Vec<RelationEvidence>,
 }
 
+/// The argument shape observed at a single call site: how many positional
+/// arguments were passed, which keyword-argument names were used, and whether
+/// the call forwards a `*args` positional splat or a `**kwargs` keyword splat.
+///
+/// Captured per `Calls` edge so a consumer that invokes a callable positionally
+/// (unaffected by a parameter rename) can be told apart from one that names a
+/// parameter (which a rename would strand). A `**kwargs` splat means the keyword
+/// set is not statically known; the arity is known exactly only when neither
+/// splat flag is set.
+///
+/// `keywords` is kept sorted and deduplicated so the shape is order- and
+/// duplicate-independent, keeping graph writes deterministic.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CallArgShape {
+    /// Number of positional argument expressions passed. A `*sequence` splat is
+    /// not counted here; it is recorded by `has_var_positional`.
+    #[serde(default)]
+    pub positional: u32,
+    /// Sorted, deduplicated names of explicit keyword arguments (`name=value`).
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    /// The call forwards a `*sequence` positional splat (or an equivalent
+    /// pack-expansion).
+    #[serde(default)]
+    pub has_var_positional: bool,
+    /// The call forwards a `**mapping` keyword splat, so its keyword set is not
+    /// statically known.
+    #[serde(default)]
+    pub has_var_keyword: bool,
+}
+
+impl CallArgShape {
+    /// Build a shape, normalizing `keywords` to sorted, deduplicated order so
+    /// two call sites that differ only in argument order compare equal.
+    pub fn new(
+        positional: u32,
+        mut keywords: Vec<String>,
+        has_var_positional: bool,
+        has_var_keyword: bool,
+    ) -> Self {
+        keywords.sort();
+        keywords.dedup();
+        Self {
+            positional,
+            keywords,
+            has_var_positional,
+            has_var_keyword,
+        }
+    }
+}
+
 /// Concrete evidence supporting a graph relation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RelationEvidence {
@@ -125,6 +176,11 @@ pub struct RelationEvidence {
     /// Number of equivalent occurrences collapsed into this evidence record.
     #[serde(default = "default_relation_evidence_count")]
     pub occurrence_count: u32,
+    /// Argument shape of the call site that produced this edge, when captured.
+    /// Present only for `Calls` edges from languages that emit shapes; older
+    /// snapshots, non-call edges, and unresolved calls leave it `None`.
+    #[serde(default)]
+    pub call_shape: Option<CallArgShape>,
 }
 
 impl Default for RelationEvidence {
@@ -136,6 +192,7 @@ impl Default for RelationEvidence {
             source_path: None,
             resolved_path: None,
             occurrence_count: default_relation_evidence_count(),
+            call_shape: None,
         }
     }
 }
@@ -266,6 +323,7 @@ mod tests {
                 source_path: Some("app.hpp".to_string()),
                 resolved_path: Some("include/app.hpp".to_string()),
                 occurrence_count: 1,
+                call_shape: None,
             }],
         };
 

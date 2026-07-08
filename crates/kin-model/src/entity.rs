@@ -67,8 +67,24 @@ pub struct SemanticFingerprint {
     pub signature_hash: Hash256,
     /// Hash of the entity's full source text (changes on any body edit).
     pub behavior_hash: Hash256,
+    /// Hash of the entity's behavior-equivalence class: the token stream with
+    /// pure-no-op statements (e.g. docstrings) normalized away, so a
+    /// behavior-preserving body edit leaves it unchanged while any real change
+    /// alters it. The zero hash (the serde default) means "not computed" and is
+    /// never treated as a match. Always serialized — the field is positional in
+    /// the graph's binary snapshot format, so it must not be conditionally
+    /// skipped — while `#[serde(default)]` lets self-describing payloads that
+    /// predate the field deserialize to the zero sentinel.
+    #[serde(default = "zero_equivalence_hash")]
+    pub equivalence_hash: Hash256,
     /// Confidence in fingerprint stability (0.0 - 1.0).
     pub stability_score: f32,
+}
+
+/// Serde default for [`SemanticFingerprint::equivalence_hash`]: the zero hash,
+/// the sentinel for "equivalence class not computed".
+fn zero_equivalence_hash() -> Hash256 {
+    Hash256::from_bytes([0; 32])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -216,6 +232,7 @@ mod tests {
                 ast_hash: kin_blobs::Hash256::from_bytes([0; 32]),
                 signature_hash: kin_blobs::Hash256::from_bytes([0; 32]),
                 behavior_hash: kin_blobs::Hash256::from_bytes([0; 32]),
+                equivalence_hash: kin_blobs::Hash256::from_bytes([0; 32]),
                 stability_score: 1.0,
             },
             file_origin: None,
