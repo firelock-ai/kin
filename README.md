@@ -182,7 +182,7 @@ Supporting substrate:
 Kin is **0.2.x** — pre-1.0 and under active development. Expect rough edges and breaking
 changes between releases. Being precise about what is and isn't ready today:
 
-- **Install surface.** Native binaries ship on GitHub Releases and via the install script. A canonical `@kinlab/kin` npm package is not published yet; the MCP wrapper `@kinlab/kin-mcp` is.
+- **Install surface.** Native binaries ship on GitHub Releases and via the install script; the canonical `@kinlab/kin` npm package (`npm i -g @kinlab/kin`, or `npx -y @kinlab/kin`) provisions the same managed `kin` + `kin-daemon` release for npm-based workflows. `@kinlab/kin-mcp` remains published as a compatibility wrapper.
 - **Windows.** The native Windows binary is a limited, vector-free build with no filesystem projection. Use WSL2 for the complete experience.
 - **Semantic search.** `kin init` builds the graph without embeddings; run `kin embed` to enable vector search. Until then, `locate`/`search` run on lexical + graph signals and say so.
 - **Hosted KinLab.** Connecting a repo to hosted KinLab is coming soon; it is not yet a first-run flow.
