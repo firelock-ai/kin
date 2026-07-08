@@ -117,3 +117,134 @@ void caller() {
         "free-function template instantiation must emit the bare callee name"
     );
 }
+
+fn calls_from<'a>(rels: &'a [ExtractedRelation], src: &str) -> Vec<&'a str> {
+    rels.iter()
+        .filter(|r| r.kind == RelationKind::Calls && r.src_name == src)
+        .map(|r| r.dst_name.as_str())
+        .collect()
+}
+
+#[test]
+fn typed_local_receiver_binds_call_to_its_class() {
+    // Local generators whose `.add()`/`->add()` must resolve to their own class,
+    // never fan out to every same-named `add` across unrelated classes.
+    let source = r#"
+namespace Catch {
+    template<typename T>
+    struct ValuesGenerator {
+        void add( T value ) {}
+    };
+    template<typename T>
+    struct CompositeGenerator {
+        void add( const T* g ) {}
+    };
+    template<typename T>
+    CompositeGenerator<T> values( T v1, T v2 ) {
+        CompositeGenerator<T> generators;
+        ValuesGenerator<T>* valuesGen = new ValuesGenerator<T>();
+        valuesGen->add( v1 );
+        generators.add( valuesGen );
+        return generators;
+    }
+}
+"#;
+    let rels = parse_and_extract(source);
+    let calls = calls_from(&rels, "values");
+    assert!(
+        calls.contains(&"ValuesGenerator::add"),
+        "pointer-local `valuesGen->add` must bind to ValuesGenerator, got: {calls:?}"
+    );
+    assert!(
+        calls.contains(&"CompositeGenerator::add"),
+        "value-local `generators.add` must bind to CompositeGenerator, got: {calls:?}"
+    );
+    assert!(
+        !calls.contains(&"add"),
+        "no bare `add` may survive when both receivers are typed, got: {calls:?}"
+    );
+}
+
+#[test]
+fn this_receiver_binds_call_to_enclosing_class() {
+    let source = r#"
+struct Widget {
+    void run() { this->helper(); }
+    void helper() {}
+};
+"#;
+    let rels = parse_and_extract(source);
+    let calls = calls_from(&rels, "Widget::run");
+    assert!(
+        calls.contains(&"Widget::helper"),
+        "`this->helper()` must bind to the enclosing class, got: {calls:?}"
+    );
+}
+
+#[test]
+fn member_field_receiver_binds_call_to_field_class() {
+    let source = r#"
+struct Engine { void start() {} };
+struct Car {
+    Engine m_engine;
+    void drive() { m_engine.start(); }
+};
+"#;
+    let rels = parse_and_extract(source);
+    let calls = calls_from(&rels, "Car::drive");
+    assert!(
+        calls.contains(&"Engine::start"),
+        "member-field receiver `m_engine.start()` must bind to Engine, got: {calls:?}"
+    );
+}
+
+#[test]
+fn parameter_receiver_binds_call_to_parameter_class() {
+    let source = r#"
+struct Sink { void write() {} };
+void pump( Sink& out ) { out.write(); }
+"#;
+    let rels = parse_and_extract(source);
+    let calls = calls_from(&rels, "pump");
+    assert!(
+        calls.contains(&"Sink::write"),
+        "parameter receiver `out.write()` must bind to Sink, got: {calls:?}"
+    );
+}
+
+#[test]
+fn unresolvable_receiver_keeps_bare_method_name() {
+    // No declaration for `obj`: the receiver type is unknown, so the call keeps
+    // its bare rightmost name for the linker's weak ambiguous-fanout tier.
+    let source = r#"
+struct S {
+    void run() { obj.execute(); }
+};
+"#;
+    let rels = parse_and_extract(source);
+    let calls = calls_from(&rels, "S::run");
+    assert!(
+        calls.contains(&"execute"),
+        "unresolvable receiver must keep the bare method name, got: {calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|c| c.contains("::execute")),
+        "unresolvable receiver must not invent a class qualifier, got: {calls:?}"
+    );
+}
+
+#[test]
+fn explicit_scope_qualified_static_call_is_preserved() {
+    let source = r#"
+namespace Catch {
+    int helper() { return 0; }
+    int caller() { return Catch::helper(); }
+}
+"#;
+    let rels = parse_and_extract(source);
+    let calls = calls_from(&rels, "caller");
+    assert!(
+        calls.contains(&"Catch::helper"),
+        "explicit `Catch::helper()` must keep its qualified callee, got: {calls:?}"
+    );
+}

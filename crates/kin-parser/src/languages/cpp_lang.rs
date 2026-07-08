@@ -827,39 +827,242 @@ fn strip_callee_template_args(raw: &str) -> String {
     out
 }
 
-/// Recursively walk a function/method body to find `call_expression` nodes.
+/// Static receiver types visible inside one function/method body: local
+/// variables and parameters (`var_types`), the enclosing class name for a
+/// `this` receiver (`enclosing_class`), and the enclosing class's data members
+/// (`member_types`). A `recv.method()` / `recv->method()` whose receiver type
+/// resolves here is emitted as `Type::method`, so the linker binds it to that
+/// class instead of fanning the call out to every same-named method.
+#[derive(Default)]
+struct ReceiverScope {
+    enclosing_class: Option<String>,
+    var_types: std::collections::HashMap<String, String>,
+    member_types: std::collections::HashMap<String, String>,
+}
+
+impl ReceiverScope {
+    fn owner_of(&self, receiver: &str) -> Option<&str> {
+        self.var_types
+            .get(receiver)
+            .or_else(|| self.member_types.get(receiver))
+            .map(String::as_str)
+    }
+}
+
+/// Walk a function/method body and emit its `call_expression` edges. A method
+/// call's receiver static type is resolved through the body's [`ReceiverScope`]
+/// so a typed receiver binds to `Type::method`; an unresolvable receiver keeps
+/// the bare rightmost name (the linker's ambiguous-fanout tier weighs those).
 fn extract_calls_from_body(
     node: &tree_sitter::Node,
     source: &[u8],
     context_name: &str,
     relations: &mut Vec<ExtractedRelation>,
 ) {
+    let mut scope = ReceiverScope {
+        enclosing_class: context_name
+            .rsplit_once("::")
+            .map(|(owner, _)| owner.to_string()),
+        ..ReceiverScope::default()
+    };
+    collect_param_types(node, source, &mut scope.var_types);
+    collect_local_var_types(node, source, &mut scope.var_types);
+    collect_member_field_types(node, source, &mut scope.member_types);
+    collect_scoped_calls(node, source, context_name, &scope, relations);
+}
+
+fn collect_scoped_calls(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    context_name: &str,
+    scope: &ReceiverScope,
+    relations: &mut Vec<ExtractedRelation>,
+) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "call_expression" {
             if let Some(function) = child.child_by_field_name("function") {
-                let callee_name = match function.kind() {
-                    "field_expression" => {
-                        // obj.method() or obj->method()
+                let dst_name = if function.kind() == "field_expression" {
+                    let method = strip_callee_template_args(
                         function
                             .child_by_field_name("field")
-                            .map(|f| f.utf8_text(source).unwrap_or("").to_string())
-                            .unwrap_or_default()
+                            .and_then(|f| f.utf8_text(source).ok())
+                            .unwrap_or_default(),
+                    );
+                    match receiver_owner(&function, source, scope) {
+                        Some(owner) if is_valid_callee(&method) => format!("{owner}::{method}"),
+                        _ => method,
                     }
-                    _ => function.utf8_text(source).unwrap_or("").to_string(),
+                } else {
+                    strip_callee_template_args(function.utf8_text(source).unwrap_or(""))
                 };
-                let callee_name = strip_callee_template_args(&callee_name);
-                if is_valid_callee(&callee_name) {
+                if is_valid_callee(&dst_name) {
                     relations.push(ExtractedRelation {
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
-                        dst_name: callee_name,
+                        dst_name,
                         import_source: None,
                     });
                 }
             }
         }
-        extract_calls_from_body(&child, source, context_name, relations);
+        collect_scoped_calls(&child, source, context_name, scope, relations);
+    }
+}
+
+/// Resolve a `field_expression` receiver to a class name: `this` binds to the
+/// enclosing class; a bare identifier binds to its local/parameter type, then to
+/// an enclosing-class member's type. Any other receiver shape (chained access,
+/// call result, subscript) is left unresolved so the call keeps its bare name.
+fn receiver_owner(
+    field_expr: &tree_sitter::Node,
+    source: &[u8],
+    scope: &ReceiverScope,
+) -> Option<String> {
+    let receiver = field_expr.child_by_field_name("argument")?;
+    match receiver.kind() {
+        "this" => scope.enclosing_class.clone(),
+        "identifier" => scope
+            .owner_of(receiver.utf8_text(source).ok()?)
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Collect `name -> class type` for the parameters under a function declarator.
+fn collect_param_types(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    out: &mut std::collections::HashMap<String, String>,
+) {
+    if node.kind() == "parameter_list" {
+        let mut cursor = node.walk();
+        for param in node.children(&mut cursor) {
+            if matches!(
+                param.kind(),
+                "parameter_declaration" | "optional_parameter_declaration"
+            ) {
+                record_typed_declarators(&param, source, out);
+            }
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_param_types(&child, source, out);
+    }
+}
+
+/// Collect `name -> class type` for every local `declaration` in a body.
+fn collect_local_var_types(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    out: &mut std::collections::HashMap<String, String>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "declaration" {
+            record_typed_declarators(&child, source, out);
+        }
+        collect_local_var_types(&child, source, out);
+    }
+}
+
+/// Collect `member -> class type` for the enclosing class's data members, found
+/// by walking up to the nearest class/struct/union and reading its field list.
+fn collect_member_field_types(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    out: &mut std::collections::HashMap<String, String>,
+) {
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if matches!(
+            ancestor.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier"
+        ) {
+            if let Some(body) = ancestor.child_by_field_name("body") {
+                let mut cursor = body.walk();
+                for member in body.children(&mut cursor) {
+                    if member.kind() == "field_declaration" {
+                        record_typed_declarators(&member, source, out);
+                    }
+                }
+            }
+            return;
+        }
+        current = ancestor.parent();
+    }
+}
+
+/// Map each of a declaration's named declarators to its class type. Function
+/// declarators (method prototypes) carry no receiver type and are skipped, as
+/// are non-class types (`int`, `auto`, ...).
+fn record_typed_declarators(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    out: &mut std::collections::HashMap<String, String>,
+) {
+    let Some(class_type) = node
+        .child_by_field_name("type")
+        .and_then(|t| type_class_name(&t, source))
+    else {
+        return;
+    };
+    let mut cursor = node.walk();
+    for declarator in node.children_by_field_name("declarator", &mut cursor) {
+        if declarator_is_function(&declarator) {
+            continue;
+        }
+        if let Some(name) = declarator_name(&declarator, source) {
+            out.entry(name).or_insert_with(|| class_type.clone());
+        }
+    }
+}
+
+/// Reduce a `type` node to the bare class name usable as an entity key: a plain
+/// or template type yields its identifier, a qualified type its leaf; primitive
+/// and inferred (`auto`) types yield nothing.
+fn type_class_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "type_identifier" | "identifier" => node.utf8_text(source).ok().map(str::to_string),
+        "template_type" | "qualified_identifier" => node
+            .child_by_field_name("name")
+            .and_then(|n| type_class_name(&n, source)),
+        _ => None,
+    }
+}
+
+/// Descend a declarator through pointer/reference/array/init wrappers to the
+/// declared identifier.
+fn declarator_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier" | "field_identifier" => node.utf8_text(source).ok().map(str::to_string),
+        "pointer_declarator" | "array_declarator" | "init_declarator" => node
+            .child_by_field_name("declarator")
+            .and_then(|c| declarator_name(&c, source)),
+        "reference_declarator" | "parenthesized_declarator" => node
+            .named_child(0)
+            .and_then(|c| declarator_name(&c, source)),
+        _ => None,
+    }
+}
+
+/// Whether a declarator declares a function (a method prototype), which has no
+/// receiver type to record.
+fn declarator_is_function(node: &tree_sitter::Node) -> bool {
+    match node.kind() {
+        "function_declarator" => true,
+        "pointer_declarator"
+        | "reference_declarator"
+        | "init_declarator"
+        | "array_declarator"
+        | "parenthesized_declarator" => node
+            .child_by_field_name("declarator")
+            .or_else(|| node.named_child(0))
+            .map(|c| declarator_is_function(&c))
+            .unwrap_or(false),
+        _ => false,
     }
 }
 
