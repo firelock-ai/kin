@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "kin://contracts/semantic-fingerprint",
-  "description": "Kin's identity moat. Survives renames, moves, formatting.",
+  "description": "Content-based fingerprint of an entity, used to detect what changed between revisions (structure, signature, and exact contents).",
   "type": "object",
   "required": ["algorithm", "ast_hash", "behavior_hash", "signature_hash", "stability_score"],
   "properties": {

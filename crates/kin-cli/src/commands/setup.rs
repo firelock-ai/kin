@@ -889,12 +889,86 @@ fn configure_cursor() -> Result<PathBuf> {
     Ok(target)
 }
 
+/// Merge the "kin" MCP server entry into a TOML MCP config (Codex CLI's
+/// `~/.codex/config.toml`). Creates the file if it doesn't exist.
+///
+/// Codex reads MCP servers from `[mcp_servers.<name>]` tables in
+/// `config.toml` — it does not read an `mcp.json`. Uses a format-preserving
+/// TOML edit so unrelated keys, tables, and comments in the user's config are
+/// left untouched.
+fn merge_mcp_config_toml(path: &PathBuf) -> Result<()> {
+    use toml_edit::{value, Array, DocumentMut, InlineTable, Item, Table};
+
+    let mut doc: DocumentMut = if path.exists() {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        content.parse().with_context(|| {
+            format!(
+                "existing file {} is not valid TOML — refusing to overwrite it. \
+                 Fix or remove the file and try again.",
+                path.display()
+            )
+        })?
+    } else {
+        DocumentMut::new()
+    };
+
+    // Ensure mcp_servers is a standard table we can nest [mcp_servers.kin]
+    // under, preserving any existing server entries (including ones written
+    // as an inline `mcp_servers = { ... }` value).
+    if !matches!(doc.get("mcp_servers"), Some(Item::Table(_))) {
+        let mut servers = match doc.remove("mcp_servers") {
+            Some(item) => match item.into_table() {
+                Ok(table) => table,
+                Err(item) => match item.into_value() {
+                    Ok(toml_edit::Value::InlineTable(inline)) => inline.into_table(),
+                    _ => Table::new(),
+                },
+            },
+            None => Table::new(),
+        };
+        servers.set_implicit(true);
+        doc.insert("mcp_servers", Item::Table(servers));
+    }
+
+    // Build the kin entry from the same source of truth as the JSON configs.
+    let entry = kin_mcp_entry();
+    let command = entry
+        .get("command")
+        .and_then(|c| c.as_str())
+        .unwrap_or("kin")
+        .to_string();
+
+    let mut kin = Table::new();
+    kin.insert("command", value(command));
+    let mut args = Array::new();
+    args.push("mcp");
+    args.push("start");
+    kin.insert("args", value(args));
+    let mut env = InlineTable::new();
+    env.insert("KIN_MCP_TOOL_PROFILE", "agent-default".into());
+    kin.insert("env", value(env));
+
+    doc["mcp_servers"]["kin"] = Item::Table(kin);
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+    fs::write(path, doc.to_string())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+
+    Ok(())
+}
+
 /// Configure MCP for Codex CLI.
+///
+/// Codex reads MCP servers from `~/.codex/config.toml` (`[mcp_servers.<name>]`
+/// tables with `command`/`args`/`env`), not from an `mcp.json` file.
 fn configure_codex() -> Result<PathBuf> {
     let home = home_dir()?;
-    // Codex uses ~/.codex/mcp.json
-    let target = home.join(".codex").join("mcp.json");
-    merge_mcp_config(&target)?;
+    let target = home.join(".codex").join("config.toml");
+    merge_mcp_config_toml(&target)?;
     Ok(target)
 }
 
@@ -978,6 +1052,9 @@ fn inject_discovery_reminder(path: &PathBuf) -> Result<()> {
 }
 
 /// Check if a given MCP config file already has the "kin" server entry.
+///
+/// Understands both JSON configs (`mcpServers.kin`) and TOML configs such as
+/// Codex's `config.toml` (`mcp_servers.kin`).
 fn has_kin_mcp_config(path: &PathBuf) -> bool {
     if !path.exists() {
         return false;
@@ -985,6 +1062,12 @@ fn has_kin_mcp_config(path: &PathBuf) -> bool {
     let Ok(content) = fs::read_to_string(path) else {
         return false;
     };
+    if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+        let Ok(root) = toml::from_str::<toml::Value>(&content) else {
+            return false;
+        };
+        return root.get("mcp_servers").and_then(|s| s.get("kin")).is_some();
+    }
     let Ok(root) = serde_json::from_str::<serde_json::Value>(&content) else {
         return false;
     };
@@ -1119,7 +1202,16 @@ pub(crate) fn reinstall_vfs_shim() -> Result<Option<PathBuf>> {
 pub(crate) fn remerge_existing_mcp_configs() -> Vec<PathBuf> {
     let mut repaired = Vec::new();
     for (_id, _label, path) in crate::commands::health::mcp_client_config_paths() {
-        if path.exists() && merge_mcp_config(&path).is_ok() {
+        if !path.exists() {
+            continue;
+        }
+        // Codex's config.toml is TOML; every other client config is JSON.
+        let merged = if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+            merge_mcp_config_toml(&path)
+        } else {
+            merge_mcp_config(&path)
+        };
+        if merged.is_ok() {
             repaired.push(path);
         }
     }
@@ -1502,9 +1594,18 @@ fn client_id_for_index(idx: usize) -> &'static str {
     }
 }
 
-/// Read the `mcpServers.kin` sub-value from a client config, if present.
+/// Read the kin MCP server sub-value from a client config, if present.
+///
+/// Handles both JSON configs (`mcpServers.kin`) and TOML configs such as
+/// Codex's `config.toml` (`mcp_servers.kin`), normalizing the entry to JSON
+/// for the install ledger.
 fn read_kin_mcp_entry(path: &Path) -> Option<serde_json::Value> {
     let content = fs::read_to_string(path).ok()?;
+    if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+        let root: toml::Value = toml::from_str(&content).ok()?;
+        let entry = root.get("mcp_servers")?.get("kin")?;
+        return serde_json::to_value(entry).ok();
+    }
     let root: serde_json::Value = serde_json::from_str(&content).ok()?;
     root.get("mcpServers")?.get("kin").cloned()
 }
@@ -1638,7 +1739,7 @@ fn mcp_config_path_for_index(idx: usize) -> Option<PathBuf> {
             })
         }
         IDX_CURSOR => Some(home.join(".cursor").join("mcp.json")),
-        IDX_CODEX => Some(home.join(".codex").join("mcp.json")),
+        IDX_CODEX => Some(home.join(".codex").join("config.toml")),
         IDX_GEMINI => Some(home.join(".gemini").join("settings.json")),
         IDX_WINDSURF => Some(
             home.join(".codeium")
@@ -2375,6 +2476,103 @@ mod tests {
         assert!(
             val["mcpServers"]["kin"].is_object(),
             "kin entry must be added"
+        );
+    }
+
+    #[test]
+    fn merge_mcp_config_toml_refuses_to_overwrite_corrupt_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, b"this is not toml [[[").unwrap();
+
+        let original = std::fs::read(&path).unwrap();
+        let err = merge_mcp_config_toml(&path).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("not valid TOML"),
+            "expected 'not valid TOML' in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("refusing to overwrite"),
+            "expected 'refusing to overwrite' in error, got: {msg}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "corrupt file must not be modified"
+        );
+    }
+
+    #[test]
+    fn merge_mcp_config_toml_preserves_existing_codex_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# user settings\nmodel = \"o3\"\n\n[mcp_servers.other]\ncommand = \"other-server\"\n",
+        )
+        .unwrap();
+
+        merge_mcp_config_toml(&path).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let root: toml::Value = toml::from_str(&content).unwrap();
+        assert_eq!(
+            root.get("model").and_then(|v| v.as_str()),
+            Some("o3"),
+            "unrelated keys must be preserved"
+        );
+        assert!(
+            content.contains("# user settings"),
+            "comments must be preserved"
+        );
+        assert_eq!(
+            root["mcp_servers"]["other"]["command"].as_str(),
+            Some("other-server"),
+            "other MCP servers must be preserved"
+        );
+        let kin = &root["mcp_servers"]["kin"];
+        assert!(kin.get("command").is_some(), "kin entry must be added");
+        assert_eq!(
+            kin["args"].as_array().map(|a| a.len()),
+            Some(2),
+            "kin args must be [mcp, start]"
+        );
+        assert_eq!(
+            kin["env"]["KIN_MCP_TOOL_PROFILE"].as_str(),
+            Some("agent-default"),
+            "agent-default profile must be set"
+        );
+    }
+
+    #[test]
+    fn merge_mcp_config_toml_creates_missing_file_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".codex").join("config.toml");
+
+        merge_mcp_config_toml(&path).unwrap();
+        merge_mcp_config_toml(&path).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let root: toml::Value = toml::from_str(&content).unwrap();
+        assert!(
+            root["mcp_servers"]["kin"].get("command").is_some(),
+            "kin entry must exist"
+        );
+        assert_eq!(
+            content.matches("[mcp_servers.kin]").count(),
+            1,
+            "re-running must not duplicate the kin table"
+        );
+        assert!(
+            has_kin_mcp_config(&path),
+            "TOML-aware config check must see the entry"
+        );
+        let ledger_entry = read_kin_mcp_entry(&path).expect("ledger read must parse TOML");
+        assert_eq!(
+            ledger_entry["env"]["KIN_MCP_TOOL_PROFILE"], "agent-default",
+            "ledger entry must normalize the TOML entry to JSON"
         );
     }
 }

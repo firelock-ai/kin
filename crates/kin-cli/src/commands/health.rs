@@ -596,7 +596,12 @@ pub(crate) fn mcp_client_config_paths() -> Vec<(&'static str, &'static str, Path
             },
         ),
         ("cursor", "Cursor", home.join(".cursor").join("mcp.json")),
-        ("codex", "Codex CLI", home.join(".codex").join("mcp.json")),
+        (
+            "codex",
+            "Codex CLI",
+            // Codex reads MCP servers from config.toml, not an mcp.json.
+            home.join(".codex").join("config.toml"),
+        ),
         (
             "gemini",
             "Gemini CLI",
@@ -614,6 +619,10 @@ pub(crate) fn mcp_client_config_paths() -> Vec<(&'static str, &'static str, Path
 
 /// Inspect a single MCP config file for a `kin` server entry carrying the
 /// agent-default tool profile.
+///
+/// Handles both JSON configs (`mcpServers.kin`) and TOML configs such as
+/// Codex's `~/.codex/config.toml` (`mcp_servers.kin`); TOML is normalized to
+/// JSON so the same checks apply.
 pub(crate) fn evaluate_mcp_client(path: &PathBuf) -> (HealthStatus, String) {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
@@ -624,20 +633,36 @@ pub(crate) fn evaluate_mcp_client(path: &PathBuf) -> (HealthStatus, String) {
             )
         }
     };
-    let root: Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(e) => {
-            return (
-                HealthStatus::Misconfigured,
-                format!("{} is not valid JSON: {e}", path.display()),
-            )
+    let is_toml = path.extension().and_then(|e| e.to_str()) == Some("toml");
+    let (root, servers_key): (Value, &str) = if is_toml {
+        match toml::from_str::<toml::Value>(&content)
+            .ok()
+            .and_then(|v| serde_json::to_value(v).ok())
+        {
+            Some(v) => (v, "mcp_servers"),
+            None => {
+                return (
+                    HealthStatus::Misconfigured,
+                    format!("{} is not valid TOML", path.display()),
+                )
+            }
+        }
+    } else {
+        match serde_json::from_str(&content) {
+            Ok(v) => (v, "mcpServers"),
+            Err(e) => {
+                return (
+                    HealthStatus::Misconfigured,
+                    format!("{} is not valid JSON: {e}", path.display()),
+                )
+            }
         }
     };
-    let kin_entry = root.get("mcpServers").and_then(|s| s.get("kin"));
+    let kin_entry = root.get(servers_key).and_then(|s| s.get("kin"));
     match kin_entry {
         None => (
             HealthStatus::Missing,
-            format!("no mcpServers.kin entry in {}", path.display()),
+            format!("no {servers_key}.kin entry in {}", path.display()),
         ),
         Some(entry) => {
             // Entries written by older releases pass `--global`, which the MCP
@@ -650,7 +675,7 @@ pub(crate) fn evaluate_mcp_client(path: &PathBuf) -> (HealthStatus, String) {
                 return (
                     HealthStatus::Misconfigured,
                     format!(
-                        "mcpServers.kin uses the retired `--global` mode and cannot start in {}",
+                        "{servers_key}.kin uses the retired `--global` mode and cannot start in {}",
                         path.display()
                     ),
                 );
@@ -663,7 +688,7 @@ pub(crate) fn evaluate_mcp_client(path: &PathBuf) -> (HealthStatus, String) {
                 (
                     HealthStatus::Healthy,
                     format!(
-                        "mcpServers.kin present with agent-default profile ({})",
+                        "{servers_key}.kin present with agent-default profile ({})",
                         path.display()
                     ),
                 )
@@ -671,7 +696,7 @@ pub(crate) fn evaluate_mcp_client(path: &PathBuf) -> (HealthStatus, String) {
                 (
                     HealthStatus::Misconfigured,
                     format!(
-                        "mcpServers.kin present but KIN_MCP_TOOL_PROFILE is {} (expected agent-default) in {}",
+                        "{servers_key}.kin present but KIN_MCP_TOOL_PROFILE is {} (expected agent-default) in {}",
                         profile.unwrap_or("unset"),
                         path.display()
                     ),
@@ -1228,6 +1253,33 @@ mod tests {
         let path = dir.path().join("does-not-exist.json");
         let (status, _detail) = evaluate_mcp_client(&path);
         assert!(matches!(status, HealthStatus::Missing));
+    }
+
+    #[test]
+    fn mcp_config_toml_with_agent_default_profile_is_healthy() {
+        // Codex registers MCP servers in ~/.codex/config.toml, not mcp.json.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[mcp_servers.kin]\ncommand = \"kin\"\nargs = [\"mcp\", \"start\"]\nenv = { KIN_MCP_TOOL_PROFILE = \"agent-default\" }\n",
+        )
+        .unwrap();
+
+        let (status, detail) = evaluate_mcp_client(&path);
+        assert!(matches!(status, HealthStatus::Healthy), "got: {detail}");
+        assert!(detail.contains("mcp_servers.kin"));
+    }
+
+    #[test]
+    fn mcp_config_toml_without_kin_entry_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "model = \"o3\"\n").unwrap();
+
+        let (status, detail) = evaluate_mcp_client(&path);
+        assert!(matches!(status, HealthStatus::Missing), "got: {detail}");
+        assert!(detail.contains("mcp_servers.kin"));
     }
 
     #[test]

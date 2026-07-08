@@ -1038,7 +1038,8 @@ pub fn generate_config_snippets(kind: AssistantKind) -> Vec<ConfigSnippet> {
                 .into(),
             content: r#"[mcp_servers.kin]
 command = "kin"
-args = ["mcp", "start"]"#
+args = ["mcp", "start"]
+env = { KIN_MCP_TOOL_PROFILE = "agent-default" }"#
                 .into(),
             target_path: "~/.codex/config.toml".into(),
         }],
