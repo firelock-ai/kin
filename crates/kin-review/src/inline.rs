@@ -1616,6 +1616,7 @@ mod tests {
                     consumer_files: vec!["src/x.rs".to_string(), "src/y.rs".to_string()],
                     covering_tests: 1,
                     consumers_migrated_in_diff: 0,
+                    call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
                 },
                 EntityImpact {
                     entity_id: b_new.id,
@@ -1625,6 +1626,7 @@ mod tests {
                     consumer_files: vec!["src/x.rs".to_string(), "src/y.rs".to_string()],
                     covering_tests: 1,
                     consumers_migrated_in_diff: 0,
+                    call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
                 },
             ],
             ..Default::default()
@@ -1694,6 +1696,7 @@ mod tests {
                 consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
                 covering_tests: 1,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         }

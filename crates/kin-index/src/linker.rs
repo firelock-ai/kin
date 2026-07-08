@@ -601,12 +601,7 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
         ) {
             ImportPinnedTarget::Resolved(dst_id) => {
                 if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                    resolved.push(make_relation(
-                        rel,
-                        src_id,
-                        dst_id,
-                        IMPORT_PINNED_CONFIDENCE,
-                    ));
+                    resolved.push(make_relation(rel, src_id, dst_id, IMPORT_PINNED_CONFIDENCE));
                 }
                 continue;
             }
@@ -2156,7 +2151,12 @@ const LOCALITY_DISAMBIGUATED_CONFIDENCE: f32 = 0.8;
 /// Using a stable ID ensures the same logical relation (A calls B) gets the
 /// same RelationId across commits, preventing duplicate rows when the MERGE
 /// query matches on `{rel_id: $rel_id}`.
-fn make_relation(rel: &ExtractedRelation, src: EntityId, dst: EntityId, confidence: f32) -> Relation {
+fn make_relation(
+    rel: &ExtractedRelation,
+    src: EntityId,
+    dst: EntityId,
+    confidence: f32,
+) -> Relation {
     let kind = rel.kind;
     let origin = if confidence >= 1.0 {
         RelationOrigin::Parsed
@@ -3313,12 +3313,7 @@ fn resolve_one_file_incremental(
         ) {
             ImportPinnedTarget::Resolved(dst_id) => {
                 if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                    resolved.push(make_relation(
-                        rel,
-                        src_id,
-                        dst_id,
-                        IMPORT_PINNED_CONFIDENCE,
-                    ));
+                    resolved.push(make_relation(rel, src_id, dst_id, IMPORT_PINNED_CONFIDENCE));
                 }
                 continue;
             }
