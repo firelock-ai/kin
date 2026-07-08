@@ -161,6 +161,7 @@ fn extract_rust_node(
                 // Emit Implements relations for #[derive(...)] traits.
                 for trait_name in extract_derive_traits(node, source) {
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: kin_model::RelationKind::Implements,
                         src_name: name.clone(),
                         dst_name: trait_name,
@@ -185,6 +186,7 @@ fn extract_rust_node(
                 // Emit Implements relations for #[derive(...)] traits.
                 for trait_name in extract_derive_traits(node, source) {
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: kin_model::RelationKind::Implements,
                         src_name: enum_name.clone(),
                         dst_name: trait_name,
@@ -211,6 +213,7 @@ fn extract_rust_node(
                                     span: span_from_node(&variant, file_id),
                                 });
                                 relations.push(ExtractedRelation {
+                                    call_shape: None,
                                     kind: kin_model::RelationKind::Contains,
                                     src_name: enum_name.clone(),
                                     dst_name: qualified,
@@ -293,6 +296,7 @@ fn extract_rust_node(
             if let Some(ref trait_n) = trait_name {
                 if !trait_n.is_empty() && !type_name.is_empty() {
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: kin_model::RelationKind::Implements,
                         src_name: type_name.clone(),
                         dst_name: trait_n.clone(),
@@ -324,6 +328,7 @@ fn extract_rust_node(
                             extract_calls_from_context(&member, source, &qualified, relations);
                             if !type_name.is_empty() {
                                 relations.push(ExtractedRelation {
+                                    call_shape: None,
                                     kind: kin_model::RelationKind::Contains,
                                     src_name: type_name.clone(),
                                     dst_name: qualified,
@@ -533,6 +538,7 @@ fn extract_calls_from_context(
                 };
                 if is_valid_callee_name(&callee_name) {
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
                         dst_name: callee_name,
@@ -620,6 +626,7 @@ fn extract_calls_from_token_tree(
         }
         if is_valid_callee_name(&callee_name) {
             relations.push(ExtractedRelation {
+                call_shape: None,
                 kind: kin_model::RelationKind::Calls,
                 src_name: context_name.to_string(),
                 dst_name: callee_name,

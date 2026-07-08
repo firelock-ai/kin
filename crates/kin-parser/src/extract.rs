@@ -129,6 +129,25 @@ fn take_char_range(text: &str, start: usize, end: usize) -> String {
         .collect()
 }
 
+/// The argument shape written at a call site, letting the linker bind an
+/// overloaded callee by how it is called. Shared across language adapters: C++
+/// records positional arity; Python-style adapters additionally record keyword
+/// and splat shape. This is the canonical type for the parser -> linker seam; a
+/// mirror is materialized at the storage boundary when a call edge is persisted.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CallArgShape {
+    /// Positional arguments at the call site (`f(a, b)` -> 2).
+    pub positional: u32,
+    /// Named-argument names used at the call site, sorted and deduped at
+    /// construction. Always empty for C++ (no keyword arguments).
+    pub keywords: Vec<String>,
+    /// A positional pack/splat expansion is present (C++ `args...`, Python
+    /// `*args`), so the positional count is a lower bound, not exact.
+    pub has_var_positional: bool,
+    /// A keyword splat is present (Python `**kwargs`); always false for C++.
+    pub has_var_keyword: bool,
+}
+
 /// Raw extracted relation between two named entities.
 #[derive(Debug, Clone)]
 pub struct ExtractedRelation {
@@ -139,6 +158,12 @@ pub struct ExtractedRelation {
     /// e.g., `Some("requests")` for `from requests import get`,
     ///        `Some("kin_db")` for `use kin_db::InMemoryGraph`
     pub import_source: Option<String>,
+    /// For a `Calls` edge, the call site's argument shape when the adapter
+    /// records it. `None` means the adapter does not track it, so the linker
+    /// binds shape-blind as before. Lets the linker keep an overloaded callee's
+    /// argument-incompatible candidates out of the call's binding set instead of
+    /// fanning out to every same-named overload.
+    pub call_shape: Option<CallArgShape>,
 }
 
 /// A single import declaration from source code.

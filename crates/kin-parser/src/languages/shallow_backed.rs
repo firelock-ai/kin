@@ -147,6 +147,7 @@ fn extract_csharp_node(
                 });
                 if let Some(parent) = namespace_ctx {
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: kin_model::RelationKind::Contains,
                         src_name: parent.to_string(),
                         dst_name: full_name.clone(),
@@ -196,6 +197,7 @@ fn extract_csharp_node(
                 });
                 if let Some(parent) = namespace_ctx.or(type_ctx) {
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: kin_model::RelationKind::Contains,
                         src_name: parent.to_string(),
                         dst_name: full_name.clone(),
@@ -211,6 +213,7 @@ fn extract_csharp_node(
                 ) {
                     for base in extract_csharp_base_types(node, source) {
                         relations.push(ExtractedRelation {
+                            call_shape: None,
                             kind: kin_model::RelationKind::Extends,
                             src_name: full_name.clone(),
                             dst_name: base,
@@ -250,6 +253,7 @@ fn extract_csharp_node(
                         span: span_from_node(node, file_id),
                     });
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: kin_model::RelationKind::Contains,
                         src_name: owner.to_string(),
                         dst_name: full_name.clone(),
@@ -273,6 +277,7 @@ fn extract_csharp_node(
                         span: span_from_node(node, file_id),
                     });
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: kin_model::RelationKind::Contains,
                         src_name: owner.to_string(),
                         dst_name: full_name,
@@ -295,6 +300,7 @@ fn extract_csharp_node(
                         span: span_from_node(node, file_id),
                     });
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: kin_model::RelationKind::Contains,
                         src_name: owner.to_string(),
                         dst_name: full_name,
@@ -317,6 +323,7 @@ fn extract_csharp_node(
                         span: span_from_node(node, file_id),
                     });
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: kin_model::RelationKind::Contains,
                         src_name: owner.to_string(),
                         dst_name: full_name,
@@ -424,6 +431,7 @@ fn extract_csharp_calls(
                 };
                 if !callee.is_empty() {
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
                         dst_name: callee,
@@ -436,6 +444,7 @@ fn extract_csharp_calls(
                 let target = normalize_scoped_name(text_of(&ty, source).trim());
                 if !target.is_empty() {
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: kin_model::RelationKind::References,
                         src_name: context_name.to_string(),
                         dst_name: target,
@@ -551,6 +560,7 @@ fn extract_ruby_node(
                 });
                 if let Some(parent) = container_ctx {
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: kin_model::RelationKind::Contains,
                         src_name: parent.to_string(),
                         dst_name: full_name.clone(),
@@ -562,6 +572,7 @@ fn extract_ruby_node(
                         let base_name = normalize_ruby_name(text_of(&superclass, source).trim());
                         if !base_name.is_empty() {
                             relations.push(ExtractedRelation {
+                                call_shape: None,
                                 kind: kin_model::RelationKind::Extends,
                                 src_name: full_name.clone(),
                                 dst_name: base_name,
@@ -615,6 +626,7 @@ fn extract_ruby_node(
                 });
                 if let Some(owner_name) = owner {
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: kin_model::RelationKind::Contains,
                         src_name: owner_name,
                         dst_name: full_name.clone(),
@@ -652,6 +664,7 @@ fn extract_ruby_node(
                     });
                     if let Some(owner) = container_ctx {
                         relations.push(ExtractedRelation {
+                            call_shape: None,
                             kind: kin_model::RelationKind::Contains,
                             src_name: owner.to_string(),
                             dst_name: full_name,
@@ -676,6 +689,7 @@ fn extract_ruby_node(
                     if let Some(target) = extract_ruby_first_argument(node, source) {
                         if let Some(owner) = container_ctx {
                             relations.push(ExtractedRelation {
+                                call_shape: None,
                                 kind: kin_model::RelationKind::References,
                                 src_name: owner.to_string(),
                                 dst_name: normalize_ruby_name(target.trim()),
@@ -685,6 +699,7 @@ fn extract_ruby_node(
                     }
                 } else if let Some(current_callable) = callable_ctx {
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: kin_model::RelationKind::Calls,
                         src_name: current_callable.to_string(),
                         dst_name: normalize_ruby_name(&method_name),

@@ -40,7 +40,7 @@ pub mod todos;
 pub use adapter::{EditHint, LanguageAdapter};
 pub use error::{ParseError, Result};
 pub use extract::{
-    attach_file_context_metadata, ExtractedEntity, ExtractedRelation, ExtractedTest,
+    attach_file_context_metadata, CallArgShape, ExtractedEntity, ExtractedRelation, ExtractedTest,
     ExtractedTestKind, FileImport, ImportedName, ParseOutput, COMMAND_EFFECT_CONTRACT_KEY,
     FILE_IMPORT_CONTEXT_KEY, FILE_SURFACE_CONTEXT_KEY,
 };

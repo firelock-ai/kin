@@ -138,6 +138,7 @@ fn link_cross_file_calls_after_indexing() {
                 .unresolved_relations
                 .iter()
                 .map(|u| ExtractedRelation {
+                    call_shape: None,
                     kind: u.kind,
                     src_name: main_idx
                         .entities
@@ -311,6 +312,7 @@ export function divide(a: number, b: number): number {
                 .unresolved_relations
                 .iter()
                 .map(|u| ExtractedRelation {
+                    call_shape: None,
                     kind: u.kind,
                     src_name: idx
                         .entities

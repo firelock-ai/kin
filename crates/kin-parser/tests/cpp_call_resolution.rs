@@ -11,7 +11,7 @@
 //! names no name index could match.
 
 use kin_model::{FilePathId, RelationKind};
-use kin_parser::{CppAdapter, ExtractedRelation, LanguageAdapter};
+use kin_parser::{CallArgShape, CppAdapter, ExtractedRelation, LanguageAdapter};
 
 fn parse_and_extract(source: &str) -> Vec<ExtractedRelation> {
     let adapter = CppAdapter;
@@ -247,4 +247,87 @@ namespace Catch {
         calls.contains(&"Catch::helper"),
         "explicit `Catch::helper()` must keep its qualified callee, got: {calls:?}"
     );
+}
+
+/// The call shape of the one call named `name`; panics if the callee was emitted
+/// zero or multiple times so a test never reads a stale duplicate.
+fn call_shape_of<'a>(rels: &'a [ExtractedRelation], name: &str) -> &'a CallArgShape {
+    let matches = calls_named(rels, name);
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected exactly one `{name}` call, got {}",
+        matches.len()
+    );
+    matches[0]
+        .call_shape
+        .as_ref()
+        .unwrap_or_else(|| panic!("`{name}` call recorded no call shape"))
+}
+
+fn call_arg_count(rels: &[ExtractedRelation], name: &str) -> u32 {
+    call_shape_of(rels, name).positional
+}
+
+#[test]
+fn call_site_records_positional_argument_count() {
+    // The extractor must record each call's positional argument count so the
+    // linker can keep an overloaded callee's arity-incompatible overloads out of
+    // the binding set. Counts come from the argument list, so a nested call is
+    // counted by its own arguments, not folded into the outer call's.
+    let source = r#"
+void driver() {
+    two_args( a, b );
+    zero_args();
+    one_arg( x );
+    outer( inner( p ), q );
+}
+"#;
+    let rels = parse_and_extract(source);
+    assert_eq!(call_arg_count(&rels, "two_args"), 2);
+    assert_eq!(call_arg_count(&rels, "zero_args"), 0);
+    assert_eq!(call_arg_count(&rels, "one_arg"), 1);
+    // `outer(inner(p), q)`: two arguments to outer, one to the nested inner.
+    assert_eq!(call_arg_count(&rels, "outer"), 2);
+    assert_eq!(call_arg_count(&rels, "inner"), 1);
+    // No keyword args and no splats in plain C++ calls.
+    let two = call_shape_of(&rels, "two_args");
+    assert!(two.keywords.is_empty() && !two.has_var_positional && !two.has_var_keyword);
+}
+
+#[test]
+fn call_arg_count_is_not_inflated_by_callee_template_arguments() {
+    // A template-instantiated callee carries a comma-bearing `<...>` list. That
+    // list is part of the callee, not the call's arguments, so it must not lift
+    // the recorded argument count.
+    let source = r#"
+void driver() {
+    make< int, long >( only );
+}
+"#;
+    let rels = parse_and_extract(source);
+    assert_eq!(
+        call_arg_count(&rels, "make"),
+        1,
+        "callee template args (`<int, long>`) are not call arguments"
+    );
+}
+
+#[test]
+fn pack_expansion_argument_marks_shape_var_positional() {
+    // A forwarding call spreads a parameter pack (`args...`). The positional
+    // count is then a lower bound, so the shape must flag `has_var_positional`
+    // and the linker treats the call as arity-unknown (prunes no overload).
+    let source = r#"
+void driver() {
+    forward( first, rest... );
+}
+"#;
+    let rels = parse_and_extract(source);
+    let shape = call_shape_of(&rels, "forward");
+    assert!(
+        shape.has_var_positional,
+        "a `rest...` pack-expansion argument must set has_var_positional"
+    );
+    assert!(!shape.has_var_keyword, "C++ has no keyword splats");
 }

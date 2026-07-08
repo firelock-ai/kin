@@ -256,6 +256,7 @@ fn extract_swift_node(
 
                 if let Some(cls) = class_ctx {
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: kin_model::RelationKind::Contains,
                         src_name: cls.to_string(),
                         dst_name: qualified.clone(),
@@ -285,6 +286,7 @@ fn extract_swift_node(
 
             if let Some(cls) = class_ctx {
                 relations.push(ExtractedRelation {
+                    call_shape: None,
                     kind: kin_model::RelationKind::Contains,
                     src_name: cls.to_string(),
                     dst_name: init_name.clone(),
@@ -308,6 +310,7 @@ fn extract_swift_node(
                 });
 
                 relations.push(ExtractedRelation {
+                    call_shape: None,
                     kind: kin_model::RelationKind::Contains,
                     src_name: cls.to_string(),
                     dst_name: deinit_name,
@@ -347,6 +350,7 @@ fn extract_swift_node(
 
                 if let Some(cls) = class_ctx {
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: kin_model::RelationKind::Contains,
                         src_name: cls.to_string(),
                         dst_name: qualified,
@@ -393,6 +397,7 @@ fn extract_swift_node(
 
                     if let Some(cls) = class_ctx {
                         relations.push(ExtractedRelation {
+                            call_shape: None,
                             kind: kin_model::RelationKind::Contains,
                             src_name: cls.to_string(),
                             dst_name: qualified,
@@ -502,6 +507,7 @@ fn extract_type_names_from_inheritance(
                 // we emit Implements (protocol conformance) for all, which is the
                 // safer assumption.
                 relations.push(ExtractedRelation {
+                    call_shape: None,
                     kind: kin_model::RelationKind::Implements,
                     src_name: type_name.to_string(),
                     dst_name: parent_name,
@@ -589,6 +595,7 @@ fn extract_calls_from_body(
             if let Some(callee) = extract_callee_name(&child, source) {
                 if !callee.is_empty() {
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
                         dst_name: callee,

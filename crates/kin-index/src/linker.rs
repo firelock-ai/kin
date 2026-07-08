@@ -11,10 +11,10 @@ use tracing::debug;
 use sha2::{Digest, Sha256};
 
 use kin_model::{
-    ArtifactId, Entity, EntityId, EntityKind, GraphNodeId, Relation, RelationEvidence, RelationId,
-    RelationKind, RelationOrigin, Visibility,
+    ArtifactId, Entity, EntityId, EntityKind, GraphNodeId, LanguageId, Relation, RelationEvidence,
+    RelationId, RelationKind, RelationOrigin, Visibility,
 };
-use kin_parser::{ExtractedRelation, FileImport};
+use kin_parser::{CallArgShape, ExtractedRelation, FileImport};
 
 /// Result of resolving a single unresolved relation.
 #[derive(Debug)]
@@ -233,6 +233,12 @@ struct LinkContext<'a> {
     entity_by_name: HashMap<&'a str, Vec<(&'a str, EntityId)>>,
     entity_by_bare_name: HashMap<&'a str, Vec<(&'a str, EntityId)>>,
     entity_kind_by_id: HashMap<EntityId, EntityKind>,
+    /// C/C++ callee id -> the argument-count bounds parsed from its signature.
+    /// Absent for a callee whose language does not carry call arity or whose
+    /// parameter list could not be read, so the linker prunes an overloaded
+    /// callee's arity-incompatible candidates without ever pruning on missing
+    /// evidence.
+    entity_arity_by_id: HashMap<EntityId, ArityBounds>,
     entity_count_by_file: HashMap<&'a str, usize>,
     known_files: HashSet<&'a str>,
     import_map: HashMap<&'a str, HashMap<&'a str, (&'a str, &'a str)>>,
@@ -261,6 +267,7 @@ fn build_link_context<'a>(
         entity_by_name,
         entity_by_bare_name,
         entity_kind_by_id,
+        entity_arity_by_id,
         entity_count_by_file,
         known_files,
     ) = {
@@ -273,6 +280,7 @@ fn build_link_context<'a>(
         let mut entity_by_name: HashMap<&str, Vec<(&str, EntityId)>> = HashMap::new();
         let mut entity_by_bare_name: HashMap<&str, Vec<(&str, EntityId)>> = HashMap::new();
         let mut entity_kind_by_id: HashMap<EntityId, EntityKind> = HashMap::new();
+        let mut entity_arity_by_id: HashMap<EntityId, ArityBounds> = HashMap::new();
         let mut entity_count_by_file: HashMap<&str, usize> = HashMap::new();
         let mut known_files: HashSet<&str> = HashSet::new();
 
@@ -296,6 +304,10 @@ fn build_link_context<'a>(
                     .or_default()
                     .push((file_path, entity.id));
             }
+
+            if let Some(bounds) = callee_arity_bounds(entity) {
+                entity_arity_by_id.insert(entity.id, bounds);
+            }
         }
 
         for file in files {
@@ -307,6 +319,7 @@ fn build_link_context<'a>(
             entity_by_name,
             entity_by_bare_name,
             entity_kind_by_id,
+            entity_arity_by_id,
             entity_count_by_file,
             known_files,
         )
@@ -367,6 +380,7 @@ fn build_link_context<'a>(
         entity_by_name,
         entity_by_bare_name,
         entity_kind_by_id,
+        entity_arity_by_id,
         entity_count_by_file,
         known_files,
         import_map,
@@ -406,6 +420,11 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                 continue;
             }
         };
+
+        // Positional arity the call's overloads are pruned by, `None` when the
+        // shape is absent or splat-widened (fail-open). Resolved once per
+        // relation and threaded through every same-name fan-out tier below.
+        let call_arity = call_positional_arity(&rel.call_shape);
 
         if rel.kind == RelationKind::UsesMacro {
             if let Some(&dst_id) = dst_same_file {
@@ -457,6 +476,8 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                 file.file_path.as_str(),
                 &mut cross_file_twins,
             );
+            let cross_file_twins =
+                prune_ids_by_arity(cross_file_twins, call_arity, &ctx.entity_arity_by_id);
             if !cross_file_twins.is_empty() && cross_file_twins.len() < AMBIGUOUS_CALL_FANOUT_CAP {
                 for cross_id in sorted_fanout_targets(cross_file_twins) {
                     if add_deduped(&mut seen, src_id, cross_id, rel.kind) {
@@ -605,6 +626,14 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
 
         let mut linked = false;
 
+        // Arity gate for the exact-name fallbacks below: an overloaded C/C++
+        // callee recorded its call-site argument count, so drop the same-name
+        // candidates whose parameter count cannot accept it before (c) picks a
+        // target or (c2) fans out. Fail-open and a no-op for callees without
+        // recorded arity, so non-overloaded and non-C/C++ binding is unchanged.
+        let other_file_candidates =
+            prune_pairs_by_arity(other_file_candidates, call_arity, &ctx.entity_arity_by_id);
+
         if name_fallback_allowed && !other_file_candidates.is_empty() {
             let distinct_ids: HashSet<EntityId> =
                 other_file_candidates.iter().map(|&(_, id)| id).collect();
@@ -651,6 +680,8 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                     distinct_targets.insert(dst_id);
                 }
             }
+            let distinct_targets =
+                prune_ids_by_arity(distinct_targets, call_arity, &ctx.entity_arity_by_id);
             if (1..=AMBIGUOUS_CALL_FANOUT_CAP).contains(&distinct_targets.len()) {
                 for dst_id in sorted_fanout_targets(distinct_targets) {
                     if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
@@ -703,10 +734,15 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
             && matches!(rel.kind, RelationKind::Calls | RelationKind::References)
         {
             // Fan out: an ambiguous qualified leaf resolves to every distinct
-            // cross-file target (overloads / amalgamated copies), not just one.
-            for dst_id in
-                resolve_qualified_suffix(rel.dst_name.as_str(), file.file_path.as_str(), ctx)
-            {
+            // cross-file target (overloads / amalgamated copies), not just one —
+            // arity-pruned so an overloaded callee (`Catch::Main`) drops the
+            // overloads the call site's argument count cannot reach.
+            for dst_id in resolve_qualified_suffix(
+                rel.dst_name.as_str(),
+                file.file_path.as_str(),
+                call_arity,
+                ctx,
+            ) {
                 if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
                     resolved.push(make_relation(
                         rel.kind,
@@ -1200,6 +1236,256 @@ fn sorted_fanout_targets(targets: HashSet<EntityId>) -> Vec<EntityId> {
     ids
 }
 
+/// Argument-count bounds a callee accepts, read from its signature: `min`
+/// required parameters (those without a default), `max` declared parameters,
+/// and whether a trailing C variadic (`...`) or parameter pack lets it accept
+/// unboundedly many. A call of `n` positional arguments is arity-compatible
+/// with the callee iff `min <= n && (variadic || n <= max)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArityBounds {
+    min: usize,
+    max: usize,
+    variadic: bool,
+}
+
+impl ArityBounds {
+    fn accepts(&self, args: usize) -> bool {
+        args >= self.min && (self.variadic || args <= self.max)
+    }
+}
+
+/// The argument-count bounds of an entity that can be a call target, or `None`
+/// when arity should not be inferred for it. Only C/C++ function and method
+/// entities qualify: their call sites are the ones that record arity (so only
+/// their candidates are ever pruned), and their signatures share one parameter
+/// grammar. Every other language yields `None`, leaving its callees arity-blind
+/// exactly as before.
+fn callee_arity_bounds(entity: &Entity) -> Option<ArityBounds> {
+    if !matches!(entity.language, LanguageId::Cpp | LanguageId::C) {
+        return None;
+    }
+    if !matches!(entity.kind, EntityKind::Function | EntityKind::Method) {
+        return None;
+    }
+    parse_signature_arity(&entity.signature)
+}
+
+/// Compute a C/C++ callee's [`ArityBounds`] from its stored signature, or `None`
+/// when the parameter list cannot be located (arity then stays unknown and the
+/// callee is never pruned). The signature is the declaration text with
+/// whitespace normalized (`declaration_signature`): the parameter list is its
+/// first top-level `(...)` group (an `operator()` name is skipped), split into
+/// parameters on top-level commas so nested templates/parens/braces never
+/// miscount. A `void`-only list is zero; a parameter carrying a top-level `=`
+/// is optional (counts toward `max`, not `min`); a `...` or parameter-pack
+/// parameter sets `variadic`.
+fn parse_signature_arity(signature: &str) -> Option<ArityBounds> {
+    let (open, close) = param_list_span(signature)?;
+    let inner = signature[open + 1..close].trim();
+    if inner.is_empty() || inner == "void" {
+        return Some(ArityBounds {
+            min: 0,
+            max: 0,
+            variadic: false,
+        });
+    }
+    let mut min = 0usize;
+    let mut max = 0usize;
+    let mut variadic = false;
+    for param in split_top_level_commas(inner) {
+        let param = param.trim();
+        if param.is_empty() {
+            continue;
+        }
+        // `...` (C varargs) is not a counted parameter; a parameter pack
+        // (`Args... args`) accepts zero or more, so it too adds no required
+        // argument. Either way the callee accepts unboundedly many.
+        if param == "..." || param.contains("...") {
+            variadic = true;
+            continue;
+        }
+        max += 1;
+        if !param_has_default(param) {
+            min += 1;
+        }
+    }
+    Some(ArityBounds { min, max, variadic })
+}
+
+/// Byte offsets of the `(` and matching `)` of a signature's parameter list:
+/// the first `(` at top level (outside a template `<...>`) whose name is not
+/// `operator`. Returns `None` for a signature with no such group.
+fn param_list_span(sig: &str) -> Option<(usize, usize)> {
+    let bytes = sig.as_bytes();
+    let mut angle: usize = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' => angle += 1,
+            b'>' => angle = angle.saturating_sub(1),
+            b'(' if angle == 0 => {
+                let close = matching_close_paren(bytes, i)?;
+                // `operator()`: the call-operator name, not the parameter list —
+                // skip it so the real parameter list after it is found.
+                if sig[..i].trim_end().ends_with("operator") {
+                    i = close + 1;
+                    continue;
+                }
+                return Some((i, close));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Byte index of the `)` matching the `(` at `open`, tracking nested parens.
+/// `None` when the parentheses are unbalanced.
+fn matching_close_paren(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Split a parameter list's inner text on commas at the top nesting level so a
+/// comma inside `<...>`, `(...)`, `[...]`, or `{...}` (template arguments,
+/// function-pointer parameters, array bounds, brace-init defaults) never splits
+/// one parameter into several.
+fn split_top_level_commas(inner: &str) -> Vec<&str> {
+    let bytes = inner.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'<' | b'(' | b'[' | b'{' => depth += 1,
+            b'>' | b')' | b']' | b'}' => depth = (depth - 1).max(0),
+            b',' if depth == 0 => {
+                parts.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&inner[start..]);
+    parts
+}
+
+/// Whether a single parameter carries a default value: a top-level `=` that is
+/// the assignment, not a `==`/`<=`/`>=`/`!=` fragment inside a default
+/// expression.
+fn param_has_default(param: &str) -> bool {
+    let bytes = param.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' | b'(' | b'[' | b'{' => depth += 1,
+            b'>' | b')' | b']' | b'}' => depth = (depth - 1).max(0),
+            b'=' if depth == 0 => {
+                let prev = bytes[..i].last().copied();
+                let next = bytes.get(i + 1).copied();
+                let is_comparison =
+                    matches!(prev, Some(b'<' | b'>' | b'!' | b'=')) || next == Some(b'=');
+                if !is_comparison {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Keep only the entity ids a call of `arg_count` positional arguments could
+/// bind to. A candidate stays when its arity is unknown (unparsed signature or
+/// a non-C/C++ callee — never pruned on missing evidence) or accepts the count;
+/// a candidate whose known arity rejects the count is dropped. `None`
+/// `arg_count` returns the set unchanged. Fail-open: if every candidate is
+/// known-incompatible the original set is returned, so an arity read prunes
+/// wrong overloads but never erases the edge outright.
+fn prune_ids_by_arity(
+    ids: HashSet<EntityId>,
+    arg_count: Option<usize>,
+    arity_by_id: &HashMap<EntityId, ArityBounds>,
+) -> HashSet<EntityId> {
+    let Some(args) = arg_count else {
+        return ids;
+    };
+    let kept: HashSet<EntityId> = ids
+        .iter()
+        .copied()
+        .filter(|id| arity_admits(arity_by_id.get(id), args))
+        .collect();
+    if kept.is_empty() {
+        ids
+    } else {
+        kept
+    }
+}
+
+/// `(file, id)` counterpart of [`prune_ids_by_arity`] for the exact-name
+/// candidate lists, with the same fail-open semantics.
+fn prune_pairs_by_arity<'a>(
+    pairs: Vec<(&'a str, EntityId)>,
+    arg_count: Option<usize>,
+    arity_by_id: &HashMap<EntityId, ArityBounds>,
+) -> Vec<(&'a str, EntityId)> {
+    let Some(args) = arg_count else {
+        return pairs;
+    };
+    let kept: Vec<(&str, EntityId)> = pairs
+        .iter()
+        .copied()
+        .filter(|(_, id)| arity_admits(arity_by_id.get(id), args))
+        .collect();
+    if kept.is_empty() {
+        pairs
+    } else {
+        kept
+    }
+}
+
+/// Whether a candidate with the given (possibly unknown) arity admits a call of
+/// `args` positional arguments. Unknown arity always admits — the linker never
+/// prunes a candidate whose parameter count it could not read.
+fn arity_admits(bounds: Option<&ArityBounds>, args: usize) -> bool {
+    match bounds {
+        Some(bounds) => bounds.accepts(args),
+        None => true,
+    }
+}
+
+/// The exact positional argument count to prune a call's overloads by, or `None`
+/// when arity is not pinnable. A recorded [`CallArgShape`] pins arity only when
+/// no pack/splat expansion widens it: a `*args`/`args...` positional splat or a
+/// `**kwargs` keyword splat makes the positional count a lower bound, so the
+/// call is treated as arity-unknown and no overload is pruned. `None` shape
+/// (adapter recorded nothing) is likewise unknown — fail-open on both.
+fn call_positional_arity(shape: &Option<CallArgShape>) -> Option<usize> {
+    match shape {
+        Some(shape) if !shape.has_var_positional && !shape.has_var_keyword => {
+            Some(shape.positional as usize)
+        }
+        _ => None,
+    }
+}
+
 /// Resolve a Rust-style path-qualified call/reference target to a unique local
 /// entity by matching the path's resolvable suffixes against the entity indices.
 ///
@@ -1225,6 +1511,7 @@ fn sorted_fanout_targets(targets: HashSet<EntityId>) -> Vec<EntityId> {
 fn resolve_qualified_suffix(
     dst_name: &str,
     current_file: &str,
+    arg_count: Option<usize>,
     ctx: &LinkContext<'_>,
 ) -> Vec<EntityId> {
     let segments: Vec<&str> = dst_name.split("::").collect();
@@ -1238,7 +1525,8 @@ fn resolve_qualified_suffix(
     // Tier 1: type-qualified suffix `Penult::last` against the full-name index.
     // Resolves a method reached through a module/crate prefix. If this pinned
     // suffix is itself ambiguous, stop — widening to the bare leaf would be less
-    // precise, not more.
+    // precise, not more. Arity pruning first can settle that ambiguity when the
+    // rival suffix targets are overloads the call's argument count separates.
     let type_qualified = format!("{}::{}", segments[segments.len() - 2], last);
     let mut tq_targets: HashSet<EntityId> = HashSet::new();
     distinct_cross_file_targets(
@@ -1246,6 +1534,7 @@ fn resolve_qualified_suffix(
         current_file,
         &mut tq_targets,
     );
+    let tq_targets = prune_ids_by_arity(tq_targets, arg_count, &ctx.entity_arity_by_id);
     match tq_targets.len() {
         1 => return tq_targets.into_iter().collect(),
         n if n > 1 => {
@@ -1275,6 +1564,7 @@ fn resolve_qualified_suffix(
         current_file,
         &mut leaf_targets,
     );
+    let leaf_targets = prune_ids_by_arity(leaf_targets, arg_count, &ctx.entity_arity_by_id);
     match leaf_targets.len() {
         0 => Vec::new(),
         n if n <= AMBIGUOUS_CALL_FANOUT_CAP => sorted_fanout_targets(leaf_targets),
@@ -1299,6 +1589,7 @@ fn resolve_qualified_suffix(
 fn resolve_qualified_suffix_incremental(
     dst_name: &str,
     current_file: &str,
+    arg_count: Option<usize>,
     linker: &IncrementalLinker,
 ) -> Vec<EntityId> {
     let segments: Vec<&str> = dst_name.split("::").collect();
@@ -1317,6 +1608,7 @@ fn resolve_qualified_suffix_incremental(
             }
         }
     }
+    let tq_targets = prune_ids_by_arity(tq_targets, arg_count, &linker.entity_arity_by_id);
     match tq_targets.len() {
         1 => return tq_targets.into_iter().collect(),
         n if n > 1 => {
@@ -1350,6 +1642,7 @@ fn resolve_qualified_suffix_incremental(
             }
         }
     }
+    let leaf_targets = prune_ids_by_arity(leaf_targets, arg_count, &linker.entity_arity_by_id);
     match leaf_targets.len() {
         0 => Vec::new(),
         n if n <= AMBIGUOUS_CALL_FANOUT_CAP => sorted_fanout_targets(leaf_targets),
@@ -2546,6 +2839,10 @@ pub struct IncrementalLinker {
     pub entity_by_bare_name: HashMap<String, Vec<(String, EntityId)>>,
     /// entity_id -> kind
     pub entity_kind_by_id: HashMap<EntityId, EntityKind>,
+    /// C/C++ callee id -> argument-count bounds parsed from its signature. The
+    /// incremental mirror of the batch linker's `entity_arity_by_id`; backs
+    /// overload arity pruning on the live-edit path.
+    pub entity_arity_by_id: HashMap<EntityId, ArityBounds>,
     /// Set of all known files
     pub known_files: HashSet<String>,
     /// file_path -> Vec<(EntityId, Visibility)>
@@ -2571,6 +2868,7 @@ impl IncrementalLinker {
             entity_by_name: HashMap::new(),
             entity_by_bare_name: HashMap::new(),
             entity_kind_by_id: HashMap::new(),
+            entity_arity_by_id: HashMap::new(),
             known_files: HashSet::new(),
             entities_by_file: HashMap::new(),
             include_targets_by_file: HashMap::new(),
@@ -2585,6 +2883,7 @@ impl IncrementalLinker {
         if let Some(file_entities) = self.entity_by_file_name.remove(file_path) {
             for (entity_name, entity_id) in file_entities {
                 self.entity_kind_by_id.remove(&entity_id);
+                self.entity_arity_by_id.remove(&entity_id);
                 if let Some(candidates) = self.entity_by_name.get_mut(&entity_name) {
                     candidates.retain(|(fp, _)| fp != file_path);
                     if candidates.is_empty() {
@@ -2655,6 +2954,9 @@ impl IncrementalLinker {
         for entity in entities {
             file_entities_map.insert(entity.name.clone(), entity.id);
             self.entity_kind_by_id.insert(entity.id, entity.kind);
+            if let Some(bounds) = callee_arity_bounds(entity) {
+                self.entity_arity_by_id.insert(entity.id, bounds);
+            }
 
             self.entity_by_name
                 .entry(entity.name.clone())
@@ -2809,6 +3111,11 @@ fn resolve_one_file_incremental(
             }
         };
 
+        // Positional arity the call's overloads are pruned by (fail-open on an
+        // absent or splat-widened shape) — the incremental mirror of the batch
+        // linker's per-relation derivation.
+        let call_arity = call_positional_arity(&rel.call_shape);
+
         if rel.kind == RelationKind::UsesMacro {
             if let Some(dst_id) = dst_same_file {
                 if linker.entity_kind_by_id.get(&dst_id) == Some(&EntityKind::Macro) {
@@ -2858,6 +3165,8 @@ fn resolve_one_file_incremental(
                     }
                 }
             }
+            let cross_file_twins =
+                prune_ids_by_arity(cross_file_twins, call_arity, &linker.entity_arity_by_id);
             if !cross_file_twins.is_empty() && cross_file_twins.len() < AMBIGUOUS_CALL_FANOUT_CAP {
                 for cross_id in sorted_fanout_targets(cross_file_twins) {
                     if add_deduped(&mut seen, src_id, cross_id, rel.kind) {
@@ -2998,6 +3307,16 @@ fn resolve_one_file_incremental(
             ImportPinnedTarget::NoPin => {}
         }
 
+        // Arity gate mirroring the batch linker: drop the exact-name candidates
+        // an overloaded C/C++ callee's recorded call-site argument count cannot
+        // reach before (c)/(c2) bind. Fail-open and a no-op without recorded
+        // arity, so non-overloaded and non-C/C++ binding is unchanged.
+        let other_file_candidates = prune_pairs_by_arity(
+            other_file_candidates,
+            call_arity,
+            &linker.entity_arity_by_id,
+        );
+
         // (c) Global name-match fallback
         if name_fallback_allowed && !other_file_candidates.is_empty() {
             let distinct_ids: HashSet<EntityId> =
@@ -3056,6 +3375,8 @@ fn resolve_one_file_incremental(
                     .filter(|(fp, _)| fp != &file.file_path)
                     .map(|(_, id)| *id)
                     .collect();
+                let distinct_targets =
+                    prune_ids_by_arity(distinct_targets, call_arity, &linker.entity_arity_by_id);
                 if (1..=AMBIGUOUS_CALL_FANOUT_CAP).contains(&distinct_targets.len()) {
                     for dst_id in sorted_fanout_targets(distinct_targets) {
                         if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
@@ -3106,9 +3427,13 @@ fn resolve_one_file_incremental(
             && matches!(rel.kind, RelationKind::Calls | RelationKind::References)
         {
             // Fan out: an ambiguous qualified leaf resolves to every distinct
-            // cross-file target, matching the batch resolver.
-            let qualified_targets =
-                resolve_qualified_suffix_incremental(&rel.dst_name, &file.file_path, linker);
+            // cross-file target, arity-pruned, matching the batch resolver.
+            let qualified_targets = resolve_qualified_suffix_incremental(
+                &rel.dst_name,
+                &file.file_path,
+                call_arity,
+                linker,
+            );
             if !qualified_targets.is_empty() {
                 for dst_id in qualified_targets {
                     if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
@@ -3350,6 +3675,88 @@ mod tests {
         entity
     }
 
+    fn arity(min: usize, max: usize, variadic: bool) -> ArityBounds {
+        ArityBounds { min, max, variadic }
+    }
+
+    #[test]
+    fn parse_signature_arity_plain_and_empty_parameter_lists() {
+        assert_eq!(
+            parse_signature_arity("int Main(int argc, char* const argv[])"),
+            Some(arity(2, 2, false))
+        );
+        assert_eq!(
+            parse_signature_arity("void add(int value)"),
+            Some(arity(1, 1, false))
+        );
+        assert_eq!(
+            parse_signature_arity("void run()"),
+            Some(arity(0, 0, false))
+        );
+        // A C-style `(void)` list declares zero parameters, not one.
+        assert_eq!(
+            parse_signature_arity("int shutdown(void)"),
+            Some(arity(0, 0, false))
+        );
+        // No locatable parameter list: arity is unknown, never a false zero.
+        assert_eq!(parse_signature_arity("struct Widget"), None);
+    }
+
+    #[test]
+    fn parse_signature_arity_counts_template_typed_parameters_as_one() {
+        // The `<Config>` / `<int, Alloc>` commas sit inside a parameter's type,
+        // so depth-aware splitting must not read them as parameter separators.
+        assert_eq!(
+            parse_signature_arity("Ptr<Config> Main(Ptr<Config> const& config)"),
+            Some(arity(1, 1, false))
+        );
+        assert_eq!(
+            parse_signature_arity("void insert(std::map<int, Alloc> m, int key)"),
+            Some(arity(2, 2, false))
+        );
+    }
+
+    #[test]
+    fn parse_signature_arity_defaulted_parameters_widen_max_only() {
+        // A defaulted parameter is optional: it lifts `max` but not `min`.
+        assert_eq!(
+            parse_signature_arity("void f(int a, int b = 0)"),
+            Some(arity(1, 2, false))
+        );
+        assert_eq!(
+            parse_signature_arity("void g(int a, int b = 0, int c = 1)"),
+            Some(arity(1, 3, false))
+        );
+        // A relational operator inside a default expression is not the default
+        // marker and must not be miscounted as an extra parameter.
+        assert_eq!(
+            parse_signature_arity("void h(int a, bool ok = a >= 0)"),
+            Some(arity(1, 2, false))
+        );
+    }
+
+    #[test]
+    fn parse_signature_arity_variadics_accept_unbounded() {
+        // C varargs and parameter packs both make the callee accept any count at
+        // or above its required parameters.
+        let printf = parse_signature_arity("int printf(const char* fmt, ...)").unwrap();
+        assert_eq!(printf, arity(1, 1, true));
+        assert!(printf.accepts(1) && printf.accepts(5) && !printf.accepts(0));
+
+        let pack = parse_signature_arity("void emit(Args... args)").unwrap();
+        assert!(pack.variadic && pack.accepts(0) && pack.accepts(3));
+    }
+
+    #[test]
+    fn arity_bounds_accepts_matches_overload_selection() {
+        let two = arity(2, 2, false);
+        assert!(two.accepts(2));
+        assert!(!two.accepts(1));
+        assert!(!two.accepts(3));
+        let optional = arity(1, 2, false);
+        assert!(optional.accepts(1) && optional.accepts(2) && !optional.accepts(3));
+    }
+
     #[test]
     fn same_file_resolution() {
         let e1 = make_entity("foo", "src/a.ts");
@@ -3359,6 +3766,7 @@ mod tests {
             file_path: "src/a.ts".to_string(),
             entities: vec![e1.clone(), e2.clone()],
             relations: vec![ExtractedRelation {
+                call_shape: None,
                 kind: RelationKind::Calls,
                 src_name: "foo".to_string(),
                 dst_name: "bar".to_string(),
@@ -3384,6 +3792,7 @@ mod tests {
                 file_path: "src/routes/api.ts".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    call_shape: None,
                     kind: RelationKind::Calls,
                     src_name: "handler".to_string(),
                     dst_name: "executeTool".to_string(),
@@ -3440,6 +3849,7 @@ mod tests {
             file_path: "src/routes/api.ts".to_string(),
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
+                call_shape: None,
                 kind: RelationKind::Calls,
                 src_name: "handler".to_string(),
                 dst_name: "executeTool".to_string(),
@@ -3492,6 +3902,7 @@ mod tests {
             file_path: "src/app.ts".to_string(),
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
+                call_shape: None,
                 kind: RelationKind::Calls,
                 src_name: "run".to_string(),
                 dst_name: "helper".to_string(),
@@ -3522,6 +3933,7 @@ mod tests {
     #[test]
     fn parallel_resolution_is_byte_identical_to_serial() {
         let calls = |src: &str, dst: &str| ExtractedRelation {
+            call_shape: None,
             kind: RelationKind::Calls,
             src_name: src.to_string(),
             dst_name: dst.to_string(),
@@ -3741,6 +4153,7 @@ mod tests {
                 file_path: "src/app.ts".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    call_shape: None,
                     kind: RelationKind::Calls,
                     src_name: "main".to_string(),
                     dst_name: "helper".to_string(),
@@ -3773,6 +4186,7 @@ mod tests {
                 file_path: "src/app.cpp".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    call_shape: None,
                     kind: RelationKind::UsesMacro,
                     src_name: "main".to_string(),
                     dst_name: "JSON_PRIVATE_UNLESS_TESTED".to_string(),
@@ -3826,6 +4240,7 @@ mod tests {
                 file_path: "src/app.cpp".to_string(),
                 entities: vec![caller],
                 relations: vec![ExtractedRelation {
+                    call_shape: None,
                     kind: RelationKind::UsesMacro,
                     src_name: "main".to_string(),
                     dst_name: "JSON_PRIVATE_UNLESS_TESTED".to_string(),
@@ -3942,6 +4357,7 @@ void f();
                 file_path: "src/parse.ts".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    call_shape: None,
                     kind: RelationKind::Calls,
                     src_name: "_safeParse".to_string(),
                     dst_name: "util.finalizeIssue".to_string(),
@@ -3986,12 +4402,14 @@ void f();
             entities: vec![e1.clone(), e2.clone()],
             relations: vec![
                 ExtractedRelation {
+                    call_shape: None,
                     kind: RelationKind::Calls,
                     src_name: "foo".to_string(),
                     dst_name: "bar".to_string(),
                     import_source: None,
                 },
                 ExtractedRelation {
+                    call_shape: None,
                     kind: RelationKind::Calls,
                     src_name: "foo".to_string(),
                     dst_name: "bar".to_string(),
@@ -4013,6 +4431,7 @@ void f();
             file_path: "src/a.ts".to_string(),
             entities: vec![e1],
             relations: vec![ExtractedRelation {
+                call_shape: None,
                 kind: RelationKind::Calls,
                 src_name: "foo".to_string(),
                 dst_name: "nonexistent".to_string(),
@@ -4038,6 +4457,7 @@ void f();
                 file_path: "src/wiring.rs".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    call_shape: None,
                     kind: RelationKind::Calls,
                     src_name: "project_after_mcp_commit".to_string(),
                     dst_name: "project_overlay_to_files".to_string(),
@@ -4078,6 +4498,7 @@ void f();
                 file_path: "src/caller.rs".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    call_shape: None,
                     kind: RelationKind::Calls,
                     src_name: "build".to_string(),
                     dst_name: "new".to_string(),
@@ -4133,6 +4554,7 @@ void f();
             file_path: "src/wiring.rs".to_string(),
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
+                call_shape: None,
                 kind: RelationKind::Calls,
                 src_name: "project_after_mcp_commit".to_string(),
                 dst_name: "project_overlay_to_files".to_string(),
@@ -4194,24 +4616,28 @@ void f();
                 entities: vec![a, b],
                 relations: vec![
                     ExtractedRelation {
+                        call_shape: None,
                         kind: RelationKind::Calls,
                         src_name: format!("a{i}"),
                         dst_name: format!("b{i}"),
                         import_source: None,
                     },
                     ExtractedRelation {
+                        call_shape: None,
                         kind: RelationKind::Calls,
                         src_name: format!("a{i}"),
                         dst_name: "shared_target".to_string(),
                         import_source: None,
                     },
                     ExtractedRelation {
+                        call_shape: None,
                         kind: RelationKind::Calls,
                         src_name: format!("b{i}"),
                         dst_name: "common".to_string(),
                         import_source: None,
                     },
                     ExtractedRelation {
+                        call_shape: None,
                         kind: RelationKind::Calls,
                         src_name: format!("b{i}"),
                         dst_name: "work".to_string(),
@@ -4266,6 +4692,7 @@ void f();
             file_path: "src/caller.rs".to_string(),
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
+                call_shape: None,
                 kind: RelationKind::Calls,
                 src_name: "build".to_string(),
                 dst_name: "new".to_string(),
@@ -4403,6 +4830,7 @@ void f();
                 file_path: "src/api.ts".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    call_shape: None,
                     kind: RelationKind::Calls,
                     src_name: "handler".to_string(),
                     dst_name: "myWork".to_string(),
@@ -4551,6 +4979,7 @@ void f();
                 file_path: "src/routes/api.ts".to_string(),
                 entities: vec![caller.clone()],
                 relations: vec![ExtractedRelation {
+                    call_shape: None,
                     kind: RelationKind::Calls,
                     src_name: "handler".to_string(),
                     dst_name: "executeTool".to_string(),
@@ -4643,6 +5072,7 @@ void f();
                 file_path: "a.ts".to_string(),
                 entities: vec![e1.clone()],
                 relations: vec![ExtractedRelation {
+                    call_shape: None,
                     kind: RelationKind::Calls,
                     src_name: "caller".to_string(),
                     dst_name: "callee".to_string(),
@@ -4678,6 +5108,7 @@ void f();
             file_path: "src/app.rs".to_string(),
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
+                call_shape: None,
                 kind: RelationKind::Calls,
                 src_name: "run_task".to_string(),
                 dst_name: "InMemoryGraph".to_string(),
@@ -4713,6 +5144,7 @@ void f();
             file_path: "src/app.rs".to_string(),
             entities: vec![caller.clone()],
             relations: vec![ExtractedRelation {
+                call_shape: None,
                 kind: RelationKind::Calls,
                 src_name: "run_task".to_string(),
                 dst_name: "InMemoryGraph".to_string(),
@@ -4740,12 +5172,14 @@ void f();
             entities,
             relations: vec![
                 ExtractedRelation {
+                    call_shape: None,
                     kind: RelationKind::Calls,
                     src_name: "run_task".to_string(),
                     dst_name: "InMemoryGraph".to_string(),
                     import_source: Some("kin_db".to_string()),
                 },
                 ExtractedRelation {
+                    call_shape: None,
                     kind: RelationKind::Calls,
                     src_name: "run_again".to_string(),
                     dst_name: "InMemoryGraph".to_string(),
@@ -4785,6 +5219,7 @@ void f();
                 file_path: "src/routes/api.ts".to_string(),
                 entities: vec![handler.clone()],
                 relations: vec![ExtractedRelation {
+                    call_shape: None,
                     kind: RelationKind::Calls,
                     src_name: "handler".to_string(),
                     dst_name: "executeTool".to_string(),
@@ -4839,6 +5274,7 @@ void f();
 
     fn calls_relation(src: &str, dst: &str) -> ExtractedRelation {
         ExtractedRelation {
+            call_shape: None,
             kind: RelationKind::Calls,
             src_name: src.to_string(),
             dst_name: dst.to_string(),
@@ -5542,6 +5978,7 @@ void f();
 
     fn pinned_calls_relation(src: &str, dst: &str, import_source: &str) -> ExtractedRelation {
         ExtractedRelation {
+            call_shape: None,
             kind: RelationKind::Calls,
             src_name: src.to_string(),
             dst_name: dst.to_string(),

@@ -1153,6 +1153,7 @@ impl Clone for ImportedCommitSemanticState {
                 entity_by_name: self.linker.entity_by_name.clone(),
                 entity_by_bare_name: self.linker.entity_by_bare_name.clone(),
                 entity_kind_by_id: self.linker.entity_kind_by_id.clone(),
+                entity_arity_by_id: self.linker.entity_arity_by_id.clone(),
                 known_files: self.linker.known_files.clone(),
                 entities_by_file: self.linker.entities_by_file.clone(),
                 include_targets_by_file: self.linker.include_targets_by_file.clone(),
