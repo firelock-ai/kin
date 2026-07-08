@@ -581,6 +581,21 @@ const DEFAULT_OPENAI_EMBED_MODEL_ID: &str = "text-embedding-3-small";
 
 /// Default model revision.
 const DEFAULT_REVISION: &str = "main";
+
+/// Serializes `--lib` unit tests that build a real [`CodeEmbedder`] against
+/// the shared on-disk HuggingFace Hub cache
+/// (`default_dimensions_match_default_model` here and
+/// `test_vector_index_dimension_mismatch_auto_recovery` in `engine::graph`;
+/// both resolve `DEFAULT_MODEL_ID`/`DEFAULT_REVISION`). `cargo test` runs
+/// unit tests from one binary concurrently by default, and two threads
+/// racing `hf_hub`'s first-time blob download for the same repo+revision
+/// can corrupt the shared cache directory. Holding this lock around
+/// embedder construction means the first test performs the real download
+/// and every later test observes an already-warm cache: no network race,
+/// and the model is fetched once per test run instead of once per test.
+#[cfg(all(test, feature = "embeddings"))]
+pub(crate) static EMBED_MODEL_DOWNLOAD_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 #[cfg(feature = "embeddings")]
 const DEFAULT_MAX_BATCH_TOKENS: usize = 32_768;
 #[cfg(feature = "embeddings")]
@@ -4033,6 +4048,10 @@ mod tests {
     fn default_dimensions_match_default_model() {
         #[cfg(feature = "embeddings")]
         {
+            // See `EMBED_MODEL_DOWNLOAD_LOCK`: shares the HF Hub cache
+            // download with
+            // `engine::graph::tests::test_vector_index_dimension_mismatch_auto_recovery`.
+            let _download_guard = EMBED_MODEL_DOWNLOAD_LOCK.lock();
             let embedder = CodeEmbedder::new().unwrap();
             assert_eq!(embedder.dimensions(), DEFAULT_EMBED_DIMS);
         }

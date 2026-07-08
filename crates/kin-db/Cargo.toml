@@ -6,6 +6,8 @@ name = "kin-db"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Embeddable code graph database for Kin — entities, relations, vector and text search, snapshots"
+repository.workspace = true
 
 [lib]
 doctest = false

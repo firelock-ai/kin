@@ -8268,6 +8268,10 @@ mod tests {
     #[test]
     #[cfg(all(feature = "embeddings", feature = "vector"))]
     fn test_vector_index_dimension_mismatch_auto_recovery() {
+        // See `crate::embed::EMBED_MODEL_DOWNLOAD_LOCK`: shares the HF Hub
+        // cache download with
+        // `embed::tests::default_dimensions_match_default_model`.
+        let _download_guard = crate::embed::EMBED_MODEL_DOWNLOAD_LOCK.lock();
         let graph = InMemoryGraph::new();
         // Setup a vector index with a mismatching dimension (e.g. 100)
         let mismatched_vi = Arc::new(VectorIndex::new(100).unwrap());
