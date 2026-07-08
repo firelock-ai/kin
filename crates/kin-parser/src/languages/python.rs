@@ -9,8 +9,8 @@ use crate::adapter::{
 };
 use crate::error::Result;
 use crate::extract::{
-    ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName,
-    ParseOutput,
+    CallArgShape, ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport,
+    ImportedName, ParseOutput,
 };
 
 pub struct PythonAdapter;
@@ -500,7 +500,7 @@ fn extract_calls_from_context(
                 };
                 if is_valid_callee_name(&callee_name) {
                     relations.push(ExtractedRelation {
-                        call_shape: None,
+                        call_shape: Some(extract_call_arg_shape(&child, source)),
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
                         dst_name: callee_name,
@@ -511,6 +511,50 @@ fn extract_calls_from_context(
         }
         // Recurse into child nodes
         extract_calls_from_context(&child, source, context_name, class_ctx, relations);
+    }
+}
+
+/// Extract the [`CallArgShape`] of a tree-sitter `call` node: count positional
+/// arguments, collect explicit keyword-argument names, and note `*args` /
+/// `**kwargs` splats. Only the call's own argument list is inspected — arguments
+/// of nested calls belong to those calls, not this one. A call with no argument
+/// list yields the default (empty) shape. Keyword names are sorted and
+/// deduplicated so the shape is order- and duplicate-independent.
+pub fn extract_call_arg_shape(call: &tree_sitter::Node, source: &[u8]) -> CallArgShape {
+    let Some(arguments) = call.child_by_field_name("arguments") else {
+        return CallArgShape::default();
+    };
+
+    let mut positional = 0u32;
+    let mut keywords = Vec::new();
+    let mut has_var_positional = false;
+    let mut has_var_keyword = false;
+
+    let mut cursor = arguments.walk();
+    for arg in arguments.named_children(&mut cursor) {
+        match arg.kind() {
+            "keyword_argument" => {
+                if let Some(name) = arg
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                {
+                    keywords.push(name.to_string());
+                }
+            }
+            "list_splat" => has_var_positional = true,
+            "dictionary_splat" => has_var_keyword = true,
+            "comment" => {}
+            _ => positional += 1,
+        }
+    }
+
+    keywords.sort();
+    keywords.dedup();
+    CallArgShape {
+        positional,
+        keywords,
+        has_var_positional,
+        has_var_keyword,
     }
 }
 
@@ -602,6 +646,78 @@ fn extract_py_from_import(node: &tree_sitter::Node, source: &[u8]) -> Option<Fil
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Depth-first search for the first `call` node in a parsed tree.
+    fn first_call_node<'a>(node: tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
+        if node.kind() == "call" {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(found) = first_call_node(child) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    fn shape_of(src: &[u8]) -> CallArgShape {
+        let adapter = PythonAdapter;
+        let tree = adapter.parse(src).unwrap();
+        let call = first_call_node(tree.root_node()).expect("a call node");
+        extract_call_arg_shape(&call, src)
+    }
+
+    #[test]
+    fn call_arg_shape_positional_only() {
+        let shape = shape_of(b"f(a, b, c)");
+        assert_eq!(shape.positional, 3);
+        assert!(shape.keywords.is_empty());
+        assert!(!shape.has_var_positional);
+        assert!(!shape.has_var_keyword);
+    }
+
+    #[test]
+    fn call_arg_shape_keyword_and_mixed() {
+        let shape = shape_of(b"f(a, kw=c, other=d)");
+        assert_eq!(shape.positional, 1);
+        assert_eq!(shape.keywords, vec!["kw".to_string(), "other".to_string()]);
+        assert!(!shape.has_var_keyword);
+    }
+
+    #[test]
+    fn call_arg_shape_star_and_double_star() {
+        let shape = shape_of(b"f(a, *args, **kwargs)");
+        assert_eq!(shape.positional, 1);
+        assert!(shape.has_var_positional);
+        assert!(shape.has_var_keyword);
+        assert!(shape.keywords.is_empty());
+    }
+
+    #[test]
+    fn call_arg_shape_empty_call_is_default() {
+        assert_eq!(shape_of(b"f()"), CallArgShape::default());
+    }
+
+    #[test]
+    fn call_arg_shape_keyword_names_sorted_and_deduped() {
+        let shape = shape_of(b"f(zebra=1, alpha=2)");
+        assert_eq!(
+            shape.keywords,
+            vec!["alpha".to_string(), "zebra".to_string()]
+        );
+    }
+
+    #[test]
+    fn call_arg_shape_nested_call_counts_outer_args_only() {
+        // The inner `y=1` keyword belongs to `g`, not the outer `f` call.
+        let shape = shape_of(b"f(g(x, y=1), z)");
+        assert_eq!(shape.positional, 2);
+        assert!(
+            shape.keywords.is_empty(),
+            "inner keyword must not leak to the outer call"
+        );
+    }
 
     #[test]
     fn parse_python_function() {

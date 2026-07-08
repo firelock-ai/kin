@@ -9,7 +9,7 @@ use kin_model::Hash256;
 use serde::{Deserialize, Serialize};
 
 use crate::diff::{EntityChangeKind, SemanticDiff};
-use crate::impact::ImpactReport;
+use crate::impact::{ConsumerCallShapeSummary, ImpactReport};
 
 const COMMAND_EFFECT_CONTRACT_KEY: &str = "command_effect_contract";
 
@@ -199,6 +199,131 @@ fn python_signatures_runtime_neutral(old: &str, new: &str) -> bool {
 fn python_param_adds_no_required_arg(param: &str) -> bool {
     let param = param.trim();
     param.contains('=') || param == "/" || param.starts_with('*')
+}
+
+/// The call-contract role of a normalized Python parameter. A rename is only
+/// caller-relevant when the position keeps its role; reclassifying a position
+/// (e.g. a normal parameter becoming `*args`) is a structural change, not a
+/// rename.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PyParamRole {
+    /// A by-name/by-position parameter (`name`, `name=default`).
+    Normal,
+    /// Variadic positional collector (`*args`).
+    VarPositional,
+    /// Variadic keyword collector (`**kwargs`).
+    VarKeyword,
+    /// A bare `*` or `/` boundary marker.
+    Marker,
+}
+
+/// Classify a normalized Python parameter by call-contract role.
+fn python_param_role(param: &str) -> PyParamRole {
+    if param == "*" || param == "/" {
+        PyParamRole::Marker
+    } else if param.starts_with("**") {
+        PyParamRole::VarKeyword
+    } else if param.starts_with('*') {
+        PyParamRole::VarPositional
+    } else {
+        PyParamRole::Normal
+    }
+}
+
+/// The bare identifier of a normalized Python parameter, with any splat prefix
+/// and default value stripped. Boundary markers (`*`, `/`) have no identifier
+/// and yield an empty string.
+fn python_param_identifier(param: &str) -> &str {
+    if param == "*" || param == "/" {
+        return "";
+    }
+    let stripped = param
+        .strip_prefix("**")
+        .or_else(|| param.strip_prefix('*'))
+        .unwrap_or(param);
+    match stripped.find('=') {
+        Some(idx) => &stripped[..idx],
+        None => stripped,
+    }
+}
+
+/// When `old` → `new` is an arity-preserving pure parameter RENAME of the same
+/// Python `def` — same callable name, same parameter count, every position
+/// keeps its role, and at least one normal parameter's identifier changes —
+/// returns the OLD identifiers of the renamed normal positions. Returns `None`
+/// otherwise.
+///
+/// The result is the set of names whose by-keyword call sites a rename could
+/// strand, so a caller-shape check can decide whether the rename is actually
+/// runtime-neutral. Excluded, because they are not caller-safe renames or not
+/// renames at all:
+/// - reorders — a new identifier that reuses any old parameter's identifier;
+///   swapping positions changes positional call semantics, not just names;
+/// - role changes at any position (normal ↔ `*args`/`**kwargs`/marker);
+/// - retype- or default-only edits (identifier unchanged);
+/// - arity changes or non-`def` text.
+///
+/// Renames of `*args`/`**kwargs` collectors are not reported: no caller can
+/// target them by name, so renaming one strands nothing. Positions are visited
+/// left to right, so the returned order is deterministic.
+pub fn arity_preserving_rename(old: &str, new: &str) -> Option<Vec<String>> {
+    if old == new {
+        return None;
+    }
+    let (old_name, old_params) = python_signature_parts(old)?;
+    let (new_name, new_params) = python_signature_parts(new)?;
+    if old_name != new_name || old_params.len() != new_params.len() {
+        return None;
+    }
+    let old_identifiers: std::collections::BTreeSet<&str> = old_params
+        .iter()
+        .map(|p| python_param_identifier(p))
+        .filter(|id| !id.is_empty())
+        .collect();
+
+    let mut renamed = Vec::new();
+    for (old_param, new_param) in old_params.iter().zip(new_params.iter()) {
+        let old_role = python_param_role(old_param);
+        if old_role != python_param_role(new_param) {
+            return None;
+        }
+        let old_id = python_param_identifier(old_param);
+        let new_id = python_param_identifier(new_param);
+        if old_id == new_id {
+            continue;
+        }
+        if old_role != PyParamRole::Normal {
+            // Renaming a `*args`/`**kwargs` collector strands no caller.
+            continue;
+        }
+        if old_identifiers.contains(new_id) {
+            // The new name reuses an existing parameter name: a reorder, which
+            // changes positional semantics and is never a safe rename.
+            return None;
+        }
+        renamed.push(old_id.to_string());
+    }
+
+    if renamed.is_empty() {
+        None
+    } else {
+        Some(renamed)
+    }
+}
+
+/// True when an arity-preserving rename of `renamed_old_names` strands no
+/// graph-known consumer: every consumer is a shaped call site, none forwards
+/// `**kwargs`, and none passes a renamed parameter by keyword. Any gap in the
+/// evidence is conservative — the rename stays potentially breaking.
+pub fn rename_is_runtime_neutral_for_consumers(
+    renamed_old_names: &[String],
+    summary: &ConsumerCallShapeSummary,
+) -> bool {
+    summary.all_consumers_shaped_calls
+        && !summary.any_var_keyword_caller
+        && renamed_old_names
+            .iter()
+            .all(|name| !summary.caller_keyword_names.contains(name.as_str()))
 }
 
 /// True when `old` and `new` are Go struct type signatures that differ ONLY by
@@ -522,24 +647,48 @@ fn collect_modified_comments(
         && old.signature != new.signature
         && !signature_runtime_neutral(&old.signature, &new.signature)
     {
+        // An arity-preserving parameter rename cannot break a caller that
+        // passes the renamed parameter positionally. When the graph-known call
+        // sites prove every external consumer is a shaped positional call — no
+        // keyword use of a renamed name, no `**kwargs`, no unshaped consumer —
+        // the rename is runtime-neutral for those consumers: the signature
+        // change is still recorded as evidence, but it is not a blocking break.
+        let rename_is_neutral = consumer_count > 0
+            && match arity_preserving_rename(&old.signature, &new.signature) {
+                Some(renamed) => {
+                    let summary = per_entity
+                        .map(|e| e.call_shapes.clone())
+                        .unwrap_or_default();
+                    rename_is_runtime_neutral_for_consumers(&renamed, &summary)
+                }
+                None => false,
+            };
+
         comments.push(InlineComment {
             file: span.file.to_string(),
             start_line: span.start_line,
             end_line: span.end_line,
             kind: InlineCommentKind::SignatureChange,
-            message: format!(
-                "Signature changed: `{}` → `{}`",
-                old.signature, new.signature,
-            ),
+            message: if rename_is_neutral {
+                format!(
+                    "Signature changed: `{}` → `{}` (parameter rename; all {} graph-known call site(s) pass positionally — no runtime break)",
+                    old.signature, new.signature, consumer_count,
+                )
+            } else {
+                format!("Signature changed: `{}` → `{}`", old.signature, new.signature)
+            },
         });
 
         // Breaking only when THIS entity has EXTERNAL non-test consumers to
-        // break. Test-only consumers are covering evidence, not a broken
-        // contract. Consumers that were themselves modified in this diff are
-        // excluded from `consumer_count`; when they are the ONLY consumers the
-        // change is a coherent in-diff migration — reported as visible evidence
-        // but not a blocking break.
-        if consumer_count > 0 {
+        // break. A rename proven runtime-neutral by its call sites strands none
+        // of them, so it emits no blocking finding. Test-only consumers are
+        // covering evidence, not a broken contract. Consumers that were
+        // themselves modified in this diff are excluded from `consumer_count`;
+        // when they are the ONLY consumers the change is a coherent in-diff
+        // migration — reported as visible evidence but not a blocking break.
+        if rename_is_neutral {
+            // Proven safe by call-site shapes; the signature evidence above stands.
+        } else if consumer_count > 0 {
             comments.push(InlineComment {
                 file: span.file.to_string(),
                 start_line: span.start_line,
@@ -906,6 +1055,7 @@ mod tests {
                 consumer_files: vec!["src/client.rs".to_string()],
                 covering_tests: 0,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -957,6 +1107,7 @@ mod tests {
                     consumer_files: vec![],
                     covering_tests: 0,
                     consumers_migrated_in_diff: 0,
+                    call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
                 },
                 EntityImpact {
                     entity_id: b.id,
@@ -966,6 +1117,7 @@ mod tests {
                     consumer_files: vec!["src/client.rs".to_string()],
                     covering_tests: 0,
                     consumers_migrated_in_diff: 0,
+                    call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
                 },
             ],
             ..Default::default()
@@ -1013,6 +1165,7 @@ mod tests {
                 consumer_files: vec![],
                 covering_tests: 1,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -1062,6 +1215,7 @@ mod tests {
                 consumer_files: vec![],
                 covering_tests: 0,
                 consumers_migrated_in_diff: 2,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -1112,6 +1266,7 @@ mod tests {
                 consumer_files: vec!["src/client.rs".to_string()],
                 covering_tests: 0,
                 consumers_migrated_in_diff: 2,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -1171,6 +1326,7 @@ mod tests {
                     consumer_files: vec![],
                     covering_tests: 1,
                     consumers_migrated_in_diff: 0,
+                    call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
                 },
                 EntityImpact {
                     entity_id: uncovered.id,
@@ -1180,6 +1336,7 @@ mod tests {
                     consumer_files: vec![],
                     covering_tests: 0,
                     consumers_migrated_in_diff: 0,
+                    call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
                 },
             ],
             ..Default::default()
@@ -1273,6 +1430,7 @@ mod tests {
                 consumer_files: vec![],
                 covering_tests: 1,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -1316,6 +1474,7 @@ mod tests {
                 consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
                 covering_tests: 1,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -1457,6 +1616,7 @@ mod tests {
                     consumer_files: vec!["src/x.rs".to_string(), "src/y.rs".to_string()],
                     covering_tests: 1,
                     consumers_migrated_in_diff: 0,
+                    call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
                 },
                 EntityImpact {
                     entity_id: b_new.id,
@@ -1466,6 +1626,7 @@ mod tests {
                     consumer_files: vec!["src/x.rs".to_string(), "src/y.rs".to_string()],
                     covering_tests: 1,
                     consumers_migrated_in_diff: 0,
+                    call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
                 },
             ],
             ..Default::default()
@@ -1535,6 +1696,7 @@ mod tests {
                 consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
                 covering_tests: 1,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         }
@@ -1568,6 +1730,7 @@ mod tests {
                 consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
                 covering_tests: 1,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -1589,6 +1752,7 @@ mod tests {
                 consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
                 covering_tests: 0,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -1617,6 +1781,7 @@ mod tests {
                 consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
                 covering_tests: 1,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -1672,6 +1837,141 @@ mod tests {
             "class Item(Node, Request)",
             "class Item(Node)"
         ));
+    }
+
+    #[test]
+    fn arity_preserving_rename_detects_normal_param_renames() {
+        // The _makefile defect shape: two arity-preserving positional renames,
+        // annotations/defaults on other positions unchanged.
+        assert_eq!(
+            arity_preserving_rename(
+                "def _makefile(self, ext, args, kwargs, encoding=\"utf-8\")",
+                "def _makefile(self, ext, lines, files, encoding=\"utf-8\")"
+            ),
+            Some(vec!["args".to_string(), "kwargs".to_string()])
+        );
+        // Single rename with a leading `self`.
+        assert_eq!(
+            arity_preserving_rename("def f(self, config)", "def f(self, options)"),
+            Some(vec!["config".to_string()])
+        );
+        // Rename survives an annotation/default reformat on the same position.
+        assert_eq!(
+            arity_preserving_rename("def f(a: int = 1)", "def f(b: int = 1)"),
+            Some(vec!["a".to_string()])
+        );
+    }
+
+    #[test]
+    fn arity_preserving_rename_rejects_reorders() {
+        // Swapping two names is not a safe rename: positional callers shift.
+        assert_eq!(arity_preserving_rename("def f(a, b)", "def f(b, a)"), None);
+        // A new name that reuses an existing parameter name (a shift) is rejected.
+        assert_eq!(arity_preserving_rename("def f(a, b)", "def f(b, c)"), None);
+        // Renaming both positions to fresh names is a clean rename, not a reorder.
+        assert_eq!(
+            arity_preserving_rename("def f(a, b)", "def f(x, y)"),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn arity_preserving_rename_rejects_non_renames() {
+        // Retype-only and default-only edits keep the identifier.
+        assert_eq!(
+            arity_preserving_rename("def f(a: int)", "def f(a: str)"),
+            None
+        );
+        assert_eq!(arity_preserving_rename("def f(a=1)", "def f(a=2)"), None);
+        // Arity changes are not renames.
+        assert_eq!(arity_preserving_rename("def f(a)", "def f(a, b)"), None);
+        assert_eq!(arity_preserving_rename("def f(a, b)", "def f(a)"), None);
+        // Appended optional parameter.
+        assert_eq!(arity_preserving_rename("def f(a)", "def f(a, b=1)"), None);
+        // Different callable, identical text, and non-`def` text.
+        assert_eq!(arity_preserving_rename("def f(a)", "def g(b)"), None);
+        assert_eq!(arity_preserving_rename("def f(a)", "def f(a)"), None);
+        assert_eq!(arity_preserving_rename("class A(B)", "class A(C)"), None);
+    }
+
+    #[test]
+    fn arity_preserving_rename_ignores_collectors_and_role_changes() {
+        // Renaming `*args`/`**kwargs` collectors strands no caller.
+        assert_eq!(
+            arity_preserving_rename("def f(a, *args, **kwargs)", "def f(a, *rest, **opts)"),
+            None
+        );
+        // A normal rename alongside a collector rename reports only the normal one.
+        assert_eq!(
+            arity_preserving_rename("def f(a, *args)", "def f(b, *rest)"),
+            Some(vec!["a".to_string()])
+        );
+        // Reclassifying a position (normal → `*args`) is structural, not a rename.
+        assert_eq!(arity_preserving_rename("def f(a, b)", "def f(a, *b)"), None);
+    }
+
+    #[test]
+    fn rename_neutral_only_when_every_caller_is_positional_and_shaped() {
+        let renamed = vec!["args".to_string(), "kwargs".to_string()];
+
+        // (a) every caller positional, every consumer a shaped call → neutral.
+        let all_positional = ConsumerCallShapeSummary {
+            all_consumers_shaped_calls: true,
+            ..Default::default()
+        };
+        assert!(rename_is_runtime_neutral_for_consumers(
+            &renamed,
+            &all_positional
+        ));
+
+        // (b) a caller passes a renamed parameter by keyword → breaking.
+        let mut keyword_caller = all_positional.clone();
+        keyword_caller
+            .caller_keyword_names
+            .insert("args".to_string());
+        assert!(!rename_is_runtime_neutral_for_consumers(
+            &renamed,
+            &keyword_caller
+        ));
+
+        // (c) a keyword unrelated to the rename is fine; a renamed one is not.
+        let mut mixed = ConsumerCallShapeSummary {
+            all_consumers_shaped_calls: true,
+            ..Default::default()
+        };
+        mixed.caller_keyword_names.insert("encoding".to_string());
+        assert!(rename_is_runtime_neutral_for_consumers(&renamed, &mixed));
+        mixed.caller_keyword_names.insert("kwargs".to_string());
+        assert!(!rename_is_runtime_neutral_for_consumers(&renamed, &mixed));
+
+        // (d) a `**kwargs` caller has an unknown keyword set → breaking.
+        let var_keyword = ConsumerCallShapeSummary {
+            all_consumers_shaped_calls: true,
+            any_var_keyword_caller: true,
+            ..Default::default()
+        };
+        assert!(!rename_is_runtime_neutral_for_consumers(
+            &renamed,
+            &var_keyword
+        ));
+
+        // (f) any consumer without captured shape evidence → breaking.
+        let missing_shape = ConsumerCallShapeSummary {
+            all_consumers_shaped_calls: false,
+            ..Default::default()
+        };
+        assert!(!rename_is_runtime_neutral_for_consumers(
+            &renamed,
+            &missing_shape
+        ));
+
+        // A rename with no consumers at all is vacuously neutral: an empty
+        // real-consumer set is already handled upstream as no downstream risk.
+        let no_consumers = ConsumerCallShapeSummary {
+            all_consumers_shaped_calls: true,
+            ..Default::default()
+        };
+        assert!(rename_is_runtime_neutral_for_consumers(&[], &no_consumers));
     }
 
     #[test]
@@ -1797,6 +2097,7 @@ mod tests {
                 consumer_files: vec!["src/a.rs".to_string()],
                 covering_tests: 0,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -1844,6 +2145,7 @@ mod tests {
                 ],
                 covering_tests: 0,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -1916,6 +2218,7 @@ mod tests {
                 consumer_files: vec!["src/shared.rs".to_string()],
                 covering_tests: 0,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -1967,6 +2270,7 @@ mod tests {
                 ],
                 covering_tests: 0,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -2007,6 +2311,7 @@ mod tests {
                 consumer_files: vec!["src/only.rs".to_string()],
                 covering_tests: 0,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -2040,6 +2345,7 @@ mod tests {
                 consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
                 covering_tests: 0,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
