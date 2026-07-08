@@ -6,12 +6,14 @@ semantic system of record for software work.
 ```sh
 npm install -g @kinlab/kin
 kin --version
+kin setup --intent agent
 ```
 
 or zero-install:
 
 ```sh
 npx -y @kinlab/kin --version
+npx -y @kinlab/kin setup --intent agent --no-interactive
 ```
 
 ## What it does
@@ -28,6 +30,11 @@ npx -y @kinlab/kin --version
 The launcher and the shell installer (`scripts/install.sh`) share the same install
 contract (`$KIN_HOME`, default `~/.kin`): either lane satisfies the other, and neither
 silently downgrades an install the other made.
+
+Run `kin setup --intent agent` after provisioning. Setup writes the Kin MCP server into
+detected AI clients with the `agent-default` tool profile, adds the managed bin directory
+to your shell profile, installs the shell/session hook, and records the install ledger used
+by `kin setup status`, `kin doctor --fix`, and `kin setup uninstall`.
 
 ## Version pinning
 
@@ -55,10 +62,17 @@ the installed version already matches.
 
 ## MCP setup
 
-Any MCP client can use the included server:
+`kin setup --intent agent` is the preferred MCP setup path. It writes an absolute path to
+the managed native `kin` binary, so agents do not depend on inheriting your shell `PATH`.
+
+Any MCP client can also use the included server manually:
 
 ```json
-{ "command": "npx", "args": ["-y", "@kinlab/kin", "mcp", "start"] }
+{
+  "command": "npx",
+  "args": ["-y", "@kinlab/kin", "mcp", "start"],
+  "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
+}
 ```
 
 `@kinlab/kin-mcp` remains published for existing configurations; new setups should use

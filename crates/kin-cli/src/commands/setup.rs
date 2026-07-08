@@ -39,7 +39,8 @@ _kin_vfs_find_workspace() {
 
 _kin_vfs_shim_path() {
     local lib
-    local kin_lib="$HOME/.kin/lib"
+    local kin_home="${KIN_HOME:-${KIN_DIR:-$HOME/.kin}}"
+    local kin_lib="$kin_home/lib"
     case "$(uname -s)" in
         Darwin) lib="$kin_lib/libkin_vfs_shim.dylib" ;;
         Linux)  lib="$kin_lib/libkin_vfs_shim.so" ;;
@@ -167,7 +168,8 @@ _kin_vfs_find_workspace() {
 
 _kin_vfs_shim_path() {
     local lib
-    local kin_lib="$HOME/.kin/lib"
+    local kin_home="${KIN_HOME:-${KIN_DIR:-$HOME/.kin}}"
+    local kin_lib="$kin_home/lib"
     case "$(uname -s)" in
         Darwin) lib="$kin_lib/libkin_vfs_shim.dylib" ;;
         Linux)  lib="$kin_lib/libkin_vfs_shim.so" ;;
@@ -383,7 +385,14 @@ function _kin_vfs_activate
         disown
     end
 
-    set -l shim "$HOME/.kin/lib/libkin_vfs_shim"
+    set -l kin_home "$HOME/.kin"
+    if set -q KIN_DIR
+        set kin_home $KIN_DIR
+    end
+    if set -q KIN_HOME
+        set kin_home $KIN_HOME
+    end
+    set -l shim "$kin_home/lib/libkin_vfs_shim"
     switch (uname -s)
         case Darwin
             set shim "$shim.dylib"
@@ -526,6 +535,13 @@ fn home_dir() -> Result<PathBuf> {
 }
 
 pub(crate) fn kin_dir() -> Result<PathBuf> {
+    for key in ["KIN_HOME", "KIN_DIR"] {
+        if let Some(value) = env::var_os(key) {
+            if !value.is_empty() {
+                return Ok(PathBuf::from(value));
+            }
+        }
+    }
     Ok(home_dir()?.join(".kin"))
 }
 
@@ -582,6 +598,13 @@ fn copy_shim(src: &Path, dest: &Path) -> Result<ShimCopy> {
 
 fn find_shim() -> Option<PathBuf> {
     let name = shim_filename();
+
+    if let Ok(kin_home) = kin_dir() {
+        let candidate = kin_home.join("lib").join(name);
+        if is_usable_shim(&candidate) {
+            return Some(candidate);
+        }
+    }
 
     if let Ok(exe) = env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -1094,8 +1117,40 @@ fn rc_integration_block(source_line: &str) -> String {
     format!("\n# kin-vfs shell integration\n{source_line}\n")
 }
 
+fn shell_path_separator() -> &'static str {
+    if cfg!(target_os = "windows") {
+        ";"
+    } else {
+        ":"
+    }
+}
+
+fn rc_path_line(shell_name: &str, bin_dir: &Path) -> String {
+    match shell_name {
+        "fish" => format!("fish_add_path {}", bin_dir.display()),
+        "powershell" => {
+            format!(
+                "$env:PATH = \"{}{}$env:PATH\"",
+                bin_dir.display(),
+                shell_path_separator()
+            )
+        }
+        _ => format!("export PATH=\"{}:$PATH\"", bin_dir.display()),
+    }
+}
+
+fn rc_path_block(shell_name: &str, bin_dir: &Path) -> String {
+    format!("\n# Kin\n{}\n", rc_path_line(shell_name, bin_dir))
+}
+
+fn rc_declares_kin_bin(content: &str, bin_dir: &Path) -> bool {
+    let bin = bin_dir.to_string_lossy();
+    content.contains(bin.as_ref()) || content.contains(".kin/bin") || content.contains("kin/bin")
+}
+
 fn install_shell_hook(shell_name: &str) -> Result<(PathBuf, String)> {
     let kin_home = kin_dir()?;
+    let bin_dir = kin_home.join("bin");
     let shell_dir = kin_home.join("shell");
     let lib_dir = kin_home.join("lib");
 
@@ -1133,32 +1188,47 @@ fn install_shell_hook(shell_name: &str) -> Result<(PathBuf, String)> {
     let source_line = rc_source_line(shell_name, &hook_file);
 
     let rc_path = shell_rc(shell_name)?;
-    let already_installed = if rc_path.exists() {
-        fs::read_to_string(&rc_path)
-            .map(|c| c.contains("kin-vfs"))
-            .unwrap_or(false)
+    let mut rc_content = if rc_path.exists() {
+        fs::read_to_string(&rc_path)?
     } else {
-        false
+        String::new()
     };
+    let hook_installed = rc_content.contains("kin-vfs");
+    let path_installed = rc_declares_kin_bin(&rc_content, &bin_dir);
 
-    if already_installed {
+    if hook_installed {
         println!(
             "  Shell rc already sources kin-vfs hook: {}",
             rc_path.display()
         );
     } else {
-        let mut rc_content = if rc_path.exists() {
-            fs::read_to_string(&rc_path)?
-        } else {
-            String::new()
-        };
         if !rc_content.ends_with('\n') && !rc_content.is_empty() {
             rc_content.push('\n');
         }
         rc_content.push_str(&rc_integration_block(&source_line));
+        println!("  Appended to {}", rc_path.display());
+    }
+
+    if path_installed {
+        println!("  Shell rc already adds {} to PATH", bin_dir.display());
+    } else {
+        if !rc_content.ends_with('\n') && !rc_content.is_empty() {
+            rc_content.push('\n');
+        }
+        rc_content.push_str(&rc_path_block(shell_name, &bin_dir));
+        println!(
+            "  Added {} to PATH for new shell sessions",
+            bin_dir.display()
+        );
+    }
+
+    if !hook_installed || !path_installed {
+        if let Some(parent) = rc_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
         fs::write(&rc_path, &rc_content)
             .with_context(|| format!("failed to update {}", rc_path.display()))?;
-        println!("  Appended to {}", rc_path.display());
     }
 
     Ok((hook_file, source_line))
@@ -1660,8 +1730,22 @@ fn record_setup_ledger(plan: &SetupPlan, shell_name: &str) {
                     ledger.record(LedgerEntry::appended(
                         ArtifactKind::ShellRcLine,
                         shell_name,
-                        rc_path,
+                        rc_path.clone(),
                         block,
+                    ));
+                }
+
+                let bin_dir = kin_home.join("bin");
+                let path_block = rc_path_block(shell_name, &bin_dir);
+                let path_present = fs::read_to_string(&rc_path)
+                    .map(|c| c.contains(&path_block))
+                    .unwrap_or(false);
+                if path_present {
+                    ledger.record(LedgerEntry::appended(
+                        ArtifactKind::ShellPathLine,
+                        format!("{shell_name}-path"),
+                        rc_path,
+                        path_block,
                     ));
                 }
             }
@@ -2225,6 +2309,36 @@ pub fn uninstall(dry_run: bool, force: bool, json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+    use std::ffi::{OsStr, OsString};
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let previous = env::var_os(key);
+            env::set_var(key, value.as_ref());
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = env::var_os(key);
+            env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => env::set_var(self.key, value),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
 
     fn opts() -> WizardOptions {
         WizardOptions {
@@ -2341,6 +2455,21 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn find_shim_checks_managed_kin_home_lib() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kin_home = tmp.path().join("kin-home");
+        let shim = kin_home.join("lib").join(shim_filename());
+        fs::create_dir_all(shim.parent().unwrap()).unwrap();
+        fs::write(&shim, b"MANAGED_SHIM").unwrap();
+
+        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        let _kin_dir = EnvGuard::remove("KIN_DIR");
+
+        assert_eq!(find_shim().as_deref(), Some(shim.as_path()));
+    }
+
+    #[test]
     fn zsh_hook_clears_stale_preload_state() {
         assert!(ZSH_HOOK.contains("_kin_vfs_clear_preload"));
         assert!(ZSH_HOOK.contains("_kin_vfs_refresh_preload"));
@@ -2352,6 +2481,83 @@ mod tests {
         assert!(BASH_HOOK.contains("_kin_vfs_clear_preload"));
         assert!(BASH_HOOK.contains("_kin_vfs_refresh_preload"));
         assert!(BASH_HOOK.contains("else\n            _kin_vfs_refresh_preload"));
+    }
+
+    #[test]
+    fn shell_hooks_respect_custom_kin_home() {
+        let posix_home = r#"${KIN_HOME:-${KIN_DIR:-$HOME/.kin}}"#;
+        assert!(ZSH_HOOK.contains(posix_home));
+        assert!(BASH_HOOK.contains(posix_home));
+        assert!(FISH_HOOK.contains("if set -q KIN_DIR"));
+        assert!(FISH_HOOK.contains("if set -q KIN_HOME"));
+        assert!(FISH_HOOK.contains("\"$kin_home/lib/libkin_vfs_shim\""));
+    }
+
+    #[test]
+    fn rc_path_line_uses_shell_appropriate_syntax() {
+        let bin = Path::new("/tmp/kin-home/bin");
+        assert_eq!(
+            rc_path_line("zsh", bin),
+            "export PATH=\"/tmp/kin-home/bin:$PATH\""
+        );
+        assert_eq!(
+            rc_path_line("bash", bin),
+            "export PATH=\"/tmp/kin-home/bin:$PATH\""
+        );
+        assert_eq!(rc_path_line("fish", bin), "fish_add_path /tmp/kin-home/bin");
+        assert!(rc_path_line("powershell", bin).contains("$env:PATH"));
+    }
+
+    #[test]
+    #[serial]
+    fn kin_dir_honors_kin_home_before_kin_dir() {
+        let _kin_home = EnvGuard::remove("KIN_HOME");
+        let _kin_dir = EnvGuard::remove("KIN_DIR");
+        let fallback = PathBuf::from("/tmp/kin-dir-only");
+        let preferred = PathBuf::from("/tmp/kin-home-preferred");
+
+        env::set_var("KIN_DIR", &fallback);
+        assert_eq!(kin_dir().unwrap(), fallback);
+
+        env::set_var("KIN_HOME", &preferred);
+        assert_eq!(kin_dir().unwrap(), preferred);
+    }
+
+    #[test]
+    #[serial]
+    fn install_shell_hook_adds_path_and_hook_blocks_idempotently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let kin_home = tmp.path().join("kin-home");
+        fs::create_dir_all(&home).unwrap();
+
+        let _home = EnvGuard::set("HOME", &home);
+        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        let _kin_dir = EnvGuard::remove("KIN_DIR");
+        let _path = EnvGuard::set("PATH", "/usr/bin");
+
+        install_shell_hook("zsh").unwrap();
+        install_shell_hook("zsh").unwrap();
+
+        let rc = fs::read_to_string(home.join(".zshrc")).unwrap();
+        let path_line = rc_path_line("zsh", &kin_home.join("bin"));
+
+        assert_eq!(
+            rc.matches("kin-vfs.zsh").count(),
+            1,
+            "setup must not duplicate the shell hook source line"
+        );
+        assert_eq!(
+            rc.matches(&path_line).count(),
+            1,
+            "setup must not duplicate the Kin PATH line"
+        );
+        assert!(
+            fs::read_to_string(kin_home.join("shell").join("kin-vfs.zsh"))
+                .unwrap()
+                .contains(r#"${KIN_HOME:-${KIN_DIR:-$HOME/.kin}}"#),
+            "installed hook must resolve the active Kin home"
+        );
     }
 
     #[test]

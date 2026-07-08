@@ -45,14 +45,24 @@ pub async fn run(
     // discovery commands see live, unreconciled workspace edits.
     let shim_env =
         native_session_shim_env(&layout, &ws.root, restrict_discovery, restrict_filesystem)?;
+    let daemon_url = match std::env::var("KIN_DAEMON_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(url) => url,
+        None => crate::daemon_client::resolve_daemon_url(&layout)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("kin daemon is required for shell session binding"))?,
+    };
+    let repo_id = super::remote::resolve_repo_id(&layout).ok();
+    let mut launch_env = shell_session_env(session_id, &ws.root, &daemon_url, repo_id.as_deref());
+    launch_env.extend(shim_env);
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".into());
 
     let status = std::process::Command::new(&shell)
         .current_dir(&ws.root)
-        .env("KIN_SESSION", session_id.to_string())
-        .env("KIN_SESSION_DIR", ws.root.to_string_lossy().as_ref())
-        .envs(shim_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .envs(launch_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
@@ -65,6 +75,27 @@ pub async fn run(
     close_session_after_shell(&layout, &session_dir).await?;
 
     Ok(())
+}
+
+fn shell_session_env(
+    session_id: uuid::Uuid,
+    ws_root: &std::path::Path,
+    daemon_url: &str,
+    repo_id: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("KIN_SESSION".into(), session_id.to_string()),
+        ("KIN_SESSION_ID".into(), session_id.to_string()),
+        (
+            "KIN_SESSION_DIR".into(),
+            ws_root.to_string_lossy().into_owned(),
+        ),
+        ("KIN_DAEMON_URL".into(), daemon_url.to_string()),
+    ];
+    if let Some(repo_id) = repo_id {
+        env.push(("KIN_REPO_ID".into(), repo_id.to_string()));
+    }
+    env
 }
 
 async fn close_session_after_shell(
@@ -136,9 +167,29 @@ mod tests {
         // Validate that the env var names we use match expected conventions
         let session_id = uuid::Uuid::new_v4();
         let session_str = session_id.to_string();
+        let ws_root = std::path::Path::new("/tmp/test-repo/.kin/runs/session-test");
+        let env = super::shell_session_env(
+            session_id,
+            ws_root,
+            "http://127.0.0.1:4242",
+            Some("repo-uuid"),
+        );
 
         // KIN_SESSION should be a valid UUID string
         assert!(uuid::Uuid::parse_str(&session_str).is_ok());
+        for (key, expected) in [
+            ("KIN_SESSION", session_id.to_string()),
+            ("KIN_SESSION_ID", session_id.to_string()),
+            ("KIN_SESSION_DIR", ws_root.to_string_lossy().into_owned()),
+            ("KIN_DAEMON_URL", "http://127.0.0.1:4242".to_string()),
+            ("KIN_REPO_ID", "repo-uuid".to_string()),
+        ] {
+            assert_eq!(
+                env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str()),
+                Some(expected.as_str()),
+                "missing or wrong {key}"
+            );
+        }
 
         // Session dir path construction
         let root = std::path::Path::new("/tmp/test-repo");

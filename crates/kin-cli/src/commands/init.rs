@@ -422,6 +422,50 @@ fn read_git_head(dir: &Path) -> Option<String> {
     None
 }
 
+fn bootstrap_fresh_native_agent_doc(dir: &Path) -> Result<bool> {
+    fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create repository directory {}", dir.display()))?;
+    let target = kin_core::ManagedDocTarget {
+        path: "AGENTS.md".into(),
+        enabled: true,
+        sections: vec![
+            "summary".into(),
+            "kin-first".into(),
+            "conventions".into(),
+            "verification".into(),
+        ],
+    };
+    let managed = kin_core::generate_managed_content(&target, &kin_core::RepoSummary::default());
+    let result = kin_core::sync_doc(&dir.join("AGENTS.md"), &managed)?;
+    Ok(result.created || result.updated)
+}
+
+fn save_fresh_native_agent_config(layout: &kin_core::KinLayout) -> Result<()> {
+    let config = kin_core::ManagedDocConfig::default();
+    config.save(layout)?;
+    Ok(())
+}
+
+fn print_fresh_native_next_steps(layout: &kin_core::KinLayout, agent_doc_changed: bool) {
+    println!();
+    println!("Fresh Kin-native repository ready.");
+    if agent_doc_changed {
+        println!(
+            "  Agent guide: {}",
+            layout.working_dir().join("AGENTS.md").display()
+        );
+    } else {
+        println!(
+            "  Agent guide: {} (managed block already current)",
+            layout.working_dir().join("AGENTS.md").display()
+        );
+    }
+    println!("  Code with Kin: kin with --session codex -- \"build the first feature\"");
+    println!("  Run checks: kin exec -- <command>");
+    println!("  Commit graph truth: kin commit -m \"Create initial version\"");
+    println!("  Git escape hatch: kin git export --output <path>");
+}
+
 pub async fn run(
     path: Option<String>,
     json: bool,
@@ -436,6 +480,13 @@ pub async fn run(
         .unwrap_or_else(|| std::env::current_dir().expect("cannot determine current directory"));
 
     let is_git_repo = dir.join(".git").exists();
+    let kin_dir = dir.join(".kin");
+    let fresh_native_init = !is_git_repo && !kin_dir.exists();
+    let agent_doc_bootstrapped = if fresh_native_init {
+        bootstrap_fresh_native_agent_doc(&dir)?
+    } else {
+        false
+    };
     if is_git_repo && !json && !force {
         eprintln!(
             "Detected Git repository. Bootstrapping current state as semantic truth.\n\
@@ -459,7 +510,6 @@ pub async fn run(
     let (tmp_snapshot, snapshot_manifest) = snapshot_repo(&dir, force)?;
     phase!("snapshot_repo");
 
-    let kin_dir = dir.join(".kin");
     let is_warm = kin_dir.exists();
     let (layout, snap, blob_store, genesis_id) = if is_warm {
         let layout = kin_core::KinLayout::discover(&dir)
@@ -500,6 +550,9 @@ pub async fn run(
         }
         (layout, snap, blob_store, result.genesis_id)
     };
+    if fresh_native_init {
+        save_fresh_native_agent_config(&layout)?;
+    }
     phase!("kin_core::init");
 
     let all_files = collect_source_files(&tmp_snapshot)?;
@@ -961,6 +1014,8 @@ pub async fn run(
                 summary: init_summary,
             })?
         );
+    } else if fresh_native_init {
+        print_fresh_native_next_steps(&layout, agent_doc_bootstrapped);
     }
 
     Ok(())
@@ -6230,6 +6285,12 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             .collect()
     }
 
+    fn repo_truth_fixture_with_agent_doc(root: &Path) -> BTreeSet<String> {
+        let mut paths = repo_truth_fixture(root);
+        paths.insert("AGENTS.md".to_string());
+        paths
+    }
+
     fn tracked_graph_paths(graph: &kin_db::InMemoryGraph) -> BTreeSet<String> {
         let mut tracked = BTreeSet::new();
 
@@ -6271,10 +6332,20 @@ func prCheckout(cmd *cobra.Command, args []string) error {
 
         assert_eq!(graph.indexed_file_paths().len(), expected_paths.len());
         // Swift is an entity-source language, so docs/guide.swift is fully
-        // indexed rather than shallow-tracked — no fixture file is shallow.
+        // indexed rather than shallow-tracked. Fresh native init also writes
+        // AGENTS.md before the first snapshot, so it is graph-tracked as
+        // repo-owned guidance, not as `.kin` control-plane state.
+        let expected_opaque_artifacts = if expected_paths.contains("AGENTS.md") {
+            2
+        } else {
+            1
+        };
         assert_eq!(graph.list_shallow_files().unwrap().len(), 0);
         assert_eq!(graph.list_structured_artifacts().unwrap().len(), 1);
-        assert_eq!(graph.list_opaque_artifacts().unwrap().len(), 1);
+        assert_eq!(
+            graph.list_opaque_artifacts().unwrap().len(),
+            expected_opaque_artifacts
+        );
     }
 
     fn assert_makefile_is_text_searchable(graph: &kin_db::InMemoryGraph) {
@@ -6655,7 +6726,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
     async fn run_keeps_control_plane_paths_out_of_graph_truth_on_cold_init() {
         let repo_dir = tempfile::tempdir().unwrap();
         let home_dir = tempfile::tempdir().unwrap();
-        let expected_paths = repo_truth_fixture(repo_dir.path());
+        let expected_paths = repo_truth_fixture_with_agent_doc(repo_dir.path());
 
         let _home_guard = EnvVarGuard::set("HOME", home_dir.path());
         let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
@@ -6687,7 +6758,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
     async fn run_ignores_daemon_bootstrap_when_initializing_repo() {
         let repo_dir = tempfile::tempdir().unwrap();
         let home_dir = tempfile::tempdir().unwrap();
-        let expected_paths = repo_truth_fixture(repo_dir.path());
+        let expected_paths = repo_truth_fixture_with_agent_doc(repo_dir.path());
 
         let daemon_graph = kin_db::InMemoryGraph::new();
         daemon_graph.set_file_hash(".kin/snapshot/manifest.json", [5; 32]);

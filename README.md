@@ -4,7 +4,7 @@
 > **Kin helps teams trust AI-built software before it merges.**
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Release](https://img.shields.io/badge/release-v0.2.12-6E56CF.svg)](https://github.com/firelock-ai/kin/releases)
+[![Release](https://img.shields.io/badge/release-v0.2.14-6E56CF.svg)](https://github.com/firelock-ai/kin/releases)
 [![kinlab.ai](https://img.shields.io/badge/hosted-kinlab.ai-111111.svg)](https://kinlab.ai)
 
 AI agents now generate code faster than teams can review it. The hard part is no longer
@@ -37,7 +37,7 @@ real blast radius of a merge is.
 ## Install
 
 Kin ships as native binaries on [GitHub Releases](https://github.com/firelock-ai/kin/releases)
-(currently **v0.2.12**) for five targets: macOS (Apple Silicon and Intel), Linux (x86_64 and
+(currently **v0.2.14**) for five targets: macOS (Apple Silicon and Intel), Linux (x86_64 and
 aarch64, static musl), and Windows (x86_64 — a limited, work-in-progress build; see below).
 
 **Direct download.** Grab the archive for your platform, verify its checksum, and extract.
@@ -45,8 +45,8 @@ The release publishes a `.sha256` next to every archive.
 
 ```sh
 # Apple Silicon macOS shown; swap in your platform's archive name.
-curl -fsSLO https://github.com/firelock-ai/kin/releases/download/v0.2.12/kin-macos-aarch64.tar.gz
-curl -fsSLO https://github.com/firelock-ai/kin/releases/download/v0.2.12/kin-macos-aarch64.tar.gz.sha256
+curl -fsSLO https://github.com/firelock-ai/kin/releases/download/v0.2.14/kin-macos-aarch64.tar.gz
+curl -fsSLO https://github.com/firelock-ai/kin/releases/download/v0.2.14/kin-macos-aarch64.tar.gz.sha256
 shasum -a 256 -c kin-macos-aarch64.tar.gz.sha256
 tar xzf kin-macos-aarch64.tar.gz      # contains the `kin` and `kin-daemon` binaries
 ```
@@ -67,12 +67,13 @@ Windows build is a limited, vector-free convenience binary with no filesystem pr
 the complete, vector-enabled Kin, install under WSL2 — see
 [docs/windows-wsl2.md](docs/windows-wsl2.md).
 
-**For AI agents.** The MCP server that exposes Kin's tools to assistants is published on npm
-as [`@kinlab/kin-mcp`](https://www.npmjs.com/package/@kinlab/kin-mcp) (**0.2.12**). You
-normally don't install it by hand — `kin setup` wires it into every detected agent for you.
+**For AI agents.** `kin setup --intent agent` wires Kin's built-in MCP server into every
+detected assistant with the curated `agent-default` tool profile. npm users can install the
+canonical launcher with `npm install -g @kinlab/kin` (**0.2.14**) and run the same setup
+command; the older `@kinlab/kin-mcp` package remains as a compatibility wrapper.
 
 See [docs/quickstart.md](docs/quickstart.md) for installer environment variables
-(`KIN_VERSION`, `KIN_DIR`, `KIN_NO_SETUP`, `KIN_BASE_URL`) and daemon/runtime configuration.
+(`KIN_VERSION`, `KIN_HOME`, `KIN_DIR`, `KIN_NO_SETUP`, `KIN_BASE_URL`) and daemon/runtime configuration.
 
 ---
 
@@ -83,8 +84,8 @@ With `kin` on your PATH:
 ```sh
 kin setup                            # wire Kin's MCP tools into your AI agents
                                      #   (detects Claude Code, Cursor, Codex, Gemini, Windsurf)
-kin init                             # build the semantic graph over your repo
-                                     #   (coexists with Git; imports recent history by default)
+kin init                             # new no-Git folders become Kin-native by default;
+                                     # existing Git repos import recent history by default
 kin locate "webhook retries twice"   # find the entities/files behind an issue
 kin refs charge_customer             # who calls, imports, or references this entity
 kin review shadow main..HEAD         # report-only merge-gate verdict:

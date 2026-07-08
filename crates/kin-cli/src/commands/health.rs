@@ -521,25 +521,36 @@ fn check_shell_path() -> HealthCheck {
     let hook_installed = hook_path.exists();
 
     let rc_path = shell_rc(shell).ok();
-    let rc_sources = rc_path
+    let rc_content = rc_path
         .as_ref()
-        .map(|rc| {
-            std::fs::read_to_string(rc)
-                .map(|c| c.contains("kin-vfs"))
-                .unwrap_or(false)
-        })
-        .unwrap_or(false);
+        .and_then(|rc| std::fs::read_to_string(rc).ok())
+        .unwrap_or_default();
+    let rc_sources = rc_content.contains("kin-vfs");
+    let bin_display = bin_dir.to_string_lossy();
+    let rc_sets_path = rc_content.contains(bin_display.as_ref())
+        || rc_content.contains(".kin/bin")
+        || rc_content.contains("kin/bin");
 
     let rc_display = rc_path
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "<unknown>".to_string());
 
-    if hook_installed && rc_sources {
-        let detail = if on_path {
-            format!("{shell} hook installed and sourced from {rc_display}; ~/.kin/bin on PATH")
-        } else {
-            format!("{shell} hook installed and sourced from {rc_display}")
+    if hook_installed && rc_sources && (on_path || rc_sets_path) {
+        let detail = match (on_path, rc_sets_path) {
+            (true, _) => {
+                format!(
+                    "{shell} hook installed and sourced from {rc_display}; {} on PATH",
+                    bin_dir.display()
+                )
+            }
+            (false, true) => {
+                format!(
+                    "{shell} hook installed and sourced from {rc_display}; {} will be on PATH after shell restart",
+                    bin_dir.display()
+                )
+            }
+            (false, false) => unreachable!(),
         };
         HealthCheck::new(
             "shell_path",
@@ -555,6 +566,12 @@ fn check_shell_path() -> HealthCheck {
         }
         if !rc_sources {
             missing.push(format!("{rc_display} does not source the kin-vfs hook"));
+        }
+        if !on_path && !rc_sets_path {
+            missing.push(format!(
+                "{rc_display} does not add {} to PATH",
+                bin_dir.display()
+            ));
         }
         HealthCheck::new(
             "shell_path",
@@ -986,6 +1003,36 @@ fn check_retrieval_profile() -> HealthCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+    use std::ffi::{OsStr, OsString};
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let previous = env::var_os(key);
+            env::set_var(key, value.as_ref());
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = env::var_os(key);
+            env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => env::set_var(self.key, value),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
 
     fn write_file(path: &Path, bytes: &[u8]) {
         use std::io::Write;
@@ -1080,6 +1127,52 @@ mod tests {
         assert!(json.contains("\"platform\""));
         assert!(json.contains("\"healthy\""));
         assert!(json.contains("\"retrieval_profile\""));
+    }
+
+    #[test]
+    #[serial]
+    fn shell_path_is_healthy_when_rc_declares_path_for_next_shell() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let kin_home = tmp.path().join("kin-home");
+        let hook_dir = kin_home.join("shell");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&hook_dir).unwrap();
+
+        let hook = hook_dir.join(hook_filename("zsh"));
+        std::fs::write(&hook, "# kin-vfs test hook\n").unwrap();
+        std::fs::write(
+            home.join(".zshrc"),
+            format!(
+                "source \"{}\"\nexport PATH=\"{}:$PATH\"\n",
+                hook.display(),
+                kin_home.join("bin").display()
+            ),
+        )
+        .unwrap();
+
+        let _home = EnvGuard::set("HOME", &home);
+        let _kin_home = EnvGuard::set("KIN_HOME", &kin_home);
+        let _kin_dir = EnvGuard::remove("KIN_DIR");
+        let _shell = EnvGuard::set("SHELL", "/bin/zsh");
+        let _ps_module_path = EnvGuard::remove("PSModulePath");
+        let _ps_version_table = EnvGuard::remove("PSVersionTable");
+        let _profile = EnvGuard::remove("PROFILE");
+        let _path = EnvGuard::set("PATH", "/usr/bin");
+
+        let check = check_shell_path();
+        assert_eq!(check.id, "shell_path");
+        assert!(
+            matches!(check.status, HealthStatus::Healthy),
+            "rc-declared Kin PATH should be healthy after install; got {:?}: {}",
+            check.status,
+            check.detail
+        );
+        assert!(
+            check.detail.contains("after shell restart"),
+            "detail should explain why the current process PATH can lag: {}",
+            check.detail
+        );
     }
 
     fn check_with(id: &str, status: HealthStatus) -> HealthCheck {

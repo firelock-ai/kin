@@ -142,6 +142,9 @@ impl EnvVarSpec {
 pub const OPERATIONAL: &[EnvVarSpec] = &[
     // ---- validation control ---------------------------------------------------
     EnvVarSpec { name: "KIN_ENV_VALIDATION", kind: Kind::OneOf(&["off", "warn", "strict"]), default: "warn", sensitivity: Sensitivity::Operational, summary: "startup env validation mode: off, warn (default), or strict" },
+    // ---- install / setup root -------------------------------------------------
+    EnvVarSpec { name: "KIN_HOME", kind: Kind::Path, default: "~/.kin", sensitivity: Sensitivity::Operational, summary: "preferred root for the managed Kin install used by the launcher, setup, and shell hooks" },
+    EnvVarSpec { name: "KIN_DIR", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "compatibility alias for the managed Kin install root; KIN_HOME wins when both are set" },
     // ---- correctness / retrieval-affecting ------------------------------------
     EnvVarSpec { name: "KIN_INIT_WARM_CACHE", kind: Kind::Bool, default: "true", sensitivity: Sensitivity::Correctness, summary: "reuse a warm init cache; a cross-store warm cache can depress F1, so an override is loud" },
     EnvVarSpec { name: "KIN_SEMLOC_RERANK", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "enable semantic-locate reranking of daemon locate results" },
@@ -266,6 +269,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_BUILD_GRAPH_TIMEOUT_SECS", kind: Kind::Secs, default: "60", sensitivity: Sensitivity::Operational, summary: "timeout for building a historical ref-view graph" },
     EnvVarSpec { name: "KIN_MCP_TOOL_PROFILE", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "MCP tool exposure profile" },
     EnvVarSpec { name: "KIN_MCP_REPO", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "bind `kin mcp start` to this repository instead of the launch directory" },
+    EnvVarSpec { name: "KIN_MCP_CACHE_DIR", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "cache directory override for the npm MCP wrapper's managed Kin binary" },
 
     // ---- diagnostics / benchmarking ------------------------------------------
     EnvVarSpec { name: "KIN_LOCATE_DEBUG", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Diagnostic, summary: "emit locate pipeline debug output" },

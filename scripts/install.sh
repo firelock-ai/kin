@@ -9,16 +9,19 @@
 #
 # Options (via env vars):
 #   KIN_VERSION=0.1.0    Pin a specific version (default: latest)
-#   KIN_DIR=~/.kin        Install directory (default: ~/.kin)
+#   KIN_HOME=~/.kin       Install directory (preferred; default: ~/.kin)
+#   KIN_DIR=~/.kin        Install directory compatibility alias
 #   KIN_NO_SETUP=1        Skip interactive setup after install
 
 set -eu
 
 # ── Config ──────────────────────────────────────────────────────────────
 
-KIN_DIR="${KIN_DIR:-$HOME/.kin}"
+KIN_DIR="${KIN_HOME:-${KIN_DIR:-$HOME/.kin}}"
 KIN_BIN="$KIN_DIR/bin"
 KIN_LIB="$KIN_DIR/lib"
+export KIN_HOME="$KIN_DIR"
+export KIN_DIR="$KIN_DIR"
 GITHUB_ORG="firelock-ai"
 GITHUB_REPO="kin"
 # Override KIN_BASE_URL to install from a mirror or a local `file://` path
@@ -222,7 +225,7 @@ add_to_path() {
     local rc_file="$1"
     local line="export PATH=\"$KIN_BIN:\$PATH\""
 
-    if [ -f "$rc_file" ] && grep -q "kin/bin" "$rc_file" 2>/dev/null; then
+    if [ -f "$rc_file" ] && grep -F -q "$KIN_BIN" "$rc_file" 2>/dev/null; then
         return 0  # Already configured
     fi
 

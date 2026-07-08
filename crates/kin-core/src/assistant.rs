@@ -784,19 +784,26 @@ pub fn generate_assistant_prompt(
     let mut out = String::new();
 
     // Compact benchmark content (shared by both modes)
-    out.push_str("# Kin — Semantic Code Search\n\n");
-    out.push_str("This repository uses Kin for semantic code navigation. ");
-    out.push_str("Use `kin` CLI commands instead of grep/find/cat for code discovery.\n\n");
+    out.push_str("# Kin - Native Semantic Repository\n\n");
+    out.push_str("This repository uses Kin as the semantic system of record. ");
+    out.push_str("The graph is authority; files are the projection and execution surface. ");
+    out.push_str("Use Kin tools instead of grep/find/cat for code discovery.\n\n");
     out.push_str("## Quick Start\n");
-    out.push_str("1. `kin overview --compact` — get codebase orientation\n");
-    out.push_str("2. `kin trace <ExactName> --compact` — resolve one entity and print the focused neighborhood\n");
+    out.push_str("1. MCP: `semantic_locate` to find the right entity or file by meaning\n");
+    out.push_str("2. MCP: `get_context_pack` to load the focused neighborhood\n");
     out.push_str(
-        "3. `kin search <name> --show-body --limit 5` — exact-name lookup with inline body\n",
+        "3. MCP: `trace_data_flow` when lineage or cross-file dependency direction matters\n",
     );
-    out.push_str("4. `kin search <name> --kind function --show-body --limit 5` — narrow by kind when needed\n");
-    out.push_str("5. `kin context <entity>` — get the full token-budgeted context pack\n\n");
+    out.push_str("4. CLI: `kin overview --compact` to get codebase orientation\n");
+    out.push_str("5. CLI: `kin trace <ExactName> --compact` to resolve one entity and print the focused neighborhood\n");
+    out.push_str(
+        "6. CLI: `kin search <name> --show-body --limit 5` for exact-name lookup with inline body\n",
+    );
+    out.push_str("7. CLI: `kin context <entity>` to get the full token-budgeted context pack\n\n");
     out.push_str("## Key Principle\n");
-    out.push_str("Trace semantically first, search semantically second, read files last.\n");
+    out.push_str(
+        "Ask the graph first, read projected files second, and use raw filesystem reads last.\n",
+    );
 
     // Append summary stats if available
     if let Some(s) = summary {
@@ -901,15 +908,23 @@ pub fn generate_bootstrap_docs(_layout: &KinLayout, kind: AssistantKind) -> Stri
 
     let mut out = String::new();
     out.push_str("# Kin-Native Repository\n\n");
-    out.push_str("This repo uses a Kin control root. Start with Kin commands, not broad filesystem discovery.\n\n");
+    out.push_str("This repo uses Kin as the semantic system of record. Start with Kin graph tools, not broad filesystem discovery.\n\n");
     out.push_str("## Workflow\n");
-    out.push_str("1. If the task already names exact symbols/files, start with `kin trace <ExactName> --compact`\n");
+    out.push_str("1. If MCP is connected, start with `semantic_locate` to find the right entity or file by meaning\n");
     out.push_str(
-        "2. Use `kin overview --compact` only for broad architecture/orientation questions\n",
+        "2. Use `get_context_pack` to load the focused neighborhood before reading broad files\n",
     );
-    out.push_str("3. After `kin trace` finds the file, inspect that file directly for local detail before running more Kin queries\n");
-    out.push_str("4. `kin search <ExactName> --kind function --show-body --limit 5` only if trace is too coarse\n");
-    out.push_str("5. `kin context <entity>` for the full pack\n\n");
+    out.push_str(
+        "3. Use `trace_data_flow` when lineage or cross-file dependency direction matters\n",
+    );
+    out.push_str(
+        "4. Use `kin overview --compact` only for broad architecture/orientation questions\n",
+    );
+    out.push_str(
+        "5. If MCP is unavailable, use `kin trace <ExactName> --compact` for exact named symbols\n",
+    );
+    out.push_str("6. `kin search <ExactName> --kind function --show-body --limit 5` only if trace is too coarse\n");
+    out.push_str("7. `kin context <entity>` for the full pack\n\n");
     out.push_str("## Rules\n");
     out.push_str("- Prefer exact names like `parseStrict`, `parse`, or `$MyType`\n");
     out.push_str("- Avoid broad shotgun searches\n");
@@ -1515,7 +1530,10 @@ mod tests {
             None,
         );
 
-        assert!(prompt.contains("# Kin — Semantic Code Search"));
+        assert!(prompt.contains("# Kin - Native Semantic Repository"));
+        assert!(prompt.contains("semantic_locate"));
+        assert!(prompt.contains("get_context_pack"));
+        assert!(prompt.contains("trace_data_flow"));
         assert!(prompt.contains("kin overview --compact"));
         assert!(prompt.contains("kin trace <ExactName>"));
         assert!(prompt.contains("kin search <name> --show-body --limit 5"));
@@ -1566,13 +1584,14 @@ mod tests {
             generate_assistant_prompt(AssistantKind::ClaudeCode, PromptMode::Normal, &layout, None);
 
         // Should contain benchmark content
-        assert!(prompt.contains("# Kin — Semantic Code Search"));
+        assert!(prompt.contains("# Kin - Native Semantic Repository"));
         // Should contain comparison tables
         assert!(prompt.contains("Finding Code (use Kin instead"));
         assert!(prompt.contains("Reading Code (use Kin instead"));
         // Should contain MCP mapping (Claude is MCP-capable)
         assert!(prompt.contains("MCP Tools"));
-        assert!(prompt.contains("semantic_search"));
+        assert!(prompt.contains("semantic_locate"));
+        assert!(prompt.contains("get_context_pack"));
         // Should contain Claude-specific tips
         assert!(prompt.contains("## Claude Code Tips"));
         assert!(prompt.contains("CLAUDE.md is managed by Kin"));
@@ -1681,12 +1700,15 @@ mod tests {
 
         let doc = generate_bootstrap_docs(&layout, AssistantKind::ClaudeCode);
         assert!(doc.contains("Kin-Native Repository"));
+        assert!(doc.contains("semantic_locate"));
+        assert!(doc.contains("get_context_pack"));
+        assert!(doc.contains("trace_data_flow"));
         assert!(doc.contains("kin overview --compact"));
         assert!(doc.contains("kin trace <ExactName>"));
         assert!(doc.contains("kin context <entity>"));
         assert!(doc.contains("## For Claude Code"));
         assert!(doc.contains("claude mcp add kin"));
-        assert!(doc.contains("control root"));
+        assert!(doc.contains("semantic system of record"));
         assert!(doc.contains(".kin/docs/imported/"));
     }
 
