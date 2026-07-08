@@ -1230,6 +1230,7 @@ fn inline_comment_severity(kind: kin_review::InlineCommentKind) -> &'static str 
         | InlineCommentKind::RevertHistory => "warning",
         InlineCommentKind::Added
         | InlineCommentKind::Removed
+        | InlineCommentKind::BreakingMigrated
         | InlineCommentKind::RevertHistoryIncidental => "info",
     }
 }
