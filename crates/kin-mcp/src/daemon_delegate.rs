@@ -831,6 +831,27 @@ async fn forward_graph_status(
 }
 
 pub fn daemon_unavailable_tool_result(name: &str) -> ToolCallResult {
+    unavailable_tool_result_for(name, discover_kin_dir().as_deref())
+}
+
+/// Pure core of [`daemon_unavailable_tool_result`]: given the `.kin/`
+/// directory (if any) discovered from the server's working directory, decide
+/// whether the tool call failed because no repository is bound at all, versus
+/// a repository being bound but its daemon being unreachable. The two cases
+/// get distinct, actionable messages so an agent session that never bound a
+/// repository (e.g. a global MCP entry launched outside any Kin repo) is told
+/// how to bind one, rather than being handed a generic daemon-availability
+/// error. Factored out with an explicit `kin_dir` parameter so the branch is
+/// unit-testable without mutating the process working directory.
+fn unavailable_tool_result_for(name: &str, kin_dir: Option<&Path>) -> ToolCallResult {
+    if kin_dir.is_none() {
+        return ToolCallResult::error(format!(
+            "kin-mcp has no Kin repository bound for '{name}': not inside a kin repository (no \
+             .kin/ found from the server's working directory). Run `kin init .` in the target \
+             repository and restart this MCP server from there, or relaunch `kin mcp start` with \
+             --repo <path> (or KIN_MCP_REPO=<path>) to bind one explicitly."
+        ));
+    }
     daemon_required_unavailable(name)
 }
 
@@ -1533,5 +1554,35 @@ mod tests {
             serde_json::json!("explicit-session"),
         );
         assert_eq!(session_key(&args), "explicit-session");
+    }
+
+    #[test]
+    fn unavailable_result_reports_missing_repo_when_no_kin_dir() {
+        let result = unavailable_tool_result_for("semantic_search", None);
+        assert_eq!(result.is_error, Some(true));
+        let ContentBlock::Text { text } = result.content.first().unwrap();
+        assert!(
+            text.contains("not inside a kin repository"),
+            "expected no-repo-bound message, got: {text}"
+        );
+        assert!(
+            text.contains("--repo") && text.contains("KIN_MCP_REPO"),
+            "expected message to tell the caller how to bind a repo, got: {text}"
+        );
+    }
+
+    #[test]
+    fn unavailable_result_reports_daemon_unreachable_when_repo_is_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = unavailable_tool_result_for("semantic_search", Some(tmp.path()));
+        let ContentBlock::Text { text } = result.content.first().unwrap();
+        assert!(
+            text.contains("Kin daemon is required"),
+            "expected daemon-unreachable message, got: {text}"
+        );
+        assert!(
+            !text.contains("not inside a kin repository"),
+            "a bound repo must not report itself as unbound, got: {text}"
+        );
     }
 }

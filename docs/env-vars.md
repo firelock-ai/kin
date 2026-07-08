@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (392 total, 294 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (393 total, 294 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -40,6 +40,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_BYPASS_EMBEDDING_COVERAGE_CHECK` | bool | false | correctness | bypass the embedding-coverage correctness gate |
 | `KIN_CLAUDE_DISALLOWED_TOOLS` | string | *(unset)* | operational | comma-separated tool names disallowed in a with-session |
 | `KIN_DISABLE_SPINE` | bool | false | correctness | disable the spine federation layer, narrowing retrieval scope |
+| `KIN_MCP_REPO` | path | *(unset)* | operational | bind `kin mcp start` to this repository instead of the launch directory |
 | `KIN_MCP_TOOL_PROFILE` | string | *(unset)* | operational | MCP tool exposure profile |
 | `KIN_NO_DAEMON` | bool | false | operational | force in-process execution instead of the daemon |
 | `KIN_NO_KEYRING` | bool | false | operational | skip the OS keyring for credential storage |
