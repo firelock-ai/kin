@@ -5,8 +5,8 @@
 //!
 //! Phase 8 introduces first-class graph objects for planned work and living
 //! annotations. Work items (features, tasks, issues, debt, TODOs) are anchored
-//! to semantic scopes — not line numbers — so they survive renames, moves, and
-//! formatting churn.
+//! to semantic scopes — not line numbers — so they are designed to stay
+//! attached across renames, moves, and formatting churn.
 
 use crate::ids::*;
 use crate::timestamp::Timestamp;
@@ -188,8 +188,9 @@ impl std::str::FromStr for Priority {
 
 /// A semantic scope that a work item or annotation is anchored to.
 ///
-/// Unlike line numbers, these survive renames, moves, and formatting changes
-/// because they reference semantic identities in the graph.
+/// Unlike line numbers, these reference semantic identities in the graph,
+/// so anchors are designed to stay attached across renames, moves, and
+/// formatting changes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum WorkScope {
     Entity(EntityId),
@@ -349,9 +350,10 @@ impl std::fmt::Display for StalenessState {
 
 /// A living annotation attached to one or more semantic scopes.
 ///
-/// Annotations survive renames and moves because they are anchored to
-/// entity/contract/artifact identities, not line numbers. When the
-/// anchored entity's fingerprint drifts, staleness is detected.
+/// Annotations are anchored to entity/contract/artifact identities, not
+/// line numbers, so they are designed to stay attached across renames and
+/// moves. When the anchored entity's fingerprint drifts, staleness is
+/// detected.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Annotation {
     pub annotation_id: AnnotationId,
