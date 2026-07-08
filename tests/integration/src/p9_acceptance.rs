@@ -33,6 +33,7 @@ fn ts_import_creates_relation() {
             file_path: "src/api/route.ts".to_string(),
             entities: vec![post.clone()],
             relations: vec![ExtractedRelation {
+                call_shape: None,
                 kind: RelationKind::Imports,
                 src_name: "POST".to_string(),
                 dst_name: "helper".to_string(),
@@ -84,6 +85,7 @@ fn ts_call_creates_cross_file_relation() {
             file_path: "src/api/chat/route.ts".to_string(),
             entities: vec![post.clone()],
             relations: vec![ExtractedRelation {
+                call_shape: None,
                 kind: RelationKind::Calls,
                 src_name: "POST".to_string(),
                 dst_name: "executeTool".to_string(),
@@ -131,6 +133,7 @@ fn same_file_relation_resolves() {
         file_path: "src/animals.ts".to_string(),
         entities: vec![dog.clone(), bark.clone()],
         relations: vec![ExtractedRelation {
+            call_shape: None,
             kind: RelationKind::Contains,
             src_name: "Dog".to_string(),
             dst_name: "Dog.bark".to_string(),
@@ -165,6 +168,7 @@ fn unresolved_call_skipped_gracefully() {
         file_path: "src/api.ts".to_string(),
         entities: vec![handler.clone()],
         relations: vec![ExtractedRelation {
+            call_shape: None,
             kind: RelationKind::Calls,
             src_name: "handler".to_string(),
             dst_name: "console.log".to_string(),
@@ -306,6 +310,7 @@ fn renamed_import_resolves() {
             file_path: "src/api.ts".to_string(),
             entities: vec![handler.clone()],
             relations: vec![ExtractedRelation {
+                call_shape: None,
                 kind: RelationKind::Calls,
                 src_name: "handler".to_string(),
                 // The local alias "bar" is used in the call expression.
@@ -359,6 +364,7 @@ fn multiple_files_cross_link() {
             file_path: "src/routes.ts".to_string(),
             entities: vec![entity_a.clone()],
             relations: vec![ExtractedRelation {
+                call_shape: None,
                 kind: RelationKind::Calls,
                 src_name: "routeHandler".to_string(),
                 dst_name: "processOrder".to_string(),
@@ -377,6 +383,7 @@ fn multiple_files_cross_link() {
             file_path: "src/services/order.ts".to_string(),
             entities: vec![entity_b.clone()],
             relations: vec![ExtractedRelation {
+                call_shape: None,
                 kind: RelationKind::Calls,
                 src_name: "processOrder".to_string(),
                 dst_name: "saveToDb".to_string(),

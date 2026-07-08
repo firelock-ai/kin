@@ -227,6 +227,7 @@ fn extract_ts_node(
                                     span: span_from_node(&member, file_id),
                                 });
                                 relations.push(ExtractedRelation {
+                                    call_shape: None,
                                     kind: kin_model::RelationKind::Contains,
                                     src_name: name.clone(),
                                     dst_name: qualified,
@@ -358,6 +359,7 @@ fn extract_ts_class_member(
                     span: span_from_node(node, file_id),
                 });
                 relations.push(ExtractedRelation {
+                    call_shape: None,
                     kind: kin_model::RelationKind::Contains,
                     src_name: class_name.to_string(),
                     dst_name: qualified.clone(),
@@ -523,6 +525,7 @@ fn extract_ts_heritage(
                             let parent = value.utf8_text(source).unwrap_or("").to_string();
                             if !parent.is_empty() {
                                 relations.push(ExtractedRelation {
+                                    call_shape: None,
                                     kind: kin_model::RelationKind::Extends,
                                     src_name: class_name.to_string(),
                                     dst_name: parent,
@@ -538,6 +541,7 @@ fn extract_ts_heritage(
                                 let iface_name = iface.utf8_text(source).unwrap_or("").to_string();
                                 if !iface_name.is_empty() {
                                     relations.push(ExtractedRelation {
+                                        call_shape: None,
                                         kind: kin_model::RelationKind::Implements,
                                         src_name: class_name.to_string(),
                                         dst_name: iface_name,
@@ -631,6 +635,7 @@ fn extract_calls_from_context(
                 };
                 if is_valid_callee_name(&callee_name) {
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: kin_model::RelationKind::Calls,
                         src_name: context_name.to_string(),
                         dst_name: callee_name,

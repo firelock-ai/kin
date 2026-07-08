@@ -210,6 +210,7 @@ fn extract_hcl_block(
                         }],
                     });
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: RelationKind::Imports,
                         src_name: format!("module.{}", mod_name),
                         dst_name: source_val,
@@ -321,6 +322,7 @@ fn extract_required_providers(
                     let source_val = extract_object_attr(&child, source, "source")
                         .unwrap_or_else(|| format!("hashicorp/{}", provider_name));
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: RelationKind::References,
                         src_name: "terraform".to_string(),
                         dst_name: source_val,

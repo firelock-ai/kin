@@ -9,8 +9,8 @@ use crate::adapter::{
 };
 use crate::error::Result;
 use crate::extract::{
-    ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport, ImportedName,
-    ParseOutput,
+    CallArgShape, ExtractedEntity, ExtractedRelation, ExtractedTest, ExtractedTestKind, FileImport,
+    ImportedName, ParseOutput,
 };
 
 pub struct CppAdapter;
@@ -144,6 +144,7 @@ fn extract_cpp_node(
 
                 if let Some(cls) = class_ctx {
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: kin_model::RelationKind::Contains,
                         src_name: cls.to_string(),
                         dst_name: qualified.clone(),
@@ -171,6 +172,7 @@ fn extract_cpp_node(
                         span: span_from_node(node, file_id),
                     });
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: kin_model::RelationKind::Contains,
                         src_name: cls.to_string(),
                         dst_name: qualified,
@@ -287,6 +289,7 @@ fn extract_cpp_node(
                     .unwrap_or_else(|| alias_name.clone());
                 for referenced_type in referenced_types {
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: kin_model::RelationKind::References,
                         src_name: src_name.clone(),
                         dst_name: referenced_type,
@@ -369,6 +372,7 @@ fn extract_cpp_node(
                                 && seen.insert(token.to_string())
                             {
                                 relations.push(ExtractedRelation {
+                                    call_shape: None,
                                     kind: kin_model::RelationKind::UsesMacro,
                                     src_name: name.clone(),
                                     dst_name: token.to_string(),
@@ -470,6 +474,7 @@ fn extract_base_classes(
                 let base_name = child.utf8_text(source).unwrap_or("").to_string();
                 if !base_name.is_empty() {
                     relations.push(ExtractedRelation {
+                        call_shape: None,
                         kind: kin_model::RelationKind::Extends,
                         src_name: class_name.to_string(),
                         dst_name: base_name,
@@ -902,12 +907,56 @@ fn collect_scoped_calls(
                         src_name: context_name.to_string(),
                         dst_name,
                         import_source: None,
+                        call_shape: cpp_call_shape(&child, source),
                     });
                 }
             }
         }
         collect_scoped_calls(&child, source, context_name, scope, relations);
     }
+}
+
+/// The [`CallArgShape`] of a C++ `call_expression`. tree-sitter groups a call's
+/// arguments into an `argument_list` whose named children are the argument
+/// expressions, so the positional count is nesting-correct: `f(g(x), y)` is 2,
+/// `f(Ptr<A, B>{})` is 1 (the template comma is inside one argument), `f()` is
+/// 0. Interspersed comments are skipped. C++ has no keyword arguments, so
+/// `keywords` is empty and `has_var_keyword` is always false; a pack expansion
+/// (`args...`) sets `has_var_positional` so the linker treats the count as a
+/// lower bound and prunes nothing. `None` when the call carries no argument
+/// list, leaving the linker to bind that call shape-blind.
+fn cpp_call_shape(call_expr: &tree_sitter::Node, source: &[u8]) -> Option<CallArgShape> {
+    let arguments = call_expr.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    let mut positional: u32 = 0;
+    let mut has_var_positional = false;
+    for arg in arguments.named_children(&mut cursor) {
+        if arg.kind() == "comment" {
+            continue;
+        }
+        positional += 1;
+        if argument_is_pack_expansion(&arg, source) {
+            has_var_positional = true;
+        }
+    }
+    Some(CallArgShape {
+        positional,
+        keywords: Vec::new(),
+        has_var_positional,
+        has_var_keyword: false,
+    })
+}
+
+/// Whether a call argument is a pack/splat expansion (`args...`,
+/// `std::forward<T>(args)...`). tree-sitter can model the trailing `...` as its
+/// own token rather than part of the argument node, so this keys on the
+/// argument's text ending in `...` — the reliable surface signal, and
+/// conservative: a missed pack only forgoes an optimization, a spurious hit only
+/// widens the accepted arity, and neither drops a real edge.
+fn argument_is_pack_expansion(arg: &tree_sitter::Node, source: &[u8]) -> bool {
+    arg.utf8_text(source)
+        .map(|text| text.trim_end().ends_with("..."))
+        .unwrap_or(false)
 }
 
 /// Resolve a `field_expression` receiver to a class name: `this` binds to the
@@ -1128,6 +1177,7 @@ fn extract_includes_and_macros_recursive(
                 if let Some(src_name) = find_enclosing_entity(node, source) {
                     if src_name != name && !src_name.ends_with(&format!("::{}", name)) {
                         relations.push(ExtractedRelation {
+                            call_shape: None,
                             kind: kin_model::RelationKind::UsesMacro,
                             src_name,
                             dst_name: name.to_string(),
