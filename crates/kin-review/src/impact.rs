@@ -196,6 +196,30 @@ pub struct EntityImpact {
     /// surface change did have consumers and that they all moved with it.
     #[serde(default)]
     pub consumers_migrated_in_diff: usize,
+    /// How the counted (non-migrated, non-test) consumers invoke this entity,
+    /// distilled from the inbound `Calls` edges' argument-shape evidence. Lets
+    /// an arity-preserving parameter rename be judged against actual call sites.
+    #[serde(default)]
+    pub call_shapes: ConsumerCallShapeSummary,
+}
+
+/// How a changed callable's counted consumers invoke it, distilled from the
+/// inbound `Calls` edges' argument-shape evidence over the same real-consumer
+/// set that drives `consumer_count`. Lets an arity-preserving rename be judged
+/// against actual call sites instead of assumed keyword usage.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConsumerCallShapeSummary {
+    /// Union of keyword-argument names any counted call site passes. Sorted for
+    /// deterministic output.
+    pub caller_keyword_names: BTreeSet<String>,
+    /// Some counted call site forwards `**mapping`, so its keyword set is not
+    /// statically known — it could carry any renamed parameter.
+    pub any_var_keyword_caller: bool,
+    /// Every counted consumer is a `Calls` edge carrying argument-shape
+    /// evidence. False when a counted consumer is a non-call edge, or a call
+    /// whose shape was not captured (older snapshot, unresolved, or a language
+    /// that does not emit shapes) — either way a rename cannot be proven safe.
+    pub all_consumers_shaped_calls: bool,
 }
 
 impl EntityImpact {
@@ -320,6 +344,15 @@ pub fn analyze_impact_at<I: ImpactGraph>(
         // decision input: a consumer that happens to share the changed entity's
         // file is still a distinct consumer entity with a real inbound edge.
         let mut ent_consumer_files: BTreeSet<String> = BTreeSet::new();
+        // Argument-shape distillation over the SAME counted-consumer set: the
+        // union of keyword names any inbound call site uses, whether any caller
+        // forwards `**kwargs` (keyword set then unknown), and whether every
+        // counted consumer is a shaped call site. A non-call consumer or a call
+        // whose shape was not captured leaves the rename unprovable-safe. Sets
+        // accumulate a distinct union only; iteration order never reaches output.
+        let mut ent_caller_keyword_names: BTreeSet<String> = BTreeSet::new();
+        let mut ent_any_var_keyword_caller = false;
+        let mut ent_all_consumers_shaped_calls = true;
 
         // Find relations pointing TO this entity (callers, dependents, etc.).
         // `get_relations` serves outgoing edges only, so the inbound harvest
@@ -395,6 +428,25 @@ pub fn analyze_impact_at<I: ImpactGraph>(
                 if let Some(file) = entity_file(&entity) {
                     ent_consumer_files.insert(file);
                 }
+                // Distill this consumer edge's call-site argument shape. A rename
+                // is only provably safe when every counted consumer is a call
+                // carrying shape evidence; a non-call edge, or a call with no
+                // captured shape, leaves it unprovable.
+                if rel.kind == RelationKind::Calls {
+                    match rel.evidence.iter().find_map(|ev| ev.call_shape.as_ref()) {
+                        Some(shape) => {
+                            for keyword in &shape.keywords {
+                                ent_caller_keyword_names.insert(keyword.clone());
+                            }
+                            if shape.has_var_keyword {
+                                ent_any_var_keyword_caller = true;
+                            }
+                        }
+                        None => ent_all_consumers_shaped_calls = false,
+                    }
+                } else {
+                    ent_all_consumers_shaped_calls = false;
+                }
             }
             match rel.kind {
                 RelationKind::Calls => {
@@ -456,6 +508,11 @@ pub fn analyze_impact_at<I: ImpactGraph>(
             consumer_files: ent_consumer_files.into_iter().collect(),
             covering_tests: ent_tests.len(),
             consumers_migrated_in_diff: ent_migrated.len(),
+            call_shapes: ConsumerCallShapeSummary {
+                caller_keyword_names: ent_caller_keyword_names,
+                any_var_keyword_caller: ent_any_var_keyword_caller,
+                all_consumers_shaped_calls: ent_all_consumers_shaped_calls,
+            },
         });
     }
 
@@ -645,9 +702,12 @@ mod tests {
     // ── Per-entity attribution: direct-only consumer_count / consumer_files ──
 
     use crate::diff::{EntityChange, EntityChangeKind};
+    use crate::inline::InlineCommentKind;
     use kin_model::entity::SourceSpan;
     use kin_model::provenance::{Actor, ActorId, Approval, AuditEvent};
-    use kin_model::relation::{GraphNodeId, Relation, RelationKind, RelationOrigin};
+    use kin_model::relation::{
+        CallArgShape, GraphNodeId, Relation, RelationEvidence, RelationKind, RelationOrigin,
+    };
     use kin_model::work::{Annotation, WorkItem, WorkScope};
     use std::collections::HashMap;
 
@@ -851,6 +911,187 @@ mod tests {
             vec!["src/bar.rs".to_string(), "src/foo.rs".to_string()],
             "consumer_files is the projected file set of the consumer entities (both), report-only"
         );
+    }
+
+    // ── Call-site argument-shape harvest + arity-preserving rename gating ──
+
+    fn calls_with_shape(src: &Entity, dst: &Entity, shape: CallArgShape) -> Relation {
+        Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Calls,
+            src: GraphNodeId::Entity(src.id),
+            dst: GraphNodeId::Entity(dst.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: vec![RelationEvidence {
+                call_shape: Some(shape),
+                ..RelationEvidence::default()
+            }],
+        }
+    }
+
+    fn target_entity(signature: &str) -> Entity {
+        let mut e = entity_in_file("target", "src/mod.py", 10);
+        e.signature = signature.to_string();
+        e
+    }
+
+    /// Comment kinds emitted when `target`'s signature changes `old_sig` →
+    /// `new_sig` and each caller invokes it with the given shape (`None` = a
+    /// `Calls` edge with no captured shape).
+    fn rename_review_kinds(
+        old_sig: &str,
+        new_sig: &str,
+        caller_shapes: Vec<Option<CallArgShape>>,
+    ) -> Vec<InlineCommentKind> {
+        let new_target = target_entity(new_sig);
+        let mut old_target = new_target.clone();
+        old_target.signature = old_sig.to_string();
+
+        let mut graph = MockImpactGraph::default();
+        graph.entities.insert(new_target.id, new_target.clone());
+        let mut edges = Vec::new();
+        for (i, shape) in caller_shapes.into_iter().enumerate() {
+            let caller = entity_in_file(&format!("caller{i}"), &format!("src/c{i}.py"), 1);
+            graph.entities.insert(caller.id, caller.clone());
+            edges.push(match shape {
+                Some(s) => calls_with_shape(&caller, &new_target, s),
+                None => calls(&caller, &new_target),
+            });
+        }
+        graph.inbound.insert(new_target.id, edges);
+
+        let diff = SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new_target.id,
+                kind: EntityChangeKind::Modified {
+                    old: old_target,
+                    new: new_target.clone(),
+                },
+            }],
+            ..Default::default()
+        };
+        let report = analyze_impact_at(&graph, &diff).unwrap();
+        crate::inline::collect_inline_comments(&diff, &report)
+            .into_iter()
+            .map(|c| c.kind)
+            .collect()
+    }
+
+    const RENAME_OLD: &str = "def target(self, ext, args)";
+    const RENAME_NEW: &str = "def target(self, ext, lines)";
+
+    #[test]
+    fn harvest_distills_call_shapes_over_counted_consumers() {
+        let target = target_entity(RENAME_NEW);
+        let positional = entity_in_file("pos_caller", "src/a.py", 1);
+        let keyword = entity_in_file("kw_caller", "src/b.py", 1);
+        let mut graph = MockImpactGraph::default();
+        for e in [&target, &positional, &keyword] {
+            graph.entities.insert(e.id, e.clone());
+        }
+        graph.inbound.insert(
+            target.id,
+            vec![
+                calls_with_shape(
+                    &positional,
+                    &target,
+                    CallArgShape::new(2, vec![], false, false),
+                ),
+                calls_with_shape(
+                    &keyword,
+                    &target,
+                    CallArgShape::new(1, vec!["args".to_string()], false, false),
+                ),
+            ],
+        );
+        let diff = SemanticDiff {
+            entity_changes: vec![modified(&target)],
+            ..Default::default()
+        };
+        let report = analyze_impact_at(&graph, &diff).unwrap();
+        let summary = &report.entity_impact(&target.id).unwrap().call_shapes;
+        assert!(
+            summary.all_consumers_shaped_calls,
+            "both consumers are shaped calls"
+        );
+        assert!(!summary.any_var_keyword_caller);
+        assert!(summary.caller_keyword_names.contains("args"));
+    }
+
+    #[test]
+    fn rename_with_only_positional_callers_is_not_breaking() {
+        // (a) every call site positional → runtime-neutral, non-blocking.
+        let kinds = rename_review_kinds(
+            RENAME_OLD,
+            RENAME_NEW,
+            vec![Some(CallArgShape::new(2, vec![], false, false))],
+        );
+        assert!(kinds.contains(&InlineCommentKind::SignatureChange));
+        assert!(!kinds.contains(&InlineCommentKind::Breaking));
+        assert!(!kinds.contains(&InlineCommentKind::BreakingMigrated));
+    }
+
+    #[test]
+    fn rename_with_keyword_caller_of_renamed_param_is_breaking() {
+        // (b) a caller passes the renamed parameter by keyword → breaking.
+        let kinds = rename_review_kinds(
+            RENAME_OLD,
+            RENAME_NEW,
+            vec![Some(CallArgShape::new(
+                1,
+                vec!["args".to_string()],
+                false,
+                false,
+            ))],
+        );
+        assert!(kinds.contains(&InlineCommentKind::Breaking));
+    }
+
+    #[test]
+    fn rename_with_mixed_callers_is_breaking() {
+        // (c) one positional, one keyword-of-renamed → breaking.
+        let kinds = rename_review_kinds(
+            RENAME_OLD,
+            RENAME_NEW,
+            vec![
+                Some(CallArgShape::new(2, vec![], false, false)),
+                Some(CallArgShape::new(1, vec!["args".to_string()], false, false)),
+            ],
+        );
+        assert!(kinds.contains(&InlineCommentKind::Breaking));
+    }
+
+    #[test]
+    fn rename_with_var_keyword_caller_is_breaking() {
+        // (d) a `**kwargs` caller has an unknown keyword set → breaking.
+        let kinds = rename_review_kinds(
+            RENAME_OLD,
+            RENAME_NEW,
+            vec![Some(CallArgShape::new(1, vec![], false, true))],
+        );
+        assert!(kinds.contains(&InlineCommentKind::Breaking));
+    }
+
+    #[test]
+    fn arity_change_not_rename_is_breaking() {
+        // (e) an added required parameter is a real arity change, not a rename;
+        // positional callers are stranded → still breaking.
+        let kinds = rename_review_kinds(
+            "def target(self, ext)",
+            "def target(self, ext, extra)",
+            vec![Some(CallArgShape::new(1, vec![], false, false))],
+        );
+        assert!(kinds.contains(&InlineCommentKind::Breaking));
+    }
+
+    #[test]
+    fn rename_with_missing_shape_is_breaking() {
+        // (f) a call edge with no captured shape cannot prove safety → breaking.
+        let kinds = rename_review_kinds(RENAME_OLD, RENAME_NEW, vec![None]);
+        assert!(kinds.contains(&InlineCommentKind::Breaking));
     }
 
     #[test]

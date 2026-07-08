@@ -1938,6 +1938,7 @@ mod tests {
                             consumer_files: vec!["src/consumer.rs".to_string()],
                             covering_tests: 0,
                             consumers_migrated_in_diff: 0,
+                            call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
                         })
                         .collect(),
                     ..Default::default()
@@ -2458,6 +2459,7 @@ mod tests {
                     consumer_files: vec!["src/consumer.rs".to_string()],
                     covering_tests: 0,
                     consumers_migrated_in_diff: 0,
+                    call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
                 }],
                 ..Default::default()
             },
@@ -2556,6 +2558,7 @@ mod tests {
                     consumer_files: vec![],
                     covering_tests: 0,
                     consumers_migrated_in_diff: 0,
+                    call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
                 }],
                 ..Default::default()
             },
@@ -3164,6 +3167,7 @@ mod tests {
                     consumer_files: vec!["src/consumer.rs".to_string()],
                     covering_tests: 0,
                     consumers_migrated_in_diff: 0,
+                    call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
                 }],
                 ..Default::default()
             },

@@ -9,7 +9,7 @@ use kin_model::Hash256;
 use serde::{Deserialize, Serialize};
 
 use crate::diff::{EntityChangeKind, SemanticDiff};
-use crate::impact::ImpactReport;
+use crate::impact::{ConsumerCallShapeSummary, ImpactReport};
 
 const COMMAND_EFFECT_CONTRACT_KEY: &str = "command_effect_contract";
 
@@ -309,24 +309,6 @@ pub fn arity_preserving_rename(old: &str, new: &str) -> Option<Vec<String>> {
     } else {
         Some(renamed)
     }
-}
-
-/// How a changed callable's graph-known consumers invoke it, distilled from the
-/// inbound `Calls` edges' argument-shape evidence over the same real-consumer
-/// set that drives the breaking decision. Lets an arity-preserving rename be
-/// judged against actual call sites instead of assumed keyword usage.
-#[derive(Debug, Clone, Default)]
-pub struct ConsumerCallShapeSummary {
-    /// Union of keyword-argument names any inbound call site passes.
-    pub caller_keyword_names: std::collections::BTreeSet<String>,
-    /// Some call site forwards `**mapping`, so its keyword set is not
-    /// statically known — it could carry any renamed parameter.
-    pub any_var_keyword_caller: bool,
-    /// Every counted consumer is a `Calls` edge carrying argument-shape
-    /// evidence. False when a consumer is a non-call edge, or a call whose
-    /// shape was not captured (older snapshot, unresolved, or a language that
-    /// does not emit shapes) — either way a rename cannot be proven safe.
-    pub all_consumers_shaped_calls: bool,
 }
 
 /// True when an arity-preserving rename of `renamed_old_names` strands no
@@ -665,24 +647,48 @@ fn collect_modified_comments(
         && old.signature != new.signature
         && !signature_runtime_neutral(&old.signature, &new.signature)
     {
+        // An arity-preserving parameter rename cannot break a caller that
+        // passes the renamed parameter positionally. When the graph-known call
+        // sites prove every external consumer is a shaped positional call — no
+        // keyword use of a renamed name, no `**kwargs`, no unshaped consumer —
+        // the rename is runtime-neutral for those consumers: the signature
+        // change is still recorded as evidence, but it is not a blocking break.
+        let rename_is_neutral = consumer_count > 0
+            && match arity_preserving_rename(&old.signature, &new.signature) {
+                Some(renamed) => {
+                    let summary = per_entity
+                        .map(|e| e.call_shapes.clone())
+                        .unwrap_or_default();
+                    rename_is_runtime_neutral_for_consumers(&renamed, &summary)
+                }
+                None => false,
+            };
+
         comments.push(InlineComment {
             file: span.file.to_string(),
             start_line: span.start_line,
             end_line: span.end_line,
             kind: InlineCommentKind::SignatureChange,
-            message: format!(
-                "Signature changed: `{}` → `{}`",
-                old.signature, new.signature,
-            ),
+            message: if rename_is_neutral {
+                format!(
+                    "Signature changed: `{}` → `{}` (parameter rename; all {} graph-known call site(s) pass positionally — no runtime break)",
+                    old.signature, new.signature, consumer_count,
+                )
+            } else {
+                format!("Signature changed: `{}` → `{}`", old.signature, new.signature)
+            },
         });
 
         // Breaking only when THIS entity has EXTERNAL non-test consumers to
-        // break. Test-only consumers are covering evidence, not a broken
-        // contract. Consumers that were themselves modified in this diff are
-        // excluded from `consumer_count`; when they are the ONLY consumers the
-        // change is a coherent in-diff migration — reported as visible evidence
-        // but not a blocking break.
-        if consumer_count > 0 {
+        // break. A rename proven runtime-neutral by its call sites strands none
+        // of them, so it emits no blocking finding. Test-only consumers are
+        // covering evidence, not a broken contract. Consumers that were
+        // themselves modified in this diff are excluded from `consumer_count`;
+        // when they are the ONLY consumers the change is a coherent in-diff
+        // migration — reported as visible evidence but not a blocking break.
+        if rename_is_neutral {
+            // Proven safe by call-site shapes; the signature evidence above stands.
+        } else if consumer_count > 0 {
             comments.push(InlineComment {
                 file: span.file.to_string(),
                 start_line: span.start_line,
@@ -1049,6 +1055,7 @@ mod tests {
                 consumer_files: vec!["src/client.rs".to_string()],
                 covering_tests: 0,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -1100,6 +1107,7 @@ mod tests {
                     consumer_files: vec![],
                     covering_tests: 0,
                     consumers_migrated_in_diff: 0,
+                    call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
                 },
                 EntityImpact {
                     entity_id: b.id,
@@ -1109,6 +1117,7 @@ mod tests {
                     consumer_files: vec!["src/client.rs".to_string()],
                     covering_tests: 0,
                     consumers_migrated_in_diff: 0,
+                    call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
                 },
             ],
             ..Default::default()
@@ -1156,6 +1165,7 @@ mod tests {
                 consumer_files: vec![],
                 covering_tests: 1,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -1205,6 +1215,7 @@ mod tests {
                 consumer_files: vec![],
                 covering_tests: 0,
                 consumers_migrated_in_diff: 2,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -1255,6 +1266,7 @@ mod tests {
                 consumer_files: vec!["src/client.rs".to_string()],
                 covering_tests: 0,
                 consumers_migrated_in_diff: 2,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -1314,6 +1326,7 @@ mod tests {
                     consumer_files: vec![],
                     covering_tests: 1,
                     consumers_migrated_in_diff: 0,
+                    call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
                 },
                 EntityImpact {
                     entity_id: uncovered.id,
@@ -1323,6 +1336,7 @@ mod tests {
                     consumer_files: vec![],
                     covering_tests: 0,
                     consumers_migrated_in_diff: 0,
+                    call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
                 },
             ],
             ..Default::default()
@@ -1416,6 +1430,7 @@ mod tests {
                 consumer_files: vec![],
                 covering_tests: 1,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -1459,6 +1474,7 @@ mod tests {
                 consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
                 covering_tests: 1,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -1711,6 +1727,7 @@ mod tests {
                 consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
                 covering_tests: 1,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -1732,6 +1749,7 @@ mod tests {
                 consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
                 covering_tests: 0,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -1760,6 +1778,7 @@ mod tests {
                 consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
                 covering_tests: 1,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -2075,6 +2094,7 @@ mod tests {
                 consumer_files: vec!["src/a.rs".to_string()],
                 covering_tests: 0,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -2122,6 +2142,7 @@ mod tests {
                 ],
                 covering_tests: 0,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -2194,6 +2215,7 @@ mod tests {
                 consumer_files: vec!["src/shared.rs".to_string()],
                 covering_tests: 0,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -2245,6 +2267,7 @@ mod tests {
                 ],
                 covering_tests: 0,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -2285,6 +2308,7 @@ mod tests {
                 consumer_files: vec!["src/only.rs".to_string()],
                 covering_tests: 0,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
@@ -2318,6 +2342,7 @@ mod tests {
                 consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
                 covering_tests: 0,
                 consumers_migrated_in_diff: 0,
+                call_shapes: crate::impact::ConsumerCallShapeSummary::default(),
             }],
             ..Default::default()
         };
