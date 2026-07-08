@@ -733,6 +733,7 @@ fn finding_kind_label(kind: InlineCommentKind) -> &'static str {
         InlineCommentKind::SignatureChange => "signature_change",
         InlineCommentKind::VisibilityChange => "visibility_change",
         InlineCommentKind::ConsumerFanout => "consumer_fanout",
+        InlineCommentKind::ConsumerFanoutEquivalent => "consumer_fanout_equivalent",
         InlineCommentKind::Added => "entity_added",
         InlineCommentKind::Removed => "entity_removed",
         InlineCommentKind::Renamed => "entity_renamed",
@@ -760,6 +761,10 @@ fn finding_severity(kind: InlineCommentKind) -> &'static str {
         // Coherent-migration evidence: reported, but never a gate signal — the
         // break has no stranded external consumer to escalate on.
         InlineCommentKind::BreakingMigrated => "info",
+        // Behavior-preserving wide fanout: the body change is provably
+        // equivalent (docstring / comment / formatting), so the fanout is
+        // reported as evidence but never feeds the gate.
+        InlineCommentKind::ConsumerFanoutEquivalent => "info",
     }
 }
 
@@ -4309,5 +4314,26 @@ mod tests {
                 .map(|f| (&f.kind, &f.message))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn equivalent_fanout_is_non_gating_info() {
+        // The downgraded fanout kind maps to `info`, so gate_findings (which
+        // filters `severity != "info"`) drops it: an equivalent body change
+        // never feeds the verdict, while the attention fanout stays a warning
+        // that does.
+        assert_eq!(
+            finding_severity(InlineCommentKind::ConsumerFanoutEquivalent),
+            "info"
+        );
+        assert_eq!(
+            finding_severity(InlineCommentKind::ConsumerFanout),
+            "warning"
+        );
+        assert_eq!(
+            finding_kind_label(InlineCommentKind::ConsumerFanoutEquivalent),
+            "consumer_fanout_equivalent"
+        );
+        assert!(!is_blocking(InlineCommentKind::ConsumerFanoutEquivalent));
     }
 }

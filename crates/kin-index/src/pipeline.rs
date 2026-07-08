@@ -13,9 +13,14 @@ use kin_model::{
 use kin_parser::{attach_file_context_metadata, parse_shallow_file, AdapterRegistry, ShallowFile};
 use kin_projection::build_layout;
 
+use tree_sitter::Tree;
+
 use crate::artifacts;
 use crate::classifier::{FileClassification, FileClassifier};
 use crate::error::{IndexError, Result};
+use crate::fingerprint::{
+    behavior_equivalence_hash, language_supports_equivalence, EQUIVALENCE_CLASS_KEY,
+};
 use crate::linker::UnresolvedRelation;
 
 /// Result of indexing a single file.
@@ -150,6 +155,7 @@ impl IndexPipeline {
             })
             .collect();
         attach_file_context_metadata(&mut entities, file_id, &imports);
+        attach_equivalence_class(&mut entities, &tree, source, language);
         if language == LanguageId::Go {
             kin_parser::attach_go_command_effect_contract_metadata(&tree, source, &mut entities);
         }
@@ -289,6 +295,7 @@ impl IndexPipeline {
             })
             .collect();
         attach_file_context_metadata(&mut entities, file_id, &imports);
+        attach_equivalence_class(&mut entities, &tree, &source, language);
         if language == LanguageId::Go {
             kin_parser::attach_go_command_effect_contract_metadata(&tree, &source, &mut entities);
         }
@@ -586,6 +593,40 @@ pub fn normalize_file_path_id(path: &Path, root: &Path) -> FilePathId {
     let relative = path.strip_prefix(root).unwrap_or(path);
     let normalized = relative.to_string_lossy().replace('\\', "/");
     FilePathId::new(normalized)
+}
+
+/// Attach the behavior-equivalence class to each entity of a participating
+/// language. Stored graph-side on `metadata.extra[EQUIVALENCE_CLASS_KEY]` as a
+/// hex digest and consumed at review time to tell behavior-preserving body
+/// edits (docstring / comment / formatting) apart from real behavior changes.
+///
+/// Languages that do not participate get no entry; an absent entry means
+/// "unknown", and the review layer never downgrades on unknown — the safe
+/// default. The digest keys only on the entity's own AST node, so it is a pure,
+/// deterministic function of that node's tokens.
+fn attach_equivalence_class(
+    entities: &mut [Entity],
+    tree: &Tree,
+    source: &[u8],
+    language: LanguageId,
+) {
+    if !language_supports_equivalence(language) {
+        return;
+    }
+    let root = tree.root_node();
+    for ent in entities.iter_mut() {
+        let Some(span) = ent.span.as_ref() else {
+            continue;
+        };
+        let end = span.end_byte.saturating_sub(1).max(span.start_byte);
+        if let Some(node) = root.descendant_for_byte_range(span.start_byte, end) {
+            let class = behavior_equivalence_hash(&node, source, language);
+            ent.metadata.extra.insert(
+                EQUIVALENCE_CLASS_KEY.to_string(),
+                serde_json::Value::String(class.to_string()),
+            );
+        }
+    }
 }
 
 /// Key under which language adapters attach command-effect contracts to

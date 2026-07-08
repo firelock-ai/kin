@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use kin_index::EQUIVALENCE_CLASS_KEY;
 use kin_model::entity::{Entity, EntityKind, EntityRole, Visibility};
 use kin_model::ids::EntityId;
 use serde::{Deserialize, Serialize};
@@ -36,6 +37,12 @@ pub enum InlineCommentKind {
     SignatureChange,
     VisibilityChange,
     ConsumerFanout,
+    /// A body-only change with wide consumer fanout whose new body is provably
+    /// behavior-equivalent to the old (docstring / comment / formatting only,
+    /// per the graph-owned equivalence class). Reported as informational
+    /// evidence — the fanout is real but carries no behavior risk — so it never
+    /// feeds the gate. Downgraded sibling of [`ConsumerFanout`].
+    ConsumerFanoutEquivalent,
     Added,
     Removed,
     Renamed,
@@ -56,6 +63,7 @@ impl InlineCommentKind {
             Self::SignatureChange => "~",
             Self::VisibilityChange => "~",
             Self::ConsumerFanout => "~",
+            Self::ConsumerFanoutEquivalent => "~",
             Self::Added => "+",
             Self::Removed => "-",
             Self::Renamed => "~",
@@ -457,6 +465,22 @@ fn collect_added_comments(
     }
 }
 
+/// Whether the body change from `old` to `new` is provably behavior-preserving
+/// under the graph-owned behavior-equivalence class attached at ingest. True
+/// only when BOTH revisions carry an equivalence class and the two are equal; an
+/// absent class on either side means "unknown" and never proves equivalence —
+/// the conservative default that keeps every genuine behavior change, and every
+/// entity the ingest could not classify, in the attention channel.
+fn body_change_is_behavior_equivalent(old: &Entity, new: &Entity) -> bool {
+    match (
+        old.metadata.extra.get(EQUIVALENCE_CLASS_KEY),
+        new.metadata.extra.get(EQUIVALENCE_CLASS_KEY),
+    ) {
+        (Some(old_class), Some(new_class)) => !old_class.is_null() && old_class == new_class,
+        _ => false,
+    }
+}
+
 fn collect_modified_comments(
     old: &Entity,
     new: &Entity,
@@ -644,15 +668,38 @@ fn collect_modified_comments(
         && old.visibility == new.visibility
         && body_only_fanout_has_enough_shape
     {
+        // A body change that is provably behavior-preserving (docstring /
+        // comment / formatting, per the graph-owned equivalence class) carries
+        // no downstream behavior risk, so its wide fanout is informational
+        // evidence rather than an attention signal. The downgrade fires only
+        // when THIS entity's own new body is proven equivalent to its old body;
+        // any entity whose change is not proven equivalent keeps the attention
+        // ConsumerFanout, so a diff with even one real behavior change still
+        // gates.
+        let (kind, message) = if body_change_is_behavior_equivalent(old, new) {
+            (
+                InlineCommentKind::ConsumerFanoutEquivalent,
+                format!(
+                    "Behavior-preserving change to `{}` reaches {} distinct non-test consumer(s) across {} file(s); \
+                     the new body is provably equivalent to the old (docstring/comment/formatting), so this is informational",
+                    new.name, fanout_gate_consumer_count, consumer_file_count,
+                ),
+            )
+        } else {
+            (
+                InlineCommentKind::ConsumerFanout,
+                format!(
+                    "Behavior of `{}` changed with {} distinct non-test consumer(s) across {} file(s)",
+                    new.name, fanout_gate_consumer_count, consumer_file_count,
+                ),
+            )
+        };
         comments.push(InlineComment {
             file: span.file.to_string(),
             start_line: span.start_line,
             end_line: span.end_line,
-            kind: InlineCommentKind::ConsumerFanout,
-            message: format!(
-                "Behavior of `{}` changed with {} distinct non-test consumer(s) across {} file(s)",
-                new.name, fanout_gate_consumer_count, consumer_file_count,
-            ),
+            kind,
+            message,
         });
     }
 
@@ -1276,6 +1323,219 @@ mod tests {
             .collect();
         assert_eq!(fanout.len(), 1);
         assert!(fanout[0].message.contains("2 distinct non-test consumer"));
+    }
+
+    /// Stamp a behavior-equivalence class on an entity, as ingest does.
+    fn with_equivalence_class(mut e: Entity, class: &str) -> Entity {
+        e.metadata.extra.insert(
+            EQUIVALENCE_CLASS_KEY.to_string(),
+            serde_json::Value::String(class.to_string()),
+        );
+        e
+    }
+
+    /// A body-only wide-fanout change whose old and new bodies carry the SAME
+    /// equivalence class downgrades from the attention `ConsumerFanout` to the
+    /// informational `ConsumerFanoutEquivalent`, with the fanout evidence
+    /// preserved in the message.
+    #[test]
+    fn consumer_fanout_downgrades_when_body_is_equivalent() {
+        let base = test_entity_with_span("hot_path", "src/hot.rs", 1, 20);
+        let old = with_equivalence_class(base.clone(), "same-class");
+        let new = with_equivalence_class(base.clone(), "same-class");
+        let diff = fanout_diff(&old, &new);
+        let impact = fanout_impact(new.id);
+
+        let comments = collect_inline_comments(&diff, &impact);
+        assert!(
+            !comments
+                .iter()
+                .any(|c| c.kind == InlineCommentKind::ConsumerFanout),
+            "an equivalent body change must not raise the attention fanout: {comments:?}"
+        );
+        let downgraded: Vec<&InlineComment> = comments
+            .iter()
+            .filter(|c| c.kind == InlineCommentKind::ConsumerFanoutEquivalent)
+            .collect();
+        assert_eq!(
+            downgraded.len(),
+            1,
+            "equivalent fanout must be reported once"
+        );
+        assert!(
+            downgraded[0]
+                .message
+                .contains("2 distinct non-test consumer"),
+            "the fanout evidence must be preserved in the downgraded finding"
+        );
+    }
+
+    /// When the equivalence classes DIFFER (a real behavior change), the
+    /// attention `ConsumerFanout` still fires — the protected-true-positive path.
+    #[test]
+    fn consumer_fanout_stays_attention_when_classes_differ() {
+        let base = test_entity_with_span("hot_path", "src/hot.rs", 1, 20);
+        let old = with_equivalence_class(base.clone(), "old-class");
+        let new = with_equivalence_class(base.clone(), "new-class");
+        let diff = fanout_diff(&old, &new);
+        let impact = fanout_impact(new.id);
+
+        let comments = collect_inline_comments(&diff, &impact);
+        assert!(
+            comments
+                .iter()
+                .any(|c| c.kind == InlineCommentKind::ConsumerFanout),
+            "a real behavior change must keep the attention fanout"
+        );
+        assert!(
+            !comments
+                .iter()
+                .any(|c| c.kind == InlineCommentKind::ConsumerFanoutEquivalent),
+            "a differing equivalence class must never downgrade"
+        );
+    }
+
+    /// With no equivalence class attached (unknown), the change is conservatively
+    /// treated as attention — absence never proves equivalence.
+    #[test]
+    fn consumer_fanout_stays_attention_when_class_absent() {
+        let old = test_entity_with_span("hot_path", "src/hot.rs", 1, 20);
+        let new = old.clone();
+        let diff = fanout_diff(&old, &new);
+        let impact = fanout_impact(new.id);
+
+        let comments = collect_inline_comments(&diff, &impact);
+        assert!(
+            comments
+                .iter()
+                .any(|c| c.kind == InlineCommentKind::ConsumerFanout),
+            "an unclassified change must stay in the attention channel"
+        );
+    }
+
+    /// A diff with two wide-fanout entities — one behavior-equivalent, one a real
+    /// change — downgrades ONLY the equivalent one and keeps attention on the
+    /// other. A diff with even one real behavior change still gates.
+    #[test]
+    fn mixed_diff_keeps_attention_for_the_non_equivalent_entity() {
+        let a_base = test_entity_with_span("equiv_fn", "src/a.rs", 1, 20);
+        let a_old = with_equivalence_class(a_base.clone(), "a-class");
+        let a_new = with_equivalence_class(a_base.clone(), "a-class");
+        let b_base = test_entity_with_span("changed_fn", "src/b.rs", 1, 20);
+        let b_old = with_equivalence_class(b_base.clone(), "b-old");
+        let b_new = with_equivalence_class(b_base.clone(), "b-new");
+
+        let diff = SemanticDiff {
+            entity_changes: vec![
+                EntityChange {
+                    entity_id: a_new.id,
+                    kind: EntityChangeKind::Modified {
+                        old: a_old.clone(),
+                        new: a_new.clone(),
+                    },
+                },
+                EntityChange {
+                    entity_id: b_new.id,
+                    kind: EntityChangeKind::Modified {
+                        old: b_old.clone(),
+                        new: b_new.clone(),
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        let impact = ImpactReport {
+            changed_ids: vec![a_new.id, b_new.id],
+            entity_impacts: vec![
+                EntityImpact {
+                    entity_id: a_new.id,
+                    consumer_count: 2,
+                    strong_consumer_count: 2,
+                    contract_consumer_count: 0,
+                    consumer_files: vec!["src/x.rs".to_string(), "src/y.rs".to_string()],
+                    covering_tests: 1,
+                    consumers_migrated_in_diff: 0,
+                },
+                EntityImpact {
+                    entity_id: b_new.id,
+                    consumer_count: 2,
+                    strong_consumer_count: 2,
+                    contract_consumer_count: 0,
+                    consumer_files: vec!["src/x.rs".to_string(), "src/y.rs".to_string()],
+                    covering_tests: 1,
+                    consumers_migrated_in_diff: 0,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let comments = collect_inline_comments(&diff, &impact);
+        let attention: Vec<&InlineComment> = comments
+            .iter()
+            .filter(|c| c.kind == InlineCommentKind::ConsumerFanout)
+            .collect();
+        assert_eq!(
+            attention.len(),
+            1,
+            "exactly the non-equivalent entity keeps attention"
+        );
+        assert!(
+            attention[0].message.contains("changed_fn"),
+            "attention must be on the real behavior change, got: {:?}",
+            attention[0].message
+        );
+        assert!(
+            comments
+                .iter()
+                .any(|c| c.kind == InlineCommentKind::ConsumerFanoutEquivalent
+                    && c.message.contains("equiv_fn")),
+            "the equivalent entity is downgraded to informational"
+        );
+    }
+
+    /// The downgrade is deterministic across repeated collection.
+    #[test]
+    fn consumer_fanout_downgrade_is_deterministic() {
+        let base = test_entity_with_span("hot_path", "src/hot.rs", 1, 20);
+        let old = with_equivalence_class(base.clone(), "same-class");
+        let new = with_equivalence_class(base.clone(), "same-class");
+        let diff = fanout_diff(&old, &new);
+        let impact = fanout_impact(new.id);
+        let first = collect_inline_comments(&diff, &impact);
+        let second = collect_inline_comments(&diff, &impact);
+        let kinds = |cs: &[InlineComment]| cs.iter().map(|c| c.kind).collect::<Vec<_>>();
+        assert_eq!(kinds(&first), kinds(&second));
+    }
+
+    /// Build a body-only modified-entity diff for `old` -> `new`.
+    fn fanout_diff(old: &Entity, new: &Entity) -> SemanticDiff {
+        SemanticDiff {
+            entity_changes: vec![EntityChange {
+                entity_id: new.id,
+                kind: EntityChangeKind::Modified {
+                    old: old.clone(),
+                    new: new.clone(),
+                },
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Build an impact report giving `id` two strong non-test consumers.
+    fn fanout_impact(id: EntityId) -> ImpactReport {
+        ImpactReport {
+            changed_ids: vec![id],
+            entity_impacts: vec![EntityImpact {
+                entity_id: id,
+                consumer_count: 2,
+                strong_consumer_count: 2,
+                contract_consumer_count: 0,
+                consumer_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+                covering_tests: 1,
+                consumers_migrated_in_diff: 0,
+            }],
+            ..Default::default()
+        }
     }
 
     #[test]
