@@ -354,9 +354,19 @@ Config file locations the wizard targets (and `kin setup status` inspects):
 | --- | --- |
 | Claude Code | `~/.claude.json` (falls back to `~/.claude/config.json`) |
 | Cursor | `~/.cursor/mcp.json` |
-| Codex CLI | `~/.codex/mcp.json` |
+| Codex CLI | `~/.codex/config.toml` (TOML — see below) |
 | Gemini CLI | `~/.gemini/settings.json` |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` |
+
+Codex is the exception: it reads TOML (`[mcp_servers.<name>]` tables), not JSON. The wizard
+merges this table into `~/.codex/config.toml`, leaving the rest of the file untouched:
+
+```toml
+[mcp_servers.kin]
+command = "kin"
+args = ["mcp", "start"]
+env = { KIN_MCP_TOOL_PROFILE = "agent-default" }
+```
 
 `kin mcp start` launches the MCP **stdio** server. You normally do not run this by hand —
 your AI client launches it as a subprocess via the config above. The server binds

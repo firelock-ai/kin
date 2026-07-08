@@ -37,8 +37,10 @@ pub const LEDGER_SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
-    /// The `mcpServers.kin` entry merged into an AI client's JSON config. The
-    /// owned slice is that one sub-value; siblings are untouched.
+    /// The kin MCP server entry merged into an AI client's config — the
+    /// `mcpServers.kin` sub-value of a JSON config, or the `mcp_servers.kin`
+    /// table of a TOML config (Codex). The owned slice is that one sub-value;
+    /// siblings are untouched.
     McpConfig,
     /// A `~/.kin/shell/kin-vfs.<shell>` hook file Kin owns entirely.
     ShellHook,
@@ -122,7 +124,8 @@ impl LedgerEntry {
         }
     }
 
-    /// Build an entry for a merged `mcpServers.kin` JSON sub-value.
+    /// Build an entry for a merged kin MCP server sub-value (JSON `mcpServers.kin`
+    /// or TOML `mcp_servers.kin`, normalized to JSON by the caller).
     pub fn mcp(target: impl Into<String>, path: PathBuf, kin_entry: &serde_json::Value) -> Self {
         let now = now_rfc3339();
         Self {
@@ -273,9 +276,18 @@ fn current_owned_fingerprint(entry: &LedgerEntry) -> Option<String> {
     match entry.kind {
         ArtifactKind::McpConfig => {
             let content = fs::read_to_string(&entry.path).ok()?;
-            let root: serde_json::Value = serde_json::from_str(&content).ok()?;
-            let kin = root.get("mcpServers")?.get("kin")?;
-            Some(fingerprint_mcp_entry(kin))
+            // Codex's config.toml is TOML (`mcp_servers.kin`); every other
+            // client config is JSON (`mcpServers.kin`). Normalize to JSON so
+            // the fingerprint matches what the install path recorded.
+            let kin = if entry.path.extension().and_then(|e| e.to_str()) == Some("toml") {
+                let root: toml::Value = toml::from_str(&content).ok()?;
+                let kin = root.get("mcp_servers")?.get("kin")?;
+                serde_json::to_value(kin).ok()?
+            } else {
+                let root: serde_json::Value = serde_json::from_str(&content).ok()?;
+                root.get("mcpServers")?.get("kin")?.clone()
+            };
+            Some(fingerprint_mcp_entry(&kin))
         }
         ArtifactKind::ShellHook | ArtifactKind::VfsShim | ArtifactKind::DaemonConfig => {
             let bytes = fs::read(&entry.path).ok()?;
@@ -404,6 +416,26 @@ fn remove_owned_slice(entry: &LedgerEntry) -> Result<String> {
         ArtifactKind::McpConfig => {
             let content = fs::read_to_string(&entry.path)
                 .with_context(|| format!("failed to read {}", entry.path.display()))?;
+            if entry.path.extension().and_then(|e| e.to_str()) == Some("toml") {
+                // Codex's config.toml: excise only the [mcp_servers.kin] table
+                // with a format-preserving edit; the rest of the user's config
+                // (keys, tables, comments) is left byte-for-byte intact.
+                let mut doc: toml_edit::DocumentMut = content
+                    .parse()
+                    .with_context(|| format!("{} is not valid TOML", entry.path.display()))?;
+                if let Some(servers) = doc
+                    .get_mut("mcp_servers")
+                    .and_then(|s| s.as_table_like_mut())
+                {
+                    servers.remove("kin");
+                }
+                fs::write(&entry.path, doc.to_string())
+                    .with_context(|| format!("failed to write {}", entry.path.display()))?;
+                return Ok(format!(
+                    "removed mcp_servers.kin from {}",
+                    entry.path.display()
+                ));
+            }
             let mut root: serde_json::Value = serde_json::from_str(&content)
                 .with_context(|| format!("{} is not valid JSON", entry.path.display()))?;
             if let Some(servers) = root.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
@@ -755,6 +787,45 @@ mod tests {
             "sibling server kept"
         );
         assert_eq!(root["userSetting"], true, "unrelated keys kept");
+    }
+
+    #[test]
+    fn verify_and_uninstall_mcp_toml_config() {
+        // Codex registers its MCP entry in config.toml (`mcp_servers.kin`),
+        // not an mcp.json — the ledger must verify and excise it there.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write(
+            &path,
+            "# codex settings\nmodel = \"o3\"\n\n[mcp_servers.other]\ncommand = \"x\"\n\n[mcp_servers.kin]\ncommand = \"kin\"\nargs = [\"mcp\", \"start\"]\nenv = { KIN_MCP_TOOL_PROFILE = \"agent-default\" }\n",
+        );
+        let kin = serde_json::json!({
+            "command": "kin",
+            "args": ["mcp", "start"],
+            "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
+        });
+        let entry = LedgerEntry::mcp("codex", path.clone(), &kin);
+
+        // The on-disk TOML entry fingerprints identically to the recorded
+        // JSON-normalized value.
+        assert_eq!(verify_entry(&entry).state, EntryState::Verified);
+
+        let outcome = uninstall_entry(&entry, false, false);
+        assert_eq!(outcome.action, RemovalAction::Removed);
+
+        let content = fs::read_to_string(&path).unwrap();
+        let root: toml::Value = toml::from_str(&content).unwrap();
+        assert!(
+            root["mcp_servers"].get("kin").is_none(),
+            "kin table removed"
+        );
+        assert_eq!(
+            root["mcp_servers"]["other"]["command"].as_str(),
+            Some("x"),
+            "sibling server kept"
+        );
+        assert_eq!(root["model"].as_str(), Some("o3"), "unrelated keys kept");
+        assert!(content.contains("# codex settings"), "comments kept");
     }
 
     #[test]
