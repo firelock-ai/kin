@@ -430,7 +430,7 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
             if let Some(&dst_id) = dst_same_file {
                 if ctx.entity_kind_by_id.get(&dst_id) == Some(&EntityKind::Macro) {
                     if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                        resolved.push(make_relation(rel.kind, src_id, dst_id, 1.0));
+                        resolved.push(make_relation(rel, src_id, dst_id, 1.0));
                     }
                     continue;
                 }
@@ -444,7 +444,7 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                 &ctx.entity_kind_by_id,
             ) {
                 if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                    resolved.push(make_relation(rel.kind, src_id, dst_id, 0.95));
+                    resolved.push(make_relation(rel, src_id, dst_id, 0.95));
                 }
                 continue;
             }
@@ -468,7 +468,7 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
         // parser-certain same-file edge (1.0).
         if let Some(&dst_id) = dst_same_file {
             if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                resolved.push(make_relation(rel.kind, src_id, dst_id, 1.0));
+                resolved.push(make_relation(rel, src_id, dst_id, 1.0));
             }
             let mut cross_file_twins: HashSet<EntityId> = HashSet::new();
             distinct_cross_file_targets(
@@ -481,7 +481,7 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
             if !cross_file_twins.is_empty() && cross_file_twins.len() < AMBIGUOUS_CALL_FANOUT_CAP {
                 for cross_id in sorted_fanout_targets(cross_file_twins) {
                     if add_deduped(&mut seen, src_id, cross_id, rel.kind) {
-                        resolved.push(make_relation(rel.kind, src_id, cross_id, 0.7));
+                        resolved.push(make_relation(rel, src_id, cross_id, 0.7));
                     }
                 }
             }
@@ -513,7 +513,7 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                     {
                         if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
                             resolved.push(make_relation(
-                                rel.kind,
+                                rel,
                                 src_id,
                                 dst_id,
                                 INHERITED_METHOD_CONFIDENCE,
@@ -546,7 +546,7 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                     };
                     if let Some(dst_id) = dst_id {
                         if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                            resolved.push(make_relation(rel.kind, src_id, dst_id, 0.95));
+                            resolved.push(make_relation(rel, src_id, dst_id, 0.95));
                         }
                         continue;
                     }
@@ -567,7 +567,7 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                             .get(&(target_file.as_str(), member_name))
                         {
                             if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                                resolved.push(make_relation(rel.kind, src_id, dst_id, 0.9));
+                                resolved.push(make_relation(rel, src_id, dst_id, 0.9));
                             }
                             continue;
                         }
@@ -602,7 +602,7 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
             ImportPinnedTarget::Resolved(dst_id) => {
                 if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
                     resolved.push(make_relation(
-                        rel.kind,
+                        rel,
                         src_id,
                         dst_id,
                         IMPORT_PINNED_CONFIDENCE,
@@ -660,7 +660,7 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                 }
             };
             if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                resolved.push(make_relation(rel.kind, src_id, dst_id, confidence));
+                resolved.push(make_relation(rel, src_id, dst_id, confidence));
                 linked = true;
             }
         }
@@ -685,7 +685,7 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
             if (1..=AMBIGUOUS_CALL_FANOUT_CAP).contains(&distinct_targets.len()) {
                 for dst_id in sorted_fanout_targets(distinct_targets) {
                     if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                        resolved.push(make_relation(rel.kind, src_id, dst_id, 0.3));
+                        resolved.push(make_relation(rel, src_id, dst_id, 0.3));
                         linked = true;
                     }
                 }
@@ -711,7 +711,7 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                     {
                         if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
                             resolved.push(make_relation(
-                                rel.kind,
+                                rel,
                                 src_id,
                                 dst_id,
                                 INHERITED_METHOD_CONFIDENCE,
@@ -745,7 +745,7 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
             ) {
                 if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
                     resolved.push(make_relation(
-                        rel.kind,
+                        rel,
                         src_id,
                         dst_id,
                         QUALIFIED_SUFFIX_CONFIDENCE,
@@ -2156,7 +2156,8 @@ const LOCALITY_DISAMBIGUATED_CONFIDENCE: f32 = 0.8;
 /// Using a stable ID ensures the same logical relation (A calls B) gets the
 /// same RelationId across commits, preventing duplicate rows when the MERGE
 /// query matches on `{rel_id: $rel_id}`.
-fn make_relation(kind: RelationKind, src: EntityId, dst: EntityId, confidence: f32) -> Relation {
+fn make_relation(rel: &ExtractedRelation, src: EntityId, dst: EntityId, confidence: f32) -> Relation {
+    let kind = rel.kind;
     let origin = if confidence >= 1.0 {
         RelationOrigin::Parsed
     } else {
@@ -2175,7 +2176,25 @@ fn make_relation(kind: RelationKind, src: EntityId, dst: EntityId, confidence: f
         origin,
         created_in: None,
         import_source: None,
-        evidence: Vec::new(),
+        evidence: call_shape_evidence(rel.call_shape.as_ref()),
+    }
+}
+
+/// Convert a parser-side [`CallArgShape`] into stored relation evidence carrying
+/// the graph-model shape mirror. Empty when the call site recorded no shape, so
+/// non-call and shape-blind edges stay evidence-free as before.
+pub(crate) fn call_shape_evidence(shape: Option<&CallArgShape>) -> Vec<RelationEvidence> {
+    match shape {
+        Some(shape) => vec![RelationEvidence {
+            call_shape: Some(kin_model::CallArgShape::new(
+                shape.positional,
+                shape.keywords.clone(),
+                shape.has_var_positional,
+                shape.has_var_keyword,
+            )),
+            ..RelationEvidence::default()
+        }],
+        None => Vec::new(),
     }
 }
 
@@ -3120,7 +3139,7 @@ fn resolve_one_file_incremental(
             if let Some(dst_id) = dst_same_file {
                 if linker.entity_kind_by_id.get(&dst_id) == Some(&EntityKind::Macro) {
                     if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                        resolved.push(make_relation(rel.kind, src_id, dst_id, 1.0));
+                        resolved.push(make_relation(rel, src_id, dst_id, 1.0));
                     }
                     continue;
                 }
@@ -3133,7 +3152,7 @@ fn resolve_one_file_incremental(
                 linker,
             ) {
                 if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                    resolved.push(make_relation(rel.kind, src_id, dst_id, 0.95));
+                    resolved.push(make_relation(rel, src_id, dst_id, 0.95));
                 }
                 continue;
             }
@@ -3155,7 +3174,7 @@ fn resolve_one_file_incremental(
         // Cross-file twins carry the (c) name-match confidence (0.7).
         if let Some(dst_id) = dst_same_file {
             if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                resolved.push(make_relation(rel.kind, src_id, dst_id, 1.0));
+                resolved.push(make_relation(rel, src_id, dst_id, 1.0));
             }
             let mut cross_file_twins: HashSet<EntityId> = HashSet::new();
             if let Some(candidates) = linker.entity_by_name.get(&rel.dst_name) {
@@ -3170,7 +3189,7 @@ fn resolve_one_file_incremental(
             if !cross_file_twins.is_empty() && cross_file_twins.len() < AMBIGUOUS_CALL_FANOUT_CAP {
                 for cross_id in sorted_fanout_targets(cross_file_twins) {
                     if add_deduped(&mut seen, src_id, cross_id, rel.kind) {
-                        resolved.push(make_relation(rel.kind, src_id, cross_id, 0.7));
+                        resolved.push(make_relation(rel, src_id, cross_id, 0.7));
                     }
                 }
             }
@@ -3202,7 +3221,7 @@ fn resolve_one_file_incremental(
                     ) {
                         if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
                             resolved.push(make_relation(
-                                rel.kind,
+                                rel,
                                 src_id,
                                 dst_id,
                                 INHERITED_METHOD_CONFIDENCE,
@@ -3235,7 +3254,7 @@ fn resolve_one_file_incremental(
                     };
                     if let Some(dst_id) = dst_id {
                         if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                            resolved.push(make_relation(rel.kind, src_id, dst_id, 0.95));
+                            resolved.push(make_relation(rel, src_id, dst_id, 0.95));
                         }
                         continue;
                     }
@@ -3254,7 +3273,7 @@ fn resolve_one_file_incremental(
                             .and_then(|m| m.get(member_name))
                         {
                             if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                                resolved.push(make_relation(rel.kind, src_id, dst_id, 0.9));
+                                resolved.push(make_relation(rel, src_id, dst_id, 0.9));
                             }
                             continue;
                         }
@@ -3295,7 +3314,7 @@ fn resolve_one_file_incremental(
             ImportPinnedTarget::Resolved(dst_id) => {
                 if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
                     resolved.push(make_relation(
-                        rel.kind,
+                        rel,
                         src_id,
                         dst_id,
                         IMPORT_PINNED_CONFIDENCE,
@@ -3353,7 +3372,7 @@ fn resolve_one_file_incremental(
                 }
             };
             if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                resolved.push(make_relation(rel.kind, src_id, dst_id, confidence));
+                resolved.push(make_relation(rel, src_id, dst_id, confidence));
             }
             continue;
         }
@@ -3380,7 +3399,7 @@ fn resolve_one_file_incremental(
                 if (1..=AMBIGUOUS_CALL_FANOUT_CAP).contains(&distinct_targets.len()) {
                     for dst_id in sorted_fanout_targets(distinct_targets) {
                         if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                            resolved.push(make_relation(rel.kind, src_id, dst_id, 0.3));
+                            resolved.push(make_relation(rel, src_id, dst_id, 0.3));
                         }
                     }
                     continue;
@@ -3408,7 +3427,7 @@ fn resolve_one_file_incremental(
                     ) {
                         if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
                             resolved.push(make_relation(
-                                rel.kind,
+                                rel,
                                 src_id,
                                 dst_id,
                                 INHERITED_METHOD_CONFIDENCE,
@@ -3438,7 +3457,7 @@ fn resolve_one_file_incremental(
                 for dst_id in qualified_targets {
                     if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
                         resolved.push(make_relation(
-                            rel.kind,
+                            rel,
                             src_id,
                             dst_id,
                             QUALIFIED_SUFFIX_CONFIDENCE,

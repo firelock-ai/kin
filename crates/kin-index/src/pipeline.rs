@@ -786,7 +786,7 @@ fn resolve_relations(
                     origin: RelationOrigin::Parsed,
                     created_in: None,
                     import_source: rel.import_source.clone(),
-                    evidence: Vec::new(),
+                    evidence: crate::linker::call_shape_evidence(rel.call_shape.as_ref()),
                 });
             }
             (Some(s), None) => {
