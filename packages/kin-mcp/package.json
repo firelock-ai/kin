@@ -1,6 +1,6 @@
 {
   "name": "@kinlab/kin-mcp",
-  "version": "0.2.14",
+  "version": "0.2.15",
   "description": "Start Kin's MCP server — the semantic system of record for software work — through an npm-friendly wrapper.",
   "type": "module",
   "bin": {
