@@ -527,9 +527,19 @@ fn render_kin_first_section(target_path: &str) -> String {
     let mut out = String::new();
 
     out.push_str("## Kin-First Workflow\n\n");
-    out.push_str("This repository uses Kin semantic VCS. Kin indexes every function, class,\n");
-    out.push_str("type, and trait into a graph with cross-file relations. **Use Kin tools\n");
-    out.push_str("instead of raw file operations whenever possible.**\n\n");
+    out.push_str("This repository is Kin-native. Kin's graph-owned semantic truth is the\n");
+    out.push_str("source of authority; ordinary files are the projection and execution\n");
+    out.push_str("surface for tools that still expect a filesystem. Kin indexes every\n");
+    out.push_str("function, class, type, and trait into a graph with cross-file relations.\n");
+    out.push_str("**Use Kin tools instead of raw file operations whenever possible.**\n\n");
+
+    out.push_str("### Agent Coding Workflow\n\n");
+    out.push_str("- Start agent work inside a graph-backed session: `kin with --session codex -- \"task\"`\n");
+    out.push_str("- For direct commands, prefer `kin exec -- <command>` so execution is tied to the Kin repo context\n");
+    out.push_str("- Discover with Kin first: `semantic_locate`, `get_context_pack`, then `trace_data_flow`\n");
+    out.push_str("- Record changes with `kin commit -m \"message\"` after verification passes\n");
+    out.push_str("- Export only when an external Git consumer needs it: `kin git export --output <path>` or `kin git export --in-place`\n");
+    out.push('\n');
 
     out.push_str(&render_comparison_tables());
     out.push_str(&render_quick_reference());
@@ -543,11 +553,11 @@ fn render_kin_first_section(target_path: &str) -> String {
     }
 
     out.push_str("### Key Principle\n\n");
-    out.push_str("**Search semantically first, read files second.** Kin search returns ranked\n");
-    out.push_str("entity definitions with file:line instead of raw text matches, and context\n");
-    out.push_str("packs assemble a focal entity with its callers and dependencies instead of\n");
-    out.push_str("reading whole files. Only fall back to raw file reads when Kin doesn't have\n");
-    out.push_str("what you need.\n");
+    out.push_str("**Ask the graph first, read projected files second.** Kin search returns\n");
+    out.push_str("ranked entity definitions with file:line instead of raw text matches, and\n");
+    out.push_str("context packs assemble a focal entity with its callers and dependencies\n");
+    out.push_str("instead of reading whole files. Only fall back to raw file reads when Kin\n");
+    out.push_str("doesn't have what you need.\n");
     out.push('\n');
 
     out

@@ -47,6 +47,9 @@ pub enum ArtifactKind {
     /// The `source <hook>` block Kin appended to a shell rc file. The owned
     /// slice is the appended text captured in [`LedgerEntry::snippet`].
     ShellRcLine,
+    /// The PATH export block Kin appended to a shell rc file so managed
+    /// binaries under `~/.kin/bin` are available in new shells.
+    ShellPathLine,
     /// The VFS shim copied into `~/.kin/lib`. Kin owns the file.
     VfsShim,
     /// The Kin-first discovery block appended to an agent instruction file
@@ -61,7 +64,10 @@ impl ArtifactKind {
     /// Whether the owned slice is a distinct substring appended to a shared file
     /// (rc line, discovery reminder) rather than a whole file or JSON key.
     fn is_appended_marker(self) -> bool {
-        matches!(self, Self::ShellRcLine | Self::DiscoveryReminder)
+        matches!(
+            self,
+            Self::ShellRcLine | Self::ShellPathLine | Self::DiscoveryReminder
+        )
     }
 
     fn label(self) -> &'static str {
@@ -69,6 +75,7 @@ impl ArtifactKind {
             Self::McpConfig => "MCP config",
             Self::ShellHook => "shell hook",
             Self::ShellRcLine => "shell rc line",
+            Self::ShellPathLine => "shell PATH line",
             Self::VfsShim => "VFS shim",
             Self::DiscoveryReminder => "discovery reminder",
             Self::DaemonConfig => "daemon config",
@@ -293,7 +300,9 @@ fn current_owned_fingerprint(entry: &LedgerEntry) -> Option<String> {
             let bytes = fs::read(&entry.path).ok()?;
             Some(sha256_hex(&bytes))
         }
-        ArtifactKind::ShellRcLine | ArtifactKind::DiscoveryReminder => {
+        ArtifactKind::ShellRcLine
+        | ArtifactKind::ShellPathLine
+        | ArtifactKind::DiscoveryReminder => {
             let snippet = entry.snippet.as_ref()?;
             let content = fs::read_to_string(&entry.path).ok()?;
             content
@@ -457,7 +466,9 @@ fn remove_owned_slice(entry: &LedgerEntry) -> Result<String> {
                 .with_context(|| format!("failed to remove {}", entry.path.display()))?;
             Ok(format!("removed {}", entry.path.display()))
         }
-        ArtifactKind::ShellRcLine | ArtifactKind::DiscoveryReminder => {
+        ArtifactKind::ShellRcLine
+        | ArtifactKind::ShellPathLine
+        | ArtifactKind::DiscoveryReminder => {
             let snippet = entry
                 .snippet
                 .as_ref()

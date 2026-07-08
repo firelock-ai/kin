@@ -35,6 +35,9 @@ Codex, Gemini, Windsurf) and your shell hook. In short:
    resolved against the graph and fail loudly if the entity does not exist.
 2. **Run.** The command executes locally in that workspace (never through the
    daemon), with `KIN_SESSION`, `KIN_SESSION_ID`, and `KIN_SESSION_DIR` set.
+   Interactive shells and agent sessions also pin `KIN_DAEMON_URL` and
+   `KIN_REPO_ID` when available so nested Kin/MCP calls bind to the same repo
+   and session.
 3. **Reconcile.** On success, Kin reconciles the workspace's own changes into
    the graph — a change-set replay against the base state it was materialized
    from, not a whole-tree overwrite — then removes the workspace.
@@ -152,6 +155,10 @@ Semantic answers stay graph-backed throughout: `semantic_locate`,
 `get_context_pack`, `trace_data_flow`, and the other MCP tools are answered by
 the daemon's graph authority, never by grepping the materialized workspace.
 The workspace is an execution surface, not a search authority.
+
+`kin shell` uses the same session identity and daemon binding, so any agent or
+MCP client you launch manually from that shell inherits the session-coherent
+environment.
 
 Agent-session launches do **not** require the daemon's remote command
 execution endpoint, which stays disabled unless an operator explicitly opts in

@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (393 total, 294 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (396 total, 294 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -39,7 +39,10 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_BUILD_GRAPH_TIMEOUT_SECS` | seconds>=0 | 60 | operational | timeout for building a historical ref-view graph |
 | `KIN_BYPASS_EMBEDDING_COVERAGE_CHECK` | bool | false | correctness | bypass the embedding-coverage correctness gate |
 | `KIN_CLAUDE_DISALLOWED_TOOLS` | string | *(unset)* | operational | comma-separated tool names disallowed in a with-session |
+| `KIN_DIR` | path | *(unset)* | operational | compatibility alias for the managed Kin install root; KIN_HOME wins when both are set |
 | `KIN_DISABLE_SPINE` | bool | false | correctness | disable the spine federation layer, narrowing retrieval scope |
+| `KIN_HOME` | path | ~/.kin | operational | preferred root for the managed Kin install used by the launcher, setup, and shell hooks |
+| `KIN_MCP_CACHE_DIR` | path | *(unset)* | operational | cache directory override for the npm MCP wrapper's managed Kin binary |
 | `KIN_MCP_REPO` | path | *(unset)* | operational | bind `kin mcp start` to this repository instead of the launch directory |
 | `KIN_MCP_TOOL_PROFILE` | string | *(unset)* | operational | MCP tool exposure profile |
 | `KIN_NO_DAEMON` | bool | false | operational | force in-process execution instead of the daemon |

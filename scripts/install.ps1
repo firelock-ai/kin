@@ -8,7 +8,8 @@
 #
 # Options (via env vars):
 #   $env:KIN_VERSION = "0.1.0"   Pin a specific version (default: latest)
-#   $env:KIN_DIR = "$HOME\.kin"  Install directory (default: ~/.kin)
+#   $env:KIN_HOME = "$HOME\.kin" Install directory (preferred; default: ~/.kin)
+#   $env:KIN_DIR = "$HOME\.kin"  Install directory compatibility alias
 #   $env:KIN_NO_SETUP = "1"     Skip interactive setup after install
 #   $env:KIN_BASE_URL = "..."   Install from a mirror (CI smoke tests / offline)
 #
@@ -20,9 +21,17 @@ $ErrorActionPreference = "Stop"
 
 # ── Config ──────────────────────────────────────────────────────────────
 
-$KinDir = if ($env:KIN_DIR) { $env:KIN_DIR } else { Join-Path $HOME ".kin" }
+$KinDir = if ($env:KIN_HOME) {
+    $env:KIN_HOME
+} elseif ($env:KIN_DIR) {
+    $env:KIN_DIR
+} else {
+    Join-Path $HOME ".kin"
+}
 $KinBin = Join-Path $KinDir "bin"
 $KinLib = Join-Path $KinDir "lib"
+$env:KIN_HOME = $KinDir
+$env:KIN_DIR = $KinDir
 $GitHubOrg = "firelock-ai"
 $GitHubRepo = "kin"
 # Override KIN_BASE_URL to install from a mirror or a local path (offline /

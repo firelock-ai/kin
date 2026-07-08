@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.14] - 2026-07-08
+
+First-run setup becomes Kin-native by default for new repos and smoother for agent
+workflows, npm installs, shell sessions, and managed install roots.
+
 ### Added
 
 - Revert-history review channel: shadow review flags revert-shaped changes — an added
@@ -16,6 +21,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded window of the base ref's ancestry at review time, and feeds the gate as
   ordinary warning findings; when the base has too little history to scan, the report
   carries an explicit evidence gap instead of a silent pass.
+- Fresh no-Git `kin init` bootstraps managed `AGENTS.md` guidance before the first
+  snapshot so brand-new repositories start Kin-native, with graph truth as authority
+  and Git kept as an optional export path.
+
+### Changed
+
+- `kin setup` and the native installers now prefer `KIN_HOME` for the managed install
+  root while keeping `KIN_DIR` as a compatibility alias; shell hooks, health checks,
+  docs, and the env-var registry all agree on that contract.
+- `kin shell` now exports the same session-coherent daemon/repo/session context used by
+  agent sessions (`KIN_SESSION`, `KIN_SESSION_ID`, `KIN_SESSION_DIR`,
+  `KIN_DAEMON_URL`, and `KIN_REPO_ID`).
+
+### Fixed
+
+- `kin setup` now appends and ledgers the managed-bin PATH block idempotently, and
+  `kin setup status` treats an rc-declared PATH as healthy after shell restart.
+- Setup shim discovery checks the managed `KIN_HOME/lib` before development fallback
+  paths, so cargo-bin launches no longer claim the VFS shim is missing when the
+  installed shim is already in place.
 
 ## [0.2.13] - 2026-07-07
 
@@ -42,17 +67,6 @@ Distribution becomes first-class: Kin installs from npm as `@kinlab/kin`, doctor
 ### Security
 
 - crossbeam-epoch updated to 0.9.20 (RUSTSEC-2026-0204).
-=======
-### Added
-
-- Revert-history review channel: shadow review flags revert-shaped changes — an added
-  entity that restores content removed in the recent past (behavior-fingerprint match),
-  a reintroduction of a recently-removed surface (same name and kind, modified content),
-  and removals of recently-introduced entities. The evidence is temporal, read from a
-  bounded window of the base ref's ancestry at review time, and feeds the gate as
-  ordinary warning findings; when the base has too little history to scan, the report
-  carries an explicit evidence gap instead of a silent pass.
->>>>>>> fbfdd830 (feat(review): revert-history evidence channel for shadow review)
 
 ## [0.2.12] - 2026-07-06
 

@@ -5,7 +5,7 @@ Windows (via WSL2):
 
 1. **Install** the binaries with the one-line installer.
 2. **`kin setup`** — answer a couple of questions; the guided wizard configures your
-   shell, daemon, and AI clients.
+   shell, PATH, daemon, and AI clients.
 3. **`kin init`** + **`kin embed`** — build the semantic graph and the vector index.
 4. **Verify** with `kin setup status` and read the health checklist.
 
@@ -31,6 +31,25 @@ archive bundles them — into `~/.kin/bin` (and `~/.kin/lib`), updates your shel
 the installer aborts cleanly rather than leaving a daemon-less install. Re-running the
 installer upgrades an existing install in place and reports the version change.
 
+### npm / npx
+
+If your workflow starts from npm, use the canonical launcher and then run the same setup:
+
+```sh
+npm install -g @kinlab/kin
+kin setup --intent agent
+```
+
+For zero-install provisioning:
+
+```sh
+npx -y @kinlab/kin setup --intent agent --no-interactive
+```
+
+The launcher provisions the same managed native `kin` + `kin-daemon` release under
+`~/.kin/bin`; `kin setup` writes MCP configs with an absolute path to that binary and
+adds the managed bin directory to your shell profile for new sessions.
+
 ### Windows
 
 On native Windows, use PowerShell:
@@ -51,7 +70,8 @@ Configure the installer with environment variables (supported by both `install.s
 
 - `KIN_VERSION`: pin a specific version (e.g. `0.1.0`); otherwise the latest release is
   resolved automatically.
-- `KIN_DIR`: custom install directory (defaults to `~/.kin`).
+- `KIN_HOME`: custom managed install directory (preferred; defaults to `~/.kin`).
+- `KIN_DIR`: compatibility alias for `KIN_HOME`.
 - `KIN_NO_SETUP=1`: skip the `kin setup` wizard after the binaries are installed (run
   `kin setup` yourself when ready).
 - `KIN_BASE_URL`: install from a mirror or local path instead of GitHub releases
@@ -98,7 +118,20 @@ When the wizard finishes, it prints the **health checklist** (the same engine as
 
 ## 3. Initialize a repository
 
-Build a semantic graph over an existing Git repository or folder:
+Start a brand-new Kin-native repository:
+
+```sh
+mkdir my-app
+kin init my-app --git-history off
+cd my-app
+```
+
+In a directory with no `.git/`, `kin init` creates the native `.kin/` graph store and a
+managed `AGENTS.md` before the first snapshot. Agents that open the folder immediately see
+the Kin-native workflow: graph tools first, session workspaces for execution, `kin commit`
+for graph history, and `kin git export` only as an interoperability escape hatch.
+
+Convert an existing Git repository or folder:
 
 ```sh
 # Initialize in the current directory
@@ -107,6 +140,10 @@ kin init
 # Or initialize a specific path
 kin init path/to/project
 ```
+
+In a detected Git repository, `kin init` bootstraps the current tree as semantic truth and
+imports recent Git history by default. Git stays in place; Kin adds the semantic graph and
+agent/runtime surfaces beside it.
 
 *Flags:*
 - `--git-history <off|recent|full>`: how much Git history to import into the graph on init
@@ -295,7 +332,7 @@ The checks (IDs as emitted in `--json`):
 | `kin_daemon_binary` | `kin-daemon` found beside `kin` or on `PATH`. |
 | `vfs_projection` | The VFS shim is installed and non-zero in `~/.kin/lib` (macOS/Linux). On Windows this is **n/a** — projection uses ProjFS (planned), not the shell-injected shim. |
 | `repo_init` | The current directory is inside a Kin repository. |
-| `shell_path` | The `kin-vfs` shell hook is installed and sourced from your rc. |
+| `shell_path` | The `kin-vfs` shell hook is installed and sourced from your rc, and the managed `~/.kin/bin` directory is on PATH now or will be after shell restart. |
 | `mcp_client_*` (e.g. `mcp_client_claude`) | A detected AI client has the `kin` MCP server with the `agent-default` profile. With no client configs present, a single `mcp_clients` check reports ok ("nothing to configure"). |
 | `editor` | The `kin-editor` VS Code extension is detected in `~/.vscode/extensions`. **n/a** if not found / non-VS Code. |
 | `kinlab_connect` | A stored KinLab credential is present. **n/a** today — hosted connect is not yet a first-run flow. |
@@ -375,28 +412,31 @@ per invocation: it uses `KIN_DAEMON_URL` when set (agent sessions launched with
 from the working directory — so each agent session talks to the daemon of the
 repository it is actually working in.
 
-### npm wrapper (`@kinlab/kin-mcp`)
+### npm wrapper (`@kinlab/kin`)
 
-If you'd rather not install the binaries first, the published `@kinlab/kin-mcp` package
-downloads, checksum-verifies, and runs Kin's MCP server for you. Point your client at it:
+If you'd rather not install the binaries first, the canonical `@kinlab/kin` package
+downloads, checksum-verifies, and runs the managed Kin CLI for you. For setup:
+
+```sh
+npx -y @kinlab/kin setup --intent agent --no-interactive
+```
+
+For a manually configured MCP client:
 
 ```json
 {
   "mcpServers": {
     "kin": {
       "command": "npx",
-      "args": ["-y", "@kinlab/kin-mcp"]
+      "args": ["-y", "@kinlab/kin", "mcp", "start"],
+      "env": { "KIN_MCP_TOOL_PROFILE": "agent-default" }
     }
   }
 }
 ```
 
-On first run it provisions `kin-daemon` next to `kin`, defaults
-`KIN_MCP_TOOL_PROFILE=agent-default`, starts (or reuses) the repo daemon, and **requires an
-explicit `kin init`** (no silent init) unless you set `KIN_MCP_AUTO_INIT=1`. Requires
-Node.js 20+ on macOS or Linux (Windows users go through WSL2). See the
-[`@kinlab/kin-mcp` README](../packages/kin-mcp/README.md) for cache locations and the full
-environment-variable surface.
+The older `@kinlab/kin-mcp` package remains published for existing configurations. New
+setups should use `@kinlab/kin`, which includes the same MCP server as `kin mcp start`.
 
 ### Runtime / daemon configuration
 

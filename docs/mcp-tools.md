@@ -35,8 +35,8 @@ small curated surface below instead of the full internal one):
 }
 ```
 
-To wire a client up by hand, or to use the npm wrapper (`@kinlab/kin-mcp`, which defaults
-to the same `agent-default` profile), see
+To wire a client up by hand, or to use the canonical npm wrapper (`@kinlab/kin`, which
+can run `kin mcp start` with the same `agent-default` profile), see
 [Advanced configuration](quickstart.md#9-advanced-configuration) in the quickstart.
 
 ---
