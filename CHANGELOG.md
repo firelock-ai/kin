@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Revert-history review channel: shadow review flags revert-shaped changes — an added
+  entity that restores content removed in the recent past (behavior-fingerprint match),
+  a reintroduction of a recently-removed surface (same name and kind, modified content),
+  and removals of recently-introduced entities. The evidence is temporal, read from a
+  bounded window of the base ref's ancestry at review time, and feeds the gate as
+  ordinary warning findings; when the base has too little history to scan, the report
+  carries an explicit evidence gap instead of a silent pass.
+
 ## [0.2.13] - 2026-07-07
 
 Distribution becomes first-class: Kin installs from npm as `@kinlab/kin`, doctor heals its own VFS shim, and history hydration gains parse reuse and a timing profile.
@@ -32,6 +42,17 @@ Distribution becomes first-class: Kin installs from npm as `@kinlab/kin`, doctor
 ### Security
 
 - crossbeam-epoch updated to 0.9.20 (RUSTSEC-2026-0204).
+=======
+### Added
+
+- Revert-history review channel: shadow review flags revert-shaped changes — an added
+  entity that restores content removed in the recent past (behavior-fingerprint match),
+  a reintroduction of a recently-removed surface (same name and kind, modified content),
+  and removals of recently-introduced entities. The evidence is temporal, read from a
+  bounded window of the base ref's ancestry at review time, and feeds the gate as
+  ordinary warning findings; when the base has too little history to scan, the report
+  carries an explicit evidence gap instead of a silent pass.
+>>>>>>> fbfdd830 (feat(review): revert-history evidence channel for shadow review)
 
 ## [0.2.12] - 2026-07-06
 

@@ -37,6 +37,8 @@ pub enum InlineCommentKind {
     Renamed,
     AgentUnreviewed,
     ToolchainSurfaceChange,
+    RevertHistory,
+    RevertHistoryIncidental,
 }
 
 impl InlineCommentKind {
@@ -53,6 +55,8 @@ impl InlineCommentKind {
             Self::Removed => "-",
             Self::Renamed => "~",
             Self::AgentUnreviewed => "@",
+            Self::RevertHistory => "~",
+            Self::RevertHistoryIncidental => "~",
             Self::ToolchainSurfaceChange => "~",
         }
     }

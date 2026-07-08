@@ -518,6 +518,19 @@ fn assemble_report_with_changes<G: GraphStore>(
     // Toolchain-surface findings feed the gate as ordinary warning findings via
     // the inline-comment channel, never through the evidence-gap demotion path.
     review.inline_comments.extend(toolchain_findings);
+    // Revert-history findings use the same inline-comment channel, with an
+    // honest gap when the base has too little history to scan. Strong matches
+    // may gate as warnings; weak temporal hints stay informational. Evidence is
+    // available at review time only: the window looks strictly BEFORE the base.
+    let (revert_findings, revert_gap) = crate::revert_history::collect_revert_history_findings(
+        store,
+        &request.resolved_base,
+        changes,
+    )?;
+    review.inline_comments.extend(revert_findings);
+    if let Some(gap) = revert_gap {
+        evidence_gaps.push(gap);
+    }
     let policy = derive_policy(&review, &evidence_gaps, &changed_entities);
     let repair_context = collect_repair_context(&policy.findings, &review);
     let audit = collect_audit_evidence(store, request, &review, changes.len())?;
@@ -724,6 +737,8 @@ fn finding_kind_label(kind: InlineCommentKind) -> &'static str {
         InlineCommentKind::Renamed => "entity_renamed",
         InlineCommentKind::AgentUnreviewed => "agent_unreviewed",
         InlineCommentKind::ToolchainSurfaceChange => "toolchain_surface_change",
+        InlineCommentKind::RevertHistory => "revert_history",
+        InlineCommentKind::RevertHistoryIncidental => "revert_history_incidental",
     }
 }
 
@@ -737,7 +752,9 @@ fn finding_severity(kind: InlineCommentKind) -> &'static str {
         | InlineCommentKind::ConsumerFanout
         | InlineCommentKind::Renamed
         | InlineCommentKind::AgentUnreviewed
-        | InlineCommentKind::ToolchainSurfaceChange => "warning",
+        | InlineCommentKind::ToolchainSurfaceChange
+        | InlineCommentKind::RevertHistory => "warning",
+        InlineCommentKind::RevertHistoryIncidental => "info",
         InlineCommentKind::Added | InlineCommentKind::Removed => "info",
     }
 }
@@ -1107,6 +1124,15 @@ fn repair_guidance(kind: &str) -> &'static str {
             "The contract surface changed with graph-known downstream entities; verify each \
              listed dependent and consumer, then run the covering tests."
         }
+        "revert_history_incidental" => {
+            "One entity's body matches an older revision — often incidental on small \
+             bodies; worth a glance at the linked history, not a gate."
+        }
+        "revert_history" => {
+            "This change is revert-shaped: it reintroduces or removes recently-changed \
+             history. Confirm the original removal/addition was wrong before merging, and \
+             check the linked history for the regression the earlier change addressed."
+        }
         "toolchain_surface_change" => {
             "Inline lint or deprecation directives changed; confirm the shift in toolchain \
              enforcement is intended before merging."
@@ -1282,7 +1308,9 @@ fn collect_evidence_gaps<G: GraphStore>(
     for change in changes {
         for delta in &change.artifact_deltas {
             let file = delta.file_id.to_string();
-            if entity_files.contains(&file) {
+            if entity_files.contains(&file)
+                || semantic_removed_entity_accounts_for_artifact_file(&file, changed_entities)
+            {
                 continue;
             }
             let entry = artifact_hashes
@@ -1382,6 +1410,31 @@ fn collect_evidence_gaps<G: GraphStore>(
     });
 
     (gaps, toolchain_findings)
+}
+
+fn semantic_removed_entity_accounts_for_artifact_file(
+    file: &str,
+    changed_entities: &[ShadowChangedEntity],
+) -> bool {
+    changed_entities.iter().any(|entity| {
+        entity.change == "removed"
+            && entity.kind != "unknown"
+            && entity.role == EntityRole::Source
+            && entity
+                .file
+                .as_deref()
+                .is_some_and(|entity_file| same_filename(entity_file, file))
+    })
+}
+
+fn same_filename(left: &str, right: &str) -> bool {
+    let left = std::path::Path::new(left)
+        .file_name()
+        .and_then(|name| name.to_str());
+    let right = std::path::Path::new(right)
+        .file_name()
+        .and_then(|name| name.to_str());
+    left.is_some() && left == right
 }
 
 fn actor_kind_label(actor: &str) -> &'static str {
@@ -3212,6 +3265,56 @@ mod tests {
     }
 
     #[test]
+    fn removed_entity_under_historical_path_accounts_for_source_artifact_delta() {
+        // Historical rename shape: the source file changed at its current path,
+        // but the removed entity still carries the pre-rename file origin. The
+        // semantic diff did capture the deletion, so the artifact delta must
+        // not be treated as unparsed source.
+        let graph = InMemoryGraph::new();
+        let legacy = entity_with_span(
+            "animate",
+            "src/shared/keyed-each.js",
+            105,
+            EntityRole::Source,
+        );
+        graph.upsert_entity(&legacy).unwrap();
+
+        let base_id = change_id(0x71);
+        let head_id = change_id(0x72);
+        let base = change_with_deltas(
+            base_id,
+            vec![],
+            vec![EntityDelta::Added(legacy.clone())],
+            vec![],
+            vec![],
+        );
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![EntityDelta::Removed(legacy.id)],
+            vec![],
+            vec![ArtifactDelta {
+                file_id: FilePathId::new("src/internal/keyed-each.js"),
+                kind: ArtifactDeltaKind::Modified,
+                old_hash: Some(Hash256::from_bytes([21; 32])),
+                new_hash: Some(Hash256::from_bytes([22; 32])),
+            }],
+        );
+        graph.create_change(&base).unwrap();
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+
+        assert!(
+            !report.evidence_gaps.iter().any(|gap| {
+                gap.kind == "artifact_only_change" && gap.subject == "src/internal/keyed-each.js"
+            }),
+            "a captured removed entity under a historical path must account for the source delta"
+        );
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::Pass);
+    }
+
+    #[test]
     fn absent_relation_channel_keeps_surface_change_feeding_gate() {
         // A real signature change in a repo whose relation channel was never
         // ingested: the empty channel cannot prove the change is isolated, so
@@ -3534,6 +3637,664 @@ mod tests {
         assert!(
             findings_no_blob.is_empty(),
             "without a blob reader the toolchain channel emits nothing"
+        );
+    }
+
+    /// Chain of `n` changes: c1 applies `first_deltas`, c2 applies
+    /// `second_deltas`, the rest are empty padding so the revert-history window
+    /// sees enough depth to scan without reporting the shallow-history gap.
+    fn padded_history_graph(
+        graph: &InMemoryGraph,
+        first_deltas: Vec<EntityDelta>,
+        second_deltas: Vec<EntityDelta>,
+        n: u8,
+    ) -> SemanticChangeId {
+        let mut prev: Option<SemanticChangeId> = None;
+        for i in 1..=n {
+            let deltas = match i {
+                1 => first_deltas.clone(),
+                2 => second_deltas.clone(),
+                _ => vec![],
+            };
+            let change = change_with_deltas(
+                change_id(i),
+                prev.map(|p| vec![p]).unwrap_or_default(),
+                deltas,
+                vec![],
+                vec![],
+            );
+            graph.create_change(&change).unwrap();
+            prev = Some(change_id(i));
+        }
+        prev.expect("chain is non-empty")
+    }
+
+    #[test]
+    fn revert_history_reintroduction_flags_needs_attention() {
+        // c1 adds `retry_budget`, c2 removes it, padding to depth 30, then the
+        // head re-adds an entity with the SAME behavior fingerprint at a new
+        // location. The channel must call out the revert-shaped reintroduction
+        // and move the verdict to needs_attention.
+        let graph = InMemoryGraph::new();
+        let mut original = entity_with_span("retry_budget", "src/net.rs", 40, EntityRole::Source);
+        original.fingerprint.behavior_hash = Hash256::from_bytes([7; 32]);
+        let mut readded = original.clone();
+        readded.id = EntityId::from_content("src/net.rs", "retry_budget", "Function", 77);
+        let base_id = padded_history_graph(
+            &graph,
+            vec![EntityDelta::Added(original.clone())],
+            vec![EntityDelta::Removed(original.id)],
+            30,
+        );
+        graph.upsert_entity(&readded).unwrap();
+        let head_id = change_id(200);
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![EntityDelta::Added(readded.clone())],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+        let finding = report
+            .policy
+            .findings
+            .iter()
+            .find(|f| f.kind == "revert_history")
+            .expect("reintroduction must produce a revert_history finding");
+        assert!(
+            finding.message.contains("restores the exact content"),
+            "fingerprint match must report the strong form, got: {}",
+            finding.message
+        );
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::NeedsAttention);
+        assert!(
+            !report
+                .evidence_gaps
+                .iter()
+                .any(|g| g.kind == "revert_history_shallow"),
+            "30 changes of history must not report the shallow gap"
+        );
+    }
+
+    #[test]
+    fn revert_history_recent_addition_removal_is_evidence_only() {
+        // c2 adds `beta_flag`; the head removes that exact entity id. Deleting
+        // something that only just landed is revert-shaped and must be called
+        // out, but benign-60 proved the signal is too weak to drive the gate
+        // without an independent risk channel.
+        let graph = InMemoryGraph::new();
+        let recent = entity_with_span("beta_flag", "src/flags.rs", 12, EntityRole::Source);
+        let base_id =
+            padded_history_graph(&graph, vec![], vec![EntityDelta::Added(recent.clone())], 30);
+        let head_id = change_id(201);
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![EntityDelta::Removed(recent.id)],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+        let finding = report
+            .policy
+            .findings
+            .iter()
+            .find(|f| f.kind == "revert_history_incidental")
+            .expect("recent-addition removal must produce an evidence-only finding");
+        assert!(
+            finding.message.contains("revert-shaped removal"),
+            "got: {}",
+            finding.message
+        );
+        assert_eq!(finding.severity, "info");
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::Pass);
+    }
+
+    #[test]
+    fn fresh_addition_produces_no_revert_history_finding() {
+        // History contains an unrelated removal; the head adds a brand-new
+        // entity. No temporal match exists, so the channel must stay silent —
+        // fresh additions are the benign default this channel must never tax.
+        let graph = InMemoryGraph::new();
+        let mut unrelated = entity_with_span("old_helper", "src/util.rs", 9, EntityRole::Source);
+        unrelated.fingerprint.behavior_hash = Hash256::from_bytes([9; 32]);
+        let fresh = entity_with_span("brand_new_api", "src/api.rs", 21, EntityRole::Source);
+        let base_id = padded_history_graph(
+            &graph,
+            vec![EntityDelta::Added(unrelated.clone())],
+            vec![EntityDelta::Removed(unrelated.id)],
+            30,
+        );
+        graph.upsert_entity(&fresh).unwrap();
+        let head_id = change_id(202);
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![EntityDelta::Added(fresh)],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+        assert!(
+            !report
+                .policy
+                .findings
+                .iter()
+                .any(|f| f.kind == "revert_history"),
+            "a fresh addition must not read as revert-shaped"
+        );
+    }
+
+    #[test]
+    fn shallow_history_reports_honest_gap() {
+        // Two changes of history is not enough to assess revert evidence: the
+        // channel must say so through an evidence gap instead of certifying
+        // silence, and must not invent findings.
+        let graph = InMemoryGraph::new();
+        let fresh = entity_with_span("early_api", "src/api.rs", 5, EntityRole::Source);
+        let base_id = padded_history_graph(&graph, vec![], vec![], 2);
+        graph.upsert_entity(&fresh).unwrap();
+        let head_id = change_id(203);
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![EntityDelta::Added(fresh)],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+        assert!(
+            report
+                .evidence_gaps
+                .iter()
+                .any(|g| g.kind == "revert_history_shallow"),
+            "shallow history must surface the honesty gap"
+        );
+        assert!(
+            !report
+                .policy
+                .findings
+                .iter()
+                .any(|f| f.kind == "revert_history"),
+            "no finding may be invented from unscannable history"
+        );
+    }
+
+    #[test]
+    fn revert_of_the_base_change_itself_flags() {
+        // The most common revert shape: the head reverts exactly the change at
+        // the base — the removal lives in the base change's own deltas, which
+        // are part of the state the head builds on and must be scanned.
+        let graph = InMemoryGraph::new();
+        let mut original = entity_with_span("retry_budget", "src/net.rs", 40, EntityRole::Source);
+        original.fingerprint.behavior_hash = Hash256::from_bytes([5; 32]);
+        let mut readded = original.clone();
+        readded.id = EntityId::from_content("src/net2.rs", "retry_budget", "Function", 8);
+        // 29 pads, then the base change REMOVES the entity, then head re-adds.
+        let pad_tail = padded_history_graph(
+            &graph,
+            vec![EntityDelta::Added(original.clone())],
+            vec![],
+            29,
+        );
+        let base_id = change_id(150);
+        let base = change_with_deltas(
+            base_id,
+            vec![pad_tail],
+            vec![EntityDelta::Removed(original.id)],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&base).unwrap();
+        graph.upsert_entity(&readded).unwrap();
+        let head_id = change_id(151);
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![EntityDelta::Added(readded)],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+        let finding = report
+            .policy
+            .findings
+            .iter()
+            .find(|f| f.kind == "revert_history")
+            .expect("a revert of the base change itself must flag");
+        assert!(
+            finding.message.contains("in the base change itself"),
+            "distance-0 phrasing expected, got: {}",
+            finding.message
+        );
+    }
+
+    #[test]
+    fn body_reversion_to_older_revision_flags() {
+        // v1 -> v2 -> (head) back to v1's body: the head un-does the v2 edit.
+        // An ordinary new edit (v3 with a fresh body) must NOT match.
+        let graph = InMemoryGraph::new();
+        let mut v1 = entity_with_span("compute", "src/calc.rs", 10, EntityRole::Source);
+        v1.fingerprint.behavior_hash = Hash256::from_bytes([1; 32]);
+        let mut v2 = v1.clone();
+        v2.fingerprint.behavior_hash = Hash256::from_bytes([2; 32]);
+        let mut v_back = v2.clone();
+        v_back.fingerprint.behavior_hash = Hash256::from_bytes([1; 32]);
+
+        let pad_tail = padded_history_graph(
+            &graph,
+            vec![EntityDelta::Added(v1.clone())],
+            vec![EntityDelta::Modified {
+                old: v1.clone(),
+                new: v2.clone(),
+            }],
+            30,
+        );
+        graph.upsert_entity(&v_back).unwrap();
+        let head_id = change_id(210);
+        let head = change_with_deltas(
+            head_id,
+            vec![pad_tail],
+            vec![EntityDelta::Modified {
+                old: v2.clone(),
+                new: v_back,
+            }],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(pad_tail, head_id)).unwrap();
+        // A single entity reverting is incidental: reported at info severity,
+        // never verdict-driving (small bodies recur naturally in long
+        // histories — the v7 backtest measured 5/6 benign regressions when
+        // singletons gated).
+        let finding = report
+            .policy
+            .findings
+            .iter()
+            .find(|f| f.kind == "revert_history_incidental")
+            .expect("a lone body reversion must surface as incidental");
+        assert!(
+            finding.message.contains("revert-shaped body reversion"),
+            "got: {}",
+            finding.message
+        );
+        assert_eq!(finding.severity, "info");
+        assert!(
+            !report
+                .policy
+                .findings
+                .iter()
+                .any(|f| f.kind == "revert_history"),
+            "a lone body reversion must not produce the gating kind"
+        );
+
+        // Control: an ordinary forward edit must not produce the finding.
+        let graph2 = InMemoryGraph::new();
+        let mut v3 = v2.clone();
+        v3.fingerprint.behavior_hash = Hash256::from_bytes([3; 32]);
+        let pad_tail2 = padded_history_graph(
+            &graph2,
+            vec![EntityDelta::Added(v1.clone())],
+            vec![EntityDelta::Modified {
+                old: v1.clone(),
+                new: v2.clone(),
+            }],
+            30,
+        );
+        graph2.upsert_entity(&v3).unwrap();
+        let head2 = change_with_deltas(
+            change_id(211),
+            vec![pad_tail2],
+            vec![EntityDelta::Modified {
+                old: v2.clone(),
+                new: v3,
+            }],
+            vec![],
+            vec![],
+        );
+        graph2.create_change(&head2).unwrap();
+        let report2 = build_shadow_report(&graph2, &request(pad_tail2, change_id(211))).unwrap();
+        assert!(
+            !report2
+                .policy
+                .findings
+                .iter()
+                .any(|f| f.kind == "revert_history"),
+            "an ordinary forward edit must not read as a body reversion"
+        );
+    }
+
+    #[test]
+    fn coherent_public_leaf_body_reversion_gates() {
+        // Two entities whose new bodies both restore states un-done by the
+        // SAME historical change: a coherent snapshot restoration — the true
+        // revert shape — gates as a warning.
+        let graph = InMemoryGraph::new();
+        let mut a1 = entity_with_span("alpha", "src/a.rs", 5, EntityRole::Source);
+        a1.fingerprint.behavior_hash = Hash256::from_bytes([11; 32]);
+        let mut b1 = entity_with_span("beta", "src/b.rs", 9, EntityRole::Source);
+        b1.fingerprint.behavior_hash = Hash256::from_bytes([21; 32]);
+        let mut a2 = a1.clone();
+        a2.fingerprint.behavior_hash = Hash256::from_bytes([12; 32]);
+        let mut b2 = b1.clone();
+        b2.fingerprint.behavior_hash = Hash256::from_bytes([22; 32]);
+
+        // c1 adds both; c2 edits BOTH (the change the head un-does); padding.
+        let mut prev: Option<SemanticChangeId> = None;
+        for i in 1..=30u8 {
+            let deltas = match i {
+                1 => vec![
+                    EntityDelta::Added(a1.clone()),
+                    EntityDelta::Added(b1.clone()),
+                ],
+                2 => vec![
+                    EntityDelta::Modified {
+                        old: a1.clone(),
+                        new: a2.clone(),
+                    },
+                    EntityDelta::Modified {
+                        old: b1.clone(),
+                        new: b2.clone(),
+                    },
+                ],
+                _ => vec![],
+            };
+            let change = change_with_deltas(
+                change_id(i),
+                prev.map(|p| vec![p]).unwrap_or_default(),
+                deltas,
+                vec![],
+                vec![],
+            );
+            graph.create_change(&change).unwrap();
+            prev = Some(change_id(i));
+        }
+        let base_id = prev.unwrap();
+        let mut a_back = a2.clone();
+        a_back.fingerprint.behavior_hash = Hash256::from_bytes([11; 32]);
+        let mut b_back = b2.clone();
+        b_back.fingerprint.behavior_hash = Hash256::from_bytes([21; 32]);
+        graph.upsert_entity(&a_back).unwrap();
+        graph.upsert_entity(&b_back).unwrap();
+        let head_id = change_id(220);
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![
+                EntityDelta::Modified {
+                    old: a2.clone(),
+                    new: a_back,
+                },
+                EntityDelta::Modified {
+                    old: b2.clone(),
+                    new: b_back,
+                },
+            ],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+        let gating: Vec<_> = report
+            .policy
+            .findings
+            .iter()
+            .filter(|f| f.kind == "revert_history")
+            .collect();
+        assert_eq!(
+            gating.len(),
+            2,
+            "both public-leaf reversions must gate, got findings: {:?}",
+            report
+                .policy
+                .findings
+                .iter()
+                .map(|f| (&f.kind, &f.message))
+                .collect::<Vec<_>>()
+        );
+        assert!(gating.iter().all(|f| f.severity == "warning"));
+        assert!(gating[0].message.contains("un-doing the same change"));
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::NeedsAttention);
+    }
+
+    #[test]
+    fn coherent_module_body_reversion_does_not_gate() {
+        // Module/class aggregates co-revert for free (a module mirrors its
+        // file), so a coherent group with no public leaf stays informational —
+        // the false-coherence protection that motivated the leaf filter.
+        let graph = InMemoryGraph::new();
+        let mut a1 = entity_with_span("mod_a", "src/a.rs", 1, EntityRole::Source);
+        a1.kind = EntityKind::Module;
+        a1.fingerprint.behavior_hash = Hash256::from_bytes([11; 32]);
+        let mut b1 = entity_with_span("_helper", "src/b.rs", 9, EntityRole::Source);
+        b1.visibility = Visibility::Private;
+        b1.fingerprint.behavior_hash = Hash256::from_bytes([21; 32]);
+        let mut a2 = a1.clone();
+        a2.fingerprint.behavior_hash = Hash256::from_bytes([12; 32]);
+        let mut b2 = b1.clone();
+        b2.fingerprint.behavior_hash = Hash256::from_bytes([22; 32]);
+
+        let mut prev: Option<SemanticChangeId> = None;
+        for i in 1..=30u8 {
+            let deltas = match i {
+                1 => vec![
+                    EntityDelta::Added(a1.clone()),
+                    EntityDelta::Added(b1.clone()),
+                ],
+                2 => vec![
+                    EntityDelta::Modified {
+                        old: a1.clone(),
+                        new: a2.clone(),
+                    },
+                    EntityDelta::Modified {
+                        old: b1.clone(),
+                        new: b2.clone(),
+                    },
+                ],
+                _ => vec![],
+            };
+            let change = change_with_deltas(
+                change_id(i),
+                prev.map(|p| vec![p]).unwrap_or_default(),
+                deltas,
+                vec![],
+                vec![],
+            );
+            graph.create_change(&change).unwrap();
+            prev = Some(change_id(i));
+        }
+        let base_id = prev.unwrap();
+        let mut a_back = a2.clone();
+        a_back.fingerprint.behavior_hash = Hash256::from_bytes([11; 32]);
+        let mut b_back = b2.clone();
+        b_back.fingerprint.behavior_hash = Hash256::from_bytes([21; 32]);
+        graph.upsert_entity(&a_back).unwrap();
+        graph.upsert_entity(&b_back).unwrap();
+        let head_id = change_id(220);
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![
+                EntityDelta::Modified {
+                    old: a2.clone(),
+                    new: a_back,
+                },
+                EntityDelta::Modified {
+                    old: b2.clone(),
+                    new: b_back,
+                },
+            ],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+        assert!(
+            report
+                .policy
+                .findings
+                .iter()
+                .all(|f| f.kind != "revert_history"),
+            "module/private coherent reversion must not gate: {:?}",
+            report
+                .policy
+                .findings
+                .iter()
+                .map(|f| &f.kind)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::Pass);
+    }
+
+    #[test]
+    fn future_change_never_supplies_prior_bodies() {
+        // A change made AFTER the head trivially has the head's result as its
+        // pre-state, so a graph holding changes newer than the reviewed head
+        // (other reviews' hydrations, a warmed shared graph) must never let
+        // them serve as "prior" bodies: that reads the head's own future back
+        // as revert evidence.
+        let graph = InMemoryGraph::new();
+        let mut v1 = entity_with_span("gamma", "src/g.rs", 5, EntityRole::Source);
+        v1.fingerprint.behavior_hash = Hash256::from_bytes([31; 32]);
+        let mut v2 = v1.clone();
+        v2.fingerprint.behavior_hash = Hash256::from_bytes([32; 32]);
+        let pad_tail = padded_history_graph(
+            &graph,
+            vec![EntityDelta::Added(v1.clone())],
+            vec![EntityDelta::Modified {
+                old: v1.clone(),
+                new: v2.clone(),
+            }],
+            30,
+        );
+        // Head gives gamma a body it has NEVER carried before.
+        let mut v_new = v2.clone();
+        v_new.fingerprint.behavior_hash = Hash256::from_bytes([33; 32]);
+        graph.upsert_entity(&v_new).unwrap();
+        let head_id = change_id(240);
+        let head = change_with_deltas(
+            head_id,
+            vec![pad_tail],
+            vec![EntityDelta::Modified {
+                old: v2.clone(),
+                new: v_new.clone(),
+            }],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+        // A future edit whose pre-state IS the head's result.
+        let mut v_future = v_new.clone();
+        v_future.fingerprint.behavior_hash = Hash256::from_bytes([34; 32]);
+        let future = change_with_deltas(
+            change_id(241),
+            vec![head_id],
+            vec![EntityDelta::Modified {
+                old: v_new.clone(),
+                new: v_future,
+            }],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&future).unwrap();
+
+        let report = build_shadow_report(&graph, &request(pad_tail, head_id)).unwrap();
+        assert!(
+            report
+                .policy
+                .findings
+                .iter()
+                .all(|f| !f.kind.starts_with("revert_history")),
+            "a future change must never read as revert history: {:?}",
+            report
+                .policy
+                .findings
+                .iter()
+                .map(|f| (&f.kind, &f.message))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn merge_branch_side_never_supplies_prior_bodies() {
+        // Changes reachable only through the head's merge (the branch being
+        // merged) are not part of the BASE's causal past; their pre-states
+        // must not serve as prior bodies either.
+        let graph = InMemoryGraph::new();
+        let mut v1 = entity_with_span("delta_fn", "src/d.rs", 5, EntityRole::Source);
+        v1.fingerprint.behavior_hash = Hash256::from_bytes([51; 32]);
+        let mut v2 = v1.clone();
+        v2.fingerprint.behavior_hash = Hash256::from_bytes([52; 32]);
+        let pad_tail = padded_history_graph(
+            &graph,
+            vec![EntityDelta::Added(v1.clone())],
+            vec![EntityDelta::Modified {
+                old: v1.clone(),
+                new: v2.clone(),
+            }],
+            30,
+        );
+        // The merge result: a body delta_fn never carried on the base lineage.
+        let mut v_new = v2.clone();
+        v_new.fingerprint.behavior_hash = Hash256::from_bytes([53; 32]);
+        // Branch-side change (parented off c1, reachable only via the merge):
+        // its pre-state equals the merge result's body.
+        let mut v_branch = v_new.clone();
+        v_branch.fingerprint.behavior_hash = Hash256::from_bytes([54; 32]);
+        let branch = change_with_deltas(
+            change_id(250),
+            vec![change_id(1)],
+            vec![EntityDelta::Modified {
+                old: v_new.clone(),
+                new: v_branch,
+            }],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&branch).unwrap();
+        graph.upsert_entity(&v_new).unwrap();
+        let head_id = change_id(251);
+        let head = change_with_deltas(
+            head_id,
+            vec![pad_tail, change_id(250)],
+            vec![EntityDelta::Modified {
+                old: v2.clone(),
+                new: v_new.clone(),
+            }],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&head).unwrap();
+
+        let report = build_shadow_report(&graph, &request(pad_tail, head_id)).unwrap();
+        assert!(
+            report
+                .policy
+                .findings
+                .iter()
+                .all(|f| !f.kind.starts_with("revert_history")),
+            "branch-side changes must never read as revert history: {:?}",
+            report
+                .policy
+                .findings
+                .iter()
+                .map(|f| (&f.kind, &f.message))
+                .collect::<Vec<_>>()
         );
     }
 }
