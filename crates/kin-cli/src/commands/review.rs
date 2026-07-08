@@ -1231,6 +1231,7 @@ fn inline_comment_severity(kind: kin_review::InlineCommentKind) -> &'static str 
         InlineCommentKind::Added
         | InlineCommentKind::Removed
         | InlineCommentKind::BreakingMigrated
+        | InlineCommentKind::ConsumerFanoutEquivalent
         | InlineCommentKind::RevertHistoryIncidental => "info",
     }
 }
