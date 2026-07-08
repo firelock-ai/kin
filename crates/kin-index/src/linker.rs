@@ -661,6 +661,37 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
             }
         }
 
+        // (c4) C++ receiver-scoped inherited method. A `Owner::method` call
+        // whose receiver type the parser pinned matched no exact entity above
+        // (own method — same-file (a) or cross-file (c)) resolves through the
+        // receiver class's Extends chain to the defining ancestor: the C++
+        // counterpart of the (a2) `self.m()` walk, keyed on `::` methods.
+        // Running before (c3) keeps an inherited call pinned to its true base
+        // rather than fanning out to every same-named method the bare leaf
+        // would reach. Only a located class owner binds, so a namespace-scoped
+        // free function (`Catch::Main`) is left for the tiers below.
+        if name_fallback_allowed && !linked && rel.kind == RelationKind::Calls {
+            if let Some((owner, method)) = split_scoped_receiver_method(rel.dst_name.as_str()) {
+                if let Some((owner_file, owner_class)) =
+                    locate_base_class(&file.file_path, owner, ctx)
+                {
+                    if let Some(dst_id) =
+                        resolve_inherited_method(&owner_file, &owner_class, method, ctx)
+                    {
+                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                            resolved.push(make_relation(
+                                rel.kind,
+                                src_id,
+                                dst_id,
+                                INHERITED_METHOD_CONFIDENCE,
+                            ));
+                            linked = true;
+                        }
+                    }
+                }
+            }
+        }
+
         // (c3) Path-qualified calls (`crate::mod::func`, `Type::method`,
         // `alias::Type::method`) arrive with the full lexical path as `dst_name`
         // and no import source, so they miss (a)/(b) and the exact/bare indices
@@ -1080,6 +1111,33 @@ fn split_owner_method(name: &str) -> Option<(&str, &str)> {
     (!owner.is_empty() && !method.is_empty()).then_some((owner, method))
 }
 
+/// The two receiver-method entity keys a class + method can form: the Python
+/// adapter stores methods as `Class.method`, the C++ adapter as `Class::method`.
+/// The inheritance walk tries both so one Extends-chain resolver serves every
+/// language's method naming.
+fn receiver_method_keys(class: &str, method: &str) -> [String; 2] {
+    [format!("{class}.{method}"), format!("{class}::{method}")]
+}
+
+/// Split a C++-style receiver-qualified call `Owner::method` (or a longer
+/// `A::B::Owner::method`) into its receiver-class leaf and method name. Returns
+/// `None` for names without `::`, with non-identifier segments (turbofish,
+/// operators), or with an empty half — so only a genuine receiver-scoped method
+/// key reaches the Extends-chain walk. The owner is validated as a class at the
+/// call site, so a namespace-qualified free function (`Catch::Main`) never binds.
+fn split_scoped_receiver_method(name: &str) -> Option<(&str, &str)> {
+    let (owner_path, method) = name.rsplit_once("::")?;
+    let owner = owner_path.rsplit("::").next()?;
+    if owner.is_empty()
+        || method.is_empty()
+        || !is_path_identifier(owner)
+        || !is_path_identifier(method)
+    {
+        return None;
+    }
+    Some((owner, method))
+}
+
 /// Upper bound on how many classes an inheritance walk may visit before giving
 /// up. Real hierarchies are shallow; the cap is cycle/pathology insurance so a
 /// malformed `Extends` graph (self-inheritance, giant generated lattices) can
@@ -1460,12 +1518,13 @@ fn resolve_inherited_method(
             else {
                 continue;
             };
-            let method_key = format!("{}.{}", base_class, method);
-            if let Some(&dst_id) = ctx
-                .entity_by_file_name
-                .get(&(base_file.as_str(), method_key.as_str()))
-            {
-                return Some(dst_id);
+            for method_key in receiver_method_keys(&base_class, method) {
+                if let Some(&dst_id) = ctx
+                    .entity_by_file_name
+                    .get(&(base_file.as_str(), method_key.as_str()))
+                {
+                    return Some(dst_id);
+                }
             }
             if visited.len() >= INHERITANCE_WALK_CAP {
                 return None;
@@ -1580,13 +1639,14 @@ fn resolve_inherited_method_incremental(
             else {
                 continue;
             };
-            let method_key = format!("{}.{}", base_class, method);
-            if let Some(&dst_id) = linker
-                .entity_by_file_name
-                .get(&base_file)
-                .and_then(|m| m.get(method_key.as_str()))
-            {
-                return Some(dst_id);
+            for method_key in receiver_method_keys(&base_class, method) {
+                if let Some(&dst_id) = linker
+                    .entity_by_file_name
+                    .get(&base_file)
+                    .and_then(|m| m.get(method_key.as_str()))
+                {
+                    return Some(dst_id);
+                }
             }
             if visited.len() >= INHERITANCE_WALK_CAP {
                 return None;
@@ -3003,6 +3063,38 @@ fn resolve_one_file_incremental(
                         }
                     }
                     continue;
+                }
+            }
+        }
+
+        // (c4) C++ receiver-scoped inherited method — the incremental
+        // counterpart of the batch linker's (c4). A `Owner::method` call with
+        // no exact entity above resolves through the receiver class's Extends
+        // chain to the defining ancestor, keeping an inherited call pinned to
+        // its true base instead of the bare-leaf fan-out (c3) would reach.
+        if name_fallback_allowed && rel.kind == RelationKind::Calls {
+            if let Some((owner, method)) = split_scoped_receiver_method(rel.dst_name.as_str()) {
+                if let Some((owner_file, owner_class)) =
+                    locate_base_class_incremental(&file.file_path, owner, linker, &import_map)
+                {
+                    if let Some(dst_id) = resolve_inherited_method_incremental(
+                        &owner_file,
+                        &owner_class,
+                        method,
+                        linker,
+                        &import_map,
+                        &class_bases,
+                    ) {
+                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
+                            resolved.push(make_relation(
+                                rel.kind,
+                                src_id,
+                                dst_id,
+                                INHERITED_METHOD_CONFIDENCE,
+                            ));
+                        }
+                        continue;
+                    }
                 }
             }
         }
