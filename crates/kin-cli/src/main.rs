@@ -1407,6 +1407,12 @@ enum McpAction {
         /// Run in global mode, serving all registered repos from ~/.kin/registry.toml
         #[arg(long)]
         global: bool,
+        /// Bind this server to a specific Kin repository instead of relying on
+        /// the launching process's working directory. Overrides KIN_MCP_REPO.
+        /// Use this for a global agent-CLI MCP entry that may launch outside
+        /// any Kin repository (e.g. an umbrella workspace root).
+        #[arg(long, value_name = "PATH")]
+        repo: Option<PathBuf>,
     },
 }
 
@@ -2372,7 +2378,7 @@ fn main() -> Result<()> {
                     }
                 },
                 Command::Mcp { action } => match action {
-                    McpAction::Start { global } => commands::mcp::start(global).await,
+                    McpAction::Start { global, repo } => commands::mcp::start(global, repo).await,
                 },
                 Command::Auth { action } => match action {
                     AuthAction::Login {

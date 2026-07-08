@@ -265,6 +265,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_BINARY_PATH", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "override the kin binary path for bench dispatch" },
     EnvVarSpec { name: "KIN_BUILD_GRAPH_TIMEOUT_SECS", kind: Kind::Secs, default: "60", sensitivity: Sensitivity::Operational, summary: "timeout for building a historical ref-view graph" },
     EnvVarSpec { name: "KIN_MCP_TOOL_PROFILE", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "MCP tool exposure profile" },
+    EnvVarSpec { name: "KIN_MCP_REPO", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "bind `kin mcp start` to this repository instead of the launch directory" },
 
     // ---- diagnostics / benchmarking ------------------------------------------
     EnvVarSpec { name: "KIN_LOCATE_DEBUG", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Diagnostic, summary: "emit locate pipeline debug output" },
