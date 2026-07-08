@@ -704,7 +704,7 @@ jobs:
             | curl -fsS -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
 
   bump_homebrew:
-    name: Trigger Homebrew formula bump
+    name: Trigger & verify Homebrew formula bump
     needs: publish
     # Mirror publish's always() guard so a skipped notarize_linux does not
     # transitively skip this job.
@@ -712,16 +712,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Dispatch update to the homebrew-kin tap
+        id: dispatch
         env:
           TAP_DISPATCH_TOKEN: ${{ secrets.KIN_CI_BOT_TOKEN }}
         run: |
           if [ -z "${TAP_DISPATCH_TOKEN:-}" ]; then
             echo "KIN_CI_BOT_TOKEN not configured; the tap self-updates on its 6h schedule"
+            echo "dispatched=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # Convenience dispatch: the tap also self-updates on its 6h schedule, so a
           # failure here (e.g. a token without homebrew-kin access) warns rather than
-          # failing an already-published release.
+          # failing an already-published release. A 204 only proves GitHub accepted
+          # the POST, not that the tap's own workflow ran or bumped the formula — the
+          # step below verifies that outcome.
           code=$(curl -sS -o /tmp/tap-dispatch.out -w '%{http_code}' -X POST \
             -H "Authorization: Bearer ${TAP_DISPATCH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
@@ -729,10 +733,45 @@ jobs:
             -d '{"event_type":"kin-release"}' || echo "000")
           if [ "$code" = "204" ]; then
             echo "Dispatched kin-release to firelock-ai/homebrew-kin"
+            echo "dispatched=true" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::Homebrew tap dispatch returned HTTP ${code}; the tap self-updates on its 6h schedule, not failing the release."
             cat /tmp/tap-dispatch.out 2>/dev/null || true
+            echo "dispatched=false" >> "$GITHUB_OUTPUT"
           fi
+
+      # The dispatch above only proves the POST was accepted, not that
+      # homebrew-kin's own workflow ran and actually bumped the formula (a
+      # prior release's dispatch reported success while the tap workflow
+      # never fired and the formula stayed stale for hours until a manual
+      # rerun). Poll the tap's published formula for the version this release
+      # actually cut, mirroring version_tag_image's bounded poll-for-outcome
+      # below rather than trusting the dispatch response as release proof.
+      - name: Verify the tap formula actually bumped to this version
+        if: steps.dispatch.outputs.dispatched == 'true'
+        env:
+          TAP_DISPATCH_TOKEN: ${{ secrets.KIN_CI_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+
+          check_formula() {
+            curl -sS -H "Authorization: Bearer ${TAP_DISPATCH_TOKEN}" \
+              -H "Accept: application/vnd.github.v3.raw" \
+              "https://api.github.com/repos/firelock-ai/homebrew-kin/contents/Formula/kin.rb" \
+              | grep -qF "version \"${VERSION}\""
+          }
+
+          deadline=$(( SECONDS + 1800 ))
+          until check_formula; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::firelock-ai/homebrew-kin Formula/kin.rb did not report version \"${VERSION}\" after 30m — the kin-release dispatch was accepted but the tap's Update Formula workflow did not land the bump. Check https://github.com/firelock-ai/homebrew-kin/actions."
+              exit 1
+            fi
+            echo "Waiting for firelock-ai/homebrew-kin Formula/kin.rb to report version \"${VERSION}\"…"
+            sleep 20
+          done
+          echo "Confirmed firelock-ai/homebrew-kin Formula/kin.rb is at version \"${VERSION}\""
 
   # Version-tag the public daemon image so operators can pin a release
   # (`docker pull ghcr.io/firelock-ai/kin:0.2.7`). daemon-image.yml already pushed
