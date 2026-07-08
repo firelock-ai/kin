@@ -3,9 +3,9 @@
 
 use std::collections::BTreeMap;
 
-use kin_index::EQUIVALENCE_CLASS_KEY;
 use kin_model::entity::{Entity, EntityKind, EntityRole, Visibility};
 use kin_model::ids::EntityId;
+use kin_model::Hash256;
 use serde::{Deserialize, Serialize};
 
 use crate::diff::{EntityChangeKind, SemanticDiff};
@@ -465,20 +465,22 @@ fn collect_added_comments(
     }
 }
 
+/// The zero-hash sentinel on `SemanticFingerprint.equivalence_hash`, meaning the
+/// behavior-equivalence class was not computed for that entity (unsupported
+/// language, or an entity the ingest could not classify).
+fn equivalence_not_computed(hash: Hash256) -> bool {
+    hash == Hash256::from_bytes([0; 32])
+}
+
 /// Whether the body change from `old` to `new` is provably behavior-preserving
-/// under the graph-owned behavior-equivalence class attached at ingest. True
-/// only when BOTH revisions carry an equivalence class and the two are equal; an
-/// absent class on either side means "unknown" and never proves equivalence —
-/// the conservative default that keeps every genuine behavior change, and every
+/// under the graph-owned `equivalence_hash` attached at ingest. True only when
+/// both revisions carry a COMPUTED class and the two are equal; the zero-hash
+/// sentinel on either side means "unknown" and never proves equivalence — the
+/// conservative default that keeps every genuine behavior change, and every
 /// entity the ingest could not classify, in the attention channel.
 fn body_change_is_behavior_equivalent(old: &Entity, new: &Entity) -> bool {
-    match (
-        old.metadata.extra.get(EQUIVALENCE_CLASS_KEY),
-        new.metadata.extra.get(EQUIVALENCE_CLASS_KEY),
-    ) {
-        (Some(old_class), Some(new_class)) => !old_class.is_null() && old_class == new_class,
-        _ => false,
-    }
+    let old_class = old.fingerprint.equivalence_hash;
+    !equivalence_not_computed(old_class) && old_class == new.fingerprint.equivalence_hash
 }
 
 fn collect_modified_comments(
@@ -764,6 +766,7 @@ mod tests {
                 ast_hash: Hash256::from_bytes([0; 32]),
                 signature_hash: Hash256::from_bytes([0; 32]),
                 behavior_hash: Hash256::from_bytes([0; 32]),
+                equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
                 stability_score: 1.0,
             },
             file_origin: Some(FilePathId::new(file)),
@@ -798,6 +801,7 @@ mod tests {
                 ast_hash: Hash256::from_bytes([0; 32]),
                 signature_hash: Hash256::from_bytes([0; 32]),
                 behavior_hash: Hash256::from_bytes([0; 32]),
+                equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
                 stability_score: 1.0,
             },
             file_origin: None,
@@ -1325,12 +1329,10 @@ mod tests {
         assert!(fanout[0].message.contains("2 distinct non-test consumer"));
     }
 
-    /// Stamp a behavior-equivalence class on an entity, as ingest does.
-    fn with_equivalence_class(mut e: Entity, class: &str) -> Entity {
-        e.metadata.extra.insert(
-            EQUIVALENCE_CLASS_KEY.to_string(),
-            serde_json::Value::String(class.to_string()),
-        );
+    /// Stamp a computed behavior-equivalence class on an entity, as ingest does.
+    /// `seed` must be non-zero — the zero hash is the "not computed" sentinel.
+    fn with_equivalence_class(mut e: Entity, seed: u8) -> Entity {
+        e.fingerprint.equivalence_hash = Hash256::from_bytes([seed; 32]);
         e
     }
 
@@ -1341,8 +1343,8 @@ mod tests {
     #[test]
     fn consumer_fanout_downgrades_when_body_is_equivalent() {
         let base = test_entity_with_span("hot_path", "src/hot.rs", 1, 20);
-        let old = with_equivalence_class(base.clone(), "same-class");
-        let new = with_equivalence_class(base.clone(), "same-class");
+        let old = with_equivalence_class(base.clone(), 1);
+        let new = with_equivalence_class(base.clone(), 1);
         let diff = fanout_diff(&old, &new);
         let impact = fanout_impact(new.id);
 
@@ -1375,8 +1377,8 @@ mod tests {
     #[test]
     fn consumer_fanout_stays_attention_when_classes_differ() {
         let base = test_entity_with_span("hot_path", "src/hot.rs", 1, 20);
-        let old = with_equivalence_class(base.clone(), "old-class");
-        let new = with_equivalence_class(base.clone(), "new-class");
+        let old = with_equivalence_class(base.clone(), 1);
+        let new = with_equivalence_class(base.clone(), 2);
         let diff = fanout_diff(&old, &new);
         let impact = fanout_impact(new.id);
 
@@ -1419,11 +1421,11 @@ mod tests {
     #[test]
     fn mixed_diff_keeps_attention_for_the_non_equivalent_entity() {
         let a_base = test_entity_with_span("equiv_fn", "src/a.rs", 1, 20);
-        let a_old = with_equivalence_class(a_base.clone(), "a-class");
-        let a_new = with_equivalence_class(a_base.clone(), "a-class");
+        let a_old = with_equivalence_class(a_base.clone(), 1);
+        let a_new = with_equivalence_class(a_base.clone(), 1);
         let b_base = test_entity_with_span("changed_fn", "src/b.rs", 1, 20);
-        let b_old = with_equivalence_class(b_base.clone(), "b-old");
-        let b_new = with_equivalence_class(b_base.clone(), "b-new");
+        let b_old = with_equivalence_class(b_base.clone(), 2);
+        let b_new = with_equivalence_class(b_base.clone(), 3);
 
         let diff = SemanticDiff {
             entity_changes: vec![
@@ -1497,8 +1499,8 @@ mod tests {
     #[test]
     fn consumer_fanout_downgrade_is_deterministic() {
         let base = test_entity_with_span("hot_path", "src/hot.rs", 1, 20);
-        let old = with_equivalence_class(base.clone(), "same-class");
-        let new = with_equivalence_class(base.clone(), "same-class");
+        let old = with_equivalence_class(base.clone(), 1);
+        let new = with_equivalence_class(base.clone(), 1);
         let diff = fanout_diff(&old, &new);
         let impact = fanout_impact(new.id);
         let first = collect_inline_comments(&diff, &impact);

@@ -6,11 +6,6 @@ use kin_model::{FingerprintAlgorithm, Hash256, SemanticFingerprint};
 use sha2::{Digest, Sha256};
 use tree_sitter::Node;
 
-/// Metadata key under which the behavior-equivalence class of an entity is
-/// stored on `Entity.metadata.extra`. Present only for entities whose language
-/// participates in the equivalence relation; absent entries assert nothing.
-pub const EQUIVALENCE_CLASS_KEY: &str = "kin.behavior_equivalence_class";
-
 /// Compute a SemanticFingerprint from source text and a signature string.
 ///
 /// This operates at the entity level (post-extraction), complementing the
@@ -34,6 +29,7 @@ pub fn compute_entity_fingerprint(source: &str, signature: &str) -> SemanticFing
         ast_hash,
         signature_hash,
         behavior_hash,
+        equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
         stability_score: compute_stability(source),
     }
 }

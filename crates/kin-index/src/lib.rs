@@ -24,7 +24,6 @@ pub use classifier::{FileClassification, FileClassifier};
 pub use error::{IndexError, Result};
 pub use fingerprint::{
     behavior_equivalence_hash, compute_entity_fingerprint, language_supports_equivalence,
-    EQUIVALENCE_CLASS_KEY,
 };
 pub use linker::{
     build_projection_derived_relations_for_file, build_projection_derived_relations_from_markers,

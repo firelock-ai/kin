@@ -39,6 +39,7 @@ fn zero_fp() -> SemanticFingerprint {
         ast_hash: zero,
         signature_hash: zero,
         behavior_hash: zero,
+        equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
         stability_score: 1.0,
     }
 }

@@ -577,6 +577,7 @@ fn lkg_retains_state_on_broken_parse() {
         ast_hash: Hash256::from_bytes([0xff; 32]),
         signature_hash: Hash256::from_bytes([0xfe; 32]),
         behavior_hash: Hash256::from_bytes([0xfd; 32]),
+        equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
         stability_score: 0.0,
     };
 

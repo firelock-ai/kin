@@ -8066,6 +8066,7 @@ mod tests {
                 ast_hash: Hash256::from_bytes([0x01; 32]),
                 signature_hash: Hash256::from_bytes([0x02; 32]),
                 behavior_hash: Hash256::from_bytes([0x03; 32]),
+                equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
                 stability_score: 1.0,
             },
             file_origin: Some(kin_model::FilePathId::new(path)),
@@ -10438,6 +10439,7 @@ mod tests {
             ast_hash: zero,
             signature_hash: zero,
             behavior_hash: zero,
+            equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
             stability_score: 1.0,
         }
     }

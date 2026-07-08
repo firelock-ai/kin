@@ -18,9 +18,7 @@ use tree_sitter::Tree;
 use crate::artifacts;
 use crate::classifier::{FileClassification, FileClassifier};
 use crate::error::{IndexError, Result};
-use crate::fingerprint::{
-    behavior_equivalence_hash, language_supports_equivalence, EQUIVALENCE_CLASS_KEY,
-};
+use crate::fingerprint::{behavior_equivalence_hash, language_supports_equivalence};
 use crate::linker::UnresolvedRelation;
 
 /// Result of indexing a single file.
@@ -596,14 +594,14 @@ pub fn normalize_file_path_id(path: &Path, root: &Path) -> FilePathId {
 }
 
 /// Attach the behavior-equivalence class to each entity of a participating
-/// language. Stored graph-side on `metadata.extra[EQUIVALENCE_CLASS_KEY]` as a
-/// hex digest and consumed at review time to tell behavior-preserving body
-/// edits (docstring / comment / formatting) apart from real behavior changes.
+/// language. Written graph-side onto `fingerprint.equivalence_hash` and consumed
+/// at review time to tell behavior-preserving body edits (docstring / comment /
+/// formatting) apart from real behavior changes.
 ///
-/// Languages that do not participate get no entry; an absent entry means
-/// "unknown", and the review layer never downgrades on unknown — the safe
-/// default. The digest keys only on the entity's own AST node, so it is a pure,
-/// deterministic function of that node's tokens.
+/// Languages that do not participate keep the zero-hash sentinel; the review
+/// layer never downgrades on the sentinel — the safe default. The digest keys
+/// only on the entity's own AST node, so it is a pure, deterministic function of
+/// that node's tokens.
 fn attach_equivalence_class(
     entities: &mut [Entity],
     tree: &Tree,
@@ -620,11 +618,7 @@ fn attach_equivalence_class(
         };
         let end = span.end_byte.saturating_sub(1).max(span.start_byte);
         if let Some(node) = root.descendant_for_byte_range(span.start_byte, end) {
-            let class = behavior_equivalence_hash(&node, source, language);
-            ent.metadata.extra.insert(
-                EQUIVALENCE_CLASS_KEY.to_string(),
-                serde_json::Value::String(class.to_string()),
-            );
+            ent.fingerprint.equivalence_hash = behavior_equivalence_hash(&node, source, language);
         }
     }
 }

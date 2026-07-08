@@ -846,6 +846,7 @@ mod tests {
                     "3333333333333333333333333333333333333333333333333333333333333333",
                 )
                 .unwrap(),
+                equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
                 stability_score: 1.0,
             },
             file_origin: None,
