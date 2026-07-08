@@ -125,8 +125,9 @@ fn migrate_v6_to_v7(body: &[u8]) -> Result<Vec<u8>, KinDbError> {
 /// Migrate v7 → v8: Populate the `artifact_index` map from artifact lists.
 ///
 /// v8 introduces graph-assigned `ArtifactId`s (stored in `artifact_index`)
-/// so artifact identity survives file renames. Existing paths are mapped
-/// to deterministic v5 UUIDs to preserve legacy graph links.
+/// so artifact identity is tracked independently of file paths (designed to
+/// persist across file renames). Existing paths are mapped to deterministic
+/// v5 UUIDs to preserve legacy graph links.
 fn migrate_v7_to_v8(body: &[u8]) -> Result<Vec<u8>, KinDbError> {
     let mut snapshot: GraphSnapshot = rmp_serde::from_slice(body).map_err(|e| {
         KinDbError::StorageError(format!("v7→v8 migration: deserialization failed: {e}"))
