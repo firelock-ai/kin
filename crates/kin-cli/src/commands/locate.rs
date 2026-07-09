@@ -11893,8 +11893,38 @@ fn semantic_phase_anchor_floors(
     anchors
 }
 
-fn semantic_phase_distractor_cap(text: &str, path: &str, top_score: f32) -> Option<f32> {
-    if top_score <= 0.0 {
+/// Ratio applied to `top_score` when capping a "pass"/"expr" bucket candidate
+/// for a construction-shaped query that carries zero corroborating retrieval
+/// signal. Sits below `phase_bucket_anchor_candidates`' floor range so a
+/// capped, unsupported candidate can never outrank a floored, supported one
+/// for the same query.
+const SEMANTIC_PHASE_DISTRACTOR_CONSTRUCTION_CAP_RATIO: f32 = 0.65;
+
+/// Ratio applied to `top_score` when capping an "expr" bucket candidate for a
+/// lambda-shaped query under the same zero-corroboration condition.
+const SEMANTIC_PHASE_DISTRACTOR_LAMBDA_CAP_RATIO: f32 = 0.58;
+
+/// Phase-bucket ceilings for construction/lambda-shaped queries, derived from
+/// graph-verified cross-signal support instead of a fixed path list. A
+/// candidate whose bucket (`phase_bucket_for_path`) is in play for the
+/// query's shape but which carries zero corroborating signal
+/// (`signal_support_count` == 0 across `all_hits`) is capped below
+/// `top_score`: it is being ranked on this query's own fused pass alone, with
+/// nothing else in the retrieval evidence backing it up — the same kind of
+/// single-signal risk `phase_bucket_anchor_candidates` refuses to promote
+/// into a floor. Any candidate that does carry corroborating support is left
+/// untouched here; real cross-signal agreement is handled by the floor and
+/// bucket-penalty logic above. Dark by default
+/// (`KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS` unset): current serving
+/// behavior does not change until the same lever gating
+/// `semantic_phase_anchor_floors` is switched on.
+fn semantic_phase_distractor_cap(
+    text: &str,
+    path: &str,
+    top_score: f32,
+    all_hits: &[HashMap<String, Vec<FileHit>>],
+) -> Option<f32> {
+    if top_score <= 0.0 || !locate_env_bool("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS", false) {
         return None;
     }
 
@@ -11904,23 +11934,16 @@ fn semantic_phase_distractor_cap(text: &str, path: &str, top_score: f32) -> Opti
         return None;
     }
 
-    if construction_query && path.ends_with("/pass/expr.h") {
-        return Some(top_score * 0.66);
+    let bucket = phase_bucket_for_path(path)?;
+    if signal_support_count(path, all_hits) > 0 {
+        return None;
     }
-    if construction_query
-        && (path.ends_with("/expr/reference.c") || path.ends_with("/pass/sugar.c"))
-    {
-        return Some(top_score * 0.64);
+
+    if construction_query && matches!(bucket, "pass" | "expr") {
+        return Some(top_score * SEMANTIC_PHASE_DISTRACTOR_CONSTRUCTION_CAP_RATIO);
     }
-    if construction_query
-        && (path.ends_with("/verify/control.c")
-            || path.ends_with("/verify/type.c")
-            || path.ends_with("/verify/call.c"))
-    {
-        return Some(top_score * 0.52);
-    }
-    if lambda_query && (path.ends_with("/expr/control.c") || path.ends_with("/expr/control.h")) {
-        return Some(top_score * 0.58);
+    if lambda_query && bucket == "expr" {
+        return Some(top_score * SEMANTIC_PHASE_DISTRACTOR_LAMBDA_CAP_RATIO);
     }
 
     None
@@ -12017,7 +12040,7 @@ fn rerank_semantic_phase_paths(
     }
 
     for (path, score) in fused.iter_mut() {
-        let Some(cap) = semantic_phase_distractor_cap(text, path, top_score) else {
+        let Some(cap) = semantic_phase_distractor_cap(text, path, top_score, all_hits) else {
             continue;
         };
         if *score > cap {
