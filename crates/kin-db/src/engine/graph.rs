@@ -1081,7 +1081,18 @@ enum EmbedRecency {
 /// per-process HashMap seed.
 #[cfg(feature = "vector")]
 struct RecencyQueue<K: Eq + std::hash::Hash + Copy> {
+    /// Canonical queued membership and current recency. Keys remain here while
+    /// they are present in `frontier`; popping a batch removes them from both.
     items: hashbrown::HashMap<K, EmbedRecency>,
+    /// Deterministic total order computed once for a stable queue snapshot.
+    /// Repeated small drains pop this frontier instead of draining, selecting,
+    /// and reinserting the entire backlog every batch.
+    frontier: std::collections::VecDeque<K>,
+    /// Any membership or priority change invalidates the cached ordering. The
+    /// next drain rebuilds once from `items`, incorporating all new work.
+    frontier_dirty: bool,
+    #[cfg(test)]
+    frontier_rebuilds: usize,
 }
 
 #[cfg(feature = "vector")]
@@ -1089,6 +1100,10 @@ impl<K: Eq + std::hash::Hash + Copy> Default for RecencyQueue<K> {
     fn default() -> Self {
         Self {
             items: hashbrown::HashMap::new(),
+            frontier: std::collections::VecDeque::new(),
+            frontier_dirty: false,
+            #[cfg(test)]
+            frontier_rebuilds: 0,
         }
     }
 }
@@ -1099,19 +1114,30 @@ impl<K: Eq + std::hash::Hash + Copy> RecencyQueue<K> {
     /// higher-priority (lower) recency so a live change is never demoted to
     /// backfill by a subsequent bulk re-queue.
     fn insert(&mut self, key: K, recency: EmbedRecency) {
-        self.items
-            .entry(key)
-            .and_modify(|cur| {
-                if recency < *cur {
-                    *cur = recency;
+        match self.items.entry(key) {
+            hashbrown::hash_map::Entry::Occupied(mut entry) => {
+                if recency < *entry.get() {
+                    *entry.get_mut() = recency;
+                    self.frontier_dirty = true;
                 }
-            })
-            .or_insert(recency);
+            }
+            hashbrown::hash_map::Entry::Vacant(entry) => {
+                entry.insert(recency);
+                self.frontier_dirty = true;
+            }
+        }
     }
 
     /// Remove a key from the queue (e.g., when its entity is deleted).
     fn remove(&mut self, key: &K) -> bool {
-        self.items.remove(key).is_some()
+        let removed = self.items.remove(key).is_some();
+        if removed {
+            // Leave the stale key in the deque for now. Rebuilding from the
+            // canonical map on the next drain removes it without an O(n) scan
+            // on every deletion.
+            self.frontier_dirty = true;
+        }
+        removed
     }
 
     /// HashSet-style membership facade (used by tests; kept for parity with the
@@ -1124,6 +1150,8 @@ impl<K: Eq + std::hash::Hash + Copy> RecencyQueue<K> {
     #[allow(dead_code)]
     fn clear(&mut self) {
         self.items.clear();
+        self.frontier.clear();
+        self.frontier_dirty = false;
     }
 
     fn len(&self) -> usize {
@@ -1135,9 +1163,47 @@ impl<K: Eq + std::hash::Hash + Copy> RecencyQueue<K> {
         self.items.is_empty()
     }
 
-    /// Remove and return every `(key, recency)` pair. Iteration order is
-    /// unspecified; callers MUST sort deterministically before using the result.
+    /// Whether the deterministic frontier must be rebuilt before it is popped.
+    fn frontier_needs_rebuild(&self) -> bool {
+        self.frontier_dirty || (self.frontier.is_empty() && !self.items.is_empty())
+    }
+
+    /// Replace the cached frontier with a deterministic ordering containing
+    /// every currently queued key exactly once.
+    fn install_frontier<I>(&mut self, ordered: I)
+    where
+        I: IntoIterator<Item = K>,
+    {
+        self.frontier = ordered.into_iter().collect();
+        debug_assert_eq!(self.frontier.len(), self.items.len());
+        self.frontier_dirty = false;
+        #[cfg(test)]
+        {
+            self.frontier_rebuilds += 1;
+        }
+    }
+
+    /// Pop up to `batch_size` items from a valid frontier. Membership remains
+    /// authoritative in `items`, so stale deque entries can never escape even
+    /// if a future caller violates the rebuild precondition.
+    fn pop_frontier_batch(&mut self, batch_size: usize) -> Vec<(K, EmbedRecency)> {
+        debug_assert!(!self.frontier_dirty);
+        let mut batch = Vec::with_capacity(batch_size.min(self.items.len()));
+        while batch.len() < batch_size {
+            let Some(key) = self.frontier.pop_front() else {
+                break;
+            };
+            if let Some(recency) = self.items.remove(&key) {
+                batch.push((key, recency));
+            }
+        }
+        batch
+    }
+
+    #[cfg(test)]
     fn drain_all(&mut self) -> Vec<(K, EmbedRecency)> {
+        self.frontier.clear();
+        self.frontier_dirty = false;
         self.items.drain().collect()
     }
 }
@@ -3920,45 +3986,27 @@ impl InMemoryGraph {
             .embed_stage_timings
             .scope(crate::embed::EmbedStage::Drain);
         let batch_size = batch_size.max(1);
-        let drained = {
-            let mut queue = self.embedding_queue.lock();
-            queue.drain_all()
-        };
-        if drained.is_empty() {
+        let mut queue = self.embedding_queue.lock();
+        if queue.is_empty() {
             return Vec::new();
         }
 
-        // Compute a deterministic priority sort key for each item from current
-        // graph state (tier → recency → centrality → id), then order ascending
-        // so the smallest — highest-priority — item embeds first. The sort is
-        // GLOBAL over the entire drained queue and happens BEFORE the caller
-        // chunks the returned batch for inference, so priority is never merely
-        // per-chunk. (O(n) key build + O(n log n) sort; see `embed_sort_key_for`
-        // for the per-key O(1) bound.)
-        let mut keyed: Vec<(EmbedSortKey, RetrievalKey, EmbedRecency)> = {
+        // Compute the global deterministic priority order once for a stable
+        // queue snapshot, then retain its leftover as a frontier. Subsequent
+        // batches pop O(batch_size) work instead of draining and reinserting the
+        // O(backlog) remainder. Any enqueue, removal, or recency promotion marks
+        // the frontier dirty and folds the new work into one fresh global sort.
+        if queue.frontier_needs_rebuild() {
             let ent = self.entities.read();
-            drained
-                .into_iter()
-                .map(|(key, recency)| (embed_sort_key_for(&ent, key, recency), key, recency))
-                .collect()
-        };
-        let take = batch_size.min(keyed.len());
-        if take < keyed.len() {
-            let (_, _, _) = keyed.select_nth_unstable_by(take, |a, b| a.0.cmp(&b.0));
+            let mut ordered: Vec<(EmbedSortKey, RetrievalKey)> = queue
+                .items
+                .iter()
+                .map(|(key, recency)| (embed_sort_key_for(&ent, *key, *recency), *key))
+                .collect();
+            ordered.sort_unstable_by_key(|entry| entry.0);
+            queue.install_frontier(ordered.into_iter().map(|(_, key)| key));
         }
-
-        let leftover = keyed.split_off(take);
-        keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        if !leftover.is_empty() {
-            let mut queue = self.embedding_queue.lock();
-            for (_, key, recency) in leftover {
-                queue.insert(key, recency);
-            }
-        }
-        keyed
-            .into_iter()
-            .map(|(_, key, recency)| (key, recency))
-            .collect()
+        queue.pop_frontier_batch(batch_size)
     }
 
     /// Drain up to `batch_size` artifact IDs from the artifact embedding queue
@@ -3970,38 +4018,24 @@ impl InMemoryGraph {
     #[cfg(feature = "vector")]
     fn drain_artifact_embedding_batch(&self, batch_size: usize) -> Vec<(ArtifactId, EmbedRecency)> {
         let batch_size = batch_size.max(1);
-        let mut all = {
-            let mut queue = self.artifact_embedding_queue.lock();
-            queue.drain_all()
-        };
-        if all.is_empty() {
+        let mut queue = self.artifact_embedding_queue.lock();
+        if queue.is_empty() {
             return Vec::new();
         }
 
         // Deterministic total order: recency first (changed-this-sync before
-        // backfill), then the artifact id as the stable tiebreak. (Artifacts
-        // carry less semantic structure than entities, so recency + id is the
-        // honest priority signal available without extra lookups.) The id is a
-        // unique tiebreak, so this is a strict total order with no ties:
-        // partition the top `take` with `select_nth_unstable` (O(n)) and sort
-        // only that prefix — identical output to a full sort of the whole queue,
-        // without paying O(n log n) on the leftover that is requeued anyway.
-        let order = |a: &(ArtifactId, EmbedRecency), b: &(ArtifactId, EmbedRecency)| {
-            a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0))
-        };
-        let take = batch_size.min(all.len());
-        if take < all.len() {
-            all.select_nth_unstable_by(take, order);
+        // backfill), then artifact id as the stable tiebreak. Cache the total
+        // order exactly like the entity queue so stable bulk drains sort once.
+        if queue.frontier_needs_rebuild() {
+            let mut ordered: Vec<(EmbedRecency, ArtifactId)> = queue
+                .items
+                .iter()
+                .map(|(id, recency)| (*recency, *id))
+                .collect();
+            ordered.sort_unstable();
+            queue.install_frontier(ordered.into_iter().map(|(_, id)| id));
         }
-        let leftover = all.split_off(take);
-        all.sort_unstable_by(order);
-        if !leftover.is_empty() {
-            let mut queue = self.artifact_embedding_queue.lock();
-            for (id, recency) in leftover {
-                queue.insert(id, recency);
-            }
-        }
-        all
+        queue.pop_frontier_batch(batch_size)
     }
 
     /// Drain the current pending embedding queue in batches.
@@ -12595,6 +12629,32 @@ mod tests {
 
     #[cfg(feature = "vector")]
     #[test]
+    fn embedding_frontier_rebuilds_when_new_higher_priority_work_arrives() {
+        let g = InMemoryGraph::new();
+        let mut first = test_entity_with_id(0x91, "first");
+        first.visibility = Visibility::Private;
+        let mut second = test_entity_with_id(0x92, "second");
+        second.visibility = Visibility::Private;
+        g.upsert_entity(&first).unwrap();
+        g.upsert_entity(&second).unwrap();
+        g.embedding_queue.lock().clear();
+        g.queue_for_embedding(&[first.id, second.id]);
+
+        assert_eq!(g.drain_embedding_batch(1).len(), 1);
+        assert_eq!(g.embedding_queue.lock().frontier_rebuilds, 1);
+
+        // A newly changed public API outranks the cached private/backfill
+        // leftover. Its enqueue invalidates and rebuilds the frontier once.
+        let mut api = test_entity_with_id(0x93, "api");
+        api.kind = EntityKind::Interface;
+        g.upsert_entity(&api).unwrap();
+        let next = g.drain_embedding_batch(1);
+        assert_eq!(next[0].0, RetrievalKey::Entity(api.id));
+        assert_eq!(g.embedding_queue.lock().frontier_rebuilds, 2);
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
     fn drain_artifact_embedding_batch_is_deterministic_and_recency_first() {
         let g = InMemoryGraph::new();
         // Pure queue-ordering test: ids are arbitrary distinct graph-assigned
@@ -12628,16 +12688,13 @@ mod tests {
         assert_eq!(order, expected);
     }
 
-    /// Parity gate: the small-batch partial-selection drain must yield the
-    /// IDENTICAL sequence to draining the whole queue in one shot (a pure full
-    /// sort). `drain_embedding_batch(huge)` takes the entire queue, so its
-    /// `take == len` skips `select_nth_unstable` and the result is the reference
-    /// full sort; the small-batch path exercises `select_nth_unstable` every
-    /// round. Equality proves the top-K selection orders work exactly as the
-    /// prior whole-queue sort — the invariant the citable proof depends on.
+    /// Parity gate: popping a cached frontier in small batches must yield the
+    /// IDENTICAL sequence to draining the whole queue in one shot. Equality
+    /// proves the optimization changes only repeated queue bookkeeping, never
+    /// the proof-sensitive global embedding order.
     #[cfg(feature = "vector")]
     #[test]
-    fn drain_embedding_batch_partial_select_matches_full_sort() {
+    fn drain_embedding_batch_frontier_matches_full_sort_and_builds_once() {
         let build = || {
             let g = InMemoryGraph::new();
             for i in 0..60u128 {
@@ -12680,15 +12737,19 @@ mod tests {
         );
         assert_eq!(
             full, batched,
-            "small-batch partial selection must equal the full-sorted drain order"
+            "small-batch frontier pops must equal the full-sorted drain order"
+        );
+        assert_eq!(
+            g_batched.embedding_queue.lock().frontier_rebuilds,
+            1,
+            "a stable backlog must be globally ordered once, not once per batch"
         );
     }
 
-    /// Artifact-queue twin of the entity parity gate: the converted
-    /// `select_nth_unstable` artifact drain must match the prior full-sort order.
+    /// Artifact-queue twin of the entity parity and one-build gate.
     #[cfg(feature = "vector")]
     #[test]
-    fn drain_artifact_embedding_batch_partial_select_matches_full_sort() {
+    fn drain_artifact_embedding_batch_frontier_matches_full_sort_and_builds_once() {
         let ids: Vec<ArtifactId> = (0..50).map(|_| ArtifactId::new()).collect();
         let fill = |g: &InMemoryGraph| {
             let mut q = g.artifact_embedding_queue.lock();
@@ -12728,7 +12789,12 @@ mod tests {
         );
         assert_eq!(
             full, batched,
-            "artifact partial selection must equal the full-sorted drain order"
+            "artifact frontier pops must equal the full-sorted drain order"
+        );
+        assert_eq!(
+            g_batched.artifact_embedding_queue.lock().frontier_rebuilds,
+            1,
+            "a stable artifact backlog must be globally ordered once"
         );
     }
 
@@ -13060,9 +13126,9 @@ mod tests {
             n * 1024 / (1024 * 1024)
         );
 
-        // S2 — selection strategy in isolation (both on a Vec, so the shared
-        // HashMap drain/reinsert cost is excluded): full sort of the remaining
-        // queue every batch vs `select_nth_unstable` + sort only the taken prefix.
+        // S2 — repeated backlog partition/reinsert versus one global ordering
+        // followed by O(batch) frontier pops. This excludes HashMap lock cost,
+        // so it is a conservative view of the production improvement.
         let m = 20_000usize;
         let ids: Vec<ArtifactId> = (0..m).map(|_| ArtifactId::new()).collect();
         let batch = 256usize;
@@ -13076,37 +13142,36 @@ mod tests {
         let order = |a: &(ArtifactId, EmbedRecency), b: &(ArtifactId, EmbedRecency)| {
             a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0))
         };
-        // Each real batch drains the leftover back out of the HashMap in random
-        // order, so every batch sorts/selects UNSORTED input — model one such
-        // batch over `reps` fresh copies.
         let base: Vec<(ArtifactId, EmbedRecency)> = ids
             .iter()
             .enumerate()
             .map(|(i, id)| (*id, recency_of(i)))
             .collect();
-        let reps = 200;
 
         let t = Instant::now();
         let mut sink2 = 0u128;
-        for _ in 0..reps {
-            let mut q = base.clone();
-            q.sort_unstable_by(order);
-            sink2 ^= q[0].0 .0.as_u128();
+        let mut old_queue = base.clone();
+        while !old_queue.is_empty() {
+            let take = batch.min(old_queue.len());
+            if take < old_queue.len() {
+                old_queue.select_nth_unstable_by(take, order);
+            }
+            let leftover = old_queue.split_off(take);
+            old_queue.sort_unstable_by(order);
+            sink2 ^= old_queue[0].0 .0.as_u128();
+            old_queue = leftover;
         }
-        let old_select = t.elapsed();
+        let old_repartition = t.elapsed();
 
         let t = Instant::now();
-        for _ in 0..reps {
-            let mut q = base.clone();
-            if batch < q.len() {
-                q.select_nth_unstable_by(batch, order);
-            }
-            q[..batch].sort_unstable_by(order);
-            sink2 ^= q[0].0 .0.as_u128();
+        let mut ordered = base;
+        ordered.sort_unstable_by(order);
+        for chunk in ordered.chunks(batch) {
+            sink2 ^= chunk[0].0 .0.as_u128();
         }
-        let new_select = t.elapsed();
+        let new_frontier = t.elapsed();
         eprintln!(
-            "[S2] per-batch selection m={m} take={batch} x{reps} (unsorted input): old full-sort {old_select:?} vs new partial-select {new_select:?} (sink={sink2})"
+            "[S2] complete drain m={m} take={batch}: old repeated partition {old_repartition:?} vs cached frontier {new_frontier:?} (sink={sink2})"
         );
 
         // S3 — prune: full index scan vs incremental tracked eviction.
