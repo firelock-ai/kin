@@ -7,7 +7,7 @@
     "summary": "Firelock (the company) builds Kin (the semantic repo and collaboration substrate). KinLab is the hosted collaboration product; @kinlab is the shared package and registry scope.",
     "product": {
       "name": "Kin",
-      "descriptor": "The semantic repo and collaboration substrate — the system of record for software work.",
+      "descriptor": "The semantic repo and collaboration substrate — the system of record for AI-written software.",
       "github": "https://github.com/firelock-ai/kin"
     },
     "company": {

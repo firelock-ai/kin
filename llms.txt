@@ -1,6 +1,6 @@
 # Kin
 
-> Kin is the semantic system of record for software work — a graph-native repository and collaboration substrate that replaces the file-first, diff-first model. Code becomes a graph of entities, relations, and intents that AI agents and humans navigate semantically.
+> Kin is the system of record for AI-written software — a graph-native repository and collaboration substrate that replaces the file-first, diff-first model. Code becomes a graph of entities, relations, and intents that AI agents and humans navigate semantically.
 
 Kin coexists with Git and projects graph-owned truth back to a normal filesystem through a transparent VFS, so any tool or agent works unchanged. The fastest way for an agent to use Kin is the MCP server, which exposes semantic tools (locate, context, trace) backed by the graph rather than filesystem heuristics.
 
