@@ -19277,6 +19277,117 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn semantic_phase_distractor_cap_dark_by_default_even_with_zero_signal_support() {
+        std::env::remove_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
+
+        let cap = semantic_phase_distractor_cap(
+            "Fix return checking in constructors.",
+            "engine/pass/typecheck.rs",
+            10.0,
+            &[],
+        );
+        assert!(cap.is_none(), "unset lever must produce no cap: {cap:?}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn semantic_phase_distractor_cap_caps_unsupported_bucket_files_when_enabled() {
+        std::env::set_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS", "1");
+
+        // A fictional, non-Pony corpus: the mechanism must work from bucket +
+        // cross-signal support alone, not from any hardcoded name or path.
+        let all_hits = vec![HashMap::from([(
+            "engine/pass/typecheck.rs".to_string(),
+            hit(1.0),
+        )])];
+
+        // Construction-shaped query: both the "pass" and "expr" buckets are
+        // in play.
+        let construction_text = "Fix return checking in constructors.";
+
+        assert_eq!(
+            semantic_phase_distractor_cap(
+                construction_text,
+                "engine/pass/lower.rs",
+                10.0,
+                &all_hits,
+            ),
+            Some(6.5),
+            "an unsupported pass-bucket file must be capped for a construction query"
+        );
+        assert_eq!(
+            semantic_phase_distractor_cap(
+                construction_text,
+                "engine/expr/closure.rs",
+                10.0,
+                &all_hits,
+            ),
+            Some(6.5),
+            "an unsupported expr-bucket file must be capped for a construction query"
+        );
+        assert_eq!(
+            semantic_phase_distractor_cap(
+                construction_text,
+                "engine/pass/typecheck.rs",
+                10.0,
+                &all_hits,
+            ),
+            None,
+            "a file with corroborating cross-signal support must never be capped"
+        );
+        assert_eq!(
+            semantic_phase_distractor_cap(construction_text, "engine/ast/node.rs", 10.0, &all_hits,),
+            None,
+            "buckets outside the construction query's bucket set must never be capped"
+        );
+        assert_eq!(
+            semantic_phase_distractor_cap(
+                construction_text,
+                "engine/other/thing.rs",
+                10.0,
+                &all_hits,
+            ),
+            None,
+            "paths with no recognized phase bucket must never be capped"
+        );
+
+        // Lambda-shaped query: only the "expr" bucket is in play.
+        let lambda_text = "Handle lambda captures directly.";
+        assert_eq!(
+            semantic_phase_distractor_cap(lambda_text, "engine/expr/closure.rs", 10.0, &all_hits,),
+            Some(5.8),
+            "an unsupported expr-bucket file must be capped for a lambda query"
+        );
+        assert_eq!(
+            semantic_phase_distractor_cap(lambda_text, "engine/pass/lower.rs", 10.0, &all_hits,),
+            None,
+            "a lambda query must never cap the pass bucket"
+        );
+
+        std::env::remove_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn semantic_phase_distractor_cap_is_deterministic() {
+        std::env::set_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS", "1");
+        let all_hits: Vec<HashMap<String, Vec<FileHit>>> = vec![];
+        let text = "Fix return checking in constructors with lambda captures.";
+        let path = "engine/expr/closure.rs";
+
+        let first = semantic_phase_distractor_cap(text, path, 10.0, &all_hits);
+        let second = semantic_phase_distractor_cap(text, path, 10.0, &all_hits);
+        assert_eq!(
+            first, second,
+            "identical inputs must yield identical output"
+        );
+        assert!(first.is_some());
+
+        std::env::remove_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
+    }
+
+    #[test]
     fn rerank_cli_surface_paths_prefers_programs_over_internal_headers_for_flag_queries() {
         let mut fused = vec![
             ("lib/compress/zstd_compress.c".to_string(), 1000.0),
