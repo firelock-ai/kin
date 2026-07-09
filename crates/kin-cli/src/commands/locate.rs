@@ -11785,12 +11785,76 @@ fn is_lambda_query(text: &str) -> bool {
     lower.contains("lambda") || lower.contains("lambdas")
 }
 
+/// Cap on how many phase-bucket anchors `phase_bucket_anchor_candidates` will
+/// float per query-type/bucket-set call, mirroring how many named anchors the
+/// historical hardcoded lists carried per query type.
+const SEMANTIC_PHASE_ANCHOR_LIMIT: usize = 3;
+
+/// Per-rank floor decay applied within one `phase_bucket_anchor_candidates`
+/// call, so the first-ranked anchor sits closest to `top_score` and later
+/// ranks taper off.
+const SEMANTIC_PHASE_ANCHOR_RANK_STEP: f32 = 0.02;
+
+/// Rank graph-verified source files that fall in one of `buckets` (per
+/// `phase_bucket_for_path`) by how many independent retrieval signals
+/// (`all_hits`) already corroborate them, and return up to
+/// `SEMANTIC_PHASE_ANCHOR_LIMIT` as `(path, floor)` pairs. Buckets earlier in
+/// `buckets` win ties on signal support; `path` breaks remaining ties for a
+/// fully deterministic order regardless of `source_files` iteration order.
+///
+/// Candidates with zero corroborating signal are dropped: the floor lifts a
+/// file real retrieval already found relevant to the query's phase, it does
+/// not invent recall for a file nothing actually matched.
+fn phase_bucket_anchor_candidates(
+    buckets: &[&'static str],
+    top_score: f32,
+    base_ratio: f32,
+    source_files: &HashSet<String>,
+    all_hits: &[HashMap<String, Vec<FileHit>>],
+) -> Vec<(String, f32)> {
+    let mut ranked: Vec<(usize, usize, &str)> = source_files
+        .iter()
+        .filter_map(|path| {
+            let bucket = phase_bucket_for_path(path)?;
+            let bucket_rank = buckets.iter().position(|candidate| *candidate == bucket)?;
+            let support = signal_support_count(path, all_hits);
+            if support == 0 {
+                return None;
+            }
+            Some((support, bucket_rank, path.as_str()))
+        })
+        .collect();
+
+    ranked.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(b.2))
+    });
+
+    ranked
+        .into_iter()
+        .take(SEMANTIC_PHASE_ANCHOR_LIMIT)
+        .enumerate()
+        .map(|(rank, (_, _, path))| {
+            let ratio = base_ratio - SEMANTIC_PHASE_ANCHOR_RANK_STEP * rank as f32;
+            (path.to_string(), top_score * ratio.max(0.0))
+        })
+        .collect()
+}
+
+/// Phase-bucket floors for construction/lambda-shaped queries, derived from
+/// graph-verified source files and their real cross-signal support instead
+/// of a fixed path list. Dark by default (`KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS`
+/// unset): current serving behavior does not change until an explicit env
+/// override drives the paired A/B measurement that decides whether this lever
+/// graduates into a profile default.
 fn semantic_phase_anchor_floors(
     text: &str,
     top_score: f32,
     source_files: &HashSet<String>,
+    all_hits: &[HashMap<String, Vec<FileHit>>],
 ) -> Vec<(String, f32)> {
-    if top_score <= 0.0 {
+    if top_score <= 0.0 || !locate_env_bool("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS", false) {
         return Vec::new();
     }
 
@@ -11801,21 +11865,23 @@ fn semantic_phase_anchor_floors(
     }
 
     let mut anchors = Vec::new();
-    let mut push_if_present = |path: &str, floor: f32| {
-        if source_files.contains(path) {
-            anchors.push((path.to_string(), floor));
-        }
-    };
-
     if construction_query {
-        push_if_present("src/libponyc/pass/expr.c", top_score * 0.74);
-        push_if_present("src/libponyc/pass/syntax.c", top_score * 0.72);
-        push_if_present("src/libponyc/pass/verify.c", top_score * 0.70);
+        anchors.extend(phase_bucket_anchor_candidates(
+            &["pass"],
+            top_score,
+            0.74,
+            source_files,
+            all_hits,
+        ));
     }
     if lambda_query {
-        push_if_present("src/libponyc/expr/lambda.h", top_score * 0.68);
-        push_if_present("src/libponyc/expr/lambda.c", top_score * 0.66);
-        push_if_present("src/libponyc/pass/lambda.c", top_score * 0.66);
+        anchors.extend(phase_bucket_anchor_candidates(
+            &["expr", "pass"],
+            top_score,
+            0.68,
+            source_files,
+            all_hits,
+        ));
     }
 
     anchors.sort_by(|a, b| {
@@ -11944,7 +12010,7 @@ fn rerank_semantic_phase_paths(
         }
     }
 
-    for (path, floor) in semantic_phase_anchor_floors(text, top_score, source_files) {
+    for (path, floor) in semantic_phase_anchor_floors(text, top_score, source_files, all_hits) {
         if upsert_fused_floor(fused, path, floor) {
             changed = true;
         }
@@ -14950,6 +15016,29 @@ mod tests {
             score,
             spans: vec![],
         }]
+    }
+
+    /// Compare anchor-floor output against expected `(path, floor)` pairs with
+    /// a float tolerance, since floors are products of `top_score` and a
+    /// ratio rather than literal constants.
+    fn assert_anchors_approx(actual: &[(String, f32)], expected: &[(&str, f32)]) {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "anchor count mismatch: {actual:?} vs {expected:?}"
+        );
+        for ((actual_path, actual_floor), (expected_path, expected_floor)) in
+            actual.iter().zip(expected.iter())
+        {
+            assert_eq!(
+                actual_path, expected_path,
+                "anchor order mismatch: {actual:?} vs {expected:?}"
+            );
+            assert!(
+                (actual_floor - expected_floor).abs() < 1e-4,
+                "floor mismatch for {actual_path}: {actual_floor} vs {expected_floor}"
+            );
+        }
     }
 
     // ── Graph-native entity surface + cursor paging (static shape) ──
@@ -18999,7 +19088,9 @@ mod tests {
     }
 
     #[test]
-    fn rerank_semantic_phase_paths_promotes_pass_and_lambda_anchors() {
+    #[serial_test::serial]
+    fn rerank_semantic_phase_paths_leaves_phase_anchors_dark_by_default() {
+        std::env::remove_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
         let mut fused = vec![
             ("src/libponyc/pass/expr.h".to_string(), 0.158),
             ("src/libponyc/expr/reference.c".to_string(), 0.123),
@@ -19021,18 +19112,145 @@ mod tests {
             &source_files,
         );
 
-        let ranks: HashMap<_, _> = fused
-            .iter()
-            .enumerate()
-            .map(|(idx, (path, _))| (path.as_str(), idx))
-            .collect();
+        // With the lever unset, no source file absent from `fused` may be
+        // force-inserted purely from `source_files` membership: the historical
+        // hardcoded-path anchors are gone and nothing replaces them by default.
+        for absent in [
+            "src/libponyc/pass/syntax.c",
+            "src/libponyc/pass/verify.c",
+            "src/libponyc/expr/lambda.h",
+        ] {
+            assert!(
+                !fused.iter().any(|(path, _)| path == absent),
+                "{absent} must not be force-inserted while the graph-anchor lever is dark"
+            );
+        }
+    }
 
-        assert!(ranks["src/libponyc/pass/expr.c"] < ranks["src/libponyc/pass/expr.h"]);
-        assert!(ranks["src/libponyc/pass/syntax.c"] < ranks["src/libponyc/expr/reference.c"]);
-        assert!(ranks["src/libponyc/pass/verify.c"] < ranks["src/libponyc/verify/type.c"]);
-        assert!(fused
-            .iter()
-            .any(|(path, _)| path == "src/libponyc/expr/lambda.h"));
+    #[test]
+    #[serial_test::serial]
+    fn semantic_phase_anchor_floors_dark_by_default_even_with_full_signal_support() {
+        std::env::remove_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
+        let source_files = HashSet::from([String::from("engine/pass/typecheck.rs")]);
+        let all_hits = vec![HashMap::from([(
+            "engine/pass/typecheck.rs".to_string(),
+            hit(1.0),
+        )])];
+
+        let anchors = semantic_phase_anchor_floors(
+            "Fix return checking in constructors.",
+            10.0,
+            &source_files,
+            &all_hits,
+        );
+        assert!(
+            anchors.is_empty(),
+            "unset lever must produce zero anchors: {anchors:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn semantic_phase_anchor_floors_ranks_signal_supported_bucket_files_when_enabled() {
+        std::env::set_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS", "1");
+
+        // A fictional, non-Pony corpus: the mechanism must work from bucket +
+        // cross-signal support alone, not from any hardcoded name or path.
+        let source_files = HashSet::from([
+            String::from("engine/pass/typecheck.rs"),
+            String::from("engine/pass/lower.rs"),
+            String::from("engine/pass/const_verify.rs"),
+            String::from("engine/expr/closure.rs"),
+            String::from("engine/expr/closure_capture.rs"),
+            String::from("engine/ast/node.rs"),
+        ]);
+        let all_hits = vec![
+            HashMap::from([
+                ("engine/pass/typecheck.rs".to_string(), hit(1.0)),
+                ("engine/expr/closure.rs".to_string(), hit(1.0)),
+                ("engine/ast/node.rs".to_string(), hit(1.0)),
+            ]),
+            HashMap::from([
+                ("engine/pass/typecheck.rs".to_string(), hit(1.0)),
+                ("engine/expr/closure.rs".to_string(), hit(1.0)),
+                ("engine/ast/node.rs".to_string(), hit(1.0)),
+            ]),
+            HashMap::from([
+                ("engine/pass/typecheck.rs".to_string(), hit(1.0)),
+                ("engine/pass/lower.rs".to_string(), hit(1.0)),
+                ("engine/expr/closure_capture.rs".to_string(), hit(1.0)),
+                ("engine/ast/node.rs".to_string(), hit(1.0)),
+            ]),
+            HashMap::from([("engine/ast/node.rs".to_string(), hit(1.0))]),
+            HashMap::from([("engine/ast/node.rs".to_string(), hit(1.0))]),
+        ];
+
+        // Construction-shaped query: only the "pass" bucket is targeted.
+        let construction_anchors = semantic_phase_anchor_floors(
+            "Fix return checking in constructors.",
+            10.0,
+            &source_files,
+            &all_hits,
+        );
+        assert_anchors_approx(
+            &construction_anchors,
+            &[
+                ("engine/pass/typecheck.rs", 7.4),
+                ("engine/pass/lower.rs", 7.2),
+            ],
+        );
+        assert!(
+            !construction_anchors
+                .iter()
+                .any(|(path, _)| path.contains("const_verify") || path.contains("ast/node")),
+            "unsupported and wrong-bucket files must never appear: {construction_anchors:?}"
+        );
+
+        // Lambda-shaped query: "expr" then "pass" buckets are targeted, capped
+        // at SEMANTIC_PHASE_ANCHOR_LIMIT.
+        let lambda_anchors = semantic_phase_anchor_floors(
+            "Handle lambda captures directly.",
+            10.0,
+            &source_files,
+            &all_hits,
+        );
+        assert_anchors_approx(
+            &lambda_anchors,
+            &[
+                ("engine/pass/typecheck.rs", 6.8),
+                ("engine/expr/closure.rs", 6.6),
+                ("engine/expr/closure_capture.rs", 6.4),
+            ],
+        );
+
+        std::env::remove_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn semantic_phase_anchor_floors_is_deterministic() {
+        std::env::set_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS", "1");
+        let source_files = HashSet::from([
+            String::from("engine/pass/typecheck.rs"),
+            String::from("engine/pass/lower.rs"),
+            String::from("engine/expr/closure.rs"),
+        ]);
+        let all_hits = vec![HashMap::from([
+            ("engine/pass/typecheck.rs".to_string(), hit(1.0)),
+            ("engine/pass/lower.rs".to_string(), hit(1.0)),
+            ("engine/expr/closure.rs".to_string(), hit(1.0)),
+        ])];
+        let text = "Fix return checking in constructors with lambda captures.";
+
+        let first = semantic_phase_anchor_floors(text, 10.0, &source_files, &all_hits);
+        let second = semantic_phase_anchor_floors(text, 10.0, &source_files, &all_hits);
+        assert_eq!(
+            first, second,
+            "identical inputs must yield identical output"
+        );
+        assert!(!first.is_empty());
+
+        std::env::remove_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
     }
 
     #[test]
