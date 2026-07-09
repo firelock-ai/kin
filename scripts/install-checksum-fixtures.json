@@ -1,0 +1,52 @@
+{
+  "cases": [
+    {
+      "name": "multi-platform manifest selects exact Windows archive",
+      "archive": "kin-windows-x86_64.zip",
+      "content": "# Kin release checksums\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  kin-linux-x86_64.tar.gz\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  kin-windows-x86_64.zip\ncccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  kin-macos-aarch64.tar.gz\n",
+      "expected": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "name": "standard binary marker is accepted",
+      "archive": "kin-windows-x86_64.zip",
+      "content": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd *kin-windows-x86_64.zip\r\n",
+      "expected": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    {
+      "name": "identical duplicate entries are unambiguous",
+      "archive": "kin-windows-x86_64.zip",
+      "content": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  kin-windows-x86_64.zip\nBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB *kin-windows-x86_64.zip\n",
+      "expected": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "name": "missing exact archive rejects near matches",
+      "archive": "kin-windows-x86_64.zip",
+      "content": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  kin-windows-aarch64.zip\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  kin-windows-x86_64.zip.sha256\n",
+      "error_contains": "no entry for exact archive"
+    },
+    {
+      "name": "trailing filename whitespace is not an exact match",
+      "archive": "kin-windows-x86_64.zip",
+      "content": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  kin-windows-x86_64.zip \n",
+      "error_contains": "no entry for exact archive"
+    },
+    {
+      "name": "conflicting exact archive entries fail closed",
+      "archive": "kin-windows-x86_64.zip",
+      "content": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  kin-windows-x86_64.zip\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  kin-windows-x86_64.zip\n",
+      "error_contains": "conflicting entries"
+    },
+    {
+      "name": "bare hash is rejected because it binds no filename",
+      "archive": "kin-windows-x86_64.zip",
+      "content": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+      "error_contains": "malformed entry"
+    },
+    {
+      "name": "PowerShell Format-List hash is rejected because it binds no filename",
+      "archive": "kin-windows-x86_64.zip",
+      "content": "Hash : aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+      "error_contains": "malformed entry"
+    }
+  ]
+}

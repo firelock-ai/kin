@@ -44,6 +44,57 @@ function Write-Info  { Write-Host "  → $args" -ForegroundColor Cyan }
 function Write-Ok    { Write-Host "  ✓ $args" -ForegroundColor Green }
 function Write-Err   { Write-Host "  ✗ $args" -ForegroundColor Red }
 
+function Resolve-ArchiveChecksum {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$ChecksumContent,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$ArchiveName
+    )
+
+    $MatchingHashes = @()
+    $LineNumber = 0
+    foreach ($RawLine in [regex]::Split($ChecksumContent, "\r?\n")) {
+        $LineNumber++
+        if ([string]::IsNullOrWhiteSpace($RawLine) -or $RawLine.TrimStart().StartsWith("#")) {
+            continue
+        }
+
+        $Match = [regex]::Match(
+            $RawLine,
+            '^(?<hash>[0-9a-fA-F]{64})[ \t]+(?<filename>\*?.+?)$',
+            [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+        )
+        if (-not $Match.Success) {
+            throw "Checksum file contains malformed entry on line $LineNumber"
+        }
+
+        $Filename = $Match.Groups["filename"].Value
+        if ($Filename.StartsWith("*")) {
+            $Filename = $Filename.Substring(1)
+        }
+        if ($Filename -cne $ArchiveName) {
+            continue
+        }
+
+        $MatchingHashes += $Match.Groups["hash"].Value.ToLowerInvariant()
+    }
+
+    if ($MatchingHashes.Count -eq 0) {
+        throw "Checksum file has no entry for exact archive '$ArchiveName'"
+    }
+
+    $UniqueHashes = @($MatchingHashes | Sort-Object -Unique)
+    if ($UniqueHashes.Count -gt 1) {
+        throw "Checksum file has conflicting entries for exact archive '$ArchiveName'"
+    }
+
+    return $UniqueHashes[0]
+}
+
 # ── Detect architecture ─────────────────────────────────────────────────
 
 $Arch = if ([Environment]::Is64BitOperatingSystem) {
@@ -121,8 +172,9 @@ try {
 
 # ── Verify checksum ───────────────────────────────────────────────────
 # The release workflow publishes "<archive>.sha256" next to every archive
-# (Get-FileHash format). Download it and fail loudly if it is missing,
-# malformed, or does not match — never install an unverified download.
+# in standard "<hash>  <archive>" format. Download it and fail loudly if it
+# is missing, malformed, ambiguous, or does not match — never install an
+# unverified download.
 
 $ChecksumUrl = "$Url.sha256"
 $ChecksumFile = Join-Path $TmpDir "$Archive.sha256"
@@ -136,23 +188,16 @@ try {
 }
 
 $ChecksumContent = Get-Content $ChecksumFile -Raw
-# Match the hash on the line referencing this archive; tolerate either a bare
-# hash line or "<hash>  <filename>". Hashes are 64 hex chars.
-$ExpectedHash = $null
-foreach ($line in ($ChecksumContent -split "`n")) {
-    if ($line -match '([0-9a-fA-F]{64})') {
-        $ExpectedHash = $Matches[1].ToLower()
-        break
-    }
-}
-
-if (-not $ExpectedHash) {
-    Write-Err "Checksum file was empty or malformed: $ChecksumUrl"
+try {
+    $ExpectedHash = Resolve-ArchiveChecksum -ChecksumContent $ChecksumContent -ArchiveName $Archive
+} catch {
+    Write-Err "Checksum file is invalid: $ChecksumUrl"
+    Write-Err $_.Exception.Message
     Write-Err "Refusing to install an unverified download. Aborting."
     exit 1
 }
 
-$ActualHash = (Get-FileHash -Path (Join-Path $TmpDir $Archive) -Algorithm SHA256).Hash.ToLower()
+$ActualHash = (Get-FileHash -Path (Join-Path $TmpDir $Archive) -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($ActualHash -ne $ExpectedHash) {
     Write-Err "SHA-256 checksum mismatch!"
     Write-Err "Expected: $ExpectedHash"

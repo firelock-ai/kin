@@ -359,7 +359,9 @@ jobs:
             Write-Error "kin-daemon.exe missing from $env:ARTIFACT.zip — refusing to publish a daemon-less archive"
             exit 1
           }
-          Get-FileHash -Algorithm SHA256 "$env:ARTIFACT.zip" | Format-List Hash | Out-File -Encoding utf8 "$env:ARTIFACT.zip.sha256"
+          $ArchivePath = "$env:ARTIFACT.zip"
+          $Hash = (Get-FileHash -Algorithm SHA256 $ArchivePath).Hash.ToLowerInvariant()
+          "$Hash  $ArchivePath" | Set-Content -Encoding ascii "$ArchivePath.sha256"
         env:
           TARGET: ${{ matrix.target }}
           ARTIFACT: ${{ matrix.artifact }}
