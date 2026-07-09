@@ -46,7 +46,7 @@ pub fn tool_definitions() -> ToolsListResult {
                         "pipeline": {
                             "type": "string",
                             "enum": ["fused", "cosine"],
-                            "description": "Force a retrieval pipeline for this call: 'fused' (full multi-signal locate ranking) or 'cosine' (legacy single-vector). Defaults to the daemon's KIN_PROFILE."
+                            "description": "Force a retrieval pipeline for this call: 'fused' (full multi-signal locate ranking) or 'cosine' (legacy single-vector). Defaults to the daemon's active KIN_PROFILE — the stock compat-v0 profile serves 'cosine'; accuracy-v1 serves 'fused'."
                         },
                         "explain": {
                             "type": "boolean",

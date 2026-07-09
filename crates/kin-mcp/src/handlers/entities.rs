@@ -77,24 +77,30 @@ pub fn handle_semantic_search<G: GraphStore>(
 }
 
 pub const SEMANTIC_LOCATE_DESC: &str = "\
-Rank the code most relevant to a natural-language query using Kin's full fused retrieval \
-pipeline — the same multi-signal ranking `kin locate` serves: vector similarity, lexical \
-search, and graph-structure signals fused with role-aware ranking, exact-name promotion, \
-and (when its model is available) cross-encoder reranking. This is the tool to reach for \
+Rank the code most relevant to a natural-language query. This is the tool to reach for \
 when you are looking for \"where is the code that does X\" and you only have a \
 description of the behavior, not an exact symbol name. Unlike semantic_search (which \
 matches declarations by name/kind/language and ignores the query for ranking), \
 semantic_locate ranks by query relevance and returns act-on-able hits: entity_id, file, \
 line span, kind, score, and a bounded inline snippet. Set granularity to \"entity\" \
 (default) for ranked declarations or \"file\" to roll results up to the most relevant \
-files. The `routing` field reports which pipeline answered (`fused-v1` by default; \
-`cosine-v0` when KIN_PROFILE=compat-v0 or `pipeline: \"cosine\"` selects the legacy \
-single-vector ranking). The response also reports semantic_coverage — the fraction of \
-the graph that has embeddings indexed — plus a `degradations` array naming any \
-retrieval capability that could not fully run (empty vector index, reranker model not \
-cached, …), so a thin result set is attributable instead of silent. Requires the Kin \
-daemon: retrieval runs against the daemon's live graph, so this tool returns an error \
-in offline/no-daemon mode. On an empty result the additive `negative` object's \
+files. Two pipelines can answer. By default a stock daemon serves the legacy \
+single-vector cosine ranking (the `compat-v0` profile); the full fused retrieval \
+pipeline `kin locate` serves — vector similarity, lexical search, and graph-structure \
+signals fused with role-aware ranking, exact-name promotion, and (when its model is \
+available) cross-encoder reranking — is opt-in per call with `pipeline: \"fused\"` or by \
+running the daemon under KIN_PROFILE=accuracy-v1. The `routing` field reports which \
+pipeline actually answered: `cosine-v0` for the single-vector default, `fused-v1` for \
+the fused pipeline (also selectable per call with `pipeline: \"fused\"`). Every hit also \
+carries an additive `match_evidence` object explaining why it ranked — the ranker that \
+produced it, the score source, whether the query matched the entity name, and the \
+ranking signals that applied — derived from graph-owned retrieval data, never a \
+working-tree read. Both pipelines report semantic_coverage — the fraction of the graph \
+that has embeddings indexed; the fused arm additionally reports a `degradations` array \
+naming any retrieval capability that could not fully run (empty vector index, reranker \
+model not cached, …), so a thin result set is attributable instead of silent. Requires \
+the Kin daemon: retrieval runs against the daemon's live graph, so this tool returns an \
+error in offline/no-daemon mode. On an empty result the additive `negative` object's \
 `safe_to_conclude_absent` flag distinguishes an authoritative \"no match\" from \"not \
 yet embedded\".";
 
