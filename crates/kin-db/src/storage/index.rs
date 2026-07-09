@@ -352,6 +352,7 @@ mod tests {
                 ast_hash: Hash256::from_bytes([0x11; 32]),
                 signature_hash: Hash256::from_bytes([0x22; 32]),
                 behavior_hash: Hash256::from_bytes([0x33; 32]),
+                equivalence_hash: Hash256::from_bytes([0; 32]),
                 stability_score: 0.95,
             },
             file_origin: Some(FilePathId::new(file_path)),
