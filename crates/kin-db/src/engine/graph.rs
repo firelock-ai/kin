@@ -427,6 +427,16 @@ fn entity_ids_for_relation(relation: &Relation) -> Vec<EntityId> {
         .collect()
 }
 
+fn sorted_unique_entity_ids<I>(ids: I) -> Vec<EntityId>
+where
+    I: IntoIterator<Item = EntityId>,
+{
+    let mut ids: Vec<EntityId> = ids.into_iter().collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 fn relation_is_entity_only(relation: &Relation) -> bool {
     relation.src.as_entity().is_some() && relation.dst.as_entity().is_some()
 }
@@ -6527,13 +6537,15 @@ impl EntityStore for InMemoryGraph {
             return Ok(());
         }
 
-        {
+        let affected = {
             let mut ent = self.entities.write();
             let mut merkle_seeds = Vec::new();
+            let mut affected = HashSet::new();
 
             ent.relations.reserve(relations.len());
             for relation in relations {
                 if let Some(old) = ent.relations.remove(&relation.id) {
+                    affected.extend(entity_ids_for_relation(&old));
                     merkle_seeds.extend(entity_ids_for_relation(&old));
                     remove_relation_indexes(&mut ent, &old);
                     self.record_relation_delta_remove(&ent, &old);
@@ -6542,10 +6554,12 @@ impl EntityStore for InMemoryGraph {
                 insert_relation_indexes(&mut ent, relation);
                 ent.relations.insert(relation.id, relation.clone());
                 self.record_relation_delta_upsert(&ent, relation.clone());
+                affected.extend(entity_ids_for_relation(relation));
                 merkle_seeds.extend(entity_ids_for_relation(relation));
             }
             self.refresh_merkle_for_entities(&ent, merkle_seeds);
-        }
+            sorted_unique_entity_ids(affected)
+        };
 
         // Relation-derived text fields are now stale for affected entities,
         // but doing 20K+ individual Tantivy upserts is too expensive during
@@ -6553,6 +6567,7 @@ impl EntityStore for InMemoryGraph {
         // be honored by persist_text_index_with_root_hash before saving.
         self.text_full_rebuild_required
             .store(true, Ordering::Release);
+        self.invalidate_entities_for_embedding(&affected)?;
 
         Ok(())
     }
@@ -6579,33 +6594,36 @@ impl EntityStore for InMemoryGraph {
             new_map.insert(rel.id, rel);
         }
 
+        let mut new_relations: Vec<Relation> = new_map.into_values().collect();
+        new_relations.sort_unstable_by_key(|relation| relation.id.0);
+
         // Step 2: Single write lock — retain non-kind + insert new + rebuild indexes
-        {
+        let affected = {
             let mut ent = self.entities.write();
             let mut merkle_seeds = Vec::new();
+            let mut affected = HashSet::new();
 
             // Remove all relations of this kind — O(N) scan, no per-relation index work
-            let removed_relations: Vec<Relation> = ent
+            let mut removed_relations: Vec<Relation> = ent
                 .relations
                 .values()
                 .filter(|rel| rel.kind == kind)
                 .cloned()
                 .collect();
-            let removed = removed_relations.len();
+            removed_relations.sort_unstable_by_key(|relation| relation.id.0);
             ent.relations.retain(|_, rel| rel.kind != kind);
 
-            if removed == 0 && new_map.is_empty() {
-                return Ok(());
-            }
             for relation in &removed_relations {
+                affected.extend(entity_ids_for_relation(relation));
                 merkle_seeds.extend(entity_ids_for_relation(relation));
             }
 
             // Reserve and insert new relations
-            ent.relations.reserve(new_map.len());
-            for (id, rel) in new_map {
-                merkle_seeds.extend(entity_ids_for_relation(&rel));
-                ent.relations.insert(id, rel);
+            ent.relations.reserve(new_relations.len());
+            for rel in &new_relations {
+                affected.extend(entity_ids_for_relation(rel));
+                merkle_seeds.extend(entity_ids_for_relation(rel));
+                ent.relations.insert(rel.id, rel.clone());
             }
 
             // Rebuild ALL adjacency indexes from scratch — O(R) total
@@ -6619,14 +6637,16 @@ impl EntityStore for InMemoryGraph {
             for relation in &removed_relations {
                 self.record_relation_delta_remove(&ent, relation);
             }
-            for relation in ent.relations.values().filter(|rel| rel.kind == kind) {
+            for relation in &new_relations {
                 self.record_relation_delta_upsert(&ent, relation.clone());
             }
             self.refresh_merkle_for_entities(&ent, merkle_seeds);
-        }
+            sorted_unique_entity_ids(affected)
+        };
 
         self.text_full_rebuild_required
             .store(true, Ordering::Release);
+        self.invalidate_entities_for_embedding(&affected)?;
         Ok(())
     }
 
@@ -6635,23 +6655,27 @@ impl EntityStore for InMemoryGraph {
             return Ok(());
         }
 
-        {
+        let affected = {
             let mut ent = self.entities.write();
             let mut merkle_seeds = Vec::new();
+            let mut affected = HashSet::new();
 
             for id in ids {
                 if let Some(rel) = ent.relations.remove(*id) {
+                    affected.extend(entity_ids_for_relation(&rel));
                     merkle_seeds.extend(entity_ids_for_relation(&rel));
                     remove_relation_indexes(&mut ent, &rel);
                     self.record_relation_delta_remove(&ent, &rel);
                 }
             }
             self.refresh_merkle_for_entities(&ent, merkle_seeds);
-        }
+            sorted_unique_entity_ids(affected)
+        };
 
         // Defer text index rebuild like upsert_relations_batch.
         self.text_full_rebuild_required
             .store(true, Ordering::Release);
+        self.invalidate_entities_for_embedding(&affected)?;
 
         Ok(())
     }
@@ -7847,6 +7871,7 @@ impl VerificationStore for InMemoryGraph {
     fn delete_test_case(&self, id: &TestId) -> Result<(), KinDbError> {
         let mut ent = self.entities.write();
         let mut ver = self.verification.write();
+        let mut affected = HashSet::new();
         ver.test_cases.remove(id);
         ver.mock_hints.retain(|h| h.test_id != *id);
         let node = GraphNodeId::Test(*id);
@@ -7861,9 +7886,18 @@ impl VerificationStore for InMemoryGraph {
         relation_ids.dedup();
         for relation_id in relation_ids {
             if let Some(relation) = ent.relations.remove(&relation_id) {
+                affected.extend(entity_ids_for_relation(&relation));
                 remove_relation_indexes(&mut ent, &relation);
             }
         }
+        self.refresh_merkle_for_entities(&ent, affected.iter().copied());
+        let affected = sorted_unique_entity_ids(affected);
+        drop(ver);
+        drop(ent);
+
+        self.text_full_rebuild_required
+            .store(true, Ordering::Release);
+        self.invalidate_entities_for_embedding(&affected)?;
         self.require_full_snapshot();
         Ok(())
     }
@@ -11037,6 +11071,42 @@ mod tests {
         assert_eq!(tests_b[0].test_id, tid);
     }
 
+    #[cfg(feature = "vector")]
+    #[test]
+    fn delete_test_case_requeues_indexed_relation_endpoints() {
+        let graph = InMemoryGraph::new();
+        let entity = test_entity("target", "src/lib.rs");
+        graph.upsert_entity(&entity).unwrap();
+        let test_case = TestCase {
+            test_id: TestId::new(),
+            name: "test_target".into(),
+            language: "rust".into(),
+            kind: TestKind::Unit,
+            scopes: vec![WorkScope::Entity(entity.id)],
+            runner: TestRunner::Cargo,
+            file_origin: None,
+        };
+        graph.create_test_case(&test_case).unwrap();
+
+        let index = std::sync::Arc::new(crate::VectorIndex::new(2).unwrap());
+        index.upsert(entity.id, &[1.0, 0.0]).unwrap();
+        *graph.vector_index.lock() = Some(std::sync::Arc::clone(&index));
+        graph.embedding_queue.lock().clear();
+
+        graph.delete_test_case(&test_case.test_id).unwrap();
+
+        assert!(graph
+            .embedding_queue
+            .lock()
+            .contains(&RetrievalKey::Entity(entity.id)));
+        assert!(!index.contains(&entity.id));
+        assert_eq!(
+            graph.snapshot_root_hash(),
+            Some(compute_graph_root_hash(&graph.to_snapshot())),
+            "bulk test-relation deletion must keep the maintained Merkle root current"
+        );
+    }
+
     #[test]
     fn traverse_crosses_verification_and_entity_edges() {
         let graph = InMemoryGraph::new();
@@ -12036,6 +12106,59 @@ mod tests {
 
     #[cfg(feature = "vector")]
     #[test]
+    fn relation_batch_replace_and_remove_requeue_indexed_endpoints() {
+        let graph = InMemoryGraph::new();
+        let old_source = test_entity("old_source", "src/a.rs");
+        let shared = test_entity("shared", "src/b.rs");
+        let new_target = test_entity("new_target", "src/c.rs");
+        graph.upsert_entity(&old_source).unwrap();
+        graph.upsert_entity(&shared).unwrap();
+        graph.upsert_entity(&new_target).unwrap();
+
+        let old = test_relation(old_source.id, shared.id, RelationKind::Calls);
+        graph.upsert_relation(&old).unwrap();
+
+        let index = std::sync::Arc::new(crate::VectorIndex::new(2).unwrap());
+        index.upsert(old_source.id, &[1.0, 0.0]).unwrap();
+        index.upsert(shared.id, &[0.0, 1.0]).unwrap();
+        index.upsert(new_target.id, &[0.5, 0.5]).unwrap();
+        *graph.vector_index.lock() = Some(std::sync::Arc::clone(&index));
+        graph.embedding_queue.lock().clear();
+
+        let replacement = test_relation(shared.id, new_target.id, RelationKind::Calls);
+        graph
+            .replace_relations_of_kind(RelationKind::Calls, vec![replacement.clone()])
+            .unwrap();
+
+        {
+            let queue = graph.embedding_queue.lock();
+            assert_eq!(queue.len(), 3, "old and new endpoints must be deduplicated");
+            assert!(queue.contains(&RetrievalKey::Entity(old_source.id)));
+            assert!(queue.contains(&RetrievalKey::Entity(shared.id)));
+            assert!(queue.contains(&RetrievalKey::Entity(new_target.id)));
+        }
+        assert!(!index.contains(&old_source.id));
+        assert!(!index.contains(&shared.id));
+        assert!(!index.contains(&new_target.id));
+
+        // Reinstall vectors to prove the removal path independently invalidates
+        // and requeues both endpoints of the relation it deletes.
+        index.upsert(shared.id, &[0.0, 1.0]).unwrap();
+        index.upsert(new_target.id, &[0.5, 0.5]).unwrap();
+        graph.embedding_queue.lock().clear();
+        graph.remove_relations_batch(&[&replacement.id]).unwrap();
+
+        let queue = graph.embedding_queue.lock();
+        assert_eq!(queue.len(), 2);
+        assert!(queue.contains(&RetrievalKey::Entity(shared.id)));
+        assert!(queue.contains(&RetrievalKey::Entity(new_target.id)));
+        drop(queue);
+        assert!(!index.contains(&shared.id));
+        assert!(!index.contains(&new_target.id));
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
     fn remove_outgoing_relations_queues_affected_entities_for_reembedding() {
         let graph = InMemoryGraph::new();
         let caller = test_entity("caller", "src/a.rs");
@@ -12899,6 +13022,35 @@ mod tests {
         promoted.visibility = Visibility::Public;
         promoted.kind = EntityKind::Interface;
         g.upsert_entity(&promoted).unwrap();
+
+        let next = g.drain_embedding_batch(1);
+        assert_eq!(next[0].0, RetrievalKey::Entity(promoted.id));
+        assert_eq!(g.embedding_queue.lock().frontier_rebuilds, 2);
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn relation_batch_add_rebuilds_frontier_for_changed_centrality() {
+        let g = InMemoryGraph::new();
+        let mut first = test_entity_with_id(0x91, "first");
+        first.visibility = Visibility::Private;
+        let mut second = test_entity_with_id(0x92, "second");
+        second.visibility = Visibility::Private;
+        let mut promoted = test_entity_with_id(0x93, "promoted");
+        promoted.visibility = Visibility::Private;
+        g.upsert_entity(&first).unwrap();
+        g.upsert_entity(&second).unwrap();
+        g.upsert_entity(&promoted).unwrap();
+
+        let first_batch = g.drain_embedding_batch(1);
+        assert_eq!(first_batch[0].0, RetrievalKey::Entity(first.id));
+        assert_eq!(g.embedding_queue.lock().frontier_rebuilds, 1);
+
+        // The incoming edge increases the higher-id entity's centrality while
+        // it is already in the cached remainder. Batch relation mutation must
+        // invalidate both endpoints after dropping the entity lock.
+        let relation = test_relation(first.id, promoted.id, RelationKind::Calls);
+        g.upsert_relations_batch(&[relation]).unwrap();
 
         let next = g.drain_embedding_batch(1);
         assert_eq!(next[0].0, RetrievalKey::Entity(promoted.id));
