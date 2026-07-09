@@ -268,6 +268,13 @@ pub(crate) struct VfsTreeSnapshot {
     pub timestamps: Arc<HashMap<FilePathId, u64>>,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct VfsTreeBuildTestHook {
+    pub materialized: Arc<std::sync::Barrier>,
+    pub resume: Arc<std::sync::Barrier>,
+}
+
 /// Shared daemon state. All mutable state is behind RwLock for
 /// concurrent access from the reconciliation loop and API handlers.
 pub struct DaemonState {
@@ -300,6 +307,13 @@ pub struct DaemonState {
     /// Materialized committed VFS view keyed by exact graph head + monotonic version.
     /// Endpoint handlers never return this entry unless its key still matches live graph truth.
     pub(crate) vfs_tree_cache: std::sync::RwLock<Option<Arc<VfsTreeSnapshot>>>,
+    /// Single-flight coordinator for cold VFS materialization. Waiters recheck the cache after
+    /// acquiring this lock, so one exact head/version is replayed at most once.
+    pub(crate) vfs_tree_build_lock: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    pub(crate) vfs_tree_build_count: AtomicU64,
+    #[cfg(test)]
+    pub(crate) vfs_tree_build_test_hook: std::sync::Mutex<Option<VfsTreeBuildTestHook>>,
     /// Broadcast channel for SSE invalidation events.
     /// Subscribers (VFS daemon, spine, KinLab) receive real-time notifications.
     pub event_tx: tokio::sync::broadcast::Sender<DaemonEvent>,
@@ -668,6 +682,11 @@ impl DaemonState {
             snapshot_generation: AtomicU64::new(0),
             vfs_version: AtomicU64::new(persisted_vfs_version),
             vfs_tree_cache: std::sync::RwLock::new(None),
+            vfs_tree_build_lock: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            vfs_tree_build_count: AtomicU64::new(0),
+            #[cfg(test)]
+            vfs_tree_build_test_hook: std::sync::Mutex::new(None),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
             session_scopes: RwLock::new(HashMap::new()),
@@ -807,6 +826,11 @@ impl DaemonState {
             snapshot_generation: AtomicU64::new(generation),
             vfs_version: AtomicU64::new(persisted_vfs_version),
             vfs_tree_cache: std::sync::RwLock::new(None),
+            vfs_tree_build_lock: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            vfs_tree_build_count: AtomicU64::new(0),
+            #[cfg(test)]
+            vfs_tree_build_test_hook: std::sync::Mutex::new(None),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
             session_scopes: RwLock::new(HashMap::new()),
@@ -2092,6 +2116,11 @@ mod tests {
             snapshot_generation: AtomicU64::new(0),
             vfs_version: AtomicU64::new(0),
             vfs_tree_cache: std::sync::RwLock::new(None),
+            vfs_tree_build_lock: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            vfs_tree_build_count: AtomicU64::new(0),
+            #[cfg(test)]
+            vfs_tree_build_test_hook: std::sync::Mutex::new(None),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
             session_scopes: RwLock::new(HashMap::new()),
