@@ -40,9 +40,9 @@ $BaseUrl = if ($env:KIN_BASE_URL) { $env:KIN_BASE_URL } else { "https://github.c
 
 # ── Helpers ─────────────────────────────────────────────────────────────
 
-function Write-Info  { Write-Host "  → $args" -ForegroundColor Cyan }
-function Write-Ok    { Write-Host "  ✓ $args" -ForegroundColor Green }
-function Write-Err   { Write-Host "  ✗ $args" -ForegroundColor Red }
+function Write-Info  { Write-Host "  -> $args" -ForegroundColor Cyan }
+function Write-Ok    { Write-Host "  [ok] $args" -ForegroundColor Green }
+function Write-Err   { Write-Host "  [error] $args" -ForegroundColor Red }
 
 function Resolve-ArchiveChecksum {
     param(
@@ -274,7 +274,7 @@ if (Test-Path $KinExe) {
         Write-Ok "kin $InstalledVersion"
     }
 } else {
-    Write-Err "Installation failed — kin.exe not found"
+    Write-Err "Installation failed: kin.exe not found"
     exit 1
 }
 
