@@ -1,17 +1,17 @@
 # Kin
 
+> **AI writes code. Kin proves it safe to ship.**
 > AI made code cheap to write and expensive to trust.
-> **Kin helps teams trust AI-built software before it merges.**
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Release](https://img.shields.io/badge/release-v0.2.14-6E56CF.svg)](https://github.com/firelock-ai/kin/releases)
+[![Release](https://img.shields.io/badge/release-v0.2.15-6E56CF.svg)](https://github.com/firelock-ai/kin/releases)
 [![kinlab.ai](https://img.shields.io/badge/hosted-kinlab.ai-111111.svg)](https://kinlab.ai)
 
 AI agents now generate code faster than teams can review it. The hard part is no longer
 writing a change — it's trusting one: knowing what it actually touches, whether it silently
 reverts an earlier fix, and how far its blast radius reaches before it merges. Git tracks
-lines and files, so it can't answer those questions directly. Kin is the **semantic system
-of record** for software work: it represents your codebase as a graph of entities and
+lines and files, so it can't answer those questions directly. Kin is **the system of record
+for AI-written software**: it represents your codebase as a graph of entities and
 relations and reasons over that graph instead of over text diffs.
 
 ---

@@ -1,7 +1,7 @@
 # @kinlab/kin
 
 The canonical npm install surface for [Kin](https://github.com/firelock-ai/kin), the
-semantic system of record for software work.
+system of record for AI-written software.
 
 ```sh
 npm install -g @kinlab/kin
