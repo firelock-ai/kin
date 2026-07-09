@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use kin_blobs::BlobStore;
 use kin_core::KinLayout;
 use kin_db::StorageBackend;
-use kin_model::{EntityId, EntityStore, FilePathId, GraphOverlay, WorkingCopy};
+use kin_model::{
+    EntityId, EntityStore, FilePathId, GraphOverlay, Hash256, SemanticChangeId, WorkingCopy,
+};
 use kin_projection::ProjectionState;
 use kin_reconcile::Reconciler;
 use tokio::sync::RwLock;
@@ -251,6 +253,21 @@ pub struct SpineRefreshOutcome {
     pub cross_repo_edges: usize,
 }
 
+/// Exact graph identity for a materialized committed VFS tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VfsTreeCacheKey {
+    pub head: Option<SemanticChangeId>,
+    pub version: u64,
+}
+
+/// Graph-derived file tree and timestamps shared by the VFS endpoints.
+#[derive(Debug)]
+pub(crate) struct VfsTreeSnapshot {
+    pub key: VfsTreeCacheKey,
+    pub files: Arc<HashMap<FilePathId, Hash256>>,
+    pub timestamps: Arc<HashMap<FilePathId, u64>>,
+}
+
 /// Shared daemon state. All mutable state is behind RwLock for
 /// concurrent access from the reconciliation loop and API handlers.
 pub struct DaemonState {
@@ -280,6 +297,9 @@ pub struct DaemonState {
     /// Incremented on every graph mutation (reconcile, commit, overlay update).
     /// Unlike entity_count, this never decreases on deletions.
     pub vfs_version: AtomicU64,
+    /// Materialized committed VFS view keyed by exact graph head + monotonic version.
+    /// Endpoint handlers never return this entry unless its key still matches live graph truth.
+    pub(crate) vfs_tree_cache: std::sync::RwLock<Option<Arc<VfsTreeSnapshot>>>,
     /// Broadcast channel for SSE invalidation events.
     /// Subscribers (VFS daemon, spine, KinLab) receive real-time notifications.
     pub event_tx: tokio::sync::broadcast::Sender<DaemonEvent>,
@@ -647,6 +667,7 @@ impl DaemonState {
             storage_backend: None,
             snapshot_generation: AtomicU64::new(0),
             vfs_version: AtomicU64::new(persisted_vfs_version),
+            vfs_tree_cache: std::sync::RwLock::new(None),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
             session_scopes: RwLock::new(HashMap::new()),
@@ -785,6 +806,7 @@ impl DaemonState {
             storage_backend: Some(backend),
             snapshot_generation: AtomicU64::new(generation),
             vfs_version: AtomicU64::new(persisted_vfs_version),
+            vfs_tree_cache: std::sync::RwLock::new(None),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
             session_scopes: RwLock::new(HashMap::new()),
@@ -1306,6 +1328,15 @@ impl DaemonState {
     /// Also marks the graph as dirty for background persistence.
     pub fn bump_version(&self) {
         let v = self.vfs_version.fetch_add(1, Ordering::SeqCst) + 1;
+        // Retire the old materialization at the same publication boundary. Requests that
+        // already cloned it may finish against the pre-mutation head; every request that
+        // observes the new version must rebuild or reuse a snapshot with the new key.
+        let mut cache = self
+            .vfs_tree_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *cache = None;
+        drop(cache);
         self.mark_dirty();
         // Persist asynchronously — don't block the mutation path.
         let path = self.layout.root().join("vfs_version");
@@ -2060,6 +2091,7 @@ mod tests {
             storage_backend: None,
             snapshot_generation: AtomicU64::new(0),
             vfs_version: AtomicU64::new(0),
+            vfs_tree_cache: std::sync::RwLock::new(None),
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_overlays: RwLock::new(std::collections::HashMap::new()),
             session_scopes: RwLock::new(HashMap::new()),
