@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+pub mod change_shape;
 pub mod diff;
 pub mod error;
 pub mod format;
@@ -14,6 +15,10 @@ pub mod review;
 pub mod risk;
 pub mod shadow;
 
+pub use change_shape::{
+    classify_change_shape, evidence_note, gate_action_for, BodyShape, Branch, ChangeShape,
+    GateAction, Statement, StatementKind,
+};
 pub use diff::{
     compute_diff, diff_from_change, diff_from_changes, diff_from_entity_ids, diff_from_files,
     EntityChange, EntityChangeKind, SemanticDiff,
