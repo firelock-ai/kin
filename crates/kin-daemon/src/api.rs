@@ -4181,6 +4181,98 @@ fn semloc_rerank_priority(
     p
 }
 
+/// Classify how a query relates to an entity's name for `match_evidence`. Pure
+/// and deterministic — an EXPLANATION of the hit, never a ranking input:
+///   `exact`   — a query token equals the whole name or its last dotted segment
+///               (the same predicate the exact-name boost uses).
+///   `partial` — not exact, but a name token (snake/dotted segment, length >= 3)
+///               also appears as a query token.
+///   `none`    — no shared token.
+fn semloc_name_match(query: &str, name: &str) -> &'static str {
+    if name.trim().is_empty() {
+        return "none";
+    }
+    if semloc_query_has_exact_token(query, name) {
+        return "exact";
+    }
+    let tokens = |text: &str| -> Vec<String> {
+        text.to_ascii_lowercase()
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .flat_map(|segment| segment.split('_'))
+            .filter(|token| !token.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let query_tokens: HashSet<String> = tokens(query).into_iter().collect();
+    if tokens(name)
+        .iter()
+        .any(|token| token.len() >= 3 && query_tokens.contains(token))
+    {
+        "partial"
+    } else {
+        "none"
+    }
+}
+
+/// Build the additive `match_evidence` object for a cosine-arm hit. Explains why
+/// the hit ranked from data already in scope — the cosine ranker, the score
+/// source, the query/name relationship, the entity role, and (only when the
+/// opt-in re-rank is active) which re-rank signals fired for this hit. No new
+/// ranking is computed and result ordering is untouched.
+fn cosine_match_evidence(
+    query: &str,
+    name: &str,
+    role: Option<kin_model::EntityRole>,
+    reranked: bool,
+    is_test_query: bool,
+) -> serde_json::Value {
+    use kin_model::EntityRole;
+    let mut evidence = json!({
+        "ranker": "cosine-v0",
+        "score_source": "vector_cosine",
+        "name_match": semloc_name_match(query, name),
+        "reranked": reranked,
+    });
+    if let Some(role) = role {
+        evidence["role"] = json!(format!("{role:?}").to_lowercase());
+    }
+    if reranked {
+        let role_demoted = matches!(
+            role,
+            Some(EntityRole::Generated) | Some(EntityRole::Vendored) | Some(EntityRole::Docs)
+        ) || (matches!(role, Some(EntityRole::Test)) && !is_test_query);
+        evidence["rerank_signals"] = json!({
+            "role_demoted": role_demoted,
+            "exact_name_boost": semloc_query_has_exact_token(query, name),
+        });
+    }
+    evidence
+}
+
+/// Build the additive `match_evidence` object for a fused-arm hit. Derived only
+/// from fused-signal provenance the `LocateEntity` already carries — the fused
+/// composite score, the definition flag, and (under `explain`) the resolution
+/// origin and seed cosine — plus the same query/name relationship the cosine arm
+/// reports. No new ranking is computed and result ordering is untouched.
+fn fused_match_evidence(
+    query: &str,
+    entity: &kin_cli::commands::locate::LocateEntity,
+) -> serde_json::Value {
+    let mut evidence = json!({
+        "ranker": "fused-v1",
+        "score_source": "fused_composite",
+        "name_match": semloc_name_match(query, &entity.name),
+        "definition": entity.definition,
+    });
+    if !entity.provenance.origin.is_empty() {
+        evidence["resolution_origin"] = json!(entity.provenance.origin);
+    }
+    if let Some(cosine) = entity.provenance.cosine {
+        evidence["seed_cosine"] = json!(cosine);
+    }
+    evidence
+}
+
 /// POST /mcp/tools/call — execute an MCP tool against daemon-owned graph state.
 ///
 /// MCP stdio processes are transport shims only. They forward graph-backed
@@ -4400,6 +4492,11 @@ fn build_semantic_locate_result(
     let mut rows: Vec<serde_json::Value> = Vec::with_capacity(page_size);
     let mut seen_files: HashSet<String> = HashSet::new();
     let mut seen_entities: HashSet<String> = HashSet::new();
+    // Constant across the page and reported per hit in `match_evidence`: whether
+    // the opt-in re-rank reordered `raw` above, and whether the query is itself
+    // about test code (so Test-role hits are not treated as demoted).
+    let rerank_active = semloc_rerank_enabled();
+    let is_test_query = semloc_query_is_test_related(&query);
     for (key, distance) in raw {
         if rows.len() >= max_rows {
             break;
@@ -4467,6 +4564,12 @@ fn build_semantic_locate_result(
             kin_db::ResolvedRetrievalItem::Entity(entity) => entity.span.as_ref(),
             _ => None,
         };
+        let role = match &item {
+            kin_db::ResolvedRetrievalItem::Entity(entity) => Some(entity.role),
+            _ => None,
+        };
+        let match_evidence =
+            cosine_match_evidence(&query, &name, role, rerank_active, is_test_query);
         let mut hit = json!({
             "entity_id": entity_id,
             "kind": kind,
@@ -4474,6 +4577,7 @@ fn build_semantic_locate_result(
             "signature": signature,
             "score": score,
             "provenance": { "file": file },
+            "match_evidence": match_evidence,
         });
         if let Some(span) = span {
             hit["start_line"] = json!(span.start_line);
@@ -4560,6 +4664,21 @@ fn fused_semantic_locate_payload(
     payload.insert("routing".to_string(), json!("fused-v1"));
     if let Some(coverage) = coverage_detail {
         payload.insert("semantic_coverage_detail".to_string(), json!(coverage));
+    }
+
+    // Attach the additive per-hit `match_evidence` to each serialized entity,
+    // derived from the fused signals the `LocateEntity` already carries. The
+    // serialized `entities` array is built from `result.entities`, so a
+    // positional zip stays aligned and preserves the fused ranking order.
+    if let Some(serde_json::Value::Array(entity_values)) = payload.get_mut("entities") {
+        for (slot, entity) in entity_values.iter_mut().zip(result.entities.iter()) {
+            if let serde_json::Value::Object(map) = slot {
+                map.insert(
+                    "match_evidence".to_string(),
+                    fused_match_evidence(query, entity),
+                );
+            }
+        }
     }
 
     match serde_json::to_string_pretty(&serde_json::Value::Object(payload)) {
@@ -4979,14 +5098,16 @@ async fn mcp_tools_call(
     }
 
     // R14 — `semantic_locate`: serve the agent's primary retrieval tool from
-    // the daemon's real pipelines. Under the accuracy profile (default) this
-    // is the SAME fused multi-signal ranking `POST /locate` serves — vector,
-    // lexical, and graph fusion with role-aware ranking — so the MCP surface
-    // is no longer a weaker single-vector shadow of the product ranker. The
-    // legacy cosine ranking stays reachable via `KIN_PROFILE=compat-v0` or a
-    // per-call `pipeline: "cosine"` argument for A/B comparison. Both paths
-    // return partial results plus `semantic_coverage` rather than hard-gating
-    // on full embedding coverage (graceful degradation per R5).
+    // the daemon's real pipelines. A stock daemon serves the legacy single-vector
+    // cosine ranking by default (the compat-v0 profile). The SAME fused
+    // multi-signal ranking `POST /locate` serves — vector, lexical, and graph
+    // fusion with role-aware ranking — is opt-in via `KIN_PROFILE=accuracy-v1`
+    // or a per-call `pipeline: "fused"` argument, so the richer product ranker is
+    // reachable without changing the default serving behavior. The legacy cosine
+    // ranking is also forceable per call with `pipeline: "cosine"` for A/B
+    // comparison. Both paths return partial results plus `semantic_coverage`
+    // rather than hard-gating on full embedding coverage (graceful degradation
+    // per R5).
     if request.name == "semantic_locate" {
         let pipeline_override = request
             .arguments
@@ -7739,6 +7860,182 @@ mod tests {
                 < 1e-6
         );
         assert!((semloc_rerank_priority(None, "X", q, false, 0.30) - 0.30).abs() < 1e-6);
+    }
+
+    #[test]
+    fn semloc_name_match_classifies_exact_partial_none() {
+        // A query token equal to the whole name is exact.
+        assert_eq!(semloc_name_match("find the Detector", "Detector"), "exact");
+        // A qualified name matches on its last dotted segment.
+        assert_eq!(
+            semloc_name_match("constant Raspbian", "constant.Raspbian"),
+            "exact"
+        );
+        // Shared snake-case token, but no whole-name token match -> partial.
+        assert_eq!(
+            semloc_name_match("parse the request body", "parse_request"),
+            "partial"
+        );
+        // No shared token -> none.
+        assert_eq!(semloc_name_match("configure logging", "Detector"), "none");
+        // Empty name is never a match.
+        assert_eq!(semloc_name_match("anything", ""), "none");
+        // Deterministic across repeated calls.
+        for _ in 0..100 {
+            assert_eq!(
+                semloc_name_match("parse the request body", "parse_request"),
+                "partial"
+            );
+        }
+    }
+
+    #[test]
+    fn cosine_match_evidence_is_deterministic_and_gates_rerank_signals() {
+        use kin_model::EntityRole;
+        // Re-rank OFF (the shipped default): stable base fields, role echoed, and
+        // NO rerank_signals object (the boost/demotion did not affect ordering).
+        let off = cosine_match_evidence(
+            "find Detector",
+            "Detector",
+            Some(EntityRole::Source),
+            false,
+            false,
+        );
+        assert_eq!(off["ranker"], json!("cosine-v0"));
+        assert_eq!(off["score_source"], json!("vector_cosine"));
+        assert_eq!(off["name_match"], json!("exact"));
+        assert_eq!(off["role"], json!("source"));
+        assert_eq!(off["reranked"], json!(false));
+        assert!(off.get("rerank_signals").is_none());
+
+        // Re-rank ON: signals present. A Test-role hit on a non-test query is
+        // demoted, and an exact-name match records the boost that fired.
+        let on = cosine_match_evidence(
+            "find Detector",
+            "Detector",
+            Some(EntityRole::Test),
+            true,
+            false,
+        );
+        assert_eq!(on["reranked"], json!(true));
+        assert_eq!(on["rerank_signals"]["role_demoted"], json!(true));
+        assert_eq!(on["rerank_signals"]["exact_name_boost"], json!(true));
+
+        // A test-related query must NOT demote a Test-role hit.
+        let test_q = cosine_match_evidence(
+            "test Detector",
+            "Detector",
+            Some(EntityRole::Test),
+            true,
+            true,
+        );
+        assert_eq!(test_q["rerank_signals"]["role_demoted"], json!(false));
+
+        // A non-entity hit (no role) omits the role field but is still well-formed.
+        let no_role = cosine_match_evidence("find Detector", "Detector", None, false, false);
+        assert!(no_role.get("role").is_none());
+        assert_eq!(no_role["ranker"], json!("cosine-v0"));
+
+        // Deterministic across repeated calls.
+        for _ in 0..50 {
+            assert_eq!(
+                cosine_match_evidence(
+                    "find Detector",
+                    "Detector",
+                    Some(EntityRole::Source),
+                    false,
+                    false
+                ),
+                off
+            );
+        }
+    }
+
+    #[test]
+    fn fused_match_evidence_derives_from_locate_entity() {
+        use kin_cli::commands::locate::{LocateEntity, LocateProvenance};
+        let with_explain = LocateEntity {
+            entity_id: "e1".into(),
+            kind: "function".into(),
+            name: "parse_request".into(),
+            signature: String::new(),
+            score: 0.9,
+            definition: true,
+            span: None,
+            body: None,
+            provenance: LocateProvenance {
+                file: Some("src/lib.rs".into()),
+                origin: "vector".into(),
+                cosine: Some(0.42),
+            },
+        };
+        let ev = fused_match_evidence("parse the request", &with_explain);
+        assert_eq!(ev["ranker"], json!("fused-v1"));
+        assert_eq!(ev["score_source"], json!("fused_composite"));
+        assert_eq!(ev["name_match"], json!("partial"));
+        assert_eq!(ev["definition"], json!(true));
+        assert_eq!(ev["resolution_origin"], json!("vector"));
+        let seed = ev["seed_cosine"].as_f64().expect("seed_cosine is a number");
+        assert!((seed - 0.42).abs() < 1e-6, "seed_cosine ~ 0.42, got {seed}");
+
+        // Without --explain provenance, origin/cosine are omitted (additive-only).
+        let plain = LocateEntity {
+            provenance: LocateProvenance {
+                file: Some("src/lib.rs".into()),
+                origin: String::new(),
+                cosine: None,
+            },
+            ..with_explain
+        };
+        let ev2 = fused_match_evidence("parse the request", &plain);
+        assert!(ev2.get("resolution_origin").is_none());
+        assert!(ev2.get("seed_cosine").is_none());
+        assert_eq!(ev2["definition"], json!(true));
+    }
+
+    #[test]
+    fn fused_payload_attaches_match_evidence_additively_and_in_order() {
+        use kin_cli::commands::locate::{LocateEntity, LocateProvenance, LocateResult};
+        let mk = |id: &str, name: &str| LocateEntity {
+            entity_id: id.into(),
+            kind: "function".into(),
+            name: name.into(),
+            signature: "fn x()".into(),
+            score: 0.5,
+            definition: true,
+            span: Some([1, 2]),
+            body: None,
+            provenance: LocateProvenance {
+                file: Some("f.rs".into()),
+                origin: String::new(),
+                cosine: None,
+            },
+        };
+        let result = LocateResult {
+            entities: vec![mk("a", "alpha"), mk("b", "beta")],
+            ..Default::default()
+        };
+        let tool = fused_semantic_locate_payload(result, "alpha", false);
+        let payload: serde_json::Value = serde_json::from_str(
+            tool_result_json(&tool)["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let entities = payload["entities"].as_array().unwrap();
+        assert_eq!(entities.len(), 2);
+        // Fused ranking order is preserved by the positional zip.
+        assert_eq!(entities[0]["entity_id"], json!("a"));
+        assert_eq!(entities[1]["entity_id"], json!("b"));
+        // Pre-existing keys are intact and match_evidence is purely additive.
+        for entity in entities {
+            assert!(entity.get("entity_id").is_some());
+            assert!(entity.get("kind").is_some());
+            assert!(entity.get("name").is_some());
+            assert!(entity.get("score").is_some());
+            assert_eq!(entity["match_evidence"]["ranker"], json!("fused-v1"));
+        }
+        assert_eq!(payload["routing"], json!("fused-v1"));
     }
 
     fn tool_result_json(result: &kin_mcp::ToolCallResult) -> serde_json::Value {
