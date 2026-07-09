@@ -19302,29 +19302,42 @@ mod tests {
             hit(1.0),
         )])];
 
+        // Compare a capped result against an expected ratio-of-`top_score`
+        // with a float tolerance: the cap is a product, not a literal constant.
+        fn assert_cap_approx(actual: Option<f32>, top_score: f32, ratio: f32, msg: &str) {
+            let actual = actual.unwrap_or_else(|| panic!("{msg}: expected a cap, got None"));
+            let expected = top_score * ratio;
+            assert!(
+                (actual - expected).abs() < 1e-4,
+                "{msg}: {actual} vs {expected}"
+            );
+        }
+
         // Construction-shaped query: both the "pass" and "expr" buckets are
         // in play.
         let construction_text = "Fix return checking in constructors.";
 
-        assert_eq!(
+        assert_cap_approx(
             semantic_phase_distractor_cap(
                 construction_text,
                 "engine/pass/lower.rs",
                 10.0,
                 &all_hits,
             ),
-            Some(6.5),
-            "an unsupported pass-bucket file must be capped for a construction query"
+            10.0,
+            SEMANTIC_PHASE_DISTRACTOR_CONSTRUCTION_CAP_RATIO,
+            "an unsupported pass-bucket file must be capped for a construction query",
         );
-        assert_eq!(
+        assert_cap_approx(
             semantic_phase_distractor_cap(
                 construction_text,
                 "engine/expr/closure.rs",
                 10.0,
                 &all_hits,
             ),
-            Some(6.5),
-            "an unsupported expr-bucket file must be capped for a construction query"
+            10.0,
+            SEMANTIC_PHASE_DISTRACTOR_CONSTRUCTION_CAP_RATIO,
+            "an unsupported expr-bucket file must be capped for a construction query",
         );
         assert_eq!(
             semantic_phase_distractor_cap(
@@ -19354,10 +19367,11 @@ mod tests {
 
         // Lambda-shaped query: only the "expr" bucket is in play.
         let lambda_text = "Handle lambda captures directly.";
-        assert_eq!(
-            semantic_phase_distractor_cap(lambda_text, "engine/expr/closure.rs", 10.0, &all_hits,),
-            Some(5.8),
-            "an unsupported expr-bucket file must be capped for a lambda query"
+        assert_cap_approx(
+            semantic_phase_distractor_cap(lambda_text, "engine/expr/closure.rs", 10.0, &all_hits),
+            10.0,
+            SEMANTIC_PHASE_DISTRACTOR_LAMBDA_CAP_RATIO,
+            "an unsupported expr-bucket file must be capped for a lambda query",
         );
         assert_eq!(
             semantic_phase_distractor_cap(lambda_text, "engine/pass/lower.rs", 10.0, &all_hits,),
