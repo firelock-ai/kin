@@ -6831,6 +6831,85 @@ fn recall_staleness_rank(s: StalenessState) -> u8 {
 }
 
 impl InMemoryGraph {
+    /// Register an ordered batch of semantic changes with one acquisition of
+    /// the entity, change-DAG, and pending-delta locks.
+    ///
+    /// Hydration imports changes oldest-first. Calling [`ChangeStore::create_change`]
+    /// for each item repeatedly acquires the same locks and clones every change
+    /// twice (once for live state and once for the pending snapshot delta). This
+    /// owned batch path preserves the exact input order while moving each change
+    /// into live state and cloning it only for the pending delta.
+    ///
+    /// The method is intentionally inherent rather than part of `ChangeStore`:
+    /// batch import is a KinDB capability, while generic stores can continue to
+    /// use the portable one-change trait method.
+    pub fn create_changes(&self, changes: Vec<SemanticChange>) -> Result<(), KinDbError> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+
+        // Domain lock order is part of InMemoryGraph's deadlock contract:
+        // entities -> changes. Holding both makes a batch appear as one ordered
+        // import to readers instead of exposing a partially registered DAG.
+        let mut ent = self.entities.write();
+        let mut chg = self.changes.write();
+        let mut pending = self.pending_delta.lock();
+
+        let mut touched_entities = Vec::new();
+        let mut seen_entities = HashSet::new();
+        let mut touched_parents = Vec::new();
+        let mut seen_parents = HashSet::new();
+        let mut superseded_revisions = Vec::new();
+
+        for change in changes {
+            superseded_revisions.extend(append_entity_revisions(&mut ent, &change));
+            for entity_id in change.entity_deltas.iter().map(|delta| match delta {
+                EntityDelta::Added(entity) | EntityDelta::Modified { new: entity, .. } => entity.id,
+                EntityDelta::Removed(id) => *id,
+            }) {
+                if seen_entities.insert(entity_id) {
+                    touched_entities.push(entity_id);
+                }
+            }
+
+            for parent in &change.parents {
+                let children = chg.change_children.entry(*parent).or_default();
+                children.push(change.id);
+                if seen_parents.insert(*parent) {
+                    touched_parents.push(*parent);
+                }
+            }
+
+            let change_id = change.id;
+            // The pending delta and live graph both own the change. Clone once
+            // for the delta, then move the original into the graph.
+            delta_map_upsert(&mut pending.delta.changes, change_id, change.clone());
+            chg.changes.insert(change_id, change);
+        }
+
+        // Sequential create_change updates the same pending-delta entry on
+        // every occurrence. delta_map_upsert retains the first insertion slot
+        // and replaces its value, so recording each entity/parent once with its
+        // final batch state is byte-equivalent while avoiding repeated clones.
+        for entity_id in touched_entities {
+            if let Some(revisions) = ent.entity_revisions.get(&entity_id).cloned() {
+                delta_map_upsert(&mut pending.delta.entity_revisions, entity_id, revisions);
+            }
+        }
+        for parent in touched_parents {
+            if let Some(children) = chg.change_children.get(&parent).cloned() {
+                delta_map_upsert(&mut pending.delta.change_children, parent, children);
+            }
+        }
+
+        #[cfg(feature = "vector")]
+        self.note_superseded_vectors(&superseded_revisions);
+        #[cfg(not(feature = "vector"))]
+        let _ = superseded_revisions;
+
+        Ok(())
+    }
+
     /// Capture a rename-durable [`SemanticAnchor`] for an annotation from the
     /// first live entity scope it carries.
     ///
@@ -8307,6 +8386,7 @@ mod tests {
                 ast_hash: Hash256::from_bytes([0; 32]),
                 signature_hash: Hash256::from_bytes([0; 32]),
                 behavior_hash: Hash256::from_bytes([0; 32]),
+                equivalence_hash: Hash256::from_bytes([0; 32]),
                 stability_score: 1.0,
             },
             file_origin: Some(FilePathId::new(file)),
@@ -9320,6 +9400,118 @@ mod tests {
         let since = graph.get_changes_since(&genesis_id, &child_id).unwrap();
         assert_eq!(since.len(), 1);
         assert_eq!(since[0].message, "child");
+    }
+
+    #[test]
+    fn create_changes_batch_matches_sequential_state_and_delta_bytes() {
+        let sequential = InMemoryGraph::new();
+        let batched = InMemoryGraph::new();
+
+        let original = test_entity("target", "src/lib.rs");
+        let mut modified = original.clone();
+        modified.signature = "fn target(value: usize)".to_string();
+        modified.fingerprint.signature_hash = Hash256::from_bytes([0x44; 32]);
+
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32]));
+        let first_child_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x22; 32]));
+        let second_child_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x33; 32]));
+        let timestamp = Timestamp::now();
+        let changes = vec![
+            SemanticChange {
+                id: genesis_id,
+                parents: vec![],
+                timestamp: timestamp.clone(),
+                author: AuthorId::new("test"),
+                message: "genesis".to_string(),
+                entity_deltas: vec![EntityDelta::Added(original.clone())],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            },
+            SemanticChange {
+                id: first_child_id,
+                parents: vec![genesis_id],
+                timestamp: timestamp.clone(),
+                author: AuthorId::new("test"),
+                message: "modify target".to_string(),
+                entity_deltas: vec![EntityDelta::Modified {
+                    old: original.clone(),
+                    new: modified,
+                }],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            },
+            SemanticChange {
+                id: second_child_id,
+                parents: vec![genesis_id],
+                timestamp,
+                author: AuthorId::new("test"),
+                message: "sibling".to_string(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            },
+        ];
+
+        for change in &changes {
+            sequential.create_change(change).unwrap();
+        }
+        batched.create_changes(changes).unwrap();
+
+        let sequential_snapshot = sequential.to_snapshot();
+        let batched_snapshot = batched.to_snapshot();
+        assert_eq!(
+            compute_graph_root_hash(&sequential_snapshot),
+            compute_graph_root_hash(&batched_snapshot),
+            "batch registration must preserve the canonical graph root"
+        );
+        assert_eq!(
+            sequential_snapshot.change_children.get(&genesis_id),
+            Some(&vec![first_child_id, second_child_id]),
+        );
+        assert_eq!(
+            batched_snapshot.change_children.get(&genesis_id),
+            sequential_snapshot.change_children.get(&genesis_id),
+            "parent-child registration must preserve input order"
+        );
+        assert_eq!(
+            batched_snapshot
+                .entity_revisions
+                .get(&original.id)
+                .map(Vec::len),
+            Some(2),
+            "batch registration must retain the complete revision lineage"
+        );
+
+        let sequential_delta = sequential.pending_delta_snapshot(0).unwrap();
+        let batched_delta = batched.pending_delta_snapshot(0).unwrap();
+        assert_eq!(
+            sequential_delta.to_bytes().unwrap(),
+            batched_delta.to_bytes().unwrap(),
+            "batch and sequential writes must emit byte-identical snapshot deltas"
+        );
+    }
+
+    #[test]
+    fn create_changes_empty_batch_is_a_noop() {
+        let graph = InMemoryGraph::new();
+        graph.create_changes(Vec::new()).unwrap();
+        assert!(!graph.has_pending_delta());
+        assert!(graph.to_snapshot().changes.is_empty());
     }
 
     #[test]
