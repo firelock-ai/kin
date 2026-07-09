@@ -21,6 +21,7 @@ fn test_fingerprint() -> SemanticFingerprint {
         ast_hash: Hash256::from_bytes([0; 32]),
         signature_hash: Hash256::from_bytes([0; 32]),
         behavior_hash: Hash256::from_bytes([0; 32]),
+        equivalence_hash: Hash256::from_bytes([0; 32]),
         algorithm: FingerprintAlgorithm::V1TreeSitter,
         stability_score: 1.0,
     }

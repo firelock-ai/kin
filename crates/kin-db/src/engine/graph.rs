@@ -934,6 +934,59 @@ where
     delta.modified.push((key, value));
 }
 
+#[derive(Clone, Copy)]
+enum DeltaMapSlot {
+    Added(usize),
+    Modified(usize),
+}
+
+/// Apply many map-delta upserts with one key-to-slot index build.
+///
+/// `delta_map_upsert` deliberately preserves the first vector position for a
+/// key, but finding that position with a linear scan for every item makes a
+/// history-sized batch quadratic. This helper indexes the existing `added` and
+/// `modified` slots once, retains the same added-before-modified lookup
+/// semantics, and removes restored keys from `removed` in one stable pass.
+fn delta_map_upsert_batch<K, V>(delta: &mut CollectionDelta<K, V>, updates: Vec<(K, V)>)
+where
+    K: Eq + std::hash::Hash + Clone,
+{
+    if updates.is_empty() {
+        return;
+    }
+
+    let mut slots =
+        HashMap::with_capacity(delta.added.len() + delta.modified.len() + updates.len());
+    for (index, (key, _)) in delta.added.iter().enumerate() {
+        slots
+            .entry(key.clone())
+            .or_insert(DeltaMapSlot::Added(index));
+    }
+    for (index, (key, _)) in delta.modified.iter().enumerate() {
+        slots
+            .entry(key.clone())
+            .or_insert(DeltaMapSlot::Modified(index));
+    }
+
+    let mut restored = HashSet::with_capacity(updates.len());
+    for (key, value) in updates {
+        restored.insert(key.clone());
+        match slots.get(&key).copied() {
+            Some(DeltaMapSlot::Added(index)) => delta.added[index].1 = value,
+            Some(DeltaMapSlot::Modified(index)) => delta.modified[index].1 = value,
+            None => {
+                let index = delta.modified.len();
+                delta.modified.push((key.clone(), value));
+                slots.insert(key, DeltaMapSlot::Modified(index));
+            }
+        }
+    }
+
+    // `retain` preserves the relative order of every unrelated removal, exactly
+    // matching repeated `delta_map_upsert` calls without rescanning the vector.
+    delta.removed.retain(|key| !restored.contains(key));
+}
+
 fn delta_map_remove<K, V>(delta: &mut CollectionDelta<K, V>, key: K)
 where
     K: Eq + Clone,
@@ -1114,10 +1167,23 @@ impl<K: Eq + std::hash::Hash + Copy> RecencyQueue<K> {
     /// higher-priority (lower) recency so a live change is never demoted to
     /// backfill by a subsequent bulk re-queue.
     fn insert(&mut self, key: K, recency: EmbedRecency) {
+        self.insert_inner(key, recency, false);
+    }
+
+    /// Enqueue work after a graph mutation that may have changed the key's
+    /// tier or centrality. Even when membership and recency are unchanged, a
+    /// cached entity frontier must be rebuilt against the new graph facts.
+    fn insert_graph_priority_changed(&mut self, key: K, recency: EmbedRecency) {
+        self.insert_inner(key, recency, true);
+    }
+
+    fn insert_inner(&mut self, key: K, recency: EmbedRecency, graph_priority_changed: bool) {
         match self.items.entry(key) {
             hashbrown::hash_map::Entry::Occupied(mut entry) => {
                 if recency < *entry.get() {
                     *entry.get_mut() = recency;
+                    self.frontier_dirty = true;
+                } else if graph_priority_changed {
                     self.frontier_dirty = true;
                 }
             }
@@ -2638,7 +2704,7 @@ impl InMemoryGraph {
         // as `ChangedThisSync` (the highest recency tier) rather than backfill.
         let mut queue = self.embedding_queue.lock();
         for entity_id in &unique_ids {
-            queue.insert(
+            queue.insert_graph_priority_changed(
                 RetrievalKey::Entity(*entity_id),
                 EmbedRecency::ChangedThisSync,
             );
@@ -6894,6 +6960,7 @@ impl InMemoryGraph {
         let mut touched_parents = Vec::new();
         let mut seen_parents = HashSet::new();
         let mut superseded_revisions = Vec::new();
+        let mut pending_changes = Vec::with_capacity(changes.len());
 
         for change in changes {
             superseded_revisions.extend(append_entity_revisions(&mut ent, &change));
@@ -6901,7 +6968,11 @@ impl InMemoryGraph {
                 EntityDelta::Added(entity) | EntityDelta::Modified { new: entity, .. } => entity.id,
                 EntityDelta::Removed(id) => *id,
             }) {
-                if seen_entities.insert(entity_id) {
+                // Sequential create_change records the first delta slot only
+                // once a revision chain exists. A removal before an add has no
+                // chain yet and therefore must not claim the earlier slot.
+                if ent.entity_revisions.contains_key(&entity_id) && seen_entities.insert(entity_id)
+                {
                     touched_entities.push(entity_id);
                 }
             }
@@ -6917,24 +6988,38 @@ impl InMemoryGraph {
             let change_id = change.id;
             // The pending delta and live graph both own the change. Clone once
             // for the delta, then move the original into the graph.
-            delta_map_upsert(&mut pending.delta.changes, change_id, change.clone());
+            pending_changes.push((change_id, change.clone()));
             chg.changes.insert(change_id, change);
         }
 
+        delta_map_upsert_batch(&mut pending.delta.changes, pending_changes);
+
         // Sequential create_change updates the same pending-delta entry on
-        // every occurrence. delta_map_upsert retains the first insertion slot
-        // and replaces its value, so recording each entity/parent once with its
-        // final batch state is byte-equivalent while avoiding repeated clones.
-        for entity_id in touched_entities {
-            if let Some(revisions) = ent.entity_revisions.get(&entity_id).cloned() {
-                delta_map_upsert(&mut pending.delta.entity_revisions, entity_id, revisions);
-            }
-        }
-        for parent in touched_parents {
-            if let Some(children) = chg.change_children.get(&parent).cloned() {
-                delta_map_upsert(&mut pending.delta.change_children, parent, children);
-            }
-        }
+        // every occurrence. The indexed batch helper retains the first
+        // insertion slot and replaces its value, so recording each
+        // entity/parent once with its final batch state is byte-equivalent while
+        // avoiding repeated clones and repeated linear scans.
+        let revision_updates = touched_entities
+            .into_iter()
+            .filter_map(|entity_id| {
+                ent.entity_revisions
+                    .get(&entity_id)
+                    .cloned()
+                    .map(|revisions| (entity_id, revisions))
+            })
+            .collect();
+        delta_map_upsert_batch(&mut pending.delta.entity_revisions, revision_updates);
+
+        let child_updates = touched_parents
+            .into_iter()
+            .filter_map(|parent| {
+                chg.change_children
+                    .get(&parent)
+                    .cloned()
+                    .map(|children| (parent, children))
+            })
+            .collect();
+        delta_map_upsert_batch(&mut pending.delta.change_children, child_updates);
 
         #[cfg(feature = "vector")]
         self.note_superseded_vectors(&superseded_revisions);
@@ -9537,6 +9622,143 @@ mod tests {
             sequential_delta.to_bytes().unwrap(),
             batched_delta.to_bytes().unwrap(),
             "batch and sequential writes must emit byte-identical snapshot deltas"
+        );
+    }
+
+    #[test]
+    fn create_changes_remove_before_add_matches_sequential_delta_bytes() {
+        let sequential = InMemoryGraph::new();
+        let batched = InMemoryGraph::new();
+        let removed_then_added = test_entity("late", "src/late.rs");
+        let other = test_entity("other", "src/other.rs");
+        let timestamp = Timestamp::now();
+        let make_change =
+            |id_byte: u8, message: &str, entity_deltas: Vec<EntityDelta>| SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
+                parents: vec![],
+                timestamp: timestamp.clone(),
+                author: AuthorId::new("test"),
+                message: message.to_string(),
+                entity_deltas,
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            };
+        let changes = vec![
+            make_change(
+                0x41,
+                "remove before history is available",
+                vec![EntityDelta::Removed(removed_then_added.id)],
+            ),
+            make_change(
+                0x42,
+                "add another entity first",
+                vec![EntityDelta::Added(other)],
+            ),
+            make_change(
+                0x43,
+                "add the previously removed entity",
+                vec![EntityDelta::Added(removed_then_added)],
+            ),
+        ];
+
+        for change in &changes {
+            sequential.create_change(change).unwrap();
+        }
+        batched.create_changes(changes).unwrap();
+
+        assert_eq!(
+            sequential
+                .pending_delta_snapshot(0)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            batched
+                .pending_delta_snapshot(0)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            "batch registration must preserve sequential delta slot order even when a removal precedes an add"
+        );
+    }
+
+    #[test]
+    fn delta_map_upsert_batch_preserves_sequential_slots_and_removals() {
+        let base = CollectionDelta {
+            added: vec![(1u64, 10u64)],
+            modified: vec![(2, 20)],
+            removed: vec![3, 4],
+        };
+        let updates = vec![(2, 21), (1, 11), (3, 30), (5, 50), (5, 51)];
+        let mut sequential = base.clone();
+        let mut batched = base;
+
+        for (key, value) in &updates {
+            delta_map_upsert(&mut sequential, *key, *value);
+        }
+        delta_map_upsert_batch(&mut batched, updates);
+
+        assert_eq!(
+            rmp_serde::to_vec(&sequential).unwrap(),
+            rmp_serde::to_vec(&batched).unwrap(),
+            "indexed upserts must preserve added/modified slot precedence and stable removal order"
+        );
+    }
+
+    #[test]
+    fn delta_map_upsert_batch_uses_linear_key_comparisons() {
+        #[derive(Clone)]
+        struct CountingKey {
+            value: usize,
+            comparisons: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl PartialEq for CountingKey {
+            fn eq(&self, other: &Self) -> bool {
+                self.comparisons
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.value == other.value
+            }
+        }
+
+        impl Eq for CountingKey {}
+
+        impl std::hash::Hash for CountingKey {
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                std::hash::Hash::hash(&self.value, state);
+            }
+        }
+
+        let count = 2_048usize;
+        let comparisons = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let key = |value| CountingKey {
+            value,
+            comparisons: std::sync::Arc::clone(&comparisons),
+        };
+        let mut delta = CollectionDelta::<CountingKey, usize>::default();
+        delta.modified = (0..count).map(|value| (key(value), value)).collect();
+        let updates = (0..count)
+            .map(|value| (key(value), value + count))
+            .collect();
+
+        comparisons.store(0, std::sync::atomic::Ordering::Relaxed);
+        delta_map_upsert_batch(&mut delta, updates);
+        let observed = comparisons.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert!(
+            observed < count * 32,
+            "indexed batch upsert must stay linear-ish; observed {observed} key comparisons for {count} updates"
+        );
+        assert!(
+            delta
+                .modified
+                .iter()
+                .all(|(key, value)| *value == key.value + count),
+            "every existing slot must be updated in place"
         );
     }
 
@@ -12650,6 +12872,36 @@ mod tests {
         g.upsert_entity(&api).unwrap();
         let next = g.drain_embedding_batch(1);
         assert_eq!(next[0].0, RetrievalKey::Entity(api.id));
+        assert_eq!(g.embedding_queue.lock().frontier_rebuilds, 2);
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn embedding_frontier_rebuilds_when_existing_key_graph_priority_changes() {
+        let g = InMemoryGraph::new();
+        let mut first = test_entity_with_id(0x91, "first");
+        first.visibility = Visibility::Private;
+        let mut second = test_entity_with_id(0x92, "second");
+        second.visibility = Visibility::Private;
+        let mut promoted = test_entity_with_id(0x93, "promoted");
+        promoted.visibility = Visibility::Private;
+        g.upsert_entity(&first).unwrap();
+        g.upsert_entity(&second).unwrap();
+        g.upsert_entity(&promoted).unwrap();
+
+        let first_batch = g.drain_embedding_batch(1);
+        assert_eq!(first_batch[0].0, RetrievalKey::Entity(first.id));
+        assert_eq!(g.embedding_queue.lock().frontier_rebuilds, 1);
+
+        // `promoted` is already queued as ChangedThisSync. Its mutation keeps
+        // the same membership and recency but changes the graph-derived tier,
+        // so the cached remainder must still be invalidated.
+        promoted.visibility = Visibility::Public;
+        promoted.kind = EntityKind::Interface;
+        g.upsert_entity(&promoted).unwrap();
+
+        let next = g.drain_embedding_batch(1);
+        assert_eq!(next[0].0, RetrievalKey::Entity(promoted.id));
         assert_eq!(g.embedding_queue.lock().frontier_rebuilds, 2);
     }
 
