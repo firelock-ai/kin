@@ -276,6 +276,15 @@
           }
         }
       }
+    },
+    "range_depth": {
+      "type": "object",
+      "required": ["in_range_changes", "deep_history_threshold", "is_deep_history"],
+      "properties": {
+        "in_range_changes": { "type": "number" },
+        "deep_history_threshold": { "type": "number" },
+        "is_deep_history": { "type": "boolean" }
+      }
     }
   }
 }

@@ -165,6 +165,46 @@ fn run_shadow_json(repo: &Path, base: &str, head: &str) -> Value {
     serde_json::from_slice(&output.stdout).expect("shadow report must be valid JSON on stdout")
 }
 
+/// Every shadow report stamps `range_depth` provenance (T1b): the raw in-range
+/// change count, the documented threshold, and whether the range is deep. The
+/// count is always present and threshold-independent; the threshold gates only
+/// the non-demoting `deep_history_impact_ceiling` gap, which a shallow fixture
+/// range like this one never carries. Proves the additive field survives the
+/// real CLI JSON serialization end to end.
+#[test]
+fn shadow_report_stamps_range_depth_provenance() {
+    let dir = tempdir().expect("tempdir");
+    let repo = dir.path();
+    let (base, head, _artifact_head) = setup_fixture_repo(repo);
+    kin_init(repo);
+
+    let report = run_shadow_json(repo, &base, &head);
+
+    let range_depth = report
+        .get("range_depth")
+        .expect("shadow report must stamp range_depth provenance");
+    assert!(
+        range_depth["in_range_changes"].as_u64().is_some(),
+        "range_depth.in_range_changes must be a present count: {range_depth}"
+    );
+    assert_eq!(
+        range_depth["deep_history_threshold"].as_u64(),
+        Some(1000),
+        "range_depth records the documented deep-history threshold"
+    );
+    assert_eq!(
+        range_depth["is_deep_history"].as_bool(),
+        Some(false),
+        "a shallow two-commit range must not be flagged deep-history"
+    );
+    let gaps = report["evidence_gaps"].as_array().unwrap();
+    assert!(
+        gaps.iter()
+            .all(|gap| gap["kind"] != "deep_history_impact_ceiling"),
+        "a shallow range must not attribute a deep-history ceiling: {gaps:?}"
+    );
+}
+
 #[test]
 fn shadow_report_end_to_end_change_in_report_out() {
     let dir = tempdir().expect("tempdir");
