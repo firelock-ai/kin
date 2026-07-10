@@ -1601,14 +1601,28 @@ impl SnapshotManager {
         let full_snapshot = graph.full_snapshot_required() || !path.exists();
         let generation = Self::save_graph_delta(&path, graph, base_generation)?;
         if !full_snapshot {
-            // The graph delta (the authority) is already on disk. Persist the
-            // derived vector sidecar only once the embed queue has drained;
-            // while a bulk run is still in flight the sidecar save is deferred,
-            // and any vectors missing from a mid-run snapshot are re-derived
-            // from the graph-vs-index diff on reopen.
+            // The graph delta (the authority) is already on disk. The derived
+            // vector sidecar is a full O(index) serialize, so it is written on a
+            // throttle rather than every batch:
+            //   - queue drained  -> always write (the completion checkpoint) and
+            //     reset the throttle so the next run's first batch checkpoints;
+            //   - still draining  -> write on the throttle (first batch, then
+            //     every interval / batch backstop, whichever fires first) so
+            //     persisted coverage tracks compute and a persisted-progress
+            //     watchdog sees forward motion, without paying the full serialize
+            //     every batch.
+            // A checkpoint written mid-run is stamped with the graph root hash, so
+            // a reopen loads the covered vectors and re-derives only the remainder
+            // from the graph-vs-index diff (resume), instead of re-embedding all.
             let embedding_in_flight =
                 graph.pending_embeddings() > 0 || graph.pending_artifact_embeddings() > 0;
-            if !embedding_in_flight {
+            let write_sidecar = if embedding_in_flight {
+                graph.should_flush_vector_sidecar_now()
+            } else {
+                graph.reset_vector_sidecar_flush_throttle();
+                true
+            };
+            if write_sidecar {
                 Self::save_vector_index_for_graph(&path, graph, embedder_identity)?;
             }
         }
@@ -2864,7 +2878,7 @@ mod tests {
     /// `incremental_kvec_persist_survives_crash_with_graph_intact` above.
     #[test]
     #[cfg(feature = "vector")]
-    fn flush_embed_progress_mid_bulk_crash_rederives_from_graph_truth() {
+    fn flush_embed_progress_mid_bulk_checkpoint_resumes_from_partial_on_reopen() {
         let dir = TempDir::new().unwrap();
         let snapshot_path = dir.path().join("graph.kndb");
         let vector_path = vector_index_path_for(&snapshot_path);
@@ -2898,31 +2912,35 @@ mod tests {
             assert!(!outcome.full_snapshot);
             assert_eq!(outcome.generation, None);
             assert_eq!(outcome.status.total, 3);
+            // The first in-run flush checkpoints the covered vector durably.
             // `mgr` dropped here — models a process exit mid-bulk.
         }
 
-        // Cold reopen: the graph (authority) is intact, but the mid-bulk sidecar
-        // was never stamped, so no vectors are trusted and the full set is
-        // re-queued for a from-graph-truth re-derive.
+        // Cold reopen: the graph (authority) is intact, and the mid-bulk
+        // checkpoint is a valid stamped partial index for the current graph root,
+        // so its covered vector is TRUSTED (resume) while only the uncovered
+        // remainder is re-derived from the graph-vs-index diff — instead of
+        // re-embedding the whole repo from scratch.
         let reopened = SnapshotManager::open(&snapshot_path).unwrap();
         let graph = reopened.graph();
         assert_eq!(graph.entity_count(), 3);
         let status = graph.embedding_status();
         assert_eq!(
-            status.indexed, 0,
-            "a mid-bulk crash must not leave a half-stamped sidecar trusted on reopen"
+            status.indexed, 1,
+            "the stamped mid-bulk checkpoint must be trusted on reopen (resume, not restart)"
         );
         assert_eq!(status.total, 3);
         assert_eq!(
-            status.pending, 3,
-            "every entity must be re-queued so the embed re-derives from graph truth"
+            status.pending, 2,
+            "graph-vs-index truth must report only the uncovered remainder as pending"
         );
-        // Reopen skips the unstamped sidecar and actively re-queues the full set,
-        // so the next embed pass rebuilds the derived index from graph truth.
+        // The next embed pass re-queues exactly the uncovered remainder; the
+        // already-checkpointed vector is reused, never re-embedded.
+        graph.queue_missing_for_embedding();
         assert_eq!(
             graph.pending_embeddings(),
-            3,
-            "reopen must re-queue every entity for a from-graph-truth re-derive"
+            2,
+            "reopen must re-derive only the uncovered remainder, reusing the checkpoint"
         );
     }
 
@@ -2969,25 +2987,32 @@ mod tests {
         );
     }
 
-    /// While a bulk embed is still draining, `flush_embed_progress` persists the
-    /// graph delta but DEFERS the derived vector sidecar — the whole-index
-    /// canonicalization (held under the index write lock) is deferred to the
-    /// drain so it runs once at the end instead of on every progress flush.
+    /// While a bulk embed is still draining, `flush_embed_progress` checkpoints
+    /// the derived vector sidecar on a THROTTLE: the first in-run flush lands it
+    /// immediately (so persisted coverage tracks compute and a persisted-progress
+    /// watchdog sees forward motion), while an immediate follow-up flush is
+    /// throttled (so a long run does not re-serialize the whole O(index) sidecar
+    /// on every batch). This is the fix for the batch-boundary persist wedge,
+    /// where a fully-deferred sidecar froze persisted coverage for the whole run.
     #[test]
     #[cfg(feature = "vector")]
-    fn flush_embed_progress_defers_sidecar_while_embedding_pending() {
+    fn flush_embed_progress_throttles_sidecar_while_embedding_pending() {
         let dir = TempDir::new().unwrap();
         let snapshot_path = dir.path().join("graph.kndb");
         let vector_path = vector_index_path_for(&snapshot_path);
 
         let mgr = SnapshotManager::new(&snapshot_path);
         let graph = mgr.graph();
-        let entity = test_entity("needs_embedding");
-        graph.upsert_entity(&entity).unwrap();
+        let embedded = test_entity("already_embedded");
+        let pending = test_entity("still_pending");
+        graph.upsert_entity(&embedded).unwrap();
+        graph.upsert_entity(&pending).unwrap();
         mgr.save().unwrap();
 
-        // The entity has no vector yet, so it queues for embedding (mid-bulk).
+        // One entity is embedded; the other has no vector yet, so the embed is
+        // still in flight (mid-bulk).
         let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(embedded.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
         vectors.save(&vector_path).unwrap();
         graph.load_vector_index(&vector_path).unwrap();
         graph.queue_missing_for_embedding();
@@ -2996,7 +3021,23 @@ mod tests {
             "precondition: an embedding is still pending"
         );
 
-        // Remove the sidecar so a write would be observable, then flush.
+        // Remove the sidecar so a write is observable. The FIRST in-run flush
+        // must re-create it — persisted progress lands from the first batch.
+        std::fs::remove_file(&vector_path).unwrap();
+        let outcome =
+            SnapshotManager::flush_embed_progress(&snapshot_path, graph.as_ref(), 1, None).unwrap();
+        assert!(
+            !outcome.full_snapshot,
+            "precondition: incremental flush path"
+        );
+        assert!(
+            vector_path.exists(),
+            "the first in-run flush must checkpoint the sidecar so persisted tracks compute"
+        );
+
+        // Remove it again and flush immediately: within the throttle window (well
+        // under both the time interval and the batch backstop) the write is
+        // skipped, so a long run is not billed a full index serialize per batch.
         std::fs::remove_file(&vector_path).unwrap();
         let outcome =
             SnapshotManager::flush_embed_progress(&snapshot_path, graph.as_ref(), 1, None).unwrap();
@@ -3006,7 +3047,7 @@ mod tests {
         );
         assert!(
             !vector_path.exists(),
-            "the sidecar save must be deferred while an embedding is in flight"
+            "an immediate follow-up flush must be throttled, not re-serialize the index"
         );
     }
 
@@ -3087,9 +3128,10 @@ mod tests {
     /// During a large embed, concurrent LSP enrichment keeps the graph dirty.
     /// `flush_embed_progress` must persist that graph mutation incrementally (as a
     /// delta, not a full rewrite) every flush — the graph is the authority and
-    /// stays durable. The derived vector sidecar is deferred while the embed is
-    /// still draining, so on a mid-bulk reopen the enrichment (replayed delta)
-    /// survives while the embeddings are re-derived from graph truth.
+    /// stays durable. The derived vector sidecar is checkpointed on a throttle
+    /// while the embed drains, so on a mid-bulk reopen the enrichment (replayed
+    /// delta) survives, the checkpointed vector resumes, and only the uncovered
+    /// remainder is re-derived from graph truth.
     #[test]
     #[cfg(feature = "vector")]
     fn flush_embed_progress_persists_concurrent_graph_mutation_and_recovers_on_reopen() {
@@ -3142,12 +3184,12 @@ mod tests {
         );
         let status = graph.embedding_status();
         assert_eq!(
-            status.indexed, 0,
-            "the mid-bulk sidecar is deferred, so no vectors are trusted on reopen"
+            status.indexed, 1,
+            "the throttled mid-bulk checkpoint must be trusted on reopen (resume, not restart)"
         );
         assert_eq!(
-            status.pending, 3,
-            "every entity must be re-queued so the embed re-derives from graph truth"
+            status.pending, 2,
+            "only the uncovered remainder (incl. the enriched entity) must remain pending"
         );
     }
 
