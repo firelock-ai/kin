@@ -6207,28 +6207,47 @@ fn build_vfs_tree_snapshot(
         });
     };
     let genesis_id = kin_core::build_genesis_change().id;
-    let files = kin_core::build_file_tree(state.graph.as_ref(), &genesis_id, &head_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
     let changes = state
         .graph
         .get_changes_since(&genesis_id, &head_id)
         .map_err(internal_error)?;
 
+    let mut files: HashMap<FilePathId, kin_model::Hash256> = HashMap::new();
     let mut timestamps: HashMap<FilePathId, u64> = HashMap::new();
     for change in &changes {
         let epoch_secs = change.timestamp.0.timestamp() as u64;
         for delta in &change.artifact_deltas {
             match delta.kind {
                 ArtifactDeltaKind::Added | ArtifactDeltaKind::Modified => {
+                    if let Some(hash) = delta.new_hash {
+                        files.insert(delta.file_id.clone(), hash);
+                    }
                     timestamps.insert(delta.file_id.clone(), epoch_secs);
                 }
                 ArtifactDeltaKind::Removed => {
+                    files.remove(&delta.file_id);
                     timestamps.remove(&delta.file_id);
                 }
             }
         }
     }
+
+    #[cfg(test)]
+    {
+        state
+            .vfs_tree_build_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let hook = state
+            .vfs_tree_build_test_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook.materialized.wait();
+            hook.resume.wait();
+        }
+    }
+
     Ok(VfsTreeSnapshot {
         key,
         files: Arc::new(files),
@@ -6244,7 +6263,17 @@ async fn current_vfs_snapshot(
     state: &Arc<DaemonState>,
 ) -> Result<Arc<VfsTreeSnapshot>, (StatusCode, String)> {
     for _ in 0..8 {
-        let key = current_vfs_cache_key(state)?;
+        let mut key = current_vfs_cache_key(state)?;
+        if let Some(snapshot) = read_recover(&state.vfs_tree_cache).as_ref() {
+            if snapshot.key == key {
+                return Ok(Arc::clone(snapshot));
+            }
+        }
+
+        // Serialize cold fills, then recheck both graph identity and the cache. All waiters for
+        // one head/version reuse the first fill instead of replaying the DAG independently.
+        let _build_guard = state.vfs_tree_build_lock.lock().await;
+        key = current_vfs_cache_key(state)?;
         if let Some(snapshot) = read_recover(&state.vfs_tree_cache).as_ref() {
             if snapshot.key == key {
                 return Ok(Arc::clone(snapshot));
@@ -6263,15 +6292,24 @@ async fn current_vfs_snapshot(
                     )
                 })??;
 
-        let current_key = current_vfs_cache_key(state)?;
-        if current_key != key {
+        // Recheck the complete graph identity after replay. This is deliberately outside the
+        // cache lock to avoid a cache->graph lock-order inversion with mutation paths.
+        if current_vfs_cache_key(state)? != key {
             continue;
         }
 
         let snapshot = Arc::new(snapshot);
         let mut cache = write_recover(&state.vfs_tree_cache);
+        // A mutation can land between the full-key check above and this lock. Version is the
+        // publication/CAS token: bump_version increments it before taking this same write lock
+        // to clear the cache. Therefore an old builder can publish only before the mutation
+        // boundary completes; after a completed invalidation it is discarded here.
+        let published_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+        if published_version != key.version {
+            continue;
+        }
         if let Some(existing) = cache.as_ref() {
-            if existing.key == current_key {
+            if existing.key == key {
                 return Ok(Arc::clone(existing));
             }
         }
@@ -10737,6 +10775,85 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert!(first.files.contains_key(&FilePathId::new("src/one.rs")));
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_vfs_readers_single_flight_one_materialization() {
+        use std::sync::atomic::Ordering;
+
+        const READERS: usize = 24;
+        let state = test_state();
+        install_branch_file(&state, "src/one.rs", b"one");
+        state.bump_version();
+
+        let start = Arc::new(tokio::sync::Barrier::new(READERS));
+        let mut readers = Vec::new();
+        for _ in 0..READERS {
+            let state = Arc::clone(&state);
+            let start = Arc::clone(&start);
+            readers.push(tokio::spawn(async move {
+                start.wait().await;
+                current_vfs_snapshot(&state).await.unwrap()
+            }));
+        }
+
+        let mut snapshots = Vec::new();
+        for reader in readers {
+            snapshots.push(reader.await.unwrap());
+        }
+        let first = &snapshots[0];
+        assert!(snapshots
+            .iter()
+            .all(|snapshot| Arc::ptr_eq(first, snapshot)));
+        assert_eq!(state.vfs_tree_build_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn old_vfs_builder_held_across_invalidation_cannot_publish_stale_snapshot() {
+        use std::sync::atomic::Ordering;
+
+        let state = test_state();
+        install_branch_file(&state, "src/one.rs", b"one");
+        state.bump_version();
+
+        let materialized = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        *state
+            .vfs_tree_build_test_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(crate::state::VfsTreeBuildTestHook {
+                materialized: Arc::clone(&materialized),
+                resume: Arc::clone(&resume),
+            });
+
+        let old_builder = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { current_vfs_snapshot(&state).await.unwrap() })
+        };
+        tokio::task::spawn_blocking(move || materialized.wait())
+            .await
+            .unwrap();
+
+        // The first build has materialized the old head but has not reached publication.
+        // Complete a head change and cache invalidation before allowing it to continue.
+        advance_branch_with_file(&state, "src/two.rs", b"two", 0x7a);
+        state.bump_version();
+        tokio::task::spawn_blocking(move || resume.wait())
+            .await
+            .unwrap();
+
+        let observed = old_builder.await.unwrap();
+        assert!(observed.files.contains_key(&FilePathId::new("src/one.rs")));
+        assert!(observed.files.contains_key(&FilePathId::new("src/two.rs")));
+        assert_eq!(state.vfs_tree_build_count.load(Ordering::SeqCst), 2);
+
+        let cached = read_recover(&state.vfs_tree_cache)
+            .as_ref()
+            .cloned()
+            .expect("new-head snapshot cached");
+        assert!(Arc::ptr_eq(&observed, &cached));
+        assert_eq!(observed.key, current_vfs_cache_key(&state).unwrap());
     }
 
     #[tokio::test]
