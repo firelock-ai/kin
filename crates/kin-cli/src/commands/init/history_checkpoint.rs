@@ -912,8 +912,14 @@ static DURABLE_DIRECTORY_CACHE: std::sync::OnceLock<
 fn directory_identity(path: &Path) -> Result<DurableDirectoryIdentity> {
     use std::os::unix::fs::MetadataExt;
 
-    let metadata = fs::metadata(path)
-        .with_context(|| format!("stat checkpoint directory {}", path.display()))?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("lstat checkpoint directory {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!(
+            "REFUSED checkpoint directory {}: symlink components are not allowed",
+            path.display()
+        ));
+    }
     if !metadata.is_dir() {
         return Err(anyhow!(
             "checkpoint directory destination {} is not a directory",
@@ -921,6 +927,89 @@ fn directory_identity(path: &Path) -> Result<DurableDirectoryIdentity> {
         ));
     }
     Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(unix)]
+fn validate_existing_directory_components(path: &Path) -> Result<()> {
+    let mut components = path.ancestors().collect::<Vec<_>>();
+    components.reverse();
+    for component in components {
+        match fs::symlink_metadata(component) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(anyhow!(
+                    "REFUSED checkpoint directory {}: symlink component {} is not allowed",
+                    path.display(),
+                    component.display()
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(anyhow!(
+                    "checkpoint directory component {} is not a directory",
+                    component.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "lstat checkpoint directory component {}",
+                        component.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn canonical_checkpoint_directory_path(path: &Path) -> Result<PathBuf> {
+    let mut cursor = path;
+    let mut missing = Vec::new();
+    loop {
+        match fs::symlink_metadata(cursor) {
+            Ok(metadata) => {
+                if cursor == path && metadata.file_type().is_symlink() {
+                    return Err(anyhow!(
+                        "REFUSED checkpoint directory {}: symlink component {} is not allowed",
+                        path.display(),
+                        cursor.display()
+                    ));
+                }
+                let mut canonical = fs::canonicalize(cursor).with_context(|| {
+                    format!(
+                        "canonicalize existing checkpoint directory ancestor {}",
+                        cursor.display()
+                    )
+                })?;
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = cursor.file_name().ok_or_else(|| {
+                    anyhow!(
+                        "checkpoint directory {} has no existing ancestor",
+                        path.display()
+                    )
+                })?;
+                missing.push(name.to_os_string());
+                cursor = cursor.parent().ok_or_else(|| {
+                    anyhow!(
+                        "checkpoint directory {} has no existing ancestor",
+                        path.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("lstat checkpoint directory component {}", cursor.display())
+                });
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -932,57 +1021,74 @@ fn create_dir_all_durable_with_sync<F>(
 where
     F: FnMut(&Path) -> Result<()>,
 {
-    let absolute;
-    let path = if path.is_absolute() {
-        path
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
     } else {
-        absolute = std::env::current_dir()
+        std::env::current_dir()
             .context("resolve current directory for checkpoint publication")?
-            .join(path);
-        absolute.as_path()
+            .join(path)
     };
-    if path.is_dir() {
-        let identity = directory_identity(path)?;
-        if cache
-            .lock()
-            .map_err(|_| anyhow!("checkpoint durable-directory cache is poisoned"))?
-            .get(path)
-            .is_some_and(|cached| *cached == identity)
-        {
-            return Ok(());
+    // Resolve stable pre-existing namespace aliases (for example macOS
+    // `/var` -> `/private/var`) before using the path as a cache key. The leaf
+    // itself is lstat-checked first and may never be a symlink, so moving a
+    // cached directory and symlinking its old name back to the same inode
+    // cannot produce a false cache hit.
+    let path = canonical_checkpoint_directory_path(&absolute)?;
+    let path = path.as_path();
+    validate_existing_directory_components(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            let identity = directory_identity(path)?;
+            if cache
+                .lock()
+                .map_err(|_| anyhow!("checkpoint durable-directory cache is poisoned"))?
+                .get(path)
+                .is_some_and(|cached| *cached == identity)
+            {
+                return Ok(());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("lstat checkpoint directory {}", path.display()));
         }
     }
 
     let mut missing = Vec::new();
     let mut cursor = path;
-    while !cursor.exists() {
-        missing.push(cursor.to_path_buf());
-        cursor = cursor.parent().ok_or_else(|| {
-            anyhow!(
-                "checkpoint directory {} has no existing ancestor",
-                path.display()
-            )
-        })?;
-    }
-    if !cursor.is_dir() {
-        return Err(anyhow!(
-            "checkpoint directory ancestor {} is not a directory",
-            cursor.display()
-        ));
+    loop {
+        match fs::symlink_metadata(cursor) {
+            Ok(_) => {
+                directory_identity(cursor)?;
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(cursor.to_path_buf());
+                cursor = cursor.parent().ok_or_else(|| {
+                    anyhow!(
+                        "checkpoint directory {} has no existing ancestor",
+                        path.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("lstat checkpoint directory {}", cursor.display()));
+            }
+        }
     }
 
     for directory in missing.into_iter().rev() {
         match fs::create_dir(&directory) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if !directory.is_dir() {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "checkpoint directory destination {} is not a directory",
-                            directory.display()
-                        )
-                    });
-                }
+                directory_identity(&directory).with_context(|| {
+                    format!(
+                        "checkpoint directory destination {} was replaced during creation",
+                        directory.display()
+                    )
+                })?;
             }
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -2228,7 +2334,8 @@ mod tests {
             .join("checkpoints")
             .join("history-hydration")
             .join("objects");
-        let fail_at = nested.parent().unwrap().to_path_buf();
+        let durable_nested = canonical_checkpoint_directory_path(&nested).unwrap();
+        let fail_at = durable_nested.parent().unwrap().to_path_buf();
         let cache = std::sync::Mutex::new(HashMap::new());
         let mut injected = false;
 
@@ -2258,14 +2365,58 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert!(retried.contains(&nested), "retry skipped the existing leaf");
+        assert!(
+            retried.contains(&durable_nested),
+            "retry skipped the existing leaf"
+        );
         assert!(
             retried.contains(&fail_at),
             "retry skipped the existing ancestor whose first sync failed"
         );
         let cached = cache.lock().unwrap();
-        assert!(cached.contains_key(&nested));
+        assert!(cached.contains_key(&durable_nested));
         assert!(cached.contains_key(&fail_at));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_directory_cache_refuses_moved_directory_reintroduced_by_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("checkpoints");
+        let moved = dir.path().join("moved-checkpoints");
+        let cache = std::sync::Mutex::new(HashMap::new());
+
+        create_dir_all_durable_with_sync(&original, &cache, |_| Ok(())).unwrap();
+        let cached_path = canonical_checkpoint_directory_path(&original).unwrap();
+        let cached_identity = *cache
+            .lock()
+            .unwrap()
+            .get(&cached_path)
+            .expect("first publication must cache the original namespace");
+        fs::rename(&original, &moved).unwrap();
+        symlink(&moved, &original).unwrap();
+        assert_eq!(
+            directory_identity(&moved).unwrap(),
+            cached_identity,
+            "fixture must preserve the target inode that fooled metadata-following cache checks"
+        );
+
+        let mut synced = Vec::new();
+        let error = create_dir_all_durable_with_sync(&original, &cache, |directory| {
+            synced.push(directory.to_path_buf());
+            Ok(())
+        })
+        .expect_err("a cached path replaced by a symlink must be refused");
+        assert!(
+            error.to_string().contains("symlink component"),
+            "unexpected refusal: {error:#}"
+        );
+        assert!(
+            synced.is_empty(),
+            "symlink rejection must happen before any durability sync"
+        );
     }
 
     #[test]
