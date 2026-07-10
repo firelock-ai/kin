@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+#![cfg(feature = "vector")]
+
 use kin_db::EntityStore;
 use serde_json::Value;
 use std::fs;

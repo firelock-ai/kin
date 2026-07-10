@@ -1633,6 +1633,7 @@ impl DaemonState {
     /// Returns the persisted resume `pending` count — derived from graph-vs-index
     /// truth, so it survives a crash/reopen and reaches zero only at full
     /// coverage.
+    #[cfg(feature = "embeddings")]
     pub fn flush_embed_progress(&self) -> Result<usize> {
         let _persist_guard = self
             .persist_lock
@@ -1658,6 +1659,13 @@ impl DaemonState {
         Ok(outcome.status.pending)
     }
 
+    #[cfg(not(feature = "embeddings"))]
+    pub fn flush_embed_progress(&self) -> Result<usize> {
+        Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+            "this Kin build does not include embedding support".to_string(),
+        )))
+    }
+
     /// Force the derived vector sidecar to disk regardless of the in-run flush
     /// throttle.
     ///
@@ -1670,6 +1678,7 @@ impl DaemonState {
     /// pure sidecar (not in the merkle root), so this never advances the graph
     /// generation. Cost is one index serialize per time-limited pass, not per
     /// batch.
+    #[cfg(feature = "vector")]
     pub fn persist_vector_sidecar(&self) -> Result<()> {
         let _persist_guard = self
             .persist_lock
@@ -1682,6 +1691,13 @@ impl DaemonState {
             Some(embedder_identity.as_str()),
         )
         .map_err(DaemonError::from)
+    }
+
+    #[cfg(not(feature = "vector"))]
+    pub fn persist_vector_sidecar(&self) -> Result<()> {
+        Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+            "this Kin build does not include vector support".to_string(),
+        )))
     }
 
     fn save_read_index(&self) -> Result<()> {
@@ -2093,6 +2109,7 @@ impl Drop for EmbedPassGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "vector")]
     use kin_db::VectorIndex;
     use kin_model::{
         Entity, EntityKind, EntityMetadata, FileLayout, FilePathId, FingerprintAlgorithm,
@@ -2677,6 +2694,7 @@ mod tests {
         DaemonState::open(init.layout).expect("current-version repo must open");
     }
 
+    #[cfg(feature = "vector")]
     #[test]
     fn open_rejects_stale_vector_index_sidecar() {
         // A persisted vector sidecar whose metadata root hash does NOT match the
@@ -3169,6 +3187,7 @@ mod tests {
         assert!(!state.shutdown_flush_would_wipe_graph());
     }
 
+    #[cfg(feature = "embeddings")]
     #[test]
     fn flush_embed_progress_persists_snapshot_and_reports_pending() {
         // The incremental flush persists the snapshot (full bundle on

@@ -191,6 +191,7 @@ fn validate_prepared_state(prepared_dir: &Path, expected_manifest: &Value) -> Re
     Ok(actual_manifest)
 }
 
+#[cfg(feature = "vector")]
 fn require_complete_prepared_embeddings(kin_dir: &Path) -> Result<()> {
     let graph_path = kin_dir.join("kindb/graph.kndb");
     let vector_path = kin_dir.join("kindb/graph.kvec");
@@ -211,6 +212,13 @@ fn require_complete_prepared_embeddings(kin_dir: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(not(feature = "vector"))]
+fn require_complete_prepared_embeddings(_kin_dir: &Path) -> Result<()> {
+    bail!(
+        "prepared state requires vector embeddings, but this Kin build has vector support disabled"
+    )
 }
 
 /// Whether a prepared-state manifest declares an embeddings-capable runtime,

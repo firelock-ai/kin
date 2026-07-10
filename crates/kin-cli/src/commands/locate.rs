@@ -17,6 +17,7 @@ use crate::capability::LocateProfile;
 /// hashing keeps fusion/resolution iteration order stable across processes so
 /// float score accumulation and tie-breaks are bit-reproducible.
 type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
+#[cfg(feature = "vector")]
 type EntityStableKey = (String, String, EntityKind);
 type ResolveEntitiesOutput = (
     Vec<(String, f32)>,
@@ -103,6 +104,11 @@ pub struct RetrievalDegradation {
 /// error.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct SemanticCoverage {
+    /// Whether this build contains the vector retrieval capability at all.
+    /// Older payloads predate this field and came only from vector-enabled
+    /// builds, so absence deserializes to `true` for compatibility.
+    #[serde(default = "semantic_signal_supported_default")]
+    pub supported: bool,
     /// Entities with an embedding indexed in the vector store.
     pub indexed: usize,
     /// Total entities eligible for embedding.
@@ -116,6 +122,10 @@ pub struct SemanticCoverage {
     /// semantic signal was partial. Lexical + graph signals still ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+}
+
+fn semantic_signal_supported_default() -> bool {
+    true
 }
 
 impl LocateResult {
@@ -888,11 +898,13 @@ fn disqualifies_entity_dominant_top_path(path: &str) -> bool {
         || is_amalgamated_or_generated_path(path)
 }
 
+#[cfg(feature = "vector")]
 fn entity_stable_key(entity: &kin_model::Entity) -> Option<EntityStableKey> {
     let path = entity.file_origin.as_ref()?.0.clone();
     Some((path, entity.name.clone(), entity.kind))
 }
 
+#[cfg(feature = "vector")]
 fn entity_stable_key_from_retrieval_key(
     graph: &kin_db::InMemoryGraph,
     key: &kin_db::RetrievalKey,
@@ -985,21 +997,40 @@ fn evaluate_embedding_coverage(
 /// returns, factored out so post-retrieval surfaces can re-report coverage
 /// without re-running the strict benchmark gate.
 fn coverage_from_status(status: &kin_db::EmbeddingStatus) -> SemanticCoverage {
-    let complete = embedding_status_complete(status);
-    let note = if complete {
-        None
-    } else {
-        Some(format!(
+    #[cfg(not(feature = "vector"))]
+    {
+        return SemanticCoverage {
+            supported: false,
+            indexed: status.indexed,
+            total: status.total,
+            pending: status.pending,
+            complete: false,
+            note: Some(
+                "semantic vector ranking is unsupported in this build; lexical and graph signals remain available"
+                    .to_string(),
+            ),
+        };
+    }
+
+    #[cfg(feature = "vector")]
+    {
+        let complete = embedding_status_complete(status);
+        let note = if complete {
+            None
+        } else {
+            Some(format!(
             "semantic signal partial: {} embedded. Lexical + graph results returned; run `kin embed` for full semantic ranking.",
             embedding_status_summary(status)
         ))
-    };
-    SemanticCoverage {
-        indexed: status.indexed,
-        total: status.total,
-        pending: status.pending,
-        complete,
-        note,
+        };
+        SemanticCoverage {
+            supported: true,
+            indexed: status.indexed,
+            total: status.total,
+            pending: status.pending,
+            complete,
+            note,
+        }
     }
 }
 
@@ -9160,6 +9191,7 @@ fn extract_error_signals(
 /// (e.g. historical scoped-session graphs), the vector source graph (typically
 /// the HEAD graph) is used for semantic search. Results are then post-filtered
 /// to only retain entities that exist in the primary (scoped) graph.
+#[cfg(feature = "vector")]
 fn extract_embedding_signals(
     text: &str,
     graph: &kin_db::InMemoryGraph,
@@ -9371,6 +9403,29 @@ fn extract_embedding_signals(
     }
 
     Ok(entity_seeds)
+}
+
+#[cfg(not(feature = "vector"))]
+fn extract_embedding_signals(
+    _text: &str,
+    _graph: &kin_db::InMemoryGraph,
+    _test_query: bool,
+    _vector_source: Option<&kin_db::InMemoryGraph>,
+    _quality: crate::retrieval_profile::RetrievalProfile,
+    degradations: &mut Vec<RetrievalDegradation>,
+    _ledger: Option<&mut Vec<PruneEvent>>,
+) -> Result<HashMap<kin_model::EntityId, EntityDiscovery>> {
+    record_degradation(
+        degradations,
+        RetrievalDegradation {
+            component: "vector_index".to_string(),
+            reason: "feature_disabled".to_string(),
+            detail: "this Kin build does not include vector retrieval".to_string(),
+            remediation: "install a vector-enabled Kin build for semantic similarity search"
+                .to_string(),
+        },
+    );
+    Ok(HashMap::new())
 }
 
 fn extract_cochange_signals(
@@ -9624,6 +9679,7 @@ fn push_projection_reason(explain: &mut HashMap<String, Vec<String>>, path: &str
     }
 }
 
+#[cfg(feature = "vector")]
 fn push_semantic_query(
     queries: &mut Vec<(String, f32)>,
     seen: &mut HashSet<String>,
@@ -18832,6 +18888,7 @@ mod tests {
         assert_eq!(score, 6.75);
     }
 
+    #[cfg(feature = "vector")]
     #[test]
     fn push_semantic_query_deduplicates_case_insensitively() {
         let mut queries = Vec::new();
@@ -22587,6 +22644,7 @@ mod tests {
     #[test]
     fn coverage_banner_only_warns_on_degraded_signal() {
         let complete = SemanticCoverage {
+            supported: true,
             indexed: 10,
             total: 10,
             pending: 0,
@@ -22599,6 +22657,7 @@ mod tests {
         );
 
         let partial_with_note = SemanticCoverage {
+            supported: true,
             indexed: 4,
             total: 10,
             pending: 6,
@@ -22612,6 +22671,7 @@ mod tests {
         );
 
         let partial_no_note = SemanticCoverage {
+            supported: true,
             indexed: 4,
             total: 10,
             pending: 6,

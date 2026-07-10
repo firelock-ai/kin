@@ -893,6 +893,18 @@ fn check_kinlab_connect() -> HealthCheck {
     }
 }
 
+#[cfg(not(feature = "vector"))]
+async fn check_semantic_query_readiness() -> HealthCheck {
+    HealthCheck::new(
+        "semantic_query_readiness",
+        "Semantic query readiness",
+        HealthStatus::Unsupported,
+        "semantic vector ranking is not included in this build; lexical and graph queries remain available",
+    )
+    .with_platform_note("this platform ships the supported vector-free Kin runtime")
+}
+
+#[cfg(feature = "vector")]
 async fn check_semantic_query_readiness() -> HealthCheck {
     let cwd = env::current_dir().unwrap_or_default();
     let layout = match kin_core::KinLayout::discover(&cwd) {
@@ -1244,6 +1256,16 @@ mod tests {
                 "non-healthy daemon-running must offer a remediation hint"
             );
         }
+    }
+
+    #[cfg(not(feature = "vector"))]
+    #[tokio::test]
+    async fn vector_free_build_reports_semantic_query_as_unsupported() {
+        let semantic = check_semantic_query_readiness().await;
+        assert_eq!(semantic.id, "semantic_query_readiness");
+        assert!(matches!(semantic.status, HealthStatus::Unsupported));
+        assert!(!semantic.detail.contains("kin embed"));
+        assert!(semantic.manual_fix.is_none());
     }
 
     #[test]
