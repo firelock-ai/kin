@@ -672,7 +672,7 @@ fn git_ref_requires_hydration_for_mode_inner(
     Ok(!closed
         || (enrich_semantics
             && closure_cache
-                .is_some_and(|cache| !cache.is_known_semantic_complete(&imported_change_id))))
+                .is_none_or(|cache| !cache.is_known_semantic_complete(&imported_change_id))))
 }
 
 fn git_ref_requires_hydration_inner(
@@ -1311,6 +1311,38 @@ mod tests {
         assert_eq!(outcome.inserted, vec![first]);
         assert!(graph.get_change(&first).unwrap().is_some());
         assert!(graph.get_change(&second).unwrap().is_none());
+    }
+
+    #[test]
+    fn incomplete_semantic_publication_is_never_memoized() {
+        let graph = InMemoryGraph::new();
+        let genesis = kin_core::build_genesis_change();
+        graph.create_change(&genesis).unwrap();
+        let missing_parent = change_id(0xb1);
+        let head = change_id(0xb2);
+        let cache = GitHistoryClosureCache::default();
+        let prepared = PreparedGitHydration {
+            imported_change_id: head,
+            git_oid: "dddddddddddddddddddddddddddddddddddddddd".to_string(),
+            imported: vec![kin_git::ImportedChange {
+                change: make_change(head, vec![missing_parent]),
+                git_oid: "dddddddddddddddddddddddddddddddddddddddd".to_string(),
+            }],
+            semantic_complete: true,
+        };
+        let mut before_insert = || {};
+        let error =
+            publish_prepared_git_hydration(&graph, prepared, Some(&cache), &mut before_insert)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("remained incomplete"));
+        assert!(!cache.is_known_semantic_complete(&head));
+        assert!(git_ref_requires_hydration_cached_for_mode(
+            &graph,
+            "dddddddddddddddddddddddddddddddddddddddd",
+            &cache,
+            true,
+        ));
     }
 
     fn temp_layout() -> kin_core::KinLayout {
