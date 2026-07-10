@@ -82,7 +82,7 @@ class RubyLineScan:
     code: str
     structure: str
     has_unquoted_percent: bool
-    has_hash_character_literal: bool
+    has_unsupported_question_syntax: bool
     has_unterminated_quote: bool
 
 
@@ -102,16 +102,19 @@ def scan_ruby_line(line: str) -> RubyLineScan:
     percent token fails closed. Percent signs inside quoted metadata/URLs and comments
     remain ordinary data.
 
-    Ruby also parses ``?#`` as the character literal ``"#"``, not as ``?`` followed by
-    a comment. That token must be recognized before deciding that ``#`` starts a comment;
-    otherwise its trailing statements can desynchronize the validator's block stack.
+    Ruby character literals begin with ``?`` and include escaped control/meta forms whose
+    final character may be ``#``. They must be rejected before deciding that ``#`` starts
+    a comment; otherwise trailing statements can desynchronize the validator's block
+    stack. Predicate-method suffixes such as ``File.exist?`` remain supported because
+    their ``?`` immediately follows an identifier character. The generated grammar uses
+    neither standalone character literals nor ternary expressions.
     """
 
     retained: list[str] = []
     quote: str | None = None
     escaped = False
     has_unquoted_percent = False
-    has_hash_character_literal = False
+    has_unsupported_question_syntax = False
     comment_index: int | None = None
     index = 0
 
@@ -130,11 +133,11 @@ def scan_ruby_line(line: str) -> RubyLineScan:
         if character in {'"', "'"}:
             quote = character
             retained.append(" ")
-        elif character == "?" and index + 1 < len(line) and line[index + 1] == "#":
-            has_hash_character_literal = True
-            retained.extend((" ", " "))
-            index += 2
-            continue
+        elif character == "?" and (
+            index == 0 or not (line[index - 1].isalnum() or line[index - 1] == "_")
+        ):
+            has_unsupported_question_syntax = True
+            retained.append(character)
         elif character == "#":
             comment_index = index
             break
@@ -150,7 +153,7 @@ def scan_ruby_line(line: str) -> RubyLineScan:
         code=code,
         structure="".join(retained).strip(),
         has_unquoted_percent=has_unquoted_percent,
-        has_hash_character_literal=has_hash_character_literal,
+        has_unsupported_question_syntax=has_unsupported_question_syntax,
         has_unterminated_quote=quote is not None,
     )
 
@@ -175,8 +178,8 @@ def reject_unsupported_ruby_syntax(scan: RubyLineScan, line_number: int) -> None
         reason = "Ruby brace blocks and hash literals"
     elif "`" in structure:
         reason = "Ruby command literals"
-    elif scan.has_hash_character_literal:
-        reason = "Ruby hash character literals"
+    elif scan.has_unsupported_question_syntax:
+        reason = "Ruby character literals and ternary expressions"
     elif scan.has_unquoted_percent:
         reason = "Ruby percent literals"
     elif "/" in structure:

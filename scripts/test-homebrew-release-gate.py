@@ -581,7 +581,7 @@ def test_hash_character_literal_cannot_hide_percent_scope_escape() -> None:
     formula = replace_fixture_install(scope_escape)
 
     assert_ruby_syntax_valid(formula)
-    assert_validator_rejects(formula, "Ruby hash character literals")
+    assert_validator_rejects(formula, "Ruby character literals and ternary expressions")
 
 
 def test_hash_character_literal_cannot_escape_install_scope_without_percent() -> None:
@@ -593,7 +593,22 @@ def test_hash_character_literal_cannot_escape_install_scope_without_percent() ->
     formula = replace_fixture_install(scope_escape)
 
     assert_ruby_syntax_valid(formula)
-    assert_validator_rejects(formula, "Ruby hash character literals")
+    assert_validator_rejects(formula, "Ruby character literals and ternary expressions")
+
+
+def test_escaped_character_literals_cannot_hide_comment_boundaries() -> None:
+    for character_literal in (r"?\C-#", r"?\c#", r"?\M-#"):
+        scope_escape = f"""  def install
+    {character_literal}; end
+    $kin_gate_bypass = :executed_at_class_scope
+    {character_literal}; if true
+  end"""
+        formula = replace_fixture_install(scope_escape)
+
+        assert_ruby_syntax_valid(formula)
+        assert_validator_rejects(
+            formula, "Ruby character literals and ternary expressions"
+        )
 
 
 def test_percent_characters_inside_strings_and_comments_remain_data() -> None:
@@ -851,6 +866,7 @@ def main() -> None:
         test_hash_delimited_percent_literal_cannot_escape_install_scope,
         test_hash_character_literal_cannot_hide_percent_scope_escape,
         test_hash_character_literal_cannot_escape_install_scope_without_percent,
+        test_escaped_character_literals_cannot_hide_comment_boundaries,
         test_percent_characters_inside_strings_and_comments_remain_data,
         test_unparsed_ruby_regex_cannot_supply_inactive_version,
         test_multiline_ruby_regex_inside_install_body_is_rejected,
