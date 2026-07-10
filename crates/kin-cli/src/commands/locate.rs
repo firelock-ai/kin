@@ -15046,7 +15046,10 @@ where
                     }
                 }
                 None => {
-                    acc.insert(key, (contribution, vec![list_idx], rank, list_idx, item.clone()));
+                    acc.insert(
+                        key,
+                        (contribution, vec![list_idx], rank, list_idx, item.clone()),
+                    );
                 }
             }
         }
@@ -15083,8 +15086,7 @@ pub fn fuse_locate_results(
         return results.into_iter().next().unwrap_or_default();
     }
 
-    let entity_lists: Vec<Vec<LocateEntity>> =
-        results.iter().map(|r| r.entities.clone()).collect();
+    let entity_lists: Vec<Vec<LocateEntity>> = results.iter().map(|r| r.entities.clone()).collect();
     let file_lists: Vec<Vec<LocateFileEntry>> = results.iter().map(|r| r.files.clone()).collect();
 
     let mut fused_entities = rrf_fuse(&entity_lists, |e| e.entity_id.clone(), rrf_k);
@@ -15546,11 +15548,8 @@ mod tests {
             fusion_entity("e1", "src/a.rs", 2.0),
             fusion_entity("e2", "src/b.rs", 1.0),
         ]);
-        let fused = fuse_locate_results(
-            vec!["only query".to_string()],
-            vec![result],
-            locate_rrf_k(),
-        );
+        let fused =
+            fuse_locate_results(vec!["only query".to_string()], vec![result], locate_rrf_k());
         // No fusion: order and records untouched, no attribution emitted.
         assert_eq!(fused.entities.len(), 2);
         assert_eq!(fused.entities[0].entity_id, "e1");
@@ -15610,9 +15609,16 @@ mod tests {
         let variants = vec!["q0".to_string(), "q1".to_string()];
         let first = fuse_locate_results(variants.clone(), build(), 60.0);
         let second = fuse_locate_results(variants, build(), 60.0);
-        let first_ids: Vec<&str> = first.entities.iter().map(|e| e.entity_id.as_str()).collect();
-        let second_ids: Vec<&str> =
-            second.entities.iter().map(|e| e.entity_id.as_str()).collect();
+        let first_ids: Vec<&str> = first
+            .entities
+            .iter()
+            .map(|e| e.entity_id.as_str())
+            .collect();
+        let second_ids: Vec<&str> = second
+            .entities
+            .iter()
+            .map(|e| e.entity_id.as_str())
+            .collect();
         assert_eq!(first_ids, second_ids);
     }
 
