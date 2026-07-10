@@ -964,52 +964,98 @@ fn validate_existing_directory_components(path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn canonical_checkpoint_directory_path(path: &Path) -> Result<PathBuf> {
-    let mut cursor = path;
-    let mut missing = Vec::new();
-    loop {
-        match fs::symlink_metadata(cursor) {
-            Ok(metadata) => {
-                if cursor == path && metadata.file_type().is_symlink() {
-                    return Err(anyhow!(
-                        "REFUSED checkpoint directory {}: symlink component {} is not allowed",
-                        path.display(),
-                        cursor.display()
-                    ));
-                }
-                let mut canonical = fs::canonicalize(cursor).with_context(|| {
-                    format!(
-                        "canonicalize existing checkpoint directory ancestor {}",
-                        cursor.display()
-                    )
-                })?;
-                for component in missing.iter().rev() {
-                    canonical.push(component);
-                }
-                return Ok(canonical);
+fn lexical_absolute_checkpoint_path(path: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolve current directory for checkpoint publication")?
+            .join(path)
+    };
+    let mut normalized = PathBuf::from("/");
+    for component in absolute.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(component) => normalized.push(component),
+            Component::ParentDir => {
+                return Err(anyhow!(
+                    "REFUSED checkpoint directory {}: parent-directory components are not allowed",
+                    absolute.display()
+                ));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let name = cursor.file_name().ok_or_else(|| {
-                    anyhow!(
-                        "checkpoint directory {} has no existing ancestor",
-                        path.display()
-                    )
-                })?;
-                missing.push(name.to_os_string());
-                cursor = cursor.parent().ok_or_else(|| {
-                    anyhow!(
-                        "checkpoint directory {} has no existing ancestor",
-                        path.display()
-                    )
-                })?;
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("lstat checkpoint directory component {}", cursor.display())
-                });
+            Component::Prefix(_) => {
+                return Err(anyhow!(
+                    "REFUSED checkpoint directory {}: unsupported path prefix",
+                    absolute.display()
+                ));
             }
         }
     }
+    Ok(normalized)
+}
+
+/// macOS exposes `/var` and `/tmp` as root-owned compatibility symlinks into
+/// `/private`. Resolve only those exact, verified system aliases to fixed
+/// non-symlink namespaces. Arbitrary caller-controlled symlink components are
+/// never canonicalized away and are rejected by the component walk below.
+#[cfg(target_os = "macos")]
+fn rewrite_verified_system_directory_alias(path: &Path) -> Result<PathBuf> {
+    let aliases = [
+        (Path::new("/var"), Path::new("/private/var")),
+        (Path::new("/tmp"), Path::new("/private/tmp")),
+    ];
+    let Some((alias, target)) = aliases
+        .into_iter()
+        .find(|(alias, _)| path.starts_with(alias))
+    else {
+        return Ok(path.to_path_buf());
+    };
+    let alias_metadata = fs::symlink_metadata(alias).with_context(|| {
+        format!(
+            "lstat verified macOS checkpoint namespace alias {}",
+            alias.display()
+        )
+    })?;
+    let target_metadata = fs::symlink_metadata(target).with_context(|| {
+        format!(
+            "lstat verified macOS checkpoint namespace target {}",
+            target.display()
+        )
+    })?;
+    let resolved = fs::canonicalize(alias).with_context(|| {
+        format!(
+            "resolve verified macOS checkpoint namespace alias {}",
+            alias.display()
+        )
+    })?;
+    if !alias_metadata.file_type().is_symlink()
+        || target_metadata.file_type().is_symlink()
+        || !target_metadata.is_dir()
+        || resolved.as_path() != target
+    {
+        return Err(anyhow!(
+            "REFUSED checkpoint directory {}: macOS namespace alias {} is not the verified {} mapping",
+            path.display(),
+            alias.display(),
+            target.display()
+        ));
+    }
+    Ok(target.join(path.strip_prefix(alias).expect("prefix checked above")))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn rewrite_verified_system_directory_alias(path: &Path) -> Result<PathBuf> {
+    Ok(path.to_path_buf())
+}
+
+#[cfg(unix)]
+fn checked_checkpoint_directory_path(path: &Path) -> Result<PathBuf> {
+    let path = lexical_absolute_checkpoint_path(path)?;
+    let path = rewrite_verified_system_directory_alias(&path)?;
+    validate_existing_directory_components(&path)?;
+    Ok(path)
 }
 
 #[cfg(unix)]
@@ -1021,21 +1067,12 @@ fn create_dir_all_durable_with_sync<F>(
 where
     F: FnMut(&Path) -> Result<()>,
 {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .context("resolve current directory for checkpoint publication")?
-            .join(path)
-    };
-    // Resolve stable pre-existing namespace aliases (for example macOS
-    // `/var` -> `/private/var`) before using the path as a cache key. The leaf
-    // itself is lstat-checked first and may never be a symlink, so moving a
-    // cached directory and symlinking its old name back to the same inode
-    // cannot produce a false cache hit.
-    let path = canonical_checkpoint_directory_path(&absolute)?;
+    // Validate every existing component in the caller's namespace before a
+    // cache lookup. The only rewrites are the verified macOS system aliases
+    // above, which yield fixed `/private` starting namespaces without accepting
+    // arbitrary caller-controlled symlinks.
+    let path = checked_checkpoint_directory_path(path)?;
     let path = path.as_path();
-    validate_existing_directory_components(path)?;
     match fs::symlink_metadata(path) {
         Ok(_) => {
             let identity = directory_identity(path)?;
@@ -2325,6 +2362,19 @@ mod tests {
         create_dir_all_durable(&nested).unwrap();
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn verified_macos_system_aliases_use_fixed_private_namespaces() {
+        assert_eq!(
+            rewrite_verified_system_directory_alias(Path::new("/var/folders/checkpoints")).unwrap(),
+            PathBuf::from("/private/var/folders/checkpoints")
+        );
+        assert_eq!(
+            rewrite_verified_system_directory_alias(Path::new("/tmp/checkpoints")).unwrap(),
+            PathBuf::from("/private/tmp/checkpoints")
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn durable_directory_retry_resyncs_existing_chain_after_sync_failure() {
@@ -2334,7 +2384,7 @@ mod tests {
             .join("checkpoints")
             .join("history-hydration")
             .join("objects");
-        let durable_nested = canonical_checkpoint_directory_path(&nested).unwrap();
+        let durable_nested = checked_checkpoint_directory_path(&nested).unwrap();
         let fail_at = durable_nested.parent().unwrap().to_path_buf();
         let cache = std::sync::Mutex::new(HashMap::new());
         let mut injected = false;
@@ -2380,6 +2430,96 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn durable_directory_refuses_existing_intermediate_symlink_component() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_parent = dir.path().join("real-parent");
+        let alias_parent = dir.path().join("alias-parent");
+        fs::create_dir(&real_parent).unwrap();
+        symlink(&real_parent, &alias_parent).unwrap();
+        let nested = alias_parent
+            .join("checkpoints")
+            .join("history-hydration")
+            .join("objects");
+        let cache = std::sync::Mutex::new(HashMap::new());
+        let mut synced = Vec::new();
+
+        let error = create_dir_all_durable_with_sync(&nested, &cache, |directory| {
+            synced.push(directory.to_path_buf());
+            Ok(())
+        })
+        .expect_err("an existing intermediate symlink must be refused");
+        assert!(
+            error.to_string().contains("symlink component")
+                && error.to_string().contains("alias-parent"),
+            "unexpected refusal: {error:#}"
+        );
+        assert!(
+            !real_parent.join("checkpoints").exists(),
+            "refusal must happen before creating through the symlink"
+        );
+        assert!(synced.is_empty(), "refusal must happen before any fsync");
+        assert!(cache.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_directory_cache_refuses_intermediate_component_replacement_with_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("checkpoint-parent");
+        let moved_parent = dir.path().join("moved-checkpoint-parent");
+        let nested = parent
+            .join("history-hydration")
+            .join("objects")
+            .join("segments");
+        let cache = std::sync::Mutex::new(HashMap::new());
+
+        create_dir_all_durable_with_sync(&nested, &cache, |_| Ok(())).unwrap();
+        let durable_nested = checked_checkpoint_directory_path(&nested).unwrap();
+        let cached_identity = *cache
+            .lock()
+            .unwrap()
+            .get(&durable_nested)
+            .expect("first publication must cache the original leaf");
+        let cached_before = cache.lock().unwrap().clone();
+        fs::rename(&parent, &moved_parent).unwrap();
+        symlink(&moved_parent, &parent).unwrap();
+        assert_eq!(
+            directory_identity(
+                &moved_parent
+                    .join("history-hydration")
+                    .join("objects")
+                    .join("segments")
+            )
+            .unwrap(),
+            cached_identity,
+            "fixture must preserve the cached leaf inode behind the new intermediate symlink"
+        );
+
+        let mut synced = Vec::new();
+        let error = create_dir_all_durable_with_sync(&nested, &cache, |directory| {
+            synced.push(directory.to_path_buf());
+            Ok(())
+        })
+        .expect_err("an intermediate component replaced by a symlink must be refused");
+        assert!(
+            error.to_string().contains("symlink component")
+                && error.to_string().contains("checkpoint-parent"),
+            "unexpected refusal: {error:#}"
+        );
+        assert!(synced.is_empty(), "refusal must happen before any fsync");
+        assert_eq!(
+            &*cache.lock().unwrap(),
+            &cached_before,
+            "refusal must not publish a replacement namespace identity"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn durable_directory_cache_refuses_moved_directory_reintroduced_by_symlink() {
         use std::os::unix::fs::symlink;
 
@@ -2389,7 +2529,7 @@ mod tests {
         let cache = std::sync::Mutex::new(HashMap::new());
 
         create_dir_all_durable_with_sync(&original, &cache, |_| Ok(())).unwrap();
-        let cached_path = canonical_checkpoint_directory_path(&original).unwrap();
+        let cached_path = checked_checkpoint_directory_path(&original).unwrap();
         let cached_identity = *cache
             .lock()
             .unwrap()
