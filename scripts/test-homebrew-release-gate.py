@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -344,6 +345,38 @@ end
 '''
 
 
+def replace_fixture_version(replacement: str) -> str:
+    formula = current_real_formula_shape()
+    marker = '  version "1.2.3"'
+    assert formula.count(marker) == 1
+    return formula.replace(marker, replacement)
+
+
+def assert_ruby_syntax_valid(formula: str) -> None:
+    ruby = shutil.which("ruby")
+    if ruby is None:
+        return
+    result = subprocess.run(
+        [ruby, "-c"],
+        input=formula,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def assert_validator_rejects(
+    formula: str, expected_error: str, *, ruby_syntax_valid: bool = True
+) -> None:
+    if ruby_syntax_valid:
+        assert_ruby_syntax_valid(formula)
+    result = run_validator(formula)
+    output = result.stdout.decode() + result.stderr.decode()
+    assert result.returncode == 1, output
+    assert expected_error in output, output
+
+
 def test_exact_public_formula_and_checksums_succeed_without_token() -> None:
     result, curl_args, attempts = run_verifier()
     assert result.returncode == 0, result.stdout + result.stderr
@@ -453,6 +486,69 @@ def test_extra_end_fails() -> None:
     )
 
 
+def test_ruby_block_comment_cannot_supply_inactive_version() -> None:
+    formula = replace_fixture_version('=begin\n  version "1.2.3"\n=end')
+    assert_validator_rejects(formula, "Ruby block comments")
+
+
+def test_ruby_heredoc_cannot_supply_inactive_version() -> None:
+    formula = replace_fixture_version(
+        '  ignored_version = <<~KIN_VERSION\n    version "1.2.3"\n  KIN_VERSION'
+    )
+    assert_validator_rejects(formula, "Ruby heredocs and shift expressions")
+
+
+def test_ruby_brace_block_cannot_supply_inactive_version() -> None:
+    formula = replace_fixture_version('  [false].each {\n    version "1.2.3"\n  }')
+    assert_validator_rejects(formula, "Ruby brace blocks and hash literals")
+
+
+def test_ruby_percent_literal_cannot_supply_inactive_version() -> None:
+    formula = replace_fixture_version(
+        '  ignored_version = %q(\n    version "1.2.3"\n  )'
+    )
+    assert_validator_rejects(formula, "Ruby percent literals")
+
+
+def test_unparsed_ruby_regex_cannot_supply_inactive_version() -> None:
+    formula = replace_fixture_version('  ignored_version = /\n    version "1.2.3"\n  /')
+    assert_validator_rejects(formula, "unsupported generated-formula statement")
+
+
+def test_ruby_data_section_is_rejected_fail_closed() -> None:
+    formula = current_real_formula_shape() + '__END__\nversion "1.2.3"\n'
+    assert_validator_rejects(formula, "Ruby data sections")
+
+
+def test_duplicate_empty_os_block_fails() -> None:
+    formula = current_real_formula_shape().replace(
+        "  on_macos do", "  on_macos do\n  end\n\n  on_macos do", 1
+    )
+    assert_validator_rejects(
+        formula,
+        "expected exactly one on_macos block directly inside class Kin < Formula; found 2",
+    )
+
+
+def test_duplicate_empty_arch_block_fails() -> None:
+    formula = current_real_formula_shape().replace(
+        "    on_arm do", "    on_arm do\n    end\n    on_arm do", 1
+    )
+    assert_validator_rejects(
+        formula,
+        "expected exactly one on_arm block directly inside on_macos; found 2",
+    )
+
+
+def test_unsupported_os_block_fails() -> None:
+    formula = current_real_formula_shape().replace(
+        "  on_macos do", "  on_windows do\n  end\n\n  on_macos do", 1
+    )
+    assert_validator_rejects(
+        formula, "unsupported or malformed Homebrew platform block 'on_windows'"
+    )
+
+
 def test_os_block_outside_direct_class_scope_fails() -> None:
     assert_bounded_failure(
         formula_mode="nested_os",
@@ -495,14 +591,14 @@ def test_current_real_formula_shape_is_accepted() -> None:
 def test_missing_artifact_mapping_fails() -> None:
     assert_bounded_failure(
         formula_mode="missing_mapping",
-        expected_error="expected exactly 4 formula URL directives; found 3",
+        expected_error="expected exactly one on_arm block directly inside on_linux; found 0",
     )
 
 
 def test_duplicate_artifact_mapping_fails() -> None:
     assert_bounded_failure(
         formula_mode="duplicate_mapping",
-        expected_error="duplicate formula mapping for macos/arm",
+        expected_error="expected exactly one on_arm block directly inside on_macos; found 2",
     )
 
 
@@ -569,6 +665,15 @@ def main() -> None:
         test_missing_arch_end_fails,
         test_missing_class_end_fails,
         test_extra_end_fails,
+        test_ruby_block_comment_cannot_supply_inactive_version,
+        test_ruby_heredoc_cannot_supply_inactive_version,
+        test_ruby_brace_block_cannot_supply_inactive_version,
+        test_ruby_percent_literal_cannot_supply_inactive_version,
+        test_unparsed_ruby_regex_cannot_supply_inactive_version,
+        test_ruby_data_section_is_rejected_fail_closed,
+        test_duplicate_empty_os_block_fails,
+        test_duplicate_empty_arch_block_fails,
+        test_unsupported_os_block_fails,
         test_os_block_outside_direct_class_scope_fails,
         test_arch_block_outside_direct_os_scope_fails,
         test_url_outside_direct_arch_scope_fails,

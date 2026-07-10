@@ -22,6 +22,10 @@ BLOCK_KEYWORD_RE = re.compile(
 )
 DO_BLOCK_RE = re.compile(r"(?:^|\s)do(?:\s*\|[^|]*\|)?$")
 INLINE_END_RE = re.compile(r"(?:^|;)\s*end\b")
+BLOCK_COMMENT_RE = re.compile(r"^=(?:begin|end)\b")
+PERCENT_LITERAL_RE = re.compile(r"(?<![\w%])%(?:[qQwWiIrxs])?[^\w\s=]")
+ON_PLATFORM_RE = re.compile(r"^(on_[A-Za-z0-9_!?]+)\b")
+FORMULA_METADATA_RE = re.compile(r"^(?:desc|homepage|license)\b")
 CHECKSUM_RE = re.compile(r"^\s*([0-9A-Fa-f]{64})[ \t]+\*?([^ \t]+)[ \t]*$")
 HEX_RE = re.compile(r"^[0-9A-Fa-f]{64}$")
 
@@ -120,6 +124,54 @@ def ruby_structure_code(line: str) -> str:
     return "".join(retained).strip()
 
 
+def has_unterminated_ruby_quote(line: str) -> bool:
+    quote: str | None = None
+    escaped = False
+    for character in line:
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in {'"', "'"}:
+            quote = character
+        elif character == "#":
+            break
+    return quote is not None
+
+
+def reject_unsupported_ruby_syntax(line: str, code: str, line_number: int) -> None:
+    """Fail closed where this deliberately small Ruby parser has no authority."""
+
+    structure = ruby_structure_code(line)
+    reason: str | None = None
+    if BLOCK_COMMENT_RE.match(code):
+        reason = "Ruby block comments"
+    elif code == "__END__":
+        reason = "Ruby data sections"
+    elif has_unterminated_ruby_quote(line):
+        reason = "multiline quoted strings"
+    elif "<<" in structure:
+        reason = "Ruby heredocs and shift expressions"
+    elif "{" in structure or "}" in structure:
+        reason = "Ruby brace blocks and hash literals"
+    elif "`" in structure:
+        reason = "Ruby command literals"
+    elif PERCENT_LITERAL_RE.search(structure):
+        reason = "Ruby percent literals"
+    elif structure.endswith("\\"):
+        reason = "Ruby line continuations"
+    elif INLINE_END_RE.search(structure) and code != "end":
+        reason = "inline Ruby end expressions"
+    if reason is not None:
+        raise ValidationError(
+            f"unsupported generated-formula syntax at formula line {line_number}: {reason}"
+        )
+
+
 def missing_sha_error(pending: PendingUrl) -> ValidationError:
     return ValidationError(
         f"missing sha256 directive after URL for {pending.artifact} "
@@ -152,6 +204,12 @@ def parse_formula(formula: str, expected_version: str) -> dict[str, FormulaPair]
     blocks: list[RubyBlock] = []
     versions: list[str] = []
     kin_class_count = 0
+    os_block_counts = {os_name: 0 for os_name in ("macos", "linux")}
+    arch_block_counts = {
+        (os_name, arch): 0
+        for os_name in ("macos", "linux")
+        for arch in ("arm", "intel")
+    }
     pairs_by_platform: dict[tuple[str, str], FormulaPair] = {}
     url_count = 0
     sha_count = 0
@@ -162,6 +220,7 @@ def parse_formula(formula: str, expected_version: str) -> dict[str, FormulaPair]
         code = ruby_code(line)
         if not code:
             continue
+        reject_unsupported_ruby_syntax(line, code, line_number)
 
         if code == "end":
             if pending_url is not None:
@@ -172,11 +231,6 @@ def parse_formula(formula: str, expected_version: str) -> dict[str, FormulaPair]
                 )
             blocks.pop()
             continue
-        if INLINE_END_RE.search(ruby_structure_code(line)):
-            raise ValidationError(
-                f"unsupported inline or extra end at formula line {line_number}"
-            )
-
         if match := OS_RE.fullmatch(code):
             if pending_url is not None:
                 raise missing_sha_error(pending_url)
@@ -186,6 +240,12 @@ def parse_formula(formula: str, expected_version: str) -> dict[str, FormulaPair]
                     f"class Kin < Formula at formula line {line_number}"
                 )
             os_name = match.group(1)
+            os_block_counts[os_name] += 1
+            if os_block_counts[os_name] > 1:
+                raise ValidationError(
+                    f"expected exactly one on_{os_name} block directly inside "
+                    f"class Kin < Formula; found {os_block_counts[os_name]}"
+                )
             blocks.append(RubyBlock("os", f"on_{os_name} do", line_number, os_name))
             continue
         if match := ARCH_RE.fullmatch(code):
@@ -197,8 +257,25 @@ def parse_formula(formula: str, expected_version: str) -> dict[str, FormulaPair]
                     f"operating-system block at formula line {line_number}"
                 )
             arch = match.group(1)
+            os_name = blocks[1].value
+            if os_name is None:
+                raise ValidationError(
+                    f"architecture block has an unknown operating-system parent at formula line {line_number}"
+                )
+            arch_block_counts[(os_name, arch)] += 1
+            if arch_block_counts[(os_name, arch)] > 1:
+                raise ValidationError(
+                    f"expected exactly one on_{arch} block directly inside on_{os_name}; "
+                    f"found {arch_block_counts[(os_name, arch)]}"
+                )
             blocks.append(RubyBlock("arch", f"on_{arch} do", line_number, arch))
             continue
+
+        if match := ON_PLATFORM_RE.match(code):
+            raise ValidationError(
+                f"unsupported or malformed Homebrew platform block {match.group(1)!r} "
+                f"at formula line {line_number}"
+            )
 
         if KIN_CLASS_RE.fullmatch(code):
             if pending_url is not None:
@@ -289,6 +366,13 @@ def parse_formula(formula: str, expected_version: str) -> dict[str, FormulaPair]
         if DO_BLOCK_RE.search(code):
             blocks.append(RubyBlock("do", code, line_number))
             continue
+        if is_direct_kin_scope(blocks) and FORMULA_METADATA_RE.match(code):
+            continue
+        if not blocks or blocks[-1].kind in {"kin_class", "os", "arch"}:
+            raise ValidationError(
+                "unsupported generated-formula statement outside an install/test "
+                f"body at formula line {line_number}"
+            )
 
     if pending_url is not None:
         raise missing_sha_error(pending_url)
@@ -310,6 +394,19 @@ def parse_formula(formula: str, expected_version: str) -> dict[str, FormulaPair]
         raise ValidationError(
             f"formula version is {versions[0]!r}, expected {expected_version!r}"
         )
+
+    for os_name, count in os_block_counts.items():
+        if count != 1:
+            raise ValidationError(
+                f"expected exactly one on_{os_name} block directly inside "
+                f"class Kin < Formula; found {count}"
+            )
+    for (os_name, arch), count in arch_block_counts.items():
+        if count != 1:
+            raise ValidationError(
+                f"expected exactly one on_{arch} block directly inside on_{os_name}; "
+                f"found {count}"
+            )
 
     if url_count != len(SUPPORTED_ARTIFACTS):
         raise ValidationError(
