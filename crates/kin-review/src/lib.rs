@@ -42,6 +42,7 @@ pub use review::{Review, SemanticReview};
 pub use risk::assess_risk;
 pub use shadow::{
     build_shadow_report, build_shadow_report_at, build_shadow_report_base_off_ancestry,
-    format_shadow_report, ShadowGateReport, ShadowGateVerdict, ShadowRequest,
+    derive_shadow_policy, format_shadow_report, ShadowChangedEntity, ShadowEvidenceGap,
+    ShadowGateReport, ShadowGateVerdict, ShadowPolicyFinding, ShadowPolicyResult, ShadowRequest,
     SHADOW_ENFORCEMENT_REPORT_ONLY, SHADOW_GATE_REPORT_SCHEMA_VERSION,
 };

@@ -826,6 +826,22 @@ fn artifact_subject_is_source_class(subject: &str) -> bool {
     )
 }
 
+/// Derive the shadow gate policy from an already-assembled [`Review`].
+///
+/// The production path materializes ref-state to build the `Review`,
+/// `evidence_gaps`, and `changed_entities` before running the internal policy
+/// step. Callers and tests that already hold a `Review` (diff + impact + inline
+/// comments) — a review-only re-evaluation over an existing prepared graph, or
+/// an end-to-end gate assertion — derive the same verdict here without
+/// re-materializing ref-state. Mirrors the crate-public [`crate::derive_decision`].
+pub fn derive_shadow_policy(
+    review: &Review,
+    evidence_gaps: &[ShadowEvidenceGap],
+    changed_entities: &[ShadowChangedEntity],
+) -> ShadowPolicyResult {
+    derive_policy(review, evidence_gaps, changed_entities)
+}
+
 fn derive_policy(
     review: &Review,
     evidence_gaps: &[ShadowEvidenceGap],
@@ -889,36 +905,64 @@ fn derive_policy(
         let mut surface_candidates: Vec<_> = review.diff.entity_changes.iter().collect();
         surface_candidates.sort_by_key(|change| change.entity_id);
         for change in surface_candidates {
-            let (name, location, surface_changed, demote_removal) = match &change.kind {
-                EntityChangeKind::Modified { old, new } => (
-                    new.name.clone(),
-                    new.span
-                        .as_ref()
-                        .map(|span| (span.file.to_string(), span.start_line)),
-                    (old.signature != new.signature
-                        && !crate::inline::signature_runtime_neutral(
+            let (name, location, surface_changed, demote_removal, rename_neutral) =
+                match &change.kind {
+                    EntityChangeKind::Modified { old, new } => {
+                        // An arity-preserving parameter rename whose graph-known
+                        // call sites all pass positionally strands no consumer.
+                        // Mirror the inline signature-change channel (inline.rs)
+                        // so this shadow downstream_risk channel demotes the same
+                        // runtime-neutral rename instead of re-blocking it. Reuse
+                        // the shipped classifiers (single source of truth); they
+                        // are Python-only, so a non-Python rename yields `None`
+                        // here and stays blocking.
+                        let rename_neutral = match crate::inline::arity_preserving_rename(
                             &old.signature,
                             &new.signature,
-                        ))
-                        || old.visibility != new.visibility,
-                    false,
-                ),
-                EntityChangeKind::Removed(id) => {
-                    let id_string = id.to_string();
-                    let unresolvable = unresolvable_removed.contains(id_string.as_str());
-                    let name = resolved_names
-                        .get(id_string.as_str())
-                        .map(|name| name.to_string())
-                        .unwrap_or(id_string);
-                    // Same-diff remove + re-add of the same entity name is a
-                    // move; the surviving entity carries any surface risk.
-                    if added_names.contains(name.as_str()) {
-                        continue;
+                        ) {
+                            Some(renamed) => {
+                                let summary = review
+                                    .impact
+                                    .entity_impact(&change.entity_id)
+                                    .map(|entry| entry.call_shapes.clone())
+                                    .unwrap_or_default();
+                                crate::inline::rename_is_runtime_neutral_for_consumers(
+                                    &renamed, &summary,
+                                )
+                            }
+                            None => false,
+                        };
+                        (
+                            new.name.clone(),
+                            new.span
+                                .as_ref()
+                                .map(|span| (span.file.to_string(), span.start_line)),
+                            (old.signature != new.signature
+                                && !crate::inline::signature_runtime_neutral(
+                                    &old.signature,
+                                    &new.signature,
+                                ))
+                                || old.visibility != new.visibility,
+                            false,
+                            rename_neutral,
+                        )
                     }
-                    (name, None, true, unresolvable)
-                }
-                EntityChangeKind::Added(_) => continue,
-            };
+                    EntityChangeKind::Removed(id) => {
+                        let id_string = id.to_string();
+                        let unresolvable = unresolvable_removed.contains(id_string.as_str());
+                        let name = resolved_names
+                            .get(id_string.as_str())
+                            .map(|name| name.to_string())
+                            .unwrap_or(id_string);
+                        // Same-diff remove + re-add of the same entity name is a
+                        // move; the surviving entity carries any surface risk.
+                        if added_names.contains(name.as_str()) {
+                            continue;
+                        }
+                        (name, None, true, unresolvable, false)
+                    }
+                    EntityChangeKind::Added(_) => continue,
+                };
             if !surface_changed {
                 continue;
             }
@@ -946,17 +990,29 @@ fn derive_policy(
             if already_blocking {
                 continue;
             }
-            // An unresolvable removal reports its downstream risk as attention,
-            // not a would_block: naming the severed surface as a raw UUID is
-            // not enough proof to certify a blocking breakage.
+            // Demote (do not suppress) this downstream risk to attention when we
+            // cannot certify a block: an unresolvable removal (severed surface
+            // named only as a raw UUID) or an arity-preserving rename proven
+            // runtime-neutral by its call sites. The contract surface genuinely
+            // changed, so the finding stays visible evidence; it just no longer
+            // gates. A rename carries the positional-safety proof in its message
+            // for parity with the inline signature-change channel.
+            let demote = demote_removal || rename_neutral;
             findings.push(ShadowPolicyFinding {
                 kind: "downstream_risk".to_string(),
-                severity: if demote_removal { "warning" } else { "error" }.to_string(),
-                blocking: !demote_removal,
-                message: format!(
-                    "Contract surface of `{}` changed with {} graph-known downstream entity(ies)",
-                    name, entity_consumers
-                ),
+                severity: if demote { "warning" } else { "error" }.to_string(),
+                blocking: !demote,
+                message: if rename_neutral {
+                    format!(
+                        "Contract surface of `{}` changed with {} graph-known downstream entity(ies); all {} graph-known call site(s) pass positionally — no runtime break",
+                        name, entity_consumers, entity_consumers
+                    )
+                } else {
+                    format!(
+                        "Contract surface of `{}` changed with {} graph-known downstream entity(ies)",
+                        name, entity_consumers
+                    )
+                },
                 file: location.as_ref().map(|(file, _)| file.clone()),
                 line: location.as_ref().map(|(_, line)| *line),
             });
@@ -3222,6 +3278,214 @@ mod tests {
             .expect("resolvable removal with a consumer carries a downstream risk");
         assert!(finding.blocking);
         assert_eq!(policy.verdict, ShadowGateVerdict::WouldBlock);
+    }
+
+    /// Build a Review for an arity-preserving positional rename
+    /// (`def makefile_target(ext, args)` → `def makefile_target(ext, lines)`)
+    /// with 3 graph-known consumers whose call shapes are `call_shapes`. Exercises
+    /// the shadow `downstream_risk` channel in isolation (no inline comments).
+    fn positional_rename_review(call_shapes: crate::impact::ConsumerCallShapeSummary) -> Review {
+        use crate::diff::{EntityChange, EntityChangeKind, SemanticDiff};
+        use crate::impact::{EntityImpact, ImpactReport};
+        use kin_model::review::{RiskLevel, RiskSummary};
+
+        let mut old = entity_with_span(
+            "makefile_target",
+            "src/pytester.py",
+            610,
+            EntityRole::Source,
+        );
+        old.signature = "def makefile_target(ext, args)".to_string();
+        let mut new = old.clone();
+        new.signature = "def makefile_target(ext, lines)".to_string();
+
+        Review {
+            base: None,
+            head: None,
+            diff: SemanticDiff {
+                base: None,
+                head: None,
+                entity_changes: vec![EntityChange {
+                    entity_id: new.id,
+                    kind: EntityChangeKind::Modified {
+                        old,
+                        new: new.clone(),
+                    },
+                }],
+                relation_changes: vec![],
+            },
+            impact: ImpactReport {
+                entity_impacts: vec![EntityImpact {
+                    entity_id: new.id,
+                    consumer_count: 3,
+                    strong_consumer_count: 3,
+                    contract_consumer_count: 0,
+                    consumer_files: vec![
+                        "src/pytester.py".to_string(),
+                        "src/pytester.py".to_string(),
+                        "src/pytester.py".to_string(),
+                    ],
+                    covering_tests: 0,
+                    consumers_migrated_in_diff: 0,
+                    call_shapes,
+                }],
+                ..Default::default()
+            },
+            risk: RiskSummary {
+                overall_risk: RiskLevel::Low,
+                breaking_changes: vec![],
+                test_coverage_gaps: vec![],
+                contract_violations: vec![],
+                work_risks: vec![],
+                notes: vec![],
+            },
+            inline_comments: vec![],
+        }
+    }
+
+    #[test]
+    fn shadow_downstream_risk_demotes_runtime_neutral_positional_rename() {
+        // FIR-1440: the shadow `downstream_risk` channel is a SEPARATE gate from
+        // the inline signature-change channel. An arity-preserving rename whose
+        // graph-known call sites all pass positionally is runtime-neutral, yet
+        // pre-fix this channel still emitted a BLOCKING downstream_risk (verdict
+        // WouldBlock) because it consulted only `signature_runtime_neutral`, not
+        // the rename classifiers. Post-fix it demotes to a non-blocking warning
+        // (verdict NeedsAttention), matching the inline channel.
+        let call_shapes = crate::impact::ConsumerCallShapeSummary {
+            caller_keyword_names: std::collections::BTreeSet::new(),
+            any_var_keyword_caller: false,
+            all_consumers_shaped_calls: true,
+        };
+        let review = positional_rename_review(call_shapes);
+        let policy = derive_policy(&review, &[], &[]);
+        let finding = policy
+            .findings
+            .iter()
+            .find(|f| f.kind == "downstream_risk")
+            .expect("a renamed contract surface with 3 consumers carries a downstream risk");
+        // GREEN (post-fix): demoted to attention. Pre-fix this was blocking/error
+        // with a WouldBlock verdict — the shipped FIR-1440 bug.
+        assert!(
+            !finding.blocking,
+            "a positional-safe rename must not block the shadow gate"
+        );
+        assert_eq!(finding.severity, "warning");
+        assert!(
+            finding
+                .message
+                .contains("pass positionally — no runtime break"),
+            "the demoted message carries the positional-safety proof for parity with \
+             the inline channel; got: {}",
+            finding.message
+        );
+        assert!(
+            finding
+                .message
+                .contains("3 graph-known downstream entity(ies)"),
+            "message names the consumer count; got: {}",
+            finding.message
+        );
+        assert_eq!(policy.verdict, ShadowGateVerdict::NeedsAttention);
+        assert_ne!(policy.verdict, ShadowGateVerdict::WouldBlock);
+    }
+
+    /// Negative-control helper: a rename we cannot prove runtime-neutral must keep
+    /// blocking the shadow gate — guards against over-suppression.
+    fn assert_positional_rename_stays_blocking(
+        call_shapes: crate::impact::ConsumerCallShapeSummary,
+        case: &str,
+    ) {
+        let review = positional_rename_review(call_shapes);
+        let policy = derive_policy(&review, &[], &[]);
+        let finding = policy
+            .findings
+            .iter()
+            .find(|f| f.kind == "downstream_risk")
+            .unwrap_or_else(|| panic!("{case}: expected a downstream_risk finding"));
+        assert!(
+            finding.blocking,
+            "{case}: an unprovable rename must stay blocking (no over-suppression)"
+        );
+        assert_eq!(finding.severity, "error", "{case}: stays error severity");
+        assert!(
+            !finding.message.contains("no runtime break"),
+            "{case}: must not carry the positional-safe proof"
+        );
+        assert_eq!(
+            policy.verdict,
+            ShadowGateVerdict::WouldBlock,
+            "{case}: a rename that is not provably neutral still blocks"
+        );
+    }
+
+    #[test]
+    fn shadow_downstream_risk_blocks_keyword_caller_rename() {
+        // A consumer passes the RENAMED parameter (`args`) by keyword, so the
+        // rename strands it. Stays blocking.
+        let mut kw = std::collections::BTreeSet::new();
+        kw.insert("args".to_string());
+        assert_positional_rename_stays_blocking(
+            crate::impact::ConsumerCallShapeSummary {
+                caller_keyword_names: kw,
+                any_var_keyword_caller: false,
+                all_consumers_shaped_calls: true,
+            },
+            "keyword-caller",
+        );
+    }
+
+    #[test]
+    fn shadow_downstream_risk_blocks_var_keyword_caller_rename() {
+        // A consumer forwards `**kwargs`; its keyword set is unknown and could
+        // carry the renamed name. Stays blocking.
+        assert_positional_rename_stays_blocking(
+            crate::impact::ConsumerCallShapeSummary {
+                caller_keyword_names: std::collections::BTreeSet::new(),
+                any_var_keyword_caller: true,
+                all_consumers_shaped_calls: true,
+            },
+            "var-keyword-caller",
+        );
+    }
+
+    #[test]
+    fn shadow_downstream_risk_blocks_unshaped_consumer_rename() {
+        // A counted consumer carries no call-shape evidence (non-call edge or an
+        // uncaptured shape), so the rename cannot be proven safe. Stays blocking.
+        assert_positional_rename_stays_blocking(
+            crate::impact::ConsumerCallShapeSummary {
+                caller_keyword_names: std::collections::BTreeSet::new(),
+                any_var_keyword_caller: false,
+                all_consumers_shaped_calls: false,
+            },
+            "unshaped-consumer",
+        );
+    }
+
+    #[test]
+    fn shadow_demoted_rename_message_is_deterministic() {
+        // The demoted message reads only a count and sorted BTreeSet call_shapes,
+        // so repeated evaluation must be byte-identical (citable-gate determinism).
+        let call_shapes = crate::impact::ConsumerCallShapeSummary {
+            caller_keyword_names: std::collections::BTreeSet::new(),
+            any_var_keyword_caller: false,
+            all_consumers_shaped_calls: true,
+        };
+        let message_of = || {
+            let review = positional_rename_review(call_shapes.clone());
+            derive_policy(&review, &[], &[])
+                .findings
+                .into_iter()
+                .find(|f| f.kind == "downstream_risk")
+                .expect("downstream_risk present")
+                .message
+        };
+        assert_eq!(
+            message_of(),
+            message_of(),
+            "the demoted rename message must be byte-identical across runs"
+        );
     }
 
     #[test]
