@@ -1197,8 +1197,8 @@ impl HydrationCheckpointSession {
                 linker: state.linker.to_checkpoint_v1(),
             });
         }
-        parser_states.sort_by(|a, b| a.change_id.to_string().cmp(&b.change_id.to_string()));
-        linker_states.sort_by(|a, b| a.change_id.to_string().cmp(&b.change_id.to_string()));
+        parser_states.sort_by_key(|entry| entry.change_id.to_string());
+        linker_states.sort_by_key(|entry| entry.change_id.to_string());
         let parser_frontier_payload = ParserFrontierPayloadV2 {
             format_version: FORMAT_VERSION,
             version_key: version.clone(),
