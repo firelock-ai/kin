@@ -742,20 +742,21 @@ impl DaemonState {
     ) -> Result<Self> {
         let text_index_path = layout.text_index_dir();
         let (graph, generation, loaded_snapshot) =
-            match backend.load_snapshot(repo_id).map_err(DaemonError::from)? {
-                Some((bytes, gen)) => {
-                    let snapshot =
-                        kin_db::GraphSnapshot::from_bytes(&bytes).map_err(DaemonError::from)?;
+            match kin_db::load_recovered_snapshot(backend.as_ref(), repo_id)
+                .map_err(DaemonError::from)?
+            {
+                Some(recovered) => {
                     let g = kin_db::InMemoryGraph::from_snapshot_with_text_index(
-                        snapshot,
+                        recovered.snapshot,
                         text_index_path.clone(),
                     );
                     info!(
                         repo_id,
-                        generation = gen,
+                        generation = recovered.generation,
+                        deltas_replayed = recovered.deltas_applied,
                         "loaded graph from storage backend"
                     );
-                    (Arc::new(g), gen, true)
+                    (Arc::new(g), recovered.generation, true)
                 }
                 None => {
                     info!(repo_id, "no snapshot found, starting with empty graph");
@@ -1218,18 +1219,19 @@ impl DaemonState {
                 "no storage backend configured for multi-repo mode".to_string(),
             )));
         };
-        match backend.load_snapshot(repo_id).map_err(DaemonError::from)? {
-            Some((bytes, gen)) => {
-                let snapshot =
-                    kin_db::GraphSnapshot::from_bytes(&bytes).map_err(DaemonError::from)?;
+        match kin_db::load_recovered_snapshot(backend.as_ref(), repo_id)
+            .map_err(DaemonError::from)?
+        {
+            Some(recovered) => {
                 let text_index_path = self.layout.text_index_dir();
                 let graph = Arc::new(kin_db::InMemoryGraph::from_snapshot_with_text_index(
-                    snapshot,
+                    recovered.snapshot,
                     text_index_path,
                 ));
                 info!(
                     repo_id,
-                    generation = gen,
+                    generation = recovered.generation,
+                    deltas_replayed = recovered.deltas_applied,
                     "loaded repo graph from storage backend"
                 );
                 Ok(graph)
@@ -1555,7 +1557,11 @@ impl DaemonState {
         let expected_gen = self.snapshot_generation.load(Ordering::SeqCst);
 
         let new_gen = if let Some(backend) = &self.storage_backend {
-            if force_full || self.graph.full_snapshot_required() {
+            if force_full
+                || expected_gen == kin_db::GENERATION_INIT
+                || self.graph.full_snapshot_required()
+                || !backend.supports_incremental_deltas()
+            {
                 let (bytes, _) = self
                     .graph
                     .serialize_snapshot_borrowed()
@@ -1563,7 +1569,19 @@ impl DaemonState {
                 let generation = backend
                     .save_snapshot(repo_id, &bytes, expected_gen)
                     .map_err(DaemonError::from)?;
-                backend.clear_deltas(repo_id).map_err(DaemonError::from)?;
+                // The snapshot authority is already committed. Advance the
+                // daemon CAS cursor before best-effort journal cleanup so a
+                // cleanup failure cannot leave the live daemon permanently
+                // retrying with the pre-commit generation.
+                self.snapshot_generation.store(generation, Ordering::SeqCst);
+                if let Err(error) = backend.clear_deltas(repo_id) {
+                    warn!(
+                        repo_id,
+                        generation,
+                        error = %error,
+                        "snapshot committed; deferred stale delta cleanup"
+                    );
+                }
                 self.graph.clear_pending_delta();
                 self.graph.clear_full_snapshot_required();
                 generation
@@ -1572,6 +1590,7 @@ impl DaemonState {
                 let generation = backend
                     .save_delta(repo_id, &bytes, expected_gen)
                     .map_err(DaemonError::from)?;
+                self.snapshot_generation.store(generation, Ordering::SeqCst);
                 self.graph.clear_pending_delta();
                 self.graph.flush_text_index().map_err(DaemonError::from)?;
                 generation
@@ -2101,6 +2120,112 @@ mod tests {
     };
     use kin_reconcile::ReconcileOutcome;
     use serde_json::json;
+
+    struct CleanupFailOnceBackend {
+        inner: kin_db::LocalFileBackend,
+        fail_cleanup: AtomicBool,
+    }
+
+    impl CleanupFailOnceBackend {
+        fn new(path: &std::path::Path, fail_cleanup: bool) -> Self {
+            Self {
+                inner: kin_db::LocalFileBackend::new(path),
+                fail_cleanup: AtomicBool::new(fail_cleanup),
+            }
+        }
+    }
+
+    impl kin_db::StorageBackend for CleanupFailOnceBackend {
+        fn supports_incremental_deltas(&self) -> bool {
+            true
+        }
+
+        fn load_snapshot(
+            &self,
+            repo_id: &str,
+        ) -> std::result::Result<Option<(Vec<u8>, kin_db::Generation)>, kin_db::KinDbError>
+        {
+            self.inner.load_snapshot(repo_id)
+        }
+
+        fn load_snapshot_authority(
+            &self,
+            repo_id: &str,
+        ) -> std::result::Result<Option<kin_db::SnapshotAuthority>, kin_db::KinDbError> {
+            self.inner.load_snapshot_authority(repo_id)
+        }
+
+        fn load_recovery_state(
+            &self,
+            repo_id: &str,
+        ) -> std::result::Result<kin_db::SnapshotRecoveryState, kin_db::KinDbError> {
+            self.inner.load_recovery_state(repo_id)
+        }
+
+        fn save_snapshot(
+            &self,
+            repo_id: &str,
+            data: &[u8],
+            expected_gen: kin_db::Generation,
+        ) -> std::result::Result<kin_db::Generation, kin_db::KinDbError> {
+            self.inner.save_snapshot(repo_id, data, expected_gen)
+        }
+
+        fn save_delta(
+            &self,
+            repo_id: &str,
+            delta_data: &[u8],
+            base_gen: kin_db::Generation,
+        ) -> std::result::Result<kin_db::Generation, kin_db::KinDbError> {
+            self.inner.save_delta(repo_id, delta_data, base_gen)
+        }
+
+        fn load_deltas_since(
+            &self,
+            repo_id: &str,
+            since_gen: kin_db::Generation,
+        ) -> std::result::Result<Vec<(Vec<u8>, kin_db::Generation)>, kin_db::KinDbError> {
+            self.inner.load_deltas_since(repo_id, since_gen)
+        }
+
+        fn clear_deltas(&self, repo_id: &str) -> std::result::Result<(), kin_db::KinDbError> {
+            if self.fail_cleanup.swap(false, Ordering::SeqCst) {
+                return Err(kin_db::KinDbError::StorageError(
+                    "injected delta cleanup failure".to_string(),
+                ));
+            }
+            self.inner.clear_deltas(repo_id)
+        }
+
+        fn save_overlay(
+            &self,
+            repo_id: &str,
+            session_id: &str,
+            data: &[u8],
+        ) -> std::result::Result<(), kin_db::KinDbError> {
+            self.inner.save_overlay(repo_id, session_id, data)
+        }
+
+        fn load_overlay(
+            &self,
+            repo_id: &str,
+            session_id: &str,
+        ) -> std::result::Result<Option<Vec<u8>>, kin_db::KinDbError> {
+            self.inner.load_overlay(repo_id, session_id)
+        }
+
+        fn delete_overlay(
+            &self,
+            repo_id: &str,
+            session_id: &str,
+        ) -> std::result::Result<(), kin_db::KinDbError> {
+            self.inner.delete_overlay(repo_id, session_id)
+        }
+
+        fn list_repos(&self) -> std::result::Result<Vec<String>, kin_db::KinDbError> {
+            self.inner.list_repos()
+        }
+    }
 
     fn simple_layout(file_id: &FilePathId) -> FileLayout {
         FileLayout {
@@ -2820,6 +2945,103 @@ mod tests {
                 .any(|b| b.name == branch_name && b.head == change_id),
             "published branch head must be visible after reload (refs non-empty)"
         );
+    }
+
+    #[test]
+    fn storage_backend_replays_sequential_deltas_after_restart() {
+        use kin_db::LocalFileBackend;
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+        let storage = tempfile::tempdir().unwrap();
+        let repo_id = "restart-repo";
+
+        let state = DaemonState::open_with_backend(
+            layout.clone(),
+            Box::new(LocalFileBackend::new(storage.path())),
+            repo_id,
+            None,
+        )
+        .unwrap();
+
+        let base = test_entity("base_entity", "src/base.rs");
+        state.graph.upsert_entity(&base).unwrap();
+        state
+            .save_snapshot()
+            .expect("generation zero must promote a full base snapshot");
+        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 1);
+
+        let first_delta_entity = test_entity("first_delta_entity", "src/first.rs");
+        state.graph.upsert_entity(&first_delta_entity).unwrap();
+        state.save_snapshot().expect("persist first delta");
+        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 2);
+
+        let second_delta_entity = test_entity("second_delta_entity", "src/second.rs");
+        state.graph.upsert_entity(&second_delta_entity).unwrap();
+        state.save_snapshot().expect("persist second delta");
+        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 3);
+        drop(state);
+
+        let reopened = DaemonState::open_with_backend(
+            layout,
+            Box::new(LocalFileBackend::new(storage.path())),
+            repo_id,
+            None,
+        )
+        .expect("base snapshot plus deltas must reopen");
+        assert_eq!(reopened.snapshot_generation.load(Ordering::SeqCst), 3);
+        let entities = reopened.graph.list_all_entities().unwrap();
+        let names: HashSet<_> = entities.iter().map(|entity| entity.name.as_str()).collect();
+        assert_eq!(entities.len(), 3);
+        assert!(names.contains("base_entity"));
+        assert!(names.contains("first_delta_entity"));
+        assert!(names.contains("second_delta_entity"));
+    }
+
+    #[test]
+    fn committed_full_snapshot_cleanup_failure_does_not_wedge_next_cas() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let layout = init.layout;
+        let storage = tempfile::tempdir().unwrap();
+        let repo_id = "cleanup-retry";
+
+        let state = DaemonState::open_with_backend(
+            layout.clone(),
+            Box::new(CleanupFailOnceBackend::new(storage.path(), true)),
+            repo_id,
+            None,
+        )
+        .unwrap();
+        state
+            .graph
+            .upsert_entity(&test_entity("base_entity", "src/base.rs"))
+            .unwrap();
+        state
+            .save_snapshot()
+            .expect("committed snapshot survives cleanup failure");
+        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 1);
+
+        state
+            .graph
+            .upsert_entity(&test_entity("next_entity", "src/next.rs"))
+            .unwrap();
+        state
+            .save_snapshot()
+            .expect("next delta CAS uses committed generation, not stale cursor");
+        assert_eq!(state.snapshot_generation.load(Ordering::SeqCst), 2);
+        drop(state);
+
+        let reopened = DaemonState::open_with_backend(
+            layout,
+            Box::new(CleanupFailOnceBackend::new(storage.path(), false)),
+            repo_id,
+            None,
+        )
+        .expect("snapshot plus next delta reopens after cleanup failure");
+        assert_eq!(reopened.snapshot_generation.load(Ordering::SeqCst), 2);
+        assert_eq!(reopened.graph.entity_count(), 2);
     }
 
     fn make_scoped_graph_with_entity(name: &str, file_path: &str) -> Arc<kin_db::InMemoryGraph> {
