@@ -518,7 +518,14 @@ pub async fn run(
     phase!("snapshot_repo");
 
     let is_warm = kin_dir.exists();
-    let (layout, snap, blob_store, genesis_id) = if is_warm {
+    // Git history hydration has one repository-invariant, non-colliding
+    // boundary root: Kin's canonical genesis. It must never be replaced with
+    // the current branch head on a warm init. The branch head is only the
+    // parent of this init's auto-parse change; using it as the imported Git
+    // root can either leave an out-of-window dangling parent or close a cycle
+    // when that head is itself one of the imported Git changes.
+    let history_boundary_root = kin_core::build_genesis_change().id;
+    let (layout, snap, blob_store, auto_parse_parent_id) = if is_warm {
         let layout = kin_core::KinLayout::discover(&dir)
             .ok_or_else(|| anyhow::anyhow!("layout not found in existing .kin"))?;
         let snap = crate::backend::open_kindb_snapshot(&layout)?;
@@ -655,7 +662,7 @@ pub async fn run(
         // (built from the change DAG) knows which files exist.
         let branch_name = kin_core::read_current_branch(&layout)?;
         let change_id = compute_init_change_id(
-            &genesis_id,
+            &auto_parse_parent_id,
             &compute_artifact_fingerprint(
                 indexable_files
                     .iter()
@@ -710,7 +717,7 @@ pub async fn run(
 
         let change = SemanticChange {
             id: change_id,
-            parents: vec![genesis_id],
+            parents: vec![auto_parse_parent_id],
             timestamp: Timestamp::now(),
             author: AuthorId::new(whoami()),
             message: "kin init: auto-parse".to_string(),
@@ -752,7 +759,7 @@ pub async fn run(
 
                 match kin_git::import_git_history_with_blobs(
                     &dir,
-                    genesis_id,
+                    history_boundary_root,
                     &import_opts,
                     Some(&blob_store),
                 ) {
@@ -766,7 +773,7 @@ pub async fn run(
                         match kin_git::anchor_imported_history_at_base_link(
                             &dir,
                             &mut imported,
-                            genesis_id,
+                            history_boundary_root,
                             Some(&blob_store),
                         ) {
                             Ok(Some(base_id)) => {
@@ -790,6 +797,7 @@ pub async fn run(
                             &mut imported,
                             &blob_store,
                             layout.root(),
+                            history_boundary_root,
                         )
                         .with_context(|| {
                             format!(
@@ -1020,7 +1028,7 @@ pub async fn run(
                 repo_root: layout.root().display().to_string(),
                 kindb_snapshot_path: layout.kindb_snapshot_path().display().to_string(),
                 objects_dir: layout.objects_dir().display().to_string(),
-                genesis_change: genesis_id.to_string(),
+                genesis_change: history_boundary_root.to_string(),
                 indexed_embeddings: embed_status.indexed,
                 pending_embeddings: embed_status.pending,
                 summary: init_summary,
@@ -1239,9 +1247,9 @@ impl Clone for ImportedCommitSemanticState {
 /// so "process a commit after its first parent" is a forest constraint; Kahn's
 /// algorithm seeded and drained in ascending index order yields a stable order
 /// in which every commit follows its first parent, staying as close as possible
-/// to the input order. Any commit left unvisited by an (impossible for git)
-/// cycle is appended in index order so no commit is silently dropped.
-fn first_parent_topological_order(first_parent_index: &[Option<usize>]) -> Vec<usize> {
+/// to the input order. An (impossible for Git) cycle is rejected instead of
+/// manufacturing an order that would replay a child before its baseline.
+fn first_parent_topological_order(first_parent_index: &[Option<usize>]) -> Result<Vec<usize>> {
     let n = first_parent_index.len();
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut indegree = vec![0usize; n];
@@ -1255,12 +1263,7 @@ fn first_parent_topological_order(first_parent_index: &[Option<usize>]) -> Vec<u
     let mut queue: std::collections::VecDeque<usize> =
         (0..n).filter(|&i| indegree[i] == 0).collect();
     let mut order = Vec::with_capacity(n);
-    let mut seen = vec![false; n];
     while let Some(i) = queue.pop_front() {
-        if seen[i] {
-            continue;
-        }
-        seen[i] = true;
         order.push(i);
         for &child in &children[i] {
             indegree[child] -= 1;
@@ -1269,20 +1272,26 @@ fn first_parent_topological_order(first_parent_index: &[Option<usize>]) -> Vec<u
             }
         }
     }
-    for (i, visited) in seen.iter().enumerate() {
-        if !visited {
-            order.push(i);
-        }
+    if order.len() != n {
+        return Err(anyhow!(
+            "historical hydration invariant violated: imported first-parent graph contains a cycle"
+        ));
     }
-    order
+    Ok(order)
 }
 
 fn validate_imported_parent_closure(
     imported: &[kin_git::ImportedChange],
-    genesis_id: SemanticChangeId,
+    boundary_root: SemanticChangeId,
 ) -> Result<()> {
     let mut imported_ids = HashSet::with_capacity(imported.len());
     for imported_change in imported {
+        if imported_change.change.id == boundary_root {
+            return Err(anyhow!(
+                "historical hydration invariant violated: imported change collides with boundary root {}",
+                boundary_root
+            ));
+        }
         if !imported_ids.insert(imported_change.change.id) {
             return Err(anyhow!(
                 "historical hydration invariant violated: duplicate imported change {}",
@@ -1295,16 +1304,16 @@ fn validate_imported_parent_closure(
             return Err(anyhow!(
                 "historical hydration invariant violated: imported change {} has no parent; Git roots must reference canonical genesis {}",
                 imported_change.change.id,
-                genesis_id
+                boundary_root
             ));
         }
         for parent in &imported_change.change.parents {
-            if *parent != genesis_id && !imported_ids.contains(parent) {
+            if *parent != boundary_root && !imported_ids.contains(parent) {
                 return Err(anyhow!(
                     "historical hydration invariant violated: imported change {} has dangling parent {} (expected imported history or canonical genesis {})",
                     imported_change.change.id,
                     parent,
-                    genesis_id
+                    boundary_root
                 ));
             }
         }
@@ -1386,7 +1395,7 @@ fn enrich_imported_changes_with_semantics_and_genesis(
     blob_store: &kin_blobs::BlobStore,
     genesis_id: SemanticChangeId,
 ) -> Result<()> {
-    enrich_imported_changes_with_semantics_with_checkpoints_and_genesis(
+    enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
         imported, blob_store, true, None, genesis_id,
     )
     .map(|_| ())
@@ -1411,13 +1420,15 @@ pub(crate) fn enrich_imported_changes_with_semantics_checkpointed(
     imported: &mut [kin_git::ImportedChange],
     blob_store: &kin_blobs::BlobStore,
     kin_root: &Path,
+    boundary_root: SemanticChangeId,
 ) -> Result<HydrationReplayStats> {
     let config = HydrationCheckpointConfig::production(kin_root);
-    let stats = enrich_imported_changes_with_semantics_with_checkpoints(
+    let stats = enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
         imported,
         blob_store,
         true,
         Some(config),
+        boundary_root,
     )?;
     debug!(
         resumed_from = stats.resumed_from,
@@ -1442,8 +1453,9 @@ pub(crate) fn enrich_imported_changes_with_semantics_test_checkpoint(
     blob_store: &kin_blobs::BlobStore,
     kin_root: &Path,
     clean_git_sha: &str,
+    boundary_root: SemanticChangeId,
 ) -> Result<HydrationReplayStats> {
-    enrich_imported_changes_with_semantics_with_checkpoints(
+    enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
         imported,
         blob_store,
         true,
@@ -1453,6 +1465,7 @@ pub(crate) fn enrich_imported_changes_with_semantics_test_checkpoint(
             1,
             16 * 1024 * 1024,
         )),
+        boundary_root,
     )
 }
 
@@ -1474,13 +1487,14 @@ fn enrich_imported_changes_with_semantics_inner(
     Ok((stats.parse_memo_hits, stats.parse_memo_misses))
 }
 
+#[cfg(test)]
 fn enrich_imported_changes_with_semantics_with_checkpoints(
     imported: &mut [kin_git::ImportedChange],
     blob_store: &kin_blobs::BlobStore,
     parse_memo_enabled: bool,
     checkpoint_config: Option<HydrationCheckpointConfig>,
 ) -> Result<HydrationReplayStats> {
-    enrich_imported_changes_with_semantics_with_checkpoints_and_genesis(
+    enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
         imported,
         blob_store,
         parse_memo_enabled,
@@ -1489,12 +1503,12 @@ fn enrich_imported_changes_with_semantics_with_checkpoints(
     )
 }
 
-fn enrich_imported_changes_with_semantics_with_checkpoints_and_genesis(
+fn enrich_imported_changes_with_semantics_with_checkpoints_and_boundary_root(
     imported: &mut [kin_git::ImportedChange],
     blob_store: &kin_blobs::BlobStore,
     parse_memo_enabled: bool,
     checkpoint_config: Option<HydrationCheckpointConfig>,
-    genesis_id: SemanticChangeId,
+    boundary_root: SemanticChangeId,
 ) -> Result<HydrationReplayStats> {
     // Profiling timers (accumulated across every commit in the pass).
     let mut total_blob_read_time = std::time::Duration::ZERO;
@@ -1516,7 +1530,7 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_genesis(
     // Validate that contract before acquiring the checkpoint-store lock, reading
     // blobs, or mutating deltas so corruption can never be mistaken for a root
     // baseline or leave a partial side effect.
-    validate_imported_parent_closure(imported, genesis_id)?;
+    validate_imported_parent_closure(imported, boundary_root)?;
 
     // Resolve each imported commit's FIRST git parent to an in-set slice index.
     // kin-git derives a commit's artifact deltas by diffing its tree against its
@@ -1534,7 +1548,7 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_genesis(
         .iter()
         .map(|imported_change| {
             imported_change.change.parents.first().and_then(|parent| {
-                (*parent != genesis_id).then(|| {
+                (*parent != boundary_root).then(|| {
                     *index_by_change_id
                         .get(parent)
                         .expect("validated imported first parent must be present")
@@ -1552,7 +1566,11 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_genesis(
     }
     let initial_remaining_children = remaining_children.clone();
 
-    let order = first_parent_topological_order(&first_parent_index);
+    // Reject cycles before checkpoint prepare acquires the repository-scoped
+    // store lock or creates any store paths. Git cannot contain a commit
+    // cycle, so accepting one here would only turn corrupt input into a later
+    // missing-snapshot failure with partial hydration side effects.
+    let order = first_parent_topological_order(&first_parent_index)?;
     let mut snapshots = HashMap::<SemanticChangeId, ImportedCommitSemanticState>::new();
     let mut resumed_from = 0usize;
     let mut checkpoint_session = if let Some(config) = checkpoint_config {
@@ -2013,6 +2031,13 @@ fn enrich_imported_changes_with_semantics_with_checkpoints_and_genesis(
                 detached_boundary_state.as_ref(),
             )?;
         }
+    }
+
+    // Finalize even when `resumed_from == total_commits` and the replay loop
+    // executed zero times. Cache cap enforcement and orphan reachability GC
+    // are store invariants, not side effects of replaying a new boundary.
+    if let Some(session) = checkpoint_session.as_mut() {
+        session.finalize()?;
     }
 
     if total_commits > 0 {
@@ -5603,6 +5628,30 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         true
     }
 
+    fn commit_git_file_for_test(dir: &Path, path: &str, content: &str, message: &str) -> bool {
+        let file = dir.join(path);
+        if let Some(parent) = file.parent() {
+            if fs::create_dir_all(parent).is_err() {
+                return false;
+            }
+        }
+        if fs::write(&file, content).is_err() {
+            return false;
+        }
+        Command::new("git")
+            .args(["add", path])
+            .current_dir(dir)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+            && Command::new("git")
+                .args(["commit", "-q", "-m", message])
+                .current_dir(dir)
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+    }
+
     /// Replay the DAG reachable from `head` and report whether a LIVE relation
     /// exists whose source entity is named `src_name` and destination entity is
     /// named `dst_name`. Names are resolved from the reachable entity deltas;
@@ -6343,6 +6392,9 @@ func prCheckout(cmd *cobra.Command, args []string) error {
     const CHECKPOINT_WORKER_ROOT: &str = "KIN_TEST_CHECKPOINT_WORKER_ROOT";
     const CHECKPOINT_WORKER_BLOBS: &str = "KIN_TEST_CHECKPOINT_WORKER_BLOBS";
     const CHECKPOINT_WORKER_VARIANT: &str = "KIN_TEST_CHECKPOINT_WORKER_VARIANT";
+    const CHECKPOINT_WORKER_LOCK_ATTEMPT: &str = "KIN_TEST_CHECKPOINT_LOCK_ATTEMPT";
+    const CHECKPOINT_WORKER_LOCK_ACQUIRED: &str = "KIN_TEST_CHECKPOINT_LOCK_ACQUIRED";
+    const CHECKPOINT_WORKER_LOCK_RELEASE: &str = "KIN_TEST_CHECKPOINT_LOCK_RELEASE";
 
     fn checkpoint_worker_command(
         root: &Path,
@@ -6372,6 +6424,18 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         );
     }
 
+    fn wait_for_test_path(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for test handshake {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn checkpoint_subprocess_worker() {
         let Ok(root) = std::env::var(CHECKPOINT_WORKER_ROOT) else {
@@ -6383,15 +6447,33 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let mut history = checkpoint_fixture(&blob_store);
         if variant == "linear" {
             history.truncate(2);
+        } else if variant == "crash-orphan" {
+            history[0].change.message = "orphan-only crash boundary".to_string();
         } else {
             assert_eq!(variant, "branched");
         }
-        let config = HydrationCheckpointConfig::clean_for_test(
+        let mut config = HydrationCheckpointConfig::clean_for_test(
             Path::new(&root),
             "subprocess-clean-sha",
             1,
             16 * 1024 * 1024,
         );
+        if let (Ok(attempt), Ok(acquired)) = (
+            std::env::var(CHECKPOINT_WORKER_LOCK_ATTEMPT),
+            std::env::var(CHECKPOINT_WORKER_LOCK_ACQUIRED),
+        ) {
+            let release = std::env::var(CHECKPOINT_WORKER_LOCK_RELEASE)
+                .ok()
+                .map(PathBuf::from);
+            config = config.with_lock_test_hook(
+                PathBuf::from(attempt),
+                PathBuf::from(acquired),
+                release,
+            );
+        }
+        if variant == "crash-orphan" {
+            config = config.with_crash_after_objects_before_manifest();
+        }
         enrich_imported_changes_with_semantics_with_checkpoints(
             &mut history,
             &blob_store,
@@ -6427,15 +6509,40 @@ func prCheckout(cmd *cobra.Command, args []string) error {
     fn concurrent_processes_publish_without_dangling_checkpoint_references() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("shared-kin");
-        let linear = checkpoint_worker_command(&root, &dir.path().join("linear-blobs"), "linear")
-            .spawn()
-            .unwrap();
-        let branched =
-            checkpoint_worker_command(&root, &dir.path().join("branched-blobs"), "branched")
-                .spawn()
-                .unwrap();
+        let holder_attempt = dir.path().join("holder-attempt");
+        let holder_acquired = dir.path().join("holder-acquired");
+        let holder_release = dir.path().join("holder-release");
+        let waiter_attempt = dir.path().join("waiter-attempt");
+        let waiter_acquired = dir.path().join("waiter-acquired");
+
+        let mut holder_command =
+            checkpoint_worker_command(&root, &dir.path().join("linear-blobs"), "linear");
+        holder_command
+            .env(CHECKPOINT_WORKER_LOCK_ATTEMPT, &holder_attempt)
+            .env(CHECKPOINT_WORKER_LOCK_ACQUIRED, &holder_acquired)
+            .env(CHECKPOINT_WORKER_LOCK_RELEASE, &holder_release);
+        let linear = holder_command.spawn().unwrap();
+        wait_for_test_path(&holder_acquired);
+
+        let mut waiter_command =
+            checkpoint_worker_command(&root, &dir.path().join("branched-blobs"), "branched");
+        waiter_command
+            .env(CHECKPOINT_WORKER_LOCK_ATTEMPT, &waiter_attempt)
+            .env(CHECKPOINT_WORKER_LOCK_ACQUIRED, &waiter_acquired);
+        let branched = waiter_command.spawn().unwrap();
+        wait_for_test_path(&waiter_attempt);
+        assert!(
+            !waiter_acquired.exists(),
+            "second process acquired the store while the first process held it"
+        );
+
+        fs::write(&holder_release, b"release\n").unwrap();
         assert_checkpoint_worker(linear.wait_with_output().unwrap());
         assert_checkpoint_worker(branched.wait_with_output().unwrap());
+        assert!(
+            waiter_acquired.exists(),
+            "waiting process never acquired the store after deterministic release"
+        );
 
         let config = HydrationCheckpointConfig::clean_for_test(
             &root,
@@ -6458,6 +6565,55 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         )
         .unwrap();
         assert!(stats.resumed_from > 0);
+    }
+
+    #[test]
+    fn installed_objects_without_manifest_are_recovered_after_real_process_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("crash-kin");
+        let crashed =
+            checkpoint_worker_command(&root, &dir.path().join("crash-blobs"), "crash-orphan")
+                .output()
+                .unwrap();
+        assert!(
+            !crashed.status.success(),
+            "crash worker unexpectedly published a complete checkpoint"
+        );
+
+        let orphan_objects: Vec<_> = recursive_checkpoint_files(&root)
+            .into_iter()
+            .filter(|path| path.to_string_lossy().contains("/objects/"))
+            .collect();
+        assert!(
+            orphan_objects.len() >= 3,
+            "crash did not leave the installed segment and frontier objects"
+        );
+        assert!(
+            recursive_checkpoint_files(&root)
+                .iter()
+                .all(|path| !path.to_string_lossy().ends_with(".manifest.json")),
+            "crash injection occurred after manifest publication"
+        );
+
+        assert_checkpoint_worker(
+            checkpoint_worker_command(&root, &dir.path().join("recovery-blobs"), "branched")
+                .output()
+                .unwrap(),
+        );
+        for orphan in orphan_objects {
+            assert!(
+                !orphan.exists(),
+                "prepare maintenance retained unreachable crash object {}",
+                orphan.display()
+            );
+        }
+        let config = HydrationCheckpointConfig::clean_for_test(
+            &root,
+            "subprocess-clean-sha",
+            1,
+            16 * 1024 * 1024,
+        );
+        history_checkpoint::validate_store_for_test(&config).unwrap();
     }
 
     #[test]
@@ -6753,6 +6909,53 @@ func prCheckout(cmd *cobra.Command, args []string) error {
     }
 
     #[test]
+    fn lowered_byte_cap_and_orphan_gc_apply_on_exact_full_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let root = dir.path().join("cap-resume");
+        let high_cap =
+            HydrationCheckpointConfig::clean_for_test(&root, "clean-sha", 1, 16 * 1024 * 1024);
+        let mut seeded = checkpoint_fixture(&blob_store);
+        let seed_stats = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut seeded,
+            &blob_store,
+            true,
+            Some(high_cap),
+        )
+        .unwrap();
+        let low_cap = seed_stats.checkpoint_io.retained_bytes;
+        assert!(low_cap > 0);
+
+        // Model an object that was installed after the high-cap run but never
+        // made reachable from a manifest. The lower cap is exactly the known
+        // good store size, so a zero-replay resume must collect this object in
+        // prepare rather than returning early above the new policy limit.
+        let orphan = root
+            .join("checkpoints/history-hydration/objects/segments")
+            .join(format!("{}.json", "f".repeat(64)));
+        fs::write(&orphan, vec![0x55; 8 * 1024]).unwrap();
+
+        let low_config = HydrationCheckpointConfig::clean_for_test(&root, "clean-sha", 1, low_cap);
+        let mut resumed = checkpoint_fixture(&blob_store);
+        let resume_stats = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut resumed,
+            &blob_store,
+            true,
+            Some(low_config.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            resume_stats.resumed_from,
+            resumed.len(),
+            "exact final checkpoint should still take the zero-replay path"
+        );
+        assert!(!orphan.exists(), "unreachable object survived prepare GC");
+        assert!(resume_stats.checkpoint_io.retained_bytes <= low_cap);
+        history_checkpoint::validate_store_for_test(&low_config).unwrap();
+        assert_same_hydration_deltas(&seeded, &resumed);
+    }
+
+    #[test]
     fn checkpoint_retention_keeps_base_latest_and_even_interior_with_deterministic_gc() {
         let dir = tempfile::tempdir().unwrap();
         let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
@@ -6893,6 +7096,70 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         assert!(
             !root.join("checkpoints/history-hydration").exists(),
             "parent preflight must run before lock/store creation"
+        );
+    }
+
+    #[test]
+    fn cyclic_imported_first_parent_refuses_before_checkpoint_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let root = dir.path().join("kin");
+        let config =
+            HydrationCheckpointConfig::clean_for_test(&root, "clean-sha", 1, 16 * 1024 * 1024);
+        let mut imported = checkpoint_fixture(&blob_store);
+        let first = imported[0].change.id;
+        let second = imported[1].change.id;
+        imported[0].change.parents = vec![second];
+        imported[1].change.parents = vec![first];
+
+        let error = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut imported,
+            &blob_store,
+            true,
+            Some(config),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("first-parent graph contains a cycle"),
+            "unexpected cycle refusal: {error:#}"
+        );
+        assert!(imported
+            .iter()
+            .all(|entry| entry.change.entity_deltas.is_empty()
+                && entry.change.relation_deltas.is_empty()));
+        assert!(
+            !root.join("checkpoints/history-hydration").exists(),
+            "cycle preflight must run before lock/store creation"
+        );
+    }
+
+    #[test]
+    fn imported_change_cannot_collide_with_boundary_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let root = dir.path().join("kin");
+        let config =
+            HydrationCheckpointConfig::clean_for_test(&root, "clean-sha", 1, 16 * 1024 * 1024);
+        let boundary_root = kin_core::build_genesis_change().id;
+        let mut imported = checkpoint_fixture(&blob_store);
+        imported[0].change.id = boundary_root;
+
+        let error = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut imported,
+            &blob_store,
+            true,
+            Some(config),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("collides with boundary root"),
+            "unexpected root-collision refusal: {error:#}"
+        );
+        assert!(
+            !root.join("checkpoints/history-hydration").exists(),
+            "root-collision preflight must run before lock/store creation"
         );
     }
 
@@ -7741,6 +8008,102 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         assert_repo_owned_graph_truth(graph.as_ref(), &expected_paths);
         assert_makefile_is_text_searchable(graph.as_ref());
         assert!(!tracked_graph_paths(graph.as_ref()).contains(".kin/snapshot/manifest.json"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn consecutive_default_git_history_inits_keep_canonical_boundary_root() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        if !init_git_repo_for_test(repo_dir.path())
+            || !commit_git_file_for_test(
+                repo_dir.path(),
+                "src/lib.rs",
+                "pub fn answer() -> u32 { 42 }\n",
+                "initial",
+            )
+        {
+            return;
+        }
+        let git_oid = read_git_head(repo_dir.path()).unwrap();
+        let git_change = kin_git::semantic_change_id_from_git_oid_hex(&git_oid).unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home_dir.path());
+        let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
+        let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
+
+        for _ in 0..2 {
+            run(
+                Some(repo_dir.path().display().to_string()),
+                false,
+                true,
+                false,
+                true,
+                "recent".to_string(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
+        let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+        let imported = snap.graph().get_change(&git_change).unwrap().unwrap();
+        assert_eq!(
+            imported.parents,
+            vec![kin_core::build_genesis_change().id],
+            "true Git root must stay attached to canonical Kin genesis"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn git_history_off_then_recent_uses_canonical_boundary_root() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        if !init_git_repo_for_test(repo_dir.path())
+            || !commit_git_file_for_test(
+                repo_dir.path(),
+                "src/lib.rs",
+                "pub fn answer() -> u32 { 42 }\n",
+                "initial",
+            )
+        {
+            return;
+        }
+        let git_oid = read_git_head(repo_dir.path()).unwrap();
+        let git_change = kin_git::semantic_change_id_from_git_oid_hex(&git_oid).unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home_dir.path());
+        let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
+        let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
+
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "off".to_string(),
+        )
+        .await
+        .unwrap();
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "recent".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
+        let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+        let imported = snap.graph().get_change(&git_change).unwrap().unwrap();
+        assert_eq!(
+            imported.parents,
+            vec![kin_core::build_genesis_change().id],
+            "warm import must not use the prior auto-parse head as its root"
+        );
     }
 
     #[tokio::test]

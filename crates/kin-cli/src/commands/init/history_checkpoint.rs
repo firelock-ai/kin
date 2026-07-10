@@ -86,6 +86,18 @@ pub(super) struct HydrationCheckpointConfig {
     history_limit: usize,
     byte_cap: u64,
     build_policy: CheckpointBuildPolicy,
+    #[cfg(test)]
+    lock_test_hook: Option<CheckpointLockTestHook>,
+    #[cfg(test)]
+    crash_after_objects_before_manifest: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct CheckpointLockTestHook {
+    attempt_signal: PathBuf,
+    acquired_signal: PathBuf,
+    release_barrier: Option<PathBuf>,
 }
 
 impl HydrationCheckpointConfig {
@@ -104,6 +116,10 @@ impl HydrationCheckpointConfig {
             history_limit: DEFAULT_HISTORY_LIMIT,
             byte_cap: DEFAULT_BYTE_CAP,
             build_policy,
+            #[cfg(test)]
+            lock_test_hook: None,
+            #[cfg(test)]
+            crash_after_objects_before_manifest: false,
         }
     }
 
@@ -124,6 +140,8 @@ impl HydrationCheckpointConfig {
                 clean_git_sha,
                 "test-cargo-lock-provenance",
             )),
+            lock_test_hook: None,
+            crash_after_objects_before_manifest: false,
         }
     }
 
@@ -136,6 +154,8 @@ impl HydrationCheckpointConfig {
             history_limit: DEFAULT_HISTORY_LIMIT,
             byte_cap: DEFAULT_BYTE_CAP,
             build_policy: CheckpointBuildPolicy::Disabled(reason.to_string()),
+            lock_test_hook: None,
+            crash_after_objects_before_manifest: false,
         }
     }
 
@@ -155,6 +175,27 @@ impl HydrationCheckpointConfig {
         if let CheckpointBuildPolicy::Enabled(version) = &mut self.build_policy {
             version.dependency_provenance = provenance.to_string();
         }
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_lock_test_hook(
+        mut self,
+        attempt_signal: PathBuf,
+        acquired_signal: PathBuf,
+        release_barrier: Option<PathBuf>,
+    ) -> Self {
+        self.lock_test_hook = Some(CheckpointLockTestHook {
+            attempt_signal,
+            acquired_signal,
+            release_barrier,
+        });
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_crash_after_objects_before_manifest(mut self) -> Self {
+        self.crash_after_objects_before_manifest = true;
         self
     }
 }
@@ -693,11 +734,46 @@ impl CheckpointStoreLock {
             .truncate(false)
             .open(&lock_path)
             .with_context(|| format!("open checkpoint lock {}", lock_path.display()))?;
+        #[cfg(test)]
+        if let Some(hook) = &config.lock_test_hook {
+            publish_test_signal(&hook.attempt_signal)?;
+        }
         file.lock_exclusive()
             .with_context(|| format!("lock checkpoint store {}", root.display()))?;
+        #[cfg(test)]
+        if let Some(hook) = &config.lock_test_hook {
+            publish_test_signal(&hook.acquired_signal)?;
+            if let Some(barrier) = &hook.release_barrier {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !barrier.exists() {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(anyhow!(
+                            "timed out waiting for checkpoint lock test barrier {}",
+                            barrier.display()
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
         cleanup_stale_checkpoint_temps(&root)?;
         Ok(Self { file })
     }
+}
+
+#[cfg(test)]
+fn publish_test_signal(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(b"ready\n")?;
+    file.sync_all()?;
+    Ok(())
 }
 
 impl Drop for CheckpointStoreLock {
@@ -780,9 +856,12 @@ fn write_new_or_identical(
 
     match fs::hard_link(&temp, path) {
         Ok(()) => {
-            // Persist the newly installed directory entry before removing the
-            // temporary link. Without the directory fsync, a power loss could
-            // leave a durable manifest whose referenced object link vanished.
+            // On Unix, persist the newly installed directory entry before
+            // removing the temporary link. Without the directory fsync, a
+            // power loss could leave a durable manifest whose referenced
+            // object link vanished. Non-Unix platforms retain the atomic
+            // process-crash publication contract below but make no power-loss
+            // durability claim for directory metadata.
             sync_parent_directory(path)?;
             fs::remove_file(&temp)?;
             sync_parent_directory(path)?;
@@ -820,9 +899,11 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
         .with_context(|| format!("sync checkpoint directory {}", parent.display()))
 }
 
-// Opening a directory as `std::fs::File` is not portable to Windows. File and
-// hard-link publication are still atomic there; skip the Unix directory-fsync
-// durability enhancement rather than making every checkpoint write fail.
+// Opening a directory as `std::fs::File` is not portable to Windows. Installing
+// the destination hard link remains one atomic namespace operation for normal
+// process-crash recovery, but this no-op deliberately does not claim that the
+// directory entry survives sudden power loss. Keep the stronger metadata
+// durability statement Unix-only rather than pretending a flush occurred.
 #[cfg(not(unix))]
 fn sync_parent_directory(_path: &Path) -> Result<()> {
     Ok(())
@@ -1012,6 +1093,22 @@ impl HydrationCheckpointSession {
             retained_bytes,
             disabled_after_cap: false,
         };
+        if session.version_key.is_some() {
+            // Startup maintenance is mandatory even when the exact final
+            // checkpoint will make replay a zero-iteration fast path. It
+            // removes content-addressed objects installed by a process that
+            // died before publishing its manifest, applies a newly lowered
+            // cap, and prunes stale histories before any candidate restore.
+            let retention = enforce_retention(
+                &session.config,
+                &session.history_digest,
+                true,
+                false,
+                &mut session.io_stats,
+                &mut session.retained_bytes,
+            )?;
+            session.io_stats.retained_bytes = retention.total_bytes;
+        }
         let resume = if session.version_key.is_some() {
             session.load_nearest(
                 imported,
@@ -1038,6 +1135,29 @@ impl HydrationCheckpointSession {
 
     pub(super) fn io_stats(&self) -> CheckpointIoStats {
         self.io_stats
+    }
+
+    /// Complete store maintenance for every enabled session, including a
+    /// fully resumed one that persisted no new boundary. This is the second
+    /// and final full retained-byte reconciliation for the healthy path (the
+    /// first is at prepare), keeping normal accounting linear in store size.
+    pub(super) fn finalize(&mut self) -> Result<()> {
+        if self.version_key.is_none() {
+            return Ok(());
+        }
+        let retention = enforce_retention(
+            &self.config,
+            &self.history_digest,
+            true,
+            true,
+            &mut self.io_stats,
+            &mut self.retained_bytes,
+        )?;
+        self.io_stats.retained_bytes = retention.total_bytes;
+        if !retention.current_history_retained && self.last_boundary > 0 {
+            self.disabled_after_cap = true;
+        }
+        Ok(())
     }
 
     fn load_nearest(
@@ -1420,6 +1540,14 @@ impl HydrationCheckpointSession {
             &mut self.io_stats,
         )?;
 
+        // Test-only process-crash injection after all immutable objects are
+        // durably installed but before the reachability manifest exists.
+        // Recovery must happen in the next process's prepare maintenance.
+        #[cfg(test)]
+        if self.config.crash_after_objects_before_manifest {
+            std::process::abort();
+        }
+
         let manifest = ManifestPayloadV2 {
             format_version: FORMAT_VERSION,
             version_key: version,
@@ -1453,7 +1581,8 @@ impl HydrationCheckpointSession {
         let retention = enforce_retention(
             &self.config,
             &self.history_digest,
-            processed_count == imported.len(),
+            false,
+            false,
             &mut self.io_stats,
             &mut self.retained_bytes,
         )?;
@@ -1747,7 +1876,8 @@ fn remove_dir_all_counted(path: &Path, retained_total: &mut u64) -> Result<()> {
 fn enforce_retention(
     config: &HydrationCheckpointConfig,
     current_history_digest: &str,
-    final_boundary: bool,
+    full_gc: bool,
+    reconcile: bool,
     stats: &mut CheckpointIoStats,
     retained_total: &mut u64,
 ) -> Result<RetentionOutcome> {
@@ -1755,13 +1885,15 @@ fn enforce_retention(
     let removed_history =
         prune_history_identities(config, current_history_digest, stats, retained_total)?;
     garbage_collect_frontiers(config, stats, retained_total)?;
-    if final_boundary || removed_history {
+    if full_gc || removed_history {
         garbage_collect_segments(config, stats, retained_total)?;
     }
 
-    // Reconcile incremental accounting only at finalization or when the cap
-    // forces GC. Periodic boundaries stay O(1) in accumulated segment count.
-    let reconcile_after_gc = final_boundary || *retained_total > config.byte_cap;
+    // Reconcile incremental accounting only at session finalization or when
+    // the cap forces GC. Periodic boundaries stay O(1) in accumulated segment
+    // count. Prepare starts from an exact scan and can therefore run full GC
+    // without immediately scanning the same store a second time.
+    let reconcile_after_gc = reconcile || *retained_total > config.byte_cap;
     if *retained_total > config.byte_cap {
         // An interrupted prior write may have left an unreferenced segment.
         // Collect those before discarding any still-usable history.
@@ -1930,5 +2062,27 @@ mod tests {
             checkpoint_build_policy("abc123def456", false, true, "unknown"),
             CheckpointBuildPolicy::Disabled(_)
         ));
+    }
+
+    #[test]
+    fn finalize_collects_unreachable_object_without_a_replay_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = HydrationCheckpointConfig::clean_for_test(dir.path(), "clean-sha", 1, 1024);
+        let mut imported = Vec::<kin_git::ImportedChange>::new();
+        let (mut session, resume) =
+            HydrationCheckpointSession::prepare(config.clone(), &mut imported, &[], &[], &[])
+                .unwrap();
+        assert!(resume.is_none());
+
+        let orphan = segment_dir(&config).join(format!("{}.json", "e".repeat(64)));
+        fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+        fs::write(&orphan, b"installed without manifest").unwrap();
+        session.finalize().unwrap();
+
+        assert!(
+            !orphan.exists(),
+            "zero-replay finalization retained an unreachable object"
+        );
+        assert!(session.io_stats().retained_bytes <= config.byte_cap);
     }
 }

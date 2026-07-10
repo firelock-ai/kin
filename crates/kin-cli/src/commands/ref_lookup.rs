@@ -480,7 +480,10 @@ fn hydrate_imported_git_ref(
 ) -> Result<usize> {
     hydrate_imported_git_ref_with(graph, layout, git_oid, |imported, blob_store, kin_root| {
         crate::commands::init::enrich_imported_changes_with_semantics_checkpointed(
-            imported, blob_store, kin_root,
+            imported,
+            blob_store,
+            kin_root,
+            kin_core::build_genesis_change().id,
         )
         .map(|_| ())
     })
@@ -702,6 +705,7 @@ mod tests {
                         blob_store,
                         kin_root,
                         "lazy-ref-clean-sha",
+                        kin_core::build_genesis_change().id,
                     )?;
                 first_resumed.set(stats.resumed_from());
                 Ok(())
@@ -725,6 +729,7 @@ mod tests {
                         blob_store,
                         kin_root,
                         "lazy-ref-clean-sha",
+                        kin_core::build_genesis_change().id,
                     )?;
                 second_resumed.set(stats.resumed_from());
                 Ok(())
@@ -761,6 +766,7 @@ mod tests {
                     blob_store,
                     kin_root,
                     "lazy-ref-clean-sha",
+                    kin_core::build_genesis_change().id,
                 )
                 .map(|_| ())
             },
@@ -811,6 +817,7 @@ mod tests {
                     blob_store,
                     kin_root,
                     "lazy-ref-clean-sha",
+                    kin_core::build_genesis_change().id,
                 )
                 .map(|_| ())
             },
