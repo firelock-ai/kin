@@ -335,11 +335,7 @@ pub fn execute_verify_run(
 
     let started_at = Timestamp::now();
     let start_instant = std::time::Instant::now();
-    let output = std::process::Command::new("sh")
-        .current_dir(layout.working_dir())
-        .arg("-c")
-        .arg(&cmd_str)
-        .output();
+    let output = verification_command(layout.working_dir(), &cmd_str).output();
     let duration = start_instant.elapsed();
     let finished_at = Timestamp::now();
 
@@ -424,6 +420,24 @@ pub fn execute_verify_run(
     }
 
     Ok(VerifyRunResponse { lines })
+}
+
+#[cfg(unix)]
+fn verification_shell_program() -> &'static str {
+    // POSIX systems provide /bin/sh; resolving through PATH makes verification
+    // fail under otherwise valid restricted-path environments.
+    "/bin/sh"
+}
+
+#[cfg(not(unix))]
+fn verification_shell_program() -> &'static str {
+    "sh"
+}
+
+fn verification_command(working_dir: &std::path::Path, command: &str) -> std::process::Command {
+    let mut shell = std::process::Command::new(verification_shell_program());
+    shell.current_dir(working_dir).arg("-c").arg(command);
+    shell
 }
 
 #[derive(Debug, Clone)]
@@ -961,6 +975,22 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verification_shell_does_not_depend_on_path_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty_path = dir.path().join("empty-path");
+        std::fs::create_dir(&empty_path).unwrap();
+
+        let output = verification_command(dir.path(), "printf path-independent")
+            .env("PATH", &empty_path)
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"path-independent");
     }
 
     #[tokio::test]
