@@ -429,7 +429,10 @@ fn find_child_of_kind<'a>(
 ) -> Option<tree_sitter::Node<'a>> {
     let count = node.child_count();
     for i in 0..count {
-        if let Some(child) = node.child(i) {
+        let Ok(child_index) = i.try_into() else {
+            continue;
+        };
+        if let Some(child) = node.child(child_index) {
             if child.kind() == kind {
                 return Some(child);
             }
@@ -493,7 +496,7 @@ fn extract_c_include(
         // Use index-based iteration to avoid borrow-checker issues with cursor.
         let count = node.child_count();
         (0..count)
-            .filter_map(|i| node.child(i))
+            .filter_map(|i| i.try_into().ok().and_then(|index| node.child(index)))
             .find(|c| c.kind() == "system_lib_string" || c.kind() == "string_literal")
     });
 
