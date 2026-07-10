@@ -3178,6 +3178,43 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         }
     }
 
+    // Per-query dynamic-k sizing (dark lever, default OFF == byte-identical).
+    // adaptive_cap sizes from cluster/floor heuristics; when the fused score
+    // vector shows a decisive knee this resizes to that knee, and when the tail
+    // is flat / score-tied it keeps the incumbent size (recall-safe — it only
+    // ever cuts on a clear break). It composes before the declaration cutoff
+    // below: both are suffix-only trims over the same rank-ordered list sharing
+    // one gap primitive, so the shorter keep simply wins and they cannot fight.
+    if locate_env_bool("KIN_LOCATE_DYNAMIC_K", false) {
+        let k_min = locate_env_usize("KIN_LOCATE_DYNAMIC_K_MIN", 3);
+        let k_max = locate_env_usize("KIN_LOCATE_DYNAMIC_K_MAX", 20);
+        let gap = locate_env_f32("KIN_LOCATE_DYNAMIC_K_GAP", 2.0);
+        let scores: Vec<f32> = results.iter().map(|(_, score)| *score).collect();
+        if let Some(keep) =
+            crate::commands::locate_sizing::dynamic_k_len(&scores, k_min, k_max, gap)
+        {
+            // No-silent-elimination: attribute every cut file in the prune ledger.
+            if explain {
+                if let Some(debug) = debug_info.as_mut() {
+                    for (path, score) in results.iter().skip(keep) {
+                        debug.prune_ledger.push(PruneEvent {
+                            stage: "dynamic_k".to_string(),
+                            kind: "score_knee".to_string(),
+                            path: Some(path.clone()),
+                            name: None,
+                            score: Some(*score),
+                            dropped: None,
+                            limit: Some(keep),
+                            threshold: Some(gap),
+                            detail: String::new(),
+                        });
+                    }
+                }
+            }
+            results.truncate(keep);
+        }
+    }
+
     // Confidence-calibrated declaration cutoff (profile lever, default OFF ==
     // byte-identical). Kin recalls the right files but declares too many, so a
     // pinned result cap reads as low precision on every F1/Acc@k comparison. When
@@ -11328,14 +11365,12 @@ fn declaration_cutoff_len(results: &[(String, f32)], gap: f32, min_keep: usize) 
         return n;
     }
     // The earliest boundary we may cut after is index `floor - 1`, which keeps
-    // exactly `floor` files.
+    // exactly `floor` files. The gap test shares one primitive with the dynamic-k
+    // sizer so both trims measure separation identically: cut at the first
+    // adjacent pair whose relative gap exceeds `gap` (a non-positive next score
+    // reads as an infinite separation).
     for i in (floor - 1)..(n - 1) {
-        let cur = results[i].1;
-        let next = results[i + 1].1;
-        if next <= 0.0 {
-            return i + 1;
-        }
-        if cur > 0.0 && cur / next > gap {
+        if crate::commands::locate_sizing::score_gap_ratio(results[i].1, results[i + 1].1) > gap {
             return i + 1;
         }
     }
