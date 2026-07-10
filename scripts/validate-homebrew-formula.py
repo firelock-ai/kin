@@ -24,8 +24,11 @@ DO_BLOCK_RE = re.compile(r"(?:^|\s)do(?:\s*\|[^|]*\|)?$")
 INLINE_END_RE = re.compile(r"(?:^|;)\s*end\b")
 BLOCK_COMMENT_RE = re.compile(r"^=(?:begin|end)\b")
 PERCENT_LITERAL_RE = re.compile(r"(?<![\w%])%(?:[qQwWiIrxs])?[^\w\s=]")
+GENERIC_CLASS_RE = re.compile(r"^class\b")
 ON_PLATFORM_RE = re.compile(r"^(on_[A-Za-z0-9_!?]+)\b")
 FORMULA_METADATA_RE = re.compile(r"^(?:desc|homepage|license)\b")
+INSTALL_BLOCK_RE = re.compile(r"^def\s+install$")
+TEST_BLOCK_RE = re.compile(r"^test\s+do$")
 CHECKSUM_RE = re.compile(r"^\s*([0-9A-Fa-f]{64})[ \t]+\*?([^ \t]+)[ \t]*$")
 HEX_RE = re.compile(r"^[0-9A-Fa-f]{64}$")
 
@@ -152,6 +155,8 @@ def reject_unsupported_ruby_syntax(line: str, code: str, line_number: int) -> No
         reason = "Ruby block comments"
     elif code == "__END__":
         reason = "Ruby data sections"
+    elif GENERIC_CLASS_RE.match(code) and not KIN_CLASS_RE.fullmatch(code):
+        reason = "Ruby class reopening and additional class declarations"
     elif has_unterminated_ruby_quote(line):
         reason = "multiline quoted strings"
     elif "<<" in structure:
@@ -162,6 +167,8 @@ def reject_unsupported_ruby_syntax(line: str, code: str, line_number: int) -> No
         reason = "Ruby command literals"
     elif PERCENT_LITERAL_RE.search(structure):
         reason = "Ruby percent literals"
+    elif "/" in structure:
+        reason = "Ruby regular expressions and division expressions"
     elif structure.endswith("\\"):
         reason = "Ruby line continuations"
     elif INLINE_END_RE.search(structure) and code != "end":
@@ -204,6 +211,8 @@ def parse_formula(formula: str, expected_version: str) -> dict[str, FormulaPair]
     blocks: list[RubyBlock] = []
     versions: list[str] = []
     kin_class_count = 0
+    install_block_count = 0
+    test_block_count = 0
     os_block_counts = {os_name: 0 for os_name in ("macos", "linux")}
     arch_block_counts = {
         (os_name, arch): 0
@@ -358,12 +367,56 @@ def parse_formula(formula: str, expected_version: str) -> dict[str, FormulaPair]
         if pending_url is not None:
             raise missing_sha_error(pending_url)
 
+        if INSTALL_BLOCK_RE.fullmatch(code):
+            if not is_direct_kin_scope(blocks):
+                raise ValidationError(
+                    "install block must be directly inside class Kin < Formula "
+                    f"at formula line {line_number}"
+                )
+            install_block_count += 1
+            if install_block_count > 1:
+                raise ValidationError(
+                    "expected exactly one install block directly inside "
+                    f"class Kin < Formula; found {install_block_count}"
+                )
+            blocks.append(RubyBlock("install", code, line_number))
+            continue
+
+        if TEST_BLOCK_RE.fullmatch(code):
+            if not is_direct_kin_scope(blocks):
+                raise ValidationError(
+                    "test block must be directly inside class Kin < Formula "
+                    f"at formula line {line_number}"
+                )
+            test_block_count += 1
+            if test_block_count > 1:
+                raise ValidationError(
+                    "expected exactly one test block directly inside "
+                    f"class Kin < Formula; found {test_block_count}"
+                )
+            blocks.append(RubyBlock("test", code, line_number))
+            continue
+
         if match := BLOCK_KEYWORD_RE.match(code):
             keyword = match.group(1)
-            kind = "class" if keyword == "class" else keyword
-            blocks.append(RubyBlock(kind, code, line_number))
+            if keyword in {"class", "module", "def"}:
+                raise ValidationError(
+                    "unsupported Ruby class/module/method declaration outside the "
+                    f"canonical install/test grammar at formula line {line_number}"
+                )
+            if not any(block.kind in {"install", "test"} for block in blocks):
+                raise ValidationError(
+                    "unsupported Ruby block outside an install/test body "
+                    f"at formula line {line_number}"
+                )
+            blocks.append(RubyBlock(keyword, code, line_number))
             continue
         if DO_BLOCK_RE.search(code):
+            if not any(block.kind in {"install", "test"} for block in blocks):
+                raise ValidationError(
+                    "unsupported Ruby do block outside an install/test body "
+                    f"at formula line {line_number}"
+                )
             blocks.append(RubyBlock("do", code, line_number))
             continue
         if is_direct_kin_scope(blocks) and FORMULA_METADATA_RE.match(code):
@@ -393,6 +446,16 @@ def parse_formula(formula: str, expected_version: str) -> dict[str, FormulaPair]
     if versions[0] != expected_version:
         raise ValidationError(
             f"formula version is {versions[0]!r}, expected {expected_version!r}"
+        )
+    if install_block_count != 1:
+        raise ValidationError(
+            "expected exactly one install block directly inside "
+            f"class Kin < Formula; found {install_block_count}"
+        )
+    if test_block_count != 1:
+        raise ValidationError(
+            "expected exactly one test block directly inside "
+            f"class Kin < Formula; found {test_block_count}"
         )
 
     for os_name, count in os_block_counts.items():

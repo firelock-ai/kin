@@ -438,7 +438,7 @@ def test_comment_only_version_fails() -> None:
 def test_conditional_inactive_version_fails() -> None:
     assert_bounded_failure(
         formula_mode="conditional_version",
-        expected_error="version directive must be directly inside class Kin < Formula",
+        expected_error="unsupported Ruby block outside an install/test body",
     )
 
 
@@ -459,7 +459,7 @@ def test_duplicate_kin_class_fails() -> None:
 def test_missing_linux_end_fails() -> None:
     assert_bounded_failure(
         formula_mode="missing_linux_end",
-        expected_error="unclosed Ruby block(s): class Kin < Formula opened at line 1",
+        expected_error="install block must be directly inside class Kin < Formula",
     )
 
 
@@ -512,7 +512,58 @@ def test_ruby_percent_literal_cannot_supply_inactive_version() -> None:
 
 def test_unparsed_ruby_regex_cannot_supply_inactive_version() -> None:
     formula = replace_fixture_version('  ignored_version = /\n    version "1.2.3"\n  /')
-    assert_validator_rejects(formula, "unsupported generated-formula statement")
+    assert_validator_rejects(
+        formula, "Ruby regular expressions and division expressions"
+    )
+
+
+def test_multiline_ruby_regex_inside_install_body_is_rejected() -> None:
+    formula = current_real_formula_shape().replace(
+        '    bin.install "kin"',
+        '    ignored = /\n      version "9.9.9"\n    /x\n    bin.install "kin"',
+        1,
+    )
+    assert_validator_rejects(
+        formula, "Ruby regular expressions and division expressions"
+    )
+
+
+def test_reopened_kin_class_is_rejected() -> None:
+    formula = (
+        current_real_formula_shape()
+        + """
+class Kin
+  def install
+    bin.install "replacement"
+  end
+end
+"""
+    )
+    assert_validator_rejects(
+        formula, "Ruby class reopening and additional class declarations"
+    )
+
+
+def test_version_dsl_cannot_be_shadowed_by_class_method() -> None:
+    formula = current_real_formula_shape().replace(
+        '  version "1.2.3"',
+        '  def self.version(*)\n  end\n  version "1.2.3"',
+        1,
+    )
+    assert_validator_rejects(
+        formula, "unsupported Ruby class/module/method declaration"
+    )
+
+
+def test_platform_dsl_cannot_be_shadowed_by_class_method() -> None:
+    formula = current_real_formula_shape().replace(
+        "  on_macos do",
+        "  def self.on_macos(&block)\n  end\n\n  on_macos do",
+        1,
+    )
+    assert_validator_rejects(
+        formula, "unsupported Ruby class/module/method declaration"
+    )
 
 
 def test_ruby_data_section_is_rejected_fail_closed() -> None:
@@ -552,27 +603,21 @@ def test_unsupported_os_block_fails() -> None:
 def test_os_block_outside_direct_class_scope_fails() -> None:
     assert_bounded_failure(
         formula_mode="nested_os",
-        expected_error=(
-            "operating-system block must be directly inside class Kin < Formula"
-        ),
+        expected_error="unsupported Ruby block outside an install/test body",
     )
 
 
 def test_arch_block_outside_direct_os_scope_fails() -> None:
     assert_bounded_failure(
         formula_mode="nested_arch",
-        expected_error=(
-            "architecture block must be directly inside a supported operating-system block"
-        ),
+        expected_error="unsupported Ruby block outside an install/test body",
     )
 
 
 def test_url_outside_direct_arch_scope_fails() -> None:
     assert_bounded_failure(
         formula_mode="nested_url",
-        expected_error=(
-            "formula URL must be directly inside a supported architecture block"
-        ),
+        expected_error="unsupported Ruby block outside an install/test body",
     )
 
 
@@ -670,6 +715,10 @@ def main() -> None:
         test_ruby_brace_block_cannot_supply_inactive_version,
         test_ruby_percent_literal_cannot_supply_inactive_version,
         test_unparsed_ruby_regex_cannot_supply_inactive_version,
+        test_multiline_ruby_regex_inside_install_body_is_rejected,
+        test_reopened_kin_class_is_rejected,
+        test_version_dsl_cannot_be_shadowed_by_class_method,
+        test_platform_dsl_cannot_be_shadowed_by_class_method,
         test_ruby_data_section_is_rejected_fail_closed,
         test_duplicate_empty_os_block_fails,
         test_duplicate_empty_arch_block_fails,
