@@ -653,6 +653,50 @@ fn invalid_utf8_declaration_ranges_never_panic() {
     }
 }
 
+#[test]
+fn python_invalid_utf8_declarations_are_opaque_and_byte_distinct() {
+    let sources: [&[u8]; 3] = [
+        b"# coding: latin-1\ndef target(value=\"x  \xff y\"):\n    return value\n",
+        b"# coding: latin-1\ndef target(value=\"x \xff y\"):\n    return value\n",
+        b"# coding: latin-1\ndef target(value=\"x  \xfe y\"):\n    return value\n",
+    ];
+    let adapter = PythonAdapter;
+    let file_id = FilePathId::new("invalid_utf8.py");
+    let mut signatures = Vec::new();
+
+    for source in sources {
+        let tree = adapter.parse(source).expect("parse Latin-1 Python fixture");
+        let output = adapter
+            .extract(&tree, source, &file_id)
+            .expect("extract Latin-1 Python fixture");
+        assert!(
+            matches!(output.parse_state, ParseState::Valid),
+            "the safety regression must exercise tree-sitter's valid parse path"
+        );
+        let signature = output
+            .entities
+            .iter()
+            .find(|entity| entity.name == "target")
+            .expect("target entity")
+            .signature
+            .clone();
+        assert!(
+            signature.starts_with("non_utf8_hex:"),
+            "invalid-UTF-8 declarations must stay outside semantic classifiers: {signature}"
+        );
+        signatures.push(signature);
+    }
+
+    assert_ne!(
+        signatures[0], signatures[1],
+        "semantic whitespace around an invalid byte must remain visible"
+    );
+    assert_ne!(
+        signatures[0], signatures[2],
+        "distinct invalid byte values must remain visible"
+    );
+}
+
 // ---- Registry conformance ----
 
 #[test]

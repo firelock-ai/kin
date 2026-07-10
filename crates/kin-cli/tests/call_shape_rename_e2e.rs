@@ -24,19 +24,23 @@
 use kin_db::{EntityStore, InMemoryGraph};
 use kin_index::{link_cross_file, FileParseData};
 use kin_model::review::{RiskLevel, RiskSummary};
-use kin_model::{Entity, FilePathId, GraphNodeId, RelationKind};
+use kin_model::{Entity, FilePathId, GraphNodeId, ParseState, RelationKind};
 use kin_parser::{LanguageAdapter, PythonAdapter};
 use kin_review::{
     analyze_impact, collect_inline_comments, derive_shadow_policy, EntityChange, EntityChangeKind,
     InlineCommentKind, Review, SemanticDiff, ShadowGateVerdict,
 };
 
-fn parse_python(file_path: &str, source: &str) -> FileParseData {
+fn parse_python_bytes(file_path: &str, bytes: &[u8]) -> FileParseData {
     let adapter = PythonAdapter;
     let file_id = FilePathId::new(file_path);
-    let bytes = source.as_bytes();
     let tree = adapter.parse(bytes).expect("parse");
     let output = adapter.extract(&tree, bytes, &file_id).expect("extract");
+    assert!(
+        matches!(output.parse_state, ParseState::Valid),
+        "call-shape fixture must exercise a valid Python parse: {:?}",
+        output.parse_state
+    );
     let entities: Vec<Entity> = output
         .entities
         .into_iter()
@@ -48,6 +52,10 @@ fn parse_python(file_path: &str, source: &str) -> FileParseData {
         relations: output.relations,
         imports: output.imports,
     }
+}
+
+fn parse_python(file_path: &str, source: &str) -> FileParseData {
+    parse_python_bytes(file_path, source.as_bytes())
 }
 
 fn find_entity(files: &[FileParseData], name: &str) -> Entity {
@@ -63,7 +71,13 @@ fn find_entity(files: &[FileParseData], name: &str) -> Entity {
 /// does — each `Calls` edge carries its call-site argument shape. Returns the
 /// parsed files (for entity lookup), the linked relations, and the graph store.
 fn link_into_graph(source: &str) -> (Vec<FileParseData>, Vec<kin_model::Relation>, InMemoryGraph) {
-    let files = vec![parse_python("mod.py", source)];
+    link_into_graph_bytes(source.as_bytes())
+}
+
+fn link_into_graph_bytes(
+    source: &[u8],
+) -> (Vec<FileParseData>, Vec<kin_model::Relation>, InMemoryGraph) {
+    let files = vec![parse_python_bytes("mod.py", source)];
 
     // Real linker: resolves calls and persists each Calls edge's argument shape.
     let relations = link_cross_file(&files);
@@ -151,8 +165,15 @@ fn link_and_shadow_verdict_from_sources(
     old_source: &str,
     new_source: &str,
 ) -> (ShadowGateVerdict, String, String) {
-    let (old_files, _relations, graph) = link_into_graph(old_source);
-    let new_files = vec![parse_python("mod.py", new_source)];
+    link_and_shadow_verdict_from_source_bytes(old_source.as_bytes(), new_source.as_bytes())
+}
+
+fn link_and_shadow_verdict_from_source_bytes(
+    old_source: &[u8],
+    new_source: &[u8],
+) -> (ShadowGateVerdict, String, String) {
+    let (old_files, _relations, graph) = link_into_graph_bytes(old_source);
+    let new_files = vec![parse_python_bytes("mod.py", new_source)];
     let old = find_entity(&old_files, "target");
     let new = find_entity(&new_files, "target");
     assert_eq!(
@@ -271,6 +292,12 @@ def caller_one():
 def caller_two():
     return target(2, "explicit")
 "#;
+
+const LATIN1_DEFAULT_CHANGE_OLD: &[u8] = b"# coding: latin-1\ndef target(ext, args=\"x  \xff y\"):\n    return ext, args\n\n\ndef caller_one():\n    return target(1)\n\n\ndef caller_two():\n    return target(2, \"explicit\")\n";
+
+const LATIN1_DEFAULT_WHITESPACE_CHANGE_NEW: &[u8] = b"# coding: latin-1\ndef target(ext, lines=\"x \xff y\"):\n    return ext, lines\n\n\ndef caller_one():\n    return target(1)\n\n\ndef caller_two():\n    return target(2, \"explicit\")\n";
+
+const LATIN1_DEFAULT_BYTE_CHANGE_NEW: &[u8] = b"# coding: latin-1\ndef target(ext, lines=\"x  \xfe y\"):\n    return ext, lines\n\n\ndef caller_one():\n    return target(1)\n\n\ndef caller_two():\n    return target(2, \"explicit\")\n";
 
 #[test]
 fn linker_persists_positional_call_shape_on_calls_edges() {
@@ -443,6 +470,40 @@ fn e2e_parsed_sources_preserve_and_block_changed_string_default() {
         ShadowGateVerdict::WouldBlock,
         "a parsed rename plus semantic string-default change must stay blocking"
     );
+}
+
+#[test]
+fn e2e_invalid_utf8_defaults_are_opaque_and_fail_closed() {
+    for (label, changed_source) in [
+        (
+            "semantic whitespace around an invalid byte",
+            LATIN1_DEFAULT_WHITESPACE_CHANGE_NEW,
+        ),
+        (
+            "a distinct invalid byte value",
+            LATIN1_DEFAULT_BYTE_CHANGE_NEW,
+        ),
+    ] {
+        let (verdict, old_signature, new_signature) =
+            link_and_shadow_verdict_from_source_bytes(LATIN1_DEFAULT_CHANGE_OLD, changed_source);
+        assert!(
+            old_signature.starts_with("non_utf8_hex:"),
+            "old invalid-UTF-8 declaration must be opaque: {old_signature}"
+        );
+        assert!(
+            new_signature.starts_with("non_utf8_hex:"),
+            "new invalid-UTF-8 declaration must be opaque: {new_signature}"
+        );
+        assert_ne!(
+            old_signature, new_signature,
+            "raw declaration changes must remain visible for {label}"
+        );
+        assert_eq!(
+            verdict,
+            ShadowGateVerdict::WouldBlock,
+            "rename analysis must fail closed for {label}"
+        );
+    }
 }
 
 #[test]

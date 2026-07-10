@@ -126,7 +126,9 @@ fn hash_token_stream(node: &Node, source: &[u8], hasher: &mut Sha256) {
 /// `function_body`/`class_body`) are cut at that child by kind. Line wrapping
 /// and indentation outside literals must not leak into signatures, while
 /// syntax-tree string/character/template literal ranges are copied byte-for-
-/// byte because their whitespace is semantic data.
+/// byte because their whitespace is semantic data. A declaration containing
+/// invalid UTF-8 is represented as an opaque, reversible byte string instead
+/// of lossy text so distinct source contracts can never collapse together.
 pub fn declaration_signature(node: &Node, source: &[u8]) -> String {
     let start = node.start_byte();
     let mut end = node.end_byte();
@@ -144,24 +146,37 @@ pub fn declaration_signature(node: &Node, source: &[u8]) -> String {
     }
     let end = end.max(start);
     let source_slice = source.get(start..end).unwrap_or_default();
-    let text = String::from_utf8_lossy(source_slice);
+    let Ok(text) = std::str::from_utf8(source_slice) else {
+        return opaque_non_utf8_signature(source_slice);
+    };
     let mut literal_ranges = Vec::new();
-    // Tree-sitter spans address the original bytes. Lossy UTF-8 decoding can
-    // change their offsets, so literal copying is safe only while those byte
-    // offsets still name valid boundaries in the decoded signature.
-    if std::str::from_utf8(source_slice).is_ok() {
-        collect_literal_ranges(node, start, end, &mut literal_ranges);
-        literal_ranges.retain(|(literal_start, literal_end)| {
-            literal_start < literal_end
-                && *literal_end <= text.len()
-                && text.is_char_boundary(*literal_start)
-                && text.is_char_boundary(*literal_end)
-        });
-    }
-    canonicalize_signature_spacing(&text, &literal_ranges)
+    collect_literal_ranges(node, start, end, &mut literal_ranges);
+    literal_ranges.retain(|(literal_start, literal_end)| {
+        literal_start < literal_end
+            && *literal_end <= text.len()
+            && text.is_char_boundary(*literal_start)
+            && text.is_char_boundary(*literal_end)
+    });
+    canonicalize_signature_spacing(text, &literal_ranges)
         .trim_end_matches(['{', ':'])
         .trim()
         .to_string()
+}
+
+/// Preserve every original byte while keeping invalid-UTF-8 declarations out
+/// of language-specific signature classifiers. The prefix contains no source
+/// syntax and the hexadecimal payload is injective, so callers can compare
+/// signatures safely but cannot mistake the opaque value for a parsed `def`,
+/// function, or method declaration.
+fn opaque_non_utf8_signature(source: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut signature = String::with_capacity("non_utf8_hex:".len() + source.len() * 2);
+    signature.push_str("non_utf8_hex:");
+    for byte in source {
+        signature.push(HEX[(byte >> 4) as usize] as char);
+        signature.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    signature
 }
 
 /// Protect syntax-tree literal nodes from declaration whitespace
