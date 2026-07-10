@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (396 total, 294 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (401 total, 299 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -271,6 +271,10 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_DIRECT_DOMINANCE_TAIL_PENALTY` | float>=0 | 0.35 | correctness | locate tuning knob: direct dominance tail penalty |
 | `KIN_LOCATE_DIR_MATCH_FILE_LIMIT` | usize | 20 | correctness | locate tuning knob: dir match file limit |
 | `KIN_LOCATE_DOCS_PATH_PENALTY` | float>=0 | 0.01 | correctness | locate tuning knob: docs path penalty |
+| `KIN_LOCATE_DYNAMIC_K` | bool | false | correctness | locate tuning knob: dynamic k |
+| `KIN_LOCATE_DYNAMIC_K_GAP` | float>=0 | 2.0 | correctness | locate tuning knob: dynamic k gap |
+| `KIN_LOCATE_DYNAMIC_K_MAX` | usize | 20 | correctness | locate tuning knob: dynamic k max |
+| `KIN_LOCATE_DYNAMIC_K_MIN` | usize | 3 | correctness | locate tuning knob: dynamic k min |
 | `KIN_LOCATE_EMBEDDING_MIN_SIMILARITY` | float>=0 | context-dependent | correctness | locate tuning knob: embedding min similarity |
 | `KIN_LOCATE_EMBED_FLOOR_EXEMPT_TOPK` | usize | 5 | correctness | locate tuning knob: embed floor exempt topk |
 | `KIN_LOCATE_EMIT_INNER_METHODS` | bool | false | correctness | locate tuning knob: emit inner methods |
@@ -401,6 +405,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_LOCATE_SEED_DIVERSITY_TAIL_LIMIT` | usize | 8 | correctness | locate tuning knob: seed diversity tail limit |
 | `KIN_LOCATE_SEED_GAP_THRESHOLD` | float>=0 | 0.5 | correctness | locate tuning knob: seed gap threshold |
 | `KIN_LOCATE_SEMANTIC_FETCH_LIMIT` | usize | 250 | correctness | locate tuning knob: semantic fetch limit |
+| `KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS` | bool | false | correctness | locate tuning knob: semantic phase graph anchors |
 | `KIN_LOCATE_SEMANTIC_PHASE_WINDOW` | usize | 12 | correctness | locate tuning knob: semantic phase window |
 | `KIN_LOCATE_SEMANTIC_PRIMACY_K` | float>=0 | 8.0 | correctness | locate tuning knob: semantic primacy k |
 | `KIN_LOCATE_SEMANTIC_PRIMACY_WEIGHT` | float>=0 | 0.5 | correctness | locate tuning knob: semantic primacy weight |

@@ -41,6 +41,7 @@ pub mod intent;
 pub mod locate;
 pub mod locate_cursor;
 pub mod locate_debug;
+pub mod locate_sizing;
 pub mod locate_telemetry;
 pub mod log;
 pub mod mcp;
