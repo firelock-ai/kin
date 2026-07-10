@@ -9882,7 +9882,7 @@ mod tests {
     }
 
     #[test]
-    fn foreground_embed_batch_flush_defers_sidecar_while_queue_pending() {
+    fn foreground_embed_batch_flush_checkpoints_sidecar_on_throttle() {
         let state = test_state();
         state
             .graph
@@ -9897,11 +9897,23 @@ mod tests {
         state.graph.queue_missing_for_embedding();
         assert!(state.graph.pending_embeddings() > 0);
 
+        // The first in-run flush checkpoints the sidecar so persisted coverage
+        // tracks compute from the first batch (the persist-wedge fix).
+        std::fs::remove_file(&vector_path).unwrap();
+        persist_foreground_embed_batch(state.as_ref()).unwrap();
+        assert!(
+            vector_path.exists(),
+            "the first foreground per-batch flush must checkpoint the sidecar"
+        );
+
+        // An immediate follow-up flush is throttled (within the interval and the
+        // batch backstop), so a long run is not billed a full index serialize on
+        // every batch while work is still pending.
         std::fs::remove_file(&vector_path).unwrap();
         persist_foreground_embed_batch(state.as_ref()).unwrap();
         assert!(
             !vector_path.exists(),
-            "foreground per-batch flush must defer the sidecar while work is pending"
+            "an immediate follow-up foreground flush must be throttled while work is pending"
         );
     }
 
