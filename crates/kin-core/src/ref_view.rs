@@ -2,10 +2,12 @@
 // Copyright 2026 Firelock, LLC
 
 use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::ops::Range;
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use kin_blobs::BlobStore;
 use kin_db::{GraphSnapshot, InMemoryGraph};
@@ -165,7 +167,7 @@ fn build_graph_at_ref_with_repo_inner(
         cancelled,
         "Git blob-repair initialization",
     )?;
-    let reader = BlobReader::new(blob_store, git_repair.as_ref(), repo_path);
+    let reader = BlobReader::new(blob_store, git_repair.as_ref());
     let ref_file_tree = match git_repair
         .as_ref()
         .map(|repair| repair.materialize_file_tree(blob_store, cancelled))
@@ -182,11 +184,9 @@ fn build_graph_at_ref_with_repo_inner(
         }
         Some(Ok(_)) => resolved.file_tree.clone(),
         Some(Err(err)) => {
-            tracing::warn!(
-                error = %err,
-                "failed to materialize git tree for historical ref; falling back to graph artifact deltas"
-            );
-            resolved.file_tree.clone()
+            return Err(KinError::Other(format!(
+                "failed to materialize authoritative Git tree for historical ref: {err}"
+            )))
         }
         None => resolved.file_tree.clone(),
     };
@@ -346,8 +346,9 @@ pub fn filter_vector_results_to_scope(
 /// Reads blob content, repairing from Git objects when the blob store misses.
 ///
 /// Layered fallback for missing blobs (Kin's SHA-256 store -> Git tree by path
-/// via gix -> `git cat-file blob`). All tiers verify the content hash matches
-/// the requested Kin SHA-256 before back-filling the store.
+/// via gix). Git promisor retrieval is performed in one bounded batch while
+/// materializing the tree, using the actual Git object ids rather than Kin's
+/// unrelated SHA-256 content address.
 ///
 /// Migration debt: the Git repair tiers exist for repos initialized before
 /// import.rs persisted old blob hashes (commit 244de43), and for shallow
@@ -356,19 +357,13 @@ pub fn filter_vector_results_to_scope(
 struct BlobReader<'a> {
     blob_store: &'a BlobStore,
     git_repair: Option<&'a GitBlobRepair>,
-    repo_path: Option<&'a Path>,
 }
 
 impl<'a> BlobReader<'a> {
-    fn new(
-        blob_store: &'a BlobStore,
-        git_repair: Option<&'a GitBlobRepair>,
-        repo_path: Option<&'a Path>,
-    ) -> Self {
+    fn new(blob_store: &'a BlobStore, git_repair: Option<&'a GitBlobRepair>) -> Self {
         Self {
             blob_store,
             git_repair,
-            repo_path,
         }
     }
 
@@ -379,9 +374,6 @@ impl<'a> BlobReader<'a> {
         if let Some(content) = self.repair_from_git_tree(hash, file_path) {
             return Some(content);
         }
-        if let Some(content) = self.repair_from_git_object(hash, file_path) {
-            return Some(content);
-        }
         None
     }
 
@@ -389,16 +381,6 @@ impl<'a> BlobReader<'a> {
         let repair = self.git_repair?;
         let content = repair.read_blob(file_path)?;
         self.accept_repaired_blob(hash, file_path, content, "git tree")
-    }
-
-    fn repair_from_git_object(
-        &self,
-        hash: &kin_blobs::Hash256,
-        file_path: &str,
-    ) -> Option<Vec<u8>> {
-        let repo_path = self.repo_path?;
-        let content = git_cat_file_blob(repo_path, &hash.to_string())?;
-        self.accept_repaired_blob(hash, file_path, content, "git cat-file")
     }
 
     fn accept_repaired_blob(
@@ -438,26 +420,6 @@ impl<'a> BlobReader<'a> {
     }
 }
 
-/// Final-tier blob repair: ask Git to dump the blob content for a hash.
-///
-/// Works when the repository is using SHA-256 object format (Git's optional
-/// modern OID format). For SHA-1 repos this returns `None` because Kin's hash
-/// won't address any Git object; that failure is expected and silent.
-fn git_cat_file_blob(repo_path: &Path, hash_hex: &str) -> Option<Vec<u8>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_path)
-        .arg("cat-file")
-        .arg("blob")
-        .arg(hash_hex)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(output.stdout)
-}
-
 /// One-time blob repair from Git for repos with unpersisted old blob hashes.
 ///
 /// Constructed once per `build_graph_at_ref` call when `repo_path` is provided
@@ -469,6 +431,7 @@ fn git_cat_file_blob(repo_path: &Path, hash_hex: &str) -> Option<Vec<u8>> {
 /// with the import.rs fix that persists old blob hashes (commit 244de43).
 struct GitBlobRepair {
     repo: gix::Repository,
+    repo_path: PathBuf,
     tree_id: gix::ObjectId,
 }
 
@@ -479,6 +442,173 @@ fn open_repo(path: &Path) -> std::result::Result<gix::Repository, gix::open::Err
     } else {
         gix::open(path)
     }
+}
+
+const GIT_PROMISOR_BATCH_LIMIT: Duration = Duration::from_secs(60);
+
+fn parse_git_cat_file_batch(
+    stdout: std::process::ChildStdout,
+) -> std::result::Result<HashMap<String, Vec<u8>>, String> {
+    let mut reader = BufReader::new(stdout);
+    let mut blobs = HashMap::new();
+    loop {
+        let mut header = String::new();
+        let read = reader
+            .read_line(&mut header)
+            .map_err(|err| format!("failed to read git cat-file batch header: {err}"))?;
+        if read == 0 {
+            break;
+        }
+        let header = header.trim_end_matches(['\r', '\n']);
+        let mut parts = header.split_whitespace();
+        let oid = parts
+            .next()
+            .ok_or_else(|| "git cat-file returned an empty batch header".to_string())?;
+        let object_type = parts
+            .next()
+            .ok_or_else(|| format!("git cat-file returned malformed batch header '{header}'"))?;
+        if object_type == "missing" {
+            return Err(format!("promisor remote did not provide Git object {oid}"));
+        }
+        if object_type != "blob" {
+            return Err(format!(
+                "git cat-file returned {object_type} for expected blob {oid}"
+            ));
+        }
+        let size = parts
+            .next()
+            .ok_or_else(|| format!("git cat-file omitted size for blob {oid}"))?
+            .parse::<usize>()
+            .map_err(|err| format!("invalid git cat-file size for blob {oid}: {err}"))?;
+        let mut content = vec![0; size];
+        reader
+            .read_exact(&mut content)
+            .map_err(|err| format!("failed to read git blob {oid} from batch: {err}"))?;
+        let mut terminator = [0u8; 1];
+        reader
+            .read_exact(&mut terminator)
+            .map_err(|err| format!("git cat-file omitted terminator for blob {oid}: {err}"))?;
+        if terminator[0] != b'\n' {
+            return Err(format!(
+                "git cat-file returned invalid terminator for blob {oid}"
+            ));
+        }
+        blobs.insert(oid.to_string(), content);
+    }
+    Ok(blobs)
+}
+
+/// Fetch missing promisor blobs through one bounded Git batch process. Inputs
+/// are real Git OIDs collected from the historical tree, never Kin hashes.
+fn fetch_git_blobs_batch(
+    repo_path: &Path,
+    object_ids: &[String],
+    cancelled: Option<&AtomicBool>,
+) -> std::result::Result<HashMap<String, Vec<u8>>, String> {
+    if object_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    ensure_ref_not_cancelled(cancelled, "Git promisor blob batch")?;
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("cat-file")
+        .arg("--batch")
+        .env_remove("GIT_NO_LAZY_FETCH")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to start git cat-file batch: {err}"))?;
+
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "git cat-file batch stdin was unavailable".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "git cat-file batch stdout was unavailable".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "git cat-file batch stderr was unavailable".to_string())?;
+    let ids_for_writer = object_ids.to_vec();
+    let writer = std::thread::spawn(move || -> std::result::Result<(), String> {
+        let mut writer = BufWriter::new(stdin);
+        for oid in ids_for_writer {
+            writeln!(writer, "{oid}")
+                .map_err(|err| format!("failed to write Git oid {oid} to batch: {err}"))?;
+        }
+        writer
+            .flush()
+            .map_err(|err| format!("failed to flush git cat-file batch input: {err}"))
+    });
+    let reader = std::thread::spawn(move || parse_git_cat_file_batch(stdout));
+    let stderr_reader = std::thread::spawn(move || {
+        let mut stderr = stderr;
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes);
+        bytes
+    });
+
+    let deadline = Instant::now() + GIT_PROMISOR_BATCH_LIMIT;
+    let mut forced_error = None;
+    let status = loop {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            forced_error = Some("Git promisor blob batch cancelled".to_string());
+            let _ = child.kill();
+            break child
+                .wait()
+                .map_err(|err| format!("failed to reap cancelled git cat-file batch: {err}"))?;
+        }
+        if Instant::now() >= deadline {
+            forced_error = Some(format!(
+                "Git promisor blob batch exceeded {}s wall-clock cap",
+                GIT_PROMISOR_BATCH_LIMIT.as_secs()
+            ));
+            let _ = child.kill();
+            break child
+                .wait()
+                .map_err(|err| format!("failed to reap timed-out git cat-file batch: {err}"))?;
+        }
+        match child
+            .try_wait()
+            .map_err(|err| format!("failed to poll git cat-file batch: {err}"))?
+        {
+            Some(status) => break status,
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+
+    let writer_result = writer
+        .join()
+        .map_err(|_| "git cat-file batch writer panicked".to_string())?;
+    let blobs_result = reader
+        .join()
+        .map_err(|_| "git cat-file batch reader panicked".to_string())?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "git cat-file batch stderr reader panicked".to_string())?;
+    if let Some(error) = forced_error {
+        return Err(error);
+    }
+    writer_result?;
+    if !status.success() {
+        return Err(format!(
+            "git cat-file batch failed: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        ));
+    }
+    let blobs = blobs_result?;
+    for oid in object_ids {
+        if !blobs.contains_key(oid) {
+            return Err(format!(
+                "git cat-file batch completed without requested blob {oid}"
+            ));
+        }
+    }
+    Ok(blobs)
 }
 
 impl GitBlobRepair {
@@ -510,7 +640,11 @@ impl GitBlobRepair {
             let tree = commit.tree().map_err(|e| e.to_string())?;
             tree.id
         };
-        Ok(Self { repo, tree_id })
+        Ok(Self {
+            repo,
+            repo_path: repo_path.to_path_buf(),
+            tree_id,
+        })
     }
 
     fn read_blob(&self, file_path: &str) -> Option<Vec<u8>> {
@@ -542,7 +676,10 @@ impl GitBlobRepair {
 
         let t_loop = std::time::Instant::now();
         let mut blob_count = 0usize;
-        let mut file_tree = HashMap::new();
+        let mut tree_entries = Vec::new();
+        let mut blob_contents = HashMap::new();
+        let mut missing_oids = Vec::new();
+        let mut missing_seen = HashSet::new();
         for entry in entries {
             ensure_ref_not_cancelled(cancelled, "Git blob materialization")?;
             if !entry.mode.is_blob_or_symlink() {
@@ -550,13 +687,32 @@ impl GitBlobRepair {
             }
             blob_count += 1;
             let path = std::str::from_utf8(entry.filepath.as_ref())
-                .map_err(|err| format!("non-utf8 git path: {err}"))?;
-            let content = self
-                .repo
-                .find_object(entry.oid)
-                .map_err(|err| format!("failed to read Git blob for {path}: {err}"))?;
+                .map_err(|err| format!("non-utf8 git path: {err}"))?
+                .to_string();
+            let oid = entry.oid.to_string();
+            match self.repo.find_object(entry.oid) {
+                Ok(object) => {
+                    blob_contents.insert(oid.clone(), object.data.to_vec());
+                }
+                Err(_) if missing_seen.insert(oid.clone()) => missing_oids.push(oid.clone()),
+                Err(_) => {}
+            }
+            tree_entries.push((path, oid));
+        }
+
+        if !missing_oids.is_empty() {
+            let fetched = fetch_git_blobs_batch(&self.repo_path, &missing_oids, cancelled)?;
+            blob_contents.extend(fetched);
+        }
+
+        let mut file_tree = HashMap::new();
+        for (path, oid) in tree_entries {
+            ensure_ref_not_cancelled(cancelled, "Git blob materialization")?;
+            let content = blob_contents
+                .get(&oid)
+                .ok_or_else(|| format!("Git blob {oid} for {path} was not materialized"))?;
             let hash = blob_store
-                .write(&content.data)
+                .write(content)
                 .map_err(|err| format!("failed to write git blob for {path}: {err}"))?;
             file_tree.insert(FilePathId::new(path), hash);
         }
@@ -2817,7 +2973,7 @@ def uri_encoder(value):\n    return value\n",
     fn blob_reader_returns_none_when_all_tiers_miss() {
         let temp = tempfile::tempdir().unwrap();
         let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
-        let reader = BlobReader::new(&blob_store, None, None);
+        let reader = BlobReader::new(&blob_store, None);
         // Hash that was never written.
         let missing = kin_blobs::Hash256::from_bytes([0xfe; 32]);
         assert!(reader.read(&missing, "any/path").is_none());
@@ -2836,7 +2992,7 @@ def uri_encoder(value):\n    return value\n",
     fn blob_reader_warns_on_hash_mismatch_during_repair() {
         let temp = tempfile::tempdir().unwrap();
         let blob_store = BlobStore::new(temp.path().join("objects")).unwrap();
-        let reader = BlobReader::new(&blob_store, None, None);
+        let reader = BlobReader::new(&blob_store, None);
 
         // Expected hash addresses some imaginary blob; the content we hand
         // in corresponds to a different payload and therefore hashes to a
@@ -2865,6 +3021,83 @@ def uri_encoder(value):\n    return value\n",
         assert!(
             blob_store.read(&actual_hash).is_err(),
             "rejected blob must not be back-filled under its own hash either"
+        );
+    }
+
+    #[test]
+    fn partial_clone_materialization_fetches_promisor_blob_by_git_oid() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        run_git(&source, &["init", "-q"]);
+        run_git(&source, &["config", "user.email", "test@example.com"]);
+        run_git(&source, &["config", "user.name", "Kin Test"]);
+        let payload = b"blob fetched lazily from the promisor remote\n";
+        std::fs::write(source.join("payload.txt"), payload).unwrap();
+        run_git(&source, &["add", "payload.txt"]);
+        run_git(&source, &["commit", "-qm", "add payload"]);
+        let head_oid = run_git(&source, &["rev-parse", "HEAD"]);
+        let blob_oid = run_git(&source, &["rev-parse", "HEAD:payload.txt"]);
+
+        let origin = root.path().join("origin.git");
+        let clone_bare = Command::new("git")
+            .arg("clone")
+            .arg("-q")
+            .arg("--bare")
+            .arg(&source)
+            .arg(&origin)
+            .output()
+            .unwrap();
+        assert!(
+            clone_bare.status.success(),
+            "bare clone failed: {}",
+            String::from_utf8_lossy(&clone_bare.stderr)
+        );
+        run_git(&origin, &["config", "uploadpack.allowFilter", "true"]);
+        run_git(
+            &origin,
+            &["config", "uploadpack.allowAnySHA1InWant", "true"],
+        );
+
+        let partial = root.path().join("partial");
+        let origin_url = format!("file://{}", origin.display());
+        let clone_partial = Command::new("git")
+            .arg("clone")
+            .arg("-q")
+            .arg("--filter=blob:none")
+            .arg("--no-checkout")
+            .arg(&origin_url)
+            .arg(&partial)
+            .output()
+            .unwrap();
+        assert!(
+            clone_partial.status.success(),
+            "partial clone failed: {}",
+            String::from_utf8_lossy(&clone_partial.stderr)
+        );
+        let missing = run_git(
+            &partial,
+            &["rev-list", "--objects", "--missing=print", "HEAD"],
+        );
+        if !missing.lines().any(|line| line == format!("?{blob_oid}")) {
+            eprintln!("Git server ignored blob:none filter; skipping promisor-specific assertion");
+            return;
+        }
+
+        let head = git_change_id_for_test(&head_oid);
+        let repair = GitBlobRepair::new(&partial, &head, &[], None, Some(&head_oid), None).unwrap();
+        let blob_store = BlobStore::new(root.path().join("kin-objects")).unwrap();
+        let file_tree = repair.materialize_file_tree(&blob_store, None).unwrap();
+        let expected_hash = kin_blobs::digest(payload);
+
+        assert_eq!(
+            file_tree.get(&FilePathId::new("payload.txt")),
+            Some(&expected_hash)
+        );
+        assert_eq!(blob_store.read(&expected_hash).unwrap(), payload);
+        run_git(
+            &partial,
+            &["cat-file", "-e", &format!("{blob_oid}^{{blob}}")],
         );
     }
 
