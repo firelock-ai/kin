@@ -9,7 +9,7 @@ use kin_model::Hash256;
 use serde::{Deserialize, Serialize};
 
 use crate::diff::{EntityChangeKind, SemanticDiff};
-use crate::impact::{ConsumerCallShapeSummary, ImpactReport};
+use crate::impact::{ConsumerCallShapeSummary, EntityImpact, ImpactReport};
 
 const COMMAND_EFFECT_CONTRACT_KEY: &str = "command_effect_contract";
 
@@ -342,6 +342,31 @@ pub fn rename_is_runtime_neutral_for_consumers(
             .all(|name| !summary.caller_keyword_names.contains(name.as_str()))
 }
 
+/// True when an entity's signature edit is a pure arity-preserving parameter
+/// rename and every graph-known consumer proves that rename cannot strand it.
+///
+/// This is the shared policy predicate for both inline findings and the shadow
+/// gate's downstream-risk pass. Keeping the decision here prevents the two
+/// layers from disagreeing about the same graph evidence: a rename certified
+/// as "no runtime break" must not be reintroduced as a blocking downstream
+/// risk later in report derivation. Missing impact, zero consumers, unshaped
+/// calls, renamed keyword use, and `**kwargs` forwarding all fail closed.
+pub(crate) fn signature_rename_is_runtime_neutral_for_consumers(
+    old_signature: &str,
+    new_signature: &str,
+    entity_impact: Option<&EntityImpact>,
+) -> bool {
+    let Some(entity_impact) = entity_impact else {
+        return false;
+    };
+    if entity_impact.consumer_count == 0 {
+        return false;
+    }
+    arity_preserving_rename(old_signature, new_signature).is_some_and(|renamed| {
+        rename_is_runtime_neutral_for_consumers(&renamed, &entity_impact.call_shapes)
+    })
+}
+
 /// True when `old` and `new` are Go struct type signatures that differ ONLY by
 /// added fields: identical `Name struct` header, and every whitespace token of
 /// the old field body still appears, in order, inside a strictly larger new
@@ -669,16 +694,11 @@ fn collect_modified_comments(
         // keyword use of a renamed name, no `**kwargs`, no unshaped consumer —
         // the rename is runtime-neutral for those consumers: the signature
         // change is still recorded as evidence, but it is not a blocking break.
-        let rename_is_neutral = consumer_count > 0
-            && match arity_preserving_rename(&old.signature, &new.signature) {
-                Some(renamed) => {
-                    let summary = per_entity
-                        .map(|e| e.call_shapes.clone())
-                        .unwrap_or_default();
-                    rename_is_runtime_neutral_for_consumers(&renamed, &summary)
-                }
-                None => false,
-            };
+        let rename_is_neutral = signature_rename_is_runtime_neutral_for_consumers(
+            &old.signature,
+            &new.signature,
+            per_entity,
+        );
 
         comments.push(InlineComment {
             file: span.file.to_string(),

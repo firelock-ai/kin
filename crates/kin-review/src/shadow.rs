@@ -899,6 +899,11 @@ fn derive_policy(
                         && !crate::inline::signature_runtime_neutral(
                             &old.signature,
                             &new.signature,
+                        )
+                        && !crate::inline::signature_rename_is_runtime_neutral_for_consumers(
+                            &old.signature,
+                            &new.signature,
+                            review.impact.entity_impact(&change.entity_id),
                         ))
                         || old.visibility != new.visibility,
                     false,
@@ -1672,7 +1677,9 @@ mod tests {
     };
     use kin_model::graph::{ChangeStore, EntityStore};
     use kin_model::ids::*;
-    use kin_model::relation::{GraphNodeId, Relation, RelationKind, RelationOrigin};
+    use kin_model::relation::{
+        CallArgShape, GraphNodeId, Relation, RelationEvidence, RelationKind, RelationOrigin,
+    };
     use kin_model::timestamp::Timestamp;
 
     fn entity_with_span(name: &str, file: &str, start_line: u32, role: EntityRole) -> Entity {
@@ -1826,6 +1833,75 @@ mod tests {
         (graph, base_id, head_id)
     }
 
+    /// Graph modelling FIR-1440's exact policy split: the inline layer can
+    /// prove an arity-preserving Python parameter rename safe from persisted
+    /// call-shape evidence, while the same real consumer also reaches the
+    /// shadow policy's downstream-risk pass.
+    fn rename_change_graph(
+        call_shape: Option<CallArgShape>,
+        reduce_visibility: bool,
+    ) -> (InMemoryGraph, SemanticChangeId, SemanticChangeId) {
+        let graph = InMemoryGraph::new();
+
+        let mut target_v1 = entity_with_span(
+            "Testdir._makefile",
+            "src/_pytest/pytester.py",
+            610,
+            EntityRole::Source,
+        );
+        target_v1.signature = "def _makefile(self, ext, args, kwargs, encoding=\"utf-8\")".into();
+        let mut target_v2 = target_v1.clone();
+        target_v2.signature = "def _makefile(self, ext, lines, files, encoding=\"utf-8\")".into();
+        if reduce_visibility {
+            target_v2.visibility = Visibility::Private;
+        }
+
+        let caller = entity_with_span(
+            "Testdir.makefile",
+            "src/_pytest/pytester.py",
+            640,
+            EntityRole::Source,
+        );
+        let mut calls_rel = relation(&caller, &target_v2, RelationKind::Calls);
+        if let Some(call_shape) = call_shape {
+            calls_rel.evidence.push(RelationEvidence {
+                call_shape: Some(call_shape),
+                ..RelationEvidence::default()
+            });
+        }
+
+        graph.upsert_entity(&target_v2).unwrap();
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_relation(&calls_rel).unwrap();
+
+        let base_id = change_id(41);
+        let head_id = change_id(42);
+        let base = change_with_deltas(
+            base_id,
+            vec![],
+            vec![
+                EntityDelta::Added(target_v1.clone()),
+                EntityDelta::Added(caller),
+            ],
+            vec![RelationDelta::Added(calls_rel)],
+            vec![],
+        );
+        let head = change_with_deltas(
+            head_id,
+            vec![base_id],
+            vec![EntityDelta::Modified {
+                old: target_v1,
+                new: target_v2,
+            }],
+            vec![],
+            vec![],
+        );
+        graph.create_change(&base).unwrap();
+        graph.create_change(&head).unwrap();
+
+        (graph, base_id, head_id)
+    }
+
     #[test]
     fn report_carries_blast_radius_verdict_and_audit() {
         let (graph, base_id, head_id) = signature_change_graph();
@@ -1884,6 +1960,85 @@ mod tests {
             .evidence_gaps
             .iter()
             .any(|gap| gap.kind == "cross_repo_not_evaluated"));
+    }
+
+    #[test]
+    fn positional_safe_rename_does_not_reappear_as_downstream_risk() {
+        let (graph, base_id, head_id) =
+            rename_change_graph(Some(CallArgShape::new(4, vec![], false, false)), false);
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+
+        let signature = report
+            .policy
+            .findings
+            .iter()
+            .find(|finding| finding.kind == "signature_change")
+            .expect("the safe rename remains visible as signature evidence");
+        assert!(signature.message.contains("no runtime break"));
+        assert!(
+            !report.policy.findings.iter().any(|finding| {
+                finding.blocking
+                    && (finding.kind == "breaking" || finding.kind == "downstream_risk")
+            }),
+            "the downstream policy must honor the same safe-rename proof: {:?}",
+            report.policy.findings
+        );
+        assert_eq!(report.policy.blocking_count, 0);
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::NeedsAttention);
+    }
+
+    #[test]
+    fn unsafe_or_unproven_renames_still_block_downstream() {
+        let cases = [
+            (
+                Some(CallArgShape::new(3, vec!["args".to_string()], false, false)),
+                "renamed keyword caller",
+            ),
+            (
+                Some(CallArgShape::new(0, vec![], false, true)),
+                "var-keyword caller",
+            ),
+            (None, "missing call-shape evidence"),
+        ];
+
+        for (shape, label) in cases {
+            let (graph, base_id, head_id) = rename_change_graph(shape, false);
+            let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+            assert_eq!(
+                report.policy.verdict,
+                ShadowGateVerdict::WouldBlock,
+                "{label} must remain fail-closed"
+            );
+            assert!(
+                report.policy.findings.iter().any(|finding| finding.blocking
+                    && (finding.kind == "breaking" || finding.kind == "downstream_risk")),
+                "{label} must retain a blocking contract finding"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_rename_does_not_hide_a_visibility_reduction() {
+        let (graph, base_id, head_id) =
+            rename_change_graph(Some(CallArgShape::new(4, vec![], false, false)), true);
+
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+
+        assert_eq!(report.policy.verdict, ShadowGateVerdict::WouldBlock);
+        assert!(
+            report
+                .policy
+                .findings
+                .iter()
+                .any(|finding| finding.blocking),
+            "the independent visibility reduction must retain a blocking finding"
+        );
+        assert!(report
+            .policy
+            .findings
+            .iter()
+            .any(|finding| finding.kind == "visibility_change"));
     }
 
     #[test]
