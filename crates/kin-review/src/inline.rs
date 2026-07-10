@@ -530,6 +530,13 @@ fn python_quote_end(bytes: &[u8], start: usize) -> Option<usize> {
     if !matches!(delimiter, b'\'' | b'"') {
         return None;
     }
+    if python_string_prefix_is_interpolated(bytes, start) {
+        // Python 3.12 permits same-quoted strings inside an f-string
+        // replacement field. A quote-only scanner cannot distinguish those
+        // nested expressions from the outer delimiter, so fail closed rather
+        // than truncate the parameter list and hide a later contract change.
+        return None;
+    }
     let width = if bytes.get(start..start + 3) == Some(&[delimiter; 3]) {
         3
     } else {
@@ -559,6 +566,20 @@ fn python_quote_end(bytes: &[u8], start: usize) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+/// Whether the quote at `start` carries an interpolated-string prefix.
+/// Contiguous ASCII letters are sufficient here: valid Python prefixes are
+/// adjacent to the delimiter, and treating an invalid longer prefix as
+/// unsupported is the conservative review behavior.
+fn python_string_prefix_is_interpolated(bytes: &[u8], start: usize) -> bool {
+    let mut prefix_start = start;
+    while prefix_start > 0 && bytes[prefix_start - 1].is_ascii_alphabetic() {
+        prefix_start -= 1;
+    }
+    bytes[prefix_start..start]
+        .iter()
+        .any(|byte| matches!(byte, b'f' | b'F' | b't' | b'T'))
 }
 
 fn python_identifier_byte(byte: u8) -> bool {
@@ -2351,6 +2372,44 @@ mod tests {
         );
         assert_eq!(
             arity_preserving_rename(r#"def f(a=")", tail=1)"#, r#"def f(b=")", tail=1)"#),
+            Some(vec!["a".to_string()])
+        );
+        // Python 3.12 permits a same-quoted string inside an f-string
+        // replacement field. The lightweight signature scanner deliberately
+        // fails closed on interpolated strings so that an inner `)` can never
+        // hide a changed later default.
+        for interpolated_default in [
+            r#"f"{foo(")")}""#,
+            r#"F"{foo(")")}""#,
+            r#"rf"{foo(")")}""#,
+            r#"fr"{foo(")")}""#,
+            r#"f'{foo(')')}'"#,
+            r##"f"{ {"x": ")"} }""##,
+            r##"f"{x:{foo(")")}}""##,
+            r####"f"""value""""####,
+        ] {
+            let old = format!("def f(a={interpolated_default}, tail=1)");
+            let changed_tail = format!("def f(b={interpolated_default}, tail=2)");
+            let rename_only = format!("def f(b={interpolated_default}, tail=1)");
+            assert_eq!(
+                arity_preserving_rename(&old, &changed_tail),
+                None,
+                "interpolated default must not hide a later contract change: {interpolated_default}"
+            );
+            assert_eq!(
+                arity_preserving_rename(&old, &rename_only),
+                None,
+                "interpolated defaults deliberately fail closed: {interpolated_default}"
+            );
+        }
+        // Non-interpolated raw and bytes literals still use the precise quote
+        // scanner and remain eligible for rename-only classification.
+        assert_eq!(
+            arity_preserving_rename(r#"def f(a=r")", tail=1)"#, r#"def f(b=r")", tail=1)"#),
+            Some(vec!["a".to_string()])
+        );
+        assert_eq!(
+            arity_preserving_rename(r#"def f(a=b")", tail=1)"#, r#"def f(b=b")", tail=1)"#),
             Some(vec!["a".to_string()])
         );
         // Escaped delimiters and triple-quoted defaults are scanned as complete
