@@ -24,7 +24,6 @@ BLOCK_KEYWORD_RE = re.compile(
 DO_BLOCK_RE = re.compile(r"(?:^|\s)do(?:\s*\|[^|]*\|)?$")
 INLINE_END_RE = re.compile(r"(?:^|;)\s*end\b")
 BLOCK_COMMENT_RE = re.compile(r"^=(?:begin|end)\b")
-PERCENT_LITERAL_RE = re.compile(r"(?<![\w%])%(?:[qQwWiIrxs])?[^\w\s=]")
 GENERIC_CLASS_RE = re.compile(r"^class\b")
 ON_PLATFORM_RE = re.compile(r"^(on_[A-Za-z0-9_!?]+)\b")
 FORMULA_METADATA_PREFIX_RE = re.compile(r"^(?:desc|homepage|license)\b")
@@ -78,40 +77,72 @@ class PendingUrl:
     url: str
 
 
+@dataclass(frozen=True)
+class RubyLineScan:
+    code: str
+    structure: str
+    has_unquoted_percent: bool
+    has_unsupported_question_syntax: bool
+    has_unterminated_quote: bool
+
+
 def expected_url(artifact: str) -> str:
     return (
         f"https://github.com/firelock-ai/kin/releases/download/v#{{version}}/{artifact}"
     )
 
 
-def ruby_code(line: str) -> str:
-    """Return code before a Ruby comment, preserving hashes inside strings."""
+def question_follows_predicate_identifier(line: str, index: int) -> bool:
+    """Return whether ``line[index]`` terminates a Ruby predicate identifier.
 
-    quote: str | None = None
-    escaped = False
-    for index, character in enumerate(line):
-        if quote is not None:
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == quote:
-                quote = None
-            continue
-        if character in {'"', "'"}:
-            quote = character
-        elif character == "#":
-            return line[:index].strip()
-    return line.strip()
+    A single preceding alphanumeric is insufficient: Ruby parses no-space
+    ternaries after numeric, instance, class, and global variables (for example
+    ``1?2:3`` and ``@flag?2:3``). Predicate method names instead end in an
+    identifier whose first character is alphabetic or ``_`` and whose token is
+    not introduced by a variable sigil, including Ruby's ``$-w`` option-global
+    form. Qualified calls such as ``File.exist?`` and identifiers containing
+    digits such as ``ready1?`` remain supported.
+    """
+
+    start = index
+    while start > 0 and (line[start - 1].isalnum() or line[start - 1] == "_"):
+        start -= 1
+    identifier = line[start:index]
+    if not identifier or not (identifier[0].isalpha() or identifier[0] == "_"):
+        return False
+    if start > 0 and line[start - 1] in {"@", "$"}:
+        return False
+    return start < 2 or line[start - 2 : start] != "$-"
 
 
-def ruby_structure_code(line: str) -> str:
-    """Return Ruby code with strings/comments blanked for keyword checks."""
+def scan_ruby_line(line: str) -> RubyLineScan:
+    """Scan one generated-formula line with the Ruby tokens relevant here.
+
+    Ruby percent literals may use ``#`` as their delimiter. Comment stripping cannot
+    therefore run before this check: doing so can hide both the delimiter and arbitrary
+    Ruby that follows it on the same physical line. This validator's generated-formula
+    grammar needs neither percent literals nor modulo expressions, so every unquoted
+    percent token fails closed. Percent signs inside quoted metadata/URLs and comments
+    remain ordinary data.
+
+    Ruby character literals begin with ``?`` and include escaped control/meta forms whose
+    final character may be ``#``. They must be rejected before deciding that ``#`` starts
+    a comment; otherwise trailing statements can desynchronize the validator's block
+    stack. Predicate-method suffixes such as ``File.exist?`` remain supported because
+    their ``?`` immediately follows an identifier character. The generated grammar uses
+    neither standalone character literals nor ternary expressions.
+    """
 
     retained: list[str] = []
     quote: str | None = None
     escaped = False
-    for character in line:
+    has_unquoted_percent = False
+    has_unsupported_question_syntax = False
+    comment_index: int | None = None
+    index = 0
+
+    while index < len(line):
+        character = line[index]
         if quote is not None:
             retained.append(" ")
             if escaped:
@@ -120,40 +151,41 @@ def ruby_structure_code(line: str) -> str:
                 escaped = True
             elif character == quote:
                 quote = None
+            index += 1
             continue
         if character in {'"', "'"}:
             quote = character
             retained.append(" ")
+        elif character == "?" and not question_follows_predicate_identifier(
+            line, index
+        ):
+            has_unsupported_question_syntax = True
+            retained.append(character)
         elif character == "#":
+            comment_index = index
             break
+        elif character == "%":
+            has_unquoted_percent = True
+            retained.append(character)
         else:
             retained.append(character)
-    return "".join(retained).strip()
+        index += 1
+
+    code = line[:comment_index].strip() if comment_index is not None else line.strip()
+    return RubyLineScan(
+        code=code,
+        structure="".join(retained).strip(),
+        has_unquoted_percent=has_unquoted_percent,
+        has_unsupported_question_syntax=has_unsupported_question_syntax,
+        has_unterminated_quote=quote is not None,
+    )
 
 
-def has_unterminated_ruby_quote(line: str) -> bool:
-    quote: str | None = None
-    escaped = False
-    for character in line:
-        if quote is not None:
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == quote:
-                quote = None
-            continue
-        if character in {'"', "'"}:
-            quote = character
-        elif character == "#":
-            break
-    return quote is not None
-
-
-def reject_unsupported_ruby_syntax(line: str, code: str, line_number: int) -> None:
+def reject_unsupported_ruby_syntax(scan: RubyLineScan, line_number: int) -> None:
     """Fail closed where this deliberately small Ruby parser has no authority."""
 
-    structure = ruby_structure_code(line)
+    code = scan.code
+    structure = scan.structure
     reason: str | None = None
     if BLOCK_COMMENT_RE.match(code):
         reason = "Ruby block comments"
@@ -161,7 +193,7 @@ def reject_unsupported_ruby_syntax(line: str, code: str, line_number: int) -> No
         reason = "Ruby data sections"
     elif GENERIC_CLASS_RE.match(code) and not KIN_CLASS_RE.fullmatch(code):
         reason = "Ruby class reopening and additional class declarations"
-    elif has_unterminated_ruby_quote(line):
+    elif scan.has_unterminated_quote:
         reason = "multiline quoted strings"
     elif "<<" in structure:
         reason = "Ruby heredocs and shift expressions"
@@ -169,7 +201,9 @@ def reject_unsupported_ruby_syntax(line: str, code: str, line_number: int) -> No
         reason = "Ruby brace blocks and hash literals"
     elif "`" in structure:
         reason = "Ruby command literals"
-    elif PERCENT_LITERAL_RE.search(structure):
+    elif scan.has_unsupported_question_syntax:
+        reason = "Ruby character literals and ternary expressions"
+    elif scan.has_unquoted_percent:
         reason = "Ruby percent literals"
     elif "/" in structure:
         reason = "Ruby regular expressions and division expressions"
@@ -232,10 +266,11 @@ def parse_formula(formula: str, expected_version: str) -> dict[str, FormulaPair]
 
     for index, line in enumerate(lines):
         line_number = index + 1
-        code = ruby_code(line)
+        scan = scan_ruby_line(line)
+        code = scan.code
         if not code:
             continue
-        reject_unsupported_ruby_syntax(line, code, line_number)
+        reject_unsupported_ruby_syntax(scan, line_number)
 
         if code == "end":
             if pending_url is not None:

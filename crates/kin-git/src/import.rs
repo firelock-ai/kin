@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use chrono::TimeZone;
@@ -261,7 +262,153 @@ fn import_shallow(
     }])
 }
 
-/// Full history import: walk commits in topological order.
+/// Order a selected commit set so every in-set parent precedes its children.
+///
+/// Oid order is only a deterministic tie-break between commits whose selected
+/// parents have already been emitted. It must never override Git ancestry.
+fn order_selected_oids_parent_first(
+    repo: &gix::Repository,
+    selected: Vec<gix::ObjectId>,
+) -> Result<Vec<gix::ObjectId>> {
+    let selected_set: HashSet<gix::ObjectId> = selected.iter().copied().collect();
+    if selected_set.len() != selected.len() {
+        return Err(GitError::Git(
+            "history walk returned a duplicate commit id".to_string(),
+        ));
+    }
+
+    let mut indegree: HashMap<gix::ObjectId, usize> =
+        selected.iter().copied().map(|oid| (oid, 0)).collect();
+    let mut children: BTreeMap<gix::ObjectId, BTreeSet<gix::ObjectId>> = BTreeMap::new();
+
+    for &oid in &selected {
+        let commit = repo
+            .find_object(oid)
+            .map_err(|err| GitError::Git(err.to_string()))?
+            .into_commit();
+        let selected_parents: BTreeSet<gix::ObjectId> = commit
+            .parent_ids()
+            .map(|parent| parent.detach())
+            .filter(|parent| selected_set.contains(parent))
+            .collect();
+
+        *indegree
+            .get_mut(&oid)
+            .expect("every selected oid has an indegree entry") = selected_parents.len();
+        for parent in selected_parents {
+            children.entry(parent).or_default().insert(oid);
+        }
+    }
+
+    let mut ready: BTreeSet<gix::ObjectId> = indegree
+        .iter()
+        .filter_map(|(oid, degree)| (*degree == 0).then_some(*oid))
+        .collect();
+    let mut ordered = Vec::with_capacity(selected.len());
+
+    while let Some(oid) = ready.iter().next().copied() {
+        ready.remove(&oid);
+        ordered.push(oid);
+
+        if let Some(commit_children) = children.get(&oid) {
+            for &child in commit_children {
+                let degree = indegree
+                    .get_mut(&child)
+                    .expect("every selected child has an indegree entry");
+                *degree = degree
+                    .checked_sub(1)
+                    .expect("selected commit indegree cannot underflow");
+                if *degree == 0 {
+                    ready.insert(child);
+                }
+            }
+        }
+    }
+
+    if ordered.len() != selected.len() {
+        return Err(GitError::Git(
+            "selected Git history is not an acyclic parent graph".to_string(),
+        ));
+    }
+
+    Ok(ordered)
+}
+
+/// Select a deterministic, ancestry-connected history window rooted at HEAD.
+///
+/// Sorting the entire walk by `(time desc, oid asc)` before truncation can drop
+/// HEAD when an equal-timestamp tie straddles the limit. It can also select an
+/// ancestor while omitting the commits that connect it to HEAD, leaving the
+/// imported branch head pointed at the wrong change or carrying unreachable
+/// history. Instead, expand only parents of commits already selected, choosing
+/// the newest frontier parent (oid as the tie-break) each time. The result is
+/// input-order independent, always contains HEAD for a non-empty limit, and is
+/// connected through Git parent edges. Emission order is imposed separately by
+/// [`order_selected_oids_parent_first`].
+pub(crate) fn select_history_oids_from_head(
+    repo: &gix::Repository,
+    head_id: gix::ObjectId,
+    timed: Vec<(i64, gix::ObjectId)>,
+    max_commits: usize,
+) -> Result<Vec<gix::ObjectId>> {
+    let mut commit_times = HashMap::with_capacity(timed.len());
+    for (commit_time, oid) in timed {
+        if commit_times.insert(oid, commit_time).is_some() {
+            return Err(GitError::Git(
+                "history walk returned a duplicate commit id".to_string(),
+            ));
+        }
+    }
+    let head_time = commit_times.get(&head_id).copied().ok_or_else(|| {
+        GitError::Git("history walk did not contain the requested head commit".to_string())
+    })?;
+
+    // Unlimited import already contains the entire reachable ancestry, so it
+    // needs no frontier expansion (and no second object lookup per commit).
+    // Keep a deterministic child-first order for co-change consumers; semantic
+    // history imposes parent-first emission in the following phase.
+    if max_commits == 0 {
+        let mut all: Vec<_> = commit_times
+            .into_iter()
+            .map(|(oid, commit_time)| (Reverse(commit_time), oid))
+            .collect();
+        all.sort_unstable();
+        return Ok(all.into_iter().map(|(_, oid)| oid).collect());
+    }
+
+    let mut frontier = BTreeSet::from([(Reverse(head_time), head_id)]);
+    let mut selected = Vec::with_capacity(max_commits.min(commit_times.len()));
+    let mut selected_set = HashSet::new();
+
+    while selected.len() < max_commits {
+        let Some(candidate) = frontier.iter().next().copied() else {
+            break;
+        };
+        frontier.remove(&candidate);
+        let oid = candidate.1;
+        if !selected_set.insert(oid) {
+            continue;
+        }
+        selected.push(oid);
+
+        let commit = repo
+            .find_object(oid)
+            .map_err(|err| GitError::Git(err.to_string()))?
+            .into_commit();
+        for parent in commit.parent_ids().map(|parent| parent.detach()) {
+            if selected_set.contains(&parent) {
+                continue;
+            }
+            if let Some(parent_time) = commit_times.get(&parent).copied() {
+                frontier.insert((Reverse(parent_time), parent));
+            }
+        }
+    }
+
+    Ok(selected)
+}
+
+/// Full history import: walk commits in deterministic topological order.
 fn import_full(
     repo: &gix::Repository,
     head_id: gix::ObjectId,
@@ -286,17 +433,13 @@ fn import_full(
         .all()
         .map_err(|e| GitError::Git(e.to_string()))?;
 
-    // Phase 1: collect every commit as (commit time, oid), then impose a
-    // deterministic total order (time descending, then oid) before honoring
-    // max_commits. A raw `ByCommitTime` walk leaves equal-timestamp commits in a
-    // process-dependent order, so truncating it — or handing it to the
-    // order-sensitive enrichment pass that partitions entity/relation deltas per
-    // commit — would select or order the imported commits differently across two
-    // preps of identical history. `select_commit_oids` makes the selected set and
-    // its order a pure function of commit content, so the per-commit change
-    // partition (and every EntityRevisionId/RelationRevisionId derived from an
-    // imported change id) is byte-identical run to run. This order is the
-    // authority for the final output order.
+    // Phase 1: collect every commit as (commit time, oid), then select a
+    // deterministic ancestry-connected window by expanding from HEAD. A raw
+    // `ByCommitTime` walk leaves equal-timestamp commits in a process-dependent
+    // order, while global oid truncation can drop HEAD or disconnect the chosen
+    // set. Selection order is not emission order: once the set is fixed, a
+    // deterministic Kahn pass below emits every selected parent before its
+    // selected children, using oid order only among simultaneously ready nodes.
     let oids: Vec<gix::ObjectId> = {
         let _span = tracing::info_span!("kin.git.import_full.collect_oids").entered();
         let timed: Vec<(i64, gix::ObjectId)> = walk
@@ -305,7 +448,8 @@ fn import_full(
                     .map_err(|e| GitError::Git(e.to_string()))
             })
             .collect::<Result<Vec<_>>>()?;
-        crate::cochange::select_commit_oids(timed, max_commits)
+        let selected = select_history_oids_from_head(repo, head_id, timed, max_commits)?;
+        order_selected_oids_parent_first(repo, selected)?
     };
 
     // Phase 2: map each commit to an ImportedChange in parallel. Each commit's
@@ -364,9 +508,6 @@ fn import_full(
     // Close the DAG at the truncation horizon before emitting (see the helper).
     close_truncated_history_dag(&mut changes, genesis_id);
 
-    // Reverse so oldest commit is first (topological order).
-    changes.reverse();
-
     info!(count = changes.len(), "full history import complete");
     Ok(changes)
 }
@@ -390,8 +531,8 @@ fn import_full_serial(
         .all()
         .map_err(|e| GitError::Git(e.to_string()))?;
 
-    // Same deterministic (time desc, then oid) selection as `import_full`, so the
-    // serial reference stays byte-identical to the parallel path under
+    // Same deterministic selection and parent-first ordering as `import_full`,
+    // so the serial reference stays byte-identical to the parallel path under
     // equal-timestamp ties and `max_commits` truncation.
     let timed: Vec<(i64, gix::ObjectId)> = walk
         .map(|r| {
@@ -399,7 +540,8 @@ fn import_full_serial(
                 .map_err(|e| GitError::Git(e.to_string()))
         })
         .collect::<Result<Vec<_>>>()?;
-    let oids = crate::cochange::select_commit_oids(timed, max_commits);
+    let selected = select_history_oids_from_head(repo, head_id, timed, max_commits)?;
+    let oids = order_selected_oids_parent_first(repo, selected)?;
 
     for oid in &oids {
         let commit = repo
@@ -416,7 +558,6 @@ fn import_full_serial(
 
     close_truncated_history_dag(&mut changes, genesis_id);
 
-    changes.reverse();
     Ok(changes)
 }
 
@@ -1322,14 +1463,84 @@ mod tests {
         Some(dir)
     }
 
-    /// Determinism regression: two preps of byte-identical history must partition the
-    /// same commits into the same imported changes. When every commit shares a
-    /// timestamp, the pre-fix `take(max_commits)` over a raw `ByCommitTime` walk
-    /// selected a process-dependent subset; the content-addressed
-    /// `select_commit_oids` total order must instead pick the same subset — the
-    /// `max_commits` smallest oids — and emit it in the same order every run, so
-    /// every imported change id (and the entity/relation revision ids derived from
-    /// it) is stable across preps.
+    fn run_dated_git(dir: &Path, args: &[&str], fixed_date: &str) {
+        let output = Command::new("git")
+            .args(args)
+            .env("GIT_AUTHOR_DATE", fixed_date)
+            .env("GIT_COMMITTER_DATE", fixed_date)
+            .current_dir(dir)
+            .output()
+            .expect("run git command");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn build_equal_timestamp_merge_repo() -> Option<tempfile::TempDir> {
+        let dir = tempfile::tempdir().unwrap();
+        if !init_git_repo(dir.path()) {
+            return None;
+        }
+        let _ = Command::new("git")
+            .args(["config", "core.hooksPath", "/dev/null"])
+            .current_dir(dir.path())
+            .output();
+        let fixed_date = "1112911993 +0000";
+
+        run_dated_git(
+            dir.path(),
+            &["symbolic-ref", "HEAD", "refs/heads/main"],
+            fixed_date,
+        );
+        std::fs::write(dir.path().join("root.txt"), "root\n").unwrap();
+        run_dated_git(dir.path(), &["add", "root.txt"], fixed_date);
+        run_dated_git(dir.path(), &["commit", "-m", "root"], fixed_date);
+
+        run_dated_git(dir.path(), &["switch", "-c", "feature"], fixed_date);
+        std::fs::write(dir.path().join("feature.txt"), "feature\n").unwrap();
+        run_dated_git(dir.path(), &["add", "feature.txt"], fixed_date);
+        run_dated_git(dir.path(), &["commit", "-m", "feature"], fixed_date);
+
+        run_dated_git(dir.path(), &["switch", "main"], fixed_date);
+        std::fs::write(dir.path().join("main.txt"), "main\n").unwrap();
+        run_dated_git(dir.path(), &["add", "main.txt"], fixed_date);
+        run_dated_git(dir.path(), &["commit", "-m", "main"], fixed_date);
+        run_dated_git(
+            dir.path(),
+            &["merge", "--no-ff", "feature", "-m", "merge"],
+            fixed_date,
+        );
+
+        Some(dir)
+    }
+
+    fn assert_import_order_is_parent_first(changes: &[ImportedChange]) {
+        let positions: HashMap<SemanticChangeId, usize> = changes
+            .iter()
+            .enumerate()
+            .map(|(index, imported)| (imported.change.id, index))
+            .collect();
+        for (child_index, imported) in changes.iter().enumerate() {
+            for parent in &imported.change.parents {
+                if let Some(parent_index) = positions.get(parent) {
+                    assert!(
+                        *parent_index < child_index,
+                        "selected parent {parent} at {parent_index} must precede child {} at {child_index}",
+                        imported.change.id
+                    );
+                }
+            }
+        }
+    }
+
+    /// Determinism regression: two preps of byte-identical history must select
+    /// the same HEAD-rooted window and emit it in stable parent-first order.
+    /// When every commit shares a timestamp, neither the raw walk order nor a
+    /// global oid cutoff may decide the branch tip: HEAD and its contiguous
+    /// ancestry are authoritative, with oid used only between frontier parents.
     #[test]
     fn import_full_truncation_is_deterministic_under_equal_timestamps() {
         let Some(dir) = build_equal_timestamp_repo(8) else {
@@ -1348,38 +1559,118 @@ mod tests {
         // The full import enumerates every commit; its ids are the ground truth.
         let full = import_full(&repo, head_id, genesis_id, 0, None).expect("full import");
         assert_eq!(full.len(), 8, "all commits import when max_commits == 0");
+        assert_import_order_is_parent_first(&full);
 
-        // Expected truncated selection: the 4 smallest oids (content tie-break),
-        // emitted oldest-first — i.e. that ascending set reversed, matching how
-        // `import_full` reverses the time-desc/oid-asc order it selects.
-        let mut all_oids: Vec<String> = full.iter().map(|c| c.git_oid.clone()).collect();
-        all_oids.sort();
-        let expected: Vec<String> = all_oids.into_iter().take(4).rev().collect();
+        // This fixture must exercise the old defect: reversing oid order is not
+        // a valid ancestry order for this equal-timestamp chain.
+        let full_oids: Vec<String> = full.iter().map(|c| c.git_oid.clone()).collect();
+        let mut naive_oid_order = full_oids.clone();
+        naive_oid_order.sort();
+        naive_oid_order.reverse();
+        assert_ne!(
+            full_oids, naive_oid_order,
+            "fixture must distinguish parent-first order from reversed oid order"
+        );
 
-        // Two independent truncated imports must both equal the expected set, in
-        // the same order — proving the boundary depends on content, not on the
-        // walk's (process-dependent) emission order for the tied commits.
+        // A linear history's bounded window is exactly its newest four commits,
+        // ending at HEAD even though every timestamp is tied.
+        let expected_order = full_oids[full_oids.len() - 4..].to_vec();
+
+        // Two independent truncated imports must both equal the expected
+        // parent-first order, proving selection and emission are deterministic
+        // without conflating their authorities.
+        let head_oid = head_id.to_string();
         for _ in 0..2 {
             let limited = import_full(&repo, head_id, genesis_id, 4, None).expect("limited import");
             let got_oids: Vec<String> = limited.iter().map(|c| c.git_oid.clone()).collect();
             assert_eq!(
-                got_oids, expected,
-                "equal-timestamp truncation must select the oid-deterministic subset"
+                got_oids, expected_order,
+                "equal-timestamp truncation must keep the contiguous HEAD-rooted window"
             );
-            let got_ids: Vec<String> = limited.iter().map(|c| c.change.id.to_string()).collect();
-            let expected_ids: Vec<String> = expected
-                .iter()
-                .map(|oid| {
-                    semantic_change_id_from_git_oid_hex(oid)
-                        .expect("valid oid")
-                        .to_string()
-                })
-                .collect();
+            assert_import_order_is_parent_first(&limited);
             assert_eq!(
-                got_ids, expected_ids,
-                "imported change ids must be stable across preps"
+                limited.last().map(|change| change.git_oid.as_str()),
+                Some(head_oid.as_str()),
+                "the imported branch head must remain the requested Git HEAD"
+            );
+            for imported in &limited {
+                assert_eq!(
+                    imported.change.id,
+                    semantic_change_id_from_git_oid_hex(&imported.git_oid).expect("valid oid"),
+                    "imported change id must remain bound to its Git oid"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn import_full_orders_equal_timestamp_merge_dag_parent_first() {
+        let Some(dir) = build_equal_timestamp_merge_repo() else {
+            eprintln!("git not available, skipping equal-timestamp merge-DAG test");
+            return;
+        };
+        let repo = open_repo(dir.path()).expect("open repo");
+        let head_id = repo
+            .head_ref()
+            .expect("head_ref")
+            .expect("non-empty repo")
+            .id()
+            .detach();
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x57; 32]));
+
+        let first = import_full(&repo, head_id, genesis_id, 0, None).expect("first full import");
+        let second = import_full(&repo, head_id, genesis_id, 0, None).expect("second full import");
+        assert_eq!(
+            first.len(),
+            4,
+            "root, two branch tips, and merge must import"
+        );
+        assert_import_order_is_parent_first(&first);
+        assert_eq!(
+            first.iter().map(|c| &c.git_oid).collect::<Vec<_>>(),
+            second.iter().map(|c| &c.git_oid).collect::<Vec<_>>(),
+            "equal-timestamp merge-DAG order must be repeatable"
+        );
+
+        let positions: HashMap<String, usize> = first
+            .iter()
+            .enumerate()
+            .map(|(index, imported)| (imported.git_oid.clone(), index))
+            .collect();
+        let merge = repo
+            .find_object(head_id)
+            .expect("find merge commit")
+            .into_commit();
+        let merge_index = positions[&head_id.to_string()];
+        let merge_parents: Vec<String> = merge.parent_ids().map(|id| id.to_string()).collect();
+        assert_eq!(merge_parents.len(), 2, "fixture must contain a real merge");
+        for parent in merge_parents {
+            assert!(
+                positions[&parent] < merge_index,
+                "both merge parents must precede the merge commit"
             );
         }
+
+        let head_oid = head_id.to_string();
+        let limited =
+            import_full(&repo, head_id, genesis_id, 2, None).expect("bounded merge import");
+        assert_eq!(limited.len(), 2, "bounded window keeps HEAD and one parent");
+        assert_import_order_is_parent_first(&limited);
+        assert_eq!(
+            limited.last().map(|change| change.git_oid.as_str()),
+            Some(head_oid.as_str()),
+            "bounded merge history must still end at the requested HEAD"
+        );
+        let selected_parent = limited[0].change.id;
+        let bounded_head = &limited[1].change;
+        assert!(
+            bounded_head.parents.contains(&selected_parent),
+            "the selected frontier parent must remain connected to HEAD"
+        );
+        assert!(
+            bounded_head.parents.contains(&genesis_id),
+            "the omitted merge parent must close at the history boundary"
+        );
     }
 
     /// A SemanticChange carrying only an id and parents — enough to exercise the

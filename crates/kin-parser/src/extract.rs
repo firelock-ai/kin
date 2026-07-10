@@ -5,6 +5,7 @@ use kin_model::{
     Entity, EntityId, EntityKind, EntityMetadata, EntityRole, FilePathId, LanguageId, ParseState,
     RelationKind, SemanticFingerprint, SourceSpan, Visibility,
 };
+use serde::{Deserialize, Serialize};
 
 pub const EMBEDDING_BODY_PREVIEW_KEY: &str = "embedding_body_preview";
 pub const COMMAND_EFFECT_CONTRACT_KEY: &str = "command_effect_contract";
@@ -134,7 +135,8 @@ fn take_char_range(text: &str, start: usize, end: usize) -> String {
 /// records positional arity; Python-style adapters additionally record keyword
 /// and splat shape. This is the canonical type for the parser -> linker seam; a
 /// mirror is materialized at the storage boundary when a call edge is persisted.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CallArgShape {
     /// Positional arguments at the call site (`f(a, b)` -> 2).
     pub positional: u32,
@@ -149,7 +151,8 @@ pub struct CallArgShape {
 }
 
 /// Raw extracted relation between two named entities.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExtractedRelation {
     pub kind: RelationKind,
     pub src_name: String,
@@ -170,7 +173,8 @@ pub struct ExtractedRelation {
 ///
 /// Represents `import { foo, bar as baz } from './utils'` or
 /// `from utils import foo` etc.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileImport {
     /// The module path as written in source (e.g., `"./utils"`, `"lodash"`, `"../lib"`).
     pub module_path: String,
@@ -179,7 +183,8 @@ pub struct FileImport {
 }
 
 /// A single imported name within an import declaration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImportedName {
     /// The name as used locally in this file.
     pub local_name: String,
