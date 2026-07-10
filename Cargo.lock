@@ -3040,6 +3040,9 @@ dependencies = [
 [[package]]
 name = "kin-buildinfo"
 version = "0.2.15"
+dependencies = [
+ "sha2 0.11.0",
+]
 
 [[package]]
 name = "kin-cli"
@@ -3057,6 +3060,7 @@ dependencies = [
  "directories 5.0.1",
  "ed25519-dalek",
  "flate2",
+ "fs2",
  "hex",
  "keyring",
  "kin-blobs",
@@ -3269,6 +3273,8 @@ dependencies = [
  "notify",
  "pretty_assertions",
  "rayon",
+ "serde",
+ "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
@@ -3418,6 +3424,7 @@ version = "0.2.15"
 dependencies = [
  "kin-model",
  "pretty_assertions",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",

@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{GitError, Result};
 use crate::genesis::is_genesis_change;
-use crate::import::commit_file_deltas;
+use crate::import::{commit_file_deltas, select_history_oids_from_head};
 
 const MAX_ENTITIES_PER_FILE: usize = 8;
 
@@ -23,30 +23,6 @@ fn cochange_env_usize(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
-}
-
-/// Select up to `max_commits` commit ids by a deterministic total order
-/// (commit time descending, then id ascending).
-///
-/// A `ByCommitTime` walk orders commits by time but leaves the order among
-/// equal-timestamp commits unspecified and process-dependent, so both truncating
-/// the raw walk with `take(max_commits)` and consuming it in emission order can
-/// vary run to run whenever a timestamp tie straddles the cutoff or feeds an
-/// order-sensitive consumer. Imposing the id tie-break before truncating makes
-/// the selected set — and its order — depend only on commit content. Shared by
-/// the co-change miner (where it stabilizes per-pair counts folded into each
-/// relation's content hash) and the semantic-history import (where it stabilizes
-/// how entity/relation deltas partition across the imported changes), so the two
-/// paths cannot drift.
-pub(crate) fn select_commit_oids<Id: Ord>(
-    mut timed: Vec<(i64, Id)>,
-    max_commits: usize,
-) -> Vec<Id> {
-    timed.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    if max_commits > 0 {
-        timed.truncate(max_commits);
-    }
-    timed.into_iter().map(|(_, id)| id).collect()
 }
 
 pub fn mine_from_change_dag<G>(graph: &G, changes: &[SemanticChange]) -> Result<Vec<Relation>>
@@ -124,8 +100,9 @@ where
         .all()
         .map_err(|e| GitError::Git(e.to_string()))?;
 
-    // Phase 1: Collect (commit time, OID) for the full walk, then truncate to
-    // max_commits under a deterministic total order — see `select_commit_oids`.
+    // Phase 1: collect the full walk, then select the same deterministic,
+    // HEAD-rooted ancestry window used by semantic-history import. This keeps
+    // co-change evidence aligned with the commits present in recent history.
     let oids: Vec<gix::ObjectId> = {
         let _span = tracing::info_span!("kin.git.cochange.collect_oids").entered();
         let timed: Vec<(i64, gix::ObjectId)> = walk
@@ -134,7 +111,7 @@ where
                     .map_err(|e| GitError::Git(e.to_string()))
             })
             .collect::<Result<Vec<_>>>()?;
-        select_commit_oids(timed, max_commits)
+        select_history_oids_from_head(&repo, head_id, timed, max_commits)?
     };
 
     // Phase 2: Parallel tree diffs — propagate object/diff errors
@@ -430,58 +407,6 @@ mod tests {
         Visibility,
     };
     use std::process::Command;
-
-    #[test]
-    fn select_commit_oids_is_input_order_independent_at_tie_boundary() {
-        // A commit-time tie (t=100) straddles the max_commits cutoff. The
-        // selected set must depend only on (time desc, id asc), never on the
-        // walk's (process-dependent) emission order for the tied commits.
-        let base: Vec<(i64, u32)> = vec![
-            (300, 0x10),
-            (200, 0x20),
-            (100, 0x05),
-            (100, 0x03),
-            (100, 0x09),
-            (50, 0x40),
-        ];
-        let max = 4;
-        let expected = select_commit_oids(base.clone(), max);
-        // Top two by time, then the two smallest ids within the t=100 tie group.
-        assert_eq!(expected, vec![0x10u32, 0x20, 0x03, 0x05]);
-
-        let shuffles: Vec<Vec<(i64, u32)>> = vec![
-            base.iter().rev().copied().collect(),
-            vec![
-                (100, 0x09),
-                (300, 0x10),
-                (100, 0x03),
-                (50, 0x40),
-                (200, 0x20),
-                (100, 0x05),
-            ],
-            vec![
-                (100, 0x05),
-                (100, 0x03),
-                (100, 0x09),
-                (200, 0x20),
-                (300, 0x10),
-                (50, 0x40),
-            ],
-        ];
-        for s in shuffles {
-            assert_eq!(
-                select_commit_oids(s, max),
-                expected,
-                "truncated commit set must be independent of walk emission order"
-            );
-        }
-
-        // max_commits == 0 keeps all commits, still in deterministic total order.
-        assert_eq!(
-            select_commit_oids(base, 0),
-            vec![0x10u32, 0x20, 0x03, 0x05, 0x09, 0x40]
-        );
-    }
 
     fn test_entity(name: &str, path: &str, line: u32) -> kin_model::Entity {
         kin_model::Entity {
