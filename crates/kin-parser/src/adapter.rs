@@ -143,12 +143,21 @@ pub fn declaration_signature(node: &Node, source: &[u8]) -> String {
         }
     }
     let end = end.max(start);
-    let text = source
-        .get(start..end)
-        .map(String::from_utf8_lossy)
-        .unwrap_or_default();
+    let source_slice = source.get(start..end).unwrap_or_default();
+    let text = String::from_utf8_lossy(source_slice);
     let mut literal_ranges = Vec::new();
-    collect_literal_ranges(node, start, end, &mut literal_ranges);
+    // Tree-sitter spans address the original bytes. Lossy UTF-8 decoding can
+    // change their offsets, so literal copying is safe only while those byte
+    // offsets still name valid boundaries in the decoded signature.
+    if std::str::from_utf8(source_slice).is_ok() {
+        collect_literal_ranges(node, start, end, &mut literal_ranges);
+        literal_ranges.retain(|(literal_start, literal_end)| {
+            literal_start < literal_end
+                && *literal_end <= text.len()
+                && text.is_char_boundary(*literal_start)
+                && text.is_char_boundary(*literal_end)
+        });
+    }
     canonicalize_signature_spacing(&text, &literal_ranges)
         .trim_end_matches(['{', ':'])
         .trim()

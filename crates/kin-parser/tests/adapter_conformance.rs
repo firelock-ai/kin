@@ -637,6 +637,22 @@ fn conformance_deterministic_output() {
     }
 }
 
+#[test]
+fn invalid_utf8_declaration_ranges_never_panic() {
+    let source = b"jj==\n\xff\xff";
+    let registry = AdapterRegistry::new();
+    let file_id = FilePathId::new("invalid_utf8");
+
+    for language in registry.supported_languages() {
+        let adapter = registry
+            .get_by_language(language)
+            .expect("supported language has an adapter");
+        if let Ok(tree) = adapter.parse(source) {
+            let _ = adapter.extract(&tree, source, &file_id);
+        }
+    }
+}
+
 // ---- Registry conformance ----
 
 #[test]
