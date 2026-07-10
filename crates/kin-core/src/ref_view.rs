@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use kin_blobs::BlobStore;
 use kin_db::{GraphSnapshot, InMemoryGraph};
@@ -54,7 +55,27 @@ pub fn build_graph_at_ref_with_repo(
     repo_path: Option<&Path>,
     oid_cache: Option<&ChangeOidCache>,
 ) -> Result<InMemoryGraph> {
-    build_graph_at_ref_with_repo_inner(graph, blob_store, head, repo_path, oid_cache, None)
+    build_graph_at_ref_with_repo_inner(graph, blob_store, head, repo_path, oid_cache, None, None)
+}
+
+/// Cooperative-cancellation counterpart for daemon temporal-scope builds.
+pub fn build_graph_at_ref_with_repo_cancellable(
+    graph: &InMemoryGraph,
+    blob_store: &BlobStore,
+    head: &SemanticChangeId,
+    repo_path: Option<&Path>,
+    oid_cache: Option<&ChangeOidCache>,
+    cancelled: &AtomicBool,
+) -> Result<InMemoryGraph> {
+    build_graph_at_ref_with_repo_inner(
+        graph,
+        blob_store,
+        head,
+        repo_path,
+        oid_cache,
+        None,
+        Some(cancelled),
+    )
 }
 
 pub fn build_graph_at_git_ref_with_repo(
@@ -72,6 +93,28 @@ pub fn build_graph_at_git_ref_with_repo(
         Some(repo_path),
         oid_cache,
         Some(git_oid_hint),
+        None,
+    )
+}
+
+/// Git-hinted cooperative-cancellation counterpart for daemon scope builds.
+pub fn build_graph_at_git_ref_with_repo_cancellable(
+    graph: &InMemoryGraph,
+    blob_store: &BlobStore,
+    head: &SemanticChangeId,
+    repo_path: &Path,
+    git_oid_hint: &str,
+    oid_cache: Option<&ChangeOidCache>,
+    cancelled: &AtomicBool,
+) -> Result<InMemoryGraph> {
+    build_graph_at_ref_with_repo_inner(
+        graph,
+        blob_store,
+        head,
+        Some(repo_path),
+        oid_cache,
+        Some(git_oid_hint),
+        Some(cancelled),
     )
 }
 
@@ -82,6 +125,7 @@ fn build_graph_at_ref_with_repo_inner(
     repo_path: Option<&Path>,
     oid_cache: Option<&ChangeOidCache>,
     git_oid_hint: Option<&str>,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<InMemoryGraph> {
     let build_start = std::time::Instant::now();
     let timing = std::env::var("KIN_SCOPE_TIMING").is_ok();
@@ -90,7 +134,9 @@ fn build_graph_at_ref_with_repo_inner(
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(60.0);
 
-    let changes = collect_changes_at_ref(graph, head)?;
+    ensure_ref_build_active(build_start, build_timeout_secs, cancelled, "history walk")?;
+    let changes = collect_changes_at_ref_inner(graph, head, cancelled)?;
+    ensure_ref_build_active(build_start, build_timeout_secs, cancelled, "graph replay")?;
     let resolved = graph
         .resolve_graph_at(head)
         .map_err(|err| KinError::Graph(err.to_string()))?;
@@ -102,7 +148,7 @@ fn build_graph_at_ref_with_repo_inner(
     }
 
     let git_repair = repo_path.and_then(|path| {
-        match GitBlobRepair::new(path, head, &changes, oid_cache, git_oid_hint) {
+        match GitBlobRepair::new(path, head, &changes, oid_cache, git_oid_hint, cancelled) {
             Ok(repair) => Some(repair),
             Err(err) => {
                 tracing::warn!(
@@ -113,10 +159,16 @@ fn build_graph_at_ref_with_repo_inner(
             }
         }
     });
+    ensure_ref_build_active(
+        build_start,
+        build_timeout_secs,
+        cancelled,
+        "Git blob-repair initialization",
+    )?;
     let reader = BlobReader::new(blob_store, git_repair.as_ref(), repo_path);
     let ref_file_tree = match git_repair
         .as_ref()
-        .map(|repair| repair.materialize_file_tree(blob_store))
+        .map(|repair| repair.materialize_file_tree(blob_store, cancelled))
     {
         Some(Ok(git_tree)) if !git_tree.is_empty() => {
             if git_tree != resolved.file_tree {
@@ -138,6 +190,12 @@ fn build_graph_at_ref_with_repo_inner(
         }
         None => resolved.file_tree.clone(),
     };
+    ensure_ref_build_active(
+        build_start,
+        build_timeout_secs,
+        cancelled,
+        "historical tree materialization",
+    )?;
     if timing {
         eprintln!(
             "[scope-timing] after materialize_file_tree: {}ms",
@@ -164,10 +222,22 @@ fn build_graph_at_ref_with_repo_inner(
     if let Ok(parent_branches) = graph.list_branches() {
         let reachable_ids: HashSet<SemanticChangeId> = changes.iter().map(|c| c.id).collect();
         for mut b in parent_branches {
+            ensure_ref_build_active(
+                build_start,
+                build_timeout_secs,
+                cancelled,
+                "branch projection",
+            )?;
             let mut curr = b.head;
             let mut found = false;
             let mut visited = HashSet::new();
             while !visited.contains(&curr) {
+                ensure_ref_build_active(
+                    build_start,
+                    build_timeout_secs,
+                    cancelled,
+                    "branch projection",
+                )?;
                 visited.insert(curr);
                 if reachable_ids.contains(&curr) {
                     b.head = curr;
@@ -201,6 +271,7 @@ fn build_graph_at_ref_with_repo_inner(
         &lifecycle,
         build_start,
         build_timeout_secs,
+        cancelled,
     )?;
     rebuild_non_entity_tracked_files(
         &mut snapshot,
@@ -208,6 +279,7 @@ fn build_graph_at_ref_with_repo_inner(
         &reader,
         build_start,
         build_timeout_secs,
+        cancelled,
     )?;
     filter_temporal_cochange_relations(&mut snapshot);
     if timing {
@@ -218,6 +290,26 @@ fn build_graph_at_ref_with_repo_inner(
     }
 
     Ok(InMemoryGraph::from_snapshot(snapshot))
+}
+
+fn ensure_ref_build_active(
+    build_start: std::time::Instant,
+    build_timeout_secs: f64,
+    cancelled: Option<&AtomicBool>,
+    phase: &str,
+) -> Result<()> {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Err(KinError::Graph(format!(
+            "historical graph build cancelled during {phase}"
+        )));
+    }
+    if build_start.elapsed().as_secs_f64() > build_timeout_secs {
+        return Err(KinError::Graph(format!(
+            "historical graph build timed out after {:.1}s during {phase}; refusing partial graph",
+            build_start.elapsed().as_secs_f64()
+        )));
+    }
+    Ok(())
 }
 
 /// Post-filter vector search results to retain only entities present in a
@@ -377,8 +469,6 @@ fn git_cat_file_blob(repo_path: &Path, hash_hex: &str) -> Option<Vec<u8>> {
 /// with the import.rs fix that persists old blob hashes (commit 244de43).
 struct GitBlobRepair {
     repo: gix::Repository,
-    repo_path: std::path::PathBuf,
-    git_oid: gix::ObjectId,
     tree_id: gix::ObjectId,
 }
 
@@ -398,7 +488,9 @@ impl GitBlobRepair {
         _changes: &[SemanticChange],
         oid_cache: Option<&ChangeOidCache>,
         git_oid_hint: Option<&str>,
+        cancelled: Option<&AtomicBool>,
     ) -> std::result::Result<Self, String> {
+        ensure_ref_not_cancelled(cancelled, "Git blob-repair initialization")?;
         let repo = open_repo(repo_path).map_err(|e| e.to_string())?;
         let git_oid = if let Some(git_oid) = git_oid_hint {
             let oid = gix::ObjectId::from_hex(git_oid.as_bytes())
@@ -411,19 +503,14 @@ impl GitBlobRepair {
             }
             oid
         } else {
-            find_git_oid_for_change(&repo, head, oid_cache)?
+            find_git_oid_for_change(&repo, head, oid_cache, cancelled)?
         };
         let tree_id = {
             let commit = repo.find_commit(git_oid).map_err(|e| e.to_string())?;
             let tree = commit.tree().map_err(|e| e.to_string())?;
             tree.id
         };
-        Ok(Self {
-            repo,
-            repo_path: repo_path.to_path_buf(),
-            git_oid,
-            tree_id,
-        })
+        Ok(Self { repo, tree_id })
     }
 
     fn read_blob(&self, file_path: &str) -> Option<Vec<u8>> {
@@ -436,74 +523,46 @@ impl GitBlobRepair {
     fn materialize_file_tree(
         &self,
         blob_store: &BlobStore,
+        cancelled: Option<&AtomicBool>,
     ) -> std::result::Result<HashMap<FilePathId, Hash256>, String> {
         let timing = std::env::var("KIN_SCOPE_TIMING").is_ok();
-        let t_lstree = std::time::Instant::now();
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&self.repo_path)
-            .arg("ls-tree")
-            .arg("-rz")
-            .arg(self.git_oid.to_string())
-            .output()
-            .map_err(|err| format!("git ls-tree failed to start: {err}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "git ls-tree exited with status {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-        let lstree_ms = t_lstree.elapsed().as_millis();
+        ensure_ref_not_cancelled(cancelled, "Git tree traversal")?;
+        let t_tree = std::time::Instant::now();
+        let tree = self
+            .repo
+            .find_tree(self.tree_id)
+            .map_err(|err| format!("failed to open historical Git tree: {err}"))?;
+        let entries = tree
+            .traverse()
+            .breadthfirst
+            .files()
+            .map_err(|err| format!("failed to traverse historical Git tree: {err}"))?;
+        ensure_ref_not_cancelled(cancelled, "Git tree traversal")?;
+        let tree_ms = t_tree.elapsed().as_millis();
 
         let t_loop = std::time::Instant::now();
         let mut blob_count = 0usize;
         let mut file_tree = HashMap::new();
-        for raw in output.stdout.split(|byte| *byte == 0) {
-            if raw.is_empty() {
-                continue;
-            }
-            let record =
-                std::str::from_utf8(raw).map_err(|err| format!("non-utf8 git path: {err}"))?;
-            let Some((meta, path)) = record.split_once('\t') else {
-                continue;
-            };
-            let mut meta_parts = meta.split_whitespace();
-            let _mode = meta_parts.next();
-            let Some(kind) = meta_parts.next() else {
-                continue;
-            };
-            let Some(oid) = meta_parts.next() else {
-                continue;
-            };
-            if kind != "blob" {
+        for entry in entries {
+            ensure_ref_not_cancelled(cancelled, "Git blob materialization")?;
+            if !entry.mode.is_blob_or_symlink() {
                 continue;
             }
             blob_count += 1;
-
-            let content = Command::new("git")
-                .arg("-C")
-                .arg(&self.repo_path)
-                .arg("cat-file")
-                .arg("blob")
-                .arg(oid)
-                .output()
-                .map_err(|err| format!("git cat-file failed to start for {path}: {err}"))?;
-            if !content.status.success() {
-                return Err(format!(
-                    "git cat-file failed for {path} ({oid}) with status {}: {}",
-                    content.status,
-                    String::from_utf8_lossy(&content.stderr)
-                ));
-            }
+            let path = std::str::from_utf8(entry.filepath.as_ref())
+                .map_err(|err| format!("non-utf8 git path: {err}"))?;
+            let content = self
+                .repo
+                .find_object(entry.oid)
+                .map_err(|err| format!("failed to read Git blob for {path}: {err}"))?;
             let hash = blob_store
-                .write(&content.stdout)
+                .write(&content.data)
                 .map_err(|err| format!("failed to write git blob for {path}: {err}"))?;
             file_tree.insert(FilePathId::new(path), hash);
         }
         if timing {
             eprintln!(
-                "[scope-timing] materialize_file_tree: {blob_count} blobs, ls-tree {lstree_ms}ms, cat-file loop {}ms",
+                "[scope-timing] materialize_file_tree: {blob_count} blobs, tree walk {tree_ms}ms, blob loop {}ms",
                 t_loop.elapsed().as_millis()
             );
         }
@@ -535,13 +594,29 @@ pub type ChangeOidCache = HashMap<SemanticChangeId, gix::ObjectId>;
 pub fn build_change_oid_cache(
     repo: &gix::Repository,
 ) -> std::result::Result<ChangeOidCache, String> {
+    build_change_oid_cache_inner(repo, None)
+}
+
+pub fn build_change_oid_cache_cancellable(
+    repo: &gix::Repository,
+    cancelled: &AtomicBool,
+) -> std::result::Result<ChangeOidCache, String> {
+    build_change_oid_cache_inner(repo, Some(cancelled))
+}
+
+fn build_change_oid_cache_inner(
+    repo: &gix::Repository,
+    cancelled: Option<&AtomicBool>,
+) -> std::result::Result<ChangeOidCache, String> {
     use sha2::{Digest, Sha256};
 
+    ensure_ref_not_cancelled(cancelled, "change OID cache build")?;
     let tip = repo.head_id().map_err(|e| e.to_string())?.detach();
     let walk = repo.rev_walk([tip]).all().map_err(|e| e.to_string())?;
 
     let mut cache = HashMap::new();
     for info_result in walk {
+        ensure_ref_not_cancelled(cancelled, "change OID cache build")?;
         let info = info_result.map_err(|e| e.to_string())?;
         let oid = info.id;
         let mut hasher = Sha256::new();
@@ -564,7 +639,9 @@ fn find_git_oid_for_change(
     repo: &gix::Repository,
     head: &SemanticChangeId,
     cache: Option<&ChangeOidCache>,
+    cancelled: Option<&AtomicBool>,
 ) -> std::result::Result<gix::ObjectId, String> {
+    ensure_ref_not_cancelled(cancelled, "Git OID lookup")?;
     if let Some(cache) = cache {
         return cache
             .get(head)
@@ -579,6 +656,7 @@ fn find_git_oid_for_change(
     let walk = repo.rev_walk([tip]).all().map_err(|e| e.to_string())?;
 
     for info_result in walk {
+        ensure_ref_not_cancelled(cancelled, "Git OID lookup")?;
         let info = info_result.map_err(|e| e.to_string())?;
         let oid = info.id;
         let mut hasher = Sha256::new();
@@ -594,6 +672,17 @@ fn find_git_oid_for_change(
     }
 
     Err(format!("no git commit found for change {head}"))
+}
+
+fn ensure_ref_not_cancelled(
+    cancelled: Option<&AtomicBool>,
+    phase: &str,
+) -> std::result::Result<(), String> {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        Err(format!("historical graph build cancelled during {phase}"))
+    } else {
+        Ok(())
+    }
 }
 
 /// Snapshot of which changes and entities are alive at the target ref.
@@ -837,6 +926,31 @@ where
     G: GraphStore,
     <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
+    collect_changes_at_ref_inner(graph, head, None)
+}
+
+/// Cooperative-cancellation form for daemon temporal-scope post-processing.
+pub fn collect_changes_at_ref_cancellable<G>(
+    graph: &G,
+    head: &SemanticChangeId,
+    cancelled: &AtomicBool,
+) -> Result<Vec<SemanticChange>>
+where
+    G: GraphStore,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    collect_changes_at_ref_inner(graph, head, Some(cancelled))
+}
+
+fn collect_changes_at_ref_inner<G>(
+    graph: &G,
+    head: &SemanticChangeId,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<SemanticChange>>
+where
+    G: GraphStore,
+    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
+{
     let mut seen = HashSet::new();
     let mut ordered = Vec::new();
     enum Frame {
@@ -846,6 +960,11 @@ where
 
     let mut stack = vec![Frame::Visit(*head)];
     while let Some(frame) = stack.pop() {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(KinError::Graph(
+                "historical graph build cancelled during history walk".to_string(),
+            ));
+        }
         match frame {
             Frame::Visit(id) => {
                 if !seen.insert(id) {
@@ -948,6 +1067,7 @@ fn rebuild_non_entity_tracked_files(
     reader: &BlobReader<'_>,
     build_start: std::time::Instant,
     build_timeout_secs: f64,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<()> {
     let entity_paths: HashSet<String> = snapshot
         .entities
@@ -957,13 +1077,12 @@ fn rebuild_non_entity_tracked_files(
         .collect();
 
     for (file_id, hash) in file_tree {
-        if build_start.elapsed().as_secs_f64() > build_timeout_secs {
-            tracing::warn!(
-                "rebuild_non_entity_tracked_files: timeout after {:.1}s, returning partial results",
-                build_start.elapsed().as_secs_f64()
-            );
-            break;
-        }
+        ensure_ref_build_active(
+            build_start,
+            build_timeout_secs,
+            cancelled,
+            "non-entity file reconstruction",
+        )?;
         if entity_paths.contains(&file_id.0) {
             continue;
         }
@@ -1030,6 +1149,7 @@ fn rebuild_entity_source_file_layouts(
     lifecycle: &RefLifecycle,
     build_start: std::time::Instant,
     build_timeout_secs: f64,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<()> {
     let pipeline = IndexPipeline::new();
     let mut rebuilt_entities = Vec::new();
@@ -1040,13 +1160,12 @@ fn rebuild_entity_source_file_layouts(
     let known_files: HashSet<String> = file_tree.keys().map(|file_id| file_id.0.clone()).collect();
 
     for (file_id, hash) in file_tree {
-        if build_start.elapsed().as_secs_f64() > build_timeout_secs {
-            tracing::warn!(
-                "rebuild_entity_source_file_layouts: timeout after {:.1}s, returning partial results",
-                build_start.elapsed().as_secs_f64()
-            );
-            break;
-        }
+        ensure_ref_build_active(
+            build_start,
+            build_timeout_secs,
+            cancelled,
+            "entity source reconstruction",
+        )?;
         if !matches!(
             FileClassifier::classify(Path::new(&file_id.0)),
             FileClassification::EntitySource
@@ -1176,6 +1295,12 @@ fn rebuild_entity_source_file_layouts(
     }
 
     if !rebuilt_entities.is_empty() {
+        ensure_ref_build_active(
+            build_start,
+            build_timeout_secs,
+            cancelled,
+            "cross-file relation linking",
+        )?;
         snapshot.file_layouts.extend(parsed_layouts);
         for entity in rebuilt_entities {
             snapshot.entities.insert(entity.id, entity);
@@ -1186,6 +1311,12 @@ fn rebuild_entity_source_file_layouts(
             &parsed_files,
             &universe_entities,
         ));
+        ensure_ref_build_active(
+            build_start,
+            build_timeout_secs,
+            cancelled,
+            "cross-file relation linking",
+        )?;
     }
 
     parsed_relations.extend(projection_relations);
@@ -1590,6 +1721,15 @@ mod tests {
         EntityStore, FingerprintAlgorithm, LanguageId, SemanticChange, SemanticFingerprint,
         SourceSpan, Timestamp, Visibility,
     };
+
+    #[test]
+    fn cancelled_history_collection_returns_no_partial_prefix() {
+        let graph = InMemoryGraph::new();
+        let cancelled = AtomicBool::new(true);
+        let head = SemanticChangeId::from_hash(Hash256::from_bytes([0x91; 32]));
+        let result = collect_changes_at_ref_cancellable(&graph, &head, &cancelled);
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+    }
 
     fn change(
         id: SemanticChangeId,

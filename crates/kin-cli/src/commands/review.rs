@@ -187,6 +187,27 @@ pub fn execute_review_request_cached(
     closure_cache: &crate::commands::ref_lookup::GitHistoryClosureCache,
     before_first_insert: &mut dyn FnMut(),
 ) -> Result<ReviewExecution> {
+    execute_review_request_cached_with_prepared_hydration(
+        layout,
+        graph,
+        request,
+        closure_cache,
+        before_first_insert,
+        Vec::new(),
+    )
+}
+
+/// Execute after a daemon has prepared and published shadow-ref history on its
+/// blocking pool. The seed ids preserve truthful hydration accounting in the
+/// user-facing response while the ordinary resolver verifies the now-warm refs.
+pub fn execute_review_request_cached_with_prepared_hydration(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: ReviewRequest,
+    closure_cache: &crate::commands::ref_lookup::GitHistoryClosureCache,
+    before_first_insert: &mut dyn FnMut(),
+    prepared_hydrated_change_ids: Vec<kin_model::SemanticChangeId>,
+) -> Result<ReviewExecution> {
     match request {
         ReviewRequest::Run {
             change,
@@ -221,6 +242,7 @@ pub fn execute_review_request_cached(
                 json,
                 closure_cache,
                 before_first_insert,
+                prepared_hydrated_change_ids,
             )?;
             let hydrated_changes = hydrated_change_ids.len();
             Ok(ReviewExecution {
@@ -265,6 +287,47 @@ pub fn execute_review_request_cached(
         ReviewRequest::List { state } => list_reviews_with_graph(graph, state),
         ReviewRequest::Show { review_id } => show_review_with_graph(graph, review_id),
     }
+}
+
+/// Run only the Git-DAG stale-base fast path for a shadow request. Daemon
+/// callers invoke this off Tokio before preparing semantic history, retaining
+/// the cheap no-hydration result for the common branch-behind-base case.
+pub fn execute_review_shadow_fast_path_cached(
+    layout: &kin_core::KinLayout,
+    graph: &kin_db::InMemoryGraph,
+    request: &ReviewRequest,
+    closure_cache: &crate::commands::ref_lookup::GitHistoryClosureCache,
+) -> Result<Option<ReviewExecution>> {
+    let ReviewRequest::Shadow {
+        base,
+        head,
+        title,
+        source_url,
+        author,
+        json,
+    } = request
+    else {
+        return Ok(None);
+    };
+    let Some(report) = shadow_ancestry_fast_path_gap(
+        graph,
+        layout,
+        base,
+        head,
+        title,
+        source_url,
+        author,
+        closure_cache,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ReviewExecution {
+        response: shadow_response_from_report(&report, *json, 0)?,
+        mutated: false,
+        hydrated_changes: 0,
+        hydrated_change_ids: Vec::new(),
+    }))
 }
 
 fn build_review_run_response(
@@ -350,6 +413,7 @@ fn build_shadow_run_response(
     json: bool,
     closure_cache: &crate::commands::ref_lookup::GitHistoryClosureCache,
     before_first_insert: &mut dyn FnMut(),
+    mut prepared_hydrated_change_ids: Vec<kin_model::SemanticChangeId>,
 ) -> Result<(ReviewResponse, Vec<kin_model::SemanticChangeId>)> {
     // The everyday "your branch is behind main" case: base is not on head's
     // ancestry. That gap is provable from the Git commit-parent DAG alone —
@@ -369,7 +433,11 @@ fn build_shadow_run_response(
     )? {
         // The fast path never hydrates anything, so this is always a true
         // zero, not a placeholder.
-        return Ok((shadow_response_from_report(&report, json, 0)?, Vec::new()));
+        let hydrated_changes = prepared_hydrated_change_ids.len();
+        return Ok((
+            shadow_response_from_report(&report, json, hydrated_changes)?,
+            prepared_hydrated_change_ids,
+        ));
     }
 
     // Resolve the head ref before the base ref. A review pair is almost always
@@ -394,7 +462,8 @@ fn build_shadow_run_response(
             before_first_insert,
         )
         .with_context(|| format!("resolve shadow base ref '{}'", base))?;
-    let mut hydrated_change_ids = resolved_head.hydrated_change_ids;
+    let mut hydrated_change_ids = std::mem::take(&mut prepared_hydrated_change_ids);
+    hydrated_change_ids.extend(resolved_head.hydrated_change_ids);
     hydrated_change_ids.extend(resolved_base.hydrated_change_ids);
     let hydrated_changes = hydrated_change_ids.len();
 
@@ -1454,6 +1523,7 @@ mod tests {
             true,
             &cache,
             &mut || {},
+            Vec::new(),
         )
         .expect("a stale base must produce a gap report, not an error");
 
@@ -1547,6 +1617,7 @@ mod tests {
             true,
             &cache,
             &mut || {},
+            Vec::new(),
         )
         .unwrap();
 
@@ -1559,5 +1630,30 @@ mod tests {
             serde_json::from_str(response.json.as_deref().expect("json response")).unwrap();
         assert_eq!(json["hydrated_changes"], 0);
         assert_eq!(json["review_mutations"], 0);
+
+        let (prepared_response, prepared_ids) = build_shadow_run_response(
+            &layout,
+            &graph,
+            format!("kin:{base_id}"),
+            format!("kin:{head_id}"),
+            None,
+            None,
+            None,
+            true,
+            &cache,
+            &mut || {},
+            vec![head_id],
+        )
+        .unwrap();
+        assert_eq!(prepared_ids, vec![head_id]);
+        let prepared_json: serde_json::Value = serde_json::from_str(
+            prepared_response
+                .json
+                .as_deref()
+                .expect("prepared json response"),
+        )
+        .unwrap();
+        assert_eq!(prepared_json["hydrated_changes"], 1);
+        assert_eq!(prepared_json["review_mutations"], 0);
     }
 }

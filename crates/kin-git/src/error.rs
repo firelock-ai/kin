@@ -39,6 +39,12 @@ pub enum GitError {
     #[error("graph error: {0}")]
     Graph(String),
 
+    /// A caller explicitly cancelled a potentially expensive Git-history walk.
+    /// Kept distinct from repository/data failures so daemon timeouts can fail
+    /// closed without misreporting cancellation as corrupt Git state.
+    #[error("git history import cancelled")]
+    Cancelled,
+
     #[error("{0}")]
     Other(String),
 }

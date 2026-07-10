@@ -5,6 +5,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use kin_model::{BranchName, ChangeStore, Entity, EntityFilter, GraphStore};
 use kin_model::{Hash256, SemanticChangeId};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 use tracing::warn;
 
@@ -72,6 +73,18 @@ pub struct ResolvedRef {
     /// this frontier to invalidate only a materialized VFS view that was
     /// actually affected, without replaying the whole active history again.
     pub hydrated_change_ids: Vec<SemanticChangeId>,
+}
+
+/// A complete Git import prepared without mutating the Kin graph.
+///
+/// Daemon callers build this value on the blocking pool under the bounded
+/// heavy-prepare semaphore, then take the short history-writer gate only for
+/// [`publish_prepared_git_hydration`]. This keeps rev-walk, blob IO, parsing,
+/// and semantic enrichment away from both Tokio workers and graph writers.
+pub struct PreparedGitHydration {
+    imported_change_id: SemanticChangeId,
+    git_oid: String,
+    imported: Vec<kin_git::ImportedChange>,
 }
 
 /// Per-graph memo of Git-derived histories proven complete down to Kin's
@@ -238,7 +251,7 @@ fn resolve_ref_importing_git_if_needed_with_mode(
     let mut hydrated_change_ids = Vec::new();
     if let Some(git_oid) = reference.and_then(extract_git_ref) {
         let imported_change_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid)?;
-        if !imported_git_history_is_closed_cached(graph, imported_change_id, closure_cache)? {
+        if !imported_git_history_is_closed_cached(graph, imported_change_id, closure_cache, None)? {
             hydrated_change_ids = hydrate_imported_git_ref(
                 graph,
                 layout,
@@ -582,6 +595,31 @@ pub fn git_ref_requires_hydration_cached(
     git_ref_requires_hydration_inner(graph, reference, Some(closure_cache))
 }
 
+/// Cancellable cached closure check for daemon blocking-pool work. Unlike the
+/// conservative boolean helper, cancellation is returned to the caller so a
+/// timed-out request cannot silently start a replacement import.
+pub fn git_ref_requires_hydration_cached_cancellable(
+    graph: &kin_db::InMemoryGraph,
+    reference: &str,
+    closure_cache: &GitHistoryClosureCache,
+    cancelled: &AtomicBool,
+) -> Result<bool> {
+    let Some(git_oid) = extract_git_ref(reference) else {
+        return Ok(false);
+    };
+    let Ok(imported_change_id) = kin_git::semantic_change_id_from_git_oid_hex(git_oid) else {
+        // Preserve the ordinary resolver's detailed bad-ref error instead of
+        // turning malformed 40-character input into a closure-check failure.
+        return Ok(false);
+    };
+    Ok(!imported_git_history_is_closed_cached(
+        graph,
+        imported_change_id,
+        Some(closure_cache),
+        Some(cancelled),
+    )?)
+}
+
 fn git_ref_requires_hydration_inner(
     graph: &kin_db::InMemoryGraph,
     reference: &str,
@@ -594,7 +632,7 @@ fn git_ref_requires_hydration_inner(
         return false;
     };
     !matches!(
-        imported_git_history_is_closed_cached(graph, imported_change_id, closure_cache),
+        imported_git_history_is_closed_cached(graph, imported_change_id, closure_cache, None),
         Ok(true)
     )
 }
@@ -608,7 +646,15 @@ fn imported_git_history_is_closed_cached(
     graph: &kin_db::InMemoryGraph,
     head: SemanticChangeId,
     closure_cache: Option<&GitHistoryClosureCache>,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<bool> {
+    let ensure_not_cancelled = || -> Result<()> {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            bail!("Git history closure check cancelled");
+        }
+        Ok(())
+    };
+    ensure_not_cancelled()?;
     if closure_cache.is_some_and(|cache| cache.is_known_closed(&head)) {
         return Ok(true);
     }
@@ -622,6 +668,7 @@ fn imported_git_history_is_closed_cached(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     });
+    ensure_not_cancelled()?;
     if closure_cache.is_some_and(|cache| cache.is_known_closed(&head)) {
         return Ok(true);
     }
@@ -639,6 +686,7 @@ fn imported_git_history_is_closed_cached(
     let mut verified = HashSet::new();
 
     while let Some((change_id, exiting)) = stack.pop() {
+        ensure_not_cancelled()?;
         if exiting {
             visiting.remove(&change_id);
             verified.insert(change_id);
@@ -686,7 +734,7 @@ pub fn semantic_history_is_closed_cached(
     head: SemanticChangeId,
     closure_cache: &GitHistoryClosureCache,
 ) -> Result<bool> {
-    imported_git_history_is_closed_cached(graph, head, Some(closure_cache))
+    imported_git_history_is_closed_cached(graph, head, Some(closure_cache), None)
 }
 
 /// Lazily import the Git ancestry of `git_oid` into `graph`, returning the exact
@@ -699,24 +747,68 @@ fn hydrate_imported_git_ref(
     closure_cache: Option<&GitHistoryClosureCache>,
     before_first_insert: &mut dyn FnMut(),
 ) -> Result<Vec<SemanticChangeId>> {
-    let imported_change_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid)?;
+    let prepared = prepare_git_hydration_inner(layout, git_oid, enrich_semantics, None)?;
+    publish_prepared_git_hydration(graph, prepared, closure_cache, before_first_insert)
+}
 
+/// Prepare a Git ancestry import cooperatively, without changing graph state.
+pub fn prepare_git_hydration_cancellable(
+    layout: &kin_core::KinLayout,
+    git_oid: &str,
+    enrich_semantics: bool,
+    cancelled: &AtomicBool,
+) -> Result<PreparedGitHydration> {
+    prepare_git_hydration_inner(layout, git_oid, enrich_semantics, Some(cancelled))
+}
+
+fn prepare_git_hydration_inner(
+    layout: &kin_core::KinLayout,
+    git_oid: &str,
+    enrich_semantics: bool,
+    cancelled: Option<&AtomicBool>,
+) -> Result<PreparedGitHydration> {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        bail!("Git history hydration cancelled");
+    }
+    let imported_change_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid)?;
     let blob_store = kin_blobs::BlobStore::new(layout.objects_dir())
         .context("open blob store for imported Git ref hydration")?;
     let genesis_id = kin_core::build_genesis_change().id;
-    let mut imported = kin_git::import_git_history_to_commit_with_blobs(
-        layout.working_dir(),
-        git_oid,
-        genesis_id,
-        Some(&blob_store),
-    )
+    let mut imported = match cancelled {
+        Some(cancelled) => kin_git::import_git_history_to_commit_with_blobs_cancellable(
+            layout.working_dir(),
+            git_oid,
+            genesis_id,
+            Some(&blob_store),
+            cancelled,
+        ),
+        None => kin_git::import_git_history_to_commit_with_blobs(
+            layout.working_dir(),
+            git_oid,
+            genesis_id,
+            Some(&blob_store),
+        ),
+    }
     .with_context(|| format!("hydrate imported Git commit '{}'", git_oid))?;
 
     if enrich_semantics {
-        if let Err(err) = crate::commands::init::enrich_imported_changes_with_semantics(
-            &mut imported,
-            &blob_store,
-        ) {
+        let enrichment = match cancelled {
+            Some(cancelled) => {
+                crate::commands::init::enrich_imported_changes_with_semantics_cancellable(
+                    &mut imported,
+                    &blob_store,
+                    cancelled,
+                )
+            }
+            None => crate::commands::init::enrich_imported_changes_with_semantics(
+                &mut imported,
+                &blob_store,
+            ),
+        };
+        if let Err(err) = enrichment {
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return Err(err).context("Git history hydration cancelled during enrichment");
+            }
             warn!(
                 error = %err,
                 git_oid = %git_oid,
@@ -724,9 +816,27 @@ fn hydrate_imported_git_ref(
             );
         }
     }
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        bail!("Git history hydration cancelled");
+    }
+    Ok(PreparedGitHydration {
+        imported_change_id,
+        git_oid: git_oid.to_string(),
+        imported,
+    })
+}
 
+/// Publish a fully prepared import. Callers must serialize this with every
+/// other SemanticChange writer. Exact existing ids are skipped, allowing a
+/// second waiter for the same ref to coalesce after the first publication.
+pub fn publish_prepared_git_hydration(
+    graph: &kin_db::InMemoryGraph,
+    prepared: PreparedGitHydration,
+    closure_cache: Option<&GitHistoryClosureCache>,
+    before_first_insert: &mut dyn FnMut(),
+) -> Result<Vec<SemanticChangeId>> {
     let mut inserted = Vec::new();
-    for imported_change in &imported {
+    for imported_change in &prepared.imported {
         if graph.get_change(&imported_change.change.id)?.is_none() {
             if inserted.is_empty() {
                 before_first_insert();
@@ -736,9 +846,14 @@ fn hydrate_imported_git_ref(
         }
     }
 
-    if !imported_git_history_is_closed_cached(graph, imported_change_id, closure_cache)? {
+    if !imported_git_history_is_closed_cached(
+        graph,
+        prepared.imported_change_id,
+        closure_cache,
+        None,
+    )? {
         return Err(ref_error(
-            git_oid,
+            &prepared.git_oid,
             "imported Git commit history remained incomplete after hydration",
         ));
     }
@@ -834,6 +949,20 @@ mod tests {
     use super::*;
     use kin_db::InMemoryGraph;
     use kin_model::{AuthorId, Branch, ChangeStore, SemanticChange, Timestamp};
+
+    #[test]
+    fn cancelled_cached_closure_check_fails_instead_of_requesting_import() {
+        let graph = InMemoryGraph::new();
+        let cache = GitHistoryClosureCache::default();
+        let cancelled = AtomicBool::new(true);
+        let result = git_ref_requires_hydration_cached_cancellable(
+            &graph,
+            "git:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &cache,
+            &cancelled,
+        );
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+    }
 
     fn temp_layout() -> kin_core::KinLayout {
         let temp = tempfile::tempdir().unwrap();

@@ -16,12 +16,16 @@ pub mod export;
 pub mod genesis;
 pub mod import;
 
-pub use cochange::{mine_from_change_dag, mine_from_git_log, mine_from_git_log_with_limit};
+pub use cochange::{
+    mine_from_change_dag, mine_from_change_dag_cancellable, mine_from_git_log,
+    mine_from_git_log_with_limit,
+};
 pub use error::{GitError, Result};
 pub use export::{export_changes, export_to_git, ExportOptions, ExportResult};
 pub use genesis::is_genesis_change;
 pub use import::{
     anchor_imported_history_at_base_link, expand_git_commit_prefix, import_git_history,
-    import_git_history_to_commit_with_blobs, import_git_history_with_blobs, is_ancestor_commit,
-    semantic_change_id_from_git_oid_hex, GitOidPrefixExpansion, ImportOptions, ImportedChange,
+    import_git_history_to_commit_with_blobs, import_git_history_to_commit_with_blobs_cancellable,
+    import_git_history_with_blobs, is_ancestor_commit, semantic_change_id_from_git_oid_hex,
+    GitOidPrefixExpansion, ImportOptions, ImportedChange,
 };

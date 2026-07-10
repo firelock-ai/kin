@@ -4,6 +4,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Display;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use kin_model::{
     Entity, EntityFilter, EntityId, EntityStore, FilePathId, Relation, RelationId, RelationKind,
@@ -54,6 +55,32 @@ where
     G: EntityStore + Sync,
     G::Error: Display,
 {
+    mine_from_change_dag_inner(graph, changes, None)
+}
+
+/// Cooperative-cancellation form used by temporal-scope reconstruction.
+pub fn mine_from_change_dag_cancellable<G>(
+    graph: &G,
+    changes: &[SemanticChange],
+    cancelled: &AtomicBool,
+) -> Result<Vec<Relation>>
+where
+    G: EntityStore + Sync,
+    G::Error: Display,
+{
+    mine_from_change_dag_inner(graph, changes, Some(cancelled))
+}
+
+fn mine_from_change_dag_inner<G>(
+    graph: &G,
+    changes: &[SemanticChange],
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<Relation>>
+where
+    G: EntityStore + Sync,
+    G::Error: Display,
+{
+    ensure_not_cancelled(cancelled)?;
     let _span = tracing::info_span!(
         "kin.git.cochange.mine_from_change_dag",
         changes = changes.len()
@@ -62,14 +89,29 @@ where
     let max_files_per_commit = cochange_env_usize("KIN_COCHANGE_MAX_FILES_PER_COMMIT", 20);
     let change_sets = {
         let _span = tracing::info_span!("kin.git.cochange.collect_change_sets").entered();
-        changes
-            .iter()
-            .filter(|change| !is_genesis_change(change))
-            .map(changed_files_from_change)
-            .filter(|files| files.len() >= 2 && files.len() <= max_files_per_commit)
-            .collect::<Vec<_>>()
+        let mut sets = Vec::new();
+        for change in changes {
+            ensure_not_cancelled(cancelled)?;
+            if is_genesis_change(change) {
+                continue;
+            }
+            let files = changed_files_from_change(change);
+            if files.len() >= 2 && files.len() <= max_files_per_commit {
+                sets.push(files);
+            }
+        }
+        sets
     };
-    build_relations_from_change_sets(graph, &change_sets)
+    build_relations_from_change_sets(graph, &change_sets, cancelled)
+}
+
+#[inline]
+fn ensure_not_cancelled(cancelled: Option<&AtomicBool>) -> Result<()> {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        Err(GitError::Cancelled)
+    } else {
+        Ok(())
+    }
 }
 
 fn open_repo(path: &Path) -> std::result::Result<gix::Repository, gix::open::Error> {
@@ -162,7 +204,7 @@ where
             .collect()
     };
 
-    build_relations_from_change_sets(graph, &change_sets)
+    build_relations_from_change_sets(graph, &change_sets, None)
 }
 
 fn changed_files_from_change(change: &SemanticChange) -> BTreeSet<String> {
@@ -176,11 +218,13 @@ fn changed_files_from_change(change: &SemanticChange) -> BTreeSet<String> {
 fn build_relations_from_change_sets<G>(
     graph: &G,
     change_sets: &[BTreeSet<String>],
+    cancelled: Option<&AtomicBool>,
 ) -> Result<Vec<Relation>>
 where
     G: EntityStore + Sync,
     G::Error: Display,
 {
+    ensure_not_cancelled(cancelled)?;
     let _span = tracing::info_span!(
         "kin.git.cochange.build_relations_from_change_sets",
         change_sets = change_sets.len()
@@ -198,6 +242,7 @@ where
         let mut interner: HashMap<&str, u32> = HashMap::new();
         let mut file_names: Vec<&str> = Vec::new();
         for files in change_sets {
+            ensure_not_cancelled(cancelled)?;
             for file in files {
                 if !interner.contains_key(file.as_str()) {
                     interner.insert(file.as_str(), file_names.len() as u32);
@@ -205,10 +250,16 @@ where
                 }
             }
         }
-        let indexed_sets: Vec<Vec<u32>> = change_sets
-            .iter()
-            .map(|files| files.iter().map(|file| interner[file.as_str()]).collect())
-            .collect();
+        let mut indexed_sets = Vec::with_capacity(change_sets.len());
+        for files in change_sets {
+            ensure_not_cancelled(cancelled)?;
+            indexed_sets.push(
+                files
+                    .iter()
+                    .map(|file| interner[file.as_str()])
+                    .collect::<Vec<_>>(),
+            );
+        }
 
         let (touch_idx, pair_idx) = indexed_sets
             .par_iter()
@@ -220,6 +271,9 @@ where
                     )
                 },
                 |(mut tc, mut pc), files| {
+                    if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                        return (tc, pc);
+                    }
                     for &file in files {
                         *tc.entry(file).or_default() += 1;
                     }
@@ -245,6 +299,7 @@ where
                     (tc1, pc1)
                 },
             );
+        ensure_not_cancelled(cancelled)?;
 
         // Re-key back to owned Strings for the (unchanged) downstream logic —
         // one allocation per unique file / unique pair, not per commit-pair.
@@ -282,6 +337,7 @@ where
         unique_files
             .into_par_iter()
             .map(|file| {
+                ensure_not_cancelled(cancelled)?;
                 let filter = EntityFilter {
                     file_path: Some(FilePathId::new(&file)),
                     ..Default::default()
@@ -317,6 +373,7 @@ where
     let max_fan_out = cochange_env_usize("KIN_COCHANGE_MAX_FAN_OUT", 15);
     let mut partner_counts: HashMap<String, HashSet<String>> = HashMap::new();
     for ((src, dst), _count) in &sorted_pairs {
+        ensure_not_cancelled(cancelled)?;
         partner_counts
             .entry(src.clone())
             .or_default()
@@ -357,6 +414,9 @@ where
             .par_iter()
             .map(|((src_file, dst_file), pair_count)| {
                 let mut out = Vec::new();
+                if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                    return out;
+                }
                 let Some(src_touch_count) = touch_counts.get(src_file).copied() else {
                     return out;
                 };
@@ -374,6 +434,9 @@ where
                 let confidence = *pair_count as f32 / src_touch_count as f32;
                 for src_entity in src_entities {
                     for dst_entity in dst_entities {
+                        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                            return out;
+                        }
                         if src_entity.id == dst_entity.id {
                             continue;
                         }
@@ -394,12 +457,14 @@ where
             })
             .collect()
     };
+    ensure_not_cancelled(cancelled)?;
 
     // Sequential first-wins dedup preserving the original ordering (a safety net:
     // ordered entity-pairs are already unique across file-pairs).
     let mut seen_relation_ids = HashSet::new();
     let mut relations = Vec::with_capacity(per_pair.iter().map(Vec::len).sum());
     for pair_relations in per_pair {
+        ensure_not_cancelled(cancelled)?;
         for relation in pair_relations {
             if seen_relation_ids.insert(relation.id) {
                 relations.push(relation);
@@ -430,6 +495,15 @@ mod tests {
         Visibility,
     };
     use std::process::Command;
+
+    #[test]
+    fn cancelled_change_dag_mining_publishes_no_relations() {
+        let graph = kin_db::InMemoryGraph::new();
+        let cancelled = AtomicBool::new(true);
+        let result = mine_from_change_dag_cancellable(&graph, &[], &cancelled);
+        assert!(matches!(result, Err(GitError::Cancelled)));
+        assert!(graph.list_all_entities().unwrap().is_empty());
+    }
 
     #[test]
     fn select_commit_oids_is_input_order_independent_at_tie_boundary() {

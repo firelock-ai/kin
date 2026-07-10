@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::TimeZone;
 use kin_blobs::BlobStore;
@@ -130,7 +131,14 @@ pub fn import_git_history_with_blobs(
         return import_shallow(&repo, head_id, genesis_id, blob_store);
     }
 
-    import_full(&repo, head_id, genesis_id, opts.max_commits, blob_store)
+    import_full(
+        &repo,
+        head_id,
+        genesis_id,
+        opts.max_commits,
+        blob_store,
+        None,
+    )
 }
 
 /// Import the ancestry reachable from a specific Git commit.
@@ -140,6 +148,45 @@ pub fn import_git_history_to_commit_with_blobs(
     genesis_id: SemanticChangeId,
     blob_store: Option<&BlobStore>,
 ) -> Result<Vec<ImportedChange>> {
+    import_git_history_to_commit_with_blobs_inner(
+        repo_path,
+        git_oid_hex,
+        genesis_id,
+        blob_store,
+        None,
+    )
+}
+
+/// Cancellable counterpart of [`import_git_history_to_commit_with_blobs`].
+///
+/// Cancellation is cooperative and checked throughout the rev-walk, parallel
+/// commit mapping, tree-diff, and blob-materialization loops. The function
+/// never publishes graph state itself, so a cancelled call leaves no partial
+/// SemanticChange history for its caller to expose.
+pub fn import_git_history_to_commit_with_blobs_cancellable(
+    repo_path: &Path,
+    git_oid_hex: &str,
+    genesis_id: SemanticChangeId,
+    blob_store: Option<&BlobStore>,
+    cancelled: &AtomicBool,
+) -> Result<Vec<ImportedChange>> {
+    import_git_history_to_commit_with_blobs_inner(
+        repo_path,
+        git_oid_hex,
+        genesis_id,
+        blob_store,
+        Some(cancelled),
+    )
+}
+
+fn import_git_history_to_commit_with_blobs_inner(
+    repo_path: &Path,
+    git_oid_hex: &str,
+    genesis_id: SemanticChangeId,
+    blob_store: Option<&BlobStore>,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<ImportedChange>> {
+    check_cancelled(cancelled)?;
     let _span = tracing::info_span!(
         "kin.git.import_history_to_commit",
         repo = %repo_path.display(),
@@ -152,7 +199,16 @@ pub fn import_git_history_to_commit_with_blobs(
         .map_err(|err| GitError::Git(format!("invalid git oid '{}': {}", git_oid_hex, err)))?;
     repo.find_commit(target_id)
         .map_err(|e| GitError::CommitNotFound(format!("{git_oid_hex}: {e}")))?;
-    import_full(&repo, target_id, genesis_id, 0, blob_store)
+    import_full(&repo, target_id, genesis_id, 0, blob_store, cancelled)
+}
+
+#[inline]
+fn check_cancelled(cancelled: Option<&AtomicBool>) -> Result<()> {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        Err(GitError::Cancelled)
+    } else {
+        Ok(())
+    }
 }
 
 /// Cheap, Git-native ancestry check: is `ancestor_oid_hex` reachable by
@@ -250,7 +306,7 @@ fn import_shallow(
         .find_commit(head_id)
         .map_err(|e| GitError::CommitNotFound(format!("{head_id}: {e}")))?;
 
-    let change = commit_to_change(repo, &commit, genesis_id, true, blob_store)?;
+    let change = commit_to_change(repo, &commit, genesis_id, true, blob_store, None)?;
     let oid_str = head_id.to_string();
 
     info!(git_oid = %oid_str, kin_id = %change.id, "shallow import from HEAD");
@@ -268,7 +324,9 @@ fn import_full(
     genesis_id: SemanticChangeId,
     max_commits: usize,
     blob_store: Option<&BlobStore>,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<Vec<ImportedChange>> {
+    check_cancelled(cancelled)?;
     let _span = tracing::info_span!(
         "kin.git.import_full",
         head = %head_id,
@@ -301,6 +359,7 @@ fn import_full(
         let _span = tracing::info_span!("kin.git.import_full.collect_oids").entered();
         let timed: Vec<(i64, gix::ObjectId)> = walk
             .map(|r| {
+                check_cancelled(cancelled)?;
                 r.map(|info| (info.commit_time.unwrap_or(0), info.id().detach()))
                     .map_err(|e| GitError::Git(e.to_string()))
             })
@@ -336,6 +395,7 @@ fn import_full(
 
         oids.par_iter()
             .map(|oid| {
+                check_cancelled(cancelled)?;
                 let local = thread_safe.to_thread_local();
                 // Object lookups can transiently miss while another worker is
                 // still initializing a shared object-database slot (the loose-
@@ -350,7 +410,14 @@ fn import_full(
                 }
                 .into_commit();
                 let is_root = commit.parent_ids().count() == 0;
-                let change = commit_to_change(&local, &commit, genesis_id, is_root, blob_store)?;
+                let change = commit_to_change(
+                    &local,
+                    &commit,
+                    genesis_id,
+                    is_root,
+                    blob_store,
+                    cancelled,
+                )?;
                 let oid_str = oid.to_string();
                 debug!(git_oid = %oid_str, kin_id = %change.id, parents = change.parents.len(), "imported commit");
                 Ok(ImportedChange {
@@ -407,7 +474,7 @@ fn import_full_serial(
             .map_err(|e| GitError::Git(e.to_string()))?
             .into_commit();
         let is_root = commit.parent_ids().count() == 0;
-        let change = commit_to_change(repo, &commit, genesis_id, is_root, blob_store)?;
+        let change = commit_to_change(repo, &commit, genesis_id, is_root, blob_store, None)?;
         changes.push(ImportedChange {
             change,
             git_oid: oid.to_string(),
@@ -471,7 +538,9 @@ fn commit_to_change(
     genesis_id: SemanticChangeId,
     is_root: bool,
     blob_store: Option<&BlobStore>,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<SemanticChange> {
+    check_cancelled(cancelled)?;
     let oid = commit.id;
     let change_id = change_id_from_git_oid(&oid);
 
@@ -511,7 +580,7 @@ fn commit_to_change(
     // For a full import, we'd diff against parent trees. For now, we record
     // file paths from the tree as artifact deltas (the indexing pipeline
     // will later enrich these with entity extraction).
-    let artifact_deltas = extract_artifact_deltas(repo, commit, blob_store)?;
+    let artifact_deltas = extract_artifact_deltas(repo, commit, blob_store, cancelled)?;
 
     let authored_on = if is_root {
         Some(BranchName::new("main"))
@@ -544,9 +613,11 @@ fn extract_artifact_deltas(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     blob_store: Option<&BlobStore>,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<Vec<ArtifactDelta>> {
     let mut deltas = Vec::new();
-    for delta in commit_file_deltas(repo, commit)? {
+    for delta in commit_file_deltas_cancellable(repo, commit, cancelled)? {
+        check_cancelled(cancelled)?;
         let kind = match (delta.old_blob_id, delta.new_blob_id) {
             (None, Some(_)) => ArtifactDeltaKind::Added,
             (Some(_), None) => ArtifactDeltaKind::Removed,
@@ -578,6 +649,15 @@ pub(crate) fn commit_file_deltas(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
 ) -> Result<Vec<CommitFileDelta>> {
+    commit_file_deltas_cancellable(repo, commit, None)
+}
+
+fn commit_file_deltas_cancellable(
+    repo: &gix::Repository,
+    commit: &gix::Commit<'_>,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<CommitFileDelta>> {
+    check_cancelled(cancelled)?;
     let tree = commit.tree().map_err(|e| GitError::Git(e.to_string()))?;
     let parent_tree = commit
         .parent_ids()
@@ -596,6 +676,7 @@ pub(crate) fn commit_file_deltas(
 
     let mut deltas = Vec::new();
     for change in changes {
+        check_cancelled(cancelled)?;
         match change {
             gix::object::tree::diff::ChangeDetached::Addition {
                 location,
@@ -882,6 +963,19 @@ pub fn anchor_imported_history_at_base_link(
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn cancelled_target_import_stops_before_repository_io() {
+        let cancelled = AtomicBool::new(true);
+        let result = import_git_history_to_commit_with_blobs_cancellable(
+            Path::new("/definitely/not/a/repository"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            SemanticChangeId::from_hash(Hash256::from_bytes([0x41; 32])),
+            None,
+            &cancelled,
+        );
+        assert!(matches!(result, Err(GitError::Cancelled)));
+    }
 
     #[test]
     fn test_open_repo_resolves_git_suffix_directories() {
@@ -1346,7 +1440,7 @@ mod tests {
         let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x55; 32]));
 
         // The full import enumerates every commit; its ids are the ground truth.
-        let full = import_full(&repo, head_id, genesis_id, 0, None).expect("full import");
+        let full = import_full(&repo, head_id, genesis_id, 0, None, None).expect("full import");
         assert_eq!(full.len(), 8, "all commits import when max_commits == 0");
 
         // Expected truncated selection: the 4 smallest oids (content tie-break),
@@ -1360,7 +1454,8 @@ mod tests {
         // the same order — proving the boundary depends on content, not on the
         // walk's (process-dependent) emission order for the tied commits.
         for _ in 0..2 {
-            let limited = import_full(&repo, head_id, genesis_id, 4, None).expect("limited import");
+            let limited =
+                import_full(&repo, head_id, genesis_id, 4, None, None).expect("limited import");
             let got_oids: Vec<String> = limited.iter().map(|c| c.git_oid.clone()).collect();
             assert_eq!(
                 got_oids, expected,
@@ -1478,10 +1573,11 @@ mod tests {
             .detach();
         let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x66; 32]));
 
-        let full = import_full(&repo, head_id, genesis_id, 0, None).expect("full import");
+        let full = import_full(&repo, head_id, genesis_id, 0, None, None).expect("full import");
         assert_eq!(full.len(), 12, "all commits import when max_commits == 0");
 
-        let limited = import_full(&repo, head_id, genesis_id, 5, None).expect("limited import");
+        let limited =
+            import_full(&repo, head_id, genesis_id, 5, None, None).expect("limited import");
         assert_eq!(
             limited.len(),
             5,
@@ -1527,7 +1623,7 @@ mod tests {
         let store_par = BlobStore::new(dir.path().join("blobs-par")).unwrap();
         let store_ser = BlobStore::new(dir.path().join("blobs-ser")).unwrap();
 
-        let parallel = import_full(&repo, head_id, genesis_id, 0, Some(&store_par))
+        let parallel = import_full(&repo, head_id, genesis_id, 0, Some(&store_par), None)
             .expect("parallel import should succeed");
         let serial = import_full_serial(&repo, head_id, genesis_id, 0, Some(&store_ser))
             .expect("serial import should succeed");
@@ -1549,7 +1645,7 @@ mod tests {
 
         // Re-running the parallel path must also be byte-stable.
         let store_par2 = BlobStore::new(dir.path().join("blobs-par2")).unwrap();
-        let parallel_again = import_full(&repo, head_id, genesis_id, 0, Some(&store_par2))
+        let parallel_again = import_full(&repo, head_id, genesis_id, 0, Some(&store_par2), None)
             .expect("second parallel import should succeed");
         assert_eq!(
             format!("{parallel:?}"),
@@ -1560,7 +1656,8 @@ mod tests {
         // The byte-identical guarantee must also hold under max_commits truncation.
         let store_a = BlobStore::new(dir.path().join("blobs-a")).unwrap();
         let store_b = BlobStore::new(dir.path().join("blobs-b")).unwrap();
-        let par_limited = import_full(&repo, head_id, genesis_id, 10, Some(&store_a)).unwrap();
+        let par_limited =
+            import_full(&repo, head_id, genesis_id, 10, Some(&store_a), None).unwrap();
         let ser_limited =
             import_full_serial(&repo, head_id, genesis_id, 10, Some(&store_b)).unwrap();
         assert_eq!(par_limited.len(), 10);
@@ -1594,7 +1691,7 @@ mod tests {
 
         let store_par = BlobStore::new(dir.path().join("blobs-t-par")).unwrap();
         let t1 = std::time::Instant::now();
-        let parallel = import_full(&repo, head_id, genesis_id, 0, Some(&store_par)).unwrap();
+        let parallel = import_full(&repo, head_id, genesis_id, 0, Some(&store_par), None).unwrap();
         let parallel_ms = t1.elapsed().as_micros() as f64 / 1000.0;
 
         eprintln!(

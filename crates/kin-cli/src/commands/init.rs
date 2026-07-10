@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -1309,6 +1309,23 @@ pub(crate) fn enrich_imported_changes_with_semantics(
     enrich_imported_changes_with_semantics_inner(imported, blob_store, true).map(|_| ())
 }
 
+/// Cooperative-cancellation form used by daemon history preparation. The
+/// caller publishes only after the whole prepared sequence succeeds, so a
+/// cancellation cannot expose partially enriched SemanticChanges.
+pub fn enrich_imported_changes_with_semantics_cancellable(
+    imported: &mut [kin_git::ImportedChange],
+    blob_store: &kin_blobs::BlobStore,
+    cancelled: &AtomicBool,
+) -> Result<()> {
+    enrich_imported_changes_with_semantics_cancellable_inner(
+        imported,
+        blob_store,
+        true,
+        Some(cancelled),
+    )
+    .map(|_| ())
+}
+
 /// Replay body shared by production (`parse_memo_enabled = true`) and the
 /// memo-off serial oracle used in tests. Returns `(parse_memo_hits,
 /// parse_memo_misses)` observed over the pass.
@@ -1317,6 +1334,27 @@ fn enrich_imported_changes_with_semantics_inner(
     blob_store: &kin_blobs::BlobStore,
     parse_memo_enabled: bool,
 ) -> Result<(usize, usize)> {
+    enrich_imported_changes_with_semantics_cancellable_inner(
+        imported,
+        blob_store,
+        parse_memo_enabled,
+        None,
+    )
+}
+
+fn enrich_imported_changes_with_semantics_cancellable_inner(
+    imported: &mut [kin_git::ImportedChange],
+    blob_store: &kin_blobs::BlobStore,
+    parse_memo_enabled: bool,
+    cancelled: Option<&AtomicBool>,
+) -> Result<(usize, usize)> {
+    let ensure_not_cancelled = || -> Result<()> {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            anyhow::bail!("history semantic enrichment cancelled");
+        }
+        Ok(())
+    };
+    ensure_not_cancelled()?;
     // Profiling timers (accumulated across every commit in the pass).
     let mut total_blob_read_time = std::time::Duration::ZERO;
     let mut total_parsing_time = std::time::Duration::ZERO;
@@ -1343,6 +1381,7 @@ fn enrich_imported_changes_with_semantics_inner(
     // historical refs.
     let mut index_by_change_id = HashMap::<SemanticChangeId, usize>::with_capacity(total_commits);
     for (i, imported_change) in imported.iter().enumerate() {
+        ensure_not_cancelled()?;
         index_by_change_id.insert(imported_change.change.id, i);
     }
     let first_parent_index: Vec<Option<usize>> = imported
@@ -1368,6 +1407,7 @@ fn enrich_imported_changes_with_semantics_inner(
     let mut snapshots = HashMap::<SemanticChangeId, ImportedCommitSemanticState>::new();
 
     for (processed, &i) in order.iter().enumerate() {
+        ensure_not_cancelled()?;
         if total_commits > 0 {
             let percent = ((processed + 1) * 100) / total_commits;
             let short_oid: String = imported[i].git_oid.chars().take(7).collect();
@@ -1430,6 +1470,7 @@ fn enrich_imported_changes_with_semantics_inner(
         let mut scheduled_jobs: HashMap<(kin_blobs::Hash256, u32), usize> = HashMap::new();
 
         for (delta_idx, artifact_delta) in deltas.iter().enumerate() {
+            ensure_not_cancelled()?;
             let file_path = &artifact_delta.file_id.0;
 
             if !matches!(
@@ -1495,6 +1536,9 @@ fn enrich_imported_changes_with_semantics_inner(
             let job_contents: Vec<Result<Vec<u8>, String>> = parse_jobs
                 .par_iter()
                 .map(|job| {
+                    if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                        return Err("history semantic enrichment cancelled".to_string());
+                    }
                     blob_store
                         .read(&job.blob_hash)
                         .map_err(|err| err.to_string())
@@ -1512,6 +1556,9 @@ fn enrich_imported_changes_with_semantics_inner(
                 .par_iter()
                 .zip(job_contents.par_iter())
                 .map_init(kin_index::IndexPipeline::new, |pipeline, (job, content)| {
+                    if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                        return Some(Err("history semantic enrichment cancelled".to_string()));
+                    }
                     let content = content.as_ref().ok()?;
                     Some(
                         pipeline
@@ -1528,6 +1575,7 @@ fn enrich_imported_changes_with_semantics_inner(
                 })
                 .collect();
             total_parsing_time += parse_start.elapsed();
+            ensure_not_cancelled()?;
 
             // Merge (serial, deterministic): populate the content-keyed memo,
             // resolve every served delta, settle same-commit reappearance
@@ -1538,6 +1586,7 @@ fn enrich_imported_changes_with_semantics_inner(
                 .map(|content| content.err())
                 .collect();
             for (job_idx, job) in parse_jobs.iter().enumerate() {
+                ensure_not_cancelled()?;
                 let extra_appearances = job.served_deltas.len() - 1;
                 match &job_parses[job_idx] {
                     Some(Ok(parsed)) => {
@@ -1590,6 +1639,7 @@ fn enrich_imported_changes_with_semantics_inner(
         // path at most once, so a delta's baseline `old_state` is independent of
         // its siblings and this fold reproduces the serial result exactly.
         for (delta_idx, artifact_delta) in imported[i].change.artifact_deltas.iter().enumerate() {
+            ensure_not_cancelled()?;
             let file_path = artifact_delta.file_id.0.clone();
             let old_state = current_files.get(&file_path).cloned();
             if let Some(old_state) = &old_state {
@@ -1663,6 +1713,7 @@ fn enrich_imported_changes_with_semantics_inner(
 
         let mut old_relations = HashMap::<RelationId, Relation>::new();
         for relation_id in &old_relation_ids {
+            ensure_not_cancelled()?;
             if let Some(old_relation) = current_relations.remove(relation_id) {
                 remove_relation_indexes(
                     &mut relations_by_src,
@@ -1683,18 +1734,21 @@ fn enrich_imported_changes_with_semantics_inner(
             for relation in
                 kin_index::link_cross_file_incremental(&changed_parse_data, &incremental_linker)
             {
+                ensure_not_cancelled()?;
                 new_relations_by_id.insert(relation.id, relation);
             }
             total_linking_time += link_start_time.elapsed();
 
             let post_link_start = std::time::Instant::now();
             for old_relation_id in old_relations.keys() {
+                ensure_not_cancelled()?;
                 if !new_relations_by_id.contains_key(old_relation_id) {
                     relation_deltas.push(RelationDelta::Removed(*old_relation_id));
                 }
             }
 
             for (relation_id, relation) in new_relations_by_id {
+                ensure_not_cancelled()?;
                 match old_relations.remove(&relation_id) {
                     Some(old_relation)
                         if imported_relations_equivalent(&old_relation, &relation) =>

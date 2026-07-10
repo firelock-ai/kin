@@ -4,6 +4,7 @@
 use anyhow::Result;
 use kin_model::{EntityStore, Relation, RelationKind};
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 pub(crate) fn refresh_from_git_history_with_limit(
     graph: &kin_db::InMemoryGraph,
@@ -32,6 +33,24 @@ pub fn refresh_from_changes(
     let relations = kin_git::mine_from_change_dag(graph, changes).map_err(|e| {
         anyhow::anyhow!("failed to mine co-change relations from change dag: {}", e)
     })?;
+    replace_relations(graph, relations)
+}
+
+/// Cooperative-cancellation form used by temporal-scope reconstruction. The
+/// replacement is reached only after the complete relation set is mined, so a
+/// cancelled build never installs a partial co-change projection.
+pub fn refresh_from_changes_cancellable(
+    graph: &kin_db::InMemoryGraph,
+    changes: &[kin_model::SemanticChange],
+    cancelled: &AtomicBool,
+) -> Result<usize> {
+    let _span =
+        tracing::info_span!("kin.cochange.refresh_from_changes", changes = changes.len()).entered();
+    let relations = kin_git::mine_from_change_dag_cancellable(graph, changes, cancelled)
+        .map_err(|e| anyhow::anyhow!("failed to mine co-change relations from change dag: {e}"))?;
+    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        anyhow::bail!("co-change refresh cancelled before publication");
+    }
     replace_relations(graph, relations)
 }
 
