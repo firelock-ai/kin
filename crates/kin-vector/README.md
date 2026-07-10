@@ -29,9 +29,10 @@ cargo build
 cargo test
 ```
 
-SIMD (aarch64 NEON) distance kernels are compiled in by default but gated off
-at runtime. Set `KIN_VECTOR_SIMD=1` to enable them. The scalar path is
-bit-identical to the frozen benchmark baseline on every target.
+SIMD (aarch64 NEON) distance kernels are compiled in and enabled by default at
+runtime. Set `KIN_VECTOR_SIMD=0` (or `false`, `no`, `off`) to select the scalar
+path instead. The scalar path is bit-identical to the frozen benchmark baseline
+on every target.
 
 ## Key types
 
