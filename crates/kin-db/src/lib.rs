@@ -34,7 +34,10 @@ pub use storage::{
     verify_entity, verify_subgraph, EntityVerification, MerkleHash, TamperedNode,
     VerificationReport, ZERO_HASH,
 };
-pub use storage::{Generation, LocalFileBackend, StorageBackend, GENERATION_INIT};
+pub use storage::{
+    load_recovered_snapshot, Generation, LocalFileBackend, PersistedDelta, RecoveredSnapshot,
+    SnapshotAuthority, SnapshotRecoveryState, StorageBackend, GENERATION_INIT,
+};
 pub use storage::{LoadStrategy, SystemMemInfo, TieredConfig, TieredGraph};
 pub use store::{
     ChangeStore, EntityStore, GraphStore, ProvenanceStore, SessionStore, VerificationStore,

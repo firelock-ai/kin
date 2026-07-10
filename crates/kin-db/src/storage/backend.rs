@@ -11,6 +11,9 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
 use crate::error::KinDbError;
 use crate::storage::format::GraphSnapshot;
 
@@ -23,12 +26,185 @@ pub type Generation = u64;
 /// Sentinel value indicating no prior generation exists (first write).
 pub const GENERATION_INIT: Generation = 0;
 
+pub(crate) fn checked_next_generation(
+    generation: Generation,
+    authority: &str,
+) -> Result<Generation, KinDbError> {
+    generation.checked_add(1).ok_or_else(|| {
+        KinDbError::StorageError(format!(
+            "generation exhausted at {generation} while allocating {authority}"
+        ))
+    })
+}
+
+/// Atomic persistence authority for a snapshot plus its acknowledged journal.
+#[derive(Debug)]
+pub struct SnapshotAuthority {
+    pub snapshot_bytes: Vec<u8>,
+    /// Generation represented by `snapshot_bytes` before journal replay.
+    pub snapshot_generation: Generation,
+    /// Last acknowledged generation. Every generation in
+    /// `(snapshot_generation, head_generation]` must have one exact delta.
+    pub head_generation: Generation,
+}
+
+pub type PersistedDelta = (Vec<u8>, Generation);
+pub type SnapshotRecoveryState = (Option<SnapshotAuthority>, Vec<PersistedDelta>);
+
+/// A snapshot reconstructed from durable base bytes plus its acknowledged
+/// incremental-delta chain.
+#[derive(Debug)]
+pub struct RecoveredSnapshot {
+    pub snapshot: GraphSnapshot,
+    pub generation: Generation,
+    pub deltas_applied: usize,
+    pub deltas_seen: usize,
+}
+
+/// Load a backend snapshot and replay its complete authoritative delta chain.
+///
+/// Entries outside the authority's exact `(snapshot_generation,
+/// head_generation]` range are unacknowledged or stale and are ignored. Every
+/// generation inside that range is mandatory, ordered, and must declare the
+/// immediately preceding generation as its base. Missing prefixes, missing
+/// heads, duplicates, corrupt bytes, and gaps fail closed.
+pub fn load_recovered_snapshot<B: StorageBackend + ?Sized>(
+    backend: &B,
+    repo_id: &str,
+) -> Result<Option<RecoveredSnapshot>, KinDbError> {
+    let (loaded, raw_deltas) = backend.load_recovery_state(repo_id)?;
+
+    let Some(authority) = loaded else {
+        if raw_deltas.is_empty() {
+            return Ok(None);
+        }
+        return Err(KinDbError::StorageError(format!(
+            "repo {repo_id} has {} persisted deltas but no base snapshot",
+            raw_deltas.len()
+        )));
+    };
+
+    if authority.snapshot_generation > authority.head_generation {
+        return Err(KinDbError::StorageError(format!(
+            "repo {repo_id} snapshot base generation {} exceeds acknowledged head {}",
+            authority.snapshot_generation, authority.head_generation
+        )));
+    }
+
+    let mut snapshot = GraphSnapshot::from_bytes(&authority.snapshot_bytes)?;
+    let deltas_seen = raw_deltas.len();
+    if authority.snapshot_generation == authority.head_generation {
+        return Ok(Some(RecoveredSnapshot {
+            snapshot,
+            generation: authority.head_generation,
+            deltas_applied: 0,
+            deltas_seen,
+        }));
+    }
+    let mut expected_generation = checked_next_generation(
+        authority.snapshot_generation,
+        &format!("repo {repo_id} recovery"),
+    )?;
+    let mut recovered_generation = authority.snapshot_generation;
+    let mut applied = 0usize;
+    let mut previous_generation = None;
+    for (bytes, generation) in raw_deltas {
+        if generation == GENERATION_INIT {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id} delta journal contains reserved generation 0"
+            )));
+        }
+        if previous_generation.is_some_and(|previous| generation <= previous) {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id} delta journal is not strictly ordered: generation {generation} follows {}",
+                previous_generation.expect("checked above")
+            )));
+        }
+        previous_generation = Some(generation);
+
+        if generation > authority.head_generation {
+            // A delta staged before an authority-commit crash is not durable
+            // authority. It may be overwritten by a retry at the same
+            // generation and must never be attached speculatively.
+            continue;
+        }
+        if generation != expected_generation {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id} delta chain is incomplete: expected generation {expected_generation}, found {generation}"
+            )));
+        }
+        let delta = crate::storage::delta::GraphSnapshotDelta::from_bytes(&bytes)?;
+        let expected_base = generation - 1;
+        if delta.base_generation != expected_base {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id} delta generation {generation} declares base {}, expected {expected_base}",
+                delta.base_generation
+            )));
+        }
+        crate::storage::delta::apply_graph_delta(&mut snapshot, &delta);
+        applied += 1;
+        recovered_generation = generation;
+        if generation < authority.head_generation {
+            expected_generation =
+                checked_next_generation(generation, &format!("repo {repo_id} recovery"))?;
+        }
+    }
+
+    if recovered_generation != authority.head_generation {
+        return Err(KinDbError::StorageError(format!(
+            "repo {repo_id} delta chain ended at generation {recovered_generation}, acknowledged head is {}",
+            authority.head_generation
+        )));
+    }
+
+    Ok(Some(RecoveredSnapshot {
+        snapshot,
+        generation: authority.head_generation,
+        deltas_applied: applied,
+        deltas_seen,
+    }))
+}
+
 /// Pluggable storage backend for graph snapshots and overlay state.
 ///
 /// All methods are synchronous — the caller (daemon) can wrap in
 /// `spawn_blocking` if needed. Implementations must be `Send + Sync`
 /// so they can be shared across threads behind an `Arc`.
 pub trait StorageBackend: Send + Sync {
+    /// Whether this backend has a durable, CAS-safe incremental-delta write
+    /// path. Backends must opt in; callers otherwise persist full snapshots.
+    fn supports_incremental_deltas(&self) -> bool {
+        false
+    }
+
+    /// Load snapshot bytes together with the persisted base and acknowledged
+    /// journal-head generations. Backends with no incremental authority can
+    /// use the default base=head representation.
+    fn load_snapshot_authority(
+        &self,
+        repo_id: &str,
+    ) -> Result<Option<SnapshotAuthority>, KinDbError> {
+        Ok(self
+            .load_snapshot(repo_id)?
+            .map(|(snapshot_bytes, generation)| SnapshotAuthority {
+                snapshot_bytes,
+                snapshot_generation: generation,
+                head_generation: generation,
+            }))
+    }
+
+    /// Read snapshot authority and its journal from one coherent backend view.
+    /// Transactional/lock-backed implementations override this so authority
+    /// cannot move between the snapshot and journal reads.
+    fn load_recovery_state(&self, repo_id: &str) -> Result<SnapshotRecoveryState, KinDbError> {
+        let authority = self.load_snapshot_authority(repo_id)?;
+        let since = authority
+            .as_ref()
+            .map_or(GENERATION_INIT, |authority| authority.snapshot_generation);
+        let deltas = self.load_deltas_since(repo_id, since)?;
+        Ok((authority, deltas))
+    }
+
     /// Load a repo's graph snapshot.
     ///
     /// Returns `Ok(None)` if no snapshot exists yet (new repo).
@@ -93,29 +269,22 @@ pub trait StorageBackend: Send + Sync {
     /// runs `GraphSnapshot::compact()` for GC, saves the merged snapshot,
     /// and clears the delta journal.
     fn compact_deltas(&self, repo_id: &str) -> Result<Generation, KinDbError> {
-        let (snap_bytes, snap_gen) = self
-            .load_snapshot(repo_id)?
+        let recovered = load_recovered_snapshot(self, repo_id)?
             .ok_or_else(|| KinDbError::StorageError("no snapshot to compact".to_string()))?;
-
-        // Load ALL deltas (since gen 0) because the shared generation counter
-        // is advanced by both save_snapshot and save_delta, so snap_gen may
-        // already include delta generations.
-        let deltas = self.load_deltas_since(repo_id, GENERATION_INIT)?;
-        if deltas.is_empty() {
-            return Ok(snap_gen);
+        if recovered.deltas_seen == 0 {
+            return Ok(recovered.generation);
         }
-
-        let mut snapshot = GraphSnapshot::from_bytes(&snap_bytes)?;
-        for (delta_bytes, _gen) in &deltas {
-            let delta = crate::storage::delta::GraphSnapshotDelta::from_bytes(delta_bytes)?;
-            crate::storage::delta::apply_graph_delta(&mut snapshot, &delta);
+        if recovered.deltas_applied == 0 {
+            self.clear_deltas(repo_id)?;
+            return Ok(recovered.generation);
         }
 
         // GC pass: remove orphaned cross-references accumulated over deltas
+        let mut snapshot = recovered.snapshot;
         snapshot.compact();
 
         let merged_bytes = snapshot.to_bytes()?;
-        let new_gen = self.save_snapshot(repo_id, &merged_bytes, snap_gen)?;
+        let new_gen = self.save_snapshot(repo_id, &merged_bytes, recovered.generation)?;
         self.clear_deltas(repo_id)?;
         Ok(new_gen)
     }
@@ -148,16 +317,32 @@ pub trait StorageBackend: Send + Sync {
 ///
 /// Layout under `base_path`:
 /// ```text
-/// {base_path}/{repo_id}/graph.kndb          — snapshot
-/// {base_path}/{repo_id}/graph.kndb.gen      — generation counter
+/// {base_path}/{repo_id}/authority.json      — atomic base/head authority
+/// {base_path}/{repo_id}/snapshots/GEN.kndb  — immutable snapshot versions
+/// {base_path}/{repo_id}/graph.kndb          — compatibility projection
+/// {base_path}/{repo_id}/graph.kndb.gen      — legacy generation counter
 /// {base_path}/{repo_id}/overlays/{session_id}.bin — overlay state
 /// ```
 ///
-/// Write safety uses the same atomic-write strategy as `SnapshotManager`:
-/// write to `.tmp`, fsync, rename. The generation file provides CAS semantics
-/// equivalent to GCS generation-match.
+/// Snapshot and delta files are staged and fsynced before `authority.json` is
+/// atomically replaced. That single authority rename is the commit point: a
+/// crash before it leaves an ignored orphan, while a crash after it leaves a
+/// complete base-to-head chain.
 pub struct LocalFileBackend {
     base_path: PathBuf,
+    #[cfg(test)]
+    fail_before_authority_commit: std::sync::atomic::AtomicBool,
+}
+
+const LOCAL_AUTHORITY_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LocalAuthorityRecord {
+    version: u32,
+    snapshot_generation: Generation,
+    head_generation: Generation,
+    snapshot_file: String,
+    snapshot_sha256: String,
 }
 
 impl LocalFileBackend {
@@ -165,6 +350,8 @@ impl LocalFileBackend {
     pub fn new(base_path: impl Into<PathBuf>) -> Self {
         Self {
             base_path: base_path.into(),
+            #[cfg(test)]
+            fail_before_authority_commit: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -179,6 +366,19 @@ impl LocalFileBackend {
 
     fn generation_path(&self, repo_id: &str) -> PathBuf {
         self.base_path.join(repo_id).join("graph.kndb.gen")
+    }
+
+    fn authority_path(&self, repo_id: &str) -> PathBuf {
+        self.base_path.join(repo_id).join("authority.json")
+    }
+
+    fn snapshots_dir(&self, repo_id: &str) -> PathBuf {
+        self.base_path.join(repo_id).join("snapshots")
+    }
+
+    fn versioned_snapshot_path(&self, repo_id: &str, generation: Generation) -> PathBuf {
+        self.snapshots_dir(repo_id)
+            .join(format!("{generation:020}.kndb"))
     }
 
     fn overlay_path(&self, repo_id: &str, session_id: &str) -> PathBuf {
@@ -209,6 +409,7 @@ impl LocalFileBackend {
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(&lock_path)
             .map_err(|e| {
                 KinDbError::StorageError(format!(
@@ -226,7 +427,7 @@ impl LocalFileBackend {
         Ok(lock_file)
     }
 
-    fn read_generation(&self, repo_id: &str) -> Result<Generation, KinDbError> {
+    fn read_legacy_generation(&self, repo_id: &str) -> Result<Generation, KinDbError> {
         let gen_path = self.generation_path(repo_id);
         if !gen_path.exists() {
             return Ok(GENERATION_INIT);
@@ -278,148 +479,222 @@ impl LocalFileBackend {
                 tmp_path.display(),
                 gen_path.display()
             ))
-        })
-    }
-}
-
-impl StorageBackend for LocalFileBackend {
-    fn load_snapshot(&self, repo_id: &str) -> Result<Option<(Vec<u8>, Generation)>, KinDbError> {
-        let path = self.snapshot_path(repo_id);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let data = std::fs::read(&path).map_err(|e| {
-            KinDbError::StorageError(format!("failed to read {}: {e}", path.display()))
         })?;
-        let gen = self.read_generation(repo_id)?;
-        Ok(Some((data, gen)))
+        Self::sync_parent(&gen_path)
     }
 
-    fn save_snapshot(
-        &self,
-        repo_id: &str,
-        data: &[u8],
-        expected_gen: Generation,
-    ) -> Result<Generation, KinDbError> {
-        let _lock = self.acquire_lock(repo_id)?;
-        let current_gen = self.read_generation(repo_id)?;
-        if current_gen != expected_gen {
-            return Err(KinDbError::StorageError(format!(
-                "generation mismatch for repo {repo_id}: expected {expected_gen}, found {current_gen} \
-                 (another writer committed since last load)"
-            )));
+    fn sync_parent(path: &Path) -> Result<(), KinDbError> {
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+        #[cfg(not(unix))]
+        {
+            let _ = parent;
+            return Ok(());
         }
-
-        let path = self.snapshot_path(repo_id);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
+        #[cfg(unix)]
+        {
+            let directory = std::fs::File::open(parent).map_err(|error| {
                 KinDbError::StorageError(format!(
-                    "failed to create directory {}: {e}",
+                    "failed to open directory {} for fsync: {error}",
+                    parent.display()
+                ))
+            })?;
+            directory.sync_all().map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to fsync directory {}: {error}",
+                    parent.display()
+                ))
+            })
+        }
+    }
+
+    fn atomic_write(path: &Path, data: &[u8]) -> Result<(), KinDbError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to create directory {}: {error}",
                     parent.display()
                 ))
             })?;
         }
-
-        // Validate the bytes without re-serializing — from_bytes proves the
-        // data round-trips, then we write the *original* bytes to disk.
-        let _snapshot = GraphSnapshot::from_bytes(data)?;
-
-        // Atomic write: tmp file → fsync → rename (same crash-safety as
-        // mmap::atomic_write but avoids the redundant to_bytes() call).
-        let tmp_path = path.with_extension("kndb.tmp");
+        let tmp_path = path.with_extension(format!(
+            "{}.tmp",
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("file")
+        ));
         {
-            let mut file = std::fs::File::create(&tmp_path).map_err(|e| {
+            let mut file = std::fs::File::create(&tmp_path).map_err(|error| {
                 KinDbError::StorageError(format!(
-                    "failed to create tmp file {}: {e}",
+                    "failed to create staged file {}: {error}",
                     tmp_path.display()
                 ))
             })?;
-            file.write_all(data).map_err(|e| {
+            file.write_all(data).map_err(|error| {
                 KinDbError::StorageError(format!(
-                    "failed to write tmp file {}: {e}",
+                    "failed to write staged file {}: {error}",
                     tmp_path.display()
                 ))
             })?;
-            file.sync_all().map_err(|e| {
+            file.sync_all().map_err(|error| {
                 KinDbError::StorageError(format!(
-                    "failed to fsync tmp file {}: {e}",
+                    "failed to fsync staged file {}: {error}",
                     tmp_path.display()
                 ))
             })?;
         }
-        std::fs::rename(&tmp_path, &path).map_err(|e| {
+        std::fs::rename(&tmp_path, path).map_err(|error| {
             KinDbError::StorageError(format!(
-                "failed to rename {} → {}: {e}",
+                "failed to promote {} to {}: {error}",
                 tmp_path.display(),
                 path.display()
             ))
         })?;
-
-        let new_gen = current_gen + 1;
-        self.write_generation(repo_id, new_gen)?;
-        Ok(new_gen)
+        Self::sync_parent(path)
     }
 
-    fn save_delta(
+    fn snapshot_file_name(generation: Generation) -> String {
+        format!("{generation:020}.kndb")
+    }
+
+    fn snapshot_digest(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    fn read_authority_record_unlocked(
         &self,
         repo_id: &str,
-        delta_data: &[u8],
-        base_gen: Generation,
-    ) -> Result<Generation, KinDbError> {
-        let _lock = self.acquire_lock(repo_id)?;
-        let current_gen = self.read_generation(repo_id)?;
-        if current_gen != base_gen {
+    ) -> Result<Option<LocalAuthorityRecord>, KinDbError> {
+        let path = self.authority_path(repo_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&path).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to read local authority {}: {error}",
+                path.display()
+            ))
+        })?;
+        let record: LocalAuthorityRecord = serde_json::from_slice(&bytes).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "invalid local authority {}: {error}",
+                path.display()
+            ))
+        })?;
+        if record.version != LOCAL_AUTHORITY_VERSION {
             return Err(KinDbError::StorageError(format!(
-                "delta base generation mismatch for repo {repo_id}: expected {base_gen}, found {current_gen}"
+                "unsupported local authority version {} in {}",
+                record.version,
+                path.display()
             )));
         }
-
-        let deltas_dir = self.deltas_dir(repo_id);
-        std::fs::create_dir_all(&deltas_dir).map_err(|e| {
-            KinDbError::StorageError(format!(
-                "failed to create deltas directory {}: {e}",
-                deltas_dir.display()
-            ))
-        })?;
-
-        let new_gen = current_gen + 1;
-        let delta_path = self.delta_path(repo_id, new_gen);
-
-        // Atomic write: tmp → fsync → rename
-        let tmp_path = delta_path.with_extension("kndd.tmp");
-        {
-            let mut file = std::fs::File::create(&tmp_path).map_err(|e| {
-                KinDbError::StorageError(format!(
-                    "failed to create tmp delta file {}: {e}",
-                    tmp_path.display()
-                ))
-            })?;
-            file.write_all(delta_data).map_err(|e| {
-                KinDbError::StorageError(format!(
-                    "failed to write tmp delta file {}: {e}",
-                    tmp_path.display()
-                ))
-            })?;
-            file.sync_all().map_err(|e| {
-                KinDbError::StorageError(format!(
-                    "failed to fsync tmp delta file {}: {e}",
-                    tmp_path.display()
-                ))
-            })?;
+        if record.snapshot_generation > record.head_generation {
+            return Err(KinDbError::StorageError(format!(
+                "local authority for repo {repo_id} has snapshot generation {} above head {}",
+                record.snapshot_generation, record.head_generation
+            )));
         }
-        std::fs::rename(&tmp_path, &delta_path).map_err(|e| {
-            KinDbError::StorageError(format!(
-                "failed to rename {} → {}: {e}",
-                tmp_path.display(),
-                delta_path.display()
-            ))
-        })?;
-
-        self.write_generation(repo_id, new_gen)?;
-        Ok(new_gen)
+        let expected_file = Self::snapshot_file_name(record.snapshot_generation);
+        if record.snapshot_file != expected_file {
+            return Err(KinDbError::StorageError(format!(
+                "local authority for repo {repo_id} references noncanonical snapshot file {}",
+                record.snapshot_file
+            )));
+        }
+        Ok(Some(record))
     }
 
-    fn load_deltas_since(
+    fn load_authority_unlocked(
+        &self,
+        repo_id: &str,
+    ) -> Result<Option<SnapshotAuthority>, KinDbError> {
+        if let Some(record) = self.read_authority_record_unlocked(repo_id)? {
+            let path = self.snapshots_dir(repo_id).join(&record.snapshot_file);
+            let snapshot_bytes = std::fs::read(&path).map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to read authoritative snapshot {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let digest = Self::snapshot_digest(&snapshot_bytes);
+            if digest != record.snapshot_sha256 {
+                return Err(KinDbError::StorageError(format!(
+                    "authoritative snapshot digest mismatch for repo {repo_id}: expected {}, found {digest}",
+                    record.snapshot_sha256
+                )));
+            }
+            return Ok(Some(SnapshotAuthority {
+                snapshot_bytes,
+                snapshot_generation: record.snapshot_generation,
+                head_generation: record.head_generation,
+            }));
+        }
+
+        let legacy_path = self.snapshot_path(repo_id);
+        if !legacy_path.exists() {
+            return Ok(None);
+        }
+        let mut legacy_has_deltas = false;
+        if self.deltas_dir(repo_id).exists() {
+            for entry in std::fs::read_dir(self.deltas_dir(repo_id)).map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "failed to inspect legacy deltas for repo {repo_id}: {error}"
+                ))
+            })? {
+                let entry = entry.map_err(|error| {
+                    KinDbError::StorageError(format!(
+                        "failed to inspect legacy delta entry for repo {repo_id}: {error}"
+                    ))
+                })?;
+                if entry.path().extension().and_then(|value| value.to_str()) == Some("kndd") {
+                    legacy_has_deltas = true;
+                    break;
+                }
+            }
+        }
+        if legacy_has_deltas {
+            return Err(KinDbError::StorageError(format!(
+                "legacy local repo {repo_id} has deltas but no persisted snapshot-base authority; refusing unprovable replay"
+            )));
+        }
+        let snapshot_bytes = std::fs::read(&legacy_path).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to read legacy snapshot {}: {error}",
+                legacy_path.display()
+            ))
+        })?;
+        let _snapshot = GraphSnapshot::from_bytes(&snapshot_bytes)?;
+        let generation = self.read_legacy_generation(repo_id)?;
+        let versioned_path = self.versioned_snapshot_path(repo_id, generation);
+        Self::atomic_write(&versioned_path, &snapshot_bytes)?;
+        let record = LocalAuthorityRecord {
+            version: LOCAL_AUTHORITY_VERSION,
+            snapshot_generation: generation,
+            head_generation: generation,
+            snapshot_file: Self::snapshot_file_name(generation),
+            snapshot_sha256: Self::snapshot_digest(&snapshot_bytes),
+        };
+        self.write_authority_unlocked(repo_id, &record)?;
+        Ok(Some(SnapshotAuthority {
+            snapshot_bytes,
+            snapshot_generation: generation,
+            head_generation: generation,
+        }))
+    }
+
+    fn write_authority_unlocked(
+        &self,
+        repo_id: &str,
+        record: &LocalAuthorityRecord,
+    ) -> Result<(), KinDbError> {
+        let bytes = serde_json::to_vec(record).map_err(|error| {
+            KinDbError::StorageError(format!("failed to encode local authority: {error}"))
+        })?;
+        Self::atomic_write(&self.authority_path(repo_id), &bytes)
+    }
+
+    fn load_deltas_since_unlocked(
         &self,
         repo_id: &str,
         since_gen: Generation,
@@ -430,42 +705,210 @@ impl StorageBackend for LocalFileBackend {
         }
 
         let mut entries: Vec<(Generation, PathBuf)> = Vec::new();
-        for entry in std::fs::read_dir(&deltas_dir).map_err(|e| {
+        for entry in std::fs::read_dir(&deltas_dir).map_err(|error| {
             KinDbError::StorageError(format!(
-                "failed to read deltas directory {}: {e}",
+                "failed to read deltas directory {}: {error}",
                 deltas_dir.display()
             ))
         })? {
-            let entry = entry.map_err(|e| {
-                KinDbError::StorageError(format!("failed to read delta entry: {e}"))
+            let entry = entry.map_err(|error| {
+                KinDbError::StorageError(format!("failed to read delta entry: {error}"))
             })?;
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("kndd") {
+            if path.extension().and_then(|extension| extension.to_str()) != Some("kndd") {
                 continue;
             }
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            if let Ok(gen) = stem.parse::<Generation>() {
-                if gen > since_gen {
-                    entries.push((gen, path));
-                }
+            let stem = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .ok_or_else(|| {
+                    KinDbError::StorageError(format!(
+                        "delta authority {} has a non-UTF8 generation",
+                        path.display()
+                    ))
+                })?;
+            let generation = stem.parse::<Generation>().map_err(|error| {
+                KinDbError::StorageError(format!(
+                    "delta authority {} has an invalid generation: {error}",
+                    path.display()
+                ))
+            })?;
+            let canonical_name = format!("{generation:020}.kndd");
+            if path.file_name().and_then(|name| name.to_str()) != Some(canonical_name.as_str()) {
+                return Err(KinDbError::StorageError(format!(
+                    "delta authority {} has a noncanonical generation name",
+                    path.display()
+                )));
+            }
+            if generation > since_gen {
+                entries.push((generation, path));
             }
         }
+        entries.sort_by_key(|(generation, _)| *generation);
 
-        // Sort by generation (oldest first)
-        entries.sort_by_key(|(gen, _)| *gen);
+        entries
+            .into_iter()
+            .map(|(generation, path)| {
+                std::fs::read(&path)
+                    .map(|bytes| (bytes, generation))
+                    .map_err(|error| {
+                        KinDbError::StorageError(format!(
+                            "failed to read delta {}: {error}",
+                            path.display()
+                        ))
+                    })
+            })
+            .collect()
+    }
 
-        let mut result = Vec::with_capacity(entries.len());
-        for (gen, path) in entries {
-            let data = std::fs::read(&path).map_err(|e| {
-                KinDbError::StorageError(format!("failed to read delta {}: {e}", path.display()))
-            })?;
-            result.push((data, gen));
+    #[cfg(test)]
+    fn fail_next_snapshot_before_authority_commit(&self) {
+        self.fail_before_authority_commit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl StorageBackend for LocalFileBackend {
+    fn supports_incremental_deltas(&self) -> bool {
+        true
+    }
+
+    fn load_snapshot(&self, repo_id: &str) -> Result<Option<(Vec<u8>, Generation)>, KinDbError> {
+        Ok(self
+            .load_snapshot_authority(repo_id)?
+            .map(|authority| (authority.snapshot_bytes, authority.head_generation)))
+    }
+
+    fn load_snapshot_authority(
+        &self,
+        repo_id: &str,
+    ) -> Result<Option<SnapshotAuthority>, KinDbError> {
+        let _lock = self.acquire_lock(repo_id)?;
+        self.load_authority_unlocked(repo_id)
+    }
+
+    fn load_recovery_state(&self, repo_id: &str) -> Result<SnapshotRecoveryState, KinDbError> {
+        let _lock = self.acquire_lock(repo_id)?;
+        let authority = self.load_authority_unlocked(repo_id)?;
+        let since = authority
+            .as_ref()
+            .map_or(GENERATION_INIT, |authority| authority.snapshot_generation);
+        let deltas = self.load_deltas_since_unlocked(repo_id, since)?;
+        Ok((authority, deltas))
+    }
+
+    fn save_snapshot(
+        &self,
+        repo_id: &str,
+        data: &[u8],
+        expected_gen: Generation,
+    ) -> Result<Generation, KinDbError> {
+        let _lock = self.acquire_lock(repo_id)?;
+        let current = self.load_authority_unlocked(repo_id)?;
+        let current_gen = current
+            .as_ref()
+            .map_or(GENERATION_INIT, |authority| authority.head_generation);
+        if current_gen != expected_gen {
+            return Err(KinDbError::StorageError(format!(
+                "generation mismatch for repo {repo_id}: expected {expected_gen}, found {current_gen} \
+                 (another writer committed since last load)"
+            )));
         }
 
-        Ok(result)
+        // Validate the bytes without re-serializing — from_bytes proves the
+        // data round-trips, then we write the *original* bytes to disk.
+        let _snapshot = GraphSnapshot::from_bytes(data)?;
+        let new_gen = checked_next_generation(current_gen, "local snapshot")?;
+        let versioned_path = self.versioned_snapshot_path(repo_id, new_gen);
+        Self::atomic_write(&versioned_path, data)?;
+
+        #[cfg(test)]
+        if self
+            .fail_before_authority_commit
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(KinDbError::StorageError(
+                "injected crash before local snapshot authority commit".to_string(),
+            ));
+        }
+
+        let record = LocalAuthorityRecord {
+            version: LOCAL_AUTHORITY_VERSION,
+            snapshot_generation: new_gen,
+            head_generation: new_gen,
+            snapshot_file: Self::snapshot_file_name(new_gen),
+            snapshot_sha256: Self::snapshot_digest(data),
+        };
+        self.write_authority_unlocked(repo_id, &record)?;
+
+        // These are compatibility projections, not authority. A failure after
+        // the authority commit must not report the snapshot as uncommitted or
+        // leave the caller using a stale CAS generation.
+        if let Err(error) = Self::atomic_write(&self.snapshot_path(repo_id), data) {
+            tracing::warn!(repo_id, error = %error, "failed to refresh local graph.kndb projection");
+        }
+        if let Err(error) = self.write_generation(repo_id, new_gen) {
+            tracing::warn!(repo_id, error = %error, "failed to refresh legacy generation projection");
+        }
+        Ok(new_gen)
+    }
+
+    fn save_delta(
+        &self,
+        repo_id: &str,
+        delta_data: &[u8],
+        base_gen: Generation,
+    ) -> Result<Generation, KinDbError> {
+        let _lock = self.acquire_lock(repo_id)?;
+        let Some(mut record) = self.read_authority_record_unlocked(repo_id)? else {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id} has no atomic local snapshot authority; persist a full snapshot before deltas"
+            )));
+        };
+        let current_gen = record.head_generation;
+        if current_gen != base_gen {
+            return Err(KinDbError::StorageError(format!(
+                "delta base generation mismatch for repo {repo_id}: expected {base_gen}, found {current_gen}"
+            )));
+        }
+
+        let delta = crate::storage::delta::GraphSnapshotDelta::from_bytes(delta_data)?;
+        if delta.base_generation != base_gen {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id} delta payload declares base {}, expected {base_gen}",
+                delta.base_generation
+            )));
+        }
+        let new_gen = checked_next_generation(current_gen, "local delta")?;
+        let delta_path = self.delta_path(repo_id, new_gen);
+        Self::atomic_write(&delta_path, delta_data)?;
+        record.head_generation = new_gen;
+        self.write_authority_unlocked(repo_id, &record)?;
+        if let Err(error) = self.write_generation(repo_id, new_gen) {
+            tracing::warn!(repo_id, error = %error, "failed to refresh legacy generation projection");
+        }
+        Ok(new_gen)
+    }
+
+    fn load_deltas_since(
+        &self,
+        repo_id: &str,
+        since_gen: Generation,
+    ) -> Result<Vec<(Vec<u8>, Generation)>, KinDbError> {
+        let _lock = self.acquire_lock(repo_id)?;
+        self.load_deltas_since_unlocked(repo_id, since_gen)
     }
 
     fn clear_deltas(&self, repo_id: &str) -> Result<(), KinDbError> {
+        let _lock = self.acquire_lock(repo_id)?;
+        if let Some(authority) = self.load_authority_unlocked(repo_id)? {
+            if authority.snapshot_generation != authority.head_generation {
+                return Err(KinDbError::StorageError(format!(
+                    "refusing to clear authoritative deltas for repo {repo_id}: snapshot generation {}, head {}",
+                    authority.snapshot_generation, authority.head_generation
+                )));
+            }
+        }
         let deltas_dir = self.deltas_dir(repo_id);
         if !deltas_dir.exists() {
             return Ok(());
@@ -545,7 +988,8 @@ impl StorageBackend for LocalFileBackend {
             })?;
             if entry.path().is_dir() {
                 let snapshot = entry.path().join("graph.kndb");
-                if snapshot.exists() {
+                let authority = entry.path().join("authority.json");
+                if snapshot.exists() || authority.exists() {
                     if let Some(name) = entry.file_name().to_str() {
                         repos.push(name.to_string());
                     }
@@ -713,6 +1157,137 @@ mod tests {
     }
 
     #[test]
+    fn local_backend_recovery_replays_sequential_deltas_after_reopen() {
+        let dir = TempDir::new().unwrap();
+        let repo_id = "restart-repo";
+        let mut base = GraphSnapshot::empty();
+        base.file_hashes.insert("base.rs".to_string(), [1; 32]);
+
+        {
+            let backend = LocalFileBackend::new(dir.path());
+            let gen1 = backend
+                .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
+                .unwrap();
+
+            let mut after_first = base.clone();
+            after_first
+                .file_hashes
+                .insert("first.rs".to_string(), [2; 32]);
+            let first_delta = crate::storage::delta::compute_graph_delta(&base, &after_first, gen1);
+            let gen2 = backend
+                .save_delta(repo_id, &first_delta.to_bytes().unwrap(), gen1)
+                .unwrap();
+
+            let mut after_second = after_first.clone();
+            after_second
+                .file_hashes
+                .insert("second.rs".to_string(), [3; 32]);
+            let second_delta =
+                crate::storage::delta::compute_graph_delta(&after_first, &after_second, gen2);
+            let gen3 = backend
+                .save_delta(repo_id, &second_delta.to_bytes().unwrap(), gen2)
+                .unwrap();
+            assert_eq!(gen3, 3);
+        }
+
+        let reopened = LocalFileBackend::new(dir.path());
+        let recovered = load_recovered_snapshot(&reopened, repo_id)
+            .unwrap()
+            .expect("base snapshot exists");
+        assert_eq!(recovered.generation, 3);
+        assert_eq!(recovered.deltas_seen, 2);
+        assert_eq!(recovered.deltas_applied, 2);
+        assert_eq!(recovered.snapshot.file_hashes.len(), 3);
+        assert!(recovered.snapshot.file_hashes.contains_key("base.rs"));
+        assert!(recovered.snapshot.file_hashes.contains_key("first.rs"));
+        assert!(recovered.snapshot.file_hashes.contains_key("second.rs"));
+    }
+
+    #[test]
+    fn local_legacy_snapshot_without_journal_migrates_to_explicit_base_authority() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "legacy-clean";
+        let snapshot = GraphSnapshot::empty().to_bytes().unwrap();
+        std::fs::create_dir_all(dir.path().join(repo_id)).unwrap();
+        std::fs::write(backend.snapshot_path(repo_id), &snapshot).unwrap();
+        std::fs::write(backend.generation_path(repo_id), b"7").unwrap();
+
+        let authority = backend
+            .load_snapshot_authority(repo_id)
+            .unwrap()
+            .expect("legacy snapshot migrates");
+        assert_eq!(authority.snapshot_generation, 7);
+        assert_eq!(authority.head_generation, 7);
+        assert!(backend.authority_path(repo_id).exists());
+        assert!(backend.versioned_snapshot_path(repo_id, 7).exists());
+    }
+
+    #[test]
+    fn local_legacy_snapshot_with_unbound_journal_fails_closed() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "legacy-unbound";
+        std::fs::create_dir_all(backend.deltas_dir(repo_id)).unwrap();
+        std::fs::write(
+            backend.snapshot_path(repo_id),
+            GraphSnapshot::empty().to_bytes().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(backend.generation_path(repo_id), b"8").unwrap();
+        std::fs::write(
+            backend.delta_path(repo_id, 8),
+            crate::storage::delta::GraphSnapshotDelta::empty(7)
+                .to_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let error = backend
+            .load_snapshot_authority(repo_id)
+            .expect_err("legacy journal has no provable snapshot base");
+        assert!(error
+            .to_string()
+            .contains("no persisted snapshot-base authority"));
+        assert!(!backend.authority_path(repo_id).exists());
+    }
+
+    #[test]
+    fn local_backend_recovery_does_not_reapply_stale_deltas_after_full_promotion() {
+        let dir = TempDir::new().unwrap();
+        let backend = LocalFileBackend::new(dir.path());
+        let repo_id = "promoted-repo";
+        let base = GraphSnapshot::empty();
+        let gen1 = backend
+            .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+
+        let mut current = base.clone();
+        current
+            .file_hashes
+            .insert("current.rs".to_string(), [7; 32]);
+        let delta = crate::storage::delta::compute_graph_delta(&base, &current, gen1);
+        let gen2 = backend
+            .save_delta(repo_id, &delta.to_bytes().unwrap(), gen1)
+            .unwrap();
+
+        // Model a crash after full snapshot promotion but before clear_deltas.
+        let gen3 = backend
+            .save_snapshot(repo_id, &current.to_bytes().unwrap(), gen2)
+            .unwrap();
+        assert_eq!(gen3, 3);
+
+        let recovered = load_recovered_snapshot(&backend, repo_id)
+            .unwrap()
+            .expect("promoted snapshot exists");
+        assert_eq!(recovered.generation, gen3);
+        assert_eq!(recovered.deltas_seen, 0);
+        assert_eq!(recovered.deltas_applied, 0);
+        assert_eq!(recovered.snapshot.file_hashes.len(), 1);
+        assert!(recovered.snapshot.file_hashes.contains_key("current.rs"));
+    }
+
+    #[test]
     fn local_backend_clear_deltas() {
         let dir = TempDir::new().unwrap();
         let backend = LocalFileBackend::new(dir.path());
@@ -731,16 +1306,120 @@ mod tests {
         );
         let delta_bytes = empty_delta.to_bytes().unwrap();
         let gen2 = backend.save_delta("test-repo", &delta_bytes, gen1).unwrap();
-        backend.save_delta("test-repo", &delta_bytes, gen2).unwrap();
+        let second_delta = crate::storage::delta::GraphSnapshotDelta::empty(gen2);
+        backend
+            .save_delta("test-repo", &second_delta.to_bytes().unwrap(), gen2)
+            .unwrap();
 
         // Should have 2 deltas
         let deltas = backend.load_deltas_since("test-repo", gen1).unwrap();
         assert_eq!(deltas.len(), 2);
 
-        // Clear them
+        let error = backend
+            .clear_deltas("test-repo")
+            .expect_err("authoritative deltas cannot be cleared before promotion");
+        assert!(error
+            .to_string()
+            .contains("refusing to clear authoritative"));
+
+        // Promote the recovered head, then journal cleanup is safe.
+        let recovered = load_recovered_snapshot(&backend, "test-repo")
+            .unwrap()
+            .unwrap();
+        backend
+            .save_snapshot(
+                "test-repo",
+                &recovered.snapshot.to_bytes().unwrap(),
+                recovered.generation,
+            )
+            .unwrap();
         backend.clear_deltas("test-repo").unwrap();
         let empty = backend.load_deltas_since("test-repo", gen1).unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn local_snapshot_promotion_crash_before_authority_keeps_old_chain_recoverable() {
+        let dir = TempDir::new().unwrap();
+        let repo_id = "promotion-crash";
+        let backend = LocalFileBackend::new(dir.path());
+        let base = GraphSnapshot::empty();
+        let gen1 = backend
+            .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let mut current = base.clone();
+        current.file_hashes.insert("delta.rs".to_string(), [9; 32]);
+        let delta = crate::storage::delta::compute_graph_delta(&base, &current, gen1);
+        let gen2 = backend
+            .save_delta(repo_id, &delta.to_bytes().unwrap(), gen1)
+            .unwrap();
+
+        backend.fail_next_snapshot_before_authority_commit();
+        let error = backend
+            .save_snapshot(repo_id, &current.to_bytes().unwrap(), gen2)
+            .expect_err("injected inner-window crash must abort before authority commit");
+        assert!(error
+            .to_string()
+            .contains("before local snapshot authority"));
+        assert!(backend.versioned_snapshot_path(repo_id, 3).exists());
+
+        let reopened = LocalFileBackend::new(dir.path());
+        let recovered = load_recovered_snapshot(&reopened, repo_id)
+            .unwrap()
+            .expect("old base plus acknowledged delta remains authoritative");
+        assert_eq!(recovered.generation, gen2);
+        assert_eq!(recovered.deltas_applied, 1);
+        assert!(recovered.snapshot.file_hashes.contains_key("delta.rs"));
+
+        let gen3 = reopened
+            .save_snapshot(repo_id, &current.to_bytes().unwrap(), gen2)
+            .expect("retry promotes the staged generation atomically");
+        assert_eq!(gen3, 3);
+        let promoted = load_recovered_snapshot(&reopened, repo_id)
+            .unwrap()
+            .expect("promoted snapshot exists");
+        assert_eq!(promoted.generation, gen3);
+        assert_eq!(promoted.deltas_applied, 0);
+        assert!(promoted.snapshot.file_hashes.contains_key("delta.rs"));
+    }
+
+    fn local_backend_with_two_deltas() -> (TempDir, LocalFileBackend, &'static str) {
+        let dir = TempDir::new().unwrap();
+        let repo_id = "incomplete-chain";
+        let backend = LocalFileBackend::new(dir.path());
+        let base = GraphSnapshot::empty();
+        let gen1 = backend
+            .save_snapshot(repo_id, &base.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let first = crate::storage::delta::GraphSnapshotDelta::empty(gen1);
+        let gen2 = backend
+            .save_delta(repo_id, &first.to_bytes().unwrap(), gen1)
+            .unwrap();
+        let second = crate::storage::delta::GraphSnapshotDelta::empty(gen2);
+        backend
+            .save_delta(repo_id, &second.to_bytes().unwrap(), gen2)
+            .unwrap();
+        (dir, backend, repo_id)
+    }
+
+    #[test]
+    fn local_recovery_rejects_missing_delta_prefix() {
+        let (_dir, backend, repo_id) = local_backend_with_two_deltas();
+        std::fs::remove_file(backend.delta_path(repo_id, 2)).unwrap();
+        let error = load_recovered_snapshot(&backend, repo_id)
+            .expect_err("missing first delta must fail closed");
+        assert!(error.to_string().contains("expected generation 2, found 3"));
+    }
+
+    #[test]
+    fn local_recovery_rejects_missing_delta_head() {
+        let (_dir, backend, repo_id) = local_backend_with_two_deltas();
+        std::fs::remove_file(backend.delta_path(repo_id, 3)).unwrap();
+        let error = load_recovered_snapshot(&backend, repo_id)
+            .expect_err("missing acknowledged head must fail closed");
+        assert!(error
+            .to_string()
+            .contains("delta chain ended at generation 2, acknowledged head is 3"));
     }
 
     #[test]
@@ -876,7 +1555,7 @@ mod tests {
         backend.write_generation("test-repo", 42).unwrap();
 
         // The generation reads back correctly
-        let gen = backend.read_generation("test-repo").unwrap();
+        let gen = backend.read_legacy_generation("test-repo").unwrap();
         assert_eq!(gen, 42);
 
         // No .tmp file left behind

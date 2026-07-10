@@ -10,20 +10,26 @@
 //!
 //! Object layout in the bucket:
 //! ```text
-//! {prefix}/{repo_id}/graph.kndb              — snapshot
+//! {prefix}/{repo_id}/graph.kndb              — checksummed full-authority snapshot envelope
 //! {prefix}/{repo_id}/overlays/{session_id}.bin — overlay state
 //! ```
 
-use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
-use parking_lot::Mutex;
+use object_store::{
+    ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
+};
+use sha2::{Digest, Sha256};
 
 use crate::error::KinDbError;
-use crate::storage::backend::{Generation, StorageBackend, GENERATION_INIT};
+use crate::storage::backend::{
+    Generation, SnapshotAuthority, SnapshotRecoveryState, StorageBackend, GENERATION_INIT,
+};
+
+const GCS_FULL_AUTHORITY_MAGIC: [u8; 8] = *b"KNGCSF02";
+const GCS_FULL_AUTHORITY_HEADER_LEN: usize = 8 + 8 + 32;
 
 /// GCS-backed storage for graph snapshots and overlays.
 ///
@@ -36,16 +42,6 @@ pub struct GcsBackend {
     prefix: String,
     /// Lazily-initialized tokio runtime for when no ambient runtime exists.
     fallback_rt: OnceLock<tokio::runtime::Runtime>,
-    /// Maps object paths to their last-seen raw ETag string.
-    /// Used for UpdateVersion on subsequent writes so we don't lose
-    /// fidelity by round-tripping through u64.
-    etags: Mutex<HashMap<String, String>>,
-    /// Maps object paths to their last-seen object version (the GCS object
-    /// generation). GCS conditional updates are generation-based, so
-    /// object_store requires this `version` — not just the e_tag — or it
-    /// rejects the write with "Version required for conditional update".
-    /// Captured on load and after every successful write.
-    versions: Mutex<HashMap<String, String>>,
 }
 
 impl GcsBackend {
@@ -66,8 +62,6 @@ impl GcsBackend {
             store: Box::new(store),
             prefix: prefix.into(),
             fallback_rt: OnceLock::new(),
-            etags: Mutex::new(HashMap::new()),
-            versions: Mutex::new(HashMap::new()),
         })
     }
 
@@ -78,8 +72,6 @@ impl GcsBackend {
             store,
             prefix: prefix.into(),
             fallback_rt: OnceLock::new(),
-            etags: Mutex::new(HashMap::new()),
-            versions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -101,45 +93,141 @@ impl GcsBackend {
             ))
         }
     }
+
+    fn numeric_version(version: Option<&str>, authority: &str) -> Result<Generation, KinDbError> {
+        let version = version.ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "GCS {authority} is missing object meta.version; refusing ETag or synthetic generation fallback"
+            ))
+        })?;
+        version.parse::<Generation>().map_err(|error| {
+            KinDbError::StorageError(format!(
+                "GCS {authority} has nonnumeric object version {version:?}: {error}"
+            ))
+        })
+    }
+
+    fn snapshot_meta(&self, path: &ObjectPath) -> Result<ObjectMeta, KinDbError> {
+        self.block_on(self.store.head(path)).map_err(|error| {
+            KinDbError::StorageError(format!("GCS head failed for {path}: {error}"))
+        })
+    }
+
+    fn encode_full_snapshot_authority(snapshot_bytes: &[u8]) -> Result<Vec<u8>, KinDbError> {
+        let payload_len = u64::try_from(snapshot_bytes.len()).map_err(|_| {
+            KinDbError::StorageError("GCS snapshot payload length exceeds u64".to_string())
+        })?;
+        let mut encoded = Vec::with_capacity(GCS_FULL_AUTHORITY_HEADER_LEN + snapshot_bytes.len());
+        encoded.extend_from_slice(&GCS_FULL_AUTHORITY_MAGIC);
+        encoded.extend_from_slice(&payload_len.to_le_bytes());
+        encoded.extend_from_slice(&Sha256::digest(snapshot_bytes));
+        encoded.extend_from_slice(snapshot_bytes);
+        Ok(encoded)
+    }
+
+    fn decode_full_snapshot_authority(bytes: &[u8]) -> Result<(Vec<u8>, bool), KinDbError> {
+        if !bytes.starts_with(&GCS_FULL_AUTHORITY_MAGIC) {
+            return Ok((bytes.to_vec(), false));
+        }
+        if bytes.len() < GCS_FULL_AUTHORITY_HEADER_LEN {
+            return Err(KinDbError::StorageError(
+                "GCS full-snapshot authority envelope is truncated".to_string(),
+            ));
+        }
+        let payload_len = u64::from_le_bytes(bytes[8..16].try_into().expect("fixed range"));
+        let payload_len = usize::try_from(payload_len).map_err(|_| {
+            KinDbError::StorageError(
+                "GCS full-snapshot authority payload length exceeds usize".to_string(),
+            )
+        })?;
+        let expected_len = GCS_FULL_AUTHORITY_HEADER_LEN
+            .checked_add(payload_len)
+            .ok_or_else(|| {
+                KinDbError::StorageError(
+                    "GCS full-snapshot authority payload length overflows".to_string(),
+                )
+            })?;
+        if bytes.len() != expected_len {
+            return Err(KinDbError::StorageError(format!(
+                "GCS full-snapshot authority length mismatch: expected {expected_len}, found {}",
+                bytes.len()
+            )));
+        }
+        let payload = &bytes[GCS_FULL_AUTHORITY_HEADER_LEN..];
+        let expected_digest: [u8; 32] = bytes[16..48].try_into().expect("fixed range");
+        let actual_digest: [u8; 32] = Sha256::digest(payload).into();
+        if actual_digest != expected_digest {
+            return Err(KinDbError::StorageError(
+                "GCS full-snapshot authority digest mismatch".to_string(),
+            ));
+        }
+        Ok((payload.to_vec(), true))
+    }
+
+    fn load_snapshot_object(
+        &self,
+        repo_id: &str,
+    ) -> Result<Option<(SnapshotAuthority, bool)>, KinDbError> {
+        let path = self.snapshot_path(repo_id);
+        let get_result = match self.block_on(self.store.get(&path)) {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => {
+                return Err(KinDbError::StorageError(format!(
+                    "GCS load failed for {path}: {error}"
+                )))
+            }
+        };
+        let generation = Self::numeric_version(
+            get_result.meta.version.as_deref(),
+            &format!("snapshot {path}"),
+        )?;
+        let bytes = self.block_on(get_result.bytes()).map_err(|error| {
+            KinDbError::StorageError(format!("GCS read bytes failed for {path}: {error}"))
+        })?;
+        let (snapshot_bytes, has_full_authority) = Self::decode_full_snapshot_authority(&bytes)?;
+        Ok(Some((
+            SnapshotAuthority {
+                snapshot_bytes,
+                snapshot_generation: generation,
+                head_generation: generation,
+            },
+            has_full_authority,
+        )))
+    }
 }
 
 impl StorageBackend for GcsBackend {
     fn load_snapshot(&self, repo_id: &str) -> Result<Option<(Vec<u8>, Generation)>, KinDbError> {
-        let path = self.snapshot_path(repo_id);
+        Ok(self
+            .load_snapshot_authority(repo_id)?
+            .map(|authority| (authority.snapshot_bytes, authority.head_generation)))
+    }
 
-        match self.block_on(self.store.get(&path)) {
-            Ok(get_result) => {
-                // Parse generation from ETag for the trait interface, but also
-                // stash the raw ETag so save_snapshot can use it verbatim.
-                let raw_etag = get_result.meta.e_tag.clone();
-                // An object we just loaded exists, so its generation must be
-                // above GENERATION_INIT — otherwise the next save would take the
-                // Create branch and fail "already exists". (Real GCS generations
-                // are large timestamps; this only matters for backends whose
-                // first object has etag/generation 0, e.g. the in-memory store.)
-                let generation = raw_etag
-                    .as_ref()
-                    .and_then(|etag| etag.trim_matches('"').parse::<Generation>().ok())
-                    .unwrap_or(1)
-                    .max(GENERATION_INIT + 1);
+    fn load_snapshot_authority(
+        &self,
+        repo_id: &str,
+    ) -> Result<Option<SnapshotAuthority>, KinDbError> {
+        Ok(self
+            .load_snapshot_object(repo_id)?
+            .map(|(authority, _)| authority))
+    }
 
-                if let Some(ref etag) = raw_etag {
-                    self.etags.lock().insert(path.to_string(), etag.clone());
-                }
-                if let Some(version) = get_result.meta.version.clone() {
-                    self.versions.lock().insert(path.to_string(), version);
-                }
-
-                let bytes = self.block_on(get_result.bytes()).map_err(|e| {
-                    KinDbError::StorageError(format!("GCS read bytes failed for {path}: {e}"))
-                })?;
-                Ok(Some((bytes.to_vec(), generation)))
-            }
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(KinDbError::StorageError(format!(
-                "GCS load failed for {path}: {e}"
-            ))),
+    fn load_recovery_state(&self, repo_id: &str) -> Result<SnapshotRecoveryState, KinDbError> {
+        // GCS incremental writes are disabled until snapshot+journal authority
+        // has one conditional commit point. A snapshot written by this backend
+        // carries a full-authority envelope, so leftover legacy journals after
+        // its commit are stale and ignored. Raw legacy snapshots with journals
+        // fail closed because no base/head binding exists.
+        let Some((authority, has_full_authority)) = self.load_snapshot_object(repo_id)? else {
+            return Ok((None, Vec::new()));
+        };
+        if !has_full_authority && !self.load_deltas_since(repo_id, GENERATION_INIT)?.is_empty() {
+            return Err(KinDbError::StorageError(format!(
+                "legacy GCS repo {repo_id} has journals but no full-snapshot authority envelope; refusing unbound replay"
+            )));
         }
+        Ok((Some(authority), Vec::new()))
     }
 
     fn save_snapshot(
@@ -148,8 +236,9 @@ impl StorageBackend for GcsBackend {
         data: &[u8],
         expected_gen: Generation,
     ) -> Result<Generation, KinDbError> {
+        let _snapshot = crate::storage::format::GraphSnapshot::from_bytes(data)?;
         let path = self.snapshot_path(repo_id);
-        let payload = PutPayload::from(data.to_vec());
+        let payload = PutPayload::from(Self::encode_full_snapshot_authority(data)?);
 
         let opts = if expected_gen == GENERATION_INIT {
             PutOptions {
@@ -157,23 +246,18 @@ impl StorageBackend for GcsBackend {
                 ..PutOptions::default()
             }
         } else {
-            // GCS conditional updates are generation-based: object_store's GCS
-            // backend requires the object `version` (generation), not just the
-            // e_tag, or it rejects the write with "Version required for
-            // conditional update". Prefer the version captured on load/last
-            // write; fall back to the expected generation so a cold writer
-            // still sends a precondition.
-            let etag = self.etags.lock().get(&path.to_string()).cloned();
-            let version = self
-                .versions
-                .lock()
-                .get(&path.to_string())
-                .cloned()
-                .unwrap_or_else(|| format!("{expected_gen}"));
+            let meta = self.snapshot_meta(&path)?;
+            let current_generation =
+                Self::numeric_version(meta.version.as_deref(), &format!("snapshot {path}"))?;
+            if current_generation != expected_gen {
+                return Err(KinDbError::StorageError(format!(
+                    "GCS snapshot generation mismatch for {path}: expected {expected_gen}, found {current_generation}"
+                )));
+            }
             PutOptions {
                 mode: PutMode::Update(UpdateVersion {
-                    e_tag: etag,
-                    version: Some(version),
+                    e_tag: meta.e_tag,
+                    version: meta.version,
                 }),
                 ..PutOptions::default()
             }
@@ -183,50 +267,27 @@ impl StorageBackend for GcsBackend {
             .block_on(self.store.put_opts(&path, payload, opts))
             .map_err(|e| KinDbError::StorageError(format!("GCS save failed for {path}: {e}")))?;
 
-        // Stash the new ETag for the next CAS write.
-        if let Some(ref etag) = result.e_tag {
-            self.etags.lock().insert(path.to_string(), etag.clone());
+        let generation = Self::numeric_version(
+            result.version.as_deref(),
+            &format!("save result for {path}"),
+        )?;
+        if generation <= expected_gen {
+            return Err(KinDbError::StorageError(format!(
+                "GCS save result for {path} did not advance generation: expected above {expected_gen}, found {generation}"
+            )));
         }
-        // Stash the new object version (generation) for the next conditional update.
-        if let Some(ref version) = result.version {
-            self.versions
-                .lock()
-                .insert(path.to_string(), version.clone());
-        }
-
-        // Parse generation for the trait return value. Clamp to at least
-        // expected_gen + 1 to guarantee forward progress (InMemory backend
-        // returns "0" on first write).
-        let raw_gen = result
-            .e_tag
-            .as_ref()
-            .and_then(|etag| etag.trim_matches('"').parse::<Generation>().ok())
-            .unwrap_or(expected_gen + 1);
-        let new_gen = raw_gen.max(expected_gen + 1);
-
-        Ok(new_gen)
+        Ok(generation)
     }
 
     fn save_delta(
         &self,
         repo_id: &str,
-        delta_data: &[u8],
-        _base_gen: Generation,
+        _delta_data: &[u8],
+        base_gen: Generation,
     ) -> Result<Generation, KinDbError> {
-        // Use a monotonic timestamp suffix to order deltas.
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let path = ObjectPath::from(format!("{}/{repo_id}/deltas/{ts:020}.kndd", self.prefix));
-        let payload = PutPayload::from(delta_data.to_vec());
-
-        self.block_on(self.store.put(&path, payload)).map_err(|e| {
-            KinDbError::StorageError(format!("GCS delta save failed for {path}: {e}"))
-        })?;
-
-        // Return a synthetic generation (timestamp-based).
-        Ok(ts as Generation)
+        Err(KinDbError::StorageError(format!(
+            "GCS incremental delta persistence is disabled for repo {repo_id} at base {base_gen}: no single conditional snapshot+journal authority"
+        )))
     }
 
     fn load_deltas_since(
@@ -386,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn gcs_backend_roundtrip_snapshot() {
+    fn gcs_backend_rejects_nonversioned_store_without_etag_fallback() {
         let backend = test_backend();
 
         // No snapshot yet
@@ -395,15 +456,78 @@ mod tests {
         // Create and save
         let snapshot = GraphSnapshot::empty();
         let bytes = snapshot.to_bytes().unwrap();
-        let new_gen = backend
+        let error = backend
             .save_snapshot("test-repo", &bytes, GENERATION_INIT)
-            .unwrap();
-        assert!(new_gen > 0);
+            .expect_err("InMemory has ETags but no numeric object versions");
+        assert!(error.to_string().contains("missing object meta.version"));
 
-        // Load back
-        let (loaded_bytes, _gen) = backend.load_snapshot("test-repo").unwrap().unwrap();
-        let loaded = GraphSnapshot::from_bytes(&loaded_bytes).unwrap();
-        assert_eq!(loaded.version, GraphSnapshot::CURRENT_VERSION);
+        let load_error = backend
+            .load_snapshot("test-repo")
+            .expect_err("load must also reject ETag-only authority");
+        assert!(load_error
+            .to_string()
+            .contains("missing object meta.version"));
+    }
+
+    #[test]
+    fn gcs_backend_requires_numeric_object_versions() {
+        assert_eq!(
+            GcsBackend::numeric_version(Some("123456789"), "test").unwrap(),
+            123456789
+        );
+        for version in [None, Some("etag-hash"), Some("-1")] {
+            let error = GcsBackend::numeric_version(version, "test")
+                .expect_err("missing or nonnumeric GCS version must fail closed");
+            assert!(error.to_string().contains("GCS test"));
+        }
+    }
+
+    #[test]
+    fn gcs_full_snapshot_authority_envelope_roundtrips_and_detects_corruption() {
+        let bytes = GraphSnapshot::empty().to_bytes().unwrap();
+        let encoded = GcsBackend::encode_full_snapshot_authority(&bytes).unwrap();
+        let (decoded, authoritative) =
+            GcsBackend::decode_full_snapshot_authority(&encoded).unwrap();
+        assert!(authoritative);
+        assert_eq!(decoded, bytes);
+
+        let (legacy, authoritative) = GcsBackend::decode_full_snapshot_authority(&bytes).unwrap();
+        assert!(!authoritative);
+        assert_eq!(legacy, bytes);
+
+        let mut corrupt = encoded;
+        *corrupt.last_mut().unwrap() ^= 0xff;
+        let error = GcsBackend::decode_full_snapshot_authority(&corrupt)
+            .expect_err("corrupt authoritative envelope must fail closed");
+        assert!(error.to_string().contains("digest mismatch"));
+    }
+
+    #[test]
+    fn gcs_backend_disables_uncommitted_legacy_delta_authority() {
+        let backend = test_backend();
+        let repo_id = "restart-repo";
+        assert!(!backend.supports_incremental_deltas());
+        let delta = crate::storage::delta::GraphSnapshotDelta::empty(42)
+            .to_bytes()
+            .unwrap();
+        let error = backend
+            .save_delta(repo_id, &delta, 42)
+            .expect_err("GCS delta writes must remain disabled");
+        assert!(error
+            .to_string()
+            .contains("no single conditional snapshot+journal authority"));
+
+        let legacy_path = ObjectPath::from(format!("test/{repo_id}/deltas/{:020}.kndd", 43_u64));
+        backend
+            .block_on(backend.store.put(&legacy_path, PutPayload::from(delta)))
+            .unwrap();
+        assert_eq!(backend.load_deltas_since(repo_id, 0).unwrap().len(), 1);
+        let (authority, recovery_deltas) = backend.load_recovery_state(repo_id).unwrap();
+        assert!(authority.is_none());
+        assert!(
+            recovery_deltas.is_empty(),
+            "unbound legacy GCS journals must never be inferred as authority"
+        );
     }
 
     #[test]
@@ -454,36 +578,10 @@ mod tests {
         backend.delete_overlay("test-repo", "session-1").unwrap();
     }
 
-    #[test]
-    fn gcs_backend_etag_cached_across_load_save() {
-        let backend = test_backend();
-
-        let snapshot = GraphSnapshot::empty();
-        let bytes = snapshot.to_bytes().unwrap();
-
-        // First write (Create mode)
-        let gen1 = backend
-            .save_snapshot("test-repo", &bytes, GENERATION_INIT)
-            .unwrap();
-        assert!(gen1 > 0);
-
-        // Load populates the ETag cache
-        let (_loaded, gen_loaded) = backend.load_snapshot("test-repo").unwrap().unwrap();
-
-        // Second write should use the cached ETag from load
-        let gen2 = backend
-            .save_snapshot("test-repo", &bytes, gen_loaded)
-            .unwrap();
-        assert!(gen2 > gen_loaded);
-
-        // The etag map should have an entry for this path
-        let etags = backend.etags.lock();
-        assert!(!etags.is_empty());
-    }
-
-    /// Real-GCS reproduction of the conditional-update bug. InMemory keys CAS
-    /// on the e_tag and so never exercised GCS's generation-based
-    /// precondition; this hits the live bucket via ADC. Run explicitly:
+    /// Real-GCS proof of numeric version authority and conditional updates.
+    /// InMemory has no object versions and intentionally fails the unit path;
+    /// this hits the live bucket via ADC and exercises GCS's generation-based
+    /// precondition. Run explicitly:
     /// `KINDB_GCS_CAS_BUCKET=kin-ecosystem-kin-graphs-dev \
     ///  cargo test -p kin-db --features gcs gcs_real_conditional_update -- --ignored --nocapture`
     #[test]

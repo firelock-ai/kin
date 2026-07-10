@@ -15,7 +15,10 @@ mod snapshot;
 pub mod sql;
 pub mod tiered;
 
-pub use backend::{Generation, LocalFileBackend, StorageBackend, GENERATION_INIT};
+pub use backend::{
+    load_recovered_snapshot, Generation, LocalFileBackend, PersistedDelta, RecoveredSnapshot,
+    SnapshotAuthority, SnapshotRecoveryState, StorageBackend, GENERATION_INIT,
+};
 pub use delta::{
     apply_graph_delta, compute_graph_delta, CollectionDelta, GraphSnapshotDelta, VecDelta,
 };
