@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -90,7 +90,10 @@ pub async fn run_loop(
     let interval = Duration::from_millis(config.poll_interval_ms);
     let mut cancel = cancel;
     // Track the effective batch size for backpressure catch-up.
-    let base_batch_size = config.batch_size;
+    let base_batch_size = config.batch_size.max(1);
+    if config.batch_size == 0 {
+        warn!("reconciliation batch_size=0 is invalid; clamping to 1");
+    }
 
     // RACE CONDITION HARDENING: Retry queue for files that were modified
     // during reconciliation. When a FileModifiedDuringReconcile error
@@ -100,9 +103,18 @@ pub async fn run_loop(
     // injects synthetic Changed events at the start of the next tick.
     let mut retry_queue: Vec<PathBuf> = Vec::new();
 
+    // The watcher API drains its whole channel at once, while this loop deliberately
+    // processes only a bounded batch per tick. Keep the unprocessed tail here so a burst
+    // larger than `batch_size` is deferred instead of silently discarded.
+    let mut pending_events: VecDeque<FileEvent> = VecDeque::new();
+    let mut backlog_warning_active = false;
+
     loop {
         // Check for shutdown signal.
         if *cancel.borrow() {
+            state
+                .reconciliation_status
+                .store(RECON_IDLE, Ordering::Relaxed);
             info!("reconciliation loop shutting down");
             break;
         }
@@ -114,24 +126,26 @@ pub async fn run_loop(
             }
         }
 
-        // Drain pending file events.
-        let mut events = watcher.drain();
-
-        // Inject retries from the previous tick's FileModifiedDuringReconcile errors.
+        // Collect retries first and real watcher notifications second. Dedup once per tick,
+        // only when something new arrived; a real remove/recreate therefore supersedes a
+        // synthetic Changed retry without repeatedly rebuilding an unchanged backlog.
+        let mut incoming_events = Vec::new();
         if !retry_queue.is_empty() {
             debug!(
                 count = retry_queue.len(),
                 "injecting retry events from previous tick"
             );
-            let retries: Vec<FileEvent> = retry_queue.drain(..).map(FileEvent::Changed).collect();
-            events.extend(retries);
+            incoming_events.extend(retry_queue.drain(..).map(FileEvent::Changed));
         }
+        incoming_events.extend(watcher.drain());
+        enqueue_file_events(&mut pending_events, incoming_events);
 
-        if events.is_empty() {
+        if pending_events.is_empty() {
             // No events — sleep briefly then check again.
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
                 _ = cancel.changed() => {
+                    state.reconciliation_status.store(RECON_IDLE, Ordering::Relaxed);
                     info!("reconciliation loop shutting down");
                     break;
                 }
@@ -143,33 +157,26 @@ pub async fn run_loop(
             .reconciliation_status
             .store(RECON_PROCESSING, Ordering::Relaxed);
 
-        // Backpressure: if event count exceeds batch_size * 4, increase
-        // the effective batch size temporarily for catch-up.
-        let event_count = events.len();
-        let effective_batch_size = if event_count > base_batch_size * 4 {
-            warn!(
-                pending = event_count,
-                base_batch = base_batch_size,
-                "event queue backpressure — increasing batch size for catch-up"
-            );
-            event_count // process all pending events to catch up
+        // Backpressure stays bounded. A large burst remains in `pending_events` and is
+        // consumed over multiple iterations; processing the entire queue under the write
+        // locks would starve API tasks and delay cancellation.
+        let event_count = pending_events.len();
+        if event_count > base_batch_size.saturating_mul(4) {
+            if !backlog_warning_active {
+                warn!(
+                    pending = event_count,
+                    base_batch = base_batch_size,
+                    "event queue backpressure — retaining bounded batches for fair catch-up"
+                );
+                backlog_warning_active = true;
+            }
         } else {
-            base_batch_size
-        };
+            backlog_warning_active = false;
+        }
 
-        // Process events in batches.
-        let batch: Vec<FileEvent> = events.into_iter().take(effective_batch_size).collect();
-
-        // RACE CONDITION HARDENING: Deduplicate events per file path.
-        //
-        // Rapid concurrent writes (e.g., save-all, multi-file refactor, or
-        // an editor writing a temp file then renaming) can produce multiple
-        // events for the same file in a single batch. Processing them all
-        // wastes work and can cause inconsistencies: the first event may
-        // reconcile against stale content while the second sees the final
-        // state. By keeping only the last event per path, we reconcile
-        // exactly once per file per tick, using the most recent state.
-        let batch = dedup_file_events(batch);
+        // Process only the configured prefix. `take_file_event_batch` removes that prefix
+        // and leaves every later event in `pending_events` for the next loop iteration.
+        let batch = take_file_event_batch(&mut pending_events, base_batch_size);
         debug!(count = batch.len(), "processing file events (after dedup)");
 
         // Acquire write locks for reconciliation.
@@ -350,14 +357,23 @@ pub async fn run_loop(
             }
         }
 
-        state
-            .reconciliation_status
-            .store(RECON_IDLE, Ordering::Relaxed);
+        let backlog_remains = !pending_events.is_empty() || !retry_queue.is_empty();
+        if !backlog_remains {
+            state
+                .reconciliation_status
+                .store(RECON_IDLE, Ordering::Relaxed);
+        }
 
         // Mark initialized after the first successful reconciliation cycle.
         if !state.is_initialized.load(Ordering::Relaxed) {
             state.is_initialized.store(true, Ordering::Relaxed);
             info!("daemon initialized after first reconciliation cycle");
+        }
+
+        // A retained backlog should catch up promptly, but yield between batches so the
+        // daemon's other Tokio tasks and the cancellation sender are never starved.
+        if backlog_remains {
+            tokio::task::yield_now().await;
         }
     }
 
@@ -387,6 +403,31 @@ fn dedup_file_events(events: Vec<FileEvent>) -> Vec<FileEvent> {
     let mut deduped: Vec<(usize, FileEvent)> = last_event.into_values().collect();
     deduped.sort_by_key(|(idx, _)| *idx);
     deduped.into_iter().map(|(_, event)| event).collect()
+}
+
+/// Append events to the retained watcher backlog and keep only the last event per path.
+///
+/// Deduplicating the whole backlog, rather than just the next processing batch, also handles a
+/// path whose superseding event arrives after an earlier event was deferred to the next tick.
+fn enqueue_file_events(
+    pending: &mut VecDeque<FileEvent>,
+    events: impl IntoIterator<Item = FileEvent>,
+) {
+    let incoming = events.into_iter().collect::<Vec<_>>();
+    if incoming.is_empty() {
+        return;
+    }
+
+    let mut combined = Vec::with_capacity(pending.len() + incoming.len());
+    combined.extend(pending.drain(..));
+    combined.extend(incoming);
+    pending.extend(dedup_file_events(combined));
+}
+
+/// Remove at most `batch_size` events from the front of the retained backlog.
+fn take_file_event_batch(pending: &mut VecDeque<FileEvent>, batch_size: usize) -> Vec<FileEvent> {
+    let count = batch_size.max(1).min(pending.len());
+    (0..count).filter_map(|_| pending.pop_front()).collect()
 }
 
 #[cfg(test)]
@@ -445,6 +486,119 @@ mod tests {
     fn dedup_empty_input() {
         let deduped = dedup_file_events(vec![]);
         assert!(deduped.is_empty());
+    }
+
+    #[test]
+    fn retained_backlog_processes_every_event_across_bounded_batches() {
+        let mut pending = VecDeque::new();
+        let events = (0..6)
+            .map(|n| FileEvent::Changed(PathBuf::from(format!("/{n}.rs"))))
+            .collect::<Vec<_>>();
+        enqueue_file_events(&mut pending, events);
+
+        let first = take_file_event_batch(&mut pending, 2);
+        let second = take_file_event_batch(&mut pending, 2);
+        let third = take_file_event_batch(&mut pending, 2);
+
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 2);
+        assert_eq!(third.len(), 2);
+        assert!(pending.is_empty());
+        let ordered_paths = first
+            .into_iter()
+            .chain(second)
+            .chain(third)
+            .map(|event| match event {
+                FileEvent::Changed(path) | FileEvent::Removed(path) => path,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered_paths,
+            (0..6)
+                .map(|n| PathBuf::from(format!("/{n}.rs")))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn retained_backlog_honors_default_batch_boundaries_and_large_bursts() {
+        const BATCH: usize = 64;
+
+        for total in [64usize, 65, 256, 257] {
+            let mut pending = VecDeque::new();
+            enqueue_file_events(
+                &mut pending,
+                (0..total).map(|n| FileEvent::Changed(PathBuf::from(format!("/{total}-{n}.rs")))),
+            );
+
+            let mut processed = Vec::new();
+            while !pending.is_empty() {
+                let batch = take_file_event_batch(&mut pending, BATCH);
+                assert!(!batch.is_empty());
+                assert!(batch.len() <= BATCH);
+                processed.extend(batch);
+            }
+
+            assert_eq!(processed.len(), total);
+            for (index, event) in processed.into_iter().enumerate() {
+                let actual = match event {
+                    FileEvent::Changed(path) | FileEvent::Removed(path) => path,
+                };
+                assert_eq!(actual, PathBuf::from(format!("/{total}-{index}.rs")));
+            }
+        }
+    }
+
+    #[test]
+    fn retained_backlog_zero_batch_cannot_stall_forever() {
+        let mut pending = VecDeque::from([FileEvent::Changed(PathBuf::from("/a.rs"))]);
+        let batch = take_file_event_batch(&mut pending, 0);
+        assert_eq!(batch.len(), 1);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn retained_backlog_deduplicates_across_ticks_without_dropping_other_paths() {
+        let mut pending = VecDeque::new();
+        enqueue_file_events(
+            &mut pending,
+            [
+                FileEvent::Changed(PathBuf::from("/a.rs")),
+                FileEvent::Changed(PathBuf::from("/b.rs")),
+                FileEvent::Changed(PathBuf::from("/c.rs")),
+            ],
+        );
+        let first = take_file_event_batch(&mut pending, 1);
+        assert!(matches!(&first[0], FileEvent::Changed(path) if path == &PathBuf::from("/a.rs")));
+
+        enqueue_file_events(
+            &mut pending,
+            [
+                FileEvent::Removed(PathBuf::from("/b.rs")),
+                FileEvent::Changed(PathBuf::from("/d.rs")),
+            ],
+        );
+        let rest = take_file_event_batch(&mut pending, 8);
+
+        assert_eq!(rest.len(), 3);
+        assert!(matches!(&rest[0], FileEvent::Changed(path) if path == &PathBuf::from("/c.rs")));
+        assert!(matches!(&rest[1], FileEvent::Removed(path) if path == &PathBuf::from("/b.rs")));
+        assert!(matches!(&rest[2], FileEvent::Changed(path) if path == &PathBuf::from("/d.rs")));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn real_remove_supersedes_synthetic_changed_retry() {
+        let path = PathBuf::from("/removed.rs");
+        let mut pending = VecDeque::new();
+
+        // Production enqueues synthetic retries first and real watcher events second.
+        enqueue_file_events(&mut pending, [FileEvent::Changed(path.clone())]);
+        enqueue_file_events(&mut pending, [FileEvent::Removed(path.clone())]);
+
+        let batch = take_file_event_batch(&mut pending, 1);
+        assert!(matches!(&batch[0], FileEvent::Removed(actual) if actual == &path));
+        assert!(pending.is_empty());
     }
 
     #[test]
