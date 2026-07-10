@@ -91,7 +91,7 @@ pub struct GitHistoryClosureCache {
 }
 
 impl GitHistoryClosureCache {
-    fn contains(&self, head: &SemanticChangeId) -> bool {
+    pub fn is_known_closed(&self, head: &SemanticChangeId) -> bool {
         self.closed
             .read()
             .map(|closed| closed.contains(head))
@@ -101,6 +101,14 @@ impl GitHistoryClosureCache {
     fn remember(&self, closed_history: HashSet<SemanticChangeId>) {
         if let Ok(mut closed) = self.closed.write() {
             closed.extend(closed_history);
+        }
+    }
+
+    /// Mark one newly inserted change closed after its parent topology was
+    /// validated against already-closed graph truth.
+    pub fn remember_closed_change(&self, change_id: SemanticChangeId) {
+        if let Ok(mut closed) = self.closed.write() {
+            closed.insert(change_id);
         }
     }
 
@@ -601,7 +609,7 @@ fn imported_git_history_is_closed_cached(
     head: SemanticChangeId,
     closure_cache: Option<&GitHistoryClosureCache>,
 ) -> Result<bool> {
-    if closure_cache.is_some_and(|cache| cache.contains(&head)) {
+    if closure_cache.is_some_and(|cache| cache.is_known_closed(&head)) {
         return Ok(true);
     }
 
@@ -614,7 +622,7 @@ fn imported_git_history_is_closed_cached(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     });
-    if closure_cache.is_some_and(|cache| cache.contains(&head)) {
+    if closure_cache.is_some_and(|cache| cache.is_known_closed(&head)) {
         return Ok(true);
     }
 
@@ -626,24 +634,26 @@ fn imported_git_history_is_closed_cached(
     }
 
     let genesis_id = kin_core::build_genesis_change().id;
-    let mut stack = vec![head];
-    let mut visited = HashSet::new();
-    let mut reached_genesis = false;
+    let mut stack = vec![(head, false)];
+    let mut visiting = HashSet::new();
+    let mut verified = HashSet::new();
 
-    while let Some(change_id) = stack.pop() {
-        if closure_cache.is_some_and(|cache| cache.contains(&change_id)) {
-            // A previously verified ancestor already proves the remainder of
-            // this path reaches canonical genesis. Only the new descendant
-            // prefix needs to be inspected and memoized.
-            reached_genesis = true;
+    while let Some((change_id, exiting)) = stack.pop() {
+        if exiting {
+            visiting.remove(&change_id);
+            verified.insert(change_id);
             continue;
         }
-        if change_id == genesis_id {
-            reached_genesis = true;
+        if change_id == genesis_id
+            || verified.contains(&change_id)
+            || closure_cache.is_some_and(|cache| cache.is_known_closed(&change_id))
+        {
             continue;
         }
-        if !visited.insert(change_id) {
-            continue;
+        if !visiting.insert(change_id) {
+            // A back-edge means at least one parent path is cyclic. One other
+            // path reaching genesis cannot make that malformed side path valid.
+            return Ok(false);
         }
         let Some(change) = graph.get_change(&change_id)? else {
             return Ok(false);
@@ -651,16 +661,32 @@ fn imported_git_history_is_closed_cached(
         if change.parents.is_empty() {
             return Ok(false);
         }
-        stack.extend(change.parents);
+        stack.push((change_id, true));
+        stack.extend(
+            change
+                .parents
+                .into_iter()
+                .rev()
+                .map(|parent| (parent, false)),
+        );
     }
 
-    if reached_genesis {
-        visited.insert(genesis_id);
-        if let Some(cache) = closure_cache {
-            cache.remember(visited);
-        }
+    verified.insert(genesis_id);
+    if let Some(cache) = closure_cache {
+        cache.remember(verified);
     }
-    Ok(reached_genesis)
+    Ok(true)
+}
+
+/// Verify arbitrary SemanticChange ancestry against the same canonical-genesis
+/// contract used for imported Git refs. This is public for daemon commit
+/// preflight so malformed missing/cyclic parents never enter the graph.
+pub fn semantic_history_is_closed_cached(
+    graph: &kin_db::InMemoryGraph,
+    head: SemanticChangeId,
+    closure_cache: &GitHistoryClosureCache,
+) -> Result<bool> {
+    imported_git_history_is_closed_cached(graph, head, Some(closure_cache))
 }
 
 /// Lazily import the Git ancestry of `git_oid` into `graph`, returning the exact
@@ -941,6 +967,24 @@ mod tests {
             1,
             "warm cached resolutions must not replay Git history"
         );
+    }
+
+    #[test]
+    fn closure_rejects_cyclic_side_path_even_when_another_parent_is_genesis() {
+        let graph = InMemoryGraph::new();
+        let genesis = kin_core::build_genesis_change();
+        graph.create_change(&genesis).unwrap();
+        let head = change_id(0xb1);
+        let side = change_id(0xb2);
+        graph
+            .create_change(&make_change(head, vec![genesis.id, side]))
+            .unwrap();
+        graph.create_change(&make_change(side, vec![head])).unwrap();
+        let cache = GitHistoryClosureCache::default();
+
+        assert!(!semantic_history_is_closed_cached(&graph, head, &cache).unwrap());
+        assert!(!cache.is_known_closed(&head));
+        assert!(!cache.is_known_closed(&side));
     }
 
     #[test]

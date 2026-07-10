@@ -274,10 +274,6 @@ pub(crate) struct VfsTreeSnapshot {
     /// was built. Used to decide whether a later history insertion can affect
     /// the unchanged active head without replaying the whole DAG per insert.
     pub reachable_change_ids: Arc<HashSet<SemanticChangeId>>,
-    /// Parent ids referenced by the reachable history but not present when the
-    /// snapshot was built. Filling one of these ids changes the active tree even
-    /// though the branch head itself stays byte-identical.
-    pub missing_parent_ids: Arc<HashSet<SemanticChangeId>>,
 }
 
 pub(crate) type VfsTreeBuildResult =
@@ -306,6 +302,7 @@ pub(crate) struct VfsTreeBuildTestHook {
 pub(crate) struct VfsHistoryMutationGuard<'a> {
     state: &'a DaemonState,
     finalized: bool,
+    committed_history_mutated: bool,
 }
 
 impl VfsHistoryMutationGuard<'_> {
@@ -316,13 +313,22 @@ impl VfsHistoryMutationGuard<'_> {
     pub(crate) fn finish(mut self) {
         self.finalized = true;
     }
+
+    /// Upgrade a general publication guard after the SemanticChange insertion
+    /// succeeds. Errors before that point dirty/persist graph side effects but
+    /// do not falsely invalidate committed-history caches.
+    pub(crate) fn mark_committed_history_mutated(&mut self) {
+        self.committed_history_mutated = true;
+    }
 }
 
 impl Drop for VfsHistoryMutationGuard<'_> {
     fn drop(&mut self) {
         let recovering = !self.finalized;
         if recovering {
-            self.state.bump_committed_history_version();
+            if self.committed_history_mutated {
+                self.state.bump_committed_history_version();
+            }
             // `bump_version` marks the graph dirty for the daemon's persistence
             // loop. Drop cannot return a save error, so immediate success paths
             // still save explicitly; this is the cancellation/error backstop.
@@ -338,7 +344,11 @@ impl Drop for VfsHistoryMutationGuard<'_> {
             // receiving a transient in-flight 503.
             self.state.emit_event(DaemonEvent::GraphRootChanged {
                 old_root_hash: None,
-                new_root_hash: "history-mutation-recovery".to_string(),
+                new_root_hash: if self.committed_history_mutated {
+                    "history-mutation-recovery".to_string()
+                } else {
+                    "graph-publication-recovery".to_string()
+                },
             });
         }
     }
@@ -424,9 +434,13 @@ pub struct DaemonState {
     /// Optional allowlist for cloud repo discovery. When present, only these
     /// repo IDs are visible through the multi-repo HTTP API.
     pub allowed_repo_ids: Option<HashSet<String>>,
-    /// True when the in-memory graph has been mutated since the last save.
-    /// The background persistence task checks this to decide when to flush.
-    pub dirty: AtomicBool,
+    /// Monotonic graph-mutation generation. Persistence captures this value
+    /// before serialization and advances `persisted_mutation_generation` only
+    /// through the captured generation after a successful save. Deriving dirty
+    /// state from the two counters prevents a concurrent mutation from being
+    /// erased by a later unconditional boolean clear.
+    pub mutation_generation: AtomicU64,
+    pub persisted_mutation_generation: AtomicU64,
     /// Serializes explicit `/embed` requests with the background embedding
     /// worker so they cannot drain queues and mutate the vector index
     /// concurrently.
@@ -501,22 +515,25 @@ pub struct DaemonState {
     /// separate HTTP calls) must live here to survive between calls; sessions and
     /// intents persist through the graph, but transactions have no graph backing.
     pub mcp_transactions: Mutex<HashMap<String, kin_mcp::McpTransaction>>,
+    /// Durable audit ids, seeded lazily once from the loaded graph and then
+    /// maintained on every daemon audit write. This makes retry dedupe O(1)
+    /// without cloning/scanning the full provenance log per commit.
+    pub audit_event_ids: Mutex<Option<HashSet<kin_model::provenance::AuditEventId>>>,
     /// Cached locate entity-rankings keyed by paging-cursor key, so `kin locate
     /// --next` (and `semantic_locate` cursors) page a held ranking without
     /// re-running retrieval. Bounded by [`LOCATE_RANKING_CACHE_CAP`].
     pub locate_rankings: Mutex<HashMap<String, CachedLocateRanking>>,
     /// Cached `semantic_locate` result pages keyed by paging-cursor key.
     pub semantic_locate_pages: Mutex<HashMap<String, CachedSemanticPage>>,
-    /// Serializes lazy git-ancestry hydration — the full-history import behind a
-    /// `review`/`history`/`blame`/`locate --ref`/`scope` ref that names an
-    /// unimported Git commit. At most one such import runs at a time: two
-    /// concurrent deep imports roughly double peak memory and can OOM-kill the
-    /// daemon. Concurrent requests for the SAME unimported commit coalesce —
-    /// whoever wins the gate imports it, and later waiters observe it already
-    /// present (the get-or-build guard in `hydrate_imported_git_ref`) and skip
-    /// the re-import. Held across the request `.await` (and moved into the
-    /// `set_scope` blocking task), so it is a tokio mutex behind an `Arc` — not
-    /// the std locks used for the synchronous critical sections above.
+    /// Serializes every production SemanticChange insert/check pair and branch
+    /// publication, including lazy git-ancestry hydration, direct/command
+    /// commits, and explicit branch mutations. kin-db's current primitive
+    /// replaces a duplicate id, so all daemon writers share this gate to make
+    /// immutable-id preflight plus insertion atomic and keep closure memos
+    /// sound. It also keeps at most one deep import active: concurrent imports
+    /// roughly double peak memory and can OOM-kill the daemon. Held across
+    /// synchronous publication (and moved into the `set_scope` blocking task),
+    /// so it is a Tokio mutex behind an `Arc`.
     pub hydration_gate: Arc<tokio::sync::Mutex<()>>,
     /// Monotonic closure memo for the live HEAD graph. Explicit historical
     /// refs pay one completeness walk after daemon startup, then stay O(1).
@@ -785,7 +802,8 @@ impl DaemonState {
             spine: std::sync::OnceLock::new(),
             repo_graphs: RwLock::new(HashMap::new()),
             allowed_repo_ids: None,
-            dirty: AtomicBool::new(false),
+            mutation_generation: AtomicU64::new(0),
+            persisted_mutation_generation: AtomicU64::new(0),
             embedding_work: Mutex::new(()),
             persist_lock: Mutex::new(()),
             last_save: std::sync::Mutex::new(Instant::now()),
@@ -802,6 +820,7 @@ impl DaemonState {
             mass_deletion_blocked: AtomicBool::new(false),
             embed_worker_failed: AtomicBool::new(false),
             mcp_transactions: Mutex::new(HashMap::new()),
+            audit_event_ids: Mutex::new(None),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
             hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -937,7 +956,8 @@ impl DaemonState {
             spine: std::sync::OnceLock::new(),
             repo_graphs: RwLock::new(HashMap::new()), // populated below
             allowed_repo_ids,
-            dirty: AtomicBool::new(false),
+            mutation_generation: AtomicU64::new(0),
+            persisted_mutation_generation: AtomicU64::new(0),
             embedding_work: Mutex::new(()),
             persist_lock: Mutex::new(()),
             last_save: std::sync::Mutex::new(Instant::now()),
@@ -954,6 +974,7 @@ impl DaemonState {
             mass_deletion_blocked: AtomicBool::new(false),
             embed_worker_failed: AtomicBool::new(false),
             mcp_transactions: Mutex::new(HashMap::new()),
+            audit_event_ids: Mutex::new(None),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
             hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -1470,6 +1491,20 @@ impl DaemonState {
         VfsHistoryMutationGuard {
             state: self,
             finalized: false,
+            committed_history_mutated: true,
+        }
+    }
+
+    /// Open a fail-closed publication window before non-history side effects.
+    /// Call `mark_committed_history_mutated` only after change insertion.
+    pub(crate) fn begin_graph_publication_mutation(&self) -> VfsHistoryMutationGuard<'_> {
+        self.vfs_history_mutations_inflight
+            .fetch_add(1, Ordering::SeqCst);
+        self.vfs_history_epoch.fetch_add(1, Ordering::SeqCst);
+        VfsHistoryMutationGuard {
+            state: self,
+            finalized: false,
+            committed_history_mutated: false,
         }
     }
 
@@ -1695,6 +1730,11 @@ impl DaemonState {
             .lock()
             .map_err(|_| DaemonError::Io(std::io::Error::other("persist lock poisoned")))?;
 
+        // Capture the graph generation while holding the persistence lock and
+        // immediately before serialization. Mutations that race after this
+        // point deliberately remain dirty even when the serializer happened
+        // to observe them; a redundant later flush is safer than losing one.
+        let saved_mutation_generation = self.mutation_generation.load(Ordering::SeqCst);
         let repo_id = self.cached_repo_id.as_str();
         let expected_gen = self.snapshot_generation.load(Ordering::SeqCst);
 
@@ -1752,6 +1792,7 @@ impl DaemonState {
         // anti-wipe baseline so a later shutdown is measured against what was
         // actually persisted.
         self.record_persisted_entity_count();
+        self.mark_persisted_through(saved_mutation_generation);
 
         info!(
             repo_id,
@@ -1782,6 +1823,7 @@ impl DaemonState {
             .persist_lock
             .lock()
             .map_err(|_| DaemonError::Io(std::io::Error::other("persist lock poisoned")))?;
+        let saved_mutation_generation = self.mutation_generation.load(Ordering::SeqCst);
         let base_gen = self.snapshot_generation.load(Ordering::SeqCst);
         let embedder_identity = kin_buildinfo::sha_with_dirty(kin_buildinfo::get());
         let outcome = kin_db::SnapshotManager::flush_embed_progress(
@@ -1799,6 +1841,7 @@ impl DaemonState {
             self.snapshot_generation.store(generation, Ordering::SeqCst);
             self.write_generation_marker(generation);
         }
+        self.mark_persisted_through(saved_mutation_generation);
         Ok(outcome.status.pending)
     }
 
@@ -2008,23 +2051,30 @@ impl DaemonState {
     /// Called after any graph mutation. The background persistence task
     /// will flush to disk when it sees this flag.
     pub fn mark_dirty(&self) {
-        self.dirty.store(true, Ordering::SeqCst);
+        self.mutation_generation.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut last) = self.last_mutation.lock() {
             *last = Instant::now();
         }
     }
 
-    /// Mark the graph as clean (just saved). Records the save timestamp.
+    /// Record the save timestamp. Successful persistence advances the durable
+    /// mutation generation inside the save critical section; this method is
+    /// intentionally unable to clear a newer concurrent mutation.
     pub fn mark_clean(&self) {
-        self.dirty.store(false, Ordering::SeqCst);
         if let Ok(mut last) = self.last_save.lock() {
             *last = Instant::now();
         }
     }
 
+    fn mark_persisted_through(&self, saved_generation: u64) {
+        self.persisted_mutation_generation
+            .fetch_max(saved_generation, Ordering::SeqCst);
+    }
+
     /// Check if the graph has unsaved mutations.
     pub fn is_dirty(&self) -> bool {
-        self.dirty.load(Ordering::SeqCst)
+        self.mutation_generation.load(Ordering::SeqCst)
+            != self.persisted_mutation_generation.load(Ordering::SeqCst)
     }
 
     /// Whether persisting the current in-memory graph on shutdown would overwrite
@@ -2276,7 +2326,8 @@ mod tests {
             spine: std::sync::OnceLock::new(),
             repo_graphs: RwLock::new(HashMap::new()),
             allowed_repo_ids: None,
-            dirty: AtomicBool::new(false),
+            mutation_generation: AtomicU64::new(0),
+            persisted_mutation_generation: AtomicU64::new(0),
             embedding_work: Mutex::new(()),
             persist_lock: Mutex::new(()),
             last_save: std::sync::Mutex::new(Instant::now()),
@@ -2293,6 +2344,7 @@ mod tests {
             mass_deletion_blocked: AtomicBool::new(false),
             embed_worker_failed: AtomicBool::new(false),
             mcp_transactions: Mutex::new(HashMap::new()),
+            audit_event_ids: Mutex::new(None),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
             hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -2444,6 +2496,26 @@ mod tests {
         assert!(state.time_since_mutation() >= Duration::from_millis(20));
         state.mark_dirty();
         assert!(state.time_since_mutation() < Duration::from_millis(20));
+    }
+
+    #[test]
+    fn persisted_generation_cannot_clear_a_newer_mutation() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = test_state(init.layout, repo_dir.path());
+
+        state.mark_dirty();
+        let generation_captured_before_save = state.mutation_generation.load(Ordering::SeqCst);
+        state.mark_dirty();
+        state.mark_persisted_through(generation_captured_before_save);
+        state.mark_clean();
+
+        assert!(
+            state.is_dirty(),
+            "a save may acknowledge only the mutation generation captured before serialization"
+        );
+        state.mark_persisted_through(state.mutation_generation.load(Ordering::SeqCst));
+        assert!(!state.is_dirty());
     }
 
     #[test]

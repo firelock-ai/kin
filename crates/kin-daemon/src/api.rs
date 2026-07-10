@@ -1631,6 +1631,253 @@ async fn get_scope(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticChangeInsertDisposition {
+    New,
+    ExistingIdentical,
+}
+
+fn semantic_change_definition(
+    change: &kin_model::SemanticChange,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    // Timestamp and author are record metadata and are intentionally excluded
+    // from Kin's content identity. All graph/history-defining fields must match
+    // before an existing id can be treated as an idempotent publication retry.
+    serde_json::to_value((
+        &change.id,
+        &change.parents,
+        &change.message,
+        &change.entity_deltas,
+        &change.relation_deltas,
+        &change.artifact_deltas,
+        &change.projected_files,
+        &change.spec_link,
+        &change.evidence,
+        &change.risk_summary,
+        &change.authored_on,
+    ))
+    .map_err(internal_error)
+}
+
+/// Classify a daemon history insert while the caller holds `hydration_gate`.
+/// The gate makes this check atomic with every production SemanticChange
+/// writer. Exact semantic retries may finish publication after a prior
+/// post-insert failure; conflicting redefinitions are rejected before mutation.
+fn classify_semantic_change_insert(
+    graph: &kin_db::InMemoryGraph,
+    change: &kin_model::SemanticChange,
+) -> Result<SemanticChangeInsertDisposition, (StatusCode, String)> {
+    let Some(existing) = graph.get_change(&change.id).map_err(internal_error)? else {
+        return Ok(SemanticChangeInsertDisposition::New);
+    };
+    if semantic_change_definition(&existing)? == semantic_change_definition(change)? {
+        return Ok(SemanticChangeInsertDisposition::ExistingIdentical);
+    }
+    Err((
+        StatusCode::CONFLICT,
+        format!(
+            "semantic change id {} already exists with a different immutable definition; refusing redefinition",
+            change.id
+        ),
+    ))
+}
+
+fn validate_semantic_change_topology(
+    graph: &kin_db::InMemoryGraph,
+    change: &kin_model::SemanticChange,
+    disposition: SemanticChangeInsertDisposition,
+    closure_cache: &kin_cli::commands::ref_lookup::GitHistoryClosureCache,
+) -> Result<(), (StatusCode, String)> {
+    let genesis = kin_core::build_genesis_change();
+    if change.id == genesis.id {
+        if semantic_change_definition(change)? == semantic_change_definition(&genesis)? {
+            return Ok(());
+        }
+        return Err((
+            StatusCode::CONFLICT,
+            "canonical genesis id cannot carry a different semantic definition".to_string(),
+        ));
+    }
+
+    if disposition == SemanticChangeInsertDisposition::ExistingIdentical {
+        let closed = kin_cli::commands::ref_lookup::semantic_history_is_closed_cached(
+            graph,
+            change.id,
+            closure_cache,
+        )
+        .map_err(internal_error)?;
+        if closed {
+            return Ok(());
+        }
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "semantic change {} exists with missing, rootless, or cyclic ancestry",
+                change.id
+            ),
+        ));
+    }
+
+    if change.parents.is_empty() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "semantic change {} is rootless; only canonical genesis may have no parents",
+                change.id
+            ),
+        ));
+    }
+    for parent in &change.parents {
+        if *parent == change.id {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("semantic change {} cannot be its own parent", change.id),
+            ));
+        }
+        let closed = kin_cli::commands::ref_lookup::semantic_history_is_closed_cached(
+            graph,
+            *parent,
+            closure_cache,
+        )
+        .map_err(internal_error)?;
+        if !closed {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "semantic change {} parent {} is missing, rootless, or cyclic",
+                    change.id, parent
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn semantic_change_is_ancestor(
+    graph: &kin_db::InMemoryGraph,
+    ancestor: kin_model::SemanticChangeId,
+    head: kin_model::SemanticChangeId,
+) -> Result<bool, (StatusCode, String)> {
+    let mut stack = vec![head];
+    let mut visited = HashSet::new();
+    while let Some(current) = stack.pop() {
+        if current == ancestor {
+            return Ok(true);
+        }
+        if !visited.insert(current) {
+            continue;
+        }
+        let Some(change) = graph.get_change(&current).map_err(internal_error)? else {
+            return Ok(false);
+        };
+        stack.extend(change.parents);
+    }
+    Ok(false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchPublication {
+    Create,
+    Update,
+    Noop,
+}
+
+fn plan_semantic_change_branch_publication(
+    graph: &kin_db::InMemoryGraph,
+    branch_name: &BranchName,
+    change: &kin_model::SemanticChange,
+    disposition: SemanticChangeInsertDisposition,
+) -> Result<BranchPublication, (StatusCode, String)> {
+    let Some(branch) = graph.get_branch(branch_name).map_err(internal_error)? else {
+        return Ok(BranchPublication::Create);
+    };
+    if branch.head == change.id {
+        return Ok(BranchPublication::Noop);
+    }
+    if change.parents.contains(&branch.head) {
+        return Ok(BranchPublication::Update);
+    }
+    if disposition == SemanticChangeInsertDisposition::ExistingIdentical
+        && semantic_change_is_ancestor(graph, change.id, branch.head)?
+    {
+        // The original publication succeeded and the branch has since moved
+        // forward. Treat the retry as complete without rewinding newer work.
+        return Ok(BranchPublication::Noop);
+    }
+    Err((
+        StatusCode::CONFLICT,
+        format!(
+            "branch '{}' moved to {} and cannot publish semantic change {} without a matching parent",
+            branch_name, branch.head, change.id
+        ),
+    ))
+}
+
+fn apply_semantic_change_branch_publication(
+    graph: &kin_db::InMemoryGraph,
+    branch_name: &BranchName,
+    change_id: kin_model::SemanticChangeId,
+    publication: BranchPublication,
+) -> Result<(), (StatusCode, String)> {
+    match publication {
+        BranchPublication::Create => graph
+            .create_branch(&Branch {
+                name: branch_name.clone(),
+                head: change_id,
+            })
+            .map_err(internal_error)?,
+        BranchPublication::Update => graph
+            .update_branch_head(branch_name, &change_id)
+            .map_err(internal_error)?,
+        BranchPublication::Noop => {}
+    }
+    Ok(())
+}
+
+fn record_audit_event_once(
+    state: &DaemonState,
+    event: &kin_model::provenance::AuditEvent,
+) -> Result<bool, (StatusCode, String)> {
+    let mut ids = state
+        .audit_event_ids
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if ids.is_none() {
+        *ids = Some(
+            state
+                .graph
+                .query_audit_events(None, usize::MAX)
+                .map_err(internal_error)?
+                .into_iter()
+                .map(|event| event.event_id)
+                .collect(),
+        );
+    }
+    let ids = ids.as_mut().expect("audit id cache initialized");
+    if ids.contains(&event.event_id) {
+        return Ok(false);
+    }
+    state
+        .graph
+        .record_audit_event(event)
+        .map_err(internal_error)?;
+    ids.insert(event.event_id);
+    Ok(true)
+}
+
+fn remember_recorded_audit_event_id(
+    state: &DaemonState,
+    event_id: kin_model::provenance::AuditEventId,
+) {
+    let mut ids = state
+        .audit_event_ids
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(ids) = ids.as_mut() {
+        ids.insert(event_id);
+    }
+}
+
 /// POST /graph/commit — accepts a full semantic commit from the CLI and applies it to Truth.
 async fn graph_commit(
     State(state): State<Arc<DaemonState>>,
@@ -1639,7 +1886,6 @@ async fn graph_commit(
     use kin_model::{EntityDelta, RelationDelta};
 
     let graph = &*state.graph;
-
     // --- Lease enforcement gate ---
     // Collect the entity scopes touched by this commit and check for hard
     // lock conflicts. If another session holds a hard lease on any scope
@@ -1699,73 +1945,102 @@ async fn graph_commit(
         }
     }
 
-    let vfs_history_mutation = state.begin_vfs_history_mutation();
-
-    for delta in &request.change.entity_deltas {
-        match delta {
-            EntityDelta::Added(e) => {
-                graph.upsert_entity(e).map_err(internal_error)?;
-            }
-            EntityDelta::Modified { new, .. } => {
-                graph.upsert_entity(new).map_err(internal_error)?;
-            }
-            EntityDelta::Removed(id) => {
-                graph.remove_entity(id).map_err(internal_error)?;
-            }
-        }
-    }
-
-    for delta in &request.change.relation_deltas {
-        match delta {
-            RelationDelta::Added(r) => {
-                graph.upsert_relation(r).map_err(internal_error)?;
-            }
-            RelationDelta::Removed(id) => {
-                graph.remove_relation(id).map_err(internal_error)?;
-            }
-        }
-    }
-
-    for clear in &request.shallow_clears {
-        graph.delete_shallow_file(clear).map_err(internal_error)?;
-    }
-
-    for sf in &request.shallow_files {
-        graph.upsert_shallow_file(sf).map_err(internal_error)?;
-    }
-
-    graph
-        .create_change(&request.change)
-        .map_err(internal_error)?;
-    invalidate_vfs_for_inserted_changes(&state, [request.change.id])?;
-    if graph
-        .get_branch(&request.branch_name)
-        .map_err(internal_error)?
-        .is_some()
+    // Serialize the duplicate check and insertion with lazy ancestry imports
+    // and every other daemon history writer. The kin-db primitive currently
+    // replaces duplicate keys, so a read-before-write check without this gate
+    // would still race and could make a verified closure memo stale.
+    let _history_write_gate = state.hydration_gate.lock().await;
+    let disposition = classify_semantic_change_insert(graph, &request.change)?;
+    validate_semantic_change_topology(
+        graph,
+        &request.change,
+        disposition,
+        state.history_closure_cache.as_ref(),
+    )?;
+    let branch_publication = plan_semantic_change_branch_publication(
+        graph,
+        &request.branch_name,
+        &request.change,
+        disposition,
+    )?;
+    if disposition == SemanticChangeInsertDisposition::ExistingIdentical
+        && branch_publication == BranchPublication::Noop
+        && !state.is_dirty()
     {
-        graph
-            .update_branch_head(&request.branch_name, &request.change.id)
-            .map_err(internal_error)?;
-    } else {
-        graph
-            .create_branch(&Branch {
-                name: request.branch_name.clone(),
-                head: request.change.id,
-            })
-            .map_err(internal_error)?;
+        return Ok(Json(serde_json::json!({
+            "status": "ok",
+            "idempotent": true,
+        })));
     }
-    if let Some(audit) = &request.audit_event {
-        graph.record_audit_event(audit).map_err(internal_error)?;
+
+    let mut publication_guard = Some(state.begin_graph_publication_mutation());
+    if disposition == SemanticChangeInsertDisposition::New {
+        // Publication order is deliberate: every request-owned side effect and
+        // audit entry lands before create_change. Therefore observing the
+        // existing identical change on retry proves those steps completed; the
+        // retry must never replay old entity deltas over newer descendants.
+        for delta in &request.change.entity_deltas {
+            match delta {
+                EntityDelta::Added(e) => {
+                    graph.upsert_entity(e).map_err(internal_error)?;
+                }
+                EntityDelta::Modified { new, .. } => {
+                    graph.upsert_entity(new).map_err(internal_error)?;
+                }
+                EntityDelta::Removed(id) => {
+                    graph.remove_entity(id).map_err(internal_error)?;
+                }
+            }
+        }
+        for delta in &request.change.relation_deltas {
+            match delta {
+                RelationDelta::Added(r) => {
+                    graph.upsert_relation(r).map_err(internal_error)?;
+                }
+                RelationDelta::Removed(id) => {
+                    graph.remove_relation(id).map_err(internal_error)?;
+                }
+            }
+        }
+        for clear in &request.shallow_clears {
+            graph.delete_shallow_file(clear).map_err(internal_error)?;
+        }
+        for sf in &request.shallow_files {
+            graph.upsert_shallow_file(sf).map_err(internal_error)?;
+        }
+        if let Some(audit) = &request.audit_event {
+            record_audit_event_once(&state, audit)?;
+        }
+        graph
+            .create_change(&request.change)
+            .map_err(internal_error)?;
+        publication_guard
+            .as_mut()
+            .expect("publication guard")
+            .mark_committed_history_mutated();
+        state
+            .history_closure_cache
+            .remember_closed_change(request.change.id);
+        invalidate_vfs_for_inserted_changes(&state, [request.change.id])?;
     }
+    apply_semantic_change_branch_publication(
+        graph,
+        &request.branch_name,
+        request.change.id,
+        branch_publication,
+    )?;
 
     // Broadcast root hash change and compact the delta journal at the commit boundary.
     state.bump_version();
     state.save_snapshot_full().map_err(internal_error)?;
+    state.mark_clean();
     state.emit_event(DaemonEvent::GraphRootChanged {
         old_root_hash: None,
         new_root_hash: request.change.id.to_string(),
     });
-    vfs_history_mutation.finish();
+    if let Some(mutation) = publication_guard.take() {
+        mutation.finish();
+    }
 
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
@@ -1802,13 +2077,14 @@ async fn graph_mutations(
         graph.create_annotation(ann).map_err(internal_error)?;
     }
     for audit in &request.audit_events {
-        kin_cli::provenance::record_cli_audit_event(
+        let event_id = kin_cli::provenance::record_cli_audit_event(
             graph,
             &audit.action,
             audit.target_scope.clone(),
             audit.details.clone(),
         )
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        remember_recorded_audit_event_id(&state, event_id);
     }
 
     state.bump_version();
@@ -2307,6 +2583,12 @@ async fn command_branch(
         ));
     }
 
+    let _history_write_gate = if matches!(&request, kin_cli::commands::branch::BranchRequest::List)
+    {
+        None
+    } else {
+        Some(state.hydration_gate.lock().await)
+    };
     let response = kin_cli::commands::branch::execute_branch_request(
         &state.layout,
         state.graph.as_ref(),
@@ -2596,11 +2878,16 @@ async fn command_commit(
         }));
     }
 
-    // Acquire the only async lock needed by the commit before mutating graph
-    // history. From this point through graph/head + working-copy publication
-    // there is no cancellation point that can strand a half-finalized commit.
+    // Share the daemon-wide history writer gate with lazy hydration and direct
+    // graph commits so duplicate-id rejection plus insertion is atomic with
+    // respect to every production SemanticChange writer. Acquire it before the
+    // working-copy lock: a long hydration must not let a queued commit convoy
+    // unrelated VFS reads and overlay writers while it is still waiting.
+    let _history_write_gate = state.hydration_gate.lock().await;
+    // Acquire every async lock before mutating graph history. From this point
+    // through graph/head + working-copy publication there is no cancellation
+    // point that can strand a half-finalized commit.
     let mut working_copy = state.working_copy.write().await;
-    let vfs_history_mutation = state.begin_vfs_history_mutation();
 
     // Create the semantic change.
     let content_id =
@@ -2623,25 +2910,54 @@ async fn command_commit(
 
     let change_id = change.id;
 
-    graph.create_change(&change).map_err(internal_error)?;
-    invalidate_vfs_for_inserted_changes(&state, [change_id])?;
-    graph
-        .update_branch_head(&branch_name, &change_id)
-        .map_err(internal_error)?;
+    let disposition = classify_semantic_change_insert(graph, &change)?;
+    validate_semantic_change_topology(
+        graph,
+        &change,
+        disposition,
+        state.history_closure_cache.as_ref(),
+    )?;
+    let branch_publication =
+        plan_semantic_change_branch_publication(graph, &branch_name, &change, disposition)?;
+    let mut publication_guard = Some(state.begin_graph_publication_mutation());
+    if disposition == SemanticChangeInsertDisposition::New {
+        graph.create_change(&change).map_err(internal_error)?;
+        publication_guard
+            .as_mut()
+            .expect("publication guard")
+            .mark_committed_history_mutated();
+        state
+            .history_closure_cache
+            .remember_closed_change(change_id);
+        invalidate_vfs_for_inserted_changes(&state, [change_id])?;
+    }
+    apply_semantic_change_branch_publication(graph, &branch_name, change_id, branch_publication)?;
 
     // Clear the working copy overlay — mutations are now committed.
-    working_copy.base_change = change_id;
+    working_copy.base_change = graph
+        .get_branch(&branch_name)
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("published branch '{}' disappeared", branch_name),
+            )
+        })?
+        .head;
     working_copy.uncommitted_mutations = kin_model::GraphOverlay::default();
     drop(working_copy);
 
     // Broadcast events and mark dirty for background persistence.
     state.bump_version();
     state.save_snapshot_full().map_err(internal_error)?;
+    state.mark_clean();
     state.emit_event(DaemonEvent::GraphRootChanged {
         old_root_hash: None,
         new_root_hash: change_id.to_string(),
     });
-    vfs_history_mutation.finish();
+    if let Some(mutation) = publication_guard.take() {
+        mutation.finish();
+    }
 
     Ok(Json(CommandCommitResponse {
         change_id: change_id.to_string(),
@@ -2664,6 +2980,29 @@ struct CreateBranchRequest {
 struct BranchResponse {
     name: String,
     head: String,
+}
+
+fn require_closed_branch_head(
+    state: &DaemonState,
+    head: kin_model::SemanticChangeId,
+) -> Result<(), (StatusCode, String)> {
+    let closed = kin_cli::commands::ref_lookup::semantic_history_is_closed_cached(
+        state.graph.as_ref(),
+        head,
+        state.history_closure_cache.as_ref(),
+    )
+    .map_err(internal_error)?;
+    if closed {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::CONFLICT,
+            format!(
+                "branch head {} has missing, rootless, or cyclic semantic history",
+                head
+            ),
+        ))
+    }
 }
 
 async fn graph_list_branches(
@@ -2713,6 +3052,8 @@ async fn graph_create_branch(
         head: SemanticChangeId::from_hash(head_hash),
     };
 
+    let _history_write_gate = state.hydration_gate.lock().await;
+    require_closed_branch_head(&state, branch.head)?;
     state.graph.create_branch(&branch).map_err(internal_error)?;
     state.bump_version();
 
@@ -2737,6 +3078,7 @@ async fn graph_delete_branch(
     }
 
     use kin_model::BranchName;
+    let _history_write_gate = state.hydration_gate.lock().await;
     state
         .graph
         .delete_branch(&BranchName::new(&name))
@@ -2769,13 +3111,13 @@ async fn graph_update_branch_head(
     use kin_model::{BranchName, Hash256, SemanticChangeId};
 
     let head_hash = Hash256::from_hex(&request.head).map_err(bad_request)?;
+    let head = SemanticChangeId::from_hash(head_hash);
 
+    let _history_write_gate = state.hydration_gate.lock().await;
+    require_closed_branch_head(&state, head)?;
     state
         .graph
-        .update_branch_head(
-            &BranchName::new(&name),
-            &SemanticChangeId::from_hash(head_hash),
-        )
+        .update_branch_head(&BranchName::new(&name), &head)
         .map_err(internal_error)?;
 
     // Broadcast root hash change. bump_version() marks dirty for background persistence.
@@ -6346,9 +6688,9 @@ struct VfsHistoryWalk {
     missing_parent_ids: HashSet<kin_model::SemanticChangeId>,
 }
 
-/// Walk the active SemanticChange history with the same DFS-then-reverse order
-/// as `GraphStore::get_changes_since`, while also retaining the existing and
-/// missing id frontier needed for O(1) same-head invalidation decisions.
+/// Walk committed history in deterministic parent-before-child order. Enter /
+/// exit coloring rejects legacy cycles instead of letting a global visited set
+/// hide a malformed side path, and rootless non-genesis changes fail loud.
 fn walk_vfs_history(
     state: &DaemonState,
     head_id: kin_model::SemanticChangeId,
@@ -6359,27 +6701,59 @@ fn walk_vfs_history(
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let genesis_id = kin_core::build_genesis_change().id;
     let mut changes = Vec::new();
-    let mut visited = HashSet::new();
+    enum Frame {
+        Enter(kin_model::SemanticChangeId),
+        Exit(kin_model::SemanticChange),
+    }
+
+    let mut visiting = HashSet::new();
+    let mut completed = HashSet::new();
     let mut reachable_change_ids = HashSet::new();
     let mut missing_parent_ids = HashSet::new();
-    let mut stack = vec![head_id];
+    let mut stack = vec![Frame::Enter(head_id)];
 
-    while let Some(change_id) = stack.pop() {
-        if change_id == genesis_id || !visited.insert(change_id) {
-            continue;
-        }
-        match state.graph.get_change(&change_id).map_err(internal_error)? {
-            Some(change) => {
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Enter(change_id) => {
+                if change_id == genesis_id || completed.contains(&change_id) {
+                    continue;
+                }
+                if !visiting.insert(change_id) {
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!(
+                            "committed graph history for head {} contains a cycle through {}",
+                            head_id, change_id
+                        ),
+                    ));
+                }
+                let Some(change) = state.graph.get_change(&change_id).map_err(internal_error)?
+                else {
+                    visiting.remove(&change_id);
+                    missing_parent_ids.insert(change_id);
+                    continue;
+                };
+                if change.parents.is_empty() {
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!(
+                            "committed graph history for head {} contains rootless non-genesis change {}",
+                            head_id, change_id
+                        ),
+                    ));
+                }
                 reachable_change_ids.insert(change_id);
-                stack.extend(change.parents.iter().copied());
-                changes.push(change);
+                stack.push(Frame::Exit(change.clone()));
+                stack.extend(change.parents.iter().rev().copied().map(Frame::Enter));
             }
-            None => {
-                missing_parent_ids.insert(change_id);
+            Frame::Exit(change) => {
+                visiting.remove(&change.id);
+                if completed.insert(change.id) {
+                    changes.push(change);
+                }
             }
         }
     }
-    changes.reverse();
     Ok(VfsHistoryWalk {
         changes,
         reachable_change_ids,
@@ -6387,9 +6761,9 @@ fn walk_vfs_history(
     })
 }
 
-/// Invalidate only when one of the inserted ids was already part of the active
-/// view (defensive duplicate/collision case) or fills a missing active ancestor.
-/// Unrelated branch writes leave the cached Arc and history generation intact.
+/// Invalidate only when an inserted id was already part of the published active
+/// view, which is a defensive invariant-breach/collision case. Partial history
+/// is never published, and unrelated branch writes preserve the cached Arc.
 fn invalidate_vfs_for_inserted_changes(
     state: &DaemonState,
     inserted: impl IntoIterator<Item = kin_model::SemanticChangeId>,
@@ -6398,13 +6772,9 @@ fn invalidate_vfs_for_inserted_changes(
     let Some(cached) = cached else {
         return Ok(false);
     };
-    // Reconcile against the retained snapshot's head, not only the currently
-    // selected branch. A caller can cache A, switch to B, fill a missing
-    // ancestor of A while B is active, then switch back to A without reading
-    // the VFS in between. The retained A snapshot must still be invalidated.
-    let affects_active = inserted.into_iter().any(|id| {
-        cached.reachable_change_ids.contains(&id) || cached.missing_parent_ids.contains(&id)
-    });
+    let affects_active = inserted
+        .into_iter()
+        .any(|id| cached.reachable_change_ids.contains(&id));
     if affects_active {
         state.bump_committed_history_version();
     }
@@ -6451,10 +6821,26 @@ fn build_vfs_tree_snapshot(
             files: Arc::new(HashMap::new()),
             timestamps: Arc::new(HashMap::new()),
             reachable_change_ids: Arc::new(HashSet::new()),
-            missing_parent_ids: Arc::new(HashSet::new()),
         });
     };
     let walked = walk_vfs_history(state, head_id)?;
+    if !walked.missing_parent_ids.is_empty() {
+        let first_missing = walked
+            .missing_parent_ids
+            .iter()
+            .map(ToString::to_string)
+            .min()
+            .unwrap_or_else(|| "unknown".to_string());
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "committed graph history for head {} is incomplete: {} parent change(s) missing (first {}); hydrate or repair graph truth before retrying VFS",
+                head_id,
+                walked.missing_parent_ids.len(),
+                first_missing,
+            ),
+        ));
+    }
 
     let mut files: HashMap<FilePathId, kin_model::Hash256> = HashMap::new();
     let mut timestamps: HashMap<FilePathId, u64> = HashMap::new();
@@ -6497,7 +6883,6 @@ fn build_vfs_tree_snapshot(
         files: Arc::new(files),
         timestamps: Arc::new(timestamps),
         reachable_change_ids: Arc::new(walked.reachable_change_ids),
-        missing_parent_ids: Arc::new(walked.missing_parent_ids),
     })
 }
 
@@ -8961,12 +9346,14 @@ mod tests {
     #[tokio::test]
     async fn graph_commit_creates_missing_branch_for_first_hosted_publish() {
         let state = test_state();
+        let genesis = kin_core::build_genesis_change();
+        state.graph.create_change(&genesis).unwrap();
         let entity = test_entity("served_fn", "src/lib.py");
         let change_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x83; 32]));
         let payload = serde_json::json!({
             "change": {
                 "id": change_id,
-                "parents": [],
+                "parents": [genesis.id],
                 "timestamp": Timestamp::now(),
                 "author": "tester",
                 "message": "first hosted publish",
@@ -9009,6 +9396,266 @@ mod tests {
         assert_eq!(refs.branch_name.as_deref(), Some("main"));
         assert_eq!(refs.head_ref.as_deref(), Some(change_id_string.as_str()));
         assert_eq!(state.graph.entity_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn graph_commit_rejects_cached_semantic_change_id_redefinition() {
+        let state = test_state();
+        let genesis = kin_core::build_genesis_change();
+        state.graph.create_change(&genesis).unwrap();
+        let git_oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let head_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid).unwrap();
+        let head = SemanticChange {
+            id: head_id,
+            parents: vec![genesis.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "verified imported head".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(BranchName::new("main")),
+        };
+        state.graph.create_change(&head).unwrap();
+        state
+            .graph
+            .create_branch(&Branch {
+                name: BranchName::new("main"),
+                head: head_id,
+            })
+            .unwrap();
+        kin_core::write_current_branch(&state.layout, &BranchName::new("main")).unwrap();
+        assert!(
+            !kin_cli::commands::ref_lookup::git_ref_requires_hydration_cached(
+                state.graph.as_ref(),
+                git_oid,
+                state.history_closure_cache.as_ref(),
+            ),
+            "fixture head must be memoized as closed before the overwrite attempt"
+        );
+
+        let missing_parent = SemanticChangeId::from_hash(Hash256::from_bytes([0xde; 32]));
+        let replacement = SemanticChange {
+            parents: vec![missing_parent],
+            message: "malicious redefinition".to_string(),
+            ..head.clone()
+        };
+        let history_version_before = state
+            .committed_history_version
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "change": replacement,
+                            "branch_name": "main",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let stored = state.graph.get_change(&head_id).unwrap().unwrap();
+        assert_eq!(stored.parents, vec![genesis.id]);
+        assert!(state.graph.get_change(&missing_parent).unwrap().is_none());
+        assert_eq!(
+            state
+                .committed_history_version
+                .load(std::sync::atomic::Ordering::SeqCst),
+            history_version_before,
+            "rejected redefinition must not open an unfinished mutation guard"
+        );
+        assert!(!state.is_dirty());
+        assert!(
+            !kin_cli::commands::ref_lookup::git_ref_requires_hydration_cached(
+                state.graph.as_ref(),
+                git_oid,
+                state.history_closure_cache.as_ref(),
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_existing_change_retry_finishes_publication_without_rewind() {
+        let state = test_state();
+        let genesis = kin_core::build_genesis_change();
+        state.graph.create_change(&genesis).unwrap();
+        let branch_name = BranchName::new("main");
+        state
+            .graph
+            .create_branch(&Branch {
+                name: branch_name.clone(),
+                head: genesis.id,
+            })
+            .unwrap();
+        kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
+
+        let change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0xc1; 32])),
+            parents: vec![genesis.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "inserted before publication failure".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(branch_name.clone()),
+        };
+        // Simulate a prior attempt that inserted history and then failed before
+        // moving/persisting the branch.
+        state.graph.create_change(&change).unwrap();
+
+        let request_body = serde_json::json!({
+            "change": &change,
+            "branch_name": "main",
+        });
+        let app = router(Arc::clone(&state));
+        let retry = app
+            .clone()
+            .oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+        assert_eq!(
+            state.graph.get_branch(&branch_name).unwrap().unwrap().head,
+            change.id
+        );
+
+        let descendant = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0xc2; 32])),
+            parents: vec![change.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "newer work".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(branch_name.clone()),
+        };
+        state.graph.create_change(&descendant).unwrap();
+        state
+            .graph
+            .update_branch_head(&branch_name, &descendant.id)
+            .unwrap();
+
+        let late_retry = app
+            .oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(late_retry.status(), StatusCode::OK);
+        assert_eq!(
+            state.graph.get_branch(&branch_name).unwrap().unwrap().head,
+            descendant.id,
+            "an idempotent late retry must not rewind newer branch work"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_change_retry_does_not_replay_entity_delta_over_descendant() {
+        let state = test_state();
+        let genesis = kin_core::build_genesis_change();
+        state.graph.create_change(&genesis).unwrap();
+        let branch_name = BranchName::new("main");
+        let v1 = test_entity("entity_v1", "src/state.rs");
+        let mut v2 = v1.clone();
+        v2.name = "entity_v2".to_string();
+        let c = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0xc3; 32])),
+            parents: vec![genesis.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "publish v1".to_string(),
+            entity_deltas: vec![EntityDelta::Added(v1.clone())],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(branch_name.clone()),
+        };
+        let d = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0xc4; 32])),
+            parents: vec![c.id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "publish v2".to_string(),
+            entity_deltas: vec![EntityDelta::Modified {
+                old: v1.clone(),
+                new: v2.clone(),
+            }],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(branch_name.clone()),
+        };
+        state.graph.create_change(&c).unwrap();
+        state.graph.create_change(&d).unwrap();
+        state.graph.upsert_entity(&v2).unwrap();
+        state
+            .graph
+            .create_branch(&Branch {
+                name: branch_name.clone(),
+                head: d.id,
+            })
+            .unwrap();
+        kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/graph/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "change": &c,
+                            "branch_name": "main",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state.graph.get_entity(&v1.id).unwrap().unwrap().name,
+            "entity_v2"
+        );
+        assert_eq!(
+            state.graph.get_branch(&branch_name).unwrap().unwrap().head,
+            d.id
+        );
     }
 
     #[tokio::test]
@@ -9242,9 +9889,11 @@ mod tests {
             .unwrap();
         kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
 
-        let before = current_vfs_snapshot(&state).await.unwrap();
-        assert!(before.missing_parent_ids.contains(&parent_id));
-        assert!(!before.files.contains_key(&FilePathId::new("parent.txt")));
+        let before_error = current_vfs_snapshot(&state)
+            .await
+            .expect_err("partial history must fail loud instead of serving a partial VFS tree");
+        assert_eq!(before_error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(before_error.1.contains(&parent_id.to_string()));
 
         let response = router(Arc::clone(&state))
             .oneshot(
@@ -9268,7 +9917,6 @@ mod tests {
         assert!(state.graph.get_change(&parent_id).unwrap().is_some());
 
         let after = current_vfs_snapshot(&state).await.unwrap();
-        assert!(!Arc::ptr_eq(&before, &after));
         assert!(after.files.contains_key(&FilePathId::new("parent.txt")));
         assert!(!state.is_dirty(), "successful endpoint hydration was saved");
         std::env::remove_var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
@@ -10050,6 +10698,72 @@ mod tests {
             .get_branch(&BranchName::new("feature"))
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn direct_branch_endpoints_reject_missing_history_without_version_bump() {
+        let state = test_state();
+        let genesis = kin_core::build_genesis_change();
+        state.graph.create_change(&genesis).unwrap();
+        let main = BranchName::new("main");
+        state
+            .graph
+            .create_branch(&Branch {
+                name: main.clone(),
+                head: genesis.id,
+            })
+            .unwrap();
+        kin_core::write_current_branch(&state.layout, &main).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let missing = SemanticChangeId::from_hash(Hash256::from_bytes([0xfa; 32]));
+        let version_before = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+        let app = router(Arc::clone(&state));
+
+        let create = app
+            .clone()
+            .oneshot(
+                Request::post("/graph/branches")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "broken",
+                            "head": missing.to_string(),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CONFLICT);
+        assert!(state
+            .graph
+            .get_branch(&BranchName::new("broken"))
+            .unwrap()
+            .is_none());
+
+        let update = app
+            .oneshot(
+                Request::put("/graph/branches/main/head")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "head": missing.to_string() }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            state.graph.get_branch(&main).unwrap().unwrap().head,
+            genesis.id
+        );
+        assert_eq!(
+            state.vfs_version.load(std::sync::atomic::Ordering::SeqCst),
+            version_before
+        );
     }
 
     #[tokio::test]
@@ -11313,7 +12027,128 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retained_head_missing_ancestor_insert_invalidates_after_branch_round_trip() {
+    async fn vfs_rejects_cyclic_side_path_even_when_merge_reaches_genesis() {
+        let state = test_state();
+        let genesis = kin_core::build_genesis_change();
+        state.graph.create_change(&genesis).unwrap();
+        let head_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xd1; 32]));
+        let side_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xd2; 32]));
+        let make = |id, parents| SemanticChange {
+            id,
+            parents,
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "cycle fixture".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(BranchName::new("main")),
+        };
+        state
+            .graph
+            .create_change(&make(head_id, vec![genesis.id, side_id]))
+            .unwrap();
+        state
+            .graph
+            .create_change(&make(side_id, vec![head_id]))
+            .unwrap();
+        state
+            .graph
+            .create_branch(&Branch {
+                name: BranchName::new("main"),
+                head: head_id,
+            })
+            .unwrap();
+        kin_core::write_current_branch(&state.layout, &BranchName::new("main")).unwrap();
+
+        let error = current_vfs_snapshot(&state)
+            .await
+            .expect_err("cyclic committed history must fail loud");
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.1.contains("cycle"));
+        assert!(read_recover(&state.vfs_tree_cache).is_none());
+    }
+
+    #[tokio::test]
+    async fn vfs_merge_replay_is_parent_before_child_for_shared_ancestor() {
+        let state = test_state();
+        let genesis = kin_core::build_genesis_change();
+        state.graph.create_change(&genesis).unwrap();
+        let file = FilePathId::new("src/diamond.rs");
+        let c_hash = state.blobs.write(b"ancestor").unwrap();
+        let a_hash = state.blobs.write(b"child-a").unwrap();
+        let c_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xe1; 32]));
+        let a_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xe2; 32]));
+        let b_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xe3; 32]));
+        let h_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xe4; 32]));
+        let make = |id, parents, artifact_deltas| SemanticChange {
+            id,
+            parents,
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "diamond fixture".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas,
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(BranchName::new("main")),
+        };
+        state
+            .graph
+            .create_change(&make(
+                c_id,
+                vec![genesis.id],
+                vec![ArtifactDelta {
+                    file_id: file.clone(),
+                    kind: ArtifactDeltaKind::Added,
+                    old_hash: None,
+                    new_hash: Some(c_hash),
+                }],
+            ))
+            .unwrap();
+        state
+            .graph
+            .create_change(&make(
+                a_id,
+                vec![c_id],
+                vec![ArtifactDelta {
+                    file_id: file.clone(),
+                    kind: ArtifactDeltaKind::Modified,
+                    old_hash: Some(c_hash),
+                    new_hash: Some(a_hash),
+                }],
+            ))
+            .unwrap();
+        state
+            .graph
+            .create_change(&make(b_id, vec![c_id], vec![]))
+            .unwrap();
+        state
+            .graph
+            .create_change(&make(h_id, vec![a_id, b_id], vec![]))
+            .unwrap();
+        state
+            .graph
+            .create_branch(&Branch {
+                name: BranchName::new("main"),
+                head: h_id,
+            })
+            .unwrap();
+        kin_core::write_current_branch(&state.layout, &BranchName::new("main")).unwrap();
+
+        let snapshot = current_vfs_snapshot(&state).await.unwrap();
+        assert_eq!(snapshot.files.get(&file), Some(&a_hash));
+    }
+
+    #[tokio::test]
+    async fn partial_head_is_never_published_and_repairs_after_branch_round_trip() {
         let state = test_state();
         let branch_name = BranchName::new("main");
         let genesis = kin_core::build_genesis_change();
@@ -11352,11 +12187,11 @@ mod tests {
             .unwrap();
         kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
 
-        let before = current_vfs_snapshot(&state).await.unwrap();
-        assert!(before.files.contains_key(&FilePathId::new("src/head.rs")));
-        assert!(!before.files.contains_key(&FilePathId::new("src/parent.rs")));
-        assert!(before.missing_parent_ids.contains(&parent_id));
-        let version_before = before.key.history_version;
+        let partial = current_vfs_snapshot(&state)
+            .await
+            .expect_err("a missing ancestor must fail loud");
+        assert_eq!(partial.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(partial.1.contains(&parent_id.to_string()));
 
         let other_branch = BranchName::new("other");
         state
@@ -11367,6 +12202,8 @@ mod tests {
             })
             .unwrap();
         kin_core::write_current_branch(&state.layout, &other_branch).unwrap();
+        let other_snapshot = current_vfs_snapshot(&state).await.unwrap();
+        let version_before = other_snapshot.key.history_version;
 
         {
             let mutation = state.begin_vfs_history_mutation();
@@ -11392,16 +12229,19 @@ mod tests {
                 authored_on: Some(branch_name.clone()),
             };
             state.graph.create_change(&parent).unwrap();
-            assert!(invalidate_vfs_for_inserted_changes(&state, [parent_id]).unwrap());
+            assert!(
+                !invalidate_vfs_for_inserted_changes(&state, [parent_id]).unwrap(),
+                "repairing another branch must preserve the complete retained snapshot"
+            );
             mutation.finish();
         }
 
         kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
 
         let after = current_vfs_snapshot(&state).await.unwrap();
-        assert_eq!(after.key.head, before.key.head, "active head did not move");
-        assert_eq!(after.key.history_version, version_before + 1);
-        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(after.key.head, Some(head_id));
+        assert_eq!(after.key.history_version, version_before);
+        assert!(!Arc::ptr_eq(&other_snapshot, &after));
         assert!(after.files.contains_key(&FilePathId::new("src/parent.rs")));
         assert!(after.files.contains_key(&FilePathId::new("src/head.rs")));
     }
@@ -11478,8 +12318,11 @@ mod tests {
             })
             .unwrap();
         kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
-        let before = current_vfs_snapshot(&state).await.unwrap();
-        assert!(before.missing_parent_ids.contains(&first_missing));
+        let partial = current_vfs_snapshot(&state)
+            .await
+            .expect_err("partial history must not publish a VFS snapshot");
+        assert_eq!(partial.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(partial.1.contains(&first_missing.to_string()));
 
         let other_branch = BranchName::new("other");
         state
@@ -11490,6 +12333,7 @@ mod tests {
             })
             .unwrap();
         kin_core::write_current_branch(&state.layout, &other_branch).unwrap();
+        let _other_snapshot = current_vfs_snapshot(&state).await.unwrap();
 
         let walks_before = state.vfs_history_walk_count.load(Ordering::SeqCst);
         {
@@ -11526,7 +12370,7 @@ mod tests {
                     .unwrap();
                 inserted.push(id);
             }
-            assert!(invalidate_vfs_for_inserted_changes(&state, inserted).unwrap());
+            assert!(!invalidate_vfs_for_inserted_changes(&state, inserted).unwrap());
             assert_eq!(
                 state.vfs_history_walk_count.load(Ordering::SeqCst) - walks_before,
                 0,
@@ -11537,7 +12381,6 @@ mod tests {
         kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
         let after = current_vfs_snapshot(&state).await.unwrap();
         assert_eq!(after.reachable_change_ids.len(), INSERTED + 1);
-        assert!(after.missing_parent_ids.is_empty());
     }
 
     #[tokio::test]
@@ -11661,6 +12504,41 @@ mod tests {
             events.try_recv(),
             Ok(DaemonEvent::GraphRootChanged { new_root_hash, .. })
                 if new_root_hash == "history-mutation-recovery"
+        ));
+    }
+
+    #[tokio::test]
+    async fn unfinished_publication_marks_dirty_without_false_history_invalidation() {
+        let state = test_state();
+        install_branch_file(&state, "src/one.rs", b"one");
+        let before = current_vfs_snapshot(&state).await.unwrap();
+        let history_before = state
+            .committed_history_version
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let vfs_before = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+        let mut events = state.event_tx.subscribe();
+
+        {
+            let _unfinished = state.begin_graph_publication_mutation();
+        }
+
+        assert_eq!(
+            state
+                .committed_history_version
+                .load(std::sync::atomic::Ordering::SeqCst),
+            history_before
+        );
+        assert_eq!(
+            state.vfs_version.load(std::sync::atomic::Ordering::SeqCst),
+            vfs_before + 1
+        );
+        assert!(state.is_dirty());
+        let after = current_vfs_snapshot(&state).await.unwrap();
+        assert!(Arc::ptr_eq(&before, &after));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(DaemonEvent::GraphRootChanged { new_root_hash, .. })
+                if new_root_hash == "graph-publication-recovery"
         ));
     }
 
