@@ -137,6 +137,7 @@ mod tests {
         bind_daemon_for_repo_dir, build_mcp_start_config, resolve_repo_override,
         session_authority_notice, start,
     };
+    use serial_test::serial;
     use std::path::PathBuf;
 
     /// RAII guard that saves and restores a single env var around a test, so
@@ -200,6 +201,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn repo_override_prefers_explicit_flag_over_env() {
         let _guard = EnvVarGuard::set("KIN_MCP_REPO", "/env/path");
         let resolved = resolve_repo_override(Some(PathBuf::from("/flag/path")));
@@ -207,6 +209,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn repo_override_falls_back_to_env_var() {
         let _guard = EnvVarGuard::set("KIN_MCP_REPO", "/env/path");
         let resolved = resolve_repo_override(None);
@@ -214,12 +217,14 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn repo_override_none_when_neither_flag_nor_env_set() {
         let _guard = EnvVarGuard::remove("KIN_MCP_REPO");
         assert_eq!(resolve_repo_override(None), None);
     }
 
     #[tokio::test]
+    #[serial]
     async fn bind_daemon_reports_missing_repo_without_hard_error() {
         // A directory with no .kin/ must produce an `Err` reason string for
         // the caller to log, never a panic or a process-killing error
@@ -236,6 +241,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn bind_daemon_short_circuits_on_explicit_daemon_url() {
         // When KIN_DAEMON_URL is already set (e.g. by a supervising session),
         // binding must trust it directly rather than requiring a local .kin/

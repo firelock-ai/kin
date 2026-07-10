@@ -6697,10 +6697,13 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             resumed_stats.checkpoint_io.serialized_units, 8,
             "two suffix boundaries serialize exactly segment+parser-frontier+linker-frontier+manifest each"
         );
-        assert_eq!(resumed_stats.checkpoint_io.reused_units, 4);
         assert_eq!(
-            resumed_stats.checkpoint_io.written_units, 4,
-            "the first replayed boundary reuses three immutable objects and final replay reuses its still-live segment; pruned frontier objects and manifests are rebuilt"
+            resumed_stats.checkpoint_io.reused_units, 0,
+            "prepare GC must remove every object made unreachable by the deleted manifests"
+        );
+        assert_eq!(
+            resumed_stats.checkpoint_io.written_units, 8,
+            "both replayed boundaries must rebuild segment, frontiers, and manifest after startup reachability GC"
         );
         assert_eq!(
             checkpoint_file_map(&root_a),
