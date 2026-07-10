@@ -20,8 +20,42 @@ pub(crate) struct BenchMeta {
     vector_index_metadata_version: Option<u32>,
     feature_flags: Vec<&'static str>,
     embeddings: EmbeddingMeta,
+    coordination: CoordinationMeta,
     kin_commit: &'static str,
     kin_dirty: bool,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct CoordinationMeta {
+    pub schema: String,
+    pub effective_mode: String,
+    pub default_mode: String,
+    pub hard_rejection_active: bool,
+    pub capability_evaluation_active: bool,
+    pub capability_fail_closed_active: bool,
+    pub intent_registration_linearized: bool,
+    pub max_concurrent_intents_enforced: bool,
+    pub hard_intent_capabilities_checked: Vec<String>,
+    pub transaction_capabilities_covered: Vec<String>,
+    pub surfaces: CoordinationSurfaceMeta,
+    pub durable_event_schema: String,
+    pub durable_event_store: String,
+    pub durable_event_fsync_before_broadcast: bool,
+    pub durable_event_families: Vec<String>,
+    pub contract_scope_claim_eligible: bool,
+    pub all_write_surfaces_claim_eligible: bool,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct CoordinationSurfaceMeta {
+    pub vfs_agent_write_entity: bool,
+    pub vfs_agent_write_artifact: bool,
+    pub mcp_transaction_entity: bool,
+    pub mcp_transaction_artifact: bool,
+    pub mcp_relation_endpoint_entities: bool,
+    pub contract: bool,
+    pub direct_filesystem_write: bool,
+    pub non_transaction_graph_mutation_tools: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -131,6 +165,14 @@ pub async fn run(json: bool, prepared_state: bool) -> Result<()> {
             println!("vector_index_metadata_version: disabled");
         }
         println!("feature_flags: {}", meta.feature_flags.join(","));
+        println!(
+            "coordination_enforcement_mode: {}",
+            meta.coordination.effective_mode
+        );
+        println!(
+            "coordination_contract_scope_claim_eligible: {}",
+            meta.coordination.contract_scope_claim_eligible
+        );
         println!("kin_commit: {}", meta.kin_commit);
         println!("kin_dirty: {}", meta.kin_dirty);
         if let Some(model_id) = meta.embeddings.model_id.as_deref() {
@@ -160,9 +202,49 @@ pub(crate) fn build_meta() -> Result<BenchMeta> {
         vector_index_metadata_version: vector_index_metadata_version(),
         feature_flags: feature_flags(),
         embeddings: embedding_meta(),
+        coordination: coordination_meta(),
         kin_commit: build.sha,
         kin_dirty: build.dirty,
     })
+}
+
+pub fn coordination_meta() -> CoordinationMeta {
+    coordination_meta_for_mode(kin_mcp::CoordinationEnforcementMode::from_env())
+}
+
+pub fn coordination_meta_for_mode(mode: kin_mcp::CoordinationEnforcementMode) -> CoordinationMeta {
+    CoordinationMeta {
+        schema: "kin.coordination-enforcement.v1".to_string(),
+        effective_mode: mode.as_str().to_string(),
+        default_mode: "warn".to_string(),
+        hard_rejection_active: mode.is_enforcing(),
+        capability_evaluation_active: mode.evaluates(),
+        capability_fail_closed_active: mode.is_enforcing(),
+        intent_registration_linearized: true,
+        max_concurrent_intents_enforced: true,
+        hard_intent_capabilities_checked: vec!["can_write".to_string()],
+        transaction_capabilities_covered: vec!["can_write".to_string(), "can_commit".to_string()],
+        surfaces: CoordinationSurfaceMeta {
+            vfs_agent_write_entity: true,
+            vfs_agent_write_artifact: true,
+            mcp_transaction_entity: true,
+            mcp_transaction_artifact: true,
+            mcp_relation_endpoint_entities: true,
+            contract: false,
+            direct_filesystem_write: false,
+            non_transaction_graph_mutation_tools: false,
+        },
+        durable_event_schema: "kin.coordination-event.v1".to_string(),
+        durable_event_store: ".kin/coordination_events.jsonl".to_string(),
+        durable_event_fsync_before_broadcast: true,
+        durable_event_families: vec![
+            "intent_registration".to_string(),
+            "intent_release".to_string(),
+            "transaction_outcome".to_string(),
+        ],
+        contract_scope_claim_eligible: false,
+        all_write_surfaces_claim_eligible: false,
+    }
 }
 
 /// Whether the Metal embedding backend is *actually* compiled into this binary.

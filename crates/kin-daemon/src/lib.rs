@@ -35,9 +35,11 @@
 //! # Write veto (`KIN_WRITE_VETO`)
 //!
 //! Rung-3 of the write path. The agent-write apply paths (`POST /vfs/write-notify`,
-//! `POST /vfs/file-changed`) evaluate whether a write touches a scope held under
-//! another session's hard intent and, by default, surface the collision without
-//! blocking.
+//! `POST /vfs/file-changed`, and MCP `kin_transaction_commit`) evaluate whether
+//! a write touches a scope held under another session's hard intent and, by
+//! default, surface the collision without blocking. Intent registration and
+//! transaction apply share a coordinator gate, so enforce mode cannot race a
+//! hard-intent registration between preflight and graph apply.
 //!
 //! - Default (unset): **warn**. The write still proceeds — a colliding write is
 //!   declined by the reconciler's own check and reported as a soft notification —
@@ -47,13 +49,14 @@
 //! - `KIN_WRITE_VETO=enforce`: the write is rejected *before* it is folded into
 //!   the graph with a structured `409 Conflict` (`error: "write_veto"`) naming
 //!   the blocking intent(s).
-//! - `KIN_WRITE_VETO=off` (`0`/`false`/`disabled`/`none`): the veto never
-//!   evaluates; the apply path is byte-identical to pre-veto behavior (no
-//!   annotation).
+//! - `KIN_WRITE_VETO=off`: the veto never evaluates and never annotates or
+//!   rejects. MCP transaction responses still carry the additive coordination
+//!   coverage attestation with `evaluated:false`.
 //!
 //! What rung-3 enforces today is exactly **entity/artifact scope containment
 //! versus other sessions' hard intents** — the only "contract" expressible with
-//! current intent data. A session is never blocked by its own intent, and soft
+//! current intent data. MCP relation mutations cover their endpoint entities.
+//! A session is never blocked by its own intent, and soft
 //! intents stay advisory. Content-hash and semantic-contract (e.g.
 //! [`IntentScope::Contract`](kin_model::session::IntentScope)) vetoes are future
 //! work: no contract-content data exists at the apply boundary, and file writes
@@ -90,9 +93,16 @@
 //!   metadata, not entity truth; ungated.
 //! - `PUT /graph/branches/{name}/head`, `DELETE /graph/branches/{name}`: branch
 //!   ref operations; ungated.
-//! - `POST /mcp/tools/call` (`mcp_tools_call`): MCP write transactions — out of
-//!   this crate's veto scope (kin-mcp lane), with its own stage/commit
-//!   validation.
+//! - `POST /mcp/tools/call` (`kin_transaction_commit`): **write-veto** before
+//!   `apply_transaction_delta`, plus `can_write`/`can_commit` capability checks.
+//!   Enforce mode fails closed for an unknown/non-rich session. Exact entity,
+//!   entity-file artifact, and relation-endpoint scopes are covered; contract
+//!   scopes and non-transaction graph-mutating MCP tools are explicitly not
+//!   claim-eligible yet. Each terminal outcome is submitted to
+//!   `.kin/coordination_events.jsonl` with sequence, repo/session/intent,
+//!   effective mode, and release attribution; a successful append is fsynced
+//!   before live broadcast, and persistence failures are logged without a
+//!   misleading broadcast.
 
 pub mod api;
 pub mod commit_deltas;

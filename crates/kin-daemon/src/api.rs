@@ -9,8 +9,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::state::{
-    CachedLocateRanking, CachedSemanticPage, DaemonEvent, DaemonState, ProjectionChangedSet,
-    VfsTreeCacheKey, VfsTreeSnapshot, LOCATE_RANKING_CACHE_CAP,
+    CachedLocateRanking, CachedSemanticPage, CoordinationEventDraft, DaemonEvent, DaemonState,
+    ProjectionChangedSet, VfsTreeCacheKey, VfsTreeSnapshot, LOCATE_RANKING_CACHE_CAP,
 };
 
 use axum::extract::{Path, Query, State};
@@ -112,6 +112,14 @@ pub struct HealthResponse {
     /// `kin_core::behavior_env`.
     #[serde(default)]
     pub behavior_env: kin_core::behavior_env::BehaviorEnv,
+    /// Effective coordination mode and exact surface/capability coverage for
+    /// operator and benchmark attestation.
+    #[serde(default = "kin_cli::commands::bench_meta::coordination_meta")]
+    pub coordination: kin_cli::commands::bench_meta::CoordinationMeta,
+    /// Must remain zero for a coordination-event stream to be eligible as a
+    /// complete citable measurement source during this daemon lifetime.
+    #[serde(default)]
+    pub coordination_event_persist_failures: u64,
     pub build: BuildResponse,
 }
 
@@ -232,6 +240,12 @@ struct RegisterIntentResponse {
     status: String,
     conflicts: Vec<IntentSummary>,
     downstream_warnings: Vec<IntentSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_intents: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_concurrent_intents: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    required_capability: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1268,6 +1282,12 @@ async fn health(
         embed_worker_failed,
         graph_generation: DaemonState::read_generation_marker(&state.layout),
         behavior_env: kin_core::behavior_env::snapshot_from_process(),
+        coordination: kin_cli::commands::bench_meta::coordination_meta_for_mode(
+            state.coordination_mode(),
+        ),
+        coordination_event_persist_failures: state
+            .coordination_event_persist_failures
+            .load(std::sync::atomic::Ordering::Relaxed),
         build: current_build_response(),
     }))
 }
@@ -2759,6 +2779,7 @@ async fn end_session(
     Path(session_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let _coordination = state.coordination_gate.lock().await;
     let session_id = parse_session_id(&session_id)?;
     let session = state
         .coordinator
@@ -2770,10 +2791,27 @@ async fn end_session(
                 format!("session not found: {session_id}"),
             )
         })?;
+    let intents = state
+        .coordinator
+        .list_intents(&session_id)
+        .map_err(internal_error)?;
     state
         .coordinator
         .deregister_session(&session_id)
         .map_err(internal_error)?;
+    for intent in intents {
+        state.record_coordination_event(CoordinationEventDraft {
+            event: "intent_release",
+            outcome: "session_ended".to_string(),
+            session_id: Some(session_id.to_string()),
+            intent_id: Some(intent.intent_id.to_string()),
+            intent_ids: vec![intent.intent_id.to_string()],
+            transaction_id: None,
+            scopes: intent.scopes.iter().map(format_scope).collect(),
+            enforcement_mode: state.coordination_mode().as_str().to_string(),
+            blocking_intent_ids: Vec::new(),
+        });
+    }
 
     Ok(Json(SessionEndResponse {
         session_id: session.session_id.to_string(),
@@ -2807,6 +2845,7 @@ async fn clear_session_intents(
     Path(session_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let _coordination = state.coordination_gate.lock().await;
     let session_id = parse_session_id(&session_id)?;
     let intents = state
         .coordinator
@@ -2818,6 +2857,17 @@ async fn clear_session_intents(
             .coordinator
             .release_intent(&session_id, &intent.intent_id)
             .map_err(internal_error)?;
+        state.record_coordination_event(CoordinationEventDraft {
+            event: "intent_release",
+            outcome: "cleared".to_string(),
+            session_id: Some(session_id.to_string()),
+            intent_id: Some(intent.intent_id.to_string()),
+            intent_ids: vec![intent.intent_id.to_string()],
+            transaction_id: None,
+            scopes: intent.scopes.iter().map(format_scope).collect(),
+            enforcement_mode: state.coordination_mode().as_str().to_string(),
+            blocking_intent_ids: Vec::new(),
+        });
     }
 
     Ok(Json(ClearedIntentsResponse {
@@ -2843,6 +2893,10 @@ async fn register_intent(
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<RegisterIntentRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Serialize the full check+register decision with transaction preflight and
+    // apply. This daemon gate complements the coordinator's own linearization
+    // lock and closes the cross-surface HTTP race.
+    let _coordination = state.coordination_gate.lock().await;
     let mut scope_values = request.scopes;
     if scope_values.is_empty() {
         if request.scope.trim().is_empty() {
@@ -2857,6 +2911,7 @@ async fn register_intent(
         .iter()
         .map(|scope| parse_scope(scope))
         .collect::<Result<Vec<_>, _>>()?;
+    let scope_labels = scopes.iter().map(format_scope).collect::<Vec<_>>();
     let lock_type = parse_lock_type(&request.lock_type)?;
     let session_id = resolve_or_create_session(&state, request.session_id.as_deref())?;
     let result = state
@@ -2874,28 +2929,95 @@ async fn register_intent(
         )
         .map_err(internal_error)?;
 
-    let response = match result {
+    let (response, outcome, blocking_intent_ids) = match result {
         crate::session_registry::IntentRegistrationResult::Registered {
             intent_id,
             downstream_warnings,
-        } => RegisterIntentResponse {
-            intent_id: intent_id.to_string(),
-            session_id: session_id.to_string(),
-            status: "registered".to_string(),
-            conflicts: Vec::new(),
-            downstream_warnings,
-        },
+        } => (
+            RegisterIntentResponse {
+                intent_id: intent_id.to_string(),
+                session_id: session_id.to_string(),
+                status: "registered".to_string(),
+                conflicts: Vec::new(),
+                downstream_warnings,
+                active_intents: None,
+                max_concurrent_intents: None,
+                required_capability: None,
+            },
+            "registered".to_string(),
+            Vec::new(),
+        ),
         crate::session_registry::IntentRegistrationResult::Blocked {
             intent_id,
             conflicts,
-        } => RegisterIntentResponse {
-            intent_id: intent_id.to_string(),
-            session_id: session_id.to_string(),
-            status: "blocked".to_string(),
-            conflicts,
-            downstream_warnings: Vec::new(),
-        },
+        } => {
+            let blocking = conflicts
+                .iter()
+                .map(|conflict| conflict.intent_id.to_string())
+                .collect();
+            (
+                RegisterIntentResponse {
+                    intent_id: intent_id.to_string(),
+                    session_id: session_id.to_string(),
+                    status: "blocked".to_string(),
+                    conflicts,
+                    downstream_warnings: Vec::new(),
+                    active_intents: None,
+                    max_concurrent_intents: None,
+                    required_capability: None,
+                },
+                "blocked".to_string(),
+                blocking,
+            )
+        }
+        crate::session_registry::IntentRegistrationResult::LimitExceeded {
+            intent_id,
+            active,
+            limit,
+        } => (
+            RegisterIntentResponse {
+                intent_id: intent_id.to_string(),
+                session_id: session_id.to_string(),
+                status: "limit_exceeded".to_string(),
+                conflicts: Vec::new(),
+                downstream_warnings: Vec::new(),
+                active_intents: Some(active),
+                max_concurrent_intents: Some(limit),
+                required_capability: None,
+            },
+            "limit_exceeded".to_string(),
+            Vec::new(),
+        ),
+        crate::session_registry::IntentRegistrationResult::CapabilityDenied {
+            intent_id,
+            capability,
+        } => (
+            RegisterIntentResponse {
+                intent_id: intent_id.to_string(),
+                session_id: session_id.to_string(),
+                status: "capability_denied".to_string(),
+                conflicts: Vec::new(),
+                downstream_warnings: Vec::new(),
+                active_intents: None,
+                max_concurrent_intents: None,
+                required_capability: Some(capability.to_string()),
+            },
+            "capability_denied".to_string(),
+            Vec::new(),
+        ),
     };
+
+    state.record_coordination_event(CoordinationEventDraft {
+        event: "intent_registration",
+        outcome,
+        session_id: Some(session_id.to_string()),
+        intent_id: Some(response.intent_id.clone()),
+        intent_ids: vec![response.intent_id.clone()],
+        transaction_id: None,
+        scopes: scope_labels,
+        enforcement_mode: state.coordination_mode().as_str().to_string(),
+        blocking_intent_ids,
+    });
 
     Ok(Json(response))
 }
@@ -2905,6 +3027,7 @@ async fn release_intent(
     Path(intent_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let _coordination = state.coordination_gate.lock().await;
     let intent_id = parse_intent_id(&intent_id)?;
     let intent = state
         .graph
@@ -2921,6 +3044,17 @@ async fn release_intent(
         .coordinator
         .release_intent(&intent.session_id, &intent_id)
         .map_err(internal_error)?;
+    state.record_coordination_event(CoordinationEventDraft {
+        event: "intent_release",
+        outcome: "released".to_string(),
+        session_id: Some(intent.session_id.to_string()),
+        intent_id: Some(intent_id.to_string()),
+        intent_ids: vec![intent_id.to_string()],
+        transaction_id: None,
+        scopes: intent.scopes.iter().map(format_scope).collect(),
+        enforcement_mode: state.coordination_mode().as_str().to_string(),
+        blocking_intent_ids: Vec::new(),
+    });
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3999,6 +4133,7 @@ fn mcp_session_registry_snapshot(
     let sessions = state.coordinator.list_sessions().map_err(internal_error)?;
     let intents = state.graph.list_all_intents().map_err(internal_error)?;
     let registry = kin_mcp::SessionRegistry::new();
+    registry.set_coordination_mode(state.coordination_mode());
     registry.replace_agent_sessions_and_intents(sessions, intents);
     // Restore in-flight transactions so a registry built fresh for this request
     // sees what earlier requests staged; sessions/intents persist via the graph,
@@ -4089,6 +4224,83 @@ fn collect_pre_commit_entities(
         }
     }
     (entities, supplied_bodies)
+}
+
+fn transaction_coordination_context(
+    state: &DaemonState,
+    sessions: &kin_mcp::SessionRegistry,
+    arguments: &HashMap<String, serde_json::Value>,
+) -> (
+    Option<String>,
+    Option<String>,
+    Vec<IntentScope>,
+    Vec<String>,
+) {
+    let transaction_id = arguments
+        .get("transaction_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let Some(transaction) = transaction_id
+        .as_deref()
+        .and_then(|id| sessions.get_transaction(id))
+    else {
+        return (None, transaction_id, Vec::new(), Vec::new());
+    };
+
+    let mut touched = Vec::new();
+    let mut push = |scope: IntentScope| {
+        if !touched.contains(&scope) {
+            touched.push(scope);
+        }
+    };
+    let mut operations = transaction.staged_operations;
+    if let Some(inline) = arguments.get("operations") {
+        if let Ok(mut parsed) =
+            serde_json::from_value::<Vec<kin_mcp::McpMutationOperation>>(inline.clone())
+        {
+            operations.append(&mut parsed);
+        }
+    }
+    for operation in &operations {
+        match operation.payload.as_ref() {
+            Some(kin_mcp::McpMutationPayload::Entity(entity)) => {
+                push(IntentScope::Entity(entity.id));
+                if let Some(file) = entity.file_origin.clone() {
+                    push(IntentScope::Artifact(file));
+                }
+                let mut existing = state.graph.get_entity(&entity.id).ok().flatten();
+                if existing.is_none() {
+                    existing = state
+                        .graph
+                        .query_entities(&kin_model::EntityFilter {
+                            name_pattern: Some(entity.name.clone()),
+                            kinds: Some(vec![entity.kind]),
+                            ..Default::default()
+                        })
+                        .ok()
+                        .and_then(|mut matches| matches.pop());
+                }
+                if let Some(existing) = existing {
+                    push(IntentScope::Entity(existing.id));
+                    if let Some(file) = existing.file_origin {
+                        push(IntentScope::Artifact(file));
+                    }
+                }
+            }
+            Some(kin_mcp::McpMutationPayload::Relation { from, to, .. }) => {
+                push(IntentScope::Entity(*from));
+                push(IntentScope::Entity(*to));
+            }
+            Some(kin_mcp::McpMutationPayload::Blob(_)) | None => {}
+        }
+    }
+    let labels = touched.iter().map(format_scope).collect();
+    (
+        Some(transaction.session_id),
+        transaction_id,
+        touched,
+        labels,
+    )
 }
 
 /// The transaction id a terminal transaction tool (commit/abort) acted on, used
@@ -5143,7 +5355,45 @@ async fn mcp_tools_call(
         )));
     }
 
+    // Serialize the full daemon transaction lifecycle and other graph-mutating
+    // MCP tools. Commit holds this gate from final intent/capability preflight
+    // through graph application and projection; intent registration uses it
+    // too, closing transaction-state races and keeping touched-scope derivation
+    // stable until apply. Non-transaction mutators are sequenced here but remain
+    // explicitly unattested for intent-veto coverage in bench-meta.
+    let _coordination_guard = if mcp_tool_is_transaction(&request.name) || mutates {
+        Some(state.coordination_gate.lock().await)
+    } else {
+        None
+    };
+
     let sessions = mcp_session_registry_snapshot(&state)?;
+    let (transaction_session_id, transaction_id, transaction_scopes, transaction_scope_labels) =
+        if request.name == "kin_transaction_commit" {
+            transaction_coordination_context(&state, &sessions, &request.arguments)
+        } else {
+            (None, None, Vec::new(), Vec::new())
+        };
+    let transaction_preflight = transaction_session_id.as_deref().map(|session_id| {
+        sessions.evaluate_transaction_write(session_id, transaction_scopes.clone())
+    });
+    let transaction_intent_ids = transaction_session_id
+        .as_deref()
+        .and_then(|session_id| uuid::Uuid::parse_str(session_id).ok().map(SessionId))
+        .map(|session_id| {
+            sessions
+                .list_intents_for_session(&session_id)
+                .into_iter()
+                .filter(|intent| {
+                    intent
+                        .scopes
+                        .iter()
+                        .any(|scope| transaction_scopes.contains(scope))
+                })
+                .map(|intent| intent.intent_id.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     // Snapshot entity state before the commit so we can project the
     // mutations into working-directory files after the graph is updated.
@@ -5179,6 +5429,33 @@ async fn mcp_tools_call(
                 forget_mcp_transaction(&state, &tx_id);
             }
         }
+    }
+
+    if request.name == "kin_transaction_commit" && result.is_error == Some(true) {
+        state.record_coordination_event(CoordinationEventDraft {
+            event: "transaction_outcome",
+            outcome: "rejected_before_graph_apply".to_string(),
+            session_id: transaction_session_id.clone(),
+            intent_id: None,
+            intent_ids: transaction_intent_ids.clone(),
+            transaction_id: transaction_id.clone(),
+            scopes: transaction_scope_labels.clone(),
+            enforcement_mode: transaction_preflight
+                .as_ref()
+                .map(|preflight| preflight.mode.as_str())
+                .unwrap_or_else(|| state.coordination_mode().as_str())
+                .to_string(),
+            blocking_intent_ids: transaction_preflight
+                .as_ref()
+                .map(|preflight| {
+                    preflight
+                        .blocking_intents
+                        .iter()
+                        .map(|intent| intent.intent_id.to_string())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        });
     }
 
     if mutates && result.is_error != Some(true) {
@@ -5217,6 +5494,21 @@ async fn mcp_tools_call(
             .await
             {
                 Err(proj_err) => {
+                    state.record_coordination_event(CoordinationEventDraft {
+                        event: "transaction_outcome",
+                        outcome: "projection_failed_after_graph_apply".to_string(),
+                        session_id: transaction_session_id.clone(),
+                        intent_id: None,
+                        intent_ids: transaction_intent_ids.clone(),
+                        transaction_id: transaction_id.clone(),
+                        scopes: transaction_scope_labels.clone(),
+                        enforcement_mode: transaction_preflight
+                            .as_ref()
+                            .map(|preflight| preflight.mode.as_str())
+                            .unwrap_or("warn")
+                            .to_string(),
+                        blocking_intent_ids: Vec::new(),
+                    });
                     return Ok(Json(kin_mcp::ToolCallResult::error(format!(
                         "graph commit succeeded but file projection failed — agent intent is \
                          preserved in the graph; retry projection or inspect the source file. \
@@ -5239,6 +5531,21 @@ async fn mcp_tools_call(
                             )
                         })
                         .collect();
+                    state.record_coordination_event(CoordinationEventDraft {
+                        event: "transaction_outcome",
+                        outcome: "projection_conflict_after_graph_apply".to_string(),
+                        session_id: transaction_session_id.clone(),
+                        intent_id: None,
+                        intent_ids: transaction_intent_ids.clone(),
+                        transaction_id: transaction_id.clone(),
+                        scopes: transaction_scope_labels.clone(),
+                        enforcement_mode: transaction_preflight
+                            .as_ref()
+                            .map(|preflight| preflight.mode.as_str())
+                            .unwrap_or("warn")
+                            .to_string(),
+                        blocking_intent_ids: Vec::new(),
+                    });
                     return Ok(Json(kin_mcp::ToolCallResult::error(format!(
                         "graph commit succeeded but {n} entity/entities had concurrent file \
                          edits — those entities were NOT projected (human edits preserved). \
@@ -5255,6 +5562,30 @@ async fn mcp_tools_call(
         // response so a commit reports what it did instead of an opaque
         // "committed". `ops_applied`/`empty` already rode in from the handler.
         result = enrich_commit_result(result, &new_root_hash, &modified_files, &collision_warnings);
+        state.record_coordination_event(CoordinationEventDraft {
+            event: "transaction_outcome",
+            outcome: "committed".to_string(),
+            session_id: transaction_session_id,
+            intent_id: None,
+            intent_ids: transaction_intent_ids,
+            transaction_id,
+            scopes: transaction_scope_labels,
+            enforcement_mode: transaction_preflight
+                .as_ref()
+                .map(|preflight| preflight.mode.as_str())
+                .unwrap_or("warn")
+                .to_string(),
+            blocking_intent_ids: transaction_preflight
+                .as_ref()
+                .map(|preflight| {
+                    preflight
+                        .blocking_intents
+                        .iter()
+                        .map(|intent| intent.intent_id.to_string())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        });
     }
 
     Ok(Json(result))
@@ -6755,6 +7086,9 @@ async fn vfs_file_changed(
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<FileChangedRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // One ordering with intent registration and transaction commits: no hard
+    // intent can appear after this path's precheck but before graph apply.
+    let _coordination = state.coordination_gate.lock().await;
     let file_path = std::path::PathBuf::from(&request.path);
     tracing::info!(path = %request.path, "VFS file-changed notification received");
 
@@ -6938,6 +7272,7 @@ async fn vfs_write_notify(
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<WriteNotifyRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let _coordination = state.coordination_gate.lock().await;
     let file_path = std::path::PathBuf::from(&request.file_path);
     tracing::info!(path = %request.file_path, "VFS write-notify received");
 
@@ -7098,7 +7433,7 @@ async fn vfs_write_notify(
 /// GET /vfs/subscribe — SSE stream for real-time invalidation events.
 ///
 /// Subscribers receive DaemonEvent messages (EntityChanged, TreeChanged,
-/// OverlayUpdated, GraphRootChanged) as they happen. The VFS daemon uses
+/// OverlayUpdated, GraphRootChanged, Coordination) as they happen. The VFS daemon uses
 /// these to invalidate its cache; the spine uses them to update its metadata index.
 ///
 /// Protocol: Server-Sent Events (text/event-stream). Each event is a JSON
@@ -7444,7 +7779,10 @@ fn resolve_or_create_session(
             SessionTransport::Cli,
             None,
             state.layout.working_dir().to_path_buf(),
-            SessionCapabilities::default(),
+            SessionCapabilities {
+                can_write: true,
+                ..SessionCapabilities::default()
+            },
         )
         .map_err(internal_error)
 }
@@ -8594,6 +8932,11 @@ mod tests {
         assert!(!json.build.built_at.is_empty());
         // Additive freshness marker present; 0 before any snapshot is committed.
         assert_eq!(json.graph_generation, 0);
+        assert_eq!(json.coordination.schema, "kin.coordination-enforcement.v1");
+        assert!(json.coordination.surfaces.mcp_transaction_entity);
+        assert!(!json.coordination.surfaces.contract);
+        assert!(!json.coordination.contract_scope_claim_eligible);
+        assert_eq!(json.coordination_event_persist_failures, 0);
     }
 
     #[tokio::test]
@@ -9091,6 +9434,221 @@ mod tests {
             before + 1,
             "committed entity must land in the canonical graph"
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_transaction_enforce_rejects_before_graph_apply_and_records_event() {
+        let state = test_state();
+        *state
+            .coordination_mode
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            kin_mcp::CoordinationEnforcementMode::Enforce;
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let capabilities = SessionCapabilities {
+            can_write: true,
+            can_commit: true,
+            ..SessionCapabilities::default()
+        };
+        let owner = state
+            .coordinator
+            .register_session(
+                "claude-code",
+                "owner",
+                SessionTransport::Mcp,
+                None,
+                state.layout.working_dir().to_path_buf(),
+                capabilities.clone(),
+            )
+            .unwrap();
+        let caller = state
+            .coordinator
+            .register_session(
+                "codex",
+                "caller",
+                SessionTransport::Mcp,
+                None,
+                state.layout.working_dir().to_path_buf(),
+                capabilities,
+            )
+            .unwrap();
+        let entity = test_entity("blocked_fn", "src/lib.rs");
+        let registration = state
+            .coordinator
+            .register_intent(
+                &owner,
+                vec![IntentScope::Entity(entity.id)],
+                LockType::Hard,
+                "exclusive edit",
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            registration,
+            crate::session_registry::IntentRegistrationResult::Registered { .. }
+        ));
+        let before = state.graph.entity_count();
+
+        let begin = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_begin",
+            serde_json::json!({
+                "session_id": caller.to_string(),
+                "scope": "file:src/lib.rs"
+            }),
+        )
+        .await;
+        let begin_json: serde_json::Value = serde_json::from_str(&mcp_result_text(&begin)).unwrap();
+        let tx_id = begin_json["transaction_id"].as_str().unwrap().to_string();
+        let stage = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_stage",
+            serde_json::json!({
+                "transaction_id": tx_id,
+                "operations": [{
+                    "verb": "create",
+                    "target": "",
+                    "payload": { "Entity": entity },
+                    "description": "must be vetoed"
+                }]
+            }),
+        )
+        .await;
+        assert_ne!(stage.is_error, Some(true));
+
+        let commit = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_commit",
+            serde_json::json!({ "transaction_id": tx_id }),
+        )
+        .await;
+        assert_eq!(commit.is_error, Some(true));
+        assert!(mcp_result_text(&commit).contains("before graph apply"));
+        assert_eq!(
+            state.graph.entity_count(),
+            before,
+            "rejected transaction must not mutate graph truth"
+        );
+
+        let records = std::fs::read_to_string(state.coordination_events.path()).unwrap();
+        let last: crate::state::CoordinationEventEnvelope =
+            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert_eq!(last.event, "transaction_outcome");
+        assert_eq!(last.outcome, "rejected_before_graph_apply");
+        assert_eq!(last.transaction_id.as_deref(), Some(tx_id.as_str()));
+        assert_eq!(last.session_id, Some(caller.to_string()));
+        assert_eq!(last.enforcement_mode, "enforce");
+        assert_eq!(last.blocking_intent_ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mcp_transaction_preflight_covers_name_kind_upsert_resolution() {
+        let state = test_state();
+        *state
+            .coordination_mode
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            kin_mcp::CoordinationEnforcementMode::Enforce;
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let capabilities = SessionCapabilities {
+            can_write: true,
+            can_commit: true,
+            ..SessionCapabilities::default()
+        };
+        let owner = state
+            .coordinator
+            .register_session(
+                "claude-code",
+                "owner",
+                SessionTransport::Mcp,
+                None,
+                state.layout.working_dir().to_path_buf(),
+                capabilities.clone(),
+            )
+            .unwrap();
+        let caller = state
+            .coordinator
+            .register_session(
+                "codex",
+                "caller",
+                SessionTransport::Mcp,
+                None,
+                state.layout.working_dir().to_path_buf(),
+                capabilities,
+            )
+            .unwrap();
+
+        let existing = test_entity("resolved_by_name", "src/protected.py");
+        state.graph.upsert_entity(&existing).unwrap();
+        assert!(matches!(
+            state
+                .coordinator
+                .register_intent(
+                    &owner,
+                    vec![IntentScope::Entity(existing.id)],
+                    LockType::Hard,
+                    "protect existing entity",
+                    None,
+                )
+                .unwrap(),
+            crate::session_registry::IntentRegistrationResult::Registered { .. }
+        ));
+
+        // The commit path resolves an unknown payload id by name+kind. The
+        // preflight must mirror that resolution or a caller could bypass an
+        // intent on `existing.id` by submitting a fresh id with the same name.
+        let mut alias_payload = existing.clone();
+        alias_payload.id = EntityId::new();
+        alias_payload.signature = "def resolved_by_name(changed)".to_string();
+        let alias_id = alias_payload.id;
+        let begin = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_begin",
+            json!({ "session_id": caller.to_string(), "scope": "entity" }),
+        )
+        .await;
+        let begin_json: serde_json::Value = serde_json::from_str(&mcp_result_text(&begin)).unwrap();
+        let tx_id = begin_json["transaction_id"].as_str().unwrap().to_string();
+        let stage = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_stage",
+            json!({
+                "transaction_id": tx_id,
+                "operations": [{
+                    "verb": "upsert",
+                    "target": "",
+                    "payload": { "Entity": alias_payload },
+                    "description": "attempt id-alias bypass"
+                }]
+            }),
+        )
+        .await;
+        assert_ne!(stage.is_error, Some(true));
+
+        let commit = mcp_call(
+            router(Arc::clone(&state)),
+            "kin_transaction_commit",
+            json!({ "transaction_id": tx_id }),
+        )
+        .await;
+        assert_eq!(commit.is_error, Some(true));
+        assert!(mcp_result_text(&commit).contains(&existing.id.to_string()));
+        assert_eq!(
+            state
+                .graph
+                .get_entity(&existing.id)
+                .unwrap()
+                .unwrap()
+                .signature,
+            existing.signature
+        );
+        assert!(state.graph.get_entity(&alias_id).unwrap().is_none());
     }
 
     #[test]
@@ -10226,7 +10784,10 @@ mod tests {
                 SessionTransport::Cli,
                 None,
                 state.layout.working_dir().to_path_buf(),
-                SessionCapabilities::default(),
+                SessionCapabilities {
+                    can_write: true,
+                    ..SessionCapabilities::default()
+                },
             )
             .unwrap();
         let entity_id = EntityId::new();
@@ -10299,6 +10860,62 @@ mod tests {
         let registered: RegisterIntentResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(registered.status, "registered");
         assert!(!registered.session_id.is_empty());
+
+        let records = std::fs::read_to_string(state.coordination_events.path()).unwrap();
+        let registered_event: crate::state::CoordinationEventEnvelope =
+            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert_eq!(registered_event.event, "intent_registration");
+        assert_eq!(registered_event.outcome, "registered");
+        assert_eq!(
+            registered_event.intent_id.as_deref(),
+            Some(registered.intent_id.as_str())
+        );
+        assert_eq!(registered_event.kin_version, kin_buildinfo::version());
+
+        let contender = state
+            .coordinator
+            .register_session(
+                "claude-code",
+                "contender",
+                SessionTransport::Mcp,
+                None,
+                state.layout.working_dir().to_path_buf(),
+                SessionCapabilities {
+                    can_write: true,
+                    ..SessionCapabilities::default()
+                },
+            )
+            .unwrap();
+        let blocked = app
+            .clone()
+            .oneshot(
+                Request::post("/intent/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "session_id": contender.to_string(),
+                            "scope": "file:src/lib.rs",
+                            "lock_type": "hard",
+                            "task_description": "conflicting edit"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::OK);
+        let blocked_body = axum::body::to_bytes(blocked.into_body(), 4096)
+            .await
+            .unwrap();
+        let blocked: RegisterIntentResponse = serde_json::from_slice(&blocked_body).unwrap();
+        assert_eq!(blocked.status, "blocked");
+        assert_eq!(blocked.conflicts.len(), 1);
+        let records = std::fs::read_to_string(state.coordination_events.path()).unwrap();
+        let blocked_event: crate::state::CoordinationEventEnvelope =
+            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert_eq!(blocked_event.outcome, "blocked");
+        assert_eq!(blocked_event.blocking_intent_ids.len(), 1);
 
         let traffic = app
             .clone()
@@ -13164,7 +13781,10 @@ mod tests {
                 SessionTransport::Mcp,
                 None,
                 state.layout.working_dir().to_path_buf(),
-                SessionCapabilities::default(),
+                SessionCapabilities {
+                    can_write: true,
+                    ..SessionCapabilities::default()
+                },
             )
             .unwrap()
     }
