@@ -481,6 +481,34 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_delta_load_preserves_cutoff_and_generation_order() {
+        let backend = test_backend();
+        let repo_id = "ordered-deltas";
+        {
+            let conn = backend.conn.lock();
+            for (generation, data) in [(3_i64, b"three".as_slice()), (1_i64, b"one".as_slice())] {
+                conn.execute(
+                    "INSERT INTO deltas (repo_id, generation, data) VALUES (?1, ?2, ?3)",
+                    params![repo_id, generation, data],
+                )
+                .unwrap();
+            }
+        }
+
+        let all = StorageBackend::load_deltas_since(&backend, repo_id, GENERATION_INIT).unwrap();
+        assert_eq!(all, vec![(b"one".to_vec(), 1), (b"three".to_vec(), 3)]);
+
+        let after_one = StorageBackend::load_deltas_since(&backend, repo_id, 1).unwrap();
+        assert_eq!(after_one, vec![(b"three".to_vec(), 3)]);
+
+        assert!(
+            StorageBackend::load_deltas_since(&backend, repo_id, Generation::MAX)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn sqlite_backend_overlay_roundtrip() {
         let backend = test_backend();
 
