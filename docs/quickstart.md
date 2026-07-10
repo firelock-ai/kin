@@ -58,9 +58,10 @@ On native Windows, use PowerShell:
 irm https://get.kinlab.dev/install.ps1 | iex
 ```
 
-The native Windows build is a **limited, vector-free convenience binary with no filesystem
-projection** — the installer prints this up front. For the complete, vector-enabled Kin
-with working projection, install under **WSL2** and follow the Linux path inside it. See
+The native Windows build is a **supported vector-free runtime** for graph, lexical, daemon,
+setup, and MCP workflows. Vector similarity and filesystem projection are unsupported, and
+the installer prints that boundary up front. For the complete vector-enabled/projection
+experience, install under **WSL2** and follow the Linux path inside it. See
 [windows-wsl2.md](./windows-wsl2.md).
 
 ### Installer options

@@ -57,15 +57,13 @@ jobs:
     name: Build (${{ matrix.artifact }})
     needs: config
     runs-on: ${{ matrix.os }}
-    # Windows is a work-in-progress release target while the vector-free
-    # dependency path is hardened. It must not block the macOS/Linux release:
-    # the experimental leg is non-blocking so Publish Release + npm still run.
-    continue-on-error: ${{ matrix.experimental || false }}
+    # Every advertised platform is release-blocking. A public release must not
+    # be created without one of the archives consumed by the installers.
     # macOS signing/notarization secrets are surfaced as env so they can be used
     # in step `if:` guards. The `secrets` context is NOT available in `if:`
     # conditions, so guarding on `env.MACOS_CERTIFICATE != ''` is the supported
-    # pattern. When the secrets are unset every signing step is skipped and the
-    # pipeline still builds, packages, and publishes the (unsigned) binaries.
+    # pattern. Tagged releases separately require every credential and fail
+    # closed; branch workflow-dispatch runs may still exercise unsigned builds.
     env:
       MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
       MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
@@ -99,7 +97,9 @@ jobs:
             artifact: kin-linux-aarch64
             shim_name: libkin_vfs_shim.so
             cross: false
-          - os: macos-latest
+          # Use an Intel host so this archive is executed before packaging;
+          # building x86_64 on an arm64 runner would leave it unproven.
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             artifact: kin-macos-x86_64
             shim_name: libkin_vfs_shim.dylib
@@ -114,7 +114,6 @@ jobs:
             artifact: kin-windows-x86_64
             shim_name: kin_vfs_shim.dll
             skip_vector: true
-            experimental: true
             cross: false
 
     steps:
@@ -144,6 +143,8 @@ jobs:
         with:
           repository: firelock-ai/kin-vfs
           path: kin-vfs
+          # Release inputs must never move under an unchanged Kin tag.
+          ref: 48c757dfda2ca6b115f32d86875c6adde587b861
 
       - name: Cache Cargo registry and build artifacts
         uses: actions/cache@v6
@@ -157,30 +158,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-
 
-      - name: Checkout kin-db (for Windows vector-free build)
-        if: ${{ matrix.skip_vector }}
-        uses: actions/checkout@v7
-        with:
-          repository: firelock-ai/kin-db
-          path: kin-db-local
-
-      - name: Patch kin-db to disable vector on Windows
-        if: ${{ matrix.skip_vector }}
+      - name: Assert clean release source
         shell: bash
         run: |
-          # 1. Remove vector feature from kin-db defaults
-          sed -i 's/^default = \["vector"\]/default = []/' kin-db-local/crates/kin-db/Cargo.toml
-          # 2. Remove features = ["vector"] from kin's dep on kin-db
-          sed -i 's/, features = \["vector"\]//' Cargo.toml
-          # 3. Point kin's dep to the patched local checkout
-          mkdir -p .cargo
-          cat >> .cargo/config.toml << 'TOML'
-          [patch."https://github.com/firelock-ai/kin-db.git"]
-          kin-db = { path = "kin-db-local/crates/kin-db" }
-          # kin-model is its own repo (no longer vendored under kin-db/crates) —
-          # it resolves from the main [patch.kin] git pin like every other
-          # platform; only kin-db needs the local vector-disabled override here.
-          TOML
+          set -euo pipefail
+          dirty="$(git status --porcelain --untracked-files=all)"
+          if [ -n "$dirty" ]; then
+            printf '%s\n' "$dirty" >&2
+            echo "::error::release checkout is not clean before compilation"
+            exit 1
+          fi
 
       - name: Build kin-cli + kin-daemon (native)
         if: ${{ !matrix.cross }}
@@ -193,14 +180,14 @@ jobs:
           # The daemon is the runtime: `kin init` works without it but
           # `kin status`/`kin search`/the MCP server all require kin-daemon on
           # PATH, so a clean public install must ship it alongside `kin`.
-          cargo build --release --target "$TARGET" -p kin-cli -p kin-daemon $FLAGS
+          cargo build --locked --release --target "$TARGET" -p kin-cli -p kin-daemon $FLAGS
         env:
           TARGET: ${{ matrix.target }}
           SKIP_VECTOR: ${{ matrix.skip_vector }}
 
       - name: Build kin-cli + kin-daemon (cross)
         if: ${{ matrix.cross }}
-        run: cross build --release --target "$TARGET" -p kin-cli -p kin-daemon
+        run: cross build --locked --release --target "$TARGET" -p kin-cli -p kin-daemon
         env:
           TARGET: ${{ matrix.target }}
 
@@ -213,8 +200,8 @@ jobs:
           # libc-specific: on Linux it builds against gnu (VFS_TARGET) so it can
           # preload into the host distro's glibc programs. macOS/Windows have no
           # vfs_target, so VFS_TARGET falls back to the core target there.
-          cargo build --release --target "$VFS_TARGET" -p kin-vfs-cli
-          cargo build --release --target "$VFS_TARGET" -p kin-vfs-shim
+          cargo build --locked --release --target "$VFS_TARGET" -p kin-vfs-cli
+          cargo build --locked --release --target "$VFS_TARGET" -p kin-vfs-shim
         env:
           VFS_TARGET: ${{ matrix.vfs_target || matrix.target }}
 
@@ -222,15 +209,113 @@ jobs:
         if: ${{ matrix.cross }}
         working-directory: kin-vfs
         run: |
-          cross build --release --target "$TARGET" -p kin-vfs-cli
-          cross build --release --target "$TARGET" -p kin-vfs-shim
+          cross build --locked --release --target "$TARGET" -p kin-vfs-cli
+          cross build --locked --release --target "$TARGET" -p kin-vfs-shim
         env:
           TARGET: ${{ matrix.target }}
 
+      - name: Verify native release build provenance
+        if: ${{ !matrix.cross }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          SKIP_VECTOR: ${{ matrix.skip_vector }}
+        run: |
+          set -euo pipefail
+          case "$RUNNER_ARCH:$TARGET" in
+            X64:x86_64-*|ARM64:aarch64-*) ;;
+            *)
+              echo "Skipping execution of cross-architecture artifact $TARGET on $RUNNER_ARCH; the matching macOS leg executes the same source and lock provenance."
+              exit 0
+              ;;
+          esac
+
+          suffix=""
+          [ "$RUNNER_OS" = "Windows" ] && suffix=".exe"
+          kin_bin="target/$TARGET/release/kin$suffix"
+          daemon_bin="target/$TARGET/release/kin-daemon$suffix"
+          provenance_dir="$RUNNER_TEMP/kin-release-provenance-$TARGET"
+          mkdir -p "$provenance_dir"
+          "$kin_bin" --version | tee "$provenance_dir/kin-version.txt"
+          "$daemon_bin" --version | tee "$provenance_dir/kin-daemon-version.txt"
+          "$kin_bin" bench-meta --json > "$provenance_dir/kin-build-meta.json"
+          expected_sha="$(git rev-parse HEAD)"
+
+          EXPECTED_SHA="$expected_sha" SKIP_VECTOR="$SKIP_VECTOR" PROVENANCE_DIR="$provenance_dir" node <<'NODE'
+          const fs = require("fs");
+          const expected = process.env.EXPECTED_SHA;
+          const dir = process.env.PROVENANCE_DIR;
+          const lines = ["kin-version.txt", "kin-daemon-version.txt"].map((path) =>
+            fs.readFileSync(`${dir}/${path}`, "utf8").trim()
+          );
+          const shas = lines.map((line) => {
+            const match = line.match(/\(([0-9a-f]{40})(-dirty)?\s/);
+            if (!match) throw new Error(`release version line lacks a full build SHA: ${line}`);
+            if (match[2]) throw new Error(`release binary was built dirty: ${line}`);
+            return match[1];
+          });
+          if (shas.some((sha) => sha !== expected) || shas[0] !== shas[1]) {
+            throw new Error(`release binary SHAs ${shas.join(", ")} do not match checkout ${expected}`);
+          }
+
+          const meta = JSON.parse(fs.readFileSync(`${dir}/kin-build-meta.json`, "utf8"));
+          if (process.env.GITHUB_REF_TYPE === "tag") {
+            const expectedVersion = process.env.GITHUB_REF_NAME.replace(/^v/, "");
+            if (meta.kin_version !== expectedVersion) {
+              throw new Error(`kin package version ${meta.kin_version ?? "missing"} does not match release tag ${expectedVersion}`);
+            }
+          }
+          if (meta.kin_commit !== expected || meta.kin_dirty !== false || meta.kin_source_known !== true) {
+            throw new Error("kin bench-meta did not prove a clean, known release source");
+          }
+          if (!/^[0-9a-f]{64}$/.test(meta.dependency_provenance ?? "")) {
+            throw new Error("kin bench-meta did not expose valid Cargo.lock provenance");
+          }
+          if (process.env.SKIP_VECTOR === "true") {
+            for (const feature of ["vector", "embeddings", "metal"]) {
+              if (meta.feature_flags.includes(feature)) {
+                throw new Error(`vector-free release unexpectedly enabled ${feature}`);
+              }
+            }
+          }
+          NODE
+
+      - name: Assert release build did not mutate source
+        shell: bash
+        run: |
+          set -euo pipefail
+          dirty="$(git status --porcelain --untracked-files=all)"
+          if [ -n "$dirty" ]; then
+            printf '%s\n' "$dirty" >&2
+            echo "::error::release build mutated the source checkout"
+            exit 1
+          fi
+
       # --- macOS code signing + notarization -------------------------------
-      # Runs only on the macOS legs, and only when signing secrets are present
-      # (see the job-level env block). Signing happens BEFORE packaging so the
-      # tarball + its published sha256 cover the signed binaries.
+      # Tag releases fail closed when signing/notarization credentials are not
+      # configured. A branch workflow_dispatch may still exercise unsigned
+      # build plumbing because the publish job is tag-only below.
+      - name: Require macOS release signing credentials
+        if: ${{ runner.os == 'macOS' && github.ref_type == 'tag' }}
+        run: |
+          set -euo pipefail
+          for name in MACOS_CERTIFICATE MACOS_CERTIFICATE_PWD MACOS_DEVELOPER_ID; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::$name is required for a tagged macOS release"
+              exit 1
+            fi
+          done
+          if [ "$NOTARIZE_ON_LINUX" != "true" ]; then
+            for name in APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+              if [ -z "${!name:-}" ]; then
+                echo "::error::$name is required for native macOS notarization"
+                exit 1
+              fi
+            done
+          fi
+
+      # Signing happens BEFORE packaging so the tarball + its published
+      # sha256 cover the signed binaries.
       - name: Import code signing certificate (macOS)
         if: ${{ runner.os == 'macOS' && env.MACOS_CERTIFICATE != '' }}
         run: |
@@ -254,11 +339,10 @@ jobs:
             "target/${TARGET}/release/kin-daemon" \
             "kin-vfs/target/${TARGET}/release/kin-vfs" \
             "kin-vfs/target/${TARGET}/release/${SHIM_NAME}"; do
-            if [ -f "$f" ]; then
-              codesign --force --options runtime --timestamp \
-                --sign "$MACOS_DEVELOPER_ID" "$f"
-              codesign --verify --strict --verbose=2 "$f"
-            fi
+            test -f "$f"
+            codesign --force --options runtime --timestamp \
+              --sign "$MACOS_DEVELOPER_ID" "$f"
+            codesign --verify --strict --verbose=2 "$f"
           done
         env:
           TARGET: ${{ matrix.target }}
@@ -271,7 +355,7 @@ jobs:
       # tool submits the zip. Built once here and reused by whichever backend
       # notarizes (macOS notarytool inline, or rcodesign on the Linux job).
       - name: Stage signed binaries for notarization (macOS)
-        if: ${{ runner.os == 'macOS' && env.MACOS_CERTIFICATE != '' && env.APPLE_ID != '' }}
+        if: ${{ runner.os == 'macOS' && env.MACOS_CERTIFICATE != '' && (env.NOTARIZE_ON_LINUX == 'true' || env.APPLE_ID != '') }}
         run: |
           NOTARIZE_ZIP="${ARTIFACT}-notarize.zip"
           FILES=()
@@ -311,7 +395,7 @@ jobs:
       # submits it to Apple Notary via rcodesign on a (10x cheaper) Linux runner.
       # The zip is short-lived job-internal plumbing, not a published artifact.
       - name: Upload signed binaries for Linux notarization
-        if: ${{ runner.os == 'macOS' && env.MACOS_CERTIFICATE != '' && env.APPLE_ID != '' && env.NOTARIZE_ON_LINUX == 'true' }}
+        if: ${{ runner.os == 'macOS' && env.MACOS_CERTIFICATE != '' && env.NOTARIZE_ON_LINUX == 'true' }}
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}-notarize-zip
@@ -330,15 +414,16 @@ jobs:
           cp "target/${TARGET}/release/kin-daemon" "$ARTIFACT/"
           # kin-vfs (cli + shim) is built under VFS_TARGET, which on Linux is the
           # gnu triple (the shim is libc-specific) and elsewhere equals TARGET.
-          cp "kin-vfs/target/${VFS_TARGET}/release/kin-vfs" "$ARTIFACT/" 2>/dev/null || true
-          cp "kin-vfs/target/${VFS_TARGET}/release/${SHIM_NAME}" "$ARTIFACT/" 2>/dev/null || true
+          cp "kin-vfs/target/${VFS_TARGET}/release/kin-vfs" "$ARTIFACT/"
+          cp "kin-vfs/target/${VFS_TARGET}/release/${SHIM_NAME}" "$ARTIFACT/"
           tar czf "${ARTIFACT}.tar.gz" "$ARTIFACT"
-          # Assert the published archive actually contains kin-daemon so
-          # a daemon-less build can never be released green.
-          if ! tar tzf "${ARTIFACT}.tar.gz" | grep -q "/kin-daemon$"; then
-            echo "::error::kin-daemon missing from ${ARTIFACT}.tar.gz — refusing to publish a daemon-less archive"
-            exit 1
-          fi
+          # All supported Unix surfaces are mandatory release contents.
+          for required in kin kin-daemon kin-vfs "$SHIM_NAME"; do
+            if ! tar tzf "${ARTIFACT}.tar.gz" | grep -q "/${required}$"; then
+              echo "::error::$required missing from ${ARTIFACT}.tar.gz"
+              exit 1
+            fi
+          done
           shasum -a 256 "${ARTIFACT}.tar.gz" > "${ARTIFACT}.tar.gz.sha256"
         env:
           TARGET: ${{ matrix.target }}
@@ -403,6 +488,16 @@ jobs:
       RCODESIGN_VERSION: "0.29.0"
       RCODESIGN_SHA256: "dbe85cedd8ee4217b64e9a0e4c2aef92ab8bcaaa41f20bde99781ff02e600002"
     steps:
+      - name: Require App Store Connect API credentials
+        run: |
+          set -euo pipefail
+          for name in APPLE_API_ISSUER_ID APPLE_API_KEY_ID APPLE_API_PRIVATE_KEY; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::$name is required when Linux notarization is selected"
+              exit 1
+            fi
+          done
+
       - name: Download signed notarization zips
         uses: actions/download-artifact@v8
         with:
@@ -420,7 +515,6 @@ jobs:
           rcodesign --version
 
       - name: Notarize signed binaries via rcodesign
-        if: ${{ env.APPLE_API_ISSUER_ID != '' && env.APPLE_API_KEY_ID != '' && env.APPLE_API_PRIVATE_KEY != '' }}
         run: |
           # Reconstruct the App Store Connect API .p8 and fold it (with the
           # issuer + key id) into the single unified key JSON rcodesign expects.
@@ -465,7 +559,7 @@ jobs:
     # must still run then, but must NOT run if notarization actually failed or
     # was cancelled. `always() && !failure() && !cancelled()` lets a skipped
     # dependency through while still gating on a real Linux-notarize failure.
-    if: ${{ always() && !failure() && !cancelled() }}
+    if: ${{ always() && !failure() && !cancelled() && github.ref_type == 'tag' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -495,12 +589,34 @@ jobs:
             cat "$f" >> checksums-sha256.txt
           done
 
+      - name: Verify complete release asset inventory
+        run: |
+          set -euo pipefail
+          assets=(
+            kin-linux-x86_64.tar.gz
+            kin-linux-aarch64.tar.gz
+            kin-macos-x86_64.tar.gz
+            kin-macos-aarch64.tar.gz
+            kin-windows-x86_64.zip
+          )
+          for asset in "${assets[@]}"; do
+            test -s "$asset"
+            test -s "$asset.sha256"
+            sha256sum -c "$asset.sha256"
+          done
+          test -s checksums-sha256.txt
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           body_path: ./release-notes.md
           generate_release_notes: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          # Every tag starts non-latest so anonymous installation can exercise
+          # the public assets without exposing an unproven stable release as
+          # /releases/latest. Stable tags are promoted only after install_proof.
+          prerelease: true
+          make_latest: false
+          fail_on_unmatched_files: true
           files: |
             kin-linux-x86_64.tar.gz
             kin-linux-x86_64.tar.gz.sha256
@@ -514,13 +630,54 @@ jobs:
             kin-windows-x86_64.zip.sha256
             checksums-sha256.txt
 
+  # Releases created with GITHUB_TOKEN do not emit a second workflow run.
+  # Invoke the reusable anonymous install proof directly after assets are public.
+  install_proof:
+    name: Public Install Proof
+    needs: publish
+    uses: ./.github/workflows/install-proof.yml
+    with:
+      release_tag: ${{ github.ref_name }}
+    permissions:
+      contents: read
+
+  finalize_release:
+    name: Promote Proven Release
+    needs: [publish, install_proof]
+    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Promote stable tag after public proof
+        if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --prerelease=false --latest
+
+      - name: Verify final release channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          actual="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq '.prerelease')"
+          expected=true
+          case "$GITHUB_REF_NAME" in
+            *-*) ;;
+            *) expected=false ;;
+          esac
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::release prerelease=$actual, expected $expected after proof"
+            exit 1
+          fi
+
   publish_npm:
     name: Publish npm Wrapper
-    needs: publish
+    needs: [publish, install_proof, finalize_release]
     # publish uses always() to survive a skipped notarize_linux (the default
     # macOS-notarytool path); mirror that guard here or GitHub transitively skips
     # this job whenever notarize_linux is skipped.
-    if: ${{ always() && !failure() && !cancelled() }}
+    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     # Trusted Publishing (OIDC): npm authenticates this workflow via a short-lived
     # OIDC token instead of a long-lived NPM_TOKEN secret — no token to leak or
@@ -591,12 +748,12 @@ jobs:
 
   publish_npm_canonical:
     name: Publish npm Canonical Package (@kinlab/kin)
-    needs: publish
+    needs: [publish, install_proof, finalize_release]
     # Runs parallel to publish_npm (independent packages: a kin-mcp registry
     # failure must not block the canonical package, and vice versa). Mirror
     # publish's always() guard so a skipped notarize_linux does not
     # transitively skip this job.
-    if: ${{ always() && !failure() && !cancelled() }}
+    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     # Trusted Publishing (OIDC), same as publish_npm. Requires a Trusted
     # Publisher configured on npm for @kinlab/kin pointing at firelock-ai/kin +
@@ -670,10 +827,10 @@ jobs:
 
   publish_boundary_contracts:
     name: Publish boundary contracts to KinLab
-    needs: publish
+    needs: [publish, install_proof, finalize_release]
     # Mirror publish's always() guard so a skipped notarize_linux does not
     # transitively skip this job.
-    if: ${{ always() && !failure() && !cancelled() }}
+    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -712,10 +869,10 @@ jobs:
 
   bump_homebrew:
     name: Trigger & verify Homebrew formula bump
-    needs: publish
+    needs: [publish, install_proof, finalize_release]
     # Mirror publish's always() guard so a skipped notarize_linux does not
     # transitively skip this job.
-    if: ${{ always() && !failure() && !cancelled() }}
+    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -772,7 +929,7 @@ jobs:
   # other release surfaces here.
   version_tag_image:
     name: Version-tag ghcr image
-    needs: publish
+    needs: [publish, install_proof, finalize_release]
     # Mirror publish's always() guard so a skipped notarize_linux does not
     # transitively skip this job, and only tag real version-tag pushes (not a
     # workflow_dispatch on a branch) so `:<version>` never points at an

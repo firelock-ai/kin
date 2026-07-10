@@ -9,7 +9,18 @@
 name: Install Proof
 
 on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Exact public release tag to install and verify.
+        required: true
+        type: string
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Optional exact release tag; blank verifies the latest public release.
+        required: false
+        type: string
   release:
     types: [published]
   schedule:
@@ -30,7 +41,11 @@ jobs:
         include:
           - os: ubuntu-latest
             setup-shell: bash
+          - os: ubuntu-24.04-arm
+            setup-shell: bash
           - os: macos-latest
+            setup-shell: zsh
+          - os: macos-15-intel
             setup-shell: zsh
           - os: windows-latest
             setup-shell: powershell
@@ -38,7 +53,7 @@ jobs:
       - name: Public install (Unix)
         if: runner.os != 'Windows'
         env:
-          RELEASE_EVENT_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_EVENT_TAG: ${{ inputs.release_tag || github.event.release.tag_name || '' }}
         run: |
           set -eu
           if [ -n "$RELEASE_EVENT_TAG" ]; then
@@ -56,7 +71,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          RELEASE_EVENT_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_EVENT_TAG: ${{ inputs.release_tag || github.event.release.tag_name || '' }}
         run: |
           $ErrorActionPreference = "Stop"
           if ($env:RELEASE_EVENT_TAG) {
@@ -69,11 +84,13 @@ jobs:
       - name: Verify binaries installed + runnable
         shell: bash
         env:
-          RELEASE_EVENT_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_EVENT_TAG: ${{ inputs.release_tag || github.event.release.tag_name || '' }}
         run: |
           set -euo pipefail
-          kin --version | tee kin-version.txt
-          kin-daemon --version | tee kin-daemon-version.txt
+          kin_version_line="$(kin --version)"
+          daemon_version_line="$(kin-daemon --version)"
+          printf '%s\n' "$kin_version_line" | tee kin-version.txt
+          printf '%s\n' "$daemon_version_line" | tee kin-daemon-version.txt
 
           expected_tag="$RELEASE_EVENT_TAG"
           if [ -z "$expected_tag" ]; then
@@ -89,8 +106,19 @@ jobs:
             *) echo "could not resolve a version tag from '$expected_tag'" >&2; exit 1 ;;
           esac
 
-          installed_version="$(kin --version | awk '{print $2}')"
-          installed_daemon_version="$(kin-daemon --version | awk '{print $2}')"
+          tag_refs="$(git ls-remote --tags https://github.com/firelock-ai/kin.git \
+            "refs/tags/$expected_tag" "refs/tags/$expected_tag^{}")"
+          expected_commit="$(printf '%s\n' "$tag_refs" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
+          if [ -z "$expected_commit" ]; then
+            expected_commit="$(printf '%s\n' "$tag_refs" | awk 'NR == 1 {print $1}')"
+          fi
+          if ! printf '%s\n' "$expected_commit" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "could not resolve the 40-hex commit for $expected_tag" >&2
+            exit 1
+          fi
+
+          installed_version="$(printf '%s\n' "$kin_version_line" | awk '{print $2}')"
+          installed_daemon_version="$(printf '%s\n' "$daemon_version_line" | awk '{print $2}')"
           expected_version="${expected_tag#v}"
           if [ "$installed_version" != "$expected_version" ]; then
             echo "installed kin $installed_version, expected latest release $expected_version" >&2
@@ -101,6 +129,7 @@ jobs:
             exit 1
           fi
           printf '%s\n' "$expected_version" > expected-version.txt
+          printf '%s\n' "$expected_commit" > expected-commit.txt
 
       - name: First-run repository, daemon, and setup proof
         shell: bash
@@ -131,6 +160,8 @@ jobs:
           # the shell wait for the daemon and then tests a process that just exited.
           kin status > kin-status.txt 2>&1
           cat kin-status.txt
+          kin status --json > kin-status.json 2>&1
+          cat kin-status.json
           kin setup --no-interactive --intent local --shell "$PROOF_SHELL" \
             2>&1 | tee kin-setup.txt
           kin setup status --json | tee kin-health.json
@@ -139,6 +170,52 @@ jobs:
           node <<'NODE'
           const fs = require("fs");
           const runnerOs = process.env.RUNNER_OS;
+          const expectedCommit = fs.readFileSync("../expected-commit.txt", "utf8").trim();
+          const status = JSON.parse(fs.readFileSync("kin-status.json", "utf8"));
+          const build = status.build;
+          if (!build) {
+            throw new Error("kin-status.json: build provenance is missing");
+          }
+          const fullSha = /^[0-9a-f]{40}$/;
+          const lockSha = /^[0-9a-f]{64}$/;
+          for (const side of ["cli", "daemon"]) {
+            const sha = build[`${side}_sha`];
+            const dirty = build[`${side}_dirty`];
+            const sourceKnown = build[`${side}_source_known`];
+            const provenance = build[`${side}_dependency_provenance`];
+            if (!fullSha.test(sha ?? "")) {
+              throw new Error(`${side} build SHA is not a full 40-hex commit: ${sha ?? "missing"}`);
+            }
+            if (sha !== expectedCommit) {
+              throw new Error(`${side} build SHA ${sha} does not match release tag ${expectedCommit}`);
+            }
+            if (dirty !== false) {
+              throw new Error(`${side} release binary is dirty or did not report a clean build`);
+            }
+            if (sourceKnown !== true) {
+              throw new Error(`${side} release binary did not prove source_known=true`);
+            }
+            if (!lockSha.test(provenance ?? "")) {
+              throw new Error(`${side} Cargo.lock provenance is missing or malformed`);
+            }
+          }
+          if (build.cli_dependency_provenance !== build.daemon_dependency_provenance) {
+            throw new Error("CLI and daemon were built from different Cargo.lock provenance");
+          }
+          const semanticCoverage = status.semantic_coverage;
+          if (!semanticCoverage) {
+            throw new Error("kin-status.json: semantic_coverage is missing");
+          }
+          if (runnerOs === "Windows") {
+            if (semanticCoverage.supported !== false || semanticCoverage.complete !== false) {
+              throw new Error("Windows vector-free status must report semantic coverage as unsupported and incomplete");
+            }
+            if ((semanticCoverage.note ?? "").includes("kin embed")) {
+              throw new Error("Windows vector-free status offers impossible kin embed remediation");
+            }
+          } else if (semanticCoverage.supported !== true) {
+            throw new Error(`${runnerOs} release unexpectedly lacks semantic vector support`);
+          }
           const reports = ["kin-health.json", "kin-doctor.json"].map((path) => [
             path,
             JSON.parse(fs.readFileSync(path, "utf8")),
@@ -164,6 +241,14 @@ jobs:
                 throw new Error(`${path}: ${id} is ${actual ?? "missing"}, expected ${expected}`);
               }
             }
+            const semanticReadiness = checks.get("semantic_query_readiness")?.status;
+            if (runnerOs === "Windows") {
+              if (semanticReadiness !== "unsupported") {
+                throw new Error(`${path}: semantic_query_readiness is ${semanticReadiness ?? "missing"}, expected unsupported`);
+              }
+            } else if (!["healthy", "stale"].includes(semanticReadiness)) {
+              throw new Error(`${path}: semantic_query_readiness is ${semanticReadiness ?? "missing"}, expected healthy or stale`);
+            }
             const hardFailures = report.checks.filter((check) =>
               check.status === "missing" || check.status === "misconfigured"
             );
@@ -184,6 +269,7 @@ jobs:
             kin-version.txt
             kin-daemon-version.txt
             expected-version.txt
+            expected-commit.txt
             latest-release-url.txt
             kin-install-proof/*.txt
             kin-install-proof/*.json

@@ -63,8 +63,9 @@ curl -fsSL https://get.kinlab.dev/install | sh
 ```
 
 On **Windows**, use PowerShell (`irm https://get.kinlab.dev/install.ps1 | iex`). The native
-Windows build is a limited, vector-free convenience binary with no filesystem projection. For
-the complete, vector-enabled Kin, install under WSL2 — see
+Windows build is a supported vector-free runtime for graph, lexical, daemon, setup, and MCP
+workflows, with vector similarity and filesystem projection explicitly unsupported. For the
+complete vector-enabled/projection experience, install under WSL2 — see
 [docs/windows-wsl2.md](docs/windows-wsl2.md).
 
 **For AI agents.** `kin setup --intent agent` wires Kin's built-in MCP server into every
@@ -184,7 +185,7 @@ Kin is **0.2.x** — pre-1.0 and under active development. Expect rough edges an
 changes between releases. Being precise about what is and isn't ready today:
 
 - **Install surface.** Native binaries ship on GitHub Releases and via the install script; the canonical `@kinlab/kin` npm package (`npm i -g @kinlab/kin`, or `npx -y @kinlab/kin`) provisions the same managed `kin` + `kin-daemon` release for npm-based workflows. `@kinlab/kin-mcp` remains published as a compatibility wrapper.
-- **Windows.** The native Windows binary is a limited, vector-free build with no filesystem projection. Use WSL2 for the complete experience.
+- **Windows.** The native Windows binary is a supported vector-free build for graph, lexical, daemon, setup, and MCP workflows; vector similarity and filesystem projection are unsupported. Use WSL2 for the complete experience.
 - **Semantic search.** `kin init` builds the graph without embeddings; run `kin embed` to enable vector search. Until then, `locate`/`search` run on lexical + graph signals and say so.
 - **Hosted KinLab.** Connecting a repo to hosted KinLab is coming soon; it is not yet a first-run flow.
 - **Graph-first, with transitional compatibility.** The graph is the authority for Kin's own commands. File-first and Git-interop paths are supported as a migration boundary, not the long-term model.

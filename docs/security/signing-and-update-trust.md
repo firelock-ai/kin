@@ -30,9 +30,17 @@ A convenience `checksums-sha256.txt` aggregating every per-artifact file is also
 attached to the release, but the installer verifies against the per-artifact
 `.sha256` file, not the aggregate.
 
-The Windows leg is marked experimental (`continue-on-error`) while its
-vector-free dependency path is hardened, so it must not be treated as a fully
-supported, signed target.
+The Windows archive is a release-blocking target. It ships the supported
+vector-free runtime: graph, lexical, daemon, setup, and MCP surfaces are present,
+while vector similarity and local embedding are reported explicitly as
+unsupported. Windows VFS projection is also not shipped. The archive is
+checksum-protected but is not OS-code-signed by this pipeline.
+
+Every tag is first published as a non-latest prerelease. The anonymous install
+proof installs all five archives (Linux x86_64/aarch64, macOS x86_64/aarch64,
+and Windows x86_64), verifies exact tag/commit/lock provenance, and exercises a
+fresh repository plus daemon/setup health. A stable tag is promoted to the
+Latest release only after all five legs pass.
 
 ## Two Independent Integrity Layers
 
@@ -76,11 +84,10 @@ codesign --verify --strict --verbose=2 "$f"
   binary under a signed-looking name.
 
 The signing secrets are surfaced as job-level environment so steps can guard on
-`env.MACOS_CERTIFICATE != ''`. When those secrets are **absent**, every signing
-and notarization step is skipped and the pipeline still builds, packages, and
-publishes the (then-unsigned) binaries. A reviewer therefore cannot infer from
-the presence of a release alone that a given build was signed; signing is gated
-on the secrets being configured for that run.
+`env.MACOS_CERTIFICATE != ''`. Tagged releases require the certificate,
+password, and Developer ID and fail before packaging when any is absent. A
+manual branch workflow may exercise unsigned build plumbing, but the publish job
+is tag-only, so that path cannot create a public release.
 
 ### 2. Apple notarization
 
@@ -99,8 +106,9 @@ Notarization uploads the signed binaries to Apple, which scans them and, on
 success, issues a notarization ticket bound to the binaries' code-signing
 identity. The `--wait` makes the job block on the result (capped at 30 minutes so
 a stalled Apple queue fails fast rather than burning the runner), and a
-notarization rejection fails the job. This step runs only when both the signing
-certificate and `APPLE_ID` secrets are present.
+notarization rejection fails the job. Tagged releases require either the native
+Apple ID credential set or the explicitly selected Linux rcodesign credential
+set; missing credentials fail the release.
 
 ### 3. Online ticket validation (no stapling)
 
@@ -173,10 +181,10 @@ spctl --assess --type execute --verbose ./kin
   compromise of the release pipeline or its secrets could produce a validly
   signed malicious build. This is the standard trust assumption for
   CI-signed releases.
-- **Unsigned-but-published builds are possible.** Because every signing step is
-  guarded on the secrets being present, a run without those secrets publishes
-  unsigned binaries. Verify the macOS signature/notarization (above) rather than
-  assuming a release is signed.
+- **Tagged macOS publication is fail-closed.** Missing signing or notarization
+  credentials fail the tagged workflow, and publication cannot proceed. Manual
+  branch workflows may build unsigned binaries for diagnostics but cannot
+  publish a GitHub release.
 - **Linux/Windows have one integrity layer.** They are protected by the SHA-256
   checksum and the release host, not by an OS code signature from this pipeline.
   The checksum protects integrity (tamper-evidence) but not authorship
