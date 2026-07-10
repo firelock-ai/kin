@@ -41,6 +41,27 @@ pub const SHADOW_GATE_REPORT_SCHEMA_VERSION: u32 = 1;
 /// Enforcement label carried by every shadow report.
 pub const SHADOW_ENFORCEMENT_REPORT_ONLY: &str = "report_only";
 
+/// In-range committed-change count above which an empty blast radius is
+/// attributed to a deep-history substrate-fidelity ceiling rather than treated
+/// as proven isolation.
+///
+/// A review whose base..head range spans this many committed changes reaches
+/// far enough back that the persisted graph substrate it reads at the head ref
+/// — replayed faithfully, but built long ago — drifts further from what a live
+/// re-index would produce than a nearby range does (FIR-1267): the deeper the
+/// range, the more the persisted relation closure and entity roles diverge.
+/// When such a range ALSO
+/// yields an empty blast radius, that emptiness is more plausibly a ceiling of
+/// the historical substrate than evidence the change is genuinely isolated, so
+/// the report attributes it explicitly (a non-demoting `deep_history_impact_ceiling`
+/// gap) instead of leaving it folded into the generic `impact_signal_absent`.
+///
+/// This threshold is a RANGE-DEPTH PROXY, not a measurement of reconstruction:
+/// it gates only whether the attribution gap is emitted. The raw in-range
+/// change count is always stamped on the report (`range_depth.in_range_changes`)
+/// so downstream scoring can apply its own policy to the exact number.
+pub const DEEP_HISTORY_IMPACT_CEILING_THRESHOLD: usize = 1000;
+
 /// Inputs for one shadow gate evaluation.
 #[derive(Debug, Clone)]
 pub struct ShadowRequest {
@@ -213,8 +234,8 @@ pub struct ShadowRepairItem {
 pub struct ShadowEvidenceGap {
     /// "artifact_only_change" | "entity_inert_change" | "missing_span"
     /// | "actor_attribution_unavailable" | "impact_signal_absent"
-    /// | "cross_repo_not_evaluated" | "ref_state_unavailable"
-    /// | "base_not_on_head_ancestry"
+    /// | "deep_history_impact_ceiling" | "cross_repo_not_evaluated"
+    /// | "ref_state_unavailable" | "base_not_on_head_ancestry"
     pub kind: String,
     pub subject: String,
     pub detail: String,
@@ -251,6 +272,29 @@ pub struct ShadowAuditEvidence {
     pub head_approvals: Vec<ShadowApproval>,
 }
 
+/// Provenance for how deep the reviewed `base..head` range reaches, stamped on
+/// every report so downstream scoring can attribute an accepted historical-
+/// substrate ceiling (FIR-1267) instead of scoring a deep-history row as clean.
+///
+/// The raw count is ALWAYS present and independent of any threshold; the
+/// threshold gates only the non-demoting `deep_history_impact_ceiling` evidence
+/// gap, never this data. A scorer may read `in_range_changes` and apply its own
+/// policy, or trust `is_deep_history` for the report's own default policy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShadowRangeDepth {
+    /// Count of committed semantic changes in the reviewed `base..head` range
+    /// (the same range the audit records as `changes_in_range`).
+    pub in_range_changes: usize,
+    /// The documented threshold this report used to decide `is_deep_history`.
+    pub deep_history_threshold: usize,
+    /// `in_range_changes > deep_history_threshold`. When this is true AND the
+    /// blast radius is empty, the report carries a non-demoting
+    /// `deep_history_impact_ceiling` gap attributing the empty impact to a
+    /// range-depth proxy for historical-substrate fidelity rather than to
+    /// proven isolation.
+    pub is_deep_history: bool,
+}
+
 /// The complete shadow-mode merge-gate report.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShadowGateReport {
@@ -264,6 +308,11 @@ pub struct ShadowGateReport {
     pub repair_context: Vec<ShadowRepairItem>,
     pub evidence_gaps: Vec<ShadowEvidenceGap>,
     pub audit: ShadowAuditEvidence,
+    /// Range-depth provenance (see [`ShadowRangeDepth`]). Additive and
+    /// `serde(default)` so a report serialized before this field existed still
+    /// deserializes.
+    #[serde(default)]
+    pub range_depth: ShadowRangeDepth,
 }
 
 /// Build a shadow-mode merge-gate report for a resolved base..head range.
@@ -535,6 +584,17 @@ fn assemble_report_with_changes<G: GraphStore>(
     let repair_context = collect_repair_context(&policy.findings, &review);
     let audit = collect_audit_evidence(store, request, &review, changes.len())?;
 
+    // Range-depth provenance is stamped on every report from the same in-range
+    // change count the audit records. Always present and threshold-independent;
+    // the threshold decides only `is_deep_history` (and thus whether the
+    // non-demoting `deep_history_impact_ceiling` gap fires in
+    // `collect_evidence_gaps`), never whether the raw count is reported.
+    let range_depth = ShadowRangeDepth {
+        in_range_changes: changes.len(),
+        deep_history_threshold: DEEP_HISTORY_IMPACT_CEILING_THRESHOLD,
+        is_deep_history: changes.len() > DEEP_HISTORY_IMPACT_CEILING_THRESHOLD,
+    };
+
     Ok(ShadowGateReport {
         schema_version: SHADOW_GATE_REPORT_SCHEMA_VERSION,
         mode: "shadow".to_string(),
@@ -553,6 +613,7 @@ fn assemble_report_with_changes<G: GraphStore>(
         repair_context,
         evidence_gaps,
         audit,
+        range_depth,
     })
 }
 
@@ -803,6 +864,11 @@ fn is_blocking(kind: InlineCommentKind) -> bool {
 ///   itself remains the honest record of the deficit, and the coverage-gap
 ///   channel is suppressed on the same condition so the empty channel is
 ///   never double-counted.
+/// - `deep_history_impact_ceiling` is reported but never demotes: it is a
+///   range-depth PROXY attributing an empty blast radius on a deep range to a
+///   historical-substrate ceiling (FIR-1267). Absence of evidence is not
+///   evidence of risk, so it makes the ceiling attributable without changing
+///   the verdict.
 /// - Structural v1 limits (cross-repo not evaluated, attribution
 ///   unavailable) are constant framing, reported but never demoting.
 fn gap_blocks_pass(gap: &ShadowEvidenceGap) -> bool {
@@ -1457,6 +1523,34 @@ fn collect_evidence_gaps<G: GraphStore>(
                      repository before treating the empty blast radius as proof of isolation"
                 .to_string(),
         });
+
+        // A deep base..head range reaches far enough back that the persisted
+        // graph substrate the review replays at head drifts further from a live
+        // re-index than a nearby range does (FIR-1267). When such a range ALSO
+        // yields an empty blast radius (the condition above), attribute that
+        // emptiness explicitly to the range-depth ceiling instead of leaving it
+        // folded into the generic impact_signal_absent gap. This is a
+        // RANGE-DEPTH PROXY, not a measurement of reconstruction, and it is
+        // NON-DEMOTING (`gap_blocks_pass` returns false for this kind): it never
+        // changes the verdict, only makes the ceiling attributable to scoring.
+        // The raw range depth is stamped on the report regardless (`range_depth`).
+        if changes.len() > DEEP_HISTORY_IMPACT_CEILING_THRESHOLD {
+            gaps.push(ShadowEvidenceGap {
+                kind: "deep_history_impact_ceiling".to_string(),
+                subject: "blast_radius".to_string(),
+                detail: format!(
+                    "reviewed range spans {} committed changes (over the {} deep-history \
+                     threshold). This is a RANGE-DEPTH PROXY for historical-substrate fidelity \
+                     (FIR-1267): across a range this deep the graph state materialized at the \
+                     head ref is a less faithful representation than a live re-index, so an empty \
+                     blast radius is more plausibly a substrate ceiling than proof the change is \
+                     isolated. Reported as an accepted ceiling and NON-DEMOTING; the raw range \
+                     depth is stamped on the report for scoring",
+                    changes.len(),
+                    DEEP_HISTORY_IMPACT_CEILING_THRESHOLD
+                ),
+            });
+        }
     }
 
     // Actor attribution requires recorded audit events; absence is a gap, not
@@ -2217,6 +2311,180 @@ mod tests {
             &[],
         );
         assert_eq!(policy.verdict, ShadowGateVerdict::Pass);
+    }
+
+    fn low_risk() -> kin_model::review::RiskSummary {
+        kin_model::review::RiskSummary {
+            overall_risk: kin_model::review::RiskLevel::Low,
+            breaking_changes: vec![],
+            test_coverage_gaps: vec![],
+            contract_violations: vec![],
+            work_risks: vec![],
+            notes: vec![],
+        }
+    }
+
+    fn review_with_impact(impact: ImpactReport) -> Review {
+        Review {
+            base: None,
+            head: None,
+            diff: SemanticDiff::default(),
+            impact,
+            risk: low_risk(),
+            inline_comments: vec![],
+        }
+    }
+
+    // A range of `n` committed changes. Ids may repeat: only the count feeds the
+    // deep-history gate, and the changes carry no artifact deltas so they add no
+    // other gaps.
+    fn range_of(n: usize) -> Vec<SemanticChange> {
+        (0..n)
+            .map(|i| change_with_deltas(change_id((i % 251) as u8), vec![], vec![], vec![], vec![]))
+            .collect()
+    }
+
+    fn one_changed_entity() -> Vec<ShadowChangedEntity> {
+        vec![ShadowChangedEntity {
+            entity_id: "e1".to_string(),
+            name: "foo".to_string(),
+            kind: "Function".to_string(),
+            change: "modified".to_string(),
+            file: Some("src/lib.rs".to_string()),
+            start_line: Some(1),
+            end_line: Some(2),
+            signature_changed: false,
+            visibility_changed: false,
+            role: EntityRole::Source,
+        }]
+    }
+
+    #[test]
+    fn deep_history_impact_ceiling_gap_fires_only_on_deep_empty_range() {
+        let changed = one_changed_entity();
+        let has_ceiling = |gaps: &[ShadowEvidenceGap]| {
+            gaps.iter().any(|g| g.kind == "deep_history_impact_ceiling")
+        };
+
+        // Deep range + empty blast radius + changed entities -> ceiling attributed,
+        // riding ALONGSIDE the generic empty-impact gap (never replacing it, so
+        // the existing relation_channel_absent gate logic is untouched).
+        let deep = range_of(DEEP_HISTORY_IMPACT_CEILING_THRESHOLD + 1);
+        let (gaps, _) = collect_evidence_gaps::<InMemoryGraph>(
+            &review_with_impact(ImpactReport::default()),
+            &deep,
+            &changed,
+            None,
+            None,
+        );
+        assert!(
+            has_ceiling(&gaps),
+            "a deep range with an empty blast radius must attribute the ceiling"
+        );
+        assert!(gaps.iter().any(|g| g.kind == "impact_signal_absent"));
+
+        // A range AT the threshold (not over it) attributes no ceiling.
+        let shallow = range_of(DEEP_HISTORY_IMPACT_CEILING_THRESHOLD);
+        let (gaps, _) = collect_evidence_gaps::<InMemoryGraph>(
+            &review_with_impact(ImpactReport::default()),
+            &shallow,
+            &changed,
+            None,
+            None,
+        );
+        assert!(
+            !has_ceiling(&gaps),
+            "a range at the threshold must not attribute a ceiling"
+        );
+        assert!(gaps.iter().any(|g| g.kind == "impact_signal_absent"));
+
+        // Deep range but a NON-empty blast radius: impact was proven, so there is
+        // nothing to attribute to a substrate ceiling.
+        let mut nonempty = ImpactReport::default();
+        nonempty.affected_callers = vec![entity_with_span(
+            "consumer",
+            "src/c.rs",
+            1,
+            EntityRole::Source,
+        )];
+        let (gaps, _) = collect_evidence_gaps::<InMemoryGraph>(
+            &review_with_impact(nonempty),
+            &deep,
+            &changed,
+            None,
+            None,
+        );
+        assert!(
+            !has_ceiling(&gaps),
+            "a non-empty blast radius must not attribute a ceiling"
+        );
+    }
+
+    #[test]
+    fn deep_history_impact_ceiling_gap_is_non_demoting() {
+        let ceiling = ShadowEvidenceGap {
+            kind: "deep_history_impact_ceiling".to_string(),
+            subject: "blast_radius".to_string(),
+            detail: "range-depth proxy".to_string(),
+        };
+        // The gate never fails to certify a pass over an accepted ceiling.
+        assert!(!gap_blocks_pass(&ceiling));
+
+        // And it leaves the verdict a would-be pass produces exactly as it was.
+        let review = review_with_impact(ImpactReport::default());
+        let baseline = derive_policy(&review, &[], &[]);
+        let with_ceiling = derive_policy(&review, std::slice::from_ref(&ceiling), &[]);
+        assert_eq!(baseline.verdict, ShadowGateVerdict::Pass);
+        assert_eq!(
+            with_ceiling.verdict, baseline.verdict,
+            "the ceiling attribution must not change the verdict"
+        );
+    }
+
+    #[test]
+    fn report_stamps_range_depth_and_round_trips() {
+        let (graph, base_id, head_id) = signature_change_graph();
+        let report = build_shadow_report(&graph, &request(base_id, head_id)).unwrap();
+
+        // T1b: the raw in-range count is always stamped, mirrors the audit
+        // count, and records the threshold used. This fixture's range is shallow.
+        assert_eq!(
+            report.range_depth.in_range_changes,
+            report.audit.changes_in_range
+        );
+        assert_eq!(
+            report.range_depth.deep_history_threshold,
+            DEEP_HISTORY_IMPACT_CEILING_THRESHOLD
+        );
+        assert!(!report.range_depth.is_deep_history);
+        assert!(report
+            .evidence_gaps
+            .iter()
+            .all(|g| g.kind != "deep_history_impact_ceiling"));
+
+        // JSON round-trip: the additive field survives serialize -> deserialize.
+        let json = serde_json::to_string(&report).unwrap();
+        let parsed: ShadowGateReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.range_depth.in_range_changes,
+            report.range_depth.in_range_changes
+        );
+        assert_eq!(
+            parsed.range_depth.deep_history_threshold,
+            DEEP_HISTORY_IMPACT_CEILING_THRESHOLD
+        );
+        assert_eq!(
+            parsed.range_depth.is_deep_history,
+            report.range_depth.is_deep_history
+        );
+
+        // A payload serialized before the field existed still deserializes: the
+        // field is serde(default). Drop it from the JSON and re-parse.
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value.as_object_mut().unwrap().remove("range_depth");
+        let legacy: ShadowGateReport = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.range_depth.in_range_changes, 0);
+        assert!(!legacy.range_depth.is_deep_history);
     }
 
     #[test]
