@@ -473,6 +473,239 @@ fn print_fresh_native_next_steps(layout: &kin_core::KinLayout, agent_doc_changed
     println!("  Git escape hatch: kin git export --output <path>");
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeterministicChangeProvenance {
+    /// `kin init: auto-parse` regenerates these machine-local fields on retry.
+    Regenerated,
+    /// Imported Git provenance is part of the immutable source record.
+    Stable,
+}
+
+/// Whether two records with the same deterministic change id carry the same
+/// authoritative payload. Only the auto-parse retry path may ignore its
+/// regenerated wall-clock provenance. Imported Git author/timestamp fields are
+/// stable source truth and a same-id mismatch must be refused.
+fn deterministic_change_payload_matches(
+    left: &SemanticChange,
+    right: &SemanticChange,
+    provenance: DeterministicChangeProvenance,
+) -> bool {
+    fn graph_payload(change: &SemanticChange) -> Option<serde_json::Value> {
+        let mut value = serde_json::to_value(change).ok()?;
+        let object = value.as_object_mut()?;
+        object.remove("timestamp");
+        object.remove("author");
+        Some(value)
+    }
+
+    match provenance {
+        DeterministicChangeProvenance::Regenerated => {
+            match (graph_payload(left), graph_payload(right)) {
+                (Some(left), Some(right)) => left == right,
+                _ => false,
+            }
+        }
+        DeterministicChangeProvenance::Stable => {
+            match (serde_json::to_value(left), serde_json::to_value(right)) {
+                (Ok(left), Ok(right)) => left == right,
+                _ => false,
+            }
+        }
+    }
+}
+
+/// Publish a deterministic init/import change exactly once.
+///
+/// kin-db 0.2.31's `create_change` is an insertion primitive, not an upsert:
+/// calling it again appends the id to every parent's reverse-child vector and
+/// replays entity revisions before overwriting the change map entry. Guarding
+/// here keeps repeated warm init idempotent while refusing a same-id collision
+/// whose graph-defining payload changed.
+fn create_deterministic_change_once(
+    graph: &kin_db::InMemoryGraph,
+    change: &SemanticChange,
+    provenance: DeterministicChangeProvenance,
+) -> Result<bool> {
+    if let Some(existing) = graph.get_change(&change.id)? {
+        if deterministic_change_payload_matches(&existing, change, provenance) {
+            return Ok(false);
+        }
+        return Err(anyhow!(
+            "REFUSED deterministic init change {}: existing graph payload differs",
+            change.id
+        ));
+    }
+    graph.create_change(change)?;
+    Ok(true)
+}
+
+fn validate_repaired_change_history(
+    changes: &HashMap<SemanticChangeId, SemanticChange>,
+    branches: &HashMap<kin_model::BranchName, kin_model::Branch>,
+    boundary_root: SemanticChangeId,
+) -> Result<()> {
+    let Some(root) = changes.get(&boundary_root) else {
+        return Err(anyhow!(
+            "REFUSED legacy history repair: canonical genesis {} is absent",
+            boundary_root
+        ));
+    };
+    if !root.parents.is_empty() {
+        return Err(anyhow!(
+            "REFUSED legacy history repair: canonical genesis {} has parents",
+            boundary_root
+        ));
+    }
+    for branch in branches.values() {
+        if !changes.contains_key(&branch.head) {
+            return Err(anyhow!(
+                "REFUSED legacy history repair: branch {} has missing head {}",
+                branch.name,
+                branch.head
+            ));
+        }
+    }
+    for change in changes.values() {
+        if change.id != boundary_root && change.parents.is_empty() {
+            return Err(anyhow!(
+                "REFUSED legacy history repair: non-genesis change {} has no parent",
+                change.id
+            ));
+        }
+        for parent in &change.parents {
+            if !changes.contains_key(parent) {
+                return Err(anyhow!(
+                    "REFUSED legacy history repair: change {} has missing parent {}",
+                    change.id,
+                    parent
+                ));
+            }
+        }
+    }
+
+    // Validate every parent edge after normalizing the known legacy self-edge.
+    // Refuse broader corruption rather than silently inventing ancestry for it.
+    let mut color = HashMap::<SemanticChangeId, u8>::with_capacity(changes.len());
+    for start in changes.keys().copied() {
+        if color.get(&start) == Some(&2) {
+            continue;
+        }
+        let mut stack = vec![(start, false)];
+        while let Some((change_id, exiting)) = stack.pop() {
+            if exiting {
+                color.insert(change_id, 2);
+                continue;
+            }
+            match color.get(&change_id).copied().unwrap_or(0) {
+                2 => continue,
+                1 => {
+                    return Err(anyhow!(
+                        "REFUSED legacy history repair: parent DAG contains a cycle at {}",
+                        change_id
+                    ));
+                }
+                _ => {}
+            }
+            color.insert(change_id, 1);
+            stack.push((change_id, true));
+            for parent in changes[&change_id].parents.iter().rev().copied() {
+                stack.push((parent, false));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn has_reachable_self_parent(graph: &kin_db::InMemoryGraph) -> Result<bool> {
+    let mut stack: Vec<_> = graph
+        .list_branches()?
+        .into_iter()
+        .map(|branch| branch.head)
+        .collect();
+    let mut visited = HashSet::new();
+    while let Some(change_id) = stack.pop() {
+        if !visited.insert(change_id) {
+            continue;
+        }
+        let Some(change) = graph.get_change(&change_id)? else {
+            continue;
+        };
+        if change.parents.contains(&change.id) {
+            return Ok(true);
+        }
+        stack.extend(change.parents);
+    }
+    Ok(false)
+}
+
+/// Repair snapshots produced by the legacy warm-init boundary bug.
+///
+/// Those snapshots could overwrite an imported Git root with a self-parent.
+/// Re-inserting the corrected record is insufficient on kin-db 0.2.31 because
+/// it leaves the old self edge in `change_children` and duplicates revision
+/// generations. Rebuild both derived indexes from the corrected change map and
+/// atomically swap the manager's graph before any new init mutation occurs.
+fn repair_legacy_self_parented_history(
+    manager: &kin_db::SnapshotManager,
+    layout: &kin_core::KinLayout,
+    boundary_root: SemanticChangeId,
+) -> Result<usize> {
+    let graph = manager.graph();
+    if !has_reachable_self_parent(graph.as_ref())? {
+        return Ok(0);
+    }
+
+    let mut snapshot = graph.to_snapshot();
+    let mut repaired = 0usize;
+    for change in snapshot.changes.values_mut() {
+        if !change.parents.contains(&change.id) {
+            continue;
+        }
+        let mut normalized = Vec::with_capacity(change.parents.len());
+        for parent in change.parents.iter().copied() {
+            let parent = if parent == change.id {
+                boundary_root
+            } else {
+                parent
+            };
+            if !normalized.contains(&parent) {
+                normalized.push(parent);
+            }
+        }
+        change.parents = normalized;
+        repaired += 1;
+    }
+
+    let mut change_children = HashMap::<SemanticChangeId, Vec<SemanticChangeId>>::new();
+    for change in snapshot.changes.values() {
+        for parent in &change.parents {
+            change_children.entry(*parent).or_default().push(change.id);
+        }
+    }
+    for children in change_children.values_mut() {
+        children.sort_by_key(ToString::to_string);
+        children.dedup();
+    }
+    snapshot.change_children = change_children;
+
+    validate_repaired_change_history(&snapshot.changes, &snapshot.branches, boundary_root)?;
+
+    // Empty means "derive from canonical change truth" on graph restore. This
+    // removes revision generations appended by repeated insertion of the same
+    // deterministic change id without attempting an error-prone in-place edit.
+    snapshot.entity_revisions.clear();
+    let repaired_graph =
+        kin_db::InMemoryGraph::from_snapshot_with_text_index(snapshot, layout.text_index_dir());
+    manager.swap(repaired_graph);
+    // Persist immediately. A warm repository with no indexable working-tree
+    // files otherwise takes the early no-change path and would leave the
+    // repaired graph only in memory, causing the same recovery on every open.
+    manager
+        .save()
+        .context("persist repaired legacy semantic history")?;
+    Ok(repaired)
+}
+
 pub async fn run(
     path: Option<String>,
     json: bool,
@@ -534,6 +767,13 @@ pub async fn run(
         // For a warm cache hit, the genesis change isn't created anew.
         // We look up the current head of the default branch to use as the parent
         // for the new auto-parse change.
+        let repaired = repair_legacy_self_parented_history(&snap, &layout, history_boundary_root)?;
+        if repaired > 0 {
+            warn!(
+                repaired_changes = repaired,
+                "repaired legacy self-parented Git history and rebuilt derived revision indexes"
+            );
+        }
         let config = kin_core::KinConfig::load(&layout.config_path())?;
         let parent_id = snap
             .graph()
@@ -692,7 +932,11 @@ pub async fn run(
                 new_hash: Some(kin_model::Hash256::from_bytes(f.hash)),
             })
             .collect();
-        let all_entities = graph.list_all_entities()?;
+        let mut all_entities = graph.list_all_entities()?;
+        // `list_all_entities` is backed by a hash map. Canonicalize its order
+        // before it becomes a deterministic init change payload so a repeated
+        // warm init cannot look different solely because hash iteration moved.
+        all_entities.sort_by_key(|entity| entity.id);
         // Gather relation deltas while only borrowing the entity list, then
         // consume the list itself into the entity deltas. Building the Added
         // entity deltas by value (instead of `.iter().cloned()`) avoids holding
@@ -730,7 +974,11 @@ pub async fn run(
             risk_summary: None,
             authored_on: Some(branch_name.clone()),
         };
-        graph.create_change(&change)?;
+        create_deterministic_change_once(
+            graph.as_ref(),
+            &change,
+            DeterministicChangeProvenance::Regenerated,
+        )?;
         graph.update_branch_head(&branch_name, &change_id)?;
 
         phase!("change_dag+blob_backfill");
@@ -807,7 +1055,11 @@ pub async fn run(
 
                         let mut last_id = None;
                         for ic in &imported {
-                            graph.create_change(&ic.change)?;
+                            create_deterministic_change_once(
+                                graph.as_ref(),
+                                &ic.change,
+                                DeterministicChangeProvenance::Stable,
+                            )?;
                             last_id = Some(ic.change.id);
                         }
                         if let Some(head) = last_id {
@@ -1315,6 +1567,47 @@ fn validate_imported_parent_closure(
                     parent,
                     boundary_root
                 ));
+            }
+        }
+    }
+
+    // Validate the complete parent DAG, not only the first-parent forest used
+    // as the semantic replay baseline. A merge can name canonical genesis as
+    // its first parent while a secondary-parent path closes a cycle. Closure
+    // validation alone accepts that shape, and first-parent ordering cannot see
+    // it. Reject every such cycle here, before checkpoint prepare can acquire
+    // the store lock or create directories.
+    let parents_by_id: HashMap<_, _> = imported
+        .iter()
+        .map(|entry| (entry.change.id, entry.change.parents.as_slice()))
+        .collect();
+    let mut color = HashMap::<SemanticChangeId, u8>::with_capacity(imported.len());
+    for start in imported_ids.iter().copied() {
+        if color.get(&start) == Some(&2) {
+            continue;
+        }
+        let mut stack = vec![(start, false)];
+        while let Some((change_id, exiting)) = stack.pop() {
+            if exiting {
+                color.insert(change_id, 2);
+                continue;
+            }
+            match color.get(&change_id).copied().unwrap_or(0) {
+                2 => continue,
+                1 => {
+                    return Err(anyhow!(
+                        "historical hydration invariant violated: imported parent DAG contains a cycle at {}",
+                        change_id
+                    ));
+                }
+                _ => {}
+            }
+            color.insert(change_id, 1);
+            stack.push((change_id, true));
+            for parent in parents_by_id[&change_id].iter().rev().copied() {
+                if parent != boundary_root {
+                    stack.push((parent, false));
+                }
             }
         }
     }
@@ -4519,6 +4812,56 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_change_retry_only_relaxes_regenerated_provenance() {
+        let mut original = kin_core::build_genesis_change();
+        original.id = SemanticChangeId::from_hash(Hash256::from_bytes([0x81; 32]));
+        original.parents = vec![kin_core::build_genesis_change().id];
+        original.message = "kin init: auto-parse".to_string();
+        let mut retried = original.clone();
+        retried.author = AuthorId::new("different-local-user");
+        retried.timestamp = Timestamp::now();
+
+        assert!(deterministic_change_payload_matches(
+            &original,
+            &retried,
+            DeterministicChangeProvenance::Regenerated,
+        ));
+        assert!(!deterministic_change_payload_matches(
+            &original,
+            &retried,
+            DeterministicChangeProvenance::Stable,
+        ));
+
+        retried.message = "changed semantic payload".to_string();
+        assert!(!deterministic_change_payload_matches(
+            &original,
+            &retried,
+            DeterministicChangeProvenance::Regenerated,
+        ));
+    }
+
+    #[test]
+    fn repaired_history_validation_refuses_non_self_cycles() {
+        let root = kin_core::build_genesis_change();
+        let root_id = root.id;
+        let first_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x82; 32]));
+        let second_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x83; 32]));
+        let mut first = root.clone();
+        first.id = first_id;
+        first.parents = vec![second_id];
+        let mut second = root.clone();
+        second.id = second_id;
+        second.parents = vec![first_id];
+        let changes = [(root_id, root), (first_id, first), (second_id, second)]
+            .into_iter()
+            .collect();
+
+        let error = validate_repaired_change_history(&changes, &HashMap::new(), root_id)
+            .expect_err("repair must not normalize broader parent-DAG corruption");
+        assert!(error.to_string().contains("parent DAG contains a cycle"));
+    }
+
+    #[test]
     fn hydrate_stage_timings_json_is_parseable_with_explicit_residue() {
         // Representative pass: the four buckets leave a non-trivial residue, and
         // most parses were served from the memo.
@@ -6377,6 +6720,16 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         output
     }
 
+    fn checkpoint_path_has_component(path: &Path, expected: &str) -> bool {
+        path.components()
+            .any(|component| component.as_os_str() == expected)
+    }
+
+    fn checkpoint_path_has_file_suffix(path: &Path, suffix: &str) -> bool {
+        path.file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with(suffix))
+    }
+
     fn checkpoint_file_map(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         recursive_checkpoint_files(root)
             .into_iter()
@@ -6582,7 +6935,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
 
         let orphan_objects: Vec<_> = recursive_checkpoint_files(&root)
             .into_iter()
-            .filter(|path| path.to_string_lossy().contains("/objects/"))
+            .filter(|path| checkpoint_path_has_component(path, "objects"))
             .collect();
         assert!(
             orphan_objects.len() >= 3,
@@ -6591,7 +6944,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         assert!(
             recursive_checkpoint_files(&root)
                 .iter()
-                .all(|path| !path.to_string_lossy().ends_with(".manifest.json")),
+                .all(|path| !checkpoint_path_has_file_suffix(path, ".manifest.json")),
             "crash injection occurred after manifest publication"
         );
 
@@ -6660,7 +7013,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
 
         let segment_files: Vec<_> = recursive_checkpoint_files(&root_a)
             .into_iter()
-            .filter(|path| path.to_string_lossy().contains("/segments/"))
+            .filter(|path| checkpoint_path_has_component(path, "segments"))
             .collect();
         assert_eq!(segment_files.len(), 4, "one immutable segment per boundary");
 
@@ -6679,7 +7032,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
 
         let mut manifests: Vec<_> = recursive_checkpoint_files(&root_a)
             .into_iter()
-            .filter(|path| path.to_string_lossy().ends_with(".manifest.json"))
+            .filter(|path| checkpoint_path_has_file_suffix(path, ".manifest.json"))
             .collect();
         manifests.sort();
         fs::remove_file(&manifests[2]).unwrap();
@@ -6840,12 +7193,12 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let dir = tempfile::tempdir().unwrap();
         let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
         for component in [
-            "/segments/",
-            "/parser-frontiers/",
-            "/linker-frontiers/",
-            ".manifest.json",
+            "segments",
+            "parser-frontiers",
+            "linker-frontiers",
+            "manifest",
         ] {
-            let root = dir.path().join(component.replace(['/', '.'], "_"));
+            let root = dir.path().join(format!("corrupt-{component}"));
             let config =
                 HydrationCheckpointConfig::clean_for_test(&root, "clean-sha", 1, 16 * 1024 * 1024);
             let mut seeded = checkpoint_fixture(&blob_store);
@@ -6858,7 +7211,13 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             .unwrap();
             let targets: Vec<_> = recursive_checkpoint_files(&root)
                 .into_iter()
-                .filter(|path| path.to_string_lossy().contains(component))
+                .filter(|path| {
+                    if component == "manifest" {
+                        checkpoint_path_has_file_suffix(path, ".manifest.json")
+                    } else {
+                        checkpoint_path_has_component(path, component)
+                    }
+                })
                 .collect();
             assert!(!targets.is_empty(), "missing {component} fixture artifact");
             for path in targets {
@@ -6978,7 +7337,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let files = recursive_checkpoint_files(&root);
         let manifests: Vec<_> = files
             .iter()
-            .filter(|path| path.to_string_lossy().ends_with(".manifest.json"))
+            .filter(|path| checkpoint_path_has_file_suffix(path, ".manifest.json"))
             .collect();
         let manifest_positions: Vec<_> = manifests
             .iter()
@@ -6997,7 +7356,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         assert_eq!(
             files
                 .iter()
-                .filter(|path| path.to_string_lossy().contains("/parser-frontiers/"))
+                .filter(|path| checkpoint_path_has_component(path, "parser-frontiers"))
                 .count(),
             3,
             "unreferenced parser frontier was not collected"
@@ -7005,7 +7364,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         assert_eq!(
             files
                 .iter()
-                .filter(|path| path.to_string_lossy().contains("/linker-frontiers/"))
+                .filter(|path| checkpoint_path_has_component(path, "linker-frontiers"))
                 .count(),
             3,
             "unreferenced linker frontier was not collected"
@@ -7013,7 +7372,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         assert_eq!(
             files
                 .iter()
-                .filter(|path| path.to_string_lossy().contains("/segments/"))
+                .filter(|path| checkpoint_path_has_component(path, "segments"))
                 .count(),
             4,
             "latest immutable delta chain must retain every bounded segment to genesis"
@@ -7125,7 +7484,7 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         assert!(
             error
                 .to_string()
-                .contains("first-parent graph contains a cycle"),
+                .contains("imported parent DAG contains a cycle"),
             "unexpected cycle refusal: {error:#}"
         );
         assert!(imported
@@ -7135,6 +7494,47 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         assert!(
             !root.join("checkpoints/history-hydration").exists(),
             "cycle preflight must run before lock/store creation"
+        );
+    }
+
+    #[test]
+    fn cyclic_imported_secondary_parent_refuses_before_checkpoint_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let root = dir.path().join("kin");
+        let config =
+            HydrationCheckpointConfig::clean_for_test(&root, "clean-sha", 1, 16 * 1024 * 1024);
+        let mut imported = checkpoint_fixture(&blob_store);
+        let boundary_root = kin_core::build_genesis_change().id;
+        let first = imported[0].change.id;
+        let second = imported[1].change.id;
+
+        // Both first-parent paths reach canonical genesis, but the secondary
+        // edges form first -> second -> first. First-parent-only validation
+        // used to accept this corrupt merge shape and acquire the store lock.
+        imported[0].change.parents = vec![boundary_root, second];
+        imported[1].change.parents = vec![boundary_root, first];
+
+        let error = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut imported,
+            &blob_store,
+            true,
+            Some(config),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("imported parent DAG contains a cycle"),
+            "unexpected secondary-parent cycle refusal: {error:#}"
+        );
+        assert!(imported
+            .iter()
+            .all(|entry| entry.change.entity_deltas.is_empty()
+                && entry.change.relation_deltas.is_empty()));
+        assert!(
+            !root.join("checkpoints/history-hydration").exists(),
+            "secondary-parent preflight must run before lock/store creation"
         );
     }
 
@@ -8034,7 +8434,10 @@ func prCheckout(cmd *cobra.Command, args []string) error {
         let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
         let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
 
-        for _ in 0..2 {
+        let mut second_change_children = None;
+        let mut second_entity_revisions = None;
+        let mut second_changes = None;
+        for pass in 0..3 {
             run(
                 Some(repo_dir.path().display().to_string()),
                 false,
@@ -8045,16 +8448,192 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             )
             .await
             .unwrap();
+
+            if pass >= 1 {
+                let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
+                let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+                let persisted = snap.graph().to_snapshot();
+                for children in persisted.change_children.values() {
+                    let unique: HashSet<_> = children.iter().copied().collect();
+                    assert_eq!(
+                        unique.len(),
+                        children.len(),
+                        "repeated init duplicated a parent-to-child reverse edge"
+                    );
+                }
+                for revisions in persisted.entity_revisions.values() {
+                    let unique: HashSet<_> = revisions
+                        .iter()
+                        .map(|revision| revision.revision_id)
+                        .collect();
+                    assert_eq!(
+                        unique.len(),
+                        revisions.len(),
+                        "repeated init duplicated an entity revision generation"
+                    );
+                }
+                if pass == 1 {
+                    second_change_children = Some(persisted.change_children);
+                    second_entity_revisions = Some(persisted.entity_revisions);
+                    second_changes = Some(
+                        persisted
+                            .changes
+                            .iter()
+                            .map(|(id, change)| {
+                                (id.to_string(), serde_json::to_value(change).unwrap())
+                            })
+                            .collect::<BTreeMap<_, _>>(),
+                    );
+                } else {
+                    assert_eq!(
+                        second_change_children.as_ref().unwrap(),
+                        &persisted.change_children,
+                        "third init changed reverse DAG indexes"
+                    );
+                    assert_eq!(
+                        second_entity_revisions.as_ref().unwrap(),
+                        &persisted.entity_revisions,
+                        "third init replayed revision generations"
+                    );
+                    assert_eq!(
+                        second_changes.as_ref().unwrap(),
+                        &persisted
+                            .changes
+                            .iter()
+                            .map(|(id, change)| {
+                                (id.to_string(), serde_json::to_value(change).unwrap())
+                            })
+                            .collect::<BTreeMap<_, _>>(),
+                        "third init rewrote a deterministic change record"
+                    );
+                }
+            }
         }
 
         let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
         let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
-        let imported = snap.graph().get_change(&git_change).unwrap().unwrap();
+        let graph = snap.graph();
+        let imported = graph.get_change(&git_change).unwrap().unwrap();
         assert_eq!(
             imported.parents,
             vec![kin_core::build_genesis_change().id],
             "true Git root must stay attached to canonical Kin genesis"
         );
+        let persisted = graph.to_snapshot();
+        assert_eq!(
+            persisted
+                .change_children
+                .get(&kin_core::build_genesis_change().id)
+                .into_iter()
+                .flatten()
+                .filter(|child| **child == git_change)
+                .count(),
+            1,
+            "canonical genesis must name the imported root exactly once"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn warm_init_repairs_legacy_self_parent_without_stale_reverse_edges() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        if !init_git_repo_for_test(repo_dir.path())
+            || !commit_git_file_for_test(
+                repo_dir.path(),
+                "src/lib.rs",
+                "pub fn answer() -> u32 { 42 }\n",
+                "initial",
+            )
+        {
+            return;
+        }
+        let git_oid = read_git_head(repo_dir.path()).unwrap();
+        let git_change = kin_git::semantic_change_id_from_git_oid_hex(&git_oid).unwrap();
+        let canonical_root = kin_core::build_genesis_change().id;
+        let home_dir = tempfile::tempdir().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home_dir.path());
+        let _cache_guard = EnvVarGuard::remove("KIN_INIT_CACHE_DIR");
+        let _warm_cache_guard = EnvVarGuard::set("KIN_INIT_WARM_CACHE", "0");
+
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "recent".to_string(),
+        )
+        .await
+        .unwrap();
+
+        // Reproduce the pre-fix warm-init corruption under kin-db 0.2.31:
+        // overwriting the deterministic Git change with a self-parent appends
+        // both a stale reverse edge and duplicate revision generations.
+        let layout = kin_core::KinLayout::new(repo_dir.path().join(".kin"));
+        {
+            let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+            let graph = snap.graph();
+            let mut malformed = graph.get_change(&git_change).unwrap().unwrap();
+            malformed.parents = vec![git_change];
+            graph.create_change(&malformed).unwrap();
+            let branch = kin_core::read_current_branch(&layout).unwrap();
+            graph.update_branch_head(&branch, &git_change).unwrap();
+            snap.save().unwrap();
+        }
+
+        run(
+            Some(repo_dir.path().display().to_string()),
+            false,
+            true,
+            false,
+            true,
+            "recent".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let snap = open_snapshot_with_retry(layout.kindb_snapshot_path());
+        let persisted = snap.graph().to_snapshot();
+        assert_eq!(
+            persisted.changes[&git_change].parents,
+            vec![canonical_root],
+            "legacy self-parent was not repaired to canonical genesis"
+        );
+        assert!(
+            !persisted
+                .change_children
+                .get(&git_change)
+                .into_iter()
+                .flatten()
+                .any(|child| *child == git_change),
+            "repair left the legacy self edge in the reverse index"
+        );
+        assert_eq!(
+            persisted
+                .change_children
+                .get(&canonical_root)
+                .into_iter()
+                .flatten()
+                .filter(|child| **child == git_change)
+                .count(),
+            1,
+            "repair did not rebuild exactly one canonical reverse edge"
+        );
+        for children in persisted.change_children.values() {
+            let unique: HashSet<_> = children.iter().copied().collect();
+            assert_eq!(unique.len(), children.len());
+        }
+        for revisions in persisted.entity_revisions.values() {
+            let unique: HashSet<_> = revisions
+                .iter()
+                .map(|revision| revision.revision_id)
+                .collect();
+            assert_eq!(
+                unique.len(),
+                revisions.len(),
+                "repair retained duplicate revision generations"
+            );
+        }
     }
 
     #[tokio::test]

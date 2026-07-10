@@ -724,8 +724,17 @@ struct CheckpointStoreLock {
 impl CheckpointStoreLock {
     fn acquire(config: &HydrationCheckpointConfig) -> Result<Self> {
         let root = checkpoint_root(config);
-        fs::create_dir_all(&root)
+        create_dir_all_durable(&root)
             .with_context(|| format!("create checkpoint root {}", root.display()))?;
+        // Root creation happens before the inter-process store lock exists, so
+        // another opener can observe it in the narrow create-before-fsync
+        // window. Re-sync the existing root once per session to close that
+        // race without adding directory flushes to every object reuse.
+        #[cfg(unix)]
+        {
+            sync_directory(&root)?;
+            sync_parent_directory(&root)?;
+        }
         let lock_path = root.join(STORE_LOCK_FILE);
         let file = OpenOptions::new()
             .read(true)
@@ -826,7 +835,7 @@ fn write_new_or_identical(
     stats: &mut CheckpointIoStats,
 ) -> Result<bool> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        create_dir_all_durable(parent)?;
     }
     if path.exists() {
         let existing = fs::read(path)?;
@@ -887,6 +896,89 @@ fn write_new_or_identical(
             Err(error).with_context(|| format!("install checkpoint artifact {}", path.display()))
         }
     }
+}
+
+/// Create every missing directory component with durable namespace metadata.
+///
+/// `create_dir_all` can install several nested entries while leaving every
+/// ancestor except the leaf unsynchronized. On Unix that is not enough for the
+/// checkpoint publication contract: after sudden power loss an fsynced object
+/// may survive while one of the directories leading to it does not. Creating
+/// one component at a time and syncing both the new directory and its parent
+/// makes each link in the path durable before an object or manifest is linked
+/// below it.
+#[cfg(unix)]
+fn create_dir_all_durable(path: &Path) -> Result<()> {
+    let absolute;
+    let path = if path.is_absolute() {
+        path
+    } else {
+        absolute = std::env::current_dir()
+            .context("resolve current directory for checkpoint publication")?
+            .join(path);
+        absolute.as_path()
+    };
+    if path.is_dir() {
+        return Ok(());
+    }
+
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    while !cursor.exists() {
+        missing.push(cursor.to_path_buf());
+        cursor = cursor.parent().ok_or_else(|| {
+            anyhow!(
+                "checkpoint directory {} has no existing ancestor",
+                path.display()
+            )
+        })?;
+    }
+    if !cursor.is_dir() {
+        return Err(anyhow!(
+            "checkpoint directory ancestor {} is not a directory",
+            cursor.display()
+        ));
+    }
+
+    for directory in missing.into_iter().rev() {
+        match fs::create_dir(&directory) {
+            Ok(()) => {
+                sync_directory(&directory)?;
+                sync_parent_directory(&directory)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if !directory.is_dir() {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "checkpoint directory destination {} is not a directory",
+                            directory.display()
+                        )
+                    });
+                }
+                sync_directory(&directory)?;
+                sync_parent_directory(&directory)?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("create checkpoint directory {}", directory.display())
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_dir_all_durable(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)
+        .with_context(|| format!("create checkpoint directory {}", path.display()))
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("sync checkpoint directory {}", path.display()))
 }
 
 #[cfg(unix)]
@@ -2029,6 +2121,26 @@ mod tests {
         assert!(!write_new_or_identical(&path, b"first", &mut stats).unwrap());
         let error = write_new_or_identical(&path, b"different", &mut stats).unwrap_err();
         assert!(error.to_string().contains("different bytes"));
+    }
+
+    #[test]
+    fn checkpoint_directory_creation_installs_every_nested_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir
+            .path()
+            .join("checkpoints")
+            .join("history-hydration")
+            .join("objects")
+            .join("parser-frontiers");
+
+        create_dir_all_durable(&nested).unwrap();
+        assert!(nested.is_dir());
+        assert!(nested.parent().unwrap().is_dir());
+        assert!(nested.parent().unwrap().parent().unwrap().is_dir());
+
+        // The idempotent path must not require recreating or replacing any
+        // already-durable directory entry.
+        create_dir_all_durable(&nested).unwrap();
     }
 
     #[test]
