@@ -939,6 +939,26 @@ fn normalize_entity_file_origins_to_historical_tree(
                 span.file = canonical;
             }
         }
+        // Re-derive the entity role from its canonical historical path.
+        //
+        // `resolve_graph_at` replays persisted entities verbatim, and this
+        // reconstruction is the only stage that re-canonicalizes their paths --
+        // yet it never re-derived `role`. An entity persisted before the
+        // amalgamated-bundle / vendored path rules landed (e.g. `single_include/`
+        // single-header copies persisted with `role=Source`) therefore replays
+        // with a stale role. `impact.rs` excludes `Generated`/`Vendored`
+        // consumers from `consumer_count`, so a stale-`Source` derived copy leaks
+        // into the count and inflates a benign refactor's blast radius into a
+        // false breaking finding.
+        //
+        // `classify_file_role` is the same pure path function ingest applies
+        // (`pipeline.rs`), so re-applying it here is idempotent for correctly
+        // classified entities and only upgrades stale ones. `role` is not part of
+        // entity identity (`EntityId::from_content` keys on path/kind/name/line),
+        // so re-deriving it cannot desync persisted-vs-reconstructed identity.
+        if let Some(file_origin) = entity.file_origin.as_ref() {
+            entity.role = kin_index::classify_file_role(&file_origin.0);
+        }
     }
 }
 
@@ -2292,6 +2312,60 @@ def uri_encoder(value):\n    return value.replace(' ', '%20')\n",
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    /// FIR-1267 (687 false would_block): the historical-ref reconstruction
+    /// replays persisted entities verbatim and is the only stage that
+    /// re-canonicalizes their paths, so it must also re-derive `role`. A
+    /// single-header amalgamated copy persisted before the `single_include/`
+    /// rule landed replays with a stale `role=Source`; `impact.rs` only excludes
+    /// `Generated`/`Vendored` consumers, so the stale copy leaks into
+    /// `consumer_count` and inflates a benign refactor's blast radius into a
+    /// false breaking finding. Reconstruction must reclassify it to `Generated`
+    /// while leaving a genuine source consumer at a real path as `Source`.
+    #[test]
+    fn generated_consumer_excluded_at_historical_ref() {
+        let mut amalgamated = test_entity("addReporter", "single_include/catch.hpp");
+        amalgamated.role = EntityRole::Source; // stale persisted role (pre-rule ingest)
+        let amalgamated_id = amalgamated.id;
+
+        let mut real_source =
+            test_entity("addReporter", "include/reporters/catch_reporter_multi.hpp");
+        real_source.role = EntityRole::Source;
+        let real_source_id = real_source.id;
+
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.entities.insert(amalgamated_id, amalgamated);
+        snapshot.entities.insert(real_source_id, real_source);
+
+        let file_tree: HashMap<FilePathId, Hash256> = [
+            (
+                FilePathId::new("single_include/catch.hpp"),
+                Hash256::from_bytes([0x11; 32]),
+            ),
+            (
+                FilePathId::new("include/reporters/catch_reporter_multi.hpp"),
+                Hash256::from_bytes([0x22; 32]),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let path_resolver = HistoricalPathResolver::from_changes(&[], &file_tree);
+        normalize_entity_file_origins_to_historical_tree(&mut snapshot, &file_tree, &path_resolver);
+
+        assert_eq!(
+            snapshot.entities[&amalgamated_id].role,
+            EntityRole::Generated,
+            "a single_include/ amalgamated copy persisted as Source must be re-derived to \
+             Generated during historical-ref reconstruction so impact.rs excludes it from \
+             consumer_count (the FIR-1267 687 divergence)"
+        );
+        assert_eq!(
+            snapshot.entities[&real_source_id].role,
+            EntityRole::Source,
+            "a genuine source consumer at a real path must remain a counted consumer"
+        );
     }
 
     #[test]

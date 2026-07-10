@@ -399,8 +399,7 @@ pub fn analyze_impact_at<I: ImpactGraph>(
                 || changed_keys.contains(&entity_identity_key(&entity))
             {
                 let is_test = entity.role == EntityRole::Test || rel.kind == RelationKind::Tests;
-                let is_derived =
-                    matches!(entity.role, EntityRole::Generated | EntityRole::Vendored);
+                let is_derived = consumer_is_derived(&entity);
                 // Only a real consumer surface counts as a migrated consumer;
                 // a co-updated test or regenerated copy was never a break.
                 if !is_test && !is_derived {
@@ -412,7 +411,7 @@ pub fn analyze_impact_at<I: ImpactGraph>(
             let is_test = entity.role == EntityRole::Test || rel.kind == RelationKind::Tests;
             if is_test {
                 ent_tests.insert(affected_id);
-            } else if matches!(entity.role, EntityRole::Generated | EntityRole::Vendored) {
+            } else if consumer_is_derived(&entity) {
                 // Derived copies (amalgamated bundles, vendored snapshots)
                 // regenerate from their sources; they appear in the blast
                 // radius for navigation but cannot be "broken" consumers,
@@ -600,6 +599,35 @@ fn entity_file(entity: &Entity) -> Option<String> {
         Some(span) => Some(span.file.to_string()),
         None => entity.file_origin.as_ref().map(|file| file.to_string()),
     }
+}
+
+/// Whether a consumer is a derived copy (amalgamated single-header bundle,
+/// vendored snapshot) that regenerates from its sources and so can never be a
+/// broken consumer.
+///
+/// The persisted `role` is the primary signal, but the review evaluates a graph
+/// materialized by `resolve_graph_at`, which replays persisted entities verbatim
+/// and never reparses. An entity ingested before the amalgamated-bundle /
+/// vendored path rules landed (e.g. a `single_include/*` copy persisted with
+/// `role=Source`) therefore replays with a stale role and would be counted as a
+/// real breaking consumer. The path-based check is the read-time backstop: it
+/// re-derives the derived-copy status from the entity's canonical path with the
+/// same pure `classify_file_role` function ingest applies. It only ever adds
+/// exclusions (a derived path can never turn a real Source consumer into a
+/// counted one it was not already), and `role` is not part of entity identity,
+/// so this changes no persisted state.
+fn consumer_is_derived(entity: &Entity) -> bool {
+    if matches!(entity.role, EntityRole::Generated | EntityRole::Vendored) {
+        return true;
+    }
+    entity_file(entity)
+        .map(|path| {
+            matches!(
+                kin_index::classify_file_role(&path),
+                EntityRole::Generated | EntityRole::Vendored
+            )
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -873,6 +901,54 @@ mod tests {
         // C is still reachable as transitive blast radius (report surface),
         // just not as a direct-consumer attribution.
         assert!(report.affected_dependents.iter().any(|e| e.id == c.id));
+    }
+
+    #[test]
+    fn stale_source_amalgamated_consumer_excluded_from_consumer_count_by_path() {
+        // FIR-1267 (687 false would_block): the review evaluates a graph
+        // materialized by resolve_graph_at, which replays persisted entities
+        // verbatim and never reparses. A single-header amalgamated copy ingested
+        // before the single_include/ rule landed replays with a stale
+        // role=Source, yet it must still be excluded from consumer_count by its
+        // path so a benign signature change is not inflated with a phantom
+        // breaking consumer. Only the real src/invoice.rs consumer counts.
+        let target = entity_in_file("compute_total", "src/billing.rs", 1);
+        let real = entity_in_file("render_invoice", "src/invoice.rs", 1);
+        let amalgamated = entity_in_file("bundled_total", "single_include/catch.hpp", 1);
+        assert_eq!(
+            amalgamated.role,
+            EntityRole::Source,
+            "fixture: the amalgamated copy carries a stale persisted role"
+        );
+
+        let mut graph = MockImpactGraph::default();
+        for entity in [&target, &real, &amalgamated] {
+            graph.entities.insert(entity.id, entity.clone());
+        }
+        graph.inbound.insert(
+            target.id,
+            vec![calls(&real, &target), calls(&amalgamated, &target)],
+        );
+
+        let diff = SemanticDiff {
+            entity_changes: vec![modified(&target)],
+            ..Default::default()
+        };
+
+        let report = analyze_impact_at(&graph, &diff).unwrap();
+        let impact = report
+            .entity_impact(&target.id)
+            .expect("target has an impact entry");
+        assert_eq!(
+            impact.consumer_count, 1,
+            "the single_include/ amalgamated copy must be excluded by path; only the real \
+             src/invoice.rs consumer counts"
+        );
+        assert_eq!(
+            impact.consumer_files,
+            vec!["src/invoice.rs".to_string()],
+            "consumer_files must not include the generated single-header bundle"
+        );
     }
 
     #[test]
