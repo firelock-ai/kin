@@ -427,6 +427,16 @@ fn entity_ids_for_relation(relation: &Relation) -> Vec<EntityId> {
         .collect()
 }
 
+fn sorted_unique_entity_ids<I>(ids: I) -> Vec<EntityId>
+where
+    I: IntoIterator<Item = EntityId>,
+{
+    let mut ids: Vec<EntityId> = ids.into_iter().collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 fn relation_is_entity_only(relation: &Relation) -> bool {
     relation.src.as_entity().is_some() && relation.dst.as_entity().is_some()
 }
@@ -934,6 +944,59 @@ where
     delta.modified.push((key, value));
 }
 
+#[derive(Clone, Copy)]
+enum DeltaMapSlot {
+    Added(usize),
+    Modified(usize),
+}
+
+/// Apply many map-delta upserts with one key-to-slot index build.
+///
+/// `delta_map_upsert` deliberately preserves the first vector position for a
+/// key, but finding that position with a linear scan for every item makes a
+/// history-sized batch quadratic. This helper indexes the existing `added` and
+/// `modified` slots once, retains the same added-before-modified lookup
+/// semantics, and removes restored keys from `removed` in one stable pass.
+fn delta_map_upsert_batch<K, V>(delta: &mut CollectionDelta<K, V>, updates: Vec<(K, V)>)
+where
+    K: Eq + std::hash::Hash + Clone,
+{
+    if updates.is_empty() {
+        return;
+    }
+
+    let mut slots =
+        HashMap::with_capacity(delta.added.len() + delta.modified.len() + updates.len());
+    for (index, (key, _)) in delta.added.iter().enumerate() {
+        slots
+            .entry(key.clone())
+            .or_insert(DeltaMapSlot::Added(index));
+    }
+    for (index, (key, _)) in delta.modified.iter().enumerate() {
+        slots
+            .entry(key.clone())
+            .or_insert(DeltaMapSlot::Modified(index));
+    }
+
+    let mut restored = HashSet::with_capacity(updates.len());
+    for (key, value) in updates {
+        restored.insert(key.clone());
+        match slots.get(&key).copied() {
+            Some(DeltaMapSlot::Added(index)) => delta.added[index].1 = value,
+            Some(DeltaMapSlot::Modified(index)) => delta.modified[index].1 = value,
+            None => {
+                let index = delta.modified.len();
+                delta.modified.push((key.clone(), value));
+                slots.insert(key, DeltaMapSlot::Modified(index));
+            }
+        }
+    }
+
+    // `retain` preserves the relative order of every unrelated removal, exactly
+    // matching repeated `delta_map_upsert` calls without rescanning the vector.
+    delta.removed.retain(|key| !restored.contains(key));
+}
+
 fn delta_map_remove<K, V>(delta: &mut CollectionDelta<K, V>, key: K)
 where
     K: Eq + Clone,
@@ -1081,7 +1144,18 @@ enum EmbedRecency {
 /// per-process HashMap seed.
 #[cfg(feature = "vector")]
 struct RecencyQueue<K: Eq + std::hash::Hash + Copy> {
+    /// Canonical queued membership and current recency. Keys remain here while
+    /// they are present in `frontier`; popping a batch removes them from both.
     items: hashbrown::HashMap<K, EmbedRecency>,
+    /// Deterministic total order computed once for a stable queue snapshot.
+    /// Repeated small drains pop this frontier instead of draining, selecting,
+    /// and reinserting the entire backlog every batch.
+    frontier: std::collections::VecDeque<K>,
+    /// Any membership or priority change invalidates the cached ordering. The
+    /// next drain rebuilds once from `items`, incorporating all new work.
+    frontier_dirty: bool,
+    #[cfg(test)]
+    frontier_rebuilds: usize,
 }
 
 #[cfg(feature = "vector")]
@@ -1089,6 +1163,10 @@ impl<K: Eq + std::hash::Hash + Copy> Default for RecencyQueue<K> {
     fn default() -> Self {
         Self {
             items: hashbrown::HashMap::new(),
+            frontier: std::collections::VecDeque::new(),
+            frontier_dirty: false,
+            #[cfg(test)]
+            frontier_rebuilds: 0,
         }
     }
 }
@@ -1099,19 +1177,43 @@ impl<K: Eq + std::hash::Hash + Copy> RecencyQueue<K> {
     /// higher-priority (lower) recency so a live change is never demoted to
     /// backfill by a subsequent bulk re-queue.
     fn insert(&mut self, key: K, recency: EmbedRecency) {
-        self.items
-            .entry(key)
-            .and_modify(|cur| {
-                if recency < *cur {
-                    *cur = recency;
+        self.insert_inner(key, recency, false);
+    }
+
+    /// Enqueue work after a graph mutation that may have changed the key's
+    /// tier or centrality. Even when membership and recency are unchanged, a
+    /// cached entity frontier must be rebuilt against the new graph facts.
+    fn insert_graph_priority_changed(&mut self, key: K, recency: EmbedRecency) {
+        self.insert_inner(key, recency, true);
+    }
+
+    fn insert_inner(&mut self, key: K, recency: EmbedRecency, graph_priority_changed: bool) {
+        match self.items.entry(key) {
+            hashbrown::hash_map::Entry::Occupied(mut entry) => {
+                if recency < *entry.get() {
+                    *entry.get_mut() = recency;
+                    self.frontier_dirty = true;
+                } else if graph_priority_changed {
+                    self.frontier_dirty = true;
                 }
-            })
-            .or_insert(recency);
+            }
+            hashbrown::hash_map::Entry::Vacant(entry) => {
+                entry.insert(recency);
+                self.frontier_dirty = true;
+            }
+        }
     }
 
     /// Remove a key from the queue (e.g., when its entity is deleted).
     fn remove(&mut self, key: &K) -> bool {
-        self.items.remove(key).is_some()
+        let removed = self.items.remove(key).is_some();
+        if removed {
+            // Leave the stale key in the deque for now. Rebuilding from the
+            // canonical map on the next drain removes it without an O(n) scan
+            // on every deletion.
+            self.frontier_dirty = true;
+        }
+        removed
     }
 
     /// HashSet-style membership facade (used by tests; kept for parity with the
@@ -1124,6 +1226,8 @@ impl<K: Eq + std::hash::Hash + Copy> RecencyQueue<K> {
     #[allow(dead_code)]
     fn clear(&mut self) {
         self.items.clear();
+        self.frontier.clear();
+        self.frontier_dirty = false;
     }
 
     fn len(&self) -> usize {
@@ -1135,9 +1239,47 @@ impl<K: Eq + std::hash::Hash + Copy> RecencyQueue<K> {
         self.items.is_empty()
     }
 
-    /// Remove and return every `(key, recency)` pair. Iteration order is
-    /// unspecified; callers MUST sort deterministically before using the result.
+    /// Whether the deterministic frontier must be rebuilt before it is popped.
+    fn frontier_needs_rebuild(&self) -> bool {
+        self.frontier_dirty || (self.frontier.is_empty() && !self.items.is_empty())
+    }
+
+    /// Replace the cached frontier with a deterministic ordering containing
+    /// every currently queued key exactly once.
+    fn install_frontier<I>(&mut self, ordered: I)
+    where
+        I: IntoIterator<Item = K>,
+    {
+        self.frontier = ordered.into_iter().collect();
+        debug_assert_eq!(self.frontier.len(), self.items.len());
+        self.frontier_dirty = false;
+        #[cfg(test)]
+        {
+            self.frontier_rebuilds += 1;
+        }
+    }
+
+    /// Pop up to `batch_size` items from a valid frontier. Membership remains
+    /// authoritative in `items`, so stale deque entries can never escape even
+    /// if a future caller violates the rebuild precondition.
+    fn pop_frontier_batch(&mut self, batch_size: usize) -> Vec<(K, EmbedRecency)> {
+        debug_assert!(!self.frontier_dirty);
+        let mut batch = Vec::with_capacity(batch_size.min(self.items.len()));
+        while batch.len() < batch_size {
+            let Some(key) = self.frontier.pop_front() else {
+                break;
+            };
+            if let Some(recency) = self.items.remove(&key) {
+                batch.push((key, recency));
+            }
+        }
+        batch
+    }
+
+    #[cfg(test)]
     fn drain_all(&mut self) -> Vec<(K, EmbedRecency)> {
+        self.frontier.clear();
+        self.frontier_dirty = false;
         self.items.drain().collect()
     }
 }
@@ -2572,7 +2714,7 @@ impl InMemoryGraph {
         // as `ChangedThisSync` (the highest recency tier) rather than backfill.
         let mut queue = self.embedding_queue.lock();
         for entity_id in &unique_ids {
-            queue.insert(
+            queue.insert_graph_priority_changed(
                 RetrievalKey::Entity(*entity_id),
                 EmbedRecency::ChangedThisSync,
             );
@@ -3920,45 +4062,27 @@ impl InMemoryGraph {
             .embed_stage_timings
             .scope(crate::embed::EmbedStage::Drain);
         let batch_size = batch_size.max(1);
-        let drained = {
-            let mut queue = self.embedding_queue.lock();
-            queue.drain_all()
-        };
-        if drained.is_empty() {
+        let mut queue = self.embedding_queue.lock();
+        if queue.is_empty() {
             return Vec::new();
         }
 
-        // Compute a deterministic priority sort key for each item from current
-        // graph state (tier → recency → centrality → id), then order ascending
-        // so the smallest — highest-priority — item embeds first. The sort is
-        // GLOBAL over the entire drained queue and happens BEFORE the caller
-        // chunks the returned batch for inference, so priority is never merely
-        // per-chunk. (O(n) key build + O(n log n) sort; see `embed_sort_key_for`
-        // for the per-key O(1) bound.)
-        let mut keyed: Vec<(EmbedSortKey, RetrievalKey, EmbedRecency)> = {
+        // Compute the global deterministic priority order once for a stable
+        // queue snapshot, then retain its leftover as a frontier. Subsequent
+        // batches pop O(batch_size) work instead of draining and reinserting the
+        // O(backlog) remainder. Any enqueue, removal, or recency promotion marks
+        // the frontier dirty and folds the new work into one fresh global sort.
+        if queue.frontier_needs_rebuild() {
             let ent = self.entities.read();
-            drained
-                .into_iter()
-                .map(|(key, recency)| (embed_sort_key_for(&ent, key, recency), key, recency))
-                .collect()
-        };
-        let take = batch_size.min(keyed.len());
-        if take < keyed.len() {
-            let (_, _, _) = keyed.select_nth_unstable_by(take, |a, b| a.0.cmp(&b.0));
+            let mut ordered: Vec<(EmbedSortKey, RetrievalKey)> = queue
+                .items
+                .iter()
+                .map(|(key, recency)| (embed_sort_key_for(&ent, *key, *recency), *key))
+                .collect();
+            ordered.sort_unstable_by_key(|entry| entry.0);
+            queue.install_frontier(ordered.into_iter().map(|(_, key)| key));
         }
-
-        let leftover = keyed.split_off(take);
-        keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        if !leftover.is_empty() {
-            let mut queue = self.embedding_queue.lock();
-            for (_, key, recency) in leftover {
-                queue.insert(key, recency);
-            }
-        }
-        keyed
-            .into_iter()
-            .map(|(_, key, recency)| (key, recency))
-            .collect()
+        queue.pop_frontier_batch(batch_size)
     }
 
     /// Drain up to `batch_size` artifact IDs from the artifact embedding queue
@@ -3970,38 +4094,24 @@ impl InMemoryGraph {
     #[cfg(feature = "vector")]
     fn drain_artifact_embedding_batch(&self, batch_size: usize) -> Vec<(ArtifactId, EmbedRecency)> {
         let batch_size = batch_size.max(1);
-        let mut all = {
-            let mut queue = self.artifact_embedding_queue.lock();
-            queue.drain_all()
-        };
-        if all.is_empty() {
+        let mut queue = self.artifact_embedding_queue.lock();
+        if queue.is_empty() {
             return Vec::new();
         }
 
         // Deterministic total order: recency first (changed-this-sync before
-        // backfill), then the artifact id as the stable tiebreak. (Artifacts
-        // carry less semantic structure than entities, so recency + id is the
-        // honest priority signal available without extra lookups.) The id is a
-        // unique tiebreak, so this is a strict total order with no ties:
-        // partition the top `take` with `select_nth_unstable` (O(n)) and sort
-        // only that prefix — identical output to a full sort of the whole queue,
-        // without paying O(n log n) on the leftover that is requeued anyway.
-        let order = |a: &(ArtifactId, EmbedRecency), b: &(ArtifactId, EmbedRecency)| {
-            a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0))
-        };
-        let take = batch_size.min(all.len());
-        if take < all.len() {
-            all.select_nth_unstable_by(take, order);
+        // backfill), then artifact id as the stable tiebreak. Cache the total
+        // order exactly like the entity queue so stable bulk drains sort once.
+        if queue.frontier_needs_rebuild() {
+            let mut ordered: Vec<(EmbedRecency, ArtifactId)> = queue
+                .items
+                .iter()
+                .map(|(id, recency)| (*recency, *id))
+                .collect();
+            ordered.sort_unstable();
+            queue.install_frontier(ordered.into_iter().map(|(_, id)| id));
         }
-        let leftover = all.split_off(take);
-        all.sort_unstable_by(order);
-        if !leftover.is_empty() {
-            let mut queue = self.artifact_embedding_queue.lock();
-            for (id, recency) in leftover {
-                queue.insert(id, recency);
-            }
-        }
-        all
+        queue.pop_frontier_batch(batch_size)
     }
 
     /// Drain the current pending embedding queue in batches.
@@ -6427,13 +6537,15 @@ impl EntityStore for InMemoryGraph {
             return Ok(());
         }
 
-        {
+        let affected = {
             let mut ent = self.entities.write();
             let mut merkle_seeds = Vec::new();
+            let mut affected = HashSet::new();
 
             ent.relations.reserve(relations.len());
             for relation in relations {
                 if let Some(old) = ent.relations.remove(&relation.id) {
+                    affected.extend(entity_ids_for_relation(&old));
                     merkle_seeds.extend(entity_ids_for_relation(&old));
                     remove_relation_indexes(&mut ent, &old);
                     self.record_relation_delta_remove(&ent, &old);
@@ -6442,10 +6554,12 @@ impl EntityStore for InMemoryGraph {
                 insert_relation_indexes(&mut ent, relation);
                 ent.relations.insert(relation.id, relation.clone());
                 self.record_relation_delta_upsert(&ent, relation.clone());
+                affected.extend(entity_ids_for_relation(relation));
                 merkle_seeds.extend(entity_ids_for_relation(relation));
             }
             self.refresh_merkle_for_entities(&ent, merkle_seeds);
-        }
+            sorted_unique_entity_ids(affected)
+        };
 
         // Relation-derived text fields are now stale for affected entities,
         // but doing 20K+ individual Tantivy upserts is too expensive during
@@ -6453,6 +6567,7 @@ impl EntityStore for InMemoryGraph {
         // be honored by persist_text_index_with_root_hash before saving.
         self.text_full_rebuild_required
             .store(true, Ordering::Release);
+        self.invalidate_entities_for_embedding(&affected)?;
 
         Ok(())
     }
@@ -6479,33 +6594,36 @@ impl EntityStore for InMemoryGraph {
             new_map.insert(rel.id, rel);
         }
 
+        let mut new_relations: Vec<Relation> = new_map.into_values().collect();
+        new_relations.sort_unstable_by_key(|relation| relation.id.0);
+
         // Step 2: Single write lock — retain non-kind + insert new + rebuild indexes
-        {
+        let affected = {
             let mut ent = self.entities.write();
             let mut merkle_seeds = Vec::new();
+            let mut affected = HashSet::new();
 
             // Remove all relations of this kind — O(N) scan, no per-relation index work
-            let removed_relations: Vec<Relation> = ent
+            let mut removed_relations: Vec<Relation> = ent
                 .relations
                 .values()
                 .filter(|rel| rel.kind == kind)
                 .cloned()
                 .collect();
-            let removed = removed_relations.len();
+            removed_relations.sort_unstable_by_key(|relation| relation.id.0);
             ent.relations.retain(|_, rel| rel.kind != kind);
 
-            if removed == 0 && new_map.is_empty() {
-                return Ok(());
-            }
             for relation in &removed_relations {
+                affected.extend(entity_ids_for_relation(relation));
                 merkle_seeds.extend(entity_ids_for_relation(relation));
             }
 
             // Reserve and insert new relations
-            ent.relations.reserve(new_map.len());
-            for (id, rel) in new_map {
-                merkle_seeds.extend(entity_ids_for_relation(&rel));
-                ent.relations.insert(id, rel);
+            ent.relations.reserve(new_relations.len());
+            for rel in &new_relations {
+                affected.extend(entity_ids_for_relation(rel));
+                merkle_seeds.extend(entity_ids_for_relation(rel));
+                ent.relations.insert(rel.id, rel.clone());
             }
 
             // Rebuild ALL adjacency indexes from scratch — O(R) total
@@ -6519,14 +6637,16 @@ impl EntityStore for InMemoryGraph {
             for relation in &removed_relations {
                 self.record_relation_delta_remove(&ent, relation);
             }
-            for relation in ent.relations.values().filter(|rel| rel.kind == kind) {
+            for relation in &new_relations {
                 self.record_relation_delta_upsert(&ent, relation.clone());
             }
             self.refresh_merkle_for_entities(&ent, merkle_seeds);
-        }
+            sorted_unique_entity_ids(affected)
+        };
 
         self.text_full_rebuild_required
             .store(true, Ordering::Release);
+        self.invalidate_entities_for_embedding(&affected)?;
         Ok(())
     }
 
@@ -6535,23 +6655,27 @@ impl EntityStore for InMemoryGraph {
             return Ok(());
         }
 
-        {
+        let affected = {
             let mut ent = self.entities.write();
             let mut merkle_seeds = Vec::new();
+            let mut affected = HashSet::new();
 
             for id in ids {
                 if let Some(rel) = ent.relations.remove(*id) {
+                    affected.extend(entity_ids_for_relation(&rel));
                     merkle_seeds.extend(entity_ids_for_relation(&rel));
                     remove_relation_indexes(&mut ent, &rel);
                     self.record_relation_delta_remove(&ent, &rel);
                 }
             }
             self.refresh_merkle_for_entities(&ent, merkle_seeds);
-        }
+            sorted_unique_entity_ids(affected)
+        };
 
         // Defer text index rebuild like upsert_relations_batch.
         self.text_full_rebuild_required
             .store(true, Ordering::Release);
+        self.invalidate_entities_for_embedding(&affected)?;
 
         Ok(())
     }
@@ -6831,6 +6955,104 @@ fn recall_staleness_rank(s: StalenessState) -> u8 {
 }
 
 impl InMemoryGraph {
+    /// Register an ordered batch of semantic changes with one acquisition of
+    /// the entity, change-DAG, and pending-delta locks.
+    ///
+    /// Hydration imports changes oldest-first. Calling [`ChangeStore::create_change`]
+    /// for each item repeatedly acquires the same locks and clones every change
+    /// twice (once for live state and once for the pending snapshot delta). This
+    /// owned batch path preserves the exact input order while moving each change
+    /// into live state and cloning it only for the pending delta.
+    ///
+    /// The method is intentionally inherent rather than part of `ChangeStore`:
+    /// batch import is a KinDB capability, while generic stores can continue to
+    /// use the portable one-change trait method.
+    pub fn create_changes(&self, changes: Vec<SemanticChange>) -> Result<(), KinDbError> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+
+        // Domain lock order is part of InMemoryGraph's deadlock contract:
+        // entities -> changes. Holding both makes a batch appear as one ordered
+        // import to readers instead of exposing a partially registered DAG.
+        let mut ent = self.entities.write();
+        let mut chg = self.changes.write();
+        let mut pending = self.pending_delta.lock();
+
+        let mut touched_entities = Vec::new();
+        let mut seen_entities = HashSet::new();
+        let mut touched_parents = Vec::new();
+        let mut seen_parents = HashSet::new();
+        let mut superseded_revisions = Vec::new();
+        let mut pending_changes = Vec::with_capacity(changes.len());
+
+        for change in changes {
+            superseded_revisions.extend(append_entity_revisions(&mut ent, &change));
+            for entity_id in change.entity_deltas.iter().map(|delta| match delta {
+                EntityDelta::Added(entity) | EntityDelta::Modified { new: entity, .. } => entity.id,
+                EntityDelta::Removed(id) => *id,
+            }) {
+                // Sequential create_change records the first delta slot only
+                // once a revision chain exists. A removal before an add has no
+                // chain yet and therefore must not claim the earlier slot.
+                if ent.entity_revisions.contains_key(&entity_id) && seen_entities.insert(entity_id)
+                {
+                    touched_entities.push(entity_id);
+                }
+            }
+
+            for parent in &change.parents {
+                let children = chg.change_children.entry(*parent).or_default();
+                children.push(change.id);
+                if seen_parents.insert(*parent) {
+                    touched_parents.push(*parent);
+                }
+            }
+
+            let change_id = change.id;
+            // The pending delta and live graph both own the change. Clone once
+            // for the delta, then move the original into the graph.
+            pending_changes.push((change_id, change.clone()));
+            chg.changes.insert(change_id, change);
+        }
+
+        delta_map_upsert_batch(&mut pending.delta.changes, pending_changes);
+
+        // Sequential create_change updates the same pending-delta entry on
+        // every occurrence. The indexed batch helper retains the first
+        // insertion slot and replaces its value, so recording each
+        // entity/parent once with its final batch state is byte-equivalent while
+        // avoiding repeated clones and repeated linear scans.
+        let revision_updates = touched_entities
+            .into_iter()
+            .filter_map(|entity_id| {
+                ent.entity_revisions
+                    .get(&entity_id)
+                    .cloned()
+                    .map(|revisions| (entity_id, revisions))
+            })
+            .collect();
+        delta_map_upsert_batch(&mut pending.delta.entity_revisions, revision_updates);
+
+        let child_updates = touched_parents
+            .into_iter()
+            .filter_map(|parent| {
+                chg.change_children
+                    .get(&parent)
+                    .cloned()
+                    .map(|children| (parent, children))
+            })
+            .collect();
+        delta_map_upsert_batch(&mut pending.delta.change_children, child_updates);
+
+        #[cfg(feature = "vector")]
+        self.note_superseded_vectors(&superseded_revisions);
+        #[cfg(not(feature = "vector"))]
+        let _ = superseded_revisions;
+
+        Ok(())
+    }
+
     /// Capture a rename-durable [`SemanticAnchor`] for an annotation from the
     /// first live entity scope it carries.
     ///
@@ -7649,6 +7871,7 @@ impl VerificationStore for InMemoryGraph {
     fn delete_test_case(&self, id: &TestId) -> Result<(), KinDbError> {
         let mut ent = self.entities.write();
         let mut ver = self.verification.write();
+        let mut affected = HashSet::new();
         ver.test_cases.remove(id);
         ver.mock_hints.retain(|h| h.test_id != *id);
         let node = GraphNodeId::Test(*id);
@@ -7663,9 +7886,18 @@ impl VerificationStore for InMemoryGraph {
         relation_ids.dedup();
         for relation_id in relation_ids {
             if let Some(relation) = ent.relations.remove(&relation_id) {
+                affected.extend(entity_ids_for_relation(&relation));
                 remove_relation_indexes(&mut ent, &relation);
             }
         }
+        self.refresh_merkle_for_entities(&ent, affected.iter().copied());
+        let affected = sorted_unique_entity_ids(affected);
+        drop(ver);
+        drop(ent);
+
+        self.text_full_rebuild_required
+            .store(true, Ordering::Release);
+        self.invalidate_entities_for_embedding(&affected)?;
         self.require_full_snapshot();
         Ok(())
     }
@@ -9324,6 +9556,255 @@ mod tests {
     }
 
     #[test]
+    fn create_changes_batch_matches_sequential_state_and_delta_bytes() {
+        let sequential = InMemoryGraph::new();
+        let batched = InMemoryGraph::new();
+
+        let original = test_entity("target", "src/lib.rs");
+        let mut modified = original.clone();
+        modified.signature = "fn target(value: usize)".to_string();
+        modified.fingerprint.signature_hash = Hash256::from_bytes([0x44; 32]);
+
+        let genesis_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x11; 32]));
+        let first_child_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x22; 32]));
+        let second_child_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x33; 32]));
+        let timestamp = Timestamp::now();
+        let changes = vec![
+            SemanticChange {
+                id: genesis_id,
+                parents: vec![],
+                timestamp: timestamp.clone(),
+                author: AuthorId::new("test"),
+                message: "genesis".to_string(),
+                entity_deltas: vec![EntityDelta::Added(original.clone())],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            },
+            SemanticChange {
+                id: first_child_id,
+                parents: vec![genesis_id],
+                timestamp: timestamp.clone(),
+                author: AuthorId::new("test"),
+                message: "modify target".to_string(),
+                entity_deltas: vec![EntityDelta::Modified {
+                    old: original.clone(),
+                    new: modified,
+                }],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            },
+            SemanticChange {
+                id: second_child_id,
+                parents: vec![genesis_id],
+                timestamp,
+                author: AuthorId::new("test"),
+                message: "sibling".to_string(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            },
+        ];
+
+        for change in &changes {
+            sequential.create_change(change).unwrap();
+        }
+        batched.create_changes(changes).unwrap();
+
+        let sequential_snapshot = sequential.to_snapshot();
+        let batched_snapshot = batched.to_snapshot();
+        assert_eq!(
+            compute_graph_root_hash(&sequential_snapshot),
+            compute_graph_root_hash(&batched_snapshot),
+            "batch registration must preserve the canonical graph root"
+        );
+        assert_eq!(
+            sequential_snapshot.change_children.get(&genesis_id),
+            Some(&vec![first_child_id, second_child_id]),
+        );
+        assert_eq!(
+            batched_snapshot.change_children.get(&genesis_id),
+            sequential_snapshot.change_children.get(&genesis_id),
+            "parent-child registration must preserve input order"
+        );
+        assert_eq!(
+            batched_snapshot
+                .entity_revisions
+                .get(&original.id)
+                .map(Vec::len),
+            Some(2),
+            "batch registration must retain the complete revision lineage"
+        );
+
+        let sequential_delta = sequential.pending_delta_snapshot(0).unwrap();
+        let batched_delta = batched.pending_delta_snapshot(0).unwrap();
+        assert_eq!(
+            sequential_delta.to_bytes().unwrap(),
+            batched_delta.to_bytes().unwrap(),
+            "batch and sequential writes must emit byte-identical snapshot deltas"
+        );
+    }
+
+    #[test]
+    fn create_changes_remove_before_add_matches_sequential_delta_bytes() {
+        let sequential = InMemoryGraph::new();
+        let batched = InMemoryGraph::new();
+        let removed_then_added = test_entity("late", "src/late.rs");
+        let other = test_entity("other", "src/other.rs");
+        let timestamp = Timestamp::now();
+        let make_change =
+            |id_byte: u8, message: &str, entity_deltas: Vec<EntityDelta>| SemanticChange {
+                id: SemanticChangeId::from_hash(Hash256::from_bytes([id_byte; 32])),
+                parents: vec![],
+                timestamp: timestamp.clone(),
+                author: AuthorId::new("test"),
+                message: message.to_string(),
+                entity_deltas,
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: None,
+            };
+        let changes = vec![
+            make_change(
+                0x41,
+                "remove before history is available",
+                vec![EntityDelta::Removed(removed_then_added.id)],
+            ),
+            make_change(
+                0x42,
+                "add another entity first",
+                vec![EntityDelta::Added(other)],
+            ),
+            make_change(
+                0x43,
+                "add the previously removed entity",
+                vec![EntityDelta::Added(removed_then_added)],
+            ),
+        ];
+
+        for change in &changes {
+            sequential.create_change(change).unwrap();
+        }
+        batched.create_changes(changes).unwrap();
+
+        assert_eq!(
+            sequential
+                .pending_delta_snapshot(0)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            batched
+                .pending_delta_snapshot(0)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            "batch registration must preserve sequential delta slot order even when a removal precedes an add"
+        );
+    }
+
+    #[test]
+    fn delta_map_upsert_batch_preserves_sequential_slots_and_removals() {
+        let base = CollectionDelta {
+            added: vec![(1u64, 10u64)],
+            modified: vec![(2, 20)],
+            removed: vec![3, 4],
+        };
+        let updates = vec![(2, 21), (1, 11), (3, 30), (5, 50), (5, 51)];
+        let mut sequential = base.clone();
+        let mut batched = base;
+
+        for (key, value) in &updates {
+            delta_map_upsert(&mut sequential, *key, *value);
+        }
+        delta_map_upsert_batch(&mut batched, updates);
+
+        assert_eq!(
+            rmp_serde::to_vec(&sequential).unwrap(),
+            rmp_serde::to_vec(&batched).unwrap(),
+            "indexed upserts must preserve added/modified slot precedence and stable removal order"
+        );
+    }
+
+    #[test]
+    fn delta_map_upsert_batch_uses_linear_key_comparisons() {
+        #[derive(Clone)]
+        struct CountingKey {
+            value: usize,
+            comparisons: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl PartialEq for CountingKey {
+            fn eq(&self, other: &Self) -> bool {
+                self.comparisons
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.value == other.value
+            }
+        }
+
+        impl Eq for CountingKey {}
+
+        impl std::hash::Hash for CountingKey {
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                std::hash::Hash::hash(&self.value, state);
+            }
+        }
+
+        let count = 2_048usize;
+        let comparisons = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let key = |value| CountingKey {
+            value,
+            comparisons: std::sync::Arc::clone(&comparisons),
+        };
+        let mut delta = CollectionDelta::<CountingKey, usize>::default();
+        delta.modified = (0..count).map(|value| (key(value), value)).collect();
+        let updates = (0..count)
+            .map(|value| (key(value), value + count))
+            .collect();
+
+        comparisons.store(0, std::sync::atomic::Ordering::Relaxed);
+        delta_map_upsert_batch(&mut delta, updates);
+        let observed = comparisons.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert!(
+            observed < count * 32,
+            "indexed batch upsert must stay linear-ish; observed {observed} key comparisons for {count} updates"
+        );
+        assert!(
+            delta
+                .modified
+                .iter()
+                .all(|(key, value)| *value == key.value + count),
+            "every existing slot must be updated in place"
+        );
+    }
+
+    #[test]
+    fn create_changes_empty_batch_is_a_noop() {
+        let graph = InMemoryGraph::new();
+        graph.create_changes(Vec::new()).unwrap();
+        assert!(!graph.has_pending_delta());
+        assert!(graph.to_snapshot().changes.is_empty());
+    }
+
+    #[test]
     fn resolve_entity_at_replays_entity_deltas_for_target_head() {
         let graph = InMemoryGraph::new();
 
@@ -10590,6 +11071,42 @@ mod tests {
         assert_eq!(tests_b[0].test_id, tid);
     }
 
+    #[cfg(feature = "vector")]
+    #[test]
+    fn delete_test_case_requeues_indexed_relation_endpoints() {
+        let graph = InMemoryGraph::new();
+        let entity = test_entity("target", "src/lib.rs");
+        graph.upsert_entity(&entity).unwrap();
+        let test_case = TestCase {
+            test_id: TestId::new(),
+            name: "test_target".into(),
+            language: "rust".into(),
+            kind: TestKind::Unit,
+            scopes: vec![WorkScope::Entity(entity.id)],
+            runner: TestRunner::Cargo,
+            file_origin: None,
+        };
+        graph.create_test_case(&test_case).unwrap();
+
+        let index = std::sync::Arc::new(crate::VectorIndex::new(2).unwrap());
+        index.upsert(entity.id, &[1.0, 0.0]).unwrap();
+        *graph.vector_index.lock() = Some(std::sync::Arc::clone(&index));
+        graph.embedding_queue.lock().clear();
+
+        graph.delete_test_case(&test_case.test_id).unwrap();
+
+        assert!(graph
+            .embedding_queue
+            .lock()
+            .contains(&RetrievalKey::Entity(entity.id)));
+        assert!(!index.contains(&entity.id));
+        assert_eq!(
+            graph.snapshot_root_hash(),
+            Some(compute_graph_root_hash(&graph.to_snapshot())),
+            "bulk test-relation deletion must keep the maintained Merkle root current"
+        );
+    }
+
     #[test]
     fn traverse_crosses_verification_and_entity_edges() {
         let graph = InMemoryGraph::new();
@@ -11589,6 +12106,59 @@ mod tests {
 
     #[cfg(feature = "vector")]
     #[test]
+    fn relation_batch_replace_and_remove_requeue_indexed_endpoints() {
+        let graph = InMemoryGraph::new();
+        let old_source = test_entity("old_source", "src/a.rs");
+        let shared = test_entity("shared", "src/b.rs");
+        let new_target = test_entity("new_target", "src/c.rs");
+        graph.upsert_entity(&old_source).unwrap();
+        graph.upsert_entity(&shared).unwrap();
+        graph.upsert_entity(&new_target).unwrap();
+
+        let old = test_relation(old_source.id, shared.id, RelationKind::Calls);
+        graph.upsert_relation(&old).unwrap();
+
+        let index = std::sync::Arc::new(crate::VectorIndex::new(2).unwrap());
+        index.upsert(old_source.id, &[1.0, 0.0]).unwrap();
+        index.upsert(shared.id, &[0.0, 1.0]).unwrap();
+        index.upsert(new_target.id, &[0.5, 0.5]).unwrap();
+        *graph.vector_index.lock() = Some(std::sync::Arc::clone(&index));
+        graph.embedding_queue.lock().clear();
+
+        let replacement = test_relation(shared.id, new_target.id, RelationKind::Calls);
+        graph
+            .replace_relations_of_kind(RelationKind::Calls, vec![replacement.clone()])
+            .unwrap();
+
+        {
+            let queue = graph.embedding_queue.lock();
+            assert_eq!(queue.len(), 3, "old and new endpoints must be deduplicated");
+            assert!(queue.contains(&RetrievalKey::Entity(old_source.id)));
+            assert!(queue.contains(&RetrievalKey::Entity(shared.id)));
+            assert!(queue.contains(&RetrievalKey::Entity(new_target.id)));
+        }
+        assert!(!index.contains(&old_source.id));
+        assert!(!index.contains(&shared.id));
+        assert!(!index.contains(&new_target.id));
+
+        // Reinstall vectors to prove the removal path independently invalidates
+        // and requeues both endpoints of the relation it deletes.
+        index.upsert(shared.id, &[0.0, 1.0]).unwrap();
+        index.upsert(new_target.id, &[0.5, 0.5]).unwrap();
+        graph.embedding_queue.lock().clear();
+        graph.remove_relations_batch(&[&replacement.id]).unwrap();
+
+        let queue = graph.embedding_queue.lock();
+        assert_eq!(queue.len(), 2);
+        assert!(queue.contains(&RetrievalKey::Entity(shared.id)));
+        assert!(queue.contains(&RetrievalKey::Entity(new_target.id)));
+        drop(queue);
+        assert!(!index.contains(&shared.id));
+        assert!(!index.contains(&new_target.id));
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
     fn remove_outgoing_relations_queues_affected_entities_for_reembedding() {
         let graph = InMemoryGraph::new();
         let caller = test_entity("caller", "src/a.rs");
@@ -12404,6 +12974,91 @@ mod tests {
 
     #[cfg(feature = "vector")]
     #[test]
+    fn embedding_frontier_rebuilds_when_new_higher_priority_work_arrives() {
+        let g = InMemoryGraph::new();
+        let mut first = test_entity_with_id(0x91, "first");
+        first.visibility = Visibility::Private;
+        let mut second = test_entity_with_id(0x92, "second");
+        second.visibility = Visibility::Private;
+        g.upsert_entity(&first).unwrap();
+        g.upsert_entity(&second).unwrap();
+        g.embedding_queue.lock().clear();
+        g.queue_for_embedding(&[first.id, second.id]);
+
+        assert_eq!(g.drain_embedding_batch(1).len(), 1);
+        assert_eq!(g.embedding_queue.lock().frontier_rebuilds, 1);
+
+        // A newly changed public API outranks the cached private/backfill
+        // leftover. Its enqueue invalidates and rebuilds the frontier once.
+        let mut api = test_entity_with_id(0x93, "api");
+        api.kind = EntityKind::Interface;
+        g.upsert_entity(&api).unwrap();
+        let next = g.drain_embedding_batch(1);
+        assert_eq!(next[0].0, RetrievalKey::Entity(api.id));
+        assert_eq!(g.embedding_queue.lock().frontier_rebuilds, 2);
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn embedding_frontier_rebuilds_when_existing_key_graph_priority_changes() {
+        let g = InMemoryGraph::new();
+        let mut first = test_entity_with_id(0x91, "first");
+        first.visibility = Visibility::Private;
+        let mut second = test_entity_with_id(0x92, "second");
+        second.visibility = Visibility::Private;
+        let mut promoted = test_entity_with_id(0x93, "promoted");
+        promoted.visibility = Visibility::Private;
+        g.upsert_entity(&first).unwrap();
+        g.upsert_entity(&second).unwrap();
+        g.upsert_entity(&promoted).unwrap();
+
+        let first_batch = g.drain_embedding_batch(1);
+        assert_eq!(first_batch[0].0, RetrievalKey::Entity(first.id));
+        assert_eq!(g.embedding_queue.lock().frontier_rebuilds, 1);
+
+        // `promoted` is already queued as ChangedThisSync. Its mutation keeps
+        // the same membership and recency but changes the graph-derived tier,
+        // so the cached remainder must still be invalidated.
+        promoted.visibility = Visibility::Public;
+        promoted.kind = EntityKind::Interface;
+        g.upsert_entity(&promoted).unwrap();
+
+        let next = g.drain_embedding_batch(1);
+        assert_eq!(next[0].0, RetrievalKey::Entity(promoted.id));
+        assert_eq!(g.embedding_queue.lock().frontier_rebuilds, 2);
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn relation_batch_add_rebuilds_frontier_for_changed_centrality() {
+        let g = InMemoryGraph::new();
+        let mut first = test_entity_with_id(0x91, "first");
+        first.visibility = Visibility::Private;
+        let mut second = test_entity_with_id(0x92, "second");
+        second.visibility = Visibility::Private;
+        let mut promoted = test_entity_with_id(0x93, "promoted");
+        promoted.visibility = Visibility::Private;
+        g.upsert_entity(&first).unwrap();
+        g.upsert_entity(&second).unwrap();
+        g.upsert_entity(&promoted).unwrap();
+
+        let first_batch = g.drain_embedding_batch(1);
+        assert_eq!(first_batch[0].0, RetrievalKey::Entity(first.id));
+        assert_eq!(g.embedding_queue.lock().frontier_rebuilds, 1);
+
+        // The incoming edge increases the higher-id entity's centrality while
+        // it is already in the cached remainder. Batch relation mutation must
+        // invalidate both endpoints after dropping the entity lock.
+        let relation = test_relation(first.id, promoted.id, RelationKind::Calls);
+        g.upsert_relations_batch(&[relation]).unwrap();
+
+        let next = g.drain_embedding_batch(1);
+        assert_eq!(next[0].0, RetrievalKey::Entity(promoted.id));
+        assert_eq!(g.embedding_queue.lock().frontier_rebuilds, 2);
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
     fn drain_artifact_embedding_batch_is_deterministic_and_recency_first() {
         let g = InMemoryGraph::new();
         // Pure queue-ordering test: ids are arbitrary distinct graph-assigned
@@ -12437,16 +13092,13 @@ mod tests {
         assert_eq!(order, expected);
     }
 
-    /// Parity gate: the small-batch partial-selection drain must yield the
-    /// IDENTICAL sequence to draining the whole queue in one shot (a pure full
-    /// sort). `drain_embedding_batch(huge)` takes the entire queue, so its
-    /// `take == len` skips `select_nth_unstable` and the result is the reference
-    /// full sort; the small-batch path exercises `select_nth_unstable` every
-    /// round. Equality proves the top-K selection orders work exactly as the
-    /// prior whole-queue sort — the invariant the citable proof depends on.
+    /// Parity gate: popping a cached frontier in small batches must yield the
+    /// IDENTICAL sequence to draining the whole queue in one shot. Equality
+    /// proves the optimization changes only repeated queue bookkeeping, never
+    /// the proof-sensitive global embedding order.
     #[cfg(feature = "vector")]
     #[test]
-    fn drain_embedding_batch_partial_select_matches_full_sort() {
+    fn drain_embedding_batch_frontier_matches_full_sort_and_builds_once() {
         let build = || {
             let g = InMemoryGraph::new();
             for i in 0..60u128 {
@@ -12489,15 +13141,19 @@ mod tests {
         );
         assert_eq!(
             full, batched,
-            "small-batch partial selection must equal the full-sorted drain order"
+            "small-batch frontier pops must equal the full-sorted drain order"
+        );
+        assert_eq!(
+            g_batched.embedding_queue.lock().frontier_rebuilds,
+            1,
+            "a stable backlog must be globally ordered once, not once per batch"
         );
     }
 
-    /// Artifact-queue twin of the entity parity gate: the converted
-    /// `select_nth_unstable` artifact drain must match the prior full-sort order.
+    /// Artifact-queue twin of the entity parity and one-build gate.
     #[cfg(feature = "vector")]
     #[test]
-    fn drain_artifact_embedding_batch_partial_select_matches_full_sort() {
+    fn drain_artifact_embedding_batch_frontier_matches_full_sort_and_builds_once() {
         let ids: Vec<ArtifactId> = (0..50).map(|_| ArtifactId::new()).collect();
         let fill = |g: &InMemoryGraph| {
             let mut q = g.artifact_embedding_queue.lock();
@@ -12537,7 +13193,12 @@ mod tests {
         );
         assert_eq!(
             full, batched,
-            "artifact partial selection must equal the full-sorted drain order"
+            "artifact frontier pops must equal the full-sorted drain order"
+        );
+        assert_eq!(
+            g_batched.artifact_embedding_queue.lock().frontier_rebuilds,
+            1,
+            "a stable artifact backlog must be globally ordered once"
         );
     }
 
@@ -12869,9 +13530,9 @@ mod tests {
             n * 1024 / (1024 * 1024)
         );
 
-        // S2 — selection strategy in isolation (both on a Vec, so the shared
-        // HashMap drain/reinsert cost is excluded): full sort of the remaining
-        // queue every batch vs `select_nth_unstable` + sort only the taken prefix.
+        // S2 — repeated backlog partition/reinsert versus one global ordering
+        // followed by O(batch) frontier pops. This excludes HashMap lock cost,
+        // so it is a conservative view of the production improvement.
         let m = 20_000usize;
         let ids: Vec<ArtifactId> = (0..m).map(|_| ArtifactId::new()).collect();
         let batch = 256usize;
@@ -12885,37 +13546,36 @@ mod tests {
         let order = |a: &(ArtifactId, EmbedRecency), b: &(ArtifactId, EmbedRecency)| {
             a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0))
         };
-        // Each real batch drains the leftover back out of the HashMap in random
-        // order, so every batch sorts/selects UNSORTED input — model one such
-        // batch over `reps` fresh copies.
         let base: Vec<(ArtifactId, EmbedRecency)> = ids
             .iter()
             .enumerate()
             .map(|(i, id)| (*id, recency_of(i)))
             .collect();
-        let reps = 200;
 
         let t = Instant::now();
         let mut sink2 = 0u128;
-        for _ in 0..reps {
-            let mut q = base.clone();
-            q.sort_unstable_by(order);
-            sink2 ^= q[0].0 .0.as_u128();
+        let mut old_queue = base.clone();
+        while !old_queue.is_empty() {
+            let take = batch.min(old_queue.len());
+            if take < old_queue.len() {
+                old_queue.select_nth_unstable_by(take, order);
+            }
+            let leftover = old_queue.split_off(take);
+            old_queue.sort_unstable_by(order);
+            sink2 ^= old_queue[0].0 .0.as_u128();
+            old_queue = leftover;
         }
-        let old_select = t.elapsed();
+        let old_repartition = t.elapsed();
 
         let t = Instant::now();
-        for _ in 0..reps {
-            let mut q = base.clone();
-            if batch < q.len() {
-                q.select_nth_unstable_by(batch, order);
-            }
-            q[..batch].sort_unstable_by(order);
-            sink2 ^= q[0].0 .0.as_u128();
+        let mut ordered = base;
+        ordered.sort_unstable_by(order);
+        for chunk in ordered.chunks(batch) {
+            sink2 ^= chunk[0].0 .0.as_u128();
         }
-        let new_select = t.elapsed();
+        let new_frontier = t.elapsed();
         eprintln!(
-            "[S2] per-batch selection m={m} take={batch} x{reps} (unsorted input): old full-sort {old_select:?} vs new partial-select {new_select:?} (sink={sink2})"
+            "[S2] complete drain m={m} take={batch}: old repeated partition {old_repartition:?} vs cached frontier {new_frontier:?} (sink={sink2})"
         );
 
         // S3 — prune: full index scan vs incremental tracked eviction.
