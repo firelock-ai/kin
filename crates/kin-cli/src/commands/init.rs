@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -775,15 +776,20 @@ pub async fn run(
                             }
                         }
 
-                        if let Err(err) =
-                            enrich_imported_changes_with_semantics(&mut imported, &blob_store)
-                        {
-                            warn!(
-                                error = %err,
-                                mode = %git_history,
-                                "failed to enrich imported Git history with semantic deltas; continuing with artifact-only history"
-                            );
-                        }
+                        // Historical semantic truth is an authority path. A
+                        // checkpoint with a stale version key or invalid digest
+                        // must stop init rather than silently degrade the graph
+                        // to artifact-only history.
+                        enrich_imported_changes_with_semantics_checkpointed(
+                            &mut imported,
+                            &blob_store,
+                            layout.root(),
+                        )
+                        .with_context(|| {
+                            format!(
+                                "enrich imported Git history with semantic deltas ({git_history})"
+                            )
+                        })?;
 
                         let mut last_id = None;
                         for ic in &imported {
@@ -1138,7 +1144,8 @@ struct DiscoveredTest {
     target_entity_ids: Vec<EntityId>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ImportedSemanticFileState {
     file_path: String,
     entities: Vec<Entity>,
@@ -1216,6 +1223,831 @@ impl Clone for ImportedCommitSemanticState {
             },
         }
     }
+}
+
+const HISTORY_CHECKPOINT_SCHEMA: &str = "kin.history-hydration.checkpoint.v1";
+const HISTORY_CHECKPOINT_FORMAT_VERSION: u32 = 1;
+/// Bump for any replay semantic change that can alter restored state even when
+/// the JSON shape itself remains unchanged.
+const HISTORY_CHECKPOINT_SEMANTICS_VERSION: u32 = 1;
+const HISTORY_CHECKPOINT_INTERVAL: usize = 2_000;
+/// Storage budget: at most four `(frontier state + completed delta prefix)`
+/// payloads for each of at most two exact history identities. The operator
+/// line emitted after every write reports the current exact-history byte total;
+/// old boundaries and then old history identities are compacted automatically.
+const HISTORY_CHECKPOINTS_PER_HISTORY: usize = 4;
+const HISTORY_CHECKPOINT_HISTORY_LIMIT: usize = 2;
+const BASE_LINK_MESSAGE: &str = "kin import: base-link (window base universe)";
+
+#[derive(Debug, Clone)]
+struct HydrationCheckpointConfig {
+    kin_root: PathBuf,
+    interval: usize,
+}
+
+impl HydrationCheckpointConfig {
+    fn production(kin_root: &Path) -> Self {
+        Self {
+            kin_root: kin_root.to_path_buf(),
+            interval: HISTORY_CHECKPOINT_INTERVAL,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct HydrationReplayStats {
+    parse_memo_hits: usize,
+    parse_memo_misses: usize,
+    resumed_from: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HydrationCheckpointVersionKeyV1 {
+    graph_snapshot_version: u32,
+    parser_semantics_version: u32,
+    hydration_semantics_version: u32,
+    incremental_linker_checkpoint_version: u32,
+    kin_index_crate_version: String,
+    kin_cli_crate_version: String,
+}
+
+impl HydrationCheckpointVersionKeyV1 {
+    fn current() -> Self {
+        Self {
+            graph_snapshot_version: kin_db::GraphSnapshot::CURRENT_VERSION,
+            parser_semantics_version: kin_parser::PARSER_SEMANTICS_VERSION,
+            hydration_semantics_version: HISTORY_CHECKPOINT_SEMANTICS_VERSION,
+            incremental_linker_checkpoint_version: kin_index::INCREMENTAL_LINKER_CHECKPOINT_VERSION,
+            kin_index_crate_version: kin_index::KIN_INDEX_CRATE_VERSION.to_string(),
+            kin_cli_crate_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum HydrationCheckpointBoundaryV1 {
+    BaseLink,
+    Periodic,
+    Final,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EntityRelationIndexCheckpointV1 {
+    entity_id: EntityId,
+    relation_ids: Vec<RelationId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactRelationIndexCheckpointV1 {
+    artifact_id: ArtifactId,
+    relation_ids: Vec<RelationId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportedCommitSemanticStateCheckpointV1 {
+    files: Vec<(String, ImportedSemanticFileState)>,
+    relations: Vec<(RelationId, Relation)>,
+    relations_by_src: Vec<EntityRelationIndexCheckpointV1>,
+    relations_by_src_artifact: Vec<ArtifactRelationIndexCheckpointV1>,
+    relations_by_dst: Vec<EntityRelationIndexCheckpointV1>,
+    linker: kin_index::IncrementalLinkerCheckpointV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HydrationFrontierCheckpointV1 {
+    change_id: SemanticChangeId,
+    state: ImportedCommitSemanticStateCheckpointV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompletedSemanticDeltasCheckpointV1 {
+    change_id: SemanticChangeId,
+    entity_deltas: Vec<EntityDelta>,
+    relation_deltas: Vec<RelationDelta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HydrationCheckpointPayloadV1 {
+    format_version: u32,
+    version_key: HydrationCheckpointVersionKeyV1,
+    history_fingerprint: String,
+    processed_count: usize,
+    boundary_change_id: SemanticChangeId,
+    boundary: HydrationCheckpointBoundaryV1,
+    remaining_children: Vec<usize>,
+    frontier: Vec<HydrationFrontierCheckpointV1>,
+    completed: Vec<CompletedSemanticDeltasCheckpointV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HydrationCheckpointEnvelopeV1 {
+    schema: String,
+    payload_sha256: String,
+    payload: HydrationCheckpointPayloadV1,
+}
+
+#[derive(Serialize)]
+struct HydrationHistoryIdentityEntry<'a> {
+    git_oid: &'a str,
+    change_id: SemanticChangeId,
+    parents: &'a [SemanticChangeId],
+    message: &'a str,
+    artifact_deltas: &'a [kin_model::ArtifactDelta],
+}
+
+fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    fn sort(value: serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => serde_json::Value::Object(
+                map.into_iter()
+                    .collect::<BTreeMap<_, _>>()
+                    .into_iter()
+                    .map(|(key, value)| (key, sort(value)))
+                    .collect(),
+            ),
+            serde_json::Value::Array(values) => {
+                serde_json::Value::Array(values.into_iter().map(sort).collect())
+            }
+            other => other,
+        }
+    }
+
+    let value = serde_json::to_value(value).context("serialize hydration checkpoint value")?;
+    serde_json::to_vec(&sort(value)).context("encode canonical hydration checkpoint JSON")
+}
+
+fn hydration_history_fingerprint(imported: &[kin_git::ImportedChange]) -> Result<String> {
+    let identity: Vec<_> = imported
+        .iter()
+        .map(|entry| HydrationHistoryIdentityEntry {
+            git_oid: &entry.git_oid,
+            change_id: entry.change.id,
+            parents: &entry.change.parents,
+            message: &entry.change.message,
+            artifact_deltas: &entry.change.artifact_deltas,
+        })
+        .collect();
+    let mut hasher = Sha256::new();
+    hasher.update(b"kin-history-hydration-input-v1\0");
+    hasher.update(canonical_json_bytes(&identity)?);
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn sorted_relation_ids(ids: &HashSet<RelationId>) -> Vec<RelationId> {
+    let mut ids: Vec<_> = ids.iter().copied().collect();
+    ids.sort_by_key(|id| id.0);
+    ids
+}
+
+impl ImportedCommitSemanticState {
+    fn to_checkpoint_v1(&self) -> ImportedCommitSemanticStateCheckpointV1 {
+        let Self {
+            files,
+            relations,
+            relations_by_src,
+            relations_by_src_artifact,
+            relations_by_dst,
+            linker,
+        } = self;
+
+        let mut files: Vec<_> = files
+            .iter()
+            .map(|(path, state)| (path.clone(), state.clone()))
+            .collect();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut relations: Vec<_> = relations
+            .iter()
+            .map(|(id, relation)| (*id, relation.clone()))
+            .collect();
+        relations.sort_by_key(|(id, _)| id.0);
+
+        let mut relations_by_src: Vec<_> = relations_by_src
+            .iter()
+            .map(|(entity_id, ids)| EntityRelationIndexCheckpointV1 {
+                entity_id: *entity_id,
+                relation_ids: sorted_relation_ids(ids),
+            })
+            .collect();
+        relations_by_src.sort_by_key(|entry| entry.entity_id);
+
+        let mut relations_by_src_artifact: Vec<_> = relations_by_src_artifact
+            .iter()
+            .map(|(artifact_id, ids)| ArtifactRelationIndexCheckpointV1 {
+                artifact_id: *artifact_id,
+                relation_ids: sorted_relation_ids(ids),
+            })
+            .collect();
+        relations_by_src_artifact.sort_by_key(|entry| entry.artifact_id);
+
+        let mut relations_by_dst: Vec<_> = relations_by_dst
+            .iter()
+            .map(|(entity_id, ids)| EntityRelationIndexCheckpointV1 {
+                entity_id: *entity_id,
+                relation_ids: sorted_relation_ids(ids),
+            })
+            .collect();
+        relations_by_dst.sort_by_key(|entry| entry.entity_id);
+
+        ImportedCommitSemanticStateCheckpointV1 {
+            files,
+            relations,
+            relations_by_src,
+            relations_by_src_artifact,
+            relations_by_dst,
+            linker: linker.to_checkpoint_v1(),
+        }
+    }
+
+    fn from_checkpoint_v1(checkpoint: ImportedCommitSemanticStateCheckpointV1) -> Result<Self> {
+        let ImportedCommitSemanticStateCheckpointV1 {
+            files,
+            relations,
+            relations_by_src,
+            relations_by_src_artifact,
+            relations_by_dst,
+            linker,
+        } = checkpoint;
+
+        let mut state = Self {
+            files: collect_unique_checkpoint_pairs(files, "files")?,
+            relations: collect_unique_checkpoint_pairs(relations, "relations")?,
+            relations_by_src: collect_entity_relation_index(relations_by_src, "relations_by_src")?,
+            relations_by_src_artifact: collect_artifact_relation_index(
+                relations_by_src_artifact,
+                "relations_by_src_artifact",
+            )?,
+            relations_by_dst: collect_entity_relation_index(relations_by_dst, "relations_by_dst")?,
+            linker: kin_index::IncrementalLinker::from_checkpoint_v1(linker)
+                .map_err(|error| anyhow!(error))?,
+        };
+        validate_checkpoint_state_indexes(&mut state)?;
+        Ok(state)
+    }
+}
+
+fn collect_unique_checkpoint_pairs<K, V>(entries: Vec<(K, V)>, field: &str) -> Result<HashMap<K, V>>
+where
+    K: std::hash::Hash + Eq,
+{
+    let mut output = HashMap::with_capacity(entries.len());
+    for (key, value) in entries {
+        if output.insert(key, value).is_some() {
+            return Err(anyhow!(
+                "hydration checkpoint contains duplicate key in {field}"
+            ));
+        }
+    }
+    Ok(output)
+}
+
+fn collect_relation_id_set(ids: Vec<RelationId>, field: &str) -> Result<HashSet<RelationId>> {
+    let expected = ids.len();
+    let output: HashSet<_> = ids.into_iter().collect();
+    if output.len() != expected {
+        return Err(anyhow!(
+            "hydration checkpoint contains duplicate relation id in {field}"
+        ));
+    }
+    Ok(output)
+}
+
+fn collect_entity_relation_index(
+    entries: Vec<EntityRelationIndexCheckpointV1>,
+    field: &str,
+) -> Result<HashMap<EntityId, HashSet<RelationId>>> {
+    collect_unique_checkpoint_pairs(
+        entries
+            .into_iter()
+            .map(|entry| {
+                collect_relation_id_set(entry.relation_ids, field).map(|ids| (entry.entity_id, ids))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        field,
+    )
+}
+
+fn collect_artifact_relation_index(
+    entries: Vec<ArtifactRelationIndexCheckpointV1>,
+    field: &str,
+) -> Result<HashMap<ArtifactId, HashSet<RelationId>>> {
+    collect_unique_checkpoint_pairs(
+        entries
+            .into_iter()
+            .map(|entry| {
+                collect_relation_id_set(entry.relation_ids, field)
+                    .map(|ids| (entry.artifact_id, ids))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        field,
+    )
+}
+
+fn validate_checkpoint_state_indexes(state: &mut ImportedCommitSemanticState) -> Result<()> {
+    let mut expected_by_src = HashMap::new();
+    let mut expected_by_src_artifact = HashMap::new();
+    let mut expected_by_dst = HashMap::new();
+    for relation in state.relations.values() {
+        insert_relation_indexes(
+            &mut expected_by_src,
+            &mut expected_by_src_artifact,
+            &mut expected_by_dst,
+            relation,
+        );
+    }
+    if state.relations_by_src != expected_by_src
+        || state.relations_by_src_artifact != expected_by_src_artifact
+        || state.relations_by_dst != expected_by_dst
+    {
+        return Err(anyhow!(
+            "hydration checkpoint relation indexes do not match relation truth"
+        ));
+    }
+    Ok(())
+}
+
+struct HydrationResumeState {
+    processed_count: usize,
+    remaining_children: Vec<usize>,
+    frontier: HashMap<SemanticChangeId, ImportedCommitSemanticState>,
+}
+
+fn hydration_checkpoint_history_dir(
+    config: &HydrationCheckpointConfig,
+    history_fingerprint: &str,
+) -> PathBuf {
+    config
+        .kin_root
+        .join("checkpoints")
+        .join("history-hydration")
+        .join(history_fingerprint)
+}
+
+fn hydration_checkpoint_file_name(payload: &HydrationCheckpointPayloadV1) -> String {
+    format!(
+        "{:020}-{}.json",
+        payload.processed_count, payload.boundary_change_id
+    )
+}
+
+fn decode_hydration_checkpoint(path: &Path) -> Result<HydrationCheckpointPayloadV1> {
+    let bytes =
+        fs::read(path).with_context(|| format!("read hydration checkpoint {}", path.display()))?;
+    let envelope: HydrationCheckpointEnvelopeV1 =
+        serde_json::from_slice(&bytes).map_err(|error| {
+            anyhow!(
+                "REFUSED hydration checkpoint {}: invalid schema payload: {}",
+                path.display(),
+                error
+            )
+        })?;
+    if envelope.schema != HISTORY_CHECKPOINT_SCHEMA {
+        return Err(anyhow!(
+            "REFUSED hydration checkpoint {}: schema '{}' does not match '{}'",
+            path.display(),
+            envelope.schema,
+            HISTORY_CHECKPOINT_SCHEMA
+        ));
+    }
+    if envelope.payload.format_version != HISTORY_CHECKPOINT_FORMAT_VERSION {
+        return Err(anyhow!(
+            "REFUSED hydration checkpoint {}: format version {} does not match {}",
+            path.display(),
+            envelope.payload.format_version,
+            HISTORY_CHECKPOINT_FORMAT_VERSION
+        ));
+    }
+    let current_version = HydrationCheckpointVersionKeyV1::current();
+    if envelope.payload.version_key != current_version {
+        return Err(anyhow!(
+            "REFUSED hydration checkpoint {}: runtime version key mismatch (stored {:?}, current {:?}); remove this exact-history checkpoint directory only after accepting a full replay",
+            path.display(),
+            envelope.payload.version_key,
+            current_version
+        ));
+    }
+    let payload_bytes = canonical_json_bytes(&envelope.payload)?;
+    let actual_digest = hex::encode(Sha256::digest(&payload_bytes));
+    if actual_digest != envelope.payload_sha256 {
+        return Err(anyhow!(
+            "REFUSED hydration checkpoint {}: payload digest mismatch (stored {}, actual {})",
+            path.display(),
+            envelope.payload_sha256,
+            actual_digest
+        ));
+    }
+    Ok(envelope.payload)
+}
+
+fn encode_hydration_checkpoint(payload: HydrationCheckpointPayloadV1) -> Result<Vec<u8>> {
+    let payload_sha256 = hex::encode(Sha256::digest(canonical_json_bytes(&payload)?));
+    canonical_json_bytes(&HydrationCheckpointEnvelopeV1 {
+        schema: HISTORY_CHECKPOINT_SCHEMA.to_string(),
+        payload_sha256,
+        payload,
+    })
+}
+
+fn write_hydration_checkpoint_atomically(
+    dir: &Path,
+    payload: HydrationCheckpointPayloadV1,
+) -> Result<PathBuf> {
+    fs::create_dir_all(dir)
+        .with_context(|| format!("create hydration checkpoint dir {}", dir.display()))?;
+    let destination = dir.join(hydration_checkpoint_file_name(&payload));
+    let bytes = encode_hydration_checkpoint(payload)?;
+    let temp = dir.join(format!(
+        ".{}.tmp.{}",
+        destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("checkpoint"),
+        std::process::id()
+    ));
+    let mut file = fs::File::create(&temp)
+        .with_context(|| format!("create hydration checkpoint temp {}", temp.display()))?;
+    file.write_all(&bytes)
+        .with_context(|| format!("write hydration checkpoint temp {}", temp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync hydration checkpoint temp {}", temp.display()))?;
+    drop(file);
+    fs::rename(&temp, &destination).with_context(|| {
+        format!(
+            "atomically install hydration checkpoint {}",
+            destination.display()
+        )
+    })?;
+    Ok(destination)
+}
+
+fn list_hydration_checkpoint_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    for entry in fs::read_dir(dir)
+        .with_context(|| format!("read hydration checkpoint dir {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn prune_hydration_checkpoints(dir: &Path) -> Result<()> {
+    let mut entries = Vec::new();
+    for path in list_hydration_checkpoint_files(dir)? {
+        let payload = decode_hydration_checkpoint(&path)?;
+        entries.push((path, payload.processed_count, payload.boundary));
+    }
+    if entries.len() <= HISTORY_CHECKPOINTS_PER_HISTORY {
+        return Ok(());
+    }
+
+    entries.sort_by_key(|(_, processed, _)| *processed);
+    let base_link = entries
+        .iter()
+        .rev()
+        .find(|(_, _, boundary)| *boundary == HydrationCheckpointBoundaryV1::BaseLink)
+        .map(|(path, _, _)| path.clone());
+    let mut keep = HashSet::<PathBuf>::new();
+    if let Some(path) = base_link {
+        keep.insert(path);
+    }
+    for (path, _, _) in entries.iter().rev() {
+        if keep.len() >= HISTORY_CHECKPOINTS_PER_HISTORY {
+            break;
+        }
+        keep.insert(path.clone());
+    }
+    for (path, _, _) in entries {
+        if !keep.contains(&path) {
+            fs::remove_file(&path)
+                .with_context(|| format!("prune hydration checkpoint {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn prune_hydration_checkpoint_histories(current_history_dir: &Path) -> Result<()> {
+    let Some(root) = current_history_dir.parent() else {
+        return Ok(());
+    };
+    let mut histories = Vec::new();
+    for entry in fs::read_dir(root)
+        .with_context(|| format!("read hydration checkpoint root {}", root.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        histories.push((path, modified));
+    }
+    histories.sort_by(|(path_a, time_a), (path_b, time_b)| {
+        time_a.cmp(time_b).then_with(|| path_a.cmp(path_b))
+    });
+    while histories.len() > HISTORY_CHECKPOINT_HISTORY_LIMIT {
+        let remove_idx = histories
+            .iter()
+            .position(|(path, _)| path != current_history_dir)
+            .ok_or_else(|| anyhow!("cannot select an old hydration checkpoint history to prune"))?;
+        let (path, _) = histories.remove(remove_idx);
+        fs::remove_dir_all(&path)
+            .with_context(|| format!("prune hydration checkpoint history {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn hydration_checkpoint_storage(dir: &Path) -> Result<(usize, u64)> {
+    let files = list_hydration_checkpoint_files(dir)?;
+    let mut bytes = 0u64;
+    for path in &files {
+        bytes = bytes.saturating_add(fs::metadata(path)?.len());
+    }
+    Ok((files.len(), bytes))
+}
+
+fn remaining_children_after_prefix(
+    initial_remaining_children: &[usize],
+    first_parent_index: &[Option<usize>],
+    order: &[usize],
+    processed_count: usize,
+) -> Result<Vec<usize>> {
+    let mut remaining = initial_remaining_children.to_vec();
+    for index in order.iter().take(processed_count).copied() {
+        if let Some(parent) = first_parent_index[index] {
+            remaining[parent] = remaining[parent].checked_sub(1).ok_or_else(|| {
+                anyhow!("hydration checkpoint replay prefix underflowed remaining child count")
+            })?;
+        }
+    }
+    Ok(remaining)
+}
+
+fn hydration_checkpoint_matches_history_prefix(
+    payload: &HydrationCheckpointPayloadV1,
+    imported: &[kin_git::ImportedChange],
+    order: &[usize],
+    first_parent_index: &[Option<usize>],
+    initial_remaining_children: &[usize],
+) -> Result<bool> {
+    if payload.processed_count == 0 {
+        return Err(anyhow!(
+            "REFUSED hydration checkpoint: processed_count must be non-zero"
+        ));
+    }
+    if payload.completed.len() != payload.processed_count {
+        return Err(anyhow!(
+            "REFUSED hydration checkpoint: completed delta count {} does not match processed_count {}",
+            payload.completed.len(),
+            payload.processed_count
+        ));
+    }
+    if payload.remaining_children.len() < payload.processed_count {
+        return Err(anyhow!(
+            "REFUSED hydration checkpoint: remaining-child vector length {} is shorter than processed_count {}",
+            payload.remaining_children.len(),
+            payload.processed_count
+        ));
+    }
+    if payload.processed_count > order.len() {
+        return Ok(false);
+    }
+    let expected_boundary = imported[order[payload.processed_count - 1]].change.id;
+    if payload.boundary_change_id != expected_boundary {
+        return Ok(false);
+    }
+    for (position, completed) in payload.completed.iter().enumerate() {
+        let expected = imported[order[position]].change.id;
+        if completed.change_id != expected {
+            return Ok(false);
+        }
+    }
+
+    let current_remaining = remaining_children_after_prefix(
+        initial_remaining_children,
+        first_parent_index,
+        order,
+        payload.processed_count,
+    )?;
+    let expected_frontier: HashSet<_> = order[..payload.processed_count]
+        .iter()
+        .copied()
+        .filter(|index| current_remaining[*index] > 0)
+        .map(|index| imported[index].change.id)
+        .collect();
+    let actual_frontier: HashSet<_> = payload
+        .frontier
+        .iter()
+        .map(|entry| entry.change_id)
+        .collect();
+    if actual_frontier.len() != payload.frontier.len() {
+        return Err(anyhow!(
+            "REFUSED hydration checkpoint: frontier contains duplicate change ids"
+        ));
+    }
+    if !actual_frontier.contains(&payload.boundary_change_id) {
+        return Err(anyhow!(
+            "REFUSED hydration checkpoint: boundary state is missing from the persisted frontier"
+        ));
+    }
+    Ok(expected_frontier.is_subset(&actual_frontier))
+}
+
+fn load_nearest_hydration_checkpoint(
+    config: &HydrationCheckpointConfig,
+    imported: &mut [kin_git::ImportedChange],
+    order: &[usize],
+    first_parent_index: &[Option<usize>],
+    initial_remaining_children: &[usize],
+) -> Result<Option<HydrationResumeState>> {
+    let root = config
+        .kin_root
+        .join("checkpoints")
+        .join("history-hydration");
+    if !root.exists() {
+        return Ok(None);
+    }
+    let mut nearest: Option<(PathBuf, HydrationCheckpointPayloadV1)> = None;
+    let mut history_dirs = Vec::new();
+    for entry in fs::read_dir(&root)
+        .with_context(|| format!("read hydration checkpoint root {}", root.display()))?
+    {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            history_dirs.push(entry.path());
+        }
+    }
+    history_dirs.sort();
+    for dir in history_dirs {
+        for path in list_hydration_checkpoint_files(&dir)? {
+            let payload = decode_hydration_checkpoint(&path)?;
+            if !hydration_checkpoint_matches_history_prefix(
+                &payload,
+                imported,
+                order,
+                first_parent_index,
+                initial_remaining_children,
+            )? {
+                continue;
+            }
+            let replace = nearest
+                .as_ref()
+                .map(|(_, current)| payload.processed_count > current.processed_count)
+                .unwrap_or(true);
+            if replace {
+                nearest = Some((path, payload));
+            }
+        }
+    }
+    let Some((path, payload)) = nearest else {
+        return Ok(None);
+    };
+
+    for (position, completed) in payload.completed.into_iter().enumerate() {
+        let change = &mut imported[order[position]].change;
+        change.entity_deltas = completed.entity_deltas;
+        change.relation_deltas = completed.relation_deltas;
+    }
+    let remaining_children = remaining_children_after_prefix(
+        initial_remaining_children,
+        first_parent_index,
+        order,
+        payload.processed_count,
+    )?;
+    let expected_frontier: HashSet<_> = order[..payload.processed_count]
+        .iter()
+        .copied()
+        .filter(|index| remaining_children[*index] > 0)
+        .map(|index| imported[index].change.id)
+        .collect();
+    let mut frontier = HashMap::with_capacity(expected_frontier.len());
+    for entry in payload.frontier {
+        if !expected_frontier.contains(&entry.change_id) {
+            continue;
+        }
+        let state =
+            ImportedCommitSemanticState::from_checkpoint_v1(entry.state).with_context(|| {
+                format!("restore hydration checkpoint frontier {}", entry.change_id)
+            })?;
+        if frontier.insert(entry.change_id, state).is_some() {
+            return Err(anyhow!(
+                "REFUSED hydration checkpoint {}: duplicate frontier state {}",
+                path.display(),
+                entry.change_id
+            ));
+        }
+    }
+    eprintln!(
+        "  Hydration Checkpoint: resumed {}/{} commits from {}",
+        payload.processed_count,
+        imported.len(),
+        path.display()
+    );
+    Ok(Some(HydrationResumeState {
+        processed_count: payload.processed_count,
+        remaining_children,
+        frontier,
+    }))
+}
+
+fn persist_hydration_checkpoint(
+    config: &HydrationCheckpointConfig,
+    history_fingerprint: &str,
+    imported: &[kin_git::ImportedChange],
+    order: &[usize],
+    first_parent_index: &[Option<usize>],
+    initial_remaining_children: &[usize],
+    processed_count: usize,
+    boundary: HydrationCheckpointBoundaryV1,
+    remaining_children: &[usize],
+    frontier: &HashMap<SemanticChangeId, ImportedCommitSemanticState>,
+    detached_boundary_state: Option<&ImportedCommitSemanticState>,
+) -> Result<()> {
+    let completed = order[..processed_count]
+        .iter()
+        .map(|index| CompletedSemanticDeltasCheckpointV1 {
+            change_id: imported[*index].change.id,
+            entity_deltas: imported[*index].change.entity_deltas.clone(),
+            relation_deltas: imported[*index].change.relation_deltas.clone(),
+        })
+        .collect();
+    let mut checkpoint_frontier: Vec<_> = frontier
+        .iter()
+        .map(|(change_id, state)| HydrationFrontierCheckpointV1 {
+            change_id: *change_id,
+            state: state.to_checkpoint_v1(),
+        })
+        .collect();
+    let boundary_change_id = imported[order[processed_count - 1]].change.id;
+    if !frontier.contains_key(&boundary_change_id) {
+        let state = detached_boundary_state.ok_or_else(|| {
+            anyhow!(
+                "cannot persist hydration checkpoint: boundary state {} is not retained",
+                boundary_change_id
+            )
+        })?;
+        checkpoint_frontier.push(HydrationFrontierCheckpointV1 {
+            change_id: boundary_change_id,
+            state: state.to_checkpoint_v1(),
+        });
+    }
+    checkpoint_frontier.sort_by(|a, b| a.change_id.to_string().cmp(&b.change_id.to_string()));
+
+    let payload = HydrationCheckpointPayloadV1 {
+        format_version: HISTORY_CHECKPOINT_FORMAT_VERSION,
+        version_key: HydrationCheckpointVersionKeyV1::current(),
+        history_fingerprint: history_fingerprint.to_string(),
+        processed_count,
+        boundary_change_id,
+        boundary,
+        remaining_children: remaining_children.to_vec(),
+        frontier: checkpoint_frontier,
+        completed,
+    };
+    if !hydration_checkpoint_matches_history_prefix(
+        &payload,
+        imported,
+        order,
+        first_parent_index,
+        initial_remaining_children,
+    )? {
+        return Err(anyhow!(
+            "new hydration checkpoint does not match its own deterministic replay prefix"
+        ));
+    }
+    let dir = hydration_checkpoint_history_dir(config, history_fingerprint);
+    let path = write_hydration_checkpoint_atomically(&dir, payload)?;
+    prune_hydration_checkpoints(&dir)?;
+    prune_hydration_checkpoint_histories(&dir)?;
+    let (retained, bytes) = hydration_checkpoint_storage(&dir)?;
+    eprintln!(
+        "  Hydration Checkpoint: persisted {} (retained {}/{} for this history, {} bytes; at most {} histories)",
+        path.display(),
+        retained,
+        HISTORY_CHECKPOINTS_PER_HISTORY,
+        bytes,
+        HISTORY_CHECKPOINT_HISTORY_LIMIT
+    );
+    Ok(())
 }
 
 /// Deterministic topological order over the first-parent forest.
@@ -1309,6 +2141,26 @@ pub(crate) fn enrich_imported_changes_with_semantics(
     enrich_imported_changes_with_semantics_inner(imported, blob_store, true).map(|_| ())
 }
 
+fn enrich_imported_changes_with_semantics_checkpointed(
+    imported: &mut [kin_git::ImportedChange],
+    blob_store: &kin_blobs::BlobStore,
+    kin_root: &Path,
+) -> Result<HydrationReplayStats> {
+    let config = HydrationCheckpointConfig::production(kin_root);
+    let stats = enrich_imported_changes_with_semantics_with_checkpoints(
+        imported,
+        blob_store,
+        true,
+        Some(&config),
+    )?;
+    debug!(
+        resumed_from = stats.resumed_from,
+        total_commits = imported.len(),
+        "historical semantic hydration checkpoint outcome"
+    );
+    Ok(stats)
+}
+
 /// Replay body shared by production (`parse_memo_enabled = true`) and the
 /// memo-off serial oracle used in tests. Returns `(parse_memo_hits,
 /// parse_memo_misses)` observed over the pass.
@@ -1317,6 +2169,21 @@ fn enrich_imported_changes_with_semantics_inner(
     blob_store: &kin_blobs::BlobStore,
     parse_memo_enabled: bool,
 ) -> Result<(usize, usize)> {
+    let stats = enrich_imported_changes_with_semantics_with_checkpoints(
+        imported,
+        blob_store,
+        parse_memo_enabled,
+        None,
+    )?;
+    Ok((stats.parse_memo_hits, stats.parse_memo_misses))
+}
+
+fn enrich_imported_changes_with_semantics_with_checkpoints(
+    imported: &mut [kin_git::ImportedChange],
+    blob_store: &kin_blobs::BlobStore,
+    parse_memo_enabled: bool,
+    checkpoint_config: Option<&HydrationCheckpointConfig>,
+) -> Result<HydrationReplayStats> {
     // Profiling timers (accumulated across every commit in the pass).
     let mut total_blob_read_time = std::time::Duration::ZERO;
     let mut total_parsing_time = std::time::Duration::ZERO;
@@ -1363,11 +2230,29 @@ fn enrich_imported_changes_with_semantics_inner(
     for parent in first_parent_index.iter().flatten() {
         remaining_children[*parent] += 1;
     }
+    let initial_remaining_children = remaining_children.clone();
 
     let order = first_parent_topological_order(&first_parent_index);
+    let history_fingerprint = checkpoint_config
+        .map(|_| hydration_history_fingerprint(imported))
+        .transpose()?;
     let mut snapshots = HashMap::<SemanticChangeId, ImportedCommitSemanticState>::new();
+    let mut resumed_from = 0usize;
+    if let Some(config) = checkpoint_config {
+        if let Some(resume) = load_nearest_hydration_checkpoint(
+            config,
+            imported,
+            &order,
+            &first_parent_index,
+            &initial_remaining_children,
+        )? {
+            resumed_from = resume.processed_count;
+            remaining_children = resume.remaining_children;
+            snapshots = resume.frontier;
+        }
+    }
 
-    for (processed, &i) in order.iter().enumerate() {
+    for (processed, &i) in order.iter().enumerate().skip(resumed_from) {
         if total_commits > 0 {
             let percent = ((processed + 1) * 100) / total_commits;
             let short_oid: String = imported[i].git_oid.chars().take(7).collect();
@@ -1748,20 +2633,62 @@ fn enrich_imported_changes_with_semantics_inner(
         imported[i].change.entity_deltas = entity_deltas;
         imported[i].change.relation_deltas = relation_deltas;
 
-        // Retain this commit's resulting state only while a later child will
-        // fork from it; leaves are dropped immediately.
+        let processed_count = processed + 1;
+        let checkpoint_boundary = checkpoint_config.and_then(|config| {
+            let is_base_link = imported[i].change.message == BASE_LINK_MESSAGE;
+            let is_final = processed_count == total_commits;
+            let is_periodic = processed_count % config.interval.max(1) == 0;
+            if is_base_link {
+                Some(HydrationCheckpointBoundaryV1::BaseLink)
+            } else if is_final {
+                Some(HydrationCheckpointBoundaryV1::Final)
+            } else if is_periodic {
+                Some(HydrationCheckpointBoundaryV1::Periodic)
+            } else {
+                None
+            }
+        });
+
+        let resulting_state = ImportedCommitSemanticState {
+            files: current_files,
+            relations: current_relations,
+            relations_by_src,
+            relations_by_src_artifact,
+            relations_by_dst,
+            linker: incremental_linker,
+        };
+
+        // Retain this commit's resulting state while a later child will fork
+        // from it. A checkpoint boundary additionally retains its own state
+        // even when it is currently a leaf, allowing a longer or shorter
+        // exact-prefix history to resume from that nearest ancestor later.
+        let mut detached_boundary_state = None;
         if remaining_children[i] > 0 {
-            snapshots.insert(
-                imported[i].change.id,
-                ImportedCommitSemanticState {
-                    files: current_files,
-                    relations: current_relations,
-                    relations_by_src,
-                    relations_by_src_artifact,
-                    relations_by_dst,
-                    linker: incremental_linker,
-                },
-            );
+            snapshots.insert(imported[i].change.id, resulting_state);
+        } else if checkpoint_boundary.is_some() {
+            detached_boundary_state = Some(resulting_state);
+        } else {
+            drop(resulting_state);
+        }
+
+        if let (Some(config), Some(history_fingerprint), Some(boundary)) = (
+            checkpoint_config,
+            history_fingerprint.as_deref(),
+            checkpoint_boundary,
+        ) {
+            persist_hydration_checkpoint(
+                config,
+                history_fingerprint,
+                imported,
+                &order,
+                &first_parent_index,
+                &initial_remaining_children,
+                processed_count,
+                boundary,
+                &remaining_children,
+                &snapshots,
+                detached_boundary_state.as_ref(),
+            )?;
         }
     }
 
@@ -1770,6 +2697,8 @@ fn enrich_imported_changes_with_semantics_inner(
         let total_time_sec = start_time.elapsed().as_secs_f64();
         eprintln!("  Hydration Profiling Summary:");
         eprintln!("    Total Commits: {}", total_commits);
+        eprintln!("    Resumed From: {}", resumed_from);
+        eprintln!("    Replayed Commits: {}", total_commits - resumed_from);
         eprintln!("    Total Time: {:.1}s", total_time_sec);
         eprintln!(
             "    - Blob Read: {:.1}s ({:.1}%)",
@@ -1802,6 +2731,7 @@ fn enrich_imported_changes_with_semantics_inner(
                 "{}",
                 hydrate_stage_timings_json(
                     total_commits,
+                    resumed_from,
                     total_time_sec,
                     total_blob_read_time.as_secs_f64(),
                     total_parsing_time.as_secs_f64(),
@@ -1814,7 +2744,11 @@ fn enrich_imported_changes_with_semantics_inner(
         }
     }
 
-    Ok((parse_memo_hits, parse_memo_misses))
+    Ok(HydrationReplayStats {
+        parse_memo_hits,
+        parse_memo_misses,
+        resumed_from,
+    })
 }
 
 /// One machine-readable record of the history-hydration replay profile, emitted
@@ -1823,11 +2757,15 @@ fn enrich_imported_changes_with_semantics_inner(
 /// so the line reads in the same order as the human summary printed above it.
 #[derive(Serialize)]
 struct HydrateStageTimings {
-    /// Commits replayed in the pass.
+    /// Total commits in the requested history.
     total_commits: usize,
+    /// Prefix restored from a persisted semantic checkpoint.
+    resumed_from_commits: usize,
+    /// Commits actually replayed during this pass.
+    replayed_commits: usize,
     /// Wall-clock seconds for the whole pass.
     total_s: f64,
-    /// Replay throughput (`total_commits` / `total_s`).
+    /// Replay throughput (`replayed_commits` / `total_s`).
     commits_per_s: f64,
     /// Seconds spent reading blobs.
     blob_read_s: f64,
@@ -1874,6 +2812,7 @@ fn hydrate_stage_timings_enabled() -> bool {
 #[allow(clippy::too_many_arguments)]
 fn hydrate_stage_timings_json(
     total_commits: usize,
+    resumed_from_commits: usize,
     total_s: f64,
     blob_read_s: f64,
     parsing_s: f64,
@@ -1882,11 +2821,12 @@ fn hydrate_stage_timings_json(
     parse_memo_hits: usize,
     parse_memo_misses: usize,
 ) -> String {
+    let replayed_commits = total_commits.saturating_sub(resumed_from_commits);
     // Guard the divide so a zero wall never yields NaN/Infinity (serde renders
     // those as `null`, which would break the "always a parseable number"
     // contract). A real pass always has a positive wall.
     let commits_per_s = if total_s > 0.0 {
-        total_commits as f64 / total_s
+        replayed_commits as f64 / total_s
     } else {
         0.0
     };
@@ -1894,6 +2834,8 @@ fn hydrate_stage_timings_json(
     let line = HydrateStageTimingsLine {
         kin_hydrate_stage_timings: HydrateStageTimings {
             total_commits,
+            resumed_from_commits,
+            replayed_commits,
             total_s,
             commits_per_s,
             blob_read_s,
@@ -4227,8 +5169,9 @@ mod tests {
     fn hydrate_stage_timings_json_is_parseable_with_explicit_residue() {
         // Representative pass: the four buckets leave a non-trivial residue, and
         // most parses were served from the memo.
-        let line =
-            hydrate_stage_timings_json(32865, 1933.4, 42.5, 261.9, 954.7, 641.2, 30000, 2865);
+        let line = hydrate_stage_timings_json(
+            32865, 32000, 1933.4, 42.5, 261.9, 954.7, 641.2, 30000, 2865,
+        );
 
         let value: serde_json::Value =
             serde_json::from_str(&line).expect("emitted line must be parseable JSON");
@@ -4238,6 +5181,8 @@ mod tests {
 
         // Count is an integer; every timing is a real (finite) float, never null.
         assert_eq!(obj["total_commits"].as_u64(), Some(32865));
+        assert_eq!(obj["resumed_from_commits"].as_u64(), Some(32000));
+        assert_eq!(obj["replayed_commits"].as_u64(), Some(865));
         for key in [
             "total_s",
             "commits_per_s",
@@ -4273,13 +5218,15 @@ mod tests {
             "other_s must be the explicit unattributed residue"
         );
 
-        // Throughput is commits / wall.
-        assert!((obj["commits_per_s"].as_f64().unwrap() - 32865.0 / 1933.4).abs() < 1e-9);
+        // Throughput counts only work done in this process, never the restored prefix.
+        assert!((obj["commits_per_s"].as_f64().unwrap() - 865.0 / 1933.4).abs() < 1e-9);
 
         // Keys are emitted in the documented order, not alphabetized.
         let order = [
             "kin_hydrate_stage_timings",
             "total_commits",
+            "resumed_from_commits",
+            "replayed_commits",
             "total_s",
             "commits_per_s",
             "blob_read_s",
@@ -4304,7 +5251,7 @@ mod tests {
     fn hydrate_stage_timings_json_guards_zero_wall() {
         // A zero wall must not emit NaN/Infinity (serde renders those as null);
         // commits_per_s falls back to 0.0 and stays a parseable number.
-        let line = hydrate_stage_timings_json(10, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0);
+        let line = hydrate_stage_timings_json(10, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0);
         let value: serde_json::Value =
             serde_json::from_str(&line).expect("emitted line must be parseable JSON");
         let obj = &value["kin_hydrate_stage_timings"];
@@ -5906,6 +6853,217 @@ func prCheckout(cmd *cobra.Command, args []string) error {
             },
             git_oid: hex::encode(id_bytes),
         }
+    }
+
+    #[test]
+    fn hydration_checkpoint_resume_is_bit_identical_canonical_and_fail_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = kin_blobs::BlobStore::new(dir.path().join("objects")).unwrap();
+        let util_v1 = blob_store
+            .write(b"def helper(value):\n    return value\n")
+            .unwrap();
+        let app_v1 = blob_store
+            .write(b"from util import helper\n\ndef run():\n    return helper(1)\n")
+            .unwrap();
+        let util_v2 = blob_store
+            .write(b"def helper(value):\n    return value + 1\n")
+            .unwrap();
+        let sibling_v1 = blob_store
+            .write(b"def sibling():\n    return 'branch'\n")
+            .unwrap();
+
+        let fixture = || {
+            vec![
+                imported_change(
+                    [0x71; 32],
+                    [0x70; 32],
+                    BASE_LINK_MESSAGE,
+                    vec![artifact_delta(
+                        "util.py",
+                        kin_model::ArtifactDeltaKind::Added,
+                        None,
+                        Some(Hash256::from_bytes(util_v1.0)),
+                    )],
+                ),
+                imported_change(
+                    [0x72; 32],
+                    [0x71; 32],
+                    "add caller",
+                    vec![artifact_delta(
+                        "app.py",
+                        kin_model::ArtifactDeltaKind::Added,
+                        None,
+                        Some(Hash256::from_bytes(app_v1.0)),
+                    )],
+                ),
+                imported_change(
+                    [0x73; 32],
+                    [0x71; 32],
+                    "add sibling branch",
+                    vec![artifact_delta(
+                        "sibling.py",
+                        kin_model::ArtifactDeltaKind::Added,
+                        None,
+                        Some(Hash256::from_bytes(sibling_v1.0)),
+                    )],
+                ),
+                imported_change(
+                    [0x74; 32],
+                    [0x72; 32],
+                    "change helper",
+                    vec![artifact_delta(
+                        "util.py",
+                        kin_model::ArtifactDeltaKind::Modified,
+                        Some(Hash256::from_bytes(util_v1.0)),
+                        Some(Hash256::from_bytes(util_v2.0)),
+                    )],
+                ),
+            ]
+        };
+        let assert_same_deltas =
+            |expected: &[kin_git::ImportedChange], actual: &[kin_git::ImportedChange]| {
+                assert_eq!(expected.len(), actual.len());
+                for (position, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+                    assert_eq!(
+                        canonical_json(&expected.change.entity_deltas),
+                        canonical_json(&actual.change.entity_deltas),
+                        "entity deltas diverged at commit {position}"
+                    );
+                    assert_eq!(
+                        canonical_json(&expected.change.relation_deltas),
+                        canonical_json(&actual.change.relation_deltas),
+                        "relation deltas diverged at commit {position}"
+                    );
+                }
+            };
+
+        let mut oracle = fixture();
+        enrich_imported_changes_with_semantics_inner(&mut oracle, &blob_store, true).unwrap();
+
+        let config_a = HydrationCheckpointConfig {
+            kin_root: dir.path().join("kin-a"),
+            interval: 1,
+        };
+        let mut first = fixture();
+        let first_stats = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut first,
+            &blob_store,
+            true,
+            Some(&config_a),
+        )
+        .unwrap();
+        assert_eq!(first_stats.resumed_from, 0);
+        assert_same_deltas(&oracle, &first);
+
+        // A second full replay into an independent root must produce identical
+        // checkpoint filenames and bytes, not merely equivalent decoded state.
+        let config_b = HydrationCheckpointConfig {
+            kin_root: dir.path().join("kin-b"),
+            interval: 1,
+        };
+        let mut independent = fixture();
+        enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut independent,
+            &blob_store,
+            true,
+            Some(&config_b),
+        )
+        .unwrap();
+        let fingerprint = hydration_history_fingerprint(&fixture()).unwrap();
+        let files_a = list_hydration_checkpoint_files(&hydration_checkpoint_history_dir(
+            &config_a,
+            &fingerprint,
+        ))
+        .unwrap();
+        let files_b = list_hydration_checkpoint_files(&hydration_checkpoint_history_dir(
+            &config_b,
+            &fingerprint,
+        ))
+        .unwrap();
+        assert_eq!(files_a.len(), 4);
+        assert_eq!(files_a.len(), files_b.len());
+        for (a, b) in files_a.iter().zip(&files_b) {
+            assert_eq!(a.file_name(), b.file_name());
+            assert_eq!(
+                fs::read(a).unwrap(),
+                fs::read(b).unwrap(),
+                "canonical checkpoint bytes diverged at {}",
+                a.file_name().unwrap().to_string_lossy()
+            );
+        }
+
+        // A historical-ref request has a different full-history fingerprint,
+        // but its topological sequence is an exact prefix. It must reuse the
+        // nearest ancestor checkpoint instead of replaying from genesis.
+        let mut historical_ref = fixture();
+        historical_ref.truncate(3);
+        let historical_stats = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut historical_ref,
+            &blob_store,
+            true,
+            Some(&config_a),
+        )
+        .unwrap();
+        assert_eq!(historical_stats.resumed_from, 3);
+        assert_same_deltas(&oracle[..3], &historical_ref);
+
+        // Remove the final checkpoint to model an interrupted run after the
+        // second boundary. The next pass must choose boundary 2, restore its
+        // completed deltas/frontier, and replay only the suffix.
+        fs::remove_file(&files_a[2]).unwrap();
+        fs::remove_file(&files_a[3]).unwrap();
+        let mut resumed = fixture();
+        let resumed_stats = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut resumed,
+            &blob_store,
+            true,
+            Some(&config_a),
+        )
+        .unwrap();
+        assert_eq!(resumed_stats.resumed_from, 2);
+        assert_same_deltas(&oracle, &resumed);
+
+        // ImportedCommitSemanticState has no serde defaults: a missing field is
+        // an incompatible artifact, not an empty-state fallback.
+        let mut state_json =
+            serde_json::to_value(ImportedCommitSemanticState::default().to_checkpoint_v1())
+                .unwrap();
+        state_json
+            .as_object_mut()
+            .unwrap()
+            .remove("relations_by_dst");
+        assert!(
+            serde_json::from_value::<ImportedCommitSemanticStateCheckpointV1>(state_json).is_err()
+        );
+
+        // A composite-version mismatch must stop the authority path loudly.
+        let checkpoint_dir = hydration_checkpoint_history_dir(&config_a, &fingerprint);
+        let version_file = list_hydration_checkpoint_files(&checkpoint_dir)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut stale: serde_json::Value =
+            serde_json::from_slice(&fs::read(&version_file).unwrap()).unwrap();
+        let version = stale
+            .pointer_mut("/payload/version_key/parser_semantics_version")
+            .unwrap();
+        *version = serde_json::Value::from(kin_parser::PARSER_SEMANTICS_VERSION.saturating_add(1));
+        fs::write(&version_file, serde_json::to_vec(&stale).unwrap()).unwrap();
+        let mut refused = fixture();
+        let error = enrich_imported_changes_with_semantics_with_checkpoints(
+            &mut refused,
+            &blob_store,
+            true,
+            Some(&config_a),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("REFUSED hydration checkpoint"),
+            "{message}"
+        );
+        assert!(message.contains("version key mismatch"), "{message}");
     }
 
     fn entity_by_name(graph: &kin_db::InMemoryGraph, file: &str, name: &str) -> Entity {
