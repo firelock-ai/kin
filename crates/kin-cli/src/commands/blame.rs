@@ -19,7 +19,14 @@ pub struct BlameResponse {
 
 pub struct BlameExecution {
     pub response: BlameResponse,
-    pub hydrated_git_history: bool,
+    /// Count of historical changes resolving this request's ref lazily
+    /// hydrated into the graph (0 when the ref was already present, or when
+    /// no ref was supplied and the current head resolved with no import).
+    /// Reported as a real count rather than a swallowed "did anything
+    /// hydrate" boolean, so a cold multi-thousand-change import is never
+    /// described the same way as a no-op: daemon owners persist the hydrated
+    /// state and broadcast the growth on this count being non-zero.
+    pub hydrated_changes: usize,
 }
 
 /// `kin blame <entity>` — Show who/when each version of an entity was committed.
@@ -79,7 +86,7 @@ pub fn execute_blame_request(
         lines.push("  No history recorded for this entity.".to_string());
         return Ok(BlameExecution {
             response: BlameResponse { lines },
-            hydrated_git_history: resolved.hydrated_git_history,
+            hydrated_changes: resolved.hydrated_changes,
         });
     }
 
@@ -113,6 +120,6 @@ pub fn execute_blame_request(
 
     Ok(BlameExecution {
         response: BlameResponse { lines },
-        hydrated_git_history: resolved.hydrated_git_history,
+        hydrated_changes: resolved.hydrated_changes,
     })
 }

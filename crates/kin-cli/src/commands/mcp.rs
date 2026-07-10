@@ -219,7 +219,11 @@ mod tests {
         assert_eq!(resolve_repo_override(None), None);
     }
 
+    // Serialized against every other test that mutates the process-global
+    // `KIN_DAEMON_URL` (its sibling below, and the init bootstrap test) so a
+    // concurrent set/remove from another test can never be observed mid-body.
     #[tokio::test]
+    #[serial_test::serial]
     async fn bind_daemon_reports_missing_repo_without_hard_error() {
         // A directory with no .kin/ must produce an `Err` reason string for
         // the caller to log, never a panic or a process-killing error
@@ -236,6 +240,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn bind_daemon_short_circuits_on_explicit_daemon_url() {
         // When KIN_DAEMON_URL is already set (e.g. by a supervising session),
         // binding must trust it directly rather than requiring a local .kin/
