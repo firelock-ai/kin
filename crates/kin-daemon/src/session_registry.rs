@@ -770,6 +770,7 @@ fn is_process_alive(pid: u32) -> bool {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         // On unsupported platforms, assume alive (conservative).
+        let _ = pid;
         true
     }
 }
