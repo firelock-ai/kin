@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -394,10 +394,11 @@ fn build_link_context<'a>(
 /// Resolve the name-based relations of a single file into entity-ID relations.
 ///
 /// All reads are against the shared read-only [`LinkContext`]; the only mutable
-/// state is a file-local dedup set, so this is pure with respect to other files.
+/// state is a file-local relation accumulator, so this is pure with respect to
+/// other files.
 fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation> {
     let mut resolved = Vec::new();
-    let mut seen: HashSet<(EntityId, EntityId, RelationKind)> = HashSet::new();
+    let mut relation_indices = HashMap::new();
     // Lazily resolved once per file: only ambiguous name buckets need them.
     let mut caller_import_targets: Option<HashSet<String>> = None;
     let mut caller_include_closure: Option<HashMap<String, usize>> = None;
@@ -431,9 +432,11 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
         if rel.kind == RelationKind::UsesMacro {
             if let Some(&dst_id) = dst_same_file {
                 if ctx.entity_kind_by_id.get(&dst_id) == Some(&EntityKind::Macro) {
-                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                        resolved.push(make_relation(rel, src_id, dst_id, 1.0));
-                    }
+                    accumulate_relation(
+                        &mut resolved,
+                        &mut relation_indices,
+                        make_relation(rel, src_id, dst_id, 1.0),
+                    );
                     continue;
                 }
             }
@@ -445,9 +448,11 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                 &ctx.entity_by_file_name,
                 &ctx.entity_kind_by_id,
             ) {
-                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                    resolved.push(make_relation(rel, src_id, dst_id, 0.95));
-                }
+                accumulate_relation(
+                    &mut resolved,
+                    &mut relation_indices,
+                    make_relation(rel, src_id, dst_id, 0.95),
+                );
                 continue;
             }
 
@@ -469,9 +474,11 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
         // so they carry the (c) name-match confidence (0.7), below the
         // parser-certain same-file edge (1.0).
         if let Some(&dst_id) = dst_same_file {
-            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                resolved.push(make_relation(rel, src_id, dst_id, 1.0));
-            }
+            accumulate_relation(
+                &mut resolved,
+                &mut relation_indices,
+                make_relation(rel, src_id, dst_id, 1.0),
+            );
             let mut cross_file_twins: HashSet<EntityId> = HashSet::new();
             distinct_cross_file_targets(
                 ctx.entity_by_name.get(rel.dst_name.as_str()),
@@ -482,9 +489,11 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                 prune_ids_by_arity(cross_file_twins, call_arity, &ctx.entity_arity_by_id);
             if !cross_file_twins.is_empty() && cross_file_twins.len() < AMBIGUOUS_CALL_FANOUT_CAP {
                 for cross_id in sorted_fanout_targets(cross_file_twins) {
-                    if add_deduped(&mut seen, src_id, cross_id, rel.kind) {
-                        resolved.push(make_relation(rel, src_id, cross_id, 0.7));
-                    }
+                    accumulate_relation(
+                        &mut resolved,
+                        &mut relation_indices,
+                        make_relation(rel, src_id, cross_id, 0.7),
+                    );
                 }
             }
             continue;
@@ -513,14 +522,11 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                     if let Some(dst_id) =
                         resolve_inherited_method(&file.file_path, owner, method, ctx)
                     {
-                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                            resolved.push(make_relation(
-                                rel,
-                                src_id,
-                                dst_id,
-                                INHERITED_METHOD_CONFIDENCE,
-                            ));
-                        }
+                        accumulate_relation(
+                            &mut resolved,
+                            &mut relation_indices,
+                            make_relation(rel, src_id, dst_id, INHERITED_METHOD_CONFIDENCE),
+                        );
                         continue;
                     }
                     dst_lookup = method;
@@ -547,9 +553,11 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                         None
                     };
                     if let Some(dst_id) = dst_id {
-                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                            resolved.push(make_relation(rel, src_id, dst_id, 0.95));
-                        }
+                        accumulate_relation(
+                            &mut resolved,
+                            &mut relation_indices,
+                            make_relation(rel, src_id, dst_id, 0.95),
+                        );
                         continue;
                     }
                 }
@@ -568,9 +576,11 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                             .entity_by_file_name
                             .get(&(target_file.as_str(), member_name))
                         {
-                            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                                resolved.push(make_relation(rel, src_id, dst_id, 0.9));
-                            }
+                            accumulate_relation(
+                                &mut resolved,
+                                &mut relation_indices,
+                                make_relation(rel, src_id, dst_id, 0.9),
+                            );
                             continue;
                         }
                     }
@@ -602,9 +612,11 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
             &other_file_candidates,
         ) {
             ImportPinnedTarget::Resolved(dst_id) => {
-                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                    resolved.push(make_relation(rel, src_id, dst_id, IMPORT_PINNED_CONFIDENCE));
-                }
+                accumulate_relation(
+                    &mut resolved,
+                    &mut relation_indices,
+                    make_relation(rel, src_id, dst_id, IMPORT_PINNED_CONFIDENCE),
+                );
                 continue;
             }
             ImportPinnedTarget::PinnedMiss => name_fallback_allowed = false,
@@ -656,10 +668,12 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                     None => (other_file_candidates[0].1, 0.7),
                 }
             };
-            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                resolved.push(make_relation(rel, src_id, dst_id, confidence));
-                linked = true;
-            }
+            accumulate_relation(
+                &mut resolved,
+                &mut relation_indices,
+                make_relation(rel, src_id, dst_id, confidence),
+            );
+            linked = true;
         }
 
         // (c2) Receiver-method calls (`x.method()`) arrive as the bare method
@@ -681,10 +695,12 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                 prune_ids_by_arity(distinct_targets, call_arity, &ctx.entity_arity_by_id);
             if (1..=AMBIGUOUS_CALL_FANOUT_CAP).contains(&distinct_targets.len()) {
                 for dst_id in sorted_fanout_targets(distinct_targets) {
-                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                        resolved.push(make_relation(rel, src_id, dst_id, 0.3));
-                        linked = true;
-                    }
+                    accumulate_relation(
+                        &mut resolved,
+                        &mut relation_indices,
+                        make_relation(rel, src_id, dst_id, 0.3),
+                    );
+                    linked = true;
                 }
             }
         }
@@ -706,15 +722,12 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                     if let Some(dst_id) =
                         resolve_inherited_method(&owner_file, &owner_class, method, ctx)
                     {
-                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                            resolved.push(make_relation(
-                                rel,
-                                src_id,
-                                dst_id,
-                                INHERITED_METHOD_CONFIDENCE,
-                            ));
-                            linked = true;
-                        }
+                        accumulate_relation(
+                            &mut resolved,
+                            &mut relation_indices,
+                            make_relation(rel, src_id, dst_id, INHERITED_METHOD_CONFIDENCE),
+                        );
+                        linked = true;
                     }
                 }
             }
@@ -740,15 +753,12 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
                 call_arity,
                 ctx,
             ) {
-                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                    resolved.push(make_relation(
-                        rel,
-                        src_id,
-                        dst_id,
-                        QUALIFIED_SUFFIX_CONFIDENCE,
-                    ));
-                    linked = true;
-                }
+                accumulate_relation(
+                    &mut resolved,
+                    &mut relation_indices,
+                    make_relation(rel, src_id, dst_id, QUALIFIED_SUFFIX_CONFIDENCE),
+                );
+                linked = true;
             }
         }
 
@@ -765,11 +775,7 @@ fn resolve_one_file(file: &FileParseData, ctx: &LinkContext<'_>) -> Vec<Relation
         if let Some(external) =
             make_external_reference_relation(rel, src_id, &file.file_path, &ctx.known_files)
         {
-            if let GraphNodeId::Entity(dst_id) = external.dst {
-                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                    resolved.push(external);
-                }
-            }
+            accumulate_relation(&mut resolved, &mut relation_indices, external);
             continue;
         }
 
@@ -794,12 +800,10 @@ fn merge_resolved(
     ctx: &LinkContext<'_>,
 ) -> Vec<Relation> {
     let mut resolved = Vec::new();
-    let mut seen: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
+    let mut relation_indices = HashMap::new();
     for file_relations in per_file_relations {
         for rel in file_relations {
-            if seen.insert((rel.src, rel.dst, rel.kind)) {
-                resolved.push(rel);
-            }
+            accumulate_relation(&mut resolved, &mut relation_indices, rel);
         }
     }
 
@@ -901,12 +905,10 @@ fn merge_resolved_serial(
     ctx: &LinkContext<'_>,
 ) -> Vec<Relation> {
     let mut resolved = Vec::new();
-    let mut seen: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
+    let mut relation_indices = HashMap::new();
     for file_relations in per_file_relations {
         for rel in file_relations {
-            if seen.insert((rel.src, rel.dst, rel.kind)) {
-                resolved.push(rel);
-            }
+            accumulate_relation(&mut resolved, &mut relation_indices, rel);
         }
     }
     let mut seen_artifact: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
@@ -1090,14 +1092,166 @@ fn resolve_reachable_macro_target_incremental(
     None
 }
 
-/// Try to insert a (src, dst, kind) triple; returns true if it was new.
-fn add_deduped(
-    seen: &mut HashSet<(EntityId, EntityId, RelationKind)>,
-    src: EntityId,
-    dst: EntityId,
-    kind: RelationKind,
-) -> bool {
-    seen.insert((src, dst, kind))
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CallShapeEvidenceKey {
+    positional: u32,
+    keywords: Vec<String>,
+    has_var_positional: bool,
+    has_var_keyword: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CallEvidenceKey {
+    source_span: Option<(String, usize, usize, u32, u32, u32, u32)>,
+    parser_rule: Option<String>,
+    token: Option<String>,
+    source_path: Option<String>,
+    resolved_path: Option<String>,
+    call_shape: Option<CallShapeEvidenceKey>,
+}
+
+fn canonicalize_call_evidence(evidence: &mut Vec<RelationEvidence>) {
+    let mut canonical = BTreeMap::<CallEvidenceKey, RelationEvidence>::new();
+
+    for mut record in evidence.drain(..) {
+        if let Some(shape) = &mut record.call_shape {
+            shape.keywords.sort();
+            shape.keywords.dedup();
+        }
+        // Exhaustive destructuring makes a future RelationEvidence field fail
+        // compilation until the deterministic key explicitly accounts for it.
+        let RelationEvidence {
+            source_span,
+            parser_rule,
+            token,
+            source_path,
+            resolved_path,
+            occurrence_count: _,
+            call_shape,
+        } = &record;
+        let key = CallEvidenceKey {
+            source_span: source_span.as_ref().map(|span| {
+                (
+                    span.file.to_string(),
+                    span.start_byte,
+                    span.end_byte,
+                    span.start_line,
+                    span.start_col,
+                    span.end_line,
+                    span.end_col,
+                )
+            }),
+            parser_rule: parser_rule.clone(),
+            token: token.clone(),
+            source_path: source_path.clone(),
+            resolved_path: resolved_path.clone(),
+            call_shape: call_shape.as_ref().map(|shape| {
+                let kin_model::CallArgShape {
+                    positional,
+                    keywords,
+                    has_var_positional,
+                    has_var_keyword,
+                } = shape;
+                CallShapeEvidenceKey {
+                    positional: *positional,
+                    keywords: keywords.clone(),
+                    has_var_positional: *has_var_positional,
+                    has_var_keyword: *has_var_keyword,
+                }
+            }),
+        };
+        match canonical.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(record);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let occurrence_count = entry
+                    .get()
+                    .occurrence_count
+                    .saturating_add(record.occurrence_count);
+                entry.get_mut().occurrence_count = occurrence_count;
+            }
+        }
+    }
+
+    evidence.extend(canonical.into_values());
+}
+
+fn relation_origin_priority(origin: RelationOrigin) -> u8 {
+    match origin {
+        RelationOrigin::Manual => 4,
+        RelationOrigin::Lsp => 3,
+        RelationOrigin::Parsed => 2,
+        RelationOrigin::Inferred => 1,
+    }
+}
+
+/// Merge scalar metadata without making the retained relation depend on which
+/// source occurrence happened to be linked first. Confidence is the review
+/// gate's authority, so the strongest resolution wins and carries its origin.
+/// Equal-confidence origins use the same provenance ordering as semantic
+/// resolution elsewhere in Kin. Import sources are explanatory rather than a
+/// strength signal; retain one deterministically instead of dropping a later
+/// source-bearing occurrence.
+fn merge_relation_metadata(existing: &mut Relation, incoming: &Relation) {
+    let incoming_is_stronger = match incoming.confidence.total_cmp(&existing.confidence) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Equal => {
+            relation_origin_priority(incoming.origin) > relation_origin_priority(existing.origin)
+        }
+        std::cmp::Ordering::Less => false,
+    };
+    if incoming_is_stronger {
+        existing.confidence = incoming.confidence;
+        existing.origin = incoming.origin;
+    }
+
+    match (&existing.import_source, &incoming.import_source) {
+        (None, Some(_)) => existing.import_source.clone_from(&incoming.import_source),
+        (Some(current), Some(candidate)) if candidate < current => {
+            existing.import_source.clone_from(&incoming.import_source);
+        }
+        _ => {}
+    }
+}
+
+/// Insert one logical relation, preserving every call-site shape on repeated
+/// `(src, dst, Calls)` edges. Relation IDs intentionally identify the logical
+/// caller/callee edge rather than an individual source occurrence, so distinct
+/// shapes live as deterministic evidence records and identical shapes collapse
+/// through `occurrence_count`. An empty evidence vector is an older or
+/// shape-blind call site; when mixed with shaped occurrences it becomes an
+/// explicit `call_shape: None` marker so downstream proof fails closed.
+pub(crate) fn accumulate_relation(
+    resolved: &mut Vec<Relation>,
+    relation_indices: &mut HashMap<(GraphNodeId, GraphNodeId, RelationKind), usize>,
+    mut relation: Relation,
+) {
+    let key = (relation.src, relation.dst, relation.kind);
+    let Some(&index) = relation_indices.get(&key) else {
+        relation_indices.insert(key, resolved.len());
+        resolved.push(relation);
+        return;
+    };
+
+    let existing = &mut resolved[index];
+    merge_relation_metadata(existing, &relation);
+
+    if relation.kind != RelationKind::Calls {
+        return;
+    }
+
+    let existing_missing_shape = existing.evidence.is_empty();
+    let incoming_missing_shape = relation.evidence.is_empty();
+    if existing_missing_shape {
+        existing.evidence.push(RelationEvidence::default());
+    }
+    if incoming_missing_shape {
+        existing.evidence.push(RelationEvidence::default());
+    } else {
+        existing.evidence.append(&mut relation.evidence);
+    }
+    canonicalize_call_evidence(&mut existing.evidence);
 }
 
 /// Split a dotted member access like `util.finalizeIssue` into the import alias (`util`)
@@ -3295,7 +3449,7 @@ fn resolve_one_file_incremental(
     class_bases: &HashMap<String, Vec<(String, Vec<String>)>>,
 ) -> Vec<Relation> {
     let mut resolved = Vec::new();
-    let mut seen: HashSet<(EntityId, EntityId, RelationKind)> = HashSet::new();
+    let mut relation_indices = HashMap::new();
     // Lazily resolved once per file: only ambiguous name buckets need them.
     let mut caller_import_targets: Option<HashSet<String>> = None;
     let mut caller_include_closure: Option<HashMap<String, usize>> = None;
@@ -3332,9 +3486,11 @@ fn resolve_one_file_incremental(
         if rel.kind == RelationKind::UsesMacro {
             if let Some(dst_id) = dst_same_file {
                 if linker.entity_kind_by_id.get(&dst_id) == Some(&EntityKind::Macro) {
-                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                        resolved.push(make_relation(rel, src_id, dst_id, 1.0));
-                    }
+                    accumulate_relation(
+                        &mut resolved,
+                        &mut relation_indices,
+                        make_relation(rel, src_id, dst_id, 1.0),
+                    );
                     continue;
                 }
             }
@@ -3345,9 +3501,11 @@ fn resolve_one_file_incremental(
                 &include_graph,
                 linker,
             ) {
-                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                    resolved.push(make_relation(rel, src_id, dst_id, 0.95));
-                }
+                accumulate_relation(
+                    &mut resolved,
+                    &mut relation_indices,
+                    make_relation(rel, src_id, dst_id, 0.95),
+                );
                 continue;
             }
 
@@ -3367,9 +3525,11 @@ fn resolve_one_file_incremental(
         // the same-file target plus its cross-file twins stay within the cap.
         // Cross-file twins carry the (c) name-match confidence (0.7).
         if let Some(dst_id) = dst_same_file {
-            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                resolved.push(make_relation(rel, src_id, dst_id, 1.0));
-            }
+            accumulate_relation(
+                &mut resolved,
+                &mut relation_indices,
+                make_relation(rel, src_id, dst_id, 1.0),
+            );
             let mut cross_file_twins: HashSet<EntityId> = HashSet::new();
             if let Some(candidates) = linker.entity_by_name.get(&rel.dst_name) {
                 for (fp, id) in candidates {
@@ -3382,9 +3542,11 @@ fn resolve_one_file_incremental(
                 prune_ids_by_arity(cross_file_twins, call_arity, &linker.entity_arity_by_id);
             if !cross_file_twins.is_empty() && cross_file_twins.len() < AMBIGUOUS_CALL_FANOUT_CAP {
                 for cross_id in sorted_fanout_targets(cross_file_twins) {
-                    if add_deduped(&mut seen, src_id, cross_id, rel.kind) {
-                        resolved.push(make_relation(rel, src_id, cross_id, 0.7));
-                    }
+                    accumulate_relation(
+                        &mut resolved,
+                        &mut relation_indices,
+                        make_relation(rel, src_id, cross_id, 0.7),
+                    );
                 }
             }
             continue;
@@ -3413,14 +3575,11 @@ fn resolve_one_file_incremental(
                         &import_map,
                         &class_bases,
                     ) {
-                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                            resolved.push(make_relation(
-                                rel,
-                                src_id,
-                                dst_id,
-                                INHERITED_METHOD_CONFIDENCE,
-                            ));
-                        }
+                        accumulate_relation(
+                            &mut resolved,
+                            &mut relation_indices,
+                            make_relation(rel, src_id, dst_id, INHERITED_METHOD_CONFIDENCE),
+                        );
                         continue;
                     }
                     dst_lookup = method;
@@ -3447,9 +3606,11 @@ fn resolve_one_file_incremental(
                         None
                     };
                     if let Some(dst_id) = dst_id {
-                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                            resolved.push(make_relation(rel, src_id, dst_id, 0.95));
-                        }
+                        accumulate_relation(
+                            &mut resolved,
+                            &mut relation_indices,
+                            make_relation(rel, src_id, dst_id, 0.95),
+                        );
                         continue;
                     }
                 }
@@ -3466,9 +3627,11 @@ fn resolve_one_file_incremental(
                             .get(&target_file)
                             .and_then(|m| m.get(member_name))
                         {
-                            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                                resolved.push(make_relation(rel, src_id, dst_id, 0.9));
-                            }
+                            accumulate_relation(
+                                &mut resolved,
+                                &mut relation_indices,
+                                make_relation(rel, src_id, dst_id, 0.9),
+                            );
                             continue;
                         }
                     }
@@ -3506,9 +3669,11 @@ fn resolve_one_file_incremental(
             &other_file_candidates,
         ) {
             ImportPinnedTarget::Resolved(dst_id) => {
-                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                    resolved.push(make_relation(rel, src_id, dst_id, IMPORT_PINNED_CONFIDENCE));
-                }
+                accumulate_relation(
+                    &mut resolved,
+                    &mut relation_indices,
+                    make_relation(rel, src_id, dst_id, IMPORT_PINNED_CONFIDENCE),
+                );
                 continue;
             }
             ImportPinnedTarget::PinnedMiss => name_fallback_allowed = false,
@@ -3560,9 +3725,11 @@ fn resolve_one_file_incremental(
                     None => (other_file_candidates[0].1, 0.7),
                 }
             };
-            if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                resolved.push(make_relation(rel, src_id, dst_id, confidence));
-            }
+            accumulate_relation(
+                &mut resolved,
+                &mut relation_indices,
+                make_relation(rel, src_id, dst_id, confidence),
+            );
             continue;
         }
 
@@ -3587,9 +3754,11 @@ fn resolve_one_file_incremental(
                     prune_ids_by_arity(distinct_targets, call_arity, &linker.entity_arity_by_id);
                 if (1..=AMBIGUOUS_CALL_FANOUT_CAP).contains(&distinct_targets.len()) {
                     for dst_id in sorted_fanout_targets(distinct_targets) {
-                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                            resolved.push(make_relation(rel, src_id, dst_id, 0.3));
-                        }
+                        accumulate_relation(
+                            &mut resolved,
+                            &mut relation_indices,
+                            make_relation(rel, src_id, dst_id, 0.3),
+                        );
                     }
                     continue;
                 }
@@ -3614,14 +3783,11 @@ fn resolve_one_file_incremental(
                         &import_map,
                         &class_bases,
                     ) {
-                        if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                            resolved.push(make_relation(
-                                rel,
-                                src_id,
-                                dst_id,
-                                INHERITED_METHOD_CONFIDENCE,
-                            ));
-                        }
+                        accumulate_relation(
+                            &mut resolved,
+                            &mut relation_indices,
+                            make_relation(rel, src_id, dst_id, INHERITED_METHOD_CONFIDENCE),
+                        );
                         continue;
                     }
                 }
@@ -3644,14 +3810,11 @@ fn resolve_one_file_incremental(
             );
             if !qualified_targets.is_empty() {
                 for dst_id in qualified_targets {
-                    if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                        resolved.push(make_relation(
-                            rel,
-                            src_id,
-                            dst_id,
-                            QUALIFIED_SUFFIX_CONFIDENCE,
-                        ));
-                    }
+                    accumulate_relation(
+                        &mut resolved,
+                        &mut relation_indices,
+                        make_relation(rel, src_id, dst_id, QUALIFIED_SUFFIX_CONFIDENCE),
+                    );
                 }
                 continue;
             }
@@ -3665,11 +3828,7 @@ fn resolve_one_file_incremental(
         if let Some(external) =
             make_external_reference_relation(rel, src_id, &file.file_path, &linker.known_files)
         {
-            if let GraphNodeId::Entity(dst_id) = external.dst {
-                if add_deduped(&mut seen, src_id, dst_id, rel.kind) {
-                    resolved.push(external);
-                }
-            }
+            accumulate_relation(&mut resolved, &mut relation_indices, external);
             continue;
         }
     }
@@ -3761,12 +3920,10 @@ fn merge_incremental_resolved(
     linker: &IncrementalLinker,
 ) -> Vec<Relation> {
     let mut resolved = Vec::new();
-    let mut seen: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
+    let mut relation_indices = HashMap::new();
     for file_relations in per_file_relations {
         for rel in file_relations {
-            if seen.insert((rel.src, rel.dst, rel.kind)) {
-                resolved.push(rel);
-            }
+            accumulate_relation(&mut resolved, &mut relation_indices, rel);
         }
     }
 
@@ -4047,6 +4204,212 @@ mod tests {
         assert_eq!(result[0].src, GraphNodeId::Entity(e1.id));
         assert_eq!(result[0].dst, GraphNodeId::Entity(e2.id));
         assert_eq!(result[0].confidence, 1.0);
+    }
+
+    #[test]
+    fn repeated_call_shapes_are_complete_deterministic_and_batch_incremental_equal() {
+        let caller = make_entity("caller", "src/a.py");
+        let target = make_entity("target", "src/a.py");
+        let positional_two = CallArgShape {
+            positional: 2,
+            ..CallArgShape::default()
+        };
+        let keyword = CallArgShape {
+            positional: 1,
+            keywords: vec!["args".to_string()],
+            ..CallArgShape::default()
+        };
+        let var_positional = CallArgShape {
+            has_var_positional: true,
+            ..CallArgShape::default()
+        };
+        let forward_shapes = vec![
+            Some(positional_two.clone()),
+            Some(keyword.clone()),
+            Some(positional_two),
+            Some(var_positional),
+        ];
+
+        let build = |mut shapes: Vec<Option<CallArgShape>>| FileParseData {
+            file_path: "src/a.py".to_string(),
+            entities: vec![caller.clone(), target.clone()],
+            relations: shapes
+                .drain(..)
+                .map(|call_shape| ExtractedRelation {
+                    call_shape,
+                    kind: RelationKind::Calls,
+                    src_name: "caller".to_string(),
+                    dst_name: "target".to_string(),
+                    import_source: None,
+                })
+                .collect(),
+            imports: vec![],
+        };
+        let edge_evidence = |relations: &[Relation]| {
+            find_calls_edge(relations, &caller, &target)
+                .expect("logical caller-target edge")
+                .evidence
+                .clone()
+        };
+
+        let forward = vec![build(forward_shapes.clone())];
+        let mut reversed_shapes = forward_shapes;
+        reversed_shapes.reverse();
+        let reversed = vec![build(reversed_shapes)];
+        let batch_forward = edge_evidence(&link_cross_file(&forward));
+        let batch_reversed = edge_evidence(&link_cross_file(&reversed));
+
+        let mut incremental = IncrementalLinker::new();
+        incremental.add_file("src/a.py", &[caller.clone(), target.clone()]);
+        let incremental_forward =
+            edge_evidence(&link_cross_file_incremental(&forward, &incremental));
+        let incremental_reversed =
+            edge_evidence(&link_cross_file_incremental(&reversed, &incremental));
+
+        assert_eq!(batch_forward, batch_reversed);
+        assert_eq!(batch_forward, incremental_forward);
+        assert_eq!(batch_forward, incremental_reversed);
+        assert_eq!(batch_forward.len(), 3, "three distinct call shapes");
+        assert_eq!(
+            batch_forward
+                .iter()
+                .map(|evidence| evidence.occurrence_count)
+                .sum::<u32>(),
+            4,
+            "all four call sites survive through occurrence counts"
+        );
+        assert!(batch_forward.iter().any(|evidence| {
+            evidence.occurrence_count == 2
+                && evidence
+                    .call_shape
+                    .as_ref()
+                    .is_some_and(|shape| shape.positional == 2)
+        }));
+        assert!(batch_forward.iter().any(|evidence| {
+            evidence
+                .call_shape
+                .as_ref()
+                .is_some_and(|shape| shape.keywords == ["args"])
+        }));
+        assert!(batch_forward.iter().any(|evidence| {
+            evidence
+                .call_shape
+                .as_ref()
+                .is_some_and(|shape| shape.has_var_positional)
+        }));
+    }
+
+    #[test]
+    fn repeated_call_with_any_missing_shape_retains_fail_closed_marker() {
+        let caller = make_entity("caller", "src/a.py");
+        let target = make_entity("target", "src/a.py");
+        let build = |shapes: Vec<Option<CallArgShape>>| FileParseData {
+            file_path: "src/a.py".to_string(),
+            entities: vec![caller.clone(), target.clone()],
+            relations: shapes
+                .into_iter()
+                .map(|call_shape| ExtractedRelation {
+                    call_shape,
+                    kind: RelationKind::Calls,
+                    src_name: "caller".to_string(),
+                    dst_name: "target".to_string(),
+                    import_source: None,
+                })
+                .collect(),
+            imports: vec![],
+        };
+        let shaped = Some(CallArgShape {
+            positional: 2,
+            ..CallArgShape::default()
+        });
+        let forward = vec![build(vec![shaped.clone(), None])];
+        let reversed = vec![build(vec![None, shaped])];
+        let evidence = |files: &[FileParseData]| {
+            find_calls_edge(&link_cross_file(files), &caller, &target)
+                .expect("logical caller-target edge")
+                .evidence
+                .clone()
+        };
+
+        let forward_evidence = evidence(&forward);
+        let reversed_evidence = evidence(&reversed);
+        assert_eq!(forward_evidence, reversed_evidence);
+        assert_eq!(forward_evidence.len(), 2);
+        assert!(forward_evidence
+            .iter()
+            .any(|record| record.call_shape.is_none()));
+        assert!(forward_evidence
+            .iter()
+            .any(|record| record.call_shape.is_some()));
+    }
+
+    #[test]
+    fn repeated_call_metadata_keeps_strongest_resolution_independent_of_source_order() {
+        let caller = rust_fn("caller", "src/caller.rs");
+        let target = make_method_entity("Widget::make", "src/model.rs");
+        let build = |strong_first: bool| {
+            let mut relations = vec![
+                calls_relation("caller", "Widget::make"),
+                calls_relation("caller", "make"),
+            ];
+            if !strong_first {
+                relations.reverse();
+            }
+            vec![
+                FileParseData {
+                    file_path: "src/caller.rs".to_string(),
+                    entities: vec![caller.clone()],
+                    relations,
+                    imports: vec![],
+                },
+                FileParseData {
+                    file_path: "src/model.rs".to_string(),
+                    entities: vec![target.clone()],
+                    relations: vec![],
+                    imports: vec![],
+                },
+            ]
+        };
+        let batch_edge = |files: &[FileParseData]| {
+            find_calls_edge(&link_cross_file(files), &caller, &target)
+                .expect("qualified and bare calls should resolve to one logical edge")
+                .clone()
+        };
+        let incremental_edge = |files: &[FileParseData]| {
+            let mut linker = IncrementalLinker::new();
+            for file in files {
+                linker.add_file(&file.file_path, &file.entities);
+            }
+            find_calls_edge(
+                &link_cross_file_incremental(files, &linker),
+                &caller,
+                &target,
+            )
+            .expect("incremental qualified and bare calls should resolve to one logical edge")
+            .clone()
+        };
+
+        let forward = build(true);
+        let reversed = build(false);
+        let batch_forward = batch_edge(&forward);
+        let batch_reversed = batch_edge(&reversed);
+        let incremental_forward = incremental_edge(&forward);
+        let incremental_reversed = incremental_edge(&reversed);
+
+        let canonical = serde_json::to_value(&batch_forward).unwrap();
+        assert_eq!(canonical, serde_json::to_value(&batch_reversed).unwrap());
+        assert_eq!(
+            canonical,
+            serde_json::to_value(&incremental_forward).unwrap()
+        );
+        assert_eq!(
+            canonical,
+            serde_json::to_value(&incremental_reversed).unwrap()
+        );
+        assert_eq!(batch_forward.confidence, 0.7);
+        assert_eq!(batch_forward.origin, RelationOrigin::Inferred);
+        assert_eq!(batch_forward.evidence.len(), 1);
+        assert_eq!(batch_forward.evidence[0].occurrence_count, 2);
     }
 
     #[test]

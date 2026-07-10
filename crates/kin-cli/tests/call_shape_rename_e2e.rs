@@ -133,9 +133,18 @@ fn link_and_review(
 /// mini-graph. This is the merge-trust verdict the shipped FIR-1440 bug slipped
 /// through: the inline-only assertions above never exercised it. Builds a
 /// `Review` from the real diff + impact + inline comments — reproducing the
-/// exact production seam — and returns the gate verdict.
-fn link_and_shadow_verdict(source: &str, old_sig: &str, new_sig: &str) -> ShadowGateVerdict {
-    let (files, _relations, graph) = link_into_graph(source);
+/// exact production seam — and returns the gate verdict with the graph inputs
+/// so evidence-level regressions can inspect the persisted logical edges.
+fn link_and_shadow_analysis(
+    source: &str,
+    old_sig: &str,
+    new_sig: &str,
+) -> (
+    ShadowGateVerdict,
+    Vec<FileParseData>,
+    Vec<kin_model::Relation>,
+) {
+    let (files, relations, graph) = link_into_graph(source);
     let diff = rename_diff(&files, old_sig, new_sig);
     let report = analyze_impact(&graph, &diff).expect("analyze impact");
     let inline_comments = collect_inline_comments(&diff, &report);
@@ -154,7 +163,36 @@ fn link_and_shadow_verdict(source: &str, old_sig: &str, new_sig: &str) -> Shadow
         },
         inline_comments,
     };
-    derive_shadow_policy(&review, &[], &[]).verdict
+    (
+        derive_shadow_policy(&review, &[], &[]).verdict,
+        files,
+        relations,
+    )
+}
+
+fn link_and_shadow_verdict(source: &str, old_sig: &str, new_sig: &str) -> ShadowGateVerdict {
+    link_and_shadow_analysis(source, old_sig, new_sig).0
+}
+
+fn same_caller_shadow_evidence(
+    source: &str,
+    old_sig: &str,
+    new_sig: &str,
+) -> (ShadowGateVerdict, Vec<kin_model::RelationEvidence>) {
+    let (verdict, files, relations) = link_and_shadow_analysis(source, old_sig, new_sig);
+    let target = find_entity(&files, "target");
+    let inbound: Vec<_> = relations
+        .iter()
+        .filter(|relation| {
+            relation.kind == RelationKind::Calls && relation.dst == GraphNodeId::Entity(target.id)
+        })
+        .collect();
+    assert_eq!(
+        inbound.len(),
+        1,
+        "one caller entity must produce one logical Calls edge"
+    );
+    (verdict, inbound[0].evidence.clone())
 }
 
 /// Build old and new entities from their real source declarations, rather than
@@ -254,6 +292,70 @@ def caller_one():
 
 def caller_two(**opts):
     return target(**opts)
+";
+
+const SAME_CALLER_POSITIONAL_THEN_KEYWORD: &str = "\
+def target(ext, args):
+    return ext, args
+
+
+def caller():
+    target(1, 2)
+    return target(3, args=4)
+";
+
+const SAME_CALLER_KEYWORD_THEN_POSITIONAL: &str = "\
+def target(ext, args):
+    return ext, args
+
+
+def caller():
+    target(3, args=4)
+    return target(1, 2)
+";
+
+const SAME_CALLER_POSITIONAL_THEN_VAR_KEYWORD: &str = "\
+def target(ext, args):
+    return ext, args
+
+
+def caller(opts):
+    target(1, 2)
+    return target(**opts)
+";
+
+const SAME_CALLER_VAR_KEYWORD_THEN_POSITIONAL: &str = "\
+def target(ext, args):
+    return ext, args
+
+
+def caller(opts):
+    target(**opts)
+    return target(1, 2)
+";
+
+const SAME_CALLER_ALL_POSITIONAL: &str = "\
+def target(ext, args=1):
+    return ext, args
+
+
+def caller(values):
+    target(1)
+    target(2, 3)
+    target(4, 5)
+    return target(*values)
+";
+
+const SAME_CALLER_ALL_POSITIONAL_REVERSED: &str = "\
+def target(ext, args=1):
+    return ext, args
+
+
+def caller(values):
+    target(*values)
+    target(4, 5)
+    target(2, 3)
+    return target(1)
 ";
 
 const POSITIONAL_DEFAULT_CALLERS: &str = "\
@@ -433,6 +535,108 @@ fn e2e_shadow_gate_var_keyword_caller_rename_would_block() {
         ShadowGateVerdict::WouldBlock,
         "**kwargs caller keeps the shadow gate blocking"
     );
+}
+
+#[test]
+fn e2e_same_caller_keyword_shape_blocks_independent_of_source_order() {
+    let old = "def target(ext, args)";
+    let new = "def target(ext, lines)";
+    let (forward_verdict, forward_evidence) =
+        same_caller_shadow_evidence(SAME_CALLER_POSITIONAL_THEN_KEYWORD, old, new);
+    let (reverse_verdict, reverse_evidence) =
+        same_caller_shadow_evidence(SAME_CALLER_KEYWORD_THEN_POSITIONAL, old, new);
+
+    assert_eq!(forward_verdict, ShadowGateVerdict::WouldBlock);
+    assert_eq!(reverse_verdict, ShadowGateVerdict::WouldBlock);
+    assert_eq!(
+        forward_evidence, reverse_evidence,
+        "logical call evidence must be byte-stable across source-order reversal"
+    );
+    assert_eq!(forward_evidence.len(), 2, "both distinct shapes survive");
+    assert!(forward_evidence.iter().any(|evidence| {
+        evidence
+            .call_shape
+            .as_ref()
+            .is_some_and(|shape| shape.keywords == ["args"])
+    }));
+    assert!(forward_evidence.iter().any(|evidence| {
+        evidence.call_shape.as_ref().is_some_and(|shape| {
+            shape.positional == 2 && shape.keywords.is_empty() && !shape.has_var_keyword
+        })
+    }));
+}
+
+#[test]
+fn e2e_same_caller_var_keyword_shape_blocks_independent_of_source_order() {
+    let old = "def target(ext, args)";
+    let new = "def target(ext, lines)";
+    let (forward_verdict, forward_evidence) =
+        same_caller_shadow_evidence(SAME_CALLER_POSITIONAL_THEN_VAR_KEYWORD, old, new);
+    let (reverse_verdict, reverse_evidence) =
+        same_caller_shadow_evidence(SAME_CALLER_VAR_KEYWORD_THEN_POSITIONAL, old, new);
+
+    assert_eq!(forward_verdict, ShadowGateVerdict::WouldBlock);
+    assert_eq!(reverse_verdict, ShadowGateVerdict::WouldBlock);
+    assert_eq!(
+        forward_evidence, reverse_evidence,
+        "`**kwargs` evidence must not depend on which call appears first"
+    );
+    assert_eq!(forward_evidence.len(), 2, "both distinct shapes survive");
+    assert!(forward_evidence.iter().any(|evidence| {
+        evidence
+            .call_shape
+            .as_ref()
+            .is_some_and(|shape| shape.has_var_keyword)
+    }));
+}
+
+#[test]
+fn e2e_same_caller_all_positional_shapes_remain_neutral_and_deterministic() {
+    let old = "def target(ext, args=1)";
+    let new = "def target(ext, lines=1)";
+    let (forward_verdict, forward_evidence) =
+        same_caller_shadow_evidence(SAME_CALLER_ALL_POSITIONAL, old, new);
+    let (reverse_verdict, reverse_evidence) =
+        same_caller_shadow_evidence(SAME_CALLER_ALL_POSITIONAL_REVERSED, old, new);
+
+    assert_eq!(forward_verdict, ShadowGateVerdict::NeedsAttention);
+    assert_eq!(reverse_verdict, ShadowGateVerdict::NeedsAttention);
+    assert_eq!(
+        forward_evidence, reverse_evidence,
+        "all-positional evidence must sort and deduplicate deterministically"
+    );
+    assert_eq!(
+        forward_evidence.len(),
+        3,
+        "four calls collapse to three distinct shapes"
+    );
+    assert_eq!(
+        forward_evidence
+            .iter()
+            .map(|evidence| evidence.occurrence_count)
+            .sum::<u32>(),
+        4,
+        "occurrence counts retain every call site"
+    );
+    assert!(forward_evidence.iter().all(|evidence| {
+        evidence
+            .call_shape
+            .as_ref()
+            .is_some_and(|shape| shape.keywords.is_empty() && !shape.has_var_keyword)
+    }));
+    assert!(forward_evidence.iter().any(|evidence| {
+        evidence
+            .call_shape
+            .as_ref()
+            .is_some_and(|shape| shape.has_var_positional)
+    }));
+    assert!(forward_evidence.iter().any(|evidence| {
+        evidence.occurrence_count == 2
+            && evidence
+                .call_shape
+                .as_ref()
+                .is_some_and(|shape| shape.positional == 2 && !shape.has_var_positional)
+    }));
 }
 
 #[test]

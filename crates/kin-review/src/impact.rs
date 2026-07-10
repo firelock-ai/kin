@@ -427,21 +427,29 @@ pub fn analyze_impact_at<I: ImpactGraph>(
                 if let Some(file) = entity_file(&entity) {
                     ent_consumer_files.insert(file);
                 }
-                // Distill this consumer edge's call-site argument shape. A rename
-                // is only provably safe when every counted consumer is a call
-                // carrying shape evidence; a non-call edge, or a call with no
-                // captured shape, leaves it unprovable.
+                // Distill every call-site argument shape retained on this logical
+                // consumer edge. A single caller can invoke the same target many
+                // times, so relation evidence is a per-site set rather than a
+                // scalar. A rename is only provably safe when every counted
+                // consumer is a call and every occurrence carries shape evidence;
+                // a non-call edge, an older empty edge, or an explicit unshaped
+                // occurrence leaves it unprovable.
                 if rel.kind == RelationKind::Calls {
-                    match rel.evidence.iter().find_map(|ev| ev.call_shape.as_ref()) {
-                        Some(shape) => {
-                            for keyword in &shape.keywords {
-                                ent_caller_keyword_names.insert(keyword.clone());
+                    if rel.evidence.is_empty() {
+                        ent_all_consumers_shaped_calls = false;
+                    }
+                    for evidence in &rel.evidence {
+                        match evidence.call_shape.as_ref() {
+                            Some(shape) => {
+                                for keyword in &shape.keywords {
+                                    ent_caller_keyword_names.insert(keyword.clone());
+                                }
+                                if shape.has_var_keyword {
+                                    ent_any_var_keyword_caller = true;
+                                }
                             }
-                            if shape.has_var_keyword {
-                                ent_any_var_keyword_caller = true;
-                            }
+                            None => ent_all_consumers_shaped_calls = false,
                         }
-                        None => ent_all_consumers_shaped_calls = false,
                     }
                 } else {
                     ent_all_consumers_shaped_calls = false;
@@ -992,6 +1000,14 @@ mod tests {
     // ── Call-site argument-shape harvest + arity-preserving rename gating ──
 
     fn calls_with_shape(src: &Entity, dst: &Entity, shape: CallArgShape) -> Relation {
+        calls_with_shapes(src, dst, vec![Some(shape)])
+    }
+
+    fn calls_with_shapes(
+        src: &Entity,
+        dst: &Entity,
+        shapes: Vec<Option<CallArgShape>>,
+    ) -> Relation {
         Relation {
             id: RelationId::new(),
             kind: RelationKind::Calls,
@@ -1001,10 +1017,13 @@ mod tests {
             origin: RelationOrigin::Parsed,
             created_in: None,
             import_source: None,
-            evidence: vec![RelationEvidence {
-                call_shape: Some(shape),
-                ..RelationEvidence::default()
-            }],
+            evidence: shapes
+                .into_iter()
+                .map(|call_shape| RelationEvidence {
+                    call_shape,
+                    ..RelationEvidence::default()
+                })
+                .collect(),
         }
     }
 
@@ -1095,6 +1114,43 @@ mod tests {
         );
         assert!(!summary.any_var_keyword_caller);
         assert!(summary.caller_keyword_names.contains("args"));
+    }
+
+    #[test]
+    fn harvest_fails_closed_when_any_call_occurrence_lacks_shape() {
+        let target = target_entity(RENAME_NEW);
+        let caller = entity_in_file("caller", "src/caller.py", 1);
+        let mut graph = MockImpactGraph::default();
+        graph.entities.insert(target.id, target.clone());
+        graph.entities.insert(caller.id, caller.clone());
+        graph.inbound.insert(
+            target.id,
+            vec![calls_with_shapes(
+                &caller,
+                &target,
+                vec![
+                    Some(CallArgShape::new(
+                        1,
+                        vec!["safe_other_keyword".to_string()],
+                        false,
+                        false,
+                    )),
+                    None,
+                ],
+            )],
+        );
+        let diff = SemanticDiff {
+            entity_changes: vec![modified(&target)],
+            ..Default::default()
+        };
+        let report = analyze_impact_at(&graph, &diff).unwrap();
+        let summary = &report.entity_impact(&target.id).unwrap().call_shapes;
+
+        assert!(summary.caller_keyword_names.contains("safe_other_keyword"));
+        assert!(
+            !summary.all_consumers_shaped_calls,
+            "one unshaped occurrence makes the entire rename proof incomplete"
+        );
     }
 
     #[test]

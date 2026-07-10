@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use tracing::debug;
@@ -764,6 +765,7 @@ fn resolve_relations(
     entities: &[Entity],
 ) -> (Vec<Relation>, Vec<UnresolvedRelation>) {
     let mut resolved = Vec::new();
+    let mut relation_indices = HashMap::new();
     let mut unresolved = Vec::new();
 
     for rel in extracted {
@@ -773,21 +775,25 @@ fn resolve_relations(
         match (src, dst) {
             (Some(s), Some(d)) => {
                 // Same-file relation: fully resolved
-                resolved.push(Relation {
-                    id: RelationId::from_content(
-                        &s.id.0.to_string(),
-                        &d.id.0.to_string(),
-                        &format!("{:?}", rel.kind),
-                    ),
-                    kind: rel.kind,
-                    src: kin_model::GraphNodeId::Entity(s.id),
-                    dst: kin_model::GraphNodeId::Entity(d.id),
-                    confidence: 1.0,
-                    origin: RelationOrigin::Parsed,
-                    created_in: None,
-                    import_source: rel.import_source.clone(),
-                    evidence: crate::linker::call_shape_evidence(rel.call_shape.as_ref()),
-                });
+                crate::linker::accumulate_relation(
+                    &mut resolved,
+                    &mut relation_indices,
+                    Relation {
+                        id: RelationId::from_content(
+                            &s.id.0.to_string(),
+                            &d.id.0.to_string(),
+                            &format!("{:?}", rel.kind),
+                        ),
+                        kind: rel.kind,
+                        src: kin_model::GraphNodeId::Entity(s.id),
+                        dst: kin_model::GraphNodeId::Entity(d.id),
+                        confidence: 1.0,
+                        origin: RelationOrigin::Parsed,
+                        created_in: None,
+                        import_source: rel.import_source.clone(),
+                        evidence: crate::linker::call_shape_evidence(rel.call_shape.as_ref()),
+                    },
+                );
             }
             (Some(s), None) => {
                 // Partial resolution: src found, dst is cross-file
@@ -866,6 +872,52 @@ mod tests {
                 .any(|entity| entity.kind == kin_model::EntityKind::Function
                     && entity.name == "greet")
         );
+    }
+
+    #[test]
+    fn index_python_repeated_calls_aggregate_shape_evidence_order_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::new(dir.path().join("blobs")).unwrap();
+        let pipeline = IndexPipeline::new();
+        let py_file = dir.path().join("test.py");
+        let forward = b"def target(ext, args):\n    return ext, args\n\n\ndef caller():\n    target(1, 2)\n    return target(3, args=4)\n";
+        let reversed = b"def target(ext, args):\n    return ext, args\n\n\ndef caller():\n    target(3, args=4)\n    return target(1, 2)\n";
+        let evidence_for = |source: &[u8]| {
+            std::fs::write(&py_file, source).unwrap();
+            let indexed = pipeline.index_file(&py_file, &blob_store).unwrap();
+            let caller = indexed
+                .entities
+                .iter()
+                .find(|entity| entity.name == "caller")
+                .expect("caller entity");
+            let target = indexed
+                .entities
+                .iter()
+                .find(|entity| entity.name == "target")
+                .expect("target entity");
+            indexed
+                .relations
+                .iter()
+                .find(|relation| {
+                    relation.kind == kin_model::RelationKind::Calls
+                        && relation.src == kin_model::GraphNodeId::Entity(caller.id)
+                        && relation.dst == kin_model::GraphNodeId::Entity(target.id)
+                })
+                .expect("one logical Calls edge")
+                .evidence
+                .clone()
+        };
+
+        let forward_evidence = evidence_for(forward);
+        let reversed_evidence = evidence_for(reversed);
+        assert_eq!(forward_evidence, reversed_evidence);
+        assert_eq!(forward_evidence.len(), 2);
+        assert!(forward_evidence.iter().any(|evidence| {
+            evidence
+                .call_shape
+                .as_ref()
+                .is_some_and(|shape| shape.keywords == ["args"])
+        }));
     }
 
     #[test]
