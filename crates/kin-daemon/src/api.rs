@@ -12779,6 +12779,7 @@ mod tests {
                     .body(Body::from(
                         serde_json::to_string(&kin_cli::daemon_client::LocateRequest {
                             text: "parse config".to_string(),
+                            queries: Vec::new(),
                             explain: false,
                             max_files: 10,
                             max_files_explicit: true,
@@ -12968,6 +12969,7 @@ mod tests {
                     .body(Body::from(
                         serde_json::to_string(&kin_cli::daemon_client::LocateRequest {
                             text: "parse config".to_string(),
+                            queries: Vec::new(),
                             explain: false,
                             max_files: 10,
                             max_files_explicit: true,

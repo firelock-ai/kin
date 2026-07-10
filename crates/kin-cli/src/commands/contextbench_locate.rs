@@ -149,6 +149,7 @@ pub async fn run(task_file: PathBuf, json: bool, debug: bool) -> Result<()> {
     let max_files_explicit = std::env::var("KIN_CONTEXTBENCH_MAX_FILES").is_ok();
     let locate_result = crate::commands::locate::capture(
         &bounded_query,
+        Vec::new(),
         true,
         max_files,
         max_files_explicit,
