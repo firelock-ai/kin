@@ -23,11 +23,21 @@ payload="$(docker run --rm --entrypoint /usr/local/bin/kin-daemon \
   "$image" --compat-json)"
 printf '%s\n' "$payload"
 
+if [ ! -f Cargo.lock ]; then
+  echo "error: Cargo.lock is required to verify container dependency provenance" >&2
+  exit 2
+fi
+if command -v sha256sum >/dev/null 2>&1; then
+  expected_lock="$(sha256sum Cargo.lock | awk '{print $1}')"
+else
+  expected_lock="$(shasum -a 256 Cargo.lock | awk '{print $1}')"
+fi
+
 printf '%s\n' "$payload" | grep -Fq "\"sha\":\"${expected_sha}\""
 printf '%s\n' "$payload" | grep -Fq '"dirty":false'
 printf '%s\n' "$payload" | grep -Fq '"source_known":true'
 printf '%s\n' "$payload" \
-  | grep -Eq '"dependency_provenance":"[0-9a-f]{64}"'
+  | grep -Fq "\"dependency_provenance\":\"${expected_lock}\""
 
 if printf '%s\n' "$payload" | grep -Fq '"sha":"unknown"'; then
   echo "error: container embedded unknown source identity" >&2

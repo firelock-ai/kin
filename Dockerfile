@@ -30,9 +30,9 @@ RUN if [ -n "$KIN_BUILD_GIT_SHA" ] || [ -n "$KIN_BUILD_DIRTY" ] || [ -n "$KIN_BU
       KIN_BUILD_GIT_SHA_OVERRIDE="$KIN_BUILD_GIT_SHA" \
       KIN_BUILD_DIRTY_OVERRIDE="$KIN_BUILD_DIRTY" \
       KIN_BUILD_BRANCH_OVERRIDE="$KIN_BUILD_BRANCH" \
-      cargo build --release --features gcs --bin kin-daemon --bin kin; \
+      cargo build --locked --release --features gcs --bin kin-daemon --bin kin; \
     else \
-      cargo build --release --features gcs --bin kin-daemon --bin kin; \
+      cargo build --locked --release --features gcs --bin kin-daemon --bin kin; \
     fi
 
 FROM debian:trixie-slim
