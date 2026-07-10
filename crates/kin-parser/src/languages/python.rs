@@ -737,6 +737,27 @@ mod tests {
     }
 
     #[test]
+    fn declaration_signature_preserves_default_literal_bytes() {
+        let adapter = PythonAdapter;
+        let source = br#"def target(value="a  b ) , c", other=(1, 2)):
+    return value, other
+"#;
+        let tree = adapter.parse(source).unwrap();
+        let file_id = FilePathId::new("test.py");
+        let output = adapter.extract(&tree, source, &file_id).unwrap();
+        let target = output
+            .entities
+            .iter()
+            .find(|entity| entity.name == "target")
+            .expect("target entity");
+        assert_eq!(
+            target.signature,
+            r#"def target(value="a  b ) , c", other=(1, 2))"#,
+            "declaration canonicalization may normalize outer formatting but must copy a literal byte-for-byte"
+        );
+    }
+
+    #[test]
     fn parse_python_uppercase_constant() {
         let adapter = PythonAdapter;
         let source = b"PROBE_SECRET_abcd1234 = 'uuid'\n";

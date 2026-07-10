@@ -143,6 +143,55 @@ fn link_and_shadow_verdict(source: &str, old_sig: &str, new_sig: &str) -> Shadow
     derive_shadow_policy(&review, &[], &[]).verdict
 }
 
+/// Build old and new entities from their real source declarations, rather than
+/// overwriting a parsed entity's signature with hand-authored strings. This
+/// covers the production declaration canonicalizer as well as parse, link,
+/// persist, impact, inline, and shadow policy.
+fn link_and_shadow_verdict_from_sources(
+    old_source: &str,
+    new_source: &str,
+) -> (ShadowGateVerdict, String, String) {
+    let (old_files, _relations, graph) = link_into_graph(old_source);
+    let new_files = vec![parse_python("mod.py", new_source)];
+    let old = find_entity(&old_files, "target");
+    let new = find_entity(&new_files, "target");
+    assert_eq!(
+        old.id, new.id,
+        "the same declaration path/name must retain graph identity"
+    );
+    let old_signature = old.signature.clone();
+    let new_signature = new.signature.clone();
+    let diff = SemanticDiff {
+        entity_changes: vec![EntityChange {
+            entity_id: new.id,
+            kind: EntityChangeKind::Modified { old, new },
+        }],
+        ..Default::default()
+    };
+    let report = analyze_impact(&graph, &diff).expect("analyze impact");
+    let inline_comments = collect_inline_comments(&diff, &report);
+    let review = Review {
+        base: None,
+        head: None,
+        diff,
+        impact: report,
+        risk: RiskSummary {
+            overall_risk: RiskLevel::Low,
+            breaking_changes: vec![],
+            test_coverage_gaps: vec![],
+            contract_violations: vec![],
+            work_risks: vec![],
+            notes: vec![],
+        },
+        inline_comments,
+    };
+    (
+        derive_shadow_policy(&review, &[], &[]).verdict,
+        old_signature,
+        new_signature,
+    )
+}
+
 const POSITIONAL_CALLERS: &str = "\
 def target(ext, args):
     return ext, args
@@ -185,6 +234,43 @@ def caller_one():
 def caller_two(**opts):
     return target(**opts)
 ";
+
+const POSITIONAL_DEFAULT_CALLERS: &str = "\
+def target(ext, args=1):
+    return ext, args
+
+
+def caller_one():
+    return target(1)
+
+
+def caller_two():
+    return target(2, 3)
+";
+
+const PARSED_DEFAULT_CHANGE_OLD: &str = r#"def target(ext, args="x  y"):
+    return ext, args
+
+
+def caller_one():
+    return target(1)
+
+
+def caller_two():
+    return target(2, "explicit")
+"#;
+
+const PARSED_DEFAULT_CHANGE_NEW: &str = r#"def target(ext, lines="xy"):
+    return ext, lines
+
+
+def caller_one():
+    return target(1)
+
+
+def caller_two():
+    return target(2, "explicit")
+"#;
 
 #[test]
 fn linker_persists_positional_call_shape_on_calls_edges() {
@@ -319,6 +405,43 @@ fn e2e_shadow_gate_var_keyword_caller_rename_would_block() {
         verdict,
         ShadowGateVerdict::WouldBlock,
         "**kwargs caller keeps the shadow gate blocking"
+    );
+}
+
+#[test]
+fn e2e_shadow_gate_rename_with_default_change_would_block() {
+    // Full negative-control chain: parse the real defaulted declaration and
+    // positional callers, link and persist their call shapes, harvest impact,
+    // then drive the shadow merge-trust verdict. Complete positional evidence
+    // must not demote a simultaneous default-value change.
+    let verdict = link_and_shadow_verdict(
+        POSITIONAL_DEFAULT_CALLERS,
+        "def target(ext, args=1)",
+        "def target(ext, lines=2)",
+    );
+    assert_eq!(
+        verdict,
+        ShadowGateVerdict::WouldBlock,
+        "a rename with a changed default must stay blocking after the full graph path"
+    );
+}
+
+#[test]
+fn e2e_parsed_sources_preserve_and_block_changed_string_default() {
+    let (verdict, old_signature, new_signature) =
+        link_and_shadow_verdict_from_sources(PARSED_DEFAULT_CHANGE_OLD, PARSED_DEFAULT_CHANGE_NEW);
+    assert!(
+        old_signature.contains(r#"args="x  y""#),
+        "the production declaration signature must preserve both literal spaces: {old_signature}"
+    );
+    assert!(
+        new_signature.contains(r#"lines="xy""#),
+        "new declaration signature comes from parsed source: {new_signature}"
+    );
+    assert_eq!(
+        verdict,
+        ShadowGateVerdict::WouldBlock,
+        "a parsed rename plus semantic string-default change must stay blocking"
     );
 }
 

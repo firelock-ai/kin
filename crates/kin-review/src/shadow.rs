@@ -3552,7 +3552,11 @@ mod tests {
     /// (`def makefile_target(ext, args)` → `def makefile_target(ext, lines)`)
     /// with 3 graph-known consumers whose call shapes are `call_shapes`. Exercises
     /// the shadow `downstream_risk` channel in isolation (no inline comments).
-    fn positional_rename_review(call_shapes: crate::impact::ConsumerCallShapeSummary) -> Review {
+    fn positional_rename_review_with_signatures(
+        old_signature: &str,
+        new_signature: &str,
+        call_shapes: crate::impact::ConsumerCallShapeSummary,
+    ) -> Review {
         use crate::diff::{EntityChange, EntityChangeKind, SemanticDiff};
         use crate::impact::{EntityImpact, ImpactReport};
         use kin_model::review::{RiskLevel, RiskSummary};
@@ -3563,9 +3567,9 @@ mod tests {
             610,
             EntityRole::Source,
         );
-        old.signature = "def makefile_target(ext, args)".to_string();
+        old.signature = old_signature.to_string();
         let mut new = old.clone();
-        new.signature = "def makefile_target(ext, lines)".to_string();
+        new.signature = new_signature.to_string();
 
         Review {
             base: None,
@@ -3609,6 +3613,14 @@ mod tests {
             },
             inline_comments: vec![],
         }
+    }
+
+    fn positional_rename_review(call_shapes: crate::impact::ConsumerCallShapeSummary) -> Review {
+        positional_rename_review_with_signatures(
+            "def makefile_target(ext, args)",
+            "def makefile_target(ext, lines)",
+            call_shapes,
+        )
     }
 
     #[test]
@@ -3656,6 +3668,65 @@ mod tests {
         );
         assert_eq!(policy.verdict, ShadowGateVerdict::NeedsAttention);
         assert_ne!(policy.verdict, ShadowGateVerdict::WouldBlock);
+    }
+
+    #[test]
+    fn shadow_downstream_risk_blocks_rename_with_default_change() {
+        // Even complete positional call-shape evidence cannot certify a rename
+        // with a simultaneous default change as runtime-neutral. The default is
+        // part of the callable contract independently of the observed callers.
+        let review = positional_rename_review_with_signatures(
+            "def makefile_target(ext, args=1)",
+            "def makefile_target(ext, lines=2)",
+            crate::impact::ConsumerCallShapeSummary {
+                caller_keyword_names: std::collections::BTreeSet::new(),
+                any_var_keyword_caller: false,
+                all_consumers_shaped_calls: true,
+            },
+        );
+        let policy = derive_policy(&review, &[], &[]);
+        let finding = policy
+            .findings
+            .iter()
+            .find(|finding| finding.kind == "downstream_risk")
+            .expect("a renamed surface with a changed default carries downstream risk");
+        assert!(finding.blocking, "changed defaults must stay blocking");
+        assert_eq!(finding.severity, "error");
+        assert!(
+            !finding.message.contains("no runtime break"),
+            "changed defaults must not carry the positional-safe proof"
+        );
+        assert_eq!(policy.verdict, ShadowGateVerdict::WouldBlock);
+    }
+
+    #[test]
+    fn shadow_treats_collector_rename_as_neutral_but_role_change_as_blocking() {
+        let collector_rename = positional_rename_review_with_signatures(
+            "def makefile_target(ext, *args, **kwargs)",
+            "def makefile_target(ext, *items, **options)",
+            crate::impact::ConsumerCallShapeSummary::default(),
+        );
+        let neutral = derive_policy(&collector_rename, &[], &[]);
+        assert_eq!(neutral.verdict, ShadowGateVerdict::Pass);
+        assert!(
+            neutral
+                .findings
+                .iter()
+                .all(|finding| finding.kind != "downstream_risk"),
+            "collector-only local binding renames are not contract-surface risk"
+        );
+
+        let role_change = positional_rename_review_with_signatures(
+            "def makefile_target(ext, *args)",
+            "def makefile_target(ext, **args)",
+            crate::impact::ConsumerCallShapeSummary::default(),
+        );
+        let blocking = derive_policy(&role_change, &[], &[]);
+        assert_eq!(blocking.verdict, ShadowGateVerdict::WouldBlock);
+        assert!(blocking
+            .findings
+            .iter()
+            .any(|finding| finding.kind == "downstream_risk" && finding.blocking));
     }
 
     /// Negative-control helper: a rename we cannot prove runtime-neutral must keep

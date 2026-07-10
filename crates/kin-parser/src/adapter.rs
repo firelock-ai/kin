@@ -119,15 +119,14 @@ fn hash_token_stream(node: &Node, source: &[u8], hasher: &mut Sha256) {
     }
 }
 
-/// Whitespace-collapsed declaration text of a node, cut before its `body`
+/// Formatting-canonical declaration text of a node, cut before its `body`
 /// child and any C++ member-initializer list, falling back to the full node
 /// text for body-less declarations. Grammars that expose the body as a
 /// plainly-kinded child instead of a `body` field (e.g. Kotlin's
-/// `function_body`/`class_body`) are cut at that child by kind. Line
-/// wrapping and indentation must not leak into signatures: a multi-line
-/// declarator and its single-line reformat are the same declaration, and a
-/// signature string that differs only by formatting reads as a false
-/// signature change downstream.
+/// `function_body`/`class_body`) are cut at that child by kind. Line wrapping
+/// and indentation outside literals must not leak into signatures, while
+/// syntax-tree string/character/template literal ranges are copied byte-for-
+/// byte because their whitespace is semantic data.
 pub fn declaration_signature(node: &Node, source: &[u8]) -> String {
     let start = node.start_byte();
     let mut end = node.end_byte();
@@ -148,20 +147,84 @@ pub fn declaration_signature(node: &Node, source: &[u8]) -> String {
         .get(start..end)
         .map(String::from_utf8_lossy)
         .unwrap_or_default();
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    canonicalize_signature_spacing(&collapsed)
+    let mut literal_ranges = Vec::new();
+    collect_literal_ranges(node, start, end, &mut literal_ranges);
+    canonicalize_signature_spacing(&text, &literal_ranges)
         .trim_end_matches(['{', ':'])
         .trim()
         .to_string()
 }
 
-/// Canonicalize spacing around punctuation in a collapsed signature so that
-/// a line break at a token boundary (`ArgParser\n(...)`) and its inline form
-/// (`ArgParser(...)`) render identically: no space before `()[],;<>`, none
-/// after an opening bracket.
-fn canonicalize_signature_spacing(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
+/// Protect syntax-tree literal nodes from declaration whitespace
+/// canonicalization. Literal source bytes are semantic data: collapsing
+/// `"a  b"` to `"a b"`, or deleting a space before punctuation inside a
+/// string, changes a Python default and can corrupt review classification.
+fn collect_literal_ranges(
+    node: &Node,
+    signature_start: usize,
+    signature_end: usize,
+    ranges: &mut Vec<(usize, usize)>,
+) {
+    if node.end_byte() <= signature_start || node.start_byte() >= signature_end {
+        return;
+    }
+    let kind = node.kind();
+    if kind.contains("string")
+        || kind.contains("char_literal")
+        || kind.contains("character_literal")
+        || kind.contains("template")
+    {
+        let start = node.start_byte().max(signature_start) - signature_start;
+        let end = node.end_byte().min(signature_end) - signature_start;
+        if start < end {
+            ranges.push((start, end));
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_literal_ranges(&child, signature_start, signature_end, ranges);
+    }
+}
+
+/// Collapse declaration formatting and canonicalize punctuation while copying
+/// literal ranges byte-for-byte. A line break at a token boundary
+/// (`ArgParser\n(...)`) and its inline form (`ArgParser(...)`) remain identical,
+/// but whitespace and punctuation inside strings are never rewritten.
+fn canonicalize_signature_spacing(source: &str, literal_ranges: &[(usize, usize)]) -> String {
+    let mut ranges = literal_ranges.to_vec();
+    ranges.sort_unstable();
+    let mut range_index = 0usize;
+    let mut out = String::with_capacity(source.len());
+    let mut pending_space = false;
+    let mut i = 0usize;
+
+    while i < source.len() {
+        if let Some(&(start, end)) = ranges.get(range_index) {
+            if i == start {
+                if pending_space
+                    && !matches!(out.chars().last(), Some('(') | Some('[') | Some('<') | None)
+                {
+                    out.push(' ');
+                }
+                out.push_str(&source[start..end]);
+                pending_space = false;
+                i = end;
+                range_index += 1;
+                continue;
+            }
+        }
+
+        let ch = source[i..]
+            .chars()
+            .next()
+            .expect("i is always a UTF-8 character boundary");
+        if ch.is_whitespace() {
+            pending_space = true;
+            i += ch.len_utf8();
+            continue;
+        }
+
         match ch {
             '(' | ')' | ',' | '[' | ']' | ';' | '<' | '>' => {
                 while out.ends_with(' ') {
@@ -169,13 +232,17 @@ fn canonicalize_signature_spacing(s: &str) -> String {
                 }
                 out.push(ch);
             }
-            ' ' => {
-                if !matches!(out.chars().last(), Some('(') | Some('[') | Some('<') | None) {
+            _ => {
+                if pending_space
+                    && !matches!(out.chars().last(), Some('(') | Some('[') | Some('<') | None)
+                {
                     out.push(' ');
                 }
+                out.push(ch);
             }
-            c => out.push(c),
         }
+        pending_space = false;
+        i += ch.len_utf8();
     }
     out
 }
