@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Component, Path as FsPath, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -1422,6 +1423,282 @@ fn scope_build_timeout() -> Duration {
     )
 }
 
+#[derive(Clone, Copy)]
+enum HistoryHydrationMode {
+    ArtifactOnly,
+    Semantic,
+}
+
+/// Set by request-future cancellation while blocking preparation is in flight.
+/// Tokio drops a request future on disconnect/outer timeout; this guard turns
+/// that drop into cooperative cancellation instead of leaving an unbounded
+/// orphaned Git walk on the blocking pool.
+struct BlockingWorkCancellation {
+    flag: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl BlockingWorkCancellation {
+    fn new() -> Self {
+        Self {
+            flag: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn cancel(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+        // One async owner waits on each request-local signal. `notify_one`
+        // retains a permit across the check/register race.
+        self.notify.notify_one();
+    }
+
+    fn flag(&self) -> &AtomicBool {
+        &self.flag
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+
+    async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        self.notify.notified().await;
+    }
+}
+
+struct CancelBlockingWorkOnDrop {
+    cancellation: Arc<BlockingWorkCancellation>,
+    armed: bool,
+}
+
+impl CancelBlockingWorkOnDrop {
+    fn new(cancellation: Arc<BlockingWorkCancellation>) -> Self {
+        Self {
+            cancellation,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelBlockingWorkOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancellation.cancel();
+        }
+    }
+}
+
+async fn save_snapshot_off_runtime(state: Arc<DaemonState>) -> Result<(), (StatusCode, String)> {
+    tokio::task::spawn_blocking(move || state.save_snapshot().map_err(internal_error))
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("snapshot persistence task failed: {error}"),
+            )
+        })??;
+    Ok(())
+}
+
+async fn save_snapshot_full_off_runtime(
+    state: Arc<DaemonState>,
+) -> Result<(), (StatusCode, String)> {
+    tokio::task::spawn_blocking(move || state.save_snapshot_full().map_err(internal_error))
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("full snapshot persistence task failed: {error}"),
+            )
+        })??;
+    Ok(())
+}
+
+/// Resolve one ref while keeping all cold closure checks, Git IO, parsing, and
+/// graph persistence off Tokio workers. Heavy preparation is daemon-bounded;
+/// after each waiter gets the permit it re-checks closure, so same-ref requests
+/// coalesce behind the first publication. The history writer gate is acquired
+/// only after preparation is complete.
+async fn resolve_ref_for_daemon(
+    state: Arc<DaemonState>,
+    graph: Arc<kin_db::InMemoryGraph>,
+    history_closure_cache: Arc<kin_cli::commands::ref_lookup::GitHistoryClosureCache>,
+    reference: String,
+    mode: HistoryHydrationMode,
+    cancellation: Arc<BlockingWorkCancellation>,
+) -> Result<kin_cli::commands::ref_lookup::ResolvedRef, (StatusCode, String)> {
+    let mut cancel_on_drop = CancelBlockingWorkOnDrop::new(Arc::clone(&cancellation));
+    let mut hydrated_change_ids = Vec::new();
+
+    if let Some(git_oid) =
+        kin_cli::commands::ref_lookup::extract_git_ref(&reference).map(str::to_string)
+    {
+        let prepare_gate = Arc::clone(&state.history_prepare_gate);
+        let _prepare_permit = tokio::select! {
+            permit = prepare_gate.acquire_owned() => permit.map_err(|_| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "history preparation gate closed".to_string(),
+                )
+            })?,
+            () = cancellation.cancelled() => {
+                return Err((
+                    StatusCode::REQUEST_TIMEOUT,
+                    "history hydration cancelled while waiting for preparation capacity".to_string(),
+                ));
+            }
+        };
+
+        let graph_for_check = Arc::clone(&graph);
+        let cache_for_check = Arc::clone(&history_closure_cache);
+        let reference_for_check = reference.clone();
+        let cancellation_for_check = Arc::clone(&cancellation);
+        let needs_hydration = tokio::task::spawn_blocking(move || {
+            kin_cli::commands::ref_lookup::git_ref_requires_hydration_cached_cancellable(
+                graph_for_check.as_ref(),
+                &reference_for_check,
+                cache_for_check.as_ref(),
+                cancellation_for_check.flag(),
+            )
+        })
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("history closure check task failed: {error}"),
+            )
+        })?
+        .map_err(|error| {
+            if cancellation.is_cancelled() {
+                (StatusCode::REQUEST_TIMEOUT, format!("{error:#}"))
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
+            }
+        })?;
+
+        if needs_hydration {
+            let state_for_prepare = Arc::clone(&state);
+            let cancellation_for_prepare = Arc::clone(&cancellation);
+            let enrich_semantics = matches!(mode, HistoryHydrationMode::Semantic);
+            let prepared = tokio::task::spawn_blocking(move || {
+                kin_cli::commands::ref_lookup::prepare_git_hydration_cancellable(
+                    &state_for_prepare.layout,
+                    &git_oid,
+                    enrich_semantics,
+                    cancellation_for_prepare.flag(),
+                )
+            })
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("history preparation task failed: {error}"),
+                )
+            })?
+            .map_err(|error| {
+                if cancellation.is_cancelled() {
+                    (StatusCode::REQUEST_TIMEOUT, format!("{error:#}"))
+                } else {
+                    (StatusCode::BAD_REQUEST, format!("{error:#}"))
+                }
+            })?;
+
+            if cancellation.is_cancelled() {
+                return Err((
+                    StatusCode::REQUEST_TIMEOUT,
+                    "history hydration cancelled before publication".to_string(),
+                ));
+            }
+
+            let writer_gate = Arc::clone(&state.hydration_gate);
+            let writer = tokio::select! {
+                writer = writer_gate.lock_owned() => writer,
+                () = cancellation.cancelled() => {
+                    return Err((
+                        StatusCode::REQUEST_TIMEOUT,
+                        "history hydration cancelled while waiting to publish".to_string(),
+                    ));
+                }
+            };
+            let graph_for_publish = Arc::clone(&graph);
+            let cache_for_publish = Arc::clone(&history_closure_cache);
+            let mutates_live_graph = Arc::ptr_eq(&graph, &state.graph);
+            // Open the publication window only after all heavyweight prepare
+            // work has completed. Keep it open through cache invalidation and
+            // durable persistence, not merely the insertion loop.
+            let mut publication = mutates_live_graph.then(|| state.begin_vfs_history_mutation());
+            hydrated_change_ids = tokio::task::spawn_blocking(move || {
+                let _writer = writer;
+                let mut before_first_insert = || {};
+                let inserted = kin_cli::commands::ref_lookup::publish_prepared_git_hydration(
+                    graph_for_publish.as_ref(),
+                    prepared,
+                    Some(cache_for_publish.as_ref()),
+                    &mut before_first_insert,
+                )
+                .map_err(|error| (StatusCode::BAD_REQUEST, format!("{error:#}")))?;
+                Ok::<_, (StatusCode, String)>(inserted)
+            })
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("history publication task failed: {error}"),
+                )
+            })??;
+
+            if !hydrated_change_ids.is_empty() && mutates_live_graph {
+                invalidate_vfs_for_inserted_changes(&state, hydrated_change_ids.iter().copied())?;
+                state.bump_version();
+                save_snapshot_off_runtime(Arc::clone(&state)).await?;
+                state.mark_clean();
+                state.emit_event(DaemonEvent::GraphRootChanged {
+                    old_root_hash: None,
+                    new_root_hash: "history-hydration".to_string(),
+                });
+            }
+            if let Some(publication) = publication.take() {
+                publication.finish();
+            }
+        }
+    }
+
+    let graph_for_resolve = Arc::clone(&graph);
+    let layout = state.layout.clone();
+    let reference_for_resolve = reference.clone();
+    let head = tokio::task::spawn_blocking(move || {
+        kin_cli::commands::ref_lookup::resolve_ref(
+            graph_for_resolve.as_ref(),
+            &layout,
+            Some(&reference_for_resolve),
+        )
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("ref resolution task failed: {error}"),
+        )
+    })?
+    .map_err(|error| (StatusCode::BAD_REQUEST, format!("{error:#}")))?;
+
+    cancel_on_drop.disarm();
+    let hydrated_changes = hydrated_change_ids.len();
+    Ok(kin_cli::commands::ref_lookup::ResolvedRef {
+        head,
+        hydrated_git_history: hydrated_changes > 0,
+        hydrated_changes,
+        hydrated_change_ids,
+    })
+}
+
 /// POST /session/{session_id}/scope — set a temporal scope for a session.
 async fn set_scope(
     Path(session_id): Path<String>,
@@ -1441,81 +1718,47 @@ async fn set_scope(
             )
         })?;
 
-    // Offload the heavy computation to a blocking thread to keep the main event loop responsive
-    let state_clone = Arc::clone(&state);
-    let ref_string = req.ref_string.clone();
     let timeout = scope_build_timeout();
-    // A deep scope base_commit lazily imports its full ancestry; serialize that
-    // against every other daemon hydration so two deep imports never run at once
-    // (roughly 2x peak memory → OOM). Already-imported refs skip the gate and
-    // stay on the fast path. Acquired here (async) and moved into the blocking
-    // task so it is held for the whole import.
-    let history_closure_cache = Arc::clone(&state.history_closure_cache);
-    let needs_hydration = kin_cli::commands::ref_lookup::git_ref_requires_hydration_cached(
-        state.graph.as_ref(),
-        &ref_string,
-        history_closure_cache.as_ref(),
-    );
-    let hydration_gate = if needs_hydration {
-        Some(Arc::clone(&state.hydration_gate).lock_owned().await)
-    } else {
-        None
-    };
-    let scope_task = tokio::task::spawn_blocking(
-        move || -> std::result::Result<_, (StatusCode, String)> {
-            let _hydration_gate = hydration_gate;
-            let mut vfs_history_mutation = None;
-            // Resolve the ref to a SemanticChangeId using the LOCATE resolve mode
-            // (enrich_semantics=false). Scope-for-retrieval only needs the
-            // base_commit's tree state; the full per-commit semantic-delta enrichment
-            // of its entire ancestry ("Hydrating History: [n/26747]") re-parses and
-            // re-links every ancestor commit — ~10 min on a deep base_commit — and the
-            // session-scope locate path never reads those deltas (it ranks the scoped
-            // entity set with HEAD vectors via `vector_source`). The /locate ref path
-            // already uses this lighter mode.
-            let resolved = {
-                let mut before_first_insert = || {
-                    if vfs_history_mutation.is_none() {
-                        vfs_history_mutation = Some(state_clone.begin_vfs_history_mutation());
-                    }
-                };
-                kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate_with_report_cached(
-                    state_clone.graph.as_ref(),
-                    &state_clone.layout,
-                    Some(&ref_string),
-                    history_closure_cache.as_ref(),
-                    &mut before_first_insert,
-                )
-                .map_err(|err| (StatusCode::BAD_REQUEST, format!("{:#}", err)))?
-            };
-            if resolved.hydrated_git_history {
-                invalidate_vfs_for_inserted_changes(
-                    &state_clone,
-                    resolved.hydrated_change_ids.iter().copied(),
-                )?;
-                state_clone.bump_version();
-                state_clone.save_snapshot().map_err(internal_error)?;
-                state_clone.mark_clean();
-                state_clone.emit_event(DaemonEvent::GraphRootChanged {
-                    old_root_hash: None,
-                    new_root_hash: "scope-hydration".to_string(),
-                });
-            }
-            if let Some(mutation) = vfs_history_mutation.take() {
-                mutation.finish();
-            }
-            let head = resolved.head;
+    let cancellation = Arc::new(BlockingWorkCancellation::new());
+    let state_for_task = Arc::clone(&state);
+    let ref_string = req.ref_string.clone();
+    let cancellation_for_task = Arc::clone(&cancellation);
+    let mut scope_task = tokio::spawn(async move {
+        // Scope retrieval needs artifact history, not the far more expensive
+        // per-commit semantic enrichment. Preparation and closure verification
+        // still happen off-runtime; only publication takes the writer gate.
+        let resolved = resolve_ref_for_daemon(
+            Arc::clone(&state_for_task),
+            Arc::clone(&state_for_task.graph),
+            Arc::clone(&state_for_task.history_closure_cache),
+            ref_string.clone(),
+            HistoryHydrationMode::ArtifactOnly,
+            Arc::clone(&cancellation_for_task),
+        )
+        .await?;
+        let head = resolved.head;
 
+        let state_for_build = Arc::clone(&state_for_task);
+        tokio::task::spawn_blocking(move || {
+            if cancellation_for_task.is_cancelled() {
+                return Err((
+                    StatusCode::REQUEST_TIMEOUT,
+                    "temporal scope build cancelled before reconstruction".to_string(),
+                ));
+            }
             // Build the historical graph at that ref, using cached OID mapping
             // for fast scope switching without re-walking the commit DAG.
             let oid_cache: Option<kin_core::ChangeOidCache> = {
-                let needs_build = read_recover(&state_clone.change_oid_cache).is_none();
+                let needs_build = read_recover(&state_for_build.change_oid_cache).is_none();
                 if needs_build {
-                    if let Ok(repo) = open_repo(state_clone.layout.working_dir()) {
-                        match kin_core::build_change_oid_cache(&repo) {
+                    if let Ok(repo) = open_repo(state_for_build.layout.working_dir()) {
+                        match kin_core::build_change_oid_cache_cancellable(
+                            &repo,
+                            cancellation_for_task.flag(),
+                        ) {
                             Ok(cache) => {
                                 info!("built change OID cache for fast scope switching");
-                                *write_recover(&state_clone.change_oid_cache) = Some(cache);
+                                *write_recover(&state_for_build.change_oid_cache) = Some(cache);
                             }
                             Err(err) => {
                                 tracing::warn!(error = %err, "failed to build change OID cache, falling back to per-call lookup");
@@ -1523,57 +1766,89 @@ async fn set_scope(
                         }
                     }
                 }
-                read_recover(&state_clone.change_oid_cache).clone()
+                read_recover(&state_for_build.change_oid_cache).clone()
             };
             let historical = if let Some(git_oid) = ref_string.strip_prefix("git:") {
-                kin_core::build_graph_at_git_ref_with_repo(
-                    state_clone.graph.as_ref(),
-                    state_clone.blobs.as_ref(),
+                kin_core::build_graph_at_git_ref_with_repo_cancellable(
+                    state_for_build.graph.as_ref(),
+                    state_for_build.blobs.as_ref(),
                     &head,
-                    state_clone.layout.working_dir(),
+                    state_for_build.layout.working_dir(),
                     git_oid,
                     oid_cache.as_ref(),
+                    cancellation_for_task.flag(),
                 )
             } else {
-                kin_core::build_graph_at_ref_with_repo(
-                    state_clone.graph.as_ref(),
-                    state_clone.blobs.as_ref(),
+                kin_core::build_graph_at_ref_with_repo_cancellable(
+                    state_for_build.graph.as_ref(),
+                    state_for_build.blobs.as_ref(),
                     &head,
-                    Some(state_clone.layout.working_dir()),
+                    Some(state_for_build.layout.working_dir()),
                     oid_cache.as_ref(),
+                    cancellation_for_task.flag(),
                 )
             }
             .map_err(internal_error)?;
 
-            // Refresh cochange relations from the historical change set so the
-            // cached graph matches what run_with_graph_capture_at_ref() produces.
-            let changes = kin_core::collect_changes_at_ref(&historical, &head)
+            if cancellation_for_task.is_cancelled() {
+                return Err((
+                    StatusCode::REQUEST_TIMEOUT,
+                    "temporal scope build cancelled before cochange refresh".to_string(),
+                ));
+            }
+            let changes = kin_core::collect_changes_at_ref_cancellable(
+                &historical,
+                &head,
+                cancellation_for_task.flag(),
+            )
                 .map_err(|err| internal_error(err.to_string()))?;
-            let _ = kin_cli::commands::cochange::refresh_from_changes(&historical, &changes);
-
-            let cached_graph = Arc::new(historical);
-
-            Ok((head, cached_graph))
-        },
-    );
-    let (head, cached_graph) = match tokio::time::timeout(timeout, scope_task).await {
-        Ok(joined) => joined.map_err(|err| {
+            kin_cli::commands::cochange::refresh_from_changes_cancellable(
+                &historical,
+                &changes,
+                cancellation_for_task.flag(),
+            )
+            .map_err(internal_error)?;
+            if cancellation_for_task.is_cancelled() {
+                return Err((
+                    StatusCode::REQUEST_TIMEOUT,
+                    "temporal scope build cancelled after cochange refresh".to_string(),
+                ));
+            }
+            Ok((head, Arc::new(historical)))
+        })
+        .await
+        .map_err(|error| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("spawn_blocking failed: {err}"),
+                format!("temporal scope blocking task failed: {error}"),
+            )
+        })?
+    });
+
+    let (head, cached_graph) = match tokio::time::timeout(timeout, &mut scope_task).await {
+        Ok(joined) => joined.map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("temporal scope task failed: {error}"),
             )
         })??,
         Err(_) => {
+            cancellation.cancel();
+            // Do not detach the blocking job: wait for its cooperative
+            // acknowledgement before returning, so it cannot keep consuming
+            // CPU/memory or publish a late partial scope after timeout.
+            let acknowledgement = scope_task.await;
             tracing::warn!(
                 session = %session_id,
                 ref_string = %req.ref_string,
                 timeout_secs = timeout.as_secs(),
-                "temporal scope build timed out"
+                acknowledged = acknowledgement.is_ok(),
+                "temporal scope build timed out and cancellation was acknowledged"
             );
             return Err((
                 StatusCode::GATEWAY_TIMEOUT,
                 format!(
-                    "temporal scope build timed out after {}s for {}",
+                    "temporal scope build timed out after {}s for {}; cancellation acknowledged and no scope installed",
                     timeout.as_secs(),
                     req.ref_string
                 ),
@@ -1949,7 +2224,7 @@ async fn graph_commit(
     // and every other daemon history writer. The kin-db primitive currently
     // replaces duplicate keys, so a read-before-write check without this gate
     // would still race and could make a verified closure memo stale.
-    let _history_write_gate = state.hydration_gate.lock().await;
+    let history_write_gate = state.hydration_gate.lock().await;
     let disposition = classify_semantic_change_insert(graph, &request.change)?;
     validate_semantic_change_topology(
         graph,
@@ -2032,7 +2307,11 @@ async fn graph_commit(
 
     // Broadcast root hash change and compact the delta journal at the commit boundary.
     state.bump_version();
-    state.save_snapshot_full().map_err(internal_error)?;
+    // The in-memory publication is atomic now. Do not pin the history writer
+    // across O(graph) serialization; persistence's captured mutation
+    // generation keeps any later writer dirty for a follow-up flush.
+    drop(history_write_gate);
+    save_snapshot_full_off_runtime(Arc::clone(&state)).await?;
     state.mark_clean();
     state.emit_event(DaemonEvent::GraphRootChanged {
         old_root_hash: None,
@@ -2883,7 +3162,7 @@ async fn command_commit(
     // respect to every production SemanticChange writer. Acquire it before the
     // working-copy lock: a long hydration must not let a queued commit convoy
     // unrelated VFS reads and overlay writers while it is still waiting.
-    let _history_write_gate = state.hydration_gate.lock().await;
+    let history_write_gate = state.hydration_gate.lock().await;
     // Acquire every async lock before mutating graph history. From this point
     // through graph/head + working-copy publication there is no cancellation
     // point that can strand a half-finalized commit.
@@ -2949,7 +3228,8 @@ async fn command_commit(
 
     // Broadcast events and mark dirty for background persistence.
     state.bump_version();
-    state.save_snapshot_full().map_err(internal_error)?;
+    drop(history_write_gate);
+    save_snapshot_full_off_runtime(Arc::clone(&state)).await?;
     state.mark_clean();
     state.emit_event(DaemonEvent::GraphRootChanged {
         old_root_hash: None,
@@ -3458,73 +3738,52 @@ async fn locate(
     );
 
     let mut result = if let Some(reference) = req.reference.as_deref() {
-        // Explicit --ref always takes precedence over session scope.
-        // Locating at an unimported Git ref lazily imports its full ancestry;
-        // serialize that against every other daemon hydration. Already-imported
-        // refs skip the gate and stay on the fast path.
-        let needs_hydration = kin_cli::commands::ref_lookup::git_ref_requires_hydration_cached(
-            state.graph.as_ref(),
-            reference,
-            state.history_closure_cache.as_ref(),
-        );
-        let _hydration_gate = if needs_hydration {
-            Some(state.hydration_gate.lock().await)
-        } else {
-            None
-        };
-        let mut vfs_history_mutation = None;
-        let resolved = {
-            let mut before_first_insert = || {
-                if vfs_history_mutation.is_none() {
-                    vfs_history_mutation = Some(state.begin_vfs_history_mutation());
-                }
-            };
-            kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate_with_report_cached(
-                state.graph.as_ref(),
-                &state.layout,
-                Some(reference),
-                state.history_closure_cache.as_ref(),
-                &mut before_first_insert,
-            )
-            .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?
-        };
-        if resolved.hydrated_git_history {
-            invalidate_vfs_for_inserted_changes(
-                &state,
-                resolved.hydrated_change_ids.iter().copied(),
-            )?;
-            state.bump_version();
-            state.save_snapshot().map_err(internal_error)?;
-            state.mark_clean();
-            state.emit_event(DaemonEvent::GraphRootChanged {
-                old_root_hash: None,
-                new_root_hash: "locate-hydration".to_string(),
-            });
-        }
-        if let Some(mutation) = vfs_history_mutation.take() {
-            mutation.finish();
-        }
-        let head = resolved.head;
-        kin_cli::commands::locate::run_with_graph_capture_at_ref(
-            &state.layout,
-            state.graph.as_ref(),
-            state.blobs.as_ref(),
-            &head,
-            reference,
-            &req.text,
-            req.explain,
-            req.max_files,
-            req.max_files_explicit,
-            snippet_opts,
+        // Explicit --ref always takes precedence over session scope. Cold
+        // closure/import work and the full ref-scoped locate pipeline run on
+        // the blocking pool; only prepared history publication takes the
+        // daemon writer gate.
+        let reference = reference.to_string();
+        let resolved = resolve_ref_for_daemon(
+            Arc::clone(&state),
+            Arc::clone(&state.graph),
+            Arc::clone(&state.history_closure_cache),
+            reference.clone(),
+            HistoryHydrationMode::ArtifactOnly,
+            Arc::new(BlockingWorkCancellation::new()),
         )
-        .map_err(|error| error.to_string())
+        .await?;
+        let head = resolved.head;
+        let state_for_locate = Arc::clone(&state);
+        let text = req.text.clone();
+        tokio::task::spawn_blocking(move || {
+            kin_cli::commands::locate::run_with_graph_capture_at_ref(
+                &state_for_locate.layout,
+                state_for_locate.graph.as_ref(),
+                state_for_locate.blobs.as_ref(),
+                &head,
+                &reference,
+                &text,
+                req.explain,
+                req.max_files,
+                req.max_files_explicit,
+                snippet_opts,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("ref-scoped locate task failed: {error}"),
+            )
+        })?
     } else {
         // Use scoped graph if session has a temporal scope, otherwise HEAD.
         let graph = resolve_session_graph(&state, session_id.as_ref()).await;
         run_fused_locate_for_state(
             &state,
             session_id.as_ref(),
-            graph.as_ref(),
+            graph,
             &req.text,
             req.explain,
             req.max_files,
@@ -3558,7 +3817,7 @@ async fn locate(
 async fn run_fused_locate_for_state(
     state: &Arc<DaemonState>,
     session_id: Option<&SessionId>,
-    graph: &kin_db::InMemoryGraph,
+    graph: Arc<kin_db::InMemoryGraph>,
     text: &str,
     explain: bool,
     max_files: usize,
@@ -3575,42 +3834,43 @@ async fn run_fused_locate_for_state(
     } else {
         None
     };
-    let extra_priority_files = scope_ref_string
-        .as_deref()
-        .map(|ref_str| {
-            // `graph` is the session's ref-scoped graph, so the historical
-            // test-artifact signal is read from its graph-owned truth.
-            kin_cli::commands::locate::discover_historical_test_artifact_priority_files(
-                graph, ref_str, text,
-            )
-        })
-        .unwrap_or_default();
-
-    // Always pass the HEAD graph as vector source for embedding signals.
-    // For scoped sessions, the scoped graph has no vector index — HEAD
-    // vectors are queried and post-filtered to the scoped entity set.
-    // For unscoped queries, the HEAD graph IS the primary graph, so
-    // vector_source provides the same index — but extract_embedding_signals
-    // only uses vector_source when the primary graph has no embeddings,
-    // so there's no double-query.
-    let vector_source = Some(state.graph.as_ref());
     let workspace_root = if scope_ref_string.is_some() {
         None
     } else {
         Some(kin_core::source_dir(&state.layout))
     };
-    kin_cli::commands::locate::run_with_graph_capture_with_priority_files_and_vector_source(
-        graph,
-        workspace_root.as_deref(),
-        text,
-        explain,
-        max_files,
-        max_files_explicit,
-        extra_priority_files,
-        vector_source,
-        snippet_opts,
-    )
-    .map_err(|error| error.to_string())
+    let vector_source = Arc::clone(&state.graph);
+    let text = text.to_string();
+    tokio::task::spawn_blocking(move || {
+        let extra_priority_files = scope_ref_string
+            .as_deref()
+            .map(|ref_str| {
+                // `graph` is the session's ref-scoped graph, so the historical
+                // test-artifact signal is read from its graph-owned truth.
+                kin_cli::commands::locate::discover_historical_test_artifact_priority_files(
+                    graph.as_ref(),
+                    ref_str,
+                    &text,
+                )
+            })
+            .unwrap_or_default();
+
+        // Always pass the HEAD graph as vector source for embedding signals.
+        kin_cli::commands::locate::run_with_graph_capture_with_priority_files_and_vector_source(
+            graph.as_ref(),
+            workspace_root.as_deref(),
+            &text,
+            explain,
+            max_files,
+            max_files_explicit,
+            extra_priority_files,
+            Some(vector_source.as_ref()),
+            snippet_opts,
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("fused locate blocking task failed: {error}"))?
 }
 
 /// Insert a full locate ranking into the paging cache, evicting the oldest entry
@@ -3784,81 +4044,87 @@ async fn review(
             .await
     };
     let mutates_live_graph = Arc::ptr_eq(&graph, &state.graph);
-    // A shadow review over an unimported Git ref lazily imports its full
-    // ancestry; serialize that against every other daemon hydration so two deep
-    // imports never run at once. Already-imported (or non-Git) refs skip the
-    // gate and stay on the fast path.
-    let needs_hydration = match &req {
-        kin_cli::commands::review::ReviewRequest::Shadow { base, head, .. } => {
-            kin_cli::commands::ref_lookup::git_ref_requires_hydration_cached(
-                graph.as_ref(),
-                base,
-                history_closure_cache.as_ref(),
-            ) || kin_cli::commands::ref_lookup::git_ref_requires_hydration_cached(
-                graph.as_ref(),
-                head,
-                history_closure_cache.as_ref(),
+    // Preserve the cheap stale-base Git-DAG answer before paying for semantic
+    // hydration. The preflight itself may walk Git, so it also runs off Tokio.
+    if matches!(
+        &req,
+        kin_cli::commands::review::ReviewRequest::Shadow { .. }
+    ) {
+        let layout = state.layout.clone();
+        let graph_for_preflight = Arc::clone(&graph);
+        let cache_for_preflight = Arc::clone(&history_closure_cache);
+        let request_for_preflight = req.clone();
+        let fast = tokio::task::spawn_blocking(move || {
+            kin_cli::commands::review::execute_review_shadow_fast_path_cached(
+                &layout,
+                graph_for_preflight.as_ref(),
+                &request_for_preflight,
+                cache_for_preflight.as_ref(),
             )
+        })
+        .await
+        .map_err(|error| internal_error(format!("shadow review preflight failed: {error}")))?
+        .map_err(internal_error)?;
+        if let Some(execution) = fast {
+            return Ok(Json(execution.response));
         }
-        _ => false,
-    };
-    let _hydration_gate = if needs_hydration {
-        Some(state.hydration_gate.lock().await)
-    } else {
-        None
-    };
-    let mut vfs_history_mutation = None;
-    let execution = {
-        let mut before_first_insert = || {
-            if mutates_live_graph && vfs_history_mutation.is_none() {
-                vfs_history_mutation = Some(state.begin_vfs_history_mutation());
-            }
-        };
-        kin_cli::commands::review::execute_review_request_cached(
-            &state.layout,
-            graph.as_ref(),
-            req,
-            history_closure_cache.as_ref(),
-            &mut before_first_insert,
+    }
+
+    let cancellation = Arc::new(BlockingWorkCancellation::new());
+    let mut prepared_hydrated_change_ids = Vec::new();
+    if let kin_cli::commands::review::ReviewRequest::Shadow { base, head, .. } = &req {
+        // Resolve head first: it normally contains base and turns the second
+        // closure check into a warm O(1) lookup.
+        let resolved_head = resolve_ref_for_daemon(
+            Arc::clone(&state),
+            Arc::clone(&graph),
+            Arc::clone(&history_closure_cache),
+            head.clone(),
+            HistoryHydrationMode::Semantic,
+            Arc::clone(&cancellation),
         )
-        .map_err(|err| {
-            // A ref the resolver cannot make sense of is the caller's
-            // input, not a server fault — e.g. a shadow request naming a
-            // ref that doesn't exist or uses syntax the resolver doesn't
-            // understand — so it is reported as a client error with the
-            // full "why" chain instead of falling into the generic
-            // internal-error path.
-            if kin_cli::commands::ref_lookup::is_ref_resolution_error(&err) {
-                (StatusCode::BAD_REQUEST, format!("{err:#}"))
-            } else {
-                internal_error(err)
-            }
-        })?
-    };
+        .await?;
+        prepared_hydrated_change_ids.extend(resolved_head.hydrated_change_ids);
+        let resolved_base = resolve_ref_for_daemon(
+            Arc::clone(&state),
+            Arc::clone(&graph),
+            Arc::clone(&history_closure_cache),
+            base.clone(),
+            HistoryHydrationMode::Semantic,
+            Arc::clone(&cancellation),
+        )
+        .await?;
+        prepared_hydrated_change_ids.extend(resolved_base.hydrated_change_ids);
+    }
+
+    let layout = state.layout.clone();
+    let graph_for_review = Arc::clone(&graph);
+    let cache_for_review = Arc::clone(&history_closure_cache);
+    let execution = tokio::task::spawn_blocking(move || {
+        kin_cli::commands::review::execute_review_request_cached_with_prepared_hydration(
+            &layout,
+            graph_for_review.as_ref(),
+            req,
+            cache_for_review.as_ref(),
+            &mut || {},
+            prepared_hydrated_change_ids,
+        )
+    })
+    .await
+    .map_err(|error| internal_error(format!("review task failed: {error}")))?
+    .map_err(|err| {
+        if kin_cli::commands::ref_lookup::is_ref_resolution_error(&err) {
+            (StatusCode::BAD_REQUEST, format!("{err:#}"))
+        } else {
+            internal_error(err)
+        }
+    })?;
     if execution.hydrated_changes > 0 && mutates_live_graph {
         tracing::info!(
             hydrated_changes = execution.hydrated_changes,
             review_mutations = 0u64,
-            "shadow review hydrated historical changes into the graph"
+            "shadow review used daemon-prepared historical changes"
         );
-        invalidate_vfs_for_inserted_changes(&state, execution.hydrated_change_ids.iter().copied())?;
-        state.bump_version();
-    }
-    if execution.hydrated_changes > 0 && mutates_live_graph {
-        state.save_snapshot().map_err(internal_error)?;
-        state.mark_clean();
-        // A live SSE subscriber (e.g. the VFS daemon) should hear about this
-        // graph growth exactly like any other root change, not just the
-        // `mutated` case below — otherwise a hydration-only shadow review is
-        // invisible to anything watching /events in real time, even though
-        // it just persisted a potentially large import.
-        state.emit_event(DaemonEvent::GraphRootChanged {
-            old_root_hash: None,
-            new_root_hash: "review-hydration".to_string(),
-        });
-    }
-    if let Some(mutation) = vfs_history_mutation.take() {
-        mutation.finish();
     }
     if execution.mutated {
         state.bump_version();
@@ -4062,6 +4328,20 @@ fn persist_foreground_embed_batch(state: &DaemonState) -> Result<(), kin_db::Kin
     })
 }
 
+fn history_surface_hydration_error(
+    (status, message): (StatusCode, String),
+) -> (StatusCode, String) {
+    // Blame/history historically classify a ref that cannot be read from the
+    // selected (possibly private scoped) graph as a server-side read failure.
+    // Preserve that API contract while locate/scope/review keep their explicit
+    // bad-input classification.
+    if status == StatusCode::BAD_REQUEST {
+        (StatusCode::INTERNAL_SERVER_ERROR, message)
+    } else {
+        (status, message)
+    }
+}
+
 /// POST /blame — render entity blame from daemon-owned graph state.
 async fn blame(
     headers: axum::http::HeaderMap,
@@ -4082,51 +4362,40 @@ async fn blame(
     let (graph, history_closure_cache) = state
         .graph_and_history_cache_for_request(session_id.as_ref())
         .await;
-    let mutates_live_graph = Arc::ptr_eq(&graph, &state.graph);
-    // Blaming at an unimported Git ref lazily imports its full ancestry;
-    // serialize that against every other daemon hydration. Already-imported (or
-    // absent) refs skip the gate and stay on the fast path.
-    let needs_hydration = req.reference.as_deref().is_some_and(|reference| {
-        kin_cli::commands::ref_lookup::git_ref_requires_hydration_cached(
-            graph.as_ref(),
+    let cancellation = Arc::new(BlockingWorkCancellation::new());
+    let mut prepared_hydrated_change_ids = Vec::new();
+    if let Some(reference) = req.reference.clone() {
+        let resolved = resolve_ref_for_daemon(
+            Arc::clone(&state),
+            Arc::clone(&graph),
+            Arc::clone(&history_closure_cache),
             reference,
-            history_closure_cache.as_ref(),
+            HistoryHydrationMode::Semantic,
+            Arc::clone(&cancellation),
         )
-    });
-    let _hydration_gate = if needs_hydration {
-        Some(state.hydration_gate.lock().await)
-    } else {
-        None
-    };
-    let mut vfs_history_mutation = None;
-    let execution = {
-        let mut before_first_insert = || {
-            if mutates_live_graph && vfs_history_mutation.is_none() {
-                vfs_history_mutation = Some(state.begin_vfs_history_mutation());
-            }
-        };
+        .await
+        .map_err(history_surface_hydration_error)?;
+        prepared_hydrated_change_ids = resolved.hydrated_change_ids;
+    }
+    let layout = state.layout.clone();
+    let graph_for_blame = Arc::clone(&graph);
+    let cache_for_blame = Arc::clone(&history_closure_cache);
+    let mut execution = tokio::task::spawn_blocking(move || {
         kin_cli::commands::blame::execute_blame_request_cached(
-            &state.layout,
-            graph.as_ref(),
+            &layout,
+            graph_for_blame.as_ref(),
             &req,
-            history_closure_cache.as_ref(),
-            &mut before_first_insert,
+            cache_for_blame.as_ref(),
+            &mut || {},
         )
-        .map_err(internal_error)?
-    };
-    if execution.hydrated_git_history && mutates_live_graph {
-        invalidate_vfs_for_inserted_changes(&state, execution.hydrated_change_ids.iter().copied())?;
-        state.bump_version();
-        state.save_snapshot().map_err(internal_error)?;
-        state.mark_clean();
-        state.emit_event(DaemonEvent::GraphRootChanged {
-            old_root_hash: None,
-            new_root_hash: "blame-hydration".to_string(),
-        });
-    }
-    if let Some(mutation) = vfs_history_mutation.take() {
-        mutation.finish();
-    }
+    })
+    .await
+    .map_err(|error| internal_error(format!("blame task failed: {error}")))?
+    .map_err(internal_error)?;
+    execution
+        .hydrated_change_ids
+        .extend(prepared_hydrated_change_ids);
+    execution.hydrated_git_history = !execution.hydrated_change_ids.is_empty();
     Ok(Json(execution.response))
 }
 
@@ -4150,51 +4419,40 @@ async fn history(
     let (graph, history_closure_cache) = state
         .graph_and_history_cache_for_request(session_id.as_ref())
         .await;
-    let mutates_live_graph = Arc::ptr_eq(&graph, &state.graph);
-    // History at an unimported Git ref lazily imports its full ancestry;
-    // serialize that against every other daemon hydration. Already-imported (or
-    // absent) refs skip the gate and stay on the fast path.
-    let needs_hydration = req.reference.as_deref().is_some_and(|reference| {
-        kin_cli::commands::ref_lookup::git_ref_requires_hydration_cached(
-            graph.as_ref(),
+    let cancellation = Arc::new(BlockingWorkCancellation::new());
+    let mut prepared_hydrated_change_ids = Vec::new();
+    if let Some(reference) = req.reference.clone() {
+        let resolved = resolve_ref_for_daemon(
+            Arc::clone(&state),
+            Arc::clone(&graph),
+            Arc::clone(&history_closure_cache),
             reference,
-            history_closure_cache.as_ref(),
+            HistoryHydrationMode::Semantic,
+            Arc::clone(&cancellation),
         )
-    });
-    let _hydration_gate = if needs_hydration {
-        Some(state.hydration_gate.lock().await)
-    } else {
-        None
-    };
-    let mut vfs_history_mutation = None;
-    let execution = {
-        let mut before_first_insert = || {
-            if mutates_live_graph && vfs_history_mutation.is_none() {
-                vfs_history_mutation = Some(state.begin_vfs_history_mutation());
-            }
-        };
+        .await
+        .map_err(history_surface_hydration_error)?;
+        prepared_hydrated_change_ids = resolved.hydrated_change_ids;
+    }
+    let layout = state.layout.clone();
+    let graph_for_history = Arc::clone(&graph);
+    let cache_for_history = Arc::clone(&history_closure_cache);
+    let mut execution = tokio::task::spawn_blocking(move || {
         kin_cli::commands::history::execute_history_request_cached(
-            &state.layout,
-            graph.as_ref(),
+            &layout,
+            graph_for_history.as_ref(),
             &req,
-            history_closure_cache.as_ref(),
-            &mut before_first_insert,
+            cache_for_history.as_ref(),
+            &mut || {},
         )
-        .map_err(internal_error)?
-    };
-    if execution.hydrated_git_history && mutates_live_graph {
-        invalidate_vfs_for_inserted_changes(&state, execution.hydrated_change_ids.iter().copied())?;
-        state.bump_version();
-        state.save_snapshot().map_err(internal_error)?;
-        state.mark_clean();
-        state.emit_event(DaemonEvent::GraphRootChanged {
-            old_root_hash: None,
-            new_root_hash: "history-hydration".to_string(),
-        });
-    }
-    if let Some(mutation) = vfs_history_mutation.take() {
-        mutation.finish();
-    }
+    })
+    .await
+    .map_err(|error| internal_error(format!("history task failed: {error}")))?
+    .map_err(internal_error)?;
+    execution
+        .hydrated_change_ids
+        .extend(prepared_hydrated_change_ids);
+    execution.hydrated_git_history = !execution.hydrated_change_ids.is_empty();
     Ok(Json(execution.response))
 }
 
@@ -5193,7 +5451,7 @@ fn fused_semantic_locate_payload(
 async fn build_fused_semantic_locate_result(
     state: &Arc<DaemonState>,
     session_id: Option<&SessionId>,
-    graph: &kin_db::InMemoryGraph,
+    graph: Arc<kin_db::InMemoryGraph>,
     arguments: &HashMap<String, serde_json::Value>,
 ) -> kin_mcp::ToolCallResult {
     let query = match arguments.get("query").and_then(serde_json::Value::as_str) {
@@ -5282,7 +5540,7 @@ async fn build_fused_semantic_locate_result(
                 // live embedding status — the same struct the fresh page carried.
                 result.semantic_coverage =
                     Some(kin_cli::commands::locate::local_semantic_coverage(
-                        graph,
+                        graph.as_ref(),
                         Some(state.graph.as_ref()),
                     ));
                 return fused_semantic_locate_payload(result, &query, file_granularity);
@@ -5305,7 +5563,7 @@ async fn build_fused_semantic_locate_result(
     let mut locate_result = match run_fused_locate_for_state(
         state,
         session_id,
-        graph,
+        Arc::clone(&graph),
         &query,
         explain,
         limit,
@@ -5616,7 +5874,7 @@ async fn mcp_tools_call(
                 build_fused_semantic_locate_result(
                     &state,
                     session_id.as_ref(),
-                    graph.as_ref(),
+                    Arc::clone(&graph),
                     &request.arguments,
                 )
                 .await,
@@ -9160,6 +9418,36 @@ mod tests {
             resolve_scope_build_timeout(Some("12")),
             Duration::from_secs(12)
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_wakes_history_prepare_capacity_waiter() {
+        let state = test_state();
+        let held_permit = state
+            .history_prepare_gate
+            .acquire()
+            .await
+            .expect("test preparation permit");
+        let cancellation = Arc::new(BlockingWorkCancellation::new());
+        let task = tokio::spawn(resolve_ref_for_daemon(
+            Arc::clone(&state),
+            Arc::clone(&state.graph),
+            Arc::clone(&state.history_closure_cache),
+            "git:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            HistoryHydrationMode::ArtifactOnly,
+            Arc::clone(&cancellation),
+        ));
+
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancelled waiter must acknowledge promptly")
+            .expect("waiter task must not panic")
+            .expect_err("cancelled waiter must fail closed");
+        assert_eq!(result.0, StatusCode::REQUEST_TIMEOUT);
+        assert!(result.1.contains("preparation capacity"));
+        drop(held_permit);
     }
 
     fn test_entity(name: &str, path: &str) -> Entity {

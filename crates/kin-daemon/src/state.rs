@@ -530,11 +530,17 @@ pub struct DaemonState {
     /// commits, and explicit branch mutations. kin-db's current primitive
     /// replaces a duplicate id, so all daemon writers share this gate to make
     /// immutable-id preflight plus insertion atomic and keep closure memos
-    /// sound. It also keeps at most one deep import active: concurrent imports
-    /// roughly double peak memory and can OOM-kill the daemon. Held across
-    /// synchronous publication (and moved into the `set_scope` blocking task),
-    /// so it is a Tokio mutex behind an `Arc`.
+    /// sound. Heavy import preparation is bounded separately by
+    /// `history_prepare_gate`; this gate covers only the short in-memory
+    /// publication phase and is moved into that blocking task, so it is a
+    /// Tokio mutex behind an `Arc`.
     pub hydration_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Bounds heavyweight Git rev-walk/blob/enrichment preparation to one job
+    /// per daemon. Waiters re-check graph closure after acquiring the permit,
+    /// so concurrent requests for the same ref coalesce behind the first
+    /// publisher instead of duplicating CPU and peak memory. Unlike
+    /// `hydration_gate`, this is never a graph-writer lock.
+    pub history_prepare_gate: Arc<tokio::sync::Semaphore>,
     /// Monotonic closure memo for the live HEAD graph. Explicit historical
     /// refs pay one completeness walk after daemon startup, then stay O(1).
     pub history_closure_cache: Arc<kin_cli::commands::ref_lookup::GitHistoryClosureCache>,
@@ -824,6 +830,7 @@ impl DaemonState {
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
             hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
+            history_prepare_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             history_closure_cache: Arc::new(
                 kin_cli::commands::ref_lookup::GitHistoryClosureCache::default(),
             ),
@@ -978,6 +985,7 @@ impl DaemonState {
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
             hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
+            history_prepare_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             history_closure_cache: Arc::new(
                 kin_cli::commands::ref_lookup::GitHistoryClosureCache::default(),
             ),
@@ -2348,6 +2356,7 @@ mod tests {
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
             hydration_gate: Arc::new(tokio::sync::Mutex::new(())),
+            history_prepare_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             history_closure_cache: Arc::new(
                 kin_cli::commands::ref_lookup::GitHistoryClosureCache::default(),
             ),
