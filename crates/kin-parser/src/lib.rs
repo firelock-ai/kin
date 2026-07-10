@@ -28,7 +28,7 @@ pub const PARSER_SCHEMA_EPOCH: &str = "parser-schema-2026-03-29-v1";
 /// doubt, bump — a spurious bump only costs a cold re-parse, while a missed bump
 /// silently serves stale semantics (the stale-binary class of bug). Mirrors
 /// kin-db's `GraphSnapshot::CURRENT_VERSION` convention.
-pub const PARSER_SEMANTICS_VERSION: u32 = 1;
+pub const PARSER_SEMANTICS_VERSION: u32 = 2;
 
 pub mod adapter;
 pub mod error;
