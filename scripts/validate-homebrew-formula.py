@@ -425,6 +425,11 @@ def parse_formula(formula: str, expected_version: str) -> dict[str, FormulaPair]
             blocks.append(RubyBlock("do", code, line_number))
             continue
         if is_direct_kin_scope(blocks) and FORMULA_METADATA_PREFIX_RE.match(code):
+            if "#{" in code:
+                raise ValidationError(
+                    "formula metadata directives cannot contain Ruby interpolation "
+                    f"at formula line {line_number}"
+                )
             if not FORMULA_METADATA_RE.fullmatch(code):
                 raise ValidationError(
                     "formula metadata directives must use one canonical quoted-string "

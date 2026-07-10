@@ -587,6 +587,18 @@ def test_metadata_requires_one_canonical_quoted_string() -> None:
     )
 
 
+def test_metadata_cannot_execute_ruby_interpolation() -> None:
+    formula = current_real_formula_shape().replace(
+        '  desc "Semantic system of record for software work"',
+        '  desc "#{define_singleton_method(:version, method(:puts))}'
+        'Semantic system of record for software work"',
+        1,
+    )
+    assert_validator_rejects(
+        formula, "metadata directives cannot contain Ruby interpolation"
+    )
+
+
 def test_ruby_data_section_is_rejected_fail_closed() -> None:
     formula = current_real_formula_shape() + '__END__\nversion "1.2.3"\n'
     assert_validator_rejects(formula, "Ruby data sections")
@@ -742,6 +754,7 @@ def main() -> None:
         test_platform_dsl_cannot_be_shadowed_by_class_method,
         test_metadata_cannot_append_a_dsl_shadowing_statement,
         test_metadata_requires_one_canonical_quoted_string,
+        test_metadata_cannot_execute_ruby_interpolation,
         test_ruby_data_section_is_rejected_fail_closed,
         test_duplicate_empty_os_block_fails,
         test_duplicate_empty_arch_block_fails,
