@@ -126,6 +126,18 @@ pub enum DaemonEvent {
     },
 }
 
+/// Authority owning the graph selected for a daemon request.
+///
+/// HEAD mutations participate in the daemon's durable snapshot/version/event
+/// contract. Session-scope mutations are intentionally private and ephemeral:
+/// publishing them as a HEAD change would invalidate unrelated readers while
+/// persisting a different graph than the one that actually changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestGraphAuthority {
+    Head,
+    SessionScope,
+}
+
 /// Type of entity change for SSE events.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1474,13 +1486,9 @@ impl DaemonState {
         &self,
         session_id: &kin_model::SessionId,
     ) -> Arc<kin_db::InMemoryGraph> {
-        let scopes = self.session_scopes.read().await;
-        if let Some(scope) = scopes.get(session_id) {
-            if !scope.is_expired() {
-                return Arc::clone(&scope.cached_graph);
-            }
-        }
-        Arc::clone(&self.graph)
+        self.graph_for_request_with_authority(Some(session_id))
+            .await
+            .0
     }
 
     /// Scoped graph for a WRITE (reconcile). Returns the session's private
@@ -1508,9 +1516,83 @@ impl DaemonState {
         &self,
         session_id: Option<&kin_model::SessionId>,
     ) -> Arc<kin_db::InMemoryGraph> {
-        match session_id {
-            Some(sid) => self.graph_for_session(sid).await,
-            None => Arc::clone(&self.graph),
+        self.graph_for_request_with_authority(session_id).await.0
+    }
+
+    /// Resolve both the graph and the authority that owns mutations made to it.
+    /// The pair is chosen under one scope read lock so a caller never mistakes a
+    /// scoped graph for HEAD (or vice versa) because it separately probed scope
+    /// state before resolving the graph.
+    pub(crate) async fn graph_for_request_with_authority(
+        &self,
+        session_id: Option<&kin_model::SessionId>,
+    ) -> (Arc<kin_db::InMemoryGraph>, RequestGraphAuthority) {
+        if let Some(session_id) = session_id {
+            let scopes = self.session_scopes.read().await;
+            if let Some(scope) = scopes.get(session_id) {
+                if !scope.is_expired() {
+                    return (
+                        Arc::clone(&scope.cached_graph),
+                        RequestGraphAuthority::SessionScope,
+                    );
+                }
+            }
+        }
+
+        (Arc::clone(&self.graph), RequestGraphAuthority::Head)
+    }
+
+    /// Resolve the graph authority for a request that may hydrate a Git ref.
+    ///
+    /// Ref hydration mutates the selected graph even though blame/history are
+    /// query surfaces. Treat an active temporal scope like a write lease:
+    /// prune expired entries and refresh the selected scope under the same
+    /// write lock used to clone its graph. This gives hydration a fresh scope
+    /// lease instead of starting from a nearly-expired one. Callers must still
+    /// re-resolve through this method after waiting on the global hydration
+    /// gate because the session scope may have changed while the request was
+    /// queued.
+    pub(crate) async fn graph_for_ref_hydration_with_authority(
+        &self,
+        session_id: Option<&kin_model::SessionId>,
+    ) -> (Arc<kin_db::InMemoryGraph>, RequestGraphAuthority) {
+        if let Some(session_id) = session_id {
+            let mut scopes = self.session_scopes.write().await;
+            scopes.retain(|_, scope| !scope.is_expired());
+            if let Some(scope) = scopes.get_mut(session_id) {
+                scope.created_at = Instant::now();
+                return (
+                    Arc::clone(&scope.cached_graph),
+                    RequestGraphAuthority::SessionScope,
+                );
+            }
+        }
+
+        (Arc::clone(&self.graph), RequestGraphAuthority::Head)
+    }
+
+    /// Revalidate that the authority selected before ref hydration still owns
+    /// the exact graph that was mutated. Session scopes may expire or be
+    /// replaced while synchronous history import is running; in that case the
+    /// old graph is an orphan and must not be acknowledged as current session
+    /// state. HEAD ownership is stable for the daemon lifetime.
+    pub(crate) async fn ref_hydration_authority_is_current(
+        &self,
+        session_id: Option<&kin_model::SessionId>,
+        graph: &Arc<kin_db::InMemoryGraph>,
+        authority: RequestGraphAuthority,
+    ) -> bool {
+        match authority {
+            RequestGraphAuthority::Head => Arc::ptr_eq(graph, &self.graph),
+            RequestGraphAuthority::SessionScope => {
+                let Some(session_id) = session_id else {
+                    return false;
+                };
+                let scopes = self.session_scopes.read().await;
+                scopes.get(session_id).is_some_and(|scope| {
+                    !scope.is_expired() && Arc::ptr_eq(graph, &scope.cached_graph)
+                })
+            }
         }
     }
 
