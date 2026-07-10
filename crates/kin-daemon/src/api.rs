@@ -3617,6 +3617,17 @@ async fn embed(
                 .save_snapshot()
                 .map_err(|error| format!("embed snapshot save failed: {error:#}"))?;
             state_for_embed.mark_clean();
+            // A time-limited pass stopped mid-drain, so the throttled per-batch
+            // sidecar flush may not have captured the vectors embedded since the
+            // last throttle tick. Force one sidecar write at the pass boundary so
+            // a graceful daemon exit before the next pass resumes with the full
+            // pass persisted. A pass that drained the queue already wrote the
+            // sidecar unconditionally, so this only fires when work remains.
+            if result.result.time_limited {
+                state_for_embed
+                    .persist_vector_sidecar()
+                    .map_err(|error| format!("embed sidecar persist failed: {error:#}"))?;
+            }
         }
         Ok::<_, String>(result)
     })
@@ -10019,7 +10030,7 @@ mod tests {
     }
 
     #[test]
-    fn foreground_embed_batch_flush_defers_sidecar_while_queue_pending() {
+    fn foreground_embed_batch_flush_checkpoints_sidecar_on_throttle() {
         let state = test_state();
         state
             .graph
@@ -10034,11 +10045,23 @@ mod tests {
         state.graph.queue_missing_for_embedding();
         assert!(state.graph.pending_embeddings() > 0);
 
+        // The first in-run flush checkpoints the sidecar so persisted coverage
+        // tracks compute from the first batch (the persist-wedge fix).
+        std::fs::remove_file(&vector_path).unwrap();
+        persist_foreground_embed_batch(state.as_ref()).unwrap();
+        assert!(
+            vector_path.exists(),
+            "the first foreground per-batch flush must checkpoint the sidecar"
+        );
+
+        // An immediate follow-up flush is throttled (within the interval and the
+        // batch backstop), so a long run is not billed a full index serialize on
+        // every batch while work is still pending.
         std::fs::remove_file(&vector_path).unwrap();
         persist_foreground_embed_batch(state.as_ref()).unwrap();
         assert!(
             !vector_path.exists(),
-            "foreground per-batch flush must defer the sidecar while work is pending"
+            "an immediate follow-up foreground flush must be throttled while work is pending"
         );
     }
 
