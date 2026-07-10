@@ -9871,7 +9871,7 @@ mod tests {
     }
 
     #[test]
-    fn foreground_embed_batch_flush_defers_sidecar_while_queue_pending() {
+    fn foreground_embed_batch_flush_checkpoints_then_throttles_while_queue_pending() {
         let state = test_state();
         state
             .graph
@@ -9889,8 +9889,15 @@ mod tests {
         std::fs::remove_file(&vector_path).unwrap();
         persist_foreground_embed_batch(state.as_ref()).unwrap();
         assert!(
+            vector_path.exists(),
+            "the first foreground batch must checkpoint persisted vector progress"
+        );
+
+        std::fs::remove_file(&vector_path).unwrap();
+        persist_foreground_embed_batch(state.as_ref()).unwrap();
+        assert!(
             !vector_path.exists(),
-            "foreground per-batch flush must defer the sidecar while work is pending"
+            "an immediate foreground follow-up must throttle the vector sidecar while work is pending"
         );
     }
 
