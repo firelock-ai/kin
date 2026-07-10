@@ -24,7 +24,6 @@ BLOCK_KEYWORD_RE = re.compile(
 DO_BLOCK_RE = re.compile(r"(?:^|\s)do(?:\s*\|[^|]*\|)?$")
 INLINE_END_RE = re.compile(r"(?:^|;)\s*end\b")
 BLOCK_COMMENT_RE = re.compile(r"^=(?:begin|end)\b")
-PERCENT_LITERAL_RE = re.compile(r"(?<![\w%])%(?:[qQwWiIrxs])?[^\w\s=]")
 GENERIC_CLASS_RE = re.compile(r"^class\b")
 ON_PLATFORM_RE = re.compile(r"^(on_[A-Za-z0-9_!?]+)\b")
 FORMULA_METADATA_PREFIX_RE = re.compile(r"^(?:desc|homepage|license)\b")
@@ -82,6 +81,37 @@ def expected_url(artifact: str) -> str:
     return (
         f"https://github.com/firelock-ai/kin/releases/download/v#{{version}}/{artifact}"
     )
+
+
+def has_unquoted_ruby_percent(line: str) -> bool:
+    """Return whether code before a comment contains unsupported ``%`` syntax.
+
+    Ruby percent literals may use ``#`` as their delimiter. Comment stripping cannot
+    therefore run before this check: doing so can hide both the delimiter and arbitrary
+    Ruby that follows it on the same physical line. This validator's generated-formula
+    grammar needs neither percent literals nor modulo expressions, so every unquoted
+    percent token fails closed. Percent signs inside quoted metadata/URLs and comments
+    remain ordinary data.
+    """
+
+    quote: str | None = None
+    escaped = False
+    for character in line:
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in {'"', "'"}:
+            quote = character
+        elif character == "#":
+            return False
+        elif character == "%":
+            return True
+    return False
 
 
 def ruby_code(line: str) -> str:
@@ -169,7 +199,7 @@ def reject_unsupported_ruby_syntax(line: str, code: str, line_number: int) -> No
         reason = "Ruby brace blocks and hash literals"
     elif "`" in structure:
         reason = "Ruby command literals"
-    elif PERCENT_LITERAL_RE.search(structure):
+    elif has_unquoted_ruby_percent(line):
         reason = "Ruby percent literals"
     elif "/" in structure:
         reason = "Ruby regular expressions and division expressions"

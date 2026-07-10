@@ -547,6 +547,39 @@ def test_ruby_percent_literal_cannot_supply_inactive_version() -> None:
     assert_validator_rejects(formula, "Ruby percent literals")
 
 
+def test_hash_delimited_percent_literal_cannot_escape_install_scope() -> None:
+    formula = current_real_formula_shape()
+    canonical_install = """  def install
+    bin.install "kin"
+    bin.install "kin-daemon"
+    bin.install "kin-vfs" if File.exist?("kin-vfs")
+    lib.install "libkin_vfs_shim.dylib" if File.exist?("libkin_vfs_shim.dylib")
+    lib.install "libkin_vfs_shim.so" if File.exist?("libkin_vfs_shim.so")
+  end"""
+    scope_escape = """  def install
+    %q=#=; end
+    $kin_gate_bypass = :executed_at_class_scope
+    %q=#=; if true
+  end"""
+    assert canonical_install in formula
+    formula = formula.replace(canonical_install, scope_escape, 1)
+
+    assert_validator_rejects(formula, "Ruby percent literals")
+
+
+def test_percent_characters_inside_strings_and_comments_remain_data() -> None:
+    formula = current_real_formula_shape().replace(
+        '    bin.install "kin"',
+        '    puts "100% verified"\n    # 100% comment\n    bin.install "kin"',
+        1,
+    )
+    assert_ruby_syntax_valid(formula)
+
+    result = run_validator(formula)
+
+    assert result.returncode == 0, result.stdout.decode() + result.stderr.decode()
+
+
 def test_unparsed_ruby_regex_cannot_supply_inactive_version() -> None:
     formula = replace_fixture_version('  ignored_version = /\n    version "1.2.3"\n  /')
     assert_validator_rejects(
@@ -786,6 +819,8 @@ def main() -> None:
         test_ruby_heredoc_cannot_supply_inactive_version,
         test_ruby_brace_block_cannot_supply_inactive_version,
         test_ruby_percent_literal_cannot_supply_inactive_version,
+        test_hash_delimited_percent_literal_cannot_escape_install_scope,
+        test_percent_characters_inside_strings_and_comments_remain_data,
         test_unparsed_ruby_regex_cannot_supply_inactive_version,
         test_multiline_ruby_regex_inside_install_body_is_rejected,
         test_reopened_kin_class_is_rejected,
