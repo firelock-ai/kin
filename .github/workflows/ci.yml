@@ -70,6 +70,21 @@ jobs:
       - name: Test @kinlab/kin-mcp (compatibility wrapper)
         run: npm run test:unit --prefix ./packages/kin-mcp && npm run lint --prefix ./packages/kin-mcp
 
+  windows-installer:
+    name: Windows installer checksum tests
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Test exact archive checksum selection (PowerShell 7)
+        shell: pwsh
+        run: ./scripts/test-install-checksum.ps1
+
+      - name: Test exact archive checksum selection (Windows PowerShell 5.1)
+        shell: powershell
+        run: ./scripts/test-install-checksum.ps1
+
   check:
     name: Check & Test
     runs-on: ${{ matrix.os }}
@@ -79,6 +94,12 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
+
+      - name: Validate installer checksum fixtures
+        run: python3 scripts/test-install-checksum.py
+
+      - name: Validate mandatory Homebrew release outcome gate
+        run: python3 scripts/test-homebrew-release-gate.py
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.96.0

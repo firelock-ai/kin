@@ -3040,6 +3040,9 @@ dependencies = [
 [[package]]
 name = "kin-buildinfo"
 version = "0.2.15"
+dependencies = [
+ "sha2 0.11.0",
+]
 
 [[package]]
 name = "kin-cli"
@@ -3057,6 +3060,7 @@ dependencies = [
  "directories 5.0.1",
  "ed25519-dalek",
  "flate2",
+ "fs2",
  "hex",
  "keyring",
  "kin-blobs",
@@ -3199,9 +3203,9 @@ dependencies = [
 
 [[package]]
 name = "kin-db"
-version = "0.2.29"
+version = "0.2.33"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "b8db25ed526e6ba34c69d1d1f4db648c63dabceb61c3549b9399c09662d801c7"
+checksum = "48dbae484d52e67dd92a80d7538c30585c9852e9e51395009ec246a2947c6891"
 dependencies = [
  "bincode",
  "bytes",
@@ -3269,6 +3273,8 @@ dependencies = [
  "notify",
  "pretty_assertions",
  "rayon",
+ "serde",
+ "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
@@ -3330,9 +3336,9 @@ dependencies = [
 
 [[package]]
 name = "kin-lsp"
-version = "0.2.1"
+version = "0.2.2"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "9c7c7e73c7a2baadbecfc93e3c9603346b688d49359bf75f341cba6c5549f3a2"
+checksum = "b6f4d495f89be0c1538ae99be3855fca0469c0c68be5522aac1caa04f02e0f51"
 dependencies = [
  "kin-model",
  "serde",
@@ -3418,6 +3424,7 @@ version = "0.2.15"
 dependencies = [
  "kin-model",
  "pretty_assertions",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
@@ -3562,9 +3569,9 @@ dependencies = [
 
 [[package]]
 name = "kin-search"
-version = "0.1.2"
+version = "0.1.4"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "370ae50ac9eede78dba38b45ff5e9ea24f5c3c634b626a2408a20981db5c2769"
+checksum = "c22df488cae18fe19e80f2e07e5a117f2c8362bf776509a3cb8a0b8a818bbbfa"
 dependencies = [
  "bincode",
  "parking_lot",

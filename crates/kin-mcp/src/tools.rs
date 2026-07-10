@@ -29,6 +29,11 @@ pub fn tool_definitions() -> ToolsListResult {
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "description": "Natural-language description of the code to find. Optional when paging with `cursor`." },
+                        "queries": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional additional query variants for multi-query fan-out. When present, `query` plus each variant are retrieved independently and their rankings RRF-fused into one deduped result, with each hit's `match_evidence.matched_variants` naming the variants that surfaced it. Diverse variants (identifiers, behavior, subsystem) recover more relevant hits than any single phrasing. Requires the fused pipeline (automatic when set)."
+                        },
                         "limit": { "type": "integer", "description": "Max ranked entities per page (page size). Default 20.", "default": 20 },
                         "page_size": { "type": "integer", "description": "Entities per page; overrides `limit` for paging when set." },
                         "cursor": { "type": "string", "description": "Opaque cursor from a prior result's `next_cursor`: returns the NEXT page of ranked entities from the cached ranking with no re-search. Omit for a fresh query." },
@@ -46,7 +51,7 @@ pub fn tool_definitions() -> ToolsListResult {
                         "pipeline": {
                             "type": "string",
                             "enum": ["fused", "cosine"],
-                            "description": "Force a retrieval pipeline for this call: 'fused' (full multi-signal locate ranking) or 'cosine' (legacy single-vector). Defaults to the daemon's KIN_PROFILE."
+                            "description": "Force a retrieval pipeline for this call: 'fused' (full multi-signal locate ranking) or 'cosine' (legacy single-vector). Defaults to the daemon's active KIN_PROFILE — the stock compat-v0 profile serves 'cosine'; accuracy-v1 serves 'fused'."
                         },
                         "explain": {
                             "type": "boolean",

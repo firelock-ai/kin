@@ -92,25 +92,30 @@ jobs:
             vfs_target: x86_64-unknown-linux-gnu
             artifact: kin-linux-x86_64
             shim_name: libkin_vfs_shim.so
+            cross: false
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             vfs_target: aarch64-unknown-linux-gnu
             artifact: kin-linux-aarch64
             shim_name: libkin_vfs_shim.so
+            cross: false
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact: kin-macos-x86_64
             shim_name: libkin_vfs_shim.dylib
+            cross: false
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: kin-macos-aarch64
             shim_name: libkin_vfs_shim.dylib
+            cross: false
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: kin-windows-x86_64
             shim_name: kin_vfs_shim.dll
             skip_vector: true
             experimental: true
+            cross: false
 
     steps:
       - name: Checkout
@@ -359,7 +364,9 @@ jobs:
             Write-Error "kin-daemon.exe missing from $env:ARTIFACT.zip — refusing to publish a daemon-less archive"
             exit 1
           }
-          Get-FileHash -Algorithm SHA256 "$env:ARTIFACT.zip" | Format-List Hash | Out-File -Encoding utf8 "$env:ARTIFACT.zip.sha256"
+          $ArchivePath = "$env:ARTIFACT.zip"
+          $Hash = (Get-FileHash -Algorithm SHA256 $ArchivePath).Hash.ToLowerInvariant()
+          "$Hash  $ArchivePath" | Set-Content -Encoding ascii "$ArchivePath.sha256"
         env:
           TARGET: ${{ matrix.target }}
           ARTIFACT: ${{ matrix.artifact }}
@@ -711,14 +718,15 @@ jobs:
     if: ${{ always() && !failure() && !cancelled() }}
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
       - name: Dispatch update to the homebrew-kin tap
-        id: dispatch
         env:
           TAP_DISPATCH_TOKEN: ${{ secrets.KIN_CI_BOT_TOKEN }}
         run: |
           if [ -z "${TAP_DISPATCH_TOKEN:-}" ]; then
-            echo "KIN_CI_BOT_TOKEN not configured; the tap self-updates on its 6h schedule"
-            echo "dispatched=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::KIN_CI_BOT_TOKEN is not configured; skipping the best-effort dispatch. The public formula outcome gate below still runs for version tags."
             exit 0
           fi
           # Convenience dispatch: the tap also self-updates on its 6h schedule, so a
@@ -733,11 +741,9 @@ jobs:
             -d '{"event_type":"kin-release"}' || echo "000")
           if [ "$code" = "204" ]; then
             echo "Dispatched kin-release to firelock-ai/homebrew-kin"
-            echo "dispatched=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::Homebrew tap dispatch returned HTTP ${code}; the tap self-updates on its 6h schedule, not failing the release."
+            echo "::warning::Homebrew tap dispatch returned HTTP ${code}; continuing to the mandatory public formula outcome gate."
             cat /tmp/tap-dispatch.out 2>/dev/null || true
-            echo "dispatched=false" >> "$GITHUB_OUTPUT"
           fi
 
       # The dispatch above only proves the POST was accepted, not that
@@ -748,30 +754,12 @@ jobs:
       # actually cut, mirroring version_tag_image's bounded poll-for-outcome
       # below rather than trusting the dispatch response as release proof.
       - name: Verify the tap formula actually bumped to this version
-        if: steps.dispatch.outputs.dispatched == 'true'
-        env:
-          TAP_DISPATCH_TOKEN: ${{ secrets.KIN_CI_BOT_TOKEN }}
+        # Dispatch is only an accelerator. Every real version-tag release must
+        # prove the public tap outcome, including when the token is absent or
+        # GitHub rejects the dispatch request.
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
         run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-
-          check_formula() {
-            curl -sS -H "Authorization: Bearer ${TAP_DISPATCH_TOKEN}" \
-              -H "Accept: application/vnd.github.v3.raw" \
-              "https://api.github.com/repos/firelock-ai/homebrew-kin/contents/Formula/kin.rb" \
-              | grep -qF "version \"${VERSION}\""
-          }
-
-          deadline=$(( SECONDS + 1800 ))
-          until check_formula; do
-            if [ "$SECONDS" -ge "$deadline" ]; then
-              echo "::error::firelock-ai/homebrew-kin Formula/kin.rb did not report version \"${VERSION}\" after 30m — the kin-release dispatch was accepted but the tap's Update Formula workflow did not land the bump. Check https://github.com/firelock-ai/homebrew-kin/actions."
-              exit 1
-            fi
-            echo "Waiting for firelock-ai/homebrew-kin Formula/kin.rb to report version \"${VERSION}\"…"
-            sleep 20
-          done
-          echo "Confirmed firelock-ai/homebrew-kin Formula/kin.rb is at version \"${VERSION}\""
+          bash scripts/verify-homebrew-formula.sh "$GITHUB_REF_NAME"
 
   # Version-tag the public daemon image so operators can pin a release
   # (`docker pull ghcr.io/firelock-ai/kin:0.2.7`). daemon-image.yml already pushed

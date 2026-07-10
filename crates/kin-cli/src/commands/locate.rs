@@ -71,6 +71,11 @@ pub struct LocateResult {
     /// tell a strong answer from a degraded one without parsing logs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degradations: Vec<RetrievalDegradation>,
+    /// In multi-query fusion mode, the ordered query variants whose per-variant
+    /// rankings were RRF-fused into this result (index 0 is the primary query).
+    /// Empty for a single-query locate, so single-query output is byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queries: Vec<String>,
 }
 
 /// One retrieval capability that did not fully run for a query, with the
@@ -120,7 +125,7 @@ impl LocateResult {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct LocateFileEntry {
     pub path: String,
     pub score: f32,
@@ -146,6 +151,11 @@ pub struct LocateFileEntry {
     /// Per-stage score breakdown (only with --explain).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score_breakdown: Option<std::collections::HashMap<String, f32>>,
+    /// Under multi-query RRF fusion, the query variants that surfaced this file
+    /// (each is one of [`LocateResult::queries`]). Empty (and omitted) for a
+    /// single-query locate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_queries: Vec<String>,
 }
 
 /// A single ranked symbol (graph entity) attributed to a file by `kin locate`.
@@ -223,6 +233,12 @@ pub struct LocateEntity {
     pub body: Option<String>,
     /// Where this entity lives. The file is provenance, not the result.
     pub provenance: LocateProvenance,
+    /// Under multi-query RRF fusion, the query variants that surfaced this entity
+    /// (each is one of [`LocateResult::queries`]). Travels with the entity through
+    /// paging and the daemon ranking cache so a paged hit keeps its attribution.
+    /// Empty (and omitted) for a single-query locate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_queries: Vec<String>,
 }
 
 /// Provenance for a [`LocateEntity`]: the file (and resolution origin) the entity
@@ -1153,8 +1169,10 @@ pub struct LocatePaging {
     pub page_size: Option<usize>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     text: &str,
+    queries: Vec<String>,
     json: bool,
     explain: bool,
     max_files: usize,
@@ -1173,6 +1191,7 @@ pub async fn run(
     .entered();
     let result = capture(
         text,
+        queries,
         explain,
         max_files,
         max_files_explicit,
@@ -1188,8 +1207,10 @@ pub async fn run(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn capture(
     text: &str,
+    queries: Vec<String>,
     explain: bool,
     max_files: usize,
     max_files_explicit: bool,
@@ -1208,6 +1229,7 @@ pub async fn capture(
     let result = try_locate_via_daemon(
         &layout,
         text,
+        queries,
         explain,
         max_files,
         max_files_explicit,
@@ -1289,9 +1311,11 @@ fn emit_telemetry_disclosure_once() {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn try_locate_via_daemon(
     layout: &kin_core::KinLayout,
     text: &str,
+    queries: Vec<String>,
     explain: bool,
     max_files: usize,
     max_files_explicit: bool,
@@ -1310,6 +1334,7 @@ async fn try_locate_via_daemon(
     let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
     let request = crate::daemon_client::LocateRequest {
         text: text.to_string(),
+        queries,
         explain,
         max_files,
         max_files_explicit,
@@ -3175,6 +3200,43 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         if let Some(debug) = debug_info.as_mut() {
             debug.pruned_files = pruned_files;
             debug.prune_ledger = std::mem::take(&mut prune_ledger);
+        }
+    }
+
+    // Per-query dynamic-k sizing (dark lever, default OFF == byte-identical).
+    // adaptive_cap sizes from cluster/floor heuristics; when the fused score
+    // vector shows a decisive knee this resizes to that knee, and when the tail
+    // is flat / score-tied it keeps the incumbent size (recall-safe — it only
+    // ever cuts on a clear break). It composes before the declaration cutoff
+    // below: both are suffix-only trims over the same rank-ordered list sharing
+    // one gap primitive, so the shorter keep simply wins and they cannot fight.
+    if locate_env_bool("KIN_LOCATE_DYNAMIC_K", false) {
+        let k_min = locate_env_usize("KIN_LOCATE_DYNAMIC_K_MIN", 3);
+        let k_max = locate_env_usize("KIN_LOCATE_DYNAMIC_K_MAX", 20);
+        let gap = locate_env_f32("KIN_LOCATE_DYNAMIC_K_GAP", 2.0);
+        let scores: Vec<f32> = results.iter().map(|(_, score)| *score).collect();
+        if let Some(keep) =
+            crate::commands::locate_sizing::dynamic_k_len(&scores, k_min, k_max, gap)
+        {
+            // No-silent-elimination: attribute every cut file in the prune ledger.
+            if explain {
+                if let Some(debug) = debug_info.as_mut() {
+                    for (path, score) in results.iter().skip(keep) {
+                        debug.prune_ledger.push(PruneEvent {
+                            stage: "dynamic_k".to_string(),
+                            kind: "score_knee".to_string(),
+                            path: Some(path.clone()),
+                            name: None,
+                            score: Some(*score),
+                            dropped: None,
+                            limit: Some(keep),
+                            threshold: Some(gap),
+                            detail: String::new(),
+                        });
+                    }
+                }
+            }
+            results.truncate(keep);
         }
     }
 
@@ -6852,12 +6914,95 @@ fn curate_search_terms(text: &str, graph: &kin_db::InMemoryGraph) -> Result<Vec<
             });
         }
         fallback.truncate(locate_env_usize("KIN_LOCATE_FALLBACK_TERM_LIMIT", 6));
-        return Ok(fallback);
+        return Ok(augment_terms_with_query_identifiers(text, fallback));
     }
 
     // Skip graph expansion — it adds noise terms that dilute specificity.
     // The entity-first pipeline handles graph exploration in Phase 2.
-    Ok(curated)
+    Ok(augment_terms_with_query_identifiers(text, curated))
+}
+
+/// Identifier tokens pulled straight out of the raw query. This keeps a long,
+/// prose-heavy problem statement from being distilled down to one or two generic
+/// tokens: a multi-sentence issue whose curated terms collapse to a single
+/// domain word (e.g. `["behavior"]`) starves both the text and vector tracks of
+/// the actual symbols to anchor on. Only genuinely identifier-shaped tokens
+/// survive — CamelCase, snake_case, SCREAMING_SNAKE, dotted/qualified, and
+/// CLI-flag forms — while stopwords, generic code modifiers, numerics, and issue
+/// boilerplate are dropped. Pure lexical: no graph lookups, no network, no
+/// model — fully deterministic for a given query.
+fn preserved_query_identifiers(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for term in extract_search_terms(text) {
+        // Keep only compound/symbolic identifiers, not bare prose words, so the
+        // augmentation anchors on code entities rather than English.
+        if !is_symbolic_search_term(&term) {
+            continue;
+        }
+        let canonical = term.to_ascii_lowercase();
+        if is_english_stopword(&canonical)
+            || is_generic_code_modifier_term(&canonical)
+            || is_numeric_issue_term(&canonical)
+            || is_issue_boilerplate_term(&canonical)
+            || is_noise_term(&canonical)
+        {
+            continue;
+        }
+        if seen.insert(canonical) {
+            out.push(term);
+        }
+    }
+    out
+}
+
+/// Union identifier tokens from the raw query into the curated term set,
+/// front-loading them so they survive the downstream `take(N)` that the vector
+/// track applies before embedding. Curated terms (which passed the graph-support
+/// gate) are always retained by reserving slots for them. Deterministic and
+/// order-stable. `KIN_LOCATE_PRESERVE_QUERY_IDENTIFIERS` is OFF by default, so
+/// the returned set is byte-identical to `curated` unless the lever is set.
+fn augment_terms_with_query_identifiers(text: &str, curated: Vec<String>) -> Vec<String> {
+    if !locate_env_bool("KIN_LOCATE_PRESERVE_QUERY_IDENTIFIERS", false) {
+        return curated;
+    }
+    let limit = locate_env_usize("KIN_LOCATE_QUERY_IDENTIFIER_LIMIT", 10);
+    merge_query_identifier_terms(preserved_query_identifiers(text), curated, limit)
+}
+
+/// Pure merge used by [`augment_terms_with_query_identifiers`]: prepend as many
+/// query-identifier tokens as fit once room is reserved for the curated set, then
+/// append the curated terms, deduping case-insensitively and capping at `limit`.
+/// Curated terms are never evicted by the identifiers.
+fn merge_query_identifier_terms(
+    identifiers: Vec<String>,
+    curated: Vec<String>,
+    limit: usize,
+) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let curated_reserve = curated.len().min(limit);
+    let identifier_budget = limit.saturating_sub(curated_reserve);
+    let mut merged = Vec::with_capacity(limit);
+    let mut seen = HashSet::new();
+    for term in identifiers {
+        if merged.len() >= identifier_budget {
+            break;
+        }
+        if seen.insert(term.to_ascii_lowercase()) {
+            merged.push(term);
+        }
+    }
+    for term in curated {
+        if merged.len() >= limit {
+            break;
+        }
+        if seen.insert(term.to_ascii_lowercase()) {
+            merged.push(term);
+        }
+    }
+    merged
 }
 
 fn term_has_graph_support(
@@ -11328,14 +11473,12 @@ fn declaration_cutoff_len(results: &[(String, f32)], gap: f32, min_keep: usize) 
         return n;
     }
     // The earliest boundary we may cut after is index `floor - 1`, which keeps
-    // exactly `floor` files.
+    // exactly `floor` files. The gap test shares one primitive with the dynamic-k
+    // sizer so both trims measure separation identically: cut at the first
+    // adjacent pair whose relative gap exceeds `gap` (a non-positive next score
+    // reads as an infinite separation).
     for i in (floor - 1)..(n - 1) {
-        let cur = results[i].1;
-        let next = results[i + 1].1;
-        if next <= 0.0 {
-            return i + 1;
-        }
-        if cur > 0.0 && cur / next > gap {
+        if crate::commands::locate_sizing::score_gap_ratio(results[i].1, results[i + 1].1) > gap {
             return i + 1;
         }
     }
@@ -11785,12 +11928,76 @@ fn is_lambda_query(text: &str) -> bool {
     lower.contains("lambda") || lower.contains("lambdas")
 }
 
+/// Cap on how many phase-bucket anchors `phase_bucket_anchor_candidates` will
+/// float per query-type/bucket-set call, mirroring how many named anchors the
+/// historical hardcoded lists carried per query type.
+const SEMANTIC_PHASE_ANCHOR_LIMIT: usize = 3;
+
+/// Per-rank floor decay applied within one `phase_bucket_anchor_candidates`
+/// call, so the first-ranked anchor sits closest to `top_score` and later
+/// ranks taper off.
+const SEMANTIC_PHASE_ANCHOR_RANK_STEP: f32 = 0.02;
+
+/// Rank graph-verified source files that fall in one of `buckets` (per
+/// `phase_bucket_for_path`) by how many independent retrieval signals
+/// (`all_hits`) already corroborate them, and return up to
+/// `SEMANTIC_PHASE_ANCHOR_LIMIT` as `(path, floor)` pairs. Buckets earlier in
+/// `buckets` win ties on signal support; `path` breaks remaining ties for a
+/// fully deterministic order regardless of `source_files` iteration order.
+///
+/// Candidates with zero corroborating signal are dropped: the floor lifts a
+/// file real retrieval already found relevant to the query's phase, it does
+/// not invent recall for a file nothing actually matched.
+fn phase_bucket_anchor_candidates(
+    buckets: &[&'static str],
+    top_score: f32,
+    base_ratio: f32,
+    source_files: &HashSet<String>,
+    all_hits: &[HashMap<String, Vec<FileHit>>],
+) -> Vec<(String, f32)> {
+    let mut ranked: Vec<(usize, usize, &str)> = source_files
+        .iter()
+        .filter_map(|path| {
+            let bucket = phase_bucket_for_path(path)?;
+            let bucket_rank = buckets.iter().position(|candidate| *candidate == bucket)?;
+            let support = signal_support_count(path, all_hits);
+            if support == 0 {
+                return None;
+            }
+            Some((support, bucket_rank, path.as_str()))
+        })
+        .collect();
+
+    ranked.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(b.2))
+    });
+
+    ranked
+        .into_iter()
+        .take(SEMANTIC_PHASE_ANCHOR_LIMIT)
+        .enumerate()
+        .map(|(rank, (_, _, path))| {
+            let ratio = base_ratio - SEMANTIC_PHASE_ANCHOR_RANK_STEP * rank as f32;
+            (path.to_string(), top_score * ratio.max(0.0))
+        })
+        .collect()
+}
+
+/// Phase-bucket floors for construction/lambda-shaped queries, derived from
+/// graph-verified source files and their real cross-signal support instead
+/// of a fixed path list. Dark by default (`KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS`
+/// unset): current serving behavior does not change until an explicit env
+/// override drives the paired A/B measurement that decides whether this lever
+/// graduates into a profile default.
 fn semantic_phase_anchor_floors(
     text: &str,
     top_score: f32,
     source_files: &HashSet<String>,
+    all_hits: &[HashMap<String, Vec<FileHit>>],
 ) -> Vec<(String, f32)> {
-    if top_score <= 0.0 {
+    if top_score <= 0.0 || !locate_env_bool("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS", false) {
         return Vec::new();
     }
 
@@ -11801,21 +12008,23 @@ fn semantic_phase_anchor_floors(
     }
 
     let mut anchors = Vec::new();
-    let mut push_if_present = |path: &str, floor: f32| {
-        if source_files.contains(path) {
-            anchors.push((path.to_string(), floor));
-        }
-    };
-
     if construction_query {
-        push_if_present("src/libponyc/pass/expr.c", top_score * 0.74);
-        push_if_present("src/libponyc/pass/syntax.c", top_score * 0.72);
-        push_if_present("src/libponyc/pass/verify.c", top_score * 0.70);
+        anchors.extend(phase_bucket_anchor_candidates(
+            &["pass"],
+            top_score,
+            0.74,
+            source_files,
+            all_hits,
+        ));
     }
     if lambda_query {
-        push_if_present("src/libponyc/expr/lambda.h", top_score * 0.68);
-        push_if_present("src/libponyc/expr/lambda.c", top_score * 0.66);
-        push_if_present("src/libponyc/pass/lambda.c", top_score * 0.66);
+        anchors.extend(phase_bucket_anchor_candidates(
+            &["expr", "pass"],
+            top_score,
+            0.68,
+            source_files,
+            all_hits,
+        ));
     }
 
     anchors.sort_by(|a, b| {
@@ -11827,8 +12036,38 @@ fn semantic_phase_anchor_floors(
     anchors
 }
 
-fn semantic_phase_distractor_cap(text: &str, path: &str, top_score: f32) -> Option<f32> {
-    if top_score <= 0.0 {
+/// Ratio applied to `top_score` when capping a "pass"/"expr" bucket candidate
+/// for a construction-shaped query that carries zero corroborating retrieval
+/// signal. Sits below `phase_bucket_anchor_candidates`' floor range so a
+/// capped, unsupported candidate can never outrank a floored, supported one
+/// for the same query.
+const SEMANTIC_PHASE_DISTRACTOR_CONSTRUCTION_CAP_RATIO: f32 = 0.65;
+
+/// Ratio applied to `top_score` when capping an "expr" bucket candidate for a
+/// lambda-shaped query under the same zero-corroboration condition.
+const SEMANTIC_PHASE_DISTRACTOR_LAMBDA_CAP_RATIO: f32 = 0.58;
+
+/// Phase-bucket ceilings for construction/lambda-shaped queries, derived from
+/// graph-verified cross-signal support instead of a fixed path list. A
+/// candidate whose bucket (`phase_bucket_for_path`) is in play for the
+/// query's shape but which carries zero corroborating signal
+/// (`signal_support_count` == 0 across `all_hits`) is capped below
+/// `top_score`: it is being ranked on this query's own fused pass alone, with
+/// nothing else in the retrieval evidence backing it up — the same kind of
+/// single-signal risk `phase_bucket_anchor_candidates` refuses to promote
+/// into a floor. Any candidate that does carry corroborating support is left
+/// untouched here; real cross-signal agreement is handled by the floor and
+/// bucket-penalty logic above. Dark by default
+/// (`KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS` unset): current serving
+/// behavior does not change until the same lever gating
+/// `semantic_phase_anchor_floors` is switched on.
+fn semantic_phase_distractor_cap(
+    text: &str,
+    path: &str,
+    top_score: f32,
+    all_hits: &[HashMap<String, Vec<FileHit>>],
+) -> Option<f32> {
+    if top_score <= 0.0 || !locate_env_bool("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS", false) {
         return None;
     }
 
@@ -11838,23 +12077,16 @@ fn semantic_phase_distractor_cap(text: &str, path: &str, top_score: f32) -> Opti
         return None;
     }
 
-    if construction_query && path.ends_with("/pass/expr.h") {
-        return Some(top_score * 0.66);
+    let bucket = phase_bucket_for_path(path)?;
+    if signal_support_count(path, all_hits) > 0 {
+        return None;
     }
-    if construction_query
-        && (path.ends_with("/expr/reference.c") || path.ends_with("/pass/sugar.c"))
-    {
-        return Some(top_score * 0.64);
+
+    if construction_query && matches!(bucket, "pass" | "expr") {
+        return Some(top_score * SEMANTIC_PHASE_DISTRACTOR_CONSTRUCTION_CAP_RATIO);
     }
-    if construction_query
-        && (path.ends_with("/verify/control.c")
-            || path.ends_with("/verify/type.c")
-            || path.ends_with("/verify/call.c"))
-    {
-        return Some(top_score * 0.52);
-    }
-    if lambda_query && (path.ends_with("/expr/control.c") || path.ends_with("/expr/control.h")) {
-        return Some(top_score * 0.58);
+    if lambda_query && bucket == "expr" {
+        return Some(top_score * SEMANTIC_PHASE_DISTRACTOR_LAMBDA_CAP_RATIO);
     }
 
     None
@@ -11944,14 +12176,14 @@ fn rerank_semantic_phase_paths(
         }
     }
 
-    for (path, floor) in semantic_phase_anchor_floors(text, top_score, source_files) {
+    for (path, floor) in semantic_phase_anchor_floors(text, top_score, source_files, all_hits) {
         if upsert_fused_floor(fused, path, floor) {
             changed = true;
         }
     }
 
     for (path, score) in fused.iter_mut() {
-        let Some(cap) = semantic_phase_distractor_cap(text, path, top_score) else {
+        let Some(cap) = semantic_phase_distractor_cap(text, path, top_score, all_hits) else {
             continue;
         };
         if *score > cap {
@@ -14670,6 +14902,7 @@ pub fn build_entity_view(
                         origin: sym.origin.clone(),
                         cosine: sym.cosine,
                     },
+                    matched_queries: Vec::new(),
                 },
             ));
         }
@@ -14768,6 +15001,146 @@ pub fn apply_entity_page(
     });
 }
 
+/// Reciprocal-rank-fusion constant `k` (`KIN_LOCATE_RRF_K`, default 60). Larger
+/// `k` flattens the rank-position weighting; the standard literature value is 60.
+/// Floored at 1 so the denominator can never collapse. Shares the same knob the
+/// internal signal-fusion RRF reads, so both fusions stay on one constant.
+pub fn locate_rrf_k() -> f64 {
+    locate_env_f32("KIN_LOCATE_RRF_K", 60.0).max(1.0) as f64
+}
+
+/// Reciprocal Rank Fusion over several already-ranked item lists. Each item
+/// contributes `1 / (k + rank + 1)` (0-based `rank`) to the fused score of its
+/// dedup key; contributions from every list that surfaced the key are summed.
+/// Returns one entry per distinct key: the best-ranked record (lowest rank, ties
+/// broken by lowest list index), the sorted indices of the lists that surfaced
+/// it, and the fused score. Order of the returned Vec is unspecified — the caller
+/// applies a total-order sort — but the computation is fully deterministic for a
+/// given input. Pure: no graph, no clock, no randomness.
+pub fn rrf_fuse<T, K, FKey>(
+    per_list: &[Vec<T>],
+    key_of: FKey,
+    rrf_k: f64,
+) -> Vec<(T, Vec<usize>, f64)>
+where
+    T: Clone,
+    K: Eq + std::hash::Hash,
+    FKey: Fn(&T) -> K,
+{
+    // (fused_score, contributing list indices, best_rank, best_list, best_record)
+    let mut acc: HashMap<K, (f64, Vec<usize>, usize, usize, T)> = HashMap::new();
+    for (list_idx, items) in per_list.iter().enumerate() {
+        for (rank, item) in items.iter().enumerate() {
+            let key = key_of(item);
+            let contribution = 1.0 / (rrf_k + rank as f64 + 1.0);
+            match acc.get_mut(&key) {
+                Some(entry) => {
+                    entry.0 += contribution;
+                    if !entry.1.contains(&list_idx) {
+                        entry.1.push(list_idx);
+                    }
+                    if rank < entry.2 || (rank == entry.2 && list_idx < entry.3) {
+                        entry.2 = rank;
+                        entry.3 = list_idx;
+                        entry.4 = item.clone();
+                    }
+                }
+                None => {
+                    acc.insert(
+                        key,
+                        (contribution, vec![list_idx], rank, list_idx, item.clone()),
+                    );
+                }
+            }
+        }
+    }
+    acc.into_values()
+        .map(|(score, mut lists, _, _, record)| {
+            lists.sort_unstable();
+            (record, lists, score)
+        })
+        .collect()
+}
+
+/// The file path a located entity resolves to, for a stable fusion tie-break.
+fn locate_entity_tiebreak_path(entity: &LocateEntity) -> &str {
+    entity.provenance.file.as_deref().unwrap_or("")
+}
+
+/// Fuse the per-variant [`LocateResult`]s of a multi-query locate into a single
+/// deduped result via Reciprocal Rank Fusion. `variants` is the ordered variant
+/// text (index-aligned with `results`; index 0 is the primary query). Entities
+/// are fused by `entity_id`, files by path; each fused hit records which variant
+/// texts surfaced it in `matched_queries`. Ordering is RRF-score-descending with
+/// deterministic tie-breaks (entities by file path then id; files by path). The
+/// per-hit composite `score` is preserved from the hit's best-ranked variant —
+/// array order carries the fused ranking. `degradations` are unioned; the debug
+/// object and semantic coverage are taken from the primary variant. With a single
+/// variant this returns that result unchanged (no fusion, no attribution).
+pub fn fuse_locate_results(
+    variants: Vec<String>,
+    results: Vec<LocateResult>,
+    rrf_k: f64,
+) -> LocateResult {
+    if variants.len() <= 1 || results.len() <= 1 {
+        return results.into_iter().next().unwrap_or_default();
+    }
+
+    let entity_lists: Vec<Vec<LocateEntity>> = results.iter().map(|r| r.entities.clone()).collect();
+    let file_lists: Vec<Vec<LocateFileEntry>> = results.iter().map(|r| r.files.clone()).collect();
+
+    let mut fused_entities = rrf_fuse(&entity_lists, |e| e.entity_id.clone(), rrf_k);
+    fused_entities.sort_by(|(a, _, sa), (b, _, sb)| {
+        sb.partial_cmp(sa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| locate_entity_tiebreak_path(a).cmp(locate_entity_tiebreak_path(b)))
+            .then_with(|| a.entity_id.cmp(&b.entity_id))
+    });
+    let entities: Vec<LocateEntity> = fused_entities
+        .into_iter()
+        .map(|(mut entity, lists, _)| {
+            entity.matched_queries = lists.iter().map(|&i| variants[i].clone()).collect();
+            entity
+        })
+        .collect();
+
+    let mut fused_files = rrf_fuse(&file_lists, |f| f.path.clone(), rrf_k);
+    fused_files.sort_by(|(a, _, sa), (b, _, sb)| {
+        sb.partial_cmp(sa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    let files: Vec<LocateFileEntry> = fused_files
+        .into_iter()
+        .map(|(mut file, lists, _)| {
+            file.matched_queries = lists.iter().map(|&i| variants[i].clone()).collect();
+            file
+        })
+        .collect();
+
+    let mut degradations: Vec<RetrievalDegradation> = Vec::new();
+    for result in &results {
+        for degradation in &result.degradations {
+            if !degradations.contains(degradation) {
+                degradations.push(degradation.clone());
+            }
+        }
+    }
+
+    let primary = results.into_iter().next().unwrap_or_default();
+    LocateResult {
+        entities,
+        next_cursor: None,
+        page: 0,
+        total_ranked: 0,
+        files,
+        debug: primary.debug,
+        semantic_coverage: primary.semantic_coverage,
+        degradations,
+        queries: variants,
+    }
+}
+
 fn build_result(
     results: &[(String, f32)],
     all_hits: &[HashMap<String, Vec<FileHit>>],
@@ -14820,6 +15193,7 @@ fn build_result(
             } else {
                 None
             },
+            matched_queries: Vec::new(),
         })
         .collect();
 
@@ -14952,6 +15326,29 @@ mod tests {
         }]
     }
 
+    /// Compare anchor-floor output against expected `(path, floor)` pairs with
+    /// a float tolerance, since floors are products of `top_score` and a
+    /// ratio rather than literal constants.
+    fn assert_anchors_approx(actual: &[(String, f32)], expected: &[(&str, f32)]) {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "anchor count mismatch: {actual:?} vs {expected:?}"
+        );
+        for ((actual_path, actual_floor), (expected_path, expected_floor)) in
+            actual.iter().zip(expected.iter())
+        {
+            assert_eq!(
+                actual_path, expected_path,
+                "anchor order mismatch: {actual:?} vs {expected:?}"
+            );
+            assert!(
+                (actual_floor - expected_floor).abs() < 1e-4,
+                "floor mismatch for {actual_path}: {actual_floor} vs {expected_floor}"
+            );
+        }
+    }
+
     // ── Graph-native entity surface + cursor paging (static shape) ──
 
     fn mk_locate_entity(name: &str, score: f32, definition: bool) -> LocateEntity {
@@ -14969,6 +15366,7 @@ mod tests {
                 origin: "vector".to_string(),
                 cosine: Some(0.5),
             },
+            matched_queries: Vec::new(),
         }
     }
 
@@ -15101,6 +15499,129 @@ mod tests {
         assert_ne!(a, locate_cursor_key("find the parser", Some("main"), 42));
     }
 
+    fn fusion_entity(id: &str, path: &str, score: f32) -> LocateEntity {
+        LocateEntity {
+            entity_id: id.to_string(),
+            kind: "function".to_string(),
+            name: id.to_string(),
+            signature: String::new(),
+            score,
+            definition: true,
+            span: None,
+            body: None,
+            provenance: LocateProvenance {
+                file: Some(path.to_string()),
+                origin: String::new(),
+                cosine: None,
+            },
+            matched_queries: Vec::new(),
+        }
+    }
+
+    fn fusion_result(entities: Vec<LocateEntity>) -> LocateResult {
+        LocateResult {
+            entities,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rrf_fuse_sums_contributions_and_attributes_lists() {
+        // "a" is rank 0 in list 0 and rank 1 in list 1; "b" only in list 1.
+        let lists = vec![vec!["a", "c"], vec!["b", "a"]];
+        let mut fused = rrf_fuse(&lists, |s| s.to_string(), 60.0);
+        fused.sort_by(|(_, _, sa), (_, _, sb)| {
+            sb.partial_cmp(sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        // "a" surfaced in both lists → highest fused score and both list indices.
+        let (top, lists_of_top, _score) = &fused[0];
+        assert_eq!(*top, "a");
+        assert_eq!(lists_of_top, &vec![0, 1]);
+        // Singleton keys carry exactly one contributing list.
+        let b = fused.iter().find(|(k, _, _)| *k == "b").unwrap();
+        assert_eq!(b.1, vec![1]);
+    }
+
+    #[test]
+    fn fuse_locate_results_single_variant_is_passthrough() {
+        let result = fusion_result(vec![
+            fusion_entity("e1", "src/a.rs", 2.0),
+            fusion_entity("e2", "src/b.rs", 1.0),
+        ]);
+        let fused =
+            fuse_locate_results(vec!["only query".to_string()], vec![result], locate_rrf_k());
+        // No fusion: order and records untouched, no attribution emitted.
+        assert_eq!(fused.entities.len(), 2);
+        assert_eq!(fused.entities[0].entity_id, "e1");
+        assert!(fused.queries.is_empty());
+        assert!(fused.entities.iter().all(|e| e.matched_queries.is_empty()));
+    }
+
+    #[test]
+    fn fuse_locate_results_unions_and_attributes_variants() {
+        // v0 ranks e1 > e2; v1 ranks e3 > e1. e1 appears in both → should win.
+        let v0 = fusion_result(vec![
+            fusion_entity("e1", "src/one.rs", 5.0),
+            fusion_entity("e2", "src/two.rs", 4.0),
+        ]);
+        let v1 = fusion_result(vec![
+            fusion_entity("e3", "src/three.rs", 5.0),
+            fusion_entity("e1", "src/one.rs", 3.0),
+        ]);
+        let variants = vec!["identifier query".to_string(), "behavior query".to_string()];
+        let fused = fuse_locate_results(variants.clone(), vec![v0, v1], 60.0);
+
+        assert_eq!(fused.queries, variants);
+        // e1 (in both variants) fuses to the top.
+        assert_eq!(fused.entities[0].entity_id, "e1");
+        assert_eq!(
+            fused.entities[0].matched_queries,
+            vec!["identifier query".to_string(), "behavior query".to_string()]
+        );
+        // Union covers every distinct entity across the variants.
+        let ids: Vec<&str> = fused
+            .entities
+            .iter()
+            .map(|e| e.entity_id.as_str())
+            .collect();
+        assert!(ids.contains(&"e1") && ids.contains(&"e2") && ids.contains(&"e3"));
+        // Single-variant hits attribute to exactly the variant that surfaced them.
+        let e2 = fused.entities.iter().find(|e| e.entity_id == "e2").unwrap();
+        assert_eq!(e2.matched_queries, vec!["identifier query".to_string()]);
+        let e3 = fused.entities.iter().find(|e| e.entity_id == "e3").unwrap();
+        assert_eq!(e3.matched_queries, vec!["behavior query".to_string()]);
+    }
+
+    #[test]
+    fn fuse_locate_results_is_deterministic() {
+        let build = || {
+            vec![
+                fusion_result(vec![
+                    fusion_entity("e1", "src/one.rs", 5.0),
+                    fusion_entity("e2", "src/two.rs", 4.0),
+                ]),
+                fusion_result(vec![
+                    fusion_entity("e2", "src/two.rs", 3.0),
+                    fusion_entity("e3", "src/three.rs", 2.0),
+                ]),
+            ]
+        };
+        let variants = vec!["q0".to_string(), "q1".to_string()];
+        let first = fuse_locate_results(variants.clone(), build(), 60.0);
+        let second = fuse_locate_results(variants, build(), 60.0);
+        let first_ids: Vec<&str> = first
+            .entities
+            .iter()
+            .map(|e| e.entity_id.as_str())
+            .collect();
+        let second_ids: Vec<&str> = second
+            .entities
+            .iter()
+            .map(|e| e.entity_id.as_str())
+            .collect();
+        assert_eq!(first_ids, second_ids);
+    }
+
     #[test]
     fn build_entity_view_is_noop_when_snippets_disabled() {
         let graph = kin_db::InMemoryGraph::new();
@@ -15115,6 +15636,7 @@ mod tests {
                 provenance: None,
                 signal_scores: None,
                 score_breakdown: None,
+                matched_queries: Vec::new(),
             }],
             ..Default::default()
         };
@@ -18869,6 +19391,149 @@ mod tests {
     }
 
     #[test]
+    fn preserved_query_identifiers_preserves_identifiers_from_prose() {
+        // A multi-sentence problem statement whose curated terms would otherwise
+        // collapse to a generic domain word. The identifier-bearing tokens must
+        // survive: CamelCase, snake_case, and the qualified pair.
+        let text = "Stale package entries linger in the scan report after a purge.\n\n\
+             The ScanReport keeps them because RemoveStalePackFromReport never runs \
+             during finalize. Update purge_stale_entries so the report stays consistent.";
+        let terms = preserved_query_identifiers(text);
+
+        assert!(terms.iter().any(|t| t == "ScanReport"), "{terms:?}");
+        assert!(
+            terms.iter().any(|t| t == "RemoveStalePackFromReport"),
+            "{terms:?}"
+        );
+        assert!(
+            terms.iter().any(|t| t == "purge_stale_entries"),
+            "{terms:?}"
+        );
+        // Bare prose words are not identifier-shaped and must be dropped.
+        for prose in ["stale", "package", "report", "update", "during", "the"] {
+            assert!(
+                !terms.iter().any(|t| t.eq_ignore_ascii_case(prose)),
+                "prose term {prose} leaked into {terms:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserved_query_identifiers_is_deterministic() {
+        let text = "The ScanReport keeps them because RemoveStalePackFromReport never \
+             runs during finalize. Update purge_stale_entries and RefreshReport.";
+        let first = preserved_query_identifiers(text);
+        let second = preserved_query_identifiers(text);
+        assert_eq!(first, second);
+        // Order is stable across the identifier kinds encountered in the text.
+        assert!(first.len() >= 3, "{first:?}");
+    }
+
+    #[test]
+    fn preserved_query_identifiers_drops_stopwords_numerics_and_modifiers() {
+        // Numerics, stopwords, and generic code modifiers must never be treated
+        // as entity anchors even when adjacent to real identifiers.
+        let text = "When public and private members change, issue 12345 breaks ScanReport.";
+        let terms = preserved_query_identifiers(text);
+        assert!(terms.iter().any(|t| t == "ScanReport"), "{terms:?}");
+        for dropped in ["public", "private", "12345", "when", "and"] {
+            assert!(
+                !terms.iter().any(|t| t.eq_ignore_ascii_case(dropped)),
+                "{dropped} leaked into {terms:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserved_query_identifiers_short_prose_query_yields_nothing() {
+        // A short natural-language query with no identifier-shaped tokens must
+        // contribute nothing — the augmentation only fires on real symbols.
+        assert!(preserved_query_identifiers("fix the failing case").is_empty());
+        // A short query that names one symbol keeps exactly that symbol.
+        assert_eq!(
+            preserved_query_identifiers("call ScanReport"),
+            vec!["ScanReport".to_string()]
+        );
+    }
+
+    #[test]
+    fn merge_query_identifier_terms_prepends_identifiers_and_keeps_curated() {
+        // The collapse case: curated distilled down to one generic token; the
+        // identifiers must be front-loaded so the vector track's take(N) sees
+        // them, and the curated token must still be retained.
+        let merged = merge_query_identifier_terms(
+            vec![
+                "RemoveStalePackFromReport".to_string(),
+                "ScanReport".to_string(),
+            ],
+            vec!["behavior".to_string()],
+            10,
+        );
+        assert_eq!(
+            merged,
+            vec![
+                "RemoveStalePackFromReport".to_string(),
+                "ScanReport".to_string(),
+                "behavior".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_query_identifier_terms_dedups_case_insensitively() {
+        let merged = merge_query_identifier_terms(
+            vec!["ScanReport".to_string(), "scanreport".to_string()],
+            vec!["ScanReport".to_string(), "behavior".to_string()],
+            10,
+        );
+        assert_eq!(
+            merged,
+            vec!["ScanReport".to_string(), "behavior".to_string()]
+        );
+    }
+
+    #[test]
+    fn merge_query_identifier_terms_never_evicts_curated() {
+        // Even with more identifiers than the cap, every curated term survives
+        // because slots are reserved for the graph-supported set.
+        let identifiers: Vec<String> = (0..20).map(|i| format!("SymbolNum{i}")).collect();
+        let curated = vec![
+            "AlphaType".to_string(),
+            "beta_handler".to_string(),
+            "GammaModule".to_string(),
+        ];
+        let merged = merge_query_identifier_terms(identifiers, curated.clone(), 6);
+        assert_eq!(merged.len(), 6);
+        for term in &curated {
+            assert!(
+                merged.contains(term),
+                "curated {term} evicted from {merged:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_query_identifier_terms_zero_limit_is_empty() {
+        assert!(merge_query_identifier_terms(
+            vec!["ScanReport".to_string()],
+            vec!["behavior".to_string()],
+            0
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn augment_terms_with_query_identifiers_off_is_byte_identical() {
+        // Default (lever unset) must return the curated set untouched.
+        let curated = vec!["behavior".to_string(), "ScanReport".to_string()];
+        let out = augment_terms_with_query_identifiers(
+            "The ScanReport keeps RemoveStalePackFromReport stale entries around.",
+            curated.clone(),
+        );
+        assert_eq!(out, curated);
+    }
+
+    #[test]
     fn curate_search_terms_promotes_subtype_alias_over_implementation_boilerplate() {
         let graph = kin_db::InMemoryGraph::new();
 
@@ -18999,7 +19664,9 @@ mod tests {
     }
 
     #[test]
-    fn rerank_semantic_phase_paths_promotes_pass_and_lambda_anchors() {
+    #[serial_test::serial]
+    fn rerank_semantic_phase_paths_leaves_phase_anchors_dark_by_default() {
+        std::env::remove_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
         let mut fused = vec![
             ("src/libponyc/pass/expr.h".to_string(), 0.158),
             ("src/libponyc/expr/reference.c".to_string(), 0.123),
@@ -19021,18 +19688,270 @@ mod tests {
             &source_files,
         );
 
-        let ranks: HashMap<_, _> = fused
-            .iter()
-            .enumerate()
-            .map(|(idx, (path, _))| (path.as_str(), idx))
-            .collect();
+        // With the lever unset, no source file absent from `fused` may be
+        // force-inserted purely from `source_files` membership: the historical
+        // hardcoded-path anchors are gone and nothing replaces them by default.
+        for absent in [
+            "src/libponyc/pass/syntax.c",
+            "src/libponyc/pass/verify.c",
+            "src/libponyc/expr/lambda.h",
+        ] {
+            assert!(
+                !fused.iter().any(|(path, _)| path == absent),
+                "{absent} must not be force-inserted while the graph-anchor lever is dark"
+            );
+        }
+    }
 
-        assert!(ranks["src/libponyc/pass/expr.c"] < ranks["src/libponyc/pass/expr.h"]);
-        assert!(ranks["src/libponyc/pass/syntax.c"] < ranks["src/libponyc/expr/reference.c"]);
-        assert!(ranks["src/libponyc/pass/verify.c"] < ranks["src/libponyc/verify/type.c"]);
-        assert!(fused
-            .iter()
-            .any(|(path, _)| path == "src/libponyc/expr/lambda.h"));
+    #[test]
+    #[serial_test::serial]
+    fn semantic_phase_anchor_floors_dark_by_default_even_with_full_signal_support() {
+        std::env::remove_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
+        let source_files = HashSet::from([String::from("engine/pass/typecheck.rs")]);
+        let all_hits = vec![HashMap::from([(
+            "engine/pass/typecheck.rs".to_string(),
+            hit(1.0),
+        )])];
+
+        let anchors = semantic_phase_anchor_floors(
+            "Fix return checking in constructors.",
+            10.0,
+            &source_files,
+            &all_hits,
+        );
+        assert!(
+            anchors.is_empty(),
+            "unset lever must produce zero anchors: {anchors:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn semantic_phase_anchor_floors_ranks_signal_supported_bucket_files_when_enabled() {
+        std::env::set_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS", "1");
+
+        // A fictional, non-Pony corpus: the mechanism must work from bucket +
+        // cross-signal support alone, not from any hardcoded name or path.
+        let source_files = HashSet::from([
+            String::from("engine/pass/typecheck.rs"),
+            String::from("engine/pass/lower.rs"),
+            String::from("engine/pass/const_verify.rs"),
+            String::from("engine/expr/closure.rs"),
+            String::from("engine/expr/closure_capture.rs"),
+            String::from("engine/ast/node.rs"),
+        ]);
+        let all_hits = vec![
+            HashMap::from([
+                ("engine/pass/typecheck.rs".to_string(), hit(1.0)),
+                ("engine/expr/closure.rs".to_string(), hit(1.0)),
+                ("engine/ast/node.rs".to_string(), hit(1.0)),
+            ]),
+            HashMap::from([
+                ("engine/pass/typecheck.rs".to_string(), hit(1.0)),
+                ("engine/expr/closure.rs".to_string(), hit(1.0)),
+                ("engine/ast/node.rs".to_string(), hit(1.0)),
+            ]),
+            HashMap::from([
+                ("engine/pass/typecheck.rs".to_string(), hit(1.0)),
+                ("engine/pass/lower.rs".to_string(), hit(1.0)),
+                ("engine/expr/closure_capture.rs".to_string(), hit(1.0)),
+                ("engine/ast/node.rs".to_string(), hit(1.0)),
+            ]),
+            HashMap::from([("engine/ast/node.rs".to_string(), hit(1.0))]),
+            HashMap::from([("engine/ast/node.rs".to_string(), hit(1.0))]),
+        ];
+
+        // Construction-shaped query: only the "pass" bucket is targeted.
+        let construction_anchors = semantic_phase_anchor_floors(
+            "Fix return checking in constructors.",
+            10.0,
+            &source_files,
+            &all_hits,
+        );
+        assert_anchors_approx(
+            &construction_anchors,
+            &[
+                ("engine/pass/typecheck.rs", 7.4),
+                ("engine/pass/lower.rs", 7.2),
+            ],
+        );
+        assert!(
+            !construction_anchors
+                .iter()
+                .any(|(path, _)| path.contains("const_verify") || path.contains("ast/node")),
+            "unsupported and wrong-bucket files must never appear: {construction_anchors:?}"
+        );
+
+        // Lambda-shaped query: "expr" then "pass" buckets are targeted, capped
+        // at SEMANTIC_PHASE_ANCHOR_LIMIT.
+        let lambda_anchors = semantic_phase_anchor_floors(
+            "Handle lambda captures directly.",
+            10.0,
+            &source_files,
+            &all_hits,
+        );
+        assert_anchors_approx(
+            &lambda_anchors,
+            &[
+                ("engine/pass/typecheck.rs", 6.8),
+                ("engine/expr/closure.rs", 6.6),
+                ("engine/expr/closure_capture.rs", 6.4),
+            ],
+        );
+
+        std::env::remove_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn semantic_phase_anchor_floors_is_deterministic() {
+        std::env::set_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS", "1");
+        let source_files = HashSet::from([
+            String::from("engine/pass/typecheck.rs"),
+            String::from("engine/pass/lower.rs"),
+            String::from("engine/expr/closure.rs"),
+        ]);
+        let all_hits = vec![HashMap::from([
+            ("engine/pass/typecheck.rs".to_string(), hit(1.0)),
+            ("engine/pass/lower.rs".to_string(), hit(1.0)),
+            ("engine/expr/closure.rs".to_string(), hit(1.0)),
+        ])];
+        let text = "Fix return checking in constructors with lambda captures.";
+
+        let first = semantic_phase_anchor_floors(text, 10.0, &source_files, &all_hits);
+        let second = semantic_phase_anchor_floors(text, 10.0, &source_files, &all_hits);
+        assert_eq!(
+            first, second,
+            "identical inputs must yield identical output"
+        );
+        assert!(!first.is_empty());
+
+        std::env::remove_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn semantic_phase_distractor_cap_dark_by_default_even_with_zero_signal_support() {
+        std::env::remove_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
+
+        let cap = semantic_phase_distractor_cap(
+            "Fix return checking in constructors.",
+            "engine/pass/typecheck.rs",
+            10.0,
+            &[],
+        );
+        assert!(cap.is_none(), "unset lever must produce no cap: {cap:?}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn semantic_phase_distractor_cap_caps_unsupported_bucket_files_when_enabled() {
+        std::env::set_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS", "1");
+
+        // A fictional, non-Pony corpus: the mechanism must work from bucket +
+        // cross-signal support alone, not from any hardcoded name or path.
+        let all_hits = vec![HashMap::from([(
+            "engine/pass/typecheck.rs".to_string(),
+            hit(1.0),
+        )])];
+
+        // Compare a capped result against an expected ratio-of-`top_score`
+        // with a float tolerance: the cap is a product, not a literal constant.
+        fn assert_cap_approx(actual: Option<f32>, top_score: f32, ratio: f32, msg: &str) {
+            let actual = actual.unwrap_or_else(|| panic!("{msg}: expected a cap, got None"));
+            let expected = top_score * ratio;
+            assert!(
+                (actual - expected).abs() < 1e-4,
+                "{msg}: {actual} vs {expected}"
+            );
+        }
+
+        // Construction-shaped query: both the "pass" and "expr" buckets are
+        // in play.
+        let construction_text = "Fix return checking in constructors.";
+
+        assert_cap_approx(
+            semantic_phase_distractor_cap(
+                construction_text,
+                "engine/pass/lower.rs",
+                10.0,
+                &all_hits,
+            ),
+            10.0,
+            SEMANTIC_PHASE_DISTRACTOR_CONSTRUCTION_CAP_RATIO,
+            "an unsupported pass-bucket file must be capped for a construction query",
+        );
+        assert_cap_approx(
+            semantic_phase_distractor_cap(
+                construction_text,
+                "engine/expr/closure.rs",
+                10.0,
+                &all_hits,
+            ),
+            10.0,
+            SEMANTIC_PHASE_DISTRACTOR_CONSTRUCTION_CAP_RATIO,
+            "an unsupported expr-bucket file must be capped for a construction query",
+        );
+        assert_eq!(
+            semantic_phase_distractor_cap(
+                construction_text,
+                "engine/pass/typecheck.rs",
+                10.0,
+                &all_hits,
+            ),
+            None,
+            "a file with corroborating cross-signal support must never be capped"
+        );
+        assert_eq!(
+            semantic_phase_distractor_cap(construction_text, "engine/ast/node.rs", 10.0, &all_hits,),
+            None,
+            "buckets outside the construction query's bucket set must never be capped"
+        );
+        assert_eq!(
+            semantic_phase_distractor_cap(
+                construction_text,
+                "engine/other/thing.rs",
+                10.0,
+                &all_hits,
+            ),
+            None,
+            "paths with no recognized phase bucket must never be capped"
+        );
+
+        // Lambda-shaped query: only the "expr" bucket is in play.
+        let lambda_text = "Handle lambda captures directly.";
+        assert_cap_approx(
+            semantic_phase_distractor_cap(lambda_text, "engine/expr/closure.rs", 10.0, &all_hits),
+            10.0,
+            SEMANTIC_PHASE_DISTRACTOR_LAMBDA_CAP_RATIO,
+            "an unsupported expr-bucket file must be capped for a lambda query",
+        );
+        assert_eq!(
+            semantic_phase_distractor_cap(lambda_text, "engine/pass/lower.rs", 10.0, &all_hits,),
+            None,
+            "a lambda query must never cap the pass bucket"
+        );
+
+        std::env::remove_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn semantic_phase_distractor_cap_is_deterministic() {
+        std::env::set_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS", "1");
+        let all_hits: Vec<HashMap<String, Vec<FileHit>>> = vec![];
+        let text = "Fix return checking in constructors with lambda captures.";
+        let path = "engine/expr/closure.rs";
+
+        let first = semantic_phase_distractor_cap(text, path, 10.0, &all_hits);
+        let second = semantic_phase_distractor_cap(text, path, 10.0, &all_hits);
+        assert_eq!(
+            first, second,
+            "identical inputs must yield identical output"
+        );
+        assert!(first.is_some());
+
+        std::env::remove_var("KIN_LOCATE_SEMANTIC_PHASE_GRAPH_ANCHORS");
     }
 
     #[test]
@@ -21722,6 +22641,7 @@ mod tests {
                 provenance: None,
                 signal_scores: None,
                 score_breakdown: None,
+                matched_queries: Vec::new(),
             }],
             debug: None,
             semantic_coverage: None,

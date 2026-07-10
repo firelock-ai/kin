@@ -73,6 +73,7 @@ which = "7"
 dialoguer = { workspace = true }
 console = { workspace = true }
 flate2 = "1"
+fs2 = { workspace = true }
 regex = "1"
 tar = "0.4"
 zip = "2"

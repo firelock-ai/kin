@@ -10,3 +10,6 @@ description = "Embedded build provenance for Kin binaries"
 build = "build.rs"
 
 [dependencies]
+
+[build-dependencies]
+sha2 = { workspace = true }
