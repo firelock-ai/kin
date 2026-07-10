@@ -305,40 +305,56 @@ struct HistoryIdentityEntry<'a> {
     artifact_deltas: &'a [kin_model::ArtifactDelta],
 }
 
-fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    fn sort(value: serde_json::Value) -> serde_json::Value {
-        match value {
-            serde_json::Value::Object(map) => serde_json::Value::Object(
-                map.into_iter()
-                    .collect::<BTreeMap<_, _>>()
-                    .into_iter()
-                    .map(|(key, value)| (key, sort(value)))
-                    .collect(),
-            ),
-            serde_json::Value::Array(values) => {
-                serde_json::Value::Array(values.into_iter().map(sort).collect())
+fn canonicalize_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let sorted = std::mem::take(map).into_iter().collect::<BTreeMap<_, _>>();
+            for (key, mut child) in sorted {
+                canonicalize_json_value(&mut child);
+                map.insert(key, child);
             }
-            other => other,
         }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                canonicalize_json_value(child);
+            }
+        }
+        _ => {}
     }
+}
 
-    let value = serde_json::to_value(value).context("serialize hydration checkpoint unit")?;
-    serde_json::to_vec(&sort(value)).context("encode canonical hydration checkpoint JSON")
+fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    let mut value = serde_json::to_value(value).context("serialize hydration checkpoint unit")?;
+    canonicalize_json_value(&mut value);
+    serde_json::to_vec(&value).context("encode canonical hydration checkpoint JSON")
 }
 
 fn encode_envelope<T: Serialize>(schema: &str, payload: &T) -> Result<Vec<u8>> {
-    let payload_value = serde_json::to_value(payload).context("serialize checkpoint payload")?;
-    let payload_bytes = canonical_json_bytes(&payload_value)?;
+    // Canonicalize the one owned payload tree in place. The v1 implementation
+    // repeatedly converted and cloned this tree while hashing and wrapping it;
+    // a frontier is repo-sized, so those redundant deep copies could dominate
+    // checkpoint RSS even after delta segmentation removed prefix growth.
+    let mut payload_value =
+        serde_json::to_value(payload).context("serialize checkpoint payload")?;
+    canonicalize_json_value(&mut payload_value);
+    let payload_sha256 = {
+        let payload_bytes =
+            serde_json::to_vec(&payload_value).context("encode canonical checkpoint payload")?;
+        hex::encode(Sha256::digest(&payload_bytes))
+    };
     let envelope = CheckpointEnvelope {
         schema: schema.to_string(),
-        payload_sha256: hex::encode(Sha256::digest(&payload_bytes)),
+        payload_sha256,
         payload: payload_value,
     };
-    canonical_json_bytes(&envelope)
+    // Envelope fields are a struct (fixed serde order), and its payload map is
+    // already canonical. Serialize directly rather than cloning the frontier
+    // through another serde_json::Value.
+    serde_json::to_vec(&envelope).context("encode hydration checkpoint envelope")
 }
 
 fn decode_envelope<T: DeserializeOwned>(schema: &str, path: &Path, bytes: &[u8]) -> Result<T> {
-    let envelope: CheckpointEnvelope = serde_json::from_slice(bytes).map_err(|error| {
+    let mut envelope: CheckpointEnvelope = serde_json::from_slice(bytes).map_err(|error| {
         anyhow!(
             "REFUSED hydration checkpoint {}: invalid envelope: {}",
             path.display(),
@@ -353,7 +369,10 @@ fn decode_envelope<T: DeserializeOwned>(schema: &str, path: &Path, bytes: &[u8])
             schema
         ));
     }
-    let actual = hex::encode(Sha256::digest(canonical_json_bytes(&envelope.payload)?));
+    canonicalize_json_value(&mut envelope.payload);
+    let canonical_payload = serde_json::to_vec(&envelope.payload)
+        .context("encode canonical hydration checkpoint payload for verification")?;
+    let actual = hex::encode(Sha256::digest(&canonical_payload));
     if actual != envelope.payload_sha256 {
         return Err(anyhow!(
             "REFUSED hydration checkpoint {}: payload digest mismatch",
