@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -13,9 +14,34 @@ fn main() {
     if let Some(head) = git(&root, &["rev-parse", "--git-path", "HEAD"]) {
         println!("cargo:rerun-if-changed={head}");
     }
+    if let Some(index) = git(&root, &["rev-parse", "--git-path", "index"]) {
+        println!("cargo:rerun-if-changed={index}");
+    }
     if let Some(reference) = git(&root, &["symbolic-ref", "-q", "HEAD"]) {
         if let Some(path) = git(&root, &["rev-parse", "--git-path", &reference]) {
             println!("cargo:rerun-if-changed={path}");
+        }
+    }
+
+    // The build identity is an authority input for persisted semantic caches.
+    // Watching only HEAD/reference files can leave KIN_BUILD_DIRTY stale when
+    // another workspace crate changes without touching kin-buildinfo. Watch
+    // every tracked top-level source subtree (but never target/) so any source
+    // edit, newly created file below a tracked subtree, stage, commit, or
+    // checkout reruns this build script before a binary is linked.
+    if let Some(files) = git(&root, &["ls-files"]) {
+        let mut watched = BTreeSet::new();
+        for file in files.lines().filter(|line| !line.is_empty()) {
+            let path = Path::new(file);
+            let top = path.components().next().map(|part| part.as_os_str());
+            if let Some(top) = top {
+                watched.insert(root.join(top));
+            }
+        }
+        for path in watched {
+            if path.file_name().and_then(|name| name.to_str()) != Some("target") {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
         }
     }
 

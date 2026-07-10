@@ -4,7 +4,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use kin_model::{BranchName, ChangeStore, Entity, EntityFilter, GraphStore};
 use kin_model::{Hash256, SemanticChangeId};
-use tracing::warn;
 
 /// A reference did not resolve to a semantic change — unknown ref syntax, a
 /// ref that legitimately does not exist, or a relative-ref hop (`^N`/`~N`)
@@ -95,7 +94,7 @@ pub fn resolve_ref_importing_git_if_needed(
     layout: &kin_core::KinLayout,
     reference: Option<&str>,
 ) -> Result<SemanticChangeId> {
-    Ok(resolve_ref_importing_git_if_needed_with_mode(graph, layout, reference, true)?.head)
+    Ok(resolve_ref_importing_git_if_needed_with_report_inner(graph, layout, reference)?.head)
 }
 
 pub fn resolve_ref_importing_git_if_needed_for_locate(
@@ -103,7 +102,7 @@ pub fn resolve_ref_importing_git_if_needed_for_locate(
     layout: &kin_core::KinLayout,
     reference: Option<&str>,
 ) -> Result<SemanticChangeId> {
-    Ok(resolve_ref_importing_git_if_needed_with_mode(graph, layout, reference, false)?.head)
+    Ok(resolve_ref_importing_git_if_needed_with_report_inner(graph, layout, reference)?.head)
 }
 
 pub fn resolve_ref_importing_git_if_needed_with_report(
@@ -111,7 +110,7 @@ pub fn resolve_ref_importing_git_if_needed_with_report(
     layout: &kin_core::KinLayout,
     reference: Option<&str>,
 ) -> Result<ResolvedRef> {
-    resolve_ref_importing_git_if_needed_with_mode(graph, layout, reference, true)
+    resolve_ref_importing_git_if_needed_with_report_inner(graph, layout, reference)
 }
 
 pub fn resolve_ref_importing_git_if_needed_for_locate_with_report(
@@ -119,14 +118,13 @@ pub fn resolve_ref_importing_git_if_needed_for_locate_with_report(
     layout: &kin_core::KinLayout,
     reference: Option<&str>,
 ) -> Result<ResolvedRef> {
-    resolve_ref_importing_git_if_needed_with_mode(graph, layout, reference, false)
+    resolve_ref_importing_git_if_needed_with_report_inner(graph, layout, reference)
 }
 
-fn resolve_ref_importing_git_if_needed_with_mode(
+fn resolve_ref_importing_git_if_needed_with_report_inner(
     graph: &kin_db::InMemoryGraph,
     layout: &kin_core::KinLayout,
     reference: Option<&str>,
-    enrich_semantics: bool,
 ) -> Result<ResolvedRef> {
     match resolve_ref(graph, layout, reference) {
         Ok(head) => Ok(ResolvedRef {
@@ -141,8 +139,7 @@ fn resolve_ref_importing_git_if_needed_with_mode(
             let Some(git_oid) = extract_git_ref(reference) else {
                 return Err(original_err);
             };
-            let hydrated_changes =
-                hydrate_imported_git_ref(graph, layout, git_oid, enrich_semantics)?;
+            let hydrated_changes = hydrate_imported_git_ref(graph, layout, git_oid)?;
             let head = resolve_ref(graph, layout, Some(reference))?;
             Ok(ResolvedRef {
                 head,
@@ -480,8 +477,28 @@ fn hydrate_imported_git_ref(
     graph: &kin_db::InMemoryGraph,
     layout: &kin_core::KinLayout,
     git_oid: &str,
-    enrich_semantics: bool,
 ) -> Result<usize> {
+    hydrate_imported_git_ref_with(graph, layout, git_oid, |imported, blob_store, kin_root| {
+        crate::commands::init::enrich_imported_changes_with_semantics_checkpointed(
+            imported, blob_store, kin_root,
+        )
+        .map(|_| ())
+    })
+}
+
+fn hydrate_imported_git_ref_with<F>(
+    graph: &kin_db::InMemoryGraph,
+    layout: &kin_core::KinLayout,
+    git_oid: &str,
+    enrich_semantics: F,
+) -> Result<usize>
+where
+    F: FnOnce(
+        &mut [kin_git::ImportedChange],
+        &kin_blobs::BlobStore,
+        &std::path::Path,
+    ) -> Result<()>,
+{
     let imported_change_id = kin_git::semantic_change_id_from_git_oid_hex(git_oid)?;
     if graph.get_change(&imported_change_id)?.is_some() {
         return Ok(0);
@@ -498,18 +515,12 @@ fn hydrate_imported_git_ref(
     )
     .with_context(|| format!("hydrate imported Git commit '{}'", git_oid))?;
 
-    if enrich_semantics {
-        if let Err(err) = crate::commands::init::enrich_imported_changes_with_semantics(
-            &mut imported,
-            &blob_store,
-        ) {
-            warn!(
-                error = %err,
-                git_oid = %git_oid,
-                "failed to enrich hydrated Git history with semantic deltas; continuing with artifact-only history"
-            );
-        }
-    }
+    enrich_semantics(&mut imported, &blob_store, layout.root()).with_context(|| {
+        format!(
+            "semantically hydrate imported Git history for ref '{}'",
+            git_oid
+        )
+    })?;
 
     let mut inserted = 0usize;
     for imported_change in &imported {
@@ -618,6 +629,38 @@ mod tests {
     use kin_db::InMemoryGraph;
     use kin_model::{AuthorId, Branch, ChangeStore, SemanticChange, Timestamp};
 
+    fn git_ok(cwd: &std::path::Path, args: &[&str]) -> Option<String> {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    fn checkpoint_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        fn walk(path: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(path) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, files);
+                } else if path.is_file() {
+                    files.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(root, &mut files);
+        files.sort();
+        files
+    }
+
     fn temp_layout() -> kin_core::KinLayout {
         let temp = tempfile::tempdir().unwrap();
         let kin_dir = temp.path().join(".kin");
@@ -625,6 +668,115 @@ mod tests {
         // Keep the tempdir alive by leaking it for the test process lifetime.
         let leaked = temp.keep();
         kin_core::KinLayout::new(leaked.join(".kin"))
+    }
+
+    #[test]
+    fn lazy_git_ref_hydration_resumes_checkpoint_and_refuses_corruption_before_insert() {
+        let repo = tempfile::tempdir().unwrap();
+        if git_ok(repo.path(), &["init", "-q"]).is_none() {
+            return;
+        }
+        assert!(git_ok(repo.path(), &["config", "user.email", "test@kin.dev"]).is_some());
+        assert!(git_ok(repo.path(), &["config", "user.name", "Kin Test"]).is_some());
+        std::fs::write(
+            repo.path().join("main.py"),
+            "def answer():\n    return 42\n",
+        )
+        .unwrap();
+        assert!(git_ok(repo.path(), &["add", "main.py"]).is_some());
+        assert!(git_ok(repo.path(), &["commit", "-q", "-m", "initial"]).is_some());
+        let git_oid = git_ok(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        let imported_id = kin_git::semantic_change_id_from_git_oid_hex(&git_oid).unwrap();
+        let layout = kin_core::init(repo.path()).unwrap().layout;
+
+        let first_resumed = std::cell::Cell::new(usize::MAX);
+        let first_graph = InMemoryGraph::new();
+        let first_inserted = hydrate_imported_git_ref_with(
+            &first_graph,
+            &layout,
+            &git_oid,
+            |imported, blob_store, kin_root| {
+                let stats =
+                    crate::commands::init::enrich_imported_changes_with_semantics_test_checkpoint(
+                        imported,
+                        blob_store,
+                        kin_root,
+                        "lazy-ref-clean-sha",
+                    )?;
+                first_resumed.set(stats.resumed_from());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(first_inserted > 0);
+        assert_eq!(first_resumed.get(), 0);
+        assert!(first_graph.get_change(&imported_id).unwrap().is_some());
+
+        let second_resumed = std::cell::Cell::new(0usize);
+        let second_graph = InMemoryGraph::new();
+        hydrate_imported_git_ref_with(
+            &second_graph,
+            &layout,
+            &git_oid,
+            |imported, blob_store, kin_root| {
+                let stats =
+                    crate::commands::init::enrich_imported_changes_with_semantics_test_checkpoint(
+                        imported,
+                        blob_store,
+                        kin_root,
+                        "lazy-ref-clean-sha",
+                    )?;
+                second_resumed.set(stats.resumed_from());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(second_resumed.get() > 0, "lazy ref path did not resume");
+        assert!(second_graph.get_change(&imported_id).unwrap().is_some());
+
+        let checkpoint_root = layout.root().join("checkpoints/history-hydration");
+        let files = checkpoint_files(&checkpoint_root);
+        for component in ["/segments/", "/parser-frontiers/", "/linker-frontiers/"] {
+            assert!(
+                files
+                    .iter()
+                    .any(|path| path.to_string_lossy().contains(component)),
+                "lazy ref checkpoint did not persist {component}"
+            );
+        }
+        let manifest = files
+            .into_iter()
+            .find(|path| path.to_string_lossy().ends_with(".manifest.json"))
+            .unwrap();
+        std::fs::write(&manifest, b"corrupt").unwrap();
+
+        let refused_graph = InMemoryGraph::new();
+        let error = hydrate_imported_git_ref_with(
+            &refused_graph,
+            &layout,
+            &git_oid,
+            |imported, blob_store, kin_root| {
+                crate::commands::init::enrich_imported_changes_with_semantics_test_checkpoint(
+                    imported,
+                    blob_store,
+                    kin_root,
+                    "lazy-ref-clean-sha",
+                )
+                .map(|_| ())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("semantically hydrate"),
+            "lazy ref error lost its semantic hydration context: {error:#}"
+        );
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("REFUSED hydration checkpoint")),
+            "lazy ref corruption did not fail through the checkpoint wrapper: {error:#}"
+        );
+        assert!(refused_graph.get_change(&imported_id).unwrap().is_none());
     }
 
     #[test]
