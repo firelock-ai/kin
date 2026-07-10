@@ -257,7 +257,7 @@ pub struct SpineRefreshOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VfsTreeCacheKey {
     pub head: Option<SemanticChangeId>,
-    pub version: u64,
+    pub history_version: u64,
 }
 
 /// Graph-derived file tree and timestamps shared by the VFS endpoints.
@@ -266,6 +266,14 @@ pub(crate) struct VfsTreeSnapshot {
     pub key: VfsTreeCacheKey,
     pub files: Arc<HashMap<FilePathId, Hash256>>,
     pub timestamps: Arc<HashMap<FilePathId, u64>>,
+    /// Existing SemanticChange ids reachable from `key.head` when this snapshot
+    /// was built. Used to decide whether a later history insertion can affect
+    /// the unchanged active head without replaying the whole DAG per insert.
+    pub reachable_change_ids: Arc<HashSet<SemanticChangeId>>,
+    /// Parent ids referenced by the reachable history but not present when the
+    /// snapshot was built. Filling one of these ids changes the active tree even
+    /// though the branch head itself stays byte-identical.
+    pub missing_parent_ids: Arc<HashSet<SemanticChangeId>>,
 }
 
 #[cfg(test)]
@@ -273,6 +281,36 @@ pub(crate) struct VfsTreeSnapshot {
 pub(crate) struct VfsTreeBuildTestHook {
     pub materialized: Arc<std::sync::Barrier>,
     pub resume: Arc<std::sync::Barrier>,
+}
+
+/// Marks a SemanticChange-history mutation window. Warm readers may keep using
+/// the last fully-published snapshot while the mutation is in flight, but a
+/// cold builder must not publish a partially hydrated history. The epoch makes
+/// builders that straddle the window retry after it closes.
+pub(crate) struct VfsHistoryMutationGuard<'a> {
+    state: &'a DaemonState,
+    reconciled: bool,
+}
+
+impl VfsHistoryMutationGuard<'_> {
+    /// Mark the mutation window as reconciled against the committed-tree cache.
+    /// Dropping an unfinished guard invalidates conservatively so a partial
+    /// mutation followed by an error can never leave a same-head snapshot stale.
+    pub(crate) fn finish(mut self) {
+        self.reconciled = true;
+    }
+}
+
+impl Drop for VfsHistoryMutationGuard<'_> {
+    fn drop(&mut self) {
+        if !self.reconciled {
+            self.state.bump_committed_history_version();
+        }
+        self.state.vfs_history_epoch.fetch_add(1, Ordering::SeqCst);
+        self.state
+            .vfs_history_mutations_inflight
+            .fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Shared daemon state. All mutable state is behind RwLock for
@@ -304,14 +342,28 @@ pub struct DaemonState {
     /// Incremented on every graph mutation (reconcile, commit, overlay update).
     /// Unlike entity_count, this never decreases on deletions.
     pub vfs_version: AtomicU64,
-    /// Materialized committed VFS view keyed by exact graph head + monotonic version.
-    /// Endpoint handlers never return this entry unless its key still matches live graph truth.
+    /// In-process generation for committed SemanticChange history that can alter
+    /// the active head's materialized tree without moving that head. Ordinary
+    /// graph metadata, embeddings, and overlays do not change this generation.
+    pub committed_history_version: AtomicU64,
+    /// Changes at both ends of a SemanticChange mutation window. This is a
+    /// build-publication CAS token only, not a cache key: unrelated branch
+    /// inserts must not evict an already-valid active-tree snapshot.
+    pub vfs_history_epoch: AtomicU64,
+    /// Number of SemanticChange mutation windows currently open. A cold VFS
+    /// build refuses to materialize while non-zero so it never publishes a
+    /// partially hydrated ancestry.
+    pub vfs_history_mutations_inflight: AtomicU64,
+    /// Materialized committed VFS view keyed by exact active branch head plus
+    /// scoped committed-history generation.
     pub(crate) vfs_tree_cache: std::sync::RwLock<Option<Arc<VfsTreeSnapshot>>>,
     /// Single-flight coordinator for cold VFS materialization. Waiters recheck the cache after
     /// acquiring this lock, so one exact head/version is replayed at most once.
     pub(crate) vfs_tree_build_lock: tokio::sync::Mutex<()>,
     #[cfg(test)]
     pub(crate) vfs_tree_build_count: AtomicU64,
+    #[cfg(test)]
+    pub(crate) vfs_history_walk_count: AtomicU64,
     #[cfg(test)]
     pub(crate) vfs_tree_build_test_hook: std::sync::Mutex<Option<VfsTreeBuildTestHook>>,
     /// Broadcast channel for SSE invalidation events.
@@ -681,10 +733,15 @@ impl DaemonState {
             storage_backend: None,
             snapshot_generation: AtomicU64::new(0),
             vfs_version: AtomicU64::new(persisted_vfs_version),
+            committed_history_version: AtomicU64::new(0),
+            vfs_history_epoch: AtomicU64::new(0),
+            vfs_history_mutations_inflight: AtomicU64::new(0),
             vfs_tree_cache: std::sync::RwLock::new(None),
             vfs_tree_build_lock: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             vfs_tree_build_count: AtomicU64::new(0),
+            #[cfg(test)]
+            vfs_history_walk_count: AtomicU64::new(0),
             #[cfg(test)]
             vfs_tree_build_test_hook: std::sync::Mutex::new(None),
             event_tx: tokio::sync::broadcast::channel(256).0,
@@ -825,10 +882,15 @@ impl DaemonState {
             storage_backend: Some(backend),
             snapshot_generation: AtomicU64::new(generation),
             vfs_version: AtomicU64::new(persisted_vfs_version),
+            committed_history_version: AtomicU64::new(0),
+            vfs_history_epoch: AtomicU64::new(0),
+            vfs_history_mutations_inflight: AtomicU64::new(0),
             vfs_tree_cache: std::sync::RwLock::new(None),
             vfs_tree_build_lock: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             vfs_tree_build_count: AtomicU64::new(0),
+            #[cfg(test)]
+            vfs_history_walk_count: AtomicU64::new(0),
             #[cfg(test)]
             vfs_tree_build_test_hook: std::sync::Mutex::new(None),
             event_tx: tokio::sync::broadcast::channel(256).0,
@@ -1352,19 +1414,29 @@ impl DaemonState {
     /// Also marks the graph as dirty for background persistence.
     pub fn bump_version(&self) {
         let v = self.vfs_version.fetch_add(1, Ordering::SeqCst) + 1;
-        // Retire the old materialization at the same publication boundary. Requests that
-        // already cloned it may finish against the pre-mutation head; every request that
-        // observes the new version must rebuild or reuse a snapshot with the new key.
-        let mut cache = self
-            .vfs_tree_cache
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *cache = None;
-        drop(cache);
         self.mark_dirty();
         // Persist asynchronously — don't block the mutation path.
         let path = self.layout.root().join("vfs_version");
         let _ = std::fs::write(&path, v.to_string());
+    }
+
+    /// Open a bounded SemanticChange-history mutation window. See
+    /// [`VfsHistoryMutationGuard`] for the publication contract.
+    pub(crate) fn begin_vfs_history_mutation(&self) -> VfsHistoryMutationGuard<'_> {
+        self.vfs_history_mutations_inflight
+            .fetch_add(1, Ordering::SeqCst);
+        self.vfs_history_epoch.fetch_add(1, Ordering::SeqCst);
+        VfsHistoryMutationGuard {
+            state: self,
+            reconciled: false,
+        }
+    }
+
+    /// Invalidate a committed-tree snapshot when reachable history changed
+    /// without a branch-head move.
+    pub(crate) fn bump_committed_history_version(&self) {
+        self.committed_history_version
+            .fetch_add(1, Ordering::SeqCst);
     }
 
     /// Get or create a session-scoped overlay for the given session.
@@ -2115,10 +2187,15 @@ mod tests {
             storage_backend: None,
             snapshot_generation: AtomicU64::new(0),
             vfs_version: AtomicU64::new(0),
+            committed_history_version: AtomicU64::new(0),
+            vfs_history_epoch: AtomicU64::new(0),
+            vfs_history_mutations_inflight: AtomicU64::new(0),
             vfs_tree_cache: std::sync::RwLock::new(None),
             vfs_tree_build_lock: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             vfs_tree_build_count: AtomicU64::new(0),
+            #[cfg(test)]
+            vfs_history_walk_count: AtomicU64::new(0),
             #[cfg(test)]
             vfs_tree_build_test_hook: std::sync::Mutex::new(None),
             event_tx: tokio::sync::broadcast::channel(256).0,

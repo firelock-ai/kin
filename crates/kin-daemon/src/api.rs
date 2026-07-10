@@ -1449,10 +1449,11 @@ async fn set_scope(
     // (roughly 2x peak memory → OOM). Already-imported refs skip the gate and
     // stay on the fast path. Acquired here (async) and moved into the blocking
     // task so it is held for the whole import.
-    let hydration_gate = if kin_cli::commands::ref_lookup::git_ref_requires_hydration(
+    let needs_hydration = kin_cli::commands::ref_lookup::git_ref_requires_hydration(
         state.graph.as_ref(),
         &ref_string,
-    ) {
+    );
+    let hydration_gate = if needs_hydration {
         Some(Arc::clone(&state.hydration_gate).lock_owned().await)
     } else {
         None
@@ -1460,6 +1461,8 @@ async fn set_scope(
     let scope_task = tokio::task::spawn_blocking(
         move || -> std::result::Result<_, (StatusCode, String)> {
             let _hydration_gate = hydration_gate;
+            let vfs_history_mutation =
+                needs_hydration.then(|| state_clone.begin_vfs_history_mutation());
             // Resolve the ref to a SemanticChangeId using the LOCATE resolve mode
             // (enrich_semantics=false). Scope-for-retrieval only needs the
             // base_commit's tree state; the full per-commit semantic-delta enrichment
@@ -1476,7 +1479,13 @@ async fn set_scope(
             )
             .map_err(|err| (StatusCode::BAD_REQUEST, format!("{:#}", err)))?;
             if resolved.hydrated_git_history {
+                invalidate_vfs_after_bulk_hydration(&state_clone)?;
                 state_clone.bump_version();
+            }
+            if let Some(mutation) = vfs_history_mutation {
+                mutation.finish();
+            }
+            if resolved.hydrated_git_history {
                 state_clone.save_snapshot().map_err(internal_error)?;
                 state_clone.mark_clean();
             }
@@ -1675,6 +1684,8 @@ async fn graph_commit(
         }
     }
 
+    let vfs_history_mutation = state.begin_vfs_history_mutation();
+
     for delta in &request.change.entity_deltas {
         match delta {
             EntityDelta::Added(e) => {
@@ -1711,6 +1722,7 @@ async fn graph_commit(
     graph
         .create_change(&request.change)
         .map_err(internal_error)?;
+    invalidate_vfs_for_inserted_changes(&state, [request.change.id])?;
     if graph
         .get_branch(&request.branch_name)
         .map_err(internal_error)?
@@ -1727,6 +1739,7 @@ async fn graph_commit(
             })
             .map_err(internal_error)?;
     }
+    vfs_history_mutation.finish();
 
     if let Some(audit) = &request.audit_event {
         graph.record_audit_event(audit).map_err(internal_error)?;
@@ -2569,6 +2582,8 @@ async fn command_commit(
         }));
     }
 
+    let vfs_history_mutation = state.begin_vfs_history_mutation();
+
     // Create the semantic change.
     let content_id =
         kin_core::content_identity_from_deltas(&entity_deltas, &relation_deltas, &artifact_deltas);
@@ -2591,9 +2606,11 @@ async fn command_commit(
     let change_id = change.id;
 
     graph.create_change(&change).map_err(internal_error)?;
+    invalidate_vfs_for_inserted_changes(&state, [change_id])?;
     graph
         .update_branch_head(&branch_name, &change_id)
         .map_err(internal_error)?;
+    vfs_history_mutation.finish();
 
     // Clear the working copy overlay — mutations are now committed.
     let mut working_copy = state.working_copy.write().await;
@@ -3086,14 +3103,17 @@ async fn locate(
         // Locating at an unimported Git ref lazily imports its full ancestry;
         // serialize that against every other daemon hydration. Already-imported
         // refs skip the gate and stay on the fast path.
-        let _hydration_gate = if kin_cli::commands::ref_lookup::git_ref_requires_hydration(
+        let needs_hydration = kin_cli::commands::ref_lookup::git_ref_requires_hydration(
             state.graph.as_ref(),
             reference,
-        ) {
+        );
+        let _hydration_gate = if needs_hydration {
             Some(state.hydration_gate.lock().await)
         } else {
             None
         };
+        let vfs_history_mutation = needs_hydration
+            .then(|| state.begin_vfs_history_mutation());
         let resolved = kin_cli::commands::ref_lookup::resolve_ref_importing_git_if_needed_for_locate_with_report(
             state.graph.as_ref(),
             &state.layout,
@@ -3101,7 +3121,13 @@ async fn locate(
         )
         .map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
         if resolved.hydrated_git_history {
+            invalidate_vfs_after_bulk_hydration(&state)?;
             state.bump_version();
+        }
+        if let Some(mutation) = vfs_history_mutation {
+            mutation.finish();
+        }
+        if resolved.hydrated_git_history {
             state.save_snapshot().map_err(internal_error)?;
             state.mark_clean();
         }
@@ -3395,6 +3421,7 @@ async fn review(
     } else {
         None
     };
+    let vfs_history_mutation = needs_hydration.then(|| state.begin_vfs_history_mutation());
     let execution =
         kin_cli::commands::review::execute_review_request(&state.layout, graph.as_ref(), req)
             .await
@@ -3417,7 +3444,13 @@ async fn review(
             review_mutations = 0u64,
             "shadow review hydrated historical changes into the graph"
         );
+        invalidate_vfs_after_bulk_hydration(&state)?;
         state.bump_version();
+    }
+    if let Some(mutation) = vfs_history_mutation {
+        mutation.finish();
+    }
+    if execution.hydrated_changes > 0 {
         state.save_snapshot().map_err(internal_error)?;
         state.mark_clean();
         // A live SSE subscriber (e.g. the VFS daemon) should hear about this
@@ -3661,11 +3694,18 @@ async fn blame(
     } else {
         None
     };
+    let vfs_history_mutation = needs_hydration.then(|| state.begin_vfs_history_mutation());
     let execution =
         kin_cli::commands::blame::execute_blame_request(&state.layout, graph.as_ref(), &req)
             .map_err(internal_error)?;
     if execution.hydrated_git_history {
+        invalidate_vfs_after_bulk_hydration(&state)?;
         state.bump_version();
+    }
+    if let Some(mutation) = vfs_history_mutation {
+        mutation.finish();
+    }
+    if execution.hydrated_git_history {
         state.save_snapshot().map_err(internal_error)?;
         state.mark_clean();
     }
@@ -3701,11 +3741,18 @@ async fn history(
     } else {
         None
     };
+    let vfs_history_mutation = needs_hydration.then(|| state.begin_vfs_history_mutation());
     let execution =
         kin_cli::commands::history::execute_history_request(&state.layout, graph.as_ref(), &req)
             .map_err(internal_error)?;
     if execution.hydrated_git_history {
+        invalidate_vfs_after_bulk_hydration(&state)?;
         state.bump_version();
+    }
+    if let Some(mutation) = vfs_history_mutation {
+        mutation.finish();
+    }
+    if execution.hydrated_git_history {
         state.save_snapshot().map_err(internal_error)?;
         state.mark_clean();
     }
@@ -6173,16 +6220,20 @@ fn resolve_branch_head(
     }
 }
 
-/// Capture an exact VFS cache key without straddling a graph-version change.
+/// Capture an exact VFS cache key without straddling a scoped history change.
 fn current_vfs_cache_key(state: &DaemonState) -> Result<VfsTreeCacheKey, (StatusCode, String)> {
     for _ in 0..8 {
-        let version_before = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+        let version_before = state
+            .committed_history_version
+            .load(std::sync::atomic::Ordering::SeqCst);
         let head = resolve_branch_head(state)?.map(|(_, head)| head);
-        let version_after = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+        let version_after = state
+            .committed_history_version
+            .load(std::sync::atomic::Ordering::SeqCst);
         if version_before == version_after {
             return Ok(VfsTreeCacheKey {
                 head,
-                version: version_after,
+                history_version: version_after,
             });
         }
     }
@@ -6190,6 +6241,133 @@ fn current_vfs_cache_key(state: &DaemonState) -> Result<VfsTreeCacheKey, (Status
         StatusCode::SERVICE_UNAVAILABLE,
         "graph changed repeatedly while resolving the VFS snapshot key; retry".to_string(),
     ))
+}
+
+struct VfsHistoryWalk {
+    changes: Vec<kin_model::SemanticChange>,
+    reachable_change_ids: HashSet<kin_model::SemanticChangeId>,
+    missing_parent_ids: HashSet<kin_model::SemanticChangeId>,
+}
+
+/// Walk the active SemanticChange history with the same DFS-then-reverse order
+/// as `GraphStore::get_changes_since`, while also retaining the existing and
+/// missing id frontier needed for O(1) same-head invalidation decisions.
+fn walk_vfs_history(
+    state: &DaemonState,
+    head_id: kin_model::SemanticChangeId,
+) -> Result<VfsHistoryWalk, (StatusCode, String)> {
+    #[cfg(test)]
+    state
+        .vfs_history_walk_count
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let genesis_id = kin_core::build_genesis_change().id;
+    let mut changes = Vec::new();
+    let mut visited = HashSet::new();
+    let mut reachable_change_ids = HashSet::new();
+    let mut missing_parent_ids = HashSet::new();
+    let mut stack = vec![head_id];
+
+    while let Some(change_id) = stack.pop() {
+        if change_id == genesis_id || !visited.insert(change_id) {
+            continue;
+        }
+        match state.graph.get_change(&change_id).map_err(internal_error)? {
+            Some(change) => {
+                reachable_change_ids.insert(change_id);
+                stack.extend(change.parents.iter().copied());
+                changes.push(change);
+            }
+            None => {
+                missing_parent_ids.insert(change_id);
+            }
+        }
+    }
+    changes.reverse();
+    Ok(VfsHistoryWalk {
+        changes,
+        reachable_change_ids,
+        missing_parent_ids,
+    })
+}
+
+/// Invalidate only when one of the inserted ids was already part of the active
+/// view (defensive duplicate/collision case) or fills a missing active ancestor.
+/// Unrelated branch writes leave the cached Arc and history generation intact.
+fn invalidate_vfs_for_inserted_changes(
+    state: &DaemonState,
+    inserted: impl IntoIterator<Item = kin_model::SemanticChangeId>,
+) -> Result<bool, (StatusCode, String)> {
+    let cached = read_recover(&state.vfs_tree_cache).as_ref().cloned();
+    let Some(cached) = cached else {
+        return Ok(false);
+    };
+    if current_vfs_cache_key(state)?.head != cached.key.head {
+        return Ok(false);
+    }
+    let affects_active = inserted.into_iter().any(|id| {
+        cached.reachable_change_ids.contains(&id) || cached.missing_parent_ids.contains(&id)
+    });
+    if affects_active {
+        state.bump_committed_history_version();
+    }
+    Ok(affects_active)
+}
+
+/// Reconcile one completed bulk hydration against the cached active frontier.
+/// This is one O(active-history) pass per hydration, not one pass per inserted
+/// commit. It avoids evicting the active snapshot when a non-active ref grows.
+fn invalidate_vfs_after_bulk_hydration(state: &DaemonState) -> Result<bool, (StatusCode, String)> {
+    let cached = read_recover(&state.vfs_tree_cache).as_ref().cloned();
+    let Some(cached) = cached else {
+        return Ok(false);
+    };
+    let Some((_, head)) = resolve_branch_head(state)? else {
+        return Ok(false);
+    };
+    if cached.key.head.as_ref() != Some(&head) {
+        return Ok(false);
+    }
+    let epoch_before = state
+        .vfs_history_epoch
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let walked = walk_vfs_history(state, head)?;
+    let epoch_after = state
+        .vfs_history_epoch
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let changed = epoch_before != epoch_after
+        || *cached.reachable_change_ids != walked.reachable_change_ids
+        || *cached.missing_parent_ids != walked.missing_parent_ids;
+    if changed {
+        state.bump_committed_history_version();
+    }
+    Ok(changed)
+}
+
+fn stable_vfs_history_epoch(state: &DaemonState) -> Result<u64, (StatusCode, String)> {
+    if state
+        .vfs_history_mutations_inflight
+        .load(std::sync::atomic::Ordering::SeqCst)
+        != 0
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "committed history is being hydrated; retry the VFS request".to_string(),
+        ));
+    }
+    let epoch = state
+        .vfs_history_epoch
+        .load(std::sync::atomic::Ordering::SeqCst);
+    if state
+        .vfs_history_mutations_inflight
+        .load(std::sync::atomic::Ordering::SeqCst)
+        != 0
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "committed history started changing; retry the VFS request".to_string(),
+        ));
+    }
+    Ok(epoch)
 }
 
 /// Materialize one committed VFS snapshot for an already-captured graph key.
@@ -6204,17 +6382,15 @@ fn build_vfs_tree_snapshot(
             key,
             files: Arc::new(HashMap::new()),
             timestamps: Arc::new(HashMap::new()),
+            reachable_change_ids: Arc::new(HashSet::new()),
+            missing_parent_ids: Arc::new(HashSet::new()),
         });
     };
-    let genesis_id = kin_core::build_genesis_change().id;
-    let changes = state
-        .graph
-        .get_changes_since(&genesis_id, &head_id)
-        .map_err(internal_error)?;
+    let walked = walk_vfs_history(state, head_id)?;
 
     let mut files: HashMap<FilePathId, kin_model::Hash256> = HashMap::new();
     let mut timestamps: HashMap<FilePathId, u64> = HashMap::new();
-    for change in &changes {
+    for change in &walked.changes {
         let epoch_secs = change.timestamp.0.timestamp() as u64;
         for delta in &change.artifact_deltas {
             match delta.kind {
@@ -6252,6 +6428,8 @@ fn build_vfs_tree_snapshot(
         key,
         files: Arc::new(files),
         timestamps: Arc::new(timestamps),
+        reachable_change_ids: Arc::new(walked.reachable_change_ids),
+        missing_parent_ids: Arc::new(walked.missing_parent_ids),
     })
 }
 
@@ -6280,6 +6458,8 @@ async fn current_vfs_snapshot(
             }
         }
 
+        let build_epoch = stable_vfs_history_epoch(state)?;
+
         let build_state = Arc::clone(state);
         let build_key = key.clone();
         let snapshot =
@@ -6292,20 +6472,17 @@ async fn current_vfs_snapshot(
                     )
                 })??;
 
-        // Recheck the complete graph identity after replay. This is deliberately outside the
-        // cache lock to avoid a cache->graph lock-order inversion with mutation paths.
-        if current_vfs_cache_key(state)? != key {
+        // Recheck both scoped identity and the mutation-window CAS after replay.
+        if current_vfs_cache_key(state)? != key || stable_vfs_history_epoch(state)? != build_epoch {
             continue;
         }
 
         let snapshot = Arc::new(snapshot);
         let mut cache = write_recover(&state.vfs_tree_cache);
-        // A mutation can land between the full-key check above and this lock. Version is the
-        // publication/CAS token: bump_version increments it before taking this same write lock
-        // to clear the cache. Therefore an old builder can publish only before the mutation
-        // boundary completes; after a completed invalidation it is discarded here.
-        let published_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
-        if published_version != key.version {
+        // A history mutation can begin between the checks above and publication.
+        // No mutation path takes the cache lock, so re-reading graph identity
+        // here cannot invert cache->graph lock order.
+        if current_vfs_cache_key(state)? != key || stable_vfs_history_epoch(state)? != build_epoch {
             continue;
         }
         if let Some(existing) = cache.as_ref() {
@@ -10778,6 +10955,209 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_head_missing_ancestor_insert_invalidates_committed_tree() {
+        let state = test_state();
+        let branch_name = BranchName::new("main");
+        let genesis = kin_core::build_genesis_change();
+        state.graph.create_change(&genesis).unwrap();
+
+        let parent_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x88; 32]));
+        let head_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x89; 32]));
+        let head_hash = state.blobs.write(b"head").unwrap();
+        let head = SemanticChange {
+            id: head_id,
+            parents: vec![parent_id],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "head before ancestor hydration".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![ArtifactDelta {
+                file_id: FilePathId::new("src/head.rs"),
+                kind: ArtifactDeltaKind::Added,
+                old_hash: None,
+                new_hash: Some(head_hash),
+            }],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(branch_name.clone()),
+        };
+        state.graph.create_change(&head).unwrap();
+        state
+            .graph
+            .create_branch(&Branch {
+                name: branch_name.clone(),
+                head: head_id,
+            })
+            .unwrap();
+        kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
+
+        let before = current_vfs_snapshot(&state).await.unwrap();
+        assert!(before.files.contains_key(&FilePathId::new("src/head.rs")));
+        assert!(!before.files.contains_key(&FilePathId::new("src/parent.rs")));
+        assert!(before.missing_parent_ids.contains(&parent_id));
+        let version_before = before.key.history_version;
+
+        {
+            let mutation = state.begin_vfs_history_mutation();
+            let parent_hash = state.blobs.write(b"parent").unwrap();
+            let parent = SemanticChange {
+                id: parent_id,
+                parents: vec![genesis.id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "hydrate missing parent".to_string(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas: vec![ArtifactDelta {
+                    file_id: FilePathId::new("src/parent.rs"),
+                    kind: ArtifactDeltaKind::Added,
+                    old_hash: None,
+                    new_hash: Some(parent_hash),
+                }],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: Some(branch_name.clone()),
+            };
+            state.graph.create_change(&parent).unwrap();
+            assert!(invalidate_vfs_for_inserted_changes(&state, [parent_id]).unwrap());
+            mutation.finish();
+        }
+
+        let after = current_vfs_snapshot(&state).await.unwrap();
+        assert_eq!(after.key.head, before.key.head, "active head did not move");
+        assert_eq!(after.key.history_version, version_before + 1);
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert!(after.files.contains_key(&FilePathId::new("src/parent.rs")));
+        assert!(after.files.contains_key(&FilePathId::new("src/head.rs")));
+    }
+
+    #[tokio::test]
+    async fn unrelated_history_insert_preserves_active_snapshot_arc() {
+        let state = test_state();
+        install_branch_file(&state, "src/active.rs", b"active");
+        let before = current_vfs_snapshot(&state).await.unwrap();
+        let version_before = before.key.history_version;
+        let genesis_id = kin_core::build_genesis_change().id;
+        let unrelated_id = SemanticChangeId::from_hash(Hash256::from_bytes([0x8a; 32]));
+
+        {
+            let mutation = state.begin_vfs_history_mutation();
+            let unrelated = SemanticChange {
+                id: unrelated_id,
+                parents: vec![genesis_id],
+                timestamp: Timestamp::now(),
+                author: AuthorId::new("test"),
+                message: "unrelated branch history".to_string(),
+                entity_deltas: vec![],
+                relation_deltas: vec![],
+                artifact_deltas: vec![],
+                projected_files: vec![],
+                spec_link: None,
+                evidence: vec![],
+                risk_summary: None,
+                authored_on: Some(BranchName::new("other")),
+            };
+            state.graph.create_change(&unrelated).unwrap();
+            assert!(!invalidate_vfs_for_inserted_changes(&state, [unrelated_id]).unwrap());
+            mutation.finish();
+        }
+        state.bump_version();
+
+        let after = current_vfs_snapshot(&state).await.unwrap();
+        assert_eq!(after.key.history_version, version_before);
+        assert!(Arc::ptr_eq(&before, &after));
+    }
+
+    #[tokio::test]
+    async fn bulk_hydration_reconciles_active_reachability_once() {
+        use std::sync::atomic::Ordering;
+
+        const INSERTED: usize = 64;
+        let state = test_state();
+        let branch_name = BranchName::new("main");
+        let genesis = kin_core::build_genesis_change();
+        state.graph.create_change(&genesis).unwrap();
+        let first_missing = SemanticChangeId::from_hash(Hash256::from_bytes([0x20; 32]));
+        let head_id = SemanticChangeId::from_hash(Hash256::from_bytes([0xf1; 32]));
+        let head = SemanticChange {
+            id: head_id,
+            parents: vec![first_missing],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("test"),
+            message: "head with lazy ancestry".to_string(),
+            entity_deltas: vec![],
+            relation_deltas: vec![],
+            artifact_deltas: vec![],
+            projected_files: vec![],
+            spec_link: None,
+            evidence: vec![],
+            risk_summary: None,
+            authored_on: Some(branch_name.clone()),
+        };
+        state.graph.create_change(&head).unwrap();
+        state
+            .graph
+            .create_branch(&Branch {
+                name: branch_name.clone(),
+                head: head_id,
+            })
+            .unwrap();
+        kin_core::write_current_branch(&state.layout, &branch_name).unwrap();
+        let before = current_vfs_snapshot(&state).await.unwrap();
+        assert!(before.missing_parent_ids.contains(&first_missing));
+
+        let walks_before = state.vfs_history_walk_count.load(Ordering::SeqCst);
+        {
+            let mutation = state.begin_vfs_history_mutation();
+            for index in 0..INSERTED {
+                let id = SemanticChangeId::from_hash(Hash256::from_bytes(
+                    [0x20u8.wrapping_add(index as u8); 32],
+                ));
+                let parent = if index + 1 == INSERTED {
+                    genesis.id
+                } else {
+                    SemanticChangeId::from_hash(Hash256::from_bytes(
+                        [0x20u8.wrapping_add(index as u8 + 1); 32],
+                    ))
+                };
+                state
+                    .graph
+                    .create_change(&SemanticChange {
+                        id,
+                        parents: vec![parent],
+                        timestamp: Timestamp::now(),
+                        author: AuthorId::new("test"),
+                        message: format!("hydrate ancestor {index}"),
+                        entity_deltas: vec![],
+                        relation_deltas: vec![],
+                        artifact_deltas: vec![],
+                        projected_files: vec![],
+                        spec_link: None,
+                        evidence: vec![],
+                        risk_summary: None,
+                        authored_on: Some(branch_name.clone()),
+                    })
+                    .unwrap();
+            }
+            assert!(invalidate_vfs_after_bulk_hydration(&state).unwrap());
+            assert_eq!(
+                state.vfs_history_walk_count.load(Ordering::SeqCst) - walks_before,
+                1,
+                "one bulk hydration must perform one active-history reconciliation, not one per insert"
+            );
+            mutation.finish();
+        }
+        let after = current_vfs_snapshot(&state).await.unwrap();
+        assert_eq!(after.reachable_change_ids.len(), INSERTED + 1);
+        assert!(after.missing_parent_ids.is_empty());
+    }
+
+    #[tokio::test]
     async fn concurrent_cold_vfs_readers_single_flight_one_materialization() {
         use std::sync::atomic::Ordering;
 
@@ -10806,6 +11186,39 @@ mod tests {
             .iter()
             .all(|snapshot| Arc::ptr_eq(first, snapshot)));
         assert_eq!(state.vfs_tree_build_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cold_vfs_build_refuses_partial_history_mutation_window() {
+        let state = test_state();
+        install_branch_file(&state, "src/one.rs", b"one");
+        let mutation = state.begin_vfs_history_mutation();
+
+        let error = current_vfs_snapshot(&state)
+            .await
+            .expect_err("a cold build must not publish from an in-flight history mutation");
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.1.contains("history"));
+
+        mutation.finish();
+        assert!(current_vfs_snapshot(&state).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn unfinished_history_mutation_invalidates_fail_closed() {
+        let state = test_state();
+        install_branch_file(&state, "src/one.rs", b"one");
+        let before = current_vfs_snapshot(&state).await.unwrap();
+
+        {
+            let _unfinished = state.begin_vfs_history_mutation();
+            // Simulate an early-return/error path after a mutation window was
+            // opened but before its inserted history could be reconciled.
+        }
+
+        let after = current_vfs_snapshot(&state).await.unwrap();
+        assert_eq!(after.key.history_version, before.key.history_version + 1);
+        assert!(!Arc::ptr_eq(&before, &after));
     }
 
     #[tokio::test]
@@ -10866,7 +11279,14 @@ mod tests {
         advance_branch_with_file(&state, "src/two.rs", b"two", 0x78);
         state.bump_version();
 
-        assert!(read_recover(&state.vfs_tree_cache).is_none());
+        // Head movement invalidates by key, not by clearing a shared Arc on
+        // every graph/version bump. Readers already holding the old immutable
+        // snapshot may finish, while the next request replaces it.
+        let retained_old = read_recover(&state.vfs_tree_cache)
+            .as_ref()
+            .cloned()
+            .expect("old-head snapshot remains available to in-flight readers");
+        assert!(Arc::ptr_eq(&first, &retained_old));
 
         let refreshed = current_vfs_snapshot(&state).await.unwrap();
         assert!(!Arc::ptr_eq(&first, &refreshed));
