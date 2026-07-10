@@ -77,14 +77,23 @@ class PendingUrl:
     url: str
 
 
+@dataclass(frozen=True)
+class RubyLineScan:
+    code: str
+    structure: str
+    has_unquoted_percent: bool
+    has_hash_character_literal: bool
+    has_unterminated_quote: bool
+
+
 def expected_url(artifact: str) -> str:
     return (
         f"https://github.com/firelock-ai/kin/releases/download/v#{{version}}/{artifact}"
     )
 
 
-def has_unquoted_ruby_percent(line: str) -> bool:
-    """Return whether code before a comment contains unsupported ``%`` syntax.
+def scan_ruby_line(line: str) -> RubyLineScan:
+    """Scan one generated-formula line with the Ruby tokens relevant here.
 
     Ruby percent literals may use ``#`` as their delimiter. Comment stripping cannot
     therefore run before this check: doing so can hide both the delimiter and arbitrary
@@ -92,56 +101,22 @@ def has_unquoted_ruby_percent(line: str) -> bool:
     grammar needs neither percent literals nor modulo expressions, so every unquoted
     percent token fails closed. Percent signs inside quoted metadata/URLs and comments
     remain ordinary data.
+
+    Ruby also parses ``?#`` as the character literal ``"#"``, not as ``?`` followed by
+    a comment. That token must be recognized before deciding that ``#`` starts a comment;
+    otherwise its trailing statements can desynchronize the validator's block stack.
     """
-
-    quote: str | None = None
-    escaped = False
-    for character in line:
-        if quote is not None:
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == quote:
-                quote = None
-            continue
-        if character in {'"', "'"}:
-            quote = character
-        elif character == "#":
-            return False
-        elif character == "%":
-            return True
-    return False
-
-
-def ruby_code(line: str) -> str:
-    """Return code before a Ruby comment, preserving hashes inside strings."""
-
-    quote: str | None = None
-    escaped = False
-    for index, character in enumerate(line):
-        if quote is not None:
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == quote:
-                quote = None
-            continue
-        if character in {'"', "'"}:
-            quote = character
-        elif character == "#":
-            return line[:index].strip()
-    return line.strip()
-
-
-def ruby_structure_code(line: str) -> str:
-    """Return Ruby code with strings/comments blanked for keyword checks."""
 
     retained: list[str] = []
     quote: str | None = None
     escaped = False
-    for character in line:
+    has_unquoted_percent = False
+    has_hash_character_literal = False
+    comment_index: int | None = None
+    index = 0
+
+    while index < len(line):
+        character = line[index]
         if quote is not None:
             retained.append(" ")
             if escaped:
@@ -150,40 +125,41 @@ def ruby_structure_code(line: str) -> str:
                 escaped = True
             elif character == quote:
                 quote = None
+            index += 1
             continue
         if character in {'"', "'"}:
             quote = character
             retained.append(" ")
+        elif character == "?" and index + 1 < len(line) and line[index + 1] == "#":
+            has_hash_character_literal = True
+            retained.extend((" ", " "))
+            index += 2
+            continue
         elif character == "#":
+            comment_index = index
             break
+        elif character == "%":
+            has_unquoted_percent = True
+            retained.append(character)
         else:
             retained.append(character)
-    return "".join(retained).strip()
+        index += 1
+
+    code = line[:comment_index].strip() if comment_index is not None else line.strip()
+    return RubyLineScan(
+        code=code,
+        structure="".join(retained).strip(),
+        has_unquoted_percent=has_unquoted_percent,
+        has_hash_character_literal=has_hash_character_literal,
+        has_unterminated_quote=quote is not None,
+    )
 
 
-def has_unterminated_ruby_quote(line: str) -> bool:
-    quote: str | None = None
-    escaped = False
-    for character in line:
-        if quote is not None:
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == quote:
-                quote = None
-            continue
-        if character in {'"', "'"}:
-            quote = character
-        elif character == "#":
-            break
-    return quote is not None
-
-
-def reject_unsupported_ruby_syntax(line: str, code: str, line_number: int) -> None:
+def reject_unsupported_ruby_syntax(scan: RubyLineScan, line_number: int) -> None:
     """Fail closed where this deliberately small Ruby parser has no authority."""
 
-    structure = ruby_structure_code(line)
+    code = scan.code
+    structure = scan.structure
     reason: str | None = None
     if BLOCK_COMMENT_RE.match(code):
         reason = "Ruby block comments"
@@ -191,7 +167,7 @@ def reject_unsupported_ruby_syntax(line: str, code: str, line_number: int) -> No
         reason = "Ruby data sections"
     elif GENERIC_CLASS_RE.match(code) and not KIN_CLASS_RE.fullmatch(code):
         reason = "Ruby class reopening and additional class declarations"
-    elif has_unterminated_ruby_quote(line):
+    elif scan.has_unterminated_quote:
         reason = "multiline quoted strings"
     elif "<<" in structure:
         reason = "Ruby heredocs and shift expressions"
@@ -199,7 +175,9 @@ def reject_unsupported_ruby_syntax(line: str, code: str, line_number: int) -> No
         reason = "Ruby brace blocks and hash literals"
     elif "`" in structure:
         reason = "Ruby command literals"
-    elif has_unquoted_ruby_percent(line):
+    elif scan.has_hash_character_literal:
+        reason = "Ruby hash character literals"
+    elif scan.has_unquoted_percent:
         reason = "Ruby percent literals"
     elif "/" in structure:
         reason = "Ruby regular expressions and division expressions"
@@ -262,10 +240,11 @@ def parse_formula(formula: str, expected_version: str) -> dict[str, FormulaPair]
 
     for index, line in enumerate(lines):
         line_number = index + 1
-        code = ruby_code(line)
+        scan = scan_ruby_line(line)
+        code = scan.code
         if not code:
             continue
-        reject_unsupported_ruby_syntax(line, code, line_number)
+        reject_unsupported_ruby_syntax(scan, line_number)
 
         if code == "end":
             if pending_url is not None:
