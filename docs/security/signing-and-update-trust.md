@@ -28,32 +28,46 @@ per-artifact SHA-256 file:
 
 A convenience `checksums-sha256.txt` aggregating every per-artifact file is also
 attached to the release, but the installer verifies against the per-artifact
-`.sha256` file, not the aggregate.
+`.sha256` file, not the aggregate. Each archive also has a provenance manifest,
+and the release includes an aggregate manifest binding the Kin and pinned
+`kin-vfs` commits, both lockfile hashes, every archive hash, and every packaged
+binary hash. GitHub signs an artifact attestation over the final archives and
+aggregate manifest before the prerelease is created.
 
 The Windows archive is a release-blocking target. It ships the supported
 vector-free runtime: graph, lexical, daemon, setup, and MCP surfaces are present,
 while vector similarity and local embedding are reported explicitly as
 unsupported. Windows VFS projection is also not shipped. The archive is
-checksum-protected but is not OS-code-signed by this pipeline.
+checksum-protected and GitHub-attested, but is not OS-code-signed by this pipeline.
 
 Every tag is first published as a non-latest prerelease. The anonymous install
 proof installs all five archives (Linux x86_64/aarch64, macOS x86_64/aarch64,
-and Windows x86_64), verifies exact tag/commit/lock provenance, and exercises a
-fresh repository plus daemon/setup health. A stable tag is promoted to the
-Latest release only after all five legs pass.
+and Windows x86_64), verifies the GitHub attestation plus exact tag/commit/lock
+provenance, and exercises a fresh repository, graph search/locate, MCP
+initialize/list/call, and all supported agent configuration writers. The four
+Unix legs additionally build embeddings and prove semantic search/locate at
+complete coverage. Both npm packages are then published under a provisional
+tag and anonymously installed and exercised. A stable tag reaches npm
+`latest` and GitHub Latest only after every gate passes.
 
-## Two Independent Integrity Layers
+## Three Independent Integrity Layers
 
-Kin's release trust rests on two layers that are verified independently:
+Kin's release trust rests on three layers that are verified independently:
 
 1. **A SHA-256 checksum** published next to every archive. This is the
    cross-platform integrity check the installer enforces on every platform.
-2. **Apple code-signing and notarization** of the macOS binaries. This is an
+2. **A GitHub artifact attestation** over the final archives and aggregate
+   provenance manifest. The release workflow signs it through GitHub OIDC;
+   install proof verifies the signer workflow, source tag, source commit, and
+   hosted-runner provenance. The convenience installers do not yet perform
+   this verification themselves, so users who need the additional supply-chain
+   check should run `gh attestation verify <archive> --repo firelock-ai/kin`.
+3. **Apple code-signing and notarization** of the macOS binaries. This is an
    OS-level authenticity and integrity check enforced by macOS Gatekeeper, and
    it applies only to the macOS artifacts.
 
-Linux and Windows artifacts rely on the SHA-256 layer (plus the integrity of the
-GitHub release asset host); they are not OS-code-signed by this pipeline today.
+Linux and Windows artifacts rely on the SHA-256 and GitHub-attestation layers;
+they are not OS-code-signed by this pipeline today.
 
 ## macOS Trust Chain
 

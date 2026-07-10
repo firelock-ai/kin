@@ -242,6 +242,7 @@ jobs:
           expected_sha="$(git rev-parse HEAD)"
 
           EXPECTED_SHA="$expected_sha" SKIP_VECTOR="$SKIP_VECTOR" PROVENANCE_DIR="$provenance_dir" node <<'NODE'
+          const crypto = require("crypto");
           const fs = require("fs");
           const expected = process.env.EXPECTED_SHA;
           const dir = process.env.PROVENANCE_DIR;
@@ -268,8 +269,12 @@ jobs:
           if (meta.kin_commit !== expected || meta.kin_dirty !== false || meta.kin_source_known !== true) {
             throw new Error("kin bench-meta did not prove a clean, known release source");
           }
-          if (!/^[0-9a-f]{64}$/.test(meta.dependency_provenance ?? "")) {
-            throw new Error("kin bench-meta did not expose valid Cargo.lock provenance");
+          const tagLockSha = crypto.createHash("sha256").update(fs.readFileSync("Cargo.lock")).digest("hex");
+          if (meta.dependency_provenance !== tagLockSha) {
+            throw new Error(
+              `embedded Cargo.lock provenance ${meta.dependency_provenance ?? "missing"} ` +
+              `does not match tagged Cargo.lock ${tagLockSha}`
+            );
           }
           if (process.env.SKIP_VECTOR === "true") {
             for (const feature of ["vector", "embeddings", "metal"]) {
@@ -457,6 +462,98 @@ jobs:
           ARTIFACT: ${{ matrix.artifact }}
           SHIM_NAME: ${{ matrix.shim_name }}
 
+      - name: Generate artifact provenance manifest
+        shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          TARGET: ${{ matrix.target }}
+          VFS_TARGET: ${{ matrix.vfs_target || matrix.target }}
+          EXPECTED_VFS_COMMIT: 48c757dfda2ca6b115f32d86875c6adde587b861
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const childProcess = require("child_process");
+          const crypto = require("crypto");
+          const fs = require("fs");
+          const path = require("path");
+
+          const artifact = process.env.ARTIFACT;
+          const target = process.env.TARGET;
+          const root = process.cwd();
+          const sha256 = (file) =>
+            crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+          const git = (cwd, ...args) =>
+            childProcess.execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+
+          const kinCommit = git(root, "rev-parse", "HEAD");
+          const vfsRoot = path.join(root, "kin-vfs");
+          const vfsCommit = git(vfsRoot, "rev-parse", "HEAD");
+          if (vfsCommit !== process.env.EXPECTED_VFS_COMMIT) {
+            throw new Error(`kin-vfs checkout ${vfsCommit} does not match pinned ${process.env.EXPECTED_VFS_COMMIT}`);
+          }
+
+          const kinLockSha = sha256(path.join(root, "Cargo.lock"));
+          const vfsLockSha = sha256(path.join(vfsRoot, "Cargo.lock"));
+          const buildMetaPath = path.join(
+            process.env.RUNNER_TEMP,
+            `kin-release-provenance-${target}`,
+            "kin-build-meta.json"
+          );
+          const buildMeta = JSON.parse(fs.readFileSync(buildMetaPath, "utf8"));
+          if (buildMeta.kin_commit !== kinCommit || buildMeta.dependency_provenance !== kinLockSha) {
+            throw new Error("embedded build provenance does not match the tagged Kin source and Cargo.lock");
+          }
+
+          const archives = [`${artifact}.tar.gz`, `${artifact}.zip`].filter((file) => fs.existsSync(file));
+          if (archives.length !== 1) {
+            throw new Error(`expected exactly one final archive for ${artifact}, found ${archives.join(", ") || "none"}`);
+          }
+          const archive = archives[0];
+          const contents = fs.readdirSync(artifact, { withFileTypes: true })
+            .filter((entry) => entry.isFile())
+            .map((entry) => {
+              const file = path.join(artifact, entry.name);
+              return {
+                name: entry.name,
+                sha256: sha256(file),
+                size_bytes: fs.statSync(file).size,
+              };
+            })
+            .sort((left, right) => left.name.localeCompare(right.name));
+          if (contents.length < 2) {
+            throw new Error(`${artifact} does not contain the mandatory kin and kin-daemon binaries`);
+          }
+
+          const manifest = {
+            schema_version: 1,
+            release_tag: process.env.GITHUB_REF_NAME,
+            artifact,
+            target,
+            vfs_target: process.env.VFS_TARGET,
+            kin: {
+              commit: kinCommit,
+              cargo_lock_sha256: kinLockSha,
+              embedded_dependency_provenance: buildMeta.dependency_provenance,
+            },
+            kin_vfs: {
+              commit: vfsCommit,
+              cargo_lock_sha256: vfsLockSha,
+            },
+            archive: {
+              name: archive,
+              sha256: sha256(archive),
+              size_bytes: fs.statSync(archive).size,
+            },
+            archive_contents: contents,
+            workflow: {
+              repository: process.env.GITHUB_REPOSITORY,
+              run_id: process.env.GITHUB_RUN_ID,
+              run_attempt: process.env.GITHUB_RUN_ATTEMPT,
+            },
+          };
+          fs.writeFileSync(`${artifact}.provenance.json`, `${JSON.stringify(manifest, null, 2)}\n`);
+          NODE
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
@@ -466,6 +563,7 @@ jobs:
             ${{ matrix.artifact }}.tar.gz.sha256
             ${{ matrix.artifact }}.zip
             ${{ matrix.artifact }}.zip.sha256
+            ${{ matrix.artifact }}.provenance.json
 
   # Notarize the macOS binaries from a Linux runner via rcodesign (the
   # apple-codesign Rust tool). Runs ONLY when NOTARIZE_ON_LINUX is selected; the
@@ -561,9 +659,21 @@ jobs:
     # dependency through while still gating on a real Linux-notarize failure.
     if: ${{ always() && !failure() && !cancelled() && github.ref_type == 'tag' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Checkout pinned kin-vfs provenance source
+        uses: actions/checkout@v7
+        with:
+          repository: firelock-ai/kin-vfs
+          path: release-inputs/kin-vfs
+          ref: 48c757dfda2ca6b115f32d86875c6adde587b861
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -603,8 +713,176 @@ jobs:
             test -s "$asset"
             test -s "$asset.sha256"
             sha256sum -c "$asset.sha256"
+            case "$asset" in
+              *.tar.gz) artifact="${asset%.tar.gz}" ;;
+              *.zip) artifact="${asset%.zip}" ;;
+            esac
+            test -s "$artifact.provenance.json"
           done
           test -s checksums-sha256.txt
+
+      - name: Verify and aggregate release provenance
+        env:
+          EXPECTED_VFS_COMMIT: 48c757dfda2ca6b115f32d86875c6adde587b861
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const childProcess = require("child_process");
+          const crypto = require("crypto");
+          const fs = require("fs");
+          const os = require("os");
+          const path = require("path");
+
+          const root = process.cwd();
+          const sha256 = (file) =>
+            crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+          const git = (cwd, ...args) =>
+            childProcess.execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+          const fail = (condition, message) => {
+            if (!condition) throw new Error(message);
+          };
+          const specs = [
+            {
+              artifact: "kin-linux-x86_64",
+              archive: "kin-linux-x86_64.tar.gz",
+              target: "x86_64-unknown-linux-musl",
+              vfsTarget: "x86_64-unknown-linux-gnu",
+              required: ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.so"],
+            },
+            {
+              artifact: "kin-linux-aarch64",
+              archive: "kin-linux-aarch64.tar.gz",
+              target: "aarch64-unknown-linux-musl",
+              vfsTarget: "aarch64-unknown-linux-gnu",
+              required: ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.so"],
+            },
+            {
+              artifact: "kin-macos-x86_64",
+              archive: "kin-macos-x86_64.tar.gz",
+              target: "x86_64-apple-darwin",
+              vfsTarget: "x86_64-apple-darwin",
+              required: ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.dylib"],
+            },
+            {
+              artifact: "kin-macos-aarch64",
+              archive: "kin-macos-aarch64.tar.gz",
+              target: "aarch64-apple-darwin",
+              vfsTarget: "aarch64-apple-darwin",
+              required: ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.dylib"],
+            },
+            {
+              artifact: "kin-windows-x86_64",
+              archive: "kin-windows-x86_64.zip",
+              target: "x86_64-pc-windows-msvc",
+              vfsTarget: "x86_64-pc-windows-msvc",
+              required: ["kin.exe", "kin-daemon.exe"],
+            },
+          ];
+
+          const kinCommit = git(root, "rev-parse", "HEAD");
+          const kinLockSha = sha256(path.join(root, "Cargo.lock"));
+          const vfsRoot = path.join(root, "release-inputs", "kin-vfs");
+          const vfsCommit = git(vfsRoot, "rev-parse", "HEAD");
+          const vfsLockSha = sha256(path.join(vfsRoot, "Cargo.lock"));
+          fail(vfsCommit === process.env.EXPECTED_VFS_COMMIT,
+            `kin-vfs checkout ${vfsCommit} does not match pinned ${process.env.EXPECTED_VFS_COMMIT}`);
+
+          const artifacts = specs.map((spec) => {
+            const manifestPath = `${spec.artifact}.provenance.json`;
+            const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+            fail(manifest.schema_version === 1, `${manifestPath} has an unsupported schema`);
+            fail(manifest.release_tag === process.env.GITHUB_REF_NAME,
+              `${manifestPath} release tag does not match ${process.env.GITHUB_REF_NAME}`);
+            fail(manifest.artifact === spec.artifact, `${manifestPath} artifact identity is wrong`);
+            fail(manifest.target === spec.target, `${manifestPath} target identity is wrong`);
+            fail(manifest.vfs_target === spec.vfsTarget, `${manifestPath} kin-vfs target identity is wrong`);
+            fail(manifest.kin?.commit === kinCommit, `${manifestPath} Kin commit does not match the tag`);
+            fail(manifest.kin?.cargo_lock_sha256 === kinLockSha,
+              `${manifestPath} Kin Cargo.lock hash does not match the tag`);
+            fail(manifest.kin?.embedded_dependency_provenance === kinLockSha,
+              `${manifestPath} embedded dependency provenance does not match the tagged Cargo.lock`);
+            fail(manifest.kin_vfs?.commit === vfsCommit,
+              `${manifestPath} kin-vfs commit does not match the pinned checkout`);
+            fail(manifest.kin_vfs?.cargo_lock_sha256 === vfsLockSha,
+              `${manifestPath} kin-vfs Cargo.lock hash does not match the pinned checkout`);
+            fail(manifest.archive?.name === spec.archive, `${manifestPath} archive name is wrong`);
+            fail(manifest.archive?.sha256 === sha256(spec.archive),
+              `${manifestPath} archive hash does not match the final archive`);
+            fail(manifest.archive?.size_bytes === fs.statSync(spec.archive).size,
+              `${manifestPath} archive size does not match the final archive`);
+            fail(Array.isArray(manifest.archive_contents), `${manifestPath} has no archive content hashes`);
+            fail(manifest.workflow?.repository === process.env.GITHUB_REPOSITORY,
+              `${manifestPath} repository identity does not match this run`);
+            fail(manifest.workflow?.run_id === process.env.GITHUB_RUN_ID,
+              `${manifestPath} run ID does not match this run`);
+            fail(manifest.workflow?.run_attempt === process.env.GITHUB_RUN_ATTEMPT,
+              `${manifestPath} run attempt does not match this run`);
+
+            const extractRoot = fs.mkdtempSync(path.join(os.tmpdir(), `${spec.artifact}-`));
+            try {
+              if (spec.archive.endsWith(".zip")) {
+                childProcess.execFileSync("unzip", ["-q", spec.archive, "-d", extractRoot]);
+              } else {
+                childProcess.execFileSync("tar", ["-xzf", spec.archive, "-C", extractRoot]);
+              }
+              const nested = path.join(extractRoot, spec.artifact);
+              const contentRoot = fs.existsSync(nested) ? nested : extractRoot;
+              const entries = fs.readdirSync(contentRoot, { withFileTypes: true });
+              fail(entries.every((entry) => entry.isFile()), `${spec.archive} has unexpected nested content`);
+              const actualNames = entries.map((entry) => entry.name).sort();
+              const manifestNames = manifest.archive_contents.map((entry) => entry.name).sort();
+              fail(JSON.stringify(actualNames) === JSON.stringify(manifestNames),
+                `${manifestPath} content inventory does not match ${spec.archive}`);
+              const records = new Map(manifest.archive_contents.map((entry) => [entry.name, entry]));
+              fail(records.size === manifest.archive_contents.length,
+                `${manifestPath} contains duplicate content records`);
+              for (const name of actualNames) {
+                const file = path.join(contentRoot, name);
+                const record = records.get(name);
+                fail(record?.sha256 === sha256(file), `${manifestPath} hash mismatch for ${name}`);
+                fail(record?.size_bytes === fs.statSync(file).size, `${manifestPath} size mismatch for ${name}`);
+              }
+              for (const required of spec.required) {
+                fail(records.has(required), `${spec.archive} is missing required ${required}`);
+              }
+            } finally {
+              fs.rmSync(extractRoot, { recursive: true, force: true });
+            }
+            return manifest;
+          });
+
+          const releaseManifest = {
+            schema_version: 1,
+            release_tag: process.env.GITHUB_REF_NAME,
+            kin: { commit: kinCommit, cargo_lock_sha256: kinLockSha },
+            kin_vfs: { commit: vfsCommit, cargo_lock_sha256: vfsLockSha },
+            artifacts,
+            workflow: {
+              repository: process.env.GITHUB_REPOSITORY,
+              run_id: process.env.GITHUB_RUN_ID,
+              run_attempt: process.env.GITHUB_RUN_ATTEMPT,
+            },
+          };
+          fs.writeFileSync("release-provenance.json", `${JSON.stringify(releaseManifest, null, 2)}\n`);
+          fs.writeFileSync(
+            "release-provenance.json.sha256",
+            `${sha256("release-provenance.json")}  release-provenance.json\n`
+          );
+          NODE
+          sha256sum -c release-provenance.json.sha256
+
+      - name: Attest final release archives and provenance
+        # Fail closed: without a repository attestation, no public prerelease is
+        # created and no npm candidate can be provisioned from these archives.
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: |
+            kin-linux-x86_64.tar.gz
+            kin-linux-aarch64.tar.gz
+            kin-macos-x86_64.tar.gz
+            kin-macos-aarch64.tar.gz
+            kin-windows-x86_64.zip
+            release-provenance.json
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -613,7 +891,8 @@ jobs:
           generate_release_notes: true
           # Every tag starts non-latest so anonymous installation can exercise
           # the public assets without exposing an unproven stable release as
-          # /releases/latest. Stable tags are promoted only after install_proof.
+          # /releases/latest. Stable tags are promoted only after install_proof
+          # plus anonymous npm candidate provisioning and npm latest promotion.
           prerelease: true
           make_latest: false
           fail_on_unmatched_files: true
@@ -629,6 +908,13 @@ jobs:
             kin-windows-x86_64.zip
             kin-windows-x86_64.zip.sha256
             checksums-sha256.txt
+            kin-linux-x86_64.provenance.json
+            kin-linux-aarch64.provenance.json
+            kin-macos-x86_64.provenance.json
+            kin-macos-aarch64.provenance.json
+            kin-windows-x86_64.provenance.json
+            release-provenance.json
+            release-provenance.json.sha256
 
   # Releases created with GITHUB_TOKEN do not emit a second workflow run.
   # Invoke the reusable anonymous install proof directly after assets are public.
@@ -640,16 +926,308 @@ jobs:
       release_tag: ${{ github.ref_name }}
     permissions:
       contents: read
+      attestations: read
+
+  publish_npm:
+    name: Publish npm Wrapper Candidate
+    needs: [publish, install_proof]
+    # publish uses always() to survive a skipped notarize_linux (the default
+    # macOS-notarytool path); mirror that guard here or GitHub transitively skips
+    # this job whenever notarize_linux is skipped.
+    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    # New versions use npm Trusted Publishing (OIDC). The token secret is used
+    # only to restore the provisional tag on an idempotent rerun; npm dist-tag
+    # mutation is not supported by Trusted Publishing.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Upgrade npm for OIDC trusted publishing (needs >= 11.5.1)
+        run: npm install -g npm@latest
+
+      - name: Verify npm package version matches tag
+        run: |
+          PACKAGE_VERSION=$(node -p "require('./packages/kin-mcp/package.json').version")
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          test "$PACKAGE_VERSION" = "$TAG_VERSION"
+
+      - name: Publish npm candidate (Trusted Publishing via OIDC)
+        id: npm_pub
+        shell: bash
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          PKG=$(node -p "require('./packages/kin-mcp/package.json').name")
+          VER=$(node -p "require('./packages/kin-mcp/package.json').version")
+          CANDIDATE_TAG="release-candidate-$(printf '%s' "$VER" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+          {
+            echo "pkg=$PKG"
+            echo "ver=$VER"
+            echo "candidate_tag=$CANDIDATE_TAG"
+          } >> "$GITHUB_OUTPUT"
+          if env -u NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG=/dev/null npm view "${PKG}@${VER}" version >/dev/null 2>&1; then
+            if [ -z "${NPM_TOKEN:-}" ]; then
+              echo "::error::NPM_TOKEN is required to restore $CANDIDATE_TAG on an idempotent rerun"
+              exit 1
+            fi
+            env NODE_AUTH_TOKEN="$NPM_TOKEN" npm dist-tag add "${PKG}@${VER}" "$CANDIDATE_TAG"
+            echo "${PKG}@${VER} already existed; restored provisional tag $CANDIDATE_TAG."
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          env -u NODE_AUTH_TOKEN npm publish ./packages/kin-mcp --access public --tag "$CANDIDATE_TAG"
+          echo "published=true" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Discord (npm candidate)
+        if: steps.npm_pub.outputs.published == 'true' && env.DISCORD_WEBHOOK_URL != ''
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          PKG: ${{ steps.npm_pub.outputs.pkg }}
+          VER: ${{ steps.npm_pub.outputs.ver }}
+          CANDIDATE_TAG: ${{ steps.npm_pub.outputs.candidate_tag }}
+        run: |
+          jq -nc --arg c "📦 \`${PKG}@${VER}\` published to **npm** under provisional tag \`${CANDIDATE_TAG}\`." '{content:$c}' \
+            | curl -fsS -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
+
+  publish_npm_canonical:
+    name: Publish npm Canonical Candidate (@kinlab/kin)
+    needs: [publish, install_proof]
+    # Both candidate jobs run in parallel, but both are mandatory inputs to the
+    # anonymous smoke and promotion gates below.
+    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    # Trusted Publishing is the publication credential. NPM_TOKEN is limited to
+    # dist-tag restoration/promotion because OIDC does not authorize dist-tag.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Upgrade npm for OIDC trusted publishing (needs >= 11.5.1)
+        run: npm install -g npm@latest
+
+      - name: Verify npm package version matches tag
+        run: |
+          PACKAGE_VERSION=$(node -p "require('./packages/kin/package.json').version")
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          test "$PACKAGE_VERSION" = "$TAG_VERSION"
+
+      - name: Run launcher tests
+        run: npm test --prefix ./packages/kin
+
+      - name: Publish npm candidate (Trusted Publishing via OIDC)
+        id: npm_pub_kin
+        shell: bash
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          PKG=$(node -p "require('./packages/kin/package.json').name")
+          VER=$(node -p "require('./packages/kin/package.json').version")
+          CANDIDATE_TAG="release-candidate-$(printf '%s' "$VER" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+          {
+            echo "pkg=$PKG"
+            echo "ver=$VER"
+            echo "candidate_tag=$CANDIDATE_TAG"
+          } >> "$GITHUB_OUTPUT"
+          if env -u NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG=/dev/null npm view "${PKG}@${VER}" version >/dev/null 2>&1; then
+            if [ -z "${NPM_TOKEN:-}" ]; then
+              echo "::error::NPM_TOKEN is required to restore $CANDIDATE_TAG on an idempotent rerun"
+              exit 1
+            fi
+            env NODE_AUTH_TOKEN="$NPM_TOKEN" npm dist-tag add "${PKG}@${VER}" "$CANDIDATE_TAG"
+            echo "${PKG}@${VER} already existed; restored provisional tag $CANDIDATE_TAG."
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          env -u NODE_AUTH_TOKEN npm publish ./packages/kin --access public --tag "$CANDIDATE_TAG"
+          echo "published=true" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Discord (npm candidate)
+        if: steps.npm_pub_kin.outputs.published == 'true' && env.DISCORD_WEBHOOK_URL != ''
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          PKG: ${{ steps.npm_pub_kin.outputs.pkg }}
+          VER: ${{ steps.npm_pub_kin.outputs.ver }}
+          CANDIDATE_TAG: ${{ steps.npm_pub_kin.outputs.candidate_tag }}
+        run: |
+          jq -nc --arg c "📦 \`${PKG}@${VER}\` published to **npm** under provisional tag \`${CANDIDATE_TAG}\` (canonical Kin install surface)." '{content:$c}' \
+            | curl -fsS -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
+
+  smoke_npm_candidates:
+    name: Anonymous npm Candidate Smoke (${{ matrix.package }})
+    needs: [publish_npm, publish_npm_canonical]
+    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: "@kinlab/kin"
+            binary: kin
+            surface: canonical
+          - package: "@kinlab/kin-mcp"
+            binary: kin-mcp
+            surface: compatibility
+    steps:
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install and provision candidate without credentials
+        shell: bash
+        env:
+          PACKAGE: ${{ matrix.package }}
+          BINARY: ${{ matrix.binary }}
+          SURFACE: ${{ matrix.surface }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          CANDIDATE_TAG="release-candidate-$(printf '%s' "$VERSION" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          mkdir -p "$tmp/home"
+          : > "$tmp/empty-npmrc"
+
+          resolved=""
+          for attempt in $(seq 1 18); do
+            resolved="$(env -u NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG="$tmp/empty-npmrc" \
+              npm view "${PACKAGE}@${CANDIDATE_TAG}" version 2>/dev/null || true)"
+            if [ "$resolved" = "$VERSION" ]; then
+              break
+            fi
+            if [ "$attempt" -eq 18 ]; then
+              echo "::error::anonymous npm lookup did not resolve ${PACKAGE}@${CANDIDATE_TAG} to $VERSION"
+              exit 1
+            fi
+            sleep 10
+          done
+
+          env -u NODE_AUTH_TOKEN \
+            HOME="$tmp/home" \
+            NPM_CONFIG_CACHE="$tmp/npm-cache" \
+            NPM_CONFIG_USERCONFIG="$tmp/empty-npmrc" \
+            npm install --global --prefix "$tmp/prefix" --no-audit --no-fund \
+            "${PACKAGE}@${CANDIDATE_TAG}"
+          launcher="$tmp/prefix/bin/$BINARY"
+          test -x "$launcher"
+
+          if [ "$SURFACE" = "canonical" ]; then
+            output="$(HOME="$tmp/home" KIN_HOME="$tmp/kin-home" "$launcher" --version)"
+            printf '%s\n' "$output"
+            case "$output" in
+              "kin $VERSION"*) ;;
+              *)
+                echo "::error::$PACKAGE provisioned a binary that did not report Kin $VERSION"
+                exit 1
+                ;;
+            esac
+          else
+            kin_bin="$(HOME="$tmp/home" KIN_MCP_CACHE_DIR="$tmp/kin-mcp-cache" "$launcher" --print-bin)"
+            daemon_bin="$(HOME="$tmp/home" KIN_MCP_CACHE_DIR="$tmp/kin-mcp-cache" "$launcher" --print-daemon-bin)"
+            test -x "$kin_bin"
+            test -x "$daemon_bin"
+            "$kin_bin" --version
+            "$daemon_bin" --version
+          fi
+
+  promote_npm:
+    name: Promote Proven npm Packages
+    needs: [publish_npm, publish_npm_canonical, smoke_npm_candidates]
+    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Upgrade npm
+        run: npm install -g npm@latest
+
+      - name: Promote both proven package versions
+        shell: bash
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NPM_TOKEN:-}" ]; then
+            echo "::error::NPM_TOKEN is required to promote proven npm versions"
+            exit 1
+          fi
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          CANDIDATE_TAG="release-candidate-$(printf '%s' "$VERSION" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')"
+          case "$VERSION" in
+            *-alpha*) FINAL_TAG="alpha" ;;
+            *-beta*) FINAL_TAG="beta" ;;
+            *-rc*) FINAL_TAG="rc" ;;
+            *-*)
+              echo "::error::unsupported npm prerelease channel in $VERSION; expected alpha, beta, or rc"
+              exit 1
+              ;;
+            *) FINAL_TAG="latest" ;;
+          esac
+          packages=("@kinlab/kin" "@kinlab/kin-mcp")
+
+          for package in "${packages[@]}"; do
+            env NODE_AUTH_TOKEN="$NPM_TOKEN" npm dist-tag add "${package}@${VERSION}" "$FINAL_TAG"
+          done
+
+          for package in "${packages[@]}"; do
+            resolved=""
+            for attempt in $(seq 1 18); do
+              resolved="$(env -u NODE_AUTH_TOKEN NPM_CONFIG_USERCONFIG=/dev/null \
+                npm view "${package}@${FINAL_TAG}" version 2>/dev/null || true)"
+              if [ "$resolved" = "$VERSION" ]; then
+                break
+              fi
+              if [ "$attempt" -eq 18 ]; then
+                echo "::error::anonymous npm lookup did not resolve ${package}@${FINAL_TAG} to $VERSION"
+                exit 1
+              fi
+              sleep 10
+            done
+          done
+
+          for package in "${packages[@]}"; do
+            env NODE_AUTH_TOKEN="$NPM_TOKEN" npm dist-tag rm "$package" "$CANDIDATE_TAG"
+          done
 
   finalize_release:
     name: Promote Proven Release
-    needs: [publish, install_proof]
+    needs: [publish, install_proof, promote_npm]
     if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Promote stable tag after public proof
+      - name: Promote stable tag after public and npm proof
         if: ${{ !contains(github.ref_name, '-') }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -670,160 +1248,13 @@ jobs:
             echo "::error::release prerelease=$actual, expected $expected after proof"
             exit 1
           fi
-
-  publish_npm:
-    name: Publish npm Wrapper
-    needs: [publish, install_proof, finalize_release]
-    # publish uses always() to survive a skipped notarize_linux (the default
-    # macOS-notarytool path); mirror that guard here or GitHub transitively skips
-    # this job whenever notarize_linux is skipped.
-    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
-    runs-on: ubuntu-latest
-    # Trusted Publishing (OIDC): npm authenticates this workflow via a short-lived
-    # OIDC token instead of a long-lived NPM_TOKEN secret — no token to leak or
-    # rotate, and it satisfies the @kinlab org's 2FA-for-publish policy. Requires a
-    # Trusted Publisher configured on npm for @kinlab/kin-mcp pointing at
-    # firelock-ai/kin + this workflow (release.yml).
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Install Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: 20
-          registry-url: https://registry.npmjs.org
-
-      - name: Upgrade npm for OIDC trusted publishing (needs >= 11.5.1)
-        run: npm install -g npm@latest
-
-      - name: Verify npm package version matches tag
-        run: |
-          PACKAGE_VERSION=$(node -p "require('./packages/kin-mcp/package.json').version")
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          test "$PACKAGE_VERSION" = "$TAG_VERSION"
-
-      - name: Resolve npm dist-tag
-        id: dist-tag
-        shell: bash
-        run: |
-          ref="${GITHUB_REF_NAME#v}"
-          case "$ref" in
-            *-alpha*) tag="alpha" ;;
-            *-beta*) tag="beta" ;;
-            *-rc*) tag="rc" ;;
-            *) tag="latest" ;;
-          esac
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
-      - name: Publish npm package (Trusted Publishing via OIDC)
-        id: npm_pub
-        run: |
-          PKG=$(node -p "require('./packages/kin-mcp/package.json').name")
-          VER=$(node -p "require('./packages/kin-mcp/package.json').version")
-          echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
-          echo "ver=$VER" >> "$GITHUB_OUTPUT"
-          if npm view "${PKG}@${VER}" version >/dev/null 2>&1; then
-            echo "${PKG}@${VER} already published — skipping (idempotent recut)."
-            echo "published=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          if [ "$expected" = "false" ]; then
+            latest="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name')"
+            if [ "$latest" != "$GITHUB_REF_NAME" ]; then
+              echo "::error::GitHub Latest resolved to $latest, expected $GITHUB_REF_NAME"
+              exit 1
+            fi
           fi
-          npm publish ./packages/kin-mcp --access public --tag "${NPM_DIST_TAG}"
-          echo "published=true" >> "$GITHUB_OUTPUT"
-        env:
-          NPM_DIST_TAG: ${{ steps.dist-tag.outputs.tag }}
-
-      - name: Notify Discord (npm publish)
-        if: steps.npm_pub.outputs.published == 'true' && env.DISCORD_WEBHOOK_URL != ''
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          PKG: ${{ steps.npm_pub.outputs.pkg }}
-          VER: ${{ steps.npm_pub.outputs.ver }}
-        run: |
-          jq -nc --arg c "📦 \`${PKG}@${VER}\` published to **npm**." '{content:$c}' \
-            | curl -fsS -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
-
-  publish_npm_canonical:
-    name: Publish npm Canonical Package (@kinlab/kin)
-    needs: [publish, install_proof, finalize_release]
-    # Runs parallel to publish_npm (independent packages: a kin-mcp registry
-    # failure must not block the canonical package, and vice versa). Mirror
-    # publish's always() guard so a skipped notarize_linux does not
-    # transitively skip this job.
-    if: ${{ always() && !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
-    runs-on: ubuntu-latest
-    # Trusted Publishing (OIDC), same as publish_npm. Requires a Trusted
-    # Publisher configured on npm for @kinlab/kin pointing at firelock-ai/kin +
-    # this workflow (release.yml). Until that npm-side configuration (or a
-    # one-time manual first publish) exists, this job fails visibly here
-    # without affecting the release or the kin-mcp compatibility publish.
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Install Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: 20
-          registry-url: https://registry.npmjs.org
-
-      - name: Upgrade npm for OIDC trusted publishing (needs >= 11.5.1)
-        run: npm install -g npm@latest
-
-      - name: Verify npm package version matches tag
-        run: |
-          PACKAGE_VERSION=$(node -p "require('./packages/kin/package.json').version")
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          test "$PACKAGE_VERSION" = "$TAG_VERSION"
-
-      - name: Run launcher tests
-        run: npm test --prefix ./packages/kin
-
-      - name: Resolve npm dist-tag
-        id: dist-tag
-        shell: bash
-        run: |
-          ref="${GITHUB_REF_NAME#v}"
-          case "$ref" in
-            *-alpha*) tag="alpha" ;;
-            *-beta*) tag="beta" ;;
-            *-rc*) tag="rc" ;;
-            *) tag="latest" ;;
-          esac
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
-      - name: Publish npm package (Trusted Publishing via OIDC)
-        id: npm_pub_kin
-        run: |
-          PKG=$(node -p "require('./packages/kin/package.json').name")
-          VER=$(node -p "require('./packages/kin/package.json').version")
-          echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
-          echo "ver=$VER" >> "$GITHUB_OUTPUT"
-          if npm view "${PKG}@${VER}" version >/dev/null 2>&1; then
-            echo "${PKG}@${VER} already published — skipping (idempotent recut)."
-            echo "published=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          npm publish ./packages/kin --access public --tag "${NPM_DIST_TAG}"
-          echo "published=true" >> "$GITHUB_OUTPUT"
-        env:
-          NPM_DIST_TAG: ${{ steps.dist-tag.outputs.tag }}
-
-      - name: Notify Discord (npm publish)
-        if: steps.npm_pub_kin.outputs.published == 'true' && env.DISCORD_WEBHOOK_URL != ''
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          PKG: ${{ steps.npm_pub_kin.outputs.pkg }}
-          VER: ${{ steps.npm_pub_kin.outputs.ver }}
-        run: |
-          jq -nc --arg c "📦 \`${PKG}@${VER}\` published to **npm** (canonical Kin install surface)." '{content:$c}' \
-            | curl -fsS -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK_URL"
 
   publish_boundary_contracts:
     name: Publish boundary contracts to KinLab

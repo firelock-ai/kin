@@ -925,10 +925,12 @@ fn entity_from_retrieval_key(
     }
 }
 
+#[cfg(feature = "vector")]
 fn embedding_status_complete(status: &kin_db::EmbeddingStatus) -> bool {
     status.total == 0 || (status.indexed == status.total && status.pending == 0)
 }
 
+#[cfg(feature = "vector")]
 fn embedding_status_summary(status: &kin_db::EmbeddingStatus) -> String {
     format!(
         "{}/{} indexed, {} unindexed, {} pending",
@@ -945,6 +947,7 @@ fn embedding_status_summary(status: &kin_db::EmbeddingStatus) -> String {
 /// benchmark-integrity (incomplete coverage refuses to score). An explicit
 /// `KIN_BYPASS_EMBEDDING_COVERAGE_CHECK=1` forces degradation even if strict
 /// was requested (kept for backward compatibility / tests).
+#[cfg(feature = "vector")]
 fn embedding_strict_mode() -> bool {
     locate_env_bool("KIN_REQUIRE_COMPLETE_EMBEDDINGS", false)
         && !locate_env_bool("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK", false)
@@ -982,6 +985,7 @@ fn evaluate_embedding_coverage(
 ) -> Result<SemanticCoverage> {
     let status = effective_embedding_status(graph, vector_source);
 
+    #[cfg(feature = "vector")]
     if !embedding_status_complete(&status) && embedding_strict_mode() {
         anyhow::bail!(
             "semantic locate requires complete embeddings; graph has {}. Run `kin embed` until `kin status --json` reports embeddingsIndexed == embeddingsTotal and embeddingsPending == 0. (Set KIN_REQUIRE_COMPLETE_EMBEDDINGS=0 to allow graceful degradation.)",
@@ -1067,6 +1071,19 @@ fn record_vector_index_degradation(
     sink: &mut Vec<RetrievalDegradation>,
 ) {
     if coverage.complete {
+        return;
+    }
+    if !coverage.supported {
+        record_degradation(
+            sink,
+            RetrievalDegradation {
+                component: "vector_index".to_string(),
+                reason: "feature_disabled".to_string(),
+                detail: "this Kin build does not include vector retrieval".to_string(),
+                remediation: "install a vector-enabled Kin build for semantic similarity search"
+                    .to_string(),
+            },
+        );
         return;
     }
     let vector_arm_present = coverage.indexed > 0
@@ -16360,6 +16377,7 @@ mod tests {
         assert_eq!(base, ones);
     }
 
+    #[cfg(feature = "vector")]
     #[test]
     #[serial_test::serial]
     fn locate_strict_mode_rejects_incomplete_embeddings() {
@@ -16383,6 +16401,35 @@ mod tests {
             format!("{err}").contains("semantic locate requires complete embeddings"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[cfg(not(feature = "vector"))]
+    #[test]
+    #[serial_test::serial]
+    fn vector_free_locate_ignores_impossible_strict_embedding_gate() {
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = test_entity("handler", "src/lib.py", 1, 5);
+        graph.upsert_entity(&entity).unwrap();
+
+        std::env::set_var("KIN_REQUIRE_COMPLETE_EMBEDDINGS", "1");
+        std::env::remove_var("KIN_BYPASS_EMBEDDING_COVERAGE_CHECK");
+        let result = run_with_graph_capture(&graph, "handler failure", true, 10, true)
+            .expect("a vector-free build must still serve lexical and graph locate");
+        std::env::remove_var("KIN_REQUIRE_COMPLETE_EMBEDDINGS");
+
+        let coverage = result
+            .semantic_coverage
+            .expect("vector-free locate must report semantic capability");
+        assert!(!coverage.supported);
+        assert!(!coverage.complete);
+        let vector_degradations = result
+            .degradations
+            .iter()
+            .filter(|degradation| degradation.component == "vector_index")
+            .collect::<Vec<_>>();
+        assert_eq!(vector_degradations.len(), 1);
+        assert_eq!(vector_degradations[0].reason, "feature_disabled");
+        assert!(!vector_degradations[0].remediation.contains("kin embed"));
     }
 
     #[test]

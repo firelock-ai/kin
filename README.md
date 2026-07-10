@@ -38,7 +38,7 @@ real blast radius of a merge is.
 
 Kin ships as native binaries on [GitHub Releases](https://github.com/firelock-ai/kin/releases)
 (currently **v0.2.15**) for five targets: macOS (Apple Silicon and Intel), Linux (x86_64 and
-aarch64, static musl), and Windows (x86_64 — a limited, work-in-progress build; see below).
+aarch64, static musl), and Windows (x86_64, supported for the vector-free surface described below).
 
 **Direct download.** Grab the archive for your platform, verify its checksum, and extract.
 The release publishes a `.sha256` next to every archive.
